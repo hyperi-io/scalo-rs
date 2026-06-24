@@ -20,8 +20,12 @@ Opinionated about correctness -- backpressure, memory safety and the probe
 trinity are on by default. Unopinionated about your domain -- no web
 framework, no ORM, no enforced transport. Drop it in; it works out of the box.
 
-Same batteries, idiomatic in each language: `cargo add scalo` (scalo-rs) /
-`pip install scalo` (scalo-py).
+scalo comes in two halves, same conventions, idiomatic in each language.
+**scalo-rs** (this crate) is the **data plane** -- the Rust hot path where
+every microsecond and byte counts (`cargo add scalo`). **scalo-py** is the
+**control plane** -- orchestration, APIs and integration in Python
+(`pip install scalo`). Use whichever fits the tier; both share the same
+config cascade, logging, metrics and resilience conventions.
 
 Not a framework you assemble from twenty crates and 8 weeks of munging. Built
 as the foundation for PB/hr data services.

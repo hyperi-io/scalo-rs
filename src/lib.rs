@@ -20,6 +20,11 @@
 //! no ORM, no enforced transport. Built as the foundation for PB/hr data
 //! services.
 //!
+//! scalo-rs (this crate) is the **data plane** -- the Rust hot path where
+//! every microsecond and byte counts. Its Python sibling **scalo-py** is the
+//! **control plane** (orchestration, APIs, integration), sharing the same
+//! config cascade, logging, metrics and resilience conventions.
+//!
 //! Full reference docs live under [`docs/`](https://github.com/hyperi-io/scalo-rs/tree/main/docs).
 //! Start at [`docs/README.md`](https://github.com/hyperi-io/scalo-rs/blob/main/docs/README.md)
 //! for the entry-point index.
