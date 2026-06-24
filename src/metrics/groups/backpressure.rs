@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/metrics/dfe_groups/backpressure.rs
+// File:      src/metrics/groups/backpressure.rs
 // Purpose:   DFE backpressure metrics group
 // Language:  Rust
 //

@@ -97,7 +97,7 @@ impl Spool {
 
         self.len += 1;
         #[cfg(feature = "metrics")]
-        ::metrics::gauge!("dfe_spool_queue_depth").set(self.len as f64);
+        ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
         Ok(())
     }
 
@@ -167,7 +167,7 @@ impl Spool {
                     .map_err(|e| SpoolError::Queue(e.to_string()))?;
                 self.len = self.len.saturating_sub(1);
                 #[cfg(feature = "metrics")]
-                ::metrics::gauge!("dfe_spool_queue_depth").set(self.len as f64);
+                ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
                 Ok(Some(data))
             }
             Err(yaque::TryRecvError::Io(e)) => Err(SpoolError::Io(e)),
@@ -200,7 +200,7 @@ impl Spool {
             .map_err(|e| SpoolError::Queue(e.to_string()))?;
         self.len = self.len.saturating_sub(1);
         #[cfg(feature = "metrics")]
-        ::metrics::gauge!("dfe_spool_queue_depth").set(self.len as f64);
+        ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
         Ok(data)
     }
 
@@ -236,7 +236,7 @@ impl Spool {
         }
         self.len = 0;
         #[cfg(feature = "metrics")]
-        ::metrics::gauge!("dfe_spool_queue_depth").set(0.0);
+        ::metrics::gauge!("spool_queue_depth").set(0.0);
         Ok(())
     }
 

@@ -14,9 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 /// Process metrics collector.
+///
+/// Emits BARE metric names (e.g. `process_resident_memory_bytes`). Namespacing
+/// is applied once by the prefix layer on the global recorder, so process
+/// metrics get the same `{namespace}_` prefix as everything else.
 #[derive(Debug, Clone)]
 pub struct ProcessMetrics {
-    namespace: String,
     system: Arc<std::sync::Mutex<System>>,
     pid: sysinfo::Pid,
     start_time: f64,
@@ -24,8 +27,12 @@ pub struct ProcessMetrics {
 
 impl ProcessMetrics {
     /// Create a new process metrics collector.
+    ///
+    /// The `namespace` argument is accepted for API compatibility but no longer
+    /// used to build names -- names are bare and the recorder's prefix layer
+    /// adds the namespace.
     #[must_use]
-    pub fn new(namespace: &str) -> Self {
+    pub fn new(_namespace: &str) -> Self {
         let pid = sysinfo::Pid::from_u32(std::process::id());
         let system = System::new_with_specifics(
             RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
@@ -35,41 +42,35 @@ impl ProcessMetrics {
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
 
-        let this = Self {
-            namespace: namespace.to_string(),
+        // Register metric descriptions (bare names; namespace added by the
+        // recorder's prefix layer).
+        Self::register_metrics();
+
+        Self {
             system: Arc::new(std::sync::Mutex::new(system)),
             pid,
             start_time,
-        };
-
-        // Register metric descriptions
-        this.register_metrics();
-        this
+        }
     }
 
-    /// Register metric descriptions.
-    fn register_metrics(&self) {
-        let ns = &self.namespace;
-
+    /// Register metric descriptions (bare names).
+    fn register_metrics() {
         metrics::describe_gauge!(
-            format!("{ns}_process_cpu_seconds_total"),
-            "Total user and system CPU time spent in seconds".to_string()
+            "process_cpu_seconds_total",
+            "Total user and system CPU time spent in seconds"
         );
         metrics::describe_gauge!(
-            format!("{ns}_process_resident_memory_bytes"),
-            "Resident memory size in bytes".to_string()
+            "process_resident_memory_bytes",
+            "Resident memory size in bytes"
         );
         metrics::describe_gauge!(
-            format!("{ns}_process_virtual_memory_bytes"),
-            "Virtual memory size in bytes".to_string()
+            "process_virtual_memory_bytes",
+            "Virtual memory size in bytes"
         );
+        metrics::describe_gauge!("process_open_fds", "Number of open file descriptors");
         metrics::describe_gauge!(
-            format!("{ns}_process_open_fds"),
-            "Number of open file descriptors".to_string()
-        );
-        metrics::describe_gauge!(
-            format!("{ns}_process_start_time_seconds"),
-            "Start time of the process since unix epoch in seconds".to_string()
+            "process_start_time_seconds",
+            "Start time of the process since unix epoch in seconds"
         );
     }
 
@@ -86,28 +87,26 @@ impl ProcessMetrics {
         );
 
         if let Some(process) = system.process(self.pid) {
-            let ns = &self.namespace;
-
             // CPU time (approximate - sysinfo gives percentage, not total time)
             let cpu_usage = f64::from(process.cpu_usage());
-            metrics::gauge!(format!("{ns}_process_cpu_seconds_total")).set(cpu_usage);
+            metrics::gauge!("process_cpu_seconds_total").set(cpu_usage);
 
             // Memory
             let rss = process.memory();
             let virtual_mem = process.virtual_memory();
-            metrics::gauge!(format!("{ns}_process_resident_memory_bytes")).set(rss as f64);
-            metrics::gauge!(format!("{ns}_process_virtual_memory_bytes")).set(virtual_mem as f64);
+            metrics::gauge!("process_resident_memory_bytes").set(rss as f64);
+            metrics::gauge!("process_virtual_memory_bytes").set(virtual_mem as f64);
 
             // File descriptors (Linux-specific)
             #[cfg(target_os = "linux")]
             {
                 if let Ok(fds) = count_open_fds() {
-                    metrics::gauge!(format!("{ns}_process_open_fds")).set(fds as f64);
+                    metrics::gauge!("process_open_fds").set(fds as f64);
                 }
             }
 
             // Start time
-            metrics::gauge!(format!("{ns}_process_start_time_seconds")).set(self.start_time);
+            metrics::gauge!("process_start_time_seconds").set(self.start_time);
         }
     }
 }
@@ -126,7 +125,6 @@ mod tests {
     #[test]
     fn test_process_metrics_new() {
         let pm = ProcessMetrics::new("test");
-        assert_eq!(pm.namespace, "test");
         assert!(pm.start_time > 0.0);
     }
 

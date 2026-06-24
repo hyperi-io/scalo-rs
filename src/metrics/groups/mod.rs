@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/metrics/dfe_groups/mod.rs
+// File:      src/metrics/groups/mod.rs
 // Purpose:   DFE-specific metric groups
 // Language:  Rust
 //
@@ -9,18 +9,21 @@
 //! Composable DFE metric groups.
 //!
 //! Opt-in metric structs for DFE pipeline applications. Each group registers
-//! standardised metrics using the [`MetricsManager`](super::MetricsManager)
-//! namespace prefix (e.g. `dfe_loader_buffer_bytes`).
+//! standardised metrics with BARE names (e.g. `buffer_bytes`). When the
+//! [`MetricsManager`](super::MetricsManager) has a non-empty namespace, the
+//! prefix layer on the global recorder and the manifest registry add a single
+//! `{namespace}_` prefix uniformly (e.g. `dfe_buffer_bytes`).
 //!
-//! Feature-gated behind `metrics-dfe`. Non-DFE apps are unaffected.
+//! Feature-gated behind `service-metrics`. Non-DFE apps are unaffected.
 //!
 //! ## Usage
 //!
 //! ```rust,no_run
 //! use scalo::metrics::MetricsManager;
-//! use scalo::metrics::dfe_groups::*;
+//! use scalo::metrics::FlushTrigger;
+//! use scalo::metrics::groups::*;
 //!
-//! let mgr = MetricsManager::new("dfe_loader");
+//! let mgr = MetricsManager::new("loader");
 //! let app = AppMetrics::new(&mgr, env!("CARGO_PKG_VERSION"), "abc123");
 //! let buffer = BufferMetrics::new(&mgr);
 //! let consumer = ConsumerMetrics::new(&mgr);
@@ -29,7 +32,7 @@
 //! let bp = BackpressureMetrics::new(&mgr);
 //!
 //! app.record_received(100);
-//! buffer.record_flush(0.042, "size");
+//! buffer.record_flush(0.042, FlushTrigger::Size);
 //! consumer.set_lag("events", 3, 1500);
 //! sink.record_duration("clickhouse", 0.015);
 //! cb.record_transition("db.events", "open");

@@ -92,8 +92,8 @@ impl FileDlqInner {
 
         #[cfg(feature = "metrics")]
         {
-            metrics::counter!("dfe_dlq_entries_total").increment(count);
-            metrics::gauge!("dfe_dlq_entries_written").set(self.writer.lines_written() as f64);
+            metrics::counter!("dlq_entries_total").increment(count);
+            metrics::gauge!("dlq_entries_written").set(self.writer.lines_written() as f64);
         }
 
         debug!(

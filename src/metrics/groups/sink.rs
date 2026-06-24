@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/metrics/dfe_groups/sink.rs
+// File:      src/metrics/groups/sink.rs
 // Purpose:   DFE sink metrics group
 // Language:  Rust
 //
@@ -19,27 +19,22 @@ use super::super::manifest::{MetricDescriptor, MetricType};
 #[derive(Clone)]
 pub struct SinkMetrics {
     pub concurrent_inserts: Gauge,
-    namespace: String,
 }
 
 impl SinkMetrics {
     #[must_use]
     pub fn new(manager: &MetricsManager) -> Self {
-        let ns = manager.namespace();
+        // All names are BARE -- the prefix layer on the global recorder and the
+        // manifest registry apply the namespace.
 
         // sink_duration_seconds -- label-based, register descriptor manually
-        let dur_key = if ns.is_empty() {
-            "sink_duration_seconds".to_string()
-        } else {
-            format!("{ns}_sink_duration_seconds")
-        };
         metrics::describe_histogram!(
-            dur_key.clone(),
+            "sink_duration_seconds",
             metrics::Unit::Seconds,
             "Sink write latency"
         );
         manager.registry().push(MetricDescriptor {
-            name: dur_key,
+            name: "sink_duration_seconds".into(),
             metric_type: MetricType::Histogram,
             description: "Sink write latency".into(),
             unit: "seconds".into(),
@@ -51,14 +46,9 @@ impl SinkMetrics {
         });
 
         // sink_errors_total -- label-based
-        let err_key = if ns.is_empty() {
-            "sink_errors_total".to_string()
-        } else {
-            format!("{ns}_sink_errors_total")
-        };
-        metrics::describe_counter!(err_key.clone(), "Sink write errors");
+        metrics::describe_counter!("sink_errors_total", "Sink write errors");
         manager.registry().push(MetricDescriptor {
-            name: err_key,
+            name: "sink_errors_total".into(),
             metric_type: MetricType::Counter,
             description: "Sink write errors".into(),
             unit: String::new(),
@@ -70,14 +60,9 @@ impl SinkMetrics {
         });
 
         // bytes_sent_total -- label-based
-        let bytes_key = if ns.is_empty() {
-            "bytes_sent_total".to_string()
-        } else {
-            format!("{ns}_bytes_sent_total")
-        };
-        metrics::describe_counter!(bytes_key.clone(), "Bytes sent to sink");
+        metrics::describe_counter!("bytes_sent_total", "Bytes sent to sink");
         manager.registry().push(MetricDescriptor {
-            name: bytes_key,
+            name: "bytes_sent_total".into(),
             metric_type: MetricType::Counter,
             description: "Bytes sent to sink".into(),
             unit: String::new(),
@@ -95,41 +80,26 @@ impl SinkMetrics {
                 &[],
                 "sink",
             ),
-            namespace: ns.to_string(),
         }
     }
 
     /// Record a sink write with backend label.
     #[inline]
     pub fn record_duration(&self, backend: &str, seconds: f64) {
-        let key = if self.namespace.is_empty() {
-            "sink_duration_seconds".to_string()
-        } else {
-            format!("{}_sink_duration_seconds", self.namespace)
-        };
-        metrics::histogram!(key, "backend" => backend.to_string()).record(seconds);
+        metrics::histogram!("sink_duration_seconds", "backend" => backend.to_string())
+            .record(seconds);
     }
 
     /// Record a sink write error with backend label.
     #[inline]
     pub fn record_error(&self, backend: &str) {
-        let key = if self.namespace.is_empty() {
-            "sink_errors_total".to_string()
-        } else {
-            format!("{}_sink_errors_total", self.namespace)
-        };
-        metrics::counter!(key, "backend" => backend.to_string()).increment(1);
+        metrics::counter!("sink_errors_total", "backend" => backend.to_string()).increment(1);
     }
 
     /// Record bytes sent with format label.
     #[inline]
     pub fn record_bytes_sent(&self, format: &str, bytes: u64) {
-        let key = if self.namespace.is_empty() {
-            "bytes_sent_total".to_string()
-        } else {
-            format!("{}_bytes_sent_total", self.namespace)
-        };
-        metrics::counter!(key, "format" => format.to_string()).increment(bytes);
+        metrics::counter!("bytes_sent_total", "format" => format.to_string()).increment(bytes);
     }
 
     #[inline]

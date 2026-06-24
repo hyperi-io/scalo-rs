@@ -110,8 +110,17 @@ impl MetricRegistry {
     }
 
     /// Push a metric descriptor into the registry.
-    pub(crate) fn push(&self, descriptor: MetricDescriptor) {
+    ///
+    /// The descriptor's `name` is expected to be BARE (no namespace prefix).
+    /// When the registry has a non-empty `app` namespace, `{app}_` is prepended
+    /// here -- the single place the manifest applies the namespace, mirroring
+    /// the prefix layer on the global recorder so emitted and manifest names
+    /// match.
+    pub(crate) fn push(&self, mut descriptor: MetricDescriptor) {
         if let Ok(mut inner) = self.inner.write() {
+            if !inner.app.is_empty() {
+                descriptor.name = format!("{}_{}", inner.app, descriptor.name);
+            }
             inner.descriptors.push(descriptor);
         }
     }
@@ -124,30 +133,38 @@ impl MetricRegistry {
         }
     }
 
-    /// Set use cases for a metric by full name. No-op if not found.
+    /// Set use cases for a metric by BARE name. No-op if not found.
+    ///
+    /// Pass the bare metric name (no namespace prefix); `{app}_` is prepended
+    /// here to match the stored descriptor name.
     pub(crate) fn set_use_cases(&self, metric_name: &str, use_cases: &[&str]) {
         if let Ok(mut inner) = self.inner.write() {
-            if let Some(desc) = inner.descriptors.iter_mut().find(|d| d.name == metric_name) {
+            let lookup = prefixed_lookup(&inner.app, metric_name);
+            if let Some(desc) = inner.descriptors.iter_mut().find(|d| d.name == lookup) {
                 desc.use_cases = use_cases.iter().map(|s| (*s).to_string()).collect();
             } else {
                 #[cfg(feature = "logger")]
                 tracing::warn!(
-                    metric = metric_name,
+                    metric = lookup,
                     "set_use_cases: metric not found in registry"
                 );
             }
         }
     }
 
-    /// Set dashboard hint for a metric by full name. No-op if not found.
+    /// Set dashboard hint for a metric by BARE name. No-op if not found.
+    ///
+    /// Pass the bare metric name (no namespace prefix); `{app}_` is prepended
+    /// here to match the stored descriptor name.
     pub(crate) fn set_dashboard_hint(&self, metric_name: &str, hint: &str) {
         if let Ok(mut inner) = self.inner.write() {
-            if let Some(desc) = inner.descriptors.iter_mut().find(|d| d.name == metric_name) {
+            let lookup = prefixed_lookup(&inner.app, metric_name);
+            if let Some(desc) = inner.descriptors.iter_mut().find(|d| d.name == lookup) {
                 desc.dashboard_hint = Some(hint.to_string());
             } else {
                 #[cfg(feature = "logger")]
                 tracing::warn!(
-                    metric = metric_name,
+                    metric = lookup,
                     "set_dashboard_hint: metric not found in registry"
                 );
             }
@@ -166,6 +183,16 @@ impl MetricRegistry {
             registered_at: inner.registered_at.clone(),
             metrics: inner.descriptors.clone(),
         }
+    }
+}
+
+/// Prepend `{app}_` to a bare metric name, or return it unchanged when `app`
+/// is empty. Used to translate bare lookup keys into stored descriptor names.
+fn prefixed_lookup(app: &str, bare: &str) -> String {
+    if app.is_empty() {
+        bare.to_string()
+    } else {
+        format!("{app}_{bare}")
     }
 }
 
@@ -340,8 +367,9 @@ mod tests {
     #[test]
     fn test_registry_push_and_manifest() {
         let reg = MetricRegistry::new("test_app");
+        // Push a BARE name; the registry applies the `{app}_` prefix.
         reg.push(MetricDescriptor {
-            name: "test_app_requests_total".into(),
+            name: "requests_total".into(),
             metric_type: MetricType::Counter,
             description: "Total requests".into(),
             unit: String::new(),
@@ -357,6 +385,44 @@ mod tests {
         assert_eq!(manifest.metrics.len(), 1);
         assert_eq!(manifest.metrics[0].name, "test_app_requests_total");
         assert_eq!(manifest.metrics[0].labels, vec!["method"]);
+    }
+
+    #[test]
+    fn test_registry_push_bare_namespace_is_bare() {
+        // Empty namespace -> names stay bare.
+        let reg = MetricRegistry::new("");
+        reg.push(MetricDescriptor {
+            name: "transport_sent_total".into(),
+            metric_type: MetricType::Counter,
+            description: "sent".into(),
+            unit: String::new(),
+            labels: vec![],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
+        let manifest = reg.manifest();
+        assert_eq!(manifest.metrics[0].name, "transport_sent_total");
+    }
+
+    #[test]
+    fn test_registry_push_applies_namespace_prefix() {
+        // Non-empty namespace -> single `{app}_` prefix on the manifest name.
+        let reg = MetricRegistry::new("acme");
+        reg.push(MetricDescriptor {
+            name: "transport_sent_total".into(),
+            metric_type: MetricType::Counter,
+            description: "sent".into(),
+            unit: String::new(),
+            labels: vec![],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
+        let manifest = reg.manifest();
+        assert_eq!(manifest.metrics[0].name, "acme_transport_sent_total");
     }
 
     #[test]

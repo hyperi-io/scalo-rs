@@ -175,7 +175,7 @@ impl TransportSender for RoutedSender {
         // bounded by the routing table size, not by message count.
         #[cfg(feature = "metrics")]
         metrics::counter!(
-            "dfe_transport_sent_total",
+            "transport_sent_total",
             "transport" => "routed",
             "route" => route_name.to_string()
         )

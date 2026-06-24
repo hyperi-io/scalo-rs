@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/metrics/dfe_groups/app.rs
+// File:      src/metrics/groups/app.rs
 // Purpose:   Mandatory app-level DFE metrics
 // Language:  Rust
 //
@@ -39,22 +39,17 @@ impl AppMetrics {
     pub fn new(manager: &MetricsManager, version: &str, commit: &str) -> Self {
         manager.set_build_info(version, commit);
 
-        // Info metric for service discovery
-        let ns = manager.namespace();
-        let info_name = if ns.is_empty() {
-            "info".to_string()
-        } else {
-            format!("{ns}_info")
-        };
-        metrics::describe_gauge!(info_name.clone(), "Application info for service discovery");
+        // Info metric for service discovery. Names are BARE -- the prefix layer
+        // on the global recorder and the registry apply the namespace.
+        metrics::describe_gauge!("info", "Application info for service discovery");
         metrics::gauge!(
-            info_name.clone(),
+            "info",
             "version" => version.to_string(),
             "commit" => commit.to_string()
         )
         .set(1.0);
         manager.registry().push(MetricDescriptor {
-            name: info_name,
+            name: "info".into(),
             metric_type: MetricType::Gauge,
             description: "Application info for service discovery".into(),
             unit: String::new(),
@@ -78,15 +73,12 @@ impl AppMetrics {
                 .map_or(0.0, |d| d.as_secs_f64()),
         );
 
-        // config_reloads_total -- label-based, register descriptor manually
-        let config_key = if ns.is_empty() {
-            "config_reloads_total".to_string()
-        } else {
-            format!("{ns}_config_reloads_total")
-        };
-        metrics::describe_counter!(config_key.clone(), "Config reload attempts");
+        // config_reloads_total -- label-based, register descriptor manually.
+        // BARE name; the recorder's prefix layer adds the namespace at emit time.
+        let config_key = "config_reloads_total";
+        metrics::describe_counter!(config_key, "Config reload attempts");
         manager.registry().push(MetricDescriptor {
-            name: config_key.clone(),
+            name: config_key.into(),
             metric_type: MetricType::Counter,
             description: "Config reload attempts".into(),
             unit: String::new(),
@@ -140,7 +132,7 @@ impl AppMetrics {
                 &[],
                 "app",
             ),
-            config_reloads_success: metrics::counter!(config_key.clone(), "result" => "success"),
+            config_reloads_success: metrics::counter!(config_key, "result" => "success"),
             config_reloads_error: metrics::counter!(config_key, "result" => "error"),
         }
     }

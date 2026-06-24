@@ -148,7 +148,7 @@ impl Dlq {
             batch_size: config.batch_size,
             flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
             overflow: Overflow::Drop,
-            metric_prefix: Some("dfe_dlq"),
+            metric_prefix: Some("dlq"),
         };
 
         // Derive a child token so `Dlq::shutdown` can stop the drain

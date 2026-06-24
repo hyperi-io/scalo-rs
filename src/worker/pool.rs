@@ -383,7 +383,7 @@ impl AdaptiveWorkerPool {
             }
 
             #[cfg(feature = "metrics")]
-            ::metrics::gauge!("dfe_fanout_inflight").set(set.len() as f64);
+            ::metrics::gauge!("fanout_inflight").set(set.len() as f64);
 
             let Some(joined) = set.join_next().await else {
                 break; // nothing in flight -- done (or cancelled with none left)
@@ -392,7 +392,7 @@ impl AdaptiveWorkerPool {
                 Ok((idx, outcome)) => {
                     #[cfg(feature = "metrics")]
                     if matches!(outcome, FanOutResult::TimedOut) {
-                        ::metrics::counter!("dfe_fanout_timeout_total").increment(1);
+                        ::metrics::counter!("fanout_timeout_total").increment(1);
                     }
                     results[idx] = outcome;
                 }
@@ -402,7 +402,7 @@ impl AdaptiveWorkerPool {
                         results[idx] = FanOutResult::Panicked;
                     }
                     #[cfg(feature = "metrics")]
-                    ::metrics::counter!("dfe_fanout_panic_total").increment(1);
+                    ::metrics::counter!("fanout_panic_total").increment(1);
                     tracing::error!(error = %join_err, "fan_out_async_with_policy task panicked");
                 }
             }
@@ -415,8 +415,8 @@ impl AdaptiveWorkerPool {
 
         #[cfg(feature = "metrics")]
         {
-            ::metrics::gauge!("dfe_fanout_inflight").set(0.0);
-            ::metrics::histogram!("dfe_fanout_batch_duration_seconds")
+            ::metrics::gauge!("fanout_inflight").set(0.0);
+            ::metrics::histogram!("fanout_batch_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
         }
 

@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/metrics/dfe_groups/circuit_breaker.rs
+// File:      src/metrics/groups/circuit_breaker.rs
 // Purpose:   DFE circuit breaker metrics group
 // Language:  Rust
 //
@@ -16,26 +16,21 @@ use super::super::manifest::{MetricDescriptor, MetricType};
 /// State values: 0=closed (healthy), 1=open (failing), 2=half-open (probing).
 #[derive(Clone)]
 pub struct CircuitBreakerMetrics {
-    namespace: String,
+    _private: (),
 }
 
 impl CircuitBreakerMetrics {
     #[must_use]
     pub fn new(manager: &MetricsManager) -> Self {
-        let ns = manager.namespace();
+        // BARE names -- the recorder prefix layer and registry apply the namespace.
 
         // circuit_breaker_state -- label-based, register descriptor manually
-        let state_key = if ns.is_empty() {
-            "circuit_breaker_state".to_string()
-        } else {
-            format!("{ns}_circuit_breaker_state")
-        };
         metrics::describe_gauge!(
-            state_key.clone(),
+            "circuit_breaker_state",
             "Circuit breaker state (0=closed, 1=open, 2=half-open)"
         );
         manager.registry().push(MetricDescriptor {
-            name: state_key,
+            name: "circuit_breaker_state".into(),
             metric_type: MetricType::Gauge,
             description: "Circuit breaker state (0=closed, 1=open, 2=half-open)".into(),
             unit: String::new(),
@@ -47,14 +42,12 @@ impl CircuitBreakerMetrics {
         });
 
         // circuit_breaker_transitions_total -- label-based
-        let trans_key = if ns.is_empty() {
-            "circuit_breaker_transitions_total".to_string()
-        } else {
-            format!("{ns}_circuit_breaker_transitions_total")
-        };
-        metrics::describe_counter!(trans_key.clone(), "Circuit breaker state transitions");
+        metrics::describe_counter!(
+            "circuit_breaker_transitions_total",
+            "Circuit breaker state transitions"
+        );
         manager.registry().push(MetricDescriptor {
-            name: trans_key,
+            name: "circuit_breaker_transitions_total".into(),
             metric_type: MetricType::Counter,
             description: "Circuit breaker state transitions".into(),
             unit: String::new(),
@@ -65,32 +58,21 @@ impl CircuitBreakerMetrics {
             dashboard_hint: None,
         });
 
-        Self {
-            namespace: ns.to_string(),
-        }
+        Self { _private: () }
     }
 
     /// Set circuit breaker state for a target.
     #[inline]
     pub fn set_state(&self, target: &str, state: u8) {
-        let key = if self.namespace.is_empty() {
-            "circuit_breaker_state".to_string()
-        } else {
-            format!("{}_circuit_breaker_state", self.namespace)
-        };
-        metrics::gauge!(key, "target" => target.to_string()).set(f64::from(state));
+        metrics::gauge!("circuit_breaker_state", "target" => target.to_string())
+            .set(f64::from(state));
     }
 
     /// Record a state transition.
     #[inline]
     pub fn record_transition(&self, target: &str, to_state: &str) {
-        let key = if self.namespace.is_empty() {
-            "circuit_breaker_transitions_total".to_string()
-        } else {
-            format!("{}_circuit_breaker_transitions_total", self.namespace)
-        };
         metrics::counter!(
-            key,
+            "circuit_breaker_transitions_total",
             "target" => target.to_string(),
             "to_state" => to_state.to_string()
         )

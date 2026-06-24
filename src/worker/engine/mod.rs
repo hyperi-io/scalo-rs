@@ -584,7 +584,7 @@ impl BatchEngine {
             FilterDlqPolicy::Reject => Err(EngineError::FilterDlqUnrouted(entries.len())),
             FilterDlqPolicy::DiscardWithMetric => {
                 #[cfg(feature = "metrics")]
-                ::metrics::counter!("dfe_engine_filter_dlq_discarded_total")
+                ::metrics::counter!("engine_filter_dlq_discarded_total")
                     .increment(entries.len() as u64);
                 Ok(())
             }

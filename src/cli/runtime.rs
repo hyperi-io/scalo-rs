@@ -110,8 +110,8 @@ impl ServiceRuntime {
         app_name: &str,
         env_prefix: &str,
         metrics_addr: &str,
-        #[cfg_attr(not(feature = "metrics-dfe"), allow(unused_variables))] version: &str,
-        #[cfg_attr(not(feature = "metrics-dfe"), allow(unused_variables))] commit: &str,
+        #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] version: &str,
+        #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] commit: &str,
         #[cfg(feature = "scaling")] scaling_components: Vec<crate::ScalingComponent>,
     ) -> Result<Self, CliError> {
         let ctx = runtime_context();
@@ -121,10 +121,9 @@ impl ServiceRuntime {
         let dfe = Arc::new(crate::metrics::ServiceMetrics::register(&metrics));
 
         // App info metric (version, commit, service name)
-        #[cfg(feature = "metrics-dfe")]
+        #[cfg(feature = "service-metrics")]
         {
-            let _app_metrics =
-                crate::metrics::dfe_groups::AppMetrics::new(&metrics, version, commit);
+            let _app_metrics = crate::metrics::groups::AppMetrics::new(&metrics, version, commit);
         }
 
         // --- Memory guard ---

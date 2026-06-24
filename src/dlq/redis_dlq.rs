@@ -109,7 +109,7 @@ impl RedisDlqInner {
             .map_err(|e| DlqError::BackendError(format!("Redis XADD batch: {e}")))?;
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_dlq_sent_total", "backend" => "redis").increment(batch.len() as u64);
+        metrics::counter!("dlq_sent_total", "backend" => "redis").increment(batch.len() as u64);
 
         Ok(())
     }

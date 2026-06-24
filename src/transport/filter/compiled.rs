@@ -587,7 +587,7 @@ fn evaluate_cel(
     // CEL cost scales with payload size -- caps the worst case.
     if payload.len() > max_payload_bytes {
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_transport_filter_cel_payload_skip_total").increment(1);
+        metrics::counter!("transport_filter_cel_payload_skip_total").increment(1);
         return None;
     }
 

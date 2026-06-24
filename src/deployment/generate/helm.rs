@@ -112,12 +112,7 @@ fn gen_chart_yaml(
          appVersion: \"1.0.0\"\n\
          {identity_block}\n\
          keywords:\n\
-         \x20 - hyperi\n\
-         \x20 - dfe\n\
-         \n\
-         maintainers:\n\
-         \x20 - name: HyperI\n\
-         \x20   url: https://github.com/hyperi-io\n",
+         \x20 - {name}\n",
         name = c.app_name,
         desc = if c.description.is_empty() {
             &c.app_name

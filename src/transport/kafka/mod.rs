@@ -719,8 +719,7 @@ impl TransportSender for KafkaTransport {
         {
             Ok(_) => {
                 #[cfg(feature = "metrics")]
-                ::metrics::counter!("dfe_transport_sent_total", "transport" => "kafka")
-                    .increment(1);
+                ::metrics::counter!("transport_sent_total", "transport" => "kafka").increment(1);
                 SendResult::Ok
             }
             Err((err, _)) => {
@@ -728,7 +727,7 @@ impl TransportSender for KafkaTransport {
                 if err_str.contains("queue full") || err_str.contains("Local: Queue full") {
                     #[cfg(feature = "metrics")]
                     ::metrics::counter!(
-                        "dfe_transport_backpressured_total",
+                        "transport_backpressured_total",
                         "transport" => "kafka"
                     )
                     .increment(1);
@@ -736,7 +735,7 @@ impl TransportSender for KafkaTransport {
                 } else {
                     #[cfg(feature = "metrics")]
                     ::metrics::counter!(
-                        "dfe_transport_send_errors_total",
+                        "transport_send_errors_total",
                         "transport" => "kafka"
                     )
                     .increment(1);
@@ -747,7 +746,7 @@ impl TransportSender for KafkaTransport {
 
         #[cfg(feature = "metrics")]
         ::metrics::histogram!(
-            "dfe_transport_send_duration_seconds",
+            "transport_send_duration_seconds",
             "transport" => "kafka"
         )
         .record(start.elapsed().as_secs_f64());

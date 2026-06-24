@@ -325,7 +325,7 @@ impl TransportSender for FileTransport {
         tracing::debug!(bytes = payload.len(), "File transport: message sent");
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_transport_sent_total", "transport" => "file").increment(1);
+        metrics::counter!("transport_sent_total", "transport" => "file").increment(1);
 
         SendResult::Ok
     }
@@ -403,7 +403,7 @@ impl TransportReceiver for FileTransport {
 
         #[cfg(feature = "metrics")]
         if !messages.is_empty() {
-            metrics::counter!("dfe_transport_received_total", "transport" => "file")
+            metrics::counter!("transport_received_total", "transport" => "file")
                 .increment(messages.len() as u64);
         }
 

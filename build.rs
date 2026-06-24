@@ -6,7 +6,7 @@
 
 #[allow(clippy::unnecessary_wraps)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // DFE native transport proto
+    // scalo native transport proto
     #[cfg(feature = "transport-grpc")]
     {
         tonic_prost_build::configure()
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // prost-build docs, the zero-copy path only fires when the decode
             // source is itself a `bytes::Bytes`, which tonic's ProstCodec uses.
             .bytes(".")
-            .compile_protos(&["proto/dfe/transport/v1/dfe_transport.proto"], &["proto"])?;
+            .compile_protos(&["proto/scalo/transport/v1/transport.proto"], &["proto"])?;
     }
 
     // Vector wire protocol compat (vendored protos)

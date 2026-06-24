@@ -490,7 +490,7 @@ async fn ingest_handler(
         && pressure.should_hold()
     {
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_transport_backpressured_total", "transport" => "http", "reason" => "pressure")
+        metrics::counter!("transport_backpressured_total", "transport" => "http", "reason" => "pressure")
             .increment(1);
         return shed_503();
     }
@@ -526,18 +526,17 @@ async fn ingest_handler(
     match state.sender.try_send(msg) {
         Ok(()) => {
             #[cfg(feature = "metrics")]
-            metrics::counter!("dfe_transport_sent_total", "transport" => "http").increment(1);
+            metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
             axum::http::StatusCode::OK.into_response()
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             #[cfg(feature = "metrics")]
-            metrics::counter!("dfe_transport_backpressured_total", "transport" => "http")
-                .increment(1);
+            metrics::counter!("transport_backpressured_total", "transport" => "http").increment(1);
             shed_503()
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
             #[cfg(feature = "metrics")]
-            metrics::counter!("dfe_transport_refused_total", "transport" => "http").increment(1);
+            metrics::counter!("transport_refused_total", "transport" => "http").increment(1);
             axum::http::StatusCode::GONE.into_response()
         }
     }
@@ -630,7 +629,7 @@ impl TransportSender for HttpTransport {
                 tracing::debug!(url = %url, bytes = payload_len, "HTTP transport: POST sent");
 
                 #[cfg(feature = "metrics")]
-                metrics::counter!("dfe_transport_sent_total", "transport" => "http").increment(1);
+                metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
                 SendResult::Ok
             }
             Ok(resp)
@@ -641,7 +640,7 @@ impl TransportSender for HttpTransport {
                 tracing::warn!(status = %resp.status(), url = %url, "HTTP transport: backpressure");
 
                 #[cfg(feature = "metrics")]
-                metrics::counter!("dfe_transport_backpressured_total", "transport" => "http")
+                metrics::counter!("transport_backpressured_total", "transport" => "http")
                     .increment(1);
                 SendResult::Backpressured
             }
@@ -650,7 +649,7 @@ impl TransportSender for HttpTransport {
                 tracing::warn!(status = %resp.status(), url = %url, "HTTP transport: send error");
 
                 #[cfg(feature = "metrics")]
-                metrics::counter!("dfe_transport_send_errors_total", "transport" => "http")
+                metrics::counter!("transport_send_errors_total", "transport" => "http")
                     .increment(1);
                 SendResult::Fatal(TransportError::Send(format!(
                     "HTTP {} from {}",
@@ -663,14 +662,14 @@ impl TransportSender for HttpTransport {
                 tracing::warn!(error = %e, url = %url, "HTTP transport: request failed");
 
                 #[cfg(feature = "metrics")]
-                metrics::counter!("dfe_transport_send_errors_total", "transport" => "http")
+                metrics::counter!("transport_send_errors_total", "transport" => "http")
                     .increment(1);
                 SendResult::Fatal(TransportError::Send(format!("HTTP request failed: {e}")))
             }
         };
 
         #[cfg(feature = "metrics")]
-        metrics::histogram!("dfe_transport_send_duration_seconds", "transport" => "http")
+        metrics::histogram!("transport_send_duration_seconds", "transport" => "http")
             .record(start.elapsed().as_secs_f64());
 
         result

@@ -565,8 +565,7 @@ fn get_test_config() -> Option<KafkaConfig> {
 
     Some(KafkaConfig {
         brokers: brokers.split(',').map(|s| s.to_string()).collect(),
-        group: std::env::var("TEST_KAFKA_GROUP")
-            .unwrap_or_else(|_| "scalo-test-group".to_string()),
+        group: std::env::var("TEST_KAFKA_GROUP").unwrap_or_else(|_| "scalo-test-group".to_string()),
         topics: vec![
             std::env::var("TEST_KAFKA_TOPIC").unwrap_or_else(|_| "scalo-test".to_string()),
         ],

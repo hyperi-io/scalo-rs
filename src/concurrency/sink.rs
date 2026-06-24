@@ -71,7 +71,7 @@ pub struct BackgroundSinkConfig {
     /// Default `Overflow::Drop`.
     pub overflow: Overflow,
 
-    /// Optional Prometheus metric prefix. When `Some("dfe_dlq_file")`,
+    /// Optional Prometheus metric prefix. When `Some("dlq_file")`,
     /// the sink auto-registers and emits:
     ///   - `<prefix>_pushed_total`         (counter)
     ///   - `<prefix>_dropped_total`        (counter, only `Overflow::Drop`)

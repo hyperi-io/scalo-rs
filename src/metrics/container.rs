@@ -12,9 +12,11 @@ use std::fs;
 use std::path::Path;
 
 /// Container metrics collector.
+///
+/// Emits BARE metric names (e.g. `container_memory_limit_bytes`). Namespacing
+/// is applied once by the prefix layer on the global recorder.
 #[derive(Debug, Clone)]
 pub struct ContainerMetrics {
-    namespace: String,
     cgroup_version: CgroupVersion,
 }
 
@@ -27,54 +29,49 @@ enum CgroupVersion {
 
 impl ContainerMetrics {
     /// Create a new container metrics collector.
+    ///
+    /// The `namespace` argument is accepted for API compatibility but no longer
+    /// used to build names -- names are bare and the recorder's prefix layer
+    /// adds the namespace.
     #[must_use]
-    pub fn new(namespace: &str) -> Self {
+    pub fn new(_namespace: &str) -> Self {
         let cgroup_version = detect_cgroup_version();
 
-        let this = Self {
-            namespace: namespace.to_string(),
-            cgroup_version,
-        };
+        // Register metric descriptions (bare names; namespace added by the
+        // recorder's prefix layer).
+        Self::register_metrics();
 
-        this.register_metrics();
-        this
+        Self { cgroup_version }
     }
 
-    /// Register metric descriptions.
-    fn register_metrics(&self) {
-        let ns = &self.namespace;
-
+    /// Register metric descriptions (bare names).
+    fn register_metrics() {
         metrics::describe_gauge!(
-            format!("{ns}_container_memory_limit_bytes"),
-            "Container memory limit in bytes".to_string()
+            "container_memory_limit_bytes",
+            "Container memory limit in bytes"
         );
         metrics::describe_gauge!(
-            format!("{ns}_container_memory_usage_bytes"),
-            "Container memory usage in bytes".to_string()
+            "container_memory_usage_bytes",
+            "Container memory usage in bytes"
         );
-        metrics::describe_gauge!(
-            format!("{ns}_container_cpu_limit_cores"),
-            "Container CPU limit in cores".to_string()
-        );
+        metrics::describe_gauge!("container_cpu_limit_cores", "Container CPU limit in cores");
     }
 
     /// Update container metrics.
     pub fn update(&self) {
-        let ns = &self.namespace;
-
         // Memory limit
         if let Some(limit) = self.read_memory_limit() {
-            metrics::gauge!(format!("{ns}_container_memory_limit_bytes")).set(limit as f64);
+            metrics::gauge!("container_memory_limit_bytes").set(limit as f64);
         }
 
         // Memory usage
         if let Some(usage) = self.read_memory_usage() {
-            metrics::gauge!(format!("{ns}_container_memory_usage_bytes")).set(usage as f64);
+            metrics::gauge!("container_memory_usage_bytes").set(usage as f64);
         }
 
         // CPU limit
         if let Some(cores) = self.read_cpu_limit() {
-            metrics::gauge!(format!("{ns}_container_cpu_limit_cores")).set(cores);
+            metrics::gauge!("container_cpu_limit_cores").set(cores);
         }
     }
 
@@ -185,7 +182,8 @@ mod tests {
     #[test]
     fn test_container_metrics_new() {
         let cm = ContainerMetrics::new("test");
-        assert_eq!(cm.namespace, "test");
+        // Names are bare now; just confirm construction succeeds.
+        let _ = cm;
     }
 
     #[test]

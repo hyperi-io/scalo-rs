@@ -105,8 +105,9 @@ impl HttpClient {
         #[cfg(feature = "metrics")]
         {
             let status = if result.is_ok() { "success" } else { "error" };
-            metrics::counter!("dfe_http_client_requests_total", "method" => "GET", "status" => status).increment(1);
-            metrics::histogram!("dfe_http_client_duration_seconds", "method" => "GET")
+            metrics::counter!("http_client_requests_total", "method" => "GET", "status" => status)
+                .increment(1);
+            metrics::histogram!("http_client_duration_seconds", "method" => "GET")
                 .record(start.elapsed().as_secs_f64());
         }
 
@@ -147,8 +148,9 @@ impl HttpClient {
         #[cfg(feature = "metrics")]
         {
             let status = if result.is_ok() { "success" } else { "error" };
-            metrics::counter!("dfe_http_client_requests_total", "method" => "POST", "status" => status).increment(1);
-            metrics::histogram!("dfe_http_client_duration_seconds", "method" => "POST")
+            metrics::counter!("http_client_requests_total", "method" => "POST", "status" => status)
+                .increment(1);
+            metrics::histogram!("http_client_duration_seconds", "method" => "POST")
                 .record(start.elapsed().as_secs_f64());
         }
 
@@ -185,8 +187,9 @@ impl HttpClient {
         #[cfg(feature = "metrics")]
         {
             let status = if result.is_ok() { "success" } else { "error" };
-            metrics::counter!("dfe_http_client_requests_total", "method" => "PUT", "status" => status).increment(1);
-            metrics::histogram!("dfe_http_client_duration_seconds", "method" => "PUT")
+            metrics::counter!("http_client_requests_total", "method" => "PUT", "status" => status)
+                .increment(1);
+            metrics::histogram!("http_client_duration_seconds", "method" => "PUT")
                 .record(start.elapsed().as_secs_f64());
         }
 
@@ -203,8 +206,8 @@ impl HttpClient {
         #[cfg(feature = "metrics")]
         {
             let status = if result.is_ok() { "success" } else { "error" };
-            metrics::counter!("dfe_http_client_requests_total", "method" => "DELETE", "status" => status).increment(1);
-            metrics::histogram!("dfe_http_client_duration_seconds", "method" => "DELETE")
+            metrics::counter!("http_client_requests_total", "method" => "DELETE", "status" => status).increment(1);
+            metrics::histogram!("http_client_duration_seconds", "method" => "DELETE")
                 .record(start.elapsed().as_secs_f64());
         }
 

@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/metrics/dfe_groups/schema_cache.rs
+// File:      src/metrics/groups/schema_cache.rs
 // Purpose:   DFE schema cache metrics group
 // Language:  Rust
 //
@@ -21,23 +21,17 @@ pub struct SchemaCacheMetrics {
     pub hits: Counter,
     pub misses: Counter,
     pub tables: Gauge,
-    namespace: String,
 }
 
 impl SchemaCacheMetrics {
     #[must_use]
     pub fn new(manager: &MetricsManager) -> Self {
-        let ns = manager.namespace();
+        // BARE names -- the recorder prefix layer and registry apply the namespace.
 
         // schema_recovery_total -- label-based, register descriptor manually
-        let recovery_key = if ns.is_empty() {
-            "schema_recovery_total".to_string()
-        } else {
-            format!("{ns}_schema_recovery_total")
-        };
-        metrics::describe_counter!(recovery_key.clone(), "Schema mismatch recovery events");
+        metrics::describe_counter!("schema_recovery_total", "Schema mismatch recovery events");
         manager.registry().push(MetricDescriptor {
-            name: recovery_key,
+            name: "schema_recovery_total".into(),
             metric_type: MetricType::Counter,
             description: "Schema mismatch recovery events".into(),
             unit: String::new(),
@@ -67,7 +61,6 @@ impl SchemaCacheMetrics {
                 &[],
                 "schema_cache",
             ),
-            namespace: ns.to_string(),
         }
     }
 
@@ -89,11 +82,6 @@ impl SchemaCacheMetrics {
     /// Record a schema recovery event for a specific table.
     #[inline]
     pub fn record_recovery(&self, table: &str) {
-        let key = if self.namespace.is_empty() {
-            "schema_recovery_total".to_string()
-        } else {
-            format!("{}_schema_recovery_total", self.namespace)
-        };
-        metrics::counter!(key, "table" => table.to_string()).increment(1);
+        metrics::counter!("schema_recovery_total", "table" => table.to_string()).increment(1);
     }
 }

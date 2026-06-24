@@ -206,7 +206,7 @@ features = [
     "transport-kafka", "transport-grpc",
     "tiered-sink", "dlq-kafka", "spool",
     "http-server",
-    "metrics-dfe",
+    "service-metrics",
     "deployment", "version-check",
     "expression",
 ]

@@ -154,7 +154,7 @@ pub fn check_profile_with_config(expr: &str, config: &ProfileConfig) -> Vec<Stri
             if blocked.contains(&name) {
                 let reason = restriction_reason(name);
                 errors.push(format!(
-                    "Function '{name}()' is not allowed in the DFE expression profile. {reason}"
+                    "Function '{name}()' is not allowed in the expression profile. {reason}"
                 ));
             }
         }
@@ -196,7 +196,7 @@ fn restriction_reason(name: &str) -> &'static str {
         "timestamp" | "duration" => {
             "Time functions excluded -- ClickHouse handles time natively. Set allow_time: true in expression config to permit."
         }
-        _ => "Restricted by DFE expression profile.",
+        _ => "Restricted by the expression profile.",
     }
 }
 

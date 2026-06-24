@@ -160,18 +160,18 @@ impl SecretsManager {
         if let Some(cached) = self.cache.read().get(&cache_key) {
             debug!(path = %path, "Secret loaded from cache");
             #[cfg(feature = "metrics")]
-            metrics::counter!("dfe_secrets_cache_hits_total").increment(1);
+            metrics::counter!("secrets_cache_hits_total").increment(1);
             return Ok(cached);
         }
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_secrets_cache_misses_total").increment(1);
+        metrics::counter!("secrets_cache_misses_total").increment(1);
 
         // Fetch from file
         let value = self.file_provider.get(path).await?;
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_secrets_fetch_total").increment(1);
+        metrics::counter!("secrets_fetch_total").increment(1);
 
         // Update cache
         if let Err(e) = self.cache.write().set(&cache_key, &value) {
@@ -191,12 +191,12 @@ impl SecretsManager {
         if let Some(cached) = self.cache.read().get(cache_key) {
             debug!(key = %cache_key, "Secret loaded from cache");
             #[cfg(feature = "metrics")]
-            metrics::counter!("dfe_secrets_cache_hits_total").increment(1);
+            metrics::counter!("secrets_cache_hits_total").increment(1);
             return Ok(cached);
         }
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_secrets_cache_misses_total").increment(1);
+        metrics::counter!("secrets_cache_misses_total").increment(1);
 
         // Fetch from provider
         let result = match source {
@@ -236,7 +236,7 @@ impl SecretsManager {
         };
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_secrets_fetch_total").increment(1);
+        metrics::counter!("secrets_fetch_total").increment(1);
 
         match result {
             Ok(value) => {

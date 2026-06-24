@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/metrics/dfe_groups/buffer.rs
+// File:      src/metrics/groups/buffer.rs
 // Purpose:   DFE buffer metrics group
 // Language:  Rust
 //
@@ -25,23 +25,17 @@ pub struct BufferMetrics {
     pub buffer_records: Gauge,
     pub buffer_flush: Counter,
     pub buffer_flush_duration: Histogram,
-    namespace: String,
 }
 
 impl BufferMetrics {
     #[must_use]
     pub fn new(manager: &MetricsManager) -> Self {
-        let ns = manager.namespace();
+        // BARE names -- the recorder prefix layer and registry apply the namespace.
 
         // buffer_flush_trigger_total -- label-based, register descriptor manually
-        let trigger_key = if ns.is_empty() {
-            "buffer_flush_trigger_total".to_string()
-        } else {
-            format!("{ns}_buffer_flush_trigger_total")
-        };
-        metrics::describe_counter!(trigger_key.clone(), "Buffer flush trigger reason");
+        metrics::describe_counter!("buffer_flush_trigger_total", "Buffer flush trigger reason");
         manager.registry().push(MetricDescriptor {
-            name: trigger_key,
+            name: "buffer_flush_trigger_total".into(),
             metric_type: MetricType::Counter,
             description: "Buffer flush trigger reason".into(),
             unit: String::new(),
@@ -78,7 +72,6 @@ impl BufferMetrics {
                 "buffer",
                 Some(BUFFER_FLUSH_BUCKETS),
             ),
-            namespace: ns.to_string(),
         }
     }
 
@@ -93,11 +86,7 @@ impl BufferMetrics {
     pub fn record_flush(&self, duration_secs: f64, trigger: crate::metrics::FlushTrigger) {
         self.buffer_flush.increment(1);
         self.buffer_flush_duration.record(duration_secs);
-        let key = if self.namespace.is_empty() {
-            "buffer_flush_trigger_total".to_string()
-        } else {
-            format!("{}_buffer_flush_trigger_total", self.namespace)
-        };
-        metrics::counter!(key, "trigger" => trigger.as_label()).increment(1);
+        metrics::counter!("buffer_flush_trigger_total", "trigger" => trigger.as_label())
+            .increment(1);
     }
 }

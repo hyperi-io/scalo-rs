@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use scalo::worker::{AdaptiveWorkerPool, WorkerPoolConfig};
 use parking_lot::Mutex;
+use scalo::worker::{AdaptiveWorkerPool, WorkerPoolConfig};
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key)

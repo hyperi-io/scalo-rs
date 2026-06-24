@@ -467,9 +467,7 @@ async fn test_route_batch_fits_capacity_accepts_all() {
 #[cfg(feature = "governor")]
 #[tokio::test]
 async fn test_route_batch_pressure_hold_accepts_nothing() {
-    use scalo::governor::{
-        Hysteresis, MemoryPressureSource, PressureSource, UnifiedPressure,
-    };
+    use scalo::governor::{Hysteresis, MemoryPressureSource, PressureSource, UnifiedPressure};
     use scalo::memory::{MemoryGuard, MemoryGuardConfig};
 
     let port = find_available_port().await;

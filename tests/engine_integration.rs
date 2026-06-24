@@ -79,9 +79,8 @@ async fn run_workbatch_processes_injected_records_then_shuts_down() {
                     .records
                     .iter()
                     .map(|r| {
-                        let parsed =
-                            scalo::transport::codec::parse(&r.payload, r.metadata.format)
-                                .expect("valid json");
+                        let parsed = scalo::transport::codec::parse(&r.payload, r.metadata.format)
+                            .expect("valid json");
                         parsed.field_str("_table").unwrap_or("?").to_string()
                     })
                     .collect();

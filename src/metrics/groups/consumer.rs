@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/metrics/dfe_groups/consumer.rs
+// File:      src/metrics/groups/consumer.rs
 // Purpose:   DFE consumer metrics group
 // Language:  Rust
 //
@@ -23,23 +23,17 @@ pub struct ConsumerMetrics {
     pub rebalance: Counter,
     pub poll_duration: Histogram,
     pub offsets_committed: Counter,
-    namespace: String,
 }
 
 impl ConsumerMetrics {
     #[must_use]
     pub fn new(manager: &MetricsManager) -> Self {
-        let ns = manager.namespace();
+        // BARE names -- the recorder prefix layer and registry apply the namespace.
 
         // consumer_lag -- label-based, register descriptor manually
-        let lag_key = if ns.is_empty() {
-            "consumer_lag".to_string()
-        } else {
-            format!("{ns}_consumer_lag")
-        };
-        metrics::describe_gauge!(lag_key.clone(), "Kafka consumer lag per topic/partition");
+        metrics::describe_gauge!("consumer_lag", "Kafka consumer lag per topic/partition");
         manager.registry().push(MetricDescriptor {
-            name: lag_key,
+            name: "consumer_lag".into(),
             metric_type: MetricType::Gauge,
             description: "Kafka consumer lag per topic/partition".into(),
             unit: String::new(),
@@ -76,21 +70,15 @@ impl ConsumerMetrics {
                 &[],
                 "consumer",
             ),
-            namespace: ns.to_string(),
         }
     }
 
     /// Set consumer lag for a specific topic/partition.
     #[inline]
     pub fn set_lag(&self, topic: &str, partition: i32, lag: i64) {
-        let key = if self.namespace.is_empty() {
-            "consumer_lag".to_string()
-        } else {
-            format!("{}_consumer_lag", self.namespace)
-        };
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(
-            key,
+            "consumer_lag",
             "topic" => topic.to_string(),
             "partition" => partition.to_string()
         )

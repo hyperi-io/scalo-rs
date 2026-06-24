@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 HYPERI PTY LIMITED
 //
-// DFE native transport protocol.
+// scalo native transport protocol.
 // Lightweight bulk bytes transfer with format hints.
 
 syntax = "proto3";
 
-package dfe.transport.v1;
+package scalo.transport.v1;
 
-// DFE inter-service transport.
-service DfeTransport {
+// scalo inter-service transport.
+service Transport {
   // Push a batch of data to the receiver.
   rpc Push(PushRequest) returns (PushResponse);
 

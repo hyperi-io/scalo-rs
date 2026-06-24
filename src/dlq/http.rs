@@ -101,7 +101,7 @@ impl HttpDlqInner {
         }
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_dlq_sent_total", "backend" => "http").increment(batch.len() as u64);
+        metrics::counter!("dlq_sent_total", "backend" => "http").increment(batch.len() as u64);
 
         Ok(())
     }

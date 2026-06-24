@@ -28,7 +28,7 @@ exclude = [".claude/", ".github/", "ci/", "ai/", "docs/", "examples/", "benches/
 # pure-Rust feature lands, add it here.
 features = [
     "config", "config-reload", "logger",
-    "metrics-core", "metrics-process", "metrics", "metrics-dfe",
+    "metrics-core", "metrics-process", "metrics", "service-metrics",
     "otel", "otel-metrics", "otel-tracing",
     "runtime", "shutdown", "health",
     "concurrency", "strmatch", "memory", "scaling",
@@ -86,9 +86,9 @@ otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing
 otel-metrics = ["otel", "metrics", "metrics-util", "metrics-exporter-opentelemetry"]
 otel-tracing = ["otel", "opentelemetry_sdk/rt-tokio", "tokio", "tracing-subscriber"]
 
-# Standard pipeline metric groups (opt-in). Feature name retained for
-# back-compat; the dfe_* metric prefix de-brand is tracked separately.
-metrics-dfe = ["metrics"]
+# Standard pipeline metric groups (opt-in). The dfe_* metric prefix
+# de-brand is tracked separately.
+service-metrics = ["metrics"]
 
 # Directory config store (YAML directory-backed)
 # File locking uses std::fs::File::{lock,unlock} (stable since Rust 1.89).
@@ -203,7 +203,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:web
 dangerous-diagnostics = []
 
 # Full feature set
-full = ["config", "config-reload", "logger", "metrics", "metrics-dfe", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls"]
+full = ["config", "config-reload", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls"]
 
 [dependencies]
 # Serialisation (always needed)

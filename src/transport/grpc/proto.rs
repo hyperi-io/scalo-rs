@@ -10,7 +10,7 @@
 
 #[allow(clippy::all, clippy::pedantic)]
 mod inner {
-    tonic::include_proto!("dfe.transport.v1");
+    tonic::include_proto!("scalo.transport.v1");
 }
 
 pub use inner::*;

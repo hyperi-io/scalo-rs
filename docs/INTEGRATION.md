@@ -27,7 +27,7 @@ features = [
     "cli-service",          # ServiceApp trait, run_app, ServiceRuntime
     "config-reload",        # Hot-reload of the config cascade
     "logger",               # Always
-    "metrics-dfe",          # data-plane metric groups
+    "service-metrics",      # data-plane metric groups
     "transport-kafka",      # Kafka producer + consumer
     "transport-grpc",       # gRPC server + client
     "tiered-sink",          # Resilient delivery with disk spillover

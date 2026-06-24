@@ -74,10 +74,12 @@
 //! ```
 
 mod container;
-pub mod dfe;
 pub mod labels;
 pub mod manifest;
+#[cfg(any(feature = "metrics", feature = "otel-metrics"))]
+mod prefix;
 mod process;
+pub mod service;
 
 pub use labels::{AuthFailureReason, FlushTrigger, TransportKind, ValidationFailureReason};
 
@@ -103,10 +105,10 @@ use metrics_exporter_prometheus::PrometheusHandle;
 
 pub use container::ContainerMetrics;
 #[allow(deprecated)]
-pub use dfe::DfeMetrics;
-pub use dfe::ServiceMetrics;
-#[cfg(feature = "metrics-dfe")]
-pub mod dfe_groups;
+pub use service::DfeMetrics;
+pub use service::ServiceMetrics;
+#[cfg(feature = "service-metrics")]
+pub mod groups;
 pub use manifest::{ManifestResponse, MetricDescriptor, MetricRegistry, MetricType};
 pub use process::ProcessMetrics;
 
@@ -196,9 +198,20 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
     #[cfg(all(feature = "metrics", not(feature = "otel-metrics")))]
     {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        // Take the handle from the inner Prometheus recorder BEFORE wrapping:
+        // it shares the registry, so it renders the (prefixed) names too.
         let handle = recorder.handle();
-        if let Err(e) = metrics::set_global_recorder(recorder) {
-            tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+        // Namespace prefixing happens in ONE place -- the prefix layer on the
+        // global recorder. Empty namespace -> install bare.
+        if config.namespace.is_empty() {
+            if let Err(e) = metrics::set_global_recorder(recorder) {
+                tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+            }
+        } else {
+            let prefixed = prefix::PrefixRecorder::new(config.namespace.clone(), recorder);
+            if let Err(e) = metrics::set_global_recorder(prefixed) {
+                tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+            }
         }
         RecorderSetup {
             prom_handle: Some(handle),
@@ -208,11 +221,24 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
     // --- OTel only (no Prometheus) ---
     #[cfg(all(feature = "otel-metrics", not(feature = "metrics")))]
     {
+        // `build_otel_recorder`'s first arg is the OTel instrumentation SCOPE
+        // name (the meter name), NOT an instrument-name prefix. Pass the real
+        // namespace so scope identity is preserved; instrument-name prefixing
+        // is done uniformly by the prefix layer below, so there is no
+        // double-prefix on instrument names.
         match otel::build_otel_recorder(&config.namespace, &config.otel) {
             Ok((otel_recorder, provider)) => {
                 opentelemetry::global::set_meter_provider(provider.clone());
-                if let Err(e) = metrics::set_global_recorder(otel_recorder) {
-                    tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                if config.namespace.is_empty() {
+                    if let Err(e) = metrics::set_global_recorder(otel_recorder) {
+                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                    }
+                } else {
+                    let prefixed =
+                        prefix::PrefixRecorder::new(config.namespace.clone(), otel_recorder);
+                    if let Err(e) = metrics::set_global_recorder(prefixed) {
+                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                    }
                 }
                 RecorderSetup {
                     otel_provider: Some(provider),
@@ -234,19 +260,30 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
         let prom_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let prom_handle = prom_recorder.handle();
 
-        // Build OTel recorder
+        // Build OTel recorder. Scope name = real namespace (see OTel-only path);
+        // instrument-name prefixing is done once by the prefix layer that wraps
+        // the composed recorder, so there is no double-prefix.
         match otel::build_otel_recorder(&config.namespace, &config.otel) {
             Ok((otel_recorder, provider)) => {
                 opentelemetry::global::set_meter_provider(provider.clone());
 
-                // Compose via Fanout: both recorders receive every measurement
+                // Compose via Fanout: both recorders receive every measurement.
+                // The prom handle was taken from the inner prom recorder above,
+                // so it renders the (prefixed) names too.
                 let fanout = metrics_util::layers::FanoutBuilder::default()
                     .add_recorder(prom_recorder)
                     .add_recorder(otel_recorder)
                     .build();
 
-                if let Err(e) = metrics::set_global_recorder(fanout) {
-                    tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                if config.namespace.is_empty() {
+                    if let Err(e) = metrics::set_global_recorder(fanout) {
+                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                    }
+                } else {
+                    let prefixed = prefix::PrefixRecorder::new(config.namespace.clone(), fanout);
+                    if let Err(e) = metrics::set_global_recorder(prefixed) {
+                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                    }
                 }
 
                 RecorderSetup {
@@ -257,8 +294,16 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
             Err(e) => {
                 // Fallback: just Prometheus if OTel fails
                 tracing::warn!(error = %e, "Failed to build OTel recorder, falling back to Prometheus only");
-                if let Err(e) = metrics::set_global_recorder(prom_recorder) {
-                    tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                if config.namespace.is_empty() {
+                    if let Err(e) = metrics::set_global_recorder(prom_recorder) {
+                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                    }
+                } else {
+                    let prefixed =
+                        prefix::PrefixRecorder::new(config.namespace.clone(), prom_recorder);
+                    if let Err(e) = metrics::set_global_recorder(prefixed) {
+                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+                    }
                 }
                 RecorderSetup {
                     prom_handle: Some(prom_handle),
@@ -384,7 +429,10 @@ impl MetricsManager {
     /// with empty labels and `group = "custom"`.
     #[must_use]
     pub fn counter(&self, name: &str, description: &str) -> Counter {
-        let key = self.prefixed_key(name);
+        // Emit + describe + register the BARE name. Namespacing is applied
+        // once by the prefix layer on the global recorder; the registry applies
+        // it to the manifest. So the manifest and the emitted names match.
+        let key = name.to_string();
         let desc = description.to_string();
         metrics::describe_counter!(key.clone(), desc.clone());
         self.registry.push(MetricDescriptor {
@@ -414,7 +462,10 @@ impl MetricsManager {
         labels: &[&str],
         group: &str,
     ) -> Counter {
-        let key = self.prefixed_key(name);
+        // Emit + describe + register the BARE name. Namespacing is applied
+        // once by the prefix layer on the global recorder; the registry applies
+        // it to the manifest. So the manifest and the emitted names match.
+        let key = name.to_string();
         let desc = description.to_string();
         metrics::describe_counter!(key.clone(), desc.clone());
         self.registry.push(MetricDescriptor {
@@ -437,7 +488,10 @@ impl MetricsManager {
     /// with empty labels and `group = "custom"`.
     #[must_use]
     pub fn gauge(&self, name: &str, description: &str) -> Gauge {
-        let key = self.prefixed_key(name);
+        // Emit + describe + register the BARE name. Namespacing is applied
+        // once by the prefix layer on the global recorder; the registry applies
+        // it to the manifest. So the manifest and the emitted names match.
+        let key = name.to_string();
         let desc = description.to_string();
         metrics::describe_gauge!(key.clone(), desc.clone());
         self.registry.push(MetricDescriptor {
@@ -463,7 +517,10 @@ impl MetricsManager {
         labels: &[&str],
         group: &str,
     ) -> Gauge {
-        let key = self.prefixed_key(name);
+        // Emit + describe + register the BARE name. Namespacing is applied
+        // once by the prefix layer on the global recorder; the registry applies
+        // it to the manifest. So the manifest and the emitted names match.
+        let key = name.to_string();
         let desc = description.to_string();
         metrics::describe_gauge!(key.clone(), desc.clone());
         self.registry.push(MetricDescriptor {
@@ -486,7 +543,10 @@ impl MetricsManager {
     /// with empty labels and `group = "custom"`.
     #[must_use]
     pub fn histogram(&self, name: &str, description: &str) -> Histogram {
-        let key = self.prefixed_key(name);
+        // Emit + describe + register the BARE name. Namespacing is applied
+        // once by the prefix layer on the global recorder; the registry applies
+        // it to the manifest. So the manifest and the emitted names match.
+        let key = name.to_string();
         let desc = description.to_string();
         metrics::describe_histogram!(key.clone(), Unit::Seconds, desc.clone());
         self.registry.push(MetricDescriptor {
@@ -513,7 +573,10 @@ impl MetricsManager {
         group: &str,
         buckets: Option<&[f64]>,
     ) -> Histogram {
-        let key = self.prefixed_key(name);
+        // Emit + describe + register the BARE name. Namespacing is applied
+        // once by the prefix layer on the global recorder; the registry applies
+        // it to the manifest. So the manifest and the emitted names match.
+        let key = name.to_string();
         let desc = description.to_string();
         metrics::describe_histogram!(key.clone(), Unit::Seconds, desc.clone());
         self.registry.push(MetricDescriptor {
@@ -542,7 +605,10 @@ impl MetricsManager {
         description: &str,
         buckets: &[f64],
     ) -> Histogram {
-        let key = self.prefixed_key(name);
+        // Emit + describe + register the BARE name. Namespacing is applied
+        // once by the prefix layer on the global recorder; the registry applies
+        // it to the manifest. So the manifest and the emitted names match.
+        let key = name.to_string();
         let desc = description.to_string();
         metrics::describe_histogram!(key.clone(), Unit::Seconds, desc.clone());
         self.registry.push(MetricDescriptor {
@@ -926,21 +992,23 @@ impl MetricsManager {
     ///
     /// Uses interior mutability (writes through the registry's `Arc<RwLock>`),
     /// so only `&self` is needed. Called automatically by
-    /// [`dfe_groups::AppMetrics::new()`] if the `metrics-dfe` feature is enabled.
+    /// [`groups::AppMetrics::new()`] if the `service-metrics` feature is enabled.
     pub fn set_build_info(&self, version: &str, commit: &str) {
         self.registry.set_build_info(version, commit);
     }
 
-    /// Set operational use cases for a metric (by full prefixed name).
+    /// Set operational use cases for a metric (by BARE name).
     ///
-    /// No-op if the metric is not found in the registry.
+    /// Pass the bare metric name (no namespace prefix); the registry applies
+    /// the namespace internally. No-op if the metric is not found.
     pub fn set_use_cases(&self, metric_name: &str, use_cases: &[&str]) {
         self.registry.set_use_cases(metric_name, use_cases);
     }
 
-    /// Set the suggested Grafana panel type for a metric (by full prefixed name).
+    /// Set the suggested Grafana panel type for a metric (by BARE name).
     ///
-    /// No-op if the metric is not found in the registry.
+    /// Pass the bare metric name (no namespace prefix); the registry applies
+    /// the namespace internally. No-op if the metric is not found.
     pub fn set_dashboard_hint(&self, metric_name: &str, hint: &str) {
         self.registry.set_dashboard_hint(metric_name, hint);
     }
@@ -954,21 +1022,15 @@ impl MetricsManager {
         self.registry.clone()
     }
 
-    /// Get the namespace prefix (e.g. `dfe_loader`).
+    /// Get the configured namespace (e.g. `dfe`), or empty for bare names.
     ///
-    /// Used by [`dfe_groups`] metric structs to build labelled metric keys.
+    /// Metric names are bare by default. When this namespace is non-empty,
+    /// the prefix layer on the global recorder prepends `{namespace}_` to
+    /// every emitted metric name, and the manifest registry mirrors it. Callers
+    /// must NOT pre-prefix names themselves -- that would double-prefix.
     #[must_use]
     pub fn namespace(&self) -> &str {
         &self.config.namespace
-    }
-
-    /// Get prefixed metric name.
-    fn prefixed_key(&self, name: &str) -> String {
-        if self.config.namespace.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}_{}", self.config.namespace, name)
-        }
     }
 }
 

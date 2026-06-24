@@ -339,7 +339,7 @@ impl TransportFilterEngine {
         if is_likely_msgpack(payload) {
             #[cfg(feature = "metrics")]
             ::metrics::counter!(
-                "dfe_transport_filter_msgpack_bypass_total",
+                "transport_filter_msgpack_bypass_total",
                 "direction" => direction.to_string()
             )
             .increment(1);

@@ -21,7 +21,7 @@ fn dfe_source_alias_is_kafka_source() {
 
 /// `DfeMetrics` aliases `ServiceMetrics`. Compiles only if they are the same
 /// type (the identity function returns the argument under the new name).
-#[cfg(feature = "metrics-dfe")]
+#[cfg(feature = "service-metrics")]
 #[allow(dead_code)]
 fn _dfe_metrics_alias_is_service_metrics(x: scalo::metrics::ServiceMetrics) -> scalo::DfeMetrics {
     x

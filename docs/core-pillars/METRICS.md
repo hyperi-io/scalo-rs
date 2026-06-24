@@ -104,7 +104,7 @@ mgr.set_dashboard_hint("dfe_loader_send_latency_seconds", "heatmap");
 mgr.set_build_info(env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT"));
 ```
 
-`ServiceMetrics::register(&mgr)` (feature `metrics-dfe`) registers the canonical
+`ServiceMetrics::register(&mgr)` (feature `service-metrics`) registers the canonical
 data-plane metric set -- transport, batch engine, worker pool, memory, scaling -- in one call
 so every consumer service exports the same metrics with matching labels.
 
@@ -156,7 +156,7 @@ batching config.
 | `render_handle() -> Option<RenderHandle>` | Cloneable Prometheus text renderer for axum routes |
 | `start_server(addr)` / `start_server_with_routes(addr, extra)` | Built-in router / merge service routes |
 | `shutdown_otel()` | Flush OTLP batch exporter |
-| `ServiceMetrics::register(&mgr)` | Canonical data-plane metric set (feature `metrics-dfe`) |
+| `ServiceMetrics::register(&mgr)` | Canonical data-plane metric set (feature `service-metrics`) |
 | `latency_buckets()` / `size_buckets()` | Standard histogram bucket presets |
 
 ---

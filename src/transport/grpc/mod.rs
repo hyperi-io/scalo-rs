@@ -13,7 +13,7 @@
 //!
 //! ## Native Protocol
 //!
-//! Lightweight bulk bytes transfer via `dfe.transport.v1.DfeTransport/Push`.
+//! Lightweight bulk bytes transfer via `scalo.transport.v1.Transport/Push`.
 //! Payload is opaque bytes (JSON, MsgPack, or Arrow IPC) with a format hint.
 //!
 //! ## Vector Wire Protocol Compatibility (optional)
@@ -60,7 +60,7 @@ use tonic::{Request, Response, Status};
 /// satisfies the unified `Transport` trait via blanket impl.
 pub struct GrpcTransport {
     /// Client for sending (None if server-only mode).
-    client: Option<proto::dfe_transport_client::DfeTransportClient<tonic::transport::Channel>>,
+    client: Option<proto::transport_client::TransportClient<tonic::transport::Channel>>,
 
     /// Receiver channel (None if client-only mode).
     receiver: Option<tokio::sync::Mutex<mpsc::Receiver<Message<GrpcToken>>>>,
@@ -211,7 +211,7 @@ impl GrpcTransport {
 
             let channel = ep.connect_lazy();
 
-            let mut c = proto::dfe_transport_client::DfeTransportClient::new(channel)
+            let mut c = proto::transport_client::TransportClient::new(channel)
                 .max_decoding_message_size(config.max_message_size)
                 .max_encoding_message_size(config.max_message_size);
 
@@ -234,14 +234,14 @@ impl GrpcTransport {
             let (sd_tx, sd_rx) = oneshot::channel();
 
             // Native service
-            let dfe_svc = DfeTransportServiceImpl {
+            let dfe_svc = TransportServiceImpl {
                 sender: tx.clone(),
                 sequence: sequence.clone(),
                 #[cfg(feature = "governor")]
                 pressure: pressure.clone(),
             };
 
-            let dfe_server = proto::dfe_transport_server::DfeTransportServer::new(dfe_svc)
+            let dfe_server = proto::transport_server::TransportServer::new(dfe_svc)
                 .max_decoding_message_size(config.max_message_size)
                 .max_encoding_message_size(config.max_message_size)
                 .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
@@ -389,7 +389,7 @@ impl TransportSender for GrpcTransport {
         let result = match client.clone().push(request).await {
             Ok(_) => {
                 #[cfg(feature = "metrics")]
-                metrics::counter!("dfe_transport_sent_total", "transport" => "grpc").increment(1);
+                metrics::counter!("transport_sent_total", "transport" => "grpc").increment(1);
                 SendResult::Ok
             }
             Err(status) => match status.code() {
@@ -400,7 +400,7 @@ impl TransportSender for GrpcTransport {
                 | tonic::Code::DeadlineExceeded => {
                     #[cfg(feature = "metrics")]
                     metrics::counter!(
-                        "dfe_transport_backpressured_total",
+                        "transport_backpressured_total",
                         "transport" => "grpc"
                     )
                     .increment(1);
@@ -409,7 +409,7 @@ impl TransportSender for GrpcTransport {
                 _ => {
                     #[cfg(feature = "metrics")]
                     metrics::counter!(
-                        "dfe_transport_send_errors_total",
+                        "transport_send_errors_total",
                         "transport" => "grpc"
                     )
                     .increment(1);
@@ -421,10 +421,10 @@ impl TransportSender for GrpcTransport {
         #[cfg(feature = "metrics")]
         {
             self.inflight.fetch_sub(1, Ordering::Relaxed);
-            metrics::gauge!("dfe_transport_inflight", "transport" => "grpc")
+            metrics::gauge!("transport_inflight", "transport" => "grpc")
                 .set(self.inflight.load(Ordering::Relaxed) as f64);
             metrics::histogram!(
-                "dfe_transport_send_duration_seconds",
+                "transport_send_duration_seconds",
                 "transport" => "grpc"
             )
             .record(start.elapsed().as_secs_f64());
@@ -497,7 +497,7 @@ impl TransportSender for GrpcTransport {
         let payload_bytes: usize = to_send.iter().map(|r| r.payload.len()).sum();
         if payload_bytes > self.max_message_size {
             #[cfg(feature = "metrics")]
-            metrics::counter!("dfe_transport_oversize_total", "transport" => "grpc").increment(1);
+            metrics::counter!("transport_oversize_total", "transport" => "grpc").increment(1);
             return SendResult::Fatal(TransportError::Config(format!(
                 "gRPC batch payload {payload_bytes} bytes exceeds max_message_size \
                  {} -- lower the self-regulation byte budget below the gRPC limit",
@@ -540,7 +540,7 @@ impl TransportSender for GrpcTransport {
                 if accepted < sent_count as u64 {
                     #[cfg(feature = "metrics")]
                     metrics::counter!(
-                        "dfe_transport_backpressured_total",
+                        "transport_backpressured_total",
                         "transport" => "grpc"
                     )
                     .increment(1);
@@ -553,7 +553,7 @@ impl TransportSender for GrpcTransport {
                 } else {
                     #[cfg(feature = "metrics")]
                     metrics::counter!(
-                        "dfe_transport_sent_total",
+                        "transport_sent_total",
                         "transport" => "grpc",
                         "path" => "batch"
                     )
@@ -567,7 +567,7 @@ impl TransportSender for GrpcTransport {
                 | tonic::Code::DeadlineExceeded => {
                     #[cfg(feature = "metrics")]
                     metrics::counter!(
-                        "dfe_transport_backpressured_total",
+                        "transport_backpressured_total",
                         "transport" => "grpc"
                     )
                     .increment(1);
@@ -576,7 +576,7 @@ impl TransportSender for GrpcTransport {
                 _ => {
                     #[cfg(feature = "metrics")]
                     metrics::counter!(
-                        "dfe_transport_send_errors_total",
+                        "transport_send_errors_total",
                         "transport" => "grpc"
                     )
                     .increment(1);
@@ -589,7 +589,7 @@ impl TransportSender for GrpcTransport {
         {
             self.inflight.fetch_sub(1, Ordering::Relaxed);
             metrics::histogram!(
-                "dfe_transport_send_duration_seconds",
+                "transport_send_duration_seconds",
                 "transport" => "grpc"
             )
             .record(start.elapsed().as_secs_f64());
@@ -616,7 +616,7 @@ impl TransportBase for GrpcTransport {
     fn is_healthy(&self) -> bool {
         let healthy = self.healthy.load(Ordering::Relaxed);
         #[cfg(feature = "metrics")]
-        metrics::gauge!("dfe_transport_healthy", "transport" => "grpc").set(if healthy {
+        metrics::gauge!("transport_healthy", "transport" => "grpc").set(if healthy {
             1.0
         } else {
             0.0
@@ -722,7 +722,7 @@ impl Drop for GrpcTransport {
 
 /// Internal service implementation that receives Push RPCs
 /// and forwards messages into the transport's mpsc channel.
-struct DfeTransportServiceImpl {
+struct TransportServiceImpl {
     sender: mpsc::Sender<Message<GrpcToken>>,
     sequence: Arc<AtomicU64>,
     /// Optional pressure governor (G3, `governor` feature). `None` -> handlers
@@ -734,7 +734,7 @@ struct DfeTransportServiceImpl {
 }
 
 #[tonic::async_trait]
-impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
+impl proto::transport_server::Transport for TransportServiceImpl {
     async fn push(
         &self,
         request: Request<proto::PushRequest>,
@@ -747,7 +747,7 @@ impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
         {
             #[cfg(feature = "metrics")]
             metrics::counter!(
-                "dfe_transport_backpressured_total",
+                "transport_backpressured_total",
                 "transport" => "grpc",
                 "reason" => "pressure"
             )
@@ -783,9 +783,8 @@ impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
             Ok(()) => {
                 #[cfg(feature = "metrics")]
                 {
-                    metrics::counter!("dfe_transport_sent_total", "transport" => "grpc")
-                        .increment(1);
-                    metrics::gauge!("dfe_transport_queue_size", "transport" => "grpc").set(
+                    metrics::counter!("transport_sent_total", "transport" => "grpc").increment(1);
+                    metrics::gauge!("transport_queue_size", "transport" => "grpc").set(
                         self.sender
                             .max_capacity()
                             .saturating_sub(self.sender.capacity()) as f64,
@@ -796,7 +795,7 @@ impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 #[cfg(feature = "metrics")]
                 metrics::counter!(
-                    "dfe_transport_backpressured_total",
+                    "transport_backpressured_total",
                     "transport" => "grpc"
                 )
                 .increment(1);
@@ -805,7 +804,7 @@ impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 #[cfg(feature = "metrics")]
                 metrics::counter!(
-                    "dfe_transport_refused_total",
+                    "transport_refused_total",
                     "transport" => "grpc"
                 )
                 .increment(1);
@@ -825,7 +824,7 @@ impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
         {
             #[cfg(feature = "metrics")]
             metrics::counter!(
-                "dfe_transport_backpressured_total",
+                "transport_backpressured_total",
                 "transport" => "grpc",
                 "reason" => "pressure"
             )
@@ -863,7 +862,7 @@ impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
             Err(mpsc::error::TrySendError::Full(())) => {
                 #[cfg(feature = "metrics")]
                 metrics::counter!(
-                    "dfe_transport_backpressured_total",
+                    "transport_backpressured_total",
                     "transport" => "grpc"
                 )
                 .increment(1);
@@ -872,7 +871,7 @@ impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
             Err(mpsc::error::TrySendError::Closed(())) => {
                 #[cfg(feature = "metrics")]
                 metrics::counter!(
-                    "dfe_transport_refused_total",
+                    "transport_refused_total",
                     "transport" => "grpc"
                 )
                 .increment(1);
@@ -903,7 +902,7 @@ impl proto::dfe_transport_server::DfeTransport for DfeTransportServiceImpl {
 
         #[cfg(feature = "metrics")]
         metrics::counter!(
-            "dfe_transport_sent_total",
+            "transport_sent_total",
             "transport" => "grpc",
             "path" => "batch"
         )

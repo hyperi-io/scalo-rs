@@ -210,7 +210,7 @@ impl TransportSender for PipeTransport {
         );
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("dfe_transport_sent_total", "transport" => "pipe").increment(1);
+        metrics::counter!("transport_sent_total", "transport" => "pipe").increment(1);
 
         SendResult::Ok
     }
@@ -287,7 +287,7 @@ impl TransportReceiver for PipeTransport {
                     });
 
                     #[cfg(feature = "metrics")]
-                    metrics::counter!("dfe_transport_received_total", "transport" => "pipe")
+                    metrics::counter!("transport_received_total", "transport" => "pipe")
                         .increment(1);
                 }
                 Err(e) => {
