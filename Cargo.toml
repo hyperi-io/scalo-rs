@@ -1,0 +1,467 @@
+# Project:   scalo
+# File:      Cargo.toml
+# Purpose:   Self-regulating runtime for data-plane services
+# Language:  TOML
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+
+[package]
+name = "scalo"
+version = "2.8.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Self-regulating runtime for data-plane services -- config, logging, metrics, health, transport, backpressure, adaptive scaling. Batteries included; idiomatic Rust (also on PyPI)."
+license = "Apache-2.0"
+repository = "https://github.com/hyperi-io/scalo-rs"
+publish = true
+keywords = ["data-plane", "backpressure", "observability", "kafka", "autoscaling"]
+categories = ["asynchronous", "config", "network-programming", "concurrency", "development-tools"]
+exclude = [".claude/", ".github/", "ci/", "ai/", "docs/", "examples/", "benches/", "scripts/"]
+
+[package.metadata.docs.rs]
+# `all-features = true` triggers transport-kafka (needs librdkafka-dev),
+# directory-config-git (libgit2-dev), secrets-aws (aws-lc-sys cmake),
+# deployment-smoke (Docker daemon).
+# None of these are installed in the docs.rs sandbox. Enumerate the set
+# of features that builds without system libraries instead. When a new
+# pure-Rust feature lands, add it here.
+features = [
+    "config", "config-reload", "logger",
+    "metrics-core", "metrics-process", "metrics", "metrics-dfe",
+    "otel", "otel-metrics", "otel-tracing",
+    "runtime", "shutdown", "health",
+    "concurrency", "strmatch", "memory", "scaling",
+    "io", "spool", "tiered-sink",
+    "worker-pool", "worker-batch", "worker", "worker-msgpack",
+    "cli", "cli-service",
+    "http", "http-server",
+    "transport", "transport-trace",
+    "transport-memory", "transport-grpc", "transport-file",
+    "transport-pipe", "transport-http", "transport-redis",
+    "directory-config",
+    "secrets", "secrets-vault",
+    "dlq", "dlq-http", "dlq-redis",
+    "output-file",
+    "deployment",
+    "expression", "version-check",
+]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Trimmed in 2.6.0 — was [config, logger, metrics, runtime, shutdown, health],
+# now just [config, logger]. Consumers needing more list explicitly. Shaves
+# ~200 transitive deps off the I-just-want-config use case.
+default = ["config", "logger"]
+
+# Core features
+health = []
+shutdown = ["tokio", "tokio-util", "tracing"]
+runtime = ["dirs"]
+config = ["figment", "dotenvy", "serde_yaml_ng", "serde_json", "dirs", "tracing"]
+logger = ["tracing", "tracing-subscriber", "owo-colors", "serde_json", "tracing-throttle"]
+
+# Three generic async primitives (BackgroundSink, PeriodicWorker, ActorHandle).
+# Foundational helpers for any module that does fire-and-forget durable
+# writes, timer-driven loops, or stateful command-queue actors. See
+# `src/concurrency/mod.rs` for the decision matrix.
+concurrency = ["tokio", "tokio-util", "tracing", "metrics-core"]
+strmatch = ["regex", "regex-automata", "regex-syntax", "aho-corasick", "memchr", "tracing", "metrics-core"]
+
+# Metrics tiers (2.6.0 split). Consumers pay only for what they use:
+# - metrics-core: emit-only (counter!/gauge!/histogram! macros work)
+# - metrics-process: + cgroup-aware process gauges
+# - metrics: + Prometheus exporter (HTTP /metrics endpoint, manifest dump)
+metrics-core = ["dep:metrics", "tracing"]
+metrics-process = ["metrics-core", "sysinfo"]
+metrics = ["metrics-process", "metrics-exporter-prometheus", "tokio", "serde_json"]
+
+# OpenTelemetry support (modern observability)
+# `otel` is the umbrella enabling all OTel SDK deps. `otel-metrics` exports
+# Prometheus + custom metrics through OTLP. `otel-tracing` bridges the
+# `tracing` ecosystem (`tracing::span!`, `#[instrument]`) to OTel spans
+# exported via OTLP — closes the W3C distributed-tracing chain that the
+# transport-layer traceparent propagation alone can't complete.
+otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing", "tracing-opentelemetry", "serde_json"]
+otel-metrics = ["otel", "metrics", "metrics-util", "metrics-exporter-opentelemetry"]
+otel-tracing = ["otel", "opentelemetry_sdk/rt-tokio", "tokio", "tracing-subscriber"]
+
+# Standard pipeline metric groups (opt-in). Feature name retained for
+# back-compat; the dfe_* metric prefix de-brand is tracked separately.
+metrics-dfe = ["metrics"]
+
+# Directory config store (YAML directory-backed)
+# File locking uses std::fs::File::{lock,unlock} (stable since Rust 1.89).
+directory-config = ["serde_yaml_ng", "tokio", "tracing"]
+directory-config-git = ["directory-config", "git2"]
+
+# Extended features (P2)
+http = ["reqwest", "reqwest-middleware", "reqwest-retry", "serde_json", "dep:anyhow"]
+http-server = ["axum", "tower", "tower-http", "tokio", "tracing"]
+spool = ["yaque", "zstd"]
+tiered-sink = ["yaque", "zstd", "lz4_flex", "snap", "tokio", "libc", "tracing"]
+
+# Cgroup-aware memory backpressure (OOM prevention)
+memory = ["sysinfo", "tracing"]
+
+# Unified self-regulation governor: a pressure seam that combines a HARD
+# memory signal (never masked) with weighted SOFT signals under a
+# hysteresis latch. Additive, default-off. Depends on MemoryGuard, so it
+# implies `memory`.
+governor = ["memory"]
+
+# Scaling pressure calculation (KEDA autoscaling)
+scaling = ["parking_lot", "tracing"]
+
+# Adaptive worker pool tiers (2.6.0 split):
+# - worker-pool: just AdaptiveWorkerPool (rayon + tokio + sysinfo)
+# - worker-batch: + BatchEngine (sonic-rs SIMD JSON, dashmap interning, bytes)
+# - worker: back-compat alias for worker-batch (candidate for post-GA deprecation)
+worker-pool = ["rayon", "config", "metrics", "tokio", "tokio-util", "sysinfo", "parking_lot", "tracing"]
+worker-batch = ["worker-pool", "sonic-rs", "dashmap", "bytes"]
+worker = ["worker-batch"]
+
+# Worker pool with msgpack batch serialisation support.
+# Uses `rmpv` (native schema-less MsgPack value): the engine parse path decodes
+# MsgPack in a single native decode -- no rmp_serde -> serde_json bridge.
+worker-msgpack = ["worker", "rmpv"]
+
+# CLI tiers (2.6.0 split):
+# - cli: bare clap types — CommonArgs, StandardCommand, VersionInfo, CliError,
+#   output helpers. Useful for tooling-style CLIs that don't need a metrics
+#   server, worker pool, or memory guard.
+# - cli-service: + ServiceApp trait, run_app, ServiceRuntime (full service app
+#   scaffolding — pulls in metrics + memory + scaling + worker-pool).
+cli = ["clap", "tracing"]
+cli-service = ["cli", "metrics", "memory", "scaling", "worker-pool", "shutdown", "governor"]
+# TUI metrics dashboard (ratatui + crossterm via ratatui re-export)
+top = ["cli-service", "ratatui"]
+
+# Shared NDJSON file I/O (used by dlq + output-file)
+io = ["file-rotate", "parking_lot", "chrono", "tracing", "tokio"]
+
+# Dead letter queue (file backend always available)
+dlq = ["io", "concurrency", "base64", "serde_json", "tokio", "tokio-util", "tracing"]
+dlq-kafka = ["dlq", "transport-kafka"]
+dlq-http = ["dlq", "reqwest"]
+dlq-redis = ["dlq", "transport-redis"]
+
+# File output sink (local NDJSON file output)
+output-file = ["io", "serde_json", "tracing"]
+
+# CEL expression evaluation
+expression = ["dep:cel", "serde_json"]
+
+# Deployment contract validation (Helm chart + Dockerfile sync)
+deployment = ["serde_yaml_ng", "serde_json"]
+# Smoke-test helper that runs `docker build` + `docker run` against a
+# generated Dockerfile. Requires Docker daemon at test time. Opt-in.
+deployment-smoke = ["deployment"]
+
+# Public reusable test helpers (probes, skip emitter, kind cluster guard) used
+# by scalo's own e2e tests AND by downstream consumers writing their own
+# contract-artefact e2e tests. See src/deployment/test_support.rs.
+deployment-test-support = ["deployment"]
+
+# Startup version check (calls a configured version API)
+version-check = ["reqwest", "tokio", "serde_json", "tracing", "chrono", "dirs"]
+
+# Config hot-reload (SharedConfig<T> + ConfigReloader<T>)
+config-reload = ["config", "parking_lot", "tokio", "tracing"]
+
+# Transport features (2.6.0 split):
+# - transport: bare transport abstraction
+# - transport-trace: + W3C traceparent propagation via opentelemetry
+# Apps that send/receive but don't propagate distributed-trace context
+# avoid pulling in the OpenTelemetry SDK.
+transport = ["tokio", "serde_json", "rmpv", "chrono", "regex", "memchr", "sonic-rs", "parking_lot", "tracing", "metrics-core", "bytes"]
+transport-trace = ["transport", "dep:opentelemetry"]
+transport-memory = ["transport"]
+transport-kafka = ["transport", "rdkafka", "regex", "tokio-util"]
+transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream"]
+transport-grpc-vector-compat = ["transport-grpc"]
+transport-file = ["transport", "io"]
+transport-pipe = ["transport"]
+transport-http = ["transport", "http"]
+transport-redis = ["transport", "redis"]
+transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http", "transport-redis"]
+
+# Secrets management
+secrets = ["tokio", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:rand_core"]
+secrets-vault = ["secrets", "vaultrs"]
+secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager"]
+secrets-all = ["secrets-vault", "secrets-aws"]
+
+# Unified TLS trust + client-config construction (src/tls.rs). Private-CA
+# first: native + webpki + extra-PEM roots, explicit aws-lc-rs crypto provider.
+# Opt-in; TLS-consuming transports enable it as they adopt the module.
+tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:webpki-roots", "tracing"]
+
+# Diagnostics escape hatches that can leak secrets if mis-used.
+# Off in every shipping build. NOT included in `full`. Operators
+# opt-in deliberately for one-off debugging.
+dangerous-diagnostics = []
+
+# Full feature set
+full = ["config", "config-reload", "logger", "metrics", "metrics-dfe", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls"]
+
+[dependencies]
+# Serialisation (always needed)
+serde = { version = ">=1.0.228, <2", features = ["derive"] }
+
+# Error handling
+thiserror = ">=2.0.18, <3"
+
+# Environment detection
+dirs = { version = ">=6.0.0, <7", optional = true }
+
+# Configuration
+figment = { version = ">=0.10.19, <0.11", features = ["yaml", "toml", "json", "env"], optional = true }
+dotenvy = { version = ">=0.15.7, <0.16", optional = true }
+
+# Concurrent hash map (field interning)
+dashmap = { version = ">=6.1, <7", optional = true }
+serde_yaml_ng = { version = ">=0.10.0, <0.11", optional = true }
+serde_json = { version = ">=1.0.149, <2", optional = true }
+
+# Git operations (for directory-config-git)
+git2 = { version = ">=0.20.0, <0.21", optional = true }
+
+# CEL expression evaluation
+# Renamed from cel-interpreter — same project, same maintainers, near-identical API.
+cel = { version = ">=0.13, <0.14", features = ["json"], optional = true }
+
+# CLI framework
+clap = { version = ">=4.5, <5", features = ["derive", "env"], optional = true }
+
+# Logging
+tracing = { version = ">=0.1.44, <0.2", optional = true }
+tracing-subscriber = { version = ">=0.3.22, <0.4", features = ["json", "env-filter", "fmt", "time"], optional = true }
+owo-colors = { version = ">=4.2.3, <5", optional = true }
+tracing-throttle = { version = ">=0.4.2, <0.5", default-features = false, optional = true }
+
+# OpenTelemetry (modern observability - OTLP native)
+# Held at 0.31 because tracing-opentelemetry 0.32.1 (latest) only supports
+# otel 0.31. Bump once tracing-opentelemetry ships a release compatible
+# with otel 0.32+.
+opentelemetry = { version = ">=0.31.0, <0.32", optional = true }
+opentelemetry_sdk = { version = ">=0.31.0, <0.32", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = ">=0.31.0, <0.32", features = ["grpc-tonic", "http-proto", "metrics", "logs"], optional = true }
+tracing-opentelemetry = { version = ">=0.32.1, <0.33", optional = true }
+
+# Metrics (Prometheus-native)
+metrics = { version = ">=0.24.5, <0.25", optional = true }
+metrics-exporter-prometheus = { version = ">=0.18.3, <0.19", optional = true }
+metrics-util = { version = ">=0.20.3, <0.21", optional = true }
+metrics-exporter-opentelemetry = { version = ">=0.2.1, <0.3", optional = true }
+sysinfo = { version = ">=0.39, <0.40", optional = true }
+
+# Async runtime (for metrics server, http-server, shutdown)
+tokio = { version = ">=1.50.0, <2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-std", "io-util"], optional = true }
+tokio-util = { version = ">=0.7.14, <0.8", optional = true }
+
+# HTTP client — bumped 2026-05-08 to reqwest 0.13 + middleware 0.5 + retry 0.9.
+# opentelemetry-otlp 0.32 and vaultrs 0.8 both moved to reqwest 0.13, so the
+# coordinated migration is now possible.
+# `default-features = false` drops the `default-tls` feature (which pulls
+# native-tls + openssl). The standard here is rustls everywhere — `rustls-tls`
+# is enabled explicitly so the resulting client still talks HTTPS.
+reqwest = { version = ">=0.13.3, <0.14", default-features = false, features = ["json", "rustls"], optional = true }
+reqwest-middleware = { version = ">=0.5.1, <0.6", optional = true }
+reqwest-retry = { version = ">=0.9.1, <0.10", optional = true }
+# `reqwest_middleware::Error::Middleware` only constructs from
+# `anyhow::Error` (via `#[from]`); we depend on anyhow directly so the
+# HTTP client can convert serialise errors into Middleware errors
+# instead of silently dropping them.
+anyhow = { version = "1", optional = true }
+
+# Unified TLS trust module (src/tls.rs, `tls` feature). All already present
+# transitively (reqwest/aws-smithy pull rustls 0.23 + aws-lc-rs); these are
+# direct optional deps so the module can build a ClientConfig with an EXPLICIT
+# aws-lc-rs provider (the graph has both aws-lc-rs AND ring, so there is no
+# unambiguous process-default provider). Versions web-checked 2026-06-03.
+# `default-features = false` on rustls avoids pulling the `ring` provider in
+# addition to `aws_lc_rs`. pki-types `std` enables CertificateDer PEM file IO.
+rustls = { version = ">=0.23.40, <0.24", default-features = false, features = ["aws_lc_rs", "tls12", "logging", "std"], optional = true }
+rustls-native-certs = { version = ">=0.8.1, <0.9", optional = true }
+rustls-pki-types = { version = ">=1.14, <2", features = ["std"], optional = true }
+webpki-roots = { version = ">=1.0.7, <2", optional = true }
+
+# HTTP server (axum)
+axum = { version = ">=0.8.8, <0.9", optional = true }
+tower = { version = ">=0.5.3, <0.6", features = ["limit"], optional = true }
+tower-http = { version = ">=0.6.8, <0.7", features = ["timeout", "trace"], optional = true }
+
+# Async (for transport)
+chrono = { version = ">=0.4.43, <0.5", optional = true }
+
+# Native schema-less MsgPack Value decode (transport codec + engine parse fast
+# path). `3Hren/msgpack-rust` workspace, MIT, MSRV 1.85. The single decode the
+# parse path uses -- no rmp_serde -> serde_json -> sonic_rs bridge.
+# Web-checked 2026-06-04: latest 1.3.1, actively maintained.
+rmpv = { version = ">=1.3.1, <2", optional = true }
+
+# Kafka transport (dynamic-linking: use system librdkafka instead of compiling C++ from source)
+rdkafka = { version = ">=0.39.0, <0.40", features = ["dynamic-linking"], optional = true }
+
+# Redis/Valkey Streams transport
+redis = { version = ">=1.0, <2", features = ["tokio-comp", "streams"], optional = true }
+
+# gRPC transport (tonic + prost)
+# tonic-prost is used by the generated code in build.rs (vector.rs ProstCodec),
+# not by hand-written source — cargo-machete won't see it but it's required.
+# tls-aws-lc: client/server TLS on the aws-lc-rs backend (matches crate::tls's
+# explicit provider). tls-native-roots: ClientTlsConfig::with_native_roots().
+tonic = { version = ">=0.14, <0.15", features = ["gzip", "tls-aws-lc", "tls-native-roots"], optional = true }
+tonic-prost = { version = ">=0.14.5, <0.15", optional = true }
+prost = { version = ">=0.14, <0.15", optional = true }
+prost-types = { version = ">=0.14, <0.15", optional = true }
+# TcpListenerStream — lets GrpcTransport::new bind the listener synchronously
+# and serve_with_incoming_shutdown, so server readiness is guaranteed on return.
+tokio-stream = { version = ">=0.1, <0.2", features = ["net"], optional = true }
+
+# TUI dashboard (ratatui re-exports crossterm)
+ratatui = { version = ">=0.29, <0.32", optional = true }
+
+# File rotation (for DLQ file backend)
+file-rotate = { version = ">=0.7, <0.9", optional = true }
+
+# Filesystem stats (disk-aware capacity management for tiered-sink)
+libc = { version = ">=0.2, <0.3", optional = true }
+
+# Spool (disk-backed async queue) - yaque is async-native and maintained
+yaque = { version = ">=0.6.6, <0.7", optional = true }
+zstd = { version = ">=0.13.3, <0.14", optional = true }
+
+# TieredSink compression codecs
+lz4_flex = { version = ">=0.11, <0.14", optional = true }
+snap = { version = ">=1.1.1, <2", optional = true }
+
+# SIMD JSON (BatchEngine — 2-4x faster than serde_json)
+sonic-rs = { version = ">=0.5, <1", optional = true }
+
+# Regex (topic resolver include/exclude filters, strmatch)
+regex = { version = ">=1.11, <2", optional = true }
+regex-automata = { version = ">=0.4, <0.5", optional = true }
+regex-syntax = { version = ">=0.8, <0.9", optional = true }
+aho-corasick = { version = ">=1.1, <2", optional = true }
+memchr = { version = ">=2.7", optional = true }
+
+# Secrets management
+parking_lot = { version = ">=0.12.3, <0.13", optional = true }
+
+# Data parallelism (CPU-bound work distribution for worker pool)
+rayon = { version = ">=1.10, <2", optional = true }
+base64 = { version = ">=0.22, <0.23", optional = true }
+
+# AEAD for at-rest encryption of the secrets disk cache. Gated by
+# the `secrets` feature; consumers without it pay nothing. AES-256-
+# GCM picked because AES-NI gives sub-microsecond seal/open on
+# modern x86, and the RustCrypto AEAD traits are well-vetted +
+# FIPS-friendly.
+aes-gcm = { version = "0.10", optional = true }
+hkdf = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+rand_core = { version = "0.6", features = ["std"], optional = true }
+
+# Zero-copy byte buffers (BatchEngine)
+bytes = { version = ">=1.10, <2", optional = true }
+
+# Vault/OpenBao (for secrets-vault)
+# Bumped to 0.8 in the 2026-05-08 reqwest-0.13 migration (see reqwest above).
+vaultrs = { version = ">=0.8, <0.9", optional = true }
+
+# AWS (for secrets-aws)
+# NOTE: aws-config and aws-sdk-* transitively pull in aws-lc-sys, which compiles
+# C/C++ and assembly. Amazon hardcode their own crypto lib into the SDK and offer
+# no way to opt out at compile time. Every other C dependency in this crate is
+# dynamically linked against system libs, but aws-lc-sys gets a free pass because
+# apparently the AWS SDK team think we all enjoy watching cmake run. ~20-30s on
+# first build, cached by sccache after that. Revisit when they offer a ring-only
+# build — or when we find a reason to drop the AWS secrets backend entirely.
+# Default features disabled to skip the aws-sdk `rustls` feature, which is
+# confusingly named — it actually enables `aws-smithy-runtime/tls-rustls` and
+# pulls in rustls 0.21 + rustls-webpki 0.101 (RUSTSEC-2026-0098, -0099, -0104).
+# `default-https-client` uses the modern aws-smithy-http-client/rustls-aws-lc
+# path with rustls 0.23 + rustls-webpki 0.103 — that's what we want.
+aws-config = { version = ">=1.8, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+aws-sdk-secretsmanager = { version = ">=1.102, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+
+[build-dependencies]
+tonic-prost-build = { version = ">=0.14.5, <0.15", optional = true }
+prost-build = { version = ">=0.14, <0.15", optional = true }
+
+[dev-dependencies]
+tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
+tempfile = ">=3.24.0, <4"
+criterion = { version = ">=0.5, <0.9", features = ["html_reports"] }
+pretty_assertions = ">=1.4.1, <2"
+temp-env = ">=0.3.6, <0.4"
+async-trait = ">=0.1.88, <0.2"
+git2 = ">=0.20.0, <0.21"
+# Generate self-signed certs in-process for the `tls` module's unit tests
+# (no checked-in PEM fixtures to rot). Web-checked 2026-06-03.
+rcgen = ">=0.14.7, <0.15"
+# Typed MsgPack encode -- only used by tests to build msgpack fixtures; the
+# library parse path uses rmpv natively, so this is dev-only.
+rmp-serde = ">=1.3.1, <2"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# expect_used = "warn"  # Disabled for MVP, re-enable for stricter error handling
+
+# Allows for test/bench/example code (these don't inherit lib.rs attributes)
+doc_markdown = "allow"                    # Don't require backticks in doc comments
+unnecessary_debug_formatting = "allow"    # Allow {:?} in examples
+await_holding_lock = "allow"              # Common in test code with mocked locks
+redundant_closure = "allow"               # Sometimes clearer in tests
+redundant_closure_for_method_calls = "allow"  # Sometimes clearer in tests
+needless_raw_string_hashes = "allow"      # Convenience in test strings
+items_after_statements = "allow"          # Test helper structs defined where needed
+inefficient_to_string = "allow"           # Clarity over micro-optimization in tests
+unwrap_used = "allow"                     # Allowed in tests for cleaner assertions
+
+[[bench]]
+name = "config_benchmark"
+harness = false
+
+[[bench]]
+name = "logger_benchmark"
+harness = false
+
+[[bench]]
+name = "engine_benchmark"
+harness = false
+required-features = ["worker", "transport"]
+
+[[bench]]
+name = "filter_benchmark"
+harness = false
+required-features = ["transport-memory"]
+
+[[bench]]
+name = "concurrency_patterns"
+harness = false
+required-features = ["concurrency"]
+
+[[bench]]
+name = "strmatch"
+harness = false
+required-features = ["strmatch"]
+
+# Memory backpressure operational-test harness (not a product binary).
+# Driven under a cgroup --memory limit by scripts/operational-mem-test.sh.
+[[example]]
+name = "mem_loadgen"
+required-features = ["memory"]
+
+# CPU oversubscription operational-test harness (not a product binary).
+# Driven under a cgroup --cpus cap by scripts/operational-cpu-test.sh.
+[[example]]
+name = "cpu_loadgen"
+required-features = ["worker"]
+
+# Release marker: trigger v2.8.0 publish via hyperi-ci version-first pipeline.

@@ -1,0 +1,23 @@
+// Project:   scalo
+// File:      benches/config_benchmark.rs
+// Purpose:   Configuration loading benchmarks
+// Language:  Rust
+//
+// License:   Apache-2.0
+// Copyright: (c) 2026 HYPERI PTY LIMITED
+
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
+
+fn config_loading_benchmark(c: &mut Criterion) {
+    c.bench_function("config_new_default", |b| {
+        b.iter(|| {
+            // Benchmark creating a new config with defaults
+            let opts = scalo::config::ConfigOptions::default();
+            black_box(opts)
+        });
+    });
+}
+
+criterion_group!(benches, config_loading_benchmark);
+criterion_main!(benches);

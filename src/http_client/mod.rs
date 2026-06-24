@@ -1,0 +1,225 @@
+// Project:   scalo
+// File:      src/http_client/mod.rs
+// Purpose:   Production HTTP client with retry middleware
+// Language:  Rust
+//
+// License:   Apache-2.0
+// Copyright: (c) 2026 HYPERI PTY LIMITED
+
+//! Production HTTP client with automatic retries and timeouts.
+//!
+//! Wraps [`reqwest`] with [`reqwest_middleware`] and [`reqwest_retry`] to
+//! provide exponential backoff for transient errors (5xx, timeouts,
+//! connection failures). Non-retryable errors (4xx) return immediately.
+//!
+//! # Config Cascade
+//!
+//! When the `config` feature is enabled, config is auto-loaded from the
+//! cascade under the `http_client` key:
+//!
+//! ```yaml
+//! http_client:
+//!   timeout_secs: 30
+//!   connect_timeout_secs: 10
+//!   max_retries: 3
+//!   min_retry_interval_ms: 100
+//!   max_retry_interval_ms: 30000
+//!   user_agent: "dfe-fetcher/1.0"
+//! ```
+
+pub mod config;
+
+pub use config::HttpClientConfig;
+
+use reqwest::Response;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::RetryTransientMiddleware;
+use reqwest_retry::policies::ExponentialBackoff;
+
+/// HTTP client build error.
+#[derive(Debug, thiserror::Error)]
+pub enum HttpClientError {
+    /// Failed to build the underlying reqwest client.
+    #[error("failed to build HTTP client: {0}")]
+    BuildError(#[from] reqwest::Error),
+}
+
+/// Production HTTP client with retry middleware.
+pub struct HttpClient {
+    inner: ClientWithMiddleware,
+    config: HttpClientConfig,
+}
+
+impl HttpClient {
+    /// Create a new HTTP client with the given config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
+    /// client cannot be constructed (typically TLS backend init failure).
+    pub fn new(config: HttpClientConfig) -> Result<Self, HttpClientError> {
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(
+                std::time::Duration::from_millis(config.min_retry_interval_ms),
+                std::time::Duration::from_millis(config.max_retry_interval_ms),
+            )
+            .build_with_max_retries(config.max_retries);
+
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs));
+
+        if let Some(ref ua) = config.user_agent {
+            builder = builder.user_agent(ua.clone());
+        }
+
+        let reqwest_client = builder.build()?;
+
+        let client = ClientBuilder::new(reqwest_client)
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+
+        Ok(Self {
+            inner: client,
+            config,
+        })
+    }
+
+    /// Create a client from the config cascade (or defaults).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
+    /// client cannot be constructed.
+    pub fn from_cascade() -> Result<Self, HttpClientError> {
+        Self::new(HttpClientConfig::from_cascade())
+    }
+
+    /// Send a GET request.
+    pub async fn get(&self, url: &str) -> Result<Response, reqwest_middleware::Error> {
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
+
+        let result = self.inner.get(url).send().await;
+
+        #[cfg(feature = "metrics")]
+        {
+            let status = if result.is_ok() { "success" } else { "error" };
+            metrics::counter!("dfe_http_client_requests_total", "method" => "GET", "status" => status).increment(1);
+            metrics::histogram!("dfe_http_client_duration_seconds", "method" => "GET")
+                .record(start.elapsed().as_secs_f64());
+        }
+
+        result
+    }
+
+    /// Send a POST request with a JSON body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a middleware-wrapped error if JSON serialisation of `body`
+    /// fails, or a network error if the request fails to send. Previously
+    /// a serialisation failure was silently substituted with an empty body
+    /// -- the request would dispatch with no payload, hiding the bug at the
+    /// caller and producing confusing downstream behaviour.
+    pub async fn post_json<T: serde::Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<Response, reqwest_middleware::Error> {
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
+
+        let body_bytes = serde_json::to_vec(body).map_err(|e| {
+            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                "POST {url}: JSON serialise failed: {e}"
+            ))
+        })?;
+
+        let result = self
+            .inner
+            .post(url)
+            .header("content-type", "application/json")
+            .body(body_bytes)
+            .send()
+            .await;
+
+        #[cfg(feature = "metrics")]
+        {
+            let status = if result.is_ok() { "success" } else { "error" };
+            metrics::counter!("dfe_http_client_requests_total", "method" => "POST", "status" => status).increment(1);
+            metrics::histogram!("dfe_http_client_duration_seconds", "method" => "POST")
+                .record(start.elapsed().as_secs_f64());
+        }
+
+        result
+    }
+
+    /// Send a PUT request with a JSON body.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::post_json`] -- same serialise + send error contract.
+    pub async fn put_json<T: serde::Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<Response, reqwest_middleware::Error> {
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
+
+        let body_bytes = serde_json::to_vec(body).map_err(|e| {
+            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                "PUT {url}: JSON serialise failed: {e}"
+            ))
+        })?;
+
+        let result = self
+            .inner
+            .put(url)
+            .header("content-type", "application/json")
+            .body(body_bytes)
+            .send()
+            .await;
+
+        #[cfg(feature = "metrics")]
+        {
+            let status = if result.is_ok() { "success" } else { "error" };
+            metrics::counter!("dfe_http_client_requests_total", "method" => "PUT", "status" => status).increment(1);
+            metrics::histogram!("dfe_http_client_duration_seconds", "method" => "PUT")
+                .record(start.elapsed().as_secs_f64());
+        }
+
+        result
+    }
+
+    /// Send a DELETE request.
+    pub async fn delete(&self, url: &str) -> Result<Response, reqwest_middleware::Error> {
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
+
+        let result = self.inner.delete(url).send().await;
+
+        #[cfg(feature = "metrics")]
+        {
+            let status = if result.is_ok() { "success" } else { "error" };
+            metrics::counter!("dfe_http_client_requests_total", "method" => "DELETE", "status" => status).increment(1);
+            metrics::histogram!("dfe_http_client_duration_seconds", "method" => "DELETE")
+                .record(start.elapsed().as_secs_f64());
+        }
+
+        result
+    }
+
+    /// Access the underlying middleware client for custom requests.
+    #[must_use]
+    pub fn client(&self) -> &ClientWithMiddleware {
+        &self.inner
+    }
+
+    /// Access the current config.
+    #[must_use]
+    pub fn config(&self) -> &HttpClientConfig {
+        &self.config
+    }
+}

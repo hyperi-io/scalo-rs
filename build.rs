@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 HYPERI PTY LIMITED
+//
+// Protobuf code generation for gRPC transport.
+// Only runs when transport-grpc or transport-grpc-vector-compat features are enabled.
+
+#[allow(clippy::unnecessary_wraps)]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // DFE native transport proto
+    #[cfg(feature = "transport-grpc")]
+    {
+        tonic_prost_build::configure()
+            .build_server(true)
+            .build_client(true)
+            // Decode proto `bytes` fields ZERO-COPY into `bytes::Bytes` rather
+            // than the default `Vec<u8>`. This is the serde-less property of the
+            // native batch transport: `Record.payload` arrives as a refcounted
+            // view, never copied or parsed. `"."` matches every bytes field in
+            // the file (Record.payload, Header.value, PushRequest.payload). Per
+            // prost-build docs, the zero-copy path only fires when the decode
+            // source is itself a `bytes::Bytes`, which tonic's ProstCodec uses.
+            .bytes(".")
+            .compile_protos(&["proto/dfe/transport/v1/dfe_transport.proto"], &["proto"])?;
+    }
+
+    // Vector wire protocol compat (vendored protos)
+    #[cfg(feature = "transport-grpc-vector-compat")]
+    {
+        // Compile event.proto first (message types only, no services)
+        prost_build::Config::new()
+            .compile_protos(&["proto/vector/event.proto"], &["proto/vector"])?;
+
+        // Compile vector.proto (service + request/response types)
+        // extern_path tells prost the event types live in the sibling module
+        tonic_prost_build::configure()
+            .build_server(true)
+            .build_client(true)
+            .extern_path(".event", "crate::transport::vector_compat::proto::event")
+            .compile_protos(&["proto/vector/vector.proto"], &["proto/vector"])?;
+    }
+
+    Ok(())
+}

@@ -1,0 +1,415 @@
+// Project:   scalo
+// File:      src/secrets/types.rs
+// Purpose:   Secrets type definitions
+// Language:  Rust
+//
+// License:   Apache-2.0
+// Copyright: (c) 2026 HYPERI PTY LIMITED
+
+//! Type definitions for the secrets module.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
+
+use super::error::SecretsResult;
+
+/// Main configuration for the secrets manager.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecretsConfig {
+    /// Cache configuration.
+    pub cache: CacheConfig,
+
+    /// OpenBao/Vault configuration.
+    #[cfg(feature = "secrets-vault")]
+    pub openbao: Option<super::OpenBaoConfig>,
+
+    /// AWS Secrets Manager configuration.
+    #[cfg(feature = "secrets-aws")]
+    pub aws: Option<super::AwsConfig>,
+
+    /// Placeholder for vault config when feature disabled.
+    #[cfg(not(feature = "secrets-vault"))]
+    #[serde(skip)]
+    pub openbao: Option<()>,
+
+    /// Placeholder for AWS config when feature disabled.
+    #[cfg(not(feature = "secrets-aws"))]
+    #[serde(skip)]
+    pub aws: Option<()>,
+
+    /// Named secret sources.
+    pub sources: HashMap<String, SecretSource>,
+}
+
+impl SecretsConfig {
+    /// Load from the config cascade under the `secrets` key.
+    #[must_use]
+    pub fn from_cascade() -> Self {
+        #[cfg(feature = "config")]
+        {
+            if let Some(cfg) = crate::config::try_get()
+                && let Ok(secrets) = cfg.unmarshal_key_registered::<Self>("secrets")
+            {
+                return secrets;
+            }
+        }
+        Self::default()
+    }
+}
+
+/// Cache configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Enable caching.
+    pub enabled: bool,
+
+    /// Cache directory path.
+    pub directory: Option<PathBuf>,
+
+    /// Cache TTL in seconds (how long cached secrets are considered fresh).
+    pub ttl_secs: u64,
+
+    /// Stale cache grace period in seconds (how long to use expired cache on provider failure).
+    pub stale_grace_secs: u64,
+
+    /// Background refresh interval in seconds.
+    pub refresh_interval_secs: u64,
+
+    /// Refresh jitter in seconds (randomize to avoid thundering herd).
+    pub refresh_jitter_secs: u64,
+
+    /// Disk-cache encryption key. When set, on-disk cache entries are sealed
+    /// with AES-256-GCM (see `secrets::crypto`); the value is redacted in
+    /// serialisation and debug output. When `None`, the disk cache is
+    /// memory-only UNLESS `allow_plaintext_disk_cache` is explicitly enabled.
+    pub encryption_key: Option<crate::SensitiveString>,
+
+    /// Explicitly permit writing UNENCRYPTED secrets to the disk cache when
+    /// no `encryption_key` is configured. Default `false`: without a key the
+    /// disk tier is silently skipped (memory-only) rather than persisting
+    /// plaintext secrets. Enabling this is rejected by
+    /// [`validate`](CacheConfig::validate) under a production profile.
+    #[serde(default)]
+    pub allow_plaintext_disk_cache: bool,
+
+    /// Unix permission mode for the cache directory. Default `0o700`.
+    /// Set to `None` to skip chmod entirely -- required on backing
+    /// stores that reject `chmod`: S3-FUSE, root-squashed NFS, some
+    /// other network mounts. Operators are responsible for upstream
+    /// perms in that case.
+    pub dir_mode: Option<u32>,
+
+    /// Unix permission mode for cache files. Default `0o600`. `None`
+    /// skips chmod, see `dir_mode`.
+    pub file_mode: Option<u32>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directory: None,             // Auto-detect
+            ttl_secs: 3600,              // 1 hour
+            stale_grace_secs: 86400,     // 24 hours
+            refresh_interval_secs: 1800, // 30 minutes
+            refresh_jitter_secs: 300,    // 5 minutes
+            encryption_key: None,
+            allow_plaintext_disk_cache: false,
+            dir_mode: Some(0o700),
+            file_mode: Some(0o600),
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Validate the cache configuration against the deployment profile.
+    ///
+    /// Rejects writing plaintext secrets to disk in production: if the disk
+    /// cache is enabled with no `encryption_key` and
+    /// `allow_plaintext_disk_cache` is set, this returns an error under a
+    /// production profile. Call at startup (e.g. from the config registry).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `is_production` and the config would persist
+    /// unencrypted secrets to disk.
+    pub fn validate(&self, is_production: bool) -> Result<(), String> {
+        if is_production
+            && self.enabled
+            && self.encryption_key.is_none()
+            && self.allow_plaintext_disk_cache
+        {
+            return Err(
+                "secrets cache: allow_plaintext_disk_cache=true is not permitted in \
+                 production -- configure an encryption_key for the disk cache, or leave \
+                 it memory-only (allow_plaintext_disk_cache=false)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for a secret source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum SecretSource {
+    /// Load from local file.
+    File {
+        /// Path to the secret file.
+        path: String,
+    },
+
+    /// Load from OpenBao/Vault.
+    OpenBao {
+        /// Secret path in Vault (e.g., "secret/data/myapp/tls").
+        path: String,
+        /// Key within the secret (e.g., "certificate").
+        key: String,
+    },
+
+    /// Load from AWS Secrets Manager.
+    Aws {
+        /// Secret name or ARN.
+        secret_id: String,
+        /// Key within the JSON secret (optional for plaintext secrets).
+        key: Option<String>,
+    },
+}
+
+/// Value retrieved from a secrets provider.
+#[derive(Clone)]
+pub struct SecretValue {
+    /// The secret data (may be binary or text).
+    pub data: Vec<u8>,
+
+    /// When this secret was fetched.
+    pub fetched_at: SystemTime,
+
+    /// Metadata from the provider.
+    pub metadata: SecretMetadata,
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretValue")
+            .field("data", &"[REDACTED]")
+            .field("fetched_at", &self.fetched_at)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+impl SecretValue {
+    /// Create a new secret value.
+    #[must_use]
+    pub fn new(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            fetched_at: SystemTime::now(),
+            metadata: SecretMetadata::default(),
+        }
+    }
+
+    /// Create a new secret value with metadata.
+    #[must_use]
+    pub fn with_metadata(data: Vec<u8>, metadata: SecretMetadata) -> Self {
+        Self {
+            data,
+            fetched_at: SystemTime::now(),
+            metadata,
+        }
+    }
+
+    /// Get the secret as a UTF-8 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data is not valid UTF-8.
+    pub fn as_str(&self) -> SecretsResult<&str> {
+        std::str::from_utf8(&self.data)
+            .map_err(|e| super::error::SecretsError::InvalidData(format!("not valid UTF-8: {e}")))
+    }
+
+    /// Get the secret as bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Check if the secret has expired based on TTL.
+    #[must_use]
+    pub fn is_expired(&self, ttl_secs: u64) -> bool {
+        self.fetched_at
+            .elapsed()
+            .map_or(true, |d| d.as_secs() >= ttl_secs)
+    }
+
+    /// Check if the secret is within the stale grace period.
+    #[must_use]
+    pub fn is_within_grace(&self, ttl_secs: u64, grace_secs: u64) -> bool {
+        self.fetched_at
+            .elapsed()
+            .is_ok_and(|d| d.as_secs() <= ttl_secs + grace_secs)
+    }
+}
+
+/// Metadata about a secret.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecretMetadata {
+    /// Version identifier from the provider.
+    pub version: Option<String>,
+
+    /// Provider-specific ARN or path.
+    pub source_path: Option<String>,
+
+    /// Provider name.
+    pub provider: Option<String>,
+}
+
+/// Event emitted when a secret is rotated.
+#[derive(Debug, Clone)]
+pub struct RotationEvent {
+    /// Secret name.
+    pub name: String,
+
+    /// Previous version (if known).
+    pub old_version: Option<String>,
+
+    /// New version.
+    pub new_version: String,
+
+    /// When the rotation was detected.
+    pub rotated_at: SystemTime,
+}
+
+/// Serializable cache entry for disk storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CacheEntry {
+    /// Base64-encoded secret data.
+    pub data: String,
+
+    /// When this secret was fetched (Unix timestamp).
+    pub fetched_at_secs: u64,
+
+    /// Metadata.
+    pub metadata: SecretMetadata,
+}
+
+impl CacheEntry {
+    /// Create a cache entry from a secret value.
+    pub fn from_value(value: &SecretValue) -> Self {
+        use base64::Engine;
+        Self {
+            data: base64::engine::general_purpose::STANDARD.encode(&value.data),
+            fetched_at_secs: value
+                .fetched_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            metadata: value.metadata.clone(),
+        }
+    }
+
+    /// Convert to a secret value.
+    pub fn to_value(&self) -> SecretsResult<SecretValue> {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&self.data)
+            .map_err(|e| super::error::SecretsError::CacheError(format!("invalid base64: {e}")))?;
+
+        let fetched_at =
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(self.fetched_at_secs);
+
+        Ok(SecretValue {
+            data,
+            fetched_at,
+            metadata: self.metadata.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_config_validate_rejects_plaintext_disk_in_prod() {
+        // Plaintext disk opt-in is rejected in production...
+        let cfg = CacheConfig {
+            allow_plaintext_disk_cache: true,
+            encryption_key: None,
+            ..Default::default()
+        };
+        assert!(
+            cfg.validate(true).is_err(),
+            "prod must reject plaintext disk"
+        );
+        // ...but allowed outside production (dev/test convenience).
+        assert!(
+            cfg.validate(false).is_ok(),
+            "non-prod allows plaintext disk"
+        );
+
+        // Default (memory-only) is fine everywhere.
+        let safe = CacheConfig::default();
+        assert!(safe.validate(true).is_ok());
+        assert!(safe.validate(false).is_ok());
+
+        // An encryption_key makes disk persistence acceptable in prod.
+        let encrypted = CacheConfig {
+            allow_plaintext_disk_cache: true,
+            encryption_key: Some(crate::SensitiveString::from("0123456789abcdef")),
+            ..Default::default()
+        };
+        assert!(
+            encrypted.validate(true).is_ok(),
+            "an encryption_key satisfies prod validation"
+        );
+    }
+
+    #[test]
+    fn test_secret_value_new() {
+        let value = SecretValue::new(b"test-secret".to_vec());
+        assert_eq!(value.as_bytes(), b"test-secret");
+        assert_eq!(value.as_str().unwrap(), "test-secret");
+    }
+
+    #[test]
+    fn test_secret_value_expiry() {
+        let value = SecretValue::new(b"test".to_vec());
+        // Fresh secret should not be expired
+        assert!(!value.is_expired(3600));
+        assert!(value.is_within_grace(3600, 86400));
+    }
+
+    #[test]
+    fn test_cache_entry_roundtrip() {
+        let value = SecretValue::new(b"secret-data".to_vec());
+        let entry = CacheEntry::from_value(&value);
+        let restored = entry.to_value().unwrap();
+        assert_eq!(restored.data, value.data);
+    }
+
+    #[test]
+    fn test_secret_source_file_serialization() {
+        let source = SecretSource::File {
+            path: "/etc/ssl/cert.pem".to_string(),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        assert!(json.contains("\"provider\":\"file\""));
+    }
+
+    #[test]
+    fn test_cache_config_default() {
+        let config = CacheConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.ttl_secs, 3600);
+        assert_eq!(config.stale_grace_secs, 86400);
+        assert!(config.encryption_key.is_none());
+    }
+}

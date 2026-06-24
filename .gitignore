@@ -1,0 +1,111 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build
+*.log
+dist/
+dist-bin/
+build/
+out/
+test-results/
+coverage/
+
+# Temporary/cache
+.tmp/
+
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+coverage-html/
+coverage.lcov
+.cargo/
+!.cargo/config.toml
+!.cargo/audit.toml
+
+# AI agent working files (not committed)
+docs/superpowers/
+.claude/
+CLAUDE.md
+STATE.md
+
+# Git worktrees
+.worktrees/
+
+# Local working files (not committed)
+.mcp.json
+TODO.md
+.ai-version
+
+# OS junk (never useful in repo)
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Editor / IDE local state
+.idea/
+.vscode/
+
+# Local environment files (never commit -- contain secrets)
+.env
+.env.*
+!.env.example
+!.env.example.*
+
+# here.
+docs/superpowers/
+.mcp.json
+TODO.md
+.ai-version
+
+# Git worktrees (local dev convenience)
+.worktrees/
+
+# Rust build artefacts
+target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+coverage-html/
+coverage.lcov
+tarpaulin-report.json
+cobertura.xml
+
+# cargo
+.cargo/
+!.cargo/config.toml
+
+# them alone if already present.
+docs/superpowers/
+.mcp.json
+.ai-version
+
+# committed -- mirrored in .git/info/exclude.
+CLAUDE.md
+TODO.md
+AGENTS.md
+GEMINI.md
+.claude/
+.codex/
+.cursor/
+.gemini/
+.cursorrules

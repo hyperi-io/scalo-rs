@@ -1,0 +1,83 @@
+// Project:   scalo
+// File:      src/cli/mod.rs
+// Purpose:   Standard CLI framework for DFE services
+// Language:  Rust
+//
+// License:   Apache-2.0
+// Copyright: (c) 2026 HYPERI PTY LIMITED
+
+//! Standard CLI framework for DFE Rust services.
+//!
+//! Provides the 80% of CLI boilerplate that every DFE service needs:
+//! config path, log level/format, metrics address, version, config-check.
+//! Apps provide the 20% (config type, service logic) via the [`ServiceApp`] trait.
+//!
+//! ## Quick Start
+//!
+//! ```rust,ignore
+//! use clap::Parser;
+//! use scalo::cli::{CommonArgs, ServiceApp, CliError, StandardCommand, VersionInfo, run_app};
+//!
+//! #[derive(Parser)]
+//! #[command(name = "dfe-loader", version)]
+//! struct App {
+//!     #[command(flatten)]
+//!     common: CommonArgs,
+//!
+//!     #[command(subcommand)]
+//!     command: Option<StandardCommand>,
+//! }
+//!
+//! impl ServiceApp for App {
+//!     type Config = MyConfig;
+//!
+//!     fn name(&self) -> &str { "dfe-loader" }
+//!     fn env_prefix(&self) -> &str { "DFE_LOADER" }
+//!     fn version_info(&self) -> VersionInfo {
+//!         VersionInfo::new("dfe-loader", env!("CARGO_PKG_VERSION"))
+//!     }
+//!     fn common_args(&self) -> &CommonArgs { &self.common }
+//!     fn command(&self) -> Option<&StandardCommand> { self.command.as_ref() }
+//!     fn load_config(&self, path: Option<&str>) -> Result<MyConfig, CliError> { todo!() }
+//!     async fn run_service(&self, config: MyConfig) -> Result<(), CliError> { todo!() }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let app = App::parse();
+//!     if let Err(e) = run_app(app).await {
+//!         eprintln!("fatal: {e}");
+//!         std::process::exit(1);
+//!     }
+//! }
+//! ```
+
+mod args;
+mod commands;
+mod error;
+pub mod output;
+mod version;
+
+// ServiceApp + ServiceRuntime require the full service infrastructure stack
+// (MetricsManager, MemoryGuard, ScalingPressure, AdaptiveWorkerPool).
+// Gated behind `cli-service`. Bare `cli` exposes only the clap types.
+#[cfg(feature = "cli-service")]
+mod app;
+#[cfg(feature = "cli-service")]
+mod runtime;
+
+pub use args::CommonArgs;
+pub use commands::StandardCommand;
+pub use error::CliError;
+pub use version::VersionInfo;
+
+#[cfg(feature = "cli-service")]
+pub use app::{ServiceApp, run_app};
+// Deprecated brand alias for the app trait -- removed before GA.
+#[cfg(feature = "cli-service")]
+pub use app::ServiceApp as DfeApp;
+#[cfg(feature = "cli-service")]
+pub use runtime::ServiceRuntime;
+
+#[cfg(feature = "top")]
+pub use commands::TopArgs;
