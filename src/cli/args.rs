@@ -1,12 +1,12 @@
 // Project:   scalo
 // File:      src/cli/args.rs
-// Purpose:   Standard CLI arguments for DFE services
+// Purpose:   Standard CLI arguments for data-plane services
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Common CLI arguments shared across all DFE services.
+//! Common CLI arguments shared across all data-plane services.
 //!
 //! Use `#[command(flatten)]` to embed these in your application's Clap parser:
 //!
@@ -21,7 +21,7 @@
 //! }
 //! ```
 
-/// Standard CLI arguments for DFE services.
+/// Standard CLI arguments for data-plane services.
 ///
 /// Provides the 80% of flags that every service needs:
 /// config path, log level/format, metrics address, verbose/quiet modes.

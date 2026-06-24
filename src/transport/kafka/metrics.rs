@@ -287,7 +287,7 @@ impl StatsContext {
     /// internal statistics to the global metrics recorder. No-op if no
     /// recorder is installed.
     ///
-    /// Emits under the `rdkafka_` prefix per the DFE metrics standard.
+    /// Emits under the `rdkafka_` prefix per the metrics standard.
     /// Per-partition metrics are bounded by `max_partitions` (default 256).
     #[cfg(feature = "metrics")]
     pub fn emit_prometheus_metrics(&self) {

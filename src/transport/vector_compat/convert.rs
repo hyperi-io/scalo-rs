@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/transport/vector_compat/convert.rs
-// Purpose:   Vector <-> hyperi message conversion
+// Purpose:   Vector <-> data-plane message conversion
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -9,7 +9,7 @@
 //! Bidirectional conversion between Vector protobuf types and serde_json::Value.
 //!
 //! This is the ONLY place Vector's type system touches ours. Everything
-//! downstream is pure DFE `Message<serde_json::Value>`.
+//! downstream is a pure `Message<serde_json::Value>`.
 
 use super::proto::event;
 
@@ -23,7 +23,7 @@ pub fn event_wrapper_to_json(wrapper: &event::EventWrapper) -> Option<serde_json
     match wrapper.event.as_ref()? {
         Event::Log(log) => Some(log_to_json(log)),
         Event::Trace(trace) => Some(trace_to_json(trace)),
-        Event::Metric(_) => None, // DFE doesn't handle metrics
+        Event::Metric(_) => None, // the data plane doesn't handle metrics
     }
 }
 

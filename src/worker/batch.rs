@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Batch processing framework for DFE pipeline parallelisation.
+//! Batch processing framework for data-plane pipeline parallelisation.
 //!
 //! Provides the [`BatchProcessor`] trait for defining parallel-safe message
 //! processing, and [`BatchPipeline`] for orchestrating the parallel (rayon) ->
@@ -14,7 +14,7 @@
 //!
 //! ## The Pattern
 //!
-//! Every DFE app follows the same structure:
+//! Every consumer service follows the same structure:
 //!
 //! 1. **Parallel phase:** Process each message through a pure `&self` function
 //!    (parse, route, transform, enrich) -- via rayon `process_batch()`
@@ -79,7 +79,7 @@ pub trait BatchProcessor: Sync {
 
 /// Orchestrates parallel batch processing via [`AdaptiveWorkerPool`].
 ///
-/// Wraps the worker pool with common DFE pipeline concerns: stats tracking,
+/// Wraps the worker pool with common data-plane pipeline concerns: stats tracking,
 /// memory accounting, and metrics emission. Apps provide a [`BatchProcessor`]
 /// implementation; the pipeline handles the rest.
 pub struct BatchPipeline {

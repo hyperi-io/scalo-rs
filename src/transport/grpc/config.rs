@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// # Client mode
 ///
-/// Set `endpoint` to connect to a remote DFE gRPC server.
+/// Set `endpoint` to connect to a remote gRPC server.
 ///
 /// # Server mode
 ///
@@ -30,7 +30,7 @@ pub struct GrpcConfig {
     /// When set, the transport accepts incoming Push RPCs.
     pub listen: Option<String>,
 
-    /// Client endpoint URI (e.g., "http://dfe-loader:6000").
+    /// Client endpoint URI (e.g., "http://loader:6000").
     /// When set, the transport can send messages to a remote server.
     pub endpoint: Option<String>,
 
@@ -54,7 +54,7 @@ pub struct GrpcConfig {
 
     // --- Client TLS. tonic owns its TLS stack (like librdkafka), so these map
     // TlsTrust onto tonic's ClientTlsConfig rather than crate::tls's rustls
-    // ClientConfig. In-cluster DFE gRPC is usually mesh-mTLS (Istio/Linkerd);
+    // ClientConfig. In-cluster gRPC is usually mesh-mTLS (Istio/Linkerd);
     // set these only for DIRECT TLS to a remote endpoint. ---
     /// Enable client TLS for the `endpoint` connection.
     #[serde(default)]

@@ -1,6 +1,6 @@
 # Integration
 
-This walks through wiring `scalo` into a new DFE service from
+This walks through wiring `scalo` into a new data-plane service from
 empty `Cargo.toml` to running binary. The goal is a self-contained recipe;
 the deep-dive details for each line live in the subsystem docs.
 
@@ -17,7 +17,7 @@ Two questions:
   (one-shot CLI)?
 - **What transports** does it touch — Kafka, gRPC, file, none?
 
-For a typical DFE service that talks to Kafka, ingests gRPC, scales under
+For a typical data-plane service that talks to Kafka, ingests gRPC, scales under
 KEDA, and ships container artefacts, the `Cargo.toml` reads:
 
 ```toml
@@ -27,7 +27,7 @@ features = [
     "cli-service",          # ServiceApp trait, run_app, ServiceRuntime
     "config-reload",        # Hot-reload of the config cascade
     "logger",               # Always
-    "metrics-dfe",          # DFE-specific metric groups
+    "metrics-dfe",          # data-plane metric groups
     "transport-kafka",      # Kafka producer + consumer
     "transport-grpc",       # gRPC server + client
     "tiered-sink",          # Resilient delivery with disk spillover
@@ -278,7 +278,7 @@ See [AUTO-WIRING.md](AUTO-WIRING.md) for the full
 
 ## Reference apps
 
-The six core DFE apps are the canonical examples. Read whichever is
+The six core consumer services are the canonical examples. Read whichever is
 closest in shape to what you're building:
 
 | App | Best for |

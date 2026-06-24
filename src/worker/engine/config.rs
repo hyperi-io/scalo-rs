@@ -53,7 +53,7 @@ pub struct BatchProcessingConfig {
     /// Maximum number of messages per rayon chunk.
     ///
     /// Smaller chunks reduce per-task overhead; larger chunks amortise
-    /// the rayon work-stealing cost. Default 10 000 matches DFE batch sizes.
+    /// the rayon work-stealing cost. Default 10 000 matches data-plane batch sizes.
     #[serde(default = "default_max_chunk_size")]
     pub max_chunk_size: usize,
 
@@ -63,7 +63,7 @@ pub struct BatchProcessingConfig {
 
     /// JSON field used to route messages to the correct downstream sink.
     ///
-    /// For dfe-loader this is typically `"_table"`.
+    /// For a loader this is typically `"_table"`.
     #[serde(default)]
     pub routing_field: Option<String>,
 

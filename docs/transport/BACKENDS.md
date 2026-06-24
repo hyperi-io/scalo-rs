@@ -28,9 +28,9 @@ five don't make a transit-network choice.
 | Model | Persistence | Replay | Latency | Failure mode | Use when |
 |-------|-------------|--------|---------|--------------|----------|
 | **Kafka-mediated** | Yes (broker disk) | Yes | ~ms | Producer keeps writing if consumer down | Default for staged pipelines, audit-trail required, consumer-failure tolerance matters |
-| **Direct gRPC** | No | No | ~µs | Sender fails fast if receiver down | Tight DFE mesh, latency-sensitive, broker overhead unacceptable |
+| **Direct gRPC** | No | No | ~µs | Sender fails fast if receiver down | Tight data-plane mesh, latency-sensitive, broker overhead unacceptable |
 
-Apps pick per-stage. A typical DFE deployment runs
+Apps pick per-stage. A typical data-plane deployment runs
 `receiver → Kafka → loader` (durability at ingress) and
 `loader → gRPC → archiver` (latency on the sink) — same binary set,
 config-only difference.
@@ -44,7 +44,7 @@ config-only difference.
 Profile-based config (`production`, `devtest`) with
 `librdkafka_overrides` for fine control. Supports auto-discovery
 (`auto_discover: true` with include/exclude regex), SASL/SSL,
-suppression rules (`_load` masks `_land` by DFE convention).
+suppression rules (`_load` masks `_land` by convention).
 
 ```yaml
 transport:
@@ -102,9 +102,9 @@ Source: [../../src/transport/grpc/](../../src/transport/grpc/).
 ### `transport-grpc-vector-compat`
 
 Wire-compat shim for `vector.Vector/PushEvents`. Only used by
-`dfe-transform-vector` so legacy Vector sinks can target a DFE gRPC
+`dfe-transform-vector` so legacy Vector sinks can target a native gRPC
 endpoint without recompile. Enable with `vector_compat: true` in the
-gRPC config — the server then accepts both DFE and Vector RPCs on
+gRPC config — the server then accepts both native and Vector RPCs on
 the same listener. Not a separate backend, not for any other app.
 
 Source: [../../src/transport/vector_compat/](../../src/transport/vector_compat/).

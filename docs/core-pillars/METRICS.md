@@ -9,7 +9,7 @@ Every counter / gauge / histogram built through `MetricsManager` also pushes a
 `MetricDescriptor` into a `MetricRegistry`, rendered as JSON at `/metrics/manifest`
 and to `docs/metrics-manifest.json` via the `metrics-manifest` CLI subcommand.
 That manifest is the only source of metric metadata for downstream tools (Grafana
-provisioning, alert validators, the DFE docs site).
+provisioning, alert validators, the data-plane docs site).
 
 Process and container metrics (RSS, CPU, FDs, cgroup limits) auto-collect on a
 fixed interval via [sysinfo](https://crates.io/crates/sysinfo) when the relevant
@@ -25,7 +25,7 @@ features are on; container metrics read cgroup v1 and v2 transparently.
 | `metrics-process` | `metrics-core` + sysinfo process probe | Single binaries wanting RSS/CPU without an HTTP server |
 | `metrics` | `metrics-process` + Prometheus exporter + `/metrics` server | Services |
 
-DFE services pull `metrics`; published library crates pull `metrics-core` so they
+Data-plane services pull `metrics`; published library crates pull `metrics-core` so they
 don't drag a TCP listener into dependents.
 
 ---
@@ -53,7 +53,7 @@ mgr.start_server("0.0.0.0:9090").await?;
 
 Names are namespace-prefixed automatically -- `counter("foo")` records as
 `dfe_loader_foo`. Use `*_with_labels` so the label keys and group land in the
-manifest (i.e. nearly always; unlabeled metrics are rare in DFE pipelines).
+manifest (i.e. nearly always; unlabeled metrics are rare in data-plane pipelines).
 
 Single-binary services use `ServiceRuntime` from `cli`, which constructs the
 manager, wires the readiness callback, attaches optional `ScalingPressure` and
@@ -104,9 +104,9 @@ mgr.set_dashboard_hint("dfe_loader_send_latency_seconds", "heatmap");
 mgr.set_build_info(env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT"));
 ```
 
-`ServiceMetrics::register(&mgr)` (feature `metrics-dfe`) registers the canonical DFE
-metric set -- transport, batch engine, worker pool, memory, scaling -- in one call
-so every DFE app exports the same metrics with matching labels.
+`ServiceMetrics::register(&mgr)` (feature `metrics-dfe`) registers the canonical
+data-plane metric set -- transport, batch engine, worker pool, memory, scaling -- in one call
+so every consumer service exports the same metrics with matching labels.
 
 ---
 
@@ -156,7 +156,7 @@ batching config.
 | `render_handle() -> Option<RenderHandle>` | Cloneable Prometheus text renderer for axum routes |
 | `start_server(addr)` / `start_server_with_routes(addr, extra)` | Built-in router / merge service routes |
 | `shutdown_otel()` | Flush OTLP batch exporter |
-| `ServiceMetrics::register(&mgr)` | Canonical DFE metric set (feature `metrics-dfe`) |
+| `ServiceMetrics::register(&mgr)` | Canonical data-plane metric set (feature `metrics-dfe`) |
 | `latency_buckets()` / `size_buckets()` | Standard histogram bucket presets |
 
 ---

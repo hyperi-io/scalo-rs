@@ -14,7 +14,7 @@ shutdown wiring) takes it out of rotation, and only then does cancellation
 propagate.
 
 `ServiceRuntime` from `cli` calls `install_signal_handler` and hands the token to
-`run_service`. DFE apps don't construct the token -- they receive it and `select!`
+`run_service`. Consumer services don't construct the token -- they receive it and `select!`
 on `token.cancelled()` in every loop.
 
 ---

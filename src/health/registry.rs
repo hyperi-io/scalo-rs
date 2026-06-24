@@ -63,7 +63,7 @@ struct HealthEntry {
 /// # Thread Safety
 ///
 /// The registry uses `Mutex<Vec<_>>` for registration (infrequent, at
-/// init time) and read access (health checks). For the typical DFE app
+/// init time) and read access (health checks). For the typical service
 /// with 3-8 registered components, lock contention is negligible.
 pub struct HealthRegistry {
     components: Mutex<Vec<HealthEntry>>,

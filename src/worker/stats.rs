@@ -6,18 +6,18 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Atomic pipeline statistics for DFE services.
+//! Atomic pipeline statistics for data-plane services.
 //!
-//! Every DFE pipeline tracks the same base counters: received, processed,
+//! Every data-plane pipeline tracks the same base counters: received, processed,
 //! errors, DLQ. These use [`AtomicU64`] for lock-free updates from both
 //! the parallel (rayon) and sequential phases.
 //!
 //! App-specific stats extend separately -- these are the common fields
-//! shared across all 6 DFE pipeline projects.
+//! shared across all data-plane pipeline projects.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Common DFE pipeline statistics with atomic counters.
+/// Common data-plane pipeline statistics with atomic counters.
 ///
 /// Lock-free, safe to read and write from any thread. Uses
 /// `Ordering::Relaxed` -- stats are informational, not safety-critical.

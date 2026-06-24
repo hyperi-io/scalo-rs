@@ -198,7 +198,7 @@ features = ["cli-service", "http-server", "transport-http"]
 `cli-service` brings `metrics`, `memory`, `scaling`, `worker-pool`,
 `shutdown`. Add an HTTP transport.
 
-### Full DFE service
+### Full data-plane service
 
 ```toml
 features = [

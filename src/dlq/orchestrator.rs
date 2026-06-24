@@ -334,7 +334,7 @@ fn build_backends(
 
     // Redis -- feature-gated. Requires async constructor; we build a
     // tokio runtime handle inline. Spawn() must run inside a tokio
-    // runtime (true for every HyperI service).
+    // runtime (true for every data-plane service).
     #[cfg(feature = "dlq-redis")]
     {
         if config.redis.enabled {

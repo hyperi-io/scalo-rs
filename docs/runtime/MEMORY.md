@@ -5,7 +5,7 @@ process memory against a detected or configured limit and exposes a
 fast atomic `under_pressure()` check that hot-path code reads to
 decide whether to accept more work or shed load.
 
-It is a *guard*, not a *limit*. Rustlib never OOM-kills its own
+It is a *guard*, not a *limit*. scalo never OOM-kills its own
 process and takes no allocator dependency (`#![forbid(unsafe_code)]`).
 It surfaces pressure; the caller decides what to do with it.
 
@@ -72,7 +72,7 @@ reservations:
 
 The source is allocator-agnostic: pass `cap::Cap::allocated`, a
 jemalloc `stats.allocated` reader (advance the epoch inside the
-closure), or any `fn() -> usize`. Rustlib itself depends on no
+closure), or any `fn() -> usize`. scalo itself depends on no
 allocator -- the choice is the binary's. Without a registered source,
 the guard falls back to the classic per-batch reservation counter.
 

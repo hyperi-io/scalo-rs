@@ -3,7 +3,7 @@
 The DLQ (dead-letter queue) is the last-resort sink for messages the
 primary pipeline couldn't deliver — parse errors, validation
 failures, persistent transport failure, `TieredSink::SpoolFull`,
-poison records. Every DFE service shares one DLQ orchestrator built
+poison records. Every data-plane service shares one DLQ orchestrator built
 from cascade config.
 
 The orchestrator is `Dlq` — a clone-cheap handle wrapping a

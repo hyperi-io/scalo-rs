@@ -32,7 +32,7 @@
 //! | Transport | Send | Recv | Use Case |
 //! |-----------|------|------|----------|
 //! | **Kafka** | Yes | Yes | Production default, PB/day, persistence |
-//! | **gRPC** | Yes | Yes | Low-latency direct, DFE mesh |
+//! | **gRPC** | Yes | Yes | Low-latency direct, service mesh |
 //! | **Memory** | Yes | Yes | Unit tests, same-process |
 //! | **File** | Yes | Yes | Debugging, audit trails, replay |
 //! | **Pipe** | Yes | Yes | Unix pipelines, sidecar pattern |

@@ -11,7 +11,7 @@
 //! `SharedConfig<T>` wraps any config struct in an `Arc<RwLock<T>>` with a
 //! monotonic version counter and a tokio watch channel for subscriber
 //! notifications. This is the universal building block for hot-reload across
-//! all DFE components (loader, receiver, archiver).
+//! all data-plane components (loader, receiver, archiver).
 //!
 //! ## Usage
 //!
@@ -48,7 +48,7 @@
 //! assert_eq!(*rx.borrow(), 1);
 //! ```
 //!
-//! Drop-in replacement for the per-component `SharedConfig` structs DFE
+//! Drop-in replacement for the per-component `SharedConfig` structs data-plane
 //! components used to hard-code to their own `Config`. Same method names
 //! (`read`/`get`/`with`/`update`/`version`/`subscribe`); type is inferred
 //! from the argument. The old `clone_inner()` is gone -- clone the

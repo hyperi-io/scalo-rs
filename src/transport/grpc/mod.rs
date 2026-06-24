@@ -8,10 +8,10 @@
 
 //! # gRPC Transport
 //!
-//! DFE native gRPC transport using tonic. Supports client mode (sending),
+//! Native gRPC transport using tonic. Supports client mode (sending),
 //! server mode (receiving), or both.
 //!
-//! ## DFE Native Protocol
+//! ## Native Protocol
 //!
 //! Lightweight bulk bytes transfer via `dfe.transport.v1.DfeTransport/Push`.
 //! Payload is opaque bytes (JSON, MsgPack, or Arrow IPC) with a format hint.
@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
-/// gRPC transport for DFE inter-service communication.
+/// gRPC transport for inter-service communication.
 ///
 /// Implements both `TransportSender` and `TransportReceiver`, so it also
 /// satisfies the unified `Transport` trait via blanket impl.
@@ -233,7 +233,7 @@ impl GrpcTransport {
             let (tx, rx) = mpsc::channel(config.recv_buffer_size);
             let (sd_tx, sd_rx) = oneshot::channel();
 
-            // DFE native service
+            // Native service
             let dfe_svc = DfeTransportServiceImpl {
                 sender: tx.clone(),
                 sequence: sequence.clone(),
@@ -718,7 +718,7 @@ impl Drop for GrpcTransport {
     }
 }
 
-// --- DFE Transport gRPC service implementation ---
+// --- Transport gRPC service implementation ---
 
 /// Internal service implementation that receives Push RPCs
 /// and forwards messages into the transport's mpsc channel.

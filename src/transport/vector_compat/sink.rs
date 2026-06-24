@@ -9,7 +9,7 @@
 //! Vector-compatible gRPC sink.
 //!
 //! Sends events to a Vector source via the `vector.Vector/PushEvents` RPC.
-//! Use this to push DFE events to a downstream Vector pipeline.
+//! Use this to push events to a downstream Vector pipeline.
 
 use super::convert::json_to_event_wrapper;
 use super::proto::vector;

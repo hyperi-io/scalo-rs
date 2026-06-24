@@ -8,10 +8,10 @@
 
 //! Flat environment variable override helpers.
 //!
-//! DFE services running in Kubernetes receive configuration via flat env vars
-//! set by dfe-engine through Helm. These use single underscores as separators
-//! (e.g., `DFE_LOADER_KAFKA_BROKERS`), which differs from figment's double-underscore
-//! convention for nested keys.
+//! Data-plane services running in Kubernetes receive configuration via flat env
+//! vars set by the deployment tooling through Helm. These use single underscores
+//! as separators (e.g., `DFE_LOADER_KAFKA_BROKERS`), which differs from figment's
+//! double-underscore convention for nested keys.
 //!
 //! This module provides:
 //! - Runtime helper functions for reading flat env vars with type conversion
@@ -181,7 +181,7 @@ pub struct EnvVarDoc {
 
 /// Load config with full cascade: YAML -> figment env -> flat env -> normalise.
 ///
-/// This replaces the copy-pasted `Config::load()` functions across DFE services.
+/// This replaces the copy-pasted `Config::load()` functions across data-plane services.
 /// It orchestrates:
 /// 1. `.env` loading (via dotenvy, handled by `config::setup`)
 /// 2. YAML file discovery and loading

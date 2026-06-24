@@ -1,10 +1,10 @@
 # Worker Pool
 
-`AdaptiveWorkerPool` is the shared compute primitive for every DFE
+`AdaptiveWorkerPool` is the shared compute primitive for every data-plane
 service. Hybrid backend — rayon for CPU-bound work, tokio JoinSet for
 async I/O — and a permit semaphore that the scaler resizes at runtime.
 
-The DFE common pattern: one pool per process, built from the cascade
+The common pattern: one pool per process, built from the cascade
 at startup, then handed to every component that needs parallelism
 (`BatchEngine`, transforms, enrichers).
 

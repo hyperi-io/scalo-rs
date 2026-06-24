@@ -6,7 +6,7 @@ scalo version where the change first ships. Used by the
 when `cargo check` flags breakage on a downstream bump.
 
 Pre-GA discipline: no `BREAKING CHANGE:` footer, no major bump. All
-six core DFE apps migrate in lockstep.
+six core consumer services migrate in lockstep.
 
 ---
 
@@ -18,7 +18,7 @@ engine driver, with self-regulation (memory guard + inbound/byte-budget
 backpressure) ON by default. See [SELF-REGULATION.md](SELF-REGULATION.md),
 [BACKPRESSURE.md](BACKPRESSURE.md), [KAFKA-PATH.md](KAFKA-PATH.md).
 
-The six core DFE apps migrate in lockstep (Phase 6); items below are the
+The six core consumer services migrate in lockstep (Phase 6); items below are the
 consumer-facing surface changes.
 
 ### `WorkBatch` / `Record` -- the canonical currency (BREAKING)
@@ -168,7 +168,7 @@ governed-receiver constructor. `run_governed` alone wires the byte-budget lever
 (streaming sub-blocks) but does NOT brake intake; the inbound brake lives on the
 receive transport, which the plain factory constructors
 (`AnyReceiver::from_config` / `from_transport_config`) do NOT wire. Each of the
-six core apps MUST:
+six core consumer services MUST:
 
 1. Drive the engine with `run_governed` (not the legacy run loops); AND
 2. Build the receive transport through a governor-aware constructor so the
@@ -368,7 +368,7 @@ catching growth the reservations never see (e.g. a transform ballooning a
 `Vec`). Not registering it keeps the existing per-batch behaviour, so this
 is **optional**, not a required migration.
 
-To adopt in a DFE app, install a tracking allocator and wire it once at
+To adopt in a consumer service, install a tracking allocator and wire it once at
 startup. Prefer an actively-maintained allocator -- `tikv-jemalloc-ctl`
 (`cap` works but is unmaintained since 2023):
 

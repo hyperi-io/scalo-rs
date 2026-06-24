@@ -8,7 +8,7 @@
 
 //! Output formatting helpers for CLI tools.
 //!
-//! Provides consistent terminal output across all DFE services.
+//! Provides consistent terminal output across all data-plane services.
 
 use std::fmt;
 

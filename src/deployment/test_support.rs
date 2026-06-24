@@ -7,7 +7,7 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Test helpers for contract-artefact end-to-end tests, shared by scalo
-//! itself and every downstream DFE consumer (`dfe-loader`, `dfe-receiver`,
+//! itself and every downstream consumer service (`dfe-loader`, `dfe-receiver`,
 //! `dfe-archiver`, `dfe-fetcher`, `dfe-transform-vrl`, `dfe-transform-vector`).
 //!
 //! # What this module provides

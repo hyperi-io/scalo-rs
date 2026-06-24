@@ -11,12 +11,12 @@
 //! Provides source (server) and sink (client) implementations compatible
 //! with Vector's v2 gRPC protocol (`vector.Vector/PushEvents`).
 //!
-//! Migration path from Vector-based pipelines to DFE native:
+//! Migration path from Vector-based pipelines to native transport:
 //!
 //! ```text
-//! Phase 1: vector-receiver -> vector-sink -> [DFE loader + vector-compat]
-//! Phase 2: [DFE receiver] -> DFE gRPC -> [DFE loader, native proto]
-//! Phase 3: Disable vector-compat (pure DFE pipeline)
+//! Phase 1: vector-receiver -> vector-sink -> [loader + vector-compat]
+//! Phase 2: [receiver] -> native gRPC -> [loader, native proto]
+//! Phase 3: Disable vector-compat (pure native pipeline)
 //! ```
 //!
 //! ## Proto files

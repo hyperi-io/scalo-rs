@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/concurrency/mod.rs
-// Purpose:   Three generic async primitives for HyperI Rust libraries
+// Purpose:   Three generic async primitives for this library
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -23,7 +23,7 @@
 //!
 //! # The hard rule
 //!
-//! **An `async fn` in HyperI libraries MUST yield to the runtime.**
+//! **An `async fn` in this library MUST yield to the runtime.**
 //! No hidden synchronous I/O. If you need sync I/O from async:
 //!
 //! - Use `tokio::fs` / `tokio::io::AsyncWrite` for occasional async I/O.

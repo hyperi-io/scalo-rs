@@ -12,10 +12,10 @@
 //!
 //! - **Generic:** [`AdaptiveWorkerPool`] provides CPU-saturating parallelism via
 //!   rayon (CPU-bound) + tokio (async I/O), with reactive pressure-based scaling.
-//!   Useful for any workload -- not DFE-specific.
+//!   Useful for any workload -- not pipeline-specific.
 //!
 //! - **Opinionated:** [`BatchProcessor`] trait + [`BatchPipeline`] provide a
-//!   structured parallel-then-sequential pipeline for DFE apps. Apps implement
+//!   structured parallel-then-sequential pipeline for consumer services. Apps implement
 //!   `BatchProcessor` for their domain; the pipeline handles stats, scaling,
 //!   and batch orchestration. [`PipelineStats`] provides common atomic counters.
 //!

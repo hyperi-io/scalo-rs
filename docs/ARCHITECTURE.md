@@ -123,10 +123,10 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | Module | Feature | Purpose |
 |--------|---------|---------|
 | `cli` | `cli` | `clap` types: `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
-| `cli::service` | `cli-service` | `ServiceApp` trait, `run_app`, `ServiceRuntime` — full DFE app scaffolding |
+| `cli::service` | `cli-service` | `ServiceApp` trait, `run_app`, `ServiceRuntime` — full data-plane app scaffolding |
 | `top` | `top` | TUI metrics dashboard (`ratatui`) |
 | `deployment` | `deployment`, `deployment-smoke` | `DeploymentContract`, generators for Dockerfile / Helm chart / ArgoCD Application / container manifest |
-| `version_check` | `version-check` | Startup HTTP probe to the HyperI version API |
+| `version_check` | `version-check` | Startup HTTP probe to the version API |
 
 ---
 
@@ -191,5 +191,5 @@ auto-wired vs explicit.
 - **Edition:** 2024
 - **MSRV:** see `rust-version` in `Cargo.toml`
 - **Sibling lib:** `hyperi-pylib` (Python equivalent)
-- **Downstream:** the six core DFE apps consume `scalo` in
+- **Downstream:** the six core consumer services consume `scalo` in
   lockstep (see [README.md § Project facts](README.md#project-facts))

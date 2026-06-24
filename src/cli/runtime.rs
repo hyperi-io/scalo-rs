@@ -1,16 +1,16 @@
 // Project:   scalo
 // File:      src/cli/runtime.rs
-// Purpose:   ServiceRuntime -- pre-built infrastructure for DFE service apps
+// Purpose:   ServiceRuntime -- pre-built infrastructure for data-plane service apps
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Pre-built service infrastructure for DFE pipeline applications.
+//! Pre-built service infrastructure for data-plane pipeline applications.
 //!
 //! [`ServiceRuntime`] is created by [`super::run_app`] before calling
 //! [`ServiceApp::run_service`]. Apps receive it fully wired -- eliminates
-//! ~50 lines of identical boilerplate per DFE app.
+//! ~50 lines of identical boilerplate per consumer service.
 //!
 //! ## What's included (always)
 //!
@@ -55,7 +55,7 @@ pub struct ServiceRuntime {
     /// Use for registering app-specific metrics and metric groups.
     pub metrics: MetricsManager,
 
-    /// Platform DFE metrics (`dfe_*` counters/gauges). Already registered.
+    /// Platform data-plane metrics (`dfe_*` counters/gauges). Already registered.
     pub dfe: Arc<crate::metrics::ServiceMetrics>,
 
     /// Cgroup-aware memory guard. Tracks memory usage for backpressure.

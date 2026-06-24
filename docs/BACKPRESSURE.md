@@ -40,7 +40,7 @@ Kafka and fetcher sources are pull-based: pausing the pull leaves the data at
 rest in the broker / source, re-read once the gate reopens. Nothing is lost.
 
 The receiver is push-based. Its 503 / `UNAVAILABLE` is only lossless if the
-UPSTREAM caller retries. A well-behaved DFE sender does; a fire-and-forget
+UPSTREAM caller retries. A well-behaved data-plane sender does; a fire-and-forget
 client does not, and its rejected payload is gone. The gate cannot make a push
 source lossless on its own -- that contract lives with the caller. Deliberate
 limit, not a bug.

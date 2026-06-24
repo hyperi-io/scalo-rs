@@ -13,7 +13,7 @@
 //! [`MAX_PARSE_DEPTH`] -- JSON via the iterative [`json_depth_within`] (run
 //! before the recursive parser), MsgPack via `read_value_with_max_depth`.
 
-/// Max accepted JSON/MsgPack nesting depth. DFE payloads are shallow; 64 is
+/// Max accepted JSON/MsgPack nesting depth. Data-plane payloads are shallow; 64 is
 /// well above real data and under a stack hazard.
 pub(crate) const MAX_PARSE_DEPTH: usize = 64;
 

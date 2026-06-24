@@ -1,6 +1,6 @@
 # Batch Engine
 
-SIMD-optimised batch processor for DFE mid-tier pipelines. Parses JSON
+SIMD-optimised batch processor for data-plane mid-tier pipelines. Parses JSON
 via `sonic-rs`, applies pre-route filters before parsing where it can,
 interns known field names via `dashmap`, and runs the user transform
 across a rayon pool. Auto-wired by `ServiceRuntime` when the

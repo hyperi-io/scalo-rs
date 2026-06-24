@@ -9,7 +9,7 @@
 //! Custom coloured log formatter for terminal output.
 //!
 //! Provides a [`ColouredFormatter`] implementing tracing-subscriber's
-//! `FormatEvent` trait with HyperI's standard colour scheme:
+//! `FormatEvent` trait with the standard colour scheme:
 //!
 //! - **Timestamp:** dim
 //! - **Level:** ERROR=red bold, WARN=yellow, INFO=green, DEBUG=blue, TRACE=magenta dim

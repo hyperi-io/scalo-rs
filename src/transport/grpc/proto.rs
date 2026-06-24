@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Generated protobuf types for DFE native gRPC transport.
+//! Generated protobuf types for the native gRPC transport.
 
 #[allow(clippy::all, clippy::pedantic)]
 mod inner {

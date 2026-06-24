@@ -1,7 +1,7 @@
 # Service Runtime
 
 `ServiceRuntime` is the pre-wired infrastructure object that every
-DFE service receives from `run_app` before its `run_service` method
+data-plane service receives from `run_app` before its `run_service` method
 is called. It collapses the identical startup boilerplate every
 service would otherwise hand-write into a single typed struct.
 

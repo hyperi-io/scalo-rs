@@ -9,10 +9,10 @@
 //! Per-key routing transport for data originators.
 //!
 //! Routes `send(key, payload)` to different transport backends based on the
-//! key. Used by dfe-receiver and dfe-fetcher where data-based routing
-//! determines the destination (topic, endpoint, stream).
+//! key. Used by data-originator services (receiver, fetcher) where data-based
+//! routing determines the destination (topic, endpoint, stream).
 //!
-//! All other DFE stages (transforms, loader, archiver) use simple 1:1
+//! All other data-plane stages (transforms, loader, archiver) use simple 1:1
 //! transports and do NOT need this.
 //!
 //! # Config
@@ -58,7 +58,7 @@ use super::types::SendResult;
 /// A routing transport that dispatches `send()` to different backends
 /// based on the key parameter.
 ///
-/// Used by dfe-receiver and dfe-fetcher (data originators) where
+/// Used by data-originator services (receiver, fetcher) where
 /// data-based routing determines the destination.
 pub struct RoutedSender {
     /// Per-key route overrides.

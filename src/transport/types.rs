@@ -19,7 +19,7 @@ pub enum TransportType {
     /// Apache Kafka (production default).
     #[default]
     Kafka,
-    /// DFE native gRPC (tonic, inter-service mesh).
+    /// Native gRPC (tonic, inter-service mesh).
     Grpc,
     /// In-memory tokio channels (unit tests).
     Memory,

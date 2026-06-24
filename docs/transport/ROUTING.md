@@ -21,7 +21,7 @@ no new backend, no new trait.
 **Constraint**: only data originators route. Mid-tier transforms,
 loaders, and archivers see a single inbound stream and produce a
 single outbound stream — they don't need `RoutedSender`. Per the
-DFE routing model, push the routing decision as close to ingress as
+data-plane routing model, push the routing decision as close to ingress as
 possible.
 
 ---
@@ -189,6 +189,6 @@ Source: [../../src/transport/routed.rs](../../src/transport/routed.rs).
 - [OVERVIEW.md](OVERVIEW.md) — traits, `AnySender`, enum dispatch
 - [BACKENDS.md](BACKENDS.md) — concrete backends each route can pick
 - [FILTER-ENGINE.md](FILTER-ENGINE.md) — filters run per-backend, after routing
-- [../ARCHITECTURE.md](../ARCHITECTURE.md) — DFE stage model
+- [../ARCHITECTURE.md](../ARCHITECTURE.md) — data-plane stage model
 - [../INTEGRATION.md](../INTEGRATION.md) — wiring for receiver/fetcher
 - [../FEATURE-FLAGS.md](../FEATURE-FLAGS.md) — feature flags per backend

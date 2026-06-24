@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Live TUI metrics dashboard -- like `vector top` for DFE services.
+//! Live TUI metrics dashboard -- like `vector top` for data-plane services.
 //!
 //! Polls a running service's Prometheus `/metrics` endpoint and displays
 //! a sortable, auto-refreshing table of metrics in the terminal.

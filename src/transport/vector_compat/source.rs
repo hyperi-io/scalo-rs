@@ -9,8 +9,8 @@
 //! Vector-compatible gRPC source.
 //!
 //! Implements the `vector.Vector` gRPC service so that legacy Vector sinks
-//! can push events to a DFE service. Incoming `EventWrapper` messages are
-//! converted to JSON and fed into the same receive channel as native DFE traffic.
+//! can push events to a data-plane service. Incoming `EventWrapper` messages are
+//! converted to JSON and fed into the same receive channel as native traffic.
 
 use super::convert::event_wrapper_to_json;
 use super::proto::vector;
@@ -24,7 +24,7 @@ use tonic::{Request, Response, Status};
 /// gRPC service that accepts `PushEvents` RPCs from Vector sinks.
 ///
 /// Converts Vector's protobuf events to JSON and forwards them into
-/// the transport's receive channel alongside native DFE messages.
+/// the transport's receive channel alongside native messages.
 pub struct VectorCompatService {
     sender: mpsc::Sender<Message<GrpcToken>>,
     sequence: Arc<AtomicU64>,
@@ -33,7 +33,7 @@ pub struct VectorCompatService {
 impl VectorCompatService {
     /// Create a new Vector compat service.
     ///
-    /// Uses the same sender/sequence as the DFE transport server so
+    /// Uses the same sender/sequence as the native transport server so
     /// both native and Vector-compat events arrive in the same channel.
     pub fn new(sender: mpsc::Sender<Message<GrpcToken>>, sequence: Arc<AtomicU64>) -> Self {
         Self { sender, sequence }

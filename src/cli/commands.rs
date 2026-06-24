@@ -1,14 +1,14 @@
 // Project:   scalo
 // File:      src/cli/commands.rs
-// Purpose:   Standard CLI subcommands for DFE services
+// Purpose:   Standard CLI subcommands for data-plane services
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Standard subcommands shared across all DFE services.
+//! Standard subcommands shared across all data-plane services.
 //!
-//! Every DFE service gets `run`, `version`, and `config-check` for free.
+//! Every data-plane service gets `run`, `version`, and `config-check` for free.
 //! The `top` subcommand is available when the `top` feature is enabled.
 
 /// Standard subcommands provided by scalo.

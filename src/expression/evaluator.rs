@@ -9,7 +9,7 @@
 //! Core CEL expression operations -- compile, evaluate, validate.
 //!
 //! Wraps the [`cel`] crate (renamed from `cel-interpreter`), enforcing the
-//! DFE expression profile on every compilation path. Both Python (via
+//! expression profile on every compilation path. Both Python (via
 //! `common-expression-language` PyO3 bindings) and Rust share the **same**
 //! Rust crate -- zero behavioural drift between services.
 //!
@@ -87,7 +87,7 @@ fn get_profile_config() -> &'static ProfileConfig {
 
 // ── Validate ──────────────────────────────────────────────────────
 
-/// Validate an expression for syntax and DFE profile compliance.
+/// Validate an expression for syntax and profile compliance.
 ///
 /// Uses the profile config from the config cascade (if available) or
 /// [`ProfileConfig::default()`]. Returns a list of error strings
@@ -117,14 +117,14 @@ pub fn validate_with_config(expr: &str, config: &ProfileConfig) -> Vec<String> {
 
 // ── Compile ───────────────────────────────────────────────────────
 
-/// Compile a CEL expression, enforcing the DFE profile.
+/// Compile a CEL expression, enforcing the profile.
 ///
 /// Uses the profile config from the config cascade (if available).
 ///
 /// # Errors
 ///
 /// Returns [`ExpressionError::Validation`] if the expression violates the
-/// DFE profile, or [`ExpressionError::Compilation`] if it has a syntax error.
+/// profile, or [`ExpressionError::Compilation`] if it has a syntax error.
 pub fn compile(expr: &str) -> ExpressionResult<Program> {
     compile_with_config(expr, get_profile_config())
 }
@@ -134,7 +134,7 @@ pub fn compile(expr: &str) -> ExpressionResult<Program> {
 /// # Errors
 ///
 /// Returns [`ExpressionError::Validation`] if the expression violates the
-/// DFE profile, or [`ExpressionError::Compilation`] if it has a syntax error.
+/// profile, or [`ExpressionError::Compilation`] if it has a syntax error.
 pub fn compile_with_config(expr: &str, config: &ProfileConfig) -> ExpressionResult<Program> {
     let errors = validate_with_config(expr, config);
     if !errors.is_empty() {
@@ -151,7 +151,7 @@ pub fn compile_with_config(expr: &str, config: &ProfileConfig) -> ExpressionResu
 ///
 /// # Errors
 ///
-/// Returns an error if the expression is invalid, violates the DFE profile,
+/// Returns an error if the expression is invalid, violates the profile,
 /// or evaluation fails (missing fields, type mismatch).
 pub fn evaluate<'a>(
     expr: &str,

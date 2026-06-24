@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/expression/mod.rs
-// Purpose:   CEL expression evaluation for DFE components
+// Purpose:   CEL expression evaluation for data-plane components
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -8,13 +8,13 @@
 
 //! CEL expression evaluation -- compile, evaluate, validate.
 //!
-//! Provides a DFE-profile-restricted CEL expression evaluator built on the
+//! Provides a profile-restricted CEL expression evaluator built on the
 //! [`cel`] crate (renamed from `cel-interpreter`). Both Python (via
 //! `common-expression-language` PyO3 bindings) and Rust use the **same**
 //! underlying Rust crate, ensuring identical parsing and evaluation
-//! semantics across all DFE components.
+//! semantics across all data-plane components.
 //!
-//! # DFE Expression Profile
+//! # Expression Profile
 //!
 //! Only a high-performance subset of CEL is allowed:
 //!

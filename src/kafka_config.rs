@@ -205,7 +205,7 @@ pub fn merge_with_overrides<S: std::hash::BuildHasher>(
 /// | `fetch.min.bytes` | 1 MiB | 1 byte | Batch fetches for throughput |
 /// | `fetch.wait.max.ms` | 100 ms | 500 ms | Bound latency when fetch.min.bytes not met |
 /// | `queued.min.messages` | 20000 | 100000 | 10-20K batches are most efficient |
-/// | `enable.auto.commit` | false | true | DFE services manage offset commits |
+/// | `enable.auto.commit` | false | true | data-plane services manage offset commits |
 /// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable Prometheus metrics |
 pub const CONSUMER_PRODUCTION: &[(&str, &str)] = &[
     ("partition.assignment.strategy", "cooperative-sticky"),
@@ -222,7 +222,7 @@ pub const CONSUMER_PRODUCTION: &[(&str, &str)] = &[
 /// |---|---|---|---|
 /// | `partition.assignment.strategy` | `cooperative-sticky` | `range,roundrobin` | Consistent across environments |
 /// | `queued.min.messages` | 1000 | 100000 | Lower memory for dev machines |
-/// | `enable.auto.commit` | false | true | DFE services manage commits |
+/// | `enable.auto.commit` | false | true | data-plane services manage commits |
 /// | `reconnect.backoff.ms` | 10 ms | 100 ms | Fast reconnect for quick iteration |
 /// | `reconnect.backoff.max.ms` | 100 ms | 10000 ms | Cap quickly |
 /// | `log.connection.close` | true | false | Debug-friendly |
@@ -244,7 +244,7 @@ pub const CONSUMER_DEVTEST: &[(&str, &str)] = &[
 /// | `partition.assignment.strategy` | `cooperative-sticky` | `range,roundrobin` | Consistent across envs |
 /// | `fetch.wait.max.ms` | 10 ms | 500 ms | Return quickly |
 /// | `queued.min.messages` | 1000 | 100000 | Smaller pre-fetch queue |
-/// | `enable.auto.commit` | false | true | DFE manages commits |
+/// | `enable.auto.commit` | false | true | the data plane manages commits |
 /// | `reconnect.backoff.ms` | 10 ms | 100 ms | Fast reconnect |
 /// | `reconnect.backoff.max.ms` | 100 ms | 10000 ms | Cap quickly |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
@@ -329,7 +329,7 @@ pub const PRODUCER_DEVTEST: &[(&str, &str)] = &[
 ];
 
 // ============================================================================
-// DFE Source Convention
+// Source Convention
 // ============================================================================
 
 /// Default topic suffix for landing zone (raw ingest).
@@ -338,7 +338,7 @@ pub const TOPIC_SUFFIX_LAND: &str = "_land";
 /// Default topic suffix for load-ready data (post-transform).
 pub const TOPIC_SUFFIX_LOAD: &str = "_load";
 
-/// DFE service role -- determines consumer group naming convention.
+/// Service role -- determines consumer group naming convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
     /// Transform services (middleware): CG = `dfe-{service}-{source}`.
@@ -354,9 +354,9 @@ pub enum ServiceRole {
     Universal,
 }
 
-/// DFE source-aware topic naming for transform services.
+/// Source-aware topic naming for transform services.
 ///
-/// All DFE data flows follow the same topology:
+/// All data flows follow the same topology:
 ///
 /// ```text
 /// receiver -> {source}_land -> transform -> {source}_load -> loader -> ClickHouse
@@ -455,7 +455,7 @@ impl KafkaSource {
         format!("{}{}", self.name, self.load_suffix)
     }
 
-    /// Consumer group ID following DFE naming conventions.
+    /// Consumer group ID following the naming conventions.
     ///
     /// The `cg_override` takes precedence when set -- use it when the operator
     /// explicitly configures a consumer group in YAML/env.

@@ -1,6 +1,6 @@
 # Contract
 
-`DeploymentContract` is the one struct each HyperI service fills in.
+`DeploymentContract` is the one struct each service fills in.
 From it, scalo derives every deployment artefact -- Dockerfile, Helm
 chart, Compose fragment, ArgoCD `Application`, container manifest,
 runtime-stage fragment -- with no YAML templates in the app.

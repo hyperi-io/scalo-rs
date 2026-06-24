@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Bounded batch accumulator for DFE pipeline batching.
+//! Bounded batch accumulator for data-plane pipeline batching.
 //!
 //! Accumulates items from multiple producers (HTTP handlers, gRPC handlers, etc.)
 //! and drains them as batches when any threshold is met:

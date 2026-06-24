@@ -1,14 +1,14 @@
 // Project:   scalo
 // File:      src/cli/mod.rs
-// Purpose:   Standard CLI framework for DFE services
+// Purpose:   Standard CLI framework for data-plane services
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Standard CLI framework for DFE Rust services.
+//! Standard CLI framework for data-plane Rust services.
 //!
-//! Provides the 80% of CLI boilerplate that every DFE service needs:
+//! Provides the 80% of CLI boilerplate that every data-plane service needs:
 //! config path, log level/format, metrics address, version, config-check.
 //! Apps provide the 20% (config type, service logic) via the [`ServiceApp`] trait.
 //!

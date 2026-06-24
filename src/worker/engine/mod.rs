@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/worker/engine/mod.rs
-// Purpose:   SIMD-optimised batch processing engine for DFE pipelines
+// Purpose:   SIMD-optimised batch processing engine for data-plane pipelines
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -129,14 +129,14 @@ use self::pre_route::{PreRouteOutcome, apply_filters, extract_routing_field};
 use self::types::PayloadFormat;
 use super::config::WorkerPoolConfig;
 
-/// Core batch processing engine for DFE pipelines.
+/// Core batch processing engine for the data-plane pipeline.
 ///
 /// Provides two in-process processing modes (the run-loop drivers live in the
 /// `driver` module, gated on the `transport` feature):
 ///
 /// - [`process_mid_tier`](Self::process_mid_tier) -- parse JSON via SIMD, extract
 ///   known fields, apply pre-route filters, then parallel transform via rayon.
-///   The standard path for most DFE apps (loader, archiver, transforms).
+///   The standard path for most consumer services (loader, archiver, transforms).
 ///
 /// - [`process_raw`](Self::process_raw) -- skip parsing, apply pre-route on raw
 ///   bytes, then parallel transform via rayon. For apps that handle raw bytes

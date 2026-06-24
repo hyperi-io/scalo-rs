@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Universal configuration reloader for DFE components.
+//! Universal configuration reloader for data-plane components.
 //!
 //! `ConfigReloader<T>` provides three reload triggers, any combination of
 //! which can be enabled simultaneously:
@@ -66,9 +66,9 @@
 //! }
 //! ```
 //!
-//! Replaces the per-component reload implementations in dfe-loader
-//! (`ConfigWatcher`, file polling), dfe-receiver (`config_reload_task`,
-//! SIGHUP + periodic), and dfe-archiver: set the matching `ReloaderConfig`
+//! Replaces the per-component reload implementations in the loader
+//! (`ConfigWatcher`, file polling), the receiver (`config_reload_task`,
+//! SIGHUP + periodic), and the archiver: set the matching `ReloaderConfig`
 //! fields and pass the component's existing load/validate functions.
 
 use std::path::PathBuf;

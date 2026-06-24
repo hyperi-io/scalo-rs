@@ -8,7 +8,7 @@
 
 //! # Threading model and the CPU vs memory asymmetry
 //!
-//! **Foundational assumption: Tokio is HyperI's async + multithreading
+//! **Foundational assumption: Tokio is the async + multithreading
 //! substrate.** We do not build our own runtime or our own cgroup-aware
 //! thread-count plumbing -- we lean on the existing wheels:
 //!

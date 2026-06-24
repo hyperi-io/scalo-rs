@@ -12,7 +12,7 @@
 //! Field semantics align with
 //! [OpenMetrics](https://prometheus.io/docs/specs/om/open_metrics_spec/) (type,
 //! description, unit) and [OTel Advisory Parameters](https://opentelemetry.io/docs/specs/otel/metrics/api/)
-//! (labels, buckets). `group`, `use_cases`, `dashboard_hint` are HyperI extensions.
+//! (labels, buckets). `group`, `use_cases`, `dashboard_hint` are local extensions.
 //!
 //! ## Standards Alignment
 //!
@@ -23,7 +23,7 @@
 //! | `unit` | OpenMetrics `UNIT` |
 //! | `labels` | OTel Advisory `Attributes` |
 //! | `buckets` | OTel Advisory `ExplicitBucketBoundaries` |
-//! | `group`, `use_cases`, `dashboard_hint` | HyperI extensions |
+//! | `group`, `use_cases`, `dashboard_hint` | local extensions |
 
 use std::sync::{Arc, RwLock};
 
@@ -49,10 +49,10 @@ pub struct MetricDescriptor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buckets: Option<Vec<f64>>,
     /// Operational guidance: when to alert, what dashboard to use.
-    /// Novel HyperI extension. Omitted from JSON when empty.
+    /// Novel local extension. Omitted from JSON when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub use_cases: Vec<String>,
-    /// Suggested Grafana panel type. Novel HyperI extension.
+    /// Suggested Grafana panel type. Novel local extension.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dashboard_hint: Option<String>,
 }

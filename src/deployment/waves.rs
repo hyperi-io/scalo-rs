@@ -28,10 +28,10 @@ pub const WAVE_OPERATORS: i32 = -20;
 pub const WAVE_CRDS: i32 = -10;
 
 /// Cross-application Kafka topology: `KafkaTopic`, `KafkaUser`,
-/// and similar CRs that DFE apps consume.
+/// and similar CRs that consumer services consume.
 pub const WAVE_TOPICS: i32 = -5;
 
-/// DFE apps themselves (loader, receiver, archiver, ...).
+/// The consumer services themselves (loader, receiver, archiver, ...).
 /// The default for any Application without an explicit sync wave.
 pub const WAVE_APPS: i32 = 0;
 

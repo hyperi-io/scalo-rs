@@ -1,12 +1,12 @@
 # Tiered Sink
 
 `TieredSink<S>` wraps any `Sink` backend (Kafka, gRPC, S3, HTTP) with
-the resilience primitives every production DFE pipeline needs —
+the resilience primitives every production data-plane pipeline needs —
 timeout, circuit breaker, disk spillover, background drain. Apps call
 `sink.send(msg).await?` and the sink picks the right failure response.
 
 This is the canonical "resilient delivery" primitive. Every downstream
-write in the DFE stack should sit behind one.
+write in the data plane should sit behind one.
 
 ---
 

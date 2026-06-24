@@ -8,7 +8,7 @@
 
 //! # Native batch transport wire mapper (Task 0.6)
 //!
-//! Serde-less scalo<->scalo (DFE<->DFE) transfer of a whole
+//! Serde-less scalo<->scalo transfer of a whole
 //! [`WorkBatch`](crate::transport::WorkBatch) over the existing gRPC mesh. One
 //! `WorkBatch` maps to one proto [`Batch`](super::proto::Batch) and travels in a
 //! single `RouteBatch` RPC -- batch-at-a-time, NOT record-by-record streaming.

@@ -1,6 +1,6 @@
 # scalo docs
 
-Shared Rust library for HyperI services. Wire three lines at startup and you
+Shared Rust library for data-plane services. Wire three lines at startup and you
 get config cascade, structured logs, Prometheus metrics, health probes, OTel
 traces, graceful shutdown, K8s pre-stop, and deployment-artefact generation
 for free. Add a `Transport`, a `TieredSink`, a `BatchEngine` and the same
@@ -9,7 +9,7 @@ signals — all automatic.
 
 This is the index. Read [ARCHITECTURE.md](ARCHITECTURE.md) for the
 10,000-foot view of how the modules fit together, [INTEGRATION.md](INTEGRATION.md)
-for a recipe walkthrough on building a DFE service, [AUTO-WIRING.md](AUTO-WIRING.md)
+for a recipe walkthrough on building a data-plane service, [AUTO-WIRING.md](AUTO-WIRING.md)
 for the "you-get-this-for-free" model, and [FEATURE-FLAGS.md](FEATURE-FLAGS.md)
 for how features cascade into one another.
 
@@ -35,7 +35,7 @@ how the pieces work".
 
 ```mermaid
 flowchart TB
-    subgraph App["DFE app"]
+    subgraph App["data-plane app"]
         Cfg["Config::default()"] --> SR["ServiceRuntime::new()"]
     end
 
@@ -93,7 +93,7 @@ sub-components (filter engine lives inside every transport).
 ### Start here
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module map, dependency graph, layering
-- [INTEGRATION.md](INTEGRATION.md) — "I'm building a DFE app" walkthrough
+- [INTEGRATION.md](INTEGRATION.md) — "I'm building a data-plane app" walkthrough
 - [AUTO-WIRING.md](AUTO-WIRING.md) — what's wired into what, and why
 - [FEATURE-FLAGS.md](FEATURE-FLAGS.md) — feature tree, native deps, recommended bundles
 

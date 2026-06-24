@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Version information for DFE services.
+//! Version information for data-plane services.
 
 use std::fmt;
 

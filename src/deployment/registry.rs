@@ -30,7 +30,7 @@
 //! `ghcr.io/hyperi-io/dfe-base:ubuntu-24.04`, ops can override
 //! `deployment.base_image` in the cascade without rebuilding the apps.
 
-/// Default publish-target registry for HyperI org.
+/// Default publish-target registry for the org.
 ///
 /// Combined with the contract's `app_name` to produce
 /// `<DEFAULT_IMAGE_REGISTRY>/<app_name>:<version>`.

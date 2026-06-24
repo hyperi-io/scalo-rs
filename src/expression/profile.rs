@@ -1,19 +1,19 @@
 // Project:   scalo
 // File:      src/expression/profile.rs
-// Purpose:   DFE expression profile -- allowed/restricted CEL functions
+// Purpose:   Expression profile -- allowed/restricted CEL functions
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! DFE expression profile -- allowed and restricted CEL functions.
+//! Expression profile -- allowed and restricted CEL functions.
 //!
-//! The DFE profile restricts CEL to a high-performance subset suitable
+//! The profile restricts CEL to a high-performance subset suitable
 //! for per-record evaluation at ingest/query time. Functions with
 //! unbounded or unpredictable cost are blocked by default but can be
 //! unlocked per-category via [`ProfileConfig`].
 
-/// CEL functions allowed unconditionally in the DFE profile.
+/// CEL functions allowed unconditionally in the profile.
 pub const ALLOWED_FUNCTIONS: &[&str] = &[
     // String operations (SIMD-friendly, bounded cost)
     "contains",
@@ -50,7 +50,7 @@ pub const DISALLOWED_FUNCTIONS: &[&str] = &[
     "duration",
 ];
 
-/// Configuration for the DFE expression profile.
+/// Configuration for the expression profile.
 ///
 /// Each flag unlocks a category of restricted functions. All default
 /// to `false` (blocked). Set explicitly in application config to opt in.
@@ -94,7 +94,7 @@ const SKIP_NAMES: &[&str] = &[
 /// Scan an expression for restricted function calls using default config.
 ///
 /// Returns a list of error strings (empty if all function calls are
-/// within the DFE profile). Equivalent to `check_profile_with_config`
+/// within the profile). Equivalent to `check_profile_with_config`
 /// with [`ProfileConfig::default()`] (all restrictions active).
 #[must_use]
 pub fn check_profile(expr: &str) -> Vec<String> {

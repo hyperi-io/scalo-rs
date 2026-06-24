@@ -10,7 +10,7 @@
 //!
 //! ## Profile System
 //!
-//! HyperI Kafka uses a profile-based configuration system where:
+//! Kafka uses a profile-based configuration system where:
 //! 1. A **profile** provides opinionated librdkafka defaults for a use case
 //! 2. **User config** can override any librdkafka setting via `librdkafka_overrides`
 //! 3. Overrides always win over profile defaults
@@ -512,7 +512,7 @@ pub struct SuppressionRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KafkaProfile {
-    /// Production profile: lean baseline for all DFE services.
+    /// Production profile: lean baseline for all data-plane services.
     ///
     /// Only sets values that differ from librdkafka defaults.
     /// Services add overrides via `librdkafka_overrides`.
@@ -603,7 +603,7 @@ pub fn merge_with_overrides<S: std::hash::BuildHasher>(
 /// | `fetch.min.bytes` | 1 MiB | 1 byte | Batch fetches for throughput |
 /// | `fetch.wait.max.ms` | 100 ms | 500 ms | Bound latency when fetch.min.bytes not met |
 /// | `queued.min.messages` | 20000 | 100000 | 10-20K batches are most efficient |
-/// | `enable.auto.commit` | false | true | DFE services manage offset commits |
+/// | `enable.auto.commit` | false | true | data-plane services manage offset commits |
 /// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable Prometheus metrics |
 pub const PRODUCTION_PROFILE: &[(&str, &str)] = &[
     ("partition.assignment.strategy", "cooperative-sticky"),
@@ -624,7 +624,7 @@ pub const PRODUCTION_PROFILE: &[(&str, &str)] = &[
 /// |---|---|---|---|
 /// | `partition.assignment.strategy` | `cooperative-sticky` | `range,roundrobin` | Consistent across all environments |
 /// | `queued.min.messages` | 1000 | 100000 | Lower memory for dev machines |
-/// | `enable.auto.commit` | false | true | DFE services manage commits |
+/// | `enable.auto.commit` | false | true | data-plane services manage commits |
 /// | `reconnect.backoff.ms` | 10 ms | 100 ms | Fast reconnect for quick iteration |
 /// | `reconnect.backoff.max.ms` | 100 ms | 10000 ms | Cap quickly |
 /// | `log.connection.close` | true | false | Debug-friendly |
@@ -743,7 +743,7 @@ pub const HIGH_THROUGHPUT_CONSUMER_DEFAULTS: &[(&str, &str)] = PRODUCTION_PROFIL
 /// | `partition.assignment.strategy` | `cooperative-sticky` | `range,roundrobin` | Consistent across envs |
 /// | `fetch.wait.max.ms` | 10 ms | 500 ms | Return quickly |
 /// | `queued.min.messages` | 1000 | 100000 | Smaller pre-fetch queue |
-/// | `enable.auto.commit` | false | true | DFE manages commits |
+/// | `enable.auto.commit` | false | true | the data plane manages commits |
 /// | `reconnect.backoff.ms` | 10 ms | 100 ms | Fast reconnect |
 /// | `reconnect.backoff.max.ms` | 100 ms | 10000 ms | Cap quickly |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
@@ -829,7 +829,7 @@ pub struct KafkaConfig {
 
     /// Suppression rules: if a topic with preferred_suffix exists,
     /// suppress the topic with suppressed_suffix for the same base name.
-    /// Default: _load suppresses _land (DFE convention).
+    /// Default: _load suppresses _land (the convention).
     #[serde(default = "default_topic_suppression_rules")]
     pub topic_suppression_rules: Vec<SuppressionRule>,
 

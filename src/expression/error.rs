@@ -13,7 +13,7 @@ use thiserror::Error;
 /// Errors from expression validation, compilation, or evaluation.
 #[derive(Error, Debug)]
 pub enum ExpressionError {
-    /// Expression failed DFE profile validation or syntax check.
+    /// Expression failed profile validation or syntax check.
     #[error("Expression validation failed: {}", .0.join("; "))]
     Validation(Vec<String>),
 

@@ -8,7 +8,7 @@
 
 //! Unified dead letter queue (DLQ) with pluggable backends.
 //!
-//! Provides a shared DLQ abstraction for all DFE services. Failed messages
+//! Provides a shared DLQ abstraction for all data-plane services. Failed messages
 //! are routed to one or more backends (file, Kafka, or custom) using
 //! configurable cascade or fan-out modes.
 //!

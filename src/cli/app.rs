@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Application trait and lifecycle runner for DFE services.
+//! Application trait and lifecycle runner for data-plane services.
 //!
 //! Provides the standard startup sequence: parse → log → config → dispatch.
 //!
@@ -39,7 +39,7 @@ use super::error::CliError;
 use super::version::VersionInfo;
 use super::{CommonArgs, StandardCommand, output};
 
-/// Trait for DFE service applications.
+/// Trait for data-plane service applications.
 ///
 /// Implement this trait to get the standard CLI lifecycle for free.
 /// The 80% common behaviour (logging, config, metrics, version) is handled
@@ -119,7 +119,7 @@ pub trait ServiceApp: Sized {
     }
 }
 
-/// Drive the standard DFE service lifecycle.
+/// Drive the standard data-plane service lifecycle.
 ///
 /// Handles subcommand dispatch:
 /// - `run` (default): init logger → load config → run service

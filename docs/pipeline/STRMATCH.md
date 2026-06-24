@@ -8,7 +8,7 @@ field-presence checks, prefix tests, alternation over a fixed token
 list — never invoke the regex engine at all.
 
 Replaces casual `Regex::new(...)` calls in routers, scrubbers,
-classifiers, and field filters across the DFE stack.
+classifiers, and field filters across the data plane.
 
 ---
 
