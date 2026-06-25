@@ -157,6 +157,9 @@ than baking them into source.
 | `base_image_from_cascade()` | `deployment.base_image` | `ubuntu:24.04` |
 | `argocd_repo_url_from_cascade(app)` | `deployment.argocd.repo_url` | `https://github.com/hyperi-io/<app>` |
 
+Overriding `base_image`? Keep `glibc(runtime) >= glibc(build host)` and
+stay off musl (alpine) -- see [NATIVE-DEPS.md](NATIVE-DEPS.md#glibc-keep-runtime--build).
+
 ---
 
 ## API surface

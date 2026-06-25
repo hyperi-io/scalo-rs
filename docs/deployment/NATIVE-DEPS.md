@@ -90,6 +90,27 @@ in the image. hyperi-ci handles build-host packages separately by
 sniffing `Cargo.lock` for `-sys` crates and installing matching `-dev`
 packages on the runner.
 
+### glibc: keep runtime >= build
+
+scalo links glibc dynamically, so the rule is **glibc(runtime image)
+>= glibc(build host)**. A binary built against a newer glibc fails at
+startup on an older one (`version 'GLIBC_2.x' not found`). The default
+`base_image` is `ubuntu:24.04` (glibc 2.39) precisely because that is
+what the CI builders run -- build and runtime glibc match, so it just
+works.
+
+If you OVERRIDE `deployment.base_image`, mind the glibc relationship:
+
+| Runtime image | glibc | Built on ubuntu 24.04 (2.39)? |
+|---|---|---|
+| `ubuntu:24.04` | 2.39 | yes (match) |
+| `debian:trixie-slim` | 2.41 | yes (runtime newer) |
+| `debian:bookworm-slim` | 2.36 | NO -- needs a bookworm builder too |
+| distroless `cc-debian12` | 2.36 | NO (bookworm) + has no curl for HEALTHCHECK |
+
+musl images (alpine) are **not supported**: the native deps above
+(rdkafka, libgit2, openssl, `aws-lc-sys`) link glibc.
+
 ---
 
 ## Reading from `Cargo.toml`
