@@ -91,7 +91,7 @@ COPY {binary} /usr/local/bin/{binary}
 RUN chmod +x /usr/local/bin/{binary}
 
 # Ubuntu 24.04 ships with ubuntu user at UID 1000 -- remove before creating appuser
-RUN userdel -r ubuntu && useradd --create-home --uid 1000 appuser
+RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi && useradd --create-home --uid 1000 appuser
 USER appuser
 
 EXPOSE {expose_ports}
@@ -185,7 +185,7 @@ LABEL org.opencontainers.image.created="${{OCI_CREATED}}"
 COPY --from=builder /app/target/release/{binary} /usr/local/bin/{binary}
 RUN chmod +x /usr/local/bin/{binary}
 
-RUN userdel -r ubuntu && useradd --create-home --uid 1000 appuser
+RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi && useradd --create-home --uid 1000 appuser
 USER appuser
 
 EXPOSE {expose_ports}

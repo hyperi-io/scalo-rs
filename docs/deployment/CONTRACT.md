@@ -154,8 +154,11 @@ than baking them into source.
 | Function | Cascade key | Default |
 |----------|-------------|---------|
 | `image_registry_from_cascade()` | `deployment.image_registry` | `ghcr.io/hyperi-io` |
-| `base_image_from_cascade()` | `deployment.base_image` | `ubuntu:24.04` |
+| `base_image_from_cascade()` | `deployment.base_image` | `debian:trixie-slim` |
 | `argocd_repo_url_from_cascade(app)` | `deployment.argocd.repo_url` | `https://github.com/hyperi-io/<app>` |
+
+Overriding `base_image`? Keep `glibc(runtime) >= glibc(build host)` and
+stay off musl (alpine) -- see [NATIVE-DEPS.md](NATIVE-DEPS.md#glibc-keep-runtime--build).
 
 ---
 

@@ -220,7 +220,7 @@ pub struct SecretEnvContract {
 }
 
 fn default_base_image() -> String {
-    "ubuntu:24.04".to_string()
+    "debian:trixie-slim".to_string()
 }
 
 fn default_image_registry() -> String {

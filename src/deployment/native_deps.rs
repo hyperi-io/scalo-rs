@@ -67,7 +67,9 @@ fn confluent_repo(codename: &str) -> AptRepoContract {
 /// Maps common base images to their codenames. Falls back to `noble` if
 /// the image is not recognised.
 fn codename_from_base_image(base_image: &str) -> &'static str {
-    if base_image.contains("bookworm") {
+    if base_image.contains("trixie") {
+        "trixie"
+    } else if base_image.contains("bookworm") {
         "bookworm"
     } else if base_image.contains("jammy") {
         "jammy"
@@ -76,6 +78,17 @@ fn codename_from_base_image(base_image: &str) -> &'static str {
     } else {
         // ubuntu:24.04 and anything else → noble
         "noble"
+    }
+}
+
+/// libgit2 runtime soname package -- the version is baked into the package
+/// name and differs per distro release. Debian 13 trixie ships `libgit2-1.9`;
+/// Ubuntu 24.04 noble ships `libgit2-1.7`.
+fn libgit2_runtime_package(base_image: &str) -> &'static str {
+    if base_image.contains("trixie") {
+        "libgit2-1.9"
+    } else {
+        "libgit2-1.7"
     }
 }
 
@@ -116,7 +129,15 @@ impl NativeDepsContract {
             .any(|f| *f == "transport-kafka" || f.starts_with("dlq-kafka"));
 
         if needs_kafka {
-            apt_repos.push(confluent_repo(codename));
+            // Debian 13 trixie ships a current librdkafka1 (2.x) natively, so the
+            // Confluent client repo (added on Ubuntu, whose distro package lags the
+            // protocol) is unnecessary -- and Confluent's clients/deb has no trixie
+            // suite. Pull the native package instead.
+            if base_image.contains("trixie") {
+                add("librdkafka1");
+            } else {
+                apt_repos.push(confluent_repo(codename));
+            }
             add("libssl3");
             add("zlib1g");
         }
@@ -140,10 +161,10 @@ impl NativeDepsContract {
             add("zlib1g");
         }
 
-        // directory-config-git needs libgit2
+        // directory-config-git needs libgit2 (soname pkg differs per distro)
         let needs_git2 = features.contains(&"directory-config-git");
         if needs_git2 {
-            add("libgit2-1.7");
+            add(libgit2_runtime_package(base_image));
         }
 
         Self {
@@ -282,6 +303,26 @@ mod tests {
         let deps =
             NativeDepsContract::for_rustlib_features(&["transport-kafka"], "debian:bookworm-slim");
         assert_eq!(deps.apt_repos[0].codename, "bookworm");
+    }
+
+    #[test]
+    fn test_trixie_kafka_uses_native_librdkafka_no_confluent() {
+        // Debian 13: native librdkafka1, NO Confluent repo (it has no trixie suite).
+        let deps =
+            NativeDepsContract::for_rustlib_features(&["transport-kafka"], "debian:trixie-slim");
+        assert!(deps.apt_repos.is_empty());
+        assert!(deps.apt_packages.contains(&"librdkafka1".into()));
+        assert!(deps.apt_packages.contains(&"libssl3".into()));
+        assert!(deps.apt_packages.contains(&"zlib1g".into()));
+    }
+
+    #[test]
+    fn test_trixie_git2_soname() {
+        let deps = NativeDepsContract::for_rustlib_features(
+            &["directory-config-git"],
+            "debian:trixie-slim",
+        );
+        assert!(deps.apt_packages.contains(&"libgit2-1.9".into()));
     }
 
     #[test]

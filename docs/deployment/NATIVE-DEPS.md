@@ -90,6 +90,30 @@ in the image. hyperi-ci handles build-host packages separately by
 sniffing `Cargo.lock` for `-sys` crates and installing matching `-dev`
 packages on the runner.
 
+### glibc: keep runtime >= build
+
+scalo links glibc dynamically, so the rule is **glibc(runtime image)
+>= glibc(build host)**. A binary built against a newer glibc fails at
+startup on an older one (`version 'GLIBC_x.yz' not found`). The default
+`base_image` is `debian:trixie-slim` and the CI builders run debian
+trixie too, so build and runtime glibc are identical -- it just works.
+On trixie, `librdkafka1` comes from the native repo (Debian ships a
+current build), so the Confluent client repo is only added for Ubuntu
+bases, whose distro package lags.
+
+If you OVERRIDE `deployment.base_image`, keep its glibc >= the build
+host's (debian trixie):
+
+| Runtime image | Safe on a debian-trixie builder? |
+|---|---|
+| `debian:trixie-slim` (default) | yes -- same release |
+| a newer Debian release | yes -- newer glibc |
+| an OLDER Debian, or Ubuntu | no -- older glibc; build on that base too |
+| distroless `cc-debian*` | no -- older glibc + no curl for HEALTHCHECK |
+
+musl images (alpine) are **not supported**: the native deps above
+(rdkafka, libgit2, openssl, `aws-lc-sys`) link glibc.
+
 ---
 
 ## Reading from `Cargo.toml`

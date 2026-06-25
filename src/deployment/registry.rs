@@ -18,16 +18,16 @@
 //! ```yaml
 //! deployment:
 //!   image_registry: ghcr.io/hyperi-io        # default: ghcr.io/hyperi-io
-//!   base_image: ubuntu:24.04                 # default: ubuntu:24.04
+//!   base_image: debian:trixie-slim           # default: debian:trixie-slim
 //! ```
 //!
 //! # Defaults
 //!
 //! - [`DEFAULT_IMAGE_REGISTRY`] = `ghcr.io/hyperi-io` -- where built images go
-//! - [`DEFAULT_BASE_IMAGE`] = `ubuntu:24.04` -- what the runtime stage builds on
+//! - [`DEFAULT_BASE_IMAGE`] = `debian:trixie-slim` -- what the runtime stage builds on
 //!
 //! When (eventually) a curated GHCR base image lands at
-//! `ghcr.io/hyperi-io/dfe-base:ubuntu-24.04`, ops can override
+//! `ghcr.io/hyperi-io/dfe-base:trixie`, ops can override
 //! `deployment.base_image` in the cascade without rebuilding the apps.
 
 /// Default publish-target registry for the org.
@@ -38,10 +38,12 @@ pub const DEFAULT_IMAGE_REGISTRY: &str = "ghcr.io/hyperi-io";
 
 /// Default base image for the runtime stage.
 ///
-/// Pulled from Docker Hub (no registry prefix). To use a curated GHCR base,
-/// set `deployment.base_image` in the YAML cascade to e.g.
-/// `ghcr.io/hyperi-io/dfe-base:ubuntu-24.04` once that image exists.
-pub const DEFAULT_BASE_IMAGE: &str = "ubuntu:24.04";
+/// Pulled from Docker Hub (no registry prefix). Debian "trixie" slim: smaller
+/// and fewer CVEs than a full ubuntu base, and its glibc matches the debian
+/// trixie CI builders so binaries built on CI run as-is. Override via
+/// `deployment.base_image` in the YAML cascade (keep glibc(runtime) >=
+/// glibc(build); musl/alpine unsupported -- see docs/deployment/NATIVE-DEPS.md).
+pub const DEFAULT_BASE_IMAGE: &str = "debian:trixie-slim";
 
 /// Read the publish-target image registry from the config cascade.
 ///
@@ -115,7 +117,7 @@ mod tests {
     #[test]
     fn defaults_are_ghcr_friendly() {
         assert_eq!(DEFAULT_IMAGE_REGISTRY, "ghcr.io/hyperi-io");
-        assert_eq!(DEFAULT_BASE_IMAGE, "ubuntu:24.04");
+        assert_eq!(DEFAULT_BASE_IMAGE, "debian:trixie-slim");
     }
 
     #[test]
