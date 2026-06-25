@@ -8,7 +8,7 @@
 
 [package]
 name = "scalo"
-version = "2.8.0"
+version = "2.9.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Self-regulating runtime for data-plane services -- config, logging, metrics, health, transport, backpressure, adaptive scaling. Batteries included; idiomatic Rust (also on PyPI)."
