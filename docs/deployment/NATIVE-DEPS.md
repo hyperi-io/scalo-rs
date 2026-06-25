@@ -94,19 +94,22 @@ packages on the runner.
 
 scalo links glibc dynamically, so the rule is **glibc(runtime image)
 >= glibc(build host)**. A binary built against a newer glibc fails at
-startup on an older one (`version 'GLIBC_2.x' not found`). The default
-`base_image` is `ubuntu:24.04` (glibc 2.39) precisely because that is
-what the CI builders run -- build and runtime glibc match, so it just
-works.
+startup on an older one (`version 'GLIBC_x.yz' not found`). The default
+`base_image` is `debian:trixie-slim` and the CI builders run debian
+trixie too, so build and runtime glibc are identical -- it just works.
+On trixie, `librdkafka1` comes from the native repo (Debian ships a
+current build), so the Confluent client repo is only added for Ubuntu
+bases, whose distro package lags.
 
-If you OVERRIDE `deployment.base_image`, mind the glibc relationship:
+If you OVERRIDE `deployment.base_image`, keep its glibc >= the build
+host's (debian trixie):
 
-| Runtime image | glibc | Built on ubuntu 24.04 (2.39)? |
-|---|---|---|
-| `ubuntu:24.04` | 2.39 | yes (match) |
-| `debian:trixie-slim` | 2.41 | yes (runtime newer) |
-| `debian:bookworm-slim` | 2.36 | NO -- needs a bookworm builder too |
-| distroless `cc-debian12` | 2.36 | NO (bookworm) + has no curl for HEALTHCHECK |
+| Runtime image | Safe on a debian-trixie builder? |
+|---|---|
+| `debian:trixie-slim` (default) | yes -- same release |
+| a newer Debian release | yes -- newer glibc |
+| an OLDER Debian, or Ubuntu | no -- older glibc; build on that base too |
+| distroless `cc-debian*` | no -- older glibc + no curl for HEALTHCHECK |
 
 musl images (alpine) are **not supported**: the native deps above
 (rdkafka, libgit2, openssl, `aws-lc-sys`) link glibc.
