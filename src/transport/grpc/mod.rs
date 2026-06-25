@@ -366,6 +366,10 @@ impl TransportSender for GrpcTransport {
             metadata.insert(super::propagation::TRACEPARENT_HEADER.to_string(), tp);
         }
 
+        // Capture wire size before `payload` moves into the request.
+        #[cfg(feature = "metrics")]
+        let payload_len = payload.len();
+
         let mut request = tonic::Request::new(proto::PushRequest {
             // proto field is `Bytes` (`.bytes(".")` in build.rs) -- move, no copy.
             payload,
@@ -389,7 +393,11 @@ impl TransportSender for GrpcTransport {
         let result = match client.clone().push(request).await {
             Ok(_) => {
                 #[cfg(feature = "metrics")]
-                metrics::counter!("transport_sent_total", "transport" => "grpc").increment(1);
+                {
+                    metrics::counter!("transport_sent_total", "transport" => "grpc").increment(1);
+                    metrics::counter!("transport_sent_bytes_total", "transport" => "grpc")
+                        .increment(payload_len as u64);
+                }
                 SendResult::Ok
             }
             Err(status) => match status.code() {
@@ -552,12 +560,16 @@ impl TransportSender for GrpcTransport {
                     SendResult::Backpressured
                 } else {
                     #[cfg(feature = "metrics")]
-                    metrics::counter!(
-                        "transport_sent_total",
-                        "transport" => "grpc",
-                        "path" => "batch"
-                    )
-                    .increment(sent_count as u64);
+                    {
+                        metrics::counter!(
+                            "transport_sent_total",
+                            "transport" => "grpc",
+                            "path" => "batch"
+                        )
+                        .increment(sent_count as u64);
+                        metrics::counter!("transport_sent_bytes_total", "transport" => "grpc")
+                            .increment(payload_bytes as u64);
+                    }
                     SendResult::Ok
                 }
             }
@@ -769,6 +781,10 @@ impl proto::transport_server::Transport for TransportServiceImpl {
         let format = PayloadFormat::detect(&req.payload);
         let key = req.metadata.get("topic").map(|s| Arc::from(s.as_str()));
 
+        // Capture wire size before `req.payload` moves into the message.
+        #[cfg(feature = "metrics")]
+        let payload_len = req.payload.len();
+
         // `req.payload` is prost `Bytes` (`.bytes(".")`) -- zero-copy decode,
         // so this is a move not a copy.
         let msg = Message {
@@ -784,6 +800,10 @@ impl proto::transport_server::Transport for TransportServiceImpl {
                 #[cfg(feature = "metrics")]
                 {
                     metrics::counter!("transport_sent_total", "transport" => "grpc").increment(1);
+                    metrics::counter!("transport_received_bytes_total", "transport" => "grpc")
+                        .increment(payload_len as u64);
+                    metrics::counter!("transport_received_events_total", "transport" => "grpc")
+                        .increment(1);
                     metrics::gauge!("transport_queue_size", "transport" => "grpc").set(
                         self.sender
                             .max_capacity()
@@ -850,6 +870,9 @@ impl proto::transport_server::Transport for TransportServiceImpl {
         // single-message Push path uses, so recv() delivers them unchanged.
         let records = batch::proto_batch_to_records(proto_batch);
         let accepted = records.len() as u64;
+        // Sum raw wire bytes BEFORE the records move into the channel below.
+        #[cfg(feature = "metrics")]
+        let batch_bytes: usize = records.iter().map(|r| r.payload.len()).sum();
 
         // ATOMICITY: reserve channel capacity for the WHOLE batch via
         // `try_reserve_many` BEFORE enqueuing ANY record. Cannot fit -> reject
@@ -901,12 +924,18 @@ impl proto::transport_server::Transport for TransportServiceImpl {
         }
 
         #[cfg(feature = "metrics")]
-        metrics::counter!(
-            "transport_sent_total",
-            "transport" => "grpc",
-            "path" => "batch"
-        )
-        .increment(accepted);
+        {
+            metrics::counter!(
+                "transport_sent_total",
+                "transport" => "grpc",
+                "path" => "batch"
+            )
+            .increment(accepted);
+            metrics::counter!("transport_received_bytes_total", "transport" => "grpc")
+                .increment(batch_bytes as u64);
+            metrics::counter!("transport_received_events_total", "transport" => "grpc")
+                .increment(accepted);
+        }
 
         Ok(Response::new(proto::BatchAck { accepted }))
     }

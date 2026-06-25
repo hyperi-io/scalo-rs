@@ -210,7 +210,11 @@ impl TransportSender for PipeTransport {
         );
 
         #[cfg(feature = "metrics")]
-        metrics::counter!("transport_sent_total", "transport" => "pipe").increment(1);
+        {
+            metrics::counter!("transport_sent_total", "transport" => "pipe").increment(1);
+            metrics::counter!("transport_sent_bytes_total", "transport" => "pipe")
+                .increment(payload.len() as u64);
+        }
 
         SendResult::Ok
     }
@@ -285,10 +289,6 @@ impl TransportReceiver for PipeTransport {
                         timestamp_ms: Some(timestamp_ms),
                         format,
                     });
-
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!("transport_received_total", "transport" => "pipe")
-                        .increment(1);
                 }
                 Err(e) => {
                     return Err(TransportError::Recv(format!("stdin read failed: {e}")));
@@ -314,6 +314,16 @@ impl TransportReceiver for PipeTransport {
                 lines = messages.len(),
                 "Pipe transport: batch received from stdin"
             );
+        }
+
+        // Transport-level ingress (post-filter, batch-at-a-time).
+        #[cfg(feature = "metrics")]
+        if !messages.is_empty() {
+            let bytes: usize = messages.iter().map(|m| m.payload.len()).sum();
+            metrics::counter!("transport_received_bytes_total", "transport" => "pipe")
+                .increment(bytes as u64);
+            metrics::counter!("transport_received_events_total", "transport" => "pipe")
+                .increment(messages.len() as u64);
         }
 
         Ok(RecvBatch {

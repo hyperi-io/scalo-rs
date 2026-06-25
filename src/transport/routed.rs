@@ -174,12 +174,20 @@ impl TransportSender for RoutedSender {
         // "default"), not the per-message key. Cardinality is
         // bounded by the routing table size, not by message count.
         #[cfg(feature = "metrics")]
-        metrics::counter!(
-            "transport_sent_total",
-            "transport" => "routed",
-            "route" => route_name.to_string()
-        )
-        .increment(1);
+        {
+            metrics::counter!(
+                "transport_sent_total",
+                "transport" => "routed",
+                "route" => route_name.to_string()
+            )
+            .increment(1);
+            metrics::counter!(
+                "transport_sent_bytes_total",
+                "transport" => "routed",
+                "route" => route_name.to_string()
+            )
+            .increment(payload.len() as u64);
+        }
         #[cfg(not(feature = "metrics"))]
         let _ = route_name;
 

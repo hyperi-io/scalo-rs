@@ -92,6 +92,22 @@ impl ServiceMetrics {
             metrics::Unit::Seconds,
             "Time to send a batch to transport"
         );
+        // Byte/event throughput (Vector-modelled; batch-incremented). Bytes are
+        // raw wire bytes (summed payload.len() per WorkBatch), not decoded size.
+        metrics::describe_counter!(
+            "transport_sent_bytes_total",
+            metrics::Unit::Bytes,
+            "Raw bytes written to transport (egress)"
+        );
+        metrics::describe_counter!(
+            "transport_received_bytes_total",
+            metrics::Unit::Bytes,
+            "Raw bytes read from transport (ingress)"
+        );
+        metrics::describe_counter!(
+            "transport_received_events_total",
+            "Events received off the transport (ingress count)"
+        );
 
         // Push transport descriptors into manifest registry
         for (name, desc, mt) in [
@@ -159,6 +175,35 @@ impl ServiceMetrics {
             use_cases: vec![],
             dashboard_hint: None,
         });
+        for (name, desc, unit) in [
+            (
+                "transport_sent_bytes_total",
+                "Raw bytes written to transport (egress)",
+                "bytes",
+            ),
+            (
+                "transport_received_bytes_total",
+                "Raw bytes read from transport (ingress)",
+                "bytes",
+            ),
+            (
+                "transport_received_events_total",
+                "Events received off the transport (ingress count)",
+                "",
+            ),
+        ] {
+            reg.push(MetricDescriptor {
+                name: name.into(),
+                metric_type: MetricType::Counter,
+                description: desc.into(),
+                unit: unit.into(),
+                labels: vec!["transport".into()],
+                group: "platform".into(),
+                buckets: None,
+                use_cases: vec![],
+                dashboard_hint: None,
+            });
+        }
 
         // --- Pipeline ---
         metrics::describe_gauge!(
@@ -390,6 +435,30 @@ impl ServiceMetrics {
         .record(seconds);
     }
 
+    /// Record raw bytes written to a transport (egress). Sum `payload.len()`
+    /// across a `WorkBatch` and call once per send, not per record.
+    #[inline]
+    pub fn transport_sent_bytes(&self, transport: super::TransportKind, bytes: u64) {
+        metrics::counter!("transport_sent_bytes_total", "transport" => transport.as_label())
+            .increment(bytes);
+    }
+
+    /// Record raw bytes read off a transport (ingress). Call once per received
+    /// batch with the summed `payload.len()`.
+    #[inline]
+    pub fn transport_received_bytes(&self, transport: super::TransportKind, bytes: u64) {
+        metrics::counter!("transport_received_bytes_total", "transport" => transport.as_label())
+            .increment(bytes);
+    }
+
+    /// Record events received off a transport (ingress count). Call once per
+    /// received batch with the record count.
+    #[inline]
+    pub fn transport_received_events(&self, transport: super::TransportKind, count: u64) {
+        metrics::counter!("transport_received_events_total", "transport" => transport.as_label())
+            .increment(count);
+    }
+
     // ── Pipeline ─────────────────────────────────────────────────────
 
     /// Set pipeline readiness state.
@@ -504,6 +573,9 @@ mod tests {
         let manifest = mgr.registry().manifest();
         let names: Vec<&str> = manifest.metrics.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"test_app_transport_sent_total"));
+        assert!(names.contains(&"test_app_transport_sent_bytes_total"));
+        assert!(names.contains(&"test_app_transport_received_bytes_total"));
+        assert!(names.contains(&"test_app_transport_received_events_total"));
         assert!(names.contains(&"test_app_pipeline_ready"));
         assert!(names.contains(&"test_app_records_received_total"));
         assert!(names.contains(&"test_app_scaling_pressure"));
@@ -554,6 +626,9 @@ mod tests {
         svc.transport_queue_capacity("kafka", 1000.0);
         svc.transport_inflight("kafka", 50.0);
         svc.transport_send_duration("kafka", 0.042);
+        svc.transport_sent_bytes(super::super::TransportKind::Kafka, 4096);
+        svc.transport_received_bytes(super::super::TransportKind::Grpc, 8192);
+        svc.transport_received_events(super::super::TransportKind::Grpc, 64);
 
         svc.pipeline_ready(true);
         svc.pipeline_stall(1);

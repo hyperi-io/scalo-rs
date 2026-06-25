@@ -719,7 +719,12 @@ impl TransportSender for KafkaTransport {
         {
             Ok(_) => {
                 #[cfg(feature = "metrics")]
-                ::metrics::counter!("transport_sent_total", "transport" => "kafka").increment(1);
+                {
+                    ::metrics::counter!("transport_sent_total", "transport" => "kafka")
+                        .increment(1);
+                    ::metrics::counter!("transport_sent_bytes_total", "transport" => "kafka")
+                        .increment(payload.len() as u64);
+                }
                 SendResult::Ok
             }
             Err((err, _)) => {
@@ -1073,6 +1078,17 @@ impl KafkaTransport {
         let messages = batch.messages;
         let dlq_entries = batch.dlq_entries;
         let filtered_tokens = batch.filtered_tokens;
+
+        // Transport-level ingress (raw wire receipt, post-filter). Batch-at-a-time,
+        // distinct from the pipeline-level records_received_total (post-decode).
+        #[cfg(feature = "metrics")]
+        if !messages.is_empty() {
+            let bytes: usize = messages.iter().map(|m| m.payload.len()).sum();
+            ::metrics::counter!("transport_received_bytes_total", "transport" => "kafka")
+                .increment(bytes as u64);
+            ::metrics::counter!("transport_received_events_total", "transport" => "kafka")
+                .increment(messages.len() as u64);
+        }
 
         Ok(RecvBatch {
             messages,

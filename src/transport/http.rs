@@ -513,6 +513,10 @@ async fn ingest_handler(
     let format = PayloadFormat::detect(&body);
     let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
+    // Capture wire size before `body` moves into the message.
+    #[cfg(feature = "metrics")]
+    let body_len = body.len();
+
     // `body` is `axum::body::Bytes` (= `bytes::Bytes`) -- move it directly,
     // no copy needed.
     let msg = Message {
@@ -526,7 +530,13 @@ async fn ingest_handler(
     match state.sender.try_send(msg) {
         Ok(()) => {
             #[cfg(feature = "metrics")]
-            metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
+            {
+                metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
+                metrics::counter!("transport_received_bytes_total", "transport" => "http")
+                    .increment(body_len as u64);
+                metrics::counter!("transport_received_events_total", "transport" => "http")
+                    .increment(1);
+            }
             axum::http::StatusCode::OK.into_response()
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -623,13 +633,20 @@ impl TransportSender for HttpTransport {
 
         #[cfg(feature = "logger")]
         let payload_len = payload.len();
+        // Capture wire size before `payload` moves into the request body.
+        #[cfg(feature = "metrics")]
+        let payload_bytes = payload.len();
         let result = match request_builder.body(payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 #[cfg(feature = "logger")]
                 tracing::debug!(url = %url, bytes = payload_len, "HTTP transport: POST sent");
 
                 #[cfg(feature = "metrics")]
-                metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
+                {
+                    metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
+                    metrics::counter!("transport_sent_bytes_total", "transport" => "http")
+                        .increment(payload_bytes as u64);
+                }
                 SendResult::Ok
             }
             Ok(resp)

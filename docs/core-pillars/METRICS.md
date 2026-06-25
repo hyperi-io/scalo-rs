@@ -110,6 +110,31 @@ so every consumer service exports the same metrics with matching labels.
 
 ---
 
+## Transport throughput
+
+The transport layer counts both events AND bytes, in both directions, modelled on
+Vector's component instrumentation. All carry the `transport` label (backend kind:
+`kafka` / `grpc` / `http` / `file` / `pipe` / `redis`, plus `routed` for the
+aggregate routed view). Bytes are RAW wire bytes (summed `payload.len()` per
+`WorkBatch`), incremented once per batch send/recv -- not per event.
+
+| Metric | Direction | Meaning |
+|---|---|---|
+| `transport_sent_total` | egress | events written to the wire |
+| `transport_sent_bytes_total` | egress | raw bytes written to the wire |
+| `transport_received_events_total` | ingress | events read off the wire |
+| `transport_received_bytes_total` | ingress | raw bytes read off the wire |
+
+Transport-level ingress counts raw wire receipt (post-filter, pre-decode) and is
+distinct from the pipeline-level `records_received_total` (post-decode records).
+Graph volume with a rate query, e.g. egress bytes/sec by backend:
+
+```promql
+sum by (transport) (rate(transport_sent_bytes_total[1m]))
+```
+
+---
+
 ## Endpoints
 
 | Path | Body |
@@ -180,4 +205,4 @@ fixture installs the recorder.
 - [TRACING.md](TRACING.md) -- OTel-metrics is configured separately from OTel-tracing
 - [../runtime/SERVICE-RUNTIME.md](../runtime/SERVICE-RUNTIME.md) -- `ServiceRuntime` wires the manager
 - [../AUTO-WIRING.md](../AUTO-WIRING.md), [../FEATURE-FLAGS.md](../FEATURE-FLAGS.md)
-- Source: [`src/metrics/mod.rs`](../../src/metrics/mod.rs), [`src/metrics/manifest.rs`](../../src/metrics/manifest.rs), [`src/metrics/dfe.rs`](../../src/metrics/dfe.rs)
+- Source: [`src/metrics/mod.rs`](../../src/metrics/mod.rs), [`src/metrics/manifest.rs`](../../src/metrics/manifest.rs), [`src/metrics/service.rs`](../../src/metrics/service.rs)

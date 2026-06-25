@@ -331,7 +331,11 @@ impl TransportSender for RedisTransport {
                 tracing::debug!(stream = %stream, "Redis transport: XADD sent");
 
                 #[cfg(feature = "metrics")]
-                metrics::counter!("transport_sent_total", "transport" => "redis").increment(1);
+                {
+                    metrics::counter!("transport_sent_total", "transport" => "redis").increment(1);
+                    metrics::counter!("transport_sent_bytes_total", "transport" => "redis")
+                        .increment(payload.len() as u64);
+                }
 
                 SendResult::Ok
             }
@@ -432,7 +436,10 @@ impl TransportReceiver for RedisTransport {
 
         #[cfg(feature = "metrics")]
         if !messages.is_empty() {
-            metrics::counter!("transport_received_total", "transport" => "redis")
+            let bytes: usize = messages.iter().map(|m| m.payload.len()).sum();
+            metrics::counter!("transport_received_bytes_total", "transport" => "redis")
+                .increment(bytes as u64);
+            metrics::counter!("transport_received_events_total", "transport" => "redis")
                 .increment(messages.len() as u64);
         }
 
