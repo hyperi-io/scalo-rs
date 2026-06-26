@@ -62,13 +62,18 @@ fn confluent_repo(codename: &str) -> AptRepoContract {
     }
 }
 
-/// Derive the APT codename from a base image string.
+/// Derive the Confluent clients-repo APT suite codename from a base image.
 ///
-/// Maps common base images to their codenames. Falls back to `noble` if
-/// the image is not recognised.
+/// This is the suite used for `packages.confluent.io/clients/deb`, NOT
+/// necessarily the host distro's own codename. Confluent's clients repo has
+/// no `trixie` (debian 13) suite -- its newest debian suite is `bookworm`
+/// (debian 12), whose `librdkafka1` .deb installs cleanly on trixie (the
+/// libssl3/libsasl2/zlib deps are satisfied by trixie's newer versions). So
+/// trixie maps to `bookworm`. Falls back to `noble` if not recognised.
 fn codename_from_base_image(base_image: &str) -> &'static str {
     if base_image.contains("trixie") {
-        "trixie"
+        // Confluent has no trixie suite -- use the closest, bookworm.
+        "bookworm"
     } else if base_image.contains("bookworm") {
         "bookworm"
     } else if base_image.contains("jammy") {
@@ -129,15 +134,14 @@ impl NativeDepsContract {
             .any(|f| *f == "transport-kafka" || f.starts_with("dlq-kafka"));
 
         if needs_kafka {
-            // Debian 13 trixie ships a current librdkafka1 (2.x) natively, so the
-            // Confluent client repo (added on Ubuntu, whose distro package lags the
-            // protocol) is unnecessary -- and Confluent's clients/deb has no trixie
-            // suite. Pull the native package instead.
-            if base_image.contains("trixie") {
-                add("librdkafka1");
-            } else {
-                apt_repos.push(confluent_repo(codename));
-            }
+            // Always source librdkafka1 from the Confluent clients repo so the
+            // image ships the LATEST librdkafka -- the debian/ubuntu distro
+            // packages lag the protocol, which is why we do NOT use them. The
+            // binary dynamic-links librdkafka, so a container gets the current
+            // Confluent build supplied here, while a manual run on a host uses
+            // that host's librdkafka (older is fine). Trixie has no Confluent
+            // suite, so it maps to bookworm (see codename_from_base_image).
+            apt_repos.push(confluent_repo(codename));
             add("libssl3");
             add("zlib1g");
         }
@@ -306,12 +310,18 @@ mod tests {
     }
 
     #[test]
-    fn test_trixie_kafka_uses_native_librdkafka_no_confluent() {
-        // Debian 13: native librdkafka1, NO Confluent repo (it has no trixie suite).
+    fn test_trixie_kafka_uses_confluent_bookworm() {
+        // Trixie has no Confluent suite, so it pulls the LATEST librdkafka1 from
+        // the Confluent clients repo via the bookworm suite (debian's native
+        // package lags the protocol). librdkafka1 comes from the repo, NOT
+        // apt_packages.
         let deps =
             NativeDepsContract::for_rustlib_features(&["transport-kafka"], "debian:trixie-slim");
-        assert!(deps.apt_repos.is_empty());
-        assert!(deps.apt_packages.contains(&"librdkafka1".into()));
+        assert_eq!(deps.apt_repos.len(), 1);
+        assert!(deps.apt_repos[0].url.contains("confluent"));
+        assert_eq!(deps.apt_repos[0].codename, "bookworm");
+        assert!(deps.apt_repos[0].packages.contains(&"librdkafka1".into()));
+        assert!(!deps.apt_packages.contains(&"librdkafka1".into()));
         assert!(deps.apt_packages.contains(&"libssl3".into()));
         assert!(deps.apt_packages.contains(&"zlib1g".into()));
     }

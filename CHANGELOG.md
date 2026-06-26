@@ -4,7 +4,15 @@ All notable changes to scalo are recorded here, following
 [Semantic Versioning](https://semver.org/). History prior to the
 open-source release is intentionally not included.
 
-## 2.9.1 (unreleased)
+## 2.9.2 (unreleased)
+
+- Kafka images source librdkafka1 from the Confluent clients repo on ALL
+  bases (debian trixie via the bookworm suite, since Confluent has no trixie
+  suite), so the image ships the LATEST librdkafka rather than the distro's
+  older package. The binary still dynamic-links, so a manual host run uses
+  whatever librdkafka is on that host.
+
+## 2.9.1 (2026-06-26)
 
 - Credential specs (`vault:path:key`, `env:VAR`, literal) now resolve
   through `scalo::secrets::{resolve, resolve_optional}`, folded in from
