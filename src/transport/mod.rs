@@ -96,8 +96,8 @@ pub use error::{TransportError, TransportResult};
 pub use factory::{AnyReceiver, AnySender, AnyToken};
 pub use routed::RoutedSender;
 pub use traits::{
-    CommitToken, FromCascade, RecvBatch, RecvLimits, Transport, TransportBase, TransportReceiver,
-    TransportSender,
+    CommitToken, FromCascade, HealthcheckConfig, RecvBatch, RecvLimits, Transport, TransportBase,
+    TransportReceiver, TransportSender, boot_healthcheck,
 };
 pub use types::{Message, SendResult, TransportConfig, TransportType};
 pub use work_batch::{FramingError, Record, RecordMeta, WorkBatch};

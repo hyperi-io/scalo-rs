@@ -45,6 +45,11 @@ pub struct TieredSinkConfig {
     #[serde(default)]
     pub max_spool_items: Option<usize>,
 
+    /// Policy applied when the spool is full (see [`WhenFull`]).
+    /// Default `Block` (lossless backpressure -- preserves current behaviour).
+    #[serde(default)]
+    pub when_full: WhenFull,
+
     /// Circuit breaker: failures before opening circuit.
     #[serde(default = "default_circuit_failure_threshold")]
     pub circuit_failure_threshold: u32,
@@ -92,6 +97,7 @@ impl TieredSinkConfig {
             ordering: OrderingMode::default(),
             max_spool_bytes: None,
             max_spool_items: None,
+            when_full: WhenFull::default(),
             circuit_failure_threshold: default_circuit_failure_threshold(),
             circuit_reset_timeout_ms: default_circuit_reset_timeout_ms(),
             drain_interval_ms: default_drain_interval_ms(),
@@ -131,6 +137,13 @@ impl TieredSinkConfig {
     #[must_use]
     pub fn max_spool_bytes(mut self, max: u64) -> Self {
         self.max_spool_bytes = Some(max);
+        self
+    }
+
+    /// Set the spool-full overflow policy.
+    #[must_use]
+    pub fn when_full(mut self, policy: WhenFull) -> Self {
+        self.when_full = policy;
         self
     }
 
@@ -253,6 +266,36 @@ impl DrainStrategy {
     pub fn rate_limited(msgs_per_sec: usize) -> Self {
         Self::RateLimited { msgs_per_sec }
     }
+}
+
+/// Policy applied when the spool (disk fallback) is full -- a write that would
+/// exceed `max_spool_bytes` / `max_spool_items`.
+///
+/// `Block` (default) preserves scalo's lossless contract: the write errors so
+/// the caller backpressures the inbound source (doctrine: gate the source,
+/// never silently drop the drain). The other variants are EXPLICIT opt-in loss
+/// / diversion and emit `tiered_sink_overflow_total{policy}` (plus a
+/// `tiered_sink_dropped_total{policy}` for the drop variants) so loss is never
+/// silent and always alertable.
+///
+/// Pattern cribbed from Vector's `WhenFull` (block / drop_newest / overflow);
+/// `Dlq` is the scalo no-silent-drop addition (overflow goes to the DLQ instead
+/// of being dropped or crashing the spool).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhenFull {
+    /// Backpressure: the spool write fails so the caller slows the inbound
+    /// source. Lossless. Default (matches pre-2.10 behaviour).
+    #[default]
+    Block,
+    /// Divert the overflowing record to the DLQ -- no silent loss, no crash.
+    Dlq,
+    /// Drop the incoming (newest) record. Explicit opt-in loss; keeps the
+    /// older, lower-latency records already spooled.
+    DropNewest,
+    /// Drop the oldest spooled record to make room for the newest. Explicit
+    /// opt-in loss; keeps the freshest data.
+    DropOldest,
 }
 
 /// Ordering mode for message delivery during drain.

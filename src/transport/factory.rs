@@ -136,6 +136,29 @@ impl TransportBase for AnySender {
             _ => "none",
         }
     }
+
+    async fn healthcheck(&self) -> TransportResult<()> {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-redis")]
+            Self::Redis(t) => t.healthcheck().await,
+            #[allow(unreachable_patterns)]
+            _ => Err(TransportError::Config(
+                "no transport variant enabled".into(),
+            )),
+        }
+    }
 }
 
 impl TransportSender for AnySender {
@@ -491,6 +514,29 @@ impl TransportBase for AnyReceiver {
             Self::Redis(t) => t.name(),
             #[allow(unreachable_patterns)]
             _ => "none",
+        }
+    }
+
+    async fn healthcheck(&self) -> TransportResult<()> {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-redis")]
+            Self::Redis(t) => t.healthcheck().await,
+            #[allow(unreachable_patterns)]
+            _ => Err(TransportError::Config(
+                "no transport variant enabled".into(),
+            )),
         }
     }
 }

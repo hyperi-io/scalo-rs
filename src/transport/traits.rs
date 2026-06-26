@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-use super::error::TransportResult;
+use super::error::{TransportError, TransportResult};
 use super::filter::FilteredDlqEntry;
 use super::types::{Message, SendResult};
 use super::work_batch::{Record, WorkBatch};
@@ -89,6 +89,87 @@ pub trait TransportBase: Send + Sync {
 
     /// Get transport name for logging/metrics.
     fn name(&self) -> &'static str;
+
+    /// Active boot-time health probe.
+    ///
+    /// Run by the factory at startup (see [`boot_healthcheck`]) so a
+    /// misconfigured or unreachable downstream fails fast instead of being
+    /// discovered on the first `send`. The DEFAULT delegates to
+    /// [`is_healthy`](Self::is_healthy) (passes unless the transport already
+    /// knows it is unhealthy); a transport SHOULD override with a real probe
+    /// (Kafka metadata fetch, HTTP GET, Redis PING, file-path writability, ...).
+    ///
+    /// Cribbed shape: a boxed/async `Result<()>` per-component check run in
+    /// parallel at boot (cf. Vector's per-sink `Healthcheck`).
+    fn healthcheck(&self) -> impl Future<Output = TransportResult<()>> + Send {
+        async move {
+            if self.is_healthy() {
+                Ok(())
+            } else {
+                Err(TransportError::Connection(format!(
+                    "{} transport failed boot healthcheck (not healthy)",
+                    self.name()
+                )))
+            }
+        }
+    }
+}
+
+/// Boot-time healthcheck policy. Fail-fast by default (`enabled = true`):
+/// startup aborts if a transport's [`healthcheck`](TransportBase::healthcheck)
+/// errors or exceeds `timeout`. Set `enabled = false` to skip probing.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct HealthcheckConfig {
+    /// Run the boot probe and fail-fast on failure. Default `true`.
+    #[serde(default = "default_healthcheck_enabled")]
+    pub enabled: bool,
+    /// Per-transport probe timeout in milliseconds. Default 5000.
+    #[serde(default = "default_healthcheck_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_healthcheck_enabled() -> bool {
+    true
+}
+
+fn default_healthcheck_timeout_ms() -> u64 {
+    5000
+}
+
+impl Default for HealthcheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_healthcheck_enabled(),
+            timeout_ms: default_healthcheck_timeout_ms(),
+        }
+    }
+}
+
+/// Run a transport's boot healthcheck under the given policy (fail-fast).
+///
+/// - `cfg.enabled == false` -> skip (always `Ok`).
+/// - otherwise probe [`TransportBase::healthcheck`] under a `cfg.timeout_ms`
+///   deadline; a probe error OR a timeout returns `Err` so the caller can abort
+///   startup before accepting traffic.
+///
+/// # Errors
+/// Returns the probe's error, or a `Connection` timeout error, when enabled.
+pub async fn boot_healthcheck<T: TransportBase>(
+    transport: &T,
+    cfg: HealthcheckConfig,
+) -> TransportResult<()> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    let probe = transport.healthcheck();
+    match tokio::time::timeout(std::time::Duration::from_millis(cfg.timeout_ms), probe).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(TransportError::Connection(format!(
+            "{} transport boot healthcheck timed out after {}ms",
+            transport.name(),
+            cfg.timeout_ms
+        ))),
+    }
 }
 
 /// Send-side transport.
@@ -282,5 +363,105 @@ pub trait FromCascade: Default + serde::Serialize + serde::de::DeserializeOwned 
         #[cfg(not(feature = "config"))]
         let _ = key;
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod healthcheck_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Probe that does NOT override `healthcheck` -- exercises the default impl
+    /// (delegates to `is_healthy`).
+    struct DefaultProbe {
+        healthy: bool,
+    }
+    impl TransportBase for DefaultProbe {
+        async fn close(&self) -> TransportResult<()> {
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            self.healthy
+        }
+        fn name(&self) -> &'static str {
+            "default-probe"
+        }
+    }
+
+    /// Probe that OVERRIDES `healthcheck` with a real (here: scripted) body,
+    /// optionally hanging to exercise the boot timeout.
+    struct ActiveProbe {
+        ok: bool,
+        hang: bool,
+    }
+    impl TransportBase for ActiveProbe {
+        async fn close(&self) -> TransportResult<()> {
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "active-probe"
+        }
+        async fn healthcheck(&self) -> TransportResult<()> {
+            if self.hang {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            if self.ok {
+                Ok(())
+            } else {
+                Err(TransportError::Connection("active probe rejected".into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_healthcheck_delegates_to_is_healthy() {
+        assert!(
+            boot_healthcheck(&DefaultProbe { healthy: true }, HealthcheckConfig::default())
+                .await
+                .is_ok()
+        );
+        assert!(
+            boot_healthcheck(&DefaultProbe { healthy: false }, HealthcheckConfig::default())
+                .await
+                .is_err(),
+            "default probe must fail-fast when not healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_skips_probe_even_if_unhealthy() {
+        // Would hang/fail if probed, but disabled must short-circuit to Ok.
+        let t = ActiveProbe { ok: false, hang: true };
+        let cfg = HealthcheckConfig {
+            enabled: false,
+            timeout_ms: 10,
+        };
+        assert!(boot_healthcheck(&t, cfg).await.is_ok(), "disabled must skip");
+    }
+
+    #[tokio::test]
+    async fn active_probe_failure_fails_fast() {
+        let t = ActiveProbe { ok: false, hang: false };
+        assert!(
+            boot_healthcheck(&t, HealthcheckConfig::default())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_probe_times_out() {
+        let t = ActiveProbe { ok: true, hang: true };
+        let cfg = HealthcheckConfig {
+            enabled: true,
+            timeout_ms: 50,
+        };
+        assert!(
+            boot_healthcheck(&t, cfg).await.is_err(),
+            "a hanging probe must hit the boot timeout"
+        );
     }
 }

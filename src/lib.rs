@@ -334,8 +334,8 @@ pub use scaling::{
 pub use governor::{
     Admit, ByteBudgetConfig, ByteBudgetController, GateActuator, Hysteresis, InboundGate,
     MemoryPressureSource, NoopActuator, ObservingActuator, Pressure, PressureSource,
-    SelfRegulationConfig, SelfRegulationGovernor, SelfRegulationProfile, UnifiedPressure,
-    UnifiedPressureSnapshot,
+    RateLimitConfig, RateLimiter, SelfRegulationConfig, SelfRegulationGovernor,
+    SelfRegulationProfile, UnifiedPressure, UnifiedPressureSnapshot,
 };
 
 #[cfg(any(feature = "worker-pool", feature = "worker-batch", feature = "worker"))]
