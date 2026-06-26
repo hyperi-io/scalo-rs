@@ -50,12 +50,14 @@
 mod budget;
 mod config;
 mod gate;
+mod rate_limit;
 mod runtime;
 mod source;
 
 pub use budget::{ByteBudgetConfig, ByteBudgetController};
 pub use config::{SelfRegulationConfig, SelfRegulationProfile};
 pub use gate::{Admit, GateActuator, InboundGate, NoopActuator, ObservingActuator};
+pub use rate_limit::{RateLimitConfig, RateLimiter};
 pub use runtime::SelfRegulationGovernor;
 pub use source::{
     Hysteresis, MemoryPressureSource, Pressure, PressureSource, UnifiedPressure,

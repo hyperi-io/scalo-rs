@@ -136,6 +136,9 @@ impl SelfRegulationProfile {
                 buffer_memory_bytes: Some(67_108_864),
                 // 5 in-flight per connection -- matches exactly-once safe limit.
                 max_in_flight: Some(5),
+                // Profiles leave idempotence unset; the default (on) is applied
+                // in resolved_producer_map, independent of profile.
+                idempotence: None,
             },
             Self::Balanced => ProducerKnobs {
                 batch_size_bytes: Some(65_536), // 64 KiB
@@ -143,6 +146,7 @@ impl SelfRegulationProfile {
                 compression_type: Some("lz4".to_string()),
                 buffer_memory_bytes: Some(33_554_432), // 32 MiB
                 max_in_flight: Some(5),
+                idempotence: None,
             },
             Self::LowLatency => ProducerKnobs {
                 batch_size_bytes: Some(16_384), // 16 KiB
@@ -150,6 +154,7 @@ impl SelfRegulationProfile {
                 compression_type: Some("lz4".to_string()),
                 buffer_memory_bytes: Some(16_777_216), // 16 MiB
                 max_in_flight: Some(5),
+                idempotence: None,
             },
         }
     }
@@ -249,6 +254,19 @@ pub struct ProducerKnobs {
     /// idempotent producers.
     #[serde(default)]
     pub max_in_flight: Option<u32>,
+
+    /// Enable the Kafka idempotent producer (`enable.idempotence`).
+    ///
+    /// `None` (default) -> ON: scalo enables idempotence by default (v2.10) as
+    /// the cheap "effectively-once" step -- it dedups producer-retry writes in
+    /// the broker at near-zero cost. Idempotence REQUIRES `acks=all`,
+    /// `max.in.flight<=5` and `retries>0`, so when on
+    /// [`resolved_producer_map`](KafkaSizingConfig::resolved_producer_map)
+    /// forces `acks=all` and clamps `max.in.flight` to 5. Set `Some(false)` to
+    /// opt out (e.g. a latency-bound topic that wants `acks=1`). The raw
+    /// `producer_librdkafka` escape hatch still wins over this.
+    #[serde(default)]
+    pub idempotence: Option<bool>,
 }
 
 /// Kafka sizing surface: profile + named per-knob overrides + raw escape hatch.
@@ -317,6 +335,11 @@ const GOVERNOR_PRODUCER_KEYS: &[&str] = &[
     "max.in.flight.requests.per.connection",
     "partitioner",
     "sticky.partitioning.linger.ms",
+    // Effectively-once invariants (v2.10): the sizing surface sets these when
+    // idempotence is on; a raw override changes the delivery guarantee.
+    "enable.idempotence",
+    "acks",
+    "retries",
 ];
 
 impl KafkaSizingConfig {
@@ -417,11 +440,22 @@ impl KafkaSizingConfig {
             .buffer_memory_bytes
             .or(profile_knobs.buffer_memory_bytes)
             .unwrap_or(1_073_741_824); // 1 GiB (librdkafka default)
-        let max_in_flight = self
+        // Effectively-once (v2.10): idempotence ON by default. It REQUIRES
+        // max.in.flight<=5, so when on we clamp the resolved value to 5 (a
+        // higher value would make librdkafka reject the producer at init).
+        let idempotence = self.producer.idempotence.unwrap_or(true);
+        let mut max_in_flight = self
             .producer
             .max_in_flight
             .or(profile_knobs.max_in_flight)
             .unwrap_or(1_000_000);
+        if idempotence && max_in_flight > 5 {
+            tracing::warn!(
+                requested = max_in_flight,
+                "kafka sizing: idempotence requires max.in.flight<=5; clamping to 5"
+            );
+            max_in_flight = 5;
+        }
 
         // queue.buffering.max.kbytes is in KiB -- convert from bytes.
         let buffer_kib = (buffer_memory_bytes / 1024).max(1);
@@ -438,6 +472,20 @@ impl KafkaSizingConfig {
             "max.in.flight.requests.per.connection".to_string(),
             max_in_flight.to_string(),
         );
+
+        // Effectively-once (v2.10): enable the idempotent producer by default.
+        // Dedups producer-retry writes in the broker at near-zero cost. It
+        // REQUIRES acks=all (forced here) and retries>0 (librdkafka default is
+        // high, left alone). Opt out with producer.idempotence=Some(false), or
+        // override either key via the raw producer_librdkafka escape hatch
+        // below (which wins). Disabling restores the prior leader-/profile-ack
+        // behaviour.
+        if idempotence {
+            map.insert("enable.idempotence".to_string(), "true".to_string());
+            map.insert("acks".to_string(), "all".to_string());
+        } else {
+            map.insert("enable.idempotence".to_string(), "false".to_string());
+        }
 
         // KIP-794 / uniform sticky for null-keyed messages.
         // `partitioner.ignore.keys` is a Java-client-only property and does
@@ -1661,6 +1709,80 @@ mod tests {
                 "throughput and low_latency must differ on {key}"
             );
         }
+    }
+
+    // --- Effectively-once: idempotent producer default (v2.10) ---
+
+    /// Idempotence is ON by default and forces acks=all on every profile.
+    #[test]
+    fn idempotence_on_by_default_forces_acks_all() {
+        for profile in [
+            SelfRegulationProfile::Throughput,
+            SelfRegulationProfile::Balanced,
+            SelfRegulationProfile::LowLatency,
+        ] {
+            let map = sizing_for_profile(profile).resolved_producer_map();
+            assert_eq!(
+                map["enable.idempotence"], "true",
+                "idempotence must default on for {profile:?}"
+            );
+            assert_eq!(
+                map["acks"], "all",
+                "idempotence requires acks=all for {profile:?}"
+            );
+        }
+    }
+
+    /// Opting out (idempotence=Some(false)) disables it and does NOT force acks.
+    #[test]
+    fn idempotence_opt_out_disables_and_leaves_acks() {
+        let s = KafkaSizingConfig {
+            profile: SelfRegulationProfile::Throughput,
+            producer: ProducerKnobs {
+                idempotence: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let map = s.resolved_producer_map();
+        assert_eq!(map["enable.idempotence"], "false");
+        assert!(
+            !map.contains_key("acks"),
+            "opt-out must not force acks (leaves librdkafka/profile default)"
+        );
+    }
+
+    /// Idempotence clamps an over-large max.in.flight to the safe limit of 5.
+    #[test]
+    fn idempotence_clamps_max_in_flight_to_five() {
+        let s = KafkaSizingConfig {
+            profile: SelfRegulationProfile::Throughput,
+            producer: ProducerKnobs {
+                max_in_flight: Some(100), // illegal under idempotence
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let map = s.resolved_producer_map();
+        assert_eq!(
+            map["max.in.flight.requests.per.connection"], "5",
+            "idempotence must clamp max.in.flight to 5"
+        );
+    }
+
+    /// The raw escape hatch still wins -- an operator can override acks even
+    /// with idempotence on (at their own risk).
+    #[test]
+    fn raw_override_beats_idempotence_acks() {
+        let mut producer_librdkafka = BTreeMap::new();
+        producer_librdkafka.insert("acks".to_string(), "1".to_string());
+        let s = KafkaSizingConfig {
+            profile: SelfRegulationProfile::Throughput,
+            producer_librdkafka,
+            ..Default::default()
+        };
+        let map = s.resolved_producer_map();
+        assert_eq!(map["acks"], "1", "raw producer_librdkafka must win over forced acks=all");
     }
 
     // --- Named knob overrides beat the profile ---

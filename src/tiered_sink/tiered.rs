@@ -245,6 +245,44 @@ impl<S: Sink> TieredSink<S> {
         }
     }
 
+    /// Decide the action for a spool-full event per the configured
+    /// [`WhenFull`](crate::tiered_sink::WhenFull) policy.
+    ///
+    /// Returns `true` to DROP the incoming record (shed and continue), `false`
+    /// to BLOCK (return `SpoolFull` so the caller backpressures the inbound
+    /// source -- scalo's lossless default).
+    ///
+    /// `Dlq` and `DropOldest` are not yet wired (they need a DLQ handle and
+    /// oldest-eviction access respectively); until then they degrade to the
+    /// SAFE, lossless `Block` with a warning -- never silent loss.
+    fn drop_on_full(&self) -> bool {
+        use crate::tiered_sink::WhenFull;
+        match self.config.when_full {
+            WhenFull::DropNewest => true,
+            WhenFull::Block => false,
+            WhenFull::Dlq | WhenFull::DropOldest => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    policy = ?self.config.when_full,
+                    "spool full: policy not yet wired (needs DLQ handle / oldest-eviction); \
+                     applying Block (lossless backpressure)"
+                );
+                false
+            }
+        }
+    }
+
+    /// Record a shed (dropped) record so overflow loss is never silent.
+    fn record_overflow_drop() {
+        #[cfg(feature = "metrics")]
+        {
+            ::metrics::counter!("tiered_sink_overflow_total", "policy" => "drop_newest")
+                .increment(1);
+            ::metrics::counter!("tiered_sink_dropped_total", "policy" => "drop_newest")
+                .increment(1);
+        }
+    }
+
     /// Reserve capacity (`fetch_update`) before enqueue; roll back
     /// on failure. Atomic reservation prevents two concurrent
     /// callers from both passing the cap check and overshooting.
@@ -260,7 +298,8 @@ impl<S: Sink> TieredSink<S> {
         // Reserve item slot.
         if let Some(max_items) = self.config.max_spool_items {
             let max_items_u64 = max_items as u64;
-            self.spool_count
+            if self
+                .spool_count
                 .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |cur| {
                     if cur < max_items_u64 {
                         Some(cur + 1)
@@ -268,9 +307,17 @@ impl<S: Sink> TieredSink<S> {
                         None
                     }
                 })
-                .map_err(|_| {
-                    TieredSinkError::SpoolFull(format!("max items {max_items} reached"))
-                })?;
+                .is_err()
+            {
+                // Spool full on item count -> apply the WhenFull policy.
+                if self.drop_on_full() {
+                    Self::record_overflow_drop();
+                    return Ok(());
+                }
+                return Err(TieredSinkError::SpoolFull(format!(
+                    "max items {max_items} reached"
+                )));
+            }
         } else {
             self.spool_count.fetch_add(1, AtomicOrdering::AcqRel);
         }
@@ -285,7 +332,13 @@ impl<S: Sink> TieredSink<S> {
                         .filter(|new| *new <= max_bytes)
                 },
             ) {
+                // Roll back the item-slot reservation taken above.
                 self.spool_count.fetch_sub(1, AtomicOrdering::AcqRel);
+                // Spool full on byte budget -> apply the WhenFull policy.
+                if self.drop_on_full() {
+                    Self::record_overflow_drop();
+                    return Ok(());
+                }
                 return Err(TieredSinkError::SpoolFull(format!(
                     "max spool bytes {max_bytes} reached (current: {current_bytes}, \
                      new message: {compressed_len})"
@@ -799,6 +852,70 @@ mod tests {
             }
         }
         assert!(hit_limit, "should have hit spool byte limit");
+
+        tiered.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_when_full_drop_newest_sheds_instead_of_erroring() {
+        use crate::tiered_sink::WhenFull;
+        let dir = tempdir().unwrap();
+        let spool_path = dir.path().join("test-drop-newest");
+
+        let sink = TestSink::new();
+        sink.set_available(false); // force everything to spool
+
+        let mut config = TieredSinkConfig::new(&spool_path);
+        config.circuit_failure_threshold = 1;
+        config.max_spool_bytes = Some(50); // tiny cap
+        config.when_full = WhenFull::DropNewest;
+
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+
+        // Send well past the cap. With DropNewest, NONE of these may surface a
+        // SpoolFull error -- the overflow is shed (Ok) and counted, not errored.
+        for _ in 0..200 {
+            match tiered.send(b"more data here").await {
+                Ok(()) => {}
+                Err(e) => panic!("DropNewest must shed, never error: {e}"),
+            }
+        }
+
+        // The spool never exceeds the byte cap (overflow was dropped, not stored).
+        assert!(
+            tiered.spool_bytes() <= 50,
+            "spool must stay within cap under DropNewest, got {}",
+            tiered.spool_bytes()
+        );
+
+        tiered.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_when_full_block_is_default_and_errors() {
+        // Default policy (Block) must still surface SpoolFull (lossless
+        // backpressure) -- guards against the new field changing the default.
+        let dir = tempdir().unwrap();
+        let spool_path = dir.path().join("test-block-default");
+
+        let sink = TestSink::new();
+        sink.set_available(false);
+
+        let mut config = TieredSinkConfig::new(&spool_path);
+        config.circuit_failure_threshold = 1;
+        config.max_spool_bytes = Some(50);
+        // when_full left at default (Block).
+
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+
+        let mut hit_limit = false;
+        for _ in 0..200 {
+            if let Err(TieredSinkError::SpoolFull(_)) = tiered.send(b"more data here").await {
+                hit_limit = true;
+                break;
+            }
+        }
+        assert!(hit_limit, "default Block policy must still error on spool full");
 
         tiered.shutdown().await;
     }

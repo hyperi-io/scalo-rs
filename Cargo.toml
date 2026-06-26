@@ -107,8 +107,10 @@ memory = ["sysinfo", "tracing"]
 # Unified self-regulation governor: a pressure seam that combines a HARD
 # memory signal (never masked) with weighted SOFT signals under a
 # hysteresis latch. Additive, default-off. Depends on MemoryGuard, so it
-# implies `memory`.
-governor = ["memory"]
+# implies `memory`. Pulls `tokio` for async waits, `parking_lot` for locks, and
+# the `gcra` crate (the `governor` token-bucket lib, renamed to avoid the
+# feature/crate name clash) for the rate limiter.
+governor = ["memory", "tokio", "parking_lot", "dep:gcra"]
 
 # Scaling pressure calculation (KEDA autoscaling)
 scaling = ["parking_lot", "tracing"]
@@ -349,6 +351,11 @@ memchr = { version = ">=2.7", optional = true }
 
 # Secrets management
 parking_lot = { version = ">=0.12.3, <0.13", optional = true }
+
+# Token-bucket / GCRA rate limiter (governor crate). Imported as `gcra` to
+# avoid a name clash with scalo's own `governor` module/feature (the crate and
+# the feature would otherwise both be `governor`). Used by governor::rate_limit.
+gcra = { package = "governor", version = ">=0.10.4, <0.11", optional = true }
 
 # Data parallelism (CPU-bound work distribution for worker pool)
 rayon = { version = ">=1.10, <2", optional = true }
