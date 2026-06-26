@@ -26,6 +26,13 @@ struct ResolvedOtelConfig {
     protocol: OtelProtocol,
     export_interval: Duration,
     service_name: String,
+    /// Deployment environment (dev/staging/prod), tagged on the OTel resource
+    /// as the stable semconv attribute `deployment.environment.name`. Sourced
+    /// from scalo's env detection ([`crate::env::get_app_env`]).
+    deployment_environment: String,
+    /// Consumer-configured extra resource attributes, applied LAST so they can
+    /// override the auto-set ones (e.g. a custom `deployment.environment.name`).
+    resource_attributes: std::collections::HashMap<String, String>,
 }
 
 /// Resolve OTel config with env var overrides.
@@ -53,11 +60,19 @@ fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
     let service_name =
         std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| config.service_name.clone());
 
+    // Deployment environment for the OTel resource. Sourced from scalo's own
+    // env detection (APP_ENV/ENVIRONMENT/ENV -> "development"), so traces and
+    // metrics are tagged with the tier without per-app wiring. A consumer can
+    // override via `resource_attributes["deployment.environment.name"]`.
+    let deployment_environment = crate::env::get_app_env();
+
     ResolvedOtelConfig {
         endpoint,
         protocol,
         export_interval,
         service_name,
+        deployment_environment,
+        resource_attributes: config.resource_attributes.clone(),
     }
 }
 
@@ -104,10 +119,22 @@ pub(crate) fn build_otel_recorder(
         .with_interval(resolved.export_interval)
         .build();
 
-    // Build resource
+    // Build resource: service.name + deployment.environment.name + any
+    // consumer-configured attributes. `deployment.environment.name` is the
+    // STABLE OTel semconv key (the bare `deployment.environment` is deprecated).
     let mut resource_builder = opentelemetry_sdk::Resource::builder();
     if !resolved.service_name.is_empty() {
         resource_builder = resource_builder.with_service_name(resolved.service_name);
+    }
+    if !resolved.deployment_environment.is_empty() {
+        resource_builder = resource_builder.with_attribute(opentelemetry::KeyValue::new(
+            "deployment.environment.name",
+            resolved.deployment_environment,
+        ));
+    }
+    // Consumer attributes applied LAST so they win over the auto-set ones.
+    for (k, v) in resolved.resource_attributes {
+        resource_builder = resource_builder.with_attribute(opentelemetry::KeyValue::new(k, v));
     }
     let resource = resource_builder.build();
 
@@ -132,4 +159,56 @@ pub(crate) fn build_otel_recorder(
     );
 
     Ok((recorder, provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deploy-env OTel: the deployment environment must be sourced from scalo's
+    // env detection (APP_ENV) and configured resource_attributes must pass
+    // through to the resolved config (they were previously dropped). Mirrors
+    // the temp_env pattern used by env.rs tests.
+    #[test]
+    fn resolve_sets_deployment_environment_and_keeps_resource_attributes() {
+        temp_env::with_vars(
+            [
+                ("APP_ENV", Some("production")),
+                ("ENVIRONMENT", None::<&str>),
+                ("ENV", None::<&str>),
+                ("OTEL_SERVICE_NAME", None::<&str>),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", None::<&str>),
+            ],
+            || {
+                let mut cfg = OtelMetricsConfig::default();
+                cfg.resource_attributes
+                    .insert("team".to_string(), "data-plane".to_string());
+                let resolved = resolve_config(&cfg);
+                assert_eq!(
+                    resolved.deployment_environment, "production",
+                    "deployment environment must come from APP_ENV"
+                );
+                assert_eq!(
+                    resolved.resource_attributes.get("team").map(String::as_str),
+                    Some("data-plane"),
+                    "configured resource attributes must survive resolution"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_deployment_environment_defaults_to_development() {
+        temp_env::with_vars(
+            [
+                ("APP_ENV", None::<&str>),
+                ("ENVIRONMENT", None::<&str>),
+                ("ENV", None::<&str>),
+            ],
+            || {
+                let resolved = resolve_config(&OtelMetricsConfig::default());
+                assert_eq!(resolved.deployment_environment, "development");
+            },
+        );
+    }
 }
