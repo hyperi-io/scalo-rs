@@ -54,6 +54,7 @@ mod cache;
 mod crypto;
 mod error;
 mod provider;
+mod resolve;
 mod types;
 
 #[cfg(feature = "secrets-vault")]
@@ -65,6 +66,7 @@ mod aws;
 pub use cache::SecretCache;
 pub use error::{SecretsError, SecretsResult};
 pub use provider::{FileProvider, SecretProvider};
+pub use resolve::{CredentialError, resolve, resolve_optional};
 pub use types::{
     CacheConfig, RotationEvent, SecretMetadata, SecretSource, SecretValue, SecretsConfig,
 };
