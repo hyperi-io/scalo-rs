@@ -27,8 +27,7 @@
 //! [`acquire`](RateLimiter::acquire) uses governor's `until_ready_with_jitter`,
 //! NOT a bare sleep-the-exact-deficit: when N tasks unblock at the same refill
 //! instant a fixed wait would stampede the downstream. Jitter (up to one cell
-//! period) spreads the wakeups. (Safety practice cribbed from governor's own
-//! guidance + the v2.10 reference review.)
+//! period) spreads the wakeups.
 //!
 //! **Delivery guarantee:** the limiter only DELAYS work. It never drops,
 //! reorders past a commit, or acks before the sink confirms -- at-least-once is

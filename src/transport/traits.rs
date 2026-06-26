@@ -99,8 +99,8 @@ pub trait TransportBase: Send + Sync {
     /// knows it is unhealthy); a transport SHOULD override with a real probe
     /// (Kafka metadata fetch, HTTP GET, Redis PING, file-path writability, ...).
     ///
-    /// Cribbed shape: a boxed/async `Result<()>` per-component check run in
-    /// parallel at boot (cf. Vector's per-sink `Healthcheck`).
+    /// Shape: a per-component async `Result<()>` probe, run in parallel at boot
+    /// by the factory (see [`boot_healthcheck`]).
     fn healthcheck(&self) -> impl Future<Output = TransportResult<()>> + Send {
         async move {
             if self.is_healthy() {

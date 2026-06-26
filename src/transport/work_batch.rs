@@ -105,6 +105,38 @@ pub struct Record {
     pub metadata: RecordMeta,
 }
 
+/// Header name carrying an optional idempotency / dedup key.
+///
+/// Set by an upstream (e.g. a content hash or the source offset) and read by an
+/// idempotent downstream (e.g. a dedup-on-key table, or a deterministic object
+/// key) to drop duplicates on replay. This is the second half of
+/// effectively-once delivery: the idempotent producer removes producer-retry
+/// duplicates on the wire, the dedup key lets the sink remove replay duplicates.
+/// Carried as a header (not a struct field) so it stays optional and does not
+/// touch the zero-copy record layout.
+pub const DEDUP_KEY_HEADER: &str = "x-scalo-dedup-key";
+
+impl Record {
+    /// The idempotency / dedup key for this record, if an upstream set one (via
+    /// the [`DEDUP_KEY_HEADER`] header). `None` when no key was attached.
+    #[must_use]
+    pub fn dedup_key(&self) -> Option<&[u8]> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.as_str() == DEDUP_KEY_HEADER)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Attach (or replace) the dedup key header, builder-style.
+    #[must_use]
+    pub fn with_dedup_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.headers.retain(|(k, _)| k.as_str() != DEDUP_KEY_HEADER);
+        self.headers
+            .push((DEDUP_KEY_HEADER.to_string(), key.into()));
+        self
+    }
+}
+
 /// The canonical zero-copy block of work records.
 ///
 /// One `WorkBatch` is the single currency through `get -> process -> send ->
@@ -573,6 +605,28 @@ mod tests {
                 format: PayloadFormat::Json,
             },
         }
+    }
+
+    #[test]
+    fn dedup_key_round_trips_via_header() {
+        // No key by default.
+        assert!(record(b"x").dedup_key().is_none());
+        // Set then read back.
+        let r = record(b"x").with_dedup_key("abc123");
+        assert_eq!(r.dedup_key(), Some(b"abc123".as_slice()));
+        // Setting again replaces, never duplicates the header.
+        let r2 = r.with_dedup_key("def456");
+        assert_eq!(r2.dedup_key(), Some(b"def456".as_slice()));
+        assert_eq!(
+            r2.headers
+                .iter()
+                .filter(|(k, _)| k == DEDUP_KEY_HEADER)
+                .count(),
+            1,
+            "dedup key header must be unique"
+        );
+        // Pre-existing unrelated headers are preserved.
+        assert!(r2.headers.iter().any(|(k, _)| k == "h"));
     }
 
     #[test]
