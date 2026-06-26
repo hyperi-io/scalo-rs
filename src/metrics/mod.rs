@@ -181,6 +181,49 @@ impl Default for MetricsConfig {
     }
 }
 
+/// Cascade-loadable metrics settings -- the consumer-facing subset of
+/// [`MetricsConfig`].
+///
+/// Kept as a separate serde struct because `MetricsConfig` holds non-serde
+/// fields (a `Duration`, cfg-gated OTel config). Loaded from the `metrics`
+/// config section, mirroring the `from_cascade` pattern used by
+/// `ScalingPressureConfig` / `SelfRegulationConfig`.
+///
+/// The whole point of this type is to DECOUPLE the metric namespace from the
+/// app name: the runtime used to force `namespace = app_name` (always
+/// prefixing every metric). Per the de-brand mandate, metric names are now
+/// BARE by default and a `{namespace}_` prefix is OPT-IN -- a consumer sets
+/// `metrics.namespace` independently (commonly, but not necessarily, to their
+/// app name). Differentiation between services is done via platform LABELS
+/// (Prometheus job/instance, OTel `service.name`), not the metric name.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MetricsSettings {
+    /// Metric namespace prefix. Empty (the default) = bare metric names; set it
+    /// to opt into a `{namespace}_` prefix.
+    #[serde(default)]
+    pub namespace: String,
+}
+
+impl MetricsSettings {
+    /// Load from the config cascade under the `metrics` key.
+    ///
+    /// Falls back to [`MetricsSettings::default()`] (bare namespace) if config
+    /// is not initialised or the key is absent -- so an app that sets nothing
+    /// gets bare metrics, never an `{app_name}_` prefix.
+    #[must_use]
+    pub fn from_cascade() -> Self {
+        #[cfg(feature = "config")]
+        {
+            if let Some(cfg) = crate::config::try_get()
+                && let Ok(settings) = cfg.unmarshal_key_registered::<Self>("metrics")
+            {
+                return settings;
+            }
+        }
+        Self::default()
+    }
+}
+
 /// Intermediate struct to pass recorder setup results across cfg boundaries.
 struct RecorderSetup {
     #[cfg(feature = "metrics")]
@@ -1278,6 +1321,30 @@ mod tests {
         assert!(config.enable_process_metrics);
         assert!(config.enable_container_metrics);
         assert_eq!(config.update_interval, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn metrics_settings_default_is_bare_namespace() {
+        // The decouple from app_name: with nothing configured, the namespace is
+        // empty (bare metric names), NOT the app name.
+        let settings = MetricsSettings::default();
+        assert!(
+            settings.namespace.is_empty(),
+            "default metrics namespace must be bare, not derived from app_name"
+        );
+        // from_cascade with no cascade initialised must also fall back to bare.
+        assert!(MetricsSettings::from_cascade().namespace.is_empty());
+    }
+
+    #[test]
+    fn metrics_settings_deserialises_namespace() {
+        // A consumer opts into a prefix by setting metrics.namespace.
+        let settings: MetricsSettings =
+            serde_json::from_str(r#"{"namespace":"myapp"}"#).expect("valid settings");
+        assert_eq!(settings.namespace, "myapp");
+        // Empty object -> bare (serde default).
+        let bare: MetricsSettings = serde_json::from_str("{}").expect("valid empty");
+        assert!(bare.namespace.is_empty());
     }
 
     #[test]

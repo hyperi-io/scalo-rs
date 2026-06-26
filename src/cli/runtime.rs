@@ -117,7 +117,13 @@ impl ServiceRuntime {
         let ctx = runtime_context();
 
         // --- Metrics ---
-        let mut metrics = MetricsManager::new(app_name);
+        // Namespace is DECOUPLED from app_name: sourced from the `metrics`
+        // config section (bare by default), NOT forced to the app name. Metric
+        // names are bare unless the consumer opts into a `{namespace}_` prefix
+        // via `metrics.namespace`; services are differentiated by platform
+        // labels (Prometheus job/instance, OTel service.name), not the name.
+        let metrics_namespace = crate::metrics::MetricsSettings::from_cascade().namespace;
+        let mut metrics = MetricsManager::new(&metrics_namespace);
         let dfe = Arc::new(crate::metrics::ServiceMetrics::register(&metrics));
 
         // App info metric (version, commit, service name)
