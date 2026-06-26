@@ -278,9 +278,8 @@ impl DrainStrategy {
 /// `tiered_sink_dropped_total{policy}` for the drop variants) so loss is never
 /// silent and always alertable.
 ///
-/// Pattern cribbed from Vector's `WhenFull` (block / drop_newest / overflow);
-/// `Dlq` is the scalo no-silent-drop addition (overflow goes to the DLQ instead
-/// of being dropped or crashing the spool).
+/// `Dlq` is the scalo no-silent-drop variant: overflow is diverted to the DLQ
+/// instead of being dropped or crashing the spool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WhenFull {
