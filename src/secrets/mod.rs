@@ -25,6 +25,18 @@
 //! - Background refresh for proactive secret renewal
 //! - Rotation callbacks for application notification
 //!
+//! ## Credential specs
+//!
+//! [`resolve`] / [`resolve_optional`] turn a short credential spec string
+//! into a plaintext value, so data-plane services share one syntax:
+//!
+//! - `vault:path:key` -- fetch from OpenBao (needs the `secrets-vault` feature)
+//! - `env:VAR` -- read an environment variable (hard error if unset)
+//! - any other string -- used as a literal value
+//!
+//! Folded in from the former `credential` module - see [`CredentialError`]
+//! for the failure modes.
+//!
 //! ## Example
 //!
 //! ```rust,no_run

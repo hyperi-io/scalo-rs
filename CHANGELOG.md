@@ -4,6 +4,16 @@ All notable changes to scalo are recorded here, following
 [Semantic Versioning](https://semver.org/). History prior to the
 open-source release is intentionally not included.
 
+## 2.9.1 (unreleased)
+
+- Credential specs (`vault:path:key`, `env:VAR`, literal) now resolve
+  through `scalo::secrets::{resolve, resolve_optional}`, folded in from
+  the former `credential` module so every service shares one syntax.
+- Generated Dockerfile licence/copyright labels come from the deployment
+  contract's OCI labels, not a hardcoded value.
+- Bumped git2 to 0.21 (clears RUSTSEC-2026-0183 / -0184) and dropped the
+  libssh2-sys / openssl-sys chain it pulled in - fewer native deps.
+
 ## 2.9.0 (2026-06-24)
 
 Initial open-source release. scalo is the Apache-2.0 continuation of a

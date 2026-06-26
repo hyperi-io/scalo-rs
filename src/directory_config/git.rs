@@ -79,7 +79,7 @@ pub fn git_push(dir: &Path) -> DirectoryConfigResult<()> {
         .map_err(|e| DirectoryConfigError::GitError(format!("failed to get HEAD: {e}")))?;
     let refname = head
         .name()
-        .ok_or_else(|| DirectoryConfigError::GitError("HEAD is not a valid UTF-8 ref".into()))?;
+        .map_err(|e| DirectoryConfigError::GitError(format!("HEAD ref not valid UTF-8: {e}")))?;
 
     let mut remote = repo
         .find_remote("origin")
@@ -98,7 +98,7 @@ pub fn git_current_branch(dir: &Path) -> Option<String> {
     let repo = Repository::open(dir).ok()?;
     let head = repo.head().ok()?;
     if head.is_branch() {
-        head.shorthand().map(String::from)
+        head.shorthand().ok().map(String::from)
     } else {
         None
     }

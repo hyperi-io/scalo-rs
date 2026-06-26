@@ -46,6 +46,32 @@ K8s `Secret` volume mounts that come through as files.
 
 ---
 
+## Credential specs
+
+`resolve()` / `resolve_optional()` turn a short spec string into a
+plaintext value, so config knobs and data-plane services share one
+syntax instead of each hand-rolling its own env/vault lookup:
+
+| Spec | Resolves to |
+|------|-------------|
+| `vault:path:key` | OpenBao lookup via `SecretsManager` (needs `secrets-vault`) |
+| `env:VAR` | the environment variable `VAR` (hard error if unset) |
+| anything else | the literal string |
+
+```rust
+use scalo::secrets::resolve;
+
+// "env:KAFKA_PASSWORD" -> the env value; "s3kr3t" -> "s3kr3t" verbatim
+let password = resolve(spec).await?;
+```
+
+`resolve_optional(Option<&str>)` returns `None` for `None` or an empty
+string, otherwise resolves the inner spec. Failures surface as
+`CredentialError` -- missing env var, vault lookup failure, malformed
+vault spec, or a `vault:` spec used without the `secrets-vault` feature.
+
+---
+
 ## Caching
 
 Results are cached with a configurable TTL. Cache hits skip the
@@ -133,6 +159,9 @@ backend.
 | `SecretProvider` trait | Implement to add a custom backend |
 | `SecretValue::as_str() -> SecretsResult<&str>` | Reveal the raw value as UTF-8 (grep-able call site) |
 | `SecretValue::as_bytes() -> &[u8]` | Reveal the raw value as bytes |
+| `resolve(spec) -> String` | Resolve a `vault:`/`env:`/literal credential spec |
+| `resolve_optional(Option<spec>) -> Option<String>` | As `resolve`, but `None`/empty in -> `None` out |
+| `CredentialError` | Failure modes for `resolve` / `resolve_optional` |
 
 ---
 
