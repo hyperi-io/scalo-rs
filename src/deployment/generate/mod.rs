@@ -105,6 +105,46 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_header_defaults_to_scalo_licence_and_copyright() {
+        // Default contract (OciLabels::default) must keep scalo's own header --
+        // guards the default-preserving fix for #4 (no golden-output change).
+        let contract = test_contract();
+        let dockerfile = generate_dockerfile(&contract, None);
+        assert!(
+            dockerfile.contains("# License:   Apache-2.0"),
+            "default header must carry scalo's Apache-2.0 licence"
+        );
+        assert!(
+            dockerfile.contains("# Copyright: (c) 2026 HYPERI PTY LIMITED"),
+            "default header must carry scalo's copyright"
+        );
+    }
+
+    #[test]
+    fn dockerfile_header_uses_consumer_licence_and_copyright() {
+        // A non-Apache consumer (e.g. a BUSL-1.1 app) must get ITS licence +
+        // copyright in the generated header, not scalo's (issue #4).
+        let mut contract = test_contract();
+        contract.oci_labels = OciLabels {
+            licenses: "BUSL-1.1".into(),
+            copyright: "(c) 2026 Acme Corp".into(),
+            ..OciLabels::default()
+        };
+        let dockerfile = generate_dockerfile(&contract, None);
+        assert!(
+            dockerfile.contains("# License:   BUSL-1.1"),
+            "consumer licence must flow into the header"
+        );
+        assert!(
+            dockerfile.contains("# Copyright: (c) 2026 Acme Corp"),
+            "consumer copyright must flow into the header"
+        );
+        // And scalo's defaults must NOT leak in.
+        assert!(!dockerfile.contains("Apache-2.0"));
+        assert!(!dockerfile.contains("HYPERI PTY LIMITED"));
+    }
+
+    #[test]
     fn test_generate_dockerfile_with_native_deps() {
         let mut contract = test_contract();
         contract.native_deps = NativeDepsContract::for_rustlib_features(

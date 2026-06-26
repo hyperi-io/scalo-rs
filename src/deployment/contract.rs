@@ -141,9 +141,17 @@ pub struct OciLabels {
     /// Image vendor.
     #[serde(default = "default_vendor")]
     pub vendor: String,
-    /// License identifier.
+    /// License identifier (SPDX). Drives BOTH the OCI
+    /// `org.opencontainers.image.licenses` label AND the generated Dockerfile's
+    /// `# License` header comment, so a non-Apache consumer (e.g. a BUSL-1.1
+    /// app) gets a correct header. Defaults to scalo's own (Apache-2.0).
     #[serde(default = "default_license")]
     pub licenses: String,
+    /// Copyright holder line for the generated Dockerfile's `# Copyright`
+    /// header comment. Consumer-supplied so a non-scalo consumer does not get
+    /// scalo's copyright stamped into their repo. Defaults to scalo's own.
+    #[serde(default = "default_copyright")]
+    pub copyright: String,
 }
 
 impl Default for OciLabels {
@@ -153,6 +161,7 @@ impl Default for OciLabels {
             description: String::new(),
             vendor: default_vendor(),
             licenses: default_license(),
+            copyright: default_copyright(),
         }
     }
 }
@@ -163,6 +172,10 @@ fn default_vendor() -> String {
 
 fn default_license() -> String {
     "Apache-2.0".to_string()
+}
+
+fn default_copyright() -> String {
+    "(c) 2026 HYPERI PTY LIMITED".to_string()
 }
 
 fn default_schema_version() -> u32 {
