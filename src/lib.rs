@@ -84,6 +84,7 @@
 #![allow(clippy::missing_errors_doc)] // MVP does not require exhaustive docs
 #![allow(clippy::double_must_use)] // Return types already marked must_use
 #![allow(clippy::unused_async)] // Async for future compatibility
+#![allow(clippy::duration_suboptimal_units)] // from_hours/from_mins need Rust 1.99 > MSRV
 #![allow(clippy::redundant_closure_for_method_calls)] // Clearer with explicit closure
 #![allow(clippy::result_large_err)] // figment::Error is large by design
 #![allow(clippy::needless_pass_by_value)]
@@ -142,6 +143,11 @@ pub mod http_client;
 #[cfg_attr(docsrs, doc(cfg(feature = "http-server")))]
 pub mod http_server;
 
+// Shared on-disk spool helpers (CRC framing + corrupt-cache quarantine) used by
+// both the standalone Spool and the TieredSink cold path.
+#[cfg(any(feature = "spool", feature = "tiered-sink"))]
+pub(crate) mod spool_codec;
+
 #[cfg(feature = "spool")]
 #[cfg_attr(docsrs, doc(cfg(feature = "spool")))]
 pub mod spool;
@@ -149,6 +155,10 @@ pub mod spool;
 #[cfg(feature = "tiered-sink")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tiered-sink")))]
 pub mod tiered_sink;
+
+#[cfg(feature = "sink-stack")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sink-stack")))]
+pub mod sink_stack;
 
 #[cfg(feature = "secrets")]
 #[cfg_attr(docsrs, doc(cfg(feature = "secrets")))]
@@ -292,8 +302,8 @@ pub use spool::{Spool, SpoolConfig, SpoolError};
 #[cfg(feature = "tiered-sink")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tiered-sink")))]
 pub use tiered_sink::{
-    CircuitBreaker, CircuitState, CompressionCodec, DrainStrategy, OrderingMode, Sink, SinkError,
-    TieredSink, TieredSinkConfig, TieredSinkError,
+    CircuitBreaker, CircuitState, CompressionCodec, DrainStrategy, OrderingMode, TieredSink,
+    TieredSinkConfig, TieredSinkError,
 };
 
 #[cfg(feature = "secrets")]

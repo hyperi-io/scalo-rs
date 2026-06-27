@@ -1782,7 +1782,10 @@ mod tests {
             ..Default::default()
         };
         let map = s.resolved_producer_map();
-        assert_eq!(map["acks"], "1", "raw producer_librdkafka must win over forced acks=all");
+        assert_eq!(
+            map["acks"], "1",
+            "raw producer_librdkafka must win over forced acks=all"
+        );
     }
 
     // --- Named knob overrides beat the profile ---

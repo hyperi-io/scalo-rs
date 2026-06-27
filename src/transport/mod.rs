@@ -54,6 +54,7 @@ mod detect;
 mod error;
 pub mod factory;
 pub mod filter;
+pub mod finalizer;
 pub mod propagation;
 mod traits;
 mod types;
@@ -94,13 +95,14 @@ pub mod routed;
 pub use codec::{CodecError, FieldRef, ParsedPayload, parse};
 pub use error::{TransportError, TransportResult};
 pub use factory::{AnyReceiver, AnySender, AnyToken};
+pub use finalizer::{BatchFinalizer, DeliveryStatus, PieceFinalizer};
 pub use routed::RoutedSender;
 pub use traits::{
     CommitToken, FromCascade, HealthcheckConfig, RecvBatch, RecvLimits, Transport, TransportBase,
     TransportReceiver, TransportSender, boot_healthcheck,
 };
 pub use types::{Message, SendResult, TransportConfig, TransportType};
-pub use work_batch::{FramingError, Record, RecordMeta, WorkBatch};
+pub use work_batch::{FramingError, Record, RecordCodecError, RecordMeta, WorkBatch};
 
 #[cfg(feature = "transport-kafka")]
 pub use kafka::{KafkaConfig, KafkaToken, KafkaTransport};

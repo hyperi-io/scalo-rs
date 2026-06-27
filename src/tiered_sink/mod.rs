@@ -46,29 +46,21 @@
 //!
 //! ## Example
 //!
+//! TieredSink wraps any [`TransportSender`](crate::transport::TransportSender) --
+//! the same senders the transport factory produces. Records go straight to the
+//! sender on the happy path (no encode); only when the downstream fails are they
+//! serialised and spilled to disk, then drained back on recovery.
+//!
 //! ```rust,ignore
-//! use scalo::tiered_sink::{TieredSink, TieredSinkConfig, Sink, SinkError};
+//! use scalo::tiered_sink::{TieredSink, TieredSinkConfig};
+//! use scalo::transport::AnySender;
 //!
-//! // Implement Sink for your backend
-//! struct MyKafkaSink { /* ... */ }
-//!
-//! #[async_trait::async_trait]
-//! impl Sink for MyKafkaSink {
-//!     type Error = MyError;
-//!
-//!     async fn try_send(&self, data: &[u8]) -> Result<(), SinkError<Self::Error>> {
-//!         // Send to Kafka...
-//!         Ok(())
-//!     }
-//! }
-//!
-//! // Wrap with TieredSink
-//! let kafka = MyKafkaSink::new();
+//! let sender = AnySender::from_config("transport.output").await?;
 //! let config = TieredSinkConfig::new("/var/spool/myapp.queue");
-//! let tiered = TieredSink::new(kafka, config).await?;
+//! let tiered = TieredSink::new(sender, config).await?;
 //!
-//! // Use tiered - automatically spills to disk if Kafka is down
-//! tiered.send(b"my message").await?;
+//! // Automatically spills to disk if the downstream is down, drains on recovery.
+//! tiered.send(&record).await?;
 //! ```
 
 mod circuit;
@@ -76,14 +68,12 @@ mod codec;
 mod config;
 mod drainer;
 mod error;
-mod sink;
 mod tiered;
 
 pub use circuit::{CircuitBreaker, CircuitState};
 pub use codec::CompressionCodec;
 pub use config::{DiskAwareConfig, DrainStrategy, OrderingMode, TieredSinkConfig, WhenFull};
 pub use error::TieredSinkError;
-pub use sink::{Sink, SinkError};
 pub use tiered::TieredSink;
 
 /// Result type for tiered sink operations.

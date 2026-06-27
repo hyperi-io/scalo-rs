@@ -8,7 +8,8 @@
 
 //! Background drain task for spooled messages.
 
-use crate::tiered_sink::{CircuitBreaker, DrainStrategy, Sink, SinkError};
+use crate::tiered_sink::{CircuitBreaker, DrainStrategy};
+use crate::transport::{Record, SendResult, TransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -118,14 +119,15 @@ impl Drainer {
 enum DrainResult {
     /// Successfully sent and committed
     Success,
-    /// Sink is full (backpressure)
-    SinkFull,
-    /// Sink is unavailable
+    /// Sink is unavailable / backpressured
     SinkUnavailable,
     /// Fatal error sending
     Fatal(String),
     /// Decompression error
     DecompressError(String),
+    /// The spooled bytes could not be decoded back into a record (corrupt /
+    /// incompatible frame). Dropped (committed) so it cannot wedge the queue.
+    DecodeError(String),
     /// Queue is empty
     Empty,
     /// I/O error
@@ -142,13 +144,14 @@ enum DrainResult {
 /// `fifo_gate`: `Some` in StrictFifo, acquired per delivery cycle
 /// to serialise with senders. `None` in Interleaved (lock-free).
 #[allow(clippy::too_many_arguments)]
-pub async fn drain_loop<S: Sink>(
+pub async fn drain_loop<S: TransportSender + 'static>(
     sink: Arc<S>,
     spool_receiver: Arc<Mutex<Receiver>>,
     spool_count: Arc<AtomicU64>,
     spool_bytes: Arc<AtomicU64>,
     circuit: Arc<CircuitBreaker>,
     codec: crate::tiered_sink::CompressionCodec,
+    crc: bool,
     strategy: DrainStrategy,
     interval: Duration,
     shutdown: Arc<Notify>,
@@ -180,8 +183,10 @@ pub async fn drain_loop<S: Sink>(
             () = tokio::time::sleep(interval) => {}
         }
 
-        // Don't drain if circuit is open
-        if circuit.is_open().await {
+        // Gate the drain through the breaker. When half-open this claims the
+        // single recovery-probe permit, so the drainer alone probes the
+        // recovering sink rather than racing the hot path onto it.
+        if !circuit.allow_request().await {
             continue;
         }
 
@@ -199,48 +204,68 @@ pub async fn drain_loop<S: Sink>(
             let recv_result = receiver.try_recv();
             match recv_result {
                 Ok(guard) => {
-                    // Copy the compressed data
-                    let compressed = guard.to_vec();
-                    let compressed_len = compressed.len() as u64;
+                    let raw = guard.to_vec();
+                    let compressed_len = raw.len() as u64;
 
-                    // Decompress
-                    let decompress_result = codec.decompress(&compressed);
+                    // Verify+strip the CRC header (when enabled), then decompress.
+                    // Either failing means the spilled bytes are unreadable -- drop
+                    // (commit) the record below, never replay garbage downstream.
+                    let decompress_result: std::result::Result<Vec<u8>, String> =
+                        crate::spool_codec::unframe(crc, raw)
+                            .map_err(|c| c.0)
+                            .and_then(|c| codec.decompress(&c).map_err(|e| e.to_string()));
                     match decompress_result {
                         Ok(data) => {
-                            // Try to send
-                            let send_result = sink.try_send(&data).await;
-                            match send_result {
-                                Ok(()) => {
-                                    // Commit FIRST; only decrement on commit success.
-                                    // F5: previously decremented unconditionally,
-                                    // letting counters drift while the entry still
-                                    // sat in the queue.
-                                    match guard.commit() {
-                                        Ok(()) => {
-                                            spool_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                                            spool_bytes
-                                                .fetch_sub(compressed_len, AtomicOrdering::Relaxed);
-                                            DrainResult::Success
+                            // Decode the spooled record and replay it to the
+                            // downstream. A record that no longer decodes cannot
+                            // be replayed -- drop it (commit) like a decode error,
+                            // never block the queue forever on a poison entry.
+                            match Record::decode(&data) {
+                                Ok(record) => {
+                                    match sink.send_batch(std::slice::from_ref(&record)).await {
+                                        SendResult::Ok | SendResult::FilteredDlq => {
+                                            // Commit FIRST; only decrement on commit
+                                            // success so counters never drift while
+                                            // the entry still sits in the queue.
+                                            match guard.commit() {
+                                                Ok(()) => {
+                                                    spool_count
+                                                        .fetch_sub(1, AtomicOrdering::Relaxed);
+                                                    spool_bytes.fetch_sub(
+                                                        compressed_len,
+                                                        AtomicOrdering::Relaxed,
+                                                    );
+                                                    DrainResult::Success
+                                                }
+                                                Err(e) => DrainResult::CommitFailed(e.to_string()),
+                                            }
                                         }
-                                        Err(e) => DrainResult::CommitFailed(e.to_string()),
+                                        SendResult::Backpressured => {
+                                            // Don't commit - guard rolls back, retry later.
+                                            drop(guard);
+                                            DrainResult::SinkUnavailable
+                                        }
+                                        SendResult::Fatal(e) => match guard.commit() {
+                                            Ok(()) => {
+                                                spool_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                                                spool_bytes.fetch_sub(
+                                                    compressed_len,
+                                                    AtomicOrdering::Relaxed,
+                                                );
+                                                DrainResult::Fatal(e.to_string())
+                                            }
+                                            Err(commit_err) => {
+                                                DrainResult::CommitFailed(commit_err.to_string())
+                                            }
+                                        },
                                     }
                                 }
-                                Err(SinkError::Full) => {
-                                    // Don't commit - guard drops and rolls back
-                                    drop(guard);
-                                    DrainResult::SinkFull
-                                }
-                                Err(SinkError::Unavailable) => {
-                                    // Don't commit - guard drops and rolls back
-                                    drop(guard);
-                                    DrainResult::SinkUnavailable
-                                }
-                                Err(SinkError::Fatal(e)) => match guard.commit() {
+                                Err(decode_err) => match guard.commit() {
                                     Ok(()) => {
                                         spool_count.fetch_sub(1, AtomicOrdering::Relaxed);
                                         spool_bytes
                                             .fetch_sub(compressed_len, AtomicOrdering::Relaxed);
-                                        DrainResult::Fatal(e.to_string())
+                                        DrainResult::DecodeError(decode_err.to_string())
                                     }
                                     Err(commit_err) => {
                                         DrainResult::CommitFailed(commit_err.to_string())
@@ -252,7 +277,7 @@ pub async fn drain_loop<S: Sink>(
                             Ok(()) => {
                                 spool_count.fetch_sub(1, AtomicOrdering::Relaxed);
                                 spool_bytes.fetch_sub(compressed_len, AtomicOrdering::Relaxed);
-                                DrainResult::DecompressError(e.to_string())
+                                DrainResult::DecompressError(e)
                             }
                             Err(commit_err) => DrainResult::CommitFailed(commit_err.to_string()),
                         },
@@ -275,11 +300,6 @@ pub async fn drain_loop<S: Sink>(
                 #[cfg(feature = "tracing")]
                 tracing::debug!(rate = drainer.current_rate(), "Drained message to sink");
             }
-            DrainResult::SinkFull => {
-                drainer.record_failure();
-                #[cfg(feature = "tracing")]
-                tracing::debug!("Sink full during drain, will retry");
-            }
             DrainResult::SinkUnavailable => {
                 drainer.record_failure();
                 circuit.record_failure().await;
@@ -293,6 +313,10 @@ pub async fn drain_loop<S: Sink>(
             DrainResult::DecompressError(e) => {
                 #[cfg(feature = "tracing")]
                 tracing::error!(error = %e, "Failed to decompress spooled message, dropping");
+            }
+            DrainResult::DecodeError(e) => {
+                #[cfg(feature = "tracing")]
+                tracing::error!(error = %e, "Failed to decode spooled record, dropping");
             }
             DrainResult::Empty | DrainResult::IoError => {
                 // Nothing to do, just continue

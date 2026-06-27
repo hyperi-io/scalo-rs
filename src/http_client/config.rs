@@ -33,6 +33,12 @@ pub struct HttpClientConfig {
     #[serde(default = "default_max_retry_interval_ms")]
     pub max_retry_interval_ms: u64,
 
+    /// Allow retrying non-idempotent methods (POST). Default: false -- replaying
+    /// a POST can duplicate side effects, so enable only for endpoints that
+    /// dedupe (e.g. via an idempotency key).
+    #[serde(default)]
+    pub retry_non_idempotent: bool,
+
     /// Custom User-Agent header. Default: None (uses reqwest default).
     #[serde(default)]
     pub user_agent: Option<String>,
@@ -62,6 +68,7 @@ impl Default for HttpClientConfig {
             max_retries: default_max_retries(),
             min_retry_interval_ms: default_min_retry_interval_ms(),
             max_retry_interval_ms: default_max_retry_interval_ms(),
+            retry_non_idempotent: false,
             user_agent: None,
         }
     }
@@ -95,6 +102,7 @@ mod tests {
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.min_retry_interval_ms, 100);
         assert_eq!(config.max_retry_interval_ms, 30_000);
+        assert!(!config.retry_non_idempotent);
         assert!(config.user_agent.is_none());
     }
 

@@ -135,6 +135,175 @@ impl Record {
             .push((DEDUP_KEY_HEADER.to_string(), key.into()));
         self
     }
+
+    /// Serialise the WHOLE record (payload + key + headers + metadata) to a
+    /// compact self-describing byte frame.
+    ///
+    /// This is what the send-side spill cache persists: spilling only the
+    /// payload bytes would lose the routing key, headers, and the dedup key, so a
+    /// drained replay could not address the downstream or dedupe correctly. The
+    /// frame is little-endian and length-prefixed:
+    ///
+    /// ```text
+    /// version:u8=1 | payload(len:u32, bytes) | key(present:u8, len:u32?, utf8?)
+    ///   | headers(count:u32, [klen:u32,k, vlen:u32,v]*) | ts(present:u8, i64?)
+    ///   | format:u8 (0=auto,1=json,2=msgpack)
+    /// ```
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.payload.len() + 32);
+        buf.push(1u8); // frame version
+
+        put_u32(
+            &mut buf,
+            u32::try_from(self.payload.len()).unwrap_or(u32::MAX),
+        );
+        buf.extend_from_slice(&self.payload);
+
+        match &self.key {
+            Some(k) => {
+                buf.push(1);
+                put_u32(&mut buf, u32::try_from(k.len()).unwrap_or(u32::MAX));
+                buf.extend_from_slice(k.as_bytes());
+            }
+            None => buf.push(0),
+        }
+
+        put_u32(
+            &mut buf,
+            u32::try_from(self.headers.len()).unwrap_or(u32::MAX),
+        );
+        for (k, v) in &self.headers {
+            put_u32(&mut buf, u32::try_from(k.len()).unwrap_or(u32::MAX));
+            buf.extend_from_slice(k.as_bytes());
+            put_u32(&mut buf, u32::try_from(v.len()).unwrap_or(u32::MAX));
+            buf.extend_from_slice(v);
+        }
+
+        match self.metadata.timestamp_ms {
+            Some(ts) => {
+                buf.push(1);
+                buf.extend_from_slice(&ts.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+
+        buf.push(match self.metadata.format {
+            PayloadFormat::Auto => 0,
+            PayloadFormat::Json => 1,
+            PayloadFormat::MsgPack => 2,
+        });
+        buf
+    }
+
+    /// Reconstruct a record from a frame produced by [`encode`](Self::encode).
+    ///
+    /// # Errors
+    /// [`RecordCodecError`] on a truncated/malformed frame, an unknown version
+    /// or format byte, or invalid UTF-8 in the key/header names. Bounds are
+    /// checked on every field, so a corrupt frame fails fast rather than
+    /// over-reading or over-allocating.
+    pub fn decode(bytes: &[u8]) -> std::result::Result<Self, RecordCodecError> {
+        let mut r = FrameReader { buf: bytes, pos: 0 };
+        let version = r.u8()?;
+        if version != 1 {
+            return Err(RecordCodecError::Version(version));
+        }
+        let payload = Bytes::copy_from_slice(r.bytes()?);
+        let key = if r.u8()? == 1 {
+            let raw = r.bytes()?;
+            let s = std::str::from_utf8(raw).map_err(|_| RecordCodecError::Utf8)?;
+            Some(Arc::from(s))
+        } else {
+            None
+        };
+        let n_headers = r.u32()? as usize;
+        // Cap the pre-allocation -- a corrupt count cannot force a huge alloc;
+        // the per-header reads are still bounds-checked and fail fast on EOF.
+        let mut headers = Vec::with_capacity(n_headers.min(64));
+        for _ in 0..n_headers {
+            let k = std::str::from_utf8(r.bytes()?)
+                .map_err(|_| RecordCodecError::Utf8)?
+                .to_string();
+            let v = r.bytes()?.to_vec();
+            headers.push((k, v));
+        }
+        let timestamp_ms = if r.u8()? == 1 { Some(r.i64()?) } else { None };
+        let format = match r.u8()? {
+            0 => PayloadFormat::Auto,
+            1 => PayloadFormat::Json,
+            2 => PayloadFormat::MsgPack,
+            other => return Err(RecordCodecError::Format(other)),
+        };
+        Ok(Self {
+            payload,
+            key,
+            headers,
+            metadata: RecordMeta {
+                timestamp_ms,
+                format,
+            },
+        })
+    }
+}
+
+/// Append a little-endian `u32` length prefix.
+fn put_u32(buf: &mut Vec<u8>, n: u32) {
+    buf.extend_from_slice(&n.to_le_bytes());
+}
+
+/// Bounds-checked cursor over an encoded [`Record`] frame.
+struct FrameReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FrameReader<'a> {
+    fn take(&mut self, n: usize) -> std::result::Result<&'a [u8], RecordCodecError> {
+        let end = self.pos.checked_add(n).ok_or(RecordCodecError::Eof)?;
+        if end > self.buf.len() {
+            return Err(RecordCodecError::Eof);
+        }
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+    fn u8(&mut self) -> std::result::Result<u8, RecordCodecError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> std::result::Result<u32, RecordCodecError> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().unwrap_or([0; 4]),
+        ))
+    }
+    fn i64(&mut self) -> std::result::Result<i64, RecordCodecError> {
+        Ok(i64::from_le_bytes(
+            self.take(8)?.try_into().unwrap_or([0; 8]),
+        ))
+    }
+    /// Read a `u32`-length-prefixed byte slice.
+    fn bytes(&mut self) -> std::result::Result<&'a [u8], RecordCodecError> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
+}
+
+/// Failure modes for [`Record::decode`].
+#[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordCodecError {
+    /// The frame ended before a field could be fully read (truncated/corrupt).
+    #[error("record codec: unexpected end of frame")]
+    Eof,
+    /// The frame's version byte is not supported by this build.
+    #[error("record codec: unsupported frame version {0}")]
+    Version(u8),
+    /// A key or header name was not valid UTF-8.
+    #[error("record codec: invalid UTF-8 in key/header name")]
+    Utf8,
+    /// The payload-format byte was not a known variant.
+    #[error("record codec: unknown payload format {0}")]
+    Format(u8),
 }
 
 /// The canonical zero-copy block of work records.
@@ -605,6 +774,77 @@ mod tests {
                 format: PayloadFormat::Json,
             },
         }
+    }
+
+    #[test]
+    fn encode_decode_round_trips_full_record() {
+        let original = record(b"hello world").with_dedup_key("dedup-42");
+        let bytes = original.encode();
+        let decoded = Record::decode(&bytes).unwrap();
+        assert_eq!(decoded.payload, original.payload);
+        assert_eq!(decoded.key, original.key);
+        assert_eq!(decoded.headers, original.headers);
+        assert_eq!(decoded.metadata, original.metadata);
+        // The dedup key (a header) survives the round-trip -- effectively-once.
+        assert_eq!(decoded.dedup_key(), Some(b"dedup-42".as_slice()));
+    }
+
+    #[test]
+    fn encode_decode_round_trips_minimal_record() {
+        // No key, no headers, no timestamp, msgpack format.
+        let original = Record {
+            payload: Bytes::from_static(&[0x81, 0xa3]),
+            key: None,
+            headers: Vec::new(),
+            metadata: RecordMeta {
+                timestamp_ms: None,
+                format: PayloadFormat::MsgPack,
+            },
+        };
+        let decoded = Record::decode(&original.encode()).unwrap();
+        assert_eq!(decoded.payload, original.payload);
+        assert!(decoded.key.is_none());
+        assert!(decoded.headers.is_empty());
+        assert_eq!(decoded.metadata, original.metadata);
+    }
+
+    #[test]
+    fn encode_decode_handles_empty_payload_and_binary_headers() {
+        let original = Record {
+            payload: Bytes::new(),
+            key: Some(Arc::from("k")),
+            headers: vec![("bin".to_string(), vec![0, 255, 1, 254])],
+            metadata: RecordMeta {
+                timestamp_ms: Some(-5),
+                format: PayloadFormat::Auto,
+            },
+        };
+        let decoded = Record::decode(&original.encode()).unwrap();
+        assert_eq!(decoded.payload.len(), 0);
+        assert_eq!(decoded.headers, original.headers);
+        assert_eq!(decoded.metadata.timestamp_ms, Some(-5));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_frame() {
+        let bytes = record(b"some payload").encode();
+        // Every proper prefix shorter than the whole frame must error, never
+        // panic or over-read.
+        for cut in 0..bytes.len() {
+            assert!(
+                Record::decode(&bytes[..cut]).is_err(),
+                "truncated-to-{cut} frame must be rejected"
+            );
+        }
+        // The whole frame decodes.
+        assert!(Record::decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn decode_rejects_bad_version() {
+        let mut bytes = record(b"x").encode();
+        bytes[0] = 99; // corrupt the version byte
+        assert_eq!(Record::decode(&bytes), Err(RecordCodecError::Version(99)));
     }
 
     #[test]

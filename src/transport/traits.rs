@@ -419,14 +419,20 @@ mod healthcheck_tests {
     #[tokio::test]
     async fn default_healthcheck_delegates_to_is_healthy() {
         assert!(
-            boot_healthcheck(&DefaultProbe { healthy: true }, HealthcheckConfig::default())
-                .await
-                .is_ok()
+            boot_healthcheck(
+                &DefaultProbe { healthy: true },
+                HealthcheckConfig::default()
+            )
+            .await
+            .is_ok()
         );
         assert!(
-            boot_healthcheck(&DefaultProbe { healthy: false }, HealthcheckConfig::default())
-                .await
-                .is_err(),
+            boot_healthcheck(
+                &DefaultProbe { healthy: false },
+                HealthcheckConfig::default()
+            )
+            .await
+            .is_err(),
             "default probe must fail-fast when not healthy"
         );
     }
@@ -434,17 +440,26 @@ mod healthcheck_tests {
     #[tokio::test]
     async fn disabled_skips_probe_even_if_unhealthy() {
         // Would hang/fail if probed, but disabled must short-circuit to Ok.
-        let t = ActiveProbe { ok: false, hang: true };
+        let t = ActiveProbe {
+            ok: false,
+            hang: true,
+        };
         let cfg = HealthcheckConfig {
             enabled: false,
             timeout_ms: 10,
         };
-        assert!(boot_healthcheck(&t, cfg).await.is_ok(), "disabled must skip");
+        assert!(
+            boot_healthcheck(&t, cfg).await.is_ok(),
+            "disabled must skip"
+        );
     }
 
     #[tokio::test]
     async fn active_probe_failure_fails_fast() {
-        let t = ActiveProbe { ok: false, hang: false };
+        let t = ActiveProbe {
+            ok: false,
+            hang: false,
+        };
         assert!(
             boot_healthcheck(&t, HealthcheckConfig::default())
                 .await
@@ -454,7 +469,10 @@ mod healthcheck_tests {
 
     #[tokio::test(start_paused = true)]
     async fn hanging_probe_times_out() {
-        let t = ActiveProbe { ok: true, hang: true };
+        let t = ActiveProbe {
+            ok: true,
+            hang: true,
+        };
         let cfg = HealthcheckConfig {
             enabled: true,
             timeout_ms: 50,

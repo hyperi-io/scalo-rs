@@ -8,7 +8,7 @@
 
 [package]
 name = "scalo"
-version = "2.9.0"
+version = "2.9.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Self-regulating runtime for data-plane services -- config, logging, metrics, health, transport, backpressure, adaptive scaling. Batteries included; idiomatic Rust (also on PyPI)."
@@ -96,10 +96,17 @@ directory-config = ["serde_yaml_ng", "tokio", "tracing"]
 directory-config-git = ["directory-config", "git2"]
 
 # Extended features (P2)
-http = ["reqwest", "reqwest-middleware", "reqwest-retry", "serde_json", "dep:anyhow"]
+http = ["reqwest", "serde_json", "dep:backon", "tokio"]
 http-server = ["axum", "tower", "tower-http", "tokio", "tracing"]
-spool = ["yaque", "zstd"]
-tiered-sink = ["yaque", "zstd", "lz4_flex", "snap", "tokio", "libc", "tracing"]
+spool = ["yaque", "zstd", "dep:crc32c", "chrono"]
+tiered-sink = ["transport", "yaque", "zstd", "lz4_flex", "snap", "tokio", "libc", "tracing", "dep:crc32c", "chrono"]
+
+# Outbound sink-control stack: composes timeout + load-shed + concurrency-limit
+# + retry/backoff + rate-limit around any transport sender via tower's
+# ServiceBuilder. Opt-in; preserves at-least-once (whole-batch retry on
+# transient failure, never acks before the sink confirms). Circuit-breaking is
+# applied separately by the TieredSink's own breaker (no double-regulation).
+sink-stack = ["transport", "tower", "dep:backon", "governor", "tokio", "tracing"]
 
 # Cgroup-aware memory backpressure (OOM prevention)
 memory = ["sysinfo", "tracing"]
@@ -135,7 +142,7 @@ worker-msgpack = ["worker", "rmpv"]
 # - cli-service: + ServiceApp trait, run_app, ServiceRuntime (full service app
 #   scaffolding — pulls in metrics + memory + scaling + worker-pool).
 cli = ["clap", "tracing"]
-cli-service = ["cli", "metrics", "memory", "scaling", "worker-pool", "shutdown", "governor"]
+cli-service = ["cli", "metrics", "memory", "scaling", "worker-pool", "shutdown", "governor", "sink-stack"]
 # TUI metrics dashboard (ratatui + crossterm via ratatui re-export)
 top = ["cli-service", "ratatui"]
 
@@ -205,7 +212,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:web
 dangerous-diagnostics = []
 
 # Full feature set
-full = ["config", "config-reload", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls"]
+full = ["config", "config-reload", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls"]
 
 [dependencies]
 # Serialisation (always needed)
@@ -262,20 +269,16 @@ sysinfo = { version = ">=0.39, <0.40", optional = true }
 tokio = { version = ">=1.50.0, <2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-std", "io-util"], optional = true }
 tokio-util = { version = ">=0.7.14, <0.8", optional = true }
 
-# HTTP client — bumped 2026-05-08 to reqwest 0.13 + middleware 0.5 + retry 0.9.
-# opentelemetry-otlp 0.32 and vaultrs 0.8 both moved to reqwest 0.13, so the
-# coordinated migration is now possible.
+# HTTP client. reqwest 0.13 + rustls. Retry/backoff is the `backon` crate
+# (one backoff lib across the codebase) - retry middleware and its anyhow
+# error-wrapper dep were retired in 2.10.
 # `default-features = false` drops the `default-tls` feature (which pulls
 # native-tls + openssl). The standard here is rustls everywhere — `rustls-tls`
 # is enabled explicitly so the resulting client still talks HTTPS.
 reqwest = { version = ">=0.13.3, <0.14", default-features = false, features = ["json", "rustls"], optional = true }
-reqwest-middleware = { version = ">=0.5.1, <0.6", optional = true }
-reqwest-retry = { version = ">=0.9.1, <0.10", optional = true }
-# `reqwest_middleware::Error::Middleware` only constructs from
-# `anyhow::Error` (via `#[from]`); we depend on anyhow directly so the
-# HTTP client can convert serialise errors into Middleware errors
-# instead of silently dropping them.
-anyhow = { version = "1", optional = true }
+# Retry/backoff (GCRA-style exponential + jitter + dynamic Retry-After adjust).
+# Apache-2.0, edition 2024, MSRV 1.85. Latest 1.6.0 web-checked 2026-06-26.
+backon = { version = ">=1.6.0, <2", optional = true }
 
 # Unified TLS trust module (src/tls.rs, `tls` feature). All already present
 # transitively (reqwest/aws-smithy pull rustls 0.23 + aws-lc-rs); these are
@@ -291,7 +294,7 @@ webpki-roots = { version = ">=1.0.7, <2", optional = true }
 
 # HTTP server (axum)
 axum = { version = ">=0.8.8, <0.9", optional = true }
-tower = { version = ">=0.5.3, <0.6", features = ["limit"], optional = true }
+tower = { version = ">=0.5.3, <0.6", features = ["limit", "timeout", "load-shed", "retry", "util"], optional = true }
 tower-http = { version = ">=0.6.8, <0.7", features = ["timeout", "trace"], optional = true }
 
 # Async (for transport)
@@ -334,6 +337,10 @@ libc = { version = ">=0.2, <0.3", optional = true }
 # Spool (disk-backed async queue) - yaque is async-native and maintained
 yaque = { version = ">=0.6.6, <0.7", optional = true }
 zstd = { version = ">=0.13.3, <0.14", optional = true }
+# Per-record spool integrity (hardware-accelerated CRC32C). Apache-2.0/MIT,
+# 0.6.8 web-checked 2026-06-26. Closes the payload-integrity gap the queue's
+# length-only header leaves open.
+crc32c = { version = ">=0.6.8, <0.7", optional = true }
 
 # TieredSink compression codecs
 lz4_flex = { version = ">=0.11, <0.14", optional = true }
@@ -412,6 +419,18 @@ rcgen = ">=0.14.7, <0.15"
 # Typed MsgPack encode -- only used by tests to build msgpack fixtures; the
 # library parse path uses rmpv natively, so this is dev-only.
 rmp-serde = ">=1.3.1, <2"
+# Property-based testing (concurrency-control invariants: finalizer worst-status
+# merge, etc.). MIT/Apache-2.0, 1.11.0 web-checked 2026-06-26.
+proptest = ">=1.11.0, <2"
+# Real-broker fault-injection (NO mocks): spin a Redis/Kafka container and
+# stop/start it to drive the spill/circuit/drain + at-least-once paths. The
+# `#[ignore]`d integration tests need a Docker daemon (run on a Docker host).
+# MIT/Apache-2.0, web-checked 2026-06-26.
+testcontainers = ">=0.27.0, <0.28"
+testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["redis"] }
+# Direct client for the fault-injection tests to verify stream contents (XLEN /
+# XRANGE) independently of scalo's own transport. Matches the transport's redis.
+redis = { version = ">=1.0, <2", features = ["tokio-comp", "streams"] }
 
 [lints.rust]
 unsafe_code = "deny"
@@ -419,6 +438,10 @@ unsafe_code = "deny"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # expect_used = "warn"  # Disabled for MVP, re-enable for stricter error handling
+
+# Suggests Duration::from_hours/from_mins/from_days -- all Rust 1.99+ APIs, above
+# our MSRV, so the suggestion is unsatisfiable. Allowed crate-wide.
+duration_suboptimal_units = "allow"
 
 # Allows for test/bench/example code (these don't inherit lib.rs attributes)
 doc_markdown = "allow"                    # Don't require backticks in doc comments
@@ -443,6 +466,12 @@ harness = false
 name = "engine_benchmark"
 harness = false
 required-features = ["worker", "transport"]
+
+# scalo-side numbers for Vector baselining (docs/VECTOR-BASELINING.md).
+[[bench]]
+name = "baseline"
+harness = false
+required-features = ["transport"]
 
 [[bench]]
 name = "filter_benchmark"

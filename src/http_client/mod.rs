@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/http_client/mod.rs
-// Purpose:   Production HTTP client with retry middleware
+// Purpose:   Production HTTP client with retry/backoff
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -8,9 +8,22 @@
 
 //! Production HTTP client with automatic retries and timeouts.
 //!
-//! Wraps [`reqwest`] with [`reqwest_middleware`] and [`reqwest_retry`] to
-//! provide exponential backoff for transient errors (5xx, timeouts,
-//! connection failures). Non-retryable errors (4xx) return immediately.
+//! Wraps [`reqwest`] with exponential backoff (the `backon` crate) for
+//! transient failures (5xx, 429, 408, connect/timeout errors). Permanent
+//! errors (other 4xx) return immediately.
+//!
+//! ## Retry safety
+//!
+//! Retries are restricted to **idempotent** methods (GET, PUT, DELETE) by
+//! default: replaying a non-idempotent POST can duplicate side effects
+//! downstream. Set `retry_non_idempotent = true` only when the endpoint is
+//! known to dedupe (e.g. an idempotency key). When a throttled downstream
+//! returns `Retry-After`, that delay is honoured in preference to the
+//! exponential schedule.
+//!
+//! After retries are exhausted the **last response is returned** (even a 5xx)
+//! so the caller can inspect status/body -- a persistent server error is not
+//! masked as a transport error.
 //!
 //! # Config Cascade
 //!
@@ -24,6 +37,7 @@
 //!   max_retries: 3
 //!   min_retry_interval_ms: 100
 //!   max_retry_interval_ms: 30000
+//!   retry_non_idempotent: false
 //!   user_agent: "dfe-fetcher/1.0"
 //! ```
 
@@ -31,10 +45,10 @@ pub mod config;
 
 pub use config::HttpClientConfig;
 
-use reqwest::Response;
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::RetryTransientMiddleware;
-use reqwest_retry::policies::ExponentialBackoff;
+use std::time::Duration;
+
+use backon::{ExponentialBuilder, Retryable};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 
 /// HTTP client build error.
 #[derive(Debug, thiserror::Error)]
@@ -44,9 +58,66 @@ pub enum HttpClientError {
     BuildError(#[from] reqwest::Error),
 }
 
-/// Production HTTP client with retry middleware.
+/// Error from an HTTP request.
+///
+/// `Status` carries the [`Response`] so the caller can still inspect a
+/// persistent server error after retries are exhausted; it is surfaced by the
+/// public methods as `Ok(response)` (not `Err`), matching the historical
+/// "caller checks the status code" contract.
+#[derive(Debug, thiserror::Error)]
+pub enum HttpError {
+    /// Transport-level failure (connect, timeout, TLS, dropped connection).
+    #[error("HTTP transport error: {0}")]
+    Transport(#[from] reqwest::Error),
+
+    /// Server returned a retryable status (5xx / 429 / 408). Held internally
+    /// during the retry loop; never escapes a public method as an `Err`.
+    #[error("HTTP retryable status: {}", .0.status())]
+    Status(Box<Response>),
+
+    /// Request body could not be serialised to JSON (not retryable).
+    #[error("JSON serialise failed: {0}")]
+    Serialize(#[from] serde_json::Error),
+}
+
+impl HttpError {
+    /// Whether this error warrants a retry.
+    fn is_retryable(&self) -> bool {
+        match self {
+            // Connect/timeout are transient; decode/redirect/body are not.
+            Self::Transport(e) => e.is_timeout() || e.is_connect(),
+            // A retryable status was only constructed for the retryable set.
+            Self::Status(_) => true,
+            Self::Serialize(_) => false,
+        }
+    }
+
+    /// `Retry-After` delay advertised by the downstream, if any (delta-seconds
+    /// form). HTTP-date form is not parsed -- the exponential schedule is used.
+    fn retry_after(&self) -> Option<Duration> {
+        let Self::Status(resp) = self else {
+            return None;
+        };
+        let secs: u64 = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(Duration::from_secs(secs))
+    }
+}
+
+/// Status codes worth retrying: throttling + transient server failures.
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Production HTTP client with retry/backoff.
 pub struct HttpClient {
-    inner: ClientWithMiddleware,
+    inner: Client,
     config: HttpClientConfig,
 }
 
@@ -58,29 +129,16 @@ impl HttpClient {
     /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
     /// client cannot be constructed (typically TLS backend init failure).
     pub fn new(config: HttpClientConfig) -> Result<Self, HttpClientError> {
-        let retry_policy = ExponentialBackoff::builder()
-            .retry_bounds(
-                std::time::Duration::from_millis(config.min_retry_interval_ms),
-                std::time::Duration::from_millis(config.max_retry_interval_ms),
-            )
-            .build_with_max_retries(config.max_retries);
-
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
-            .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs));
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs));
 
         if let Some(ref ua) = config.user_agent {
             builder = builder.user_agent(ua.clone());
         }
 
-        let reqwest_client = builder.build()?;
-
-        let client = ClientBuilder::new(reqwest_client)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
-
         Ok(Self {
-            inner: client,
+            inner: builder.build()?,
             config,
         })
     }
@@ -95,128 +153,168 @@ impl HttpClient {
         Self::new(HttpClientConfig::from_cascade())
     }
 
-    /// Send a GET request.
-    pub async fn get(&self, url: &str) -> Result<Response, reqwest_middleware::Error> {
+    /// Exponential backoff schedule from config (jittered to avoid sync'd
+    /// retry storms across many clients hitting the same downstream).
+    fn backoff(&self) -> ExponentialBuilder {
+        ExponentialBuilder::new()
+            .with_min_delay(Duration::from_millis(self.config.min_retry_interval_ms))
+            .with_max_delay(Duration::from_millis(self.config.max_retry_interval_ms))
+            .with_max_times(self.config.max_retries as usize)
+            .with_jitter()
+    }
+
+    /// Send a request (built fresh per attempt by `make`), retrying transient
+    /// failures when `idempotent` (or the non-idempotent opt-in) allows it.
+    ///
+    /// `make` is called once per attempt so each retry dispatches a fresh
+    /// request -- `reqwest::RequestBuilder` is not `Clone`.
+    async fn execute(
+        &self,
+        method: &'static str,
+        idempotent: bool,
+        make: impl Fn() -> RequestBuilder,
+    ) -> Result<Response, HttpError> {
+        let attempt = || async {
+            let resp = make().send().await?;
+            if is_retryable_status(resp.status()) {
+                return Err(HttpError::Status(Box::new(resp)));
+            }
+            Ok(resp)
+        };
+
+        let retry_enabled =
+            self.config.max_retries > 0 && (idempotent || self.config.retry_non_idempotent);
+
+        let result = if retry_enabled {
+            attempt
+                .retry(self.backoff())
+                .when(HttpError::is_retryable)
+                // Honour Retry-After over the exponential candidate when present.
+                .adjust(|e: &HttpError, candidate| e.retry_after().or(candidate))
+                .sleep(tokio::time::sleep)
+                .notify(|_e: &HttpError, _dur: Duration| Self::record_retry(method))
+                .await
+        } else {
+            attempt().await
+        };
+
+        match result {
+            Ok(resp) => Ok(resp),
+            // Retries exhausted on a 5xx/429: hand back the last response so the
+            // caller can read status/body, preserving the legacy contract.
+            Err(HttpError::Status(resp)) => Ok(*resp),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Emit the retry counter (no-op without the `metrics` feature).
+    #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
+    fn record_retry(method: &'static str) {
         #[cfg(feature = "metrics")]
-        let start = std::time::Instant::now();
+        metrics::counter!("http_client_retries_total", "method" => method).increment(1);
+    }
 
-        let result = self.inner.get(url).send().await;
-
+    /// Record request outcome metrics (no-op without the `metrics` feature).
+    #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
+    fn record(method: &'static str, ok: bool, start: std::time::Instant) {
         #[cfg(feature = "metrics")]
         {
-            let status = if result.is_ok() { "success" } else { "error" };
-            metrics::counter!("http_client_requests_total", "method" => "GET", "status" => status)
+            let status = if ok { "success" } else { "error" };
+            metrics::counter!("http_client_requests_total", "method" => method, "status" => status)
                 .increment(1);
-            metrics::histogram!("http_client_duration_seconds", "method" => "GET")
+            metrics::histogram!("http_client_duration_seconds", "method" => method)
                 .record(start.elapsed().as_secs_f64());
         }
+    }
 
+    /// Send a GET request (idempotent: retried on transient failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::Transport`] on a persistent transport failure. A
+    /// persistent server status (5xx) is returned as `Ok(response)`.
+    pub async fn get(&self, url: &str) -> Result<Response, HttpError> {
+        let start = std::time::Instant::now();
+        let result = self.execute("GET", true, || self.inner.get(url)).await;
+        Self::record("GET", result.is_ok(), start);
         result
     }
 
     /// Send a POST request with a JSON body.
     ///
+    /// POST is **not** retried by default (not idempotent); enable
+    /// `retry_non_idempotent` only for dedupe-safe endpoints.
+    ///
     /// # Errors
     ///
-    /// Returns a middleware-wrapped error if JSON serialisation of `body`
-    /// fails, or a network error if the request fails to send. Previously
-    /// a serialisation failure was silently substituted with an empty body
-    /// -- the request would dispatch with no payload, hiding the bug at the
-    /// caller and producing confusing downstream behaviour.
+    /// Returns [`HttpError::Serialize`] if `body` cannot be encoded as JSON,
+    /// or [`HttpError::Transport`] on a persistent transport failure.
+    /// Previously a serialisation failure was silently substituted with an
+    /// empty body -- the request would dispatch with no payload, hiding the
+    /// bug at the caller.
     pub async fn post_json<T: serde::Serialize + ?Sized>(
         &self,
         url: &str,
         body: &T,
-    ) -> Result<Response, reqwest_middleware::Error> {
-        #[cfg(feature = "metrics")]
+    ) -> Result<Response, HttpError> {
         let start = std::time::Instant::now();
-
-        let body_bytes = serde_json::to_vec(body).map_err(|e| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                "POST {url}: JSON serialise failed: {e}"
-            ))
-        })?;
-
+        let body_bytes = serde_json::to_vec(body)?;
         let result = self
-            .inner
-            .post(url)
-            .header("content-type", "application/json")
-            .body(body_bytes)
-            .send()
+            .execute("POST", false, || {
+                self.inner
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .body(body_bytes.clone())
+            })
             .await;
-
-        #[cfg(feature = "metrics")]
-        {
-            let status = if result.is_ok() { "success" } else { "error" };
-            metrics::counter!("http_client_requests_total", "method" => "POST", "status" => status)
-                .increment(1);
-            metrics::histogram!("http_client_duration_seconds", "method" => "POST")
-                .record(start.elapsed().as_secs_f64());
-        }
-
+        Self::record("POST", result.is_ok(), start);
         result
     }
 
-    /// Send a PUT request with a JSON body.
+    /// Send a PUT request with a JSON body (idempotent: retried).
     ///
     /// # Errors
     ///
-    /// See [`Self::post_json`] -- same serialise + send error contract.
+    /// See [`Self::post_json`] -- same serialise + transport error contract.
     pub async fn put_json<T: serde::Serialize + ?Sized>(
         &self,
         url: &str,
         body: &T,
-    ) -> Result<Response, reqwest_middleware::Error> {
-        #[cfg(feature = "metrics")]
+    ) -> Result<Response, HttpError> {
         let start = std::time::Instant::now();
-
-        let body_bytes = serde_json::to_vec(body).map_err(|e| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                "PUT {url}: JSON serialise failed: {e}"
-            ))
-        })?;
-
+        let body_bytes = serde_json::to_vec(body)?;
         let result = self
-            .inner
-            .put(url)
-            .header("content-type", "application/json")
-            .body(body_bytes)
-            .send()
+            .execute("PUT", true, || {
+                self.inner
+                    .put(url)
+                    .header("content-type", "application/json")
+                    .body(body_bytes.clone())
+            })
             .await;
-
-        #[cfg(feature = "metrics")]
-        {
-            let status = if result.is_ok() { "success" } else { "error" };
-            metrics::counter!("http_client_requests_total", "method" => "PUT", "status" => status)
-                .increment(1);
-            metrics::histogram!("http_client_duration_seconds", "method" => "PUT")
-                .record(start.elapsed().as_secs_f64());
-        }
-
+        Self::record("PUT", result.is_ok(), start);
         result
     }
 
-    /// Send a DELETE request.
-    pub async fn delete(&self, url: &str) -> Result<Response, reqwest_middleware::Error> {
-        #[cfg(feature = "metrics")]
+    /// Send a DELETE request (idempotent: retried on transient failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::Transport`] on a persistent transport failure.
+    pub async fn delete(&self, url: &str) -> Result<Response, HttpError> {
         let start = std::time::Instant::now();
-
-        let result = self.inner.delete(url).send().await;
-
-        #[cfg(feature = "metrics")]
-        {
-            let status = if result.is_ok() { "success" } else { "error" };
-            metrics::counter!("http_client_requests_total", "method" => "DELETE", "status" => status).increment(1);
-            metrics::histogram!("http_client_duration_seconds", "method" => "DELETE")
-                .record(start.elapsed().as_secs_f64());
-        }
-
+        let result = self
+            .execute("DELETE", true, || self.inner.delete(url))
+            .await;
+        Self::record("DELETE", result.is_ok(), start);
         result
     }
 
-    /// Access the underlying middleware client for custom requests.
+    /// Access the underlying reqwest client for custom requests.
+    ///
+    /// Requests made directly through this handle bypass the retry/backoff
+    /// wrapper -- use the typed methods for retried delivery.
     #[must_use]
-    pub fn client(&self) -> &ClientWithMiddleware {
+    pub fn client(&self) -> &Client {
         &self.inner
     }
 
@@ -224,5 +322,37 @@ impl HttpClient {
     #[must_use]
     pub fn config(&self) -> &HttpClientConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_status_set() {
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(StatusCode::from_u16(code).unwrap()));
+        }
+        for code in [200, 201, 301, 400, 401, 404, 409, 501] {
+            assert!(!is_retryable_status(StatusCode::from_u16(code).unwrap()));
+        }
+    }
+
+    #[test]
+    fn serialise_error_not_retryable() {
+        // Build a serde_json error and confirm it never triggers a retry.
+        let err = serde_json::from_str::<i32>("not a number").unwrap_err();
+        let http_err = HttpError::Serialize(err);
+        assert!(!http_err.is_retryable());
+        assert!(http_err.retry_after().is_none());
+    }
+
+    #[tokio::test]
+    async fn build_client_from_default_config() {
+        let client = HttpClient::new(HttpClientConfig::default()).unwrap();
+        assert_eq!(client.config().max_retries, 3);
+        // The backoff honours config bounds.
+        let _ = client.backoff();
     }
 }

@@ -107,7 +107,7 @@ impl ServiceRuntime {
     ///
     /// Returns `CliError` if the metrics server fails to start.
     pub(crate) async fn build(
-        app_name: &str,
+        #[cfg_attr(not(feature = "version-check"), allow(unused_variables))] app_name: &str,
         env_prefix: &str,
         metrics_addr: &str,
         #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] version: &str,
@@ -301,5 +301,35 @@ impl ServiceRuntime {
             Some(ref gov) => AnyReceiver::from_config_with_governor(key, gov).await,
             None => AnyReceiver::from_config(key).await,
         }
+    }
+
+    /// Build the OUTBOUND sender wrapped in a [`SinkStack`](crate::sink_stack::SinkStack)
+    /// -- the symmetric, default-on companion to [`governed_receiver`](Self::governed_receiver).
+    ///
+    /// This is how an app gets retry/backoff + per-attempt timeout (and,
+    /// opt-in via config, adaptive concurrency + rate-limit) on its outbound send
+    /// for free, instead of hand-rolling them. The [`SinkStackConfig`] is read
+    /// from the cascade at `cfg_key` (e.g. `"sink_stack"`); the stack's defaults
+    /// preserve at-least-once (whole-batch retry on a transient failure, never an
+    /// ack before the sink confirms). Use the returned stack as the driver's sink
+    /// via [`SinkStack::send_workbatch`](crate::sink_stack::SinkStack::send_workbatch).
+    ///
+    /// To opt OUT, build a bare [`AnySender::from_config`](crate::transport::factory::AnySender::from_config)
+    /// directly, or set `max_retries = 0` (one attempt, no controls).
+    ///
+    /// # Errors
+    /// Returns the transport error if the sender config is missing/invalid or the
+    /// backend fails to construct.
+    #[cfg(all(feature = "sink-stack", feature = "transport"))]
+    pub async fn outbound_sink_stack(
+        &self,
+        sender_key: &str,
+        cfg_key: &str,
+    ) -> Result<crate::sink_stack::SinkStack, crate::transport::TransportError> {
+        use crate::sink_stack::{SinkStack, SinkStackConfig};
+        use crate::transport::factory::AnySender;
+        let sender = std::sync::Arc::new(AnySender::from_config(sender_key).await?);
+        let cfg = SinkStackConfig::from_cascade_key(cfg_key);
+        Ok(SinkStack::new(sender, &cfg))
     }
 }

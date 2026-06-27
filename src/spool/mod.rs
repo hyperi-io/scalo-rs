@@ -53,7 +53,7 @@ mod config;
 mod error;
 mod queue;
 
-pub use config::SpoolConfig;
+pub use config::{CorruptionPolicy, SpoolConfig};
 pub use error::SpoolError;
 pub use queue::Spool;
 

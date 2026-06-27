@@ -32,7 +32,25 @@ pub struct SpoolConfig {
     /// Queue file size cap in bytes. `push` fails when reached. Default unlimited.
     #[serde(default)]
     pub max_size_bytes: Option<u64>,
+
+    /// Prepend a CRC32C checksum to each record and verify it on read. Detects
+    /// torn writes / bit-rot that the queue's length-only header cannot (a flipped
+    /// payload byte would otherwise be returned silently). Default false (the
+    /// on-disk format is unchanged unless enabled). Trades 4 bytes/record + a
+    /// hardware-accelerated checksum for integrity.
+    #[serde(default)]
+    pub crc: bool,
+
+    /// What to do when a corrupt cache is detected (queue won't open, or a CRC
+    /// check fails on read). Default [`CorruptionPolicy::Quarantine`]: rename the
+    /// corrupt directory aside with a timestamp and start fresh, so a poisoned
+    /// spill cache can never wedge the service or silently serve bad data.
+    #[serde(default)]
+    pub on_corruption: CorruptionPolicy,
 }
+
+// The recovery action enum is shared with the TieredSink cold path.
+pub use crate::spool_codec::CorruptionPolicy;
 
 fn default_compression_level() -> i32 {
     3
@@ -46,6 +64,8 @@ impl Default for SpoolConfig {
             compression_level: default_compression_level(),
             max_items: None,
             max_size_bytes: None,
+            crc: false,
+            on_corruption: CorruptionPolicy::Quarantine,
         }
     }
 }
@@ -95,6 +115,20 @@ impl SpoolConfig {
     #[must_use]
     pub fn max_size_bytes(mut self, max: u64) -> Self {
         self.max_size_bytes = Some(max);
+        self
+    }
+
+    /// Enable per-record CRC32C integrity checking (see [`crc`](Self::crc)).
+    #[must_use]
+    pub fn crc(mut self, enabled: bool) -> Self {
+        self.crc = enabled;
+        self
+    }
+
+    /// Set the corrupt-cache recovery policy (see [`on_corruption`](Self::on_corruption)).
+    #[must_use]
+    pub fn on_corruption(mut self, policy: CorruptionPolicy) -> Self {
+        self.on_corruption = policy;
         self
     }
 }

@@ -343,9 +343,21 @@ impl TransportSender for RedisTransport {
                 #[cfg(feature = "logger")]
                 tracing::warn!(error = %e, stream = %stream, "Redis transport: XADD error");
 
-                SendResult::Fatal(TransportError::Send(format!(
-                    "XADD to stream '{stream}' failed: {e}"
-                )))
+                // A connection/IO/timeout failure is TRANSIENT: report
+                // Backpressured so a tiered sink spills and retries
+                // (at-least-once), rather than dropping the record. Only a
+                // non-transient error (bad command, auth, ...) is Fatal.
+                if e.is_connection_dropped()
+                    || e.is_connection_refusal()
+                    || e.is_io_error()
+                    || e.is_timeout()
+                {
+                    SendResult::Backpressured
+                } else {
+                    SendResult::Fatal(TransportError::Send(format!(
+                        "XADD to stream '{stream}' failed: {e}"
+                    )))
+                }
             }
         }
     }

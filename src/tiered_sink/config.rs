@@ -8,6 +8,7 @@
 
 //! TieredSink configuration.
 
+use crate::spool_codec::CorruptionPolicy;
 use crate::tiered_sink::CompressionCodec;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -67,6 +68,21 @@ pub struct TieredSinkConfig {
     /// exceeds the configured usage threshold.
     #[serde(default)]
     pub disk_aware: Option<DiskAwareConfig>,
+
+    /// Prepend a CRC32C checksum to each spilled record and verify it on drain.
+    /// Detects torn writes / bit-rot that the queue's length-only header cannot
+    /// (a flipped payload byte would otherwise replay silently-wrong). A drained
+    /// record that fails the check is dropped (logged + counted), never sent.
+    /// Default false (on-disk format unchanged unless enabled).
+    #[serde(default)]
+    pub crc: bool,
+
+    /// What to do when the spill cache cannot be opened (corrupt segments /
+    /// metadata). Default [`CorruptionPolicy::Quarantine`]: rename the corrupt
+    /// directory aside with a timestamp and start fresh, so a poisoned spill
+    /// cache can never wedge startup.
+    #[serde(default)]
+    pub on_corruption: CorruptionPolicy,
 }
 
 fn default_send_timeout_ms() -> u64 {
@@ -102,7 +118,23 @@ impl TieredSinkConfig {
             circuit_reset_timeout_ms: default_circuit_reset_timeout_ms(),
             drain_interval_ms: default_drain_interval_ms(),
             disk_aware: None,
+            crc: false,
+            on_corruption: CorruptionPolicy::Quarantine,
         }
+    }
+
+    /// Enable per-record CRC32C integrity on the spill (see [`crc`](Self::crc)).
+    #[must_use]
+    pub fn crc(mut self, enabled: bool) -> Self {
+        self.crc = enabled;
+        self
+    }
+
+    /// Set the corrupt-cache recovery policy (see [`on_corruption`](Self::on_corruption)).
+    #[must_use]
+    pub fn on_corruption(mut self, policy: CorruptionPolicy) -> Self {
+        self.on_corruption = policy;
+        self
     }
 
     /// Set send timeout.

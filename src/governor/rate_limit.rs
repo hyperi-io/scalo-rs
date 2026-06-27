@@ -85,7 +85,11 @@ impl RateLimitConfig {
     /// floored at 1 so an enabled limiter can always hold at least one token.
     #[must_use]
     fn capacity(self) -> u32 {
-        let cap = if self.burst == 0 { self.rps } else { self.burst };
+        let cap = if self.burst == 0 {
+            self.rps
+        } else {
+            self.burst
+        };
         cap.max(1)
     }
 }
