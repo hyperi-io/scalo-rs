@@ -178,6 +178,25 @@ pub struct KafkaTransport {
     partition_limited_flag: Arc<AtomicBool>,
 }
 
+/// Internal group.id used for the consumer client of a producer-only transport.
+///
+/// librdkafka >= 2.x rejects an empty group.id at consumer creation, so a
+/// producer-only config (empty `config.group`) needs an arbitrary non-empty
+/// stand-in. The consumer never subscribes in that case (topics empty + no
+/// auto_discover), so this group is inert -- no join, no rebalance, no fetch.
+/// Mirrors the admin client's `__hs_admin_internal` pattern.
+const PRODUCER_ONLY_GROUP_ID: &str = "__scalo_producer_only";
+
+/// Resolve the group.id to set on the consumer client: the caller's group when
+/// set, else the inert producer-only stand-in (see [`PRODUCER_ONLY_GROUP_ID`]).
+fn effective_consumer_group_id(group: &str) -> &str {
+    if group.is_empty() {
+        PRODUCER_ONLY_GROUP_ID
+    } else {
+        group
+    }
+}
+
 impl KafkaTransport {
     /// Create a new high-throughput Kafka transport.
     ///
@@ -203,7 +222,13 @@ impl KafkaTransport {
         let mut client_config = ClientConfig::new();
 
         client_config.set("bootstrap.servers", config.brokers.join(","));
-        client_config.set("group.id", &config.group);
+        // librdkafka >= 2.x refuses to create a consumer client with an EMPTY
+        // group.id -- `rd_kafka_poll_set_consumer` returns "consumer queue not
+        // available". A producer-only transport legitimately carries no consumer
+        // group (callers signal this by clearing `config.group`), but the
+        // constructor still builds a consumer client (it is non-optional). See
+        // effective_consumer_group_id for the inert-fallback rationale.
+        client_config.set("group.id", effective_consumer_group_id(&config.group));
         // Static membership (KIP-345): opt-in, must be unique per replica.
         if let Some(ref id) = config.group_instance_id {
             client_config.set("group.instance.id", id);
@@ -1394,6 +1419,16 @@ impl std::fmt::Debug for KafkaTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_effective_consumer_group_id_falls_back_for_producer_only() {
+        // Empty group (producer-only) -> inert internal stand-in, never empty
+        // (librdkafka >= 2.x rejects an empty group.id at consumer creation).
+        assert_eq!(effective_consumer_group_id(""), PRODUCER_ONLY_GROUP_ID);
+        assert!(!effective_consumer_group_id("").is_empty());
+        // A real group is passed through unchanged.
+        assert_eq!(effective_consumer_group_id("my-group"), "my-group");
+    }
 
     #[test]
     fn test_tuning_constants() {
