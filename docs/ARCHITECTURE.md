@@ -6,43 +6,45 @@ so consumers only pay for what they wire in.
 
 ```mermaid
 flowchart TB
-    subgraph L5["L5 — App scaffolding"]
-        CLI["cli / cli-service<br/>ServiceApp · ServiceRuntime · run_app"]
-        DEP["deployment<br/>DeploymentContract · generators"]
+    subgraph L5["L5 - App scaffolding"]
+        CLI["cli / cli-service<br/>ServiceApp, ServiceRuntime, run_app"]
+        DEP["deployment<br/>DeploymentContract + generators"]
     end
 
-    subgraph L4["L4 — Pipeline"]
+    subgraph L4["L4 - Pipeline"]
         TS["tiered-sink"]
+        SK["sink-stack<br/>timeout / load-shed / concurrency / retry / rate-limit"]
         BE["worker-batch<br/>BatchEngine"]
         WP["worker-pool<br/>AdaptiveWorkerPool"]
-        DLQ["dlq · dlq-kafka · dlq-http · dlq-redis"]
+        DLQ["dlq + kafka / http / redis backends"]
         SPL["spool"]
     end
 
-    subgraph L3["L3 — Transport & I/O"]
-        T["transport<br/>Kafka · gRPC · Memory · File · Pipe · HTTP · Redis"]
+    subgraph L3["L3 - Transport and I/O"]
+        T["transport<br/>Kafka / gRPC / Memory / File / Pipe / HTTP / Redis"]
         TF["transport-filter<br/>3-tier filter engine"]
         HS["http-server (axum)"]
         HC["http (reqwest)"]
-        SEC["secrets (Vault · AWS)"]
-        DC["directory-config (YAML · git2)"]
+        SEC["secrets (Vault / AWS)"]
+        DC["directory-config (YAML / git2)"]
         OF["output-file"]
     end
 
-    subgraph L2["L2 — Runtime"]
-        RC["runtime · env<br/>RuntimeContext (K8s/Docker/BareMetal)"]
+    subgraph L2["L2 - Runtime and self-regulation"]
+        RC["runtime / env<br/>RuntimeContext (K8s/Docker/BareMetal)"]
         MEM["memory<br/>MemoryGuard"]
         SCA["scaling<br/>ScalingPressure"]
-        CON["concurrency<br/>BackgroundSink · PeriodicWorker · ActorHandle"]
-        CACHE["cache · database · strmatch"]
+        GOV["governor<br/>UnifiedPressure gate (hard memory + soft signals)"]
+        CON["concurrency<br/>BackgroundSink / PeriodicWorker / ActorHandle"]
+        STR["strmatch"]
         EXP["expression (CEL)"]
     end
 
-    subgraph L1["L1 — Core pillars"]
+    subgraph L1["L1 - Core pillars"]
         CFG["config"]
         LOG["logger"]
-        MET["metrics · metrics-core · metrics-process"]
-        OTEL["otel · otel-metrics · otel-tracing"]
+        MET["metrics / metrics-core / metrics-process"]
+        OTEL["otel / otel-metrics / otel-tracing"]
         HLT["health"]
         SHUT["shutdown"]
     end
@@ -57,21 +59,23 @@ flowchart TB
     L3 --> L2
     L3 --> L1
     L2 --> L1
+    SK -.wraps.-> T
     TF -.embedded in.-> T
 ```
 
-Dashed line = `transport-filter` is embedded inside every transport
-backend, not a separate caller. Solid arrows show layer dependencies.
+Dashed lines mark embedded composition, not separate callers:
+`transport-filter` lives inside every transport backend, and `sink-stack`
+wraps a transport sender. Solid arrows show layer dependencies.
 
 ---
 
 ## Module map
 
-### L1 — Core pillars (always-on, auto-wired)
+### L1 - Core pillars (always-on, auto-wired)
 
 | Module | Feature | Purpose |
 |--------|---------|---------|
-| `config` | `config` (default) | 7-layer cascade (CLI → env → .env → YAML → defaults), hot-reload, section registry, `/config` admin endpoint |
+| `config` | `config` (default) | 7-layer cascade (CLI -> env -> .env -> YAML -> defaults), hot-reload, section registry, `/config` admin endpoint |
 | `logger` | `logger` (default) | `tracing-subscriber` with JSON/text autodetect, RFC 3339 timestamps, sensitive-field masking, flood-control helpers |
 | `metrics` | `metrics-core`, `metrics-process`, `metrics` | Lock-free counters/gauges/histograms, Prometheus exporter, `/metrics` + `/metrics/manifest` |
 | `otel_metrics` / `otel_tracing` | `otel`, `otel-metrics`, `otel-tracing` | OTLP exporter, OTel SDK bridge for `tracing` spans |
@@ -82,21 +86,20 @@ Pillars are singletons. Modules in higher layers call into them via macros
 (`tracing::info!`, `metrics::counter!`) or global getters
 (`config::get`). No handle passing.
 
-### L2 — Runtime
+### L2 - Runtime and self-regulation
 
 | Module | Feature | Purpose |
 |--------|---------|---------|
 | `env` | always | Detect environment (Kubernetes, Docker, container, bare metal) |
 | `runtime` | `runtime` | XDG/container-aware paths, `RuntimeContext` singleton (pod, namespace, node, memory limit, CPU quota) |
-| `memory` | `memory` | `MemoryGuard` — cgroup-aware OOM prevention with auto-detected limits |
-| `scaling` | `scaling` | `ScalingPressure` — KEDA external-scaler signal (0.0–100.0) |
-| `concurrency` | `concurrency` | `BackgroundSink`, `PeriodicWorker`, `ActorHandle` — fire-and-forget, timer, command-queue primitives |
-| `cache` | `cache` | Moka TinyLFU async cache |
-| `database` | `database` | URL builders, connection-string helpers |
+| `memory` | `memory` | `MemoryGuard` - cgroup-aware OOM prevention with auto-detected limits |
+| `scaling` | `scaling` | `ScalingPressure` - KEDA external-scaler signal (0.0-100.0) |
+| `governor` | `governor` | `UnifiedPressure` self-regulation gate - latches a hard memory signal with weighted soft signals under hysteresis, driving inbound backpressure |
+| `concurrency` | `concurrency` | `BackgroundSink`, `PeriodicWorker`, `ActorHandle` - fire-and-forget, timer, command-queue primitives |
 | `strmatch` | `strmatch` | 4-tier string matcher: `Byte`, `Literal`, `LiteralSet`, `Regex` |
 | `expression` | `expression` | CEL evaluator (used by transport filters) |
 
-### L3 — Transport & I/O
+### L3 - Transport and I/O
 
 | Module | Feature | Purpose |
 |--------|---------|---------|
@@ -108,22 +111,23 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | `directory_config` | `directory-config`, `directory-config-git` | YAML directory store with optional `git2` |
 | `output` | `output-file` | NDJSON file output sink |
 
-### L4 — Pipeline
+### L4 - Pipeline
 
 | Module | Feature | Purpose |
 |--------|---------|---------|
-| `spool` | `spool` | Disk-backed async FIFO queue (`yaque` + `zstd`) |
+| `spool` | `spool` | Disk-backed async FIFO queue (`yaque` + `zstd`), per-record CRC32C integrity |
 | `tiered_sink` | `tiered-sink` | Transport + spool + circuit breaker + retry + DLQ fallback |
+| `sink_stack` | `sink-stack` | Outbound control stack - composes timeout, load-shed, concurrency-limit, retry/backoff and rate-limit around a transport sender (tower `ServiceBuilder`); preserves at-least-once |
 | `worker::pool` | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio), pressure-based scaling |
-| `worker::engine` | `worker-batch` | `BatchEngine` — SIMD parse (`sonic-rs`), pre-route filter, field interning |
+| `worker::engine` | `worker-batch` | `BatchEngine` - SIMD parse (`sonic-rs`), pre-route filter, field interning |
 | `dlq` | `dlq`, `dlq-kafka`, `dlq-http`, `dlq-redis` | DLQ sink with file always available, Kafka/HTTP/Redis backends opt-in |
 
-### L5 — App scaffolding
+### L5 - App scaffolding
 
 | Module | Feature | Purpose |
 |--------|---------|---------|
 | `cli` | `cli` | `clap` types: `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
-| `cli::service` | `cli-service` | `ServiceApp` trait, `run_app`, `ServiceRuntime` — full data-plane app scaffolding |
+| `cli::service` | `cli-service` | `ServiceApp` trait, `run_app`, `ServiceRuntime` - full data-plane app scaffolding |
 | `top` | `top` | TUI metrics dashboard (`ratatui`) |
 | `deployment` | `deployment`, `deployment-smoke` | `DeploymentContract`, generators for Dockerfile / Helm chart / ArgoCD Application / container manifest |
 | `version_check` | `version-check` | Startup HTTP probe to the version API |
@@ -176,7 +180,7 @@ A handful of dependencies aren't visible from layer naming alone:
 - `transport-trace` is the *only* feature that pulls in the OpenTelemetry
   SDK on the transport side. Apps that send/receive without distributed
   tracing avoid that dep entirely.
-- `cli-service` (L5) reaches across the whole stack — it pulls
+- `cli-service` (L5) reaches across the whole stack - it pulls
   `metrics + memory + scaling + worker-pool + shutdown` because
   `ServiceRuntime::new` wires all of them.
 
@@ -190,6 +194,6 @@ auto-wired vs explicit.
 
 - **Edition:** 2024
 - **MSRV:** see `rust-version` in `Cargo.toml`
-- **Sibling lib:** `hyperi-pylib` (Python equivalent)
+- **Sibling lib:** `scalo-py` (Python control-plane equivalent)
 - **Downstream:** the six core consumer services consume `scalo` in
   lockstep (see [README.md § Project facts](README.md#project-facts))

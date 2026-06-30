@@ -40,7 +40,7 @@ struct shape changes in a way that breaks downstream consumers.
 ```mermaid
 flowchart LR
     R[Rust service<br/>uses scalo] -->|generate-artefacts| C[deployment-contract.json]
-    P[Python service<br/>uses pylib] -.roadmap.-> C
+    P[Python service<br/>uses scalo-py] -.roadmap.-> C
     O[bash / TS / Go service<br/>via hyperi-ci templater] -.roadmap.-> C
     C --> D[Dockerfile]
     C --> H[Helm chart/]
@@ -52,7 +52,7 @@ flowchart LR
 | Tier | Producer | Status |
 |------|----------|--------|
 | 1 | scalo (this crate) -- Rust services emit the contract from their config struct | **Shipped** |
-| 2 | pylib -- Python services emit the same contract shape | **Roadmap** |
+| 2 | scalo-py -- Python services emit the same contract shape | **Roadmap** |
 | 3 | hyperi-ci templater -- bash/TS/Go services emit the contract via templating | **Roadmap** |
 
 Tier 2/3 are aspirational. The contract is JSON-serialisable and

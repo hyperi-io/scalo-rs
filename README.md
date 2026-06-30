@@ -9,26 +9,34 @@
 
 > There's plenty of sage advice about running services in production at
 > scale -- config cascades, structured logging, secret masking, Prometheus,
-> OpenTelemetry, Kafka transports, tiered disk-spillover sinks, adaptive
-> worker pools, graceful shutdown -- but almost none of it as code you can
-> just install and use.
+> OpenTelemetry, health probes, backpressure, graceful shutdown -- but almost
+> none of it as code you can just install and use.
 >
 > This is that code.
 
-scalo is the embedded, self-regulating runtime for data-plane services.
+scalo is an integrated, self-regulating runtime for hyperscale-grade
+data-plane services. Config, logging and metrics come as one pre-wired
+trinity -- global singletons you just use, no plumbing, no init dance.
+Everything else leans on that same integration: the config cascade flows
+straight into the CLI so `run`/`version`/`config-check` just work; the metrics
+and health wiring feed the K8s probe trinity; and the deployment contract
+generates your Helm, Dockerfile and Argo manifests from the config the app
+already declares.
+
+Attach scalo to your service and a whole class of production pain -- the kind
+done wrong a hundred times elsewhere -- just goes away. Battle-tested, and
+almost no code on your side **to do it properly**. It's not a bag of utility
+functions you wire up yourself; it's the wiring, done right, for free.
+
+scalo comes in two halves that share one set of conventions, idiomatic in each
+language. **scalo-rs** (this crate) is the **data plane** -- the Rust hot path
+where every microsecond and byte counts (`cargo add scalo`). **scalo-py** is
+the **control plane** -- orchestration, APIs and integration in Python
+(`pip install scalo`).
+
 Opinionated about correctness -- backpressure, memory safety and the probe
-trinity are on by default. Unopinionated about your domain -- no web
-framework, no ORM, no enforced transport. Drop it in; it works out of the box.
-
-scalo comes in two halves, same conventions, idiomatic in each language.
-**scalo-rs** (this crate) is the **data plane** -- the Rust hot path where
-every microsecond and byte counts (`cargo add scalo`). **scalo-py** is the
-**control plane** -- orchestration, APIs and integration in Python
-(`pip install scalo`). Use whichever fits the tier; both share the same
-config cascade, logging, metrics and resilience conventions.
-
-Not a framework you assemble from twenty crates and 8 weeks of munging. Built
-as the foundation for PB/hr data services.
+trinity are on by default. Unopinionated about your domain -- no web framework,
+no ORM, no enforced transport. Built as the foundation for PB/hr data services.
 
 This module exists because of this --
 <https://www.youtube.com/watch?v=xE9W9Ghe4Jk> -- but for the backend. And of
@@ -78,9 +86,14 @@ Pick the slice you need; pay only for what you use.
 | `transport-kafka` | Kafka transport (rdkafka, dynamic-linking) |
 | `transport-grpc` | gRPC transport (tonic/prost) |
 | `transport-memory` | In-memory transport (testing/dev) |
+| `transport-redis` | Redis / Valkey Streams transport |
 | `transport-grpc-vector-compat` | Vector wire-protocol compatibility |
-| `spool` | Disk-backed async FIFO queue (yaque + zstd) |
+| `spool` | Disk-backed async FIFO queue (yaque + zstd, CRC32C integrity) |
 | `tiered-sink` | Resilient delivery: hot buffer + circuit breaker + disk spillover |
+| `sink-stack` | Outbound control stack: timeout / load-shed / concurrency-limit / retry / rate-limit (tower) |
+| `worker` | Adaptive worker pool + `BatchEngine` (SIMD parse, pre-route, field interning) |
+| `memory` | Cgroup-aware `MemoryGuard` (OOM prevention) |
+| `governor` | Unified self-regulation gate (hard memory + weighted soft signals) |
 | `secrets` | Secrets management core (file backend) |
 | `secrets-vault` | OpenBao / HashiCorp Vault provider |
 | `secrets-aws` | AWS Secrets Manager provider |
@@ -107,12 +120,12 @@ This crate dynamically links against system C libraries for several features.
 
 | Feature | Crate | Build Package | Notes |
 |---------|-------|--------------|-------|
-| `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (>= 2.12.1) | Requires [Confluent APT repo](https://packages.confluent.io/clients/deb) — Ubuntu's default is too old |
+| `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (>= 2.12.1) | Requires [Confluent APT repo](https://packages.confluent.io/clients/deb) - Ubuntu's default is too old |
 | `directory-config-git` | `libgit2-sys` | `libgit2-dev`, `libssh2-1-dev` | System lib avoids vendored C build |
 | `spool`, `tiered-sink` | `zstd-sys` | `libzstd-dev` | System lib avoids vendored C build |
 | (transitive) | `libz-sys` | `zlib1g-dev` | Used by multiple deps |
 | (transitive) | `openssl-sys` | `libssl-dev` | Dynamic linking via pkg-config |
-| `secrets-aws` | `aws-lc-sys` | — | C/C++ compiled from source (no system lib available); ~20–30s first build, cached by sccache |
+| `secrets-aws` | `aws-lc-sys` | - | C/C++ compiled from source (no system lib available); ~20-30s first build, cached by sccache |
 
 For `librdkafka-dev` >= 2.12.1, add the Confluent APT repo:
 
@@ -162,7 +175,7 @@ COPY --from=builder /app/target/release/myapp /usr/local/bin/
 
 For `librdkafka1`, add the Confluent APT repo to both build and runtime stages.
 
-## Health Check Endpoints — The Probe Trinity
+## Health Check Endpoints - The Probe Trinity
 
 For services deployed to Kubernetes, the `http-server` feature provides
 the three K8s probe types:
@@ -175,7 +188,7 @@ the three K8s probe types:
 
 Liveness MUST NEVER check downstream dependencies (a DB outage shouldn't
 restart your replicas). Readiness checks dependencies AND requires an
-explicit `set_ready()` call — cleared during graceful shutdown.
+explicit `set_ready()` call - cleared during graceful shutdown.
 
 ## Self-regulation (default vertical scaling)
 
@@ -191,17 +204,17 @@ and opt-out via `self_regulation.enabled = false`. See
 
 ## Architecture
 
-See [docs/](docs/README.md) for the full documentation index —
+See [docs/](docs/README.md) for the full documentation index -
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module map and layering,
 and [docs/core-pillars/CONFIG.md](docs/core-pillars/CONFIG.md) for the 7-layer
 config cascade reference.
 
 ## License
 
-[Apache-2.0](LICENSE) — Business Source License 1.1, transitions to Apache 2.0 after 3 years.
+[Apache-2.0](LICENSE).
 
 ## Related
 
-- **[hyperi-pylib](https://github.com/hyperi-io/hyperi-pylib)** — sister
-  library for Python services. Same opinions, same patterns, expressive
-  Python ergonomics for control planes, APIs, and integration layers.
+- **[scalo-py](https://github.com/hyperi-io/scalo-py)** -- sister library for
+  Python services. Same opinions, same patterns, expressive Python ergonomics
+  for control planes, APIs, and integration layers.

@@ -5,7 +5,7 @@ get config cascade, structured logs, Prometheus metrics, health probes, OTel
 traces, graceful shutdown, K8s pre-stop, and deployment-artefact generation
 for free. Add a `Transport`, a `TieredSink`, a `BatchEngine` and the same
 deal extends: counters, span propagation, DLQ routing, backpressure, scaling
-signals — all automatic.
+signals - all automatic.
 
 This is the index. Read [ARCHITECTURE.md](ARCHITECTURE.md) for the
 10,000-foot view of how the modules fit together, [INTEGRATION.md](INTEGRATION.md)
@@ -92,10 +92,10 @@ sub-components (filter engine lives inside every transport).
 
 ### Start here
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — module map, dependency graph, layering
-- [INTEGRATION.md](INTEGRATION.md) — "I'm building a data-plane app" walkthrough
-- [AUTO-WIRING.md](AUTO-WIRING.md) — what's wired into what, and why
-- [FEATURE-FLAGS.md](FEATURE-FLAGS.md) — feature tree, native deps, recommended bundles
+- [ARCHITECTURE.md](ARCHITECTURE.md) - module map, dependency graph, layering
+- [INTEGRATION.md](INTEGRATION.md) - "I'm building a data-plane app" walkthrough
+- [AUTO-WIRING.md](AUTO-WIRING.md) - what's wired into what, and why
+- [FEATURE-FLAGS.md](FEATURE-FLAGS.md) - feature tree, native deps, recommended bundles
 
 ### Data plane (WorkBatch + self-regulation)
 
@@ -105,64 +105,67 @@ sub-components (filter engine lives inside every transport).
 
 ### Core pillars (always-on, auto-wired)
 
-- [core-pillars/CONFIG.md](core-pillars/CONFIG.md) — 7-layer cascade, hot-reload, registry, `/config` endpoint
-- [core-pillars/LOGGING.md](core-pillars/LOGGING.md) — tracing setup, JSON/text autodetect, masking, flood control
-- [core-pillars/METRICS.md](core-pillars/METRICS.md) — Prometheus, manifest, cardinality cap
-- [core-pillars/TRACING.md](core-pillars/TRACING.md) — OTel, W3C traceparent, transport propagation
-- [core-pillars/HEALTH.md](core-pillars/HEALTH.md) — `HealthRegistry`, `/healthz` / `/readyz` / `/startupz`
-- [core-pillars/SHUTDOWN.md](core-pillars/SHUTDOWN.md) — `CancellationToken`, K8s pre-stop delay
+- [core-pillars/CONFIG.md](core-pillars/CONFIG.md) - 7-layer cascade, hot-reload, registry, `/config` endpoint
+- [core-pillars/LOGGING.md](core-pillars/LOGGING.md) - tracing setup, JSON/text autodetect, masking, flood control
+- [core-pillars/METRICS.md](core-pillars/METRICS.md) - Prometheus, manifest, cardinality cap
+- [core-pillars/TRACING.md](core-pillars/TRACING.md) - OTel, W3C traceparent, transport propagation
+- [core-pillars/HEALTH.md](core-pillars/HEALTH.md) - `HealthRegistry`, `/healthz` / `/readyz` / `/startupz`
+- [core-pillars/SHUTDOWN.md](core-pillars/SHUTDOWN.md) - `CancellationToken`, K8s pre-stop delay
 
 ### Runtime
 
-- [runtime/SERVICE-RUNTIME.md](runtime/SERVICE-RUNTIME.md) — `ServiceRuntime`, `ServiceApp` trait, `run_app`
-- [runtime/RUNTIME-CONTEXT.md](runtime/RUNTIME-CONTEXT.md) — K8s/Docker/BareMetal detection, pod metadata
-- [runtime/MEMORY.md](runtime/MEMORY.md) — `MemoryGuard`, cgroup-aware backpressure
+- [runtime/SERVICE-RUNTIME.md](runtime/SERVICE-RUNTIME.md) - `ServiceRuntime`, `ServiceApp` trait, `run_app`
+- [runtime/RUNTIME-CONTEXT.md](runtime/RUNTIME-CONTEXT.md) - K8s/Docker/BareMetal detection, pod metadata
+- [runtime/MEMORY.md](runtime/MEMORY.md) - `MemoryGuard`, cgroup-aware backpressure
 
 ### Transport
 
-- [transport/OVERVIEW.md](transport/OVERVIEW.md) — trait architecture, factory, `AnySender`, commit tokens
-- [transport/BACKENDS.md](transport/BACKENDS.md) — Kafka, gRPC, Memory, File, Pipe, HTTP, Redis
-- [transport/FILTER-ENGINE.md](transport/FILTER-ENGINE.md) — 3-tier filter (SIMD / compiled CEL / complex CEL)
-- [transport/ROUTING.md](transport/ROUTING.md) — `RoutedSender` for receiver and fetcher
+- [transport/OVERVIEW.md](transport/OVERVIEW.md) - trait architecture, factory, `AnySender`, commit tokens
+- [transport/BACKENDS.md](transport/BACKENDS.md) - Kafka, gRPC, Memory, File, Pipe, HTTP, Redis
+- [transport/FILTER-ENGINE.md](transport/FILTER-ENGINE.md) - 3-tier filter (SIMD / compiled CEL / complex CEL)
+- [transport/ROUTING.md](transport/ROUTING.md) - `RoutedSender` for receiver and fetcher
 
 ### Deployment
 
-- [deployment/CONTRACT.md](deployment/CONTRACT.md) — `DeploymentContract` struct, schema versioning
-- [deployment/ARTEFACTS.md](deployment/ARTEFACTS.md) — generated Dockerfile, Helm chart, ArgoCD Application
-- [deployment/NATIVE-DEPS.md](deployment/NATIVE-DEPS.md) — `NativeDepsContract`, feature → APT package map
-- [deployment/KEDA.md](deployment/KEDA.md) — `KedaContract`, scaler triggers, fallback HPA
+- [deployment/CONTRACT.md](deployment/CONTRACT.md) - `DeploymentContract` struct, schema versioning
+- [deployment/ARTEFACTS.md](deployment/ARTEFACTS.md) - generated Dockerfile, Helm chart, ArgoCD Application
+- [deployment/NATIVE-DEPS.md](deployment/NATIVE-DEPS.md) - `NativeDepsContract`, feature -> APT package map
+- [deployment/KEDA.md](deployment/KEDA.md) - `KedaContract`, scaler triggers, fallback HPA
 
 ### Pipeline
 
-- [pipeline/BATCH-ENGINE.md](pipeline/BATCH-ENGINE.md) — SIMD parse, pre-route filter, field interning
-- [pipeline/WORKER-POOL.md](pipeline/WORKER-POOL.md) — `AdaptiveWorkerPool`, pressure-based scaling
-- [pipeline/TIERED-SINK.md](pipeline/TIERED-SINK.md) — resilient delivery, disk spillover, circuit breaker
-- [pipeline/DLQ.md](pipeline/DLQ.md) — file, Kafka, HTTP, Redis backends
-- [pipeline/SPOOL.md](pipeline/SPOOL.md) — disk-backed async FIFO (yaque)
-- [pipeline/STRMATCH.md](pipeline/STRMATCH.md) — 4-tier regex→fast-path matcher (Byte / Literal / LiteralSet / Regex)
-- [pipeline/SCALING.md](pipeline/SCALING.md) — `ScalingPressure`, KEDA external scaler signal
+- [pipeline/BATCH-ENGINE.md](pipeline/BATCH-ENGINE.md) - SIMD parse, pre-route filter, field interning
+- [pipeline/WORKER-POOL.md](pipeline/WORKER-POOL.md) - `AdaptiveWorkerPool`, pressure-based scaling
+- [pipeline/TIERED-SINK.md](pipeline/TIERED-SINK.md) - resilient delivery, disk spillover, circuit breaker
+- [pipeline/SINK-STACK.md](pipeline/SINK-STACK.md) - outbound control stack: timeout / load-shed / concurrency (static or ARC) / retry / rate-limit
+- [pipeline/DLQ.md](pipeline/DLQ.md) - file, Kafka, HTTP, Redis backends
+- [pipeline/SPOOL.md](pipeline/SPOOL.md) - disk-backed async FIFO (yaque)
+- [pipeline/STRMATCH.md](pipeline/STRMATCH.md) - 4-tier regex->fast-path matcher (Byte / Literal / LiteralSet / Regex)
+- [pipeline/SCALING.md](pipeline/SCALING.md) - `ScalingPressure`, KEDA external scaler signal
 
 ### Less-common subsystems
 
-- [api/SECRETS.md](api/SECRETS.md) — OpenBao/Vault, AWS Secrets Manager
-- [api/HTTP-SERVER.md](api/HTTP-SERVER.md) — axum server, probe wiring, route extensions
-- [api/HTTP-CLIENT.md](api/HTTP-CLIENT.md) — `reqwest` + retry + circuit breaker
-- [api/CACHE.md](api/CACHE.md) — moka TinyLFU cache
-- [api/DIRECTORY-CONFIG.md](api/DIRECTORY-CONFIG.md) — YAML directory store with optional `git2`
-- [api/CONCURRENCY.md](api/CONCURRENCY.md) — `BackgroundSink`, `PeriodicWorker`, `ActorHandle`
+- [api/SECRETS.md](api/SECRETS.md) - OpenBao/Vault, AWS Secrets Manager
+- [api/HTTP-SERVER.md](api/HTTP-SERVER.md) - axum server, probe wiring, route extensions
+- [api/HTTP-CLIENT.md](api/HTTP-CLIENT.md) - `reqwest` + retry + circuit breaker
+- [api/DIRECTORY-CONFIG.md](api/DIRECTORY-CONFIG.md) - YAML directory store with optional `git2`
+- [api/CONCURRENCY.md](api/CONCURRENCY.md) - `BackgroundSink`, `PeriodicWorker`, `ActorHandle`
 
 ### Planned (not in current release)
 
 - **Content-based log scrubbing** (gitleaks rules + PII validators
   composed via `strmatch`). The current release ships field-name
-  masking via `MaskingWriter` only — see
+  masking via `MaskingWriter` only - see
   [core-pillars/LOGGING.md](core-pillars/LOGGING.md) for what's
   shipped.
+- **`cache` module** (moka TinyLFU async cache). Documented in
+  [api/CACHE.md](api/CACHE.md) but not currently built into the crate;
+  there is no `cache` feature or `scalo::cache` module in this release.
 
 ### Workflow artefacts (not user docs)
 
-- [superpowers/](superpowers/) — design specs and execution plans for in-flight work
-- [MIGRATIONS.md](MIGRATIONS.md) — API surface changes by scalo version; consumer-rebuild playbook
+- [superpowers/](superpowers/) - design specs and execution plans for in-flight work
+- [MIGRATIONS.md](MIGRATIONS.md) - API surface changes by scalo version; consumer-rebuild playbook
 
 ---
 
@@ -172,4 +175,4 @@ sub-components (filter engine lives inside every transport).
 - **Edition:** 2024
 - **MSRV:** see `rust-version` in `Cargo.toml`
 - **Used by:** [dfe-loader](https://github.com/hyperi-io/dfe-loader), [dfe-receiver](https://github.com/hyperi-io/dfe-receiver), [dfe-fetcher](https://github.com/hyperi-io/dfe-fetcher), [dfe-archiver](https://github.com/hyperi-io/dfe-archiver), [dfe-transform-vrl](https://github.com/hyperi-io/dfe-transform-vrl), [dfe-transform-vector](https://github.com/hyperi-io/dfe-transform-vector)
-- **Sibling libs:** [hyperi-pylib](https://github.com/hyperi-io/hyperi-pylib) (Python equivalent)
+- **Sibling lib:** [scalo-py](https://github.com/hyperi-io/scalo-py) (Python control-plane equivalent)
