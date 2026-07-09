@@ -46,9 +46,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustls::{ClientConfig, RootCertStore};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, NamedGroup, ProtocolVersion, RootCertStore};
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
+
+use crate::crypto::{CryptoProfile, PqcMode, TlsFloor};
 
 /// Errors building a TLS trust store or client config.
 #[derive(Debug, thiserror::Error)]
@@ -214,29 +217,146 @@ pub fn build_root_store(trust: &TlsTrust) -> Result<RootCertStore, TlsError> {
     Ok(store)
 }
 
-/// Build a rustls [`ClientConfig`] from a [`TlsConfigSource`].
-///
-/// Uses an explicit aws-lc-rs crypto provider, safe default protocol versions,
-/// and no client authentication. See the module docs for why the provider is
-/// explicit.
+/// Build a rustls [`ClientConfig`] with the default ([`CryptoProfile::Prod`])
+/// posture: commercial-floor best practice - TLS 1.2 floor (1.3 preferred),
+/// hybrid ML-KEM key exchange preferred with classical fallback, AES-256,
+/// verified certs. The drop-in "fire and use" form; `reqwest`, `tonic`,
+/// `tokio-rustls`, `hyper` and the clickhouse-rs fork all consume the result.
 ///
 /// # Errors
 ///
 /// Propagates [`build_root_store`] errors, and [`TlsError::Build`] if rustls
 /// rejects the protocol-version selection.
 pub fn build_client_config(source: TlsConfigSource) -> Result<Arc<ClientConfig>, TlsError> {
+    build_client_config_with(CryptoProfile::default(), source)
+}
+
+/// Build a rustls [`ClientConfig`] for an explicit [`CryptoProfile`] - e.g.
+/// [`CryptoProfile::HighSec`] to require hybrid post-quantum key exchange and
+/// pin TLS 1.3.
+///
+/// # Errors
+///
+/// As [`build_client_config`].
+pub fn build_client_config_with(
+    profile: CryptoProfile,
+    source: TlsConfigSource,
+) -> Result<Arc<ClientConfig>, TlsError> {
     match source {
         TlsConfigSource::Explicit(cfg) => Ok(cfg),
         TlsConfigSource::Trust(trust) => {
             let roots = build_root_store(&trust)?;
-            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-            let cfg = ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
+            let provider = posture_provider(profile.pqc());
+            let builder = ClientConfig::builder_with_provider(provider);
+            let versioned = match profile.tls_floor() {
+                // Commercial floor: TLS 1.2 + 1.3; peers negotiate up.
+                TlsFloor::V1_2 => builder.with_safe_default_protocol_versions(),
+                // National-security: TLS 1.3 only.
+                TlsFloor::V1_3 => builder.with_protocol_versions(&[&rustls::version::TLS13]),
+            };
+            let cfg = versioned
                 .map_err(|e| TlsError::Build(e.to_string()))?
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             Ok(Arc::new(cfg))
         }
+    }
+}
+
+/// Is `group` a hybrid post-quantum (ML-KEM) key-exchange group?
+///
+/// Add `SecP384r1MLKEM1024` (the CNSA-pure P-384 + ML-KEM-1024 hybrid) here
+/// when rustls/aws-lc-rs expose it; today the widely-deployed
+/// `X25519MLKEM768` is the one available.
+fn is_hybrid_pqc(group: NamedGroup) -> bool {
+    matches!(group, NamedGroup::X25519MLKEM768)
+}
+
+/// Build an aws-lc-rs provider with the kx-group order/selection the
+/// [`PqcMode`] mandates.
+///
+/// aws-lc-rs OFFERS the hybrid group by default but lists it LAST, so two
+/// default peers negotiate a CLASSICAL group (proven by spike). `Prefer`
+/// reorders the hybrid to the front so it is actually used; `Require` keeps
+/// only the hybrid(s) (non-PQC peers are refused); `Off` drops them.
+fn posture_provider(pqc: PqcMode) -> Arc<CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    match pqc {
+        // Stable sort: hybrid(s) to the front, classical order preserved.
+        PqcMode::Prefer => provider
+            .kx_groups
+            .sort_by_key(|g| u8::from(!is_hybrid_pqc(g.name()))),
+        PqcMode::Require => provider.kx_groups.retain(|g| is_hybrid_pqc(g.name())),
+        PqcMode::Off => provider.kx_groups.retain(|g| !is_hybrid_pqc(g.name())),
+    }
+    Arc::new(provider)
+}
+
+/// Primitive TLS-posture values, for consumers that take paths/strings rather
+/// than a rustls [`ClientConfig`] - libpq (`sslmode`/`sslrootcert`), librdkafka
+/// (`ssl.ca.location`/`ssl.cipher.suites`/`ssl.curves.list`), `sqlx`. The same
+/// posture as [`build_client_config_with`], expressed as those fields (the
+/// "primitives" mint form).
+#[derive(Debug, Clone)]
+pub struct TlsParts {
+    /// Minimum TLS version, `"1.2"` or `"1.3"`.
+    pub min_version: &'static str,
+    /// Key-exchange groups in preference order (OpenSSL/librdkafka names).
+    pub curves: Vec<&'static str>,
+    /// TLS 1.2 AEAD cipher list (OpenSSL/librdkafka form).
+    pub cipher_string: &'static str,
+    /// Private-CA bundle path(s) to trust.
+    pub ca_paths: Vec<PathBuf>,
+    /// Whether to verify the peer certificate (always true off the hard floor).
+    pub verify: bool,
+}
+
+/// Emit [`TlsParts`] for a profile + trust: the primitives mint form.
+#[must_use]
+pub fn tls_parts(profile: CryptoProfile, trust: &TlsTrust) -> TlsParts {
+    let curves = match profile.pqc() {
+        PqcMode::Require => vec!["X25519MLKEM768"],
+        PqcMode::Prefer => vec!["X25519MLKEM768", "P-384", "X25519"],
+        PqcMode::Off => vec!["P-384", "X25519"],
+    };
+    TlsParts {
+        min_version: match profile.tls_floor() {
+            TlsFloor::V1_2 => "1.2",
+            TlsFloor::V1_3 => "1.3",
+        },
+        curves,
+        cipher_string: "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384",
+        ca_paths: trust.extra_roots.clone(),
+        verify: true,
+    }
+}
+
+/// Warn (via `tracing`) if a COMPLETED handshake negotiated below the profile's
+/// preferred posture - a classical key exchange when hybrid was preferred, or
+/// TLS 1.2 when 1.3 was available. Call after the handshake on a scalo-owned
+/// socket / server connection (rustls `negotiated_key_exchange_group()` +
+/// `protocol_version()`); `reqwest`/`tonic` do not surface these to the caller.
+pub fn warn_if_downgraded(
+    profile: CryptoProfile,
+    negotiated_version: Option<ProtocolVersion>,
+    negotiated_group: Option<NamedGroup>,
+    peer: &str,
+) {
+    if !profile.warn_on_downgrade() {
+        return;
+    }
+    if profile.pqc() == PqcMode::Prefer && negotiated_group.is_some_and(|g| !is_hybrid_pqc(g)) {
+        tracing::warn!(
+            peer,
+            group = ?negotiated_group,
+            "TLS negotiated a classical key exchange (no post-quantum protection); peer does not offer hybrid ML-KEM"
+        );
+    }
+    if negotiated_version == Some(ProtocolVersion::TLSv1_2) {
+        tracing::warn!(
+            peer,
+            "TLS negotiated 1.2, below the preferred 1.3 (commercial floor)"
+        );
     }
 }
 
@@ -261,6 +381,146 @@ mod tests {
         f.write_all(contents.as_bytes()).expect("write");
         f.flush().expect("flush");
         f
+    }
+
+    // --- real in-process TLS handshake harness (no network, real crypto) ---
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use rustls::{ClientConnection, ServerConfig, ServerConnection};
+
+    /// A P-384 self-signed server cert: (DER cert, DER key, PEM for the CA file).
+    fn gen_server_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>, String) {
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let pem = ck.cert.pem();
+        let cert = ck.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()));
+        (cert, key, pem)
+    }
+
+    fn server_config_with(
+        pqc: PqcMode,
+        cert: &CertificateDer<'static>,
+        key: &PrivateKeyDer<'static>,
+    ) -> Arc<ServerConfig> {
+        Arc::new(
+            ServerConfig::builder_with_provider(posture_provider(pqc))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key.clone_key())
+                .unwrap(),
+        )
+    }
+
+    /// Drive an in-memory handshake to completion; propagate the first rustls
+    /// error (e.g. no common kx group under `Require` vs a classical peer).
+    fn pump(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection,
+    ) -> Result<(), rustls::Error> {
+        for _ in 0..40 {
+            let mut c2s: Vec<u8> = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut c2s).unwrap();
+            }
+            let mut rd: &[u8] = &c2s;
+            while !rd.is_empty() {
+                server.read_tls(&mut rd).unwrap();
+                server.process_new_packets()?;
+            }
+            let mut s2c: Vec<u8> = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut s2c).unwrap();
+            }
+            let mut rd2: &[u8] = &s2c;
+            while !rd2.is_empty() {
+                client.read_tls(&mut rd2).unwrap();
+                client.process_new_packets()?;
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn client_for(profile: CryptoProfile, ca_path: &Path) -> Arc<ClientConfig> {
+        build_client_config_with(
+            profile,
+            TlsConfigSource::Trust(TlsTrust::private_ca(ca_path)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prod_negotiates_pqc_hybrid() {
+        let (cert, key, pem) = gen_server_cert();
+        let ca = write_temp(&pem);
+        let mut client = ClientConnection::new(
+            client_for(CryptoProfile::Prod, ca.path()),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server =
+            ServerConnection::new(server_config_with(PqcMode::Prefer, &cert, &key)).unwrap();
+        pump(&mut client, &mut server).expect("handshake completes");
+        assert_eq!(
+            client.negotiated_key_exchange_group().map(|g| g.name()),
+            Some(NamedGroup::X25519MLKEM768),
+            "prod prefers and actually negotiates the hybrid PQC group"
+        );
+        assert_eq!(client.protocol_version(), Some(ProtocolVersion::TLSv1_3));
+    }
+
+    #[test]
+    fn highsec_require_fails_against_classical_only_peer() {
+        let (cert, key, pem) = gen_server_cert();
+        let ca = write_temp(&pem);
+        let mut client = ClientConnection::new(
+            client_for(CryptoProfile::HighSec, ca.path()), // requires PQC
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server =
+            ServerConnection::new(server_config_with(PqcMode::Off, &cert, &key)).unwrap(); // classical only
+        assert!(
+            pump(&mut client, &mut server).is_err(),
+            "highsec REQUIRES post-quantum kx; a classical-only peer must fail, not silently downgrade"
+        );
+    }
+
+    #[test]
+    fn posture_provider_selects_groups() {
+        let all_hybrid = |p: &CryptoProvider| p.kx_groups.iter().all(|g| is_hybrid_pqc(g.name()));
+        let any_hybrid = |p: &CryptoProvider| p.kx_groups.iter().any(|g| is_hybrid_pqc(g.name()));
+        let prefer = posture_provider(PqcMode::Prefer);
+        assert!(
+            prefer
+                .kx_groups
+                .first()
+                .is_some_and(|g| is_hybrid_pqc(g.name())),
+            "prefer puts the hybrid first"
+        );
+        assert!(
+            all_hybrid(&posture_provider(PqcMode::Require)),
+            "require keeps only hybrid"
+        );
+        assert!(
+            !any_hybrid(&posture_provider(PqcMode::Off)),
+            "off drops the hybrid"
+        );
+    }
+
+    #[test]
+    fn tls_parts_reflect_profile() {
+        let f = write_temp(&gen_ca_bundle(1));
+        let trust = TlsTrust::private_ca(f.path());
+        let prod = tls_parts(CryptoProfile::Prod, &trust);
+        assert_eq!(prod.min_version, "1.2");
+        assert_eq!(prod.curves.first(), Some(&"X25519MLKEM768"));
+        assert_eq!(prod.ca_paths, vec![f.path().to_path_buf()]);
+        let hs = tls_parts(CryptoProfile::HighSec, &trust);
+        assert_eq!(hs.min_version, "1.3");
+        assert_eq!(hs.curves, vec!["X25519MLKEM768"]);
     }
 
     #[test]
