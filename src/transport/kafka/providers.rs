@@ -67,6 +67,10 @@ pub enum AuthKind {
 /// ACTS on these (create/delete/status, teardown-to-empty) reads them from the opt-in
 /// lifecycle layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// A capability descriptor: independent boolean facts about a provider, not a state
+// machine. Two-variant enums per flag would be pure ceremony (clippy's own fallback
+// suggestion is this allow).
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProviderCapabilities {
     /// Managed SaaS/cloud (vs a self-hosted broker you run in-cluster).
     pub managed: bool,
@@ -471,6 +475,9 @@ mod tests {
     // trait -- no change to this module. (Illustrative: NOT a blessed provider.)
     struct DemoProvider;
     impl KafkaProvider for DemoProvider {
+        // The trait returns &str (a provider may name itself dynamically); this test
+        // double returns a literal, so silence the &'static str nudge here.
+        #[allow(clippy::unnecessary_literal_bound)]
         fn name(&self) -> &str {
             "demo"
         }

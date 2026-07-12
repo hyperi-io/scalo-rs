@@ -1308,10 +1308,10 @@ impl KafkaConfig {
     /// # Errors
     /// Returns `Err` if `provider` names an unknown provider.
     pub fn apply_provider(&mut self) -> Result<(), String> {
+        use super::providers::{KafkaProvider, KnownProvider};
         let Some(name) = self.provider.clone() else {
             return Ok(());
         };
-        use super::providers::{KafkaProvider, KnownProvider};
         KnownProvider::parse(&name)?.apply_auth(self);
         Ok(())
     }
