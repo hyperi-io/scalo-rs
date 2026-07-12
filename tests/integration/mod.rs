@@ -6,14 +6,22 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-// Always-compiled integration tests
-mod config_parity;
+// Always-compiled integration tests (core modules only)
 mod env;
 mod env_parity;
+
+// Feature-gated integration tests. Each is gated on the library module it
+// exercises so a partial `--features` run compiles instead of erroring (CI runs
+// `features: all`, so all of these are on there). Matches env.rs's per-mod gating.
+#[cfg(feature = "config")]
+mod config_parity;
+
+#[cfg(feature = "logger")]
 mod logger_output;
+
+#[cfg(feature = "metrics")]
 mod metrics;
 
-// Feature-gated integration tests
 #[cfg(feature = "directory-config")]
 mod directory_config;
 

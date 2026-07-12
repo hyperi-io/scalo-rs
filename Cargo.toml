@@ -500,4 +500,14 @@ required-features = ["memory"]
 name = "cpu_loadgen"
 required-features = ["worker"]
 
+# Demo examples gate on the library modules they exercise, so a partial
+# `--features` build skips them instead of erroring (CI runs `features: all`).
+[[example]]
+name = "quickstart"
+required-features = ["config", "logger"]
+
+[[example]]
+name = "full_demo"
+required-features = ["config", "logger", "metrics", "runtime"]
+
 # Release marker: trigger v2.8.0 publish via hyperi-ci version-first pipeline.

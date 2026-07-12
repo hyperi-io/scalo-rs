@@ -20,6 +20,7 @@ fn smoke_env_detection() {
     );
 }
 
+#[cfg(feature = "runtime")]
 #[test]
 fn smoke_runtime_paths() {
     let paths = scalo::runtime::RuntimePaths::discover();

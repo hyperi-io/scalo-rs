@@ -51,8 +51,10 @@
 
 mod admin;
 mod config;
+pub mod contract;
 mod metrics;
 mod producer;
+pub mod providers;
 mod token;
 pub mod topic_resolver;
 
@@ -68,6 +70,9 @@ pub use metrics::{
     BrokerMetrics, KafkaMetrics, StatsContext, healthy_broker_count, total_consumer_lag,
 };
 pub use producer::{KafkaProducer, ProducerMetrics, ProducerProfile};
+pub use providers::{
+    AuthKind, KafkaProvider, KnownProvider, MetadataMode, ProviderCapabilities, SchemaRegistry,
+};
 pub use token::KafkaToken;
 pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
 
@@ -212,9 +217,13 @@ impl KafkaTransport {
     // the additive governor fields nudged it over the 150-line soft cap.
     #[allow(clippy::too_many_lines)]
     pub async fn new(config: &KafkaConfig) -> TransportResult<Self> {
-        // Enforce the production guardrail at construction: reject ssl_skip_verify (and insecure transport without
-        // an explicit override) in prod here, not only when an app remembers
-        // to call validate() at startup.
+        // Resolve the provider preset FIRST: if `config.provider` is set, derive
+        // security_protocol + sasl_mechanism from it (never hand-set). Then enforce
+        // the production guardrail (reject ssl_skip_verify / insecure transport) at
+        // construction, not only when an app remembers to call validate().
+        let mut owned = config.clone();
+        owned.apply_provider().map_err(TransportError::Config)?;
+        let config = &owned;
         config
             .validate(crate::env::is_production())
             .map_err(TransportError::Config)?;

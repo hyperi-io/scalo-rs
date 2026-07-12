@@ -885,6 +885,14 @@ pub struct KafkaConfig {
     #[serde(default = "default_security_protocol")]
     pub security_protocol: String,
 
+    /// Optional managed-Kafka provider name (strimzi / redpanda / confluent-cloud /
+    /// redpanda-cloud / msk / plaintext). When set, DERIVES security_protocol +
+    /// sasl_mechanism from the opt-in provider presets -- the caller does NOT
+    /// hand-set them. Applied by [`apply_provider`](KafkaConfig::apply_provider)
+    /// before validate(). See [`providers`](super::providers).
+    #[serde(default)]
+    pub provider: Option<String>,
+
     /// SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER).
     #[serde(default)]
     pub sasl_mechanism: Option<String>,
@@ -1105,6 +1113,7 @@ impl Default for KafkaConfig {
             topic_refresh_secs: default_topic_refresh_secs(),
             topic_suppression_rules: default_topic_suppression_rules(),
             security_protocol: default_security_protocol(),
+            provider: None,
             sasl_mechanism: None,
             sasl_username: None,
             sasl_password: None,
@@ -1292,6 +1301,21 @@ impl KafkaConfig {
         self
     }
 
+    /// Resolve the provider preset: if [`provider`](Self::provider) is set, derive
+    /// `security_protocol` + `sasl_mechanism` from it (never hand-set). No-op when
+    /// `provider` is `None`. Call BEFORE [`validate`](Self::validate).
+    ///
+    /// # Errors
+    /// Returns `Err` if `provider` names an unknown provider.
+    pub fn apply_provider(&mut self) -> Result<(), String> {
+        let Some(name) = self.provider.clone() else {
+            return Ok(());
+        };
+        use super::providers::{KafkaProvider, KnownProvider};
+        KnownProvider::parse(&name)?.apply_auth(self);
+        Ok(())
+    }
+
     /// Validate the Kafka config against the deployment profile.
     ///
     /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
@@ -1304,10 +1328,26 @@ impl KafkaConfig {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when `is_production` and either `ssl_skip_verify` is set,
-    /// or an unencrypted transport (`plaintext`/`sasl_plaintext`) is configured
-    /// without the explicit `allow_insecure_transport` opt-in.
+    /// Returns `Err` (in ANY environment) when `sasl_mechanism` is `PLAIN` but the
+    /// transport is not `sasl_ssl` -- a PLAIN password must never cross a plaintext
+    /// transport. Additionally, when `is_production`, returns `Err` if
+    /// `ssl_skip_verify` is set, or an unencrypted transport
+    /// (`plaintext`/`sasl_plaintext`) is configured without the explicit
+    /// `allow_insecure_transport` opt-in.
     pub fn validate(&self, is_production: bool) -> Result<(), String> {
+        // Universal floor (dev AND prod): PLAIN sends the password in cleartext,
+        // so it MUST ride an encrypted transport (sasl_ssl). SCRAM challenges are
+        // safe over a plaintext transport, so only PLAIN is gated here. Mirrors the
+        // opt-in provider presets + the Python contract (dfe-engine#98).
+        if self.sasl_mechanism.as_deref() == Some("PLAIN")
+            && !self.security_protocol.eq_ignore_ascii_case("sasl_ssl")
+        {
+            return Err(format!(
+                "kafka: SASL PLAIN requires security_protocol=sasl_ssl (got '{}') -- \
+                 never send a PLAIN password over a plaintext transport",
+                self.security_protocol
+            ));
+        }
         if !is_production {
             return Ok(());
         }
@@ -1425,6 +1465,7 @@ impl KafkaConfig {
     /// - `{PREFIX}_PROFILE` -> profile (production, devtest)
     /// - `{PREFIX}_BOOTSTRAP_SERVERS` -> brokers (legacy: `{PREFIX}_BROKERS`)
     /// - `{PREFIX}_GROUP_ID` -> group
+    /// - `{PREFIX}_PROVIDER` -> provider (derives security_protocol + sasl_mechanism)
     /// - `{PREFIX}_SECURITY_PROTOCOL` -> security_protocol
     /// - `{PREFIX}_SASL_MECHANISM` -> sasl_mechanism
     /// - `{PREFIX}_SASL_USERNAME` -> sasl_username (legacy: `{PREFIX}_SASL_USER`)
@@ -1481,6 +1522,12 @@ impl KafkaConfig {
             config.group_instance_id = Some(val);
         }
 
+        // PROVIDER derives security_protocol + sasl_mechanism at construction (see
+        // apply_provider); read it here so KAFKA_PROVIDER wires the abstraction into
+        // the env-configured data-plane services.
+        if let Some(val) = prefixed("PROVIDER", &[]).get() {
+            config.provider = Some(val);
+        }
         if let Some(val) = prefixed("SECURITY_PROTOCOL", &[]).get() {
             config.security_protocol = val;
         }
@@ -1587,6 +1634,71 @@ mod tests {
             opted_in.validate(true).is_ok(),
             "allow_insecure_transport opts into plaintext in prod"
         );
+    }
+
+    #[test]
+    fn validate_refuses_plain_over_plaintext_in_any_env() {
+        // The universal floor: PLAIN sends the password in cleartext, so it must
+        // ride sasl_ssl -- rejected even in dev (is_production=false).
+        let plain_plaintext = KafkaConfig {
+            security_protocol: "sasl_plaintext".to_string(),
+            sasl_mechanism: Some("PLAIN".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            plain_plaintext.validate(false).is_err(),
+            "dev must still reject PLAIN over plaintext"
+        );
+        assert!(plain_plaintext.validate(true).is_err());
+
+        // PLAIN over sasl_ssl is fine (the Confluent Cloud shape).
+        let plain_tls = KafkaConfig {
+            security_protocol: "sasl_ssl".to_string(),
+            sasl_mechanism: Some("PLAIN".to_string()),
+            ..Default::default()
+        };
+        assert!(plain_tls.validate(false).is_ok());
+        assert!(plain_tls.validate(true).is_ok());
+
+        // SCRAM over sasl_plaintext stays allowed in dev (challenge-based, no
+        // cleartext password on the wire).
+        let scram_plaintext = KafkaConfig {
+            security_protocol: "sasl_plaintext".to_string(),
+            sasl_mechanism: Some("SCRAM-SHA-512".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            scram_plaintext.validate(false).is_ok(),
+            "SCRAM over plaintext is ok in dev"
+        );
+    }
+
+    #[test]
+    fn apply_provider_derives_from_preset() {
+        let mut cfg = KafkaConfig {
+            provider: Some("confluent-cloud".to_string()),
+            ..Default::default()
+        };
+        cfg.apply_provider().unwrap();
+        assert_eq!(cfg.security_protocol, "sasl_ssl");
+        assert_eq!(cfg.sasl_mechanism.as_deref(), Some("PLAIN"));
+    }
+
+    #[test]
+    fn apply_provider_is_a_noop_without_a_provider() {
+        let mut cfg = KafkaConfig::default();
+        cfg.apply_provider().unwrap();
+        assert_eq!(cfg.security_protocol, "plaintext");
+        assert_eq!(cfg.sasl_mechanism, None);
+    }
+
+    #[test]
+    fn apply_provider_rejects_an_unknown_provider() {
+        let mut cfg = KafkaConfig {
+            provider: Some("kinesis".to_string()),
+            ..Default::default()
+        };
+        assert!(cfg.apply_provider().is_err());
     }
 
     #[test]

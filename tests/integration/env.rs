@@ -83,6 +83,18 @@ mod kafka_env {
     }
 
     #[test]
+    fn test_kafka_from_env_provider() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&[("KAFKA_PROVIDER", "confluent-cloud")]);
+        // from_env reads the provider NAME; the mechanism derivation happens later at
+        // KafkaTransport::new (apply_provider), so here we assert the field is set.
+        assert_eq!(
+            KafkaConfig::from_env_standard().provider,
+            Some("confluent-cloud".to_string())
+        );
+    }
+
+    #[test]
     fn test_kafka_from_env_group_instance_id() {
         let _lock = ENV_LOCK.lock().unwrap();
         // Set; canonically the pod name.
