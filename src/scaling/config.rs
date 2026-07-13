@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 /// each app's config and passed to [`super::ScalingPressure::new`] via
 /// [`ScalingComponent`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct ScalingPressureConfig {
     /// Enable scaling pressure calculation.

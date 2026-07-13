@@ -63,6 +63,7 @@ impl SecretsConfig {
 
 /// Cache configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct CacheConfig {
     /// Enable caching.

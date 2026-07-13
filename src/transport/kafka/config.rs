@@ -62,6 +62,7 @@ use std::str::FromStr;
 /// | `balanced` | Mixed OLTP + analytics, moderate batch size |
 /// | `low_latency` | Near-real-time, event-driven, small messages |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SelfRegulationProfile {
     /// Maximum throughput: generous byte budgets, tolerates batching delay.
@@ -165,6 +166,7 @@ impl SelfRegulationProfile {
 /// All fields are `Option<T>`: `None` means "use the profile default".
 /// An explicit `Some(v)` wins over the profile default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct ConsumerKnobs {
     /// Minimum bytes the broker must have ready before responding to a Fetch.
     ///
@@ -212,6 +214,7 @@ pub struct ConsumerKnobs {
 ///
 /// All fields are `Option<T>`: `None` means "use the profile default".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct ProducerKnobs {
     /// Maximum bytes per MessageSet (librdkafka `batch.size`, default 1 MiB).
     ///
@@ -281,6 +284,7 @@ pub struct ProducerKnobs {
 /// that the sizing surface depends on (the fetch byte sizes and
 /// `enable.auto.commit`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct KafkaSizingConfig {
     /// Sizing profile (throughput / balanced / low_latency).
     #[serde(default)]
@@ -542,6 +546,7 @@ impl KafkaSizingConfig {
 /// for a base name, the topic with `suppressed_suffix` for that same base
 /// is removed. Default: `_load` suppresses `_land`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct SuppressionRule {
     /// The suffix of the preferred (kept) topic.
     pub preferred_suffix: String,
@@ -558,6 +563,7 @@ pub struct SuppressionRule {
 /// Profiles provide opinionated librdkafka defaults for specific use cases.
 /// Users can override any setting via `librdkafka_overrides`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum KafkaProfile {
     /// Production profile: lean baseline for all data-plane services.
@@ -814,6 +820,7 @@ pub const LOW_LATENCY_CONSUMER_DEFAULTS: &[(&str, &str)] = &[
 /// Uses a profile-based system where profiles provide opinionated defaults,
 /// and `librdkafka_overrides` allows overriding any setting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[allow(clippy::struct_excessive_bools)] // Kafka config legitimately has many boolean flags
 pub struct KafkaConfig {
     /// Configuration profile (production, devtest).

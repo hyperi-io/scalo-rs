@@ -12,6 +12,7 @@ use super::types::PayloadFormat;
 
 /// Action to take when a message fails to parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ParseErrorAction {
     /// Route failed messages to the dead-letter queue (default).
@@ -28,6 +29,7 @@ pub enum ParseErrorAction {
 /// Filters are evaluated in order. The first filter that matches determines
 /// the message's [`super::types::PreRouteResult`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PreRouteFilterConfig {
     /// Route to DLQ if a required field is absent.
@@ -49,6 +51,7 @@ pub enum PreRouteFilterConfig {
 /// All values are overridable via the 7-layer config cascade
 /// (CLI > ENV > .env > settings.{env}.yaml > settings.yaml > defaults > scalo > hard-coded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct BatchProcessingConfig {
     /// Maximum number of messages per rayon chunk.
     ///

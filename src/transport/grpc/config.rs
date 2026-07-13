@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Set both for bidirectional communication (e.g., a relay node).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct GrpcConfig {
     /// Server listen address (e.g., "0.0.0.0:6000").

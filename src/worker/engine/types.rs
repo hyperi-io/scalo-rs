@@ -16,6 +16,7 @@ use std::sync::Arc;
 /// feature is not enabled. When `transport` is enabled, conversions between the
 /// two types are provided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum PayloadFormat {
     /// Auto-detect from payload bytes.

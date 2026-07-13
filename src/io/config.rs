@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 /// File rotation period.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RotationPeriod {
     /// Rotate files every hour.

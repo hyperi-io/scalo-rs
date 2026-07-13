@@ -30,6 +30,7 @@ use super::budget::FilterBudget;
 ///   action: dlq
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct FilterRule {
     /// CEL expression to evaluate against each message payload.
     pub expression: String,
@@ -41,6 +42,7 @@ pub struct FilterRule {
 
 /// Disposition action when a filter matches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FilterAction {
     /// Silently discard the message (counted in metrics).

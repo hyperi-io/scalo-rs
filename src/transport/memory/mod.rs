@@ -42,6 +42,7 @@ use tokio::sync::mpsc;
 
 /// Configuration for memory transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct MemoryConfig {
     /// Channel buffer size.
     #[serde(default = "default_buffer_size")]

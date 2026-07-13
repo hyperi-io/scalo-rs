@@ -197,6 +197,38 @@ impl<'de> serde::Deserialize<'de> for SensitiveString {
     }
 }
 
+/// JSON Schema: a write-only string carrying the `x-dfe-secret` marker so the
+/// control plane masks the field and routes it through the secrets seam
+/// (scalo-rs#6). Gated on `config-schema`. This is why apps derive `JsonSchema`
+/// via scalo's re-exported schemars -- a `SensitiveString` field automatically
+/// gets the secret marker in the emitted `config-schema.*` with no per-field
+/// annotation.
+#[cfg(feature = "config-schema")]
+impl schemars::JsonSchema for SensitiveString {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SensitiveString".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::SensitiveString").into()
+    }
+
+    // Inline at every use site so the `x-dfe-secret` marker is directly on each
+    // secret field, not hidden behind a `$ref` into `$defs` that naive UI
+    // tooling might not resolve.
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "x-dfe-secret": true,
+            "writeOnly": true
+        })
+    }
+}
+
 impl fmt::Display for SensitiveString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{REDACTED}")
@@ -452,5 +484,32 @@ mod tests {
             b_output.contains(REDACTED),
             "thread B should have observed REDACTED, got: {b_output}"
         );
+    }
+
+    #[cfg(feature = "config-schema")]
+    #[test]
+    fn json_schema_carries_dfe_secret_marker() {
+        let schema = schemars::schema_for!(SensitiveString);
+        let v = serde_json::to_value(&schema).unwrap();
+        assert_eq!(v["type"], "string");
+        assert_eq!(v["x-dfe-secret"], true);
+        assert_eq!(v["writeOnly"], true);
+    }
+
+    /// A struct field of `SensitiveString` gets the `x-dfe-secret` marker
+    /// inlined (not behind a `$ref`) in the derived schema.
+    #[cfg(feature = "config-schema")]
+    #[test]
+    fn derived_struct_inlines_secret_marker() {
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Cfg {
+            host: String,
+            password: SensitiveString,
+        }
+        let v = serde_json::to_value(schemars::schema_for!(Cfg)).unwrap();
+        let pw = &v["properties"]["password"];
+        assert_eq!(pw["x-dfe-secret"], true, "schema was: {v}");
+        assert_eq!(pw["type"], "string");
     }
 }

@@ -53,6 +53,16 @@ pub enum StandardCommand {
     #[command(name = "generate-artefacts")]
     GenerateArtefacts(GenerateArtefactsArgs),
 
+    /// Emit the reflectable config artefacts and exit.
+    ///
+    /// Writes `config-schema.{json,yaml}` + `capability-catalog.{json,yaml}`
+    /// derived from the app's `Config` and capability catalog into the target
+    /// directory (scalo-rs#6). Also produced by `generate-artefacts`. Use to
+    /// refresh the committed contract; a drift test then keeps it honest:
+    /// `dfe-loader config-schema --dir docs/`
+    #[command(name = "config-schema")]
+    ConfigSchema(ConfigSchemaArgs),
+
     /// Live metrics dashboard (like `vector top`).
     #[cfg(feature = "top")]
     Top(TopArgs),
@@ -64,6 +74,15 @@ pub struct GenerateArtefactsArgs {
     /// Output directory for generated artefacts.
     #[arg(long = "output-dir", default_value = "docs")]
     pub output_dir: String,
+}
+
+/// Arguments for the `config-schema` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ConfigSchemaArgs {
+    /// Output directory for the config artefacts (`config-schema.*`,
+    /// `capability-catalog.*`).
+    #[arg(long = "dir", default_value = "docs")]
+    pub dir: String,
 }
 
 /// Arguments for the `top` subcommand.

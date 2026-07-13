@@ -69,4 +69,22 @@ pub enum DeploymentError {
     /// File not found.
     #[error("file not found: {0}")]
     NotFound(String),
+
+    /// Failed to serialise an artefact (schema / capability catalog).
+    #[error("failed to serialise {what}: {message}")]
+    Serialise {
+        /// What was being serialised (e.g. "config-schema.json").
+        what: String,
+        /// Underlying serialisation error message.
+        message: String,
+    },
+
+    /// A committed config artefact drifted from the freshly-generated output.
+    #[error("config artefact drift in {path}:\n{detail}")]
+    Drift {
+        /// The artefact path that drifted.
+        path: String,
+        /// Human-readable drift detail + remediation hint.
+        detail: String,
+    },
 }

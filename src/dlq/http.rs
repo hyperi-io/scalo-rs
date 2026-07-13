@@ -19,6 +19,7 @@ use super::error::DlqError;
 
 /// Configuration for the HTTP DLQ backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct HttpDlqConfig {
     /// Enable the HTTP backend.

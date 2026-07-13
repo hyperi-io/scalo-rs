@@ -241,7 +241,7 @@ mod tests {
 
     fn make_test_contract() -> DeploymentContract {
         DeploymentContract {
-            schema_version: 2,
+            schema_version: 3,
             app_name: "smoke-test".into(),
             binary_name: "smoke-test".into(),
             description: "Smoke test".into(),
@@ -261,6 +261,8 @@ mod tests {
             native_deps: super::super::NativeDepsContract::default(),
             image_profile: super::super::ImageProfile::Production,
             oci_labels: super::super::OciLabels::default(),
+            config_schema: None,
+            capabilities: vec![],
         }
     }
 }

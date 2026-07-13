@@ -124,6 +124,21 @@ pub struct DeploymentContract {
     /// OCI image labels (static -- dynamic labels injected by CI at build time).
     #[serde(default)]
     pub oci_labels: OciLabels,
+
+    /// Reflectable JSON Schema (draft 2020-12) of the app's full `Config`,
+    /// derived via schemars (scalo-rs#6). `None` when the app does not provide
+    /// one. Secret fields carry the `x-dfe-secret` marker. Carried inline so a
+    /// single fetch of the contract gives the schema; also written to
+    /// `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_schema: Option<serde_json::Value>,
+
+    /// Capability catalog -- the runtime-data surface schemars cannot derive
+    /// (service names + their knobs). Hand-authored per app. Empty when the app
+    /// does not provide one. Also written to `capability-catalog.{json,yaml}`.
+    /// See [`Capability`](super::Capability).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<super::Capability>,
 }
 
 /// OCI image labels for the container.
@@ -179,7 +194,9 @@ fn default_copyright() -> String {
 }
 
 fn default_schema_version() -> u32 {
-    2
+    // v3: added `config_schema` + `capabilities` (scalo-rs#6). Back-compat --
+    // old consumers ignore the new optional fields.
+    3
 }
 
 /// Health probe endpoint paths.
@@ -339,8 +356,10 @@ mod tests {
             base_image: "ubuntu:24.04".into(),
             native_deps: NativeDepsContract::default(),
             image_profile: ImageProfile::default(),
-            schema_version: 2,
+            schema_version: 3,
             oci_labels: OciLabels::default(),
+            config_schema: None,
+            capabilities: vec![],
         };
         let json = contract.to_json();
         assert!(json.contains("test-app"));
@@ -368,8 +387,10 @@ mod tests {
             base_image: "ubuntu:24.04".into(),
             native_deps: NativeDepsContract::default(),
             image_profile: ImageProfile::default(),
-            schema_version: 2,
+            schema_version: 3,
             oci_labels: OciLabels::default(),
+            config_schema: None,
+            capabilities: vec![],
         };
         let json = contract.to_json();
         let parsed: DeploymentContract = serde_json::from_str(&json).unwrap();
@@ -398,8 +419,10 @@ mod tests {
             base_image: "ubuntu:24.04".into(),
             native_deps: NativeDepsContract::default(),
             image_profile: ImageProfile::default(),
-            schema_version: 2,
+            schema_version: 3,
             oci_labels: OciLabels::default(),
+            config_schema: None,
+            capabilities: vec![],
         };
         assert_eq!(contract.binary(), "my-app");
     }
@@ -425,8 +448,10 @@ mod tests {
             base_image: "ubuntu:24.04".into(),
             native_deps: NativeDepsContract::default(),
             image_profile: ImageProfile::default(),
-            schema_version: 2,
+            schema_version: 3,
             oci_labels: OciLabels::default(),
+            config_schema: None,
+            capabilities: vec![],
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
         assert_eq!(contract.config_dir(), "/etc/dfe");

@@ -43,7 +43,7 @@ features = [
     "secrets", "secrets-vault",
     "dlq", "dlq-http", "dlq-redis",
     "output-file",
-    "deployment",
+    "deployment", "config-schema",
     "expression", "version-check",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
@@ -172,6 +172,12 @@ deployment-smoke = ["deployment"]
 # contract-artefact e2e tests. See src/deployment/test_support.rs.
 deployment-test-support = ["deployment"]
 
+# Reflectable config schema + capability catalog (scalo-rs#6). Derives a JSON
+# Schema of the app `Config` via schemars and carries a hand-authored capability
+# catalog the control plane reflects on to build per-endpoint CRUD forms.
+# Pure-Rust, opt-in. Implies `deployment` (the contract carries + emits both).
+config-schema = ["dep:schemars", "serde_json", "deployment"]
+
 # Startup version check (calls a configured version API)
 version-check = ["reqwest", "tokio", "serde_json", "tracing", "chrono", "dirs"]
 
@@ -212,7 +218,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:web
 dangerous-diagnostics = []
 
 # Full feature set
-full = ["config", "config-reload", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls"]
+full = ["config", "config-reload", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls"]
 
 [dependencies]
 # Serialisation (always needed)
@@ -232,6 +238,12 @@ dotenvy = { version = ">=0.15.7, <0.16", optional = true }
 dashmap = { version = ">=6.1, <7", optional = true }
 serde_yaml_ng = { version = ">=0.10.0, <0.11", optional = true }
 serde_json = { version = ">=1.0.149, <2", optional = true }
+
+# JSON Schema derivation for the reflectable config-schema capability
+# (`config-schema` feature, scalo-rs#6). schemars 1.2.1 web-checked 2026-07-13:
+# active, MSRV 1.74 (< our 1.95). `preserve_order` keeps schema property order =
+# struct declaration order, so emitted `config.schema.*` is byte-deterministic.
+schemars = { version = ">=1.2.1, <2", default-features = false, features = ["std", "derive", "preserve_order"], optional = true }
 
 # Git operations (for directory-config-git)
 git2 = { version = ">=0.21.0, <0.22", optional = true }

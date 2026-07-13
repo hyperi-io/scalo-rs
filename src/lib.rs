@@ -405,8 +405,18 @@ pub use expression::{
 #[cfg(feature = "deployment")]
 #[cfg_attr(docsrs, doc(cfg(feature = "deployment")))]
 pub use deployment::{
-    ContractMismatch, DeploymentContract, DeploymentError, HealthContract, KedaConfig, KedaContract,
+    Capability, ContractMismatch, DeploymentContract, DeploymentError, FieldSpec, FieldType,
+    HealthContract, KedaConfig, KedaContract, emit_config_artifacts,
 };
+
+/// Re-export of the `schemars` crate (JSON Schema derivation) so downstream
+/// apps derive `JsonSchema` against scalo's exact version -- one schemars in the
+/// graph, so a `SensitiveString` field's `x-dfe-secret` marker resolves against
+/// the same trait. Apps enable the `config-schema` feature and either add a
+/// matching `schemars` dep or reference this re-export. See scalo-rs#6.
+#[cfg(feature = "config-schema")]
+#[cfg_attr(docsrs, doc(cfg(feature = "config-schema")))]
+pub use schemars;
 
 #[cfg(feature = "version-check")]
 #[cfg_attr(docsrs, doc(cfg(feature = "version-check")))]

@@ -57,7 +57,9 @@
 //!     ),
 //!     image_profile: ImageProfile::Production,
 //!     oci_labels: Default::default(),
-//!     schema_version: 1,
+//!     schema_version: 3,
+//!     config_schema: None,
+//!     capabilities: vec![],
 //! };
 //!
 //! // Generate production Dockerfile (without identity annotations -- Phase 1
@@ -76,8 +78,10 @@
 //! ```
 
 pub mod app_project;
+mod capability;
 mod contract;
 pub mod contract_identity;
+mod emit;
 mod error;
 pub mod generate;
 mod keda;
@@ -91,11 +95,17 @@ mod validate;
 pub mod waves;
 
 pub use app_project::{AppProjectContract, AppProjectDestination, generate_argocd_app_project};
+pub use capability::{Capability, FieldSpec, FieldType};
 pub use contract::{
     DeploymentContract, HealthContract, ImageProfile, OciLabels, PortContract, SecretEnvContract,
     SecretGroupContract,
 };
 pub use contract_identity::{ContractIdentity, IdentityError, KEY_PREFIX, VERSION};
+#[cfg(feature = "config-schema")]
+pub use emit::config_schema_json;
+pub use emit::{
+    assert_no_config_artifact_drift, check_config_artifact_drift, emit_config_artifacts,
+};
 pub use error::{ContractMismatch, DeploymentError};
 pub use generate::{
     ArgocdConfig, generate_argocd_application, generate_chart, generate_compose_fragment,

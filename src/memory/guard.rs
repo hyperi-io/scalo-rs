@@ -98,6 +98,7 @@ pub enum MemoryPressure {
 ///   cgroup_headroom: 0.85    # use 85% of cgroup limit
 /// ```
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct MemoryGuardConfig {
     /// Explicit memory limit in bytes. 0 = auto-detect from cgroup/system.
     #[serde(default)]

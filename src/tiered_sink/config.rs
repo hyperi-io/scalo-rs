@@ -16,6 +16,7 @@ use std::time::Duration;
 
 /// Configuration for TieredSink.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct TieredSinkConfig {
     /// Path to the spool file for disk fallback.
     pub spool_path: PathBuf,
@@ -211,6 +212,7 @@ impl TieredSinkConfig {
 /// spool writes when the disk exceeds the configured threshold. Writes
 /// resume automatically when space is recovered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct DiskAwareConfig {
     /// Maximum filesystem usage percentage (0.0 - 1.0) before pausing spool writes.
     /// Default: 0.8 (80%).
@@ -242,6 +244,7 @@ impl Default for DiskAwareConfig {
 
 /// Strategy for draining spooled messages back to the primary sink.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DrainStrategy {
     /// Adaptive rate: starts slow, speeds up based on success rate.
@@ -313,6 +316,7 @@ impl DrainStrategy {
 /// `Dlq` is the scalo no-silent-drop variant: overflow is diverted to the DLQ
 /// instead of being dropped or crashing the spool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhenFull {
     /// Backpressure: the spool write fails so the caller slows the inbound
@@ -331,6 +335,7 @@ pub enum WhenFull {
 
 /// Ordering mode for message delivery during drain.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OrderingMode {
     /// New messages go hot path, spool drains in background (default).

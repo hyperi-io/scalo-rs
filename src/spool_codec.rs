@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 /// What to do when a corrupt cache is detected (queue won't open, or a CRC check
 /// fails on read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CorruptionPolicy {
     /// Rename the corrupt cache directory aside to

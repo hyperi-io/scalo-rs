@@ -86,8 +86,10 @@ mod tests {
             base_image: "ubuntu:24.04".into(),
             native_deps: NativeDepsContract::default(),
             image_profile: ImageProfile::default(),
-            schema_version: 2,
+            schema_version: 3,
             oci_labels: OciLabels::default(),
+            config_schema: None,
+            capabilities: vec![],
         }
     }
 

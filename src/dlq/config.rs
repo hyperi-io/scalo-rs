@@ -39,6 +39,7 @@ pub use crate::io::RotationPeriod;
 
 /// How backends are used when multiple are enabled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DlqMode {
     /// Try backends in order; stop on first success.
@@ -58,6 +59,7 @@ pub enum DlqMode {
 
 /// Top-level DLQ configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct DlqConfig {
     /// Whether DLQ is enabled.
@@ -118,6 +120,7 @@ impl Default for DlqConfig {
 ///
 /// Writes NDJSON files with automatic rotation and cleanup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct FileDlqConfig {
     /// Enable the file backend.
@@ -165,6 +168,7 @@ impl FileDlqConfig {
 /// Kafka-based DLQ configuration.
 #[cfg(feature = "dlq-kafka")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct KafkaDlqConfig {
     /// Enable the Kafka backend.
@@ -199,6 +203,7 @@ impl Default for KafkaDlqConfig {
 /// Kafka DLQ topic routing strategy.
 #[cfg(feature = "dlq-kafka")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DlqRouting {
     /// Route to topic matching destination with suffix.

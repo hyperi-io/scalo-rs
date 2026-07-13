@@ -206,6 +206,22 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             Ok(())
         }
 
+        StandardCommand::ConfigSchema(ref cfg_args) => {
+            #[cfg(feature = "deployment")]
+            {
+                emit_config_schema(&app, &cfg_args.dir)?;
+                Ok(())
+            }
+            #[cfg(not(feature = "deployment"))]
+            {
+                let _ = cfg_args;
+                output::print_error(
+                    "deployment feature not enabled -- no config artefacts available",
+                );
+                Err(CliError::Service("deployment feature not enabled".into()))
+            }
+        }
+
         StandardCommand::Run => {
             let version_info = app.version_info();
             init_logger_for_service(args, app.name(), &version_info.version)?;
@@ -370,6 +386,21 @@ fn generate_artefacts<A: ServiceApp>(
             CliError::Service(format!("failed to write {}: {e}", argo_path.display()))
         })?;
         generated.push("argocd-application.yaml".to_string());
+
+        // Reflectable config artefacts (config-schema.{json,yaml} +
+        // capability-catalog.{json,yaml}). Emitted only when the contract carries a
+        // config_schema and/or capabilities (scalo-rs#6). Same output as the
+        // standalone `config-schema` subcommand, so the drift test is stable
+        // whichever produced the committed copy.
+        let cfg_written = crate::deployment::emit_config_artifacts(&contract, output_dir)
+            .map_err(|e| CliError::Service(format!("config artefacts failed: {e}")))?;
+        for p in &cfg_written {
+            let name = p
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("config-artefact");
+            generated.push(name.to_string());
+        }
     }
 
     if generated.is_empty() {
@@ -385,6 +416,37 @@ fn generate_artefacts<A: ServiceApp>(
         }
     }
 
+    Ok(())
+}
+
+/// Emit just the reflectable config artefacts (`config-schema.*`,
+/// `capability-catalog.*`) for the `config-schema` subcommand.
+#[cfg(feature = "deployment")]
+fn emit_config_schema<A: ServiceApp>(app: &A, dir: &str) -> Result<(), CliError> {
+    let Some(contract) = app.deployment_contract() else {
+        output::print_warn(&format!(
+            "ServiceApp::deployment_contract() returned None for `{}` -- no config artefacts",
+            app.name()
+        ));
+        return Ok(());
+    };
+    let written = crate::deployment::emit_config_artifacts(&contract, dir)
+        .map_err(|e| CliError::Service(format!("config artefacts failed: {e}")))?;
+    if written.is_empty() {
+        output::print_warn(&format!(
+            "contract for `{}` carries no config_schema or capabilities -- nothing emitted. \
+             Populate `config_schema` + `capabilities` in the app's deployment_contract().",
+            app.name()
+        ));
+    } else {
+        output::print_success(&format!(
+            "wrote {} config artefact(s) to {dir}",
+            written.len()
+        ));
+        for p in &written {
+            output::print_kv("  wrote", &p.display().to_string());
+        }
+    }
     Ok(())
 }
 

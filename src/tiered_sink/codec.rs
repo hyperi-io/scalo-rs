@@ -19,6 +19,7 @@ use std::io;
 /// - `Snappy`: Very fast, Kafka-native - avoids transcode if sink uses Snappy
 /// - `None`: No compression - maximum speed when CPU is bottleneck
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionCodec {
     /// No compression - fastest, no CPU overhead
