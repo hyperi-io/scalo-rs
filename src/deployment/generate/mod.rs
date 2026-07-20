@@ -398,6 +398,34 @@ mod tests {
     }
 
     #[test]
+    fn test_chart_hardens_the_pod_and_container() {
+        // Without these the chart admits a container that can escalate
+        // privilege and keeps the full default capability set. Values-driven
+        // so an app with a real need can opt back out, but the DEFAULT has to
+        // be the hardened one -- a default nobody sets is the one that ships.
+        let contract = test_contract();
+        let dir = tempfile::tempdir().unwrap();
+        generate_chart(&contract, dir.path(), None).unwrap();
+
+        let values = std::fs::read_to_string(dir.path().join("values.yaml")).unwrap();
+        assert!(values.contains("runAsNonRoot: true"));
+        assert!(values.contains("type: RuntimeDefault"));
+        assert!(values.contains("allowPrivilegeEscalation: false"));
+        assert!(values.contains("- ALL"));
+        // The image creates and switches to appuser uid 1000; the chart must
+        // assert the same uid, not a different one that would fail to start.
+        assert!(values.contains("runAsUser: 1000"));
+        // Deliberately false: the spool and DLQ write to the container
+        // filesystem and the only volume mounted is the read-only config map.
+        assert!(values.contains("readOnlyRootFilesystem: false"));
+
+        let deployment =
+            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
+        assert!(deployment.contains("{{- with .Values.podSecurityContext }}"));
+        assert!(deployment.contains("{{- with .Values.securityContext }}"));
+    }
+
+    #[test]
     fn test_dockerfile_warns_when_the_release_was_assumed() {
         // A digest-pinned base carries no codename, so the package names are an
         // assumption. Say so in the artefact rather than let it ship quietly.

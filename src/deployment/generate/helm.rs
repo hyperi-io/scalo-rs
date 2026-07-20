@@ -201,6 +201,41 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
          \n",
     );
 
+    // Security contexts.
+    //
+    // The generated image already creates and switches to `appuser` (uid 1000),
+    // so pinning the same uid here asserts what the image does rather than
+    // changing it -- a mismatch is worth failing on, not papering over.
+    //
+    // readOnlyRootFilesystem is deliberately FALSE. The spool and DLQ write to
+    // the container filesystem, and the only volume this chart mounts is the
+    // read-only config map, so turning it on would break every app that spools.
+    // An app that does not spool can set it true without forking the chart.
+    out.push_str(
+        "# -- Pod-level security context. Matches the uid the generated image\n\
+         # switches to; change both together or the container will not start.\n\
+         podSecurityContext:\n\
+         \x20 runAsNonRoot: true\n\
+         \x20 runAsUser: 1000\n\
+         \x20 runAsGroup: 1000\n\
+         \x20 fsGroup: 1000\n\
+         \x20 seccompProfile:\n\
+         \x20   type: RuntimeDefault\n\
+         \n\
+         # -- Container-level security context. readOnlyRootFilesystem stays\n\
+         # false because the spool and DLQ write to disk and the only volume\n\
+         # mounted here is the read-only config map; set it true only for an\n\
+         # app that spools nowhere.\n\
+         securityContext:\n\
+         \x20 allowPrivilegeEscalation: false\n\
+         \x20 privileged: false\n\
+         \x20 readOnlyRootFilesystem: false\n\
+         \x20 capabilities:\n\
+         \x20   drop:\n\
+         \x20     - ALL\n\
+         \n",
+    );
+
     // Resources
     out.push_str(
         "resources:\n\
@@ -424,6 +459,40 @@ Service account name.
 
 /// The container `env:` entries that make a pod identifiable to observability.
 ///
+/// The three container probes, all pointed at the metrics port.
+///
+/// `startupProbe` deliberately targets the LIVENESS path, not `/startupz`.
+/// `mark_started()` is currently called by nothing, so `/startupz` answers 503
+/// for the life of the process -- aiming the startup probe at it would kill
+/// every pod on `failureThreshold`. The two halves have to move together; see
+/// scalo-rs#8 before changing either.
+fn gen_probes(c: &DeploymentContract) -> String {
+    format!(
+        "          livenessProbe:\n\
+         \x20           httpGet:\n\
+         \x20             path: {liveness}\n\
+         \x20             port: metrics\n\
+         \x20           initialDelaySeconds: 10\n\
+         \x20           periodSeconds: 10\n\
+         \x20           failureThreshold: 3\n\
+         \x20         readinessProbe:\n\
+         \x20           httpGet:\n\
+         \x20             path: {readiness}\n\
+         \x20             port: metrics\n\
+         \x20           initialDelaySeconds: 5\n\
+         \x20           periodSeconds: 5\n\
+         \x20           failureThreshold: 2\n\
+         \x20         startupProbe:\n\
+         \x20           httpGet:\n\
+         \x20             path: {liveness}\n\
+         \x20             port: metrics\n\
+         \x20           failureThreshold: 30\n\
+         \x20           periodSeconds: 5\n",
+        liveness = c.health.liveness_path,
+        readiness = c.health.readiness_path,
+    )
+}
+
 /// Per-pod / per-app differentiation rides on STANDARD OTel env vars plus
 /// platform enrichment (Prometheus scrape labels, collector k8sattributes),
 /// NEVER on metric names. The OTel SDK reads `OTEL_SERVICE_NAME` and
@@ -512,12 +581,28 @@ spec:
         {{{{- toYaml . | nindent 8 }}}}
       {{{{- end }}}}
       serviceAccountName: {{{{ include "{app}.serviceAccountName" . }}}}
+      {{{{- with .Values.podSecurityContext }}}}
+      securityContext:
+        {{{{- toYaml . | nindent 8 }}}}
+      {{{{- end }}}}
       containers:
         - name: {{{{ .Chart.Name }}}}
           image: "{{{{ .Values.image.repository }}}}:{{{{ .Values.image.tag | default .Chart.AppVersion }}}}"
           imagePullPolicy: {{{{ .Values.image.pullPolicy }}}}
 "#,
     ));
+
+    // Container security context. Kept separate from the pod-level block
+    // above because the two settle different things: the pod block decides
+    // WHO the process runs as, the container block decides what it may then
+    // do. Both are values-driven so an app with a genuine need (a capability,
+    // a writable root) can opt back out without forking the chart.
+    out.push_str(
+        "          {{- with .Values.securityContext }}\n\
+         \x20         securityContext:\n\
+         \x20           {{- toYaml . | nindent 12 }}\n\
+         \x20         {{- end }}\n",
+    );
 
     // Args
     if !c.entrypoint_args.is_empty() {
@@ -577,31 +662,7 @@ spec:
         }
     }
 
-    // Probes
-    out.push_str(&format!(
-        "          livenessProbe:\n\
-         \x20           httpGet:\n\
-         \x20             path: {liveness}\n\
-         \x20             port: metrics\n\
-         \x20           initialDelaySeconds: 10\n\
-         \x20           periodSeconds: 10\n\
-         \x20           failureThreshold: 3\n\
-         \x20         readinessProbe:\n\
-         \x20           httpGet:\n\
-         \x20             path: {readiness}\n\
-         \x20             port: metrics\n\
-         \x20           initialDelaySeconds: 5\n\
-         \x20           periodSeconds: 5\n\
-         \x20           failureThreshold: 2\n\
-         \x20         startupProbe:\n\
-         \x20           httpGet:\n\
-         \x20             path: {liveness}\n\
-         \x20             port: metrics\n\
-         \x20           failureThreshold: 30\n\
-         \x20           periodSeconds: 5\n",
-        liveness = c.health.liveness_path,
-        readiness = c.health.readiness_path,
-    ));
+    out.push_str(&gen_probes(c));
 
     // Volume mounts
     out.push_str(&format!(

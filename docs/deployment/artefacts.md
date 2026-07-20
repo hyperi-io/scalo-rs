@@ -154,9 +154,9 @@ on. Override via `ArgocdConfig`.
 | File | Purpose |
 |------|---------|
 | `Chart.yaml` | Chart metadata |
-| `values.yaml` | Configurable defaults -- image, resources, probes, secrets, KEDA, HPA, `otel` |
+| `values.yaml` | Configurable defaults -- image, resources, probes, secrets, KEDA, HPA, `otel`, `podSecurityContext` / `securityContext` |
 | `templates/_helpers.tpl` | Standard name helpers + one `<group>SecretName` helper per secret group |
-| `templates/deployment.yaml` | `Deployment` with probes, observability env, env from secrets, config mount |
+| `templates/deployment.yaml` | `Deployment` with probes, security contexts, observability env, env from secrets, config mount |
 | `templates/service.yaml` | `Service` exposing metrics port + any `extra_ports` |
 | `templates/serviceaccount.yaml` | `ServiceAccount` (auto-disable token mount) |
 | `templates/configmap.yaml` | `ConfigMap` rendering `values.yaml.config` to mounted file |
@@ -165,6 +165,31 @@ on. Override via `ArgocdConfig`.
 | `templates/keda-scaledobject.yaml` | KEDA `ScaledObject` -- **only when `contract.keda.is_some()`** |
 | `templates/keda-triggerauth.yaml` | KEDA `TriggerAuthentication` -- **only when `contract.keda.is_some()`** |
 | `templates/NOTES.txt` | Post-install hints (port-forward, log tail) |
+
+#### Security contexts on the Deployment
+
+The pod drops to a non-root user and the container gives up every capability,
+by default. Both blocks come from values, so an app with a genuine need opts
+out rather than forking the chart.
+
+| Values key | Default | What it settles |
+|---|---|---|
+| `podSecurityContext.runAsNonRoot` | `true` | refuse to start as root |
+| `podSecurityContext.runAsUser` / `runAsGroup` / `fsGroup` | `1000` | the uid the image already switches to |
+| `podSecurityContext.seccompProfile.type` | `RuntimeDefault` | the runtime's syscall filter |
+| `securityContext.allowPrivilegeEscalation` | `false` | no setuid climb |
+| `securityContext.privileged` | `false` | not a privileged container |
+| `securityContext.capabilities.drop` | `[ALL]` | no Linux capabilities |
+| `securityContext.readOnlyRootFilesystem` | `false` | see below |
+
+**`runAsUser` is coupled to the Dockerfile.** The generated image does
+`useradd --uid 1000 appuser` and `USER appuser`. Change one without the other
+and the container will not start, so a test pins both.
+
+**`readOnlyRootFilesystem` is deliberately `false`.** The spool and DLQ write
+to the container filesystem, and the only volume this chart mounts is the
+read-only config map. An app that spools nowhere can set it `true`; an app that
+spools needs a writable volume first.
 
 #### Observability env on the Deployment
 
