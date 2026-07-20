@@ -58,7 +58,7 @@ pub const DEFAULT_IMAGE_REGISTRY: &str = "ghcr.io/hyperi-io";
 /// and fewer CVEs than a full ubuntu base, and its glibc matches the debian
 /// trixie CI builders so binaries built on CI run as-is. Override via
 /// `deployment.base_image` in the YAML cascade (keep glibc(runtime) >=
-/// glibc(build); musl/alpine unsupported -- see docs/deployment/NATIVE-DEPS.md).
+/// glibc(build); musl/alpine unsupported -- see docs/deployment/native-deps.md).
 pub const DEFAULT_BASE_IMAGE: &str = "debian:trixie-slim";
 
 /// Default distro release the generated runtime package names target.

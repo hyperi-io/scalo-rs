@@ -34,7 +34,7 @@
 //! **Scope:** top-level object-key lookup only. No deep JSON-path (YAGNI -- keys
 //! live at the top level).
 //!
-//! See `docs/MIGRATIONS.md` and `docs/SELF-REGULATION.md`. Block contract in
+//! See `docs/migrations.md` and `docs/self-regulation.md`. Block contract in
 //! [`WorkBatch`](crate::transport::WorkBatch).
 
 use super::types::PayloadFormat;

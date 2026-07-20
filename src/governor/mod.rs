@@ -22,10 +22,10 @@
 //! `self_regulation` section), and [`SelfRegulationGovernor`] (the built
 //! bundle the runtime threads into transports + driver).
 //!
-//! Full picture in the docs: `docs/SELF-REGULATION.md` (the three brains --
+//! Full picture in the docs: `docs/self-regulation.md` (the three brains --
 //! memory is the HARD source of truth, CPU deliberately dropped),
-//! `docs/BACKPRESSURE.md` (gate the source, never the sink), and
-//! `docs/KAFKA-PATH.md` (the three batch sizes + the rho ~ 0.7 loop).
+//! `docs/backpressure.md` (gate the source, never the sink), and
+//! `docs/kafka-path.md` (the three batch sizes + the rho ~ 0.7 loop).
 //!
 //! # Design invariants
 //!

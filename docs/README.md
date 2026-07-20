@@ -7,10 +7,10 @@ for free. Add a `Transport`, a `TieredSink`, a `BatchEngine` and the same
 deal extends: counters, span propagation, DLQ routing, backpressure, scaling
 signals - all automatic.
 
-This is the index. Read [ARCHITECTURE.md](ARCHITECTURE.md) for the
-10,000-foot view of how the modules fit together, [INTEGRATION.md](INTEGRATION.md)
-for a recipe walkthrough on building a data-plane service, [AUTO-WIRING.md](AUTO-WIRING.md)
-for the "you-get-this-for-free" model, and [FEATURE-FLAGS.md](FEATURE-FLAGS.md)
+This is the index. Read [architecture.md](architecture.md) for the
+10,000-foot view of how the modules fit together, [integration.md](integration.md)
+for a recipe walkthrough on building a data-plane service, [auto-wiring.md](auto-wiring.md)
+for the "you-get-this-for-free" model, and [feature-flags.md](feature-flags.md)
 for how features cascade into one another.
 
 ---
@@ -92,80 +92,92 @@ sub-components (filter engine lives inside every transport).
 
 ### Start here
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) - module map, dependency graph, layering
-- [INTEGRATION.md](INTEGRATION.md) - "I'm building a data-plane app" walkthrough
-- [AUTO-WIRING.md](AUTO-WIRING.md) - what's wired into what, and why
-- [FEATURE-FLAGS.md](FEATURE-FLAGS.md) - feature tree, native deps, recommended bundles
+- [architecture.md](architecture.md) - module map, dependency graph, layering
+- [integration.md](integration.md) - "I'm building a data-plane app" walkthrough
+- [auto-wiring.md](auto-wiring.md) - what's wired into what, and why
+- [feature-flags.md](feature-flags.md) - feature tree, native deps, recommended bundles
 
 ### Data plane (WorkBatch + self-regulation)
 
-- [SELF-REGULATION.md](SELF-REGULATION.md) -- ON by default; the three brains (MemoryGuard / ScalingPressure / UnifiedPressure), observe + tune
-- [BACKPRESSURE.md](BACKPRESSURE.md) -- gate the source never the sink; the per-stage brake/commit-token table; streaming sub-blocks
-- [KAFKA-PATH.md](KAFKA-PATH.md) -- the three batch sizes, sizing profiles + librdkafka names, rho~0.7 loop, partition-limited diagnostic
+- [self-regulation.md](self-regulation.md) -- ON by default; the three brains (MemoryGuard / ScalingPressure / UnifiedPressure), observe + tune
+- [backpressure.md](backpressure.md) -- gate the source never the sink; the per-stage brake/commit-token table; streaming sub-blocks
+- [kafka-path.md](kafka-path.md) -- the three batch sizes, sizing profiles + librdkafka names, rho~0.7 loop, partition-limited diagnostic
 
 ### Core pillars (always-on, auto-wired)
 
-- [core-pillars/CONFIG.md](core-pillars/CONFIG.md) - 7-layer cascade, hot-reload, registry, `/config` endpoint
-- [core-pillars/LOGGING.md](core-pillars/LOGGING.md) - tracing setup, JSON/text autodetect, masking, flood control
-- [core-pillars/METRICS.md](core-pillars/METRICS.md) - Prometheus, manifest, cardinality cap
-- [core-pillars/TRACING.md](core-pillars/TRACING.md) - OTel, W3C traceparent, transport propagation
-- [core-pillars/HEALTH.md](core-pillars/HEALTH.md) - `HealthRegistry`, `/healthz` / `/readyz` / `/startupz`
-- [core-pillars/SHUTDOWN.md](core-pillars/SHUTDOWN.md) - `CancellationToken`, K8s pre-stop delay
+Section landing: [core-pillars/README.md](core-pillars/README.md)
+
+- [core-pillars/config.md](core-pillars/config.md) - 7-layer cascade, hot-reload, registry, `/config` endpoint
+- [core-pillars/logging.md](core-pillars/logging.md) - tracing setup, JSON/text autodetect, masking, flood control
+- [core-pillars/metrics.md](core-pillars/metrics.md) - Prometheus, manifest, cardinality cap
+- [core-pillars/tracing.md](core-pillars/tracing.md) - OTel, W3C traceparent, transport propagation
+- [core-pillars/health.md](core-pillars/health.md) - `HealthRegistry`, `/healthz` / `/readyz` / `/startupz`
+- [core-pillars/shutdown.md](core-pillars/shutdown.md) - `CancellationToken`, K8s pre-stop delay
 
 ### Runtime
 
-- [runtime/SERVICE-RUNTIME.md](runtime/SERVICE-RUNTIME.md) - `ServiceRuntime`, `ServiceApp` trait, `run_app`
-- [runtime/RUNTIME-CONTEXT.md](runtime/RUNTIME-CONTEXT.md) - K8s/Docker/BareMetal detection, pod metadata
-- [runtime/MEMORY.md](runtime/MEMORY.md) - `MemoryGuard`, cgroup-aware backpressure
+Section landing: [runtime/README.md](runtime/README.md)
+
+- [runtime/service-runtime.md](runtime/service-runtime.md) - `ServiceRuntime`, `ServiceApp` trait, `run_app`
+- [runtime/runtime-context.md](runtime/runtime-context.md) - K8s/Docker/BareMetal detection, pod metadata
+- [runtime/memory.md](runtime/memory.md) - `MemoryGuard`, cgroup-aware backpressure
 
 ### Transport
 
-- [transport/OVERVIEW.md](transport/OVERVIEW.md) - trait architecture, factory, `AnySender`, commit tokens
-- [transport/BACKENDS.md](transport/BACKENDS.md) - Kafka, gRPC, Memory, File, Pipe, HTTP, Redis
-- [transport/FILTER-ENGINE.md](transport/FILTER-ENGINE.md) - 3-tier filter (SIMD / compiled CEL / complex CEL)
-- [transport/ROUTING.md](transport/ROUTING.md) - `RoutedSender` for receiver and fetcher
+- [transport/README.md](transport/README.md) - trait architecture, factory, `AnySender`, commit tokens
+- [transport/backends.md](transport/backends.md) - Kafka, gRPC, Memory, File, Pipe, HTTP, Redis
+- [transport/filter-engine.md](transport/filter-engine.md) - 3-tier filter (SIMD / compiled CEL / complex CEL)
+- [transport/routing.md](transport/routing.md) - `RoutedSender` for receiver and fetcher
 
 ### Deployment
 
-- [deployment/CONTRACT.md](deployment/CONTRACT.md) - `DeploymentContract` struct, schema versioning
-- [deployment/ARTEFACTS.md](deployment/ARTEFACTS.md) - generated Dockerfile, Helm chart, ArgoCD Application
-- [deployment/NATIVE-DEPS.md](deployment/NATIVE-DEPS.md) - `NativeDepsContract`, feature -> APT package map
-- [deployment/KEDA.md](deployment/KEDA.md) - `KedaContract`, scaler triggers, fallback HPA
+Section landing: [deployment/README.md](deployment/README.md)
+
+- [deployment/contract.md](deployment/contract.md) - `DeploymentContract` struct, schema versioning
+- [deployment/artefacts.md](deployment/artefacts.md) - generated Dockerfile, Helm chart, ArgoCD Application
+- [deployment/native-deps.md](deployment/native-deps.md) - `NativeDepsContract`, feature -> APT package map
+- [deployment/keda.md](deployment/keda.md) - `KedaContract`, scaler triggers, fallback HPA
 
 ### Pipeline
 
-- [pipeline/BATCH-ENGINE.md](pipeline/BATCH-ENGINE.md) - SIMD parse, pre-route filter, field interning
-- [pipeline/WORKER-POOL.md](pipeline/WORKER-POOL.md) - `AdaptiveWorkerPool`, pressure-based scaling
-- [pipeline/TIERED-SINK.md](pipeline/TIERED-SINK.md) - resilient delivery, disk spillover, circuit breaker
-- [pipeline/SINK-STACK.md](pipeline/SINK-STACK.md) - outbound control stack: timeout / load-shed / concurrency (static or ARC) / retry / rate-limit
-- [pipeline/DLQ.md](pipeline/DLQ.md) - file, Kafka, HTTP, Redis backends
-- [pipeline/SPOOL.md](pipeline/SPOOL.md) - disk-backed async FIFO (yaque)
-- [pipeline/STRMATCH.md](pipeline/STRMATCH.md) - 4-tier regex->fast-path matcher (Byte / Literal / LiteralSet / Regex)
-- [pipeline/SCALING.md](pipeline/SCALING.md) - `ScalingPressure`, KEDA external scaler signal
+Section landing: [pipeline/README.md](pipeline/README.md)
+
+- [pipeline/batch-engine.md](pipeline/batch-engine.md) - SIMD parse, pre-route filter, field interning
+- [pipeline/worker-pool.md](pipeline/worker-pool.md) - `AdaptiveWorkerPool`, pressure-based scaling
+- [pipeline/tiered-sink.md](pipeline/tiered-sink.md) - resilient delivery, disk spillover, circuit breaker
+- [pipeline/sink-stack.md](pipeline/sink-stack.md) - outbound control stack: timeout / load-shed / concurrency (static or ARC) / retry / rate-limit
+- [pipeline/dlq.md](pipeline/dlq.md) - file, Kafka, HTTP, Redis backends
+- [pipeline/spool.md](pipeline/spool.md) - disk-backed async FIFO (yaque)
+- [pipeline/strmatch.md](pipeline/strmatch.md) - 4-tier regex->fast-path matcher (Byte / Literal / LiteralSet / Regex)
+- [pipeline/scaling.md](pipeline/scaling.md) - `ScalingPressure`, KEDA external scaler signal
 
 ### Less-common subsystems
 
-- [api/SECRETS.md](api/SECRETS.md) - OpenBao/Vault, AWS Secrets Manager
-- [api/HTTP-SERVER.md](api/HTTP-SERVER.md) - axum server, probe wiring, route extensions
-- [api/HTTP-CLIENT.md](api/HTTP-CLIENT.md) - `reqwest` + retry + circuit breaker
-- [api/DIRECTORY-CONFIG.md](api/DIRECTORY-CONFIG.md) - YAML directory store with optional `git2`
-- [api/CONCURRENCY.md](api/CONCURRENCY.md) - `BackgroundSink`, `PeriodicWorker`, `ActorHandle`
+Section landing: [api/README.md](api/README.md)
+
+- [api/secrets.md](api/secrets.md) - OpenBao/Vault, AWS Secrets Manager
+- [api/http-server.md](api/http-server.md) - axum server, probe wiring, route extensions
+- [api/http-client.md](api/http-client.md) - `reqwest` + retry + circuit breaker
+- [api/directory-config.md](api/directory-config.md) - YAML directory store with optional `git2`
+- [api/concurrency.md](api/concurrency.md) - `BackgroundSink`, `PeriodicWorker`, `ActorHandle`
 
 ### Planned (not in current release)
 
 - **Content-based log scrubbing** (gitleaks rules + PII validators
   composed via `strmatch`). The current release ships field-name
   masking via `MaskingWriter` only - see
-  [core-pillars/LOGGING.md](core-pillars/LOGGING.md) for what's
+  [core-pillars/logging.md](core-pillars/logging.md) for what's
   shipped.
 - **`cache` module** (moka TinyLFU async cache). Documented in
-  [api/CACHE.md](api/CACHE.md) but not currently built into the crate;
+  [api/cache.md](api/cache.md) but not currently built into the crate;
   there is no `cache` feature or `scalo::cache` module in this release.
 
 ### Workflow artefacts (not user docs)
 
-- [superpowers/](superpowers/) - design specs and execution plans for in-flight work
-- [MIGRATIONS.md](MIGRATIONS.md) - API surface changes by scalo version; consumer-rebuild playbook
+- [migrations.md](migrations.md) - API surface changes by scalo version; consumer-rebuild playbook
+
+Design specs and execution plans for in-flight work live in `docs/superpowers/`,
+which is working state and is not committed.
 
 ---
 

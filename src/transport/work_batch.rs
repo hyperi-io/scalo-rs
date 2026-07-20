@@ -30,8 +30,8 @@
 //! The block flows `get -> process -> send -> commit` through the unified
 //! engine driver (`crate::worker::engine::driver`); fields are parsed on
 //! demand via the [`codec`](super::codec). For the wider picture see
-//! `docs/BACKPRESSURE.md` (commit-token + brake contract),
-//! `docs/SELF-REGULATION.md`, and `docs/MIGRATIONS.md` (the
+//! `docs/backpressure.md` (commit-token + brake contract),
+//! `docs/self-regulation.md`, and `docs/migrations.md` (the
 //! `Message`/`RawMessage`/`RecvBatch` -> `WorkBatch` collapse).
 
 use super::filter::FilteredDlqEntry;

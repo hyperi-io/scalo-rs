@@ -198,7 +198,7 @@ ENTRYPOINT ["myapp"]
 they are `libgit2-1.7` and `libssl3t64`, on bookworm `libgit2-1.5` and
 `libssl3`. The `deployment` feature works these out for you from the
 contract's release - see the release table in
-[docs/deployment/NATIVE-DEPS.md](docs/deployment/NATIVE-DEPS.md), which also
+[docs/deployment/native-deps.md](docs/deployment/native-deps.md), which also
 covers adding the Confluent APT repo to both stages for `librdkafka1`.
 The generator also drops any pre-existing UID 1000 account (ubuntu bases ship
 one) before creating `appuser`; trixie slim does not, so the example skips it.
@@ -247,13 +247,13 @@ scale (KEDA adding pods), driven by the same pressure signal. Memory is the
 hard, never-OOM authority; CPU is left to the kernel scheduler (CFS), which
 the byte-budget loop reads through longer process times. It is ON by default
 and opt-out via `self_regulation.enabled = false`. See
-[docs/SELF-REGULATION.md](docs/SELF-REGULATION.md).
+[docs/self-regulation.md](docs/self-regulation.md).
 
 ## Architecture
 
 See [docs/](docs/README.md) for the full documentation index -
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module map and layering,
-and [docs/core-pillars/CONFIG.md](docs/core-pillars/CONFIG.md) for the 7-layer
+[docs/architecture.md](docs/architecture.md) for the module map and layering,
+and [docs/core-pillars/config.md](docs/core-pillars/config.md) for the 7-layer
 config cascade reference.
 
 ## License

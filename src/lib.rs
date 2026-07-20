@@ -61,7 +61,8 @@
 //! }
 //! ```
 //!
-//! See `docs/CORE-PILLARS.md` in the repository for the auto-wiring architecture.
+//! See `docs/auto-wiring.md` in the repository for the auto-wiring architecture,
+//! and `docs/core-pillars/` for the pillars themselves.
 
 #![deny(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
