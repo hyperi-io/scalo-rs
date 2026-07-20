@@ -262,9 +262,16 @@ owo-colors = { version = ">=4.2.3, <5", optional = true }
 tracing-throttle = { version = ">=0.4.2, <0.5", default-features = false, optional = true }
 
 # OpenTelemetry (modern observability - OTLP native)
-# Held at 0.31 because tracing-opentelemetry 0.32.1 (latest) only supports
-# otel 0.31. Bump once tracing-opentelemetry ships a release compatible
-# with otel 0.32+.
+# Held at 0.31. tracing-opentelemetry 0.33 (2026-05) unblocked its half of
+# this, but metrics-exporter-opentelemetry 0.2.1 (still the latest) requires
+# opentelemetry ^0.31, and the otel crates do not interoperate across a minor,
+# so `otel-metrics` cannot compile against a 0.32 SDK. Bump the whole stack
+# together once that exporter moves.
+#
+# This pin holds opentelemetry_sdk below the 0.32.1 that fixes the unbounded
+# allocation in W3C Baggage propagation. Not reachable here: scalo registers no
+# text-map propagator and never touches Baggage - trace context is carried by
+# hand in src/transport/propagation.rs. Re-check on the next bump.
 opentelemetry = { version = ">=0.31.0, <0.32", optional = true }
 opentelemetry_sdk = { version = ">=0.31.0, <0.32", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = ">=0.31.0, <0.32", features = ["grpc-tonic", "http-proto", "metrics", "logs"], optional = true }

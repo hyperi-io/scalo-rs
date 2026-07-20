@@ -101,6 +101,13 @@ if any are degraded but none unhealthy, `unhealthy` if any are unhealthy:
 
 ## K8s manifest
 
+> **Do not point a startupProbe at `/startupz` yet -- see [scalo-rs#8](https://github.com/hyperi-io/scalo-rs/issues/8).**
+> `MetricsManager::mark_started()` is currently called by nothing, so `/startupz`
+> answers 503 `{"status":"starting"}` for the life of the process. A startupProbe
+> aimed at it never passes and the pod is killed on `failureThreshold`, with a
+> perfectly healthy process inside. Until that is fixed, point the startupProbe
+> at `/healthz` -- which is what the generated Helm chart does.
+
 ```yaml
 spec:
   containers:
@@ -108,7 +115,8 @@ spec:
       ports:
         - { name: metrics, containerPort: 9090 }
       startupProbe:
-        httpGet: { path: /startupz, port: metrics }
+        # /startupz once scalo-rs#8 lands; /healthz until then.
+        httpGet: { path: /healthz, port: metrics }
         failureThreshold: 30          # 30 * 2s = 1 min boot budget
         periodSeconds: 2
       livenessProbe:
@@ -119,8 +127,10 @@ spec:
         periodSeconds: 5
 ```
 
-Use the metrics port -- the same HTTP server hosts both. No separate health
-listener.
+Use the metrics port -- the metrics server hosts the probes and the scrape on
+the one listener, so no separate health listener is needed. Note this is the
+METRICS server, not `HttpServer`: that one is a separate optional listener and
+does not serve `/metrics` or `/startupz`.
 
 ---
 

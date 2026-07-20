@@ -180,6 +180,25 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
         metrics_path = c.health.metrics_path,
     ));
 
+    // OTLP export.
+    //
+    // The scrape annotations above cover metrics; this covers traces. Leaving
+    // endpoint empty does NOT disable OTel -- it only declines to override
+    // whatever the app itself defaults to, and it only has any effect at all on
+    // an app built with the otel features. `service.name` and the k8s.*
+    // resource attrs are set on the container env, not here: those are derived,
+    // not operator choices.
+    out.push_str(
+        "# -- OTLP export target. Only consulted by an app built with scalo's\n\
+         # otel features; ignored otherwise. Empty leaves the app's own default\n\
+         # in place rather than switching anything off. Example:\n\
+         # http://opentelemetry-collector.observability:4317\n\
+         otel:\n\
+         \x20 endpoint: \"\"\n\
+         \x20 protocol: grpc\n\
+         \n",
+    );
+
     // Resources
     out.push_str(
         "resources:\n\
@@ -401,6 +420,56 @@ Service account name.
     out
 }
 
+/// The container `env:` entries that make a pod identifiable to observability.
+///
+/// Per-pod / per-app differentiation rides on STANDARD OTel env vars plus
+/// platform enrichment (Prometheus scrape labels, collector k8sattributes),
+/// NEVER on metric names. The OTel SDK reads `OTEL_SERVICE_NAME` and
+/// `OTEL_RESOURCE_ATTRIBUTES` natively, and the k8s Downward API feeds the
+/// resource attrs the SDK cannot derive itself -- `k8s.pod.uid` is the anchor
+/// the collector's k8sattributes processor keys on.
+///
+/// The OTLP endpoint is the other half of the picture: the scrape annotations
+/// get metrics to Prometheus, this gets traces to a collector. Both pathways,
+/// not one. It stays behind an `if` so that leaving `otel.endpoint` unset emits
+/// no env var at all, leaving whatever the app itself defaults to untouched --
+/// note that is NOT the same as switching OTel off, and none of it has any
+/// effect on an app built without the otel features.
+fn gen_observability_env(app: &str) -> String {
+    let mut out = String::with_capacity(1024);
+    out.push_str(&format!(
+        "            - name: OTEL_SERVICE_NAME\n\
+         \x20             value: \"{app}\"\n\
+         \x20           - name: POD_NAME\n\
+         \x20             valueFrom:\n\
+         \x20               fieldRef:\n\
+         \x20                 fieldPath: metadata.name\n\
+         \x20           - name: POD_NAMESPACE\n\
+         \x20             valueFrom:\n\
+         \x20               fieldRef:\n\
+         \x20                 fieldPath: metadata.namespace\n\
+         \x20           - name: POD_UID\n\
+         \x20             valueFrom:\n\
+         \x20               fieldRef:\n\
+         \x20                 fieldPath: metadata.uid\n\
+         \x20           - name: NODE_NAME\n\
+         \x20             valueFrom:\n\
+         \x20               fieldRef:\n\
+         \x20                 fieldPath: spec.nodeName\n\
+         \x20           - name: OTEL_RESOURCE_ATTRIBUTES\n\
+         \x20             value: k8s.pod.name=$(POD_NAME),k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME)\n"
+    ));
+    out.push_str(
+        "            {{- if .Values.otel.endpoint }}\n\
+         \x20           - name: OTEL_EXPORTER_OTLP_ENDPOINT\n\
+         \x20             value: {{ .Values.otel.endpoint | quote }}\n\
+         \x20           - name: OTEL_EXPORTER_OTLP_PROTOCOL\n\
+         \x20             value: {{ .Values.otel.protocol | quote }}\n\
+         \x20           {{- end }}\n",
+    );
+    out
+}
+
 fn gen_deployment_yaml(c: &DeploymentContract) -> String {
     let app = &c.app_name;
     let mut out = String::with_capacity(4096);
@@ -471,9 +540,12 @@ spec:
         ));
     }
 
+    // Env: observability identity first, then secret-backed credentials.
+    out.push_str("          env:\n");
+    out.push_str(&gen_observability_env(app));
+
     // Env vars from secrets
     if !c.secrets.is_empty() {
-        out.push_str("          env:\n");
         for group in &c.secrets {
             let helper_name = format!("{}SecretName", to_camel_suffix(&group.group_name));
             out.push_str(&format!(

@@ -141,15 +141,15 @@ impl OpenBaoConfig {
                 secret_id: secret_id.into(),
                 mount: default_approle_mount(),
             }
-        } else if let Some(role) = vault::k8s_role().get() {
+        } else {
+            // Kubernetes is the last method we try, so no role here means no
+            // authentication method is configured at all -- nothing to build.
+            let role = vault::k8s_role().get()?;
             OpenBaoAuth::Kubernetes {
                 role,
                 token_path: default_k8s_token_path(),
                 mount: default_k8s_mount(),
             }
-        } else {
-            // No authentication method configured
-            return None;
         };
 
         Some(Self {

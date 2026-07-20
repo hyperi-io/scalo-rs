@@ -22,20 +22,62 @@ use scalo::deployment::NativeDepsContract;
 
 let deps = NativeDepsContract::for_rustlib_features(
     &["transport-kafka", "spool", "tiered-sink", "secrets"],
-    "ubuntu:24.04",
+    "debian:trixie-slim",
 );
-// deps.apt_repos    = [Confluent repo (librdkafka1, codename=noble)]
-// deps.apt_packages = ["libssl3", "zlib1g", "libzstd1"]
+// deps.apt_repos    = [Confluent repo (librdkafka1, suite=bookworm)]
+// deps.apt_packages = ["libssl3t64", "zlib1g", "libzstd1"]
 ```
 
-The base image string picks the APT codename for custom repos:
+Runtime package names are release-specific, so the mapping needs to know
+which distro release the base image is. `for_features()` takes that release
+as a `BaseDistro` directly; `for_rustlib_features()` resolves it, in order:
 
-| Base image substring | Codename |
-|----------------------|----------|
-| `bookworm` | `bookworm` |
-| `jammy` | `jammy` |
-| `focal` | `focal` |
-| anything else (incl. `ubuntu:24.04`) | `noble` |
+1. `deployment.base_distro` in the config cascade, if set and recognised.
+2. The env var `DEPLOYMENT__BASE_DISTRO` - the same key's ENV-layer spelling.
+3. The base image tag, if it positively names a release.
+4. Otherwise the default (`trixie`), recorded in
+   `unresolved_base_image` so the generated Dockerfile carries a warning.
+
+Step 2 is not redundant. Artefact generation runs on a CLI path that never
+loads the config cascade, so the YAML lookup always misses there - use the env
+var when setting the release for a `generate-artefacts` run, or the YAML key
+when the app is running normally. Both spell the same thing.
+
+Tag derivation strips any digest, ignores a registry port, and tests each
+hyphen-separated component - so `debian:trixie-slim`, `rust:1-trixie` and
+`ubuntu:24.04` all resolve. A codename wins wherever it appears; a bare version
+number counts only on the `debian` and `ubuntu` images themselves, because
+`postgres:13-bookworm` is postgres 13 on bookworm, not Debian 13. A
+digest-pinned or rolling tag (`ghcr.io/org/base@sha256:...`, `:stable`), or a
+version tag on some other image (`ghcr.io/org/base:13`), names no release and
+reaches step 4. Pinning a digest is what the container standard asks for, so
+state the release alongside it:
+
+```yaml
+deployment:
+  base_image: ghcr.io/hyperi-io/dfe-base@sha256:...
+  base_distro: trixie      # trixie|bookworm|noble|jammy|focal
+```
+
+```bash
+# Equivalent, and the form that works for `<app> generate-artefacts`.
+DEPLOYMENT__BASE_DISTRO=trixie <app> generate-artefacts --output-dir ci-artefacts
+```
+
+What the release decides:
+
+| Release | Confluent suite | libgit2 | libssl |
+|---------|-----------------|---------|--------|
+| `trixie` (default) | `bookworm` | `libgit2-1.9` | `libssl3t64` |
+| `bookworm` | `bookworm` | `libgit2-1.5` | `libssl3` |
+| `noble` | `noble` | `libgit2-1.7` | `libssl3t64` |
+| `jammy` | `jammy` | `libgit2-1.1` | `libssl3` |
+| `focal` | `focal` | `libgit2-28` | `libssl1.1` |
+
+The Confluent column is the clients-repo APT SUITE, not the release's own
+codename: Confluent publishes no trixie suite, so trixie takes `bookworm`.
+The libssl split is the 64-bit `time_t` transition, which renamed `libssl3`
+to `libssl3t64` on trixie and noble.
 
 ---
 
@@ -43,22 +85,25 @@ The base image string picks the APT codename for custom repos:
 
 | Feature(s) | APT repo | Runtime packages |
 |------------|----------|-------------------|
-| `transport-kafka`, `dlq-kafka` (or any `dlq-kafka-*`) | Confluent (`packages.confluent.io/clients/deb`) | `librdkafka1`, `libssl3`, `zlib1g` |
+| `transport-kafka`, `dlq-kafka` (or any `dlq-kafka-*`) | Confluent (`packages.confluent.io/clients/deb`) | `librdkafka1`, libssl, `zlib1g` |
 | `spool`, `tiered-sink` | -- | `libzstd1` |
-| `http`, `secrets*`, `transport*`, `config-postgres`, `otel*` | -- | `libssl3`, `zlib1g` |
-| `directory-config-git` | -- | `libgit2-1.7` |
+| `http`, `secrets*`, `transport*`, `otel*` | -- | libssl, `zlib1g` |
+| `directory-config-git` | -- | libgit2 |
 | Pure-Rust features (`cli`, `logger`, `deployment`, `metrics`, ...) | -- | none |
 
+The libssl and libgit2 package names come from the release table above.
 Deduplication is automatic: enabling both `transport-kafka` and `http`
-adds `libssl3` once.
+adds libssl once.
 
 ---
 
 ## Confluent repo auto-add
 
-`librdkafka` in Debian/Ubuntu repos lags the protocol. The Confluent
-APT repo carries the current build and is auto-added when the Kafka
-feature is detected. Generated Dockerfile fragment:
+`librdkafka` in the Debian/Ubuntu repos lags the protocol, so we never
+use the distro package. The Confluent clients repo carries the current
+build and is added UNCONDITIONALLY whenever a Kafka feature is present -
+there is no distro for which we fall back to the native package. Generated
+Dockerfile fragment (suite `bookworm`, from a trixie base):
 
 ```dockerfile
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -66,15 +111,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://packages.confluent.io/clients/deb/archive.key \
        | gpg --dearmor -o /usr/share/keyrings/confluent-clients.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/confluent-clients.gpg] \
-       https://packages.confluent.io/clients/deb noble main" \
+       https://packages.confluent.io/clients/deb bookworm main" \
        > /etc/apt/sources.list.d/confluent-clients.list \
     && apt-get update && apt-get install -y --no-install-recommends \
-       librdkafka1 libssl3 zlib1g \
+       librdkafka1 libssl3t64 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 ```
 
 `gnupg` is pulled in automatically whenever a custom repo is needed
 (for `gpg --dearmor`).
+
+When the release could not be derived, the same block is preceded by a
+`# WARNING:` comment naming the base image and the release assumed, so a
+wrong guess shows up in the artefact rather than as "Unable to locate
+package" in a build log.
 
 ---
 
@@ -83,7 +133,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 | Where | Needs |
 |-------|-------|
 | **Build host** (CI runner doing `cargo build`) | `-dev` packages: `librdkafka-dev`, `libgit2-dev`, `libzstd-dev`, `libssl-dev`, `zlib1g-dev` |
-| **Runtime host** (the container image) | `.so` runtimes: `librdkafka1`, `libgit2-1.7`, `libzstd1`, `libssl3`, `zlib1g` |
+| **Runtime host** (the container image) | `.so` runtimes: `librdkafka1`, `libzstd1`, `zlib1g`, plus the release-specific libgit2 / libssl from the table above (on trixie: `libgit2-1.9`, `libssl3t64`) |
 
 `NativeDepsContract` describes the **runtime** side only -- what ships
 in the image. hyperi-ci handles build-host packages separately by
@@ -97,9 +147,18 @@ scalo links glibc dynamically, so the rule is **glibc(runtime image)
 startup on an older one (`version 'GLIBC_x.yz' not found`). The default
 `base_image` is `debian:trixie-slim` and the CI builders run debian
 trixie too, so build and runtime glibc are identical -- it just works.
-On trixie, `librdkafka1` comes from the native repo (Debian ships a
-current build), so the Confluent client repo is only added for Ubuntu
-bases, whose distro package lags.
+`librdkafka1` always comes from the Confluent clients repo, on trixie as
+everywhere else. Confluent publishes no trixie suite, so trixie maps to the
+`bookworm` one, and its `librdkafka1` installs cleanly on trixie because the
+libssl / libsasl2 / zlib deps are satisfied by trixie's newer versions.
+
+That mapping is not taken on trust. `tier_a_dockerfile_with_native_deps_builds`
+(`tests/e2e/contract_artefacts.rs`) generates a Dockerfile for the default base
+with the kafka, spool, secrets and git features, BUILDS it, and then asserts
+inside the image that `librdkafka.so`, `libssl.so`, `libgit2.so` and
+`libzstd.so` are present. A package search would not prove this either way -
+Debian's package pages do not surface `Provides:`, so a package that resolves
+perfectly well can look absent. Only a build settles it.
 
 If you OVERRIDE `deployment.base_image`, keep its glibc >= the build
 host's (debian trixie):
@@ -109,7 +168,16 @@ host's (debian trixie):
 | `debian:trixie-slim` (default) | yes -- same release |
 | a newer Debian release | yes -- newer glibc |
 | an OLDER Debian, or Ubuntu | no -- older glibc; build on that base too |
-| distroless `cc-debian*` | no -- older glibc + no curl for HEALTHCHECK |
+| distroless `cc-debian*` | no -- see below |
+
+Distroless is not a glibc problem: `cc-debian13` is trixie, so the glibc
+matches. It fails on the dependency closure. Our binaries need shared
+objects `cc-debian13` does not carry, and it has no apt to add them - on the
+build recorded in scalo-rs#7 the Confluent `librdkafka1` alone pulled
+`libcurl3t64-gnutls`, `libngtcp2-16` and `libngtcp2-crypto-gnutls8`. You
+would have to copy each `.so` in by hand and keep that list current as
+librdkafka's deps move, which is exactly the outage the contract exists to
+prevent.
 
 musl images (alpine) are **not supported**: the native deps above
 (rdkafka, libgit2, openssl, `aws-lc-sys`) link glibc.
@@ -125,7 +193,7 @@ hard-code the feature list:
 ```rust
 let deps = NativeDepsContract::from_cargo_toml(
     Path::new("Cargo.toml"),
-    "ubuntu:24.04",
+    &base_image_from_cascade(),
 );
 ```
 
@@ -149,10 +217,12 @@ Opt-in keeps the image lean.
 
 ## Codename override
 
-For a base image scalo doesn't recognise, set
-`AptRepoContract::codename` directly. The field is empty when derived;
-set it by hand and the generator uses your value as-is. Useful on a
-private base image where the substring match misses.
+For your own APT repo, set `AptRepoContract::codename` directly. Leave it
+empty and it is derived from the base image at generation time; set it and
+the generator uses your value as-is. This is the per-repo lever. For the
+auto-added Confluent repo, the operator-facing lever is
+`deployment.base_distro` in the cascade (above) - the derived suite is
+already filled in on that entry.
 
 ```rust
 let repo = AptRepoContract {
@@ -180,10 +250,14 @@ drift-detection pattern.
 
 | Item | Purpose |
 |------|---------|
-| `NativeDepsContract` | The contract -- `apt_repos` + `apt_packages` |
-| `NativeDepsContract::for_rustlib_features(&[..], base)` | Build from feature names |
+| `NativeDepsContract` | The contract -- `apt_repos`, `apt_packages`, `distro`, `unresolved_base_image` |
+| `NativeDepsContract::for_features(&[..], BaseDistro)` | Build for a stated release, nothing inferred |
+| `NativeDepsContract::for_rustlib_features(&[..], base)` | Build from feature names, resolving the release |
 | `NativeDepsContract::from_cargo_toml(path, base)` | Parse features out of `Cargo.toml` |
 | `NativeDepsContract::is_empty()` | True if no packages to install |
+| `BaseDistro` | The distro release the package names target |
+| `base_distro_from_cascade()` / `resolve_base_distro(base)` | Cascade reader / full resolution |
+| `DEFAULT_BASE_DISTRO` | The assumed release when nothing answers (`trixie`) |
 | `AptRepoContract` | One custom APT repo (`key_url`, `keyring`, `url`, `codename`, `packages`) |
 
 ---

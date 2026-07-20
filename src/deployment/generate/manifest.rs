@@ -62,6 +62,13 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         "runtime_packages": {
             "apt_repos": apt_repos,
             "apt_packages": contract.native_deps.apt_packages,
+            // Which release those package names are valid for, and whether it
+            // had to be assumed. A consumer that composes an image from this
+            // manifest rather than from the generated Dockerfile would
+            // otherwise get the assumed names with no signal at all -- the
+            // Dockerfile's warning comment does not reach it.
+            "distro": contract.native_deps.distro.map(|d| d.as_str()),
+            "unresolved_base_image": contract.native_deps.unresolved_base_image,
         },
         "expose_ports": expose_ports,
         "healthcheck": {

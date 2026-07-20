@@ -25,13 +25,22 @@ boundary.
 
 `DeploymentContract::schema_version` is checked by CI, giving a
 fail-fast hook before generation runs against a stale contract.
-Current version is **2** (the field defaults to 2). Bump it when the
+Current version is **3** (the field defaults to 3). Bump it when the
 struct shape changes in a way that breaks downstream consumers.
 
 | Version | Notes |
 |---------|-------|
 | 1 | Initial shape -- no `image_profile`, no `oci_labels` |
-| 2 | Current -- `ImageProfile`, `OciLabels`, `SecretGroupContract` |
+| 2 | `ImageProfile`, `OciLabels`, `SecretGroupContract` |
+| 3 | Current - adds `config_schema` + `capabilities` |
+
+v3 is back-compatible in both directions. Reading FORWARD, a v2 consumer
+tolerates a v3 contract because `DeploymentContract` does not set
+`deny_unknown_fields`, so serde ignores the fields it does not know -- that
+holds whether or not the new fields carry content. Reading BACKWARD, a v3
+consumer accepts a v2 contract because both fields carry `#[serde(default)]`.
+They are also `skip_serializing_if`, so an app that provides neither emits the
+same bytes it did under v2.
 
 ---
 
@@ -68,7 +77,7 @@ producers both exist today. Cross-language consumers read
 use scalo::deployment::*;
 
 let contract = DeploymentContract {
-    schema_version: 2,
+    schema_version: 3,
     app_name: "dfe-loader".into(),
     binary_name: "dfe-loader".into(),
     description: "Kafka -> ClickHouse data loader".into(),
@@ -77,8 +86,8 @@ let contract = DeploymentContract {
     env_prefix: "DFE_LOADER".into(),
     metric_prefix: "loader".into(),
     config_mount_path: "/etc/dfe/loader.yaml".into(),
-    image_registry: image_registry_from_cascade(),   // "ghcr.io/hyperi-io"
-    base_image: base_image_from_cascade(),           // "ubuntu:24.04"
+    image_registry: image_registry_from_cascade(),   // org registry
+    base_image: base_image_from_cascade(),           // org base image
     extra_ports: vec![],
     entrypoint_args: vec!["--config".into(), "/etc/dfe/loader.yaml".into()],
     secrets: vec![
@@ -103,12 +112,27 @@ let contract = DeploymentContract {
     keda: Some(KedaContract::default()),
     native_deps: NativeDepsContract::for_rustlib_features(
         &["transport-kafka", "spool", "tiered-sink"],
-        "ubuntu:24.04",
+        &base_image_from_cascade(),
     ),
     image_profile: ImageProfile::Production,
     oci_labels: OciLabels::default(),
+    // v3 fields -- both optional
+    config_schema: Some(config_schema_json::<Config>()),
+    capabilities: vec![
+        Capability::transport("kafka")
+            .description("Kafka source and sink")
+            .maturity("stable"),
+    ],
 };
 ```
+
+`config_schema` is the JSON Schema (draft 2020-12) of the app's own
+`Config`, derived by schemars - `None` when the app does not derive
+`JsonSchema`. `capabilities` is the hand-authored catalog of runtime-data
+surface schemars cannot see (service names and their knobs); empty when
+the app supplies none. Both are also written out as
+`config-schema.{json,yaml}` and `capability-catalog.{json,yaml}` by
+`emit_config_artifacts`.
 
 The field that bites people is `secrets`: it's `Vec<SecretGroupContract>`,
 not flat. Each group bundles env vars sharing one K8s `Secret` (one
@@ -134,7 +158,7 @@ linking, plus diagnostic tools (`bash`, `strace`, `tcpdump`, `procps`,
 let prod = build_contract();
 let dev  = prod.with_dev_profile();   // ImageProfile::Development
 
-generate_dockerfile(&prod, None);    // ubuntu:24.04 + runtime libs only
+generate_dockerfile(&prod, None);    // base_image + runtime libs only
 generate_dockerfile(&dev, None);     // + strace, tcpdump, ...
 ```
 
@@ -146,19 +170,22 @@ rebuilding.
 
 ## Cascade-driven defaults
 
-Three fields read from the config cascade so ops can change them
-org-wide without rebuilding each app. Wire them into the contract
-builder to pull registry and base image from `settings.yaml` rather
-than baking them into source.
+These read from the config cascade so ops can change them org-wide
+without rebuilding each app. Wire them into the contract builder to pull
+registry and base image from `settings.yaml` rather than baking them into
+source.
 
 | Function | Cascade key | Default |
 |----------|-------------|---------|
 | `image_registry_from_cascade()` | `deployment.image_registry` | `ghcr.io/hyperi-io` |
 | `base_image_from_cascade()` | `deployment.base_image` | `debian:trixie-slim` |
+| `resolve_base_distro(base_image)` | `deployment.base_distro` | derived from `base_image` |
 | `argocd_repo_url_from_cascade(app)` | `deployment.argocd.repo_url` | `https://github.com/hyperi-io/<app>` |
 
 Overriding `base_image`? Keep `glibc(runtime) >= glibc(build host)` and
 stay off musl (alpine) -- see [NATIVE-DEPS.md](NATIVE-DEPS.md#glibc-keep-runtime--build).
+Pinning it to a digest? Set `base_distro` too - runtime package names are
+release-specific and a digest carries no codename.
 
 ---
 
@@ -176,12 +203,19 @@ stay off musl (alpine) -- see [NATIVE-DEPS.md](NATIVE-DEPS.md#glibc-keep-runtime
 | `PortContract` | Extra container port beyond `metrics_port` |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |
 | `SecretEnvContract` | Single env var sourced from a Secret key |
-| `OciLabels` | Static OCI labels (`title`, `description`, `vendor`, `licenses`) |
+| `OciLabels` | Static OCI labels (`title`, `description`, `vendor`, `licenses`, `copyright`) |
 | `NativeDepsContract` | Runtime APT packages -- see [NATIVE-DEPS.md](NATIVE-DEPS.md) |
 | `KedaContract` | Autoscaling thresholds -- see [KEDA.md](KEDA.md) |
 | `ArgocdConfig` | ArgoCD `Application` repo / path / namespace |
 | `DEFAULT_IMAGE_REGISTRY` / `DEFAULT_BASE_IMAGE` | Defaults used when cascade is silent |
 | `image_registry_from_cascade()` / `base_image_from_cascade()` / `argocd_repo_url_from_cascade()` | Cascade readers |
+| `Capability` / `FieldSpec` | Capability-catalog entry and its config fields |
+| `config_schema_json::<T>()` | Derive the JSON Schema for the app's `Config` |
+
+`oci_labels.licenses` and `oci_labels.copyright` do double duty: they set the
+OCI labels AND the generated Dockerfile's `# License` / `# Copyright` header,
+so a non-Apache consumer does not get scalo's licence stamped into its repo.
+Both default to scalo's own values.
 
 ---
 

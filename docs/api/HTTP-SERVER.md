@@ -1,32 +1,48 @@
 # HTTP server
 
-`HttpServer` is the axum-backed server that hosts the probe trinity,
-the Prometheus exporter, the metrics manifest, and (opt-in) the
-`/config` admin endpoint. `ServiceRuntime` starts it automatically when
-the `http-server` feature is on -- apps don't usually instantiate
-`HttpServer` themselves.
+`HttpServer` is an axum-backed server for apps that want their own HTTP
+listener with the health paths attached. It is an OPTIONAL extra, not the
+observability port.
 
-Default port is 9090 (shared between probes and metrics -- single
-listener, single TLS config). The server respects the same
-`CancellationToken` as the rest of the runtime so SIGTERM drains
-in-flight requests before exit.
+Read this first, because the distinction has bitten people. There are TWO
+servers and they are not interchangeable:
+
+| | Metrics server | `HttpServer` |
+|---|---|---|
+| Started by | `ServiceRuntime` automatically (`metrics` feature) | the app, explicitly |
+| Default bind | `--metrics-addr`, `0.0.0.0:9090` | `0.0.0.0:8080` |
+| Implementation | hand-rolled over tokio, no axum | axum |
+| Serves `/metrics` | YES | **no** |
+| Serves `/startupz` | YES | **no** |
+
+**The observability port -- the one the deployment contract advertises and
+Prometheus scrapes -- is the METRICS server, not this one.** `ServiceRuntime`
+never constructs `HttpServer`. An app that stands up only `HttpServer` on the
+contract's `metrics_port` will answer the health probes and 404 the scrape.
+
+The server respects the same `CancellationToken` as the rest of the runtime so
+SIGTERM drains in-flight requests before exit.
 
 ---
 
 ## Mounted endpoints
 
+What `build_router` actually mounts:
+
 | Path | Wired by | What it returns |
 |------|----------|-----------------|
-| `/healthz` | `health` feature | 200 if process is alive (no dep checks -- never restart on dep down) |
-| `/readyz` | `health` feature | 200 if `ready_flag` is true AND all registered checks pass; 503 otherwise |
-| `/startupz` | `health` feature | 200 after startup completes (K8s waits before flipping to liveness) |
-| `/metrics` | `metrics` feature | Prometheus text exposition |
-| `/metrics/manifest` | `metrics` feature | JSON catalogue of every registered counter/gauge/histogram |
+| `/healthz` | on by default (`enable_health_endpoints`) | 200 if process is alive (no dep checks -- never restart on dep down) |
+| `/readyz` | same | 200 if `ready_flag` is true AND all registered checks pass; 503 otherwise |
+| `/health/live`, `/health/ready` | same | aliases of the two above |
+| `/health/detailed` | `health` + `serde_json` | per-check JSON breakdown |
 | `/config` | opt-in via `enable_config_endpoint` | JSON dump of every registered config section, with secrets redacted |
-| `/scaling/pressure` | `scaling` feature | Single `f64` 0.0-100.0 for KEDA external scaler polling |
 
-Probes plus metrics on the same port keep K8s manifest concise -- one
-`containerPort: 9090`, three probes, one `ServiceMonitor`.
+NOT mounted here, whatever the feature set: `/metrics`, `/metrics/manifest`,
+`/startupz`, `/scaling/pressure`, `/memory/pressure`. Those belong to the
+metrics server -- see [../core-pillars/METRICS.md](../core-pillars/METRICS.md).
+
+`enable_metrics_endpoint` on `HttpServerConfig` is currently inert: the field
+exists and `build_router` does not read it. Setting it changes nothing.
 
 ---
 

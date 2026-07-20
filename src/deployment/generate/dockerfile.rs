@@ -270,6 +270,21 @@ fn build_apt_block(
 
     // Build multi-step RUN: base install → repo setup → update → runtime install → cleanup
     out.push_str("# Runtime shared libraries for dynamically-linked Rust crates.\n");
+    if let Some(base_image) = &deps.unresolved_base_image {
+        // Package names below are release-specific. We could not tell which
+        // release this base image is (a digest pin carries no codename), so an
+        // assumption was made -- say so in the artefact rather than let a wrong
+        // guess reach a build log as "Unable to locate package".
+        out.push_str(&format!(
+            "# WARNING: could not derive the distro release from base image '{base_image}'.\n\
+             # Assumed {assumed}. State it explicitly with either\n\
+             # `deployment.base_distro` in the config cascade, or the env var\n\
+             # DEPLOYMENT__BASE_DISTRO=trixie|bookworm|noble|jammy|focal.\n",
+            assumed = deps
+                .distro
+                .unwrap_or(crate::deployment::DEFAULT_BASE_DISTRO),
+        ));
+    }
 
     out.push_str("RUN apt-get update && apt-get install -y --no-install-recommends \\\n");
     out.push_str(&format!("    {} \\\n", base_pkgs.join(" ")));

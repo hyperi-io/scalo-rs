@@ -30,8 +30,9 @@
 //!
 //! ```rust,no_run
 //! use scalo::deployment::{
-//!     DeploymentContract, HealthContract, ImageProfile, KedaContract, NativeDepsContract,
-//!     generate_dockerfile, generate_chart, generate_compose_fragment,
+//!     DEFAULT_BASE_DISTRO, DeploymentContract, HealthContract, ImageProfile, KedaContract,
+//!     NativeDepsContract, base_image_from_cascade, generate_dockerfile, generate_chart,
+//!     generate_compose_fragment,
 //! };
 //!
 //! let contract = DeploymentContract {
@@ -50,10 +51,10 @@
 //!     default_config: None,
 //!     depends_on: vec!["kafka".into(), "clickhouse".into()],
 //!     keda: Some(KedaContract::default()),
-//!     base_image: "ubuntu:24.04".into(),
-//!     native_deps: NativeDepsContract::for_rustlib_features(
+//!     base_image: base_image_from_cascade(),
+//!     native_deps: NativeDepsContract::for_features(
 //!         &["transport-kafka", "spool", "tiered-sink"],
-//!         "ubuntu:24.04",
+//!         DEFAULT_BASE_DISTRO,
 //!     ),
 //!     image_profile: ImageProfile::Production,
 //!     oci_labels: Default::default(),
@@ -112,10 +113,11 @@ pub use generate::{
     generate_container_manifest, generate_dockerfile, generate_runtime_stage,
 };
 pub use keda::{KedaConfig, KedaContract};
-pub use native_deps::{AptRepoContract, NativeDepsContract};
+pub use native_deps::{AptRepoContract, BaseDistro, NativeDepsContract};
 pub use registry::{
-    DEFAULT_BASE_IMAGE, DEFAULT_IMAGE_REGISTRY, argocd_repo_url_from_cascade,
-    base_image_from_cascade, image_registry_from_cascade,
+    DEFAULT_BASE_DISTRO, DEFAULT_BASE_IMAGE, DEFAULT_IMAGE_REGISTRY, argocd_repo_url_from_cascade,
+    base_distro_from_cascade, base_image_from_cascade, image_registry_from_cascade,
+    resolve_base_distro,
 };
 pub use validate::{validate_dockerfile, validate_helm_values};
 pub use waves::{WAVE_APPS, WAVE_CRDS, WAVE_OPERATORS, WAVE_POST, WAVE_TOPICS};

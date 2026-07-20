@@ -17,6 +17,10 @@ target/
 # root are KB-sized and may be referenced by Cargo.toml, so leave them.
 docs/
 
+# Local secrets -- never let these land in a builder layer
+.env
+.env.*
+
 # Benches + local dev / agent artefacts
 benches/
 .claude/

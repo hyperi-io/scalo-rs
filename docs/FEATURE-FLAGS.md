@@ -157,11 +157,15 @@ needs runtime libs.
 | Feature | `-sys` crate | Build package | Runtime package |
 |---------|--------------|---------------|-----------------|
 | `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (≥ 2.12.1, Confluent APT repo) | `librdkafka1` |
-| `directory-config-git` | `libgit2-sys` | `libgit2-dev` | `libgit2-1.7` |
+| `directory-config-git` | `libgit2-sys` | `libgit2-dev` | `libgit2-1.9` (release-specific) |
 | `spool` / `tiered-sink` | `zstd-sys` | `libzstd-dev` | `libzstd1` |
-| (transitive via several) | `openssl-sys` | `libssl-dev` | `libssl3` |
+| (transitive via several) | `openssl-sys` | `libssl-dev` | `libssl3t64` (release-specific) |
 | (transitive via several) | `libz-sys` | `zlib1g-dev` | `zlib1g` |
 | `secrets-aws` | `aws-lc-sys` | — (compiled from source, ~20-30s, sccache-cached) | — (statically linked) |
+
+The two rows marked release-specific bake a library version into the package name,
+so they differ per base release - the values above are for the default base.
+The full table is in [deployment/NATIVE-DEPS.md](deployment/NATIVE-DEPS.md).
 
 `hyperi-ci` auto-detects which `-sys` crates appear in `Cargo.lock` and
 installs the matching packages. The Confluent APT repo is added

@@ -82,7 +82,7 @@ Pick the slice you need; pay only for what you use.
 | `otel-metrics` | OpenTelemetry metrics export (OTLP) |
 | `otel-tracing` | OpenTelemetry distributed tracing |
 | `http` | HTTP client with retry middleware (reqwest) |
-| `http-server` | Axum HTTP server with health probe trinity (`/healthz/{startup,live,ready}`) |
+| `http-server` | Axum HTTP server with health probes (`/healthz`, `/readyz`, plus the `/health/live` and `/health/ready` aliases) |
 | `transport-kafka` | Kafka transport (rdkafka, dynamic-linking) |
 | `transport-grpc` | gRPC transport (tonic/prost) |
 | `transport-memory` | In-memory transport (testing/dev) |
@@ -127,13 +127,16 @@ This crate dynamically links against system C libraries for several features.
 | (transitive) | `openssl-sys` | `libssl-dev` | Dynamic linking via pkg-config |
 | `secrets-aws` | `aws-lc-sys` | - | C/C++ compiled from source (no system lib available); ~20-30s first build, cached by sccache |
 
-For `librdkafka-dev` >= 2.12.1, add the Confluent APT repo:
+For `librdkafka-dev` >= 2.12.1, add the Confluent APT repo. The suite below is
+`bookworm`, which is what a Debian trixie host uses - Confluent publishes no
+trixie suite and the bookworm .deb installs cleanly on trixie. On an Ubuntu
+24.04 host use `noble`:
 
 ```bash
 curl -fsSL https://packages.confluent.io/clients/deb/archive.key \
   | sudo gpg --dearmor -o /usr/share/keyrings/confluent-clients.gpg
 echo "deb [signed-by=/usr/share/keyrings/confluent-clients.gpg] \
-  https://packages.confluent.io/clients/deb noble main" \
+  https://packages.confluent.io/clients/deb bookworm main" \
   | sudo tee /etc/apt/sources.list.d/confluent-clients.list
 sudo apt-get update
 sudo apt-get install -y librdkafka-dev libssl-dev libsasl2-dev pkg-config
@@ -147,44 +150,88 @@ The compiled binary links against `.so` files at runtime. Install the
 | Feature | Runtime Package | Shared Object |
 |---------|----------------|---------------|
 | `transport-kafka` | `librdkafka1` (from Confluent repo) | `librdkafka.so.1` |
-| `directory-config-git` | `libgit2-1.7` (or matching version) | `libgit2.so` |
+| `directory-config-git` | `libgit2-1.9` on trixie, `libgit2-1.7` on noble | `libgit2.so` |
 | `spool`, `tiered-sink` | `libzstd1` | `libzstd.so.1` |
 | (transitive) | `zlib1g` | `libz.so.1` |
-| (transitive) | `libssl3` | `libssl.so.3` |
+| (transitive) | `libssl3t64` on trixie/noble, `libssl3` on bookworm/jammy | `libssl.so.3` |
 
 Only install what you use. Check the features your binary enables to
 determine which runtime packages are needed.
 
 ### Docker Example
 
+This is the shape the `deployment` feature's generator emits, minus the
+generated LABEL and APT blocks. The `WORKDIR /app` in the build stage is what
+makes `/app/target/release/...` resolvable from the runtime stage.
+
 ```dockerfile
 # Build stage
 FROM rust:1 AS builder
+WORKDIR /app
 RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev librdkafka-dev libgit2-dev libzstd-dev
 COPY . .
 RUN cargo build --release
 
-# Runtime stage
-FROM ubuntu:24.04
+# Runtime stage - the contract's base_image (default: the org base, currently
+# Debian trixie slim)
+FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    librdkafka1 libssl3 libgit2-1.7 libzstd1 ca-certificates \
+    librdkafka1 libssl3t64 libgit2-1.9 libzstd1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/myapp /usr/local/bin/
+
+COPY --from=builder /app/target/release/myapp /usr/local/bin/myapp
+RUN chmod +x /usr/local/bin/myapp
+
+RUN useradd --create-home --uid 1000 appuser
+USER appuser
+
+EXPOSE 9090
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -sf http://localhost:9090/healthz > /dev/null || exit 1
+
+ENTRYPOINT ["myapp"]
 ```
 
-For `librdkafka1`, add the Confluent APT repo to both build and runtime stages.
+`libgit2-1.9` and `libssl3t64` are the trixie package names; on a noble base
+they are `libgit2-1.7` and `libssl3t64`, on bookworm `libgit2-1.5` and
+`libssl3`. The `deployment` feature works these out for you from the
+contract's release - see the release table in
+[docs/deployment/NATIVE-DEPS.md](docs/deployment/NATIVE-DEPS.md), which also
+covers adding the Confluent APT repo to both stages for `librdkafka1`.
+The generator also drops any pre-existing UID 1000 account (ubuntu bases ship
+one) before creating `appuser`; trixie slim does not, so the example skips it.
+Note that Kubernetes ignores `HEALTHCHECK` - it is there for plain Docker and
+Compose. K8s uses the probe paths above.
 
-## Health Check Endpoints - The Probe Trinity
+## Health Check Endpoints
 
-For services deployed to Kubernetes, the `http-server` feature provides
-the three K8s probe types:
+For services deployed to Kubernetes, the paths are the K8s-standard ones. Two
+routers can serve them and they do NOT carry the same set, so the "served by"
+column is the one to read before pointing a probe or a scrape at a port:
 
-| Probe | Path | Checks | On failure |
-|---|---|---|---|
-| Startup | `/healthz/startup` | Init complete | K8s waits, then restarts |
-| Liveness | `/healthz/live` | Process not deadlocked | Restart pod |
-| Readiness | `/healthz/ready` | Deps healthy + ready flag set | Stop routing traffic |
+| Path | Serves | Served by | Checks | On failure |
+|---|---|---|---|---|
+| `/healthz` | liveness | metrics server + `http-server` | Process not deadlocked | Restart pod |
+| `/readyz` | readiness | metrics server + `http-server` | Deps healthy + ready flag set | Stop routing traffic |
+| `/startupz` | startup | metrics server ONLY | App has called `mark_started()` | Keep waiting |
+| `/metrics` | Prometheus scrape | metrics server ONLY | - | - |
+
+`/health/live` and `/health/ready` stay as aliases for consumer probes written
+before the rename, on both routers.
+
+The deployment contract's `metrics_path` defaults to `/metrics`, and the
+generated Helm chart puts the Prometheus scrape annotations on the contract's
+`metrics_port`. That only answers if the METRICS server is the thing listening
+on that port -- an app that stands up only the `http-server` router there will
+serve the two health paths and 404 the scrape.
+
+`/startupz` exists for the K8s `startupProbe`: 503 `{"status":"starting"}` until
+the app calls `MetricsManager::mark_started()`, 200 `{"status":"started"}` after.
+It is deliberately separate from readiness - a startup probe gets a long timeout
+for slow starters, readiness does not. Point a `startupProbe` at `/startupz` on
+the metrics server, or at `/healthz` if you only have the `http-server` router.
 
 Liveness MUST NEVER check downstream dependencies (a DB outage shouldn't
 restart your replicas). Readiness checks dependencies AND requires an

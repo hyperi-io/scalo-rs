@@ -148,6 +148,82 @@ fn write_mock_binary(build_ctx: &Path, binary_name: &str) -> std::io::Result<()>
 // Tier A -- Dockerfile: docker build + docker run --help
 // ============================================================================
 
+/// An image built from a contract's generated Dockerfile, removed on drop.
+///
+/// Dropping rather than cleaning up at the end of the test matters: an assert
+/// that fires unwinds past any trailing `docker rmi`, so a failing test would
+/// otherwise leak its image every run.
+struct BuiltImage {
+    tag: String,
+    docker_config: tempfile::TempDir,
+    // Held so the build context outlives the build.
+    _ctx: tempfile::TempDir,
+}
+
+impl BuiltImage {
+    /// Generate the Dockerfile for `contract`, build it, and return the handle.
+    /// Panics with the build output if the image does not build.
+    fn build(
+        contract: &DeploymentContract,
+        identity: Option<&ContractIdentity>,
+        tag_suffix: &str,
+    ) -> Self {
+        let dockerfile = generate_dockerfile(contract, identity);
+
+        let ctx = tempfile::tempdir().expect("tempdir");
+        let dockerfile_path = ctx.path().join("Dockerfile");
+        std::fs::write(&dockerfile_path, &dockerfile).expect("write Dockerfile");
+        write_mock_binary(ctx.path(), contract.binary()).expect("write mock binary");
+
+        let docker_config = tempfile::tempdir().expect("docker config tempdir");
+        std::fs::write(
+            docker_config.path().join("config.json"),
+            docker_empty_creds_json(),
+        )
+        .expect("write empty docker config");
+
+        let tag = format!(
+            "hyperi-contract-test:e2e-{suffix}-{pid}",
+            suffix = tag_suffix,
+            pid = std::process::id(),
+        );
+
+        let build = Command::new("docker")
+            .env("DOCKER_CONFIG", docker_config.path())
+            .args(["build", "--quiet", "-t", &tag, "-f"])
+            .arg(&dockerfile_path)
+            .arg(ctx.path())
+            .output()
+            .expect("docker build invocation");
+        assert!(
+            build.status.success(),
+            "docker build failed on base {base}: stdout={stdout} stderr={stderr}",
+            base = contract.base_image,
+            stdout = String::from_utf8_lossy(&build.stdout),
+            stderr = String::from_utf8_lossy(&build.stderr),
+        );
+
+        Self {
+            tag,
+            docker_config,
+            _ctx: ctx,
+        }
+    }
+
+    /// A `docker` command already pointed at the throwaway credential store.
+    fn docker(&self) -> Command {
+        let mut cmd = Command::new("docker");
+        cmd.env("DOCKER_CONFIG", self.docker_config.path());
+        cmd
+    }
+}
+
+impl Drop for BuiltImage {
+    fn drop(&mut self) {
+        let _ = self.docker().args(["rmi", "-f", &self.tag]).output();
+    }
+}
+
 #[test]
 fn tier_a_dockerfile_builds_and_image_runs() {
     if !docker_available() {
@@ -161,41 +237,19 @@ fn tier_a_dockerfile_builds_and_image_runs() {
 
     let contract = test_contract();
     let identity = test_identity();
-    let dockerfile = generate_dockerfile(&contract, Some(&identity));
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let ctx = tmp.path();
-    let dockerfile_path = ctx.join("Dockerfile");
-    std::fs::write(&dockerfile_path, &dockerfile).expect("write Dockerfile");
-    write_mock_binary(ctx, contract.binary()).expect("write mock binary");
-
-    let docker_config = tempfile::tempdir().expect("docker config tempdir");
-    std::fs::write(
-        docker_config.path().join("config.json"),
-        docker_empty_creds_json(),
-    )
-    .expect("write empty docker config");
-
-    let tag = format!("hyperi-contract-test:e2e-{}", std::process::id());
-
-    let build = Command::new("docker")
-        .env("DOCKER_CONFIG", docker_config.path())
-        .args(["build", "--quiet", "-t", &tag, "-f"])
-        .arg(&dockerfile_path)
-        .arg(ctx)
-        .output()
-        .expect("docker build invocation");
-    assert!(
-        build.status.success(),
-        "docker build failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr),
-    );
+    let image = BuiltImage::build(&contract, Some(&identity), "plain");
 
     let entrypoint = format!("/usr/local/bin/{}", contract.binary());
-    let run = Command::new("docker")
-        .env("DOCKER_CONFIG", docker_config.path())
-        .args(["run", "--rm", "--entrypoint", &entrypoint, &tag, "--help"])
+    let run = image
+        .docker()
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            &entrypoint,
+            &image.tag,
+            "--help",
+        ])
         .output()
         .expect("docker run invocation");
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -209,9 +263,9 @@ fn tier_a_dockerfile_builds_and_image_runs() {
         "container ran but did not produce expected output: stdout={stdout} stderr={stderr}",
     );
 
-    let inspect = Command::new("docker")
-        .env("DOCKER_CONFIG", docker_config.path())
-        .args(["inspect", "--format", "{{json .Config.Labels}}", &tag])
+    let inspect = image
+        .docker()
+        .args(["inspect", "--format", "{{json .Config.Labels}}", &image.tag])
         .output()
         .expect("docker inspect invocation");
     let labels = String::from_utf8_lossy(&inspect.stdout);
@@ -223,11 +277,69 @@ fn tier_a_dockerfile_builds_and_image_runs() {
             && labels.contains("io.hyperi.contract.image-ref"),
         "docker inspect did not show all three io.hyperi.contract.* labels: {labels}",
     );
+}
 
-    let _ = Command::new("docker")
-        .env("DOCKER_CONFIG", docker_config.path())
-        .args(["rmi", "-f", &tag])
-        .output();
+/// The apt block is the part that can be wrong in a way only a build catches.
+///
+/// The fixture above deliberately carries no native deps, so it never installs
+/// anything. This one uses the real default base and a real feature set, which
+/// makes the build resolve every generated package name for that release --
+/// the Confluent repo import, the trixie-to-bookworm suite mapping, and the
+/// release-specific `libssl3t64` / `libgit2-1.9`. A package search is not proof
+/// a package exists (it does not surface `Provides:`); a build is.
+#[test]
+fn tier_a_dockerfile_with_native_deps_builds() {
+    if !docker_available() {
+        skip(
+            "tier-a",
+            "tier_a_dockerfile_with_native_deps_builds",
+            "docker daemon not reachable",
+        );
+        return;
+    }
+
+    let mut contract = test_contract();
+    contract.base_image = scalo::deployment::DEFAULT_BASE_IMAGE.to_string();
+    contract.native_deps = scalo::deployment::NativeDepsContract::for_features(
+        &[
+            "transport-kafka",
+            "spool",
+            "secrets",
+            "directory-config-git",
+        ],
+        scalo::deployment::DEFAULT_BASE_DISTRO,
+    );
+    // A failure here means a generated package name does not resolve on this
+    // release -- the assertion inside `build` prints the apt output.
+    let image = BuiltImage::build(&contract, None, "deps");
+
+    // The .so files have to be present, not just the packages installed.
+    let run = image
+        .docker()
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/bin/sh",
+            &image.tag,
+            "-c",
+            "ldconfig -p | grep -E 'librdkafka|libssl|libgit2|libzstd'",
+        ])
+        .output()
+        .expect("docker run invocation");
+    let listed = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "could not list shared objects in the image: stderr={}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+    for so in ["librdkafka.so", "libssl.so", "libgit2.so", "libzstd.so"] {
+        assert!(
+            listed.contains(so),
+            "{so} missing from the runtime image -- the package installed but the \
+             shared object is not there: {listed}",
+        );
+    }
 }
 
 // ============================================================================

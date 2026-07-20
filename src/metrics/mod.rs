@@ -896,27 +896,11 @@ impl MetricsManager {
                     async move { h.render() }
                 }),
             )
-            .route("/startupz", {
-                let sf = self.started_flag();
-                axum::routing::get(move || {
-                    let started = sf.load(std::sync::atomic::Ordering::Acquire);
-                    async move {
-                        if started {
-                            (
-                                axum::http::StatusCode::OK,
-                                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                r#"{"status":"started"}"#,
-                            )
-                        } else {
-                            (
-                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                                r#"{"status":"starting"}"#,
-                            )
-                        }
-                    }
-                })
-            })
+            .route("/startupz", startup_route(self.started_flag()))
+            // Alias, to stay in step with the hand-rolled responder. Leaving it
+            // out here means the alias silently disappears for anything that
+            // moves onto this router.
+            .route("/health/startup", startup_route(self.started_flag()))
             .route(
                 "/healthz",
                 axum::routing::get(|| async {
@@ -1215,7 +1199,35 @@ async fn handle_connection(
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
-/// Readiness response helper for axum endpoints.
+/// Startup-probe route, shared by `/startupz` and its `/health/startup` alias
+/// so the two cannot drift apart.
+///
+/// 503 until [`mark_started`](MetricsManager::mark_started) is called, 200
+/// after. Startup is deliberately separate from readiness: a startup probe
+/// carries a long timeout for slow boots, readiness does not.
+#[cfg(all(feature = "metrics", feature = "http-server"))]
+fn startup_route(started: Arc<std::sync::atomic::AtomicBool>) -> axum::routing::MethodRouter {
+    axum::routing::get(move || {
+        let started = started.load(std::sync::atomic::Ordering::Acquire);
+        async move {
+            if started {
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"status":"started"}"#,
+                )
+            } else {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"status":"starting"}"#,
+                )
+            }
+        }
+    })
+}
+
+/// Build the readiness response.
 ///
 /// Checks the caller-supplied readiness callback AND (when the `health`
 /// feature is enabled) the global [`HealthRegistry`](crate::health::HealthRegistry).
