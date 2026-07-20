@@ -7,7 +7,7 @@ Key points for context --
 - **Lock-waits are a defect to be avoided**, not a tradeoff to accept.
 
 
-The workload: **heavily-optimised at-scale data processing** 
+The workload: **heavily-optimised at-scale data processing**
 Zero-copy, multi-threaded, SIMD, PB/hr ingest, where a **1% regression is many
 thousands of dollars** in infra or cloud spend, minimum. That's the bar
 everything here is judged against -- not *just* "is it fast", but "is it fast enough

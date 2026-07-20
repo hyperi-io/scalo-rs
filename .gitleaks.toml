@@ -9,6 +9,15 @@
 [extend]
 useDefault = true
 
+# A PGP fingerprint is a PUBLIC key identifier -- publishing it is the whole
+# point. This one pins the Confluent APT signing key so the generated
+# Dockerfile can assert the downloaded key matches before trusting the repo,
+# turning an every-build TOFU into a one-time one. Its 40 hex chars read as
+# high entropy to the generic-api-key rule.
+[[allowlists]]
+description = "Confluent APT signing-key fingerprint (public key id, not a credential)"
+regexes = ['''CBBB821E8FAF364F79835C438B1DA6120C2BF624''']
+
 # Uncomment and customise as needed:
 #
 # [[allowlists]]
