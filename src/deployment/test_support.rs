@@ -75,6 +75,48 @@ pub fn docker_available() -> bool {
     })
 }
 
+/// The daemon endpoint of docker's active context, when one resolves.
+///
+/// A test that points `DOCKER_CONFIG` at a throwaway directory -- the usual way
+/// to stop docker invoking a credential helper the host may not have -- also
+/// discards the CONTEXT STORE, which lives in that same directory. Docker then
+/// falls back to `unix:///var/run/docker.sock`. That is the right socket on
+/// Linux CI and the wrong one anywhere the daemon listens elsewhere: Docker
+/// Desktop puts it under the user's home directory, so the build fails to
+/// connect on a developer machine while passing in CI.
+///
+/// Resolve the endpoint from the REAL config up front and hand it back through
+/// `DOCKER_HOST`, so the throwaway config strips credentials and nothing else.
+/// Returns `None` when no context resolves, leaving docker's own default.
+#[must_use]
+pub fn docker_host() -> Option<&'static str> {
+    static HOST: OnceLock<Option<String>> = OnceLock::new();
+    HOST.get_or_init(|| {
+        // An explicit DOCKER_HOST already applies to every docker invocation,
+        // context store or not, so honour it rather than re-deriving.
+        if let Ok(explicit) = std::env::var("DOCKER_HOST")
+            && !explicit.is_empty()
+        {
+            return Some(explicit);
+        }
+        let out = Command::new("docker")
+            .args([
+                "context",
+                "inspect",
+                "--format",
+                "{{.Endpoints.docker.Host}}",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let host = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (!host.is_empty()).then_some(host)
+    })
+    .as_deref()
+}
+
 /// Returns true iff `helm version` succeeds.
 #[must_use]
 pub fn helm_available() -> bool {

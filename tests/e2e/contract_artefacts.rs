@@ -68,7 +68,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use scalo::deployment::test_support::{
-    docker_available, docker_empty_creds_json, ensure_kind_cluster, helm_available,
+    docker_available, docker_empty_creds_json, docker_host, ensure_kind_cluster, helm_available,
     kubeconform_available, skip, tier_b_enabled, wait_until,
 };
 use scalo::deployment::{
@@ -186,8 +186,7 @@ impl BuiltImage {
             pid = std::process::id(),
         );
 
-        let build = Command::new("docker")
-            .env("DOCKER_CONFIG", docker_config.path())
+        let build = Self::docker_cmd(docker_config.path())
             .args(["build", "--quiet", "-t", &tag, "-f"])
             .arg(&dockerfile_path)
             .arg(ctx.path())
@@ -204,11 +203,24 @@ impl BuiltImage {
         Self { tag, docker_config }
     }
 
-    /// A `docker` command already pointed at the throwaway credential store.
-    fn docker(&self) -> Command {
+    /// A `docker` command pointed at a throwaway credential store.
+    ///
+    /// The throwaway `DOCKER_CONFIG` keeps credential helpers out of the test,
+    /// but it also hides the context store, so the daemon endpoint has to be
+    /// carried across explicitly or docker falls back to a socket path that is
+    /// only correct on Linux CI.
+    fn docker_cmd(docker_config: &Path) -> Command {
         let mut cmd = Command::new("docker");
-        cmd.env("DOCKER_CONFIG", self.docker_config.path());
+        cmd.env("DOCKER_CONFIG", docker_config);
+        if let Some(host) = docker_host() {
+            cmd.env("DOCKER_HOST", host);
+        }
         cmd
+    }
+
+    /// A `docker` command bound to this image's throwaway credential store.
+    fn docker(&self) -> Command {
+        Self::docker_cmd(self.docker_config.path())
     }
 }
 
