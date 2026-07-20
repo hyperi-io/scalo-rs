@@ -308,7 +308,8 @@ impl ServiceRuntime {
     ///
     /// This is how an app gets retry/backoff + per-attempt timeout (and,
     /// opt-in via config, adaptive concurrency + rate-limit) on its outbound send
-    /// for free, instead of hand-rolling them. The [`SinkStackConfig`] is read
+    /// for free, instead of hand-rolling them. The
+    /// [`SinkStackConfig`](crate::sink_stack::SinkStackConfig) is read
     /// from the cascade at `cfg_key` (e.g. `"sink_stack"`); the stack's defaults
     /// preserve at-least-once (whole-batch retry on a transient failure, never an
     /// ack before the sink confirms). Use the returned stack as the driver's sink

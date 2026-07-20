@@ -390,7 +390,9 @@ mod tests {
 
         let deployment =
             std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        assert!(deployment.contains("{{- if .Values.otel.endpoint }}"));
+        // Parenthesised so `otel: null` yields no env rather than a Helm
+        // nil-pointer error.
+        assert!(deployment.contains("{{- if (.Values.otel).endpoint }}"));
         assert!(deployment.contains("name: OTEL_EXPORTER_OTLP_ENDPOINT"));
         assert!(deployment.contains("name: OTEL_EXPORTER_OTLP_PROTOCOL"));
     }

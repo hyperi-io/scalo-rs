@@ -8,7 +8,7 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! An opinionated, OPT-IN strict credential profile layered on top of the vanilla
-//! [`KnownProvider`](super::providers::KnownProvider) facts.
+//! [`super::providers::KnownProvider`] facts.
 //!
 //! The vanilla provider abstraction states FACTS (what each provider's platform
 //! requires). This module adds POLICY: restrict to an allow-list of blessed

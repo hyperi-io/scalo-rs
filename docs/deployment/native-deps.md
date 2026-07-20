@@ -43,6 +43,17 @@ loads the config cascade, so the YAML lookup always misses there - use the env
 var when setting the release for a `generate-artefacts` run, or the YAML key
 when the app is running normally. Both spell the same thing.
 
+An unrecognised value at step 1 or 2 is treated as unset and falls through, so a
+typo cannot pin the release to something nobody asked for, and cannot suppress a
+correctly-spelled value in the layer below it.
+
+If an explicit release CONTRADICTS a base image that names its own - say
+`base_distro: noble` against `base_image: debian:trixie-slim` - the explicit
+value still wins, because config beats a string. But the result is a Dockerfile
+whose `FROM` and whose package names are for different releases, which is
+almost never intended, so the generator stamps a second warning naming both.
+Fix one of the two rather than shipping it.
+
 Tag derivation strips any digest, ignores a registry port, and tests each
 hyphen-separated component - so `debian:trixie-slim`, `rust:1-trixie` and
 `ubuntu:24.04` all resolve. A codename wins wherever it appears; a bare version

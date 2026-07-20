@@ -193,6 +193,8 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
          # otel features; ignored otherwise. Empty leaves the app's own default\n\
          # in place rather than switching anything off. Example:\n\
          # http://opentelemetry-collector.observability:4317\n\
+         # Spans can carry request attributes, so keep this in-cluster. To leave\n\
+         # the cluster use https:// and set the OTel SDK's certificate env vars.\n\
          otel:\n\
          \x20 endpoint: \"\"\n\
          \x20 protocol: grpc\n\
@@ -460,7 +462,10 @@ fn gen_observability_env(app: &str) -> String {
          \x20             value: k8s.pod.name=$(POD_NAME),k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME)\n"
     ));
     out.push_str(
-        "            {{- if .Values.otel.endpoint }}\n\
+        // Parenthesised lookup so an operator who sets `otel: null`, or drops
+        // the key from their values file, gets no env rather than a nil-pointer
+        // template error.
+        "            {{- if (.Values.otel).endpoint }}\n\
          \x20           - name: OTEL_EXPORTER_OTLP_ENDPOINT\n\
          \x20             value: {{ .Values.otel.endpoint | quote }}\n\
          \x20           - name: OTEL_EXPORTER_OTLP_PROTOCOL\n\
@@ -544,31 +549,31 @@ spec:
     out.push_str("          env:\n");
     out.push_str(&gen_observability_env(app));
 
-    // Env vars from secrets
-    if !c.secrets.is_empty() {
-        for group in &c.secrets {
-            let helper_name = format!("{}SecretName", to_camel_suffix(&group.group_name));
+    // Env vars from secrets. No emptiness guard: it used to suppress the `env:`
+    // header, which now always precedes this, so it would only be wrapping a
+    // loop that already iterates zero times.
+    for group in &c.secrets {
+        let helper_name = format!("{}SecretName", to_camel_suffix(&group.group_name));
+        out.push_str(&format!(
+            "            # {} credentials via Secret (figment env cascade overrides file config)\n",
+            group.group_name
+        ));
+        for env in &group.env_vars {
+            // See gen_secret_yaml -- hyphenated keys must use index form.
+            let key_lookup = safe_template_lookup(
+                &format!(".Values.{}.secretKeys", group.group_name),
+                &env.key_name,
+            );
             out.push_str(&format!(
-                "            # {} credentials via Secret (figment env cascade overrides file config)\n",
-                group.group_name
+                "            - name: {env_var}\n\
+                 \x20             valueFrom:\n\
+                 \x20               secretKeyRef:\n\
+                 \x20                 name: {{{{ include \"{app}.{helper}\" . }}}}\n\
+                 \x20                 key: {{{{ {key_lookup} }}}}\n",
+                env_var = env.env_var,
+                app = app,
+                helper = helper_name,
             ));
-            for env in &group.env_vars {
-                // See gen_secret_yaml -- hyphenated keys must use index form.
-                let key_lookup = safe_template_lookup(
-                    &format!(".Values.{}.secretKeys", group.group_name),
-                    &env.key_name,
-                );
-                out.push_str(&format!(
-                    "            - name: {env_var}\n\
-                     \x20             valueFrom:\n\
-                     \x20               secretKeyRef:\n\
-                     \x20                 name: {{{{ include \"{app}.{helper}\" . }}}}\n\
-                     \x20                 key: {{{{ {key_lookup} }}}}\n",
-                    env_var = env.env_var,
-                    app = app,
-                    helper = helper_name,
-                ));
-            }
         }
     }
 

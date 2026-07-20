@@ -126,7 +126,9 @@ pub fn base_image_from_cascade() -> String {
 ///
 /// Returns `None` when unset or unrecognised. An unrecognised value is treated
 /// as unset rather than silently substituted, so [`resolve_base_distro`] can
-/// still fall through to the base image.
+/// still fall through to the env layer and then to the base image -- a typo
+/// must not be able to pin the release to something nobody asked for, nor to
+/// suppress a correctly-spelled value in the layer below it.
 #[must_use]
 pub fn base_distro_from_cascade() -> Option<BaseDistro> {
     #[cfg(feature = "config")]
@@ -134,8 +136,9 @@ pub fn base_distro_from_cascade() -> Option<BaseDistro> {
         if let Some(cfg) = crate::config::try_get()
             && let Some(s) = cfg.get_string("deployment.base_distro")
             && !s.is_empty()
+            && let Some(distro) = BaseDistro::parse(&s)
         {
-            return BaseDistro::parse(&s);
+            return Some(distro);
         }
     }
     std::env::var("DEPLOYMENT__BASE_DISTRO")

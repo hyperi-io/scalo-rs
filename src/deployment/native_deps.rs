@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 /// cascade or the base image) -- pass the list of scalo features your app
 /// enables, get back the runtime packages and any custom APT repos needed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+// Adding a field must not break downstream literal construction -- consumers
+// build this through the constructors below, never by struct literal.
+#[non_exhaustive]
 pub struct NativeDepsContract {
     /// Custom APT repositories to add before installing packages.
     #[serde(default)]
@@ -50,6 +53,17 @@ pub struct NativeDepsContract {
     /// silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unresolved_base_image: Option<String>,
+
+    /// Set when an explicit `deployment.base_distro` CONTRADICTED a base image
+    /// that names its own release.
+    ///
+    /// The explicit value still wins -- config beats a string -- but the result
+    /// is a Dockerfile whose `FROM` and whose package names are for different
+    /// releases, which is almost always a mistake rather than an intention. It
+    /// is the one disagreement the generator cannot resolve for you, so it says
+    /// so in the artefact rather than quietly picking a side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradicted_base_image: Option<String>,
 }
 
 /// A custom APT repository (e.g., Confluent for librdkafka).
@@ -99,6 +113,9 @@ fn confluent_repo(codename: &str) -> AptRepoContract {
 /// instead of silently borrowing another distro's package names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+// Adding a release is not a breaking change -- a future Debian 14 must not
+// break every downstream exhaustive match.
+#[non_exhaustive]
 pub enum BaseDistro {
     /// Debian 13 "trixie" -- the org default.
     #[default]
@@ -116,7 +133,7 @@ pub enum BaseDistro {
 impl BaseDistro {
     /// The release codename, as APT and the config cascade spell it.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Trixie => "trixie",
             Self::Bookworm => "bookworm",
@@ -221,7 +238,7 @@ impl BaseDistro {
     /// libssl/libsasl2/zlib deps are satisfied by trixie's newer versions), so
     /// trixie maps to `bookworm`.
     #[must_use]
-    pub fn confluent_suite(self) -> &'static str {
+    pub const fn confluent_suite(self) -> &'static str {
         match self {
             Self::Trixie | Self::Bookworm => "bookworm",
             Self::Noble => "noble",
@@ -236,7 +253,7 @@ impl BaseDistro {
     /// virtual provider, so this has to track each release: trixie 1.9,
     /// bookworm 1.5, noble 1.7, jammy 1.1, focal 0.28.
     #[must_use]
-    pub fn libgit2_package(self) -> &'static str {
+    pub const fn libgit2_package(self) -> &'static str {
         match self {
             Self::Trixie => "libgit2-1.9",
             Self::Bookworm => "libgit2-1.5",
@@ -253,7 +270,7 @@ impl BaseDistro {
     /// `Provides:`, but naming the real package is clearer and does not depend
     /// on that `Provides` staying in place. Focal predates OpenSSL 3.
     #[must_use]
-    pub fn libssl_package(self) -> &'static str {
+    pub const fn libssl_package(self) -> &'static str {
         match self {
             Self::Trixie | Self::Noble => "libssl3t64",
             Self::Bookworm | Self::Jammy => "libssl3",
@@ -293,19 +310,25 @@ impl NativeDepsContract {
     /// ```
     #[must_use]
     pub fn for_features(features: &[&str], distro: BaseDistro) -> Self {
-        Self::build(features, distro, None)
+        Self::packages_for(features, distro)
     }
 
     /// Build runtime native deps from a list of scalo feature names, resolving
     /// the distro release from the config cascade or the base image.
     ///
-    /// Resolution order: `deployment.base_distro` in the cascade, then the base
-    /// image where it is recognisable, then
-    /// [`DEFAULT_BASE_DISTRO`](crate::deployment::DEFAULT_BASE_DISTRO). The
-    /// last step records the base image in
-    /// [`unresolved_base_image`](Self::unresolved_base_image) and the generated
-    /// Dockerfile carries a warning, because a digest-pinned base image is
-    /// exactly the case that reaches it.
+    /// The precedence itself lives in
+    /// [`resolve_base_distro`](crate::deployment::resolve_base_distro) -- one
+    /// home, so a future layer added there cannot disagree with this. When it
+    /// answers `None` (typically a digest-pinned base image, which carries no
+    /// codename) this falls back to
+    /// [`DEFAULT_BASE_DISTRO`](crate::deployment::DEFAULT_BASE_DISTRO) and
+    /// records the base image in
+    /// [`unresolved_base_image`](Self::unresolved_base_image), so the generated
+    /// Dockerfile can say the release was assumed.
+    ///
+    /// Separately, if config states a release and the base image names a
+    /// DIFFERENT one, config still wins but the disagreement is recorded in
+    /// [`contradicted_base_image`](Self::contradicted_base_image).
     ///
     /// # Example
     ///
@@ -322,23 +345,37 @@ impl NativeDepsContract {
     /// ```
     #[must_use]
     pub fn for_rustlib_features(features: &[&str], base_image: &str) -> Self {
-        match crate::deployment::registry::resolve_base_distro(base_image) {
-            Some(distro) => Self::build(features, distro, None),
-            None => Self::build(
-                features,
-                crate::deployment::registry::DEFAULT_BASE_DISTRO,
-                Some(base_image.to_string()),
-            ),
+        if let Some(distro) = crate::deployment::registry::resolve_base_distro(base_image) {
+            let mut deps = Self::for_features(features, distro);
+            // Config won over an image that names a different release. It is
+            // still config's call, but the two disagreeing is almost always a
+            // mistake, so record it.
+            if BaseDistro::from_base_image(base_image).is_some_and(|d| d != distro) {
+                deps.contradicted_base_image = Some(base_image.to_string());
+            }
+            deps
+        } else {
+            // Nothing answered: assume the org default and say that we did.
+            let mut deps =
+                Self::for_features(features, crate::deployment::registry::DEFAULT_BASE_DISTRO);
+            deps.unresolved_base_image = Some(base_image.to_string());
+            deps
         }
     }
 
-    fn build(features: &[&str], distro: BaseDistro, unresolved: Option<String>) -> Self {
+    /// The actual feature-to-package mapping, for one stated release.
+    ///
+    /// Both constructors land here. It knows nothing about where the release
+    /// came from -- resolution and the "we assumed" / "these disagree" flags are
+    /// the callers' business, which is what keeps this a pure mapping.
+    fn packages_for(features: &[&str], distro: BaseDistro) -> Self {
         let mut apt_repos = Vec::new();
         let mut packages: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
 
+        // At most a handful of packages, so a linear scan beats a HashSet and
+        // its extra String per entry.
         let mut add = |pkg: &str| {
-            if seen.insert(pkg.to_string()) {
+            if !packages.iter().any(|p| p == pkg) {
                 packages.push(pkg.into());
             }
         };
@@ -389,7 +426,8 @@ impl NativeDepsContract {
             apt_repos,
             apt_packages: packages,
             distro: Some(distro),
-            unresolved_base_image: unresolved,
+            unresolved_base_image: None,
+            contradicted_base_image: None,
         }
     }
 
@@ -741,6 +779,39 @@ mod tests {
         // Trixie names, not the Ubuntu ones the old fallback would have served.
         assert!(deps.apt_packages.contains(&"libgit2-1.9".into()));
         assert!(deps.apt_packages.contains(&"libssl3t64".into()));
+    }
+
+    #[test]
+    fn explicit_distro_contradicting_the_base_image_is_recorded() {
+        // Config wins, but a Dockerfile whose FROM and whose package names are
+        // for different releases is almost never intended -- so say so rather
+        // than quietly picking a side. This is the one case that used to have
+        // NO signal at all.
+        temp_env::with_var("DEPLOYMENT__BASE_DISTRO", Some("noble"), || {
+            let deps = NativeDepsContract::for_rustlib_features(
+                &["transport-kafka"],
+                "debian:trixie-slim",
+            );
+            assert_eq!(deps.distro, Some(BaseDistro::Noble), "explicit config wins");
+            assert_eq!(
+                deps.contradicted_base_image.as_deref(),
+                Some("debian:trixie-slim")
+            );
+            // Not the same thing as an unresolvable base.
+            assert!(deps.unresolved_base_image.is_none());
+        });
+    }
+
+    #[test]
+    fn explicit_distro_agreeing_with_the_base_image_is_not_flagged() {
+        temp_env::with_var("DEPLOYMENT__BASE_DISTRO", Some("trixie"), || {
+            let deps = NativeDepsContract::for_rustlib_features(
+                &["transport-kafka"],
+                "debian:trixie-slim",
+            );
+            assert_eq!(deps.distro, Some(BaseDistro::Trixie));
+            assert!(deps.contradicted_base_image.is_none());
+        });
     }
 
     #[test]

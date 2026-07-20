@@ -759,8 +759,14 @@ impl MetricsManager {
 
     /// Start the metrics HTTP server.
     ///
-    /// Serves `/metrics` (Prometheus), `/healthz`, `/health/live`,
-    /// `/readyz`, `/health/ready` endpoints.
+    /// This is the OBSERVABILITY port -- the one the deployment contract
+    /// advertises and Prometheus scrapes. It serves `/metrics`,
+    /// `/metrics/manifest`, `/healthz`, `/readyz`, `/startupz` and the
+    /// `/health/live`, `/health/ready`, `/health/startup` aliases.
+    ///
+    /// Not to be confused with [`HttpServer`](crate::http_server), which is an
+    /// optional extra listener for the app's own routes and serves neither
+    /// `/metrics` nor `/startupz`.
     ///
     /// Only available when the `metrics` feature is enabled (for scraping).
     ///
@@ -822,7 +828,8 @@ impl MetricsManager {
     /// Start the metrics HTTP server with additional custom routes.
     ///
     /// Serves the same built-in endpoints as [`start_server`](Self::start_server):
-    /// `/metrics`, `/healthz`, `/health/live`, `/readyz`, `/health/ready`.
+    /// `/metrics`, `/metrics/manifest`, `/healthz`, `/health/live`, `/readyz`,
+    /// `/health/ready`, `/startupz` and `/health/startup`.
     ///
     /// Additionally:
     /// - If [`set_scaling_pressure`](Self::set_scaling_pressure) was called,
@@ -1105,6 +1112,22 @@ async fn run_server(
     }
 }
 
+/// Longest request line we will read before giving up.
+///
+/// A probe or a scrape sends a short line; anything past this is either broken
+/// or hostile. Without the cap, `read_line` appends until it sees a newline, so
+/// a client that opens a socket and streams bytes without one grows the buffer
+/// until the process dies.
+#[cfg(feature = "metrics")]
+const MAX_REQUEST_LINE: u64 = 8 * 1024;
+
+/// How long a single connection gets to send its request line.
+///
+/// Bounds the idle-connection task pile-up: this listener is on the operator
+/// port of a data-plane binary, so it must not be a way to exhaust it.
+#[cfg(feature = "metrics")]
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Handle a single HTTP connection.
 ///
 /// **Path ordering:** `/metrics/manifest` MUST be checked BEFORE `/metrics`
@@ -1117,13 +1140,24 @@ async fn handle_connection(
     readiness_fn: Option<ReadinessFn>,
     started_flag: &std::sync::atomic::AtomicBool,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     let mut reader = BufReader::new(&mut stream);
     let mut request_line = String::new();
 
-    if reader.read_line(&mut request_line).await.is_err() {
-        return;
+    // Bounded and time-limited: see MAX_REQUEST_LINE / REQUEST_READ_TIMEOUT.
+    let read = tokio::time::timeout(
+        REQUEST_READ_TIMEOUT,
+        (&mut reader)
+            .take(MAX_REQUEST_LINE)
+            .read_line(&mut request_line),
+    )
+    .await;
+    match read {
+        Ok(Ok(_)) => {}
+        // Timed out, or the peer went away mid-line. Either way there is
+        // nothing to answer.
+        _ => return,
     }
 
     // IMPORTANT: /metrics/manifest MUST come before /metrics (prefix match ordering)

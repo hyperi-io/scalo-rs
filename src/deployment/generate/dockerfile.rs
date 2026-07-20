@@ -270,6 +270,10 @@ fn build_apt_block(
 
     // Build multi-step RUN: base install → repo setup → update → runtime install → cleanup
     out.push_str("# Runtime shared libraries for dynamically-linked Rust crates.\n");
+    // The release these package names are for. Both warnings below name it.
+    let release = deps
+        .distro
+        .unwrap_or(crate::deployment::DEFAULT_BASE_DISTRO);
     if let Some(base_image) = &deps.unresolved_base_image {
         // Package names below are release-specific. We could not tell which
         // release this base image is (a digest pin carries no codename), so an
@@ -277,12 +281,19 @@ fn build_apt_block(
         // guess reach a build log as "Unable to locate package".
         out.push_str(&format!(
             "# WARNING: could not derive the distro release from base image '{base_image}'.\n\
-             # Assumed {assumed}. State it explicitly with either\n\
+             # Assumed {release}. State it explicitly with either\n\
              # `deployment.base_distro` in the config cascade, or the env var\n\
              # DEPLOYMENT__BASE_DISTRO=trixie|bookworm|noble|jammy|focal.\n",
-            assumed = deps
-                .distro
-                .unwrap_or(crate::deployment::DEFAULT_BASE_DISTRO),
+        ));
+    }
+    if let Some(base_image) = &deps.contradicted_base_image {
+        // Explicit config won, but it disagrees with the image it will run on,
+        // so the FROM line and these package names are for different releases.
+        out.push_str(&format!(
+            "# WARNING: `deployment.base_distro` says {release}, but base image\n\
+             # '{base_image}' names a different release. The packages below are\n\
+             # for {release}. Fix one of the two -- this combination is almost\n\
+             # certainly not what was intended.\n",
         ));
     }
 
@@ -291,9 +302,13 @@ fn build_apt_block(
 
     // Add each custom APT repo
     for repo in &deps.apt_repos {
+        // Download to a file rather than piping into gpg: `sh` has no pipefail,
+        // so `curl ... | gpg` discards curl's exit status and a failed fetch
+        // leaves an empty keyring instead of failing the build (hadolint DL4006).
         out.push_str(&format!(
-            "    && curl -fsSL {} \\\n\
-             \x20      | gpg --dearmor -o {} \\\n\
+            "    && curl -fsSL {} -o /tmp/repo-key.asc \\\n\
+             \x20   && gpg --dearmor -o {} /tmp/repo-key.asc \\\n\
+             \x20   && rm -f /tmp/repo-key.asc \\\n\
              \x20   && echo \"deb [signed-by={}] \\\n\
              \x20      {} {} main\" \\\n\
              \x20      > /etc/apt/sources.list.d/{}.list \\\n",

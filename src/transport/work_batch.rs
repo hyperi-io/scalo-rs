@@ -118,7 +118,7 @@ pub const DEDUP_KEY_HEADER: &str = "x-scalo-dedup-key";
 
 impl Record {
     /// The idempotency / dedup key for this record, if an upstream set one (via
-    /// the [`DEDUP_KEY_HEADER`] header). `None` when no key was attached.
+    /// the `DEDUP_KEY_HEADER` header). `None` when no key was attached.
     #[must_use]
     pub fn dedup_key(&self) -> Option<&[u8]> {
         self.headers

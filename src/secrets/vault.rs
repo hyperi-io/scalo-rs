@@ -144,6 +144,7 @@ impl OpenBaoConfig {
         } else {
             // Kubernetes is the last method we try, so no role here means no
             // authentication method is configured at all -- nothing to build.
+            // `?` returns None from `from_env`, not just from this block.
             let role = vault::k8s_role().get()?;
             OpenBaoAuth::Kubernetes {
                 role,

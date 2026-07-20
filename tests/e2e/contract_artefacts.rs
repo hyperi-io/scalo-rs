@@ -156,8 +156,6 @@ fn write_mock_binary(build_ctx: &Path, binary_name: &str) -> std::io::Result<()>
 struct BuiltImage {
     tag: String,
     docker_config: tempfile::TempDir,
-    // Held so the build context outlives the build.
-    _ctx: tempfile::TempDir,
 }
 
 impl BuiltImage {
@@ -203,11 +201,7 @@ impl BuiltImage {
             stderr = String::from_utf8_lossy(&build.stderr),
         );
 
-        Self {
-            tag,
-            docker_config,
-            _ctx: ctx,
-        }
+        Self { tag, docker_config }
     }
 
     /// A `docker` command already pointed at the throwaway credential store.

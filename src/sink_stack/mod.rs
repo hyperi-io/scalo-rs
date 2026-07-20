@@ -22,7 +22,7 @@
 //! ```
 //!
 //! With adaptive request concurrency (ARC, opt-in via
-//! [`AdaptiveConfig`](config::AdaptiveConfig)) the AIMD limiter replaces the
+//! [`config::AdaptiveConfig`]) the AIMD limiter replaces the
 //! static gate and wraps the TIMEOUT, so a timed-out or errored attempt feeds
 //! its decrease and a fast success feeds its increase:
 //!
