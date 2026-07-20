@@ -415,6 +415,34 @@ mod tests {
     }
 
     #[test]
+    fn test_dockerfile_pins_the_repo_signing_key() {
+        // Without the assertion the key is trust-on-first-use, re-fetched every
+        // build: a compromised mirror serves its own key, `signed-by` validates
+        // the attacker's repo, and we install their librdkafka1. Verified by
+        // build in both directions -- the right fingerprint passes, and a
+        // one-digit change fails the RUN.
+        let mut contract = test_contract();
+        contract.native_deps = super::super::NativeDepsContract::for_features(
+            &["transport-kafka"],
+            super::super::BaseDistro::Trixie,
+        );
+
+        let dockerfile = generate_dockerfile(&contract, None);
+        assert!(
+            dockerfile.contains("gpg --show-keys --with-colons --with-fingerprint"),
+            "the signing key must be checked before it is trusted"
+        );
+        assert!(
+            dockerfile.contains("^fpr:::::::::CBBB821E8FAF364F79835C438B1DA6120C2BF624:"),
+            "the pinned Confluent fingerprint must be asserted"
+        );
+        // The assertion has to precede the dearmor that installs the keyring.
+        let check = dockerfile.find("--with-fingerprint").unwrap();
+        let install = dockerfile.find("gpg --dearmor").unwrap();
+        assert!(check < install, "key is trusted before it is verified");
+    }
+
+    #[test]
     fn test_dockerfile_has_no_warning_for_a_recognised_release() {
         // Must carry native deps: with none, build_apt_block early-returns
         // before the warning block is even reached, so an empty contract would

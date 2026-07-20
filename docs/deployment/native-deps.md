@@ -163,6 +163,16 @@ everywhere else. Confluent publishes no trixie suite, so trixie maps to the
 `bookworm` one, and its `librdkafka1` installs cleanly on trixie because the
 libssl / libsasl2 / zlib deps are satisfied by trixie's newer versions.
 
+The repo's signing key is PINNED. The generated build downloads the key, asserts
+its OpenPGP fingerprint with `gpg` and only then dearmors it into the keyring,
+so a compromised mirror or an intercepted TLS session cannot substitute its own
+key and have `signed-by` happily validate the resulting repo. If Confluent
+rotates the key the build fails loudly - re-derive the fingerprint and update
+`confluent_repo()` rather than removing the check.
+
+Pinning converts an every-build trust-on-first-use into a one-time one. It does
+not establish that the key was legitimate to begin with.
+
 That mapping is not taken on trust. `tier_a_dockerfile_with_native_deps_builds`
 (`tests/e2e/contract_artefacts.rs`) generates a Dockerfile for the default base
 with the kafka, spool, secrets and git features, BUILDS it, and then asserts

@@ -83,6 +83,20 @@ pub struct AptRepoContract {
     #[serde(default)]
     pub codename: String,
 
+    /// Expected OpenPGP fingerprint of `key_url`, uppercase hex, no spaces.
+    ///
+    /// When set, the generated build asserts the downloaded key matches before
+    /// trusting the repo. Without it the key is trust-on-first-use, re-fetched
+    /// on every build: a compromised mirror or a CA-level intercept serves its
+    /// own key, `signed-by` then validates the attacker's repo, and we install
+    /// their `librdkafka1` into a binary the data plane dynamically links.
+    ///
+    /// Pinning locks in the key as observed. It does NOT establish that the key
+    /// was legitimate in the first place -- it converts an every-build TOFU into
+    /// a one-time one, which is the part worth having.
+    #[serde(default)]
+    pub key_fingerprint: String,
+
     /// APT packages to install from this specific repo.
     pub packages: Vec<String>,
 }
@@ -94,6 +108,11 @@ fn confluent_repo(codename: &str) -> AptRepoContract {
         keyring: "/usr/share/keyrings/confluent-clients.gpg".into(),
         url: "https://packages.confluent.io/clients/deb".into(),
         codename: codename.into(),
+        // Fingerprint of the key served at key_url, verified by build: the
+        // generated image asserts it with gpg before the repo is trusted. If
+        // Confluent rotates the key this fails loudly at build time, which is
+        // the intended behaviour -- re-derive and update rather than drop it.
+        key_fingerprint: "CBBB821E8FAF364F79835C438B1DA6120C2BF624".into(),
         packages: vec!["librdkafka1".into()],
     }
 }

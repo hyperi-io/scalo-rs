@@ -306,19 +306,32 @@ fn build_apt_block(
         // so `curl ... | gpg` discards curl's exit status and a failed fetch
         // leaves an empty keyring instead of failing the build (hadolint DL4006).
         out.push_str(&format!(
-            "    && curl -fsSL {} -o /tmp/repo-key.asc \\\n\
-             \x20   && gpg --dearmor -o {} /tmp/repo-key.asc \\\n\
+            "    && curl -fsSL {key_url} -o /tmp/repo-key.asc \\\n",
+            key_url = repo.key_url,
+        ));
+        // Assert the key is the one we pinned BEFORE it is trusted. Written to
+        // a file and grepped rather than piped, so a gpg failure cannot be
+        // swallowed by the pipeline's exit status.
+        if !repo.key_fingerprint.is_empty() {
+            out.push_str(&format!(
+                "    && gpg --show-keys --with-colons --with-fingerprint /tmp/repo-key.asc \\\n\
+                 \x20      > /tmp/repo-key.info \\\n\
+                 \x20   && grep -q \"^fpr:::::::::{fpr}:\" /tmp/repo-key.info \\\n\
+                 \x20   && rm -f /tmp/repo-key.info \\\n",
+                fpr = repo.key_fingerprint,
+            ));
+        }
+        out.push_str(&format!(
+            "    && gpg --dearmor -o {keyring} /tmp/repo-key.asc \\\n\
              \x20   && rm -f /tmp/repo-key.asc \\\n\
-             \x20   && echo \"deb [signed-by={}] \\\n\
-             \x20      {} {} main\" \\\n\
-             \x20      > /etc/apt/sources.list.d/{}.list \\\n",
-            repo.key_url,
-            repo.keyring,
-            repo.keyring,
-            repo.url,
-            repo.codename,
+             \x20   && echo \"deb [signed-by={keyring}] \\\n\
+             \x20      {url} {codename} main\" \\\n\
+             \x20      > /etc/apt/sources.list.d/{list}.list \\\n",
+            keyring = repo.keyring,
+            url = repo.url,
+            codename = repo.codename,
             // Derive a stable filename from the keyring path
-            std::path::Path::new(&repo.keyring)
+            list = std::path::Path::new(&repo.keyring)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("custom-repo"),
