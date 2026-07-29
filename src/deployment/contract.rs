@@ -108,7 +108,7 @@ pub struct DeploymentContract {
 
     /// Runtime native dependencies for the container image.
     ///
-    /// Use [`NativeDepsContract::for_rustlib_features`] to auto-populate from
+    /// Use [`NativeDepsContract::for_scalo_features`] to auto-populate from
     /// scalo feature flags. The Dockerfile generator emits the correct
     /// APT repo setup and package installation commands.
     #[serde(default)]

@@ -196,7 +196,7 @@ flowchart TD
   - *When to use:* always -- in a BINARY. Every binary gets a global allocator;
     it's the highest-leverage one-liner in the list. A LIBRARY never pins
     `#[global_allocator]` (that's the binary's call) -- it stays
-    allocator-agnostic and exposes a heap-source hook (e.g. rustlib's
+    allocator-agnostic and exposes a heap-source hook (e.g. scalo's
     `set_heap_source`).
   - *Situational:* jemalloc is the default on a long-lived Linux box -- nothing
     else touches it for heap profiling (`jeprof`, `MALLOC_CONF=prof`) or

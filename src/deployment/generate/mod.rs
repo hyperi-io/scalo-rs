@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn test_generate_dockerfile_with_native_deps() {
         let mut contract = test_contract();
-        contract.native_deps = NativeDepsContract::for_rustlib_features(
+        contract.native_deps = NativeDepsContract::for_scalo_features(
             &["transport-kafka", "spool", "tiered-sink"],
             "ubuntu:24.04",
         );
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn test_generate_dockerfile_no_native_deps() {
         let mut contract = test_contract();
-        contract.native_deps = NativeDepsContract::for_rustlib_features(
+        contract.native_deps = NativeDepsContract::for_scalo_features(
             &["cli", "deployment", "logger"],
             "ubuntu:24.04",
         );
@@ -188,7 +188,7 @@ mod tests {
         let mut contract = test_contract();
         contract.base_image = "debian:bookworm-slim".into();
         contract.native_deps =
-            NativeDepsContract::for_rustlib_features(&["transport-kafka"], "debian:bookworm-slim");
+            NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:bookworm-slim");
 
         let dockerfile = generate_dockerfile(&contract, None);
         assert!(dockerfile.contains("bookworm main"));
@@ -223,7 +223,7 @@ mod tests {
     fn test_generate_dockerfile_dev_with_native_deps() {
         let mut contract = test_contract();
         contract.native_deps =
-            NativeDepsContract::for_rustlib_features(&["transport-kafka", "spool"], "ubuntu:24.04");
+            NativeDepsContract::for_scalo_features(&["transport-kafka", "spool"], "ubuntu:24.04");
         let dev = contract.with_dev_profile();
         let dockerfile = generate_dockerfile(&dev, None);
 
@@ -431,7 +431,7 @@ mod tests {
         // assumption. Say so in the artefact rather than let it ship quietly.
         let mut contract = test_contract();
         contract.base_image = "debian@sha256:abc123".into();
-        contract.native_deps = super::super::NativeDepsContract::for_rustlib_features(
+        contract.native_deps = super::super::NativeDepsContract::for_scalo_features(
             &["transport-kafka"],
             &contract.base_image,
         );
@@ -477,7 +477,7 @@ mod tests {
         // pass this test no matter what the warning logic did.
         let mut contract = test_contract();
         contract.base_image = "debian:trixie-slim".into();
-        contract.native_deps = super::super::NativeDepsContract::for_rustlib_features(
+        contract.native_deps = super::super::NativeDepsContract::for_scalo_features(
             &["transport-kafka"],
             &contract.base_image,
         );

@@ -110,7 +110,7 @@ let contract = DeploymentContract {
     default_config: None,
     depends_on: vec!["kafka".into(), "clickhouse".into()],
     keda: Some(KedaContract::default()),
-    native_deps: NativeDepsContract::for_rustlib_features(
+    native_deps: NativeDepsContract::for_scalo_features(
         &["transport-kafka", "spool", "tiered-sink"],
         &base_image_from_cascade(),
     ),

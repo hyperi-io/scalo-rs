@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Runtime native dependencies for a container image.
 ///
 /// Populated via [`NativeDepsContract::for_features`] (explicit distro) or
-/// [`NativeDepsContract::for_rustlib_features`] (distro resolved from the
+/// [`NativeDepsContract::for_scalo_features`] (distro resolved from the
 /// cascade or the base image) -- pass the list of scalo features your app
 /// enables, get back the runtime packages and any custom APT repos needed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -308,7 +308,7 @@ impl NativeDepsContract {
     /// Build runtime native deps from a list of scalo feature names, for an
     /// explicitly stated distro release.
     ///
-    /// Prefer this over [`for_rustlib_features`](Self::for_rustlib_features)
+    /// Prefer this over [`for_scalo_features`](Self::for_scalo_features)
     /// when the app already knows its base release: nothing is inferred from a
     /// display string, so it cannot be wrong-footed by a digest pin.
     ///
@@ -354,7 +354,7 @@ impl NativeDepsContract {
     /// ```rust
     /// use scalo::deployment::NativeDepsContract;
     ///
-    /// let deps = NativeDepsContract::for_rustlib_features(
+    /// let deps = NativeDepsContract::for_scalo_features(
     ///     &["transport-kafka", "spool", "tiered-sink", "secrets"],
     ///     "debian:trixie-slim",
     /// );
@@ -363,7 +363,7 @@ impl NativeDepsContract {
     /// assert!(deps.unresolved_base_image.is_none());
     /// ```
     #[must_use]
-    pub fn for_rustlib_features(features: &[&str], base_image: &str) -> Self {
+    pub fn for_scalo_features(features: &[&str], base_image: &str) -> Self {
         if let Some(distro) = crate::deployment::registry::resolve_base_distro(base_image) {
             let mut deps = Self::for_features(features, distro);
             // Config won over an image that names a different release. It is
@@ -462,13 +462,13 @@ impl NativeDepsContract {
 
         // Parse features from the scalo dependency line
         // Matches: features = ["transport-kafka", "spool", ...]
-        let features = extract_rustlib_features(&content);
+        let features = extract_scalo_features(&content);
         if features.is_empty() {
             return Self::default();
         }
 
         let feature_refs: Vec<&str> = features.iter().map(String::as_str).collect();
-        Self::for_rustlib_features(&feature_refs, base_image)
+        Self::for_scalo_features(&feature_refs, base_image)
     }
 
     /// Returns true if there are no native deps to install.
@@ -482,9 +482,9 @@ impl NativeDepsContract {
 ///
 /// Parses the `features = [...]` array from the `scalo` dependency.
 /// Returns empty vec if not found or parsing fails.
-fn extract_rustlib_features(content: &str) -> Vec<String> {
+fn extract_scalo_features(content: &str) -> Vec<String> {
     // Find the scalo dependency line
-    let mut in_rustlib = false;
+    let mut in_scalo = false;
     let mut features = Vec::new();
 
     for line in content.lines() {
@@ -510,10 +510,10 @@ fn extract_rustlib_features(content: &str) -> Vec<String> {
 
         // Multi-line: features = [\n"transport-kafka",\n...\n]
         if trimmed.starts_with("scalo") {
-            in_rustlib = true;
+            in_scalo = true;
             continue;
         }
-        if in_rustlib {
+        if in_scalo {
             if trimmed.starts_with(']') {
                 return features;
             }
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_kafka_features_add_confluent_repo() {
-        let deps = NativeDepsContract::for_rustlib_features(&["transport-kafka"], "ubuntu:24.04");
+        let deps = NativeDepsContract::for_scalo_features(&["transport-kafka"], "ubuntu:24.04");
         assert_eq!(deps.apt_repos.len(), 1);
         assert!(deps.apt_repos[0].url.contains("confluent"));
         assert!(deps.apt_repos[0].packages.contains(&"librdkafka1".into()));
@@ -550,25 +550,25 @@ mod tests {
 
     #[test]
     fn test_spool_adds_zstd() {
-        let deps = NativeDepsContract::for_rustlib_features(&["spool"], "ubuntu:24.04");
+        let deps = NativeDepsContract::for_scalo_features(&["spool"], "ubuntu:24.04");
         assert!(deps.apt_packages.contains(&"libzstd1".into()));
     }
 
     #[test]
     fn test_tiered_sink_adds_zstd() {
-        let deps = NativeDepsContract::for_rustlib_features(&["tiered-sink"], "ubuntu:24.04");
+        let deps = NativeDepsContract::for_scalo_features(&["tiered-sink"], "ubuntu:24.04");
         assert!(deps.apt_packages.contains(&"libzstd1".into()));
     }
 
     #[test]
     fn test_no_features_empty() {
-        let deps = NativeDepsContract::for_rustlib_features(&[], "ubuntu:24.04");
+        let deps = NativeDepsContract::for_scalo_features(&[], "ubuntu:24.04");
         assert!(deps.is_empty());
     }
 
     #[test]
     fn test_pure_rust_features_empty() {
-        let deps = NativeDepsContract::for_rustlib_features(
+        let deps = NativeDepsContract::for_scalo_features(
             &["cli", "deployment", "logger"],
             "ubuntu:24.04",
         );
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn test_bookworm_codename() {
         let deps =
-            NativeDepsContract::for_rustlib_features(&["transport-kafka"], "debian:bookworm-slim");
+            NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:bookworm-slim");
         assert_eq!(deps.apt_repos[0].codename, "bookworm");
     }
 
@@ -589,7 +589,7 @@ mod tests {
         // package lags the protocol). librdkafka1 comes from the repo, NOT
         // apt_packages.
         let deps =
-            NativeDepsContract::for_rustlib_features(&["transport-kafka"], "debian:trixie-slim");
+            NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:trixie-slim");
         assert_eq!(deps.apt_repos.len(), 1);
         assert!(deps.apt_repos[0].url.contains("confluent"));
         assert_eq!(deps.apt_repos[0].codename, "bookworm");
@@ -602,16 +602,14 @@ mod tests {
 
     #[test]
     fn test_trixie_git2_soname() {
-        let deps = NativeDepsContract::for_rustlib_features(
-            &["directory-config-git"],
-            "debian:trixie-slim",
-        );
+        let deps =
+            NativeDepsContract::for_scalo_features(&["directory-config-git"], "debian:trixie-slim");
         assert!(deps.apt_packages.contains(&"libgit2-1.9".into()));
     }
 
     #[test]
     fn test_no_duplicate_packages() {
-        let deps = NativeDepsContract::for_rustlib_features(
+        let deps = NativeDepsContract::for_scalo_features(
             &["transport-kafka", "http", "secrets"],
             "ubuntu:24.04",
         );
@@ -625,20 +623,20 @@ mod tests {
 
     #[test]
     fn test_dlq_kafka_adds_confluent() {
-        let deps = NativeDepsContract::for_rustlib_features(&["dlq-kafka"], "ubuntu:24.04");
+        let deps = NativeDepsContract::for_scalo_features(&["dlq-kafka"], "ubuntu:24.04");
         assert_eq!(deps.apt_repos.len(), 1);
     }
 
     #[test]
     fn test_git2_feature() {
         let deps =
-            NativeDepsContract::for_rustlib_features(&["directory-config-git"], "ubuntu:24.04");
+            NativeDepsContract::for_scalo_features(&["directory-config-git"], "ubuntu:24.04");
         assert!(deps.apt_packages.contains(&"libgit2-1.7".into()));
     }
 
     #[test]
     fn test_full_receiver_features() {
-        let deps = NativeDepsContract::for_rustlib_features(
+        let deps = NativeDepsContract::for_scalo_features(
             &[
                 "config",
                 "config-reload",
@@ -786,7 +784,7 @@ mod tests {
         // No cascade config in a unit test, so this exercises the fallback:
         // default distro assumed, base image recorded so the generator can say
         // so in the artefact.
-        let deps = NativeDepsContract::for_rustlib_features(
+        let deps = NativeDepsContract::for_scalo_features(
             &["transport-kafka", "directory-config-git"],
             "debian@sha256:abc123",
         );
@@ -807,10 +805,8 @@ mod tests {
         // than quietly picking a side. This is the one case that used to have
         // NO signal at all.
         temp_env::with_var("DEPLOYMENT__BASE_DISTRO", Some("noble"), || {
-            let deps = NativeDepsContract::for_rustlib_features(
-                &["transport-kafka"],
-                "debian:trixie-slim",
-            );
+            let deps =
+                NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:trixie-slim");
             assert_eq!(deps.distro, Some(BaseDistro::Noble), "explicit config wins");
             assert_eq!(
                 deps.contradicted_base_image.as_deref(),
@@ -824,10 +820,8 @@ mod tests {
     #[test]
     fn explicit_distro_agreeing_with_the_base_image_is_not_flagged() {
         temp_env::with_var("DEPLOYMENT__BASE_DISTRO", Some("trixie"), || {
-            let deps = NativeDepsContract::for_rustlib_features(
-                &["transport-kafka"],
-                "debian:trixie-slim",
-            );
+            let deps =
+                NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:trixie-slim");
             assert_eq!(deps.distro, Some(BaseDistro::Trixie));
             assert!(deps.contradicted_base_image.is_none());
         });
@@ -835,7 +829,7 @@ mod tests {
 
     #[test]
     fn recognised_base_records_no_assumption() {
-        let deps = NativeDepsContract::for_rustlib_features(&["transport-kafka"], "debian:13-slim");
+        let deps = NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:13-slim");
         assert!(deps.unresolved_base_image.is_none());
         assert_eq!(deps.distro, Some(BaseDistro::Trixie));
         assert_eq!(deps.apt_repos[0].codename, "bookworm");

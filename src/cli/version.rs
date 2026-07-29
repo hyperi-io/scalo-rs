@@ -28,7 +28,7 @@ pub struct VersionInfo {
     /// Target triple (e.g. "x86_64-unknown-linux-gnu").
     pub target: Option<String>,
     /// scalo version.
-    pub rustlib_version: String,
+    pub scalo_version: String,
 }
 
 impl VersionInfo {
@@ -42,7 +42,7 @@ impl VersionInfo {
             build_date: None,
             rustc_version: None,
             target: None,
-            rustlib_version: crate::VERSION.to_string(),
+            scalo_version: crate::VERSION.to_string(),
         }
     }
 
@@ -99,7 +99,7 @@ impl fmt::Display for VersionInfo {
         if let Some(ref t) = self.target {
             writeln!(f, "  target:  {t}")?;
         }
-        write!(f, "  scalo: {}", self.rustlib_version)
+        write!(f, "  scalo: {}", self.scalo_version)
     }
 }
 
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(v.name, "dfe-loader");
         assert_eq!(v.version, "1.9.7");
         assert!(v.commit.is_none());
-        assert_eq!(v.rustlib_version, crate::VERSION);
+        assert_eq!(v.scalo_version, crate::VERSION);
     }
 
     #[test]

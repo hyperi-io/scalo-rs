@@ -16,7 +16,7 @@ use crate::deployment::contract::{DeploymentContract, ImageProfile};
 
 /// Generate a Dockerfile from the deployment contract.
 ///
-/// When `native_deps` is populated (via [`NativeDepsContract::for_rustlib_features`](crate::deployment::NativeDepsContract::for_rustlib_features)),
+/// When `native_deps` is populated (via [`NativeDepsContract::for_scalo_features`](crate::deployment::NativeDepsContract::for_scalo_features)),
 /// the generated Dockerfile automatically includes custom APT repo setup and
 /// runtime package installation. If `native_deps` is empty, only base utilities
 /// are installed.
