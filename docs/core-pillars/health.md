@@ -1,6 +1,6 @@
 # Health
 
-Three K8s probes with three distinct semantics, all mounted by the metrics HTTP
+Two K8s probes with two distinct semantics, both mounted by the metrics HTTP
 server. Modules register a health-check callback into a global `HealthRegistry`;
 `/readyz` aggregates every registered check plus an optional caller callback to
 decide 200 vs 503.
@@ -24,6 +24,29 @@ every retired path returns 404. A `startupProbe` targets `/livez`.
 
 Bodies: `{"status":"alive"}` / `{"status":"ready"}` on 200;
 `{"status":"not_ready"}` on 503.
+
+### Why no aliases
+
+An alias looks like kindness and behaves like a blindfold. While every spelling
+answers 200, nothing can tell you which spelling a given service actually
+intends -- a chart probing a name the app no longer means keeps passing, so a
+half-finished migration is indistinguishable from a finished one.
+
+This is not hypothetical. An earlier version of this library served six
+spellings: `/healthz`, `/readyz`, `/startupz` and `/health/{live,ready,startup}`.
+Across one fleet of six services on that version, the deployment contracts had
+drifted into three different answers for the same question -- some declaring
+`/healthz`, some `/health/live`, one `/livez` -- and every one of them worked,
+because the library answered all of them. The drift was invisible until a
+service that did NOT inherit these routes wired its chart to one spelling and
+its app to another. That probe 404'd, liveness killed the process, and the
+replacement crash-looped for six days before anyone noticed.
+
+Hence the second half of the contract: the canonical paths return 200 and the
+retired paths return **404**, and both directions are asserted in tests. The 404
+is the half that does the work -- it converts a stale probe from a silent
+success into an immediate, obvious failure, and it stops an alias creeping back
+in later.
 
 Readiness aggregates the registry AND the explicit ready flag. The shutdown
 handler clears the flag before draining, so K8s pulls the pod from Service
