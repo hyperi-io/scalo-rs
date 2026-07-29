@@ -30,13 +30,25 @@ use scalo::transport::redis_transport::{RedisTransport, RedisTransportConfig};
 use scalo::transport::{PayloadFormat, Record, RecordMeta, TransportSender};
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::ContainerAsync;
+use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const STREAM: &str = "scalo-fault-test";
 
+/// Redis to test against.
+///
+/// Pinned here rather than taken from testcontainers-modules, whose default is
+/// still 5.0 -- seven majors back and out of support since 2020. A crate's
+/// default image tag is invisible to dependency review: Renovate reads
+/// Cargo.toml, correctly reports the crate current, and never sees the image.
+/// Hoisting the tag into our own source is what puts it back under review.
+// renovate: datasource=docker depName=redis
+const REDIS_TAG: &str = "8.8.1";
+
 /// Start a Redis container and return it plus its connection URL.
 async fn start_redis() -> (ContainerAsync<Redis>, String) {
     let node = Redis::default()
+        .with_tag(REDIS_TAG)
         .start()
         .await
         .expect("start redis container");

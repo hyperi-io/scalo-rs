@@ -704,9 +704,9 @@ impl MetricsManager {
 
     /// Set a readiness check callback.
     ///
-    /// When set, `/readyz` and `/readyz` call this function and return
-    /// 503 Service Unavailable if it returns `false`. Without a callback,
-    /// these endpoints always return 200.
+    /// When set, `/readyz` calls this function and returns 503 Service
+    /// Unavailable if it returns `false`. Without a callback, the endpoint
+    /// always returns 200.
     pub fn set_readiness_check(&mut self, f: impl Fn() -> bool + Send + Sync + 'static) {
         self.readiness_fn = Some(Arc::new(f));
     }
