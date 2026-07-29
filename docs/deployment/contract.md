@@ -78,29 +78,29 @@ use scalo::deployment::*;
 
 let contract = DeploymentContract {
     schema_version: 3,
-    app_name: "dfe-loader".into(),
-    binary_name: "dfe-loader".into(),
+    app_name: "event-loader".into(),
+    binary_name: "event-loader".into(),
     description: "Kafka -> ClickHouse data loader".into(),
     metrics_port: 9090,
     health: HealthContract::default(),     // /livez, /readyz, /metrics
-    env_prefix: "DFE_LOADER".into(),
+    env_prefix: "EVENT_LOADER".into(),
     metric_prefix: "loader".into(),
-    config_mount_path: "/etc/dfe/loader.yaml".into(),
+    config_mount_path: "/etc/event-loader/config.yaml".into(),
     image_registry: image_registry_from_cascade(),   // org registry
     base_image: base_image_from_cascade(),           // org base image
     extra_ports: vec![],
-    entrypoint_args: vec!["--config".into(), "/etc/dfe/loader.yaml".into()],
+    entrypoint_args: vec!["--config".into(), "/etc/event-loader/config.yaml".into()],
     secrets: vec![
         SecretGroupContract {
             group_name: "kafka".into(),
             env_vars: vec![
                 SecretEnvContract {
-                    env_var: "DFE_LOADER__KAFKA__USERNAME".into(),
+                    env_var: "EVENT_LOADER__KAFKA__USERNAME".into(),
                     key_name: "username".into(),
                     secret_key: "kafka-username".into(),
                 },
                 SecretEnvContract {
-                    env_var: "DFE_LOADER__KAFKA__PASSWORD".into(),
+                    env_var: "EVENT_LOADER__KAFKA__PASSWORD".into(),
                     key_name: "password".into(),
                     secret_key: "kafka-password".into(),
                 },
@@ -126,6 +126,50 @@ let contract = DeploymentContract {
 };
 ```
 
+### Fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `schema_version` | `u32` | `3` | CI rejects an unsupported version |
+| `app_name` | `String` | required | Matches `Chart.yaml` `name`; image repo segment |
+| `binary_name` | `String` | `""` -> falls back to `app_name` via `.binary()` |
+| `description` | `String` | `""` | Chart description |
+| `metrics_port` | `u16` | required | Metrics + health listen port |
+| `health` | `HealthContract` | default | Probe paths -- see below |
+| `env_prefix` | `String` | required | Config env prefix; `__` is the nesting separator |
+| `metric_prefix` | `String` | required | Prometheus namespace |
+| `config_mount_path` | `String` | required | E.g. `/etc/event-loader/config.yaml` |
+| `image_registry` | `String` | cascade | Container registry base |
+| `extra_ports` | `Vec<PortContract>` | `[]` | HTTP / gRPC / data ports beyond metrics |
+| `entrypoint_args` | `Vec<String>` | `[]` | Default `CMD` args |
+| `secrets` | `Vec<SecretGroupContract>` | `[]` | K8s secret groups |
+| `default_config` | `Option<Value>` | `None` | Embedded `values.yaml` `config:` block |
+| `depends_on` | `Vec<String>` | `[]` | Compose-only service deps |
+| `keda` | `Option<KedaContract>` | `None` | See [keda.md](keda.md) |
+| `base_image` | `String` | cascade | Runtime base for the Dockerfile |
+| `native_deps` | `NativeDepsContract` | default | See [native-deps.md](native-deps.md) |
+| `image_profile` | `ImageProfile` | `Production` | See below |
+| `oci_labels` | `OciLabels` | default | Static OCI labels |
+| `config_schema` | `Option<Value>` | `None` | JSON Schema of the app's `Config` (v3) |
+| `capabilities` | `Vec<Capability>` | `[]` | Runtime-surface catalogue (v3) |
+
+`HealthContract` fields:
+
+| Field | Default | Consumed by |
+|-------|---------|-------------|
+| `liveness_path` | `/livez` | Dockerfile `HEALTHCHECK`, Helm `livenessProbe` AND `startupProbe` |
+| `readiness_path` | `/readyz` | Helm `readinessProbe` |
+| `metrics_path` | `/metrics` | Prometheus scrape annotation in `values.yaml` |
+
+Those three paths are the whole probe surface. There are no aliases -- a
+retired path returns 404, deliberately, because an alias that keeps answering
+200 hides a probe still aimed at the old name.
+
+There is no startup field and no `/startupz`: the `startupProbe` targets
+`liveness_path`, since Kubernetes suspends liveness until the startup probe
+passes, so one path gives both a generous boot budget and a tight liveness
+period without the two drifting apart.
+
 `config_schema` is the JSON Schema (draft 2020-12) of the app's own
 `Config`, derived by schemars - `None` when the app does not derive
 `JsonSchema`. `capabilities` is the hand-authored catalog of runtime-data
@@ -142,7 +186,7 @@ token).
 | Field | Purpose |
 |-------|---------|
 | `group_name` | Section name in `values.yaml`, helper template suffix (`kafkaSecretName`) |
-| `env_vars[].env_var` | The full env var name injected into the pod (`DFE_LOADER__KAFKA__PASSWORD`) |
+| `env_vars[].env_var` | The full env var name injected into the pod (`EVENT_LOADER__KAFKA__PASSWORD`) |
 | `env_vars[].key_name` | Field name in `values.yaml.<group>.secretKeys.<key_name>` |
 | `env_vars[].secret_key` | Default K8s Secret data key (`kafka-password`) |
 
