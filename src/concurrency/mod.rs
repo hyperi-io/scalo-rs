@@ -49,8 +49,7 @@
 //! - `tracing-appender::non_blocking` -- used elsewhere for the logger
 //!   subscriber; orthogonal to this module's tokio-runtime concerns.
 //!
-//! Rationale per [Alice Ryhl's "Actors with Tokio"](https://ryhl.io/blog/actors-with-tokio/)
-//! and the [2026-05-08 audit](https://github.com/hyperi-io/scalo-rs).
+//! Rationale per [Alice Ryhl's "Actors with Tokio"](https://ryhl.io/blog/actors-with-tokio/).
 
 mod actor;
 mod error;

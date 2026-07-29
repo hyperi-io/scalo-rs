@@ -532,7 +532,7 @@ impl BatchEngine {
     /// routing/discarding/rejecting its inline-DLQ entries per the policy and
     /// returning the batch with `dlq_entries` consumed.
     ///
-    /// Now that `recv` yields a `WorkBatch` directly (Task 0.7b), the
+    /// Because `recv` yields a `WorkBatch` directly, the
     /// inbound-filter DLQ entries arrive on
     /// [`WorkBatch::dlq_entries`](crate::transport::WorkBatch) rather than on a
     /// `RecvBatch`. Records are never touched -- only the DLQ entries are routed
@@ -1032,7 +1032,7 @@ mod engine_tests {
     }
 
     /// The driver run loops (`run_workbatch` / `run_workbatch_parsed`) replaced
-    /// the four legacy loops in Task 0.7b. These tests exercise the same
+    /// the four legacy loops. These tests exercise the same
     /// behaviours -- process+sink, ticker, on-demand (no-parse) pass-through, and
     /// sink-error resilience -- through the surviving WorkBatch driver.
     #[cfg(feature = "transport-memory")]
@@ -1263,8 +1263,8 @@ mod engine_tests {
             cancel_after(shutdown.clone(), 200);
 
             // Sink always errors -- the driver returns the error cleanly (no
-            // crash/panic). Post Remediation Phase 1 the sink error is a
-            // TERMINAL ack-barrier error rather than a logged continue.
+            // crash/panic). A sink error is a TERMINAL ack-barrier error, not a
+            // logged continue.
             let result = engine
                 .run_workbatch(
                     &transport,

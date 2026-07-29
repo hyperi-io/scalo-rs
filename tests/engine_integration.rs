@@ -143,7 +143,7 @@ async fn run_workbatch_sink_error_skips_commit() {
     });
 
     // Sink always returns an error. The sink error is now a TERMINAL ack-barrier
-    // error (Remediation Phase 1): the run stops and the commit is skipped, so
+    // error: the run stops and the commit is skipped, so
     // the ORDERED/cumulative source commit can never advance past the unsent
     // block. committed_sequence must remain 0.
     let result = engine

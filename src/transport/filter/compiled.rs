@@ -641,11 +641,10 @@ mod tests {
         assert_eq!(filter.evaluate(br#"{"host":"web1","id":1}"#), None);
     }
 
-    /// Regression for the pre-GA review C10 finding: Tier-1 used raw memmem
-    /// over the whole payload, so a `"_table":` literal appearing inside a
-    /// string VALUE would falsely trigger `has(_table)`. The post-fix
-    /// evaluator iterates hits and only counts ones at JSON-structural
-    /// positions (outside any string value).
+    /// Regression: Tier-1 used raw memmem over the whole payload, so a
+    /// `"_table":` literal appearing inside a string VALUE would falsely
+    /// trigger `has(_table)`. The evaluator iterates hits and only counts
+    /// ones at JSON-structural positions (outside any string value).
     #[test]
     fn tier1_field_exists_ignores_match_inside_string_value() {
         let filter = CompiledFilter::from_expression(
@@ -685,7 +684,7 @@ mod tests {
         assert_eq!(filter.evaluate(payload), None);
     }
 
-    /// F13: `first_structural_hit` returns hits only at depth 1
+    /// `first_structural_hit` returns hits only at depth 1
     /// (top-level child) AND outside any string. Nested hits skipped.
     #[test]
     fn first_structural_hit_only_matches_top_level() {

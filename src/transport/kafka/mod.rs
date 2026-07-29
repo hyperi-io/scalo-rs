@@ -155,16 +155,16 @@ pub struct KafkaTransport {
     topic_refresh: Option<parking_lot::Mutex<TopicRefreshHandle>>,
     /// Transport-level message filter engine.
     filter_engine: super::filter::TransportFilterEngine,
-    /// Optional inbound gate (G3, `governor` feature). `None` by default ->
+    /// Optional inbound gate (`governor` feature). `None` by default ->
     /// `recv()` makes no gate calls and behaviour is byte-identical to today.
     /// When `Some`, each `recv()` calls [`InboundGate::evaluate`], which drives
     /// the [`KafkaGateActuator`] on pause/resume edges. The poll is ALWAYS
     /// issued regardless of hold state -- paused partitions just return nothing,
-    /// keeping the consumer-group heartbeat alive (no rebalance). Phase 3 wires
-    /// this on by default; here it is purely additive and opt-in.
+    /// keeping the consumer-group heartbeat alive (no rebalance). It is purely
+    /// additive and opt-in until a later release turns it on by default.
     #[cfg(feature = "governor")]
     inbound_gate: Option<crate::governor::InboundGate>,
-    /// Diagnostic dedup latch for the `kafka_partition_limited` warning (G3).
+    /// Diagnostic dedup latch for the `kafka_partition_limited` warning.
     /// Rate-limits the warning to once per cooldown window so a persistently
     /// partition-limited consumer does not spam the log. `None` until the
     /// diagnostic is consulted; behaviour is unchanged when the diagnostic is
@@ -500,7 +500,7 @@ impl KafkaTransport {
     }
 
     /// Attach an [`InboundGate`](crate::governor::InboundGate) to this
-    /// transport (G3, `governor` feature).
+    /// transport (`governor` feature).
     ///
     /// ADDITIVE + opt-in: the default is no gate, so a transport built without
     /// this call behaves byte-identically to before. When attached, every
@@ -525,7 +525,7 @@ impl KafkaTransport {
     }
 
     /// Whether an [`InboundGate`](crate::governor::InboundGate) is attached
-    /// (G3, `governor` feature).
+    /// (`governor` feature).
     ///
     /// `true` once [`with_inbound_gate`](Self::with_inbound_gate) (directly or
     /// via [`SelfRegulationGovernor::attach_kafka_gate`](crate::SelfRegulationGovernor::attach_kafka_gate))
@@ -538,7 +538,7 @@ impl KafkaTransport {
     }
 
     /// Build a [`GateActuator`](crate::governor::GateActuator) that pauses and
-    /// resumes THIS transport's consumer (G3, `governor` feature).
+    /// resumes THIS transport's consumer (`governor` feature).
     ///
     /// The returned actuator holds an `Arc` clone of the shared consumer. On
     /// the rising edge it reads the current [`assignment`](rdkafka::consumer::Consumer::assignment)
@@ -568,7 +568,7 @@ impl KafkaTransport {
     }
 
     /// Run the `kafka_partition_limited` DIAGNOSTIC against the live group
-    /// (G3, `governor` feature).
+    /// (`governor` feature).
     ///
     /// Reads the consumer-group member count (via `fetch_group_list`), the
     /// topic partition count (from cached metadata), and the current total
@@ -579,7 +579,7 @@ impl KafkaTransport {
     /// - emits ONE rate-limited warning per cooldown window.
     ///
     /// NO topology mutation -- it never calls `createPartitions`. Returns the
-    /// decision so callers (and Phase 3 wiring) can act on it. This is a
+    /// decision so callers can act on it. This is a
     /// metadata round-trip; call it periodically (e.g. once per refresh tick),
     /// NOT on the recv hot path.
     ///
@@ -657,7 +657,7 @@ impl KafkaTransport {
 
     /// Spawn a periodic background task that runs the
     /// [`check_partition_limited`](Self::check_partition_limited) diagnostic on
-    /// `interval` until `shutdown` is cancelled (G3, `governor` feature).
+    /// `interval` until `shutdown` is cancelled (`governor` feature).
     ///
     /// This is the intended caller for the diagnostic: a COLD periodic tick OFF
     /// the hot recv path. Each tick is a broker metadata round-trip
@@ -892,7 +892,7 @@ impl KafkaTransport {
             return Err(TransportError::Closed);
         }
 
-        // G3 inbound gate (governor feature, opt-in). Evaluate the gate so it
+        // Inbound gate (governor feature, opt-in). Evaluate the gate so it
         // drives the actuator on pause/resume EDGES (pausing/resuming the
         // assigned partitions). We do NOT branch on the result: the poll below
         // ALWAYS runs. Paused partitions simply return no records, which keeps
@@ -956,7 +956,7 @@ impl KafkaTransport {
         #[cfg(feature = "metrics")]
         let poll_start = std::time::Instant::now();
 
-        // --- recv-arena (Task 0.4.3) ---------------------------------------
+        // --- recv-arena ----------------------------------------------------
         // Instead of `payload.to_vec()` per message (N copies + N heap allocs),
         // we copy every record's payload ONCE into a single growable arena and
         // collect OWNED span metadata. After the polls we freeze the arena to
@@ -1046,7 +1046,7 @@ impl KafkaTransport {
         // Phase 2: drain the queue with zero-timeout polls. librdkafka has
         // already fetched a batch from the network; we just drain it fast.
         //
-        // BYTE-AWARE STOP (Phase 2 remediation): when `max_bytes` is set, stop
+        // BYTE-AWARE STOP: when `max_bytes` is set, stop
         // draining once the arena has reached the cap. Phase 1 already took one
         // record (the floor), so a single oversized record is always returned
         // and the loop never stalls; the arena is bounded to
@@ -1196,8 +1196,7 @@ fn build_commit_tpl(tokens: &[KafkaToken]) -> TransportResult<TopicPartitionList
     Ok(tpl)
 }
 
-/// PURE byte-budget stop decision for the recv-arena drain loop (Phase 2
-/// remediation).
+/// PURE byte-budget stop decision for the recv-arena drain loop.
 ///
 /// Returns `true` when the governed poll should STOP draining because the
 /// recv-arena has reached its byte budget:
@@ -1284,7 +1283,7 @@ fn get_or_insert_topic(
     arc
 }
 
-// --- G3: inbound gate actuator (governor feature) ---------------------------
+// --- Inbound gate actuator (governor feature) -------------------------------
 
 /// A [`GateActuator`](crate::governor::GateActuator) that pauses/resumes a
 /// shared Kafka consumer's ASSIGNED partitions.
@@ -1345,7 +1344,7 @@ fn gate_actuator_error(op: &'static str) {
     let _ = op;
 }
 
-// --- G3: kafka_partition_limited diagnostic ---------------------------------
+// --- kafka_partition_limited diagnostic -------------------------------------
 
 /// PURE decision for the `kafka_partition_limited` diagnostic.
 ///
@@ -1502,7 +1501,7 @@ mod tests {
         assert!(handle.check_changed().is_none());
     }
 
-    // --- recv-arena: build_batch_from_spans (Task 0.4.3) ------------------
+    // --- recv-arena: build_batch_from_spans -------------------------------
     //
     // These de-risk the recv-arena WITHOUT a live broker: they prove the free
     // function rebuilds messages as zero-copy slices into one shared arena.
@@ -1614,7 +1613,7 @@ mod tests {
         assert_eq!(msgs[0].format, PayloadFormat::Json);
     }
 
-    // --- Remediation Phase 2: byte-aware recv-arena stop (broker-free) ----
+    // --- Byte-aware recv-arena stop (broker-free) -------------------------
     //
     // The drain loop itself is a librdkafka poll loop (needs a broker), but the
     // byte-budget STOP decision is a pure predicate extracted as
@@ -1657,7 +1656,7 @@ mod tests {
         );
     }
 
-    // --- Remediation Phase 1: highest-offset-per-partition commit list ----
+    // --- Highest-offset-per-partition commit list -------------------------
     //
     // The ack barrier commits the HIGHEST offset per partition (cumulative,
     // Kafka "commit up to N"). These prove the fold is correct WITHOUT a live
@@ -1740,7 +1739,7 @@ mod tests {
         );
     }
 
-    // --- G3: partition_limited diagnostic + gate wiring -------------------
+    // --- partition_limited diagnostic + gate wiring -----------------------
 
     #[cfg(feature = "governor")]
     #[test]
@@ -1806,7 +1805,7 @@ mod tests {
     /// The Kafka gate actuator drives pause/resume EXACTLY ONCE per edge
     /// through an `InboundGate`, broker-free. We prove the EDGE wiring (the
     /// risky part) with a counting actuator; the live consumer pause/resume
-    /// path is left to a broker integration test (Phase 4). The `recv` gate
+    /// path is left to a broker integration test. The `recv` gate
     /// hook is verified `None`-default no-op by every existing recv test.
     #[cfg(feature = "governor")]
     #[test]

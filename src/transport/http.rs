@@ -275,7 +275,7 @@ impl HttpTransport {
         .await
     }
 
-    /// Create an HTTP transport bound to a pressure governor (G3, `governor`
+    /// Create an HTTP transport bound to a pressure governor (`governor`
     /// feature).
     ///
     /// Identical to [`new`](Self::new) except the embedded receive server
@@ -458,7 +458,7 @@ fn build_receiver_router(
 struct ReceiverState {
     sender: tokio::sync::mpsc::Sender<Message<HttpToken>>,
     sequence: Arc<AtomicU64>,
-    /// Optional pressure governor (G3, `governor` feature). `None` by default
+    /// Optional pressure governor (`governor` feature). `None` by default
     /// -> the handler never consults it and behaviour is byte-identical. When
     /// `Some`, the handler rejects with 503 while [`UnifiedPressure::should_hold`]
     /// holds -- pressure-driven shedding ON TOP of the existing channel-full
@@ -481,7 +481,7 @@ async fn ingest_handler(
         return axum::http::StatusCode::BAD_REQUEST.into_response();
     }
 
-    // G3 pressure-driven shedding (governor feature, opt-in). BEFORE enqueuing,
+    // Pressure-driven shedding (governor feature, opt-in). BEFORE enqueuing,
     // if a governor is wired and it says hold, shed the request with 503 --
     // consistent with the existing channel-full 503 below (NOT 429). Default
     // `None` -> this is skipped and behaviour is byte-identical.
@@ -1007,7 +1007,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// G3: with a pressure governor pinned HIGH, the ingest handler sheds with
+    /// With a pressure governor pinned HIGH, the ingest handler sheds with
     /// 503 (SERVICE_UNAVAILABLE) -- the same status as the channel-full path.
     /// With `None` (the default `new`), POST is accepted (200) as before.
     #[cfg(all(feature = "http-server", feature = "governor"))]

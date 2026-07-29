@@ -1126,13 +1126,13 @@ async fn no_filters_no_dlq_buffer_overhead() {
 }
 
 // ============================================================================
-// Section 9: Tier-1 has() strict CEL semantics (F13)
+// Section 9: Tier-1 has() strict CEL semantics
 // ============================================================================
 
 /// Tier-1 `has(<single-field>)` only matches the field at the top
 /// level of the JSON object. Nested occurrences must NOT trigger.
-/// Codex F13 — strict CEL syntax adherence even when the engine is
-/// the SIMD fast path.
+/// Strict CEL syntax adherence holds even when the engine is on the
+/// SIMD fast path.
 #[test]
 fn has_single_field_only_matches_top_level() {
     let engine = TransportFilterEngine::new(
@@ -1154,7 +1154,7 @@ fn has_single_field_only_matches_top_level() {
     assert_eq!(
         engine.apply_inbound(nested_payload),
         FilterDisposition::Pass,
-        "F13: nested _table must not satisfy top-level has(_table)",
+        "nested _table must not satisfy top-level has(_table)",
     );
 
     // Field name appears only inside an escaped string value — no match.

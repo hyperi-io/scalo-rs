@@ -166,7 +166,7 @@ impl GrpcTransport {
         .await
     }
 
-    /// Create a gRPC transport bound to a pressure governor (G3, `governor`
+    /// Create a gRPC transport bound to a pressure governor (`governor`
     /// feature).
     ///
     /// Like [`new`](Self::new), but the receive server consults `pressure`
@@ -441,7 +441,7 @@ impl TransportSender for GrpcTransport {
         result
     }
 
-    /// Send a whole batch of records in ONE `RouteBatch` RPC (Task 0.6).
+    /// Send a whole batch of records in ONE `RouteBatch` RPC.
     ///
     /// Native batch override of [`TransportSender::send_batch`]: serde-less
     /// scalo<->scalo transfer. Records map to a proto
@@ -737,7 +737,7 @@ impl Drop for GrpcTransport {
 struct TransportServiceImpl {
     sender: mpsc::Sender<Message<GrpcToken>>,
     sequence: Arc<AtomicU64>,
-    /// Optional pressure governor (G3, `governor` feature). `None` -> handlers
+    /// Optional pressure governor (`governor` feature). `None` -> handlers
     /// never consult it. `Some` rejects an inbound Push / batch record with
     /// `Status::unavailable` while [`UnifiedPressure::should_hold`] holds --
     /// pressure-driven shedding on top of the channel-full rejection.
@@ -751,7 +751,7 @@ impl proto::transport_server::Transport for TransportServiceImpl {
         &self,
         request: Request<proto::PushRequest>,
     ) -> Result<Response<proto::PushResponse>, Status> {
-        // G3 pressure shedding: reject before doing any work if the governor
+        // Pressure shedding: reject before doing any work if the governor
         // says hold. `unavailable` = the gRPC analogue of HTTP 503.
         #[cfg(feature = "governor")]
         if let Some(pressure) = &self.pressure
@@ -837,7 +837,7 @@ impl proto::transport_server::Transport for TransportServiceImpl {
         &self,
         request: Request<proto::Batch>,
     ) -> Result<Response<proto::BatchAck>, Status> {
-        // G3 pressure shedding: reject the whole batch while pressure holds.
+        // Pressure shedding: reject the whole batch while pressure holds.
         #[cfg(feature = "governor")]
         if let Some(pressure) = &self.pressure
             && pressure.should_hold()
@@ -1070,7 +1070,7 @@ mod tests {
         transport.commit(&[]).await.unwrap();
     }
 
-    /// G3: with a pressure governor pinned HIGH, the gRPC Push handler rejects
+    /// With a pressure governor pinned HIGH, the gRPC Push handler rejects
     /// with `Status::unavailable` (the gRPC analogue of 503). The default `new`
     /// (no governor) accepts as before.
     #[cfg(feature = "governor")]

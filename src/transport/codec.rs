@@ -617,7 +617,7 @@ mod tests {
         assert!(matches!(err, CodecError::MsgPack(_)), "got {err:?}");
     }
 
-    // ---- Task 0.3b: serialise-out (round-trips through real bytes) ---------
+    // ---- Serialise-out (round-trips through real bytes) --------------------
     //
     // The contract is "parse -> (mutate) -> serialise -> parse again preserves
     // the logical value". We assert on re-parsed VALUES (via the unified
@@ -753,13 +753,13 @@ mod tests {
         assert_eq!(b1, b2, "re-serialising a re-parsed value must be stable");
     }
 
-    // ---- Phase 5: trailing-bytes hardening ------------------------------------
+    // ---- Trailing-bytes hardening ---------------------------------------------
 
     #[test]
     fn msgpack_rejects_trailing_bytes() {
         // A valid fixmap {"k": "v"} followed by a stray nil byte (0xc0).
-        // Before the fix this returns Ok (silently ignoring 0xc0).
-        // After the fix it must return CodecError::TrailingBytes(1).
+        // Without the trailing-bytes check the value parses Ok and the 0xc0 is
+        // silently ignored; it must return CodecError::TrailingBytes(1).
         let mut buf = vec![fixmap_header(1)];
         buf.extend(fixstr("k"));
         buf.extend(fixstr("v"));
@@ -830,7 +830,7 @@ mod tests {
         // Force the wrong decoder: JSON bytes through the MsgPack path. '{' is
         // 0x7b, which rmpv reads as a positive fixint -- a single-byte value
         // -- leaving the remaining 69 bytes of the JSON payload as trailing
-        // bytes. After Phase 5 hardening this MUST error with TrailingBytes.
+        // bytes, so this MUST error with TrailingBytes.
         let err = parse(&sample_json(), PayloadFormat::MsgPack)
             .expect_err("JSON fed to MsgPack path must error after trailing-bytes hardening");
         assert!(

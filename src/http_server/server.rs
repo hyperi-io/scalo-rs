@@ -132,7 +132,7 @@ impl HttpServer {
         // If drain exceeds shutdown_timeout, drop the serve future
         // so K8s terminationGracePeriodSeconds isn't blown.
         //
-        // F12: flip ready -> false BEFORE notifying drain start so
+        // Flip ready -> false BEFORE notifying drain start so
         // /readyz returns 503 the moment shutdown is signalled.
         // K8s endpoint controller catches the 503 and stops routing
         // before in-flight requests finish draining.
@@ -208,7 +208,7 @@ impl HttpServer {
         tracing::info!(address = %addr, "HTTP server listening");
 
         // Two-phase shutdown, matching `serve_with_shutdown`.
-        // F12: flip ready -> false before notifying drain start.
+        // Flip ready -> false before notifying drain start.
         let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
         let drain_started_tx = std::sync::Mutex::new(Some(drain_started_tx));
         let ready_for_signal = Arc::clone(&self.ready);

@@ -9,7 +9,7 @@ six core consumer services migrate in lockstep.
 
 ---
 
-## Unreleased -- WorkBatch data-plane spine + self-regulation (Phase 0)
+## Unreleased -- WorkBatch data-plane spine + self-regulation
 
 The data plane flips onto a single zero-copy currency -- `WorkBatch` (a block
 of `Record`s) -- driven `get -> process -> send -> commit` by ONE unified
@@ -17,7 +17,7 @@ engine driver, with self-regulation (memory guard + inbound/byte-budget
 backpressure) ON by default. See [self-regulation.md](self-regulation.md),
 [backpressure.md](backpressure.md), [kafka-path.md](kafka-path.md).
 
-The six core consumer services migrate in lockstep (Phase 6); items below are the
+The six core consumer services migrate in lockstep; items below are the
 consumer-facing surface changes.
 
 ### `WorkBatch` / `Record` -- the canonical currency (BREAKING)
@@ -161,7 +161,7 @@ with the at-least-once commit token (offset / responder / cursor) so a paused
 intake never advances the source position. `SelfRegulationGovernor::attach_kafka_gate`
 is the one-call form of the gate dance. See [backpressure.md](backpressure.md).
 
-**App adoption is TWO steps, not one (Phase 6).** The default-on governor only
+**App adoption is TWO steps, not one.** The default-on governor only
 engages end-to-end if the app adopts BOTH the driver method AND the
 governed-receiver constructor. `run_governed` alone wires the byte-budget lever
 (streaming sub-blocks) but does NOT brake intake; the inbound brake lives on the
@@ -247,7 +247,7 @@ The metric `dfe_engine_filter_dlq_unrouted_total` is replaced by
 | Old | `send(&self, key: &str, payload: &[u8]) -> SendResult` |
 | New | `send(&self, key: &str, payload: bytes::Bytes) -> SendResult` |
 
-Owned-bytes send (Phase 4.1) removes the per-send `payload.to_vec()` copy on
+Owned-bytes send removes the per-send `payload.to_vec()` copy on
 the HTTP path (reqwest `Body::from(Bytes)` is zero-copy) and lets a caller that
 already holds `Bytes` (the `BatchEngine`) flow it through without re-copying.
 

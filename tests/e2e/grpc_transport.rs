@@ -275,7 +275,7 @@ async fn test_compression() {
 
 #[tokio::test]
 async fn test_route_batch_native_transport() {
-    // Native batch transport (Task 0.6): a whole WorkBatch's records cross the
+    // Native batch transport: a whole WorkBatch's records cross the
     // wire in ONE RouteBatch RPC, payloads OPAQUE. Include a non-UTF8 binary
     // payload (NOT valid JSON or MsgPack) to prove no codec ran in transit.
     let port = find_available_port().await;
@@ -362,14 +362,14 @@ async fn create_pair_with_capacity(port: u16, capacity: usize) -> (GrpcTransport
     (server, client)
 }
 
-/// Phase 4 (atomicity): a `RouteBatch` larger than the free receiver capacity
-/// must be rejected ALL-OR-NOTHING. With a capacity-1 channel and a 2-record
-/// batch, the RPC errors (Backpressured) AND the receiver accepts ZERO records
-/// -- no partial-acceptance window. This is the contract the doc-comment on
+/// Atomicity: a `RouteBatch` larger than the free receiver capacity must be
+/// rejected ALL-OR-NOTHING. With a capacity-1 channel and a 2-record batch, the
+/// RPC errors (Backpressured) AND the receiver accepts ZERO records -- no
+/// partial-acceptance window. This is the contract the doc-comment on
 /// `send_batch` claims ("no partial-send window: the block is accepted or not
-/// as a unit"). Before the fix the server enqueued record 0 then errored on
-/// record 1, leaving 1 record stranded in the channel = partial acceptance +
-/// duplicate-on-retry.
+/// as a unit"). The failure mode it pins: the server enqueues record 0 then
+/// errors on record 1, leaving 1 record stranded in the channel = partial
+/// acceptance + duplicate-on-retry.
 #[tokio::test]
 async fn test_route_batch_is_atomic_under_capacity() {
     let port = find_available_port().await;
@@ -418,7 +418,7 @@ async fn test_route_batch_is_atomic_under_capacity() {
     let _ = server.close().await;
 }
 
-/// Phase 4 (atomicity): a `RouteBatch` that FITS the free capacity succeeds and
+/// Atomicity: a `RouteBatch` that FITS the free capacity succeeds and
 /// the receiver accepts the whole batch. Capacity 2, batch 2 -> Ok + 2 records.
 #[tokio::test]
 async fn test_route_batch_fits_capacity_accepts_all() {
@@ -460,7 +460,7 @@ async fn test_route_batch_fits_capacity_accepts_all() {
     let _ = server.close().await;
 }
 
-/// Phase 4 (atomicity): a pressure-holding governor must reject the WHOLE
+/// Atomicity: a pressure-holding governor must reject the WHOLE
 /// `RouteBatch` with `unavailable` BEFORE accepting ANY record -- consistent
 /// with all-or-nothing. With the governor pinned high, a batch of 2 surfaces as
 /// Backpressured and the receiver accepts ZERO records.

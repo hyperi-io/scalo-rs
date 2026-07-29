@@ -351,7 +351,7 @@ mod tests {
     }
 
     /// MemoryTransport does NOT override `send_batch`, so this exercises the
-    /// trait's per-record default fallback (Task 0.7c): every record is sent
+    /// trait's per-record default fallback: every record is sent
     /// individually via `send`, using its own key, and all arrive intact.
     #[tokio::test]
     async fn send_batch_default_fallback_sends_each_record() {

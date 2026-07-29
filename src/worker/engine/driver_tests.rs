@@ -534,7 +534,7 @@ impl std::fmt::Display for MemTok {
 #[cfg(feature = "memory")]
 impl CommitToken for MemTok {}
 
-// ---- Remediation Phase 1: ordered-commit ack barrier -----------------
+// ---- Ordered-commit ack barrier --------------------------------------
 //
 // Kafka (and MemoryTransport) commit is CUMULATIVE: `commit up to offset N`
 // advances a watermark via fetch_max. So if a block carrying token 0 fails
@@ -840,7 +840,7 @@ async fn streaming_sink_error_blocks_later_ordered_commits() {
     );
 }
 
-// ---- Task G4: per-unit streaming -------------------------------------
+// ---- Per-unit streaming ----------------------------------------------
 
 /// split_into_sub_blocks unit coverage: byte-budget splitting + floor-1.
 #[test]
@@ -1590,8 +1590,7 @@ fn governed_engine_low_limit(
 ///      floor (>= 1, never 0).
 ///
 /// A full OS-level cgroup OOM-kill test (a memory-limited container + a real
-/// broker or transport under load) is FLAGGED for a CI harness (Phase 5.5);
-/// see the report.
+/// broker or transport under load) needs a CI harness and is not covered here.
 #[cfg(all(feature = "governor", feature = "memory"))]
 #[tokio::test]
 async fn operational_never_oom_governed_pipeline_bounds_memory() {
@@ -1717,7 +1716,7 @@ async fn operational_never_oom_governed_pipeline_bounds_memory() {
     );
 }
 
-// ---- Remediation Phase 2: byte-aware recv bounds RECEIVE memory -------
+// ---- Byte-aware recv bounds RECEIVE memory ----------------------------
 //
 // The gap: the governed driver bounds memory by the
 // post-recv SUB-BLOCK lease, but `recv(max)` is RECORD-bounded only -- a
@@ -1991,7 +1990,7 @@ fn sub_block_drain_yields_incrementally() {
     assert!(drain.next_sub_block().is_none(), "drain exhausted");
 }
 
-// ---- Remediation Phase 3: DLQ + parse-error-action semantics ----------
+// ---- DLQ + parse-error-action semantics -------------------------------
 //
 // Two findings the parsed/process paths had:
 //   1. parse_block hardcoded route-to-DLQ, ignoring ParseErrorAction.

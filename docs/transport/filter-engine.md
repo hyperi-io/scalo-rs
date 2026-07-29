@@ -291,7 +291,7 @@ The post-spec follow-up items from earlier work, with current status:
 | 9 | Pre-quoted bytes fast path for `field == "value"` | Partial | `FieldExists` / `FieldNotExists` already use pre-compiled `memmem::Finder`; `FieldEquals` still uses SIMD extract + string compare |
 | 10 | MsgPack payloads silently pass | Acknowledged | Design choice; cheap fix would be a one-shot warn + metric on first MsgPack seen |
 | 11 | Preserve original `expression_text` through reload cycles | Pending | Current code re-allocates on reload; allocator-hygiene item, no functional impact |
-| 12 | Tier 3 CEL has no evaluation budget | Open — design spec'd | `program.execute(&ctx)` runs with no time/recursion/payload cap. A bad filter can wedge the ingest thread. Static AST budget + payload size cap + degraded-mode fallback design spec'd in the project working area; must land before Phase 3 of the log-scrub landing plan (gitleaks rules are regex-heavy by nature) |
+| 12 | Tier 3 CEL has no evaluation budget | Open | `program.execute(&ctx)` runs with no time/recursion/payload cap. A bad filter can wedge the ingest thread. Needs a static AST budget + payload size cap + degraded-mode fallback, and must land before log-scrub ships (gitleaks rules are regex-heavy by nature) |
 
 The items aren't blockers. Operators should know about #10 if their
 pipeline mixes JSON and MsgPack.

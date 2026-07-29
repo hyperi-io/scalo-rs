@@ -412,7 +412,7 @@ impl<T: CommitToken> WorkBatch<T> {
         self
     }
 
-    // ---- Zero-copy ingestion / framing helpers (Task 0.2) -----------------
+    // ---- Zero-copy ingestion / framing helpers ----------------------------
     //
     // These slice ONE inbound `Bytes` blob into per-record views so the WHOLE
     // batch shares ONE allocation: `record.payload = blob.slice(start..end)` is
@@ -1074,7 +1074,7 @@ mod tests {
         assert_eq!(wb.records[0].payload.as_ptr(), payload_ptr);
     }
 
-    /// Task 0.4.1 capability test: `Message::new` with an already-allocated
+    /// Capability test: `Message::new` with an already-allocated
     /// `Bytes` payload travels through `WorkBatch` with ZERO copies.
     ///
     /// This proves the headline win of the migration: an upstream `Bytes` (e.g.
@@ -1144,7 +1144,7 @@ mod tests {
         assert_eq!(r2.payload.as_ref(), b"shared-buffer");
     }
 
-    // ---- Task 0.2: zero-copy framing helpers -------------------------------
+    // ---- Zero-copy framing helpers -----------------------------------------
 
     /// Assert that `slice` is a zero-copy view INTO `blob` (a refcounted slice,
     /// not a fresh allocation): its byte range must fall within `blob`'s range.

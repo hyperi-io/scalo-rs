@@ -1,6 +1,6 @@
 # Dependency duplication report
 
-> At-scale hardening Task 4.3 (finding P2). Snapshot 2026-06-03.
+> Snapshot 2026-06-03.
 > Regenerate with `scripts/dep-dup-check.sh` (warning-only).
 
 `cargo tree -d --features full -e normal` reports **56 duplicated crate

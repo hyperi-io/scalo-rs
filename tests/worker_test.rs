@@ -514,8 +514,8 @@ fn test_config_validation_emergency_below_shrink_rejected() {
 
 #[test]
 fn test_config_min_threads_zero_rejected_by_validate() {
-    // Codex F11: min_threads=0 leaves the rayon semaphore spinning
-    // in yield_now() forever. validate() now rejects upfront.
+    // min_threads=0 leaves the rayon semaphore spinning in yield_now()
+    // forever, so validate() rejects it upfront.
     let config = WorkerPoolConfig {
         min_threads: 0,
         max_threads: 4,
