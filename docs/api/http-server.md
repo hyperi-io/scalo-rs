@@ -13,7 +13,7 @@ servers and they are not interchangeable:
 | Default bind | `--metrics-addr`, `0.0.0.0:9090` | `0.0.0.0:8080` |
 | Implementation | hand-rolled over tokio, no axum | axum |
 | Serves `/metrics` | YES | **no** |
-| Serves `/startupz` | YES | **no** |
+| Serves `/metrics/manifest` | YES | **no** |
 
 **The observability port -- the one the deployment contract advertises and
 Prometheus scrapes -- is the METRICS server, not this one.** `ServiceRuntime`
@@ -31,15 +31,14 @@ What `build_router` actually mounts:
 
 | Path | Wired by | What it returns |
 |------|----------|-----------------|
-| `/healthz` | on by default (`enable_health_endpoints`) | 200 if process is alive (no dep checks -- never restart on dep down) |
+| `/livez` | on by default (`enable_health_endpoints`) | 200 if process is alive (no dep checks -- never restart on dep down) |
 | `/readyz` | same | 200 if `ready_flag` is true AND all registered checks pass; 503 otherwise |
-| `/health/live`, `/health/ready` | same | aliases of the two above |
 | `/health/detailed` | `health` + `serde_json` | per-check JSON breakdown |
 | `/config` | opt-in via `enable_config_endpoint` | JSON dump of every registered config section, with secrets redacted |
 
 NOT mounted here, whatever the feature set: `/metrics`, `/metrics/manifest`,
-`/startupz`, `/scaling/pressure`, `/memory/pressure`. Those belong to the
-metrics server -- see [../core-pillars/metrics.md](../core-pillars/metrics.md).
+`/scaling/pressure`, `/memory/pressure`. Those belong to the metrics server --
+see [../core-pillars/metrics.md](../core-pillars/metrics.md).
 
 `enable_metrics_endpoint` on `HttpServerConfig` is currently inert: the field
 exists and `build_router` does not read it. Setting it changes nothing.
@@ -147,7 +146,7 @@ http_server:
 
 ## Related
 
-- [../core-pillars/health.md](../core-pillars/health.md) -- probe trinity semantics
+- [../core-pillars/health.md](../core-pillars/health.md) -- health probes semantics
 - [../core-pillars/metrics.md](../core-pillars/metrics.md) -- `/metrics` + `/metrics/manifest`
 - [../core-pillars/config.md](../core-pillars/config.md) -- `/config` endpoint
 - [../core-pillars/shutdown.md](../core-pillars/shutdown.md) -- pre-stop, K8s drain flow

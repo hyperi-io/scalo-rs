@@ -35,7 +35,7 @@ pub struct HttpServerConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
-    /// Mount /health/live + /health/ready. Default true.
+    /// Mount /livez + /readyz. Default true.
     #[serde(default = "default_true")]
     pub enable_health_endpoints: bool,
 

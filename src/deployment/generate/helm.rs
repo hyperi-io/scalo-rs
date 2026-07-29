@@ -461,11 +461,10 @@ Service account name.
 ///
 /// The three container probes, all pointed at the metrics port.
 ///
-/// `startupProbe` deliberately targets the LIVENESS path, not `/startupz`.
-/// `mark_started()` is currently called by nothing, so `/startupz` answers 503
-/// for the life of the process -- aiming the startup probe at it would kill
-/// every pod on `failureThreshold`. The two halves have to move together; see
-/// scalo-rs#8 before changing either.
+/// `startupProbe` targets the LIVENESS path. There is no startup endpoint:
+/// Kubernetes suspends liveness until the startup probe passes, so one path
+/// gives both a generous boot budget and a tight liveness period without the
+/// two drifting apart.
 fn gen_probes(c: &DeploymentContract) -> String {
     format!(
         "          livenessProbe:\n\

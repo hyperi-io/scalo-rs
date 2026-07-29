@@ -101,7 +101,7 @@ mod tests {
         assert!(dockerfile.contains("FROM ubuntu:24.04"));
         assert!(dockerfile.contains("COPY dfe-loader /usr/local/bin/dfe-loader"));
         assert!(dockerfile.contains("EXPOSE 9090"));
-        assert!(dockerfile.contains("localhost:9090/healthz"));
+        assert!(dockerfile.contains("localhost:9090/livez"));
         assert!(dockerfile.contains("ENTRYPOINT [\"dfe-loader\"]"));
         assert!(dockerfile.contains("CMD [\"--config\", \"/etc/dfe/loader.yaml\"]"));
     }
@@ -350,7 +350,7 @@ mod tests {
         assert!(content.contains("DFE_LOADER__KAFKA__USERNAME"));
         assert!(content.contains("DFE_LOADER__KAFKA__PASSWORD"));
         assert!(content.contains("DFE_LOADER__CLICKHOUSE__PASSWORD"));
-        assert!(content.contains("path: /healthz"));
+        assert!(content.contains("path: /livez"));
         assert!(content.contains("path: /readyz"));
         assert!(content.contains("/etc/dfe"));
         // Observability identity: OTel service.name + k8s downward-API resource

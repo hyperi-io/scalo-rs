@@ -14,7 +14,7 @@
 //!
 //! ## What's included (always)
 //!
-//! - [`MetricsManager`] -- started, serving `/metrics`, `/healthz`, `/readyz`
+//! - [`MetricsManager`] -- started, serving `/metrics`, `/livez`, `/readyz`
 //! - [`ServiceMetrics`] -- platform `dfe_*` metrics registered
 //! - [`MemoryGuard`] -- cgroup-aware, auto-detected from env prefix
 //! - [`CancellationToken`] -- signal handler installed with K8s pre-stop delay

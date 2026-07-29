@@ -36,7 +36,7 @@ features = [
     "memory",               # Cgroup-aware OOM prevention
     "scaling",              # KEDA pressure signal
     "worker-batch",         # BatchEngine (SIMD parse + parallel transform)
-    "http-server",          # /healthz, /readyz, /metrics, /config
+    "http-server",          # /livez, /readyz, /metrics, /config
     "deployment",           # DeploymentContract + generators
     "version-check",        # Startup probe to version API
     "expression",           # CEL for transport filters
@@ -263,7 +263,7 @@ What you skipped:
 | Prometheus exporter, `/metrics` endpoint, process metrics | `MetricsManager::new` |
 | axum HTTP server, probe routes, `/metrics`, `/config` | `http_server` (wired by `ServiceRuntime`) |
 | OTel SDK setup, OTLP exporter, traceparent propagation | `otel-tracing` + `transport-trace` |
-| `HealthRegistry`, `/healthz` / `/readyz` / `/startupz` | `health` + `http_server` |
+| `HealthRegistry`, `/livez` / `/readyz` | `health` + `http_server` |
 | SIGTERM/SIGINT, K8s pre-stop delay, cancellation propagation | `shutdown` (wired by `ServiceRuntime`) |
 | `MemoryGuard`, cgroup-aware OOM prevention | `memory` (wired by `ServiceRuntime`) |
 | Rayon pool sizing, pressure-based scaling | `worker_pool` (wired by `ServiceRuntime`) |

@@ -245,9 +245,9 @@ async fn test_05_healthz_endpoint() {
         .expect("failed to start server");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Test /healthz
-    let (status, body) = http_get(&addr, "/healthz").await;
-    assert!(status.contains("200 OK"), "expected 200 OK for /healthz");
+    // Test /livez
+    let (status, body) = http_get(&addr, "/livez").await;
+    assert!(status.contains("200 OK"), "expected 200 OK for /livez");
     assert!(
         body.contains(r#""status":"alive""#),
         "expected alive status in body"
@@ -274,12 +274,9 @@ async fn test_06_health_live_endpoint() {
         .expect("failed to start server");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Test /health/live
-    let (status, body) = http_get(&addr, "/health/live").await;
-    assert!(
-        status.contains("200 OK"),
-        "expected 200 OK for /health/live"
-    );
+    // Test /livez
+    let (status, body) = http_get(&addr, "/livez").await;
+    assert!(status.contains("200 OK"), "expected 200 OK for /livez");
     assert!(
         body.contains(r#""status":"alive""#),
         "expected alive status in body"
@@ -335,12 +332,9 @@ async fn test_08_health_ready_endpoint() {
         .expect("failed to start server");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Test /health/ready
-    let (status, body) = http_get(&addr, "/health/ready").await;
-    assert!(
-        status.contains("200 OK"),
-        "expected 200 OK for /health/ready"
-    );
+    // Test /readyz
+    let (status, body) = http_get(&addr, "/readyz").await;
+    assert!(status.contains("200 OK"), "expected 200 OK for /readyz");
     assert!(
         body.contains(r#""status":"ready""#),
         "expected ready status in body"
@@ -560,7 +554,7 @@ async fn test_16_rapid_start_stop_cycle() {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Verify it's running
-        let (status, _) = http_get(&addr, "/healthz").await;
+        let (status, _) = http_get(&addr, "/livez").await;
         assert!(
             status.contains("200 OK"),
             "server should respond during cycle"
@@ -653,8 +647,14 @@ async fn test_18_concurrent_requests_during_shutdown() {
     );
 }
 
+/// The retired probe paths are GONE, not quietly still answering.
+///
+/// An alias that keeps returning 200 hides a probe still aimed at the old
+/// name, which is how a chart and an app drift apart unnoticed. A
+/// `startupProbe` targets `/livez`: Kubernetes suspends liveness until it
+/// passes, so one path covers both without the two diverging.
 #[tokio::test]
-async fn test_19_startupz_before_and_after_mark_started() {
+async fn test_19_retired_probe_paths_are_gone() {
     let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     init_manager();
 
@@ -670,28 +670,27 @@ async fn test_19_startupz_before_and_after_mark_started() {
         .expect("failed to start server");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Before mark_started: /startupz should return 503
-    let (status, body) = http_get(&addr, "/startupz").await;
-    assert!(
-        status.contains("503"),
-        "expected 503 before mark_started, got: {status}"
-    );
-    assert!(
-        body.contains("starting"),
-        "expected 'starting' in body: {body}"
-    );
+    for path in [
+        "/healthz",
+        "/health/live",
+        "/health/ready",
+        "/health/startup",
+        "/startupz",
+    ] {
+        let (status, _) = http_get(&addr, path).await;
+        assert!(
+            status.contains("404"),
+            "retired path {path} should 404, got: {status}"
+        );
+    }
 
-    // After mark_started: /startupz should return 200
-    manager.mark_started();
-    let (status, body) = http_get(&addr, "/startupz").await;
+    // The path a startupProbe actually targets still answers.
+    let (status, body) = http_get(&addr, "/livez").await;
     assert!(
         status.contains("200"),
-        "expected 200 after mark_started, got: {status}"
+        "expected 200 on /livez, got: {status}"
     );
-    assert!(
-        body.contains("started"),
-        "expected 'started' in body: {body}"
-    );
+    assert!(body.contains("alive"), "expected 'alive' in body: {body}");
 
     // Cleanup
     let _ = manager.stop_server().await;

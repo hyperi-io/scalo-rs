@@ -57,7 +57,7 @@ impl HttpServer {
         Self::new(HttpServerConfig::new(address))
     }
 
-    /// Set the readiness state for the /health/ready endpoint.
+    /// Set the readiness state for the /readyz endpoint.
     pub fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::SeqCst);
     }
@@ -133,7 +133,7 @@ impl HttpServer {
         // so K8s terminationGracePeriodSeconds isn't blown.
         //
         // F12: flip ready -> false BEFORE notifying drain start so
-        // /health/ready returns 503 the moment shutdown is signalled.
+        // /readyz returns 503 the moment shutdown is signalled.
         // K8s endpoint controller catches the 503 and stops routing
         // before in-flight requests finish draining.
         let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
@@ -259,18 +259,16 @@ impl HttpServer {
         let mut router = app;
 
         if self.config.enable_health_endpoints {
+            // /livez and /readyz are the whole surface -- no aliases. A second
+            // path meaning the same thing eventually stops meaning the same
+            // thing, and an alias that keeps answering 200 hides a probe still
+            // aimed at a retired name. A startupProbe targets /livez:
+            // Kubernetes suspends liveness until it passes, so one path gives
+            // both a generous boot budget and a tight liveness period.
             let ready = Arc::clone(&self.ready);
-            // K8s-standard paths are /healthz and /readyz; the
-            // /health/live and /health/ready aliases stay for
-            // backward compat with existing consumer probes.
-            // Kaz #38: docs claim /readyz, code only had /health/ready.
-            let r1 = Arc::clone(&ready);
-            let r2 = Arc::clone(&ready);
             router = router
-                .route("/health/live", get(health_live))
-                .route("/health/ready", get(move || health_ready(Arc::clone(&r1))))
-                .route("/healthz", get(health_live))
-                .route("/readyz", get(move || health_ready(Arc::clone(&r2))));
+                .route("/livez", get(health_live))
+                .route("/readyz", get(move || health_ready(Arc::clone(&ready))));
         }
 
         #[cfg(all(feature = "health", feature = "serde_json"))]
@@ -431,7 +429,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/health/live")
+                    .uri("/livez")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -454,7 +452,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/health/ready")
+                    .uri("/readyz")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -474,7 +472,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/health/ready")
+                    .uri("/readyz")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -502,16 +500,14 @@ mod tests {
         future.await.unwrap();
     }
 
-    /// Kaz #38: K8s-standard `/healthz` and `/readyz` paths must
-    /// be live alongside the legacy `/health/live` and
-    /// `/health/ready` aliases.
+    /// Kaz #38: the K8s-standard `/livez` and `/readyz` paths must be mounted.
     #[tokio::test]
     async fn k8s_standard_health_paths_are_mounted() {
         let config = HttpServerConfig::default();
         let server = HttpServer::new(config);
         let app = server.build_router(Router::new());
 
-        for path in &["/healthz", "/readyz"] {
+        for path in &["/livez", "/readyz"] {
             let response = app
                 .clone()
                 .oneshot(Request::builder().uri(*path).body(Body::empty()).unwrap())
@@ -521,8 +517,34 @@ mod tests {
         }
     }
 
+    /// Retired paths are GONE, not quietly still answering.
+    ///
+    /// An alias that keeps returning 200 hides a probe still aimed at the old
+    /// name, which is how a chart and an app drift apart unnoticed.
+    #[tokio::test]
+    async fn retired_health_paths_are_not_mounted() {
+        let config = HttpServerConfig::default();
+        let server = HttpServer::new(config);
+        let app = server.build_router(Router::new());
+
+        for path in &[
+            "/healthz",
+            "/health/live",
+            "/health/ready",
+            "/health/startup",
+            "/startupz",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(*path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "path={path}");
+        }
+    }
+
     /// Regression: shutdown signal flips the readiness
-    /// flag so /health/ready returns 503 before the drain window
+    /// flag so /readyz returns 503 before the drain window
     /// completes. K8s endpoint controller stops routing on the 503.
     #[tokio::test]
     async fn shutdown_signal_flips_ready_before_drain() {

@@ -82,7 +82,7 @@ let contract = DeploymentContract {
     binary_name: "dfe-loader".into(),
     description: "Kafka -> ClickHouse data loader".into(),
     metrics_port: 9090,
-    health: HealthContract::default(),     // /healthz, /readyz, /metrics
+    health: HealthContract::default(),     // /livez, /readyz, /metrics
     env_prefix: "DFE_LOADER".into(),
     metric_prefix: "loader".into(),
     config_mount_path: "/etc/dfe/loader.yaml".into(),
@@ -199,7 +199,7 @@ release-specific and a digest carries no codename.
 | `DeploymentContract::binary()` | Effective binary name (falls back to `app_name`) |
 | `DeploymentContract::config_filename()` / `config_dir()` | Split `config_mount_path` |
 | `ImageProfile::{Production, Development}` | Profile enum |
-| `HealthContract` | `/healthz` / `/readyz` / `/metrics` paths |
+| `HealthContract` | `/livez` / `/readyz` / `/metrics` paths |
 | `PortContract` | Extra container port beyond `metrics_port` |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |
 | `SecretEnvContract` | Single env var sourced from a Secret key |

@@ -125,7 +125,7 @@ USER appuser
 EXPOSE 9090
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -sf http://localhost:9090/healthz > /dev/null || exit 1
+    CMD curl -sf http://localhost:9090/livez > /dev/null || exit 1
 
 ENTRYPOINT ["dfe-loader"]
 CMD ["--config", "/etc/dfe/loader.yaml"]
