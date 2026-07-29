@@ -141,9 +141,8 @@ sum by (transport) (rate(transport_sent_bytes_total[1m]))
 |---|---|
 | `/metrics` | Prometheus text |
 | `/metrics/manifest` | JSON catalogue |
-| `/healthz`, `/health/live` | `{"status":"alive"}` -- process alive |
-| `/startupz`, `/health/startup` | 503 until `mgr.mark_started()`, then 200 |
-| `/readyz`, `/health/ready` | 200 if readiness callback + [`HealthRegistry`](health.md) both pass, else 503 |
+| `/livez` | `{"status":"alive"}` -- process alive |
+| `/readyz` | 200 if readiness callback + [`HealthRegistry`](health.md) both pass, else 503 |
 | `/scaling/pressure` | Float `0.0-1.0` (feature `scaling` + `set_scaling_pressure`) |
 | `/memory/pressure` | JSON ratio + bytes (feature `memory` + `set_memory_guard`) |
 
@@ -174,7 +173,7 @@ batching config.
 | `counter` / `gauge` / `histogram` | Construct + auto-register |
 | `*_with_labels(name, desc, labels, group)` | Same, with manifest label keys + group |
 | `histogram_with_buckets` | Custom bucket spec (captured in manifest) |
-| `set_readiness_check(fn)` / `mark_started()` | Wire `/readyz` / flip `/startupz` |
+| `set_readiness_check(fn)` | Wire the `/readyz` gate |
 | `set_scaling_pressure(Arc<ScalingPressure>)` / `set_memory_guard(Arc<MemoryGuard>)` | Add `/scaling/pressure` / `/memory/pressure` |
 | `set_build_info` / `set_use_cases` / `set_dashboard_hint` | Manifest metadata |
 | `registry() -> MetricRegistry` | Cloneable handle for embedding `/metrics/manifest` in custom routers |

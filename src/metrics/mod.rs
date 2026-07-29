@@ -13,7 +13,7 @@
 //! - **Both:** Fanout recorder sends to both Prometheus AND OTel
 //!
 //! Counter/Gauge/Histogram types, automatic process + cgroup container metrics,
-//! built-in HTTP server, readiness/startup probes, optional scaling-pressure and
+//! built-in HTTP server, liveness/readiness probes, optional scaling-pressure and
 //! memory-guard endpoints, custom routes via
 //! [`start_server_with_routes`](MetricsManager::start_server_with_routes).
 //!
@@ -366,7 +366,6 @@ pub struct MetricsManager {
     process_metrics: Option<ProcessMetrics>,
     container_metrics: Option<ContainerMetrics>,
     readiness_fn: Option<ReadinessFn>,
-    started: Arc<std::sync::atomic::AtomicBool>,
     registry: MetricRegistry,
     #[cfg(all(feature = "metrics", feature = "scaling"))]
     scaling_pressure: Option<Arc<crate::scaling::ScalingPressure>>,
@@ -413,7 +412,6 @@ impl MetricsManager {
             process_metrics: None,
             container_metrics: None,
             readiness_fn: None,
-            started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(feature = "metrics", feature = "scaling"))]
             scaling_pressure: None,
             #[cfg(all(feature = "metrics", feature = "memory"))]
@@ -456,7 +454,6 @@ impl MetricsManager {
             process_metrics,
             container_metrics,
             readiness_fn: None,
-            started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(feature = "metrics", feature = "scaling"))]
             scaling_pressure: None,
             #[cfg(all(feature = "metrics", feature = "memory"))]
@@ -707,26 +704,11 @@ impl MetricsManager {
 
     /// Set a readiness check callback.
     ///
-    /// When set, `/readyz` and `/health/ready` call this function and return
+    /// When set, `/readyz` and `/readyz` call this function and return
     /// 503 Service Unavailable if it returns `false`. Without a callback,
     /// these endpoints always return 200.
     pub fn set_readiness_check(&mut self, f: impl Fn() -> bool + Send + Sync + 'static) {
         self.readiness_fn = Some(Arc::new(f));
-    }
-
-    /// Mark the service as started (startup probe passes).
-    ///
-    /// Call this once init is complete. K8s `startupProbe` hits `/startupz`
-    /// which returns 503 until this is called, then 200 thereafter.
-    /// Separate from readiness -- startup has a longer timeout for slow starters.
-    pub fn mark_started(&self) {
-        self.started
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Get a clone of the started flag (for passing to HTTP handler).
-    pub(crate) fn started_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::clone(&self.started)
     }
 
     /// Attach a `ScalingPressure` instance.
@@ -761,12 +743,12 @@ impl MetricsManager {
     ///
     /// This is the OBSERVABILITY port -- the one the deployment contract
     /// advertises and Prometheus scrapes. It serves `/metrics`,
-    /// `/metrics/manifest`, `/healthz`, `/readyz`, `/startupz` and the
-    /// `/health/live`, `/health/ready`, `/health/startup` aliases.
+    /// `/metrics/manifest`, `/livez` and `/readyz` -- no aliases, and no
+    /// startup route (a `startupProbe` targets `/livez`).
     ///
     /// Not to be confused with [`HttpServer`](crate::http_server), which is an
-    /// optional extra listener for the app's own routes and serves neither
-    /// `/metrics` nor `/startupz`.
+    /// optional extra listener for the app's own routes and does not serve
+    /// `/metrics`.
     ///
     /// Only available when the `metrics` feature is enabled (for scraping).
     ///
@@ -803,7 +785,6 @@ impl MetricsManager {
         let process_metrics = self.process_metrics.clone();
         let container_metrics = self.container_metrics.clone();
         let readiness_fn = self.readiness_fn.clone();
-        let started_flag = self.started_flag();
 
         let registry = self.registry();
 
@@ -817,7 +798,6 @@ impl MetricsManager {
                 process_metrics,
                 container_metrics,
                 readiness_fn,
-                started_flag,
             )
             .await;
         });
@@ -828,8 +808,7 @@ impl MetricsManager {
     /// Start the metrics HTTP server with additional custom routes.
     ///
     /// Serves the same built-in endpoints as [`start_server`](Self::start_server):
-    /// `/metrics`, `/metrics/manifest`, `/healthz`, `/health/live`, `/readyz`,
-    /// `/health/ready`, `/startupz` and `/health/startup`.
+    /// `/metrics`, `/metrics/manifest`, `/livez` and `/readyz`.
     ///
     /// Additionally:
     /// - If [`set_scaling_pressure`](Self::set_scaling_pressure) was called,
@@ -880,7 +859,6 @@ impl MetricsManager {
 
         // Build the axum router with built-in + optional + custom routes
         let metrics_handle = handle.clone();
-        let readiness_for_live = readiness_fn.clone();
         let registry_handle = self.registry();
 
         let mut app = axum::Router::new()
@@ -903,22 +881,11 @@ impl MetricsManager {
                     async move { h.render() }
                 }),
             )
-            .route("/startupz", startup_route(self.started_flag()))
-            // Alias, to stay in step with the hand-rolled responder. Leaving it
-            // out here means the alias silently disappears for anything that
-            // moves onto this router.
-            .route("/health/startup", startup_route(self.started_flag()))
+            // /livez and /readyz are the whole probe surface. No aliases, and
+            // no startup route -- a startupProbe targets /livez, since
+            // Kubernetes suspends liveness until the startup probe passes.
             .route(
-                "/healthz",
-                axum::routing::get(|| async {
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        r#"{"status":"alive"}"#,
-                    )
-                }),
-            )
-            .route(
-                "/health/live",
+                "/livez",
                 axum::routing::get(|| async {
                     (
                         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -930,13 +897,6 @@ impl MetricsManager {
                 "/readyz",
                 axum::routing::get(move || {
                     let rf = readiness_fn.clone();
-                    async move { readiness_response(rf) }
-                }),
-            )
-            .route(
-                "/health/ready",
-                axum::routing::get(move || {
-                    let rf = readiness_for_live.clone();
                     async move { readiness_response(rf) }
                 }),
             );
@@ -1080,7 +1040,6 @@ async fn run_server(
     process_metrics: Option<ProcessMetrics>,
     container_metrics: Option<ContainerMetrics>,
     readiness_fn: Option<ReadinessFn>,
-    started_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut update_interval = tokio::time::interval(update_interval);
 
@@ -1102,9 +1061,8 @@ async fn run_server(
                     let handle = handle.clone();
                     let registry = registry.clone();
                     let readiness_fn = readiness_fn.clone();
-                    let sf = Arc::clone(&started_flag);
                     tokio::spawn(async move {
-                        handle_connection(stream, handle, registry, readiness_fn, &sf).await;
+                        handle_connection(stream, handle, registry, readiness_fn).await;
                     });
                 }
             }
@@ -1138,7 +1096,6 @@ async fn handle_connection(
     handle: PrometheusHandle,
     registry: MetricRegistry,
     readiness_fn: Option<ReadinessFn>,
-    started_flag: &std::sync::atomic::AtomicBool,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -1169,33 +1126,13 @@ async fn handle_connection(
         )
     } else if request_line.starts_with("GET /metrics") {
         ("200 OK", "text/plain; charset=utf-8", handle.render())
-    } else if request_line.starts_with("GET /startupz")
-        || request_line.starts_with("GET /health/startup")
-    {
-        if started_flag.load(std::sync::atomic::Ordering::Acquire) {
-            (
-                "200 OK",
-                "application/json",
-                r#"{"status":"started"}"#.to_string(),
-            )
-        } else {
-            (
-                "503 Service Unavailable",
-                "application/json",
-                r#"{"status":"starting"}"#.to_string(),
-            )
-        }
-    } else if request_line.starts_with("GET /healthz")
-        || request_line.starts_with("GET /health/live")
-    {
+    } else if request_line.starts_with("GET /livez") {
         (
             "200 OK",
             "application/json",
             r#"{"status":"alive"}"#.to_string(),
         )
-    } else if request_line.starts_with("GET /readyz")
-        || request_line.starts_with("GET /health/ready")
-    {
+    } else if request_line.starts_with("GET /readyz") {
         let callback_ready = readiness_fn.as_ref().is_none_or(|f| f());
 
         #[cfg(feature = "health")]
@@ -1231,34 +1168,6 @@ async fn handle_connection(
     );
 
     let _ = stream.write_all(response.as_bytes()).await;
-}
-
-/// Startup-probe route, shared by `/startupz` and its `/health/startup` alias
-/// so the two cannot drift apart.
-///
-/// 503 until [`mark_started`](MetricsManager::mark_started) is called, 200
-/// after. Startup is deliberately separate from readiness: a startup probe
-/// carries a long timeout for slow boots, readiness does not.
-#[cfg(all(feature = "metrics", feature = "http-server"))]
-fn startup_route(started: Arc<std::sync::atomic::AtomicBool>) -> axum::routing::MethodRouter {
-    axum::routing::get(move || {
-        let started = started.load(std::sync::atomic::Ordering::Acquire);
-        async move {
-            if started {
-                (
-                    axum::http::StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    r#"{"status":"started"}"#,
-                )
-            } else {
-                (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    r#"{"status":"starting"}"#,
-                )
-            }
-        }
-    })
 }
 
 /// Build the readiness response.

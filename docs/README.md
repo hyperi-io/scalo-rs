@@ -111,7 +111,7 @@ Section landing: [core-pillars/README.md](core-pillars/README.md)
 - [core-pillars/logging.md](core-pillars/logging.md) - tracing setup, JSON/text autodetect, masking, flood control
 - [core-pillars/metrics.md](core-pillars/metrics.md) - Prometheus, manifest, cardinality cap
 - [core-pillars/tracing.md](core-pillars/tracing.md) - OTel, W3C traceparent, transport propagation
-- [core-pillars/health.md](core-pillars/health.md) - `HealthRegistry`, `/healthz` / `/readyz` / `/startupz`
+- [core-pillars/health.md](core-pillars/health.md) - `HealthRegistry`, `/livez` / `/readyz`
 - [core-pillars/shutdown.md](core-pillars/shutdown.md) - `CancellationToken`, K8s pre-stop delay
 
 ### Runtime

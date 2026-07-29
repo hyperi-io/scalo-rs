@@ -438,7 +438,7 @@ mod tests {
             &dockerfile,
             "FROM ubuntu:24.04\n\
              EXPOSE 9090\n\
-             HEALTHCHECK CMD curl -sf http://localhost:9090/healthz\n\
+             HEALTHCHECK CMD curl -sf http://localhost:9090/livez\n\
              CMD [\"--config\", \"/etc/test/config.yaml\"]\n",
         )
         .unwrap();
@@ -459,7 +459,7 @@ mod tests {
             &dockerfile,
             "FROM ubuntu:24.04\n\
              EXPOSE 8080\n\
-             HEALTHCHECK CMD curl -sf http://localhost:8080/healthz\n\
+             HEALTHCHECK CMD curl -sf http://localhost:8080/livez\n\
              CMD [\"--config\", \"/etc/test/config.yaml\"]\n",
         )
         .unwrap();
@@ -498,7 +498,7 @@ mod tests {
         std::fs::create_dir_all(chart_dir.join("templates")).unwrap();
         std::fs::write(
             chart_dir.join("templates/deployment.yaml"),
-            "path: /healthz\npath: /readyz\n\
+            "path: /livez\npath: /readyz\n\
              TEST_APP__KAFKA__PASSWORD\n\
              /etc/test/config.yaml\n",
         )

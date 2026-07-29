@@ -1,6 +1,6 @@
 # Health
 
-Three K8s probes with three distinct semantics, all mounted by the metrics HTTP
+Two K8s probes with two distinct semantics, both mounted by the metrics HTTP
 server. Modules register a health-check callback into a global `HealthRegistry`;
 `/readyz` aggregates every registered check plus an optional caller callback to
 decide 200 vs 503.
@@ -12,16 +12,41 @@ exists only to detect a deadlocked process.
 
 ---
 
-## Probe trinity
+## The two probes
 
 | Endpoint | Semantics | Fails when | K8s action |
 |---|---|---|---|
-| `/healthz`, `/health/live` | Liveness -- process alive | Never (always 200) | Kill + restart pod |
-| `/startupz`, `/health/startup` | Startup -- init complete | Until `mark_started()` | Wait (long timeout), then restart |
-| `/readyz`, `/health/ready` | Readiness -- deps OK + ready flag | Registry unhealthy OR readiness callback false OR ready flag cleared | Remove from Service endpoints (no traffic), don't restart |
+| `/livez` | Liveness -- process alive | Never (always 200) | Kill + restart pod |
+| `/readyz` | Readiness -- deps OK + ready flag | Registry unhealthy OR readiness callback false OR ready flag cleared | Remove from Service endpoints (no traffic), don't restart |
 
-Bodies: `{"status":"alive"}` / `{"status":"started"}` / `{"status":"ready"}` on
-200; `{"status":"not_ready"}` / `{"status":"starting"}` on 503.
+That is the whole surface. There are no aliases and no startup endpoint --
+every retired path returns 404. A `startupProbe` targets `/livez`.
+
+Bodies: `{"status":"alive"}` / `{"status":"ready"}` on 200;
+`{"status":"not_ready"}` on 503.
+
+### Why no aliases
+
+An alias looks like kindness and behaves like a blindfold. While every spelling
+answers 200, nothing can tell you which spelling a given service actually
+intends -- a chart probing a name the app no longer means keeps passing, so a
+half-finished migration is indistinguishable from a finished one.
+
+This is not hypothetical. An earlier version of this library served six
+spellings: `/healthz`, `/readyz`, `/startupz` and `/health/{live,ready,startup}`.
+Across one fleet of six services on that version, the deployment contracts had
+drifted into three different answers for the same question -- some declaring
+`/healthz`, some `/health/live`, one `/livez` -- and every one of them worked,
+because the library answered all of them. The drift was invisible until a
+service that did NOT inherit these routes wired its chart to one spelling and
+its app to another. That probe 404'd, liveness killed the process, and the
+replacement crash-looped for six days before anyone noticed.
+
+Hence the second half of the contract: the canonical paths return 200 and the
+retired paths return **404**, and both directions are asserted in tests. The 404
+is the half that does the work -- it converts a stale probe from a silent
+success into an immediate, obvious failure, and it stops an alias creeping back
+in later.
 
 Readiness aggregates the registry AND the explicit ready flag. The shutdown
 handler clears the flag before draining, so K8s pulls the pod from Service
@@ -101,26 +126,24 @@ if any are degraded but none unhealthy, `unhealthy` if any are unhealthy:
 
 ## K8s manifest
 
-> **Do not point a startupProbe at `/startupz` yet -- see [scalo-rs#8](https://github.com/hyperi-io/scalo-rs/issues/8).**
-> `MetricsManager::mark_started()` is currently called by nothing, so `/startupz`
-> answers 503 `{"status":"starting"}` for the life of the process. A startupProbe
-> aimed at it never passes and the pod is killed on `failureThreshold`, with a
-> perfectly healthy process inside. Until that is fixed, point the startupProbe
-> at `/healthz` -- which is what the generated Helm chart does.
+> **Point the startupProbe at `/livez`.** There is no startup endpoint.
+> Kubernetes suspends liveness until the startup probe passes, so one path
+> gives both a generous boot budget (`failureThreshold`) and a tight liveness
+> period, without the two drifting apart. This is what the generated Helm
+> chart does.
 
 ```yaml
 spec:
   containers:
-    - name: dfe-loader
+    - name: myapp
       ports:
         - { name: metrics, containerPort: 9090 }
       startupProbe:
-        # /startupz once scalo-rs#8 lands; /healthz until then.
-        httpGet: { path: /healthz, port: metrics }
+        httpGet: { path: /livez, port: metrics }
         failureThreshold: 30          # 30 * 2s = 1 min boot budget
         periodSeconds: 2
       livenessProbe:
-        httpGet: { path: /healthz, port: metrics }
+        httpGet: { path: /livez, port: metrics }
         periodSeconds: 10
       readinessProbe:
         httpGet: { path: /readyz, port: metrics }
@@ -130,7 +153,7 @@ spec:
 Use the metrics port -- the metrics server hosts the probes and the scrape on
 the one listener, so no separate health listener is needed. Note this is the
 METRICS server, not `HttpServer`: that one is a separate optional listener and
-does not serve `/metrics` or `/startupz`.
+does not serve `/metrics`.
 
 ---
 
@@ -139,8 +162,8 @@ does not serve `/metrics` or `/startupz`.
 1. Construct `MetricsManager`. Call `mgr.set_readiness_check(|| ...)` for an extra
    callback gate (ANDed with the registry).
 2. Modules `HealthRegistry::register()` at construction.
-3. Call `mgr.mark_started()` once init is complete (DB connected, Kafka
-   subscribed, config loaded) -- `/startupz` flips to 200.
+3. Call `mgr.set_ready()` once init is complete (DB connected, Kafka
+   subscribed, config loaded) -- `/readyz` flips to 200 and traffic arrives.
 4. Start the server via `mgr.start_server` / `mgr.start_server_with_routes`.
 5. On SIGTERM the shutdown handler clears the ready flag, waits the pre-stop
    delay, then cancels the global token. See [shutdown.md](shutdown.md).
@@ -159,7 +182,6 @@ does not serve `/metrics` or `/startupz`.
 | `HealthStatus::{Healthy, Degraded, Unhealthy}` | Three-state enum |
 | `HealthStatus::as_str()` | `"healthy"` / `"degraded"` / `"unhealthy"` |
 | `MetricsManager::set_readiness_check(fn)` | Caller callback gate (ANDed with registry) |
-| `MetricsManager::mark_started()` | Flip `/startupz` to 200 |
 
 ---
 

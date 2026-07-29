@@ -108,7 +108,7 @@ pub struct DeploymentContract {
 
     /// Runtime native dependencies for the container image.
     ///
-    /// Use [`NativeDepsContract::for_rustlib_features`] to auto-populate from
+    /// Use [`NativeDepsContract::for_scalo_features`] to auto-populate from
     /// scalo feature flags. The Dockerfile generator emits the correct
     /// APT repo setup and package installation commands.
     #[serde(default)]
@@ -200,9 +200,14 @@ fn default_schema_version() -> u32 {
 }
 
 /// Health probe endpoint paths.
+///
+/// There is no startup path. A `startupProbe` targets `liveness_path`:
+/// Kubernetes suspends liveness until the startup probe passes, so one path
+/// gives both a generous boot budget and a tight liveness period without the
+/// two drifting apart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthContract {
-    /// Liveness probe path (e.g., "/healthz").
+    /// Liveness probe path (e.g., "/livez").
     pub liveness_path: String,
 
     /// Readiness probe path (e.g., "/readyz").
@@ -316,7 +321,7 @@ impl DeploymentContract {
 impl Default for HealthContract {
     fn default() -> Self {
         Self {
-            liveness_path: "/healthz".to_string(),
+            liveness_path: "/livez".to_string(),
             readiness_path: "/readyz".to_string(),
             metrics_path: "/metrics".to_string(),
         }
@@ -330,7 +335,7 @@ mod tests {
     #[test]
     fn test_health_contract_defaults() {
         let h = HealthContract::default();
-        assert_eq!(h.liveness_path, "/healthz");
+        assert_eq!(h.liveness_path, "/livez");
         assert_eq!(h.readiness_path, "/readyz");
         assert_eq!(h.metrics_path, "/metrics");
     }

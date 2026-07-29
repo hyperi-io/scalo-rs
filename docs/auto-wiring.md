@@ -76,13 +76,13 @@ means a `Transport` impl ships with metrics-emission baked in, and the
 | Memory guard | `MemoryGuard` constructed if `memory` feature on |
 | Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)` |
 | Worker pool | `AdaptiveWorkerPool` constructed if `worker-pool` feature on |
-| Metrics server | Started on `--metrics-addr` (default `0.0.0.0:9090`) if `metrics` feature on, serving `/metrics` `/metrics/manifest` `/healthz` `/readyz` `/startupz` and the `/health/*` aliases |
+| Metrics server | Started on `--metrics-addr` (default `0.0.0.0:9090`) if `metrics` feature on, serving `/metrics` `/metrics/manifest` `/livez` `/readyz` -- and nothing else |
 
 What's **not** auto-wired and still requires an explicit call from the app:
 
 - `HttpServer` — despite the name, `ServiceRuntime` does NOT start it. It is an
   optional extra listener for apps that want one (default `0.0.0.0:8080`), and
-  it does not serve `/metrics` or `/startupz`. The observability port is the
+  it does not serve `/metrics`. The observability port is the
   metrics server above. See [api/http-server.md](api/http-server.md).
 
 - `TieredSink::new(...)` — you choose which transport, which spool, which DLQ

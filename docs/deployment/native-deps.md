@@ -13,14 +13,14 @@ forgot to add `libssl3`" outages.
 
 ## Auto-detection from features
 
-The usual path is `for_rustlib_features()`. Pass the same feature flags
+The usual path is `for_scalo_features()`. Pass the same feature flags
 the app enables on scalo, get back the runtime packages and
 any custom APT repos:
 
 ```rust
 use scalo::deployment::NativeDepsContract;
 
-let deps = NativeDepsContract::for_rustlib_features(
+let deps = NativeDepsContract::for_scalo_features(
     &["transport-kafka", "spool", "tiered-sink", "secrets"],
     "debian:trixie-slim",
 );
@@ -30,7 +30,7 @@ let deps = NativeDepsContract::for_rustlib_features(
 
 Runtime package names are release-specific, so the mapping needs to know
 which distro release the base image is. `for_features()` takes that release
-as a `BaseDistro` directly; `for_rustlib_features()` resolves it, in order:
+as a `BaseDistro` directly; `for_scalo_features()` resolves it, in order:
 
 1. `deployment.base_distro` in the config cascade, if set and recognised.
 2. The env var `DEPLOYMENT__BASE_DISTRO` - the same key's ENV-layer spelling.
@@ -229,7 +229,7 @@ when the dependency is absent -- no panic, no surprise build break.
 `NativeDepsContract::default()` is empty. A contract that doesn't
 populate `native_deps` gives a Dockerfile with only base packages
 (`ca-certificates`, `curl`, `netcat-openbsd`, `iputils-ping`). Apps
-opt in by populating the field, usually via `for_rustlib_features()`.
+opt in by populating the field, usually via `for_scalo_features()`.
 
 A pure-Rust-feature service shouldn't carry unused system libraries.
 Opt-in keeps the image lean.
@@ -273,7 +273,7 @@ drift-detection pattern.
 |------|---------|
 | `NativeDepsContract` | The contract -- `apt_repos`, `apt_packages`, `distro`, `unresolved_base_image` |
 | `NativeDepsContract::for_features(&[..], BaseDistro)` | Build for a stated release, nothing inferred |
-| `NativeDepsContract::for_rustlib_features(&[..], base)` | Build from feature names, resolving the release |
+| `NativeDepsContract::for_scalo_features(&[..], base)` | Build from feature names, resolving the release |
 | `NativeDepsContract::from_cargo_toml(path, base)` | Parse features out of `Cargo.toml` |
 | `NativeDepsContract::is_empty()` | True if no packages to install |
 | `BaseDistro` | The distro release the package names target |

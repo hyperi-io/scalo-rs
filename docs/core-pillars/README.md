@@ -14,7 +14,7 @@ would otherwise write, identically, and get subtly wrong.
 | [logging.md](logging.md) | tracing setup, JSON/text autodetect, field masking, flood control |
 | [metrics.md](metrics.md) | Prometheus exporter, manifest catalogue, cardinality cap |
 | [tracing.md](tracing.md) | OTel, W3C traceparent, transport propagation |
-| [health.md](health.md) | `HealthRegistry`, `/healthz` / `/readyz` / `/startupz` |
+| [health.md](health.md) | `HealthRegistry`, `/livez` / `/readyz` |
 | [shutdown.md](shutdown.md) | `CancellationToken`, K8s pre-stop delay, drain ordering |
 
 Start with [../auto-wiring.md](../auto-wiring.md) if you want to know what is

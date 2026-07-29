@@ -79,7 +79,7 @@ wraps a transport sender. Solid arrows show layer dependencies.
 | `logger` | `logger` (default) | `tracing-subscriber` with JSON/text autodetect, RFC 3339 timestamps, sensitive-field masking, flood-control helpers |
 | `metrics` | `metrics-core`, `metrics-process`, `metrics` | Lock-free counters/gauges/histograms, Prometheus exporter, `/metrics` + `/metrics/manifest` |
 | `otel_metrics` / `otel_tracing` | `otel`, `otel-metrics`, `otel-tracing` | OTLP exporter, OTel SDK bridge for `tracing` spans |
-| `health` | `health` | `HealthRegistry`, probe trinity (`/healthz` / `/readyz` / `/startupz`) |
+| `health` | `health` | `HealthRegistry`, health probes (`/livez` / `/readyz`) |
 | `shutdown` | `shutdown` | `CancellationToken`, SIGTERM/SIGINT, K8s pre-stop delay |
 
 Pillars are singletons. Modules in higher layers call into them via macros

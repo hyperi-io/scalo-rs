@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting metrics server on {metrics_addr}");
     println!("Endpoints:");
     println!("  - http://{metrics_addr}/metrics");
-    println!("  - http://{metrics_addr}/healthz");
+    println!("  - http://{metrics_addr}/livez");
     println!("  - http://{metrics_addr}/readyz");
     println!();
 

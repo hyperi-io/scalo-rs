@@ -19,7 +19,7 @@ data-plane services. Config, logging and metrics come as one pre-wired
 trinity -- global singletons you just use, no plumbing, no init dance.
 Everything else leans on that same integration: the config cascade flows
 straight into the CLI so `run`/`version`/`config-check` just work; the metrics
-and health wiring feed the K8s probe trinity; and the deployment contract
+and health wiring feed the K8s probes; and the deployment contract
 generates your Helm, Dockerfile and Argo manifests from the config the app
 already declares.
 
@@ -34,8 +34,8 @@ where every microsecond and byte counts (`cargo add scalo`). **scalo-py** is
 the **control plane** -- orchestration, APIs and integration in Python
 (`pip install scalo`).
 
-Opinionated about correctness -- backpressure, memory safety and the probe
-trinity are on by default. Unopinionated about your domain -- no web framework,
+Opinionated about correctness -- backpressure, memory safety and the health
+probes are on by default. Unopinionated about your domain -- no web framework,
 no ORM, no enforced transport. Built as the foundation for PB/hr data services.
 
 This module exists because of this --
@@ -82,7 +82,7 @@ Pick the slice you need; pay only for what you use.
 | `otel-metrics` | OpenTelemetry metrics export (OTLP) |
 | `otel-tracing` | OpenTelemetry distributed tracing |
 | `http` | HTTP client with retry middleware (reqwest) |
-| `http-server` | Axum HTTP server with health probes (`/healthz`, `/readyz`, plus the `/health/live` and `/health/ready` aliases) |
+| `http-server` | Axum HTTP server with health probes (`/livez` and `/readyz`) |
 | `transport-kafka` | Kafka transport (rdkafka, dynamic-linking) |
 | `transport-grpc` | gRPC transport (tonic/prost) |
 | `transport-memory` | In-memory transport (testing/dev) |
@@ -189,7 +189,7 @@ USER appuser
 EXPOSE 9090
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -sf http://localhost:9090/healthz > /dev/null || exit 1
+    CMD curl -sf http://localhost:9090/livez > /dev/null || exit 1
 
 ENTRYPOINT ["myapp"]
 ```
@@ -213,13 +213,14 @@ column is the one to read before pointing a probe or a scrape at a port:
 
 | Path | Serves | Served by | Checks | On failure |
 |---|---|---|---|---|
-| `/healthz` | liveness | metrics server + `http-server` | Process not deadlocked | Restart pod |
+| `/livez` | liveness | metrics server + `http-server` | Process not deadlocked | Restart pod |
 | `/readyz` | readiness | metrics server + `http-server` | Deps healthy + ready flag set | Stop routing traffic |
-| `/startupz` | startup | metrics server ONLY | App has called `mark_started()` | Keep waiting |
 | `/metrics` | Prometheus scrape | metrics server ONLY | - | - |
 
-`/health/live` and `/health/ready` stay as aliases for consumer probes written
-before the rename, on both routers.
+Those are the whole surface -- there are no aliases, and every retired path
+returns 404. A second path meaning the same thing eventually stops meaning the
+same thing, and an alias that keeps answering 200 hides a probe still aimed at
+the old name.
 
 The deployment contract's `metrics_path` defaults to `/metrics`, and the
 generated Helm chart puts the Prometheus scrape annotations on the contract's
@@ -227,11 +228,10 @@ generated Helm chart puts the Prometheus scrape annotations on the contract's
 on that port -- an app that stands up only the `http-server` router there will
 serve the two health paths and 404 the scrape.
 
-`/startupz` exists for the K8s `startupProbe`: 503 `{"status":"starting"}` until
-the app calls `MetricsManager::mark_started()`, 200 `{"status":"started"}` after.
-It is deliberately separate from readiness - a startup probe gets a long timeout
-for slow starters, readiness does not. Point a `startupProbe` at `/startupz` on
-the metrics server, or at `/healthz` if you only have the `http-server` router.
+There is no startup path. Point a K8s `startupProbe` at `/livez`: Kubernetes
+suspends liveness until the startup probe passes, so one path gives both a
+generous boot budget (`failureThreshold`) and a tight liveness period, without
+the two drifting apart.
 
 Liveness MUST NEVER check downstream dependencies (a DB outage shouldn't
 restart your replicas). Readiness checks dependencies AND requires an
