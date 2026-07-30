@@ -8,12 +8,25 @@
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 #
 # Usage:
-#   ./scripts/fetch-vector.sh              # ensure latest, print binary path
-#   VECTOR_VERSION=0.43.0 ./scripts/fetch-vector.sh  # pin specific version
+#   ./scripts/fetch-vector.sh              # ensure the pinned version, print path
+#   VECTOR_VERSION=0.43.0 ./scripts/fetch-vector.sh  # override the pin
 #
-# Downloads the latest Vector release only if the cached binary is missing or
-# out of date. Prints the absolute path to the vector binary on stdout (last line).
-# Status messages go to stderr.
+# Prints the absolute path to the vector binary on stdout (last line). Status
+# messages go to stderr.
+#
+# SAFE TO RUN CONCURRENTLY. Every test in tests/e2e/vector_compat.rs calls this:
+# the OnceLock that caches the result is per-PROCESS and nextest runs one process
+# per test, so N tests invoke it at once. Two things make that safe:
+#
+#   - The cache directory is keyed by version, so no run ever deletes a binary
+#     another run is about to exec. The previous "rm -rf bin, then rebuild it in
+#     place" produced `ETXTBSY` ("Text file busy") when one test exec'd the
+#     binary while another still held it open for writing.
+#   - Download and extraction happen in a private temp directory, promoted with
+#     one rename. A reader therefore sees either no directory or a complete one,
+#     never a half-extracted binary. A mkdir lock keeps concurrent runs from
+#     downloading the same tarball N times; losing the lock race means waiting
+#     for the winner, not failing.
 
 set -euo pipefail
 
@@ -21,75 +34,78 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CACHE_DIR="${REPO_ROOT}/.tmp/vector"
 ARCH="$(uname -m)"
 
-# Check what we have cached (read version from binary)
-cached_version() {
-    local bin="${CACHE_DIR}/bin/vector"
-    if [[ -x "$bin" ]]; then
-        "$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
-    fi
-}
+# Pinned. A floating "latest" made the harness retarget on every upstream
+# release, so a break landed with nothing in the diff to explain it -- and it
+# needed network plus gh/jq on every single test run. Bump deliberately; Vector
+# minor releases change CLI flags and config schema.
+# renovate: datasource=github-releases depName=vectordotdev/vector
+DEFAULT_VECTOR_VERSION="0.56.0"
 
-# Resolve the desired version
-if [[ -n "${VECTOR_VERSION:-}" ]]; then
-    WANT_VERSION="$VECTOR_VERSION"
-else
-    if command -v gh &>/dev/null; then
-        WANT_VERSION=$(gh release list --repo vectordotdev/vector --limit 30 --json tagName \
-            --jq '[.[] | select(.tagName | test("^v[0-9]"))][0].tagName' | sed 's/^v//')
-    elif command -v jq &>/dev/null; then
-        WANT_VERSION=$(curl -fsSL "https://api.github.com/repos/vectordotdev/vector/releases?per_page=30" \
-            | jq -r '[.[] | select(.tag_name | test("^v[0-9]"))][0].tag_name' | sed 's/^v//')
-    else
-        echo "ERROR: need either 'gh' or 'jq' to resolve latest version" >&2
-        exit 1
-    fi
-fi
+WANT_VERSION="${VECTOR_VERSION:-$DEFAULT_VECTOR_VERSION}"
 
-if [[ -z "$WANT_VERSION" || "$WANT_VERSION" == "null" ]]; then
-    echo "ERROR: could not resolve Vector version" >&2
-    exit 1
-fi
+# Version-keyed, so a fetch for one version cannot disturb another.
+VERSION_DIR="${CACHE_DIR}/${WANT_VERSION}-${ARCH}"
+BINARY="${VERSION_DIR}/vector"
+LOCK_DIR="${CACHE_DIR}/.lock-${WANT_VERSION}-${ARCH}"
 
-BINARY="${CACHE_DIR}/bin/vector"
-HAVE_VERSION=$(cached_version || true)
-
-# If cached binary matches desired version, use it
-if [[ "$HAVE_VERSION" == "$WANT_VERSION" ]]; then
+if [[ -x "$BINARY" ]]; then
     echo "Vector ${WANT_VERSION} already cached" >&2
     echo "$BINARY"
     exit 0
 fi
 
-if [[ -n "$HAVE_VERSION" ]]; then
-    echo "Updating Vector ${HAVE_VERSION} -> ${WANT_VERSION}" >&2
-else
-    echo "Downloading Vector ${WANT_VERSION} for ${ARCH}..." >&2
+mkdir -p "${CACHE_DIR}"
+
+# mkdir is atomic on POSIX: exactly one concurrent run creates the lock and
+# downloads; the rest wait for the binary to appear.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "Another run is fetching Vector ${WANT_VERSION}; waiting..." >&2
+    for _ in $(seq 1 300); do
+        if [[ -x "$BINARY" ]]; then
+            echo "$BINARY"
+            exit 0
+        fi
+        sleep 1
+    done
+    echo "ERROR: timed out waiting for another run to cache Vector ${WANT_VERSION}" >&2
+    echo "If no fetch is running, remove the stale lock: ${LOCK_DIR}" >&2
+    exit 1
 fi
 
-# Clean old cache
-rm -rf "${CACHE_DIR:?}/bin"
+# Release the lock however we leave, so a failed download does not wedge every
+# later run behind a lock nobody holds.
+cleanup() {
+    rm -rf "$LOCK_DIR" "${WORK_DIR:-}"
+}
+trap cleanup EXIT
 
-# Download
-mkdir -p "${CACHE_DIR}"
+WORK_DIR="$(mktemp -d "${CACHE_DIR}/.fetch-XXXXXX")"
+
+echo "Downloading Vector ${WANT_VERSION} for ${ARCH}..." >&2
 TARBALL_NAME="vector-${WANT_VERSION}-${ARCH}-unknown-linux-gnu.tar.gz"
 DOWNLOAD_URL="https://github.com/vectordotdev/vector/releases/download/v${WANT_VERSION}/${TARBALL_NAME}"
 
-curl -fSL --progress-bar -o "${CACHE_DIR}/${TARBALL_NAME}" "$DOWNLOAD_URL"
+curl -fSL --progress-bar -o "${WORK_DIR}/${TARBALL_NAME}" "$DOWNLOAD_URL"
 
-# Extract — tarball contains vector-{ARCH}-unknown-linux-gnu/bin/vector
 echo "Extracting..." >&2
-tar xzf "${CACHE_DIR}/${TARBALL_NAME}" -C "${CACHE_DIR}"
+tar xzf "${WORK_DIR}/${TARBALL_NAME}" -C "${WORK_DIR}"
 
-EXTRACTED_DIR="${CACHE_DIR}/vector-${ARCH}-unknown-linux-gnu"
-if [[ -d "$EXTRACTED_DIR" ]]; then
-    mv "${EXTRACTED_DIR}/bin" "${CACHE_DIR}/bin"
-    rm -rf "$EXTRACTED_DIR"
+# The tarball contains vector-{ARCH}-unknown-linux-gnu/bin/vector.
+EXTRACTED_BIN="${WORK_DIR}/vector-${ARCH}-unknown-linux-gnu/bin"
+if [[ ! -x "${EXTRACTED_BIN}/vector" ]]; then
+    echo "ERROR: no vector binary in ${TARBALL_NAME} at the expected path" >&2
+    exit 1
 fi
 
-# Cleanup tarball
-rm -f "${CACHE_DIR}/${TARBALL_NAME}"
+# One rename publishes the whole directory. `mv` into an existing target would
+# nest it, so check first -- the target existing means a concurrent run beat us,
+# which is a success, not a conflict.
+if [[ -x "$BINARY" ]]; then
+    echo "Vector ${WANT_VERSION} cached by a concurrent run" >&2
+else
+    mv "$EXTRACTED_BIN" "$VERSION_DIR"
+fi
 
-# Verify
 if [[ ! -x "$BINARY" ]]; then
     echo "ERROR: Vector binary not found at ${BINARY} after extraction" >&2
     exit 1
