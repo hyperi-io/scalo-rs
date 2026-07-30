@@ -1,18 +1,22 @@
-# IDE
+# IDE / editor local state
 .idea/
 .vscode/
+.cursorrules
 *.swp
 *.swo
 *~
 
-# OS
+# OS junk (never useful in repo)
 .DS_Store
 Thumbs.db
 
-# Environment
+# Local environment files (never commit -- contain secrets)
 .env
+.env.*
 .env.local
 .env.*.local
+!.env.example
+!.env.example.*
 
 # Build
 *.log
@@ -23,64 +27,9 @@ out/
 test-results/
 coverage/
 
-# Temporary/cache
-.tmp/
-
-# Rust
-target/
-Cargo.lock
-**/*.rs.bk
-*.pdb
-*.profraw
-*.profdata
-coverage-html/
-coverage.lcov
-.cargo/
-!.cargo/config.toml
-!.cargo/audit.toml
-
-# AI agent working files (not committed)
-docs/superpowers/
-.claude/
-CLAUDE.md
-STATE.md
-
-# Git worktrees
-.worktrees/
-
-# Local working files (not committed)
-.mcp.json
-TODO.md
-.ai-version
-
-# OS junk (never useful in repo)
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-*~
-
-# Editor / IDE local state
-.idea/
-.vscode/
-
-# Local environment files (never commit -- contain secrets)
-.env
-.env.*
-!.env.example
-!.env.example.*
-
-# here.
-docs/superpowers/
-.mcp.json
-TODO.md
-.ai-version
-
-# Git worktrees (local dev convenience)
-.worktrees/
-
 # Rust build artefacts
 target/
+Cargo.lock
 **/*.rs.bk
 *.pdb
 *.profraw
@@ -93,25 +42,31 @@ cobertura.xml
 # cargo
 .cargo/
 !.cargo/config.toml
+!.cargo/audit.toml
 
-# them alone if already present.
+# Git worktrees (local dev convenience)
+.worktrees/
+
+# AI agent working files -- local-only, never committed. Mirrored in
+# .git/info/exclude, because a tracked .gitignore alone does not protect a
+# clone that has not pulled it yet.
 docs/superpowers/
-.mcp.json
-.ai-version
-
-# committed -- mirrored in .git/info/exclude.
+.hyperi-ai
 CLAUDE.md
+STATE.md
 TODO.md
 AGENTS.md
 GEMINI.md
+.ai-version
+.mcp.json
 .claude/
 .codex/
 .cursor/
 .gemini/
-.cursorrules
 
 # Local scratch / tmp (CORE.md: scratch goes here, gitignored, NOT
 # /tmp). Bare patterns (no leading slash) match a tmp dir at ANY
 # depth, so these cover top-level .tmp/ and tmp/ as well as nested
 # ones like tests/tmp/. Mirrored in attach.py _DEFAULT_EXCLUDES.
+.tmp/
 tmp/
