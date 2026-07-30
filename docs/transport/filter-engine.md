@@ -318,5 +318,3 @@ Tier-1 latency confirmed at ~50-100 ns/message on the bench machine.
 - [pipeline/dlq.md](../pipeline/dlq.md) — DLQ sink backends
 - [core-pillars/config.md](../core-pillars/config.md) — cascade
 - [feature-flags.md](../feature-flags.md) — `transport`, `expression`
-- Spec history:
-  [docs/superpowers/specs/2026-04-10-transport-filter-engine-design.md](../superpowers/specs/2026-04-10-transport-filter-engine-design.md)

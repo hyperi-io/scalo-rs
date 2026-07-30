@@ -124,7 +124,7 @@ impl KafkaDlqInner {
     /// broker (per the producer's `acks` config). `send_batch` is
     /// sync-shaped -- without this flush the orchestrator barrier would
     /// ack `Dlq::flush()` callers while entries are merely queued, not
-    /// durable (scalo pre-GA C06).
+    /// durable.
     ///
     /// # Errors
     ///

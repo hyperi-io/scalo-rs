@@ -441,7 +441,7 @@ fn split_field_path(field: &str) -> Vec<String> {
 /// can also occur inside a string VALUE (e.g. `{"d":"my \"key\": stuff"}`).
 /// Walking once and tracking string-state + depth rejects those false hits.
 ///
-/// Strict CEL semantics (F13): `has(_table)` on `{"data":{"_table":"events"}}`
+/// Strict CEL semantics: `has(_table)` on `{"data":{"_table":"events"}}`
 /// must NOT match -- `_table` is at depth 2, not the implicit root. Matching
 /// anywhere outside string values broke this for routed messages where the
 /// same field name commonly appears nested in user data.
