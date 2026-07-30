@@ -182,9 +182,7 @@ pub fn check_profile_with_config(expr: &str, config: &ProfileConfig) -> Vec<Stri
                 errors.push(format!(
                     "Function '{name}()' is not allowed in the expression profile. {reason}"
                 ));
-            } else if !ALLOWED_FUNCTIONS.contains(&name)
-                && !DISALLOWED_FUNCTIONS.contains(&name)
-            {
+            } else if !ALLOWED_FUNCTIONS.contains(&name) && !DISALLOWED_FUNCTIONS.contains(&name) {
                 // In neither list. A restricted-but-unlocked function IS in
                 // DISALLOWED_FUNCTIONS, so it falls through here and passes.
                 errors.push(format!(
