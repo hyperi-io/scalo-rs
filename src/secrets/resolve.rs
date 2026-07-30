@@ -80,10 +80,46 @@ fn resolve_env(var_name: &str) -> Result<String, CredentialError> {
     })
 }
 
+/// The `SecretsConfig` a one-off `vault:` lookup runs against, with an OpenBao
+/// connection resolved from the `secrets` config section or the environment.
+///
+/// Resolving it is the whole point. `SecretsConfig::default()` leaves `openbao`
+/// as `None`, `SecretsManager::new` then builds no vault provider, and every
+/// lookup is refused with `provider not configured: openbao` before an address
+/// or token is read -- so `VAULT_ADDR` could not influence it and no `vault:`
+/// spec ever resolved.
+#[cfg(all(feature = "secrets-vault", feature = "config"))]
+fn secrets_config_for_lookup() -> Result<super::SecretsConfig, CredentialError> {
+    let mut config = super::SecretsConfig::from_cascade();
+    if config.openbao.is_none() {
+        config.openbao = super::OpenBaoConfig::from_env();
+    }
+    if config.openbao.is_none() {
+        return Err(CredentialError::Vault(
+            "no OpenBao connection configured. Set VAULT_ADDR plus one of \
+             VAULT_TOKEN, VAULT_ROLE_ID + VAULT_SECRET_ID or VAULT_K8S_ROLE \
+             (OPENBAO_* and BAO_* are accepted as legacy fallbacks), or declare \
+             a `secrets.openbao` section in the config"
+                .to_string(),
+        ));
+    }
+    Ok(config)
+}
+
+/// Without the `config` feature there is nothing to read the OpenBao address
+/// from, so say that rather than failing later as an unconfigured provider.
+#[cfg(all(feature = "secrets-vault", not(feature = "config")))]
+fn secrets_config_for_lookup() -> Result<super::SecretsConfig, CredentialError> {
+    Err(CredentialError::Vault(
+        "vault: specs need the `config` feature enabled to read the OpenBao \
+         connection from the environment or the config cascade"
+            .to_string(),
+    ))
+}
+
 #[cfg(feature = "secrets-vault")]
 async fn resolve_vault(path_key: &str) -> Result<String, CredentialError> {
-    use super::{SecretSource, SecretsConfig, SecretsManager};
-    use std::collections::HashMap;
+    use super::{SecretSource, SecretsManager};
 
     let parts: Vec<&str> = path_key.splitn(2, ':').collect();
     if parts.len() != 2 {
@@ -94,18 +130,14 @@ async fn resolve_vault(path_key: &str) -> Result<String, CredentialError> {
     let path = parts[0];
     let key = parts[1];
 
-    let mut sources = HashMap::new();
-    sources.insert(
+    let mut config = secrets_config_for_lookup()?;
+    config.sources.insert(
         "_vault_lookup".to_string(),
         SecretSource::OpenBao {
             path: path.to_string(),
             key: key.to_string(),
         },
     );
-    let config = SecretsConfig {
-        sources,
-        ..Default::default()
-    };
 
     let secrets = SecretsManager::new(config).map_err(|e| {
         CredentialError::Vault(format!("failed to initialise secrets manager: {e}"))
@@ -172,5 +204,58 @@ mod tests {
     async fn vault_without_feature_returns_clear_error() {
         let err = resolve("vault:secret/x:k").await.unwrap_err();
         assert!(matches!(err, CredentialError::VaultUnsupported));
+    }
+
+    /// A `vault:` spec with no address configured must say which variables to
+    /// set. It used to report `provider not configured: openbao`, which reads
+    /// as a scalo build problem rather than "you have not told me where OpenBao
+    /// is", and no amount of `VAULT_ADDR` changed it.
+    #[tokio::test]
+    #[cfg(all(feature = "secrets-vault", feature = "config"))]
+    async fn vault_without_an_address_names_the_variables_to_set() {
+        let err = temp_env::async_with_vars(
+            [
+                ("VAULT_ADDR", None::<&str>),
+                ("OPENBAO_ADDR", None),
+                ("BAO_ADDR", None),
+            ],
+            async { resolve("vault:secret/x:k").await.unwrap_err().to_string() },
+        )
+        .await;
+
+        assert!(
+            !err.contains("provider not configured"),
+            "the unconfigured-provider dead end is back: {err}"
+        );
+        assert!(
+            err.contains("VAULT_ADDR"),
+            "the error must name VAULT_ADDR: {err}"
+        );
+    }
+
+    /// With an address set, the lookup must reach the network -- the point being
+    /// that provider construction happened at all. A refused connection to a
+    /// closed port is the expected outcome.
+    #[tokio::test]
+    #[cfg(all(feature = "secrets-vault", feature = "config"))]
+    async fn vault_with_an_address_attempts_the_lookup() {
+        let err = temp_env::async_with_vars(
+            [
+                // Port 1 on loopback: reserved, never listening.
+                ("VAULT_ADDR", Some("http://127.0.0.1:1")),
+                ("VAULT_TOKEN", Some("not-a-real-token")),
+            ],
+            async { resolve("vault:secret/x:k").await.unwrap_err().to_string() },
+        )
+        .await;
+
+        assert!(
+            !err.contains("provider not configured"),
+            "an address was configured, so the provider must have been built: {err}"
+        );
+        assert!(
+            err.contains("lookup failed"),
+            "expected a failed lookup against the unreachable address: {err}"
+        );
     }
 }
