@@ -11,9 +11,6 @@
 //! ArgoCD project with restricted `sourceRepos`, `destinations`, and
 //! `roles`. Consumer Applications reference the project via their
 //! `spec.project` field.
-//!
-//! See the spec section 3.5 in
-//! `docs/superpowers/specs/2026-05-15-argocd-enterprise-enhancements-spec.md`.
 
 use std::fmt::Write as _;
 
