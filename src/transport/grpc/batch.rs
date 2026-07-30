@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! # Native batch transport wire mapper (Task 0.6)
+//! # Native batch transport wire mapper
 //!
 //! Serde-less scalo<->scalo transfer of a whole
 //! [`WorkBatch`](crate::transport::WorkBatch) over the existing gRPC mesh. One

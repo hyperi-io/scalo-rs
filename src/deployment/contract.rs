@@ -102,7 +102,6 @@ pub struct DeploymentContract {
     pub keda: Option<KedaContract>,
 
     /// Base container image for the runtime stage.
-    // I don't like doing it this way but it's the best compromise option
     #[serde(default = "default_base_image")]
     pub base_image: String,
 

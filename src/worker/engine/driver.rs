@@ -10,7 +10,7 @@
 //!
 //! The single run loop that the four legacy loops (`run` / `run_raw` /
 //! `run_async` / `run_raw_async`) collapsed into when the spine flipped to
-//! `WorkBatch` (Task 0.7b). It drives the canonical currency -- [`WorkBatch`] --
+//! `WorkBatch`. It drives the canonical currency -- [`WorkBatch`] --
 //! through one block at a time:
 //!
 //! ```text
@@ -621,7 +621,7 @@ impl BatchEngine {
     /// `dlq_entries` stripped) ready for the process stage. Returns `None` when
     /// the block has no records (caller should `continue`).
     ///
-    /// `recv` now yields a [`WorkBatch`] directly (Task 0.7b), so there is no
+    /// `recv` yields a [`WorkBatch`] directly, so there is no
     /// `RecvBatch` round-trip: the inbound-filter DLQ entries arrive on
     /// [`WorkBatch::dlq_entries`] and are routed here via
     /// [`apply_workbatch_dlq_policy`](BatchEngine::apply_workbatch_dlq_policy)

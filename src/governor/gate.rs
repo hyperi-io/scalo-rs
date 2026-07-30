@@ -216,7 +216,7 @@ mod tests {
     use crate::governor::source::{Hysteresis, Pressure, PressureSource};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
 
-    /// Scriptable pressure source (mirrors the G1 test double): stores the
+    /// Scriptable pressure source: stores the
     /// reading as a bit-pattern `u64` so it stays `Sync` without `unsafe`
     /// or a lock.
     struct MockSource {

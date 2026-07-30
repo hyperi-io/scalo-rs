@@ -34,13 +34,13 @@
 //! [`dedup_key`](super::Record::dedup_key) lets the sink remove the replay
 //! duplicates that at-least-once redelivery can produce.
 
-// NOTE: a loom (concurrency model-checker) pass over these atomics was attempted
-// and is blocked by the dependency graph -- `--cfg loom` is global, and tokio
-// gates `net` out under loom, breaking net-using dev-deps (bollard/hyper-util
-// via testcontainers) that `cargo test` always compiles. Running loom here would
-// need a separate minimal-dep test crate. The exactly-once + worst-status
-// concurrency is meanwhile covered by the proptest and the multi-thread
-// `concurrent_pieces_fire_ack_exactly_once` test below.
+// NOTE: loom (concurrency model-checker) cannot cover these atomics from this
+// crate -- `--cfg loom` is global, and tokio gates `net` out under loom,
+// breaking net-using dev-deps (bollard/hyper-util via testcontainers) that
+// `cargo test` always compiles. Loom here needs a separate minimal-dep test
+// crate. The exactly-once + worst-status concurrency is instead covered by the
+// proptest and the multi-thread `concurrent_pieces_fire_ack_exactly_once` test
+// below.
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};

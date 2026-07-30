@@ -32,7 +32,7 @@ answers 200, nothing can tell you which spelling a given service actually
 intends -- a chart probing a name the app no longer means keeps passing, so a
 half-finished migration is indistinguishable from a finished one.
 
-This is not hypothetical. An earlier version of this library served six
+An earlier version of this library served six
 spellings: `/healthz`, `/readyz`, `/startupz` and `/health/{live,ready,startup}`.
 Across one fleet of six services on that version, the deployment contracts had
 drifted into three different answers for the same question -- some declaring

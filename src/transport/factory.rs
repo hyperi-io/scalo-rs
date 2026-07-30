@@ -1146,7 +1146,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Governor-aware factory tests (Remediation Phase 6).
+// Governor-aware factory tests.
 //
 // Prove `*_with_governor` actually threads the governor's inbound brake into
 // the backends that own one, and that the non-governor path is unchanged.

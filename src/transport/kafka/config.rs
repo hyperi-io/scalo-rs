@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 // ============================================================================
-// Self-Regulation Profile (Task 0.5: Kafka sizing surface)
+// Self-Regulation Profile (Kafka sizing surface)
 // ============================================================================
 
 /// Opinionated sizing profile for the Kafka GET/SEND surface.
@@ -1721,7 +1721,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Task 0.5: SelfRegulationProfile + KafkaSizingConfig tests
+    // SelfRegulationProfile + KafkaSizingConfig tests
     // =========================================================================
 
     /// Helper: build a KafkaSizingConfig with the given profile and no

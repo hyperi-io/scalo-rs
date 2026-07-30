@@ -176,9 +176,6 @@ Section landing: [api/README.md](api/README.md)
 
 - [migrations.md](migrations.md) - API surface changes by scalo version; consumer-rebuild playbook
 
-Design specs and execution plans for in-flight work live in `docs/superpowers/`,
-which is working state and is not committed.
-
 ---
 
 ## Project facts

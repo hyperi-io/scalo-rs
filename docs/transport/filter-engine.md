@@ -7,10 +7,6 @@ backend, zero-cost when no rules are configured, and tiered so the
 common case (field-presence or equality on a top-level field) runs at
 ~50-100 ns per message without invoking the CEL engine at all.
 
-This is the doc consumers were missing — earlier work tracked
-post-spec follow-ups in `TRANSPORT-FILTER-FOLLOWUP.md`; the engine
-itself is now production-shipped.
-
 ---
 
 ## Why the engine exists
@@ -291,7 +287,7 @@ The post-spec follow-up items from earlier work, with current status:
 | 9 | Pre-quoted bytes fast path for `field == "value"` | Partial | `FieldExists` / `FieldNotExists` already use pre-compiled `memmem::Finder`; `FieldEquals` still uses SIMD extract + string compare |
 | 10 | MsgPack payloads silently pass | Acknowledged | Design choice; cheap fix would be a one-shot warn + metric on first MsgPack seen |
 | 11 | Preserve original `expression_text` through reload cycles | Pending | Current code re-allocates on reload; allocator-hygiene item, no functional impact |
-| 12 | Tier 3 CEL has no evaluation budget | Open — design spec'd | `program.execute(&ctx)` runs with no time/recursion/payload cap. A bad filter can wedge the ingest thread. Static AST budget + payload size cap + degraded-mode fallback design spec'd in the project working area; must land before Phase 3 of the log-scrub landing plan (gitleaks rules are regex-heavy by nature) |
+| 12 | Tier 3 CEL has no evaluation budget | Open | `program.execute(&ctx)` runs with no time/recursion/payload cap. A bad filter can wedge the ingest thread. Needs a static AST budget + payload size cap + degraded-mode fallback, and must land before log-scrub ships (gitleaks rules are regex-heavy by nature) |
 
 The items aren't blockers. Operators should know about #10 if their
 pipeline mixes JSON and MsgPack.
@@ -318,5 +314,3 @@ Tier-1 latency confirmed at ~50-100 ns/message on the bench machine.
 - [pipeline/dlq.md](../pipeline/dlq.md) — DLQ sink backends
 - [core-pillars/config.md](../core-pillars/config.md) — cascade
 - [feature-flags.md](../feature-flags.md) — `transport`, `expression`
-- Spec history:
-  [docs/superpowers/specs/2026-04-10-transport-filter-engine-design.md](../superpowers/specs/2026-04-10-transport-filter-engine-design.md)

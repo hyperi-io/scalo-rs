@@ -29,7 +29,7 @@
 //!
 //! # Rollout phase
 //!
-//! Phase 1 (this commit): generators accept `Option<&ContractIdentity>` --
+//! Phase 1 (today): generators accept `Option<&ContractIdentity>` --
 //! `Some` emits the annotations, `None` is silent (backwards-compat for
 //! consumers not yet migrated). Phase 2 makes it required once all
 //! consumer services pass identity. Phase 3 drops the `Option` wrapper.

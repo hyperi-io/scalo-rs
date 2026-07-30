@@ -86,7 +86,7 @@ fn literal_tier_ends_with_multi_byte() {
     assert!(!m.is_match(b"server.log.gz"));
 }
 
-/// Regression for pre-GA review C02: `ShapeOp::EndsWith` previously used
+/// Regression: `ShapeOp::EndsWith` previously used
 /// `hay.ends_with(lit).then_some(Match { start: hay.len() - lit.len(), .. })`
 /// which eagerly evaluates the subtraction. When the haystack is shorter
 /// than the literal, `ends_with` returns false but the subtraction underflows
@@ -146,10 +146,10 @@ fn literal_set_tier_alternation_anchored() {
     assert!(!m.is_match(b"123foo"));
 }
 
-/// Regression for pre-GA review C01: `match_set_is` / `match_set_find`
-/// for `AtEnd` and `Exact` anchors used `ac.find()` which returns the
-/// LEFTMOST AC match. If that leftmost match doesn't satisfy the anchor
-/// but a later match does, the old code returned a false negative.
+/// Regression: `match_set_is` / `match_set_find` for `AtEnd` and `Exact`
+/// anchors used `ac.find()`, which returns the LEFTMOST AC match. If that
+/// leftmost match doesn't satisfy the anchor but a later match does, a
+/// leftmost-only search reports a false negative.
 ///
 /// AtEnd requires walking find_iter to discover any match whose end ==
 /// hay.len(); Exact requires walking to find a match with both
@@ -160,8 +160,8 @@ fn literal_set_at_end_finds_later_match() {
     let m = StrMatcher::new(r"(?:foo|bar|baz)$").unwrap();
     assert_eq!(m.tier(), MatcherTier::LiteralSet);
     // Haystack contains a leftmost `foo` at position 0 (not at end)
-    // AND a `bar` at the end. Old code returned false because it only
-    // looked at the leftmost hit. New code walks find_iter.
+    // AND a `bar` at the end. A leftmost-only search reports no match here;
+    // walking find_iter finds the anchored one.
     assert!(m.is_match(b"foo_bar"));
     // Two unanchored hits at the start, none at end -> no match
     assert!(!m.is_match(b"foo_bar_baz_x"));

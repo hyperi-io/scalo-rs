@@ -254,7 +254,7 @@ https://flink.apache.org/2021/07/07/how-to-identify-the-source-of-backpressure/
   it *matches sink concurrency to downstream service capacity* so the
   drain runs as fast as the downstream can take it. scalo has nothing
   equivalent at the sink - it assumes the sink is the broker/storage and
-  gates intake. A scalo gap worth noting: **no adaptive sink concurrency
+  gates intake. A scalo gap: **no adaptive sink concurrency
   controller** for slow HTTP/gRPC downstreams. ARC is the one piece of
   Vector's self-regulation scalo could learn from.
 - scalo's edge over Vector: a hard cgroup memory guard + inbound gate
