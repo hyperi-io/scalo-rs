@@ -14,6 +14,13 @@
 //! unlocked per-category via [`ProfileConfig`].
 
 /// CEL functions allowed unconditionally in the profile.
+///
+/// Enforced as an ALLOWLIST: a function in neither this slice nor a restricted
+/// category is rejected. Listing a function here is what permits it, so anything
+/// the profile should accept has to appear -- the cost of an omission is a valid
+/// expression refused. Kept in step with scalo-py's
+/// `expression/profile.py::ALLOWED_FUNCTIONS`, except `matches`, which is
+/// restricted here and unlocked via [`ProfileConfig::allow_regex`].
 pub const ALLOWED_FUNCTIONS: &[&str] = &[
     // String operations (SIMD-friendly, bounded cost)
     "contains",
@@ -29,6 +36,24 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "double",
     "string",
     "bool",
+    "bytes",
+    // Type introspection. Constant-time, and `dyn()` only relaxes static
+    // type-checking; neither iterates.
+    "type",
+    "dyn",
+    // Timestamp and duration accessors: cheap field reads on a value that is
+    // already a timestamp. `timestamp()` and `duration()` are restricted, so
+    // these are only reachable when the datastore supplies a typed value.
+    "getDate",
+    "getDayOfMonth",
+    "getDayOfWeek",
+    "getDayOfYear",
+    "getFullYear",
+    "getHours",
+    "getMilliseconds",
+    "getMinutes",
+    "getMonth",
+    "getSeconds",
 ];
 
 /// Restricted function categories -- blocked by default, opt-in via config.
@@ -109,10 +134,11 @@ pub fn check_profile(expr: &str) -> Vec<String> {
 /// Returns a list of error strings (empty if compliant).
 #[must_use]
 pub fn check_profile_with_config(expr: &str, config: &ProfileConfig) -> Vec<String> {
+    // No early return on an empty blocked list. `blocked_functions()` is empty
+    // when all three categories are unlocked, and returning here skipped the
+    // allowlist check too -- so the most permissive config was also the one that
+    // validated nothing at all.
     let blocked = config.blocked_functions();
-    if blocked.is_empty() {
-        return Vec::new();
-    }
 
     let mut errors = Vec::new();
     let bytes = expr.as_bytes();
@@ -155,6 +181,16 @@ pub fn check_profile_with_config(expr: &str, config: &ProfileConfig) -> Vec<Stri
                 let reason = restriction_reason(name);
                 errors.push(format!(
                     "Function '{name}()' is not allowed in the expression profile. {reason}"
+                ));
+            } else if !ALLOWED_FUNCTIONS.contains(&name)
+                && !DISALLOWED_FUNCTIONS.contains(&name)
+            {
+                // In neither list. A restricted-but-unlocked function IS in
+                // DISALLOWED_FUNCTIONS, so it falls through here and passes.
+                errors.push(format!(
+                    "Function '{name}()' is not in the expression profile. Check \
+                     the spelling, or add it to ALLOWED_FUNCTIONS if it belongs \
+                     in the profile."
                 ));
             }
         }
@@ -235,6 +271,66 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("matches()"));
         assert!(errors[0].contains("allow_regex"));
+    }
+
+    /// A function in neither the allowlist nor a restricted category must be
+    /// rejected. The scan only consulted the blocked list, so a typo passed the
+    /// profile, and the CEL crate resolves functions at evaluation -- the caller
+    /// was told a misspelt expression was valid.
+    #[test]
+    fn unknown_function_rejected() {
+        for expr in [
+            "nosuchfunc(x)",
+            r#"severity == "critical" && bogus(z)"#,
+            "startWith(host)",
+            "sizeof(tags) > 3",
+        ] {
+            let errors = check_profile(expr);
+            assert!(
+                !errors.is_empty(),
+                "{expr} passed the profile despite an unknown function"
+            );
+        }
+    }
+
+    /// Unlocking every restricted category must permit those categories, not
+    /// switch the scan off. `blocked_functions()` returns empty when all three
+    /// flags are set, and the early return then skipped the allowlist check too,
+    /// so the most permissive config was also the one that validated nothing.
+    #[test]
+    fn all_categories_unlocked_still_rejects_an_unknown_function() {
+        let config = ProfileConfig {
+            allow_regex: true,
+            allow_iteration: true,
+            allow_time: true,
+        };
+        assert!(
+            check_profile_with_config(r#"msg.contains("x")"#, &config).is_empty(),
+            "an allowed function must still pass with every category unlocked"
+        );
+        assert!(
+            !check_profile_with_config("nosuchfunc(x)", &config).is_empty(),
+            "unlocking every category disabled the profile scan entirely"
+        );
+    }
+
+    /// The allowlist must not refuse legitimate profile expressions. An omission
+    /// here rejects a valid operator filter, which is the cost of enforcing it.
+    #[test]
+    fn profile_functions_still_pass() {
+        for expr in [
+            r#"has(user.id) && host.startsWith("web-")"#,
+            "size(tags) > 3",
+            r#"int(count) > 100 && message.contains("error")"#,
+            r#"double(score) >= 0.5 && string(id).endsWith("-x")"#,
+            "bytes(payload).size() > 0",
+            "type(value) == string",
+            r#"dyn(meta).contains("k")"#,
+            "created.getFullYear() == 2026",
+        ] {
+            let errors = check_profile(expr);
+            assert!(errors.is_empty(), "{expr} was rejected: {errors:?}");
+        }
     }
 
     #[test]
