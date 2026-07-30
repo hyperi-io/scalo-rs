@@ -7,10 +7,6 @@ backend, zero-cost when no rules are configured, and tiered so the
 common case (field-presence or equality on a top-level field) runs at
 ~50-100 ns per message without invoking the CEL engine at all.
 
-This is the doc consumers were missing — earlier work tracked
-post-spec follow-ups in `TRANSPORT-FILTER-FOLLOWUP.md`; the engine
-itself is now production-shipped.
-
 ---
 
 ## Why the engine exists
