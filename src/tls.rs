@@ -275,10 +275,10 @@ fn is_hybrid_pqc(group: NamedGroup) -> bool {
 /// Build an aws-lc-rs provider with the kx-group order/selection the
 /// [`PqcMode`] mandates.
 ///
-/// aws-lc-rs OFFERS the hybrid group by default but lists it LAST, so two
-/// default peers negotiate a CLASSICAL group (proven by spike). `Prefer`
-/// reorders the hybrid to the front so it is actually used; `Require` keeps
-/// only the hybrid(s) (non-PQC peers are refused); `Off` drops them.
+/// aws-lc-rs offers the hybrid group by default but lists it LAST, so two
+/// default peers negotiate a classical group. `Prefer` reorders the hybrid to
+/// the front so it is actually used; `Require` keeps only the hybrid(s)
+/// (non-PQC peers are refused); `Off` drops them.
 fn posture_provider(pqc: PqcMode) -> Arc<CryptoProvider> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     match pqc {
@@ -413,6 +413,10 @@ mod tests {
 
     /// Drive an in-memory handshake to completion; propagate the first rustls
     /// error (e.g. no common kx group under `Require` vs a classical peer).
+    ///
+    /// Running out of rounds is an error, not a success: `Ok(())` on
+    /// exhaustion would make a stalled handshake indistinguishable from a
+    /// completed one to a caller asserting `is_ok()`.
     fn pump(
         client: &mut ClientConnection,
         server: &mut ServerConnection,
@@ -440,7 +444,9 @@ mod tests {
                 return Ok(());
             }
         }
-        Ok(())
+        Err(rustls::Error::General(
+            "handshake did not complete within 40 pump rounds".to_string(),
+        ))
     }
 
     fn client_for(profile: CryptoProfile, ca_path: &Path) -> Arc<ClientConfig> {
@@ -490,7 +496,12 @@ mod tests {
 
     #[test]
     fn posture_provider_selects_groups() {
-        let all_hybrid = |p: &CryptoProvider| p.kx_groups.iter().all(|g| is_hybrid_pqc(g.name()));
+        // `all()` is vacuously true on an empty list, so require non-empty in
+        // the same closure -- otherwise "require keeps only hybrid" is also
+        // satisfied by "require keeps nothing".
+        let all_hybrid = |p: &CryptoProvider| {
+            !p.kx_groups.is_empty() && p.kx_groups.iter().all(|g| is_hybrid_pqc(g.name()))
+        };
         let any_hybrid = |p: &CryptoProvider| p.kx_groups.iter().any(|g| is_hybrid_pqc(g.name()));
         let prefer = posture_provider(PqcMode::Prefer);
         assert!(
@@ -508,6 +519,58 @@ mod tests {
             !any_hybrid(&posture_provider(PqcMode::Off)),
             "off drops the hybrid"
         );
+    }
+
+    /// `Require` must keep something. `retain` on a provider whose group names
+    /// `is_hybrid_pqc` does not recognise leaves `kx_groups` empty, and
+    /// `all_hybrid` above is vacuously true on an empty list -- so the
+    /// strictest profile can become one that completes no handshake at all
+    /// while the suite stays green.
+    ///
+    /// `is_hybrid_pqc` is a hard-coded `matches!` on a single `NamedGroup`
+    /// variant, and its own doc comment says to extend it when aws-lc-rs adds
+    /// `SecP384r1MLKEM1024`, so it is expected to be edited.
+    #[test]
+    fn require_keeps_a_nonempty_group_set() {
+        let require = posture_provider(PqcMode::Require);
+        assert!(
+            !require.kx_groups.is_empty(),
+            "PqcMode::Require retained no key-exchange groups at all -- \
+             is_hybrid_pqc matches nothing the provider offers, so HighSec \
+             cannot negotiate with any peer"
+        );
+        let off = posture_provider(PqcMode::Off);
+        assert!(
+            !off.kx_groups.is_empty(),
+            "PqcMode::Off retained no key-exchange groups at all"
+        );
+    }
+
+    /// The positive counterpart to `highsec_require_fails_against_classical_only_peer`.
+    ///
+    /// That test asserts only that the handshake fails against a classical
+    /// peer, which a `Require` set with no groups satisfies by failing against
+    /// every peer. Without both, "HighSec refuses non-PQC peers" and "HighSec
+    /// refuses everybody" are indistinguishable.
+    #[test]
+    fn highsec_completes_handshake_with_pqc_peer() {
+        let (cert, key, pem) = gen_server_cert();
+        let ca = write_temp(&pem);
+        let mut client = ClientConnection::new(
+            client_for(CryptoProfile::HighSec, ca.path()),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server =
+            ServerConnection::new(server_config_with(PqcMode::Require, &cert, &key)).unwrap();
+        pump(&mut client, &mut server)
+            .expect("HighSec must still complete a handshake with a PQC-capable peer");
+        assert_eq!(
+            client.negotiated_key_exchange_group().map(|g| g.name()),
+            Some(NamedGroup::X25519MLKEM768),
+            "highsec negotiates the hybrid PQC group"
+        );
+        assert_eq!(client.protocol_version(), Some(ProtocolVersion::TLSv1_3));
     }
 
     #[test]
