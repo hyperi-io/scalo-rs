@@ -14,8 +14,8 @@
 >
 > This is that code.
 
-scalo is an integrated, self-regulating runtime for hyperscale-grade
-data-plane services. Config, logging and metrics come as one pre-wired
+scalo is an integrated, self-regulating runtime for data-plane services.
+Config, logging and metrics come as one pre-wired
 trinity -- global singletons you just use, no plumbing, no init dance.
 Everything else leans on that same integration: the config cascade flows
 straight into the CLI so `run`/`version`/`config-check` just work; the metrics
@@ -246,8 +246,32 @@ Only when that vertical headroom is exhausted does it escalate to horizontal
 scale (KEDA adding pods), driven by the same pressure signal. Memory is the
 hard, never-OOM authority; CPU is left to the kernel scheduler (CFS), which
 the byte-budget loop reads through longer process times. It is ON by default
-and opt-out via `self_regulation.enabled = false`. See
-[docs/self-regulation.md](docs/self-regulation.md).
+and opt-out via `self_regulation.enabled = false`.
+
+The loop, since "it tunes itself" is a claim and this is the part you can
+check:
+
+- **AIMD on the byte budget.** The streaming sub-block budget grows additively
+  while things are healthy and is cut multiplicatively when they are not --
+  the same additive-increase/multiplicative-decrease shape TCP congestion
+  control has used since the 1980s.
+- **HARD signals are never masked.** The memory guard contributes its raw
+  reading with no weight applied. A saturated soft signal cannot pull the
+  level below what memory demands, and a busy soft signal cannot hide a
+  missing hard one. That is the never-OOM guarantee.
+- **SOFT signals are weighted** and compete for the level, so a low-weight
+  source at full saturation cannot force a hold that memory would not.
+- **Hysteresis, because coupled controllers oscillate.** The latch arms at
+  `pause_above` and releases at `resume_below`; between the two it holds. A
+  reading hunting around a single threshold cannot flap pause/resume, which is
+  the failure mode that makes people distrust self-tuning systems.
+- **It gates the SOURCE, never the sink.** Backpressure stops intake. It never
+  slows the write side and calls that regulation.
+
+Full write-up, including the three pressure brains and why CPU was
+deliberately dropped as a source, in
+[docs/self-regulation.md](docs/self-regulation.md) and
+[docs/backpressure.md](docs/backpressure.md).
 
 ## Architecture
 
