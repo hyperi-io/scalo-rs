@@ -1,5 +1,12 @@
 # Changelog
 
+Rendered by CI and committed back at the end of a release -- do not edit by
+hand. Release notes also appear on the GitHub Releases page, one per tag.
+
+## [2.10.8](https://github.com/hyperi-io/scalo-rs/compare/v2.10.7...v2.10.8) (2026-08-03)
+
+# Changelog
+
 All notable changes to scalo are recorded here, following
 [Semantic Versioning](https://semver.org/). History prior to the
 open-source release is intentionally not included.
