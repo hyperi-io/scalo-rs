@@ -109,7 +109,11 @@ worker_pool:
 
 `validate()` rejects out-of-order thresholds at startup
 (`grow_below >= shrink_above`, `shrink_above >= emergency_above`,
-`min_threads > max_threads`) — fail-fast on config typos.
+`min_threads > max_threads`) — fail-fast on config typos. One exception: when
+`min_threads` is the DERIVED default (not user-set) and the CPU-derived
+ceiling lands below it (a 1-CPU cgroup resolves `max_threads = 1` under the
+default `min_threads = 2`), the min clamps down to the ceiling with an INFO
+log instead of failing — a user-explicit contradictory pair still errors.
 
 ---
 

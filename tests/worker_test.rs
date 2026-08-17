@@ -69,7 +69,9 @@ fn test_from_cascade_without_config_setup_returns_defaults() {
     // It should fall back to defaults gracefully.
     let cfg = WorkerPoolConfig::from_cascade("worker_pool")
         .expect("from_cascade should not panic without config::setup()");
-    assert_eq!(cfg.min_threads, 2);
+    // On a small-CPU host the derived default min clamps to the CPU ceiling (#21).
+    let available = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    assert_eq!(cfg.min_threads, 2usize.min(available));
     assert_eq!(cfg.max_threads, 0); // auto-detect default
 }
 
