@@ -132,14 +132,14 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 
 | Item | Purpose |
 |------|---------|
-| `Dlq::disabled()` | No-op handle — `send` succeeds, nothing written |
+| `Dlq::disabled()` | No-op handle — `send` succeeds, nothing written; each routed entry is counted in `dropped()`, emitted as `dlq_dropped_total{reason="disabled"}`, and logged at ERROR (rate-limited) |
 | `Dlq::spawn(config, service_name, kafka_config, shutdown)` | Build backends, spawn drain, return cloneable handle |
 | `try_send(entry) -> Result<(), DlqError>` | Sync-shape queue submission; `QueueFull` on overflow |
 | `send(entry).await` | Async submission that awaits queue space |
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
 | `flush().await` | Barrier — wait until every entry queued before this call is durably written |
 | `shutdown().await` | Wait for drain task to exit cleanly |
-| `is_enabled() / mode() / pending() / dropped()` | Introspection |
+| `is_enabled() / mode() / pending() / dropped()` | Introspection — `dropped()` totals queue overflow + disabled-DLQ sends + batches every backend refused (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
 | `DlqEntry::new(service, error_type, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_metadata(...)` | Entry builder |
 | `DlqSource::kafka(topic, partition, offset) / ::http(url) / ...` | Provenance for the entry |
 | `DlqBackend` (enum) | `File / Kafka / Http / Redis` — feature-gated variants |

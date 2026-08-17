@@ -33,10 +33,12 @@
 //! exit (channel closes, drain drains, then exits).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::concurrency::{
     BackgroundSink, BackgroundSinkConfig, BackgroundSinkHandle, DrainError, Overflow, SinkDrain,
@@ -68,6 +70,36 @@ pub struct Dlq {
     /// child-token semantics), so the drain still exits on global
     /// shutdown.
     cancel: CancellationToken,
+    /// Dead letters that had nowhere to go: sends into a disabled DLQ
+    /// plus batches every backend refused. Shared with the drain and
+    /// across clones so [`Dlq::dropped`] surfaces the full loss.
+    lost: Arc<AtomicU64>,
+    /// Debounce clock (epoch ms) for the dead-letter-drop ERROR log.
+    lost_log_ms: Arc<AtomicU64>,
+}
+
+/// Minimum interval between dead-letter-drop ERROR logs; the counters
+/// still move for every dropped entry.
+const DROP_LOG_INTERVAL_MS: u64 = 5_000;
+
+/// Log at most once per interval. Local copy of the atomic pattern in
+/// `logger::log_debounced`, which sits behind the `logger` feature the
+/// `dlq` feature does not require.
+fn drop_log_due(last_epoch_ms: &AtomicU64, min_interval_ms: u64) -> bool {
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let last = last_epoch_ms.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= min_interval_ms {
+        last_epoch_ms.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
 }
 
 impl std::fmt::Debug for Dlq {
@@ -79,17 +111,17 @@ impl std::fmt::Debug for Dlq {
                 "pending",
                 &self.sink.as_ref().map_or(0, BackgroundSink::pending),
             )
-            .field(
-                "dropped",
-                &self.sink.as_ref().map_or(0, BackgroundSink::dropped),
-            )
+            .field("dropped", &self.dropped())
             .finish_non_exhaustive()
     }
 }
 
 impl Dlq {
     /// Build a disabled DLQ. All `send` / `try_send` calls succeed as
-    /// no-ops.
+    /// no-ops, but every entry that would have been routed is counted in
+    /// [`Dlq::dropped`], emitted as `dlq_dropped_total{reason="disabled"}`,
+    /// and shouted with a rate-limited ERROR -- a lost dead letter must
+    /// never be silent.
     #[must_use]
     pub fn disabled() -> Self {
         Self {
@@ -98,6 +130,8 @@ impl Dlq {
             enabled: false,
             mode: DlqMode::default(),
             cancel: CancellationToken::new(),
+            lost: Arc::new(AtomicU64::new(0)),
+            lost_log_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -138,9 +172,13 @@ impl Dlq {
         let names: Vec<&'static str> = backends.iter().map(DlqBackend::name).collect();
         debug!(mode = ?config.mode, backends = ?names, "DLQ initialised");
 
+        let lost = Arc::new(AtomicU64::new(0));
+        let lost_log_ms = Arc::new(AtomicU64::new(0));
         let drain = DlqDrain {
             mode: config.mode,
             backends,
+            lost: Arc::clone(&lost),
+            lost_log_ms: Arc::clone(&lost_log_ms),
         };
 
         let sink_config = BackgroundSinkConfig {
@@ -164,7 +202,25 @@ impl Dlq {
             enabled: true,
             mode: config.mode,
             cancel,
+            lost,
+            lost_log_ms,
         })
+    }
+
+    /// Count and shout dead letters that had nowhere to go. Callers still
+    /// return `Ok` -- this is visibility, not a new failure mode.
+    fn note_dropped(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let total = self.lost.fetch_add(count, Ordering::Relaxed) + count;
+        ::metrics::counter!("dlq_dropped_total", "reason" => "disabled").increment(count);
+        if drop_log_due(&self.lost_log_ms, DROP_LOG_INTERVAL_MS) {
+            error!(
+                count,
+                total, "DLQ is disabled or failed to start -- dead letters are being DROPPED"
+            );
+        }
     }
 
     /// Whether the DLQ is accepting entries.
@@ -185,10 +241,11 @@ impl Dlq {
         self.sink.as_ref().map_or(0, BackgroundSink::pending)
     }
 
-    /// Total entries dropped due to overflow since spawn.
+    /// Total entries dropped since spawn: queue overflow, sends into a
+    /// disabled DLQ, and batches every backend refused.
     #[must_use]
     pub fn dropped(&self) -> u64 {
-        self.sink.as_ref().map_or(0, BackgroundSink::dropped)
+        self.sink.as_ref().map_or(0, BackgroundSink::dropped) + self.lost.load(Ordering::Relaxed)
     }
 
     /// Sync-shaped queue submission. Returns immediately. On a full
@@ -202,6 +259,7 @@ impl Dlq {
     /// drain has exited.
     pub fn try_send(&self, entry: DlqEntry) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
+            self.note_dropped(1);
             return Ok(());
         };
         sink.try_push(entry).map_err(map_sink_err)
@@ -217,6 +275,7 @@ impl Dlq {
     /// `Closed` if the drain has exited.
     pub async fn send(&self, entry: DlqEntry) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
+            self.note_dropped(1);
             return Ok(());
         };
         sink.push_blocking(entry).await.map_err(map_sink_err)
@@ -230,6 +289,7 @@ impl Dlq {
     /// `Closed` if the drain has exited mid-batch.
     pub async fn send_batch(&self, entries: Vec<DlqEntry>) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
+            self.note_dropped(entries.len() as u64);
             return Ok(());
         };
         for entry in entries {
@@ -355,6 +415,29 @@ fn build_backends(
 struct DlqDrain {
     mode: DlqMode,
     backends: Vec<DlqBackend>,
+    /// Shared with [`Dlq`] so backend-refused batches surface in `dropped()`.
+    lost: Arc<AtomicU64>,
+    /// Shared debounce clock for the dead-letter-drop ERROR log.
+    lost_log_ms: Arc<AtomicU64>,
+}
+
+impl DlqDrain {
+    /// Count and shout a batch the actor is about to discard because every
+    /// backend refused it.
+    fn note_lost(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = count as u64;
+        let total = self.lost.fetch_add(count, Ordering::Relaxed) + count;
+        ::metrics::counter!("dlq_dropped_total", "reason" => "backends_failed").increment(count);
+        if drop_log_due(&self.lost_log_ms, DROP_LOG_INTERVAL_MS) {
+            error!(
+                count,
+                total, "every DLQ backend refused the batch -- dead letters are being DROPPED"
+            );
+        }
+    }
 }
 
 impl SinkDrain<DlqEntry> for DlqDrain {
@@ -380,6 +463,8 @@ impl SinkDrain<DlqEntry> for DlqDrain {
                         }
                     }
                 }
+                // The actor discards the batch on Err -- count the loss.
+                self.note_lost(batch.len());
                 let msg = last_err
                     .map_or_else(|| "no backends configured".to_string(), |e| e.to_string());
                 Err(DrainError::Backend(Box::new(DlqError::AllBackendsFailed(
@@ -406,6 +491,8 @@ impl SinkDrain<DlqEntry> for DlqDrain {
                 if any_ok {
                     Ok(())
                 } else {
+                    // The actor discards the batch on Err -- count the loss.
+                    self.note_lost(batch.len());
                     Err(DrainError::Backend(Box::new(DlqError::AllBackendsFailed(
                         errs.join("; "),
                     ))))
@@ -451,6 +538,56 @@ mod tests {
         dlq.send_batch(vec![test_entry("err")]).await.expect("noop");
         dlq.flush().await.expect("noop flush");
         dlq.shutdown().await.expect("noop shutdown");
+    }
+
+    /// Issue #22: a disabled DLQ must surface every entry it drops --
+    /// sends stay `Ok` but the drop counter moves.
+    #[tokio::test]
+    async fn disabled_dlq_counts_dropped_entries() {
+        let dlq = Dlq::disabled();
+        assert_eq!(dlq.dropped(), 0);
+        dlq.send(test_entry("a")).await.expect("noop send");
+        dlq.try_send(test_entry("b")).expect("noop try_send");
+        dlq.send_batch(vec![test_entry("c"), test_entry("d")])
+            .await
+            .expect("noop batch");
+        assert_eq!(dlq.dropped(), 4, "every routed entry counts as dropped");
+        // Clones share the counter, matching the shared drain contract.
+        assert_eq!(dlq.clone().dropped(), 4);
+    }
+
+    /// Issue #22: a file backend whose writes fail (the read-only-rootfs
+    /// shape) must surface the loss in the drop counter, not vanish
+    /// behind a startup fallback.
+    #[tokio::test]
+    async fn failed_writer_surfaces_drop_counter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shutdown = CancellationToken::new();
+        let dlq = Dlq::spawn(
+            &tmp_config(dir.path()),
+            "svc",
+            #[cfg(feature = "dlq-kafka")]
+            None,
+            #[cfg(not(feature = "dlq-kafka"))]
+            None,
+            shutdown.clone(),
+        )
+        .expect("spawn");
+
+        // Break the writer AFTER spawn: replace the service directory with a
+        // regular file so every subsequent open/write fails.
+        std::fs::remove_dir_all(dir.path().join("svc")).expect("remove dlq dir");
+        std::fs::write(dir.path().join("svc"), b"not a directory").expect("plant file");
+
+        dlq.send(test_entry("err")).await.expect("queued");
+        let flush = dlq.flush().await;
+        assert!(flush.is_err(), "flush must surface the drain failure");
+        assert!(
+            dlq.dropped() >= 1,
+            "drop counter must surface the lost entry"
+        );
+
+        shutdown.cancel();
     }
 
     #[tokio::test]

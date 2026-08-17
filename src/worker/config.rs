@@ -98,18 +98,28 @@ impl WorkerPoolConfig {
     /// Load config from the cascade under the given key (e.g. "worker_pool").
     ///
     /// Falls back to defaults if the config cascade is not initialised or the
-    /// key is absent. Validates after loading.
+    /// key is absent. A DERIVED (defaulted, not user-set) `min_threads` that
+    /// exceeds the CPU-derived thread ceiling is clamped down with an INFO log
+    /// so small-CPU containers resolve to a working pool; a user-explicit
+    /// `min_threads` is never clamped. Validates after loading.
     ///
     /// # Errors
     ///
-    /// Returns an error if validation fails (e.g. thresholds out of order).
+    /// Returns an error if validation fails (e.g. thresholds out of order, or
+    /// a user-explicit `min_threads > max_threads`).
     pub fn from_cascade(key: &str) -> Result<Self, crate::config::ConfigError> {
-        let pool_cfg: Self = if let Some(cfg) = crate::config::try_get() {
-            cfg.unmarshal_key(key).unwrap_or_default()
+        let (mut pool_cfg, min_explicit) = if let Some(cfg) = crate::config::try_get() {
+            let parsed: Self = cfg.unmarshal_key(key).unwrap_or_default();
+            // contains() separates a user-supplied min_threads from the serde default.
+            let explicit = cfg.contains(&format!("{key}.min_threads"));
+            (parsed, explicit)
         } else {
             tracing::debug!("Config cascade not initialised, using default WorkerPoolConfig");
-            Self::default()
+            (Self::default(), false)
         };
+        if !min_explicit {
+            pool_cfg.clamp_derived_min(detected_parallelism());
+        }
         pool_cfg.validate()?;
         Ok(pool_cfg)
     }
@@ -173,14 +183,41 @@ impl WorkerPoolConfig {
     /// - `max_threads > 0` -> cap at `min(configured, available_parallelism)`
     ///   to avoid creating more threads than physical cores
     pub fn resolve_max_threads(&mut self) {
-        let available = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        self.max_threads = self.effective_max(detected_parallelism());
+    }
 
+    /// The value `max_threads` resolves to for a given detected CPU count.
+    fn effective_max(&self, available: usize) -> usize {
         if self.max_threads == 0 {
-            self.max_threads = available;
+            available
         } else {
-            self.max_threads = self.max_threads.min(available);
+            self.max_threads.min(available)
         }
     }
+
+    /// Clamp a DERIVED (defaulted, not user-set) `min_threads` down to the
+    /// ceiling `max_threads` will resolve to, so a small-CPU container gets a
+    /// working pool instead of a min > max validation failure. Callers must
+    /// skip this for a user-explicit `min_threads` -- a contradictory explicit
+    /// pair keeps failing `validate()`.
+    fn clamp_derived_min(&mut self, available: usize) {
+        let ceiling = self.effective_max(available).max(1);
+        if self.min_threads > ceiling {
+            tracing::info!(
+                derived_min = self.min_threads,
+                clamped_min = ceiling,
+                available,
+                "worker_pool min_threads default exceeds the CPU-derived max_threads; clamping min down to max"
+            );
+            self.min_threads = ceiling;
+        }
+    }
+}
+
+/// Effective CPU count: `available_parallelism` (cgroup-aware), falling back
+/// to 4 when detection fails.
+fn detected_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
 }
 
 #[cfg(test)]
@@ -210,6 +247,43 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    /// Regression (#21): a 1-CPU cgroup derives max_threads = 1 while the
+    /// default min_threads is 2; the derived min clamps down to the ceiling
+    /// instead of failing validation.
+    #[test]
+    fn one_cpu_derivation_clamps_default_min() {
+        let mut cfg = WorkerPoolConfig::default();
+        cfg.clamp_derived_min(1);
+        assert_eq!(cfg.min_threads, 1);
+        cfg.max_threads = cfg.effective_max(1);
+        assert_eq!(cfg.max_threads, 1);
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// A user-explicit `min_threads` is never clamped: from_cascade skips the
+    /// clamp, so a 1-CPU resolution still ends in the existing error.
+    #[test]
+    fn one_cpu_explicit_min_still_fails_validation() {
+        let mut cfg = WorkerPoolConfig {
+            min_threads: 4,
+            ..Default::default()
+        };
+        cfg.max_threads = cfg.effective_max(1);
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            crate::config::ConfigError::InvalidValue { .. }
+        ));
+    }
+
+    /// The clamp is a no-op when the ceiling already accommodates the default.
+    #[test]
+    fn clamp_derived_min_noop_when_ceiling_suffices() {
+        let mut cfg = WorkerPoolConfig::default();
+        cfg.clamp_derived_min(8);
+        assert_eq!(cfg.min_threads, 2);
     }
 
     /// Regression: `min_threads: 0` previously passed

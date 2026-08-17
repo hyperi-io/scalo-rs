@@ -49,6 +49,10 @@ pub struct NdjsonWriter {
     writer: Mutex<FileRotate<AppendTimestamp>>,
     label: String,
     output_path: PathBuf,
+    /// Current (non-rotated) output file, probed after each write because
+    /// `file-rotate` swallows open failures -- its `write()` returns `Ok`
+    /// with no file handle, silently dropping the bytes.
+    file_path: PathBuf,
     lines_written: AtomicU64,
     write_errors: AtomicU64,
 }
@@ -105,7 +109,7 @@ impl NdjsonWriter {
             Compression::None
         };
 
-        let writer = FileRotate::new(file_path, suffix_scheme, content_limit, compression, None);
+        let writer = FileRotate::new(&file_path, suffix_scheme, content_limit, compression, None);
 
         debug!(
             label = label,
@@ -119,9 +123,30 @@ impl NdjsonWriter {
             writer: Mutex::new(writer),
             label: label.to_string(),
             output_path: dir,
+            file_path,
             lines_written: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
         })
+    }
+
+    /// Detect a write `file-rotate` swallowed: it reopens the target lazily
+    /// and its `write()` reports `Ok` with the bytes discarded when that open
+    /// fails (e.g. the directory vanished or the filesystem went read-only).
+    /// Rotation happens under the same mutex the caller holds, so after a
+    /// genuinely successful write the current file must exist.
+    fn verify_write_landed(&self) -> Result<(), std::io::Error> {
+        if self.file_path.exists() {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "{} writer target {} missing after write -- write was silently dropped \
+                 (directory removed or read-only filesystem?)",
+                self.label,
+                self.file_path.display()
+            ),
+        ))
     }
 
     /// Write a single line (must include trailing newline or caller appends it).
@@ -130,7 +155,11 @@ impl NdjsonWriter {
     /// and newline termination.
     pub fn write_line(&self, line: &[u8]) -> Result<(), std::io::Error> {
         let mut writer = self.writer.lock();
-        if let Err(e) = writer.write_all(line).and_then(|()| writer.flush()) {
+        if let Err(e) = writer
+            .write_all(line)
+            .and_then(|()| writer.flush())
+            .and_then(|()| self.verify_write_landed())
+        {
             self.write_errors.fetch_add(1, Ordering::Relaxed);
             return Err(e);
         }
@@ -144,7 +173,11 @@ impl NdjsonWriter {
     /// parameter is used for metrics tracking.
     pub fn write_buf(&self, buf: &[u8], count: u64) -> Result<(), std::io::Error> {
         let mut writer = self.writer.lock();
-        if let Err(e) = writer.write_all(buf).and_then(|()| writer.flush()) {
+        if let Err(e) = writer
+            .write_all(buf)
+            .and_then(|()| writer.flush())
+            .and_then(|()| self.verify_write_landed())
+        {
             self.write_errors.fetch_add(1, Ordering::Relaxed);
             return Err(e);
         }
@@ -364,6 +397,26 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("batch/out.ndjson")).expect("read");
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 5);
+    }
+
+    /// Issue #22 (scalo-rs): `file-rotate` reports `Ok` while writing
+    /// nothing when its lazy reopen fails; the writer must surface that
+    /// as an error instead of pretending the write happened.
+    #[test]
+    fn test_swallowed_write_surfaces_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path());
+        let writer = NdjsonWriter::new(&config, "gone", "out.ndjson", "dlq").expect("create");
+
+        // Replace the output directory with a regular file so the lazy
+        // reopen fails and file-rotate would otherwise swallow the write.
+        std::fs::remove_dir_all(dir.path().join("gone")).expect("remove dir");
+        std::fs::write(dir.path().join("gone"), b"not a directory").expect("plant file");
+
+        let err = writer.write_line(b"{\"msg\":\"lost\"}\n").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(writer.lines_written(), 0);
+        assert_eq!(writer.write_errors(), 1);
     }
 
     #[test]
