@@ -353,7 +353,8 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
     {
         if !config.otel.is_active() {
             tracing::info!(
-                "OTLP metric push disabled (metrics.otel.enabled=false or blank endpoint)"
+                reason = otel_types::inactive_reason(&config.otel),
+                "OTLP metric push disabled"
             );
             return RecorderSetup {
                 otel_provider: None,
@@ -401,8 +402,8 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
 
         if !config.otel.is_active() {
             tracing::info!(
-                "OTLP metric push disabled (metrics.otel.enabled=false or blank endpoint); \
-                 serving Prometheus scrape only"
+                reason = otel_types::inactive_reason(&config.otel),
+                "OTLP metric push disabled; serving Prometheus scrape only"
             );
             install_prom_only(&config.namespace, prom_recorder);
             return RecorderSetup {

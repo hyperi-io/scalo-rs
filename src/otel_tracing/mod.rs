@@ -147,9 +147,14 @@ impl OtelTracingConfig {
     }
 
     /// Whether span export should be wired up, after env-var resolution.
+    ///
+    /// Also false with no Tokio runtime: the batch processor and the OTLP
+    /// connector both need one, and building them without it panics.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.enabled && !resolve(self).endpoint.is_empty()
+        self.enabled
+            && !resolve(self).endpoint.is_empty()
+            && tokio::runtime::Handle::try_current().is_ok()
     }
 }
 
@@ -424,9 +429,23 @@ mod tests {
         assert!(cfg.service_name.is_empty());
     }
 
+    #[tokio::test]
+    async fn export_is_on_by_default_where_it_can_work() {
+        assert!(
+            OtelTracingConfig::default().is_active(),
+            "span export is on by default once a runtime exists"
+        );
+    }
+
     #[test]
-    fn export_is_off_when_disabled_or_unaddressed() {
-        assert!(OtelTracingConfig::default().is_active());
+    fn export_is_off_without_a_runtime() {
+        // No #[tokio::test]: building the batch processor here would panic,
+        // so the config has to report itself inactive instead.
+        assert!(!OtelTracingConfig::default().is_active());
+    }
+
+    #[tokio::test]
+    async fn export_is_off_when_disabled_or_unaddressed() {
         assert!(
             !OtelTracingConfig {
                 enabled: false,

@@ -101,12 +101,6 @@ async fn a_missing_collector_costs_telemetry_and_nothing_else() {
 
 #[test]
 fn export_is_off_when_disabled_or_unaddressed() {
-    let default = OtelMetricsConfig::default();
-    assert!(
-        default.is_active(),
-        "export is on by default -- a service should be a good citizen without being told"
-    );
-
     let disabled = OtelMetricsConfig {
         enabled: false,
         ..OtelMetricsConfig::default()
@@ -129,8 +123,16 @@ fn export_is_off_when_disabled_or_unaddressed() {
     );
 }
 
-#[test]
-fn the_env_var_can_switch_export_off() {
+#[tokio::test]
+async fn export_is_on_by_default_where_it_can_work() {
+    assert!(
+        OtelMetricsConfig::default().is_active(),
+        "export is on by default -- a service should be a good citizen without being told"
+    );
+}
+
+#[tokio::test]
+async fn the_env_var_can_switch_export_off() {
     temp_env::with_var("OTEL_EXPORTER_OTLP_ENDPOINT", Some(""), || {
         assert!(
             !OtelMetricsConfig::default().is_active(),
