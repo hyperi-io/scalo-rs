@@ -28,7 +28,7 @@ exclude = [".claude/", ".github/", "ci/", "ai/", "docs/", "examples/", "benches/
 # pure-Rust feature lands, add it here.
 features = [
     "config", "config-reload", "logger",
-    "metrics-core", "metrics-process", "metrics", "service-metrics",
+    "metrics-core", "metrics-process", "metrics-prometheus", "metrics", "service-metrics",
     "otel", "otel-metrics", "otel-tracing",
     "runtime", "shutdown", "health",
     "concurrency", "strmatch", "memory", "scaling",
@@ -71,10 +71,16 @@ strmatch = ["regex", "regex-automata", "regex-syntax", "aho-corasick", "memchr",
 # Metrics tiers (2.6.0 split). Consumers pay only for what they use:
 # - metrics-core: emit-only (counter!/gauge!/histogram! macros work)
 # - metrics-process: + cgroup-aware process gauges
-# - metrics: + Prometheus exporter (HTTP /metrics endpoint, manifest dump)
+# - metrics: + Prometheus scrape endpoint, OTLP metric push, OTLP span export
+#
+# Serving /metrics sends nothing to a collector, so composing the exporters
+# into `metrics` keeps a service from silently having no telemetry path out.
+# Opt out through config (`metrics.otel.enabled`, `otel_tracing.enabled`), not
+# by omitting a feature. `metrics-process` is the tier below for a consumer
+# that wants gauges without any exporter.
 metrics-core = ["dep:metrics", "tracing"]
 metrics-process = ["metrics-core", "sysinfo"]
-metrics = ["metrics-process", "metrics-exporter-prometheus", "tokio", "serde_json"]
+metrics = ["metrics-process", "metrics-exporter-prometheus", "tokio", "serde_json", "otel-metrics", "otel-tracing"]
 
 # OpenTelemetry support (modern observability)
 # `otel` is the umbrella enabling all OTel SDK deps. `otel-metrics` exports
@@ -82,8 +88,12 @@ metrics = ["metrics-process", "metrics-exporter-prometheus", "tokio", "serde_jso
 # `tracing` ecosystem (`tracing::span!`, `#[instrument]`) to OTel spans
 # exported via OTLP — closes the W3C distributed-tracing chain that the
 # transport-layer traceparent propagation alone can't complete.
+#
+# `metrics` enables `otel-metrics`, never the reverse: `otel-metrics` pulls
+# `metrics-process`, not `metrics`, because the other direction is a cargo
+# feature cycle. On its own it is the push-only build, no Prometheus exporter.
 otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing", "tracing-opentelemetry", "serde_json"]
-otel-metrics = ["otel", "metrics", "metrics-util", "metrics-exporter-opentelemetry"]
+otel-metrics = ["otel", "metrics-process", "metrics-util", "metrics-exporter-opentelemetry", "opentelemetry_sdk/rt-tokio", "tokio"]
 otel-tracing = ["otel", "opentelemetry_sdk/rt-tokio", "tokio", "tracing-subscriber"]
 
 # Standard pipeline metric groups (opt-in). The dfe_* metric prefix
@@ -453,6 +463,11 @@ testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["redis"] }
 # Direct client for the fault-injection tests to verify stream contents (XLEN /
 # XRANGE) independently of scalo's own transport. Matches the transport's redis.
 redis = { version = ">=1.0, <2", features = ["tokio-comp", "streams"] }
+# Query Prometheus's own HTTP API in the scrape test, so the assertion is what
+# Prometheus stored rather than what scalo rendered. Declaration must match the
+# optional `http` dependency exactly -- two different reqwest builds in one
+# graph is an E0464 on the lib test target.
+reqwest = { version = ">=0.13.3, <0.14", default-features = false, features = ["json", "rustls"] }
 
 [lints.rust]
 unsafe_code = "deny"

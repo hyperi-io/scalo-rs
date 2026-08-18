@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 
 use super::MetricsError;
 use super::otel_types::{OtelMetricsConfig, OtelProtocol};
@@ -25,6 +25,8 @@ struct ResolvedOtelConfig {
     endpoint: String,
     protocol: OtelProtocol,
     export_interval: Duration,
+    export_timeout: Duration,
+    headers: std::collections::HashMap<String, String>,
     service_name: String,
     /// Deployment environment (dev/staging/prod), tagged on the OTel resource
     /// as the stable semconv attribute `deployment.environment.name`. Sourced
@@ -37,8 +39,7 @@ struct ResolvedOtelConfig {
 
 /// Resolve OTel config with env var overrides.
 fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
-    let endpoint =
-        std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| config.endpoint.clone());
+    let endpoint = super::otel_types::resolved_endpoint(&config.endpoint);
 
     let protocol = std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
         .ok()
@@ -57,6 +58,14 @@ fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
             Duration::from_millis,
         );
 
+    let export_timeout = std::env::var("OTEL_METRIC_EXPORT_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or_else(
+            || Duration::from_secs(config.export_timeout_secs),
+            Duration::from_millis,
+        );
+
     let service_name =
         std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| config.service_name.clone());
 
@@ -70,6 +79,8 @@ fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
         endpoint,
         protocol,
         export_interval,
+        export_timeout,
+        headers: config.headers.clone(),
         service_name,
         deployment_environment,
         resource_attributes: config.resource_attributes.clone(),
@@ -77,19 +88,32 @@ fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
 }
 
 /// Build the OTLP metric exporter for the given protocol and endpoint.
+///
+/// The timeout is the per-attempt deadline, so an endpoint that accepts and
+/// then stalls fails the attempt instead of holding the exporter open.
 fn build_otlp_exporter(
-    protocol: OtelProtocol,
-    endpoint: &str,
+    resolved: &ResolvedOtelConfig,
 ) -> Result<opentelemetry_otlp::MetricExporter, MetricsError> {
-    match protocol {
-        OtelProtocol::Grpc => opentelemetry_otlp::MetricExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint)
-            .build()
-            .map_err(|e| MetricsError::BuildError(format!("OTel gRPC exporter: {e}"))),
+    match resolved.protocol {
+        OtelProtocol::Grpc => {
+            if !resolved.headers.is_empty() {
+                tracing::warn!(
+                    "metrics.otel.headers are only applied on the http protocol; \
+                     set OTEL_EXPORTER_OTLP_HEADERS for grpc"
+                );
+            }
+            opentelemetry_otlp::MetricExporter::builder()
+                .with_tonic()
+                .with_endpoint(&resolved.endpoint)
+                .with_timeout(resolved.export_timeout)
+                .build()
+                .map_err(|e| MetricsError::BuildError(format!("OTel gRPC exporter: {e}")))
+        }
         OtelProtocol::Http => opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&resolved.endpoint)
+            .with_timeout(resolved.export_timeout)
+            .with_headers(resolved.headers.clone())
             .build()
             .map_err(|e| MetricsError::BuildError(format!("OTel HTTP exporter: {e}"))),
     }
@@ -114,7 +138,11 @@ pub(crate) fn build_otel_recorder(
 > {
     let resolved = resolve_config(config);
 
-    let exporter = build_otlp_exporter(resolved.protocol, &resolved.endpoint)?;
+    let exporter = build_otlp_exporter(&resolved)?;
+    // Backoff starts at one export interval so the first retry is the next
+    // scheduled tick, then doubles while the collector stays unreachable.
+    let exporter =
+        crate::otel_backoff::GatedMetricExporter::new(exporter, resolved.export_interval);
     let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
         .with_interval(resolved.export_interval)
         .build();
@@ -155,7 +183,8 @@ pub(crate) fn build_otel_recorder(
         endpoint = %resolved.endpoint,
         protocol = ?resolved.protocol,
         export_interval_secs = resolved.export_interval.as_secs(),
-        "OTel metrics recorder built"
+        export_timeout_secs = resolved.export_timeout.as_secs(),
+        "OTLP metric push enabled"
     );
 
     Ok((recorder, provider))

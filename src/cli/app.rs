@@ -185,7 +185,9 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
 
         #[cfg(any(feature = "metrics", feature = "otel-metrics"))]
         StandardCommand::MetricsManifest => {
-            let mgr = crate::metrics::MetricsManager::new(app.name());
+            let mgr = crate::metrics::MetricsManager::with_config(
+                crate::metrics::MetricsConfig::offline(app.name()),
+            );
             app.register_metrics(&mgr);
             let manifest = mgr.registry().manifest();
             println!(
@@ -250,7 +252,16 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             )
             .await?;
 
-            app.run_service(config, runtime).await
+            let result = app.run_service(config, runtime).await;
+
+            // Flush what is queued before the process goes away. Both calls
+            // are bounded and safe when nothing was ever wired up.
+            #[cfg(feature = "otel-metrics")]
+            crate::metrics::shutdown_otel_export();
+            #[cfg(feature = "otel-tracing")]
+            crate::otel_tracing::shutdown();
+
+            result
         }
 
         #[cfg(feature = "top")]
@@ -319,7 +330,9 @@ fn generate_artefacts<A: ServiceApp>(
     // Metrics manifest
     #[cfg(any(feature = "metrics", feature = "otel-metrics"))]
     {
-        let mgr = crate::metrics::MetricsManager::new(app.name());
+        let mgr = crate::metrics::MetricsManager::with_config(
+            crate::metrics::MetricsConfig::offline(app.name()),
+        );
         app.register_metrics(&mgr);
         let manifest = mgr.registry().manifest();
         let path = output_dir.join("metrics-manifest.json");

@@ -75,29 +75,80 @@ pub enum OtelTracingProtocol {
 /// - `OTEL_EXPORTER_OTLP_ENDPOINT` overrides `endpoint`
 /// - `OTEL_EXPORTER_OTLP_PROTOCOL` (`grpc` | `http/protobuf` | `http`) overrides `protocol`
 /// - `OTEL_SERVICE_NAME` overrides `service_name`
+/// - `OTEL_TRACES_SAMPLER_ARG` overrides `sample_ratio`
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OtelTracingConfig {
+    /// Master switch for span export, on by default.
+    ///
+    /// Set `false`, or blank the [`endpoint`](Self::endpoint), to export
+    /// nothing. Either way the `tracing` logger is untouched.
+    pub enabled: bool,
     /// OTLP endpoint (default `http://localhost:4317` for gRPC).
     pub endpoint: String,
     /// Wire protocol.
     pub protocol: OtelTracingProtocol,
     /// `service.name` resource attribute.
     pub service_name: String,
+    /// Fraction of new traces to sample, 0.0 to 1.0.
+    ///
+    /// Applied under a parent-based sampler, so a request already sampled
+    /// upstream is always kept and distributed traces stay whole. The default
+    /// is well below 1.0 because a data-plane service creates spans at request
+    /// rate and exporting all of them costs more than the traces are worth.
+    pub sample_ratio: f64,
     /// Batch exporter scheduled-delay (milliseconds).
     pub batch_scheduled_delay_ms: u64,
     /// Batch exporter max queue size.
+    ///
+    /// The queue is the memory ceiling for un-exported spans: once full, new
+    /// spans are dropped rather than buffered, so an unreachable collector
+    /// costs spans instead of growing without bound.
     pub batch_max_queue_size: usize,
+    /// Maximum spans per export request.
+    pub batch_max_export_batch_size: usize,
+    /// Per-export deadline (milliseconds).
+    pub export_timeout_ms: u64,
 }
 
 impl Default for OtelTracingConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             endpoint: "http://localhost:4317".into(),
             protocol: OtelTracingProtocol::Grpc,
-            service_name: env!("CARGO_PKG_NAME").into(),
+            service_name: String::new(),
+            sample_ratio: 0.05,
             batch_scheduled_delay_ms: 5_000,
             batch_max_queue_size: 2_048,
+            batch_max_export_batch_size: 512,
+            export_timeout_ms: 10_000,
         }
+    }
+}
+
+impl OtelTracingConfig {
+    /// Load from the config cascade under the `otel_tracing` key.
+    ///
+    /// Falls back to defaults when config is not initialised or the key is
+    /// absent.
+    #[must_use]
+    pub fn from_cascade() -> Self {
+        #[cfg(feature = "config")]
+        {
+            if let Some(cfg) = crate::config::try_get()
+                && let Ok(settings) = cfg.unmarshal_key_registered::<Self>("otel_tracing")
+            {
+                return settings;
+            }
+        }
+        Self::default()
+    }
+
+    /// Whether span export should be wired up, after env-var resolution.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.enabled && !resolve(self).endpoint.is_empty()
     }
 }
 
@@ -119,6 +170,7 @@ fn resolve(config: &OtelTracingConfig) -> OtelTracingConfig {
     if let Ok(v) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
         resolved.endpoint = v;
     }
+    resolved.endpoint = resolved.endpoint.trim().to_string();
     if let Ok(v) = std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL") {
         resolved.protocol = match v.as_str() {
             "http/protobuf" | "http" => OtelTracingProtocol::Http,
@@ -128,24 +180,36 @@ fn resolve(config: &OtelTracingConfig) -> OtelTracingConfig {
     if let Ok(v) = std::env::var("OTEL_SERVICE_NAME") {
         resolved.service_name = v;
     }
+    // The spec's sampler knob, so an operator can turn sampling up on a
+    // service without a config change.
+    if let Ok(v) = std::env::var("OTEL_TRACES_SAMPLER_ARG")
+        && let Ok(ratio) = v.parse::<f64>()
+    {
+        resolved.sample_ratio = ratio;
+    }
     resolved
 }
 
 fn build_span_exporter(
-    protocol: OtelTracingProtocol,
-    endpoint: &str,
+    config: &OtelTracingConfig,
 ) -> Result<opentelemetry_otlp::SpanExporter, OtelTracingError> {
-    let result = match protocol {
+    let timeout = std::time::Duration::from_millis(config.export_timeout_ms);
+    let result = match config.protocol {
         OtelTracingProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
-            .with_endpoint(endpoint)
+            .with_endpoint(&config.endpoint)
+            .with_timeout(timeout)
             .build(),
         OtelTracingProtocol::Http => opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(endpoint)
+            .with_endpoint(&config.endpoint)
+            .with_timeout(timeout)
             .build(),
     };
-    result.map_err(|source| OtelTracingError::ExporterBuild { protocol, source })
+    result.map_err(|source| OtelTracingError::ExporterBuild {
+        protocol: config.protocol,
+        source,
+    })
 }
 
 /// Build an OTel tracer + tracing-subscriber layer ready for composition.
@@ -175,14 +239,40 @@ where
 {
     let resolved = resolve(config);
 
-    let exporter = build_span_exporter(resolved.protocol, &resolved.endpoint)?;
+    let exporter = build_span_exporter(&resolved)?;
 
     let resource = Resource::builder()
         .with_service_name(resolved.service_name.clone())
         .build();
 
+    // Bounded queue: spans are dropped once it fills, so an unreachable
+    // collector costs telemetry and never memory.
+    let batch_config = opentelemetry_sdk::trace::BatchConfigBuilder::default()
+        .with_max_queue_size(resolved.batch_max_queue_size)
+        .with_max_export_batch_size(resolved.batch_max_export_batch_size)
+        .with_scheduled_delay(std::time::Duration::from_millis(
+            resolved.batch_scheduled_delay_ms,
+        ))
+        .build();
+    // Backoff starts at one scheduled delay so the first retry is the next
+    // batch, then doubles while the collector stays unreachable.
+    let exporter = crate::otel_backoff::GatedSpanExporter::new(
+        exporter,
+        std::time::Duration::from_millis(resolved.batch_scheduled_delay_ms),
+    );
+    let processor = opentelemetry_sdk::trace::BatchSpanProcessor::builder(exporter)
+        .with_batch_config(batch_config)
+        .build();
+
+    // Parent-based so an upstream sampling decision is honoured; the ratio
+    // only governs traces that start here.
+    let sampler = opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+        opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(resolved.sample_ratio),
+    ));
+
     let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
+        .with_span_processor(processor)
+        .with_sampler(sampler)
         .with_resource(resource)
         .build();
 
@@ -198,11 +288,82 @@ where
         protocol = ?resolved.protocol,
         service_name = %resolved.service_name,
         scheduled_delay_ms = resolved.batch_scheduled_delay_ms,
+        max_queue_size = resolved.batch_max_queue_size,
+        sample_ratio = resolved.sample_ratio,
         "OTel tracing layer built"
     );
 
     Ok((layer, provider))
 }
+
+/// Tracer provider retained for the flush on shutdown.
+static TRACER_PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLock::new();
+
+/// What happened during [`layer_if_active`], reported once the logger exists.
+static INIT_STATUS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Build the span-export layer when config asks for it.
+///
+/// Returns `None` when export is switched off or the exporter cannot be
+/// built -- a collector that is missing or misconfigured degrades telemetry
+/// and never stops the service starting. The provider is retained for
+/// [`shutdown`].
+///
+/// Called during logger setup, before any subscriber exists, so the outcome
+/// is recorded for [`log_init_status`] rather than logged here.
+pub fn layer_if_active<S>(
+    config: &OtelTracingConfig,
+) -> Option<OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    if !config.is_active() {
+        let _ = INIT_STATUS.set(
+            "OTLP span export disabled (otel_tracing.enabled=false or blank endpoint)".to_string(),
+        );
+        return None;
+    }
+
+    match build_tracer_layer(config) {
+        Ok((layer, provider)) => {
+            let _ = TRACER_PROVIDER.set(provider);
+            let _ = INIT_STATUS.set(format!(
+                "OTLP span export enabled -> {}",
+                resolve(config).endpoint
+            ));
+            Some(layer)
+        }
+        Err(e) => {
+            let _ = INIT_STATUS.set(format!(
+                "OTLP span export unavailable, continuing without it: {e}"
+            ));
+            None
+        }
+    }
+}
+
+/// Emit whatever [`layer_if_active`] decided, now that a subscriber exists.
+pub fn log_init_status() {
+    if let Some(status) = INIT_STATUS.get() {
+        tracing::info!("{status}");
+    }
+}
+
+/// Flush and stop the tracer provider, if one was built.
+///
+/// Queued spans are dropped rather than waited on when the collector is
+/// unreachable, so this cannot hold up a shutdown.
+pub fn shutdown() {
+    if let Some(provider) = TRACER_PROVIDER.get()
+        && let Err(e) = provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
+    {
+        tracing::debug!(error = %e, "OTel tracer provider shutdown");
+    }
+}
+
+/// Flush deadline on exit, short enough to stay well inside a Kubernetes
+/// termination grace period when the collector is unreachable.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {
@@ -213,7 +374,60 @@ mod tests {
         let cfg = OtelTracingConfig::default();
         assert_eq!(cfg.protocol, OtelTracingProtocol::Grpc);
         assert!(!cfg.endpoint.is_empty());
-        assert!(!cfg.service_name.is_empty());
+        assert!(cfg.enabled, "span export is on by default");
+        // Empty on purpose: the caller supplies the app's name. A crate-name
+        // default would report every service in the fleet as "scalo".
+        assert!(cfg.service_name.is_empty());
+    }
+
+    #[test]
+    fn export_is_off_when_disabled_or_unaddressed() {
+        assert!(OtelTracingConfig::default().is_active());
+        assert!(
+            !OtelTracingConfig {
+                enabled: false,
+                ..OtelTracingConfig::default()
+            }
+            .is_active(),
+            "enabled=false must switch it off"
+        );
+        assert!(
+            !OtelTracingConfig {
+                endpoint: "  ".to_string(),
+                ..OtelTracingConfig::default()
+            }
+            .is_active(),
+            "a blank endpoint must switch it off"
+        );
+    }
+
+    #[test]
+    fn batch_defaults_bound_what_can_be_held() {
+        let cfg = OtelTracingConfig::default();
+        assert!(
+            cfg.batch_max_queue_size > 0,
+            "an unbounded queue would let a dead collector grow memory"
+        );
+        assert!(
+            cfg.batch_max_export_batch_size <= cfg.batch_max_queue_size,
+            "the SDK rejects a batch size above the queue size"
+        );
+        assert!(
+            cfg.sample_ratio > 0.0 && cfg.sample_ratio <= 1.0,
+            "sample ratio {} is outside 0..1",
+            cfg.sample_ratio
+        );
+    }
+
+    #[test]
+    fn the_sampler_arg_env_var_overrides_the_ratio() {
+        temp_env::with_var("OTEL_TRACES_SAMPLER_ARG", Some("1.0"), || {
+            let r = resolve(&OtelTracingConfig::default());
+            assert!(
+                (r.sample_ratio - 1.0).abs() < f64::EPSILON,
+                "OTEL_TRACES_SAMPLER_ARG must win over the configured ratio"
+            );
+        });
     }
 
     #[test]

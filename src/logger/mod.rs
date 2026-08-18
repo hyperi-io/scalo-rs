@@ -233,6 +233,24 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
     // Build optional throttle filter
     let throttle_filter = build_throttle_filter(&opts.throttle);
 
+    // Span export shares the subscriber, so it has to be composed in here.
+    // `None` is a no-op layer, which is what an opted-out or unbuildable
+    // exporter resolves to.
+    #[cfg(feature = "otel-tracing")]
+    let otel = {
+        let mut config = crate::otel_tracing::OtelTracingConfig::from_cascade();
+        if config.service_name.is_empty() {
+            config.service_name = opts
+                .service_name
+                .clone()
+                .or_else(|| std::env::var("SERVICE_NAME").ok())
+                .unwrap_or_default();
+        }
+        crate::otel_tracing::layer_if_active(&config)
+    };
+    #[cfg(not(feature = "otel-tracing"))]
+    let otel: Option<tracing_subscriber::layer::Identity> = None;
+
     match format {
         LogFormat::Json => {
             let writer = masking::make_masking_writer(
@@ -252,12 +270,14 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
 
             if let Some(throttle) = throttle_filter {
                 tracing_subscriber::registry()
+                    .with(otel)
                     .with(filter)
                     .with(layer.with_filter(throttle))
                     .try_init()
                     .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
             } else {
                 tracing_subscriber::registry()
+                    .with(otel)
                     .with(filter)
                     .with(layer)
                     .try_init()
@@ -278,12 +298,14 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
 
             if let Some(throttle) = throttle_filter {
                 tracing_subscriber::registry()
+                    .with(otel)
                     .with(filter)
                     .with(layer.with_filter(throttle))
                     .try_init()
                     .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
             } else {
                 tracing_subscriber::registry()
+                    .with(otel)
                     .with(filter)
                     .with(layer)
                     .try_init()
@@ -294,6 +316,10 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
     }
 
     let _ = LOGGER_INIT.set(());
+
+    #[cfg(feature = "otel-tracing")]
+    crate::otel_tracing::log_init_status();
+
     Ok(())
 }
 
