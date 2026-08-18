@@ -106,12 +106,36 @@ impl Default for OtelMetricsConfig {
 impl OtelMetricsConfig {
     /// Whether OTLP push should be wired up, after env-var resolution.
     ///
-    /// False when [`enabled`](Self::enabled) is off or the effective endpoint
-    /// is blank; callers install the Prometheus recorder alone.
+    /// False when [`enabled`](Self::enabled) is off, the effective endpoint is
+    /// blank, or there is no Tokio runtime to export on; callers install the
+    /// Prometheus recorder alone.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.enabled && !resolved_endpoint(&self.endpoint).is_empty()
+        self.enabled && !resolved_endpoint(&self.endpoint).is_empty() && runtime_available()
     }
+}
+
+/// Why export is off, for the log line that says so.
+pub(crate) fn inactive_reason(config: &OtelMetricsConfig) -> &'static str {
+    if !config.enabled {
+        "metrics.otel.enabled = false"
+    } else if resolved_endpoint(&config.endpoint).is_empty() {
+        "endpoint is blank"
+    } else if !runtime_available() {
+        "no Tokio runtime on this thread"
+    } else {
+        "active"
+    }
+}
+
+/// Whether a Tokio runtime is available to the exporter.
+///
+/// The OTLP exporter builds a hyper connector, which panics with "there is no
+/// reactor running" when constructed outside one. A `MetricsManager` built in
+/// a plain `#[test]` or any synchronous path would take the whole process
+/// down, so export is skipped instead -- it could not have worked there.
+pub(crate) fn runtime_available() -> bool {
+    tokio::runtime::Handle::try_current().is_ok()
 }
 
 /// The endpoint actually used, with the OTel env var taking precedence.
