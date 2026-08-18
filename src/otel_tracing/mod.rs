@@ -58,6 +58,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde::{Deserialize, Serialize};
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::Layer as _;
 
 /// OTLP transport protocol (mirrors [`crate::metrics::OtelProtocol`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -283,17 +284,53 @@ where
 
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-    tracing::info!(
-        endpoint = %resolved.endpoint,
-        protocol = ?resolved.protocol,
-        service_name = %resolved.service_name,
-        scheduled_delay_ms = resolved.batch_scheduled_delay_ms,
-        max_queue_size = resolved.batch_max_queue_size,
-        sample_ratio = resolved.sample_ratio,
-        "OTel tracing layer built"
-    );
-
     Ok((layer, provider))
+}
+
+/// Crates on the export path itself, whose spans must never be exported.
+///
+/// Sending a batch over OTLP runs through tonic, hyper and h2, all of which
+/// emit `tracing` spans. Feeding those to the exporter makes every export
+/// generate the spans for the next one, and the queue climbs until it is
+/// dropping data -- worse the harder the collector is to reach.
+const SELF_TELEMETRY_TARGETS: [&str; 8] = [
+    "opentelemetry",
+    "opentelemetry_sdk",
+    "h2",
+    "hyper",
+    "hyper_util",
+    "tonic",
+    "tower",
+    "reqwest",
+];
+
+/// Whether an event comes from the export path.
+///
+/// Matches a target exactly or as a module prefix (`hyper::client::...`),
+/// never a bare `starts_with`, which would also swallow an app's own
+/// `hyperion` target.
+fn is_self_telemetry(target: &str) -> bool {
+    SELF_TELEMETRY_TARGETS.iter().any(|crate_name| {
+        target
+            .strip_prefix(crate_name)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
+/// Filter keeping the export path's own spans out of the exporter.
+///
+/// Applied to the OTel layer alone, so these targets still reach the console
+/// logger when `RUST_LOG` asks for them.
+type SelfTelemetryFilter = tracing_subscriber::filter::FilterFn<fn(&tracing::Metadata<'_>) -> bool>;
+
+fn keep_out_of_export(meta: &tracing::Metadata<'_>) -> bool {
+    !is_self_telemetry(meta.target())
+}
+
+fn self_telemetry_filter() -> SelfTelemetryFilter {
+    tracing_subscriber::filter::FilterFn::new(
+        keep_out_of_export as fn(&tracing::Metadata<'_>) -> bool,
+    )
 }
 
 /// Tracer provider retained for the flush on shutdown.
@@ -313,7 +350,13 @@ static INIT_STATUS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// is recorded for [`log_init_status`] rather than logged here.
 pub fn layer_if_active<S>(
     config: &OtelTracingConfig,
-) -> Option<OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>
+) -> Option<
+    tracing_subscriber::filter::Filtered<
+        OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>,
+        SelfTelemetryFilter,
+        S,
+    >,
+>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
@@ -327,11 +370,12 @@ where
     match build_tracer_layer(config) {
         Ok((layer, provider)) => {
             let _ = TRACER_PROVIDER.set(provider);
+            let resolved = resolve(config);
             let _ = INIT_STATUS.set(format!(
-                "OTLP span export enabled -> {}",
-                resolve(config).endpoint
+                "OTLP span export enabled -> {} (sample_ratio {}, max_queue {})",
+                resolved.endpoint, resolved.sample_ratio, resolved.batch_max_queue_size
             ));
-            Some(layer)
+            Some(layer.with_filter(self_telemetry_filter()))
         }
         Err(e) => {
             let _ = INIT_STATUS.set(format!(
@@ -417,6 +461,41 @@ mod tests {
             "sample ratio {} is outside 0..1",
             cfg.sample_ratio
         );
+    }
+
+    #[test]
+    fn the_export_path_is_kept_out_of_the_export() {
+        for target in [
+            "hyper",
+            "hyper::client::conn",
+            "h2::codec",
+            "tonic::transport::channel",
+            "opentelemetry_sdk::trace::span_processor",
+            "tower::buffer",
+        ] {
+            assert!(
+                is_self_telemetry(target),
+                "{target} is on the export path and must not be exported"
+            );
+        }
+    }
+
+    #[test]
+    fn app_targets_that_merely_share_a_prefix_are_still_exported() {
+        // A bare `starts_with` would swallow all of these.
+        for target in [
+            "hyperion",
+            "hyperi_thing::worker",
+            "towerbridge",
+            "h2o",
+            "reqwest_middleware_of_ours",
+            "dfe_receiver::ingest",
+        ] {
+            assert!(
+                !is_self_telemetry(target),
+                "{target} is application telemetry and must still be exported"
+            );
+        }
     }
 
     #[test]
