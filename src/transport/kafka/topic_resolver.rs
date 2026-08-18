@@ -420,6 +420,16 @@ mod tests {
     }
 
     #[test]
+    fn default_excludes_drop_dlq_and_internal_topics() {
+        let exclude =
+            compile_patterns(&crate::transport::KafkaConfig::default().topic_exclude).unwrap();
+        assert!(passes_filters("default_land", &[], &exclude));
+        assert!(!passes_filters("dfe_loader_dlq", &[], &exclude));
+        assert!(!passes_filters("dfe_transform_dlq", &[], &exclude));
+        assert!(!passes_filters("__consumer_offsets", &[], &exclude));
+    }
+
+    #[test]
     fn compile_patterns_invalid_regex() {
         let result = compile_patterns(&["[invalid".to_string()]);
         assert!(result.is_err());

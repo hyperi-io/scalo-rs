@@ -873,7 +873,8 @@ pub struct KafkaConfig {
 
     /// Regex patterns for topic exclude filtering.
     /// Topics matching any pattern are excluded. Exclude wins over include.
-    /// Default: `["^__"]` (excludes Kafka internal topics like `__consumer_offsets`).
+    /// Default: `["^__", "_dlq$"]` -- Kafka internal topics and the DFE
+    /// standard's dead-letter topics (a DLQ consumer sets its own include).
     #[serde(default = "default_topic_exclude")]
     pub topic_exclude: Vec<String>,
 
@@ -1042,7 +1043,9 @@ pub struct KafkaConfig {
 }
 
 fn default_topic_exclude() -> Vec<String> {
-    vec!["^__".to_string()]
+    // `_dlq$`: the DFE DLQ standard pre-creates per-app dead-letter topics;
+    // auto-discovery must never feed dead letters back into a data path.
+    vec!["^__".to_string(), "_dlq$".to_string()]
 }
 
 fn default_topic_refresh_secs() -> u64 {
@@ -1712,7 +1715,10 @@ mod tests {
     fn kafka_config_topic_resolution_defaults() {
         let config = KafkaConfig::default();
         assert!(config.topic_include.is_empty());
-        assert_eq!(config.topic_exclude, vec!["^__".to_string()]);
+        assert_eq!(
+            config.topic_exclude,
+            vec!["^__".to_string(), "_dlq$".to_string()]
+        );
         assert!(!config.auto_discover);
         assert_eq!(config.topic_refresh_secs, 60);
         assert_eq!(config.topic_suppression_rules.len(), 1);
