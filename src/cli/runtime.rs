@@ -122,8 +122,12 @@ impl ServiceRuntime {
         // names are bare unless the consumer opts into a `{namespace}_` prefix
         // via `metrics.namespace`; services are differentiated by platform
         // labels (Prometheus job/instance, OTel service.name), not the name.
-        let metrics_namespace = crate::metrics::MetricsSettings::from_cascade().namespace;
-        let mut metrics = MetricsManager::new(&metrics_namespace);
+        //
+        // The whole `metrics` section is carried through, not just the
+        // namespace: `metrics.otel.*` configures the OTLP push, and the app
+        // name supplies `service.name` when config leaves it unset.
+        let metrics_config = crate::metrics::MetricsSettings::from_cascade().into_config(app_name);
+        let mut metrics = MetricsManager::with_config(metrics_config);
         let dfe = Arc::new(crate::metrics::ServiceMetrics::register(&metrics));
 
         // App info metric (version, commit, service name)

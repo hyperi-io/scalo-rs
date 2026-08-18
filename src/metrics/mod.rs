@@ -168,6 +168,27 @@ pub struct MetricsConfig {
     pub otel: OtelMetricsConfig,
 }
 
+impl MetricsConfig {
+    /// Configuration for one-shot CLI work that only needs the registry.
+    ///
+    /// Export is off: a `metrics-manifest` or `generate-artefacts` run has no
+    /// telemetry to send and no collector to send it to.
+    #[must_use]
+    pub fn offline(namespace: &str) -> Self {
+        Self {
+            namespace: namespace.to_string(),
+            enable_process_metrics: false,
+            enable_container_metrics: false,
+            #[cfg(feature = "otel-metrics")]
+            otel: OtelMetricsConfig {
+                enabled: false,
+                ..OtelMetricsConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
@@ -202,6 +223,11 @@ pub struct MetricsSettings {
     /// to opt into a `{namespace}_` prefix.
     #[serde(default)]
     pub namespace: String,
+
+    /// OTLP push settings, under `metrics.otel`.
+    #[cfg(feature = "otel-metrics")]
+    #[serde(default)]
+    pub otel: OtelMetricsConfig,
 }
 
 impl MetricsSettings {
@@ -221,6 +247,67 @@ impl MetricsSettings {
             }
         }
         Self::default()
+    }
+
+    /// Convert cascade settings into a full [`MetricsConfig`].
+    ///
+    /// `service_name` supplies the OTel `service.name` resource attribute when
+    /// config does not set one. Without it every service reports the same
+    /// name and the telemetry cannot be told apart at the collector.
+    #[must_use]
+    pub fn into_config(
+        self,
+        #[cfg_attr(not(feature = "otel-metrics"), allow(unused_variables))] service_name: &str,
+    ) -> MetricsConfig {
+        #[cfg(feature = "otel-metrics")]
+        let otel = {
+            let mut otel = self.otel;
+            if otel.service_name.is_empty() {
+                otel.service_name = service_name.to_string();
+            }
+            otel
+        };
+
+        MetricsConfig {
+            namespace: self.namespace,
+            #[cfg(feature = "otel-metrics")]
+            otel,
+            ..MetricsConfig::default()
+        }
+    }
+}
+
+/// Meter provider retained for the flush on shutdown.
+#[cfg(feature = "otel-metrics")]
+static OTEL_METER_PROVIDER: std::sync::OnceLock<opentelemetry_sdk::metrics::SdkMeterProvider> =
+    std::sync::OnceLock::new();
+
+/// Flush and stop OTLP metric push, if it was wired up.
+///
+/// Bounded at two seconds so an unreachable collector cannot hold up a
+/// shutdown; pending measurements are dropped instead.
+#[cfg(feature = "otel-metrics")]
+pub fn shutdown_otel_export() {
+    if let Some(provider) = OTEL_METER_PROVIDER.get()
+        && let Err(e) = provider.shutdown_with_timeout(std::time::Duration::from_secs(2))
+    {
+        tracing::debug!(error = %e, "OTel meter provider shutdown");
+    }
+}
+
+/// Scrape-only install, used when OTLP is switched off or its exporter cannot
+/// be built. Losing the push path must never cost the `/metrics` endpoint.
+#[cfg(all(feature = "metrics", feature = "otel-metrics"))]
+fn install_prom_only(namespace: &str, recorder: metrics_exporter_prometheus::PrometheusRecorder) {
+    if namespace.is_empty() {
+        if let Err(e) = metrics::set_global_recorder(recorder) {
+            tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+        }
+    } else {
+        let prefixed = prefix::PrefixRecorder::new(namespace.to_string(), recorder);
+        if let Err(e) = metrics::set_global_recorder(prefixed) {
+            tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
+        }
     }
 }
 
@@ -264,6 +351,14 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
     // --- OTel only (no Prometheus) ---
     #[cfg(all(feature = "otel-metrics", not(feature = "metrics")))]
     {
+        if !config.otel.is_active() {
+            tracing::info!(
+                "OTLP metric push disabled (metrics.otel.enabled=false or blank endpoint)"
+            );
+            return RecorderSetup {
+                otel_provider: None,
+            };
+        }
         // `build_otel_recorder`'s first arg is the OTel instrumentation SCOPE
         // name (the meter name), NOT an instrument-name prefix. Pass the real
         // namespace so scope identity is preserved; instrument-name prefixing
@@ -272,6 +367,7 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
         match otel::build_otel_recorder(&config.namespace, &config.otel) {
             Ok((otel_recorder, provider)) => {
                 opentelemetry::global::set_meter_provider(provider.clone());
+                let _ = OTEL_METER_PROVIDER.set(provider.clone());
                 if config.namespace.is_empty() {
                     if let Err(e) = metrics::set_global_recorder(otel_recorder) {
                         tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
@@ -303,12 +399,25 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
         let prom_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let prom_handle = prom_recorder.handle();
 
+        if !config.otel.is_active() {
+            tracing::info!(
+                "OTLP metric push disabled (metrics.otel.enabled=false or blank endpoint); \
+                 serving Prometheus scrape only"
+            );
+            install_prom_only(&config.namespace, prom_recorder);
+            return RecorderSetup {
+                prom_handle: Some(prom_handle),
+                otel_provider: None,
+            };
+        }
+
         // Build OTel recorder. Scope name = real namespace (see OTel-only path);
         // instrument-name prefixing is done once by the prefix layer that wraps
         // the composed recorder, so there is no double-prefix.
         match otel::build_otel_recorder(&config.namespace, &config.otel) {
             Ok((otel_recorder, provider)) => {
                 opentelemetry::global::set_meter_provider(provider.clone());
+                let _ = OTEL_METER_PROVIDER.set(provider.clone());
 
                 // Compose via Fanout: both recorders receive every measurement.
                 // The prom handle was taken from the inner prom recorder above,
@@ -337,17 +446,7 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
             Err(e) => {
                 // Fallback: just Prometheus if OTel fails
                 tracing::warn!(error = %e, "Failed to build OTel recorder, falling back to Prometheus only");
-                if config.namespace.is_empty() {
-                    if let Err(e) = metrics::set_global_recorder(prom_recorder) {
-                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
-                    }
-                } else {
-                    let prefixed =
-                        prefix::PrefixRecorder::new(config.namespace.clone(), prom_recorder);
-                    if let Err(e) = metrics::set_global_recorder(prefixed) {
-                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
-                    }
-                }
+                install_prom_only(&config.namespace, prom_recorder);
                 RecorderSetup {
                     prom_handle: Some(prom_handle),
                     otel_provider: None,
