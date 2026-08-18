@@ -34,17 +34,18 @@ pub struct CommonArgs {
     pub config: Option<String>,
 
     /// Log level (trace, debug, info, warn, error).
-    #[arg(
-        short = 'l',
-        long = "log-level",
-        env = "LOG_LEVEL",
-        default_value = "info"
-    )]
-    pub log_level: String,
+    ///
+    /// Unset here falls through to `logger.level` in the config cascade, then
+    /// to `info`. Carrying no clap default is what makes that fall-through
+    /// possible: a default is indistinguishable from an explicit flag.
+    #[arg(short = 'l', long = "log-level", env = "LOG_LEVEL")]
+    pub log_level: Option<String>,
 
     /// Log output format (json, text, auto).
-    #[arg(long = "log-format", env = "LOG_FORMAT", default_value = "auto")]
-    pub log_format: String,
+    ///
+    /// Unset falls through to `logger.format`, then to `auto`.
+    #[arg(long = "log-format", env = "LOG_FORMAT")]
+    pub log_format: Option<String>,
 
     /// Metrics server bind address.
     #[arg(
@@ -64,16 +65,50 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
+    /// Hard-coded log level, used when neither the CLI, the environment, nor
+    /// config supplies one.
+    pub const DEFAULT_LOG_LEVEL: &'static str = "info";
+
+    /// Hard-coded log format, used on the same terms.
+    pub const DEFAULT_LOG_FORMAT: &'static str = "auto";
+
     /// Resolve the effective log level, accounting for --verbose and --quiet flags.
+    ///
+    /// Precedence is the config cascade's: `--verbose`/`--quiet`, then
+    /// `--log-level` or `LOG_LEVEL`, then `logger.level` from config, then
+    /// [`DEFAULT_LOG_LEVEL`](Self::DEFAULT_LOG_LEVEL).
     #[must_use]
-    pub fn effective_log_level(&self) -> &str {
+    pub fn effective_log_level(&self) -> String {
         if self.verbose {
-            "debug"
-        } else if self.quiet {
-            "error"
-        } else {
-            &self.log_level
+            return "debug".to_string();
         }
+        if self.quiet {
+            return "error".to_string();
+        }
+        if let Some(level) = &self.log_level {
+            return level.clone();
+        }
+        #[cfg(feature = "logger")]
+        if let Some(level) = crate::logger::LoggerSettings::from_cascade().level {
+            return level;
+        }
+        Self::DEFAULT_LOG_LEVEL.to_string()
+    }
+
+    /// Resolve the effective log format.
+    ///
+    /// `--log-format` or `LOG_FORMAT`, then `logger.format` from config, then
+    /// [`DEFAULT_LOG_FORMAT`](Self::DEFAULT_LOG_FORMAT).
+    #[must_use]
+    pub fn effective_log_format(&self) -> String {
+        if let Some(format) = &self.log_format {
+            return format.clone();
+        }
+        #[cfg(feature = "logger")]
+        if let Some(format) = crate::logger::LoggerSettings::from_cascade().format {
+            return format;
+        }
+        Self::DEFAULT_LOG_FORMAT.to_string()
     }
 
     /// Convert to `LoggerOptions` for use with `logger::setup()`.
@@ -87,18 +122,12 @@ impl CommonArgs {
     pub fn to_logger_options(&self) -> Result<crate::logger::LoggerOptions, super::CliError> {
         use std::str::FromStr;
 
-        let level: tracing::Level =
-            self.effective_log_level()
-                .to_uppercase()
-                .parse()
-                .map_err(|_| {
-                    super::CliError::InvalidArgument(format!(
-                        "invalid log level: {}",
-                        self.effective_log_level()
-                    ))
-                })?;
+        let resolved_level = self.effective_log_level();
+        let level: tracing::Level = resolved_level.to_uppercase().parse().map_err(|_| {
+            super::CliError::InvalidArgument(format!("invalid log level: {resolved_level}"))
+        })?;
 
-        let format = crate::logger::LogFormat::from_str(&self.log_format)
+        let format = crate::logger::LogFormat::from_str(&self.effective_log_format())
             .map_err(|e| super::CliError::InvalidArgument(format!("invalid log format: {e}")))?;
 
         Ok(crate::logger::LoggerOptions {
@@ -127,28 +156,31 @@ impl CommonArgs {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_effective_log_level_default() {
-        let args = CommonArgs {
+    /// Args with nothing supplied on the command line.
+    fn bare_args() -> CommonArgs {
+        CommonArgs {
             config: None,
-            log_level: "info".to_string(),
-            log_format: "auto".to_string(),
+            log_level: None,
+            log_format: None,
             metrics_addr: "0.0.0.0:9090".to_string(),
             verbose: false,
             quiet: false,
-        };
-        assert_eq!(args.effective_log_level(), "info");
+        }
+    }
+
+    #[test]
+    fn test_effective_log_level_default() {
+        assert_eq!(
+            bare_args().effective_log_level(),
+            CommonArgs::DEFAULT_LOG_LEVEL
+        );
     }
 
     #[test]
     fn test_effective_log_level_verbose() {
         let args = CommonArgs {
-            config: None,
-            log_level: "info".to_string(),
-            log_format: "auto".to_string(),
-            metrics_addr: "0.0.0.0:9090".to_string(),
             verbose: true,
-            quiet: false,
+            ..bare_args()
         };
         assert_eq!(args.effective_log_level(), "debug");
     }
@@ -156,12 +188,8 @@ mod tests {
     #[test]
     fn test_effective_log_level_quiet() {
         let args = CommonArgs {
-            config: None,
-            log_level: "info".to_string(),
-            log_format: "auto".to_string(),
-            metrics_addr: "0.0.0.0:9090".to_string(),
-            verbose: false,
             quiet: true,
+            ..bare_args()
         };
         assert_eq!(args.effective_log_level(), "error");
     }
@@ -169,13 +197,36 @@ mod tests {
     #[test]
     fn test_effective_log_level_custom() {
         let args = CommonArgs {
-            config: None,
-            log_level: "warn".to_string(),
-            log_format: "auto".to_string(),
-            metrics_addr: "0.0.0.0:9090".to_string(),
-            verbose: false,
-            quiet: false,
+            log_level: Some("warn".to_string()),
+            ..bare_args()
         };
         assert_eq!(args.effective_log_level(), "warn");
+    }
+
+    #[test]
+    fn verbose_and_quiet_outrank_an_explicit_level() {
+        let args = CommonArgs {
+            log_level: Some("warn".to_string()),
+            verbose: true,
+            ..bare_args()
+        };
+        assert_eq!(
+            args.effective_log_level(),
+            "debug",
+            "--verbose must win over --log-level"
+        );
+    }
+
+    #[test]
+    fn format_falls_back_to_the_hard_coded_default() {
+        assert_eq!(
+            bare_args().effective_log_format(),
+            CommonArgs::DEFAULT_LOG_FORMAT
+        );
+        let args = CommonArgs {
+            log_format: Some("json".to_string()),
+            ..bare_args()
+        };
+        assert_eq!(args.effective_log_format(), "json");
     }
 }

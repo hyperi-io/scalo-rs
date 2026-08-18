@@ -195,6 +195,41 @@ impl Default for LoggerOptions {
     }
 }
 
+/// Cascade-loadable logger settings, under the `logger` config key.
+///
+/// Both fields are optional so an absent key is distinguishable from a set
+/// one: a CLI flag or environment variable outranks config, and can only do
+/// so if "not given" is representable.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LoggerSettings {
+    /// Log level (trace, debug, info, warn, error).
+    #[serde(default)]
+    pub level: Option<String>,
+
+    /// Output format (json, text, auto).
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+impl LoggerSettings {
+    /// Load from the config cascade under the `logger` key.
+    ///
+    /// Returns the default (nothing set) when config is not initialised, so
+    /// a logger built before the cascade exists still works.
+    #[must_use]
+    pub fn from_cascade() -> Self {
+        #[cfg(feature = "config")]
+        {
+            if let Some(cfg) = crate::config::try_get()
+                && let Ok(settings) = cfg.unmarshal_key_registered::<Self>("logger")
+            {
+                return settings;
+            }
+        }
+        Self::default()
+    }
+}
+
 /// Initialise the global logger with custom options.
 ///
 /// # Errors

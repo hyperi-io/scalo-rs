@@ -141,11 +141,14 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
         }
 
         StandardCommand::ConfigCheck => {
-            // Initialise logger for config-check output
+            // Same order as `run`: the level this command REPORTS is resolved
+            // partly from config, so a logger built first would report the
+            // default rather than what the cascade actually yields.
+            let config_path = args.config.as_deref();
+            let loaded = app.load_config(config_path);
             init_logger(args)?;
 
-            let config_path = args.config.as_deref();
-            match app.load_config(config_path) {
+            match loaded {
                 Ok(config) => {
                     output::print_success("configuration is valid");
                     if !args.quiet {
@@ -153,7 +156,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
                         output::print_kv("service", &app.name());
                         output::print_kv("config", &config_path.unwrap_or("(defaults)"));
                         output::print_kv("log_level", &args.effective_log_level());
-                        output::print_kv("log_format", &args.log_format);
+                        output::print_kv("log_format", &args.effective_log_format());
                         output::print_kv("metrics_addr", &args.metrics_addr);
                         eprintln!();
                         // Mask the Debug dump before printing: configs hold
@@ -226,16 +229,21 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
 
         StandardCommand::Run => {
             let version_info = app.version_info();
+            let config_path = args.config.as_deref();
+
+            // Config loads before the logger: logger setup composes the OTLP
+            // span exporter, whose settings live in the cascade. The cascade
+            // has no subscriber while it loads, so its own log lines are lost.
+            let loaded = app.load_config(config_path);
             init_logger_for_service(args, app.name(), &version_info.version)?;
+            let config = loaded?;
 
             tracing::info!(
                 service = app.name(),
                 version = version_info.version,
+                config = config_path.unwrap_or("(defaults)"),
                 "starting service"
             );
-
-            let config_path = args.config.as_deref();
-            let config = app.load_config(config_path)?;
 
             tracing::debug!(?config, "configuration loaded");
 

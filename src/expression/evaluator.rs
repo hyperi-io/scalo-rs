@@ -63,26 +63,36 @@ use serde_json::Value as JsonValue;
 use super::error::{ExpressionError, ExpressionResult};
 use super::profile::{self, ProfileConfig};
 
-/// Cached profile config -- loaded once from the config cascade or default.
+/// Cached profile config, latched only once the cascade can supply one.
 static PROFILE_CONFIG: OnceLock<ProfileConfig> = OnceLock::new();
+
+/// The all-restrictions default, handed out while config is still absent.
+static DEFAULT_PROFILE_CONFIG: OnceLock<ProfileConfig> = OnceLock::new();
 
 /// Get the active profile config.
 ///
 /// When the `config` feature is enabled and `config::setup()` has been
 /// called, reads `expression` from the cascade. Otherwise returns
 /// `ProfileConfig::default()` (all restrictions active).
+///
+/// The default is returned WITHOUT latching the cache: an expression
+/// evaluated before config loads would otherwise pin defaults for the life of
+/// the process, and the config would never take effect.
 fn get_profile_config() -> &'static ProfileConfig {
-    PROFILE_CONFIG.get_or_init(|| {
-        #[cfg(feature = "config")]
+    if let Some(cached) = PROFILE_CONFIG.get() {
+        return cached;
+    }
+
+    #[cfg(feature = "config")]
+    {
+        if let Some(cfg) = crate::config::try_get()
+            && let Ok(profile) = cfg.unmarshal_key_registered::<ProfileConfig>("expression")
         {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(profile) = cfg.unmarshal_key_registered::<ProfileConfig>("expression")
-            {
-                return profile;
-            }
+            return PROFILE_CONFIG.get_or_init(|| profile);
         }
-        ProfileConfig::default()
-    })
+    }
+
+    DEFAULT_PROFILE_CONFIG.get_or_init(ProfileConfig::default)
 }
 
 // ── Validate ──────────────────────────────────────────────────────
@@ -236,5 +246,30 @@ fn json_to_cel(json: &JsonValue) -> Value {
                 .collect();
             Value::Map(hash.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reading the profile before config exists must not pin the default.
+    ///
+    /// Relies on nextest's process-per-test isolation for the global config
+    /// to be genuinely absent here.
+    #[test]
+    fn the_default_profile_does_not_latch_the_cache() {
+        #[cfg(feature = "config")]
+        assert!(
+            crate::config::try_get().is_none(),
+            "test needs an uninitialised global config to be meaningful"
+        );
+
+        let _ = get_profile_config();
+
+        assert!(
+            PROFILE_CONFIG.get().is_none(),
+            "the default was cached, so a later config::setup would never take effect"
+        );
     }
 }
