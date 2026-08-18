@@ -1715,7 +1715,10 @@ mod tests {
     fn kafka_config_topic_resolution_defaults() {
         let config = KafkaConfig::default();
         assert!(config.topic_include.is_empty());
-        assert_eq!(config.topic_exclude, vec!["^__".to_string()]);
+        assert_eq!(
+            config.topic_exclude,
+            vec!["^__".to_string(), "_dlq$".to_string()]
+        );
         assert!(!config.auto_discover);
         assert_eq!(config.topic_refresh_secs, 60);
         assert_eq!(config.topic_suppression_rules.len(), 1);
