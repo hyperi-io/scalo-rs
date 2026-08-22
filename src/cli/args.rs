@@ -43,17 +43,20 @@ pub struct CommonArgs {
 
     /// Log output format (json, text, auto).
     ///
-    /// Unset falls through to `logger.format`, then to `auto`.
+    /// Unset falls through to `logger.format`, then derives from otel
+    /// presence: `json` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (the
+    /// deployment ships telemetry), `text` otherwise.
     #[arg(long = "log-format", env = "LOG_FORMAT")]
     pub log_format: Option<String>,
 
     /// Metrics server bind address.
-    #[arg(
-        long = "metrics-addr",
-        env = "METRICS_ADDR",
-        default_value = "0.0.0.0:9090"
-    )]
-    pub metrics_addr: String,
+    ///
+    /// Unset falls through to `metrics.address` in the config cascade, then
+    /// to `0.0.0.0:9090`. Carrying no clap default is what makes that
+    /// fall-through possible: a default is indistinguishable from an
+    /// explicit flag.
+    #[arg(long = "metrics-addr", env = "METRICS_ADDR")]
+    pub metrics_addr: Option<String>,
 
     /// Enable verbose output (sets log level to debug).
     #[arg(short = 'v', long, conflicts_with = "quiet")]
@@ -70,7 +73,15 @@ impl CommonArgs {
     pub const DEFAULT_LOG_LEVEL: &'static str = "info";
 
     /// Hard-coded log format, used on the same terms.
+    ///
+    /// Retained for API compatibility; the unset fall-through now derives
+    /// from otel presence instead of returning this. Explicit `auto` keeps
+    /// the container/terminal detection.
     pub const DEFAULT_LOG_FORMAT: &'static str = "auto";
+
+    /// Hard-coded metrics bind address, used when neither the CLI, the
+    /// environment, nor config supplies one.
+    pub const DEFAULT_METRICS_ADDR: &'static str = "0.0.0.0:9090";
 
     /// Resolve the effective log level, accounting for --verbose and --quiet flags.
     ///
@@ -98,7 +109,10 @@ impl CommonArgs {
     /// Resolve the effective log format.
     ///
     /// `--log-format` or `LOG_FORMAT`, then `logger.format` from config, then
-    /// [`DEFAULT_LOG_FORMAT`](Self::DEFAULT_LOG_FORMAT).
+    /// derived from otel presence: a deployment that ships telemetry logs
+    /// `json`, one that does not logs `text` line-by-line. The signal is the
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` env var -- the one knob the deploy
+    /// layers set exactly where telemetry is shipped.
     #[must_use]
     pub fn effective_log_format(&self) -> String {
         if let Some(format) = &self.log_format {
@@ -108,7 +122,34 @@ impl CommonArgs {
         if let Some(format) = crate::logger::LoggerSettings::from_cascade().format {
             return format;
         }
-        Self::DEFAULT_LOG_FORMAT.to_string()
+        Self::derive_log_format(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .is_ok_and(|v| !v.trim().is_empty()),
+        )
+        .to_string()
+    }
+
+    /// The otel-derived format default: `json` iff the deployment ships
+    /// telemetry to otel, `text` otherwise.
+    #[must_use]
+    pub fn derive_log_format(otel_endpoint_set: bool) -> &'static str {
+        if otel_endpoint_set { "json" } else { "text" }
+    }
+
+    /// Resolve the effective metrics bind address.
+    ///
+    /// `--metrics-addr` or `METRICS_ADDR`, then `metrics.address` from
+    /// config, then [`DEFAULT_METRICS_ADDR`](Self::DEFAULT_METRICS_ADDR).
+    #[must_use]
+    pub fn effective_metrics_addr(&self) -> String {
+        if let Some(addr) = &self.metrics_addr {
+            return addr.clone();
+        }
+        #[cfg(feature = "metrics")]
+        if let Some(addr) = crate::metrics::MetricsSettings::from_cascade().address {
+            return addr;
+        }
+        Self::DEFAULT_METRICS_ADDR.to_string()
     }
 
     /// Convert to `LoggerOptions` for use with `logger::setup()`.
@@ -162,7 +203,7 @@ mod tests {
             config: None,
             log_level: None,
             log_format: None,
-            metrics_addr: "0.0.0.0:9090".to_string(),
+            metrics_addr: None,
             verbose: false,
             quiet: false,
         }
@@ -218,15 +259,42 @@ mod tests {
     }
 
     #[test]
-    fn format_falls_back_to_the_hard_coded_default() {
-        assert_eq!(
-            bare_args().effective_log_format(),
-            CommonArgs::DEFAULT_LOG_FORMAT
-        );
+    fn explicit_format_flag_wins() {
         let args = CommonArgs {
             log_format: Some("json".to_string()),
             ..bare_args()
         };
         assert_eq!(args.effective_log_format(), "json");
+    }
+
+    #[test]
+    fn format_derives_from_otel_presence() {
+        // The deployment seam: shipping telemetry -> json, not shipping -> lines.
+        assert_eq!(CommonArgs::derive_log_format(true), "json");
+        assert_eq!(CommonArgs::derive_log_format(false), "text");
+    }
+
+    #[test]
+    fn unset_format_resolves_to_a_derived_value_not_auto() {
+        // Whatever the env holds, the unset fall-through must yield a concrete
+        // format -- `auto` is only ever an explicit opt-in now.
+        let resolved = bare_args().effective_log_format();
+        assert!(
+            resolved == "json" || resolved == "text",
+            "expected a derived concrete format, got {resolved}"
+        );
+    }
+
+    #[test]
+    fn metrics_addr_falls_back_to_the_hard_coded_default() {
+        assert_eq!(
+            bare_args().effective_metrics_addr(),
+            CommonArgs::DEFAULT_METRICS_ADDR
+        );
+        let args = CommonArgs {
+            metrics_addr: Some("127.0.0.1:9191".to_string()),
+            ..bare_args()
+        };
+        assert_eq!(args.effective_metrics_addr(), "127.0.0.1:9191");
     }
 }

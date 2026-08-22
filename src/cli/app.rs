@@ -157,7 +157,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
                         output::print_kv("config", &config_path.unwrap_or("(defaults)"));
                         output::print_kv("log_level", &args.effective_log_level());
                         output::print_kv("log_format", &args.effective_log_format());
-                        output::print_kv("metrics_addr", &args.metrics_addr);
+                        output::print_kv("metrics_addr", &args.effective_metrics_addr());
                         eprintln!();
                         // Mask the Debug dump before printing: configs hold
                         // ENV-sourced secrets in plain `String` fields, so
@@ -252,7 +252,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             let runtime = super::ServiceRuntime::build(
                 app.name(),
                 app.env_prefix(),
-                &args.metrics_addr,
+                &args.effective_metrics_addr(),
                 &version_info.version,
                 commit,
                 #[cfg(feature = "scaling")]
