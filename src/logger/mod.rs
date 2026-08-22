@@ -242,9 +242,17 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
 
     let format = opts.format.resolve();
 
-    // Build the env filter
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(opts.level.to_string()));
+    // Build the env filter. The rdkafka crate logs client/consumer/producer
+    // lifecycle at INFO and floods service logs, so seed rdkafka=warn as a
+    // floor. RUST_LOG is layered AFTER the defaults, and a later directive
+    // wins per target, so `RUST_LOG=rdkafka=info` still turns them back on.
+    let quiet_defaults = format!("{},rdkafka=warn", opts.level);
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(rust_log) if !rust_log.trim().is_empty() => {
+            EnvFilter::new(format!("{quiet_defaults},{rust_log}"))
+        }
+        _ => EnvFilter::new(quiet_defaults),
+    };
 
     // RFC 3339 timestamp format
     let timer = UtcTime::rfc_3339();
