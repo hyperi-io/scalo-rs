@@ -123,8 +123,7 @@ impl CommonArgs {
             return format;
         }
         Self::derive_log_format(
-            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                .is_ok_and(|v| !v.trim().is_empty()),
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok_and(|v| !v.trim().is_empty()),
         )
         .to_string()
     }
