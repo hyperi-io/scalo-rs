@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.10.13](https://github.com/hyperi-io/scalo-rs/compare/v2.10.12...v2.10.13) (2026-08-23)
+
+### Bug Fixes
+
+* **cli:** metrics-addr falls through to config, log format derives from otel ([#38](https://github.com/hyperi-io/scalo-rs/issues/38)) ([b47b191](https://github.com/hyperi-io/scalo-rs/commit/b47b191d935029a06461b791be416fcce03316af)), closes [#36](https://github.com/hyperi-io/scalo-rs/issues/36) [#37](https://github.com/hyperi-io/scalo-rs/issues/37)
+* **logger:** quiet rdkafka INFO spam by default, RUST_LOG still overrides ([#35](https://github.com/hyperi-io/scalo-rs/issues/35)) ([f6dcb4d](https://github.com/hyperi-io/scalo-rs/commit/f6dcb4d90002592f4c2f885a207c4c64d862856d))
+
 ## [2.10.12](https://github.com/hyperi-io/scalo-rs/compare/v2.10.11...v2.10.12) (2026-08-18)
 
 ## [2.10.11](https://github.com/hyperi-io/scalo-rs/compare/v2.10.10...v2.10.11) (2026-08-18)
