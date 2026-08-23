@@ -224,6 +224,14 @@ pub struct MetricsSettings {
     #[serde(default)]
     pub namespace: String,
 
+    /// Metrics server bind address, under `metrics.address`.
+    ///
+    /// Consumed by the CLI's `effective_metrics_addr()` fall-through when no
+    /// `--metrics-addr`/`METRICS_ADDR` is given; `None` falls to the
+    /// hard-coded default.
+    #[serde(default)]
+    pub address: Option<String>,
+
     /// OTLP push settings, under `metrics.otel`.
     #[cfg(feature = "otel-metrics")]
     #[serde(default)]

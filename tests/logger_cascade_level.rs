@@ -23,7 +23,7 @@ fn bare_args() -> CommonArgs {
         config: None,
         log_level: None,
         log_format: None,
-        metrics_addr: "0.0.0.0:9090".to_string(),
+        metrics_addr: None,
         verbose: false,
         quiet: false,
     }
