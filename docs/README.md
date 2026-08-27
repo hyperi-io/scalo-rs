@@ -160,6 +160,7 @@ Section landing: [api/README.md](api/README.md)
 - [api/http-client.md](api/http-client.md) - `reqwest` + retry + circuit breaker
 - [api/directory-config.md](api/directory-config.md) - YAML directory store with optional `git2`
 - [api/concurrency.md](api/concurrency.md) - `BackgroundSink`, `PeriodicWorker`, `ActorHandle`
+- [version-check.md](version-check.md) - opt-out startup version check
 
 ### Planned (not in current release)
 
