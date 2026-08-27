@@ -392,8 +392,7 @@ pub fn setup_default() -> Result<(), LoggerError> {
         .unwrap_or(LogFormat::Auto);
 
     let throttle_enabled = std::env::var("LOG_THROTTLE_ENABLED")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
     let throttle_burst = std::env::var("LOG_THROTTLE_BURST")
         .ok()
