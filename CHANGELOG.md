@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.10.14](https://github.com/hyperi-io/scalo-rs/compare/v2.10.13...v2.10.14) (2026-08-27)
+
+### Bug Fixes
+
+* platform-derived version-check instance id, cascade-gated, shared contract with scalo-py ([6288191](https://github.com/hyperi-io/scalo-rs/commit/6288191292067787401ae6519b5b1017d44c313d))
+
 ## [2.10.13](https://github.com/hyperi-io/scalo-rs/compare/v2.10.12...v2.10.13) (2026-08-23)
 
 ### Bug Fixes
