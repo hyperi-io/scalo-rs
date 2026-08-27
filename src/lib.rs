@@ -85,6 +85,8 @@
 #![allow(clippy::missing_errors_doc)] // MVP does not require exhaustive docs
 #![allow(clippy::double_must_use)] // Return types already marked must_use
 #![allow(clippy::unused_async)] // Async for future compatibility
+#![allow(unknown_lints)] // the next line's lint is newer than the MSRV toolchain
+#![allow(clippy::unused_async_trait_impl)] // trait contracts stay async fn
 #![allow(clippy::duration_suboptimal_units)] // from_hours/from_mins need Rust 1.99 > MSRV
 #![allow(clippy::redundant_closure_for_method_calls)] // Clearer with explicit closure
 #![allow(clippy::result_large_err)] // figment::Error is large by design
