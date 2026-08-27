@@ -20,6 +20,10 @@
 //!
 //! Run with `cargo bench --bench concurrency_patterns --features concurrency`.
 
+// Bench crates do not inherit lib.rs lint attrs; trait contracts stay async fn.
+#![allow(unknown_lints)]
+#![allow(clippy::unused_async_trait_impl)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
