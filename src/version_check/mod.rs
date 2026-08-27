@@ -46,7 +46,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// version_check:
 ///   enabled: true
 ///   api_url: "https://releases.example.com/api/v1/check"
-///   timeout_secs: 5
+///   timeout: 5
+///   send_instance_id: true   # false = no identifier in the payload
+///   instance_id: ""          # explicit override of the derived id
 /// ```
 ///
 /// `product` and `current_version` are always set programmatically -- they
@@ -72,6 +74,21 @@ pub struct VersionCheckConfig {
     /// Enable the startup version check. Opt-in: off unless explicitly true.
     #[serde(default)]
     pub enabled: bool,
+    /// Include the platform-derived instance id in the payload, so the same
+    /// install reports as the same install across restarts. On by default
+    /// within the opt-in check; set `version_check.send_instance_id: false`
+    /// for a payload with no identifier at all.
+    #[serde(default = "default_true")]
+    pub send_instance_id: bool,
+    /// Explicit instance id, sent verbatim when set. Overrides the
+    /// platform-derived id -- for deployments that carry their own stable
+    /// identifier in config.
+    #[serde(default)]
+    pub instance_id: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_timeout() -> Duration {
@@ -103,6 +120,8 @@ impl Default for VersionCheckConfig {
             api_url: String::new(),
             timeout: DEFAULT_TIMEOUT,
             enabled: false,
+            send_instance_id: true,
+            instance_id: String::new(),
         }
     }
 }
@@ -191,21 +210,13 @@ impl VersionCheck {
 
 /// Payload sent to the version check API.
 ///
-/// Intentionally minimal. Pre-2.7.5 the payload also included:
-///   - `instance_id`: a persistent UUID disk-stored in `~/.cache/hyperi/`.
-///     Effectively a tracking cookie that survived restarts. Dropped --
-///     too aggressive for an OSS library's default behaviour. Operators
-///     who want a stable identifier can set one themselves via
-///     `VersionCheckConfig` (not currently exposed; can be added if a
-///     real need emerges).
-///   - `deployment`: free-form string from the operator's config
-///     (`"production-east"`, etc.). Operators sometimes embed sensitive
-///     names; dropping by default. Field stays on `VersionCheckConfig`
-///     for forward-compat but is no longer sent.
-///
-/// Kept: `product`, `current_version`, `os` (family -- Linux/Darwin/
-/// Windows), `arch` (x86_64/aarch64). Enough signal for "which versions
-/// are running on which platforms"; zero personal data.
+/// `product`, `current_version`, `os` (family -- Linux/Darwin/Windows) and
+/// `arch` (x86_64/aarch64), plus `instance_id` unless
+/// `version_check.send_instance_id: false`. The id is derived from the
+/// platform (see [`resolve_instance_id`]) so one install reports as one
+/// install across restarts; it is a one-way UUIDv5, so nothing about the
+/// host can be recovered from it. `deployment` is never sent: operators
+/// embed sensitive names in free-form deployment strings.
 #[derive(Debug, Serialize)]
 struct CheckPayload {
     product: String,
@@ -214,6 +225,92 @@ struct CheckPayload {
     os: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance_id: Option<String>,
+}
+
+/// UUIDv5 namespace for platform-derived instance ids:
+/// `uuid5(NAMESPACE_DNS, "scalo.hyperi.io")`. Shared with scalo-py so both
+/// chassis derive the SAME id from the same platform material.
+const INSTANCE_ID_NS: uuid::Uuid = uuid::uuid!("10ada713-52f0-5b77-aab7-7792712f92a0");
+
+/// Stable per-install instance id, derived from what the app is running on.
+///
+/// Resolution order, first hit wins:
+/// 1. `version_check.instance_id` from the config, verbatim.
+/// 2. Kubernetes: UUIDv5 over the serviceaccount cluster CA cert plus the
+///    pod namespace. Both are readable in-pod with no API permissions, the
+///    CA is unique per cluster and stable for its lifetime, so the id
+///    survives every pod restart and reschedule.
+/// 3. `/etc/machine-id` (UUIDv5, app-scoped per machine-id(5) -- the raw id
+///    never leaves the host). Skipped inside a container, where a
+///    machine-id baked into the image would make every install report as
+///    the same one.
+/// 4. A UUID persisted at `~/.config/scalo/instance_id` (dev machines).
+/// 5. An ephemeral UUID for this run alone.
+fn resolve_instance_id(config: &VersionCheckConfig) -> String {
+    if !config.instance_id.is_empty() {
+        return config.instance_id.clone();
+    }
+    if let Some(id) = k8s_instance_id() {
+        return id;
+    }
+    if let Some(id) = machine_instance_id() {
+        return id;
+    }
+    if let Some(id) = persisted_instance_id() {
+        return id;
+    }
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn k8s_instance_id() -> Option<String> {
+    let sa = std::path::Path::new("/var/run/secrets/kubernetes.io/serviceaccount");
+    let ca = std::fs::read(sa.join("ca.crt")).ok()?;
+    let ns = std::fs::read_to_string(sa.join("namespace")).ok()?;
+    let mut material = b"k8s:".to_vec();
+    material.extend_from_slice(&ca);
+    material.extend_from_slice(b":");
+    material.extend_from_slice(ns.trim().as_bytes());
+    Some(uuid::Uuid::new_v5(&INSTANCE_ID_NS, &material).to_string())
+}
+
+fn machine_instance_id() -> Option<String> {
+    if in_container() {
+        return None;
+    }
+    let raw = std::fs::read_to_string("/etc/machine-id")
+        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+        .ok()?;
+    let id = raw.trim();
+    if id.len() < 32 || id.chars().all(|c| c == '0') {
+        return None;
+    }
+    let material = format!("machine:{id}");
+    Some(uuid::Uuid::new_v5(&INSTANCE_ID_NS, material.as_bytes()).to_string())
+}
+
+fn in_container() -> bool {
+    std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+        || std::fs::read_to_string("/proc/1/cgroup").is_ok_and(|c| {
+            c.contains("docker") || c.contains("containerd") || c.contains("kubepods")
+        })
+}
+
+fn persisted_instance_id() -> Option<String> {
+    let dir = dirs::config_dir()?.join("scalo");
+    let path = dir.join("instance_id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            return Some(existing.to_string());
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(&path, &id).ok()?;
+    Some(id)
 }
 
 /// Response from the version check API.
@@ -243,8 +340,10 @@ fn announce_once(config: &VersionCheckConfig) {
     ANNOUNCED.get_or_init(|| {
         tracing::info!(
             endpoint = %config.api_url,
-            "version check: sending anonymous {{product, current_version, os, arch}} \
-             to endpoint (opt-in via version_check.enabled)"
+            send_instance_id = config.send_instance_id,
+            "version check: sending {{product, current_version, os, arch, instance_id}} \
+             to endpoint (opt-in via version_check.enabled; id off via \
+             version_check.send_instance_id)"
         );
     });
 }
@@ -260,6 +359,7 @@ async fn do_version_check(
         current_version: config.current_version.clone(),
         os: Some(std::env::consts::OS.into()),
         arch: Some(std::env::consts::ARCH.into()),
+        instance_id: config.send_instance_id.then(|| resolve_instance_id(config)),
     };
 
     let client = reqwest::Client::builder()
@@ -402,19 +502,19 @@ mod tests {
     }
 
     #[test]
-    fn check_payload_omits_dropped_fields() {
-        // The payload struct itself no longer has instance_id or deployment
-        // -- this test enforces that by serialising and checking the JSON
-        // shape. A future change that re-adds them will fail here.
+    fn check_payload_never_carries_deployment() {
+        // Free-form deployment strings carry operator-sensitive names, so
+        // the payload struct must not have the field at all.
         let payload = CheckPayload {
             product: "dfe-loader".into(),
             current_version: "1.0.0".into(),
             os: Some("linux".into()),
             arch: Some("x86_64".into()),
+            instance_id: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
-        assert!(!json.contains("instance_id"));
         assert!(!json.contains("deployment"));
+        assert!(!json.contains("instance_id"));
         assert!(json.contains("product"));
         assert!(json.contains("current_version"));
         assert!(json.contains("\"os\":\"linux\""));
@@ -428,6 +528,7 @@ mod tests {
             current_version: "1.8.0".into(),
             os: Some("linux".into()),
             arch: Some("x86_64".into()),
+            instance_id: Some("10ada713-52f0-5b77-aab7-7792712f92a0".into()),
         };
 
         let json = serde_json::to_value(&payload).unwrap();
@@ -435,9 +536,39 @@ mod tests {
         assert_eq!(json["current_version"], "1.8.0");
         assert_eq!(json["os"], "linux");
         assert_eq!(json["arch"], "x86_64");
-        // Dropped fields must not reappear.
-        assert!(json.get("instance_id").is_none());
+        assert_eq!(json["instance_id"], "10ada713-52f0-5b77-aab7-7792712f92a0");
         assert!(json.get("deployment").is_none());
+    }
+
+    #[test]
+    fn test_explicit_instance_id_wins() {
+        let config = VersionCheckConfig {
+            instance_id: "operator-chosen".into(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_instance_id(&config), "operator-chosen");
+    }
+
+    #[test]
+    fn test_resolved_instance_id_is_stable() {
+        // Whatever rung of the derivation ladder this host lands on, two
+        // resolutions must agree -- the id exists to be stable.
+        let config = VersionCheckConfig::default();
+        assert_eq!(resolve_instance_id(&config), resolve_instance_id(&config));
+    }
+
+    #[test]
+    fn test_send_instance_id_defaults_on() {
+        assert!(VersionCheckConfig::default().send_instance_id);
+    }
+
+    #[test]
+    fn test_k8s_id_matches_py_derivation() {
+        // uuid5 over the same material must equal python's
+        // uuid.uuid5(SCALO_NS, material) -- the two chassis share the
+        // namespace so one platform yields one id.
+        let id = uuid::Uuid::new_v5(&INSTANCE_ID_NS, b"machine:test-fixture");
+        assert_eq!(id.to_string(), "4f9f9577-e391-5835-8236-3e88e902b11b");
     }
 
     #[test]

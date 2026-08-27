@@ -189,7 +189,7 @@ deployment-test-support = ["deployment"]
 config-schema = ["dep:schemars", "serde_json", "deployment"]
 
 # Startup version check (calls a configured version API)
-version-check = ["reqwest", "tokio", "serde_json", "tracing", "chrono", "dirs"]
+version-check = ["reqwest", "tokio", "serde_json", "tracing", "chrono", "dirs", "uuid"]
 
 # Config hot-reload (SharedConfig<T> + ConfigReloader<T>)
 config-reload = ["config", "parking_lot", "tokio", "tracing"]
@@ -239,6 +239,9 @@ thiserror = ">=2.0.18, <3"
 
 # Environment detection
 dirs = { version = ">=6.0.0, <7", optional = true }
+
+# Opt-in version-check instance id
+uuid = { version = ">=1.11, <2", features = ["v4", "v5"], optional = true }
 
 # Configuration
 figment = { version = ">=0.10.19, <0.11", features = ["yaml", "toml", "json", "env"], optional = true }
