@@ -117,6 +117,17 @@ pub trait ServiceApp: Sized {
     fn deployment_contract(&self) -> Option<crate::deployment::DeploymentContract> {
         None
     }
+
+    /// Default version-check configuration for this service.
+    ///
+    /// The runtime overlays the `version_check` config cascade on this, so
+    /// any key a deployment sets -- an explicit `enabled: false` included
+    /// -- wins. Override to supply the service's releases endpoint; the
+    /// default has none, which leaves the check inert.
+    #[cfg(feature = "version-check")]
+    fn version_check_defaults(&self) -> crate::VersionCheckConfig {
+        crate::VersionCheckConfig::default()
+    }
 }
 
 /// Drive the standard data-plane service lifecycle.
@@ -257,6 +268,8 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
                 commit,
                 #[cfg(feature = "scaling")]
                 app.scaling_components(&config),
+                #[cfg(feature = "version-check")]
+                app.version_check_defaults(),
             )
             .await?;
 

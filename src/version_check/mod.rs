@@ -53,6 +53,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// `product` and `current_version` are always set programmatically -- they
 /// come from the binary, not from config files.
+///
+/// The check is OPT-OUT: wiring it into a binary is the opt-in, so
+/// `enabled` defaults true, and the check stays inert until an `api_url`
+/// is supplied (by the binary via
+/// [`from_cascade_or`](Self::from_cascade_or), or by config). An explicit
+/// `version_check.enabled: false` in any config layer always wins.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VersionCheckConfig {
     /// Product identifier (e.g., "dfe-loader", "dfe-receiver").
@@ -71,13 +77,16 @@ pub struct VersionCheckConfig {
     /// HTTP request timeout in seconds.
     #[serde(default = "default_timeout", with = "duration_secs")]
     pub timeout: Duration,
-    /// Enable the startup version check. Opt-in: off unless explicitly true.
-    #[serde(default)]
+    /// Enable the startup version check. ON by default -- wiring the check
+    /// into a binary is the opt-in; it still does nothing until an
+    /// `api_url` is configured. An explicit `version_check.enabled: false`
+    /// in any config layer is the opt-out and always wins.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Include the platform-derived instance id in the payload, so the same
-    /// install reports as the same install across restarts. On by default
-    /// within the opt-in check; set `version_check.send_instance_id: false`
-    /// for a payload with no identifier at all.
+    /// install reports as the same install across restarts. On by default;
+    /// set `version_check.send_instance_id: false` for a payload with no
+    /// identifier at all.
     #[serde(default = "default_true")]
     pub send_instance_id: bool,
     /// Explicit instance id, sent verbatim when set. Overrides the
@@ -119,7 +128,7 @@ impl Default for VersionCheckConfig {
             deployment: None,
             api_url: String::new(),
             timeout: DEFAULT_TIMEOUT,
-            enabled: false,
+            enabled: true,
             send_instance_id: true,
             instance_id: String::new(),
         }
@@ -132,27 +141,92 @@ impl VersionCheckConfig {
     /// Reads the `version_check` key from the cascade for `enabled`,
     /// `api_url`, and `timeout`. The `product` and `current_version`
     /// fields are always set from the provided arguments (they come
-    /// from the binary, not from config files).
+    /// from the binary, not from config files). Unset keys fall to this
+    /// type's own defaults (check on, no endpoint -- inert until an
+    /// `api_url` is supplied).
     #[must_use]
     pub fn from_cascade(product: &str, current_version: &str) -> Self {
-        let mut config = Self::cascade_base();
+        Self::from_cascade_or(product, current_version, Self::default())
+    }
+
+    /// Load from the config cascade, falling back to `defaults`.
+    ///
+    /// Every `version_check` key the cascade sets wins -- an explicit
+    /// `enabled: false` included -- and a key it leaves unset falls to
+    /// `defaults` instead of this type's own defaults. The seam a binary
+    /// uses to supply its endpoint default while any config layer (file
+    /// or env) can still turn the check off:
+    ///
+    /// ```rust,no_run
+    /// use scalo::version_check::{VersionCheck, VersionCheckConfig};
+    ///
+    /// let config = VersionCheckConfig::from_cascade_or(
+    ///     "my-service",
+    ///     env!("CARGO_PKG_VERSION"),
+    ///     VersionCheckConfig {
+    ///         api_url: "https://releases.example.com/api/v1/check".into(),
+    ///         ..Default::default()
+    ///     },
+    /// );
+    /// VersionCheck::new(config).check_on_startup();
+    /// ```
+    #[must_use]
+    pub fn from_cascade_or(product: &str, current_version: &str, defaults: Self) -> Self {
+        let mut config = Self::cascade_over(defaults);
         config.product = product.into();
         config.current_version = current_version.into();
         config
     }
 
-    /// Load just the cascade portion (enabled, api_url, timeout).
-    fn cascade_base() -> Self {
+    /// Overlay the cascade's `version_check` keys on `defaults`.
+    fn cascade_over(defaults: Self) -> Self {
         #[cfg(feature = "config")]
         {
             if let Some(cfg) = crate::config::try_get()
-                && let Ok(vc) = cfg.unmarshal_key_registered::<Self>("version_check")
+                && let Ok(partial) = cfg.unmarshal_key::<PartialVersionCheckConfig>("version_check")
             {
-                return vc;
+                let merged = partial.over(defaults);
+                crate::config::registry::register::<Self>("version_check", &merged);
+                return merged;
             }
         }
-        Self::default()
+        defaults
     }
+}
+
+/// Cascade overlay for [`VersionCheckConfig::from_cascade_or`]: a key the
+/// cascade sets wins, an absent key falls to the caller's defaults.
+#[cfg(feature = "config")]
+#[derive(Debug, Default, Deserialize)]
+struct PartialVersionCheckConfig {
+    enabled: Option<bool>,
+    api_url: Option<String>,
+    #[serde(default, deserialize_with = "opt_duration_secs")]
+    timeout: Option<Duration>,
+    send_instance_id: Option<bool>,
+    instance_id: Option<String>,
+    deployment: Option<String>,
+}
+
+#[cfg(feature = "config")]
+impl PartialVersionCheckConfig {
+    fn over(self, defaults: VersionCheckConfig) -> VersionCheckConfig {
+        VersionCheckConfig {
+            product: defaults.product,
+            current_version: defaults.current_version,
+            deployment: self.deployment.or(defaults.deployment),
+            api_url: self.api_url.unwrap_or(defaults.api_url),
+            timeout: self.timeout.unwrap_or(defaults.timeout),
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            send_instance_id: self.send_instance_id.unwrap_or(defaults.send_instance_id),
+            instance_id: self.instance_id.unwrap_or(defaults.instance_id),
+        }
+    }
+}
+
+#[cfg(feature = "config")]
+fn opt_duration_secs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+    Ok(Option::<u64>::deserialize(d)?.map(Duration::from_secs))
 }
 
 /// Startup version checker.
@@ -178,7 +252,7 @@ impl VersionCheck {
     /// logs the result. Any errors are logged at warn level and swallowed.
     pub fn check_on_startup(&self) {
         if !self.config.enabled {
-            tracing::debug!("version check not enabled (opt-in)");
+            tracing::debug!("version check not enabled (version_check.enabled: false)");
             return;
         }
 
@@ -342,8 +416,8 @@ fn announce_once(config: &VersionCheckConfig) {
             endpoint = %config.api_url,
             send_instance_id = config.send_instance_id,
             "version check: sending {{product, current_version, os, arch, instance_id}} \
-             to endpoint (opt-in via version_check.enabled; id off via \
-             version_check.send_instance_id)"
+             to endpoint (off via version_check.enabled: false; id off via \
+             version_check.send_instance_id: false)"
         );
     });
 }
@@ -497,7 +571,8 @@ mod tests {
         let config = VersionCheckConfig::default();
         assert!(config.api_url.is_empty());
         assert_eq!(config.timeout, Duration::from_secs(5));
-        assert!(!config.enabled);
+        // Opt-out: on by default, inert until an api_url is configured.
+        assert!(config.enabled);
         assert!(config.product.is_empty());
     }
 
@@ -538,6 +613,70 @@ mod tests {
         assert_eq!(json["arch"], "x86_64");
         assert_eq!(json["instance_id"], "10ada713-52f0-5b77-aab7-7792712f92a0");
         assert!(json.get("deployment").is_none());
+    }
+
+    #[cfg(feature = "config")]
+    #[test]
+    fn test_overlay_explicit_false_beats_app_default_on() {
+        let partial: PartialVersionCheckConfig =
+            serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        let merged = partial.over(VersionCheckConfig {
+            enabled: true,
+            api_url: "https://releases.example.com/api/v1/check".into(),
+            ..Default::default()
+        });
+        assert!(!merged.enabled);
+        assert_eq!(merged.api_url, "https://releases.example.com/api/v1/check");
+    }
+
+    #[cfg(feature = "config")]
+    #[test]
+    fn test_overlay_unset_keys_fall_to_app_defaults() {
+        let partial: PartialVersionCheckConfig = serde_json::from_str("{}").unwrap();
+        let merged = partial.over(VersionCheckConfig {
+            enabled: true,
+            api_url: "https://releases.example.com/api/v1/check".into(),
+            ..Default::default()
+        });
+        assert!(merged.enabled);
+        assert_eq!(merged.api_url, "https://releases.example.com/api/v1/check");
+        assert_eq!(merged.timeout, Duration::from_secs(5));
+        assert!(merged.send_instance_id);
+    }
+
+    #[cfg(feature = "config")]
+    #[test]
+    fn test_overlay_cascade_url_and_timeout_win() {
+        let partial: PartialVersionCheckConfig =
+            serde_json::from_str(r#"{"api_url": "https://mirror.example.com/", "timeout": 9}"#)
+                .unwrap();
+        let merged = partial.over(VersionCheckConfig {
+            enabled: true,
+            api_url: "https://releases.example.com/api/v1/check".into(),
+            ..Default::default()
+        });
+        assert!(merged.enabled);
+        assert_eq!(merged.api_url, "https://mirror.example.com/");
+        assert_eq!(merged.timeout, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn test_from_cascade_or_without_cascade_returns_defaults() {
+        // Unit tests never initialise the global config, so the defaults
+        // must pass through untouched with product/version overlaid.
+        let config = VersionCheckConfig::from_cascade_or(
+            "my-service",
+            "1.2.3",
+            VersionCheckConfig {
+                enabled: true,
+                api_url: "https://releases.example.com/api/v1/check".into(),
+                ..Default::default()
+            },
+        );
+        assert!(config.enabled);
+        assert_eq!(config.product, "my-service");
+        assert_eq!(config.current_version, "1.2.3");
+        assert_eq!(config.api_url, "https://releases.example.com/api/v1/check");
     }
 
     #[test]
@@ -636,9 +775,25 @@ mod tests {
     fn test_not_enabled_does_not_spawn() {
         let checker = VersionCheck::new(VersionCheckConfig {
             enabled: false,
+            api_url: "https://releases.example.com/api/v1/check".into(),
+            product: "my-service".into(),
+            current_version: "1.0.0".into(),
             ..Default::default()
         });
-        // Should return immediately without panic (no tokio runtime needed)
+        // Explicit opt-out wins over everything else being set: returns
+        // immediately without panic (no tokio runtime needed).
+        checker.check_on_startup();
+    }
+
+    #[test]
+    fn test_default_no_api_url_does_not_spawn() {
+        let checker = VersionCheck::new(VersionCheckConfig {
+            product: "my-service".into(),
+            current_version: "1.0.0".into(),
+            ..Default::default()
+        });
+        // Enabled by default but inert with no endpoint: returns
+        // immediately without panic (no tokio runtime needed).
         checker.check_on_startup();
     }
 
