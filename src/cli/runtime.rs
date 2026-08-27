@@ -113,6 +113,7 @@ impl ServiceRuntime {
         #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] version: &str,
         #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] commit: &str,
         #[cfg(feature = "scaling")] scaling_components: Vec<crate::ScalingComponent>,
+        #[cfg(feature = "version-check")] version_check_defaults: crate::VersionCheckConfig,
     ) -> Result<Self, CliError> {
         let ctx = runtime_context();
 
@@ -230,10 +231,16 @@ impl ServiceRuntime {
         }
 
         // --- Version check (fire-and-forget) ---
+        // The app's defaults (its releases endpoint) sit UNDER the cascade,
+        // so a deployment's explicit version_check.* keys always win.
         #[cfg(feature = "version-check")]
         {
-            crate::VersionCheck::new(crate::VersionCheckConfig::from_cascade(app_name, version))
-                .check_on_startup();
+            crate::VersionCheck::new(crate::VersionCheckConfig::from_cascade_or(
+                app_name,
+                version,
+                version_check_defaults,
+            ))
+            .check_on_startup();
         }
 
         // Log runtime context

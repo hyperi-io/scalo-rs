@@ -82,7 +82,10 @@ Step by step inside `run_app` for the default `run` subcommand:
    - Install signal handler -- returns `CancellationToken`.
    - Start the worker pool scaling loop.
    - Start the metrics server on `args.metrics_addr`.
-   - Fire-and-forget version check if `version-check` is on.
+   - Fire-and-forget version check if `version-check` is on: enabled by
+     default, inert until `version_check_defaults()` or config supplies an
+     `api_url`, and `version_check.enabled: false` in any config layer
+     turns it off.
 5. Call `app.run_service(config, runtime)`.
 
 The service author's code starts at step 5 -- everything before that
@@ -112,6 +115,7 @@ pub trait ServiceApp: Sized {
     fn scaling_components(&self, _: &Self::Config) -> Vec<ScalingComponent> { vec![] }  // cfg: scaling
     fn register_metrics(&self, _: &MetricsManager) {}                                   // cfg: metrics | otel-metrics
     fn deployment_contract(&self) -> Option<DeploymentContract> { None }                // cfg: deployment
+    fn version_check_defaults(&self) -> VersionCheckConfig { Default::default() }       // cfg: version-check
 }
 ```
 
@@ -127,9 +131,11 @@ pub trait ServiceApp: Sized {
 | `scaling_components` | no (cfg `scaling`) | Register app-specific KEDA signals (lag, queue depth) |
 | `register_metrics` | no (cfg `metrics`) | Register app metrics for `metrics-manifest` / `generate-artefacts` |
 | `deployment_contract` | no (cfg `deployment`) | Build the contract for `generate-artefacts` |
+| `version_check_defaults` | no (cfg `version-check`) | Supply the service's releases endpoint; the cascade overlays it, `version_check.enabled: false` always wins |
 
-Apps that don't override the last four get sensible no-op defaults.
-The last three only exist when their feature is compiled in.
+Apps that don't override the optional methods get sensible no-op
+defaults. The cfg-marked ones only exist when their feature is compiled
+in.
 
 ---
 
