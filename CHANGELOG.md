@@ -3,6 +3,16 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.11.0](https://github.com/hyperi-io/scalo-rs/compare/v2.10.15...v2.11.0) (2026-08-31)
+
+### Features
+
+* **geoip-download:** MMDB provisioning shared instead of buried in dfe-loader ([080ae5f](https://github.com/hyperi-io/scalo-rs/commit/080ae5f5d5e159814a22f7e5a42ebbb6231fdece))
+
+### Bug Fixes
+
+* name the send() parameter what it is -- a destination, not a key ([07444ad](https://github.com/hyperi-io/scalo-rs/commit/07444ad3d2ad03f96af7fc26c1cc3026249a117a))
+
 ## [2.10.15](https://github.com/hyperi-io/scalo-rs/compare/v2.10.14...v2.10.15) (2026-08-27)
 
 ### Bug Fixes
