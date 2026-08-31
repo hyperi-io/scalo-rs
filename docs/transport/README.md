@@ -23,7 +23,7 @@ classDiagram
     }
     class TransportSender {
         <<trait>>
-        +send(key, payload)
+        +send(destination, payload)
     }
     class TransportReceiver {
         <<trait>>
@@ -42,7 +42,7 @@ classDiagram
 | Trait | Purpose | Object-safe? |
 |-------|---------|--------------|
 | `TransportBase` | Lifecycle + introspection — `close()`, `is_healthy()`, `name()` | Yes (no async, no generics) |
-| `TransportSender` | Add `send(key, payload)` — async fn in trait | Not via `dyn` — see below |
+| `TransportSender` | Add `send(destination, payload)` — async fn in trait | Not via `dyn` — see below |
 | `TransportReceiver` | Add `recv` + `commit`, generic `type Token: CommitToken` | Never via `dyn` — the GAT-shaped token kills it |
 | `Transport` | Marker — blanket impl for `T: Sender + Receiver` | N/A |
 
@@ -158,11 +158,12 @@ model in [filter-engine.md](filter-engine.md).
 
 ---
 
-## Routing — per-key dispatch (originators only)
+## Routing — per-destination dispatch (originators only)
 
 `RoutedSender` wraps N `AnySender`s in a `HashMap<String, AnySender>`
-plus an optional default. `send(key, payload)` picks the backend by
-key. Only `dfe-receiver` and `dfe-fetcher` use this — mid-tier and
+plus an optional default. `send(destination, payload)` picks the
+backend by destination. Only `dfe-receiver` and `dfe-fetcher` use
+this — mid-tier and
 sink stages do 1:1. See [routing.md](routing.md).
 
 ---
@@ -172,7 +173,7 @@ sink stages do 1:1. See [routing.md](routing.md).
 | Item | Purpose |
 |------|---------|
 | `TransportBase` | `close`, `is_healthy`, `name` — every backend |
-| `TransportSender::send(key, payload)` | Async send, returns `SendResult` |
+| `TransportSender::send(destination, payload)` | Async send, returns `SendResult` |
 | `TransportReceiver::recv(max)` | Async batch receive, returns `RecvBatch<Token>` (`messages` + `dlq_entries`) |
 | `TransportReceiver::commit(&tokens)` | Ack a slice of tokens through the same transport |
 | `CommitToken` | `Clone + Send + Sync + Debug + Display`, `as_str()` |

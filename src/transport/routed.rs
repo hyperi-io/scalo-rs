@@ -160,18 +160,18 @@ impl TransportBase for RoutedSender {
 }
 
 impl TransportSender for RoutedSender {
-    async fn send(&self, key: &str, payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
 
-        let Some((route_name, sender)) = self.resolve(key) else {
+        let Some((route_name, sender)) = self.resolve(destination) else {
             return SendResult::Fatal(TransportError::Config(format!(
-                "no route configured for key '{key}' and no default sender"
+                "no route configured for destination '{destination}' and no default sender"
             )));
         };
         // F7: route label is the CONFIGURED route name (or
-        // "default"), not the per-message key. Cardinality is
+        // "default"), not the per-message destination. Cardinality is
         // bounded by the routing table size, not by message count.
         #[cfg(feature = "metrics")]
         {
@@ -191,7 +191,7 @@ impl TransportSender for RoutedSender {
         #[cfg(not(feature = "metrics"))]
         let _ = route_name;
 
-        sender.send(key, payload).await
+        sender.send(destination, payload).await
     }
 }
 

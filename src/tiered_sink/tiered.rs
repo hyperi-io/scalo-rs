@@ -751,7 +751,7 @@ mod tests {
     }
 
     impl TransportSender for TestSink {
-        async fn send(&self, _key: &str, payload: bytes::Bytes) -> SendResult {
+        async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
             if self.available.load(AtomicOrdering::SeqCst) {
                 self.received.lock().await.push(rec(&payload));
                 SendResult::Ok

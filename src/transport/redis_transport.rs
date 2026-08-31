@@ -291,7 +291,7 @@ impl TransportBase for RedisTransport {
 }
 
 impl TransportSender for RedisTransport {
-    async fn send(&self, key: &str, payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
@@ -305,7 +305,7 @@ impl TransportSender for RedisTransport {
             }
         }
 
-        let stream = match self.resolve_stream(key) {
+        let stream = match self.resolve_stream(destination) {
             Ok(s) => s.to_string(),
             Err(e) => return SendResult::Fatal(e),
         };

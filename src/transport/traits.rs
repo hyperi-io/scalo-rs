@@ -178,22 +178,27 @@ pub async fn boot_healthcheck<T: TransportBase>(
 /// implementations auto-emit `dfe_transport_*` metrics when a `MetricsManager`
 /// recorder is installed.
 pub trait TransportSender: TransportBase {
-    /// Send raw bytes to a key/destination.
+    /// Send raw bytes to a destination.
     ///
-    /// The `key` semantics depend on the transport:
-    /// - Kafka: topic name
+    /// The `destination` semantics depend on the transport:
+    /// - Kafka: topic name (NOT a message/partition key -- scalo does not
+    ///   model per-record partition keys at this layer)
     /// - gRPC: metadata routing key
     /// - HTTP: URL path suffix or ignored
     /// - File: filename suffix or ignored
     /// - Redis: stream name
     /// - Pipe: ignored (single stdout)
-    fn send(&self, key: &str, payload: bytes::Bytes) -> impl Future<Output = SendResult> + Send;
+    fn send(
+        &self,
+        destination: &str,
+        payload: bytes::Bytes,
+    ) -> impl Future<Output = SendResult> + Send;
 
     /// Send a whole block of [`Record`]s in one shot.
     ///
     /// The default sends each record individually via [`send`](Self::send),
-    /// using the record's own `key` (empty when `None`) and payload (a refcount
-    /// bump, not a copy). Transports with a native batch RPC (e.g. gRPC's
+    /// using the record's own `key` as the destination (empty when `None`) and
+    /// payload (a refcount bump, not a copy). Transports with a native batch RPC (e.g. gRPC's
     /// `RouteBatch`) override this. Commit tokens and inline-DLQ entries are NOT
     /// sent -- they are the SENDER's local concern; fire the commit tokens
     /// locally after this returns [`SendResult::Ok`].
@@ -218,8 +223,8 @@ pub trait TransportSender: TransportBase {
     fn send_batch(&self, records: &[Record]) -> impl Future<Output = SendResult> + Send {
         async move {
             for record in records {
-                let key = record.key.as_deref().unwrap_or("");
-                match self.send(key, record.payload.clone()).await {
+                let destination = record.key.as_deref().unwrap_or("");
+                match self.send(destination, record.payload.clone()).await {
                     // Sent, dropped (Ok), or suppressed by an outbound dlq
                     // filter -- all handled; keep going, do NOT abort the block.
                     SendResult::Ok | SendResult::FilteredDlq => {}

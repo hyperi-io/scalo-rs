@@ -174,22 +174,22 @@ impl TransportSender for AnySender {
         )),
         allow(unused_variables)
     )]
-    async fn send(&self, key: &str, payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         match self {
             #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.send(key, payload).await,
+            Self::Kafka(t) => t.send(destination, payload).await,
             #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.send(key, payload).await,
+            Self::Grpc(t) => t.send(destination, payload).await,
             #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.send(key, payload).await,
+            Self::Memory(t) => t.send(destination, payload).await,
             #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.send(key, payload).await,
+            Self::Pipe(t) => t.send(destination, payload).await,
             #[cfg(feature = "transport-file")]
-            Self::File(t) => t.send(key, payload).await,
+            Self::File(t) => t.send(destination, payload).await,
             #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.send(key, payload).await,
+            Self::Http(t) => t.send(destination, payload).await,
             #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.send(key, payload).await,
+            Self::Redis(t) => t.send(destination, payload).await,
             #[allow(unreachable_patterns)]
             _ => SendResult::Fatal(TransportError::Config(
                 "no transport variant enabled".into(),

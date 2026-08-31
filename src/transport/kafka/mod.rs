@@ -716,7 +716,7 @@ impl TransportBase for KafkaTransport {
 }
 
 impl TransportSender for KafkaTransport {
-    async fn send(&self, key: &str, payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
@@ -729,7 +729,8 @@ impl TransportSender for KafkaTransport {
             }
         }
 
-        let record: FutureRecord<'_, str, [u8]> = FutureRecord::to(key).payload(payload.as_ref());
+        let record: FutureRecord<'_, str, [u8]> =
+            FutureRecord::to(destination).payload(payload.as_ref());
 
         // Inject W3C traceparent into Kafka headers for distributed tracing.
         #[cfg(feature = "transport-trace")]

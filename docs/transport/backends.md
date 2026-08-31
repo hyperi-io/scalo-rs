@@ -163,7 +163,7 @@ Source: [../../src/transport/file.rs](../../src/transport/file.rs).
 ## Pipe
 
 Reads from stdin, writes to stdout. Newline-delimited, one line per
-message. The `key` arg to `send()` is ignored — there's only one
+message. The `destination` arg to `send()` is ignored — there's only one
 stdout. `PipeToken` is a monotonic sequence number; `commit()` is a
 no-op because stdin is forward-only.
 
