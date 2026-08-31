@@ -217,7 +217,7 @@ impl TransportBase for MemoryTransport {
 }
 
 impl TransportSender for MemoryTransport {
-    async fn send(&self, key: &str, payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
@@ -235,7 +235,7 @@ impl TransportSender for MemoryTransport {
         let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
         let msg = InternalMessage {
-            key: Some(Arc::from(key)),
+            key: Some(Arc::from(destination)),
             payload,
             seq,
             timestamp_ms,

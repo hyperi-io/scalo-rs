@@ -174,7 +174,7 @@ impl TransportBase for PipeTransport {
 }
 
 impl TransportSender for PipeTransport {
-    async fn send(&self, _key: &str, payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }

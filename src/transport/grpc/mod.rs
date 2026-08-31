@@ -335,7 +335,7 @@ impl GrpcTransport {
 }
 
 impl TransportSender for GrpcTransport {
-    async fn send(&self, key: &str, payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
@@ -356,8 +356,8 @@ impl TransportSender for GrpcTransport {
         };
 
         let mut metadata = HashMap::new();
-        if !key.is_empty() {
-            metadata.insert("topic".to_string(), key.to_string());
+        if !destination.is_empty() {
+            metadata.insert("topic".to_string(), destination.to_string());
         }
 
         // Inject W3C traceparent into gRPC metadata.

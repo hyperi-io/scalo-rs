@@ -66,7 +66,7 @@ impl crate::transport::TransportBase for FakeSender {
 }
 
 impl TransportSender for FakeSender {
-    async fn send(&self, _key: &str, _payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, _destination: &str, _payload: bytes::Bytes) -> SendResult {
         SendResult::Ok
     }
 

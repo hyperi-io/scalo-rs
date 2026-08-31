@@ -586,7 +586,7 @@ impl TransportBase for HttpTransport {
 }
 
 impl TransportSender for HttpTransport {
-    async fn send(&self, key: &str, payload: bytes::Bytes) -> SendResult {
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
@@ -606,12 +606,12 @@ impl TransportSender for HttpTransport {
             ));
         };
 
-        // Build URL: {base_url}/{key} if key is non-empty, otherwise just {base_url}
-        let url = if key.is_empty() {
+        // Build URL: {base_url}/{destination} when non-empty, otherwise just {base_url}
+        let url = if destination.is_empty() {
             base_url.clone()
         } else {
             let base = base_url.trim_end_matches('/');
-            let suffix = key.trim_start_matches('/');
+            let suffix = destination.trim_start_matches('/');
             format!("{base}/{suffix}")
         };
 

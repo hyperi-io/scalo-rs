@@ -95,7 +95,11 @@ pub struct Record {
     /// Raw payload bytes -- zero-copy / refcounted.
     pub payload: Bytes,
 
-    /// Routing key (Kafka topic, gRPC metadata key, Redis stream, ...).
+    /// Routing destination (Kafka topic, gRPC routing key, Redis stream, ...).
+    ///
+    /// NOT a Kafka message/partition key -- scalo does not model per-record
+    /// partition keys at this layer. The field stays named `key` because
+    /// renaming a `pub` field breaks every consumer (human-only call).
     pub key: Option<Arc<str>>,
 
     /// Transport / application headers.

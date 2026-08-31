@@ -1,8 +1,9 @@
 # Routing
 
-`RoutedSender` dispatches `send(key, payload)` to one of N backend
-senders based on the key — different topics, tenants, or stream IDs
-land on different transports. Sits on top of [`AnySender`](README.md);
+`RoutedSender` dispatches `send(destination, payload)` to one of N
+backend senders based on the destination — different topics, tenants,
+or stream IDs land on different transports. Sits on top of
+[`AnySender`](README.md);
 no new backend, no new trait.
 
 ---
@@ -35,7 +36,7 @@ for low-latency capture.
 
 ```mermaid
 flowchart LR
-    Ingress["gRPC ingress"] --> RS{"RoutedSender<br/>dispatch by key"}
+    Ingress["gRPC ingress"] --> RS{"RoutedSender<br/>dispatch by destination"}
     RS -->|&quot;events.land&quot;| K1["Kafka topic events.land"]
     RS -->|&quot;events.load&quot;| K2["Kafka topic events.load"]
     RS -->|&quot;audit.land&quot;| G["gRPC archiver:6000"]
@@ -112,8 +113,8 @@ let sender = RoutedSender::new(routes, Some(default_sender));
 default. Each `AnySender` is itself enum-dispatched over the seven
 backends. So `RoutedSender::send`:
 
-1. `HashMap::get(key)` to find the route (or fall back to default).
-2. `AnySender::send(key, payload).await` on the chosen sender.
+1. `HashMap::get(destination)` to find the route (or fall back to default).
+2. `AnySender::send(destination, payload).await` on the chosen sender.
 3. Backend's own `send` runs — Kafka, gRPC, etc.
 
 Two layers of dispatch, both monomorphised by the compiler. The
@@ -147,7 +148,7 @@ the route taken.
 
 ## Empty / missing routes
 
-Behaviour when `key` is not in `routes`:
+Behaviour when `destination` is not in `routes`:
 
 | Config | Result |
 |--------|--------|
@@ -172,7 +173,7 @@ result.
 |------|---------|
 | `RoutedSender::new(routes, default)` | Construct from pre-built `AnySender`s |
 | `RoutedSender::from_route_configs(routes, default).await` | Construct from per-route `TransportConfig`s |
-| `RoutedSender::send(key, payload).await` | Dispatch by key, fall to default if missing |
+| `RoutedSender::send(destination, payload).await` | Dispatch by destination, fall to default if missing |
 | `RoutedSender::route_keys() -> Vec<&str>` | List configured route keys |
 | `RoutedSender::has_route(key) -> bool` | Check if a specific key has a route |
 | `RoutedSender::has_default() -> bool` | Check if a default sender is wired |
