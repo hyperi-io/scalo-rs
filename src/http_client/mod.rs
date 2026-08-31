@@ -240,6 +240,32 @@ impl HttpClient {
         result
     }
 
+    /// Send a GET request, customising the request before dispatch.
+    ///
+    /// Idempotent and retried exactly like [`Self::get`]. `customise` runs once
+    /// per attempt, so auth headers, query parameters and custom headers are
+    /// reapplied on every retry.
+    ///
+    /// Use this rather than [`Self::client`] when the request needs decoration
+    /// but should keep the retry/backoff and metrics behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpError::Transport`] on a persistent transport failure. A
+    /// persistent server status (5xx) is returned as `Ok(response)`.
+    pub async fn get_with(
+        &self,
+        url: &str,
+        customise: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Response, HttpError> {
+        let start = std::time::Instant::now();
+        let result = self
+            .execute("GET", true, || customise(self.inner.get(url)))
+            .await;
+        Self::record("GET", result.is_ok(), start);
+        result
+    }
+
     /// Send a POST request with a JSON body.
     ///
     /// POST is **not** retried by default (not idempotent); enable

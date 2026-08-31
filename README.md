@@ -109,6 +109,7 @@ Pick the slice you need; pay only for what you use.
 | `expression` | CEL expression evaluation |
 | `deployment` | Deployment-contract validation |
 | `version-check` | Optional startup version check |
+| `geoip-download` | GeoIP MMDB database provisioning (download + freshness, no lookup engine) |
 | `full` | Everything |
 
 ## Native System Dependencies

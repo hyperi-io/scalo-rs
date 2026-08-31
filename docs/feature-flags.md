@@ -136,6 +136,14 @@ For full distributed tracing through Kafka/gRPC, enable
 
 ---
 
+## Standalone features
+
+| Feature | Adds |
+|---------|------|
+| `geoip-download` | MMDB database provisioning -- pulls `http` (the shared `HttpClient`), plus `flate2` and `tar` for the provider archive formats. Files onto disk only, no lookup engine. See [api/geoip-download.md](api/geoip-download.md) |
+
+---
+
 ## The `full` umbrella
 
 ```toml

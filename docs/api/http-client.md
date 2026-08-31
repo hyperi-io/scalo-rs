@@ -78,6 +78,7 @@ http_client:
 | `HttpClient::new(config)` | Build from explicit config |
 | `HttpClient::from_cascade()` | Build from the `http_client` config section |
 | `.get(url)` | GET request |
+| `.get_with(url, f)` | GET request with the builder decorated by `f` (auth, headers, query) -- keeps retry and metrics, unlike `.client()` |
 | `.post_json(url, &body)` | POST with JSON body and content-type |
 | `.put_json(url, &body)` | PUT with JSON body |
 | `.delete(url)` | DELETE request |
