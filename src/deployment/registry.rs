@@ -221,6 +221,7 @@ mod tests {
 
     #[test]
     fn env_answers_when_the_cascade_is_not_loaded() {
+        let _env = crate::deployment::env_test_lock::guard();
         // The remedy the generated Dockerfile names has to work in the command
         // that GENERATES Dockerfiles -- and artefact generation never calls
         // load_config, so the YAML cascade is not initialised there. Reading the
@@ -236,6 +237,7 @@ mod tests {
 
     #[test]
     fn explicit_distro_beats_the_base_image() {
+        let _env = crate::deployment::env_test_lock::guard();
         // Config is explicit, the image string is a guess -- explicit wins.
         temp_env::with_var("DEPLOYMENT__BASE_DISTRO", Some("noble"), || {
             assert_eq!(
@@ -247,6 +249,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_or_empty_env_value_is_treated_as_unset() {
+        let _env = crate::deployment::env_test_lock::guard();
         temp_env::with_var("DEPLOYMENT__BASE_DISTRO", Some("plucky"), || {
             // Falls through to the image rather than substituting something.
             assert_eq!(
