@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.11.1](https://github.com/hyperi-io/scalo-rs/compare/v2.11.0...v2.11.1) (2026-09-01)
+
+### Bug Fixes
+
+* **geoip-download:** derive PartialEq, and stop the distro env tests racing ([2c66ad5](https://github.com/hyperi-io/scalo-rs/commit/2c66ad5014ce3452f7199cfc973a8ed122ac44bc))
+* **metrics:** honour a readiness callback set after the server started ([010f9d2](https://github.com/hyperi-io/scalo-rs/commit/010f9d24a16893f4f5278f56e7441f8beac6c8ad))
+
 ## [2.11.0](https://github.com/hyperi-io/scalo-rs/compare/v2.10.15...v2.11.0) (2026-08-31)
 
 ### Features
