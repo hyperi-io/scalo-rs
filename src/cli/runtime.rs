@@ -272,7 +272,8 @@ impl ServiceRuntime {
     /// Set the readiness check callback.
     ///
     /// Each app defines its own readiness criteria. Call this in `run_service()`
-    /// once you know what "ready" means for your app.
+    /// once you know what "ready" means for your app: the metrics listener is
+    /// already serving by then, and the callback is picked up regardless.
     pub fn set_readiness_check<F: Fn() -> bool + Send + Sync + 'static>(&mut self, check: F) {
         self.metrics.set_readiness_check(check);
     }

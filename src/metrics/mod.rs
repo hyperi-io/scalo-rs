@@ -89,7 +89,7 @@ pub(crate) mod otel;
 pub mod otel_types;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use metrics::{Counter, Gauge, Histogram, Unit};
@@ -99,6 +99,14 @@ use tokio::sync::oneshot;
 
 /// Readiness check callback type.
 pub type ReadinessFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Shared slot the running server reads on every `/readyz`.
+///
+/// The callback is stored behind a shared handle rather than moved into the
+/// server task, so [`MetricsManager::set_readiness_check`] takes effect after
+/// the listener has started -- which is the only order an app can achieve when
+/// readiness depends on state built after the runtime.
+type ReadinessSlot = Arc<RwLock<Option<ReadinessFn>>>;
 
 #[cfg(feature = "metrics")]
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -473,7 +481,7 @@ pub struct MetricsManager {
     shutdown_tx: Option<oneshot::Sender<()>>,
     process_metrics: Option<ProcessMetrics>,
     container_metrics: Option<ContainerMetrics>,
-    readiness_fn: Option<ReadinessFn>,
+    readiness_fn: ReadinessSlot,
     registry: MetricRegistry,
     #[cfg(all(feature = "metrics", feature = "scaling"))]
     scaling_pressure: Option<Arc<crate::scaling::ScalingPressure>>,
@@ -519,7 +527,7 @@ impl MetricsManager {
             shutdown_tx: None,
             process_metrics: None,
             container_metrics: None,
-            readiness_fn: None,
+            readiness_fn: ReadinessSlot::default(),
             #[cfg(all(feature = "metrics", feature = "scaling"))]
             scaling_pressure: None,
             #[cfg(all(feature = "metrics", feature = "memory"))]
@@ -561,7 +569,7 @@ impl MetricsManager {
             shutdown_tx: None,
             process_metrics,
             container_metrics,
-            readiness_fn: None,
+            readiness_fn: ReadinessSlot::default(),
             #[cfg(all(feature = "metrics", feature = "scaling"))]
             scaling_pressure: None,
             #[cfg(all(feature = "metrics", feature = "memory"))]
@@ -815,8 +823,15 @@ impl MetricsManager {
     /// When set, `/readyz` calls this function and returns 503 Service
     /// Unavailable if it returns `false`. Without a callback, the endpoint
     /// always returns 200.
+    ///
+    /// Takes effect immediately whether or not the server is already running,
+    /// because the callback lives in a slot the request handler reads rather
+    /// than a value the server task captured at start.
     pub fn set_readiness_check(&mut self, f: impl Fn() -> bool + Send + Sync + 'static) {
-        self.readiness_fn = Some(Arc::new(f));
+        *self
+            .readiness_fn
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(f));
     }
 
     /// Attach a `ScalingPressure` instance.
@@ -1147,7 +1162,7 @@ async fn run_server(
     update_interval: Duration,
     process_metrics: Option<ProcessMetrics>,
     container_metrics: Option<ContainerMetrics>,
-    readiness_fn: Option<ReadinessFn>,
+    readiness_fn: ReadinessSlot,
 ) {
     let mut update_interval = tokio::time::interval(update_interval);
 
@@ -1203,7 +1218,7 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     handle: PrometheusHandle,
     registry: MetricRegistry,
-    readiness_fn: Option<ReadinessFn>,
+    readiness_fn: ReadinessSlot,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -1241,7 +1256,11 @@ async fn handle_connection(
             r#"{"status":"alive"}"#.to_string(),
         )
     } else if request_line.starts_with("GET /readyz") {
-        let callback_ready = readiness_fn.as_ref().is_none_or(|f| f());
+        let callback_ready = readiness_fn
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_none_or(|f| f());
 
         #[cfg(feature = "health")]
         let registry_ready = crate::health::HealthRegistry::is_ready();
@@ -1284,10 +1303,14 @@ async fn handle_connection(
 /// feature is enabled) the global [`HealthRegistry`](crate::health::HealthRegistry).
 /// Both must be true for a 200 response.
 #[cfg(all(feature = "metrics", feature = "http-server"))]
-fn readiness_response(rf: Option<ReadinessFn>) -> axum::response::Response {
+fn readiness_response(rf: ReadinessSlot) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let callback_ready = rf.as_ref().is_none_or(|f| f());
+    let callback_ready = rf
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_none_or(|f| f());
 
     #[cfg(feature = "health")]
     let registry_ready = crate::health::HealthRegistry::is_ready();
@@ -1376,6 +1399,32 @@ pub fn size_buckets() -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_set_after_the_server_started_is_honoured() {
+        // ServiceRuntime::build starts the listener before an app can know what
+        // ready means, so a callback registered later must still be read.
+        let manager = MetricsManager::new("");
+        let slot = manager.readiness_fn.clone();
+        assert!(readiness_slot_ready(&slot), "no callback means ready");
+
+        let mut manager = manager;
+        manager.set_readiness_check(|| false);
+        assert!(
+            !readiness_slot_ready(&slot),
+            "the handle the server holds must see a callback set after start"
+        );
+
+        manager.set_readiness_check(|| true);
+        assert!(readiness_slot_ready(&slot), "a later callback replaces it");
+    }
+
+    fn readiness_slot_ready(slot: &ReadinessSlot) -> bool {
+        slot.read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_none_or(|f| f())
+    }
 
     #[test]
     fn test_metrics_config_default() {
