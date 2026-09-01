@@ -83,7 +83,7 @@ pub enum GeoIpProvider {
 /// The three credential fields are [`SensitiveString`], so they are redacted
 /// in `Debug` output and in any serialised form (config dumps, JSON schema
 /// examples, error reports). Only the download call itself exposes them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct AutoDownloadConfig {
@@ -125,7 +125,12 @@ impl Default for AutoDownloadConfig {
 }
 
 /// GeoIP database provisioning configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is part of the contract: a consumer nests this inside its own
+/// config and compares old against new to decide whether a reload needs a
+/// restart. Comparing serialised forms instead would read every credential
+/// change as no change, because [`SensitiveString`] redacts in `Serialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct GeoIpConfig {
@@ -191,6 +196,17 @@ mod tests {
         assert_ne!(GeoIpProvider::DbIpLite, GeoIpProvider::MaxMindGeoLite2);
         assert_ne!(GeoIpProvider::Custom, GeoIpProvider::Sapics);
         assert_ne!(GeoIpProvider::IpLocate, GeoIpProvider::IpInfoLite);
+    }
+
+    #[test]
+    fn a_changed_credential_compares_unequal() {
+        // Comparing serialised forms instead would read a rotated credential as
+        // no change, because SensitiveString redacts in Serialize.
+        let mut changed = GeoIpConfig::default();
+        changed.auto_download.ipinfo_token = Some(SensitiveString::from("a-token"));
+
+        assert_ne!(GeoIpConfig::default(), changed);
+        assert_eq!(changed, changed.clone());
     }
 
     #[test]

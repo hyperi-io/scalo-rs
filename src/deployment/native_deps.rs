@@ -539,6 +539,7 @@ mod tests {
 
     #[test]
     fn test_kafka_features_add_confluent_repo() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(&["transport-kafka"], "ubuntu:24.04");
         assert_eq!(deps.apt_repos.len(), 1);
         assert!(deps.apt_repos[0].url.contains("confluent"));
@@ -550,24 +551,28 @@ mod tests {
 
     #[test]
     fn test_spool_adds_zstd() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(&["spool"], "ubuntu:24.04");
         assert!(deps.apt_packages.contains(&"libzstd1".into()));
     }
 
     #[test]
     fn test_tiered_sink_adds_zstd() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(&["tiered-sink"], "ubuntu:24.04");
         assert!(deps.apt_packages.contains(&"libzstd1".into()));
     }
 
     #[test]
     fn test_no_features_empty() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(&[], "ubuntu:24.04");
         assert!(deps.is_empty());
     }
 
     #[test]
     fn test_pure_rust_features_empty() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(
             &["cli", "deployment", "logger"],
             "ubuntu:24.04",
@@ -577,6 +582,7 @@ mod tests {
 
     #[test]
     fn test_bookworm_codename() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps =
             NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:bookworm-slim");
         assert_eq!(deps.apt_repos[0].codename, "bookworm");
@@ -584,6 +590,7 @@ mod tests {
 
     #[test]
     fn test_trixie_kafka_uses_confluent_bookworm() {
+        let _env = crate::deployment::env_test_lock::guard();
         // Trixie has no Confluent suite, so it pulls the LATEST librdkafka1 from
         // the Confluent clients repo via the bookworm suite (debian's native
         // package lags the protocol). librdkafka1 comes from the repo, NOT
@@ -602,6 +609,7 @@ mod tests {
 
     #[test]
     fn test_trixie_git2_soname() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps =
             NativeDepsContract::for_scalo_features(&["directory-config-git"], "debian:trixie-slim");
         assert!(deps.apt_packages.contains(&"libgit2-1.9".into()));
@@ -609,6 +617,7 @@ mod tests {
 
     #[test]
     fn test_no_duplicate_packages() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(
             &["transport-kafka", "http", "secrets"],
             "ubuntu:24.04",
@@ -623,12 +632,14 @@ mod tests {
 
     #[test]
     fn test_dlq_kafka_adds_confluent() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(&["dlq-kafka"], "ubuntu:24.04");
         assert_eq!(deps.apt_repos.len(), 1);
     }
 
     #[test]
     fn test_git2_feature() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps =
             NativeDepsContract::for_scalo_features(&["directory-config-git"], "ubuntu:24.04");
         assert!(deps.apt_packages.contains(&"libgit2-1.7".into()));
@@ -636,6 +647,7 @@ mod tests {
 
     #[test]
     fn test_full_receiver_features() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(
             &[
                 "config",
@@ -781,6 +793,7 @@ mod tests {
 
     #[test]
     fn digest_pinned_base_records_the_assumption() {
+        let _env = crate::deployment::env_test_lock::guard();
         // No cascade config in a unit test, so this exercises the fallback:
         // default distro assumed, base image recorded so the generator can say
         // so in the artefact.
@@ -800,6 +813,7 @@ mod tests {
 
     #[test]
     fn explicit_distro_contradicting_the_base_image_is_recorded() {
+        let _env = crate::deployment::env_test_lock::guard();
         // Config wins, but a Dockerfile whose FROM and whose package names are
         // for different releases is almost never intended -- so say so rather
         // than quietly picking a side. This is the one case that used to have
@@ -819,6 +833,7 @@ mod tests {
 
     #[test]
     fn explicit_distro_agreeing_with_the_base_image_is_not_flagged() {
+        let _env = crate::deployment::env_test_lock::guard();
         temp_env::with_var("DEPLOYMENT__BASE_DISTRO", Some("trixie"), || {
             let deps =
                 NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:trixie-slim");
@@ -829,6 +844,7 @@ mod tests {
 
     #[test]
     fn recognised_base_records_no_assumption() {
+        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:13-slim");
         assert!(deps.unresolved_base_image.is_none());
         assert_eq!(deps.distro, Some(BaseDistro::Trixie));

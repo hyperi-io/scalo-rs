@@ -121,3 +121,16 @@ pub use registry::{
 };
 pub use validate::{validate_dockerfile, validate_helm_values};
 pub use waves::{WAVE_APPS, WAVE_CRDS, WAVE_OPERATORS, WAVE_POST, WAVE_TOPICS};
+
+#[cfg(test)]
+pub(crate) mod env_test_lock {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// `DEPLOYMENT__BASE_DISTRO` is process-wide state and the test harness runs
+    /// tests as threads, so every test that sets OR reads it must serialise.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn guard() -> MutexGuard<'static, ()> {
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
