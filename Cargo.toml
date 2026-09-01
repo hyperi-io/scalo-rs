@@ -45,7 +45,6 @@ features = [
     "output-file",
     "deployment", "config-schema",
     "expression", "version-check",
-    "geoip-download",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -192,16 +191,6 @@ config-schema = ["dep:schemars", "serde_json", "deployment"]
 # Startup version check (calls a configured version API)
 version-check = ["reqwest", "tokio", "serde_json", "tracing", "chrono", "dirs", "uuid"]
 
-# GeoIP MMDB provisioning: resolve, freshness-check and download the databases
-# an enrichment stage reads. Provisioning only -- no lookup engine, no MMDB
-# reader. Rides the shared `http` HttpClient rather than a second HTTP stack;
-# `flate2` and `tar` are the archive formats the providers publish in.
-#
-# `reqwest/query` is enabled here rather than on `http` so the token-auth
-# provider can attach its credential through the request builder instead of a
-# formatted URL; only this feature pays for `serde_urlencoded`.
-geoip-download = ["http", "reqwest/query", "dep:flate2", "dep:tar", "tokio", "chrono", "tracing"]
-
 # Config hot-reload (SharedConfig<T> + ConfigReloader<T>)
 config-reload = ["config", "parking_lot", "tokio", "tracing"]
 
@@ -239,7 +228,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:web
 dangerous-diagnostics = []
 
 # Full feature set
-full = ["config", "config-reload", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls", "geoip-download"]
+full = ["config", "config-reload", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls"]
 
 [dependencies]
 # Serialisation (always needed)
@@ -376,12 +365,6 @@ file-rotate = { version = ">=0.7, <0.9", optional = true }
 
 # Filesystem stats (disk-aware capacity management for tiered-sink)
 libc = { version = ">=0.2, <0.3", optional = true }
-
-# Gzip + tar decode for the GeoIP database archives the providers publish
-# (`geoip-download`). flate2 is already in the graph via file-rotate; tar is
-# pure Rust over the already-present filetime/libc/xattr.
-flate2 = { version = ">=1.1.9, <2", optional = true }
-tar = { version = ">=0.4.46, <0.5", optional = true }
 
 # Spool (disk-backed async queue) - yaque is async-native and maintained
 yaque = { version = ">=0.6.6, <0.7", optional = true }

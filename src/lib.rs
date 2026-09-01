@@ -238,10 +238,6 @@ pub mod concurrency;
 #[cfg_attr(docsrs, doc(cfg(feature = "strmatch")))]
 pub mod strmatch;
 
-#[cfg(feature = "geoip-download")]
-#[cfg_attr(docsrs, doc(cfg(feature = "geoip-download")))]
-pub mod geoip_download;
-
 // Re-export common types at crate root
 pub use env::{Environment, RuntimeContext, runtime_context};
 pub use kafka_config::{
@@ -431,13 +427,6 @@ pub use schemars;
 #[cfg(feature = "version-check")]
 #[cfg_attr(docsrs, doc(cfg(feature = "version-check")))]
 pub use version_check::{VersionCheck, VersionCheckConfig, VersionCheckResponse};
-
-#[cfg(feature = "geoip-download")]
-#[cfg_attr(docsrs, doc(cfg(feature = "geoip-download")))]
-pub use geoip_download::{
-    AutoDownloadConfig, DatabasePaths, GeoIpConfig, GeoIpDownloadError, GeoIpProvider,
-    ensure_databases,
-};
 
 #[cfg(feature = "concurrency")]
 #[cfg_attr(docsrs, doc(cfg(feature = "concurrency")))]
