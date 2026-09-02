@@ -39,7 +39,6 @@ pub fn generate_chart(
     let dir = output_dir.as_ref();
     let templates_dir = dir.join("templates");
 
-    // Create directories
     std::fs::create_dir_all(&templates_dir).map_err(|e| DeploymentError::CreateDir {
         path: templates_dir.display().to_string(),
         source: e,
@@ -506,12 +505,11 @@ fn gen_probes(c: &DeploymentContract) -> String {
 /// resource attrs the SDK cannot derive itself -- `k8s.pod.uid` is the anchor
 /// the collector's k8sattributes processor keys on.
 ///
-/// The OTLP endpoint is the other half of the picture: the scrape annotations
-/// get metrics to Prometheus, this gets traces to a collector. Both pathways,
-/// not one. It stays behind an `if` so that leaving `otel.endpoint` unset emits
-/// no env var at all, leaving whatever the app itself defaults to untouched --
-/// note that is NOT the same as switching OTel off, and none of it has any
-/// effect on an app built without the otel features.
+/// The OTLP endpoint is the other half: the scrape annotations carry metrics to
+/// Prometheus, this carries traces to a collector. It stays behind an `if`, so
+/// leaving `otel.endpoint` unset emits no env var and the app keeps its own
+/// default. Unset is not the same as OTel off, and none of this reaches an app
+/// built without the otel features.
 fn gen_observability_env(app: &str) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str(&format!(

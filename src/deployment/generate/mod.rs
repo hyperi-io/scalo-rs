@@ -98,9 +98,9 @@ mod tests {
         // KEDA's kafka scaler takes the principal as `username` and treats
         // `sasl` as a mechanism enum, so binding the username to `sasl` leaves
         // the trigger unable to authenticate and the lag metric unreported.
-        let dir = std::env::temp_dir().join(format!("scalo-keda-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        generate_chart(&test_contract(), &dir, None).expect("chart generates");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        generate_chart(&test_contract(), dir, None).expect("chart generates");
 
         let auth =
             std::fs::read_to_string(dir.join("templates/keda-triggerauth.yaml")).expect("read");
@@ -131,8 +131,6 @@ mod tests {
         let values = std::fs::read_to_string(dir.join("values.yaml")).expect("read");
         assert!(values.contains("sasl: \"scram_sha512\""), "{values}");
         assert!(values.contains("tls: \"disable\""), "{values}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
