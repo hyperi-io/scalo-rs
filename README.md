@@ -24,8 +24,8 @@ generates your Helm, Dockerfile and Argo manifests from the config the app
 already declares.
 
 Attach scalo to your service and a whole class of production pain -- the kind
-done wrong a hundred times elsewhere -- just goes away. Battle-tested, and
-almost no code on your side **to do it properly**. It's not a bag of utility
+done wrong a hundred times elsewhere -- just goes away, with almost no code
+on your side **to do it properly**. It's not a bag of utility
 functions you wire up yourself; it's the wiring, done right, for free.
 
 scalo comes in two halves that share one set of conventions, idiomatic in each
@@ -44,9 +44,8 @@ course, no microservices.
 
 ## Quick Start
 
-```toml
-[dependencies]
-scalo = "2"
+```console
+cargo add scalo
 ```
 
 Default features: `config`, `logger`. Add the others you want explicitly.
