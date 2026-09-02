@@ -321,6 +321,13 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
              \x20   topic: \"\"\n\
              \x20   # -- Override consumer group (default: from config)\n\
              \x20   consumerGroup: \"\"\n\
+             \x20   # -- SASL mechanism the SCALER dials with, in KEDA's spelling:\n\
+             \x20   # -- none, plaintext, scram_sha256, scram_sha512, oauthbearer, gssapi.\n\
+             \x20   # -- Set it to match the broker; it is not read from the app config,\n\
+             \x20   # -- whose key path differs per app.\n\
+             \x20   sasl: \"scram_sha512\"\n\
+             \x20   # -- enable or disable, for the scaler's own connection\n\
+             \x20   tls: \"disable\"\n\
              \x20 cpu:\n\
              \x20   enabled: {cpu_enabled}\n\
              \x20   # -- CPU utilisation percentage threshold\n\
@@ -920,8 +927,10 @@ spec:
         {{{{- end }}}}
         lagThreshold: {{{{ .Values.keda.kafka.lagThreshold | quote }}}}
         activationLagThreshold: {{{{ .Values.keda.kafka.activationLagThreshold | quote }}}}
-        saslType: scram_sha512
-        tls: disable
+        {{{{- /* KEDA reads `sasl`, not `saslType` -- the latter is an internal
+            field name and is silently ignored. */}}}}
+        sasl: {{{{ .Values.keda.kafka.sasl }}}}
+        tls: {{{{ .Values.keda.kafka.tls }}}}
     {{{{- if .Values.keda.cpu.enabled }}}}
     # CPU utilisation (secondary scaler)
     - type: cpu
@@ -955,8 +964,10 @@ metadata:
   labels:
     {{{{- include "{app}.labels" . | nindent 4 }}}}
 spec:
+  # KEDA's kafka scaler takes the principal as `username`; `sasl` is the
+  # mechanism enum and belongs in the trigger metadata, not here.
   secretTargetRef:
-    - parameter: sasl
+    - parameter: username
       name: {{{{ include "{app}.{helper_name}" . }}}}
       key: {{{{ .Values.kafka.secretKeys.username }}}}
     - parameter: password

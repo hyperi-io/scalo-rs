@@ -94,6 +94,48 @@ mod tests {
     }
 
     #[test]
+    fn keda_trigger_auth_names_the_parameters_the_scaler_reads() {
+        // KEDA's kafka scaler takes the principal as `username` and treats
+        // `sasl` as a mechanism enum, so binding the username to `sasl` leaves
+        // the trigger unable to authenticate and the lag metric unreported.
+        let dir = std::env::temp_dir().join(format!("scalo-keda-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        generate_chart(&test_contract(), &dir, None).expect("chart generates");
+
+        let auth =
+            std::fs::read_to_string(dir.join("templates/keda-triggerauth.yaml")).expect("read");
+        assert!(
+            auth.contains("parameter: username"),
+            "the principal must bind to `username`:\n{auth}"
+        );
+        assert!(
+            !auth.contains("parameter: sasl"),
+            "`sasl` is the mechanism enum, not the principal:\n{auth}"
+        );
+
+        let scaled =
+            std::fs::read_to_string(dir.join("templates/keda-scaledobject.yaml")).expect("read");
+        assert!(
+            !scaled.contains("saslType:"),
+            "`saslType` is an internal field name and is ignored:\n{scaled}"
+        );
+        assert!(
+            scaled.contains("sasl: {{ .Values.keda.kafka.sasl }}"),
+            "{scaled}"
+        );
+        assert!(
+            scaled.contains("tls: {{ .Values.keda.kafka.tls }}"),
+            "{scaled}"
+        );
+
+        let values = std::fs::read_to_string(dir.join("values.yaml")).expect("read");
+        assert!(values.contains("sasl: \"scram_sha512\""), "{values}");
+        assert!(values.contains("tls: \"disable\""), "{values}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_generate_dockerfile() {
         let contract = test_contract();
         let dockerfile = generate_dockerfile(&contract, None);
