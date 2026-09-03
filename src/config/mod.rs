@@ -610,7 +610,10 @@ mod tests {
         let _ = try_get();
         let armed_after_second = CASCADE_ABSENT_WARNED.load(std::sync::atomic::Ordering::Relaxed);
 
-        assert!(claimed_first, "flag must start clear for this test to mean anything");
+        assert!(
+            claimed_first,
+            "flag must start clear for this test to mean anything"
+        );
         assert!(
             armed_after_first || try_get().is_some(),
             "a try_get with no cascade must arm the one-shot flag"
