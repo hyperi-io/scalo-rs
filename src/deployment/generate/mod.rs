@@ -559,6 +559,48 @@ mod tests {
         );
     }
 
+    /// KEDA's Kafka scaler takes `sasl` (the MECHANISM), `username` and
+    /// `password`. The generator used to hand the username to `sasl` and supply
+    /// no `username` at all, while the trigger set `saslType`, which is not a
+    /// recognised key -- so the mechanism arrived nowhere, no username arrived,
+    /// and `password` was the only correctly wired parameter of the three.
+    /// Authentication could not succeed, so the scaler never read lag and the
+    /// app never scaled. Every DFE app that ships a generated chart had this.
+    #[test]
+    fn test_keda_kafka_auth_uses_the_parameters_keda_recognises() {
+        let contract = test_contract();
+        let dir = tempfile::tempdir().unwrap();
+        generate_chart(&contract, dir.path(), None).unwrap();
+
+        let auth =
+            std::fs::read_to_string(dir.path().join("templates/keda-triggerauth.yaml")).unwrap();
+        assert!(
+            auth.contains("- parameter: username"),
+            "TriggerAuthentication supplies no `username`, so SASL cannot authenticate:\n{auth}"
+        );
+        assert!(
+            auth.contains("- parameter: password"),
+            "TriggerAuthentication supplies no `password`:\n{auth}"
+        );
+        assert!(
+            !auth.contains("- parameter: sasl\n"),
+            "TriggerAuthentication still binds `sasl` to a credential; `sasl` is the \
+             mechanism, not the username:\n{auth}"
+        );
+
+        let scaled =
+            std::fs::read_to_string(dir.path().join("templates/keda-scaledobject.yaml")).unwrap();
+        assert!(
+            !scaled.contains("saslType:"),
+            "keda-scaledobject.yaml still uses `saslType`, which the kafka trigger does not \
+             recognise (the key is `sasl`):\n{scaled}"
+        );
+        assert!(
+            scaled.contains("sasl: scram_sha512"),
+            "keda-scaledobject.yaml supplies no SASL mechanism:\n{scaled}"
+        );
+    }
+
     /// Regression for the dfe-receiver canary 2026-05-25 finding:
     /// secret.yaml previously emitted `.Values.x.bearer-tokens` which
     /// Go templates reject ("bad character U+002D '-'"). The render
