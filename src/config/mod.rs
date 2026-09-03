@@ -215,7 +215,13 @@ impl Config {
         // 2. Environment variables (with prefix)
         // Keys are lowercased: TEST_DATABASE_HOST -> database_host
         // Use double underscore for nesting: TEST_DATABASE__HOST -> database.host
+        //
+        // Both separators after the prefix are accepted. Stripping only
+        // `{prefix}_` leaves a leading underscore on the nested spelling --
+        // TEST__DATABASE__HOST becomes `_database.host`, a key nothing reads --
+        // and that is the spelling charts emit for secret env vars.
         if !opts.env_prefix.is_empty() {
+            figment = figment.merge(Env::prefixed(&format!("{}__", opts.env_prefix)).split("__"));
             figment = figment.merge(Env::prefixed(&format!("{}_", opts.env_prefix)).split("__"));
         }
 
@@ -575,6 +581,46 @@ mod tests {
             })
             .unwrap();
             assert_eq!(config.get_string("host"), Some("testhost".to_string()));
+        });
+    }
+
+    /// The nested env spelling must reach the key it names.
+    ///
+    /// `Env::prefixed` strips exactly `{prefix}_`, so `TEST__DATABASE__HOST`
+    /// resolved to `_database.host` -- a leading-underscore key nothing reads
+    /// and serde drops. That is the spelling generated charts emit for secret
+    /// env vars, so Kafka SASL credentials, ClickHouse passwords and cloud
+    /// credentials all arrived at a key no app consults.
+    #[test]
+    fn nested_env_spelling_reaches_the_key_it_names() {
+        temp_env::with_var("TEST__DATABASE__HOST", Some("nested-host"), || {
+            let config = Config::new(ConfigOptions {
+                env_prefix: "TEST".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                config.get_string("database.host"),
+                Some("nested-host".to_string()),
+                "the double-underscore spelling did not reach database.host"
+            );
+        });
+    }
+
+    /// The single-underscore spelling keeps working.
+    #[test]
+    fn single_underscore_nesting_still_reaches_its_key() {
+        temp_env::with_var("TEST_DATABASE__HOST", Some("single-host"), || {
+            let config = Config::new(ConfigOptions {
+                env_prefix: "TEST".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                config.get_string("database.host"),
+                Some("single-host".to_string()),
+                "the single-underscore spelling stopped resolving"
+            );
         });
     }
 }
