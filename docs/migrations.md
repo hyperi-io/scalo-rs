@@ -548,12 +548,15 @@ applied at the consumer level until then.
 ### #35 — Kafka topic auto-discovery race
 
 `KafkaAdmin::list_topics` returns empty when the admin consumer
-hasn't finished its bootstrap handshake. Symptom: "Auto-discovery
-found no matching topics" at startup even though the topic exists.
+hasn't finished its bootstrap handshake.
 
-**Workaround:** drop `topic_regex` from the config and list topics
-explicitly under `topics:`. The explicit-subscribe path bypasses
-the resolver.
+**No longer fatal.** Auto-discovery that matches nothing now logs
+"Auto-discovery found no matching topics" and subscribes to nothing
+instead of failing startup, and the refresh loop (`topic_refresh_secs`,
+60 s by default) subscribes as soon as a matching topic appears. That
+covers both the race and the legitimate case of an app deployed
+before its first source exists. Set `topic_refresh_secs: 0` and a
+transport that discovered nothing consumes nothing until restart.
 
 ### #36 — `KafkaTransport` always allocates both roles
 
