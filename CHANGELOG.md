@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.0](https://github.com/hyperi-io/scalo-rs/compare/v2.11.1...v2.12.0) (2026-09-09)
+
+### Features
+
+* named destinations with fan-out, and an idle gate every app can adopt ([66f1478](https://github.com/hyperi-io/scalo-rs/commit/66f1478fa28ef547515275f348f330f6eb88c13b))
+
 ## [2.11.1](https://github.com/hyperi-io/scalo-rs/compare/v2.11.0...v2.11.1) (2026-09-01)
 
 ### Bug Fixes
