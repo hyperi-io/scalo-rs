@@ -90,6 +90,30 @@ pub trait ServiceApp: Sized {
         runtime: super::ServiceRuntime,
     ) -> impl std::future::Future<Output = Result<(), CliError>> + Send;
 
+    /// Does this configuration give the service work to do?
+    ///
+    /// The app's EMPTINESS PREDICATE, and nothing else: `load_config` still
+    /// refuses a structurally invalid config loudly, but a config that is valid
+    /// and simply empty of work -- no enabled sources, no topics, no
+    /// destination -- returns [`WorkState::Idle`](crate::lifecycle::WorkState::Idle)
+    /// with the operator-facing reason.
+    ///
+    /// [`run_app`] then keeps the service Ready with no transports open until a
+    /// config change gives it work; see [`crate::lifecycle`] for what idle looks
+    /// like from outside. The default is
+    /// [`Active`](crate::lifecycle::WorkState::Active), so an app that does not
+    /// override this behaves exactly as before.
+    ///
+    /// ```rust,ignore
+    /// fn work_state(&self, config: &Self::Config) -> WorkState {
+    ///     WorkState::idle_if(config.sources.enabled().next().is_none(), "no enabled sources")
+    /// }
+    /// ```
+    #[cfg(feature = "lifecycle")]
+    fn work_state(&self, _config: &Self::Config) -> crate::lifecycle::WorkState {
+        crate::lifecycle::WorkState::Active
+    }
+
     /// Provide scaling pressure components for KEDA autoscaling.
     ///
     /// Override to register app-specific scaling signals (buffer depth,
@@ -273,6 +297,15 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             )
             .await?;
 
+            // Idle until configured. Evaluated HERE -- after the runtime, so
+            // /livez and /readyz are already serving -- and not before, or an
+            // app with nothing to do would crash-loop with no probe surface.
+            #[cfg(feature = "lifecycle")]
+            let result = match wait_for_work(&app, config, config_path).await {
+                Some(config) => app.run_service(config, runtime).await,
+                None => Ok(()),
+            };
+            #[cfg(not(feature = "lifecycle"))]
             let result = app.run_service(config, runtime).await;
 
             // Flush what is queued before the process goes away. Both calls
@@ -289,6 +322,47 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
         StandardCommand::Top(ref top_args) => {
             let top_config = crate::top::TopConfig::from_args(top_args);
             crate::top::run_top(&top_config).map_err(|e| CliError::Service(e.to_string()))
+        }
+    }
+}
+
+/// Hold the service at the idle gate until its configuration gives it work.
+///
+/// Returns the config to run with, or `None` when shutdown arrived while the
+/// service was still idle (exit cleanly -- never start work on the way out).
+/// Every wake re-reads the config through the app's own `load_config`, so the
+/// predicate sees exactly what a fresh start would see; a load that fails while
+/// idle is logged and the previous config kept, matching the reloader.
+#[cfg(feature = "lifecycle")]
+async fn wait_for_work<A: ServiceApp>(
+    app: &A,
+    mut config: A::Config,
+    config_path: Option<&str>,
+) -> Option<A::Config> {
+    use crate::lifecycle::{GateWake, IdleGate, WorkState, wait_for_config_change};
+
+    let mut gate = IdleGate::new();
+    loop {
+        match app.work_state(&config) {
+            WorkState::Active => {
+                gate.leave_idle();
+                return Some(config);
+            }
+            WorkState::Idle(reason) => gate.enter_idle(&reason),
+        }
+
+        if wait_for_config_change(config_path.map(std::path::Path::new)).await
+            == GateWake::ShuttingDown
+        {
+            tracing::info!("shutting down while idle -- no work was ever configured");
+            return None;
+        }
+
+        match app.load_config(config_path) {
+            Ok(reloaded) => config = reloaded,
+            Err(e) => {
+                tracing::warn!(error = %e, "config reload while idle failed, keeping the current config");
+            }
         }
     }
 }

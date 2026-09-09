@@ -1,10 +1,10 @@
-# Routing
+# Routing -- the named sink set
 
-`RoutedSender` dispatches `send(destination, payload)` to one of N
-backend senders based on the destination — different topics, tenants,
-or stream IDs land on different transports. Sits on top of
-[`AnySender`](README.md);
-no new backend, no new trait.
+`RoutedSender` dispatches a send to one of N backend senders held under
+NAMES — `loader`, `archiver`, `transform-orders` — so a routing decision
+picks a name and the config decides what that name is: a Kafka topic on
+the bus, a gRPC endpoint on the direct transport. Sits on top of
+[`AnySender`](README.md); no new backend, no new trait.
 
 ---
 
@@ -12,18 +12,16 @@ no new backend, no new trait.
 
 | Stage | Routed? | Why |
 |-------|---------|-----|
-| `dfe-receiver` | **Yes** | Push ingress fans tenant traffic out to per-tenant Kafka topics |
-| `dfe-fetcher` | **Yes** | Pull ingress (AWS, Azure, M365, GCP) maps each source to its own destination |
+| `dfe-receiver` | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
+| `dfe-fetcher` | **Yes** | Each source maps to its own destination, plus per-record routes |
+| `dfe-transform-vrl` | **Yes** | Its sink list is config-driven — one destination today, a list tomorrow |
+| `dfe-transform-vector` | **Yes** | Same, though Vector owns the transform config itself |
 | `dfe-loader` | No | One ClickHouse sink — 1:1 transport |
 | `dfe-archiver` | No | One object-storage sink — 1:1 transport |
-| `dfe-transform-vrl` | No | Transform stage — 1:1 in, 1:1 out |
-| `dfe-transform-vector` | No | Vector owns its own routing config — anomaly |
 
-**Constraint**: only data originators route. Mid-tier transforms,
-loaders, and archivers see a single inbound stream and produce a
-single outbound stream — they don't need `RoutedSender`. Per the
-data-plane routing model, push the routing decision as close to ingress as
-possible.
+Push the routing decision as close to ingress as possible: a stage that
+sees one inbound stream and produces one outbound stream needs a name for
+its sink, not a routing table.
 
 ---
 
@@ -107,6 +105,56 @@ let sender = RoutedSender::new(routes, Some(default_sender));
 
 ---
 
+## Named destinations, and the wire key
+
+`send` uses ONE string for both the route lookup and the backend's wire
+destination, which fits a table keyed by topic. When the destination NAME
+is not the wire key — a destination called `loader` whose Kafka topic is
+`orders_land`, computed per record — pass the two separately:
+
+```rust
+sender.send_to("loader", "orders_land", payload).await;
+```
+
+On gRPC the key is the metadata routing key and the endpoint came from the
+route's config, so the same call works unchanged on both transports. That
+is what lets one match rule compile to a topic on the bus and an endpoint
+on the direct transport.
+
+---
+
+## Fan-out
+
+A rule's destination may be a LIST. `send_fanout` delivers one payload to
+every named destination and is acknowledged only when every one has
+accepted — this is how a matched record reaches the loader AND the
+archiver without a broker in the path:
+
+```rust
+sender.send_fanout(&["loader", "archiver"], "orders_land", payload).await;
+```
+
+The first `Backpressured`/`Fatal` short-circuits and is returned, so the
+caller retries the whole fan-out and re-delivers to whichever destinations
+already accepted: at-least-once, duplicates never loss — the same contract
+as `send_batch`'s per-record fallback. An empty list is `Ok`.
+
+---
+
+## Backpressure
+
+A routed send NEVER retries and NEVER routes to a DLQ. It returns the
+chosen backend's `SendResult` unchanged so the caller applies its own
+policy — the fetcher holds the batch and stalls its scheduler, the
+receiver back-pressures its ingest. A DLQ that only exists on the bus is
+not a fallback a brokerless deployment can take.
+
+Bounded retry with backoff is [`SinkStack`](../pipeline/sink-stack.md)'s
+job, and it composes on top: `RoutedSender` implements `TransportSender`,
+so a stack wraps the whole set.
+
+---
+
 ## Composition with `AnySender`
 
 `RoutedSender` **owns** N `AnySender`s — one per route plus the
@@ -174,9 +222,14 @@ result.
 | `RoutedSender::new(routes, default)` | Construct from pre-built `AnySender`s |
 | `RoutedSender::from_route_configs(routes, default).await` | Construct from per-route `TransportConfig`s |
 | `RoutedSender::send(destination, payload).await` | Dispatch by destination, fall to default if missing |
+| `RoutedSender::send_to(destination, key, payload).await` | Dispatch by NAME, with the wire key supplied separately |
+| `RoutedSender::send_fanout(&[destination], key, payload).await` | One payload to every named destination |
 | `RoutedSender::route_keys() -> Vec<&str>` | List configured route keys |
 | `RoutedSender::has_route(key) -> bool` | Check if a specific key has a route |
 | `RoutedSender::has_default() -> bool` | Check if a default sender is wired |
+| `RoutedSender::destination_health() -> Vec<(&str, bool)>` | Per-destination health, `"default"` included |
+| `RoutedSender::is_destination_healthy(name) -> bool` | Health of the sender that resolves `name` |
+| `RoutedSender::any_healthy() -> bool` | At least one sender healthy — the readiness form |
 | `RoutedSender::close().await` | Cascade close to every route + default |
 | `RoutedSender::is_healthy() -> bool` | True only if every constituent sender is healthy |
 | `RoutedSender::name() -> &'static str` | Returns `"routed"` |

@@ -6,14 +6,13 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Per-key routing transport for data originators.
+//! Per-key routing transport for data originators -- the NAMED SINK SET.
 //!
 //! Routes `send(key, payload)` to different transport backends based on the
 //! key. Used by data-originator services (receiver, fetcher) where data-based
-//! routing determines the destination (topic, endpoint, stream).
-//!
-//! All other data-plane stages (transforms, loader, archiver) use simple 1:1
-//! transports and do NOT need this.
+//! routing determines the destination (topic, endpoint, stream), and by any
+//! stage whose sink list is config-driven (a transform sending on to the
+//! loader, a matched record fanning out to loader AND archiver).
 //!
 //! # Config
 //!
@@ -47,6 +46,30 @@
 //! sender.send("audit.land", payload).await;   // -> gRPC to archiver
 //! sender.send("unknown", payload).await;      // -> default (Kafka)
 //! ```
+//!
+//! # Named destinations, and the wire key
+//!
+//! [`send`](TransportSender::send) uses ONE string for both the route lookup
+//! and the backend's wire destination, which fits a routing table keyed by
+//! topic. When the destination NAME is not the wire key -- a destination
+//! called `loader` whose Kafka topic is `<source>_land`, computed per record
+//! --  use [`send_to`](RoutedSender::send_to), which takes the two separately,
+//! or [`send_fanout`](RoutedSender::send_fanout) to reach a LIST of named
+//! destinations with one payload.
+//!
+//! ```rust,ignore
+//! sender.send_to("loader", "orders_land", payload).await;
+//! sender.send_fanout(&["loader", "archiver"], "orders_land", payload).await;
+//! ```
+//!
+//! # Backpressure
+//!
+//! A routed send NEVER retries and NEVER routes to a DLQ: it returns the
+//! chosen backend's [`SendResult`] unchanged, so the caller applies its own
+//! policy (the fetcher holds the batch and stalls its scheduler; the receiver
+//! back-pressures its ingest). Bounded retry with backoff is
+//! [`SinkStack`](crate::sink_stack::SinkStack)'s job and composes on top --
+//! `RoutedSender` implements [`TransportSender`], so a stack wraps it.
 
 use std::collections::HashMap;
 
@@ -118,6 +141,88 @@ impl RoutedSender {
         self.default.is_some()
     }
 
+    /// Per-destination health: the configured route name and whether its
+    /// sender is currently healthy. The default sender, when configured,
+    /// appears as `"default"`.
+    #[must_use]
+    pub fn destination_health(&self) -> Vec<(&str, bool)> {
+        let mut out: Vec<(&str, bool)> = self
+            .routes
+            .iter()
+            .map(|(name, sender)| (name.as_str(), sender.is_healthy()))
+            .collect();
+        if let Some(ref default) = self.default {
+            out.push(("default", default.is_healthy()));
+        }
+        out
+    }
+
+    /// Whether the sender resolving `destination` is healthy. An unknown
+    /// destination reports the default sender's health, or `false` when there
+    /// is no default -- the same resolution [`send_to`](Self::send_to) uses.
+    #[must_use]
+    pub fn is_destination_healthy(&self, destination: &str) -> bool {
+        self.resolve(destination)
+            .is_some_and(|(_, sender)| sender.is_healthy())
+    }
+
+    /// Whether AT LEAST ONE configured sender is healthy. Readiness gates that
+    /// must not stall a whole originator on one sick destination use this;
+    /// [`is_healthy`](TransportBase::is_healthy) is the all-of form.
+    #[must_use]
+    pub fn any_healthy(&self) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        self.routes.values().any(AnySender::is_healthy)
+            || self.default.as_ref().is_some_and(AnySender::is_healthy)
+    }
+
+    /// Send to ONE named destination, with the wire key supplied separately.
+    ///
+    /// `destination` selects the route (falling back to the default);
+    /// `key` is what the chosen backend receives as its destination -- the
+    /// Kafka topic, the gRPC metadata routing key, the Redis stream. Use this
+    /// wherever the destination NAME and the wire key differ; the bare
+    /// [`send`](TransportSender::send) is this call with the two equal.
+    pub async fn send_to(&self, destination: &str, key: &str, payload: bytes::Bytes) -> SendResult {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return SendResult::Fatal(TransportError::Closed);
+        }
+
+        let Some((route_name, sender)) = self.resolve(destination) else {
+            return SendResult::Fatal(TransportError::Config(format!(
+                "no route configured for destination '{destination}' and no default sender"
+            )));
+        };
+        record_route_send(route_name, payload.len());
+        sender.send(key, payload).await
+    }
+
+    /// Fan one payload out to EVERY named destination in `destinations`.
+    ///
+    /// Acknowledged only when every destination has accepted: the first
+    /// `Backpressured`/`Fatal` short-circuits and is returned, so the caller
+    /// retries the whole fan-out. That re-delivers to the destinations that
+    /// already accepted -- at-least-once, duplicates never loss, the same
+    /// contract as [`TransportSender::send_batch`]'s per-record fallback. An
+    /// empty destination list is `Ok` (nothing to deliver).
+    pub async fn send_fanout(
+        &self,
+        destinations: &[&str],
+        key: &str,
+        payload: bytes::Bytes,
+    ) -> SendResult {
+        for destination in destinations {
+            // Bytes clone is a refcount bump, not a payload copy.
+            match self.send_to(destination, key, payload.clone()).await {
+                SendResult::Ok | SendResult::FilteredDlq => {}
+                other => return other,
+            }
+        }
+        SendResult::Ok
+    }
+
     /// Resolve which route + sender handles a given key. Returns the
     /// configured route name (or `"default"` for the fallback) so
     /// metrics can label by route, not by per-message key (F7).
@@ -159,39 +264,32 @@ impl TransportBase for RoutedSender {
     }
 }
 
+/// Count one routed send. The route label is the CONFIGURED route name (or
+/// `"default"`), never the per-message key: cardinality is bounded by the
+/// routing table size, not by message count.
+fn record_route_send(route_name: &str, payload_len: usize) {
+    #[cfg(feature = "metrics")]
+    {
+        metrics::counter!(
+            "transport_sent_total",
+            "transport" => "routed",
+            "route" => route_name.to_string()
+        )
+        .increment(1);
+        metrics::counter!(
+            "transport_sent_bytes_total",
+            "transport" => "routed",
+            "route" => route_name.to_string()
+        )
+        .increment(payload_len as u64);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (route_name, payload_len);
+}
+
 impl TransportSender for RoutedSender {
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-            return SendResult::Fatal(TransportError::Closed);
-        }
-
-        let Some((route_name, sender)) = self.resolve(destination) else {
-            return SendResult::Fatal(TransportError::Config(format!(
-                "no route configured for destination '{destination}' and no default sender"
-            )));
-        };
-        // F7: route label is the CONFIGURED route name (or
-        // "default"), not the per-message destination. Cardinality is
-        // bounded by the routing table size, not by message count.
-        #[cfg(feature = "metrics")]
-        {
-            metrics::counter!(
-                "transport_sent_total",
-                "transport" => "routed",
-                "route" => route_name.to_string()
-            )
-            .increment(1);
-            metrics::counter!(
-                "transport_sent_bytes_total",
-                "transport" => "routed",
-                "route" => route_name.to_string()
-            )
-            .increment(payload.len() as u64);
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = route_name;
-
-        sender.send(destination, payload).await
+        self.send_to(destination, destination, payload).await
     }
 }
 
@@ -278,6 +376,99 @@ mod tests {
             .send("key", bytes::Bytes::from_static(b"payload"))
             .await;
         assert!(result.is_fatal());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "transport-memory")]
+    async fn send_to_routes_by_name_and_carries_the_wire_key() {
+        let mut route_map = HashMap::new();
+        route_map.insert("loader".into(), make_memory_sender());
+        let sender = RoutedSender::new(route_map, None);
+
+        // Name and wire key differ: the name resolves the route, the key
+        // reaches the backend.
+        let result = sender
+            .send_to("loader", "orders_land", bytes::Bytes::from_static(b"p"))
+            .await;
+        assert!(result.is_ok());
+
+        // An unknown name with no default is still fatal.
+        let result = sender
+            .send_to("nowhere", "orders_land", bytes::Bytes::from_static(b"p"))
+            .await;
+        assert!(result.is_fatal());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "transport-memory")]
+    async fn fanout_delivers_to_every_destination() {
+        let mut route_map = HashMap::new();
+        route_map.insert("loader".into(), make_memory_sender());
+        route_map.insert("archiver".into(), make_memory_sender());
+        let sender = RoutedSender::new(route_map, None);
+
+        let result = sender
+            .send_fanout(
+                &["loader", "archiver"],
+                "orders_land",
+                bytes::Bytes::from_static(b"p"),
+            )
+            .await;
+        assert!(result.is_ok());
+
+        // Empty list is a no-op, not an error.
+        assert!(
+            sender
+                .send_fanout(&[], "orders_land", bytes::Bytes::from_static(b"p"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "transport-memory")]
+    async fn fanout_short_circuits_on_an_unroutable_destination() {
+        let mut route_map = HashMap::new();
+        route_map.insert("loader".into(), make_memory_sender());
+        let sender = RoutedSender::new(route_map, None);
+
+        let result = sender
+            .send_fanout(
+                &["loader", "missing"],
+                "orders_land",
+                bytes::Bytes::from_static(b"p"),
+            )
+            .await;
+        assert!(
+            result.is_fatal(),
+            "a fan-out is acknowledged only when EVERY destination accepts"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "transport-memory")]
+    async fn destination_health_reports_each_route_and_the_default() {
+        let mut route_map = HashMap::new();
+        route_map.insert("loader".into(), make_memory_sender());
+        let sender = RoutedSender::new(route_map, Some(make_memory_sender()));
+
+        let mut health = sender.destination_health();
+        health.sort_unstable();
+        assert_eq!(health, vec![("default", true), ("loader", true)]);
+        assert!(sender.is_destination_healthy("loader"));
+        // Unknown name resolves through the default.
+        assert!(sender.is_destination_healthy("anything-else"));
+        assert!(sender.any_healthy());
+
+        sender.close().await.unwrap();
+        assert!(!sender.any_healthy(), "closed set is healthy nowhere");
+    }
+
+    #[test]
+    fn any_healthy_is_false_with_no_senders() {
+        let sender = RoutedSender::new(HashMap::new(), None);
+        assert!(!sender.any_healthy());
+        assert!(!sender.is_destination_healthy("loader"));
     }
 
     /// Regression: `resolve` returns the configured route
