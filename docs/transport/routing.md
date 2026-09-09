@@ -141,6 +141,30 @@ as `send_batch`'s per-record fallback. An empty list is `Ok`.
 
 ---
 
+## Batches
+
+`send_batch` groups a block by the route each record's `key` resolves to
+and hands each group to its sender in ONE call, so a routed block keeps
+whatever native batch the backend has — gRPC's single `RouteBatch` and its
+all-or-nothing acceptance — instead of degrading to one `send` per record.
+Order is preserved within a group, and every record is counted on its own
+route's metrics exactly as `send` counts it. Two things follow from
+grouping that the per-record default cannot give you: an unroutable record
+fails the whole block with nothing sent (the routing is deterministic, so a
+retry would re-deliver the same prefix and fail again forever), and a
+`Backpressured`/`Fatal` short-circuits at group granularity — the failing
+destination's result is the block's result, groups after it stay unsent for
+the caller's retry. An empty block is `Ok`. `send_batch_fanout` is the
+batch form of `send_fanout`: the whole block to every named destination,
+one call each.
+
+```rust
+sender.send_batch(&workbatch.records).await;
+sender.send_batch_fanout(&["loader", "archiver"], &workbatch.records).await;
+```
+
+---
+
 ## Backpressure
 
 A routed send NEVER retries and NEVER routes to a DLQ. It returns the
@@ -224,6 +248,8 @@ result.
 | `RoutedSender::send(destination, payload).await` | Dispatch by destination, fall to default if missing |
 | `RoutedSender::send_to(destination, key, payload).await` | Dispatch by NAME, with the wire key supplied separately |
 | `RoutedSender::send_fanout(&[destination], key, payload).await` | One payload to every named destination |
+| `RoutedSender::send_batch(records).await` | A block grouped by destination, one call per group |
+| `RoutedSender::send_batch_fanout(&[destination], records).await` | The whole block to every named destination |
 | `RoutedSender::route_keys() -> Vec<&str>` | List configured route keys |
 | `RoutedSender::has_route(key) -> bool` | Check if a specific key has a route |
 | `RoutedSender::has_default() -> bool` | Check if a default sender is wired |
