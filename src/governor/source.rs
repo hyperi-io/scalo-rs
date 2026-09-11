@@ -575,13 +575,18 @@ mod tests {
 
     #[test]
     fn memory_pressure_source_wraps_guard_as_hard() {
-        use crate::memory::{MemoryGuard, MemoryGuardConfig};
+        use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
 
-        let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
-            limit_bytes: 1000,
-            pressure_threshold: 0.80,
-            ..Default::default()
-        }));
+        // Pinned to the reservation counter so the ratio is the 700/1000 this
+        // test sets, not the host's own memory usage.
+        let guard = Arc::new(MemoryGuard::with_usage_source(
+            MemoryGuardConfig {
+                limit_bytes: 1000,
+                pressure_threshold: 0.80,
+                ..Default::default()
+            },
+            UsageSource::Reservations,
+        ));
         guard.add_bytes(700); // 70%
         let src = MemoryPressureSource::new(Arc::clone(&guard));
 

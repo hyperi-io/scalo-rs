@@ -116,13 +116,14 @@ fn main() {
         if now.duration_since(last_report) >= Duration::from_secs(1) {
             let held_bytes: usize = held.iter().map(|(_, b)| b.len()).sum();
             println!(
-                "t={}s accepted={} rejected={} held_count={} held_bytes={} tracked_bytes={} under_pressure={}",
+                "t={}s accepted={} rejected={} held_count={} held_bytes={} usage_bytes={} reserved_bytes={} under_pressure={}",
                 now.duration_since(start).as_secs(),
                 accepted,
                 rejected,
                 held.len(),
                 held_bytes,
                 guard.current_bytes(),
+                guard.reserved_bytes(),
                 guard.under_pressure(),
             );
             last_report = now;
@@ -135,7 +136,8 @@ fn main() {
 
     let held_bytes: usize = held.iter().map(|(_, b)| b.len()).sum();
     println!(
-        "mem_loadgen done accepted={accepted} rejected={rejected} final_held_bytes={held_bytes} tracked_bytes={}",
-        guard.current_bytes()
+        "mem_loadgen done accepted={accepted} rejected={rejected} final_held_bytes={held_bytes} usage_bytes={} reserved_bytes={}",
+        guard.current_bytes(),
+        guard.reserved_bytes()
     );
 }

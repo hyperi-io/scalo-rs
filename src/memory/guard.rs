@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::cgroup;
+use super::usage::{UsageReader, UsageSource};
 
 /// Process-wide total-heap byte source, set once at startup.
 ///
@@ -20,14 +21,18 @@ use super::cgroup;
 /// jemalloc `stats.allocated`).
 static HEAP_SOURCE: OnceLock<fn() -> usize> = OnceLock::new();
 
-/// Register a process-wide source of total live-heap bytes.
+/// Register a process-wide source of total live-heap bytes, overriding the
+/// [`UsageSource`] the guard would otherwise detect.
+///
+/// This is rarely needed. The default source is the cgroup's `memory.current`,
+/// which is both allocator-independent and the number the OOM killer acts on;
+/// an allocator statistic is narrower, since it cannot see thread stacks,
+/// mmap'd buffers, or pages the allocator retains after a free. Register one
+/// only where the allocator figure is the one you want to gate on.
 ///
 /// When set, every [`MemoryGuard`] switches its read path
 /// ([`current_bytes`](MemoryGuard::current_bytes), pressure checks, and
-/// [`try_reserve`](MemoryGuard::try_reserve) admission) from the per-batch
-/// reservation counter to this source -- a cheap, accurate, *total-process*
-/// heap figure that also catches growth the per-batch reservations never see
-/// (e.g. a transform ballooning a `Vec`).
+/// [`try_reserve`](MemoryGuard::try_reserve) admission) to this source.
 ///
 /// **Why a global hook and not a dependency:** a tracking allocator must be
 /// the binary's single `#[global_allocator]`, which is the *application's*
@@ -279,8 +284,10 @@ impl MemoryGuardConfig {
 
 /// Cgroup-aware memory tracking with backpressure signals.
 ///
-/// Tracks application-level memory usage (not process RSS) and provides
-/// fast atomic checks for the hot path. Designed for data pipeline services
+/// Reads what the kernel charges this process -- cgroup v2 `memory.current` by
+/// default, see [`UsageSource`] -- and compares it against the cgroup limit,
+/// so the signal is the one the OOM killer acts on and does not depend on
+/// which allocator the binary installed. Designed for data pipeline services
 /// where incoming data must be rejected (503) before hitting the container
 /// memory limit.
 ///
@@ -306,24 +313,36 @@ impl MemoryGuardConfig {
 /// }
 /// ```
 pub struct MemoryGuard {
-    /// Current tracked bytes (application-level, not RSS).
-    current_bytes: AtomicU64,
+    /// Outstanding per-batch reservations, from `try_reserve`/`add_bytes` less
+    /// `release`. Lease accounting, not the process's memory usage.
+    reserved_bytes: AtomicU64,
+    /// Where the process's real usage is read from.
+    usage: UsageReader,
     /// Effective memory limit in bytes.
     limit_bytes: u64,
     /// Pressure threshold (0.0-1.0).
     pressure_threshold: f64,
-    /// Fast boolean for hot-path pressure check.
+    /// Fast hot-path pressure flag. Only consulted when no usage source is
+    /// readable, where the reservation counter is all there is.
     under_pressure: AtomicBool,
 }
 
 impl MemoryGuard {
-    /// Create a new memory guard.
+    /// Create a new memory guard, detecting where to read usage from.
     ///
     /// If `config.limit_bytes` is 0, auto-detects from cgroup (K8s) or system memory,
     /// then applies `cgroup_headroom` factor to leave room for process overhead.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn new(config: MemoryGuardConfig) -> Self {
+        Self::with_usage_source(config, UsageSource::detect())
+    }
+
+    /// Create a memory guard reading usage from `source` instead of the
+    /// detected one. For a test fixture directory, or a host where detection
+    /// picks the wrong cgroup.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn with_usage_source(config: MemoryGuardConfig, source: UsageSource) -> Self {
         // Defensive: a non-finite / out-of-range threshold or headroom would
         // produce a zero/NaN limit and a divide-by-zero pressure ratio. Clamp
         // to the safe default and log loudly. Callers wanting hard rejection
@@ -352,10 +371,30 @@ impl MemoryGuard {
         // divides by it.
         let limit_bytes = raw_limit.max(1);
 
-        tracing::info!(limit_bytes, pressure_threshold, "memory guard initialised");
+        let usage = UsageReader::new(source);
+        let usage_source = if HEAP_SOURCE.get().is_some() {
+            "explicit"
+        } else {
+            usage.source().name()
+        };
+        let usage_bytes = heap_bytes().or_else(|| usage.read());
+        tracing::info!(
+            limit_bytes,
+            pressure_threshold,
+            usage_source,
+            ?usage_bytes,
+            "memory guard initialised"
+        );
+        if usage_bytes.is_none() {
+            tracing::warn!(
+                "no cgroup or procfs memory accounting readable: the guard sees \
+                 only bytes callers reserve and release, not the process's usage"
+            );
+        }
 
         Self {
-            current_bytes: AtomicU64::new(0),
+            reserved_bytes: AtomicU64::new(0),
+            usage,
             limit_bytes,
             pressure_threshold,
             under_pressure: AtomicBool::new(false),
@@ -364,21 +403,24 @@ impl MemoryGuard {
 
     /// Try to reserve bytes. Returns false if over the limit (backpressure).
     ///
-    /// With a registered [`set_heap_source`], this is a projected-admission
-    /// check against the *true total heap* (`heap() + bytes <= limit`) and does
-    /// NOT mutate the reservation counter -- the allocator already accounts the
-    /// bytes once they are allocated, and frees them on drop, so no `release`
-    /// is needed. Without a source it is the classic atomic check-and-add on
-    /// the per-batch counter (rolled back if it would exceed the limit).
+    /// This is a projected-admission check against the process's real usage
+    /// (`usage() + bytes <= limit`) and does NOT mutate the reservation
+    /// counter -- the kernel charges the bytes once they are allocated and
+    /// uncharges them on drop, so no `release` is needed to keep the check
+    /// honest. Only where no usage source is readable does it fall back to the
+    /// classic atomic check-and-add on the per-batch counter (rolled back if
+    /// it would exceed the limit).
     #[inline]
     pub fn try_reserve(&self, bytes: u64) -> bool {
-        if let Some(heap) = heap_bytes() {
-            return heap + bytes <= self.limit_bytes;
+        if let Some(usage) = self.usage_bytes() {
+            // Saturating, so an absurd `bytes` is refused rather than wrapping
+            // past the limit and being admitted.
+            return usage.saturating_add(bytes) <= self.limit_bytes;
         }
-        let current = self.current_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let current = self.reserved_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if current > self.limit_bytes {
             // Over limit -- roll back
-            self.current_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            self.reserved_bytes.fetch_sub(bytes, Ordering::Relaxed);
             self.under_pressure.store(true, Ordering::Relaxed);
             return false;
         }
@@ -386,11 +428,11 @@ impl MemoryGuard {
         true
     }
 
-    /// Add bytes without checking the limit (for tracking only).
-    /// Use when data is already accepted and you just need to track it.
+    /// Add bytes to the reservation counter without checking the limit.
+    /// Use when data is already accepted and you just need to track the lease.
     #[inline]
     pub fn add_bytes(&self, bytes: u64) {
-        let new_total = self.current_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let new_total = self.reserved_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         self.update_pressure(new_total);
     }
 
@@ -400,7 +442,7 @@ impl MemoryGuard {
     #[inline]
     pub fn release(&self, bytes: u64) {
         let prev = self
-            .current_bytes
+            .reserved_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(bytes))
             })
@@ -411,12 +453,12 @@ impl MemoryGuard {
 
     /// Fast hot-path pressure check.
     ///
-    /// With a registered [`set_heap_source`], computes live from the true heap
-    /// (one atomic load + compare); otherwise reads the cached flag maintained
-    /// by `try_reserve`/`add_bytes`/`release`.
+    /// Computes live from the usage source, whose file read is cached for a
+    /// short interval. Only where no source is readable does it read the
+    /// cached flag maintained by `try_reserve`/`add_bytes`/`release`.
     #[inline]
     pub fn under_pressure(&self) -> bool {
-        if heap_bytes().is_some() {
+        if self.usage_bytes().is_some() {
             return self.pressure_ratio() >= self.pressure_threshold;
         }
         self.under_pressure.load(Ordering::Relaxed)
@@ -441,13 +483,42 @@ impl MemoryGuard {
         self.current_bytes() as f64 / self.limit_bytes as f64
     }
 
-    /// Current memory usage in bytes.
+    /// Current memory usage in bytes: what the kernel charges this process,
+    /// read from the guard's [`UsageSource`].
     ///
-    /// Returns the true total live heap when a [`set_heap_source`] is
-    /// registered, otherwise the sum of outstanding per-batch reservations.
+    /// A registered [`set_heap_source`] overrides it. Where neither is
+    /// readable this falls back to [`reserved_bytes`](Self::reserved_bytes),
+    /// which sees only what callers reserved by hand.
     #[inline]
     pub fn current_bytes(&self) -> u64 {
-        heap_bytes().unwrap_or_else(|| self.current_bytes.load(Ordering::Relaxed))
+        self.usage_bytes()
+            .unwrap_or_else(|| self.reserved_bytes.load(Ordering::Relaxed))
+    }
+
+    /// Outstanding per-batch reservations: `try_reserve`/`add_bytes` less
+    /// `release`. This is lease accounting -- how many bytes callers say they
+    /// are holding -- not the process's memory usage, which is
+    /// [`current_bytes`](Self::current_bytes).
+    #[inline]
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The name of the usage source in force, for logs and diagnostics.
+    #[must_use]
+    pub fn usage_source(&self) -> &'static str {
+        if HEAP_SOURCE.get().is_some() {
+            "explicit"
+        } else {
+            self.usage.source().name()
+        }
+    }
+
+    /// Process usage from the explicit heap source, else the usage source.
+    /// `None` only where neither is readable.
+    #[inline]
+    fn usage_bytes(&self) -> Option<u64> {
+        heap_bytes().or_else(|| self.usage.read())
     }
 
     /// Configured memory limit in bytes.
@@ -469,9 +540,24 @@ impl MemoryGuard {
 mod tests {
     use super::*;
 
+    /// A guard pinned to the reservation counter: the byte-lease ladder these
+    /// tests exercise, with no host cgroup reading underneath it.
+    fn reservation_guard(config: MemoryGuardConfig) -> MemoryGuard {
+        MemoryGuard::with_usage_source(config, UsageSource::Reservations)
+    }
+
+    /// Write `name`->`contents` files into a fresh temp dir and return it.
+    fn cgroup_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, contents) in files {
+            std::fs::write(dir.path().join(name), contents).expect("write fixture");
+        }
+        dir
+    }
+
     #[test]
     fn test_memory_guard_default() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 1_000_000, // 1MB explicit
             ..Default::default()
         });
@@ -483,29 +569,29 @@ mod tests {
 
     #[test]
     fn test_try_reserve_within_limit() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 1000,
             ..Default::default()
         });
         assert!(guard.try_reserve(500));
-        assert_eq!(guard.current_bytes(), 500);
+        assert_eq!(guard.reserved_bytes(), 500);
     }
 
     #[test]
     fn test_try_reserve_over_limit() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 1000,
             ..Default::default()
         });
         assert!(guard.try_reserve(500));
         assert!(!guard.try_reserve(600)); // would exceed 1000
-        assert_eq!(guard.current_bytes(), 500); // rolled back
+        assert_eq!(guard.reserved_bytes(), 500); // rolled back
         assert!(guard.under_pressure());
     }
 
     #[test]
     fn test_release_reduces_pressure() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 1000,
             pressure_threshold: 0.8,
             ..Default::default()
@@ -521,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_pressure_levels() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 1000,
             pressure_threshold: 0.8,
             ..Default::default()
@@ -542,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_pressure_ratio() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 1000,
             ..Default::default()
         });
@@ -553,14 +639,14 @@ mod tests {
 
     #[test]
     fn test_release_saturating() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 1000,
             ..Default::default()
         });
         guard.add_bytes(100);
         guard.release(200); // release more than added -- saturates to 0
         assert_eq!(
-            guard.current_bytes(),
+            guard.reserved_bytes(),
             0,
             "over-release must saturate to 0, not wrap"
         );
@@ -569,7 +655,7 @@ mod tests {
 
         // Verify the guard is still functional after over-release
         assert!(guard.try_reserve(500));
-        assert_eq!(guard.current_bytes(), 500);
+        assert_eq!(guard.reserved_bytes(), 500);
     }
 
     #[test]
@@ -577,7 +663,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
+        let guard = Arc::new(reservation_guard(MemoryGuardConfig {
             limit_bytes: 100_000,
             pressure_threshold: 0.8,
             ..Default::default()
@@ -599,23 +685,108 @@ mod tests {
         // All bytes should be released -- may not be exactly 0 due to ordering
         // but should be close (within one thread's batch)
         assert!(
-            guard.current_bytes() < 1000,
+            guard.reserved_bytes() < 1000,
             "leaked bytes: {}",
-            guard.current_bytes()
+            guard.reserved_bytes()
         );
     }
 
     #[test]
     fn test_try_reserve_rollback_is_atomic() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 100,
             ..Default::default()
         });
         assert!(guard.try_reserve(90));
         assert!(!guard.try_reserve(20)); // over limit, rolled back
-        assert_eq!(guard.current_bytes(), 90); // not 110
+        assert_eq!(guard.reserved_bytes(), 90); // not 110
         assert!(guard.try_reserve(10)); // exactly at limit
-        assert_eq!(guard.current_bytes(), 100);
+        assert_eq!(guard.reserved_bytes(), 100);
+    }
+
+    #[test]
+    fn pressure_ratio_follows_the_cgroup_current_file() {
+        // The bug this guards: with jemalloc installed and no heap source
+        // registered, the guard read a reservation counter that never moved
+        // while the process held 189 MiB. It now reads what the kernel charges.
+        let limit = 536_870_912u64; // matches memory.max in the fixture
+        let dir = cgroup_fixture(&[("memory.current", "0\n"), ("memory.max", "536870912\n")]);
+        let guard = MemoryGuard::with_usage_source(
+            MemoryGuardConfig {
+                limit_bytes: limit,
+                pressure_threshold: 0.8,
+                ..Default::default()
+            },
+            UsageSource::CgroupV2(dir.path().to_path_buf()),
+        );
+
+        // 198299648 bytes = the 189 MiB the transform actually held.
+        std::fs::write(dir.path().join("memory.current"), "198299648\n").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(60)); // past the read cache
+        let ratio = guard.pressure_ratio();
+        assert!(
+            (ratio - 0.369).abs() < 0.01,
+            "189 MiB of 512 MiB is 0.369, got {ratio}"
+        );
+        assert_eq!(guard.current_bytes(), 198_299_648);
+        assert_eq!(guard.pressure(), MemoryPressure::Low);
+        assert!(!guard.under_pressure());
+
+        // Push past the threshold: 450 MiB of 512 MiB is 0.879.
+        std::fs::write(dir.path().join("memory.current"), "471859200\n").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(
+            guard.under_pressure(),
+            "88% of the cgroup limit is over the 80% threshold"
+        );
+        assert_eq!(guard.pressure(), MemoryPressure::High);
+        assert!(
+            !guard.try_reserve(64 * 1024 * 1024),
+            "admission is projected against the cgroup, so 450 + 64 MiB is refused"
+        );
+    }
+
+    #[test]
+    fn reserved_bytes_and_current_bytes_are_different_numbers() {
+        let dir = cgroup_fixture(&[("memory.current", "104857600\n")]);
+        let guard = MemoryGuard::with_usage_source(
+            MemoryGuardConfig {
+                limit_bytes: 536_870_912,
+                ..Default::default()
+            },
+            UsageSource::CgroupV2(dir.path().to_path_buf()),
+        );
+
+        guard.add_bytes(4096);
+        assert_eq!(
+            guard.reserved_bytes(),
+            4096,
+            "the caller's outstanding lease"
+        );
+        assert_eq!(
+            guard.current_bytes(),
+            104_857_600,
+            "what the kernel charges the process"
+        );
+    }
+
+    #[test]
+    fn usage_source_is_named_for_the_init_log() {
+        let dir = cgroup_fixture(&[("memory.current", "1024\n")]);
+        let guard = MemoryGuard::with_usage_source(
+            MemoryGuardConfig {
+                limit_bytes: 1000,
+                ..Default::default()
+            },
+            UsageSource::CgroupV2(dir.path().to_path_buf()),
+        );
+        assert_eq!(guard.usage_source(), "cgroup-v2");
+
+        let guard = reservation_guard(MemoryGuardConfig {
+            limit_bytes: 1000,
+            ..Default::default()
+        });
+        assert_eq!(guard.usage_source(), "reservations");
     }
 
     // Process-global heap source for the switch test. nextest isolates each
@@ -661,11 +832,13 @@ mod tests {
         TEST_HEAP.store(900, Ordering::Relaxed);
         assert!(guard.try_reserve(100), "900 + 100 == limit, admitted");
         assert!(!guard.try_reserve(200), "900 + 200 > limit, rejected");
+        assert_eq!(guard.current_bytes(), 900, "still the heap source");
         assert_eq!(
-            guard.current_bytes(),
-            900,
+            guard.reserved_bytes(),
+            0,
             "counter untouched by try_reserve"
         );
+        assert_eq!(guard.usage_source(), "explicit");
     }
 
     #[test]
@@ -757,7 +930,7 @@ mod tests {
         // A zero/NaN headroom with auto-detect could yield a zero limit ->
         // divide-by-zero. A zero pressure_threshold would make every ratio
         // "over". new() must clamp to safe defaults and keep ratios finite.
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 0,
             pressure_threshold: 0.0,
             cgroup_headroom: 0.0,
@@ -772,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_new_with_nan_threshold_is_finite() {
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let guard = reservation_guard(MemoryGuardConfig {
             limit_bytes: 1000,
             pressure_threshold: f64::NAN,
             cgroup_headroom: f64::NAN,
