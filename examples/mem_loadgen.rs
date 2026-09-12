@@ -34,6 +34,9 @@
 //!
 //! Exit 0 on clean completion. A non-zero/137 exit (SIGKILL) under a cgroup
 //! cap is the OOM signal the operational test asserts on.
+//!
+//! Logging is initialised at info so the guard's "memory guard initialised"
+//! line, and the usage source it names, appear in the harness output.
 
 use std::time::{Duration, Instant};
 
@@ -47,6 +50,10 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 fn main() {
+    // The guard names its resolved usage source in an init log, which the
+    // operational test asserts on, so the harness needs a subscriber.
+    scalo::logger::setup_default().expect("logger setup");
+
     let cap_on = std::env::var("HARNESS_CAP").map_or(true, |v| v != "off");
     let payload_bytes: usize = env_or("HARNESS_PAYLOAD_BYTES", 65_536);
     let rate_hz: u64 = env_or("HARNESS_RATE_HZ", 20_000);

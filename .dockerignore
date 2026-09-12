@@ -21,8 +21,9 @@ docs/
 .env
 .env.*
 
-# Benches + local dev / agent artefacts
-benches/
+# Local dev / agent artefacts. benches/ stays in the context: Cargo.toml
+# declares seven [[bench]] targets, and cargo refuses to parse the manifest
+# when their files are missing, so excluding them breaks every image build.
 .claude/
 .codex/
 .cursor/
