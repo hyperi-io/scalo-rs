@@ -34,6 +34,9 @@
 //!
 //! Exit 0 on clean completion. A non-zero/137 exit (SIGKILL) under a cgroup
 //! cap is the OOM signal the operational test asserts on.
+//!
+//! Logging is initialised at info so the guard's "memory guard initialised"
+//! line, and the usage source it names, appear in the harness output.
 
 use std::time::{Duration, Instant};
 
@@ -47,6 +50,10 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 fn main() {
+    // The guard names its resolved usage source in an init log, which the
+    // operational test asserts on, so the harness needs a subscriber.
+    scalo::logger::setup_default().expect("logger setup");
+
     let cap_on = std::env::var("HARNESS_CAP").map_or(true, |v| v != "off");
     let payload_bytes: usize = env_or("HARNESS_PAYLOAD_BYTES", 65_536);
     let rate_hz: u64 = env_or("HARNESS_RATE_HZ", 20_000);
@@ -116,13 +123,14 @@ fn main() {
         if now.duration_since(last_report) >= Duration::from_secs(1) {
             let held_bytes: usize = held.iter().map(|(_, b)| b.len()).sum();
             println!(
-                "t={}s accepted={} rejected={} held_count={} held_bytes={} tracked_bytes={} under_pressure={}",
+                "t={}s accepted={} rejected={} held_count={} held_bytes={} usage_bytes={} reserved_bytes={} under_pressure={}",
                 now.duration_since(start).as_secs(),
                 accepted,
                 rejected,
                 held.len(),
                 held_bytes,
                 guard.current_bytes(),
+                guard.reserved_bytes(),
                 guard.under_pressure(),
             );
             last_report = now;
@@ -135,7 +143,8 @@ fn main() {
 
     let held_bytes: usize = held.iter().map(|(_, b)| b.len()).sum();
     println!(
-        "mem_loadgen done accepted={accepted} rejected={rejected} final_held_bytes={held_bytes} tracked_bytes={}",
-        guard.current_bytes()
+        "mem_loadgen done accepted={accepted} rejected={rejected} final_held_bytes={held_bytes} usage_bytes={} reserved_bytes={}",
+        guard.current_bytes(),
+        guard.reserved_bytes()
     );
 }

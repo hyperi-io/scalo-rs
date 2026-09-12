@@ -52,10 +52,15 @@ echo "== building harness image (memory feature, pure Rust -- light) =="
 docker build -f "$DOCKERFILE" -t "$IMAGE" "$REPO_ROOT"
 
 # Over-subscribe: 1 MiB payloads held 4s, far faster than they drain.
+PAYLOAD_BYTES=1048576
 COMMON_ENV=(
-    -e HARNESS_PAYLOAD_BYTES=1048576
+    -e HARNESS_PAYLOAD_BYTES="$PAYLOAD_BYTES"
     -e HARNESS_RATE_HZ=50000
     -e HARNESS_HOLD_MS=4000
+    # Fixed format, and no colour: the init-log assertion below matches on the
+    # field text, which ANSI escapes would sit inside.
+    -e LOG_FORMAT=text
+    -e NO_COLOR=1
 )
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -69,7 +74,28 @@ echo "$on_out"
 final_rej="$(printf '%s\n' "$on_out" | sed -n 's/.*rejected=\([0-9]\+\).*/\1/p' | tail -1)"
 [ -n "$final_rej" ] && [ "$final_rej" -gt 0 ] \
     || fail "cap=on did not backpressure (rejected=$final_rej); load may not have over-subscribed -- raise rate or lower MEM"
-echo "PASS leg 1: survived, rejected=$final_rej (backpressure engaged)"
+
+# The guard must be reading the kernel's own accounting. A reservation counter
+# sees only what callers hand it, which is what let the brake sit idle while
+# the process held 189 MiB.
+printf '%s\n' "$on_out" | grep -q "memory guard initialised" \
+    || fail "no guard init log: the harness cannot show which usage source the guard resolved"
+printf '%s\n' "$on_out" | grep -Eq 'usage_source["=:]+"?cgroup-v[12]' \
+    || fail "the guard did not resolve a cgroup usage source: $(printf '%s\n' "$on_out" | grep -o 'usage_source[^ ]*' | head -1)"
+
+# Held memory must plateau at the configured limit, not merely below the
+# kernel's cap: admission is bounded to one payload over, and the kernel's
+# charge drifts between samples inside the default 15% headroom.
+# Anchored to the harness line: the cgroup module logs the raw cap under the
+# same field name before the guard applies its headroom.
+limit="$(printf '%s\n' "$on_out" | sed -n 's/^mem_loadgen start .*limit_bytes=\([0-9]\+\).*/\1/p' | head -1)"
+peak="$(printf '%s\n' "$on_out" | sed -n 's/.*usage_bytes=\([0-9]\+\).*/\1/p' | sort -n | tail -1)"
+[ -n "$limit" ] && [ -n "$peak" ] \
+    || fail "could not read limit_bytes/usage_bytes from the harness output"
+ceiling=$((limit + limit / 20))
+[ "$peak" -le "$ceiling" ] \
+    || fail "usage peaked at $peak, more than 5% over limit_bytes=$limit (ceiling $ceiling)"
+echo "PASS leg 1: survived, rejected=$final_rej (backpressure engaged), peak usage $peak <= $ceiling"
 
 echo "== leg 2/2: cap=OFF under --memory=$MEM (control: expect OOM-kill) =="
 # Cap on a short duration; it should OOM well before this.
