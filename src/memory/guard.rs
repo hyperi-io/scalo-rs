@@ -407,15 +407,25 @@ impl MemoryGuard {
     /// (`usage() + bytes <= limit`) and does NOT mutate the reservation
     /// counter -- the kernel charges the bytes once they are allocated and
     /// uncharges them on drop, so no `release` is needed to keep the check
-    /// honest. Only where no usage source is readable does it fall back to the
-    /// classic atomic check-and-add on the per-batch counter (rolled back if
-    /// it would exceed the limit).
+    /// honest. An admission is charged to the usage reader's ledger so the
+    /// callers behind it in the same cache window see it. Only where no usage
+    /// source is readable does it fall back to the classic atomic
+    /// check-and-add on the per-batch counter (rolled back if it would exceed
+    /// the limit).
     #[inline]
     pub fn try_reserve(&self, bytes: u64) -> bool {
-        if let Some(usage) = self.usage_bytes() {
+        if let Some(heap) = heap_bytes() {
+            // A registered heap source is read live, so it needs no ledger.
+            return heap.saturating_add(bytes) <= self.limit_bytes;
+        }
+        if let Some(estimate) = self.usage.estimate() {
             // Saturating, so an absurd `bytes` is refused rather than wrapping
             // past the limit and being admitted.
-            return usage.saturating_add(bytes) <= self.limit_bytes;
+            if estimate.saturating_add(bytes) > self.limit_bytes {
+                return false;
+            }
+            self.usage.admit(bytes);
+            return true;
         }
         let current = self.reserved_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if current > self.limit_bytes {
@@ -432,6 +442,9 @@ impl MemoryGuard {
     /// Use when data is already accepted and you just need to track the lease.
     #[inline]
     pub fn add_bytes(&self, bytes: u64) {
+        // Charged to the ledger as well, so a lease paired with `release` nets
+        // to zero there instead of eroding another caller's admissions.
+        self.usage.admit(bytes);
         let new_total = self.reserved_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         self.update_pressure(new_total);
     }
@@ -441,6 +454,7 @@ impl MemoryGuard {
     /// Uses saturating subtraction to prevent underflow wrapping.
     #[inline]
     pub fn release(&self, bytes: u64) {
+        self.usage.forget(bytes);
         let prev = self
             .reserved_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -454,8 +468,9 @@ impl MemoryGuard {
     /// Fast hot-path pressure check.
     ///
     /// Computes live from the usage source, whose file read is cached for a
-    /// short interval. Only where no source is readable does it read the
-    /// cached flag maintained by `try_reserve`/`add_bytes`/`release`.
+    /// short interval and topped up with the bytes admitted since. Only where
+    /// no source is readable does it read the cached flag maintained by
+    /// `try_reserve`/`add_bytes`/`release`.
     #[inline]
     pub fn under_pressure(&self) -> bool {
         if self.usage_bytes().is_some() {
@@ -484,7 +499,8 @@ impl MemoryGuard {
     }
 
     /// Current memory usage in bytes: what the kernel charges this process,
-    /// read from the guard's [`UsageSource`].
+    /// read from the guard's [`UsageSource`], plus the bytes admitted since
+    /// that reading was taken.
     ///
     /// A registered [`set_heap_source`] overrides it. Where neither is
     /// readable this falls back to [`reserved_bytes`](Self::reserved_bytes),
@@ -514,11 +530,12 @@ impl MemoryGuard {
         }
     }
 
-    /// Process usage from the explicit heap source, else the usage source.
-    /// `None` only where neither is readable.
+    /// Process usage from the explicit heap source, else the usage source plus
+    /// its ledger of bytes admitted since the sample. `None` only where
+    /// neither is readable.
     #[inline]
     fn usage_bytes(&self) -> Option<u64> {
-        heap_bytes().or_else(|| self.usage.read())
+        heap_bytes().or_else(|| self.usage.estimate())
     }
 
     /// Configured memory limit in bytes.
@@ -746,6 +763,75 @@ mod tests {
         );
     }
 
+    /// Ten MiB limit against a cgroup file that stays at zero, so admission can
+    /// only be refused by the ledger of bytes taken since that reading.
+    fn ledger_guard(dir: &tempfile::TempDir) -> MemoryGuard {
+        MemoryGuard::with_usage_source(
+            MemoryGuardConfig {
+                limit_bytes: 10 * 1024 * 1024,
+                ..Default::default()
+            },
+            UsageSource::CgroupV2(dir.path().to_path_buf()),
+        )
+    }
+
+    #[test]
+    fn a_burst_inside_one_cache_window_is_refused() {
+        // The overshoot this guards: the kernel figure is up to CACHE_INTERVAL
+        // stale, so admitting against it alone lets a burst through unbounded.
+        let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+        let guard = ledger_guard(&dir);
+        let six_mib = 6 * 1024 * 1024;
+
+        assert!(guard.try_reserve(six_mib), "6 MiB of a 10 MiB limit fits");
+        assert!(
+            !guard.try_reserve(six_mib),
+            "a second 6 MiB is 12 MiB of a 10 MiB limit, against an unchanged file"
+        );
+    }
+
+    #[test]
+    fn release_discharges_the_ledger() {
+        let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+        let guard = ledger_guard(&dir);
+        let six_mib = 6 * 1024 * 1024;
+
+        assert!(guard.try_reserve(six_mib));
+        guard.release(six_mib);
+        assert!(
+            guard.try_reserve(six_mib),
+            "the released bytes no longer count against the next admission"
+        );
+    }
+
+    #[test]
+    fn a_fresh_sample_clears_the_ledger() {
+        let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+        let guard = ledger_guard(&dir);
+        let six_mib = 6 * 1024 * 1024;
+
+        assert!(guard.try_reserve(six_mib));
+        std::thread::sleep(std::time::Duration::from_millis(60)); // past the read cache
+        assert!(
+            guard.try_reserve(six_mib),
+            "the new reading accounts for those bytes, so the ledger restarts"
+        );
+    }
+
+    #[test]
+    fn the_ledger_adds_to_what_the_kernel_already_charges() {
+        let dir = cgroup_fixture(&[("memory.current", "4194304\n")]); // 4 MiB
+        let guard = ledger_guard(&dir);
+
+        assert_eq!(guard.current_bytes(), 4 * 1024 * 1024);
+        assert!(guard.try_reserve(2 * 1024 * 1024));
+        assert_eq!(
+            guard.current_bytes(),
+            6 * 1024 * 1024,
+            "4 MiB charged plus 2 MiB admitted against that reading"
+        );
+    }
+
     #[test]
     fn reserved_bytes_and_current_bytes_are_different_numbers() {
         let dir = cgroup_fixture(&[("memory.current", "104857600\n")]);
@@ -765,8 +851,8 @@ mod tests {
         );
         assert_eq!(
             guard.current_bytes(),
-            104_857_600,
-            "what the kernel charges the process"
+            104_861_696,
+            "what the kernel charges, plus the lease taken against that reading"
         );
     }
 

@@ -139,6 +139,10 @@ pub(crate) struct UsageReader {
     cached_at_nanos: AtomicU64,
     /// False until the first successful read, so a cold reader never serves 0.
     primed: AtomicBool,
+    /// Net bytes admitted since the cached sample, floored at zero: the kernel
+    /// figure is up to [`CACHE_INTERVAL`] stale, so a burst inside one window
+    /// would otherwise be admitted against a reading that predates it.
+    admitted_since_sample: AtomicU64,
 }
 
 impl UsageReader {
@@ -149,6 +153,7 @@ impl UsageReader {
             cached_bytes: AtomicU64::new(0),
             cached_at_nanos: AtomicU64::new(0),
             primed: AtomicBool::new(false),
+            admitted_since_sample: AtomicU64::new(0),
         };
         reader.sample();
         reader
@@ -172,7 +177,35 @@ impl UsageReader {
         self.sample()
     }
 
+    /// Kernel sample plus what has been admitted against it since.
+    ///
+    /// The sample is taken first, so the ledger read afterwards is always one
+    /// the clear inside [`Self::sample`] has already reset.
+    pub(crate) fn estimate(&self) -> Option<u64> {
+        let sampled = self.read()?;
+        Some(sampled.saturating_add(self.admitted_since_sample.load(Ordering::Relaxed)))
+    }
+
+    /// Charge an admission to the ledger, until the next sample sees it.
+    pub(crate) fn admit(&self, bytes: u64) {
+        self.admitted_since_sample
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Discharge released bytes from the ledger, saturating at zero.
+    pub(crate) fn forget(&self, bytes: u64) {
+        let _ = self.admitted_since_sample.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(bytes)),
+        );
+    }
+
     fn sample(&self) -> Option<u64> {
+        // Cleared before the file read, not after: an admission landing between
+        // the two is then double-counted rather than dropped, and over-counting
+        // brakes early where an under-count is the overshoot that OOM-kills.
+        self.admitted_since_sample.store(0, Ordering::Relaxed);
         match self.source.read() {
             Some(bytes) => {
                 self.cached_bytes.store(bytes, Ordering::Relaxed);

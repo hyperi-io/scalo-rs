@@ -80,7 +80,14 @@ The file read is cached for 50 ms. The guard is sampled per payload on
 the receive path, and the kernel charges memory in per-CPU batches, so
 a reading is approximate below that interval anyway.
 
-`current_bytes()` is process usage; `reserved_bytes()` is the
+Bytes admitted since that reading are added to it, so a burst inside one
+window is charged against the limit instead of against a reading that
+predates it. The ledger is cleared whenever a fresh sample is taken --
+before the file is read, so an admission racing the sample is
+double-counted rather than dropped.
+
+`current_bytes()` is that estimate -- what the kernel charges, plus what
+has been admitted against the current reading. `reserved_bytes()` is the
 outstanding byte leases from `try_reserve`/`add_bytes` less `release`.
 They are different numbers and both are exposed.
 
@@ -100,7 +107,9 @@ allocator -- the choice is the binary's.
 `try_reserve(n)` is a projected-admission check (`usage() + n <=
 limit`) against whichever source is in force, and does NOT mutate the
 reservation counter -- the kernel uncharges the bytes when they are
-freed, so no `release` is needed to keep the check honest.
+freed, so no `release` is needed to keep the check honest. It does
+charge the ledger, so callers behind it in the same cache window see the
+admission.
 
 ---
 
@@ -151,9 +160,9 @@ if guard.under_pressure() {
 
 | Operation | Cost |
 |-----------|------|
-| `try_reserve(n)` | one cached usage read + compare (`fetch_add` + optional rollback only on rung 4) |
-| `add_bytes(n)` | `fetch_add` + threshold update |
-| `release(n)` | saturating `fetch_update` -- over-release floors at zero |
+| `try_reserve(n)` | one cached usage read + compare + `fetch_add` on the ledger (rollback on the reservation counter only on rung 4) |
+| `add_bytes(n)` | two `fetch_add` + threshold update |
+| `release(n)` | two saturating `fetch_update` -- over-release floors at zero |
 | `under_pressure()` | one cached usage read + compare; one file read per 50 ms |
 | `pressure_ratio()` | the same read + one float division; >1.0 means misconfigured limit |
 
@@ -205,11 +214,11 @@ Env vars:
 | `MemoryGuard::with_usage_source(config, source)` | Construct reading usage from a pinned `UsageSource` |
 | `MemoryGuard::try_reserve(n) -> bool` | Projected-admission check against current usage |
 | `MemoryGuard::add_bytes(n)` | Unchecked lease tracking -- data already accepted |
-| `MemoryGuard::release(n)` | Saturating subtract on the reservation counter |
+| `MemoryGuard::release(n)` | Saturating subtract on the reservation counter and the ledger |
 | `MemoryGuard::under_pressure() -> bool` | Hot-path probe |
 | `MemoryGuard::pressure() -> MemoryPressure` | Three-level enum for logs/labels |
 | `MemoryGuard::pressure_ratio() -> f64` | Usage as fraction of effective limit |
-| `MemoryGuard::current_bytes() -> u64` | What the kernel charges this process |
+| `MemoryGuard::current_bytes() -> u64` | What the kernel charges, plus bytes admitted since that reading |
 | `MemoryGuard::reserved_bytes() -> u64` | Outstanding byte leases, not process usage |
 | `MemoryGuard::usage_source() -> &'static str` | Which source is in force |
 | `MemoryGuard::limit_bytes() -> u64` | Effective limit (after headroom) |
