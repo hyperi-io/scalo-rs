@@ -322,6 +322,12 @@ impl KafkaTransport {
         }
 
         client_config.set("client.id", &config.client_id);
+        // Fetch-from-follower (KIP-392): with a rack set, the consumer reads
+        // from an in-zone replica instead of the leader. Consumer-side only,
+        // and a no-op when the field is unset.
+        if let Some(ref rack) = config.client_rack {
+            client_config.set("client.rack", rack);
+        }
 
         // Ensure statistics callbacks fire (all profiles already set this, but
         // guarantee it as a fallback for manual configs).

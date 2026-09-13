@@ -903,6 +903,22 @@ pub struct KafkaConfig {
     #[serde(default = "default_client_id")]
     pub client_id: String,
 
+    /// Rack (availability zone) this client runs in, for fetch-from-follower.
+    ///
+    /// librdkafka: `client.rack` (KIP-392). When it matches a replica's
+    /// `broker.rack` the consumer fetches from that replica instead of the
+    /// partition leader, which halves cross-AZ traffic on a three-AZ MSK or
+    /// Strimzi cluster and removes its inter-AZ charge. `None` (the default)
+    /// leaves the property unset and every fetch goes to the leader.
+    ///
+    /// Wire it from the platform's own zone label -- the K8s
+    /// `topology.kubernetes.io/zone` node label via the downward API, or the
+    /// EC2 instance's availability zone -- into `KAFKA_CLIENT_RACK`. The
+    /// broker side has to be configured for it too: replicas need `broker.rack`
+    /// set and the topic needs `min.insync.replicas` satisfied in-zone.
+    #[serde(default)]
+    pub client_rack: Option<String>,
+
     /// Static group membership id (`group.instance.id`). Opt-in: `None` (the
     /// default) uses dynamic membership.
     ///
@@ -1176,6 +1192,7 @@ impl Default for KafkaConfig {
             brokers: default_brokers(),
             group: default_group(),
             client_id: default_client_id(),
+            client_rack: None,
             group_instance_id: None,
             topics: Vec::new(),
             auto_discover: false,
@@ -1536,6 +1553,7 @@ impl KafkaConfig {
     /// - `{PREFIX}_PROFILE` -> profile (production, devtest)
     /// - `{PREFIX}_BOOTSTRAP_SERVERS` -> brokers (legacy: `{PREFIX}_BROKERS`)
     /// - `{PREFIX}_GROUP_ID` -> group
+    /// - `{PREFIX}_CLIENT_RACK` -> client_rack (legacy: `{PREFIX}_AVAILABILITY_ZONE`)
     /// - `{PREFIX}_PROVIDER` -> provider (derives security_protocol + sasl_mechanism)
     /// - `{PREFIX}_SECURITY_PROTOCOL` -> security_protocol
     /// - `{PREFIX}_SASL_MECHANISM` -> sasl_mechanism
@@ -1582,6 +1600,15 @@ impl KafkaConfig {
 
         if let Some(val) = prefixed("CLIENT_ID", &[]).get() {
             config.client_id = val;
+        }
+
+        // Fetch-from-follower (KIP-392). Wired from the platform's zone label;
+        // an empty value is treated as unset so an unpopulated downward-API
+        // variable does not pin every fetch to a rack named "".
+        if let Some(val) = prefixed("CLIENT_RACK", &["AVAILABILITY_ZONE"]).get()
+            && !val.is_empty()
+        {
+            config.client_rack = Some(val);
         }
 
         // Static group membership id (KIP-345). Opt-in; canonically wired from
@@ -1645,6 +1672,7 @@ impl KafkaConfig {
     /// - `KAFKA_TOPICS`
     /// - `KAFKA_GROUP_ID`
     /// - `KAFKA_CLIENT_ID`
+    /// - `KAFKA_CLIENT_RACK`
     /// - `KAFKA_PROFILE`
     #[cfg(feature = "config")]
     #[must_use]
@@ -1770,6 +1798,27 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.apply_provider().is_err());
+    }
+
+    /// `client.rack` is opt-in: unset means every fetch goes to the leader,
+    /// which is what a single-AZ or unlabelled deployment wants.
+    #[cfg(feature = "config")]
+    #[test]
+    fn client_rack_is_unset_unless_the_environment_names_one() {
+        assert_eq!(KafkaConfig::default().client_rack, None);
+
+        temp_env::with_var("KAFKA_CLIENT_RACK", Some("ap-southeast-2a"), || {
+            assert_eq!(
+                KafkaConfig::from_env("KAFKA").client_rack.as_deref(),
+                Some("ap-southeast-2a")
+            );
+        });
+
+        // An unpopulated downward-API variable must not pin every fetch to a
+        // rack named "".
+        temp_env::with_var("KAFKA_CLIENT_RACK", Some(""), || {
+            assert_eq!(KafkaConfig::from_env("KAFKA").client_rack, None);
+        });
     }
 
     #[test]
