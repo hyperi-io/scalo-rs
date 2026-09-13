@@ -247,7 +247,14 @@ impl KafkaProducer {
     /// * `Ok(())` - Message queued successfully
     /// * `Err(TransportError::Backpressure)` - Queue full or a retryable broker
     ///   condition; the message is still deliverable, so retry it
+    /// * `Err(TransportError::MessageTooLarge)` - Over the message-size
+    ///   ceiling, so a retry can never succeed -- dead-letter it
     /// * `Err(TransportError::Send(_))` - Retrying cannot help
+    ///
+    /// # Errors
+    ///
+    /// Returns the classified produce failure above; the caller decides
+    /// between retry, dead-letter and abort.
     pub fn send(&self, topic: &str, key: Option<&[u8]>, payload: &[u8]) -> TransportResult<()> {
         let mut record = BaseRecord::to(topic).payload(payload);
         if let Some(k) = key {
@@ -268,6 +275,10 @@ impl KafkaProducer {
                 self.errors.fetch_add(1, Ordering::Relaxed);
                 match classify_send_failure(&err) {
                     SendFailure::QueueFull => Err(TransportError::Backpressure),
+                    SendFailure::TooLarge => Err(TransportError::MessageTooLarge {
+                        bytes: payload.len(),
+                        detail: err.to_string(),
+                    }),
                     SendFailure::Retryable => {
                         // Backpressure is the recoverable outcome the caller
                         // acts on; the cause only survives in this line.
