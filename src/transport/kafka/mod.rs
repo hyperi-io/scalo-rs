@@ -84,6 +84,7 @@ use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::WorkBatch;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
+use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::Message as KafkaMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
@@ -784,6 +785,25 @@ impl TransportSender for KafkaTransport {
                     .increment(1);
                     SendResult::Backpressured
                 }
+                classify::SendFailure::TooLarge => {
+                    let refused = TransportError::MessageTooLarge {
+                        bytes: payload.len(),
+                        detail: err.to_string(),
+                    };
+                    #[cfg(feature = "metrics")]
+                    ::metrics::counter!(
+                        "transport_message_too_large_total",
+                        "transport" => "kafka"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        destination,
+                        error = %refused,
+                        "kafka: record exceeds message.max.bytes -- dead-lettering it; \
+                         raise the producer, broker and topic ceilings together"
+                    );
+                    SendResult::FilteredDlq
+                }
                 classify::SendFailure::Retryable => {
                     #[cfg(feature = "metrics")]
                     ::metrics::counter!(
@@ -1465,6 +1485,53 @@ mod tests {
         assert!(!effective_consumer_group_id("").is_empty());
         // A real group is passed through unchanged.
         assert_eq!(effective_consumer_group_id("my-group"), "my-group");
+    }
+
+    /// An oversize record is a poison record, not a transport failure: it is
+    /// dead-lettered, so the block is neither retried nor spooled.
+    #[test]
+    fn oversize_record_is_dead_lettered_not_retried() {
+        use rdkafka::error::KafkaError;
+
+        assert_eq!(
+            classify::classify_send_failure(&KafkaError::MessageProduction(
+                RDKafkaErrorCode::MessageSizeTooLarge
+            )),
+            classify::SendFailure::TooLarge
+        );
+        assert_eq!(
+            classify::classify_send_failure(&KafkaError::MessageProduction(
+                RDKafkaErrorCode::QueueFull
+            )),
+            classify::SendFailure::QueueFull
+        );
+        // A missing topic stays fatal: retrying past it hides a misconfigured
+        // destination behind the retry loop.
+        assert_eq!(
+            classify::classify_send_failure(&KafkaError::MessageProduction(
+                RDKafkaErrorCode::UnknownTopicOrPartition
+            )),
+            classify::SendFailure::Fatal
+        );
+    }
+
+    /// The error the oversize path reports is permanent: a caller branching on
+    /// `is_recoverable` must not retry it, and one branching on `is_fatal` must
+    /// not tear the transport down over a single bad record.
+    #[test]
+    fn message_too_large_is_undeliverable_not_recoverable() {
+        let err = TransportError::MessageTooLarge {
+            bytes: 20_000_000,
+            detail: "Broker: Message size too large".to_string(),
+        };
+        assert!(err.is_undeliverable());
+        assert!(!err.is_recoverable());
+        assert!(!err.is_fatal());
+        assert!(
+            err.to_string().contains("20000000"),
+            "the refused size belongs in the message: {err}"
+        );
+        assert!(!TransportError::Send("boom".into()).is_undeliverable());
     }
 
     #[test]

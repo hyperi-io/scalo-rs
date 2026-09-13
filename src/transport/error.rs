@@ -26,6 +26,21 @@ pub enum TransportError {
     #[error("transport send error: {0}")]
     Send(String),
 
+    /// A record exceeded the message-size ceiling and was refused.
+    ///
+    /// Distinct from [`Send`](Self::Send) because it is PERMANENT: the same
+    /// bytes can never be accepted, so a retry only repeats the loss. The
+    /// record belongs in a dead-letter queue. Kafka raises this locally
+    /// (librdkafka's `message.max.bytes`) before the broker is consulted, as
+    /// well as from the broker's own topic `max.message.bytes`.
+    #[error("transport message too large: {bytes} bytes exceeds the message-size ceiling: {detail}")]
+    MessageTooLarge {
+        /// Payload size that was refused, in bytes.
+        bytes: usize,
+        /// The underlying client/broker error text.
+        detail: String,
+    },
+
     /// Receive operation failed.
     #[error("transport receive error: {0}")]
     Recv(String),
@@ -66,5 +81,15 @@ impl TransportError {
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         matches!(self, Self::Closed | Self::Config(_))
+    }
+
+    /// Returns true if the same payload can never succeed.
+    ///
+    /// The transport is healthy and the next record may well go through -- it
+    /// is THIS record that is poison, so it belongs in a dead-letter queue
+    /// rather than a retry loop.
+    #[must_use]
+    pub fn is_undeliverable(&self) -> bool {
+        matches!(self, Self::MessageTooLarge { .. })
     }
 }

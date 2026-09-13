@@ -28,11 +28,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub(crate) enum SendFailure {
     /// The local producer queue is full. Drain it and re-offer the message.
     QueueFull,
+    /// The record is over the message-size ceiling. No retry and no ceiling the
+    /// broker currently carries will take it, so dead-letter the record and
+    /// keep the transport.
+    TooLarge,
     /// A transient broker, leader or network condition. The message is still
     /// deliverable, so the caller retries rather than dropping it.
     Retryable,
-    /// Retrying cannot help -- authorisation, message size, or a permanent
-    /// topic error.
+    /// Retrying cannot help -- authorisation or a permanent topic error.
     Fatal,
 }
 
@@ -40,6 +43,7 @@ pub(crate) enum SendFailure {
 pub(crate) fn classify_send_failure(err: &KafkaError) -> SendFailure {
     match err.rdkafka_error_code() {
         Some(RDKafkaErrorCode::QueueFull) => SendFailure::QueueFull,
+        Some(RDKafkaErrorCode::MessageSizeTooLarge) => SendFailure::TooLarge,
         Some(code) if is_retryable(code) => SendFailure::Retryable,
         _ => SendFailure::Fatal,
     }
@@ -204,6 +208,14 @@ mod tests {
     }
 
     #[test]
+    fn an_oversize_record_is_its_own_class() {
+        // Classing it fatal tears the transport down over one poison record;
+        // classing it retryable loops on a record no retry can deliver.
+        let err = KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge);
+        assert_eq!(classify_send_failure(&err), SendFailure::TooLarge);
+    }
+
+    #[test]
     fn transient_broker_conditions_are_retryable_not_fatal() {
         // Reporting any of these as fatal drops a deliverable message in an
         // at-least-once pipeline.
@@ -233,7 +245,6 @@ mod tests {
         for code in [
             RDKafkaErrorCode::TopicAuthorizationFailed,
             RDKafkaErrorCode::ClusterAuthorizationFailed,
-            RDKafkaErrorCode::MessageSizeTooLarge,
             RDKafkaErrorCode::UnknownTopicOrPartition,
             RDKafkaErrorCode::InvalidArgument,
         ] {
