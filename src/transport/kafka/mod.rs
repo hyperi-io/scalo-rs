@@ -62,11 +62,11 @@ pub mod topic_resolver;
 pub use admin::{KafkaAdmin, TopicInfo};
 #[allow(deprecated)]
 pub use config::{
-    ConsumerKnobs, DEVTEST_PROFILE, HIGH_THROUGHPUT_CONSUMER_DEFAULTS, KafkaConfig, KafkaProfile,
-    KafkaSizingConfig, LOW_LATENCY_CONSUMER_DEFAULTS, MESSAGE_MAX_BYTES, PRODUCER_DEFAULTS,
-    PRODUCER_DEVTEST, PRODUCER_EXACTLY_ONCE, PRODUCER_HIGH_THROUGHPUT, PRODUCER_LOW_LATENCY,
-    PRODUCTION_PROFILE, ProducerKnobs, SelfRegulationProfile, SuppressionRule,
-    merge_with_overrides,
+    CLASSIC_ONLY_CONSUMER_KEYS, ConsumerKnobs, ConsumerProtocol, DEVTEST_PROFILE,
+    HIGH_THROUGHPUT_CONSUMER_DEFAULTS, KafkaConfig, KafkaProfile, KafkaSizingConfig,
+    LOW_LATENCY_CONSUMER_DEFAULTS, MESSAGE_MAX_BYTES, PRODUCER_DEFAULTS, PRODUCER_DEVTEST,
+    PRODUCER_EXACTLY_ONCE, PRODUCER_HIGH_THROUGHPUT, PRODUCER_LOW_LATENCY, PRODUCTION_PROFILE,
+    ProducerKnobs, SelfRegulationProfile, SuppressionRule, merge_with_overrides,
 };
 pub use metrics::{
     BrokerMetrics, KafkaMetrics, StatsContext, healthy_broker_count, total_consumer_lag,
@@ -208,6 +208,280 @@ fn effective_consumer_group_id(group: &str) -> &str {
     }
 }
 
+/// Build the consumer's librdkafka config for one group protocol.
+///
+/// Every documented layer runs first -- explicit fields, profile defaults, the
+/// sizing surface, then `librdkafka_overrides` -- and the protocol is applied
+/// LAST, because under `consumer` librdkafka refuses the client outright if a
+/// classic-only property was set by any of them.
+fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> ClientConfig {
+    let mut client_config = ClientConfig::new();
+
+    client_config.set("bootstrap.servers", config.brokers.join(","));
+    // librdkafka >= 2.x refuses to create a consumer client with an EMPTY
+    // group.id -- `rd_kafka_poll_set_consumer` returns "consumer queue not
+    // available". A producer-only transport legitimately carries no consumer
+    // group (callers signal this by clearing `config.group`), but the
+    // constructor still builds a consumer client (it is non-optional). See
+    // effective_consumer_group_id for the inert-fallback rationale.
+    client_config.set("group.id", effective_consumer_group_id(&config.group));
+    // Static membership (KIP-345): opt-in, must be unique per replica.
+    if let Some(ref id) = config.group_instance_id {
+        client_config.set("group.instance.id", id);
+    }
+    client_config.set("enable.auto.commit", config.enable_auto_commit.to_string());
+    client_config.set(
+        "auto.commit.interval.ms",
+        config.auto_commit_interval_ms.to_string(),
+    );
+    client_config.set("session.timeout.ms", config.session_timeout_ms.to_string());
+    client_config.set(
+        "heartbeat.interval.ms",
+        config.heartbeat_interval_ms.to_string(),
+    );
+    client_config.set(
+        "max.poll.interval.ms",
+        config.max_poll_interval_ms.to_string(),
+    );
+    client_config.set("fetch.min.bytes", config.fetch_min_bytes.to_string());
+    client_config.set("fetch.max.bytes", config.fetch_max_bytes.to_string());
+    client_config.set(
+        "max.partition.fetch.bytes",
+        config.max_partition_fetch_bytes.to_string(),
+    );
+    client_config.set("auto.offset.reset", &config.auto_offset_reset);
+    client_config.set(
+        "enable.partition.eof",
+        config.enable_partition_eof.to_string(),
+    );
+
+    // Profile defaults (overridable by librdkafka_overrides).
+    let rdkafka_config = config.build_librdkafka_config();
+    for (key, value) in &rdkafka_config {
+        client_config.set(key, value);
+    }
+
+    // Sizing surface:
+    //   profile defaults < named consumer knobs < sizing.consumer_librdkafka
+    for (key, value) in config.sizing.resolved_consumer_map() {
+        client_config.set(key, value);
+    }
+
+    // Re-apply librdkafka_overrides LAST so they remain the highest-priority
+    // layer the docs promise (config.rs precedence list). build_librdkafka_config
+    // above also applied them, but the sizing surface in between would
+    // otherwise clobber any fetch.* key an operator set via an override --
+    // silently reverting a deployment's tuning on upgrade.
+    for (key, value) in &config.librdkafka_overrides {
+        client_config.set(key, value);
+    }
+
+    // Security.
+    client_config.set("security.protocol", &config.security_protocol);
+    if let Some(ref mechanism) = config.sasl_mechanism {
+        client_config.set("sasl.mechanism", mechanism);
+    }
+    if let Some(ref username) = config.sasl_username {
+        client_config.set("sasl.username", username);
+    }
+    if let Some(ref password) = config.sasl_password {
+        client_config.set("sasl.password", password.expose());
+    }
+
+    // TLS.
+    if let Some(ref ca) = config.ssl_ca_location {
+        client_config.set("ssl.ca.location", ca);
+    }
+    if let Some(ref cert) = config.ssl_certificate_location {
+        client_config.set("ssl.certificate.location", cert);
+    }
+    if let Some(ref key) = config.ssl_key_location {
+        client_config.set("ssl.key.location", key);
+    }
+    if config.ssl_skip_verify {
+        client_config.set("enable.ssl.certificate.verification", "false");
+    }
+
+    client_config.set("client.id", &config.client_id);
+    // Fetch-from-follower (KIP-392): with a rack set, the consumer reads
+    // from an in-zone replica instead of the leader. Consumer-side only,
+    // and a no-op when the field is unset.
+    if let Some(ref rack) = config.client_rack {
+        client_config.set("client.rack", rack);
+    }
+
+    // Ensure statistics callbacks fire (all profiles already set this, but
+    // guarantee it as a fallback for manual configs).
+    if client_config.get("statistics.interval.ms").is_none() {
+        client_config.set("statistics.interval.ms", "5000");
+    }
+
+    apply_group_protocol(&mut client_config, protocol);
+    client_config
+}
+
+/// Set `group.protocol` and strip what that protocol forbids.
+///
+/// `group.remote.assignor` is deliberately left unset: with no client-side
+/// choice the broker applies its own default (`uniform`), which is the
+/// assignment KIP-848 exists to give.
+fn apply_group_protocol(client_config: &mut ClientConfig, protocol: ConsumerProtocol) {
+    client_config.set("group.protocol", protocol.as_str());
+    if protocol != ConsumerProtocol::Consumer {
+        return;
+    }
+    // librdkafka fails client creation if any of these was set AT ALL, so
+    // remove rather than skip -- a raw override could otherwise reintroduce one.
+    let dropped: Vec<&str> = CLASSIC_ONLY_CONSUMER_KEYS
+        .iter()
+        .copied()
+        .filter(|key| client_config.get(key).is_some())
+        .collect();
+    for key in &dropped {
+        client_config.remove(key);
+    }
+    if !dropped.is_empty() {
+        tracing::debug!(
+            keys = %dropped.join(", "),
+            "kafka: dropped classic-only properties for group.protocol=consumer; \
+             their replacements are broker-side"
+        );
+    }
+}
+
+/// Create the consumer client, `Arc`-wrapped so the optional gate actuator
+/// (governor feature) can share it for pause/resume without `unsafe`.
+fn create_consumer(
+    client_config: &ClientConfig,
+) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
+    client_config
+        .create_with_context(StatsContext::new())
+        .map(Arc::new)
+        .map_err(|e| TransportError::Connection(format!("Failed to create consumer: {e}")))
+}
+
+/// Subscribe the consumer to `topics`, or do nothing when the list is empty
+/// (the producer-only case).
+fn subscribe_consumer(
+    consumer: &BaseConsumer<StatsContext>,
+    topics: &[String],
+) -> TransportResult<()> {
+    if topics.is_empty() {
+        return Ok(());
+    }
+    let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
+    consumer
+        .subscribe(&topics)
+        .map_err(|e| TransportError::Connection(format!("Failed to subscribe: {e}")))
+}
+
+/// How long to wait for the broker to accept the consumer protocol, or `None`
+/// when there is nothing to wait for.
+///
+/// `None` covers three cases: the protocol is already `classic`, the operator
+/// set the window to zero, or `statistics.interval.ms` is off -- the probe
+/// reads the group state from those statistics, so without them it could only
+/// ever time out and downgrade a healthy consumer.
+fn protocol_probe_window(
+    config: &KafkaConfig,
+    protocol: ConsumerProtocol,
+    client_config: &ClientConfig,
+) -> Option<Duration> {
+    if protocol != ConsumerProtocol::Consumer || config.consumer_protocol_probe_ms == 0 {
+        return None;
+    }
+    let stats_interval_ms: u64 = client_config
+        .get("statistics.interval.ms")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if stats_interval_ms == 0 {
+        tracing::warn!(
+            "kafka: statistics are disabled, so the group.protocol=consumer probe cannot \
+             observe the join -- keeping the consumer protocol with no fallback"
+        );
+        return None;
+    }
+    Some(Duration::from_millis(config.consumer_protocol_probe_ms))
+}
+
+/// Verdict of the one-shot KIP-848 negotiation probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProtocolProbe {
+    /// Keep the requested protocol.
+    Keep,
+    /// Rebuild as `classic`; the string is the reason for the warning.
+    FallBack(String),
+}
+
+/// librdkafka error codes that mean the broker will not speak KIP-848.
+///
+/// A ConsumerGroupHeartbeat the broker cannot answer is raised as a FATAL
+/// error carrying one of these, not as a poll error, so the fatal slot is where
+/// the refusal shows up.
+const PROTOCOL_REFUSAL_CODES: &[RDKafkaErrorCode] = &[
+    RDKafkaErrorCode::UnsupportedVersion,
+    RDKafkaErrorCode::UnsupportedFeature,
+    RDKafkaErrorCode::UnsupportedAssignor,
+];
+
+/// Classify one tick of the negotiation probe.
+///
+/// `fatal` is librdkafka's fatal-error slot, `cgrp_state` the consumer-group
+/// state from its statistics callback, and `expired` says the window is spent.
+/// `None` means keep waiting.
+fn classify_probe_tick(
+    fatal: Option<(RDKafkaErrorCode, String)>,
+    cgrp_state: Option<&str>,
+    expired: bool,
+) -> Option<ProtocolProbe> {
+    if let Some((code, detail)) = fatal {
+        return if PROTOCOL_REFUSAL_CODES.contains(&code) {
+            Some(ProtocolProbe::FallBack(detail))
+        } else {
+            // Some other fatal -- auth, fencing. Classic would not fix it.
+            Some(ProtocolProbe::Keep)
+        };
+    }
+    if cgrp_state == Some("up") {
+        return Some(ProtocolProbe::Keep);
+    }
+    if expired {
+        return Some(ProtocolProbe::FallBack(
+            "the consumer group did not reach state 'up' within the probe window".to_string(),
+        ));
+    }
+    None
+}
+
+/// Wait, bounded, for the broker to accept `group.protocol=consumer`.
+///
+/// Reads librdkafka's own state rather than polling the consumer: a poll would
+/// return a record, and dropping it here would advance the fetch position past
+/// data nobody processed.
+async fn probe_consumer_protocol(
+    consumer: &BaseConsumer<StatsContext>,
+    window: Duration,
+) -> ProtocolProbe {
+    const TICK: Duration = Duration::from_millis(100);
+
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        let state = consumer
+            .client()
+            .context()
+            .get_metrics()
+            .consumer_group_state;
+        if let Some(verdict) = classify_probe_tick(
+            consumer.client().fatal_error(),
+            state.as_deref(),
+            std::time::Instant::now() >= deadline,
+        ) {
+            return verdict;
+        }
+        tokio::time::sleep(TICK).await;
+    }
+}
+
 impl KafkaTransport {
     /// Create a new high-throughput Kafka transport.
     ///
@@ -216,11 +490,16 @@ impl KafkaTransport {
     /// - `fetch.max.bytes`: 50MB (controls network batch size)
     /// - `enable.auto.commit`: false (manual commit for at-least-once)
     ///
+    /// A subscribing consumer negotiates the KIP-848 group protocol here, so
+    /// construction can wait up to `consumer_protocol_probe_ms` before falling
+    /// back to `classic`. See [`ConsumerProtocol`].
+    ///
     /// # Errors
     ///
     /// Returns error if Kafka client creation fails.
-    // Large but linear constructor (config -> client -> subscribe -> assemble);
-    // the additive governor fields nudged it over the 150-line soft cap.
+    // Large but linear constructor (config -> client -> subscribe -> negotiate
+    // -> assemble), over the 150-line soft cap with the config building
+    // already factored out.
     #[allow(clippy::too_many_lines)]
     pub async fn new(config: &KafkaConfig) -> TransportResult<Self> {
         // Resolve the provider preset FIRST: if `config.provider` is set, derive
@@ -234,118 +513,13 @@ impl KafkaTransport {
             .validate(crate::env::is_production())
             .map_err(TransportError::Config)?;
 
-        let mut client_config = ClientConfig::new();
-
-        client_config.set("bootstrap.servers", config.brokers.join(","));
-        // librdkafka >= 2.x refuses to create a consumer client with an EMPTY
-        // group.id -- `rd_kafka_poll_set_consumer` returns "consumer queue not
-        // available". A producer-only transport legitimately carries no consumer
-        // group (callers signal this by clearing `config.group`), but the
-        // constructor still builds a consumer client (it is non-optional). See
-        // effective_consumer_group_id for the inert-fallback rationale.
-        client_config.set("group.id", effective_consumer_group_id(&config.group));
-        // Static membership (KIP-345): opt-in, must be unique per replica.
-        if let Some(ref id) = config.group_instance_id {
-            client_config.set("group.instance.id", id);
-        }
-        client_config.set("enable.auto.commit", config.enable_auto_commit.to_string());
-        client_config.set(
-            "auto.commit.interval.ms",
-            config.auto_commit_interval_ms.to_string(),
-        );
-        client_config.set("session.timeout.ms", config.session_timeout_ms.to_string());
-        client_config.set(
-            "heartbeat.interval.ms",
-            config.heartbeat_interval_ms.to_string(),
-        );
-        client_config.set(
-            "max.poll.interval.ms",
-            config.max_poll_interval_ms.to_string(),
-        );
-        client_config.set("fetch.min.bytes", config.fetch_min_bytes.to_string());
-        client_config.set("fetch.max.bytes", config.fetch_max_bytes.to_string());
-        client_config.set(
-            "max.partition.fetch.bytes",
-            config.max_partition_fetch_bytes.to_string(),
-        );
-        client_config.set("auto.offset.reset", &config.auto_offset_reset);
-        client_config.set(
-            "enable.partition.eof",
-            config.enable_partition_eof.to_string(),
-        );
-
-        // Profile defaults (overridable by librdkafka_overrides).
-        let rdkafka_config = config.build_librdkafka_config();
-        for (key, value) in &rdkafka_config {
-            client_config.set(key, value);
-        }
-
-        // Sizing surface:
-        //   profile defaults < named consumer knobs < sizing.consumer_librdkafka
-        for (key, value) in config.sizing.resolved_consumer_map() {
-            client_config.set(key, value);
-        }
-
-        // Re-apply librdkafka_overrides LAST so they remain the highest-priority
-        // layer the docs promise (config.rs precedence list). build_librdkafka_config
-        // above also applied them, but the sizing surface in between would
-        // otherwise clobber any fetch.* key an operator set via an override --
-        // silently reverting a deployment's tuning on upgrade.
-        for (key, value) in &config.librdkafka_overrides {
-            client_config.set(key, value);
-        }
-
-        // Security.
-        client_config.set("security.protocol", &config.security_protocol);
-        if let Some(ref mechanism) = config.sasl_mechanism {
-            client_config.set("sasl.mechanism", mechanism);
-        }
-        if let Some(ref username) = config.sasl_username {
-            client_config.set("sasl.username", username);
-        }
-        if let Some(ref password) = config.sasl_password {
-            client_config.set("sasl.password", password.expose());
-        }
-
-        // TLS.
-        if let Some(ref ca) = config.ssl_ca_location {
-            client_config.set("ssl.ca.location", ca);
-        }
-        if let Some(ref cert) = config.ssl_certificate_location {
-            client_config.set("ssl.certificate.location", cert);
-        }
-        if let Some(ref key) = config.ssl_key_location {
-            client_config.set("ssl.key.location", key);
-        }
-        if config.ssl_skip_verify {
-            client_config.set("enable.ssl.certificate.verification", "false");
-        }
-
-        client_config.set("client.id", &config.client_id);
-        // Fetch-from-follower (KIP-392): with a rack set, the consumer reads
-        // from an in-zone replica instead of the leader. Consumer-side only,
-        // and a no-op when the field is unset.
-        if let Some(ref rack) = config.client_rack {
-            client_config.set("client.rack", rack);
-        }
-
-        // Ensure statistics callbacks fire (all profiles already set this, but
-        // guarantee it as a fallback for manual configs).
-        if client_config.get("statistics.interval.ms").is_none() {
-            client_config.set("statistics.interval.ms", "5000");
-        }
-
         // StatsContext receives librdkafka statistics callbacks and auto-emits
         // rdkafka_* Prometheus metrics when a recorder is installed.
         // Consumer and producer each get their own context instance.
-
-        // Create consumer with StatsContext for metrics collection. Arc-wrapped
-        // so an optional gate actuator (governor feature) can share it for
-        // pause/resume without unsafe -- see the field doc.
-        let consumer: BaseConsumer<StatsContext> = client_config
-            .create_with_context(StatsContext::new())
-            .map_err(|e| TransportError::Connection(format!("Failed to create consumer: {e}")))?;
-        let consumer = Arc::new(consumer);
+        let protocol = config.effective_consumer_protocol();
+        let consumer_config = consumer_client_config(config, protocol);
+        let probe_window = protocol_probe_window(config, protocol, &consumer_config);
+        let consumer = create_consumer(&consumer_config)?;
 
         // Resolve effective topics:
         // - Explicit list -> subscribe to those
@@ -391,12 +565,33 @@ impl KafkaTransport {
         };
 
         let subscribed_topics = effective_topics;
-        if !subscribed_topics.is_empty() {
-            let topics: Vec<&str> = subscribed_topics.iter().map(String::as_str).collect();
-            consumer
-                .subscribe(&topics)
-                .map_err(|e| TransportError::Connection(format!("Failed to subscribe: {e}")))?;
-        }
+        subscribe_consumer(&consumer, &subscribed_topics)?;
+
+        // KIP-848 negotiation. A producer-only transport joins no group, so
+        // there is nothing to negotiate and no probe.
+        let consumer = match probe_window {
+            Some(window) if !subscribed_topics.is_empty() => {
+                match probe_consumer_protocol(&consumer, window).await {
+                    ProtocolProbe::Keep => consumer,
+                    ProtocolProbe::FallBack(reason) => {
+                        tracing::warn!(
+                            brokers = %config.brokers.join(","),
+                            group = %config.group,
+                            reason = %reason,
+                            "kafka: broker will not take group.protocol=consumer -- \
+                             rebuilding this consumer as classic"
+                        );
+                        let classic = create_consumer(&consumer_client_config(
+                            config,
+                            ConsumerProtocol::Classic,
+                        ))?;
+                        subscribe_consumer(&classic, &subscribed_topics)?;
+                        classic
+                    }
+                }
+            }
+            _ => consumer,
+        };
 
         // Pre-populate topic cache -- eliminates locks in the hot path.
         let mut topic_cache = HashMap::with_capacity(subscribed_topics.len());
@@ -1491,6 +1686,161 @@ mod tests {
         assert!(!effective_consumer_group_id("").is_empty());
         // A real group is passed through unchanged.
         assert_eq!(effective_consumer_group_id("my-group"), "my-group");
+    }
+
+    // =========================================================================
+    // Consumer group protocol (KIP-848)
+    // =========================================================================
+
+    /// librdkafka rejects the whole client if a classic-only property was set
+    /// alongside `group.protocol=consumer`, so the built config must carry
+    /// none of them -- including any an operator put there by hand.
+    #[test]
+    fn consumer_protocol_config_drops_every_classic_only_key() {
+        let config = KafkaConfig {
+            group: "loader".to_string(),
+            topics: vec!["events".to_string()],
+            librdkafka_overrides: HashMap::from([(
+                "partition.assignment.strategy".to_string(),
+                "range".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let built = consumer_client_config(&config, ConsumerProtocol::Consumer);
+        assert_eq!(built.get("group.protocol"), Some("consumer"));
+        for key in CLASSIC_ONLY_CONSUMER_KEYS {
+            assert_eq!(
+                built.get(key),
+                None,
+                "{key} alongside group.protocol=consumer fails client creation"
+            );
+        }
+        // The rest of the surface is untouched.
+        assert_eq!(built.get("group.id"), Some("loader"));
+        assert_eq!(built.get("enable.auto.commit"), Some("false"));
+        assert!(built.get("max.poll.interval.ms").is_some());
+    }
+
+    /// Under classic the same properties are exactly what the protocol runs
+    /// on, so nothing is stripped.
+    #[test]
+    fn classic_protocol_config_keeps_the_classic_keys() {
+        let config = KafkaConfig {
+            group: "loader".to_string(),
+            ..Default::default()
+        };
+        let built = consumer_client_config(&config, ConsumerProtocol::Classic);
+        assert_eq!(built.get("group.protocol"), Some("classic"));
+        assert_eq!(
+            built.get("session.timeout.ms"),
+            Some(config.session_timeout_ms.to_string().as_str())
+        );
+        assert_eq!(
+            built.get("heartbeat.interval.ms"),
+            Some(config.heartbeat_interval_ms.to_string().as_str())
+        );
+        assert_eq!(
+            built.get("partition.assignment.strategy"),
+            Some("cooperative-sticky")
+        );
+    }
+
+    /// The broker refusing the protocol is a FATAL error carrying one of the
+    /// unsupported codes -- that, and only that, earns the rebuild as classic.
+    #[test]
+    fn protocol_refusal_falls_back_and_other_fatals_do_not() {
+        for code in PROTOCOL_REFUSAL_CODES {
+            let verdict = classify_probe_tick(
+                Some((*code, "ConsumerGroupHeartbeat fatal error".to_string())),
+                None,
+                false,
+            );
+            assert_eq!(
+                verdict,
+                Some(ProtocolProbe::FallBack(
+                    "ConsumerGroupHeartbeat fatal error".to_string()
+                )),
+                "{code:?} means the broker will not speak KIP-848"
+            );
+        }
+
+        // An unrelated fatal is not the protocol's fault, and classic would
+        // not clear it -- do not downgrade over it.
+        let verdict = classify_probe_tick(
+            Some((
+                RDKafkaErrorCode::GroupAuthorizationFailed,
+                "not authorized".to_string(),
+            )),
+            None,
+            false,
+        );
+        assert_eq!(verdict, Some(ProtocolProbe::Keep));
+    }
+
+    /// A group that reaches `up` proves the broker took the protocol, and it
+    /// is the early exit that keeps the probe off the startup critical path.
+    #[test]
+    fn a_joined_group_ends_the_probe_immediately() {
+        assert_eq!(
+            classify_probe_tick(None, Some("up"), false),
+            Some(ProtocolProbe::Keep)
+        );
+        // Anything short of `up` keeps waiting.
+        for state in ["init", "query-coord", "wait-coord", "wait-broker"] {
+            assert_eq!(
+                classify_probe_tick(None, Some(state), false),
+                None,
+                "state {state} is still mid-join"
+            );
+        }
+        assert_eq!(classify_probe_tick(None, None, false), None);
+    }
+
+    /// A broker that never answers the heartbeat marks its coordinator dead
+    /// and re-queries in silence, so the expired window is the only signal
+    /// that case ever produces.
+    #[test]
+    fn an_expired_window_falls_back() {
+        let verdict = classify_probe_tick(None, Some("query-coord"), true);
+        assert!(matches!(verdict, Some(ProtocolProbe::FallBack(_))));
+        // A join that landed on the last tick still wins over the deadline.
+        assert_eq!(
+            classify_probe_tick(None, Some("up"), true),
+            Some(ProtocolProbe::Keep)
+        );
+    }
+
+    /// The probe reads the group state out of librdkafka's statistics, so it
+    /// must not run when they are switched off -- it could only time out and
+    /// downgrade a healthy consumer.
+    #[test]
+    fn the_probe_is_skipped_when_it_could_only_time_out() {
+        let config = KafkaConfig::default();
+        let built = consumer_client_config(&config, ConsumerProtocol::Consumer);
+        assert!(
+            protocol_probe_window(&config, ConsumerProtocol::Consumer, &built).is_some(),
+            "the shipped profiles enable statistics, so the probe runs"
+        );
+        assert!(
+            protocol_probe_window(&config, ConsumerProtocol::Classic, &built).is_none(),
+            "classic has nothing to negotiate"
+        );
+
+        let disabled = KafkaConfig {
+            consumer_protocol_probe_ms: 0,
+            ..Default::default()
+        };
+        assert!(protocol_probe_window(&disabled, ConsumerProtocol::Consumer, &built).is_none());
+
+        let no_stats = KafkaConfig {
+            librdkafka_overrides: HashMap::from([(
+                "statistics.interval.ms".to_string(),
+                "0".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let built = consumer_client_config(&no_stats, ConsumerProtocol::Consumer);
+        assert!(protocol_probe_window(&no_stats, ConsumerProtocol::Consumer, &built).is_none());
     }
 
     /// An oversize record is a poison record, not a transport failure: it is

@@ -162,15 +162,53 @@ decompresses transparently regardless of producer codec.
   `partition.assignment.strategy = cooperative-sticky` to avoid
   stop-the-world rebalances. Combined with partition-pause backpressure (see
   [backpressure.md](backpressure.md)), a paused consumer stays IN the group
-  rather than triggering a rebalance.
+  rather than triggering a rebalance. It applies to the `classic` protocol
+  only -- see the section below.
 - **KIP-794 (uniform sticky partitioner)** -- handled via
   `sticky.partitioning.linger.ms` as above, since librdkafka lacks the Java
   `partitioner.ignore.keys`.
-- **KIP-848 (new consumer group protocol)** and **Kafka 4.0** -- the sizing
-  surface is property-name based and forward-compatible: as librdkafka adds
-  support, the raw escape hatch can set the new properties without a scalo
-  change. Share groups (below) are the 4.0 answer to partition-limited
-  scaling.
+- **KIP-392 (fetch from follower)** -- `kafka.client_rack` (env
+  `<PREFIX>_CLIENT_RACK`) sets `client.rack`, so a consumer reads from an
+  in-zone replica instead of the leader. Unset by default; wire it from the
+  K8s `topology.kubernetes.io/zone` label or the EC2 availability zone.
+
+---
+
+## Consumer group protocol (KIP-848) -- on by default
+
+`kafka.consumer_protocol` picks the rebalance protocol and defaults to
+`consumer`, the KIP-848 one. The group coordinator computes the assignment and
+pushes it on the heartbeat, so adding or removing a member costs no
+stop-the-world rebalance -- the difference a KEDA scale event feels.
+
+It needs a Kafka 4.0+ broker, and the transport reaches `classic` two ways:
+
+- **The provider gate.** A provider whose brokers do not implement it at all
+  (`redpanda`, `redpanda-cloud`) resolves to `classic` at construction.
+- **The startup probe.** Otherwise the consumer joins with the consumer
+  protocol and construction waits, up to `kafka.consumer_protocol_probe_ms`
+  (default 5000), for librdkafka's statistics to report the group `up`. A
+  refusal arrives as a FATAL error carrying `UNSUPPORTED_VERSION`,
+  `_UNSUPPORTED_FEATURE` or `UNSUPPORTED_ASSIGNOR`; a broker that answers no
+  ConsumerGroupHeartbeat at all just never joins, which the window catches.
+  Either way the consumer is rebuilt once as `classic`, with a warning naming
+  the brokers and the reason, and the process carries on.
+
+The wait ends the moment the group joins, so a KIP-848 broker pays one
+`statistics.interval.ms` (1 s on the shipped profiles), not the whole window.
+A broker that is unreachable at startup also exhausts the window and falls
+back -- classic works on 4.0 too, so the cost of that misfire is one warning.
+Set the window to `0` to take the requested protocol with no fallback, or
+`consumer_protocol: classic` to opt out. A producer-only transport joins no
+group and never probes.
+
+Under `consumer`, librdkafka refuses the whole client if
+`partition.assignment.strategy`, `session.timeout.ms`,
+`heartbeat.interval.ms` or `group.protocol.type` was set at all -- their
+replacements are broker-side. The config builder therefore strips them after
+every layer has run, including the raw escape hatch, so an override cannot
+break client creation. `group.remote.assignor` is left unset and the broker
+applies its own default, `uniform`.
 
 ---
 

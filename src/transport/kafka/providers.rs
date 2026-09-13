@@ -145,6 +145,18 @@ pub trait KafkaProvider {
         SchemaRegistry::None
     }
 
+    /// Whether this provider's brokers implement the KIP-848 consumer group
+    /// protocol (`group.protocol=consumer`). Default: `true`.
+    ///
+    /// Answer `false` for a platform that does not, and the transport picks
+    /// `classic` at construction instead of discovering the refusal through
+    /// its startup probe. It is a FACT about the platform, not a preference:
+    /// an operator who wants `classic` on a broker that could do better sets
+    /// `consumer_protocol` on the config.
+    fn supports_consumer_group_protocol(&self) -> bool {
+        true
+    }
+
     /// Apply this provider's auth onto a vanilla [`KafkaConfig`].
     ///
     /// Sets `security_protocol` (lowercased to scalo's convention) + `sasl_mechanism`;
@@ -285,6 +297,18 @@ impl KafkaProvider for KnownProvider {
             Self::ConfluentCloud => SchemaRegistry::Confluent,
             Self::Redpanda | Self::RedpandaCloud => SchemaRegistry::Redpanda,
             Self::Strimzi | Self::Msk | Self::Plaintext | Self::MskIam => SchemaRegistry::None,
+        }
+    }
+
+    fn supports_consumer_group_protocol(&self) -> bool {
+        match self {
+            // Redpanda 26.2 answers no ConsumerGroupHeartbeat at all.
+            Self::Redpanda | Self::RedpandaCloud => false,
+            // Kafka-protocol platforms, gated on the broker being 4.0+, which
+            // the startup probe settles.
+            Self::Strimzi | Self::Msk | Self::ConfluentCloud | Self::Plaintext | Self::MskIam => {
+                true
+            }
         }
     }
 }
@@ -469,6 +493,29 @@ mod tests {
             SchemaRegistry::None
         );
         assert_eq!(KnownProvider::Msk.schema_registry(), SchemaRegistry::None);
+    }
+
+    /// Redpanda is the one built-in that cannot do KIP-848, so it must not be
+    /// sent to the startup probe to find that out.
+    #[test]
+    fn only_redpanda_lacks_the_consumer_group_protocol() {
+        let without: Vec<_> = CANONICAL_TABLE
+            .iter()
+            .map(|(key, _, _)| *key)
+            .filter(|key| {
+                !KnownProvider::parse(key)
+                    .unwrap()
+                    .supports_consumer_group_protocol()
+            })
+            .collect();
+        assert_eq!(without, vec!["redpanda", "redpanda-cloud"]);
+    }
+
+    /// A provider that says nothing about the protocol is assumed to speak it,
+    /// so a new third-party implementation does not silently lose KIP-848.
+    #[test]
+    fn consumer_group_protocol_defaults_to_supported() {
+        assert!(DemoProvider.supports_consumer_group_protocol());
     }
 
     // A third-party provider with its own weirdness plugs in by implementing the

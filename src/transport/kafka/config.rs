@@ -64,6 +64,75 @@ use std::str::FromStr;
 pub const MESSAGE_MAX_BYTES: i32 = 16_777_216;
 
 // ============================================================================
+// Consumer group protocol (KIP-848)
+// ============================================================================
+
+/// Which consumer-group rebalance protocol the consumer joins with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerProtocol {
+    /// KIP-848: the broker's group coordinator computes the assignment and
+    /// pushes it on the heartbeat, so adding or removing a member costs no
+    /// stop-the-world rebalance -- the difference a KEDA scale event feels.
+    /// Requires a Kafka 4.0+ broker, and the transport falls back to
+    /// [`Classic`](Self::Classic) when the broker will not speak it.
+    #[default]
+    Consumer,
+
+    /// The pre-4.0 protocol: the group leader computes the assignment and
+    /// every member stops consuming while it does.
+    Classic,
+}
+
+impl ConsumerProtocol {
+    /// The librdkafka `group.protocol` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Consumer => "consumer",
+            Self::Classic => "classic",
+        }
+    }
+}
+
+impl FromStr for ConsumerProtocol {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "consumer" => Ok(Self::Consumer),
+            "classic" => Ok(Self::Classic),
+            _ => Err(format!(
+                "unknown kafka consumer protocol {s:?}; expected one of: consumer, classic"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ConsumerProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Consumer properties librdkafka refuses alongside `group.protocol=consumer`.
+///
+/// `rd_kafka_conf_finalize` rejects the whole client if any of these was set at
+/// all -- the value is irrelevant, only that it was touched -- so they are
+/// stripped after every config layer has run rather than skipped in one of
+/// them. Their KIP-848 replacements are broker-side
+/// (`group.consumer.session.timeout.ms`,
+/// `group.consumer.heartbeat.interval.ms`) or renamed
+/// (`partition.assignment.strategy` becomes `group.remote.assignor`).
+pub const CLASSIC_ONLY_CONSUMER_KEYS: &[&str] = &[
+    "partition.assignment.strategy",
+    "session.timeout.ms",
+    "heartbeat.interval.ms",
+    "group.protocol.type",
+];
+
+// ============================================================================
 // Self-Regulation Profile (Kafka sizing surface)
 // ============================================================================
 
@@ -932,6 +1001,34 @@ pub struct KafkaConfig {
     #[serde(default)]
     pub group_instance_id: Option<String>,
 
+    /// Consumer-group rebalance protocol to join with (default: `consumer`,
+    /// KIP-848).
+    ///
+    /// Not every broker speaks it, so the resolved value is
+    /// [`effective_consumer_protocol`](Self::effective_consumer_protocol) --
+    /// a provider known not to implement KIP-848 is forced to `classic`, and
+    /// a broker that refuses it at join time drops the transport back to
+    /// `classic` once, with a warning. Set `classic` to opt out entirely.
+    #[serde(default)]
+    pub consumer_protocol: ConsumerProtocol,
+
+    /// How long construction waits for the broker to accept
+    /// `group.protocol=consumer` before rebuilding the consumer as `classic`,
+    /// in milliseconds.
+    ///
+    /// The wait ends as soon as librdkafka's statistics report the group `up`,
+    /// so on a broker that does speak KIP-848 it costs one
+    /// `statistics.interval.ms` (1 s on the shipped profiles) rather than the
+    /// whole window. A broker that is simply unreachable at startup also
+    /// exhausts the window and falls back -- classic works everywhere, so the
+    /// cost of that misfire is a warning line.
+    ///
+    /// `0` disables the probe: the requested protocol is used as-is with no
+    /// fallback. Only a subscribing consumer probes at all, since a
+    /// producer-only transport joins no group.
+    #[serde(default = "default_consumer_protocol_probe_ms")]
+    pub consumer_protocol_probe_ms: u64,
+
     /// Topics to subscribe to.
     #[serde(default)]
     pub topics: Vec<String>,
@@ -1184,6 +1281,10 @@ fn default_auto_offset_reset() -> String {
     "earliest".to_string()
 }
 
+fn default_consumer_protocol_probe_ms() -> u64 {
+    5000
+}
+
 impl Default for KafkaConfig {
     fn default() -> Self {
         #[allow(deprecated)]
@@ -1194,6 +1295,8 @@ impl Default for KafkaConfig {
             client_id: default_client_id(),
             client_rack: None,
             group_instance_id: None,
+            consumer_protocol: ConsumerProtocol::default(),
+            consumer_protocol_probe_ms: default_consumer_protocol_probe_ms(),
             topics: Vec::new(),
             auto_discover: false,
             topic_include: Vec::new(),
@@ -1404,6 +1507,27 @@ impl KafkaConfig {
         Ok(())
     }
 
+    /// The consumer-group protocol this config will actually join with.
+    ///
+    /// A provider whose brokers do not implement KIP-848 is forced to
+    /// [`ConsumerProtocol::Classic`] here, so it never pays the startup probe
+    /// to learn what is already known. An unrecognised provider name is left
+    /// alone -- [`apply_provider`](Self::apply_provider) is what rejects it.
+    #[must_use]
+    pub fn effective_consumer_protocol(&self) -> ConsumerProtocol {
+        use super::providers::{KafkaProvider, KnownProvider};
+
+        if self.consumer_protocol == ConsumerProtocol::Classic {
+            return ConsumerProtocol::Classic;
+        }
+        match self.provider.as_deref().map(KnownProvider::parse) {
+            Some(Ok(provider)) if !provider.supports_consumer_group_protocol() => {
+                ConsumerProtocol::Classic
+            }
+            _ => ConsumerProtocol::Consumer,
+        }
+    }
+
     /// Validate the Kafka config against the deployment profile.
     ///
     /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
@@ -1554,6 +1678,8 @@ impl KafkaConfig {
     /// - `{PREFIX}_BOOTSTRAP_SERVERS` -> brokers (legacy: `{PREFIX}_BROKERS`)
     /// - `{PREFIX}_GROUP_ID` -> group
     /// - `{PREFIX}_CLIENT_RACK` -> client_rack (legacy: `{PREFIX}_AVAILABILITY_ZONE`)
+    /// - `{PREFIX}_CONSUMER_PROTOCOL` -> consumer_protocol (consumer, classic)
+    /// - `{PREFIX}_CONSUMER_PROTOCOL_PROBE_MS` -> consumer_protocol_probe_ms
     /// - `{PREFIX}_PROVIDER` -> provider (derives security_protocol + sasl_mechanism)
     /// - `{PREFIX}_SECURITY_PROTOCOL` -> security_protocol
     /// - `{PREFIX}_SASL_MECHANISM` -> sasl_mechanism
@@ -1620,6 +1746,18 @@ impl KafkaConfig {
             config.group_instance_id = Some(val);
         }
 
+        // KIP-848 opt-out and the probe window that guards it.
+        if let Some(val) = prefixed("CONSUMER_PROTOCOL", &[]).get()
+            && let Ok(protocol) = val.parse()
+        {
+            config.consumer_protocol = protocol;
+        }
+        if let Some(val) = prefixed("CONSUMER_PROTOCOL_PROBE_MS", &[]).get()
+            && let Ok(ms) = val.parse()
+        {
+            config.consumer_protocol_probe_ms = ms;
+        }
+
         // PROVIDER derives security_protocol + sasl_mechanism at construction (see
         // apply_provider); read it here so KAFKA_PROVIDER wires the abstraction into
         // the env-configured data-plane services.
@@ -1673,6 +1811,7 @@ impl KafkaConfig {
     /// - `KAFKA_GROUP_ID`
     /// - `KAFKA_CLIENT_ID`
     /// - `KAFKA_CLIENT_RACK`
+    /// - `KAFKA_CONSUMER_PROTOCOL`
     /// - `KAFKA_PROFILE`
     #[cfg(feature = "config")]
     #[must_use]
@@ -1819,6 +1958,94 @@ mod tests {
         temp_env::with_var("KAFKA_CLIENT_RACK", Some(""), || {
             assert_eq!(KafkaConfig::from_env("KAFKA").client_rack, None);
         });
+    }
+
+    // =========================================================================
+    // Consumer group protocol (KIP-848)
+    // =========================================================================
+
+    /// KIP-848 is on by default; the whole point of the change is that nobody
+    /// has to opt in.
+    #[test]
+    fn consumer_protocol_defaults_to_kip_848() {
+        let cfg = KafkaConfig::default();
+        assert_eq!(cfg.consumer_protocol, ConsumerProtocol::Consumer);
+        assert_eq!(
+            cfg.effective_consumer_protocol(),
+            ConsumerProtocol::Consumer
+        );
+        assert_eq!(ConsumerProtocol::Consumer.as_str(), "consumer");
+        assert_eq!(ConsumerProtocol::Classic.as_str(), "classic");
+    }
+
+    /// Redpanda implements neither KIP-848 nor KIP-932, so naming it as the
+    /// provider resolves to classic without paying the startup probe.
+    #[test]
+    fn redpanda_resolves_to_classic() {
+        for provider in ["redpanda", "redpanda-cloud"] {
+            let cfg = KafkaConfig {
+                provider: Some(provider.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.effective_consumer_protocol(),
+                ConsumerProtocol::Classic,
+                "{provider} answers no ConsumerGroupHeartbeat"
+            );
+        }
+        for provider in ["strimzi", "msk", "confluent-cloud", "plaintext"] {
+            let cfg = KafkaConfig {
+                provider: Some(provider.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.effective_consumer_protocol(),
+                ConsumerProtocol::Consumer,
+                "{provider} is Kafka-protocol"
+            );
+        }
+    }
+
+    /// An explicit `classic` wins over the provider gate: it is the opt-out.
+    #[test]
+    fn explicit_classic_is_never_upgraded() {
+        let cfg = KafkaConfig {
+            consumer_protocol: ConsumerProtocol::Classic,
+            provider: Some("strimzi".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_consumer_protocol(), ConsumerProtocol::Classic);
+    }
+
+    /// An unknown provider is `apply_provider`'s error to raise, not a reason
+    /// to silently downgrade the protocol here.
+    #[test]
+    fn unknown_provider_does_not_downgrade_the_protocol() {
+        let cfg = KafkaConfig {
+            provider: Some("kinesis".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_consumer_protocol(),
+            ConsumerProtocol::Consumer
+        );
+    }
+
+    #[test]
+    fn consumer_protocol_parses_and_serialises_snake_case() {
+        assert_eq!(
+            "classic".parse::<ConsumerProtocol>().unwrap(),
+            ConsumerProtocol::Classic
+        );
+        assert_eq!(
+            "CONSUMER".parse::<ConsumerProtocol>().unwrap(),
+            ConsumerProtocol::Consumer
+        );
+        assert!("eager".parse::<ConsumerProtocol>().is_err());
+        assert_eq!(
+            serde_json::to_string(&ConsumerProtocol::Classic).unwrap(),
+            "\"classic\""
+        );
     }
 
     #[test]

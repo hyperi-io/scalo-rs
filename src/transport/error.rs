@@ -33,7 +33,9 @@ pub enum TransportError {
     /// record belongs in a dead-letter queue. Kafka raises this locally
     /// (librdkafka's `message.max.bytes`) before the broker is consulted, as
     /// well as from the broker's own topic `max.message.bytes`.
-    #[error("transport message too large: {bytes} bytes exceeds the message-size ceiling: {detail}")]
+    #[error(
+        "transport message too large: {bytes} bytes exceeds the message-size ceiling: {detail}"
+    )]
     MessageTooLarge {
         /// Payload size that was refused, in bytes.
         bytes: usize,
