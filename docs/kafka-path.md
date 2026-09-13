@@ -99,6 +99,14 @@ that fetched less would stall on a maximum-size record). `fetch.max.bytes` stays
 at or under 50 MiB: MSK Express holds the broker's 55 MiB fetch ceiling
 read-only, so a larger ask can never be honoured.
 
+The topic layer of that chain is set where scalo creates the topic:
+`KafkaAdmin::create_topics` gives every topic it creates
+`max.message.bytes = 16 MiB`, since a topic left on the broker's default
+refuses the very records the producer is configured to send. A topic created
+by anything else -- and an already-existing topic, which the idempotent create
+leaves alone -- keeps the ceiling it has, and the broker's own
+`message.max.bytes` still has to be raised to match.
+
 ### librdkafka property names -- mind the differences
 
 librdkafka is NOT the Java Kafka client. Several property names differ, and
