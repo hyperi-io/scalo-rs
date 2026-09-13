@@ -85,11 +85,17 @@ kafka:
 
 The profile defaults, with the ACTUAL librdkafka property each maps to:
 
-| Profile | GET `fetch.min.bytes` | GET `fetch.wait.max.ms` | GET `max.partition.fetch.bytes` | GET `fetch.max.bytes` | poll cap | SEND `batch.size` | SEND `linger.ms` | SEND codec | SEND `queue.buffering.max.kbytes` |
-|---|---|---|---|---|---|---|---|---|---|
-| `throughput` (default) | 1 MiB | 50 ms | 10 MiB | 100 MiB | 2000 | 128 KiB | 20 ms | lz4 | 64 MiB |
-| `balanced` | 256 KiB | 25 ms | 5 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | lz4 | 32 MiB |
-| `low_latency` | 1 byte | 5 ms | 1 MiB | 10 MiB | 500 | 16 KiB | 0 ms | lz4 | 16 MiB |
+| Profile | GET `fetch.min.bytes` | GET `fetch.wait.max.ms` | GET `max.partition.fetch.bytes` | GET `fetch.max.bytes` | poll cap | SEND `batch.size` | SEND `linger.ms` | SEND codec | SEND `queue.buffering.max.kbytes` | SEND `message.max.bytes` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `throughput` (default) | 1 MiB | 50 ms | 10 MiB | 100 MiB | 2000 | 128 KiB | 20 ms | lz4 | 64 MiB | 16 MiB |
+| `balanced` | 256 KiB | 25 ms | 5 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | lz4 | 32 MiB | 16 MiB |
+| `low_latency` | 1 byte | 5 ms | 1 MiB | 10 MiB | 500 | 16 KiB | 0 ms | lz4 | 16 MiB | 16 MiB |
+
+`message.max.bytes` is the only column that does not vary by profile: it is the
+largest record the pipeline carries, and the broker's `message.max.bytes`, the
+topic's `max.message.bytes` and this client ceiling must all agree. librdkafka
+defaults it to 1,000,000 bytes and rejects an oversize record LOCALLY, so
+raising the broker alone changes nothing.
 
 ### librdkafka property names -- mind the differences
 
@@ -112,9 +118,6 @@ and set `sticky.partitioning.linger.ms` equal to the linger window, so
 null-key batches stick to one partition until the batch is full, then rotate.
 The sizing surface sets this to `linger_ms` automatically. It does NOT set
 `partitioner` (keyed `RoutedSender` paths set their own).
-
-`queue.buffering.max.kbytes` is in KiB -- the config struct stores the
-producer buffer in bytes and divides by 1024 when it applies the property.
 
 ---
 

@@ -63,9 +63,10 @@ pub use admin::{KafkaAdmin, TopicInfo};
 #[allow(deprecated)]
 pub use config::{
     ConsumerKnobs, DEVTEST_PROFILE, HIGH_THROUGHPUT_CONSUMER_DEFAULTS, KafkaConfig, KafkaProfile,
-    KafkaSizingConfig, LOW_LATENCY_CONSUMER_DEFAULTS, PRODUCER_DEFAULTS, PRODUCER_DEVTEST,
-    PRODUCER_EXACTLY_ONCE, PRODUCER_HIGH_THROUGHPUT, PRODUCER_LOW_LATENCY, PRODUCTION_PROFILE,
-    ProducerKnobs, SelfRegulationProfile, SuppressionRule, merge_with_overrides,
+    KafkaSizingConfig, LOW_LATENCY_CONSUMER_DEFAULTS, MESSAGE_MAX_BYTES, PRODUCER_DEFAULTS,
+    PRODUCER_DEVTEST, PRODUCER_EXACTLY_ONCE, PRODUCER_HIGH_THROUGHPUT, PRODUCER_LOW_LATENCY,
+    PRODUCTION_PROFILE, ProducerKnobs, SelfRegulationProfile, SuppressionRule,
+    merge_with_overrides,
 };
 pub use metrics::{
     BrokerMetrics, KafkaMetrics, StatsContext, healthy_broker_count, total_consumer_lag,

@@ -44,6 +44,26 @@ use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 // ============================================================================
+// Message-size ceiling (one number across the three layers)
+// ============================================================================
+
+/// The largest single record the pipeline carries, in bytes (16 MiB).
+///
+/// This is ONE number shared by three layers that must agree: the broker's
+/// `message.max.bytes` (and `replica.fetch.max.bytes`), the topic's
+/// `max.message.bytes`, and the producer's own `message.max.bytes` set here.
+/// Raise one without the others and the odd layer rejects or stalls -- the
+/// producer refuses locally with `MSG_SIZE_TOO_LARGE`, or the consumer never
+/// fetches the record.
+///
+/// 16 MiB is derived from filebeat's own `message_max_bytes` ceiling of 10 MiB
+/// (it truncates past that, so no input can deliver more) plus headroom for the
+/// ~1.5x growth an enrichment pass adds when it re-enters Kafka. It is a
+/// CEILING, not a tuning dial: the sizing profiles vary batching and latency,
+/// never the largest record the pipeline accepts.
+pub const MESSAGE_MAX_BYTES: i32 = 16_777_216;
+
+// ============================================================================
 // Self-Regulation Profile (Kafka sizing surface)
 // ============================================================================
 
@@ -69,7 +89,8 @@ pub enum SelfRegulationProfile {
     ///
     /// Consumer: 1 MiB fetch.min.bytes, 50 ms wait, 10 MiB per-partition,
     /// 100 MiB total, 2000 poll-safety cap.
-    /// Producer: 128 KiB batch, 20 ms linger, lz4, 64 MiB buffer, 5 in-flight.
+    /// Producer: 128 KiB batch, 20 ms linger, lz4, 64 MiB buffer, 5 in-flight,
+    /// 16 MiB record ceiling.
     #[default]
     Throughput,
 
@@ -77,14 +98,16 @@ pub enum SelfRegulationProfile {
     ///
     /// Consumer: 256 KiB fetch.min.bytes, 25 ms wait, 5 MiB per-partition,
     /// 50 MiB total, 1000 poll-safety cap.
-    /// Producer: 64 KiB batch, 5 ms linger, lz4, 32 MiB buffer, 5 in-flight.
+    /// Producer: 64 KiB batch, 5 ms linger, lz4, 32 MiB buffer, 5 in-flight,
+    /// 16 MiB record ceiling.
     Balanced,
 
     /// Low latency: minimal batching delay, smaller buffers.
     ///
     /// Consumer: 1 byte fetch.min.bytes, 5 ms wait, 1 MiB per-partition,
     /// 10 MiB total, 500 poll-safety cap.
-    /// Producer: 16 KiB batch, 0 ms linger, lz4, 16 MiB buffer, 5 in-flight.
+    /// Producer: 16 KiB batch, 0 ms linger, lz4, 16 MiB buffer, 5 in-flight,
+    /// 16 MiB record ceiling.
     LowLatency,
 }
 
@@ -140,6 +163,9 @@ impl SelfRegulationProfile {
                 // Profiles leave idempotence unset; the default (on) is applied
                 // in resolved_producer_map, independent of profile.
                 idempotence: None,
+                // The pipeline-wide record ceiling -- identical on every
+                // profile, see MESSAGE_MAX_BYTES.
+                message_max_bytes: Some(MESSAGE_MAX_BYTES),
             },
             Self::Balanced => ProducerKnobs {
                 batch_size_bytes: Some(65_536), // 64 KiB
@@ -148,6 +174,7 @@ impl SelfRegulationProfile {
                 buffer_memory_bytes: Some(33_554_432), // 32 MiB
                 max_in_flight: Some(5),
                 idempotence: None,
+                message_max_bytes: Some(MESSAGE_MAX_BYTES),
             },
             Self::LowLatency => ProducerKnobs {
                 batch_size_bytes: Some(16_384), // 16 KiB
@@ -156,6 +183,7 @@ impl SelfRegulationProfile {
                 buffer_memory_bytes: Some(16_777_216), // 16 MiB
                 max_in_flight: Some(5),
                 idempotence: None,
+                message_max_bytes: Some(MESSAGE_MAX_BYTES),
             },
         }
     }
@@ -270,6 +298,18 @@ pub struct ProducerKnobs {
     /// `producer_librdkafka` escape hatch still wins over this.
     #[serde(default)]
     pub idempotence: Option<bool>,
+
+    /// Largest single record the producer will put on the wire, in bytes.
+    ///
+    /// librdkafka: `message.max.bytes`, whose default of 1,000,000 rejects an
+    /// oversize record LOCALLY with `MSG_SIZE_TOO_LARGE` -- the broker never
+    /// sees it, so raising the broker's ceiling alone changes nothing. Three
+    /// layers have to agree: the broker's `message.max.bytes`, the topic's
+    /// `max.message.bytes`, and this. Default on every profile:
+    /// [`MESSAGE_MAX_BYTES`] (16 MiB). `batch.size` is unrelated -- it is a
+    /// soft target and a larger record still ships as its own batch.
+    #[serde(default)]
+    pub message_max_bytes: Option<i32>,
 }
 
 /// Kafka sizing surface: profile + named per-knob overrides + raw escape hatch.
@@ -337,6 +377,7 @@ const GOVERNOR_PRODUCER_KEYS: &[&str] = &[
     "compression.codec",
     "queue.buffering.max.kbytes",
     "max.in.flight.requests.per.connection",
+    "message.max.bytes",
     "partitioner",
     "sticky.partitioning.linger.ms",
     // Effectively-once invariants (v2.10): the sizing surface sets these when
@@ -444,6 +485,11 @@ impl KafkaSizingConfig {
             .buffer_memory_bytes
             .or(profile_knobs.buffer_memory_bytes)
             .unwrap_or(1_073_741_824); // 1 GiB (librdkafka default)
+        let message_max_bytes = self
+            .producer
+            .message_max_bytes
+            .or(profile_knobs.message_max_bytes)
+            .unwrap_or(MESSAGE_MAX_BYTES);
         // Effectively-once (v2.10): idempotence ON by default. It REQUIRES
         // max.in.flight<=5, so when on we clamp the resolved value to 5 (a
         // higher value would make librdkafka reject the producer at init).
@@ -475,6 +521,12 @@ impl KafkaSizingConfig {
         map.insert(
             "max.in.flight.requests.per.connection".to_string(),
             max_in_flight.to_string(),
+        );
+        // The client-side record ceiling. Without it librdkafka rejects
+        // anything over 1,000,000 bytes before the broker is consulted.
+        map.insert(
+            "message.max.bytes".to_string(),
+            message_max_bytes.to_string(),
         );
 
         // Effectively-once (v2.10): enable the idempotent producer by default.
@@ -1821,6 +1873,41 @@ mod tests {
         assert_eq!(map["compression.type"], "lz4");
         let batch: i32 = map["batch.size"].parse().unwrap();
         assert!(batch < 131_072, "low_latency batch should be < throughput");
+    }
+
+    /// The record ceiling is a chain-wide constant, so every profile carries
+    /// the same value -- a profile that batches differently still has to accept
+    /// the same largest record the broker and topic do.
+    #[test]
+    fn every_profile_sets_the_same_message_max_bytes() {
+        for profile in [
+            SelfRegulationProfile::Throughput,
+            SelfRegulationProfile::Balanced,
+            SelfRegulationProfile::LowLatency,
+        ] {
+            let map = sizing_for_profile(profile).resolved_producer_map();
+            assert_eq!(
+                map["message.max.bytes"],
+                MESSAGE_MAX_BYTES.to_string(),
+                "profile {profile:?} must set the 16 MiB record ceiling; \
+                 librdkafka's 1,000,000-byte default rejects locally with \
+                 MSG_SIZE_TOO_LARGE before the broker is consulted"
+            );
+        }
+    }
+
+    /// The ceiling is a dial, not a hard-coded value.
+    #[test]
+    fn explicit_message_max_bytes_beats_the_profile() {
+        let s = KafkaSizingConfig {
+            profile: SelfRegulationProfile::Throughput,
+            producer: ProducerKnobs {
+                message_max_bytes: Some(4_194_304), // 4 MiB
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(s.resolved_producer_map()["message.max.bytes"], "4194304");
     }
 
     /// Throughput and low_latency must differ on every key producer knob.
