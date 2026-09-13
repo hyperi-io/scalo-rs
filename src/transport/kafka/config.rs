@@ -835,12 +835,19 @@ pub const DEVTEST_PROFILE: &[(&str, &str)] = &[
 /// | Setting | Value | librdkafka default | Why |
 /// |---|---|---|---|
 /// | `linger.ms` | 100 ms | 5 ms | Accumulate larger batches |
-/// | `compression.type` | zstd | none | Best ratio with good CPU |
+/// | `compression.type` | lz4 | none | Matches the sizing surface, which is applied last |
 /// | `socket.nagle.disable` | true | false | Kafka batches at app level |
 /// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable Prometheus metrics |
+///
+/// The codec here has to agree with the sizing profiles: every producer path
+/// applies `sizing.resolved_producer_map()` after this constant, and it sets
+/// `compression.codec = lz4`. A `zstd` here would be dead config that reads as
+/// the effective codec, and anyone who removed the sizing layer to follow it
+/// would recompress every lz4 batch. Opt into zstd per stage with
+/// `kafka.sizing.producer.compression_type`.
 pub const PRODUCER_HIGH_THROUGHPUT: &[(&str, &str)] = &[
     ("linger.ms", "100"),
-    ("compression.type", "zstd"),
+    ("compression.type", "lz4"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
@@ -857,15 +864,19 @@ pub const PRODUCER_HIGH_THROUGHPUT: &[(&str, &str)] = &[
 /// | `acks` | all | all (-1) | Invariant for EOS (explicit) |
 /// | `max.in.flight.requests.per.connection` | 5 | 1000000 | Max for idempotent producer |
 /// | `linger.ms` | 20 ms | 5 ms | Moderate batching |
-/// | `compression.type` | zstd | none | Best ratio |
+/// | `compression.type` | lz4 | none | Matches the sizing surface, which is applied last |
 /// | `socket.nagle.disable` | true | false | Kafka batches at app level |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
+///
+/// Same codec reasoning as [`PRODUCER_HIGH_THROUGHPUT`]: the sizing surface is
+/// applied after this constant and sets `lz4`, so any other value here is dead
+/// config that contradicts the profile.
 pub const PRODUCER_EXACTLY_ONCE: &[(&str, &str)] = &[
     ("enable.idempotence", "true"),
     ("acks", "all"),
     ("max.in.flight.requests.per.connection", "5"),
     ("linger.ms", "20"),
-    ("compression.type", "zstd"),
+    ("compression.type", "lz4"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
@@ -2461,6 +2472,29 @@ mod tests {
             assert!(
                 !map["compression.type"].is_empty(),
                 "compression.type must not be empty"
+            );
+        }
+    }
+
+    /// The legacy producer profile constants are applied BEFORE the sizing
+    /// surface on every producer path, so a codec they name that the sizing
+    /// surface then overwrites is dead config -- and one that recompresses
+    /// every lz4 batch is the worst kind of dead config to copy.
+    #[test]
+    fn legacy_producer_profiles_name_the_codec_the_sizing_surface_applies() {
+        let applied_last = sizing_for_profile(SelfRegulationProfile::Throughput)
+            .resolved_producer_map()["compression.type"]
+            .clone();
+
+        for (name, profile) in [
+            ("PRODUCER_HIGH_THROUGHPUT", PRODUCER_HIGH_THROUGHPUT),
+            ("PRODUCER_EXACTLY_ONCE", PRODUCER_EXACTLY_ONCE),
+            ("PRODUCER_LOW_LATENCY", PRODUCER_LOW_LATENCY),
+        ] {
+            let map: HashMap<&str, &str> = profile.iter().copied().collect();
+            assert_eq!(
+                map["compression.type"], applied_last,
+                "{name} contradicts the sizing surface that overwrites it"
             );
         }
     }
