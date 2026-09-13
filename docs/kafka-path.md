@@ -87,15 +87,17 @@ The profile defaults, with the ACTUAL librdkafka property each maps to:
 
 | Profile | GET `fetch.min.bytes` | GET `fetch.wait.max.ms` | GET `max.partition.fetch.bytes` | GET `fetch.max.bytes` | poll cap | SEND `batch.size` | SEND `linger.ms` | SEND codec | SEND `queue.buffering.max.kbytes` | SEND `message.max.bytes` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `throughput` (default) | 1 MiB | 50 ms | 10 MiB | 100 MiB | 2000 | 128 KiB | 20 ms | lz4 | 64 MiB | 16 MiB |
-| `balanced` | 256 KiB | 25 ms | 5 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | lz4 | 32 MiB | 16 MiB |
-| `low_latency` | 1 byte | 5 ms | 1 MiB | 10 MiB | 500 | 16 KiB | 0 ms | lz4 | 16 MiB | 16 MiB |
+| `throughput` (default) | 1 MiB | 50 ms | 16 MiB | 50 MiB | 2000 | 128 KiB | 20 ms | lz4 | 64 MiB | 16 MiB |
+| `balanced` | 256 KiB | 25 ms | 16 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | lz4 | 32 MiB | 16 MiB |
+| `low_latency` | 1 byte | 5 ms | 16 MiB | 16 MiB | 500 | 16 KiB | 0 ms | lz4 | 16 MiB | 16 MiB |
 
-`message.max.bytes` is the only column that does not vary by profile: it is the
-largest record the pipeline carries, and the broker's `message.max.bytes`, the
-topic's `max.message.bytes` and this client ceiling must all agree. librdkafka
-defaults it to 1,000,000 bytes and rejects an oversize record LOCALLY, so
-raising the broker alone changes nothing.
+Two columns do not vary by profile, because they are the record-size chain
+rather than a tuning dial: `message.max.bytes` (the producer's own ceiling,
+which librdkafka defaults to 1,000,000 bytes and enforces LOCALLY, so raising
+the broker alone changes nothing) and `max.partition.fetch.bytes` (a profile
+that fetched less would stall on a maximum-size record). `fetch.max.bytes` stays
+at or under 50 MiB: MSK Express holds the broker's 55 MiB fetch ceiling
+read-only, so a larger ask can never be honoured.
 
 ### librdkafka property names -- mind the differences
 
