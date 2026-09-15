@@ -61,6 +61,9 @@ pub mod reloader;
 #[cfg(feature = "config-reload")]
 pub mod shared;
 
+#[cfg(any(feature = "config-reload", feature = "lifecycle"))]
+pub mod watch;
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;

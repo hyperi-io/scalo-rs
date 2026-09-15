@@ -1077,13 +1077,18 @@ mod tests {
     #[tokio::test]
     async fn grpc_pressure_high_rejects_unavailable() {
         use crate::governor::{Hysteresis, MemoryPressureSource, PressureSource, UnifiedPressure};
-        use crate::memory::{MemoryGuard, MemoryGuardConfig};
+        use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
 
-        let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
-            limit_bytes: 1000,
-            pressure_threshold: 0.80,
-            ..Default::default()
-        }));
+        // Pinned to the reservation counter so 950/1000 is the ratio, not the
+        // host's own memory usage.
+        let guard = Arc::new(MemoryGuard::with_usage_source(
+            MemoryGuardConfig {
+                limit_bytes: 1000,
+                pressure_threshold: 0.80,
+                ..Default::default()
+            },
+            UsageSource::Reservations,
+        ));
         guard.add_bytes(950); // 95%
         let pressure = Arc::new(UnifiedPressure::new(
             vec![Arc::new(MemoryPressureSource::new(Arc::clone(&guard))) as Arc<dyn PressureSource>],

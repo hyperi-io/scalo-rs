@@ -1046,11 +1046,16 @@ mod tests {
 
         // --- Governor pinned HIGH (HARD memory source at 95%): 503 ---
         {
-            let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
-                limit_bytes: 1000,
-                pressure_threshold: 0.80,
-                ..Default::default()
-            }));
+            // Pinned to the reservation counter so 950/1000 is the ratio, not
+            // the host's own memory usage.
+            let guard = Arc::new(MemoryGuard::with_usage_source(
+                MemoryGuardConfig {
+                    limit_bytes: 1000,
+                    pressure_threshold: 0.80,
+                    ..Default::default()
+                },
+                crate::memory::UsageSource::Reservations,
+            ));
             guard.add_bytes(950); // 95% -> well above pause_above
             let src = MemoryPressureSource::new(Arc::clone(&guard));
             let pressure = Arc::new(UnifiedPressure::new(
