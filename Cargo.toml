@@ -230,7 +230,7 @@ transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "trans
 # Secrets management
 secrets = ["tokio", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:rand_core"]
 secrets-vault = ["secrets", "vaultrs"]
-secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager"]
+secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager", "aws-smithy-types"]
 secrets-all = ["secrets-vault", "secrets-aws"]
 
 # Unified TLS trust + client-config construction (src/tls.rs). Private-CA
@@ -454,6 +454,12 @@ vaultrs = { version = ">=0.8, <0.9", optional = true }
 # path with rustls 0.23 + rustls-webpki 0.103 — that's what we want.
 aws-config = { version = ">=1.8, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
 aws-sdk-secretsmanager = { version = ">=1.102, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+# Not used by scalo code -- declared only to hold the resolver below 1.7.0, which
+# reshaped Document::Object inside a minor and stops aws-smithy-json 0.63 from
+# compiling (E0308 in codec/deserializer.rs). aws-config 1.12.0 still depends on
+# that 0.63, so a fresh resolve without this ceiling does not build. Lift it once
+# an aws-config release depends on aws-smithy-json >= 0.64.
+aws-smithy-types = { version = ">=1.6.3, <1.7", optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = ">=0.14.5, <0.15", optional = true }
