@@ -218,7 +218,13 @@ impl Config {
         // 2. Environment variables (with prefix)
         // Keys are lowercased: TEST_DATABASE_HOST -> database_host
         // Use double underscore for nesting: TEST_DATABASE__HOST -> database.host
+        //
+        // Both separators after the prefix are accepted. Stripping only
+        // `{prefix}_` leaves a leading underscore on the nested spelling --
+        // TEST__DATABASE__HOST becomes `_database.host`, a key nothing reads --
+        // and that is the spelling charts emit for secret env vars.
         if !opts.env_prefix.is_empty() {
+            figment = figment.merge(Env::prefixed(&format!("{}__", opts.env_prefix)).split("__"));
             figment = figment.merge(Env::prefixed(&format!("{}_", opts.env_prefix)).split("__"));
         }
 
@@ -328,8 +334,17 @@ impl Config {
             }
         }
 
-        // 5. Extra paths (from ConfigOptions::config_paths)
+        // 5. Extra paths: a DIRECTORY to search, or a FILE named outright
+        // (`--config` passes a file, which no base name can be joined onto).
+        // A named file belongs to the settings layer only -- it is one document,
+        // and it outranks defaults.yaml because the operator chose it.
         for base in extra_paths {
+            if base.is_file() {
+                if base_name == "settings" {
+                    files.push(base.clone());
+                }
+                continue;
+            }
             for ext in &extensions {
                 let path = base.join(format!("{base_name}.{ext}"));
                 if path.exists() {
@@ -624,6 +639,91 @@ mod tests {
         assert!(
             armed_after_second,
             "the flag must stay armed, so the warning cannot repeat"
+        );
+    }
+
+    /// The nested env spelling must reach the key it names.
+    ///
+    /// `Env::prefixed` strips exactly `{prefix}_`, so `TEST__DATABASE__HOST`
+    /// resolved to `_database.host` -- a leading-underscore key nothing reads
+    /// and serde drops. That is the spelling generated charts emit for secret
+    /// env vars, so Kafka SASL credentials, ClickHouse passwords and cloud
+    /// credentials all arrived at a key no app consults.
+    #[test]
+    fn nested_env_spelling_reaches_the_key_it_names() {
+        temp_env::with_var("TEST__DATABASE__HOST", Some("nested-host"), || {
+            let config = Config::new(ConfigOptions {
+                env_prefix: "TEST".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                config.get_string("database.host"),
+                Some("nested-host".to_string()),
+                "the double-underscore spelling did not reach database.host"
+            );
+        });
+    }
+
+    /// The single-underscore spelling keeps working.
+    #[test]
+    fn single_underscore_nesting_still_reaches_its_key() {
+        temp_env::with_var("TEST_DATABASE__HOST", Some("single-host"), || {
+            let config = Config::new(ConfigOptions {
+                env_prefix: "TEST".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                config.get_string("database.host"),
+                Some("single-host".to_string()),
+                "the single-underscore spelling stopped resolving"
+            );
+        });
+    }
+
+    /// `--config <file>` must reach the cascade.
+    ///
+    /// `CommonArgs::to_config_options` pushes the named FILE into
+    /// `config_paths`, and this function joined a base name onto every entry --
+    /// so a file was searched as `.../config.yaml/settings.yaml`, which cannot
+    /// exist. Every container entrypoint passes `--config`, so the file never
+    /// loaded and the cascade silently answered from hard-coded defaults.
+    #[test]
+    fn named_config_file_reaches_the_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, "host: from-the-named-file\n").unwrap();
+
+        let config = Config::new(ConfigOptions {
+            config_paths: vec![file],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            config.get_string("host"),
+            Some("from-the-named-file".to_string()),
+            "a file passed as --config did not reach the cascade"
+        );
+    }
+
+    /// A directory entry keeps searching for {base_name}.yaml inside it.
+    #[test]
+    fn directory_config_path_still_searches_for_base_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("settings.yaml"), "host: from-the-dir\n").unwrap();
+
+        let config = Config::new(ConfigOptions {
+            config_paths: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            config.get_string("host"),
+            Some("from-the-dir".to_string()),
+            "a directory in config_paths stopped resolving settings.yaml"
         );
     }
 }
