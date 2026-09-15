@@ -920,7 +920,10 @@ spec:
         {{{{- end }}}}
         lagThreshold: {{{{ .Values.keda.kafka.lagThreshold | quote }}}}
         activationLagThreshold: {{{{ .Values.keda.kafka.activationLagThreshold | quote }}}}
-        saslType: scram_sha512
+        # `sasl`, not `saslType`: the kafka trigger replaced the old `authMode`
+        # property with `sasl` + `tls`, and an unrecognised key is ignored, so
+        # the mechanism was being supplied nowhere at all.
+        sasl: scram_sha512
         tls: disable
     {{{{- if .Values.keda.cpu.enabled }}}}
     # CPU utilisation (secondary scaler)
@@ -956,7 +959,12 @@ metadata:
     {{{{- include "{app}.labels" . | nindent 4 }}}}
 spec:
   secretTargetRef:
-    - parameter: sasl
+    # KEDA's `sasl` parameter is the MECHANISM, not the username -- it takes
+    # plaintext | scram_sha256 | scram_sha512 | none, and the username is its
+    # own parameter. Supplying no `username` at all means SASL authentication
+    # cannot succeed, so the scaler never reads consumer-group lag and the app
+    # never scales. The mechanism itself rides the trigger metadata.
+    - parameter: username
       name: {{{{ include "{app}.{helper_name}" . }}}}
       key: {{{{ .Values.kafka.secretKeys.username }}}}
     - parameter: password
