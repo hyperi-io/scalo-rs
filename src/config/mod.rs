@@ -328,8 +328,17 @@ impl Config {
             }
         }
 
-        // 5. Extra paths (from ConfigOptions::config_paths)
+        // 5. Extra paths: a DIRECTORY to search, or a FILE named outright
+        // (`--config` passes a file, which no base name can be joined onto).
+        // A named file belongs to the settings layer only -- it is one document,
+        // and it outranks defaults.yaml because the operator chose it.
         for base in extra_paths {
+            if base.is_file() {
+                if base_name == "settings" {
+                    files.push(base.clone());
+                }
+                continue;
+            }
             for ext in &extensions {
                 let path = base.join(format!("{base_name}.{ext}"));
                 if path.exists() {
@@ -579,5 +588,50 @@ mod tests {
             .unwrap();
             assert_eq!(config.get_string("host"), Some("testhost".to_string()));
         });
+    }
+
+    /// `--config <file>` must reach the cascade.
+    ///
+    /// `CommonArgs::to_config_options` pushes the named FILE into
+    /// `config_paths`, and this function joined a base name onto every entry --
+    /// so a file was searched as `.../config.yaml/settings.yaml`, which cannot
+    /// exist. Every container entrypoint passes `--config`, so the file never
+    /// loaded and the cascade silently answered from hard-coded defaults.
+    #[test]
+    fn named_config_file_reaches_the_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yaml");
+        std::fs::write(&file, "host: from-the-named-file\n").unwrap();
+
+        let config = Config::new(ConfigOptions {
+            config_paths: vec![file],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            config.get_string("host"),
+            Some("from-the-named-file".to_string()),
+            "a file passed as --config did not reach the cascade"
+        );
+    }
+
+    /// A directory entry keeps searching for {base_name}.yaml inside it.
+    #[test]
+    fn directory_config_path_still_searches_for_base_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("settings.yaml"), "host: from-the-dir\n").unwrap();
+
+        let config = Config::new(ConfigOptions {
+            config_paths: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            config.get_string("host"),
+            Some("from-the-dir".to_string()),
+            "a directory in config_paths stopped resolving settings.yaml"
+        );
     }
 }
