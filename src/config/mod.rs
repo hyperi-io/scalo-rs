@@ -524,10 +524,27 @@ pub fn get() -> &'static Config {
 }
 
 /// Try to get the global configuration.
+///
+/// Warns once per process when the cascade was never initialised. Every
+/// `from_cascade()` reader falls back to its own default in that case, which is
+/// indistinguishable from a cascade that genuinely says "default" -- so without
+/// this line an app runs entirely on hard-coded values and reports nothing.
 #[must_use]
 pub fn try_get() -> Option<&'static Config> {
-    CONFIG.get()
+    let cfg = CONFIG.get();
+    if cfg.is_none() && !CASCADE_ABSENT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "config cascade not initialised: config::setup() has not been called, so every \
+             from_cascade() reader is falling back to its own default and no file or \
+             environment value can reach it"
+        );
+    }
+    cfg
 }
+
+/// Guards the one-shot warning in [`try_get`].
+static CASCADE_ABSENT_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests {
@@ -594,6 +611,35 @@ mod tests {
             .unwrap();
             assert_eq!(config.get_string("host"), Some("testhost".to_string()));
         });
+    }
+
+    /// The absent-cascade warning fires at most once per process.
+    ///
+    /// A reader consulted in a hot path would otherwise flood the log, and a
+    /// flooded warning is ignored as reliably as a missing one.
+    #[test]
+    fn cascade_absent_warning_is_one_shot() {
+        CASCADE_ABSENT_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // First call claims the warning, every later call must not.
+        let claimed_first = !CASCADE_ABSENT_WARNED.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = try_get();
+        let armed_after_first = CASCADE_ABSENT_WARNED.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = try_get();
+        let armed_after_second = CASCADE_ABSENT_WARNED.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            claimed_first,
+            "flag must start clear for this test to mean anything"
+        );
+        assert!(
+            armed_after_first || try_get().is_some(),
+            "a try_get with no cascade must arm the one-shot flag"
+        );
+        assert!(
+            armed_after_second,
+            "the flag must stay armed, so the warning cannot repeat"
+        );
     }
 
     /// The nested env spelling must reach the key it names.
