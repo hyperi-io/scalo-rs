@@ -113,6 +113,7 @@ Section landing: [core-pillars/README.md](core-pillars/README.md)
 - [core-pillars/tracing.md](core-pillars/tracing.md) - OTel, W3C traceparent, transport propagation
 - [core-pillars/health.md](core-pillars/health.md) - `HealthRegistry`, `/livez` / `/readyz`
 - [core-pillars/shutdown.md](core-pillars/shutdown.md) - `CancellationToken`, K8s pre-stop delay
+- [core-pillars/lifecycle.md](core-pillars/lifecycle.md) - idle until configured, `WorkState`, `pipeline_idle`
 
 ### Runtime
 
@@ -127,7 +128,7 @@ Section landing: [runtime/README.md](runtime/README.md)
 - [transport/README.md](transport/README.md) - trait architecture, factory, `AnySender`, commit tokens
 - [transport/backends.md](transport/backends.md) - Kafka, gRPC, Memory, File, Pipe, HTTP, Redis
 - [transport/filter-engine.md](transport/filter-engine.md) - 3-tier filter (SIMD / compiled CEL / complex CEL)
-- [transport/routing.md](transport/routing.md) - `RoutedSender` for receiver and fetcher
+- [transport/routing.md](transport/routing.md) - `RoutedSender`, the named sink set: routes, fan-out
 
 ### Deployment
 
@@ -145,7 +146,7 @@ Section landing: [pipeline/README.md](pipeline/README.md)
 - [pipeline/batch-engine.md](pipeline/batch-engine.md) - SIMD parse, pre-route filter, field interning
 - [pipeline/worker-pool.md](pipeline/worker-pool.md) - `AdaptiveWorkerPool`, pressure-based scaling
 - [pipeline/tiered-sink.md](pipeline/tiered-sink.md) - resilient delivery, disk spillover, circuit breaker
-- [pipeline/sink-stack.md](pipeline/sink-stack.md) - outbound control stack: timeout / load-shed / concurrency (static or ARC) / retry / rate-limit
+- [pipeline/sink-stack.md](pipeline/sink-stack.md) - outbound control stack: timeout / load-shed / concurrency / retry / rate-limit
 - [pipeline/dlq.md](pipeline/dlq.md) - file, Kafka, HTTP, Redis backends
 - [pipeline/spool.md](pipeline/spool.md) - disk-backed async FIFO (yaque)
 - [pipeline/strmatch.md](pipeline/strmatch.md) - 4-tier regex->fast-path matcher (Byte / Literal / LiteralSet / Regex)

@@ -73,12 +73,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use super::shared::SharedConfig;
+use super::watch::{ConfigTrigger, ConfigWatch};
 
 /// Boxed error type for reload/validate callbacks.
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -217,37 +218,13 @@ impl<T: Clone + Send + Sync + 'static> ConfigReloader<T> {
         #[cfg(feature = "shutdown")]
         let shutdown_token = crate::shutdown::token();
 
-        // File polling state
-        let mut last_modified: Option<SystemTime> = match self.config.config_path.as_ref() {
-            Some(p) => file_mtime_async(p).await,
-            None => None,
-        };
+        let mut watch =
+            ConfigWatch::new(self.config.config_path.clone(), self.config.poll_interval)
+                .with_periodic(self.config.periodic_interval)
+                .with_sighup(self.config.enable_sighup);
+        watch.prime().await;
+
         let mut last_reload = Instant::now();
-
-        // Set up poll timer (for file watching)
-        let mut poll_timer = self
-            .config
-            .config_path
-            .as_ref()
-            .map(|_| tokio::time::interval(self.config.poll_interval));
-
-        // Set up periodic timer
-        let mut periodic_timer = if self.config.periodic_interval > Duration::ZERO {
-            Some(tokio::time::interval(self.config.periodic_interval))
-        } else {
-            None
-        };
-
-        // Set up SIGHUP handler
-        #[cfg(unix)]
-        let mut sighup = if self.config.enable_sighup {
-            Some(
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                    .expect("failed to register SIGHUP handler"),
-            )
-        } else {
-            None
-        };
 
         loop {
             // Check for global shutdown before waiting for next trigger
@@ -261,28 +238,13 @@ impl<T: Clone + Send + Sync + 'static> ConfigReloader<T> {
                 #[cfg(feature = "shutdown")]
                 {
                     tokio::select! {
-                        trigger = self.wait_for_trigger(
-                            &mut poll_timer,
-                            &mut periodic_timer,
-                            #[cfg(unix)]
-                            &mut sighup,
-                            &mut last_modified,
-                        ) => Some(trigger),
+                        trigger = watch.next_trigger() => Some(trigger),
                         () = shutdown_token.cancelled() => None,
                     }
                 }
                 #[cfg(not(feature = "shutdown"))]
                 {
-                    Some(
-                        self.wait_for_trigger(
-                            &mut poll_timer,
-                            &mut periodic_timer,
-                            #[cfg(unix)]
-                            &mut sighup,
-                            &mut last_modified,
-                        )
-                        .await,
-                    )
+                    Some(watch.next_trigger().await)
                 }
             };
 
@@ -298,120 +260,22 @@ impl<T: Clone + Send + Sync + 'static> ConfigReloader<T> {
             }
 
             match trigger {
-                ReloadTrigger::FileChanged => {
+                ConfigTrigger::FileChanged => {
                     info!(
                         path = ?self.config.config_path,
                         "Config file changed, reloading"
                     );
                 }
-                ReloadTrigger::Periodic => {
+                ConfigTrigger::Periodic => {
                     info!("Periodic config reload triggered");
                 }
-                ReloadTrigger::Sighup => {
+                ConfigTrigger::Sighup => {
                     info!("SIGHUP received, reloading configuration");
                 }
             }
 
             self.do_reload();
             last_reload = Instant::now();
-        }
-    }
-
-    /// Wait for the next reload trigger.
-    ///
-    /// Returns which trigger fired. For file polling, also updates last_modified.
-    async fn wait_for_trigger(
-        &self,
-        poll_timer: &mut Option<tokio::time::Interval>,
-        periodic_timer: &mut Option<tokio::time::Interval>,
-        #[cfg(unix)] sighup: &mut Option<tokio::signal::unix::Signal>,
-        last_modified: &mut Option<SystemTime>,
-    ) -> ReloadTrigger {
-        loop {
-            let trigger = self
-                .select_trigger(
-                    poll_timer,
-                    periodic_timer,
-                    #[cfg(unix)]
-                    sighup,
-                )
-                .await;
-
-            match trigger {
-                ReloadTrigger::FileChanged => {
-                    // Check if file actually changed (mtime comparison)
-                    if let Some(ref path) = self.config.config_path {
-                        let current_mtime = file_mtime_async(path).await;
-                        let changed = match (&*last_modified, &current_mtime) {
-                            (Some(last), Some(current)) => current > last,
-                            (None, Some(_)) => true,
-                            _ => false,
-                        };
-                        if changed {
-                            *last_modified = current_mtime;
-                            return ReloadTrigger::FileChanged;
-                        }
-                    }
-                    // No actual change, loop back
-                }
-                other => return other,
-            }
-        }
-    }
-
-    /// Select on all enabled triggers, returning which one fired first.
-    #[cfg(unix)]
-    async fn select_trigger(
-        &self,
-        poll_timer: &mut Option<tokio::time::Interval>,
-        periodic_timer: &mut Option<tokio::time::Interval>,
-        sighup: &mut Option<tokio::signal::unix::Signal>,
-    ) -> ReloadTrigger {
-        tokio::select! {
-            _ = async {
-                match poll_timer.as_mut() {
-                    Some(timer) => timer.tick().await,
-                    None => std::future::pending().await,
-                }
-            } => ReloadTrigger::FileChanged,
-
-            _ = async {
-                match periodic_timer.as_mut() {
-                    Some(timer) => timer.tick().await,
-                    None => std::future::pending().await,
-                }
-            } => ReloadTrigger::Periodic,
-
-            () = async {
-                match sighup.as_mut() {
-                    Some(sig) => { sig.recv().await; },
-                    None => std::future::pending::<()>().await,
-                }
-            } => ReloadTrigger::Sighup,
-        }
-    }
-
-    /// Select on all enabled triggers (non-Unix: no SIGHUP).
-    #[cfg(not(unix))]
-    async fn select_trigger(
-        &self,
-        poll_timer: &mut Option<tokio::time::Interval>,
-        periodic_timer: &mut Option<tokio::time::Interval>,
-    ) -> ReloadTrigger {
-        tokio::select! {
-            _ = async {
-                match poll_timer.as_mut() {
-                    Some(timer) => timer.tick().await,
-                    None => std::future::pending().await,
-                }
-            } => ReloadTrigger::FileChanged,
-
-            _ = async {
-                match periodic_timer.as_mut() {
-                    Some(timer) => timer.tick().await,
-                    None => std::future::pending().await,
-                }
-            } => ReloadTrigger::Periodic,
         }
     }
 
@@ -451,30 +315,6 @@ impl<T: Clone + Send + Sync + 'static> ConfigReloader<T> {
             }
         }
     }
-}
-
-/// Which trigger caused a reload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadTrigger {
-    FileChanged,
-    Periodic,
-    #[allow(dead_code)]
-    Sighup,
-}
-
-/// Get the modification time of a file. Used inside `run_loop` so the
-/// periodic poll doesn't block the runtime thread.
-async fn file_mtime_async(path: &PathBuf) -> Option<SystemTime> {
-    tokio::fs::metadata(path)
-        .await
-        .ok()
-        .and_then(|m| m.modified().ok())
-}
-
-/// Sync mtime helper -- used only by the sync-context test below.
-#[cfg(test)]
-fn file_mtime(path: &PathBuf) -> Option<SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 #[cfg(test)]
@@ -664,19 +504,5 @@ mod tests {
         assert_eq!(shared.version(), 0);
 
         handle.abort();
-    }
-
-    #[test]
-    fn test_file_mtime() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.txt");
-        fs::write(&path, "content").unwrap();
-
-        let mtime = file_mtime(&path);
-        assert!(mtime.is_some());
-
-        // Non-existent file
-        let mtime = file_mtime(&PathBuf::from("/nonexistent/file.txt"));
-        assert!(mtime.is_none());
     }
 }

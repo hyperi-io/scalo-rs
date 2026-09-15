@@ -141,13 +141,18 @@ impl SelfRegulationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemoryGuard, MemoryGuardConfig};
+    use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
 
+    /// Pinned to the reservation counter so the ratio is what each test adds,
+    /// not the host's own memory usage.
     fn guard() -> Arc<MemoryGuard> {
-        Arc::new(MemoryGuard::new(MemoryGuardConfig {
-            limit_bytes: 1024 * 1024,
-            ..Default::default()
-        }))
+        Arc::new(MemoryGuard::with_usage_source(
+            MemoryGuardConfig {
+                limit_bytes: 1024 * 1024,
+                ..Default::default()
+            },
+            UsageSource::Reservations,
+        ))
     }
 
     #[test]
