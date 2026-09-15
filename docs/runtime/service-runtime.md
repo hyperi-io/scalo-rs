@@ -39,8 +39,8 @@ to pre-governor. See [self-regulation.md](../self-regulation.md).
 
 The whole bundle is enabled via the `cli-service` feature, which
 pulls in `metrics + memory + scaling + worker-pool + shutdown +
-governor` so that a single feature flag gives a downstream app the
-full service-runtime profile.
+governor + lifecycle` so that a single feature flag gives a downstream
+app the full service-runtime profile.
 
 ---
 
@@ -53,7 +53,10 @@ flowchart LR
     C --> D[init logger]
     D --> E[app.load_config]
     E --> F[ServiceRuntime::build]
-    F --> G["app.run_service(config, runtime)"]
+    F --> W{"app.work_state"}
+    W -->|Idle| P["park until config change"]
+    P --> E
+    W -->|Active| G["app.run_service(config, runtime)"]
     G --> H[wait on shutdown token]
 ```
 
@@ -86,9 +89,12 @@ Step by step inside `run_app` for the default `run` subcommand:
      default, inert until `version_check_defaults()` or config supplies an
      `api_url`, and `version_check.enabled: false` in any config layer
      turns it off.
-5. Call `app.run_service(config, runtime)`.
+5. Evaluate `app.work_state(&config)`. Idle parks the service, Ready and
+   with nothing open, until a config change gives it work -- see
+   [../core-pillars/lifecycle.md](../core-pillars/lifecycle.md).
+6. Call `app.run_service(config, runtime)`.
 
-The service author's code starts at step 5 -- everything before that
+The service author's code starts at step 6 -- everything before that
 is the framework.
 
 ---
@@ -112,6 +118,7 @@ pub trait ServiceApp: Sized {
 
     // Optional -- defaults provided.
     fn command(&self) -> Option<&StandardCommand> { None }
+    fn work_state(&self, _: &Self::Config) -> WorkState { WorkState::Active }           // cfg: lifecycle
     fn scaling_components(&self, _: &Self::Config) -> Vec<ScalingComponent> { vec![] }  // cfg: scaling
     fn register_metrics(&self, _: &MetricsManager) {}                                   // cfg: metrics | otel-metrics
     fn deployment_contract(&self) -> Option<DeploymentContract> { None }                // cfg: deployment
@@ -128,6 +135,7 @@ pub trait ServiceApp: Sized {
 | `load_config` | yes | App-specific cascade load (typically `config::setup` + `unmarshal`) |
 | `run_service` | yes | The actual service loop -- gets a fully wired runtime |
 | `command` | no | Override to expose app-specific subcommands |
+| `work_state` | no (cfg `lifecycle`) | The emptiness predicate: a valid but workless config idles instead of refusing |
 | `scaling_components` | no (cfg `scaling`) | Register app-specific KEDA signals (lag, queue depth) |
 | `register_metrics` | no (cfg `metrics`) | Register app metrics for `metrics-manifest` / `generate-artefacts` |
 | `deployment_contract` | no (cfg `deployment`) | Build the contract for `generate-artefacts` |

@@ -3,6 +3,24 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.2](https://github.com/hyperi-io/scalo-rs/compare/v2.12.1...v2.12.2) (2026-09-12)
+
+### Bug Fixes
+
+* **memory:** read what the kernel charges, not the reservation counter ([f5164a5](https://github.com/hyperi-io/scalo-rs/commit/f5164a506514c6be7423cbabe00325d69c8eba12))
+
+## [2.12.1](https://github.com/hyperi-io/scalo-rs/compare/v2.12.0...v2.12.1) (2026-09-09)
+
+### Bug Fixes
+
+* a routed batch is grouped by destination and sent once per sink ([7997f80](https://github.com/hyperi-io/scalo-rs/commit/7997f80c7c7169521eacb59d72ef929b87aff35f))
+
+## [2.12.0](https://github.com/hyperi-io/scalo-rs/compare/v2.11.1...v2.12.0) (2026-09-09)
+
+### Features
+
+* named destinations with fan-out, and an idle gate every app can adopt ([66f1478](https://github.com/hyperi-io/scalo-rs/commit/66f1478fa28ef547515275f348f330f6eb88c13b))
+
 ## [2.11.1](https://github.com/hyperi-io/scalo-rs/compare/v2.11.0...v2.11.1) (2026-09-01)
 
 ### Bug Fixes

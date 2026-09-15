@@ -214,7 +214,22 @@ impl ServiceMetrics {
             "pipeline_stall_seconds_total",
             "Cumulative seconds the pipeline was stalled"
         );
+        metrics::describe_gauge!(
+            "pipeline_idle",
+            "Service has no work configured (1=idle, 0=working)"
+        );
 
+        reg.push(MetricDescriptor {
+            name: "pipeline_idle".into(),
+            metric_type: MetricType::Gauge,
+            description: "Service has no work configured (1=idle, 0=working)".into(),
+            unit: String::new(),
+            labels: vec![],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
         reg.push(MetricDescriptor {
             name: "pipeline_ready".into(),
             metric_type: MetricType::Gauge,

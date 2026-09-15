@@ -1171,12 +1171,17 @@ mod governor_tests {
         feature = "transport-memory"
     ))]
     fn governor(pinned_high: bool) -> crate::SelfRegulationGovernor {
-        use crate::memory::{MemoryGuard, MemoryGuardConfig};
-        let guard = std::sync::Arc::new(MemoryGuard::new(MemoryGuardConfig {
-            limit_bytes: 1000,
-            pressure_threshold: 0.80,
-            ..Default::default()
-        }));
+        use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
+        // Pinned to the reservation counter so `pinned_high` is what decides
+        // the pressure, not the host's own memory usage.
+        let guard = std::sync::Arc::new(MemoryGuard::with_usage_source(
+            MemoryGuardConfig {
+                limit_bytes: 1000,
+                pressure_threshold: 0.80,
+                ..Default::default()
+            },
+            UsageSource::Reservations,
+        ));
         if pinned_high {
             guard.add_bytes(950); // 95% -> well above pause_above
         } else {

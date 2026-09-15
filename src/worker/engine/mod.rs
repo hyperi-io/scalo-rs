@@ -784,18 +784,19 @@ mod engine_tests {
 
         let batch = make_record_batch(10);
         let expected = batch.total_payload_bytes() as u64;
-        assert_eq!(guard.current_bytes(), 0, "starts at zero");
+        // The lease counter, not process usage -- this is what the lease moves.
+        assert_eq!(guard.reserved_bytes(), 0, "starts at zero");
 
         {
             let _lease = engine.lease_ingress_batch(&batch).expect("guard present");
             assert_eq!(
-                guard.current_bytes(),
+                guard.reserved_bytes(),
                 expected,
                 "bytes accounted while lease held"
             );
         }
         // Lease dropped -> bytes released.
-        assert_eq!(guard.current_bytes(), 0, "bytes released on drop");
+        assert_eq!(guard.reserved_bytes(), 0, "bytes released on drop");
     }
 
     #[cfg(all(feature = "memory", feature = "transport"))]

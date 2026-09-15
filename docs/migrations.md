@@ -357,19 +357,42 @@ where `Config` contains `SensitiveString` fields. Symptom of missing
 this: secrets land as literal `***REDACTED***` post round-trip and
 auth fails.
 
-### `memory::set_heap_source` — total-heap backpressure (additive, opt-in)
+### `MemoryGuard` reads the cgroup, not a reservation counter (behaviour)
 
-New crate hook `scalo::memory::set_heap_source(fn() -> usize)`.
-When registered, every `MemoryGuard` switches its read path
-(`current_bytes`, pressure checks, `try_reserve` admission) from the
-per-batch reservation counter to a true **total-process heap** figure --
-catching growth the reservations never see (e.g. a transform ballooning a
-`Vec`). Not registering it keeps the existing per-batch behaviour, so this
-is **optional**, not a required migration.
+`MemoryGuard::current_bytes()` now returns what the kernel charges this
+process -- cgroup v2 `memory.current`, then cgroup v1
+`memory.usage_in_bytes`, then `/proc/self/status` `VmRSS`. It used to
+return the sum of outstanding `try_reserve`/`add_bytes` reservations
+unless the app registered a heap source, which no consumer did, so the
+pressure ratio sat near zero while a process held hundreds of MiB and
+neither the inbound brake nor the `dfe_scaling_pressure` hard gate ever
+engaged (dfe-transform-vrl #53).
 
-To adopt in a consumer service, install a tracking allocator and wire it once at
-startup. Prefer an actively-maintained allocator -- `tikv-jemalloc-ctl`
-(`cap` works but is unmaintained since 2023):
+No consumer code change is required to get the fix. Two things to know:
+
+- **`current_bytes()` no longer starts at zero.** A fresh guard reports
+  the process's real usage. Anything asserting `current_bytes() == 0`
+  after a release, or treating it as a lease balance, wants the new
+  `reserved_bytes()` instead -- that is the `add_bytes` less `release`
+  counter, unchanged.
+- **`try_reserve(n)` is a projected-admission check** (`usage() + n <=
+  limit`) and no longer mutates the reservation counter. Pair it with
+  `release` only if you also read `reserved_bytes()`; the kernel
+  uncharges freed bytes on its own.
+
+New: `MemoryGuard::reserved_bytes()`, `MemoryGuard::usage_source()`,
+`MemoryGuard::with_usage_source(config, source)` and the `UsageSource`
+enum. The guard logs which source it resolved at init, and warns when it
+resolved to `Reservations` (no kernel accounting readable -- non-Linux).
+
+### `memory::set_heap_source` — allocator override (additive, opt-in)
+
+Crate hook `scalo::memory::set_heap_source(fn() -> usize)` overrides the
+detected `UsageSource` with an allocator statistic. It is now rarely
+what you want: it cannot see thread stacks, mmap'd buffers, or pages the
+allocator retains after a free, whereas the cgroup default is the number
+the OOM killer acts on. Register one only where the allocator figure is
+the one you mean to gate on.
 
 ```rust
 #[global_allocator]
@@ -548,12 +571,15 @@ applied at the consumer level until then.
 ### #35 — Kafka topic auto-discovery race
 
 `KafkaAdmin::list_topics` returns empty when the admin consumer
-hasn't finished its bootstrap handshake. Symptom: "Auto-discovery
-found no matching topics" at startup even though the topic exists.
+hasn't finished its bootstrap handshake.
 
-**Workaround:** drop `topic_regex` from the config and list topics
-explicitly under `topics:`. The explicit-subscribe path bypasses
-the resolver.
+**No longer fatal.** Auto-discovery that matches nothing now logs
+"Auto-discovery found no matching topics" and subscribes to nothing
+instead of failing startup, and the refresh loop (`topic_refresh_secs`,
+60 s by default) subscribes as soon as a matching topic appears. That
+covers both the race and the legitimate case of an app deployed
+before its first source exists. Set `topic_refresh_secs: 0` and a
+transport that discovered nothing consumes nothing until restart.
 
 ### #36 — `KafkaTransport` always allocates both roles
 
