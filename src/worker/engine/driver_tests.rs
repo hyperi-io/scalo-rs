@@ -513,12 +513,13 @@ async fn lease_ingress_batch_accounts_and_releases() {
     let batch = WorkBatch::<MemTok>::from_records(payloads);
     let expected = batch.total_payload_bytes() as u64;
 
-    assert_eq!(guard.current_bytes(), 0);
+    // The lease counter, not process usage -- this is what the lease moves.
+    assert_eq!(guard.reserved_bytes(), 0);
     {
         let _lease = engine.lease_ingress_batch(&batch).expect("guard present");
-        assert_eq!(guard.current_bytes(), expected, "accounted while held");
+        assert_eq!(guard.reserved_bytes(), expected, "accounted while held");
     }
-    assert_eq!(guard.current_bytes(), 0, "released on drop");
+    assert_eq!(guard.reserved_bytes(), 0, "released on drop");
 }
 
 /// A minimal CommitToken for the memory-lease unit test (no transport recv).
@@ -916,11 +917,10 @@ fn split_smaller_than_target_is_one_sub_block() {
 }
 
 /// THE peak-memory proving test: a batch of N records totalling B bytes,
-/// streamed with sub_block_bytes ~= B/4. A guard with a registered guard
-/// (no heap source) reports current_bytes() = the outstanding lease. The sink
-/// samples guard.current_bytes() on EACH call (the sub-block lease is held
-/// during the sink); the high-water must stay at ~one sub-block, NOT the whole
-/// batch B. The contrast: drive_block would peak at B.
+/// streamed with sub_block_bytes ~= B/4. The sink samples
+/// `guard.reserved_bytes()` on EACH call (the sub-block lease is held during
+/// the sink); the high-water must stay at ~one sub-block, NOT the whole batch
+/// B. The contrast: drive_block would peak at B.
 #[cfg(feature = "memory")]
 #[tokio::test]
 async fn streaming_peak_lease_bounded_to_one_sub_block() {
@@ -966,7 +966,7 @@ async fn streaming_peak_lease_bounded_to_one_sub_block() {
                 let guard = Arc::clone(&guard_for_sink);
                 let hw = Arc::clone(&hw);
                 async move {
-                    let now = guard.current_bytes();
+                    let now = guard.reserved_bytes();
                     hw.fetch_max(now, Ordering::Relaxed);
                     Ok(())
                 }
@@ -994,7 +994,7 @@ async fn streaming_peak_lease_bounded_to_one_sub_block() {
              whole batch {total}"
     );
     // Lease fully released after the run.
-    assert_eq!(guard.current_bytes(), 0, "all leases released after run");
+    assert_eq!(guard.reserved_bytes(), 0, "all leases released after run");
 }
 
 /// A counting receiver: delegates recv/lifecycle to an inner MemoryTransport,
@@ -1298,11 +1298,16 @@ async fn streaming_rejects_sink_managed_commit() {
 /// the engine, returning (engine, governor) so the test can inspect both.
 #[cfg(feature = "governor")]
 fn governed_engine() -> (BatchEngine, crate::governor::SelfRegulationGovernor) {
-    use crate::memory::{MemoryGuard, MemoryGuardConfig};
-    let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
-        limit_bytes: 1024 * 1024,
-        ..Default::default()
-    }));
+    use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
+    // Pinned to the reservation counter so pressure is what the test drives,
+    // not the host's own memory usage.
+    let guard = Arc::new(MemoryGuard::with_usage_source(
+        MemoryGuardConfig {
+            limit_bytes: 1024 * 1024,
+            ..Default::default()
+        },
+        UsageSource::Reservations,
+    ));
     let gov = crate::governor::SelfRegulationConfig::default()
         .build(guard)
         .expect("enabled by default");
@@ -1433,13 +1438,18 @@ async fn governed_off_is_whole_batch_passthrough() {
 #[test]
 fn governed_gate_and_budget_share_pressure() {
     use crate::governor::{Admit, InboundGate, NoopActuator};
-    use crate::memory::{MemoryGuard, MemoryGuardConfig};
+    use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
 
-    let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
-        limit_bytes: 1000,
-        pressure_threshold: 0.80,
-        ..Default::default()
-    }));
+    // Pinned to the reservation counter so pressure is what the test drives,
+    // not the host's own memory usage.
+    let guard = Arc::new(MemoryGuard::with_usage_source(
+        MemoryGuardConfig {
+            limit_bytes: 1000,
+            pressure_threshold: 0.80,
+            ..Default::default()
+        },
+        UsageSource::Reservations,
+    ));
     let gov = crate::governor::SelfRegulationConfig::default()
         .build(Arc::clone(&guard))
         .expect("enabled");
@@ -1476,15 +1486,18 @@ fn governed_gate_and_budget_share_pressure() {
 #[tokio::test]
 async fn send_unaffected_by_pressure_pinned_high() {
     use crate::governor::{Hysteresis, MemoryPressureSource, PressureSource, UnifiedPressure};
-    use crate::memory::{MemoryGuard, MemoryGuardConfig};
+    use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
     use crate::transport::TransportSender;
 
     // Pin a REAL HARD memory source high so the latch holds (>= pause_above).
-    let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
-        limit_bytes: 1000,
-        pressure_threshold: 0.80,
-        ..Default::default()
-    }));
+    let guard = Arc::new(MemoryGuard::with_usage_source(
+        MemoryGuardConfig {
+            limit_bytes: 1000,
+            pressure_threshold: 0.80,
+            ..Default::default()
+        },
+        UsageSource::Reservations,
+    ));
     guard.add_bytes(950); // 95% -> HARD high
     let pressure = Arc::new(UnifiedPressure::new(
         vec![Arc::new(MemoryPressureSource::new(Arc::clone(&guard))) as Arc<dyn PressureSource>],
@@ -1546,12 +1559,17 @@ fn governed_engine_low_limit(
     crate::governor::SelfRegulationGovernor,
     Arc<crate::memory::MemoryGuard>,
 ) {
-    use crate::memory::{MemoryGuard, MemoryGuardConfig};
-    let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
-        limit_bytes,
-        pressure_threshold: 0.80,
-        ..Default::default()
-    }));
+    use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
+    // Pinned to the reservation counter: the invariants here are about the
+    // in-flight lease against an 18 KiB synthetic limit, not the host's usage.
+    let guard = Arc::new(MemoryGuard::with_usage_source(
+        MemoryGuardConfig {
+            limit_bytes,
+            pressure_threshold: 0.80,
+            ..Default::default()
+        },
+        UsageSource::Reservations,
+    ));
     // The governor's pressure + AIMD budget run off THIS guard.
     let gov = crate::governor::SelfRegulationConfig::default()
         .build(Arc::clone(&guard))
@@ -1583,7 +1601,7 @@ fn governed_engine_low_limit(
 ///      `Admit::Hold` (the brake the transport would apply);
 ///   2. the sink/drain KEEPS RUNNING -- every record reaches the sink and
 ///      the source acks commit (the drain is never gated);
-///   3. `MemoryGuard::current_bytes()` stays BOUNDED -- the streaming
+///   3. `MemoryGuard::reserved_bytes()` stays BOUNDED -- the streaming
 ///      peak-lease holds at most ~one shrunk sub-block in flight, well under
 ///      the whole-batch footprint, sampled at its high-water inside the sink;
 ///   4. the pipeline does NOT panic and the budget never collapses below its
@@ -1647,9 +1665,9 @@ async fn operational_never_oom_governed_pipeline_bounds_memory() {
                 let gate = Arc::clone(&gate_for_sink);
                 let n = out.records.len();
                 async move {
-                    // (3) sample current_bytes() while the sub-block lease is
+                    // (3) sample reserved_bytes() while the sub-block lease is
                     // held -- this is the in-flight high-water.
-                    hw.fetch_max(guard.current_bytes(), Ordering::Relaxed);
+                    hw.fetch_max(guard.reserved_bytes(), Ordering::Relaxed);
                     // (1) evaluate the gate over the SAME pressure: under
                     // sustained ingress it engages (Hold).
                     if gate.evaluate() == Admit::Hold {
@@ -1710,7 +1728,7 @@ async fn operational_never_oom_governed_pipeline_bounds_memory() {
         "byte budget never collapses below its floor"
     );
     assert_eq!(
-        guard.current_bytes(),
+        guard.reserved_bytes(),
         0,
         "all ingress leases released after the run -- no leak"
     );
@@ -1869,7 +1887,7 @@ impl TransportReceiver for ByteAwareSource {
 #[cfg(feature = "governor")]
 #[tokio::test]
 async fn governed_recv_is_byte_bounded_not_record_bounded() {
-    use crate::memory::{MemoryGuard, MemoryGuardConfig};
+    use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
 
     // 64 records of 4 KiB each = 256 KiB total available in the source.
     const RECORD_BYTES: usize = 4 * 1024;
@@ -1892,10 +1910,15 @@ async fn governed_recv_is_byte_bounded_not_record_bounded() {
         })
         .collect();
 
-    let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig {
-        limit_bytes: 1024 * 1024,
-        ..Default::default()
-    }));
+    // Pinned to the reservation counter: this test bounds the recv by bytes,
+    // and the host's own memory usage must not move the budget under it.
+    let guard = Arc::new(MemoryGuard::with_usage_source(
+        MemoryGuardConfig {
+            limit_bytes: 1024 * 1024,
+            ..Default::default()
+        },
+        UsageSource::Reservations,
+    ));
     let cfg = crate::governor::ByteBudgetConfig {
         start_bytes: BUDGET,
         max_bytes: BUDGET, // pin it so the budget cannot grow past BUDGET

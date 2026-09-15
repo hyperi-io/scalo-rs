@@ -1,6 +1,6 @@
 # Core pillars
 
-The six things every scalo service gets whether it asks or not. Wire
+The seven things every scalo service gets whether it asks or not. Wire
 `ServiceRuntime` (or the three setup calls) and all of this is running before
 your first line of business logic.
 
@@ -16,6 +16,7 @@ would otherwise write, identically, and get subtly wrong.
 | [tracing.md](tracing.md) | OTel, W3C traceparent, transport propagation |
 | [health.md](health.md) | `HealthRegistry`, `/livez` / `/readyz` |
 | [shutdown.md](shutdown.md) | `CancellationToken`, K8s pre-stop delay, drain ordering |
+| [lifecycle.md](lifecycle.md) | Idle until configured -- `WorkState`, the gate, `pipeline_idle` |
 
 Start with [../auto-wiring.md](../auto-wiring.md) if you want to know what is
 wired automatically and what you still have to call yourself.

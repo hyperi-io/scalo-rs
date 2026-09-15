@@ -46,7 +46,8 @@ sequenceDiagram
     SR->>Pillars: HealthRegistry::install()
     SR->>Pillars: CancellationToken::new() + signal handlers
     SR-->>Run: ServiceRuntime
-    Run->>App: run_service(config, runtime)
+    Run->>App: work_state(config)
+    Run->>App: run_service(config, runtime) [when Active]
     App->>Module: build TieredSink / BatchEngine / Transport
     Module->>Pillars: tracing::info!("started", topic = ...)
     Module->>Pillars: metrics::counter!("sent_total", "topic" => ...)
@@ -77,6 +78,7 @@ means a `Transport` impl ships with metrics-emission baked in, and the
 | Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)` |
 | Worker pool | `AdaptiveWorkerPool` constructed if `worker-pool` feature on |
 | Metrics server | Started on `--metrics-addr` (default `0.0.0.0:9090`) if `metrics` feature on, serving `/metrics` `/metrics/manifest` `/livez` `/readyz` -- and nothing else |
+| Idle gate | `app.work_state(config)` evaluated after the runtime is up if `lifecycle` feature on; a workless config parks instead of entering `run_service` ([core-pillars/lifecycle.md](core-pillars/lifecycle.md)) |
 
 What's **not** auto-wired and still requires an explicit call from the app:
 

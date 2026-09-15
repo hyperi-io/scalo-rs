@@ -123,6 +123,10 @@ pub mod health;
 #[cfg_attr(docsrs, doc(cfg(feature = "config")))]
 pub mod config;
 
+#[cfg(feature = "lifecycle")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lifecycle")))]
+pub mod lifecycle;
+
 #[cfg(feature = "logger")]
 #[cfg_attr(docsrs, doc(cfg(feature = "logger")))]
 pub mod logger;

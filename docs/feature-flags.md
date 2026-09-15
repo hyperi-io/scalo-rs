@@ -81,7 +81,8 @@ flowchart LR
 | Feature | Adds |
 |---------|------|
 | `cli` | `clap`-based `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
-| `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + worker-pool + shutdown`) |
+| `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + worker-pool + shutdown + lifecycle`) |
+| `lifecycle` | Idle-until-configured gate (`WorkState`, `IdleGate`, `pipeline_idle`) — folded into `cli-service` |
 | `top` | Above + `ratatui` TUI metrics dashboard |
 
 ### Transport
@@ -208,7 +209,7 @@ features = ["cli-service", "http-server", "transport-http"]
 ```
 
 `cli-service` brings `metrics`, `memory`, `scaling`, `worker-pool`,
-`shutdown`. Add an HTTP transport.
+`shutdown`, `lifecycle`. Add an HTTP transport.
 
 ### Full data-plane service
 
@@ -269,7 +270,7 @@ A handful of dependencies aren't visible from the feature name alone:
 - `dlq` requires `concurrency` (for the `BackgroundSink` actor that
   drains queued entries).
 - `cli-service` reaches across the stack — `metrics + memory + scaling
-  + worker-pool + shutdown`.
+  + worker-pool + shutdown + lifecycle`.
 - `top` pulls `cli-service` (and through that, the full L2 runtime).
 - `transport-redis` and `dlq-redis` share the `redis` crate; using both
   costs nothing extra beyond using one.

@@ -339,41 +339,44 @@ impl KafkaTransport {
         // - Explicit list -> subscribe to those
         // - Empty + auto_discover -> auto-discover from broker
         // - Empty + !auto_discover -> no subscription (producer-only)
-        let (effective_topics, topic_refresh, shutdown_token) =
-            if config.topics.is_empty() && config.auto_discover {
-                tracing::info!("Topics empty -- auto-discovering from broker");
-                let resolver = topic_resolver::TopicResolver::new(config)?;
-                let discovered = resolver.resolve()?;
-                if discovered.is_empty() {
-                    return Err(TransportError::Config(
-                        "Auto-discovery found no matching topics".into(),
-                    ));
-                }
+        let (effective_topics, topic_refresh, shutdown_token) = if config.topics.is_empty()
+            && config.auto_discover
+        {
+            tracing::info!("Topics empty -- auto-discovering from broker");
+            let resolver = topic_resolver::TopicResolver::new(config)?;
+            let discovered = resolver.resolve()?;
+            if discovered.is_empty() {
+                // No match yet is not a misconfiguration: the refresh loop
+                // subscribes when the first matching topic appears.
+                tracing::warn!(
+                    "Auto-discovery found no matching topics -- consuming nothing until one appears"
+                );
+            }
 
-                let token = tokio_util::sync::CancellationToken::new();
-                let refresh = if config.topic_refresh_secs > 0 {
-                    let refresh_resolver = topic_resolver::TopicResolver::new(config)?;
-                    let handle = refresh_resolver.start_refresh_loop(
-                        Duration::from_secs(config.topic_refresh_secs),
-                        token.clone(),
-                    );
-                    tracing::info!(
-                        interval_secs = config.topic_refresh_secs,
-                        "Started periodic topic refresh"
-                    );
-                    Some(parking_lot::Mutex::new(handle))
-                } else {
-                    None
-                };
-
-                (discovered, refresh, token)
+            let token = tokio_util::sync::CancellationToken::new();
+            let refresh = if config.topic_refresh_secs > 0 {
+                let refresh_resolver = topic_resolver::TopicResolver::new(config)?;
+                let handle = refresh_resolver.start_refresh_loop(
+                    Duration::from_secs(config.topic_refresh_secs),
+                    token.clone(),
+                );
+                tracing::info!(
+                    interval_secs = config.topic_refresh_secs,
+                    "Started periodic topic refresh"
+                );
+                Some(parking_lot::Mutex::new(handle))
             } else {
-                (
-                    config.topics.clone(),
-                    None,
-                    tokio_util::sync::CancellationToken::new(),
-                )
+                None
             };
+
+            (discovered, refresh, token)
+        } else {
+            (
+                config.topics.clone(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+            )
+        };
 
         let subscribed_topics = effective_topics;
         if !subscribed_topics.is_empty() {
