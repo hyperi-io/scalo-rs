@@ -10,7 +10,8 @@ those are auto-wired and live in [../core-pillars/README.md](../core-pillars/REA
 |---|---|
 | [secrets.md](secrets.md) | OpenBao / Vault, AWS Secrets Manager, file backend |
 | [http-server.md](http-server.md) | the optional axum listener, and what it does NOT serve |
-| [http-client.md](http-client.md) | `reqwest` plus retry and circuit breaker |
+| [http-client.md](http-client.md) | `reqwest` plus retry, backoff and the signing hook |
+| [auth.md](auth.md) | credential acquisition (token exchanges, metadata servers) and placement |
 | [directory-config.md](directory-config.md) | YAML directory store, optional git backing |
 | [concurrency.md](concurrency.md) | `BackgroundSink`, `PeriodicWorker`, `ActorHandle` |
 | [geoip-download.md](geoip-download.md) | GeoIP MMDB provisioning -- files onto disk, no lookup engine |

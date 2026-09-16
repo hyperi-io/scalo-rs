@@ -46,6 +46,7 @@ features = [
     "deployment", "config-schema",
     "expression", "version-check",
     "geoip-download",
+    "auth",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -107,7 +108,28 @@ directory-config = ["serde_yaml_ng", "tokio", "tracing"]
 directory-config-git = ["directory-config", "git2"]
 
 # Extended features (P2)
-http = ["reqwest", "serde_json", "dep:backon", "tokio"]
+# `base64` carries the Basic-auth credential encoder in http_client::signer:
+# reqwest's own encoder is private and only reachable from a RequestBuilder,
+# and a signer runs against a built Request.
+http = ["reqwest", "serde_json", "dep:backon", "tokio", "base64"]
+
+# Credential acquisition + placement (scalo-rs#84, #88). Sources cache and
+# renew one credential under single-flight; placements are RequestSigner impls
+# that put it on a request through the shared HttpClient retry loop.
+#
+# `reqwest/query` is the query placement's encoder and `reqwest/form` the token
+# exchange's; both are feature-gated in reqwest 0.13 so only this feature pays
+# for `serde_urlencoded`. No signing scheme is pulled in -- SigV4 and HMAC stay
+# with their consumers as impls of the trait.
+auth = [
+    "http",
+    "serde_json",
+    "dep:arc-swap",
+    "tokio",
+    "tracing",
+    "reqwest/query",
+    "reqwest/form",
+]
 http-server = ["axum", "tower", "tower-http", "tokio", "tracing"]
 spool = ["yaque", "zstd", "dep:crc32c", "chrono"]
 tiered-sink = ["transport", "yaque", "zstd", "lz4_flex", "snap", "tokio", "libc", "tracing", "dep:crc32c", "chrono"]
@@ -244,7 +266,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:web
 dangerous-diagnostics = []
 
 # Full feature set
-full = ["config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls", "geoip-download"]
+full = ["config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls", "geoip-download", "auth"]
 
 [dependencies]
 # Serialisation (always needed)
@@ -327,6 +349,13 @@ reqwest = { version = ">=0.13.3, <0.14", default-features = false, features = ["
 # Retry/backoff (GCRA-style exponential + jitter + dynamic Retry-After adjust).
 # Apache-2.0, edition 2024, MSRV 1.85. Latest 1.6.0 web-checked 2026-06-26.
 backon = { version = ">=1.6.0, <2", optional = true }
+
+# Lock-free atomic Arc swap, holding the one cached credential the `auth`
+# sources hand out. The tier list puts read-mostly state that is swapped whole
+# on ArcSwap and rules out RwLock<Arc<T>>: a cache hit is then one atomic load
+# and a pointer clone, and never parks. MIT/Apache-2.0, 1.9.2 web-checked
+# 2026-09-16 (released 2026-06-28, actively maintained).
+arc-swap = { version = ">=1.9.2, <2", optional = true }
 
 # Unified TLS trust module (src/tls.rs, `tls` feature). All already present
 # transitively (reqwest/aws-smithy pull rustls 0.23 + aws-lc-rs); these are
@@ -499,6 +528,11 @@ redis = { version = ">=1.0, <2", features = ["tokio-comp", "streams"] }
 # optional `http` dependency exactly -- two different reqwest builds in one
 # graph is an E0464 on the lib test target.
 reqwest = { version = ">=0.13.3, <0.14", default-features = false, features = ["json", "rustls"] }
+# Serves the signer and credential-exchange integration tests from a real
+# listener on an ephemeral port, so the assertions are what went over the wire.
+# Same declaration as the optional `http-server` dependency for the reason the
+# reqwest note above gives.
+axum = ">=0.8.8, <0.9"
 
 [lints.rust]
 unsafe_code = "deny"
@@ -555,6 +589,12 @@ required-features = ["concurrency"]
 name = "strmatch"
 harness = false
 required-features = ["strmatch"]
+
+# The credential cache-hit path: a number for the record, not a CI gate.
+[[bench]]
+name = "auth_hit"
+harness = false
+required-features = ["auth"]
 
 # Memory backpressure operational-test harness (not a product binary).
 # Driven under a cgroup --memory limit by scripts/operational-mem-test.sh.

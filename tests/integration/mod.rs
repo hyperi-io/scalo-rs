@@ -27,3 +27,9 @@ mod directory_config;
 
 #[cfg(feature = "expression")]
 mod expression;
+
+#[cfg(feature = "http")]
+mod http_client_signed;
+
+#[cfg(feature = "auth")]
+mod auth;
