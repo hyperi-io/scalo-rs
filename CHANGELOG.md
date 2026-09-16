@@ -3,6 +3,19 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.3](https://github.com/hyperi-io/scalo-rs/compare/v2.12.2...v2.12.3) (2026-09-16)
+
+### Bug Fixes
+
+* **auth:** shared credential sources and request signers under one retry loop ([183700f](https://github.com/hyperi-io/scalo-rs/commit/183700f59d5ef7a1823b96099d5f503dd894daab)), closes [#88](https://github.com/hyperi-io/scalo-rs/issues/88)
+* **concurrency:** count periodic ticks on a paused clock, not real time ([3e79150](https://github.com/hyperi-io/scalo-rs/commit/3e7915023308332f628c4d96e47a687296dfa83b)), closes [#113](https://github.com/hyperi-io/scalo-rs/issues/113)
+* **config:** accept the nested env spelling charts actually emit ([cb7d888](https://github.com/hyperi-io/scalo-rs/commit/cb7d8889aacfba25b9f48585e1169aae4b9bbfe8))
+* **config:** let a file passed to --config reach the cascade ([6ce361a](https://github.com/hyperi-io/scalo-rs/commit/6ce361a6c2212b23ee85ffd38f5c316b15f760a6))
+* **config:** say so when the cascade was never initialised ([a04441e](https://github.com/hyperi-io/scalo-rs/commit/a04441e6cc9296151b4a6979f4c8a4abcd480aef)), closes [#50](https://github.com/hyperi-io/scalo-rs/issues/50) [#49](https://github.com/hyperi-io/scalo-rs/issues/49)
+* **deployment:** give KEDA the Kafka auth parameters it recognises ([4b893b9](https://github.com/hyperi-io/scalo-rs/commit/4b893b991c375d49b95a305185723256b2ca477f))
+* **deps:** hold aws-smithy-types below 1.7 so a fresh resolve builds ([8949aee](https://github.com/hyperi-io/scalo-rs/commit/8949aee3b81a3bc1b2b5fdc3419045312ab35570))
+* **secrets:** resolve file:, bao: and aws: specs and read the first vault segment as the mount ([a1fd909](https://github.com/hyperi-io/scalo-rs/commit/a1fd9097e76590810d55670683ab54698734bf59)), closes [#82](https://github.com/hyperi-io/scalo-rs/issues/82)
+
 ## [2.12.2](https://github.com/hyperi-io/scalo-rs/compare/v2.12.1...v2.12.2) (2026-09-12)
 
 ### Bug Fixes
