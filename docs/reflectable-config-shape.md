@@ -104,8 +104,10 @@ seam and the UI masks the input.
 
 Multi-connection config (a source type with many `connections`) lives in the
 MOUNTED YAML config, not in ENV. Each connection carries a scalar
-`credential_secret` REF of the form `provider:path:key` (e.g.
-`vault:secret/aws/prod:credentials`). External Secrets materialises the real
+`credential_secret` REF of the form `provider:path:key`, where a vault path
+opens with its KV mount and the KV v2 `data` segment is optional (e.g.
+`vault:secret/aws/prod:credentials` reads `aws/prod` on the `secret` mount).
+External Secrets materialises the real
 secret into the referenced backend; the app resolves it at fetch time via
 `scalo::secrets::resolve`. ENV vars stay for singleton/scalar legacy config only
 -- there is NO array-index ENV encoding and NO JSON-in-ENV blob. This keeps K8s

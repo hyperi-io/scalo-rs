@@ -9,10 +9,11 @@
 //! Credential specification resolution.
 //!
 //! Resolves credential specs in these formats:
-//! - `vault:path:key` -- fetch from OpenBao via [`super::SecretsManager`]
-//!   (requires the `secrets-vault` feature)
-//! - `bao:path:key` / `openbao:path:key` -- the same lookup under the names the
-//!   OpenBao tooling uses
+//! - `vault:mount/path:key` -- fetch from OpenBao via [`super::SecretsManager`]
+//!   (requires the `secrets-vault` feature); the KV v2 `data` segment is
+//!   optional
+//! - `bao:mount/path:key` / `openbao:mount/path:key` -- the same lookup under
+//!   the names the OpenBao tooling uses
 //! - `file:path` -- read a local file, typically a mounted Kubernetes Secret
 //! - `aws:secret_id` or `aws:secret_id:key` -- fetch from AWS Secrets Manager
 //!   (requires the `secrets-aws` feature)
@@ -66,8 +67,8 @@ pub enum CredentialError {
 
 /// Resolve a credential spec to its plaintext value.
 ///
-/// - `vault:path:key`, `bao:path:key` and `openbao:path:key` resolve via
-///   OpenBao (needs `secrets-vault`)
+/// - `vault:mount/path:key`, `bao:mount/path:key` and `openbao:mount/path:key`
+///   resolve via OpenBao (needs `secrets-vault`)
 /// - `file:path` reads a local file
 /// - `aws:secret_id` or `aws:secret_id:key` resolves via AWS Secrets Manager
 ///   (needs `secrets-aws`)

@@ -54,8 +54,8 @@ syntax instead of each hand-rolling its own env/vault lookup:
 
 | Spec | Resolves to |
 |------|-------------|
-| `vault:path:key` | OpenBao lookup via `SecretsManager` (needs `secrets-vault`) |
-| `bao:path:key`, `openbao:path:key` | the same lookup, spelled as the OpenBao tooling spells it |
+| `vault:<mount>/<path>:<key>` | OpenBao lookup via `SecretsManager`: the first segment is the KV mount, the KV v2 `data` segment is optional (needs `secrets-vault`) |
+| `bao:<mount>/<path>:<key>`, `openbao:<mount>/<path>:<key>` | the same lookup, spelled as the OpenBao tooling spells it |
 | `file:path` | the contents of a local file, read fresh every time so a rotated mount is seen |
 | `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`) |
 | `env:VAR` | the environment variable `VAR` (hard error if unset) |
@@ -163,7 +163,7 @@ backend.
 | `SecretProvider` trait | Implement to add a custom backend |
 | `SecretValue::as_str() -> SecretsResult<&str>` | Reveal the raw value as UTF-8 (grep-able call site) |
 | `SecretValue::as_bytes() -> &[u8]` | Reveal the raw value as bytes |
-| `resolve(spec) -> String` | Resolve a `vault:`/`bao:`/`openbao:`/`file:`/`aws:`/`env:`/literal credential spec |
+| `resolve(spec) -> String` | Resolve a `vault:<mount>/<path>:<key>`, `bao:`, `openbao:`, `file:`, `aws:`, `env:` or literal credential spec |
 | `resolve_optional(Option<spec>) -> Option<String>` | As `resolve`, but `None`/empty in -> `None` out |
 | `CredentialError` | Failure modes for `resolve` / `resolve_optional` |
 

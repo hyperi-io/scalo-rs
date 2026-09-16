@@ -406,25 +406,21 @@ impl OpenBaoProvider {
         ))
     }
 
-    /// Parse a Vault path into mount and secret path.
+    /// Parse a Vault path into its mount and the secret path under that mount.
     ///
-    /// Handles formats:
+    /// The first segment is the mount; a `data` segment after it is the KV v2
+    /// API prefix `kv2::read` adds itself, not part of the secret path:
     /// - "secret/data/myapp/tls" -> ("secret", "myapp/tls")
-    /// - "myapp/tls" -> ("secret", "myapp/tls") (default mount)
+    /// - "kv/myapp/tls" -> ("kv", "myapp/tls")
+    /// - "myapp" -> ("secret", "myapp"), the only path with no mount to read
     fn parse_path(path: &str) -> (String, String) {
-        // Check for KV v2 "data" in path
-        if let Some(rest) = path.strip_prefix("secret/data/") {
-            return ("secret".into(), rest.into());
+        let Some((mount, rest)) = path.split_once('/') else {
+            return ("secret".into(), path.into());
+        };
+        if let Some(under_data) = rest.strip_prefix("data/") {
+            return (mount.into(), under_data.into());
         }
-
-        // Check for custom mount with "data" segment
-        let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if parts.len() >= 3 && parts[1] == "data" {
-            return (parts[0].into(), parts[2..].join("/"));
-        }
-
-        // Default to "secret" mount
-        ("secret".into(), path.into())
+        (mount.into(), rest.into())
     }
 }
 
@@ -470,11 +466,30 @@ mod tests {
         assert_eq!(path, "myapp/creds");
     }
 
+    /// A path with no `/` carries no mount segment, so it falls back to the
+    /// `secret` mount.
     #[test]
-    fn test_parse_path_default_mount() {
-        let (mount, path) = OpenBaoProvider::parse_path("myapp/tls");
+    fn parse_path_falls_back_to_the_secret_mount() {
+        let (mount, path) = OpenBaoProvider::parse_path("myapp");
         assert_eq!(mount, "secret");
-        assert_eq!(path, "myapp/tls");
+        assert_eq!(path, "myapp");
+    }
+
+    /// The first segment is the mount whether or not `data` follows it, so
+    /// `secret/tls` is the `tls` secret on the `secret` mount rather than
+    /// `secret/tls` under a doubled mount.
+    #[test]
+    fn parse_path_reads_the_first_segment_as_the_mount() {
+        let (mount, path) = OpenBaoProvider::parse_path("secret/tls");
+        assert_eq!(mount, "secret");
+        assert_eq!(path, "tls");
+    }
+
+    #[test]
+    fn parse_path_keeps_a_multi_segment_path_under_its_mount() {
+        let (mount, path) = OpenBaoProvider::parse_path("kv/dfe-test/runzero");
+        assert_eq!(mount, "kv");
+        assert_eq!(path, "dfe-test/runzero");
     }
 
     #[test]

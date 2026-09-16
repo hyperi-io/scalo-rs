@@ -561,6 +561,26 @@ the routing table size. No consumer code change required — only
 the metric label values change. Dashboards keyed on per-message
 keys need rewiring.
 
+### `vault:` path -- the first segment is the mount (BEHAVIOUR CHANGE)
+
+`OpenBaoProvider` now reads the first segment of a vault path as the KV
+mount, with the KV v2 `data` segment optional. `vault:secret/x:key` used
+to request `secret/data/secret/x`, so the obvious spelling read the wrong
+path, and a non-default mount could only be named by writing `data`
+yourself.
+
+| Spec | Old | New |
+|---|---|---|
+| `vault:secret/data/myapp/tls:k` | mount `secret`, path `myapp/tls` | unchanged |
+| `vault:kv/data/myapp/tls:k` | mount `kv`, path `myapp/tls` | unchanged |
+| `vault:kv/myapp/tls:k` | mount `secret`, path `kv/myapp/tls` | mount `kv`, path `myapp/tls` |
+| `vault:myapp:k` | mount `secret`, path `myapp` | unchanged |
+
+**Consumer adjustment** -- one spelling changes meaning: a two-segment
+path with no `data` (`myapp/tls`) was the `secret` mount and is now the
+`myapp` mount. Anything relying on it reads a path that does not exist,
+so write the mount you mean (`secret/myapp/tls`).
+
 ---
 
 ## Known open issues (not fixed on this branch)
