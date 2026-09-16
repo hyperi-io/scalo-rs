@@ -55,9 +55,10 @@ syntax instead of each hand-rolling its own env/vault lookup:
 | Spec | Resolves to |
 |------|-------------|
 | `vault:<mount>/<path>:<key>` | OpenBao lookup via `SecretsManager`: the first segment is the KV mount, the KV v2 `data` segment is optional (needs `secrets-vault`) |
+| `vault:<name>:<key>` | the same lookup on the default `secret` mount, for a path with no mount segment |
 | `bao:<mount>/<path>:<key>`, `openbao:<mount>/<path>:<key>` | the same lookup, spelled as the OpenBao tooling spells it |
-| `file:path` | the contents of a local file, read fresh every time so a rotated mount is seen |
-| `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`) |
+| `file:path` | the contents of a local file, read fresh every time so a rotated mount is seen; a zero-byte file is refused |
+| `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`). An ARN is refused -- it carries colons of its own, so use the secret name or an `aws` source in `secrets.sources` |
 | `env:VAR` | the environment variable `VAR` (hard error if unset) |
 | anything else | the literal string |
 

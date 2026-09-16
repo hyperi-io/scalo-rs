@@ -81,12 +81,86 @@ pub enum CredentialError {
 /// the spec names a provider whose feature is not enabled.
 pub async fn resolve(spec: &str) -> Result<String, CredentialError> {
     match spec.split_once(':') {
-        Some(("vault" | "bao" | "openbao", rest)) => resolve_vault(rest).await,
-        Some(("file", path)) => resolve_file(path).await,
-        Some(("aws", rest)) => resolve_aws(rest).await,
+        Some(("vault" | "bao" | "openbao", rest)) => {
+            let (path, key) = parse_vault_spec(rest)?;
+            resolve_vault(spec, path, key).await
+        }
+        Some(("file", path)) => resolve_file(spec, parse_file_spec(path)?).await,
+        Some(("aws", rest)) => {
+            let (secret_id, key) = parse_aws_spec(rest)?;
+            resolve_aws(spec, secret_id, key).await
+        }
         Some(("env", var_name)) => resolve_env(var_name),
         _ => Ok(spec.to_string()),
     }
+}
+
+/// Split the path and key out of a `vault:` spec.
+///
+/// Shape is checked before any provider work so a malformed spec reads the same
+/// whether or not the `secrets-vault` feature is compiled in.
+fn parse_vault_spec(rest: &str) -> Result<(&str, &str), CredentialError> {
+    match rest.split_once(':') {
+        Some((path, key)) if !path.is_empty() && !key.is_empty() => Ok((path, key)),
+        _ => Err(CredentialError::BadSpec(format!(
+            "invalid vault spec '{rest}', expected 'mount/path:key' with both parts present"
+        ))),
+    }
+}
+
+/// Check the path of a `file:` spec.
+fn parse_file_spec(path: &str) -> Result<&str, CredentialError> {
+    if path.is_empty() {
+        return Err(CredentialError::BadSpec(
+            "invalid file spec, expected 'file:path'".to_string(),
+        ));
+    }
+    Ok(path)
+}
+
+/// Split the secret id and the optional JSON key out of an `aws:` spec.
+///
+/// An ARN is refused rather than split: it carries colons of its own, so the
+/// `aws:secret_id[:key]` shape cannot say where the id ends.
+fn parse_aws_spec(rest: &str) -> Result<(&str, Option<&str>), CredentialError> {
+    if rest.starts_with("arn:") {
+        return Err(CredentialError::BadSpec(format!(
+            "aws spec '{rest}' names an ARN, which this shape cannot express because an \
+             ARN contains colons -- use the secret name, or declare an `aws` source in \
+             `secrets.sources` to look one up by ARN"
+        )));
+    }
+    let (secret_id, key) = match rest.split_once(':') {
+        Some((id, key)) => (id, Some(key)),
+        None => (rest, None),
+    };
+    if secret_id.is_empty() {
+        return Err(CredentialError::BadSpec(
+            "invalid aws spec, expected 'aws:secret_id' or 'aws:secret_id:key'".to_string(),
+        ));
+    }
+    Ok((secret_id, key))
+}
+
+/// The source name a one-off lookup registers its spec under.
+///
+/// [`super::SecretCache`] keys on the source name and binds the disk tier's
+/// AEAD to it, and that disk tier is shared by every scalo process running as
+/// this user, so a name fixed per provider would serve one spec's secret to the
+/// next spec that asks.
+fn one_off_source_name(spec: &str) -> String {
+    format!("credential-spec:{spec}")
+}
+
+/// Turn the cache off for a one-off lookup.
+///
+/// The manager is discarded after the single read, so a cache entry can only be
+/// read back by a different spec or a different process.
+fn without_cache(config: &mut super::SecretsConfig) {
+    config.cache = super::CacheConfig {
+        enabled: false,
+        ..super::CacheConfig::default()
+    };
 }
 
 /// Resolve an optional credential spec -- returns `None` for `None`/empty.
@@ -107,36 +181,46 @@ fn resolve_env(var_name: &str) -> Result<String, CredentialError> {
     })
 }
 
-/// Read a `file:` credential straight from disk.
+/// The `SecretsConfig` a one-off `file:` read runs against.
 ///
-/// The cache is off: a mounted Kubernetes Secret is rewritten in place when it
-/// rotates, and a cached copy would keep serving the retired value.
-async fn resolve_file(path: &str) -> Result<String, CredentialError> {
-    use super::{CacheConfig, SecretsConfig, SecretsManager};
+/// Nothing is cached: a mounted Kubernetes Secret is rewritten in place when it
+/// rotates, so a cached copy would keep serving the retired value.
+fn file_lookup_config() -> super::SecretsConfig {
+    let mut config = super::SecretsConfig::default();
+    without_cache(&mut config);
+    config
+}
 
-    if path.is_empty() {
-        return Err(CredentialError::BadSpec(
-            "invalid file spec, expected 'file:path'".to_string(),
-        ));
-    }
+/// Read a `file:` credential straight from disk.
+async fn resolve_file(spec: &str, path: &str) -> Result<String, CredentialError> {
+    use super::{SecretSource, SecretsManager};
+
     let failed = |message: String| CredentialError::File {
         path: path.to_string(),
         message,
     };
 
-    let config = SecretsConfig {
-        cache: CacheConfig {
-            enabled: false,
-            ..CacheConfig::default()
+    let name = one_off_source_name(spec);
+    let mut config = file_lookup_config();
+    config.sources.insert(
+        name.clone(),
+        SecretSource::File {
+            path: path.to_string(),
         },
-        ..SecretsConfig::default()
-    };
+    );
+
     let secrets = SecretsManager::new(config)
         .map_err(|e| failed(format!("failed to initialise secrets manager: {e}")))?;
     let value = secrets
-        .get_file(path)
+        .get(&name)
         .await
         .map_err(|e| failed(e.to_string()))?;
+    if value.as_bytes().is_empty() {
+        return Err(failed(
+            "file is empty, which is a mount or rotation failure rather than a credential"
+                .to_string(),
+        ));
+    }
     let text = value
         .as_str()
         .map_err(|e| failed(format!("file secret not valid UTF-8: {e}")))?;
@@ -167,6 +251,7 @@ fn secrets_config_for_lookup() -> Result<super::SecretsConfig, CredentialError> 
                 .to_string(),
         ));
     }
+    without_cache(&mut config);
     Ok(config)
 }
 
@@ -182,21 +267,13 @@ fn secrets_config_for_lookup() -> Result<super::SecretsConfig, CredentialError> 
 }
 
 #[cfg(feature = "secrets-vault")]
-async fn resolve_vault(path_key: &str) -> Result<String, CredentialError> {
+async fn resolve_vault(spec: &str, path: &str, key: &str) -> Result<String, CredentialError> {
     use super::{SecretSource, SecretsManager};
 
-    let parts: Vec<&str> = path_key.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err(CredentialError::BadSpec(format!(
-            "invalid vault spec '{path_key}', expected 'path:key'"
-        )));
-    }
-    let path = parts[0];
-    let key = parts[1];
-
+    let name = one_off_source_name(spec);
     let mut config = secrets_config_for_lookup()?;
     config.sources.insert(
-        "_vault_lookup".to_string(),
+        name.clone(),
         SecretSource::OpenBao {
             path: path.to_string(),
             key: key.to_string(),
@@ -207,7 +284,7 @@ async fn resolve_vault(path_key: &str) -> Result<String, CredentialError> {
         CredentialError::Vault(format!("failed to initialise secrets manager: {e}"))
     })?;
     let value = secrets
-        .get("_vault_lookup")
+        .get(&name)
         .await
         .map_err(|e| CredentialError::Vault(format!("lookup failed for {path}:{key}: {e}")))?;
     let text = value
@@ -219,7 +296,7 @@ async fn resolve_vault(path_key: &str) -> Result<String, CredentialError> {
 
 #[cfg(not(feature = "secrets-vault"))]
 #[allow(clippy::unused_async)] // signature must mirror the secrets-vault variant
-async fn resolve_vault(_path_key: &str) -> Result<String, CredentialError> {
+async fn resolve_vault(_spec: &str, _path: &str, _key: &str) -> Result<String, CredentialError> {
     Err(CredentialError::VaultUnsupported)
 }
 
@@ -241,29 +318,25 @@ fn secrets_config_for_aws_lookup() -> super::SecretsConfig {
             config.aws = Some(super::AwsConfig::default());
         }
     }
+    without_cache(&mut config);
     config
 }
 
 #[cfg(feature = "secrets-aws")]
-async fn resolve_aws(secret_ref: &str) -> Result<String, CredentialError> {
+async fn resolve_aws(
+    spec: &str,
+    secret_id: &str,
+    key: Option<&str>,
+) -> Result<String, CredentialError> {
     use super::{SecretSource, SecretsManager};
 
-    let (secret_id, key) = match secret_ref.split_once(':') {
-        Some((id, key)) => (id, Some(key.to_string())),
-        None => (secret_ref, None),
-    };
-    if secret_id.is_empty() {
-        return Err(CredentialError::BadSpec(
-            "invalid aws spec, expected 'aws:secret_id' or 'aws:secret_id:key'".to_string(),
-        ));
-    }
-
+    let name = one_off_source_name(spec);
     let mut config = secrets_config_for_aws_lookup();
     config.sources.insert(
-        "_aws_lookup".to_string(),
+        name.clone(),
         SecretSource::Aws {
             secret_id: secret_id.to_string(),
-            key,
+            key: key.map(str::to_string),
         },
     );
 
@@ -274,7 +347,7 @@ async fn resolve_aws(secret_ref: &str) -> Result<String, CredentialError> {
         .map_err(|e| CredentialError::Aws(format!("secrets manager task failed: {e}")))?
         .map_err(|e| CredentialError::Aws(format!("failed to initialise secrets manager: {e}")))?;
     let value = secrets
-        .get("_aws_lookup")
+        .get(&name)
         .await
         .map_err(|e| CredentialError::Aws(format!("lookup failed for {secret_id}: {e}")))?;
     let text = value
@@ -286,7 +359,11 @@ async fn resolve_aws(secret_ref: &str) -> Result<String, CredentialError> {
 
 #[cfg(not(feature = "secrets-aws"))]
 #[allow(clippy::unused_async)] // signature must mirror the secrets-aws variant
-async fn resolve_aws(_secret_ref: &str) -> Result<String, CredentialError> {
+async fn resolve_aws(
+    _spec: &str,
+    _secret_id: &str,
+    _key: Option<&str>,
+) -> Result<String, CredentialError> {
     Err(CredentialError::AwsUnsupported)
 }
 
@@ -375,18 +452,222 @@ mod tests {
     }
 
     /// A mounted Kubernetes Secret is rewritten in place when it rotates, so the
-    /// next read must return the new value rather than a cached one.
+    /// one-off read must not cache. The config here is the one a `file:` spec
+    /// runs against, given a live directory and the plaintext opt-in, so both
+    /// cache tiers would answer the second read if `enabled` ever flipped to
+    /// true and the rotated value would be missed.
     #[tokio::test]
-    async fn file_spec_sees_a_rotated_value_on_the_next_read() {
+    async fn file_lookups_do_not_cache_a_rotated_value() {
+        use super::super::{SecretSource, SecretsManager};
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token");
-        let spec = format!("file:{}", path.display());
-
         std::fs::write(&path, "before-rotation").unwrap();
-        assert_eq!(resolve(&spec).await.unwrap(), "before-rotation");
+
+        let name = one_off_source_name("file:token");
+        let mut config = file_lookup_config();
+        config.cache.directory = Some(dir.path().join("cache"));
+        config.cache.allow_plaintext_disk_cache = true;
+        config.sources.insert(
+            name.clone(),
+            SecretSource::File {
+                path: path.display().to_string(),
+            },
+        );
+        let secrets = SecretsManager::new(config).unwrap();
+
+        let before = secrets.get(&name).await.unwrap();
+        assert_eq!(before.as_str().unwrap(), "before-rotation");
 
         std::fs::write(&path, "after-rotation").unwrap();
-        assert_eq!(resolve(&spec).await.unwrap(), "after-rotation");
+        let after = secrets.get(&name).await.unwrap();
+        assert_eq!(
+            after.as_str().unwrap(),
+            "after-rotation",
+            "a rotated mount must not be answered from cache"
+        );
+    }
+
+    /// The disk cache tier is shared by every scalo process running as this
+    /// user and is keyed on the source name, so two one-off lookups must not
+    /// register under the same name or the second spec reads the first spec's
+    /// secret. `SecretSource::File` stands in for the providers that need a
+    /// server.
+    #[tokio::test]
+    async fn one_off_lookups_do_not_share_a_cache_entry() {
+        use super::super::CacheConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::write(&first, "first-secret").unwrap();
+        std::fs::write(&second, "second-secret").unwrap();
+
+        let cache = CacheConfig {
+            enabled: true,
+            directory: Some(dir.path().join("cache")),
+            encryption_key: Some(crate::SensitiveString::from("cache-encryption-key")),
+            ..CacheConfig::default()
+        };
+
+        assert_eq!(
+            read_through_shared_cache(&cache, "file:first", &first).await,
+            "first-secret"
+        );
+        assert_eq!(
+            read_through_shared_cache(&cache, "file:second", &second).await,
+            "second-secret",
+            "the second spec must read its own secret, not the first spec's cached one"
+        );
+    }
+
+    /// One spec's read through a fresh manager over a shared cache directory,
+    /// as two scalo processes resolving two specs would see it.
+    async fn read_through_shared_cache(
+        cache: &super::super::CacheConfig,
+        spec: &str,
+        path: &std::path::Path,
+    ) -> String {
+        use super::super::{SecretSource, SecretsConfig, SecretsManager};
+
+        let name = one_off_source_name(spec);
+        let config = SecretsConfig {
+            cache: cache.clone(),
+            sources: [(
+                name.clone(),
+                SecretSource::File {
+                    path: path.display().to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..SecretsConfig::default()
+        };
+        let secrets = SecretsManager::new(config).unwrap();
+        let value = secrets.get(&name).await.unwrap();
+        value.as_str().unwrap().to_string()
+    }
+
+    /// A zero-byte secret file is a mount or rotation failure, and resolving it
+    /// to an empty password hands the failure to whatever authenticates next.
+    #[tokio::test]
+    async fn file_spec_refuses_a_zero_byte_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-token");
+        std::fs::write(&path, "").unwrap();
+
+        let err = resolve(&format!("file:{}", path.display()))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains(&path.display().to_string()),
+            "the refusal must name the path: {err}"
+        );
+    }
+
+    /// An empty path is a malformed spec whatever the feature set, and reaching
+    /// the filesystem with it would only produce a confusing read error.
+    #[tokio::test]
+    async fn file_spec_with_no_path_is_refused() {
+        let err = resolve("file:").await.unwrap_err();
+        assert!(
+            matches!(err, CredentialError::BadSpec(_)),
+            "expected BadSpec, got {err:?}"
+        );
+    }
+
+    /// Spec shape is checked before provider dispatch, so an empty secret id is
+    /// refused under every feature set rather than reported as a missing
+    /// feature.
+    #[tokio::test]
+    async fn aws_spec_with_no_secret_id_is_refused() {
+        let err = resolve("aws:").await.unwrap_err();
+        assert!(
+            matches!(err, CredentialError::BadSpec(_)),
+            "expected BadSpec, got {err:?}"
+        );
+    }
+
+    /// An `aws:` ARN cannot be split into id and key, so refuse it and name the
+    /// way around it rather than looking up the leading fragment.
+    #[tokio::test]
+    async fn aws_spec_refuses_an_arn() {
+        let err = resolve("aws:arn:aws:secretsmanager:ap-southeast-2:1:secret:x")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("ARN"), "the refusal must name the ARN: {err}");
+        assert!(
+            err.contains("secrets.sources"),
+            "the refusal must name the way around it: {err}"
+        );
+    }
+
+    /// A `vault:` spec with no key cannot be served, so refuse it before the
+    /// round trip rather than reading the whole secret and finding no key.
+    #[tokio::test]
+    async fn vault_spec_with_no_key_is_refused() {
+        for spec in ["vault:secret/x:", "vault:secret/x"] {
+            let err = resolve(spec).await.unwrap_err();
+            assert!(
+                matches!(err, CredentialError::BadSpec(_)),
+                "{spec} must be refused as malformed, got {err:?}"
+            );
+        }
+    }
+
+    /// A one-off vault lookup throws its manager away after the read, so a
+    /// cache entry can only be read back by a different spec or a different
+    /// process.
+    #[test]
+    #[cfg(all(feature = "secrets-vault", feature = "config"))]
+    fn vault_lookup_config_turns_the_cache_off() {
+        let config = temp_env::with_vars(
+            [
+                ("VAULT_ADDR", Some("http://127.0.0.1:1")),
+                ("VAULT_TOKEN", Some("not-a-real-token")),
+            ],
+            || secrets_config_for_lookup().unwrap(),
+        );
+
+        assert!(
+            !config.cache.enabled,
+            "a one-off vault lookup must not cache"
+        );
+    }
+
+    /// As for vault: nothing reads the entry back except another spec or
+    /// another process.
+    #[test]
+    #[cfg(feature = "secrets-aws")]
+    fn aws_lookup_config_turns_the_cache_off() {
+        assert!(
+            !secrets_config_for_aws_lookup().cache.enabled,
+            "a one-off aws lookup must not cache"
+        );
+    }
+
+    /// With no region in the environment the lookup must leave it unset, so the
+    /// SDK chain (profile, IMDS) answers instead of a pinned default.
+    #[test]
+    #[cfg(feature = "secrets-aws")]
+    fn aws_lookup_leaves_an_unset_region_to_the_sdk() {
+        let region = temp_env::with_vars(
+            [
+                ("AWS_REGION", None::<&str>),
+                ("AWS_DEFAULT_REGION", None),
+                ("AWS_ENDPOINT_URL", None),
+            ],
+            || secrets_config_for_aws_lookup().aws.unwrap().region,
+        );
+
+        assert!(
+            region.is_none(),
+            "an unset region must stay unset, got {region:?}"
+        );
     }
 
     #[tokio::test]
@@ -478,6 +759,10 @@ mod tests {
         assert!(
             !err.contains("provider not configured"),
             "an AWS region was configured, so the provider must have been built: {err}"
+        );
+        assert!(
+            err.contains("lookup failed"),
+            "expected a failed lookup against the unreachable endpoint: {err}"
         );
     }
 

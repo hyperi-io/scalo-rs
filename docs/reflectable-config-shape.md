@@ -109,7 +109,10 @@ opens with its KV mount and the KV v2 `data` segment is optional (e.g.
 `vault:secret/aws/prod:credentials` reads `aws/prod` on the `secret` mount).
 External Secrets materialises the real
 secret into the referenced backend; the app resolves it at fetch time via
-`scalo::secrets::resolve`. ENV vars stay for singleton/scalar legacy config only
+`scalo::secrets::resolve`. Writing a REF is a TRUSTED role: `file:` resolves to
+the contents of any path the process can read, so whoever authors the config can
+hand any local file to the consumer that config names. ENV vars stay for
+singleton/scalar legacy config only
 -- there is NO array-index ENV encoding and NO JSON-in-ENV blob. This keeps K8s
 manifests sane at 50+ accounts and matches the per-connection secret-ref
 contract. The schema/catalog therefore describe `credential_secret` as a normal

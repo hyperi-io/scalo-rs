@@ -20,23 +20,15 @@ use super::provider::SecretProvider;
 use super::types::{SecretMetadata, SecretValue};
 
 /// AWS Secrets Manager configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AwsConfig {
-    /// AWS region.
-    pub region: String,
+    /// AWS region. `None` leaves the region to the SDK's own resolution chain
+    /// (`AWS_REGION`, the active profile, IMDS on an instance).
+    pub region: Option<String>,
 
     /// Custom endpoint URL (for LocalStack or other custom endpoints).
     pub endpoint_url: Option<String>,
-}
-
-impl Default for AwsConfig {
-    fn default() -> Self {
-        Self {
-            region: "us-east-1".into(),
-            endpoint_url: None,
-        }
-    }
 }
 
 impl AwsConfig {
@@ -46,6 +38,8 @@ impl AwsConfig {
     /// - `AWS_DEFAULT_REGION` (legacy: `AWS_REGION`)
     /// - `AWS_ENDPOINT_URL` (for LocalStack or custom endpoints)
     ///
+    /// An unset region stays unset so the SDK chain resolves it.
+    ///
     /// Note: AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
     /// are automatically loaded by the AWS SDK credential chain.
     #[cfg(feature = "config")]
@@ -54,7 +48,7 @@ impl AwsConfig {
         use crate::config::env_compat::aws;
 
         Self {
-            region: aws::region().get_or("us-east-1"),
+            region: aws::region().get(),
             endpoint_url: aws::endpoint_url().get(),
         }
     }
@@ -63,16 +57,19 @@ impl AwsConfig {
     #[must_use]
     pub fn with_region(region: &str) -> Self {
         Self {
-            region: region.to_string(),
+            region: Some(region.to_string()),
             endpoint_url: None,
         }
     }
 
     /// Create a configuration for LocalStack.
+    ///
+    /// The region is named explicitly: LocalStack has no IMDS for the SDK
+    /// chain to fall back on.
     #[must_use]
     pub fn for_localstack(endpoint: &str) -> Self {
         Self {
-            region: "us-east-1".to_string(),
+            region: Some("us-east-1".to_string()),
             endpoint_url: Some(endpoint.to_string()),
         }
     }
@@ -113,15 +110,20 @@ impl AwsProvider {
     }
 
     /// Create the AWS client asynchronously.
+    ///
+    /// A region is set only when one is configured, so an unset region falls
+    /// through to the SDK chain rather than being pinned to a default.
     async fn create_client(config: &AwsConfig) -> SecretsResult<Client> {
-        let mut aws_config = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_config::Region::new(config.region.clone()));
+        let mut loader = aws_config::defaults(BehaviorVersion::latest());
 
+        if let Some(ref region) = config.region {
+            loader = loader.region(aws_config::Region::new(region.clone()));
+        }
         if let Some(ref endpoint) = config.endpoint_url {
-            aws_config = aws_config.endpoint_url(endpoint);
+            loader = loader.endpoint_url(endpoint);
         }
 
-        let aws_config = aws_config.load().await;
+        let aws_config = loader.load().await;
         Ok(Client::new(&aws_config))
     }
 
@@ -225,17 +227,23 @@ impl SecretProvider for AwsProvider {
 mod tests {
     use super::*;
 
+    /// An unset region is the SDK's job to resolve, so the default must not
+    /// pin one.
     #[test]
     fn test_aws_config_default() {
         let config = AwsConfig::default();
-        assert_eq!(config.region, "us-east-1");
+        assert!(
+            config.region.is_none(),
+            "the default must leave the region to the SDK chain, got {:?}",
+            config.region
+        );
         assert!(config.endpoint_url.is_none());
     }
 
     #[test]
     fn test_aws_config_serialization() {
         let config = AwsConfig {
-            region: "eu-west-1".into(),
+            region: Some("eu-west-1".into()),
             endpoint_url: Some("http://localhost:4566".into()),
         };
         let json = serde_json::to_string(&config).unwrap();

@@ -576,10 +576,33 @@ yourself.
 | `vault:kv/myapp/tls:k` | mount `secret`, path `kv/myapp/tls` | mount `kv`, path `myapp/tls` |
 | `vault:myapp:k` | mount `secret`, path `myapp` | unchanged |
 
-**Consumer adjustment** -- one spelling changes meaning: a two-segment
-path with no `data` (`myapp/tls`) was the `secret` mount and is now the
-`myapp` mount. Anything relying on it reads a path that does not exist,
-so write the mount you mean (`secret/myapp/tls`).
+**Consumer adjustment** -- ANY path whose second segment is not `data`
+changes meaning, at any length: its first segment used to be the first
+segment of a path under `secret` and is now the mount. `myapp/tls` was
+`secret`/`myapp/tls` and is now `myapp`/`tls`; `kv/dfe-test/runzero` was
+`secret`/`kv/dfe-test/runzero` and is now `kv`/`dfe-test/runzero`.
+Anything relying on the old reading now asks for a path that does not
+exist, so write the mount you mean (`secret/myapp/tls`).
+
+Both surfaces move together, because one parser serves both: `vault:`,
+`bao:` and `openbao:` credential specs, AND
+`secrets.sources.<name>.path` in mounted YAML. A leading or trailing
+`/` is now refused outright rather than reaching OpenBao as a request
+that can only 404.
+
+### `secrets.aws.region` is optional (BEHAVIOUR CHANGE)
+
+`AwsConfig.region` is `Option<String>`, defaulting to `None`, and the
+client sets a region only when one is configured. An unpinned region
+was previously forced to `us-east-1`, which overrode the AWS SDK's own
+chain -- the active profile and IMDS included -- so a pod with no
+`AWS_REGION` read secrets from the wrong region.
+
+**Consumer adjustment** -- code constructing `AwsConfig` literally now
+writes `region: Some("ap-southeast-2".into())`; `AwsConfig::with_region`
+and `for_localstack` are unchanged. Anything that relied on the
+`us-east-1` default must name the region it means, in config
+(`secrets.aws.region`) or in `AWS_REGION` / `AWS_DEFAULT_REGION`.
 
 ---
 
