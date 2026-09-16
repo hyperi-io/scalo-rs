@@ -151,7 +151,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // The clock is paused, so time advances only while every task is idle
+    // and the tick count is exact whatever the host is doing.
+    #[tokio::test(start_paused = true)]
     async fn tick_fires_at_interval() {
         let ticks = Arc::new(AtomicU32::new(0));
         let shutdown = CancellationToken::new();
@@ -162,11 +164,10 @@ mod tests {
             Duration::from_millis(20),
             shutdown.clone(),
         );
-        // Wait ~110ms; expect roughly 5 ticks at 20ms interval.
         tokio::time::sleep(Duration::from_millis(110)).await;
         shutdown.cancel();
         let n = ticks.load(Ordering::SeqCst);
-        assert!((4..=7).contains(&n), "got {n} ticks, expected 4-7");
+        assert_eq!(n, 5, "110ms over a 20ms interval is five ticks");
     }
 
     #[tokio::test]
@@ -209,7 +210,7 @@ mod tests {
         assert_eq!(ticks.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failing_tick_does_not_stop_worker() {
         let ticks = Arc::new(AtomicU32::new(0));
         let shutdown = CancellationToken::new();
@@ -220,12 +221,14 @@ mod tests {
             Duration::from_millis(15),
             shutdown.clone(),
         );
-        // Wait long enough for several failing ticks.
         tokio::time::sleep(Duration::from_millis(80)).await;
         shutdown.cancel();
         let n = ticks.load(Ordering::SeqCst);
-        // Worker kept ticking despite errors -- proves no panic + no exit.
-        assert!(n >= 3, "got {n} ticks, expected >=3 even with errors");
+        // Every tick failed and the worker kept going: five, not one.
+        assert_eq!(
+            n, 5,
+            "80ms over a 15ms interval is five ticks, errors or not"
+        );
     }
 
     #[tokio::test]
