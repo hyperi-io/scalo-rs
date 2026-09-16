@@ -390,7 +390,7 @@ mod aws_env {
 
         let config = AwsConfig::from_env();
 
-        assert_eq!(config.region, "eu-west-1");
+        assert_eq!(config.region.as_deref(), Some("eu-west-1"));
     }
 
     #[test]
@@ -400,7 +400,7 @@ mod aws_env {
 
         let config = AwsConfig::from_env();
 
-        assert_eq!(config.region, "ap-southeast-2");
+        assert_eq!(config.region.as_deref(), Some("ap-southeast-2"));
     }
 
     #[test]
@@ -416,10 +416,11 @@ mod aws_env {
         );
     }
 
+    /// With no region in the environment the config carries none, so the AWS
+    /// SDK chain (profile, IMDS) resolves it instead of a pinned default.
     #[test]
-    fn test_aws_from_env_default_region() {
+    fn test_aws_from_env_leaves_an_unset_region_unset() {
         let _lock = ENV_LOCK.lock().unwrap();
-        // Clear any region vars so we get the hard-coded default
         let saved_default = std::env::var("AWS_DEFAULT_REGION").ok();
         let saved_legacy = std::env::var("AWS_REGION").ok();
         // SAFETY: ENV_LOCK held, single-threaded test
@@ -430,7 +431,11 @@ mod aws_env {
 
         let config = AwsConfig::from_env();
 
-        assert_eq!(config.region, "us-east-1");
+        assert!(
+            config.region.is_none(),
+            "an unset region must stay unset, got {:?}",
+            config.region
+        );
 
         // Restore
         // SAFETY: ENV_LOCK held, single-threaded test

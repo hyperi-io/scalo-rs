@@ -54,7 +54,11 @@ syntax instead of each hand-rolling its own env/vault lookup:
 
 | Spec | Resolves to |
 |------|-------------|
-| `vault:path:key` | OpenBao lookup via `SecretsManager` (needs `secrets-vault`) |
+| `vault:<mount>/<path>:<key>` | OpenBao lookup via `SecretsManager`: the first segment is the KV mount, the KV v2 `data` segment is optional (needs `secrets-vault`) |
+| `vault:<name>:<key>` | the same lookup on the default `secret` mount, for a path with no mount segment |
+| `bao:<mount>/<path>:<key>`, `openbao:<mount>/<path>:<key>` | the same lookup, spelled as the OpenBao tooling spells it |
+| `file:path` | the contents of a local file, read fresh every time so a rotated mount is seen; a zero-byte file is refused |
+| `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`). An ARN is refused -- it carries colons of its own, so use the secret name or an `aws` source in `secrets.sources` |
 | `env:VAR` | the environment variable `VAR` (hard error if unset) |
 | anything else | the literal string |
 
@@ -67,8 +71,9 @@ let password = resolve(spec).await?;
 
 `resolve_optional(Option<&str>)` returns `None` for `None` or an empty
 string, otherwise resolves the inner spec. Failures surface as
-`CredentialError` -- missing env var, vault lookup failure, malformed
-vault spec, or a `vault:` spec used without the `secrets-vault` feature.
+`CredentialError` -- missing env var, unreadable file, vault or AWS
+lookup failure, malformed spec, or a spec naming a provider whose
+feature is off.
 
 ---
 
@@ -159,7 +164,7 @@ backend.
 | `SecretProvider` trait | Implement to add a custom backend |
 | `SecretValue::as_str() -> SecretsResult<&str>` | Reveal the raw value as UTF-8 (grep-able call site) |
 | `SecretValue::as_bytes() -> &[u8]` | Reveal the raw value as bytes |
-| `resolve(spec) -> String` | Resolve a `vault:`/`env:`/literal credential spec |
+| `resolve(spec) -> String` | Resolve a `vault:<mount>/<path>:<key>`, `bao:`, `openbao:`, `file:`, `aws:`, `env:` or literal credential spec |
 | `resolve_optional(Option<spec>) -> Option<String>` | As `resolve`, but `None`/empty in -> `None` out |
 | `CredentialError` | Failure modes for `resolve` / `resolve_optional` |
 

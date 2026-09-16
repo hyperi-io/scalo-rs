@@ -30,7 +30,14 @@
 //! [`resolve`] / [`resolve_optional`] turn a short credential spec string
 //! into a plaintext value, so data-plane services share one syntax:
 //!
-//! - `vault:path:key` -- fetch from OpenBao (needs the `secrets-vault` feature)
+//! - `vault:mount/path:key` -- fetch from OpenBao (needs the `secrets-vault`
+//!   feature); the first segment is the KV mount and the KV v2 `data` segment
+//!   is optional
+//! - `bao:mount/path:key` / `openbao:mount/path:key` -- the same lookup,
+//!   spelled as the OpenBao tooling spells it
+//! - `file:path` -- read a local file, typically a mounted Kubernetes Secret
+//! - `aws:secret_id` or `aws:secret_id:key` -- fetch from AWS Secrets Manager
+//!   (needs the `secrets-aws` feature)
 //! - `env:VAR` -- read an environment variable (hard error if unset)
 //! - any other string -- used as a literal value
 //!

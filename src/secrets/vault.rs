@@ -371,9 +371,9 @@ impl OpenBaoProvider {
     pub async fn get(&self, path: &str, key: &str) -> SecretsResult<SecretValue> {
         let client = self.get_client().await?;
 
-        // Parse path to extract mount and secret path
-        // Expected format: "secret/data/myapp/tls" or "myapp/tls" (assumes "secret" mount)
-        let (mount, secret_path) = Self::parse_path(path);
+        // "<mount>/<path>", with an optional KV v2 "data" segment after the
+        // mount; a path with no "/" reads from the "secret" mount.
+        let (mount, secret_path) = Self::parse_path(path)?;
 
         // Read the secret
         let secret: std::collections::HashMap<String, String> =
@@ -406,25 +406,31 @@ impl OpenBaoProvider {
         ))
     }
 
-    /// Parse a Vault path into mount and secret path.
+    /// Parse a Vault path into its mount and the secret path under that mount.
     ///
-    /// Handles formats:
+    /// The first segment is the mount; a `data` segment after it is the KV v2
+    /// API prefix `kv2::read` adds itself, not part of the secret path:
     /// - "secret/data/myapp/tls" -> ("secret", "myapp/tls")
-    /// - "myapp/tls" -> ("secret", "myapp/tls") (default mount)
-    fn parse_path(path: &str) -> (String, String) {
-        // Check for KV v2 "data" in path
-        if let Some(rest) = path.strip_prefix("secret/data/") {
-            return ("secret".into(), rest.into());
+    /// - "kv/myapp/tls" -> ("kv", "myapp/tls")
+    /// - "myapp" -> ("secret", "myapp"), the only path with no mount to read
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretsError::ConfigError`] when either half is empty -- a
+    /// leading slash names no mount and a trailing slash names no secret, and
+    /// both otherwise reach OpenBao as a request that can only 404.
+    fn parse_path(path: &str) -> SecretsResult<(String, String)> {
+        let (mount, secret_path) = match path.split_once('/') {
+            Some((mount, rest)) => (mount, rest.strip_prefix("data/").unwrap_or(rest)),
+            None => ("secret", path),
+        };
+        if mount.is_empty() || secret_path.is_empty() {
+            return Err(SecretsError::ConfigError(format!(
+                "invalid vault path '{path}', expected '<mount>/<path>' with both parts \
+                 present (a leading or trailing '/' names an empty one)"
+            )));
         }
-
-        // Check for custom mount with "data" segment
-        let parts: Vec<&str> = path.splitn(3, '/').collect();
-        if parts.len() >= 3 && parts[1] == "data" {
-            return (parts[0].into(), parts[2..].join("/"));
-        }
-
-        // Default to "secret" mount
-        ("secret".into(), path.into())
+        Ok((mount.to_string(), secret_path.to_string()))
     }
 }
 
@@ -458,23 +464,82 @@ mod tests {
 
     #[test]
     fn test_parse_path_with_mount() {
-        let (mount, path) = OpenBaoProvider::parse_path("secret/data/myapp/tls");
+        let (mount, path) = OpenBaoProvider::parse_path("secret/data/myapp/tls").unwrap();
         assert_eq!(mount, "secret");
         assert_eq!(path, "myapp/tls");
     }
 
     #[test]
     fn test_parse_path_custom_mount() {
-        let (mount, path) = OpenBaoProvider::parse_path("kv/data/myapp/creds");
+        let (mount, path) = OpenBaoProvider::parse_path("kv/data/myapp/creds").unwrap();
         assert_eq!(mount, "kv");
         assert_eq!(path, "myapp/creds");
     }
 
+    /// A path with no `/` carries no mount segment, so it falls back to the
+    /// `secret` mount.
     #[test]
-    fn test_parse_path_default_mount() {
-        let (mount, path) = OpenBaoProvider::parse_path("myapp/tls");
+    fn parse_path_falls_back_to_the_secret_mount() {
+        let (mount, path) = OpenBaoProvider::parse_path("myapp").unwrap();
         assert_eq!(mount, "secret");
-        assert_eq!(path, "myapp/tls");
+        assert_eq!(path, "myapp");
+    }
+
+    /// The first segment is the mount whether or not `data` follows it, so
+    /// `secret/tls` is the `tls` secret on the `secret` mount rather than
+    /// `secret/tls` under a doubled mount.
+    #[test]
+    fn parse_path_reads_the_first_segment_as_the_mount() {
+        let (mount, path) = OpenBaoProvider::parse_path("secret/tls").unwrap();
+        assert_eq!(mount, "secret");
+        assert_eq!(path, "tls");
+    }
+
+    #[test]
+    fn parse_path_keeps_a_multi_segment_path_under_its_mount() {
+        let (mount, path) = OpenBaoProvider::parse_path("kv/dfe-test/runzero").unwrap();
+        assert_eq!(mount, "kv");
+        assert_eq!(path, "dfe-test/runzero");
+    }
+
+    /// Only a whole `data` segment is the KV v2 prefix, so a path segment that
+    /// merely starts with those bytes stays part of the secret path.
+    #[test]
+    fn parse_path_keeps_a_segment_that_only_starts_with_data() {
+        let (mount, path) = OpenBaoProvider::parse_path("kv/data-lake/x").unwrap();
+        assert_eq!(mount, "kv");
+        assert_eq!(path, "data-lake/x");
+    }
+
+    /// `data` in the mount position is a mount named `data`, not the KV v2
+    /// prefix, which only ever follows a mount.
+    #[test]
+    fn parse_path_reads_a_leading_data_segment_as_the_mount() {
+        let (mount, path) = OpenBaoProvider::parse_path("data/foo/bar").unwrap();
+        assert_eq!(mount, "data");
+        assert_eq!(path, "foo/bar");
+    }
+
+    /// A leading slash names an empty mount, which OpenBao can only answer with
+    /// a 404, so say what is wrong with the path instead.
+    #[test]
+    fn parse_path_refuses_a_leading_slash() {
+        let err = OpenBaoProvider::parse_path("/myapp/tls").unwrap_err();
+        assert!(
+            err.to_string().contains("/myapp/tls"),
+            "the refusal must name the path: {err}"
+        );
+    }
+
+    /// A trailing slash names an empty secret path, same 404 for the same
+    /// reason.
+    #[test]
+    fn parse_path_refuses_a_trailing_slash() {
+        let err = OpenBaoProvider::parse_path("kv/").unwrap_err();
+        assert!(
+            err.to_string().contains("kv/"),
+            "the refusal must name the path: {err}"
+        );
     }
 
     #[test]
