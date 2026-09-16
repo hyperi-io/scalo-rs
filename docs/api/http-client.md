@@ -39,16 +39,23 @@ transfer, say).
   Any other 4xx returns immediately.
 - **Idempotent methods only** by default. GET, HEAD, PUT, DELETE and
   OPTIONS are replayable; POST and PATCH need
-  `retry_non_idempotent: true`, which is for endpoints that dedupe.
+  `retry_non_idempotent: true`, which is for endpoints that dedupe. A
+  request the signer could not sign never left, so a transient signing
+  failure is retried whatever the method.
 - **`Retry-After` honoured** in preference to the exponential schedule,
   capped at `max_retry_interval_ms`. The cap matters: a throttled
   downstream can legally advertise hours, and taking that whole parks
-  the request inside the retry loop.
+  the request inside the retry loop. It paces the attempts `max_retries`
+  already grants and never adds one, so a downstream answering 429 plus
+  the header on every attempt still ends the loop.
 - **The last response returned** once retries are exhausted, even a 5xx,
   so the caller can read the status and body rather than getting a
   transport error.
 - **Request metrics** per method: `http_client_requests_total`,
   `http_client_duration_seconds`, `http_client_retries_total`.
+- **No request URL on an error.** reqwest keeps a copy of the URL and
+  renders it, and a credential placed in the query is inside that URL,
+  so the loop drops it from every error it returns.
 
 ---
 
@@ -64,14 +71,19 @@ a timestamp or a token that expired between attempts has to be
 regenerated rather than replayed.
 
 ```rust
-use scalo::http_client::{HttpClient, RequestSigner, SignError};
+use reqwest::header::HeaderValue;
+use scalo::http_client::{RequestSigner, SignError};
 
 struct StampSigner;
 
 impl RequestSigner for StampSigner {
     async fn sign(&self, request: &mut reqwest::Request) -> Result<(), SignError> {
-        let stamp = std::time::SystemTime::now();
-        request.headers_mut().insert("x-stamp", format_stamp(stamp)?);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| SignError::with_cause("clock is before the epoch", e))?;
+        let value = HeaderValue::from_str(&stamp.as_secs().to_string())
+            .map_err(|e| SignError::with_cause("stamp is not a header value", e))?;
+        request.headers_mut().insert("x-stamp", value);
         Ok(())
     }
 }
@@ -89,9 +101,13 @@ The unsigned methods are the same loop with `Unsigned` in place of a
 signer, so there is one retry path and not two.
 
 For the credential itself -- a token exchange, a metadata server, a
-static key, and where to put it -- see [auth.md](auth.md). A signing
-scheme with its own crypto dependencies (SigV4, a request HMAC) belongs
-in the consumer as one more implementation of this trait.
+static key, and where to put it -- see [auth.md](auth.md). A placement
+from there reports an acquisition failure as `SignError::Auth` with the
+`AuthError` whole, so the status of a refusal is there to match on. A
+signing scheme with its own crypto dependencies (SigV4, a request HMAC)
+belongs in the consumer as one more implementation of this trait, and
+reports through `SignError::Failed` -- `retryable()` when another
+attempt could get past it.
 
 ---
 
@@ -111,6 +127,17 @@ http_client:
 `max_retries: 0` disables retries. `user_agent` unset leaves reqwest's
 own default.
 
+Redirects are not in the config: they are a property of what the client
+is for, so they are set where it is built.
+`HttpClient::with_redirect_policy(config, policy)` takes any
+`reqwest::redirect::Policy`; `new(config)` is that with reqwest's
+default. reqwest strips `Authorization` on a cross-origin hop but carries
+the body, the query and any custom header across it, so a client whose
+calls are signed with a provider's own header -- or with a query
+parameter -- should refuse the hop (`Policy::none()`) or allow only the
+same origin. The token exchanges in [auth.md](auth.md) build themselves
+such a client; a client that only downloads keeps the default.
+
 ---
 
 ## API surface
@@ -118,6 +145,7 @@ own default.
 | Item | Purpose |
 |------|---------|
 | `HttpClient::new(config)` | Build from explicit config |
+| `HttpClient::with_redirect_policy(config, policy)` | Build from explicit config with a `reqwest::redirect::Policy` of the caller's choosing |
 | `HttpClient::from_cascade()` | Build from the `http_client` config section |
 | `.get(url)` | GET request |
 | `.get_with(url, f)` | GET with the builder decorated by `f` (headers, query) -- keeps retry and metrics, unlike `.client()` |

@@ -17,9 +17,13 @@
 //! Retries are restricted to **idempotent** methods (GET, HEAD, PUT, DELETE,
 //! OPTIONS) by default: replaying a non-idempotent POST can duplicate side
 //! effects downstream. Set `retry_non_idempotent = true` only when the
-//! endpoint is known to dedupe (e.g. an idempotency key). When a throttled
-//! downstream returns `Retry-After`, that delay is honoured in preference to
-//! the exponential schedule, capped at `max_retry_interval_ms`.
+//! endpoint is known to dedupe (e.g. an idempotency key). A request the signer
+//! could not sign never left, so a transient signing failure is retried
+//! whatever the method. When a throttled downstream returns `Retry-After`, that
+//! delay is honoured in preference to the exponential schedule, capped at
+//! `max_retry_interval_ms`. It paces the attempts `max_retries` already grants
+//! and never adds one, so a downstream that answers 429 plus the header forever
+//! still ends the loop.
 //!
 //! After retries are exhausted the **last response is returned** (even a 5xx)
 //! so the caller can inspect status/body -- a persistent server error is not
@@ -33,6 +37,20 @@
 //! [`Self::get_signed`](HttpClient::get_signed) and
 //! [`Self::send_signed`](HttpClient::send_signed) are the signed surface; the
 //! unsigned methods are the same loop with [`Unsigned`] in place of a signer.
+//!
+//! No error leaves the loop carrying the request URL: reqwest keeps a copy of
+//! it on a transport error and renders it, and a credential placed in the query
+//! is inside that URL. The error names what failed; the caller knows what it
+//! called.
+//!
+//! ## Redirects
+//!
+//! reqwest follows redirects by default and carries the body and any custom
+//! headers across a cross-origin hop, so a signed header follows the request to
+//! whatever host the downstream names. Build a client whose calls are signed
+//! with a header or a query parameter through
+//! [`HttpClient::with_redirect_policy`] and a policy that refuses the hop, as
+//! the token exchanges in [`crate::auth`] do for themselves.
 //!
 //! # Config Cascade
 //!
@@ -63,7 +81,6 @@ use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 
 /// HTTP client build error.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum HttpClientError {
     /// Failed to build the underlying reqwest client.
     #[error("failed to build HTTP client: {0}")]
@@ -77,7 +94,6 @@ pub enum HttpClientError {
 /// public methods as `Ok(response)` (not `Err`), matching the historical
 /// "caller checks the status code" contract.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum HttpError {
     /// Transport-level failure (connect, timeout, TLS, dropped connection).
     #[error("HTTP transport error: {0}")]
@@ -92,22 +108,50 @@ pub enum HttpError {
     #[error("JSON serialise failed: {0}")]
     Serialize(#[from] serde_json::Error),
 
-    /// The signer could not put its credential on the request (not retryable).
+    /// The signer could not put its credential on the request. Retried only
+    /// when the signer says another attempt could succeed.
     #[error("signing failed: {0}")]
     Sign(#[from] SignError),
 }
 
 impl HttpError {
     /// Whether this error warrants a retry.
-    fn is_retryable(&self) -> bool {
+    ///
+    /// `replayable` is whether a request that reached the wire may be sent
+    /// again: the method is idempotent, or the caller opted in. A request the
+    /// signer refused never left, so that decision does not apply to it.
+    fn is_retryable(&self, replayable: bool) -> bool {
         match self {
             // Connect/timeout are transient; decode/redirect/body are not.
-            Self::Transport(e) => e.is_timeout() || e.is_connect(),
+            Self::Transport(e) => replayable && (e.is_timeout() || e.is_connect()),
             // A retryable status was only constructed for the retryable set.
-            Self::Status(_) => true,
-            // A body that will not serialise and a credential that will not
-            // acquire are both unchanged by sending the request again.
-            Self::Serialize(_) | Self::Sign(_) => false,
+            Self::Status(_) => replayable,
+            // A body that will not serialise is unchanged by sending the
+            // request again.
+            Self::Serialize(_) => false,
+            // A credential endpoint that could not be reached may answer the
+            // next attempt; a refusal will not.
+            Self::Sign(e) => e.is_retryable(),
+        }
+    }
+
+    /// The same failure with reqwest's copy of the request URL dropped.
+    ///
+    /// reqwest appends the request URL to what it renders, and a credential
+    /// placed in the query rides out inside it. Matched variant by variant
+    /// rather than through a catch-all, so a new variant carrying a URL has to
+    /// answer this question before it compiles.
+    #[must_use]
+    pub(crate) fn without_url(self) -> Self {
+        match self {
+            Self::Transport(e) => Self::Transport(e.without_url()),
+            // Handed back to the caller as a response rather than rendered as
+            // an error: `Display` names only the status.
+            Self::Status(response) => Self::Status(response),
+            // Names the type that would not serialise, never a URL.
+            Self::Serialize(e) => Self::Serialize(e),
+            // The signer names its own endpoint, never the request it signed.
+            Self::Sign(e) => Self::Sign(e),
         }
     }
 
@@ -140,14 +184,18 @@ fn is_retryable_status(status: StatusCode) -> bool {
 /// The advertised delay is capped at `max`, the configured retry ceiling. A
 /// throttled downstream can advertise hours (`Retry-After: 86400` is legal), and
 /// taking that whole parks the request inside the retry loop for a day.
+///
+/// No candidate means the retry budget is spent, and that answer stands
+/// whatever the downstream advertises: a delay is how long to wait before an
+/// attempt the schedule has already granted, not a grant of another one.
 fn retry_delay(
     advertised: Option<Duration>,
     candidate: Option<Duration>,
     max: Duration,
 ) -> Option<Duration> {
-    match advertised {
-        Some(delay) => Some(delay.min(max)),
-        None => candidate,
+    match (advertised, candidate) {
+        (Some(delay), Some(_)) => Some(delay.min(max)),
+        (_, candidate) => candidate,
     }
 }
 
@@ -189,9 +237,28 @@ impl HttpClient {
     /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
     /// client cannot be constructed (typically TLS backend init failure).
     pub fn new(config: HttpClientConfig) -> Result<Self, HttpClientError> {
+        Self::with_redirect_policy(config, reqwest::redirect::Policy::default())
+    }
+
+    /// Create a new HTTP client with the given config and redirect policy.
+    ///
+    /// reqwest carries the body and any custom header across a cross-origin
+    /// redirect, so a client whose calls are signed with a header or a query
+    /// parameter should refuse the hop ([`reqwest::redirect::Policy::none`])
+    /// or allow only the same origin through a custom policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
+    /// client cannot be constructed (typically TLS backend init failure).
+    pub fn with_redirect_policy(
+        config: HttpClientConfig,
+        redirects: reqwest::redirect::Policy,
+    ) -> Result<Self, HttpClientError> {
         let mut builder = Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
-            .connect_timeout(Duration::from_secs(config.connect_timeout_secs));
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .redirect(redirects);
 
         if let Some(ref ua) = config.user_agent {
             builder = builder.user_agent(ua.clone());
@@ -264,14 +331,13 @@ impl HttpClient {
             Ok(resp)
         };
 
-        let retry_enabled =
-            self.config.max_retries > 0 && (idempotent || self.config.retry_non_idempotent);
+        let replayable = idempotent || self.config.retry_non_idempotent;
         let max_delay = Duration::from_millis(self.config.max_retry_interval_ms);
 
-        let result = if retry_enabled {
+        let result = if self.config.max_retries > 0 {
             attempt
                 .retry(self.backoff())
-                .when(HttpError::is_retryable)
+                .when(move |e: &HttpError| e.is_retryable(replayable))
                 .adjust(move |e: &HttpError, candidate| {
                     retry_delay(e.retry_after(), candidate, max_delay)
                 })
@@ -287,7 +353,9 @@ impl HttpClient {
             // Retries exhausted on a 5xx/429: hand back the last response so the
             // caller can read status/body, preserving the legacy contract.
             Err(HttpError::Status(resp)) => Ok(*resp),
-            Err(e) => Err(e),
+            // A credential placed in the query is inside the URL reqwest keeps
+            // on the error, so no error leaves this loop carrying one.
+            Err(e) => Err(e.without_url()),
         }
     }
 
@@ -468,6 +536,9 @@ impl HttpClient {
         let label = method_label(&method);
         let idempotent = is_idempotent(&method);
         let start = std::time::Instant::now();
+        // One buffer for the whole call: an attempt clones the handle, not the
+        // body, so a retried upload does not copy itself again.
+        let body = body.map(bytes::Bytes::from);
         let result = self
             .execute_signed(label, idempotent, signer, || {
                 let mut builder = self.inner.request(method.clone(), url);
@@ -516,8 +587,19 @@ mod tests {
         // Build a serde_json error and confirm it never triggers a retry.
         let err = serde_json::from_str::<i32>("not a number").unwrap_err();
         let http_err = HttpError::Serialize(err);
-        assert!(!http_err.is_retryable());
+        assert!(!http_err.is_retryable(true));
         assert!(http_err.retry_after().is_none());
+    }
+
+    #[test]
+    fn a_signing_failure_is_retried_on_the_signers_word_alone() {
+        let transient = HttpError::Sign(SignError::new("idp unreachable").retryable());
+        assert!(
+            transient.is_retryable(false),
+            "the request never left, so replaying it is not the question"
+        );
+        let refused = HttpError::Sign(SignError::new("invalid_client"));
+        assert!(!refused.is_retryable(true));
     }
 
     #[test]
@@ -544,6 +626,19 @@ mod tests {
             ),
             Some(Duration::from_secs(2)),
             "the downstream's own pacing wins over the exponential candidate"
+        );
+    }
+
+    #[test]
+    fn an_advertised_delay_cannot_outlive_the_retry_budget() {
+        assert_eq!(
+            retry_delay(
+                Some(Duration::from_secs(1)),
+                None,
+                Duration::from_millis(20)
+            ),
+            None,
+            "no candidate means the budget is spent, whatever the downstream advertises"
         );
     }
 

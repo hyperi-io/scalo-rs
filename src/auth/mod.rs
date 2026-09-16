@@ -21,7 +21,9 @@
 //!
 //! A list of placements is a tuple -- `(A, B)` is itself a signer -- so a
 //! provider wanting two headers from one exchange is two placements over one
-//! `Arc` source, with no new type and no `dyn`.
+//! `Arc` source, with no new type and no `dyn`. A consumer that only learns the
+//! shape at run time holds [`AnyCredentialSource`] and a `Vec<Placement<_>>`
+//! instead, which dispatch by match rather than by vtable.
 //!
 //! ```rust,no_run
 //! use std::sync::Arc;
@@ -34,11 +36,11 @@
 //! let http = Arc::new(HttpClient::from_cascade()?);
 //! let source = Arc::new(Cached::new(
 //!     ClientCredentials::new(
-//!         Arc::clone(&http),
+//!         &http,
 //!         "https://idp.example/oauth2/token",
 //!         "client-42",
 //!         SensitiveString::new("resolved-by-the-consumer"),
-//!     )
+//!     )?
 //!     .with_scope("events:read"),
 //! ));
 //!
@@ -67,8 +69,8 @@ pub mod placement;
 pub mod source;
 
 pub use error::AuthError;
-pub use placement::{BasicPlacement, HeaderPlacement, QueryPlacement};
+pub use placement::{BasicPlacement, HeaderPlacement, Placement, QueryPlacement};
 pub use source::{
-    Cached, ClientCredentials, Credential, CredentialSource, Exchange, MetadataServer, Static,
-    TokenPost, TokenReading,
+    AnyCredentialSource, Cached, ClientCredentials, Credential, CredentialSource, Exchange,
+    MetadataServer, Static, TokenPost, TokenReading,
 };

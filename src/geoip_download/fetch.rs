@@ -309,8 +309,10 @@ mod tests {
         assert!(rendered.contains("REDACTED"), "{rendered}");
     }
 
-    /// The migration onto the signing hook has to keep putting each provider's
-    /// credential exactly where that provider wants it.
+    /// Each provider's credential lands where that provider wants it: basic
+    /// auth in a sensitive header, a token as an encoded query parameter
+    /// alongside the parameters the URL already carries, and nothing at all
+    /// when the provider needs nothing.
     #[tokio::test]
     async fn the_credential_signs_where_the_provider_wants_it() {
         let url = "https://download.example/db.mmdb?suffix=tar.gz";

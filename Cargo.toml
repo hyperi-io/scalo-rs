@@ -110,8 +110,9 @@ directory-config-git = ["directory-config", "git2"]
 # Extended features (P2)
 # `base64` carries the Basic-auth credential encoder in http_client::signer:
 # reqwest's own encoder is private and only reachable from a RequestBuilder,
-# and a signer runs against a built Request.
-http = ["reqwest", "serde_json", "dep:backon", "tokio", "base64"]
+# and a signer runs against a built Request. `bytes` holds the request body
+# across retries, so an attempt clones a handle rather than the payload.
+http = ["reqwest", "serde_json", "dep:backon", "tokio", "base64", "bytes"]
 
 # Credential acquisition + placement (scalo-rs#84, #88). Sources cache and
 # renew one credential under single-flight; placements are RequestSigner impls

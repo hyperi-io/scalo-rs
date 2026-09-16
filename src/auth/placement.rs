@@ -11,7 +11,19 @@
 //! Each placement is a [`RequestSigner`] over a [`CredentialSource`], generic
 //! over the source so a cache hit is a pointer clone rather than a virtual call
 //! and an allocation. Two placements over one `Arc` source are two headers and
-//! one exchange -- compose them as a tuple, which is a signer itself.
+//! one exchange -- compose them as a tuple, which is a signer itself, or as a
+//! [`Placement`] list when the provider's shape is only known at run time.
+//!
+//! ## Redirects
+//!
+//! reqwest strips the `Authorization` header on a cross-origin redirect and
+//! does not strip a custom header, so a credential placed in a header of the
+//! provider's own naming follows the request to whatever host the downstream
+//! names -- as does one placed in the query. A client whose calls are signed
+//! should therefore be built with [`HttpClient::with_redirect_policy`] and a
+//! policy that refuses the hop, or allows only the same origin.
+//!
+//! [`HttpClient::with_redirect_policy`]: crate::http_client::HttpClient::with_redirect_policy
 
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
@@ -63,7 +75,10 @@ impl<S: CredentialSource> RequestSigner for HeaderPlacement<S> {
 /// Put the credential in a query parameter.
 ///
 /// It goes on the built URL rather than being formatted into the URL string, so
-/// the URL a caller logs before the call never carries it.
+/// the URL a caller holds and logs never carries it, and the value is encoded
+/// rather than appended raw. The URL the request itself carries does have the
+/// credential in it, which is why the retry loop drops reqwest's copy of that
+/// URL from every error it returns.
 #[derive(Debug, Clone)]
 pub struct QueryPlacement<S> {
     name: Box<str>,
@@ -120,6 +135,47 @@ impl<S: CredentialSource> RequestSigner for BasicPlacement<S> {
     }
 }
 
+/// A placement chosen at run time, for a consumer that reads where the provider
+/// wants its credential out of config.
+///
+/// A slice or a `Vec` of these is itself a signer, which is the tuple impls'
+/// counterpart for a list whose length is not known until the config is read.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum Placement<S> {
+    /// In a header, after an optional prefix.
+    Header(HeaderPlacement<S>),
+    /// In a query parameter.
+    Query(QueryPlacement<S>),
+    /// As the password of HTTP basic auth.
+    Basic(BasicPlacement<S>),
+}
+
+impl<S: CredentialSource> RequestSigner for Placement<S> {
+    async fn sign(&self, request: &mut reqwest::Request) -> Result<(), SignError> {
+        match self {
+            Self::Header(placement) => placement.sign(request).await,
+            Self::Query(placement) => placement.sign(request).await,
+            Self::Basic(placement) => placement.sign(request).await,
+        }
+    }
+}
+
+impl<S: CredentialSource> RequestSigner for [Placement<S>] {
+    async fn sign(&self, request: &mut reqwest::Request) -> Result<(), SignError> {
+        for placement in self {
+            placement.sign(request).await?;
+        }
+        Ok(())
+    }
+}
+
+impl<S: CredentialSource> RequestSigner for Vec<Placement<S>> {
+    async fn sign(&self, request: &mut reqwest::Request) -> Result<(), SignError> {
+        self.as_slice().sign(request).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -152,6 +208,59 @@ mod tests {
         placement.sign(&mut request).await.unwrap();
 
         assert_eq!(request.url().query(), Some("page=2&token=tok"));
+    }
+
+    /// A credential a provider hands back with a line break in it cannot be a
+    /// header value, and the refusal says so without quoting it.
+    #[tokio::test]
+    async fn a_credential_that_is_not_a_header_value_is_refused() {
+        let smuggled = "tok\r\nx-injected: 1";
+        let placement = HeaderPlacement::bearer(Cached::new(Static::new(smuggled)));
+        let mut request = request("https://api.example/things");
+
+        let error = placement
+            .sign(&mut request)
+            .await
+            .expect_err("CRLF cannot go in a header value");
+
+        assert!(!format!("{error}").contains("x-injected"), "{error}");
+        assert!(!format!("{error:?}").contains("x-injected"), "{error:?}");
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+    }
+
+    /// A credential carrying a query's own separators arrives as one parameter,
+    /// which formatting it into the URL string would not manage.
+    #[tokio::test]
+    async fn a_query_credential_is_encoded_rather_than_appended_raw() {
+        let placement = QueryPlacement::new("token", Cached::new(Static::new("a&b=c")));
+        let mut request = request("https://api.example/things");
+
+        placement.sign(&mut request).await.unwrap();
+
+        assert_eq!(request.url().query(), Some("token=a%26b%3Dc"));
+        let pairs: Vec<_> = request.url().query_pairs().collect();
+        assert_eq!(pairs.len(), 1);
+    }
+
+    /// A list of placements whose length is only known at run time signs in
+    /// order, the same as the tuple does.
+    #[tokio::test]
+    async fn a_list_of_placements_signs_in_order() {
+        let source = Arc::new(Cached::new(Static::new("tok")));
+        let placements = vec![
+            Placement::Header(HeaderPlacement::new(
+                HeaderName::from_static("dd-api-key"),
+                "",
+                Arc::clone(&source),
+            )),
+            Placement::Query(QueryPlacement::new("token", Arc::clone(&source))),
+        ];
+        let mut request = request("https://api.example/things");
+
+        placements.sign(&mut request).await.unwrap();
+
+        assert_eq!(request.headers().get("dd-api-key").unwrap(), "tok");
+        assert_eq!(request.url().query(), Some("token=tok"));
     }
 
     /// Two placements over one source is the shape a provider wanting two

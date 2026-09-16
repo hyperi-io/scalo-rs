@@ -34,6 +34,7 @@ use scalo::http_client::{HttpClient, HttpClientConfig, RequestSigner, SignError,
 struct Recorded {
     flaky_hits: u32,
     throttled_hits: u32,
+    throttled_always_hits: u32,
     plain_hits: u32,
     /// The `x-stamp` value of every request to the flaky route, in order.
     stamps: Vec<String>,
@@ -76,6 +77,24 @@ impl RequestSigner for DigestSigner {
         let value = HeaderValue::from_str(&digest_of(&query, &body))
             .map_err(|e| SignError::with_cause("digest is not a header value", e))?;
         request.headers_mut().insert("x-signature", value);
+        Ok(())
+    }
+}
+
+/// A signer whose credential endpoint is down for the first attempt and back
+/// for the second.
+struct BlinkingSigner {
+    attempts: AtomicU64,
+}
+
+impl RequestSigner for BlinkingSigner {
+    async fn sign(&self, request: &mut reqwest::Request) -> Result<(), SignError> {
+        if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+            return Err(SignError::new("token endpoint unreachable").retryable());
+        }
+        request
+            .headers_mut()
+            .insert("x-signature", HeaderValue::from_static("signed"));
         Ok(())
     }
 }
@@ -130,6 +149,18 @@ async fn throttled(State(state): State<Shared>) -> Response {
     }
 }
 
+/// 429 with a one-second `Retry-After` on every attempt, for as many attempts
+/// as the caller makes.
+async fn throttled_always(State(state): State<Shared>) -> Response {
+    state.lock().unwrap().throttled_always_hits += 1;
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("retry-after", "1")],
+        "slow down",
+    )
+        .into_response()
+}
+
 /// 503 once, then 200, recording the credential the caller's own closure put on.
 async fn plain(State(state): State<Shared>, headers: HeaderMap) -> (StatusCode, &'static str) {
     let mut recorded = state.lock().unwrap();
@@ -164,6 +195,7 @@ async fn fixture() -> (SocketAddr, Shared) {
     let app = Router::new()
         .route("/flaky", get(flaky))
         .route("/throttled", get(throttled))
+        .route("/throttled-always", get(throttled_always))
         .route("/plain", get(plain))
         .route("/digest", post(digest))
         .with_state(Arc::clone(&state));
@@ -268,6 +300,37 @@ async fn a_signature_covers_the_final_body_and_query() {
     );
 }
 
+/// A request the signer could not sign never left, so a transient signing
+/// failure is retried on a POST with the non-idempotent opt-in off: there is
+/// nothing on the wire to duplicate.
+#[tokio::test]
+async fn a_transient_signing_failure_is_retried_whatever_the_method() {
+    let (addr, state) = fixture().await;
+    let client = HttpClient::new(brisk_config()).unwrap();
+    assert!(!client.config().retry_non_idempotent);
+    let signer = BlinkingSigner {
+        attempts: AtomicU64::new(0),
+    };
+
+    let response = client
+        .send_signed(
+            reqwest::Method::POST,
+            &format!("http://{addr}/digest"),
+            Some(b"{}".to_vec()),
+            |request| request,
+            &signer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(signer.attempts.load(Ordering::Relaxed), 2);
+    assert!(
+        state.lock().unwrap().digest_matched.is_some(),
+        "the second attempt reached the endpoint, the first never left"
+    );
+}
+
 /// A `Retry-After` beats the exponential candidate, and is capped at the
 /// configured maximum so an advertised hour cannot park the request.
 #[tokio::test]
@@ -289,13 +352,41 @@ async fn retry_after_is_honoured_on_a_signed_call() {
 
     assert_eq!(response.status(), 200);
     assert_eq!(state.lock().unwrap().throttled_hits, 2);
+    // No upper bound: the cap is arithmetic, asserted where the delay is
+    // computed, and a loaded build box makes any ceiling here a flake.
     assert!(
         elapsed >= Duration::from_millis(90),
         "the advertised delay beat the 1ms exponential candidate: {elapsed:?}"
     );
-    assert!(
-        elapsed < Duration::from_millis(900),
-        "and was capped at the configured 100ms rather than the advertised second: {elapsed:?}"
+}
+
+/// A downstream that answers 429 plus a `Retry-After` on every attempt spends
+/// the retry budget and hands the last response back.
+///
+/// The advertised delay is pacing, not an extra attempt. Returning it once the
+/// exponential candidate is gone makes the loop endless, and the cap only
+/// shortens each nap.
+#[tokio::test]
+async fn a_downstream_that_always_throttles_still_exhausts_the_budget() {
+    let (addr, state) = fixture().await;
+    let client = HttpClient::new(HttpClientConfig {
+        max_retries: 2,
+        min_retry_interval_ms: 1,
+        max_retry_interval_ms: 20,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let response = client
+        .get_signed(&format!("http://{addr}/throttled-always"), &Unsigned)
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 429);
+    assert_eq!(
+        state.lock().unwrap().throttled_always_hits,
+        3,
+        "the first attempt and two retries"
     );
 }
 

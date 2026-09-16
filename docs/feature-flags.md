@@ -142,7 +142,7 @@ For full distributed tracing through Kafka/gRPC, enable
 | Feature | Adds |
 |---------|------|
 | `geoip-download` | MMDB database provisioning -- pulls `http` (the shared `HttpClient`), plus `flate2` and `tar` for the provider archive formats. Files onto disk only, no lookup engine. See [api/geoip-download.md](api/geoip-download.md) |
-| `auth` | Credential acquisition and placement -- pulls `http` (the exchange rides the shared `HttpClient`), `arc-swap` for the held credential, and reqwest's `form` and `query` encoders. No signing scheme and no crypto dependency. See [api/auth.md](api/auth.md) |
+| `auth` | Credential acquisition and placement -- pulls `http` (an exchange is an `HttpClient` call, a placement its signing hook), `arc-swap` for the held credential, and reqwest's `form` and `query` encoders. No signing scheme and no crypto dependency. See [api/auth.md](api/auth.md) |
 
 ---
 
