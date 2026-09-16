@@ -81,7 +81,8 @@ Pick the slice you need; pay only for what you use.
 | `metrics` | Prometheus metrics + process/container metrics |
 | `otel-metrics` | OpenTelemetry metrics export (OTLP) |
 | `otel-tracing` | OpenTelemetry distributed tracing |
-| `http` | HTTP client with retry middleware (reqwest) |
+| `http` | HTTP client with retry, backoff and request signing (reqwest) |
+| `auth` | Credential acquisition and placement |
 | `http-server` | Axum HTTP server with health probes (`/livez` and `/readyz`) |
 | `transport-kafka` | Kafka transport (rdkafka, dynamic-linking) |
 | `transport-grpc` | gRPC transport (tonic/prost) |

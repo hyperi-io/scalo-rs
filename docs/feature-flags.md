@@ -142,6 +142,7 @@ For full distributed tracing through Kafka/gRPC, enable
 | Feature | Adds |
 |---------|------|
 | `geoip-download` | MMDB database provisioning -- pulls `http` (the shared `HttpClient`), plus `flate2` and `tar` for the provider archive formats. Files onto disk only, no lookup engine. See [api/geoip-download.md](api/geoip-download.md) |
+| `auth` | Credential acquisition and placement -- pulls `http` (an exchange is an `HttpClient` call, a placement its signing hook), `arc-swap` for the held credential, and reqwest's `form` and `query` encoders. No signing scheme and no crypto dependency. See [api/auth.md](api/auth.md) |
 
 ---
 
@@ -277,6 +278,10 @@ A handful of dependencies aren't visible from the feature name alone:
 - `expression` pulls the `cel` crate; needed only if any transport
   filter uses Tier 2 or Tier 3 CEL (see
   [transport/filter-engine.md](transport/filter-engine.md)).
+- `auth` pulls `http`, and turns on reqwest's `form` and `query`
+  encoders. reqwest gates both behind features, so a build with `http`
+  alone has neither -- `geoip-download` turns on `query` for the same
+  reason.
 
 ---
 

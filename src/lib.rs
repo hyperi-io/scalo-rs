@@ -150,6 +150,10 @@ pub mod transport;
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod http_client;
 
+#[cfg(feature = "auth")]
+#[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+pub mod auth;
+
 #[cfg(feature = "http-server")]
 #[cfg_attr(docsrs, doc(cfg(feature = "http-server")))]
 pub mod http_server;

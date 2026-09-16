@@ -22,11 +22,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
-use reqwest::RequestBuilder;
+use reqwest::header::AUTHORIZATION;
 use tracing::info;
 
 use super::{DOWNLOAD_TIMEOUT_SECS, GeoIpDownloadError};
-use crate::http_client::{HttpClient, HttpClientConfig, HttpError};
+use crate::http_client::signer::basic_auth_value;
+use crate::http_client::{HttpClient, HttpClientConfig, HttpError, RequestSigner, SignError};
 use crate::sensitive::SensitiveString;
 
 /// Extension of the in-flight transfer file, a sibling of the destination so
@@ -78,19 +79,27 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-impl Credential {
-    /// Attach the credential to a request.
-    ///
-    /// The token goes on as a query parameter here rather than being formatted
-    /// into the URL string, so the URL the caller logs never carries it.
-    fn apply(&self, request: RequestBuilder) -> RequestBuilder {
+/// Attaching the credential is a [`RequestSigner`], so the provider auth rides
+/// the same hook every other signed call in the codebase uses.
+///
+/// The token goes on the built URL rather than being formatted into the URL
+/// string, so the URL the caller logs never carries it.
+impl RequestSigner for Credential {
+    async fn sign(&self, request: &mut reqwest::Request) -> Result<(), SignError> {
         match self {
-            Self::None => request,
+            Self::None => {}
             Self::Basic { username, password } => {
-                request.basic_auth(username.expose(), Some(password.expose()))
+                let value = basic_auth_value(username.expose(), Some(password.expose()))?;
+                request.headers_mut().insert(AUTHORIZATION, value);
             }
-            Self::QueryToken { name, value } => request.query(&[(*name, value.expose())]),
+            Self::QueryToken { name, value } => {
+                request
+                    .url_mut()
+                    .query_pairs_mut()
+                    .append_pair(name, value.expose());
+            }
         }
+        Ok(())
     }
 }
 
@@ -163,10 +172,7 @@ impl Transfer {
         config.user_agent = Some(format!("scalo/{}", crate::VERSION));
         let client = HttpClient::new(config)?;
 
-        let credential = self.credential.clone();
-        let mut response = client
-            .get_with(&self.url, move |request| credential.apply(request))
-            .await?;
+        let mut response = client.get_signed(&self.url, &self.credential).await?;
 
         // HttpClient hands back a persistent 4xx/5xx as Ok so the caller can
         // inspect it, so the status check is ours to make.
@@ -301,6 +307,48 @@ mod tests {
         let rendered = format!("{transfer:?}");
         assert!(!rendered.contains("token-wxyz"), "{rendered}");
         assert!(rendered.contains("REDACTED"), "{rendered}");
+    }
+
+    /// Each provider's credential lands where that provider wants it: basic
+    /// auth in a sensitive header, a token as an encoded query parameter
+    /// alongside the parameters the URL already carries, and nothing at all
+    /// when the provider needs nothing.
+    #[tokio::test]
+    async fn the_credential_signs_where_the_provider_wants_it() {
+        let url = "https://download.example/db.mmdb?suffix=tar.gz";
+        let mut request = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
+        Credential::Basic {
+            username: "account-1234".into(),
+            password: "licence-key".into(),
+        }
+        .sign(&mut request)
+        .await
+        .unwrap();
+        let authorization = request.headers().get(AUTHORIZATION).unwrap();
+        assert_eq!(
+            authorization.to_str().unwrap(),
+            "Basic YWNjb3VudC0xMjM0OmxpY2VuY2Uta2V5"
+        );
+        assert!(authorization.is_sensitive());
+
+        let mut request = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
+        Credential::QueryToken {
+            name: "token",
+            value: "token-wxyz".into(),
+        }
+        .sign(&mut request)
+        .await
+        .unwrap();
+        assert_eq!(
+            request.url().query(),
+            Some("suffix=tar.gz&token=token-wxyz"),
+            "appended to the query the provider already needs"
+        );
+
+        let mut request = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
+        Credential::None.sign(&mut request).await.unwrap();
+        assert!(request.headers().is_empty());
+        assert_eq!(request.url().query(), Some("suffix=tar.gz"));
     }
 
     #[test]
