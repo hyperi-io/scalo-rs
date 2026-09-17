@@ -28,7 +28,7 @@ exclude = [".claude/", ".github/", "ci/", "ai/", "docs/", "examples/", "benches/
 # pure-Rust feature lands, add it here.
 features = [
     "config", "config-reload", "logger",
-    "metrics-core", "metrics-process", "metrics-prometheus", "metrics", "service-metrics",
+    "metrics-core", "metrics-process", "metrics", "service-metrics",
     "otel", "otel-metrics", "otel-tracing",
     "runtime", "shutdown", "health",
     "concurrency", "strmatch", "memory", "scaling",

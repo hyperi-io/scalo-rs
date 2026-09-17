@@ -1,38 +1,49 @@
 # scalo
 
 <!-- BADGES:START -->
-[![Build Status](https://github.com/hyperi-io/scalo-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/scalo-rs/actions)
+<!-- Build Status and docs.rs badges omitted. The repo is private, so GitHub's
+     Actions SVG 404s for anonymous crates.io viewers, and the docs.rs badge
+     renders its own build state, which is worse than absent when it is red.
+     Re-add the Actions one at the public-visibility flip:
+     [![Build Status](https://github.com/hyperi-io/scalo-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/scalo-rs/actions) -->
 [![Crates.io](https://img.shields.io/crates/v/scalo?logo=rust)](https://crates.io/crates/scalo)
-[![docs.rs](https://img.shields.io/docsrs/scalo?logo=rust)](https://docs.rs/scalo)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Rust Version](https://img.shields.io/badge/rust-1.95%2B-blue?logo=rust)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](https://www.apache.org/licenses/LICENSE-2.0)
 <!-- BADGES:END -->
 
-> There's plenty of sage advice about running services in production at
-> scale -- config cascades, structured logging, secret masking, Prometheus,
-> OpenTelemetry, health probes, backpressure, graceful shutdown -- but almost
-> none of it as code you can just install and use.
->
-> This is that code.
+> The stuff for your app to operate at scale, in one place
 
-scalo is an integrated, self-regulating runtime for data-plane services.
-Config, logging and metrics come as one pre-wired
-trinity -- global singletons you just use, no plumbing, no init dance.
-Everything else leans on that same integration: the config cascade flows
-straight into the CLI so `run`/`version`/`config-check` just work; the metrics
-and health wiring feed the K8s probes; and the deployment contract
-generates your Helm, Dockerfile and Argo manifests from the config the app
-already declares.
+What you get:
 
-Attach scalo to your service and a whole class of production pain -- the kind
-done wrong a hundred times elsewhere -- just goes away. Battle-tested, and
-almost no code on your side **to do it properly**. It's not a bag of utility
-functions you wire up yourself; it's the wiring, done right, for free.
+- A 7-layer config cascade, hot-reloadable
+- Structured logging, JSON or text by context, secrets masked
+- Prometheus metrics, plus cgroup-aware process gauges
+- OpenTelemetry traces and metrics over OTLP
+- Kubernetes health probes on their own port
+- Backpressure, load shedding and adaptive scaling, on by default
+- A memory guard that reads the cgroup, not the host
+- Graceful shutdown that drains first
+- Kafka, gRPC, Redis Streams, HTTP, file and in-memory transports
+- A disk-backed spool, and a tiered sink with a circuit breaker
+- A dead-letter queue
+- Secrets from OpenBao, Vault or AWS Secrets Manager, under one spec grammar
+- Credential minting and request signing
+- CEL expressions
+- An adaptive worker pool with SIMD JSON batching
 
-scalo comes in two halves that share one set of conventions, idiomatic in each
-language. **scalo-rs** (this crate) is the **data plane** -- the Rust hot path
-where every microsecond and byte counts (`cargo add scalo`). **scalo-py** is
-the **control plane** -- orchestration, APIs and integration in Python
-(`pip install scalo`).
+Wired together already, which is the part you would otherwise build:
+
+- Config, logging and metrics are global singletons. No init dance.
+- The cascade feeds the CLI, so `run`, `version` and `config-check` work
+  without you parsing an argument.
+- Metrics and health feed the Kubernetes probes.
+- The deployment contract writes your Helm chart, Dockerfile and Argo
+  manifests from the config the app already declares.
+
+Two halves, one set of conventions, each idiomatic. **scalo-rs** (this crate)
+is the data plane, the Rust hot path where every microsecond and byte counts
+(`cargo add scalo`). **scalo-py** is the control plane -- orchestration, APIs
+and integration in Python (`pip install scalo`).
 
 Opinionated about correctness -- backpressure, memory safety and the health
 probes are on by default. Unopinionated about your domain -- no web framework,
