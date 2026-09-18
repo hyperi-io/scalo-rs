@@ -205,6 +205,27 @@ pub fn assert_no_config_artifact_drift(contract: &DeploymentContract, dir: impl 
     }
 }
 
+/// Panic if `default_config` has a listen address no port declares, or one
+/// that binds a different port than the port claiming it. Wraps
+/// [`DeploymentContract::undeclared_listeners`] for use directly in a `#[test]`.
+///
+/// # Panics
+///
+/// Panics listing every finding when there is at least one.
+pub fn assert_listeners_declared(contract: &DeploymentContract) {
+    let findings = contract.undeclared_listeners();
+    if !findings.is_empty() {
+        let lines: Vec<String> = findings.iter().map(|m| format!("  {m}")).collect();
+        panic!(
+            "{app}: listeners and declared ports disagree -- add a port with \
+             `bound_from`, fix its number, or list a send-only path in \
+             `unbound_listen_paths`:\n{lines}",
+            app = contract.app_name,
+            lines = lines.join("\n"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +245,7 @@ mod tests {
             config_mount_path: "/etc/demo/demo.yaml".into(),
             image_registry: "ghcr.io/hyperi-io".into(),
             extra_ports: vec![],
+            unbound_listen_paths: vec![],
             entrypoint_args: vec![],
             secrets: vec![],
             default_config: None,
@@ -313,6 +335,23 @@ mod tests {
         // Never emitted -> files missing -> drift.
         let err = check_config_artifact_drift(&contract, dir.path()).unwrap_err();
         assert!(matches!(err, DeploymentError::Drift { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn listeners_declared_passes_when_every_listener_has_a_port() {
+        let mut contract = contract_with_catalog();
+        contract.default_config = Some(serde_json::json!({ "grpc": { "listen": ":6000" } }));
+        contract.extra_ports =
+            vec![crate::deployment::PortContract::tcp("grpc", 6000).bound_from("grpc.listen")];
+        assert_listeners_declared(&contract);
+    }
+
+    #[test]
+    #[should_panic(expected = "listener grpc.listen")]
+    fn listeners_declared_panics_on_an_undeclared_listener() {
+        let mut contract = contract_with_catalog();
+        contract.default_config = Some(serde_json::json!({ "grpc": { "listen": ":6000" } }));
+        assert_listeners_declared(&contract);
     }
 
     /// Panic, naming `T` and the first offending char in context, if the

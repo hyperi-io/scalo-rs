@@ -38,8 +38,21 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         })
         .collect();
 
+    // A port with a `when` condition is not exposed, because an image cannot
+    // know whether that listener is on; it is listed with its condition instead.
     let mut expose_ports: Vec<u16> = vec![contract.metrics_port];
-    expose_ports.extend(contract.extra_ports.iter().map(|p| p.port));
+    let mut conditional_ports = Vec::new();
+    for p in &contract.extra_ports {
+        match &p.when {
+            None => expose_ports.push(p.port),
+            Some(when) => conditional_ports.push(serde_json::json!({
+                "name": p.name,
+                "port": p.port,
+                "protocol": p.protocol,
+                "when": when,
+            })),
+        }
+    }
 
     let profile_str = match contract.image_profile {
         ImageProfile::Production => "production",
@@ -52,7 +65,7 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         &contract.oci_labels.title
     };
 
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schema_version": "1",
         "app_name": contract.app_name,
         "binary_name": binary,
@@ -93,6 +106,15 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
             "org.opencontainers.image.licenses": contract.oci_labels.licenses,
         },
     });
+    // Only present when a port is gated, so an ungated contract's manifest is unchanged.
+    if !conditional_ports.is_empty()
+        && let Some(fields) = manifest.as_object_mut()
+    {
+        fields.insert(
+            "conditional_ports".to_string(),
+            serde_json::Value::Array(conditional_ports),
+        );
+    }
 
     serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("container manifest JSON failed: {e}"))

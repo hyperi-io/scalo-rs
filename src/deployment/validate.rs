@@ -413,6 +413,7 @@ mod tests {
             config_mount_path: "/etc/test/config.yaml".into(),
             image_registry: "ghcr.io/hyperi-io".into(),
             extra_ports: vec![],
+            unbound_listen_paths: vec![],
             entrypoint_args: vec!["--config".into(), "/etc/test/config.yaml".into()],
             secrets: vec![],
             default_config: Some(serde_json::json!({

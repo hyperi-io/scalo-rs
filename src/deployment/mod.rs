@@ -46,6 +46,7 @@
 //!     config_mount_path: "/etc/dfe/loader.yaml".into(),
 //!     image_registry: "ghcr.io/hyperi-io".into(),
 //!     extra_ports: vec![],
+//!     unbound_listen_paths: vec![],
 //!     entrypoint_args: vec!["--config".into(), "/etc/dfe/loader.yaml".into()],
 //!     secrets: vec![],
 //!     default_config: None,
@@ -86,6 +87,7 @@ mod emit;
 mod error;
 pub mod generate;
 mod keda;
+mod listeners;
 mod native_deps;
 mod registry;
 #[cfg(feature = "deployment-smoke")]
@@ -98,14 +100,15 @@ pub mod waves;
 pub use app_project::{AppProjectContract, AppProjectDestination, generate_argocd_app_project};
 pub use capability::{Capability, FieldSpec, FieldType};
 pub use contract::{
-    DeploymentContract, HealthContract, ImageProfile, OciLabels, PortContract, SecretEnvContract,
-    SecretGroupContract,
+    DeploymentContract, HealthContract, ImageProfile, OciLabels, PortCondition, PortContract,
+    SecretEnvContract, SecretGroupContract,
 };
 pub use contract_identity::{ContractIdentity, IdentityError, KEY_PREFIX, VERSION};
 #[cfg(feature = "config-schema")]
 pub use emit::config_schema_json;
 pub use emit::{
-    assert_no_config_artifact_drift, check_config_artifact_drift, emit_config_artifacts,
+    assert_listeners_declared, assert_no_config_artifact_drift, check_config_artifact_drift,
+    emit_config_artifacts,
 };
 pub use error::{ContractMismatch, DeploymentError};
 pub use generate::{

@@ -55,6 +55,7 @@ mod tests {
             config_mount_path: "/etc/dfe/loader.yaml".into(),
             image_registry: "ghcr.io/hyperi-io".into(),
             extra_ports: vec![],
+            unbound_listen_paths: vec![],
             entrypoint_args: vec!["--config".into(), "/etc/dfe/loader.yaml".into()],
             secrets: vec![
                 SecretGroupContract {
@@ -249,11 +250,7 @@ mod tests {
     #[test]
     fn test_generate_dockerfile_extra_ports() {
         let mut contract = test_contract();
-        contract.extra_ports = vec![PortContract {
-            name: "http".into(),
-            port: 8080,
-            protocol: "TCP".into(),
-        }];
+        contract.extra_ports = vec![PortContract::tcp("http", 8080)];
 
         let dockerfile = generate_dockerfile(&contract, None);
         assert!(dockerfile.contains("EXPOSE 9090 8080"));
@@ -262,20 +259,11 @@ mod tests {
     /// Mixed TCP and UDP extra ports, the UDP ones spelt in both cases.
     fn mixed_protocol_ports() -> Vec<PortContract> {
         vec![
+            PortContract::tcp("http", 8080),
+            PortContract::udp("syslog", 514),
             PortContract {
-                name: "http".into(),
-                port: 8080,
-                protocol: "TCP".into(),
-            },
-            PortContract {
-                name: "syslog".into(),
-                port: 514,
-                protocol: "UDP".into(),
-            },
-            PortContract {
-                name: "netflow".into(),
-                port: 2055,
                 protocol: "udp".into(),
+                ..PortContract::udp("netflow", 2055)
             },
         ]
     }
@@ -313,6 +301,297 @@ mod tests {
                  - \"514:514/udp\"\n      - \"2055:2055/udp\"\n"
             ),
             "UDP ports published as TCP:\n{compose}"
+        );
+    }
+
+    /// One always-on port, then one gated port per kind of condition.
+    fn gated_ports() -> Vec<PortContract> {
+        vec![
+            PortContract::tcp("http", 8080),
+            PortContract::tcp("grpc", 6000).when_enabled("config.grpc.enabled"),
+            PortContract::tcp("push", 6001).when_equals("config.source.transport", "direct"),
+            PortContract::udp("vrl", 6002)
+                .when_one_of("config.source.transport", ["direct", "grpc"]),
+        ]
+    }
+
+    /// A port without `when` must render exactly as it did before gates existed.
+    #[test]
+    fn test_ungated_ports_render_unchanged() {
+        let mut contract = test_contract();
+        contract.extra_ports = vec![
+            PortContract::tcp("http", 8080),
+            PortContract::udp("syslog", 514),
+        ];
+        let files = render_chart(&contract);
+
+        assert!(files["templates/deployment.yaml"].contains(
+            "          ports:\n\
+             \x20           - name: metrics\n\
+             \x20             containerPort: {{ .Values.service.port }}\n\
+             \x20             protocol: TCP\n\
+             \x20           - name: http\n\
+             \x20             containerPort: 8080\n\
+             \x20             protocol: TCP\n\
+             \x20           - name: syslog\n\
+             \x20             containerPort: 514\n\
+             \x20             protocol: UDP\n\
+             \x20         env:\n"
+        ));
+        assert!(files["templates/service.yaml"].contains(
+            "      name: metrics\n\
+             \x20   - port: 8080\n\
+             \x20     targetPort: 8080\n\
+             \x20     protocol: TCP\n\
+             \x20     name: http\n\
+             \x20   - port: 514\n\
+             \x20     targetPort: 514\n\
+             \x20     protocol: UDP\n\
+             \x20     name: syslog\n\
+             \x20 selector:\n"
+        ));
+        for (name, text) in [
+            ("dockerfile", generate_dockerfile(&contract, None)),
+            ("runtime stage", generate_runtime_stage(&contract)),
+        ] {
+            assert!(
+                text.contains("\nEXPOSE 9090 8080 514/udp\n\nHEALTHCHECK"),
+                "{name} EXPOSE changed:\n{text}"
+            );
+            assert!(!text.contains("Conditional listeners"), "{name}:\n{text}");
+        }
+        assert!(generate_compose_fragment(&contract).contains(
+            "    ports:\n      - \"9090:9090\"\n      - \"8080:8080\"\n      \
+             - \"514:514/udp\"\n    volumes:\n"
+        ));
+        let manifest: serde_json::Value =
+            serde_json::from_str(&generate_container_manifest(&contract).unwrap()).unwrap();
+        assert_eq!(
+            manifest["expose_ports"],
+            serde_json::json!([9090, 8080, 514])
+        );
+        assert!(manifest.get("conditional_ports").is_none());
+    }
+
+    #[test]
+    fn test_chart_gates_each_kind_of_condition() {
+        let mut contract = test_contract();
+        contract.extra_ports = gated_ports();
+        let files = render_chart(&contract);
+
+        let deployment = &files["templates/deployment.yaml"];
+        assert!(
+            deployment.contains(
+                "            - name: http\n\
+                 \x20             containerPort: 8080\n\
+                 \x20             protocol: TCP\n\
+                 \x20           {{- if ((.Values.config).grpc).enabled }}\n\
+                 \x20           - name: grpc\n\
+                 \x20             containerPort: 6000\n\
+                 \x20             protocol: TCP\n\
+                 \x20           {{- end }}\n\
+                 \x20           {{- if eq (toString ((.Values.config).source).transport) \"direct\" }}\n\
+                 \x20           - name: push\n\
+                 \x20             containerPort: 6001\n\
+                 \x20             protocol: TCP\n\
+                 \x20           {{- end }}\n\
+                 \x20           {{- if has (toString ((.Values.config).source).transport) (list \"direct\" \"grpc\") }}\n\
+                 \x20           - name: vrl\n\
+                 \x20             containerPort: 6002\n\
+                 \x20             protocol: UDP\n\
+                 \x20           {{- end }}\n\
+                 \x20         env:\n"
+            ),
+            "deployment ports not gated:\n{deployment}"
+        );
+
+        let service = &files["templates/service.yaml"];
+        assert!(
+            service.contains(
+                "    - port: 8080\n\
+                 \x20     targetPort: 8080\n\
+                 \x20     protocol: TCP\n\
+                 \x20     name: http\n\
+                 \x20   {{- if ((.Values.config).grpc).enabled }}\n\
+                 \x20   - port: 6000\n\
+                 \x20     targetPort: 6000\n\
+                 \x20     protocol: TCP\n\
+                 \x20     name: grpc\n\
+                 \x20   {{- end }}\n\
+                 \x20   {{- if eq (toString ((.Values.config).source).transport) \"direct\" }}\n\
+                 \x20   - port: 6001\n\
+                 \x20     targetPort: 6001\n\
+                 \x20     protocol: TCP\n\
+                 \x20     name: push\n\
+                 \x20   {{- end }}\n\
+                 \x20   {{- if has (toString ((.Values.config).source).transport) (list \"direct\" \"grpc\") }}\n\
+                 \x20   - port: 6002\n\
+                 \x20     targetPort: 6002\n\
+                 \x20     protocol: UDP\n\
+                 \x20     name: vrl\n\
+                 \x20   {{- end }}\n\
+                 \x20 selector:\n"
+            ),
+            "service ports not gated:\n{service}"
+        );
+    }
+
+    /// A quote in a gate value must not end the template string early.
+    #[test]
+    fn test_chart_gate_value_is_quoted_for_the_template() {
+        let mut contract = test_contract();
+        contract.extra_ports =
+            vec![PortContract::tcp("odd", 7000).when_equals("config.mode", r#"a"b\c"#)];
+        let files = render_chart(&contract);
+        assert!(
+            files["templates/service.yaml"]
+                .contains(r#"{{- if eq (toString (.Values.config).mode) "a\"b\\c" }}"#),
+            "{}",
+            files["templates/service.yaml"]
+        );
+    }
+
+    #[test]
+    fn test_chart_rejects_a_gate_it_cannot_render() {
+        for (port, field) in [
+            (
+                PortContract::tcp("grpc", 6000).when_enabled("config.my-grpc.enabled"),
+                "extra_ports[grpc].when",
+            ),
+            (
+                PortContract::tcp("push", 6001)
+                    .when_one_of("config.source.transport", Vec::<String>::new()),
+                "extra_ports[push].when",
+            ),
+        ] {
+            let mut contract = test_contract();
+            contract.extra_ports = vec![port];
+            let dir = tempfile::tempdir().unwrap();
+            let err = generate_chart(&contract, dir.path(), None).unwrap_err();
+            assert!(
+                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
+                "unexpected error: {err}"
+            );
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "a rejected contract left files behind"
+            );
+        }
+    }
+
+    /// A gated port leaves EXPOSE, since the image cannot know whether its
+    /// listener is on, and is listed in a comment right after the line.
+    #[test]
+    fn test_dockerfile_lists_gated_ports_instead_of_exposing_them() {
+        let mut contract = test_contract();
+        contract.extra_ports = gated_ports();
+        let expected = "\nEXPOSE 9090 8080\n\
+             # Conditional listeners, not EXPOSEd -- publish explicitly when enabled:\n\
+             #   6000/tcp grpc -- when config.grpc.enabled is true\n\
+             #   6001/tcp push -- when config.source.transport is \"direct\"\n\
+             #   6002/udp vrl -- when config.source.transport is one of \"direct\", \"grpc\"\n\
+             \nHEALTHCHECK";
+        for (name, text) in [
+            ("dockerfile", generate_dockerfile(&contract, None)),
+            ("runtime stage", generate_runtime_stage(&contract)),
+        ] {
+            assert!(text.contains(expected), "{name}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn test_manifest_lists_gated_ports_apart_from_exposed_ones() {
+        let mut contract = test_contract();
+        contract.extra_ports = gated_ports();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&generate_container_manifest(&contract).unwrap()).unwrap();
+        assert_eq!(manifest["expose_ports"], serde_json::json!([9090, 8080]));
+        assert_eq!(
+            manifest["conditional_ports"],
+            serde_json::json!([
+                { "name": "grpc", "port": 6000, "protocol": "TCP",
+                  "when": { "kind": "enabled", "path": "config.grpc.enabled" } },
+                { "name": "push", "port": 6001, "protocol": "TCP",
+                  "when": { "kind": "equals", "path": "config.source.transport", "value": "direct" } },
+                { "name": "vrl", "port": 6002, "protocol": "UDP",
+                  "when": { "kind": "one_of", "path": "config.source.transport",
+                            "values": ["direct", "grpc"] } },
+            ])
+        );
+    }
+
+    /// Compose publishes a gated port only when `default_config` turns its
+    /// listener on; off, or not decidable from the config, leaves a comment.
+    #[test]
+    fn test_compose_publishes_a_gated_port_only_when_its_listener_is_on() {
+        let mut contract = test_contract();
+        contract.extra_ports = vec![
+            PortContract::tcp("grpc", 6000).when_enabled("config.grpc.enabled"),
+            PortContract::tcp("push", 6001).when_equals("config.source.transport", "direct"),
+            PortContract::tcp("otlp", 4317).when_enabled("config.otlp.enabled"),
+            PortContract::udp("flow", 2055).when_enabled("config.flow.enabled"),
+        ];
+        contract.default_config = Some(serde_json::json!({
+            "grpc": { "enabled": true },
+            "source": { "transport": "bus" },
+            "flow": { "enabled": null },
+        }));
+
+        let compose = generate_compose_fragment(&contract);
+        assert!(
+            compose.contains(
+                "    ports:\n      - \"9090:9090\"\n      - \"6000:6000\"\n      \
+                 # - \"6001:6001\"  # only when config.source.transport is \"direct\"; \
+                 uncomment to publish\n      \
+                 # - \"4317:4317\"  # only when config.otlp.enabled is true; uncomment to publish\n      \
+                 # - \"2055:2055/udp\"  # only when config.flow.enabled is true; \
+                 uncomment to publish\n    volumes:\n"
+            ),
+            "{compose}"
+        );
+
+        // With no default config nothing is decidable, so every gated port is a comment.
+        contract.default_config = None;
+        let compose = generate_compose_fragment(&contract);
+        assert!(!compose.contains("      - \"6000:6000\""), "{compose}");
+        assert!(
+            compose.contains("      # - \"6000:6000\"  # only when"),
+            "{compose}"
+        );
+    }
+
+    /// `bound_from` and `unbound_listen_paths` feed only the listener check,
+    /// so no artefact may change with them.
+    #[test]
+    fn test_listener_metadata_changes_no_artefact() {
+        let mut plain = test_contract();
+        plain.extra_ports = gated_ports();
+        plain.default_config = Some(serde_json::json!({
+            "grpc": { "enabled": true, "listen": "0.0.0.0:6000" },
+            "kafka": { "brokers": ["k:9092"], "group_id": "g", "topics": ["t"] },
+        }));
+        let mut annotated = plain.clone();
+        for port in &mut annotated.extra_ports {
+            port.bound_from = Some(format!("{}.listen", port.name));
+        }
+        annotated.unbound_listen_paths = vec!["sink.bind_address".into()];
+
+        assert_eq!(render_chart(&plain), render_chart(&annotated));
+        assert_eq!(
+            generate_dockerfile(&plain, None),
+            generate_dockerfile(&annotated, None)
+        );
+        assert_eq!(
+            generate_runtime_stage(&plain),
+            generate_runtime_stage(&annotated)
+        );
+        assert_eq!(
+            generate_compose_fragment(&plain),
+            generate_compose_fragment(&annotated)
+        );
+        assert_eq!(
+            generate_container_manifest(&plain).unwrap(),
+            generate_container_manifest(&annotated).unwrap()
         );
     }
 

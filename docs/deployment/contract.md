@@ -89,6 +89,7 @@ let contract = DeploymentContract {
     image_registry: image_registry_from_cascade(),   // org registry
     base_image: base_image_from_cascade(),           // org base image
     extra_ports: vec![],
+    unbound_listen_paths: vec![],
     entrypoint_args: vec!["--config".into(), "/etc/event-loader/config.yaml".into()],
     secrets: vec![
         SecretGroupContract {
@@ -140,7 +141,8 @@ let contract = DeploymentContract {
 | `metric_prefix` | `String` | required | Prometheus namespace |
 | `config_mount_path` | `String` | required | E.g. `/etc/event-loader/config.yaml` |
 | `image_registry` | `String` | cascade | Container registry base |
-| `extra_ports` | `Vec<PortContract>` | `[]` | HTTP / gRPC / data ports beyond metrics |
+| `extra_ports` | `Vec<PortContract>` | `[]` | HTTP / gRPC / data ports beyond metrics -- see [Ports](#ports) |
+| `unbound_listen_paths` | `Vec<String>` | `[]` | `default_config` listen paths no port serves -- see [Ports](#ports) |
 | `entrypoint_args` | `Vec<String>` | `[]` | Default `CMD` args |
 | `secrets` | `Vec<SecretGroupContract>` | `[]` | K8s secret groups |
 | `default_config` | `Option<Value>` | `None` | Embedded `values.yaml` `config:` block |
@@ -189,6 +191,65 @@ token).
 | `env_vars[].env_var` | The full env var name injected into the pod (`EVENT_LOADER__KAFKA__PASSWORD`) |
 | `env_vars[].key_name` | Field name in `values.yaml.<group>.secretKeys.<key_name>` |
 | `env_vars[].secret_key` | Default K8s Secret data key (`kafka-password`) |
+
+---
+
+## Ports
+
+A port can say when its listener exists, and which listen address it serves.
+
+```rust
+extra_ports: vec![
+    PortContract::tcp("http", 8080).bound_from("http.listen"),
+    PortContract::tcp("push", 6000)
+        .when_one_of("config.source.transport", ["direct", "grpc"])
+        .bound_from("source.grpc.listen"),
+    PortContract::udp("netflow", 2055)
+        .when_enabled("config.flow.enabled")
+        .bound_from("flow.bind_address"),
+],
+```
+
+### `when` -- ports that only sometimes listen
+
+A service with two transports binds its push listener on one of them only. Without a gate the port lands in every artefact anyway, so the Service publishes a port that refuses connections.
+
+| Condition | Builder | Holds when the value |
+|---|---|---|
+| `Enabled { path }` | `.when_enabled(path)` | counts as true -- anything but false, null, zero or empty |
+| `Equals { path, value }` | `.when_equals(path, value)` | as a string, equals `value` |
+| `OneOf { path, values }` | `.when_one_of(path, values)` | as a string, is one of `values` (for a setting with an alias) |
+
+`path` is a dotted `.Values` path, the same convention as the KEDA trigger's, so app config sits under `config.` -- `config.source.transport`. Each segment must be a Go identifier. A bad segment, or a `one_of` with no values, makes `generate_chart` return `InvalidContract` before it writes anything. A missing or null key reads as off, never as a render error.
+
+| Artefact | A gated port |
+|---|---|
+| chart `Deployment` + `Service` | wrapped in `{{- if <condition> }}`, so it renders only when the listener is on |
+| Dockerfile + runtime stage | left out of `EXPOSE`, listed in a comment right under it with its condition |
+| `container-manifest.json` | left out of `expose_ports`, listed under `conditional_ports` (key present only when a port is gated) |
+| compose fragment | published when the condition holds for `default_config`; otherwise a commented-out line to uncomment |
+| `unresolved_values_paths()` | reports a gate whose path is absent from `default_config` (null is off, not missing) |
+
+A port without `when` renders exactly as it did before.
+
+### `bound_from` -- listeners that no port declares
+
+The other direction. `bound_from` names the `default_config` listen address a port serves, as a dotted path relative to `default_config` (`grpc.listen`, not `config.grpc.listen`). `DeploymentContract::undeclared_listeners()` walks `default_config` for listen addresses -- a key named `listen`, `bind_address` or ending `_bind_address` holding a string or null, plus `metrics.address` -- and reports:
+
+- a listen address no port claims
+- a `host:port` whose port differs from the port claiming it (`metrics.address` is claimed by `metrics_port`); a null or host-only value is not compared
+- a `bound_from` that names nothing in `default_config`
+
+Several ports can claim one address -- three UDP flow ports on one host-only `bind_address` is clean. A client that only sends still has a bind address; list it in `unbound_listen_paths` to waive it. Put the check in a test:
+
+```rust
+#[test]
+fn every_listener_has_a_port() {
+    scalo::deployment::assert_listeners_declared(&deployment_contract());
+}
+```
+
+Neither `bound_from` nor `unbound_listen_paths` changes a byte of any generated artefact.
 
 ---
 
@@ -244,7 +305,9 @@ release-specific and a digest carries no codename.
 | `DeploymentContract::config_filename()` / `config_dir()` | Split `config_mount_path` |
 | `ImageProfile::{Production, Development}` | Profile enum |
 | `HealthContract` | `/livez` / `/readyz` / `/metrics` paths |
-| `PortContract` | Extra container port beyond `metrics_port`; a `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` as `514/udp` |
+| `PortContract` | Extra container port beyond `metrics_port`; build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` as `514/udp` |
+| `PortCondition` | When a port's listener exists -- see [Ports](#ports) |
+| `DeploymentContract::undeclared_listeners()` / `assert_listeners_declared()` | Listener coverage -- see [Ports](#ports) |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |
 | `SecretEnvContract` | Single env var sourced from a Secret key |
 | `OciLabels` | Static OCI labels (`title`, `description`, `vendor`, `licenses`, `copyright`) |

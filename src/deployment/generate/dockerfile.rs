@@ -201,14 +201,34 @@ ENTRYPOINT ["{binary}"]{cmd}
     )
 }
 
-/// The EXPOSE line's ports: the metrics port, then each extra port, with UDP
-/// ports marked since a bare port number means TCP.
+/// The EXPOSE line: the metrics port, then each extra port that always
+/// listens, with UDP ports marked since a bare port number means TCP.
+///
+/// A port with a `when` condition is left out, because an image cannot know
+/// whether that listener is on; a comment after the line lists each one and
+/// its condition instead.
 fn expose_ports(contract: &DeploymentContract) -> String {
     let mut ports = vec![contract.metrics_port.to_string()];
+    let mut conditional = Vec::new();
     for p in &contract.extra_ports {
-        ports.push(format!("{}{}", p.port, udp_port_suffix(&p.protocol)));
+        match &p.when {
+            None => ports.push(format!("{}{}", p.port, udp_port_suffix(&p.protocol))),
+            Some(when) => conditional.push(format!(
+                "#   {port}/{proto} {name} -- when {when}",
+                port = p.port,
+                proto = p.protocol.to_ascii_lowercase(),
+                name = p.name,
+            )),
+        }
     }
-    ports.join(" ")
+    let mut out = ports.join(" ");
+    if !conditional.is_empty() {
+        out.push_str(
+            "\n# Conditional listeners, not EXPOSEd -- publish explicitly when enabled:\n",
+        );
+        out.push_str(&conditional.join("\n"));
+    }
+    out
 }
 
 /// Diagnostic tools installed in development images.

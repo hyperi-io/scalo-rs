@@ -73,8 +73,8 @@ use scalo::deployment::test_support::{
 };
 use scalo::deployment::{
     ArgocdConfig, ContractIdentity, DeploymentContract, HealthContract, ImageProfile,
-    KafkaLagTrigger, KedaContract, OciLabels, generate_argocd_application, generate_chart,
-    generate_dockerfile,
+    KafkaLagTrigger, KedaContract, OciLabels, PortContract, generate_argocd_application,
+    generate_chart, generate_dockerfile,
 };
 
 // ============================================================================
@@ -94,6 +94,7 @@ fn test_contract() -> DeploymentContract {
         config_mount_path: "/etc/hct/config.yaml".into(),
         image_registry: "ghcr.io/hyperi-io".into(),
         extra_ports: vec![],
+        unbound_listen_paths: vec![],
         entrypoint_args: vec![],
         secrets: vec![],
         base_image: "ubuntu:24.04".into(),
@@ -570,6 +571,110 @@ fn tier_a_keda_trigger_follows_a_source_shaped_config() {
     let no_source = rendered_kafka_trigger(&contract, &["--set-json", "config.source=null"]);
     assert_eq!(rendered_str(&no_source, "bootstrapServers"), "");
     assert_eq!(rendered_str(&no_source, "topic"), "");
+}
+
+// ============================================================================
+// Tier A -- gated ports: a port renders only while its listener is on
+// ============================================================================
+
+/// Render one template of `chart_dir` with `extra_args` and parse it.
+/// Panics with helm's stderr if the chart does not render.
+fn render_template(chart_dir: &Path, template: &str, extra_args: &[&str]) -> serde_yaml_ng::Value {
+    let out = Command::new("helm")
+        .args(["template", "test-release"])
+        .arg(chart_dir)
+        .args(["--show-only", template])
+        .args(extra_args)
+        .output()
+        .expect("helm template invocation");
+    assert!(
+        out.status.success(),
+        "helm template {template} failed with {extra_args:?}: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    serde_yaml_ng::from_slice(&out.stdout).expect("rendered template is YAML")
+}
+
+/// The port names the Deployment's container and the Service each render.
+fn rendered_port_names(chart_dir: &Path, extra_args: &[&str]) -> (Vec<String>, Vec<String>) {
+    let names = |ports: &serde_yaml_ng::Value| -> Vec<String> {
+        ports
+            .as_sequence()
+            .expect("a ports list")
+            .iter()
+            .map(|p| p["name"].as_str().expect("a port name").to_string())
+            .collect()
+    };
+    let deployment = render_template(chart_dir, "templates/deployment.yaml", extra_args);
+    let service = render_template(chart_dir, "templates/service.yaml", extra_args);
+    (
+        names(&deployment["spec"]["template"]["spec"]["containers"][0]["ports"]),
+        names(&service["spec"]["ports"]),
+    )
+}
+
+/// A gate on a key the config lacks, or sets to something else, renders
+/// nothing and does not fail the render; setting the key renders the port.
+#[test]
+fn tier_a_chart_renders_a_gated_port_only_when_its_listener_is_on() {
+    if !helm_available() {
+        skip(
+            "tier-a",
+            "tier_a_chart_renders_a_gated_port_only_when_its_listener_is_on",
+            "helm CLI not available",
+        );
+        return;
+    }
+
+    let contract = DeploymentContract {
+        extra_ports: vec![
+            PortContract::tcp("http", 8080),
+            PortContract::tcp("grpc", 6001).when_enabled("config.grpc.enabled"),
+            PortContract::tcp("push", 6000).when_equals("config.source.transport", "direct"),
+            PortContract::tcp("relay", 6002)
+                .when_one_of("config.source.transport", ["direct", "grpc"]),
+        ],
+        // No `source` key at all, and the grpc switch off.
+        default_config: Some(serde_json::json!({ "grpc": { "enabled": false } })),
+        ..test_contract()
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chart_dir = tmp.path().join("chart");
+    generate_chart(&contract, &chart_dir, None).expect("generate_chart");
+
+    let lint = Command::new("helm")
+        .arg("lint")
+        .arg(&chart_dir)
+        .output()
+        .expect("helm lint invocation");
+    assert!(
+        lint.status.success(),
+        "helm lint failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&lint.stdout),
+        String::from_utf8_lossy(&lint.stderr),
+    );
+
+    let cases: [(&[&str], &[&str]); 5] = [
+        (&[], &["metrics", "http"]),
+        (
+            &["--set", "config.source.transport=direct"],
+            &["metrics", "http", "push", "relay"],
+        ),
+        (
+            &["--set", "config.source.transport=grpc"],
+            &["metrics", "http", "relay"],
+        ),
+        (
+            &["--set", "config.grpc.enabled=true"],
+            &["metrics", "http", "grpc"],
+        ),
+        (&["--set-json", "config=null"], &["metrics", "http"]),
+    ];
+    for (args, expected) in cases {
+        let (deployment, service) = rendered_port_names(&chart_dir, args);
+        assert_eq!(deployment, expected, "Deployment ports with {args:?}");
+        assert_eq!(service, expected, "Service ports with {args:?}");
+    }
 }
 
 // ============================================================================

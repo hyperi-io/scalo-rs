@@ -252,6 +252,7 @@ mod tests {
             config_mount_path: "/etc/smoke/config.yaml".into(),
             image_registry: super::super::DEFAULT_IMAGE_REGISTRY.to_string(),
             extra_ports: vec![],
+            unbound_listen_paths: vec![],
             entrypoint_args: vec![],
             secrets: vec![],
             default_config: None,

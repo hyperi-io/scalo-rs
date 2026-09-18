@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use crate::deployment::contract::DeploymentContract;
+use crate::deployment::contract::{DeploymentContract, PortCondition};
 use crate::deployment::error::DeploymentError;
 use crate::deployment::keda::{KafkaLagTrigger, KedaContract};
 
@@ -32,9 +32,10 @@ use super::common::{is_go_identifier, safe_template_lookup, to_camel_suffix, wri
 /// # Errors
 ///
 /// Returns `DeploymentError` if files or directories cannot be created, or
-/// [`DeploymentError::InvalidContract`] if the KEDA contract names a values path
-/// that is not a dotted chain of Go identifiers, or turns off both the Kafka
-/// lag trigger and the CPU trigger while leaving KEDA on.
+/// [`DeploymentError::InvalidContract`] if the KEDA contract or a port's `when`
+/// names a values path that is not a dotted chain of Go identifiers, a `one_of`
+/// port condition lists no values, or the KEDA contract turns off both the
+/// Kafka lag trigger and the CPU trigger while leaving KEDA on.
 pub fn generate_chart(
     contract: &DeploymentContract,
     output_dir: impl AsRef<Path>,
@@ -45,6 +46,7 @@ pub fn generate_chart(
 
     // Rendered before anything is written, so a rejected contract leaves no
     // half-generated chart behind.
+    let gates = port_gates(contract)?;
     let keda_templates = match contract.enabled_keda() {
         Some(keda) => Some((
             gen_keda_scaledobject_yaml(contract, keda)?,
@@ -68,11 +70,11 @@ pub fn generate_chart(
     )?;
     write_file(
         templates_dir.join("deployment.yaml"),
-        &gen_deployment_yaml(contract),
+        &gen_deployment_yaml(contract, &gates),
     )?;
     write_file(
         templates_dir.join("service.yaml"),
-        &gen_service_yaml(contract),
+        &gen_service_yaml(contract, &gates),
     )?;
     write_file(
         templates_dir.join("serviceaccount.yaml"),
@@ -558,7 +560,63 @@ fn gen_observability_env(app: &str) -> String {
     out
 }
 
-fn gen_deployment_yaml(c: &DeploymentContract) -> String {
+/// The template condition each extra port renders under, in `extra_ports`
+/// order; `None` for a port that always listens.
+fn port_gates(c: &DeploymentContract) -> Result<Vec<Option<String>>, DeploymentError> {
+    c.extra_ports
+        .iter()
+        .map(|port| {
+            port.when
+                .as_ref()
+                .map(|when| port_gate(&port.name, when))
+                .transpose()
+        })
+        .collect()
+}
+
+/// Render a port condition as a Go template expression over a nil-safe lookup,
+/// so a missing or null key reads as off rather than failing the render.
+fn port_gate(port: &str, condition: &PortCondition) -> Result<String, DeploymentError> {
+    let field = format!("extra_ports[{port}].when");
+    let lookup = nil_safe_values_ref(&field, condition.path())?;
+    Ok(match condition {
+        PortCondition::Enabled { .. } => lookup,
+        PortCondition::Equals { value, .. } => {
+            format!("eq (toString {lookup}) {}", go_string_literal(value))
+        }
+        PortCondition::OneOf { values, .. } => {
+            if values.is_empty() {
+                return Err(DeploymentError::InvalidContract {
+                    field,
+                    reason: "a one_of condition with no values never holds, so the port would \
+                             never render"
+                        .to_string(),
+                });
+            }
+            let choices: Vec<String> = values.iter().map(|v| go_string_literal(v)).collect();
+            format!("has (toString {lookup}) (list {})", choices.join(" "))
+        }
+    })
+}
+
+/// A double-quoted Go template string for `s`; every JSON string escape is also
+/// a valid Go escape, so a quote or backslash in a value cannot end the literal.
+fn go_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_default()
+}
+
+/// Wrap one rendered list entry in its port's template condition, if it has one.
+fn push_gated(out: &mut String, indent: &str, gate: Option<&String>, entry: &str) {
+    if let Some(gate) = gate {
+        out.push_str(&format!("{indent}{{{{- if {gate} }}}}\n"));
+    }
+    out.push_str(entry);
+    if gate.is_some() {
+        out.push_str(&format!("{indent}{{{{- end }}}}\n"));
+    }
+}
+
+fn gen_deployment_yaml(c: &DeploymentContract, gates: &[Option<String>]) -> String {
     let app = &c.app_name;
     let mut out = String::with_capacity(4096);
 
@@ -633,15 +691,16 @@ spec:
          \x20             containerPort: {{ .Values.service.port }}\n\
          \x20             protocol: TCP\n",
     );
-    for port in &c.extra_ports {
-        out.push_str(&format!(
+    for (port, gate) in c.extra_ports.iter().zip(gates) {
+        let entry = format!(
             "            - name: {name}\n\
              \x20             containerPort: {port}\n\
              \x20             protocol: {proto}\n",
             name = port.name,
             port = port.port,
             proto = port.protocol,
-        ));
+        );
+        push_gated(&mut out, "            ", gate.as_ref(), &entry);
     }
 
     // Env: observability identity first, then secret-backed credentials.
@@ -722,7 +781,7 @@ spec:
     out
 }
 
-fn gen_service_yaml(c: &DeploymentContract) -> String {
+fn gen_service_yaml(c: &DeploymentContract, gates: &[Option<String>]) -> String {
     let app = &c.app_name;
     let mut out = format!(
         r#"apiVersion: v1
@@ -742,8 +801,8 @@ spec:
     );
 
     // Extra ports
-    for port in &c.extra_ports {
-        out.push_str(&format!(
+    for (port, gate) in c.extra_ports.iter().zip(gates) {
+        let entry = format!(
             "    - port: {port}\n\
              \x20     targetPort: {port}\n\
              \x20     protocol: {proto}\n\
@@ -751,7 +810,8 @@ spec:
             port = port.port,
             proto = port.protocol,
             name = port.name,
-        ));
+        );
+        push_gated(&mut out, "    ", gate.as_ref(), &entry);
     }
 
     out.push_str(&format!(
