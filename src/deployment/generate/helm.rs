@@ -46,6 +46,29 @@ pub fn generate_chart(
 
     // Rendered before anything is written, so a rejected contract leaves no
     // half-generated chart behind.
+    let files = chart_files(contract, identity)?;
+
+    std::fs::create_dir_all(&templates_dir).map_err(|e| DeploymentError::CreateDir {
+        path: templates_dir.display().to_string(),
+        source: e,
+    })?;
+    for (name, content) in &files {
+        write_file(dir.join(name), content)?;
+    }
+    Ok(())
+}
+
+/// Every file of the chart as its path under the chart root and its content,
+/// rendered in memory so a drift check needs no scratch directory.
+///
+/// # Errors
+///
+/// [`DeploymentError::InvalidContract`] for the contracts
+/// [`generate_chart`] rejects.
+pub(crate) fn chart_files(
+    contract: &DeploymentContract,
+    identity: Option<&crate::deployment::ContractIdentity>,
+) -> Result<Vec<(&'static str, String)>, DeploymentError> {
     let gates = port_gates(contract)?;
     let keda_templates = match contract.enabled_keda() {
         Some(keda) => Some((
@@ -55,49 +78,29 @@ pub fn generate_chart(
         None => None,
     };
 
-    // Create directories
-    std::fs::create_dir_all(&templates_dir).map_err(|e| DeploymentError::CreateDir {
-        path: templates_dir.display().to_string(),
-        source: e,
-    })?;
-
-    // Write all chart files
-    write_file(dir.join("Chart.yaml"), &gen_chart_yaml(contract, identity))?;
-    write_file(dir.join("values.yaml"), &gen_values_yaml(contract))?;
-    write_file(
-        templates_dir.join("_helpers.tpl"),
-        &gen_helpers_tpl(contract),
-    )?;
-    write_file(
-        templates_dir.join("deployment.yaml"),
-        &gen_deployment_yaml(contract, &gates),
-    )?;
-    write_file(
-        templates_dir.join("service.yaml"),
-        &gen_service_yaml(contract, &gates),
-    )?;
-    write_file(
-        templates_dir.join("serviceaccount.yaml"),
-        &gen_serviceaccount_yaml(contract),
-    )?;
-    write_file(
-        templates_dir.join("configmap.yaml"),
-        &gen_configmap_yaml(contract),
-    )?;
-    write_file(
-        templates_dir.join("secret.yaml"),
-        &gen_secret_yaml(contract),
-    )?;
-    write_file(templates_dir.join("hpa.yaml"), &gen_hpa_yaml(contract))?;
-
+    let mut files = vec![
+        ("Chart.yaml", gen_chart_yaml(contract, identity)),
+        ("values.yaml", gen_values_yaml(contract)),
+        ("templates/_helpers.tpl", gen_helpers_tpl(contract)),
+        (
+            "templates/deployment.yaml",
+            gen_deployment_yaml(contract, &gates),
+        ),
+        ("templates/service.yaml", gen_service_yaml(contract, &gates)),
+        (
+            "templates/serviceaccount.yaml",
+            gen_serviceaccount_yaml(contract),
+        ),
+        ("templates/configmap.yaml", gen_configmap_yaml(contract)),
+        ("templates/secret.yaml", gen_secret_yaml(contract)),
+        ("templates/hpa.yaml", gen_hpa_yaml(contract)),
+    ];
     if let Some((scaled_object, trigger_auth)) = keda_templates {
-        write_file(templates_dir.join("keda-scaledobject.yaml"), &scaled_object)?;
-        write_file(templates_dir.join("keda-triggerauth.yaml"), &trigger_auth)?;
+        files.push(("templates/keda-scaledobject.yaml", scaled_object));
+        files.push(("templates/keda-triggerauth.yaml", trigger_auth));
     }
-
-    write_file(templates_dir.join("NOTES.txt"), &gen_notes_txt(contract))?;
-
-    Ok(())
+    files.push(("templates/NOTES.txt", gen_notes_txt(contract)));
+    Ok(files)
 }
 
 // ============================================================================

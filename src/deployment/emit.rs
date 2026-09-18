@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/deployment/emit.rs
-// Purpose:   Emit + drift-check reflectable config artefacts (scalo-rs#6)
+// Purpose:   Emit + drift-check config artefacts; guard committed charts and listeners
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -25,6 +25,10 @@
 //! copy can be drift-checked against a fresh regeneration -- see
 //! [`assert_no_config_artifact_drift`]. See `docs/reflectable-config-shape.md`
 //! for the cross-language shape shared with scalo-py.
+//!
+//! [`check_chart_drift`] guards a committed Helm chart the same way, with a
+//! [`ChartPatch`] pinning each hand fix, and [`assert_listeners_declared`]
+//! checks the contract's listeners against its ports.
 
 use std::path::{Path, PathBuf};
 
@@ -205,6 +209,180 @@ pub fn assert_no_config_artifact_drift(contract: &DeploymentContract, dir: impl 
     }
 }
 
+/// A hand edit a committed chart file carries on purpose: text the generator
+/// writes (`from`) replaced by what the file holds instead (`to`).
+///
+/// [`check_chart_drift`] applies each patch to the freshly generated file
+/// before comparing, and fails once the generator stops writing `from`, so the
+/// hand fix is pinned to the content it replaces rather than exempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChartPatch {
+    /// Path under the chart root, e.g. `templates/keda-scaledobject.yaml`.
+    pub file: String,
+    /// Text the generator writes that the hand fix replaces.
+    pub from: String,
+    /// What the committed file holds in its place.
+    pub to: String,
+}
+
+/// Check that the committed chart under `chart_dir` is exactly what
+/// [`generate_chart`](super::generate_chart) writes for `contract`, with each
+/// of `patches` applied.
+///
+/// Every generated file must be on disk and equal the fresh output after its
+/// patches, each patch's `from` must still occur in the file it names, and
+/// every file in the chart root or `templates/` must be one the generator
+/// writes. The chart is rendered without identity annotations, as a committed
+/// chart is.
+///
+/// # Errors
+///
+/// Returns [`DeploymentError::Drift`] listing every problem found,
+/// [`DeploymentError::InvalidContract`] when the contract cannot generate a
+/// chart, or [`DeploymentError::ReadFile`] when a chart file cannot be read.
+pub fn check_chart_drift(
+    contract: &DeploymentContract,
+    chart_dir: &Path,
+    patches: &[ChartPatch],
+) -> Result<(), DeploymentError> {
+    let fresh = super::generate::chart_files(contract, None)?;
+    let mut problems = Vec::new();
+
+    for patch in patches {
+        if patch.from.is_empty() {
+            problems.push(format!(
+                "{}: a patch has an empty `from`, which pins nothing",
+                patch.file
+            ));
+        } else if !fresh.iter().any(|(name, _)| *name == patch.file) {
+            problems.push(format!(
+                "{}: patch no longer applies -- the generator does not write this file; drop it",
+                patch.file
+            ));
+        }
+    }
+
+    for (name, generated) in &fresh {
+        let mut expected = generated.clone();
+        let mut patches_apply = true;
+        for patch in patches
+            .iter()
+            .filter(|p| p.file == *name && !p.from.is_empty())
+        {
+            if generated.contains(&patch.from) {
+                expected = expected.replace(&patch.from, &patch.to);
+            } else {
+                patches_apply = false;
+                problems.push(format!(
+                    "{name}: patch no longer applies -- drop it (the generator no longer \
+                     writes {:?})",
+                    patch.from.lines().next().unwrap_or_default()
+                ));
+            }
+        }
+        let path = chart_dir.join(name);
+        match std::fs::read_to_string(&path) {
+            // A patch that no longer applies is the problem to report for this file.
+            Ok(_) if !patches_apply => {}
+            Ok(committed) if committed == expected => {}
+            Ok(committed) => problems.push(format!(
+                "{name}: differs from the generated chart at line {}",
+                first_differing_line(&expected, &committed)
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                problems.push(format!("{name}: generated but missing from the chart"));
+            }
+            Err(e) => {
+                return Err(DeploymentError::ReadFile {
+                    path: path.display().to_string(),
+                    source: e,
+                });
+            }
+        }
+    }
+
+    for name in files_in_chart(chart_dir)? {
+        if !fresh.iter().any(|(generated, _)| *generated == name) {
+            problems.push(format!(
+                "{name}: in the chart, but the generator does not write it"
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(DeploymentError::Drift {
+        path: chart_dir.display().to_string(),
+        detail: format!(
+            "{}\nRegenerate the chart from the contract, and keep a hand edit only as a \
+             ChartPatch.",
+            problems.join("\n")
+        ),
+    })
+}
+
+/// Panic if the committed chart under `chart_dir` drifts from the generator's
+/// output with `patches` applied. Wraps [`check_chart_drift`] for use directly
+/// in a `#[test]`.
+///
+/// # Panics
+///
+/// Panics listing every problem when the chart drifted, or when the check
+/// itself cannot run.
+pub fn assert_no_chart_drift(
+    contract: &DeploymentContract,
+    chart_dir: &Path,
+    patches: &[ChartPatch],
+) {
+    if let Err(e) = check_chart_drift(contract, chart_dir, patches) {
+        panic!("{e}");
+    }
+}
+
+/// The 1-based line where `a` and `b` first differ.
+fn first_differing_line(a: &str, b: &str) -> usize {
+    let (mut a_lines, mut b_lines) = (a.lines(), b.lines());
+    let mut line = 1;
+    loop {
+        match (a_lines.next(), b_lines.next()) {
+            (Some(x), Some(y)) if x == y => line += 1,
+            _ => return line,
+        }
+    }
+}
+
+/// Paths, relative to the chart root, of the files in the two directories the
+/// generator writes to: the root and `templates/`.
+fn files_in_chart(chart_dir: &Path) -> Result<Vec<String>, DeploymentError> {
+    let mut found = Vec::new();
+    for sub in ["", "templates"] {
+        let dir = chart_dir.join(sub);
+        let read_error = |e: std::io::Error| DeploymentError::ReadFile {
+            path: dir.display().to_string(),
+            source: e,
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(read_error(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(read_error)?;
+            if entry.path().is_file() {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                found.push(if sub.is_empty() {
+                    file
+                } else {
+                    format!("{sub}/{file}")
+                });
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// Panic if `default_config` has a listen address no port declares, or one
 /// that binds a different port than the port claiming it. Wraps
 /// [`DeploymentContract::undeclared_listeners`] for use directly in a `#[test]`.
@@ -335,6 +513,162 @@ mod tests {
         // Never emitted -> files missing -> drift.
         let err = check_config_artifact_drift(&contract, dir.path()).unwrap_err();
         assert!(matches!(err, DeploymentError::Drift { .. }), "got {err:?}");
+    }
+
+    /// A chart generated into a temp dir, standing in for a committed one.
+    fn committed_chart() -> (DeploymentContract, tempfile::TempDir) {
+        let contract = contract_with_catalog();
+        let dir = tempfile::tempdir().unwrap();
+        crate::deployment::generate_chart(&contract, dir.path(), None).unwrap();
+        (contract, dir)
+    }
+
+    /// Replace `from` with `to` in a committed chart file, as a hand fix would.
+    fn hand_edit(dir: &Path, file: &str, from: &str, to: &str) {
+        let path = dir.join(file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(from), "{file} lacks {from:?}");
+        std::fs::write(&path, text.replace(from, to)).unwrap();
+    }
+
+    fn drift_detail(result: Result<(), DeploymentError>) -> String {
+        match result {
+            Err(DeploymentError::Drift { detail, .. }) => detail,
+            other => panic!("expected drift, got {other:?}"),
+        }
+    }
+
+    const REPLICAS: &str = "  replicas: {{ .Values.replicaCount }}\n";
+
+    fn pin_replicas() -> ChartPatch {
+        ChartPatch {
+            file: "templates/deployment.yaml".into(),
+            from: REPLICAS.into(),
+            to: "  replicas: 2\n".into(),
+        }
+    }
+
+    #[test]
+    fn chart_drift_passes_on_a_fresh_chart() {
+        let (contract, dir) = committed_chart();
+        check_chart_drift(&contract, dir.path(), &[]).unwrap();
+        assert_no_chart_drift(&contract, dir.path(), &[]);
+    }
+
+    #[test]
+    fn chart_drift_passes_a_hand_fix_its_patch_pins() {
+        let (contract, dir) = committed_chart();
+        hand_edit(
+            dir.path(),
+            "templates/deployment.yaml",
+            REPLICAS,
+            "  replicas: 2\n",
+        );
+
+        check_chart_drift(&contract, dir.path(), &[pin_replicas()]).unwrap();
+        // Without the patch the same hand fix is drift.
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[]));
+        assert!(
+            detail
+                .contains("templates/deployment.yaml: differs from the generated chart at line 9"),
+            "{detail}"
+        );
+    }
+
+    /// A patch pins one edit; any other edit to the same file, or to another
+    /// file, is still drift.
+    #[test]
+    fn chart_drift_catches_an_edit_outside_the_patch() {
+        let (contract, dir) = committed_chart();
+        hand_edit(
+            dir.path(),
+            "templates/deployment.yaml",
+            REPLICAS,
+            "  replicas: 2\n",
+        );
+        hand_edit(
+            dir.path(),
+            "templates/deployment.yaml",
+            "periodSeconds: 10",
+            "periodSeconds: 20",
+        );
+        hand_edit(
+            dir.path(),
+            "values.yaml",
+            "replicaCount: 1",
+            "replicaCount: 4",
+        );
+
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[pin_replicas()]));
+        assert!(
+            detail.contains("templates/deployment.yaml: differs from the generated chart"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("values.yaml: differs from the generated chart"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn chart_drift_fails_a_patch_the_generator_has_moved_past() {
+        let (contract, dir) = committed_chart();
+        let stale = ChartPatch {
+            file: "templates/deployment.yaml".into(),
+            from: "  replicas: 3\n".into(),
+            to: "  replicas: 2\n".into(),
+        };
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[stale]));
+        assert!(
+            detail.contains("templates/deployment.yaml: patch no longer applies -- drop it"),
+            "{detail}"
+        );
+
+        for (file, from) in [("templates/pdb.yaml", "x"), ("values.yaml", "")] {
+            let patch = ChartPatch {
+                file: file.into(),
+                from: from.into(),
+                to: "y".into(),
+            };
+            let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[patch]));
+            assert!(detail.starts_with(&format!("{file}: ")), "{detail}");
+        }
+    }
+
+    #[test]
+    fn chart_drift_fails_on_a_missing_or_extra_file() {
+        let (contract, dir) = committed_chart();
+        std::fs::remove_file(dir.path().join("templates/hpa.yaml")).unwrap();
+        std::fs::write(
+            dir.path().join("templates/keda-scaledobject.yaml"),
+            "stale\n",
+        )
+        .unwrap();
+
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[]));
+        assert!(
+            detail.contains("templates/hpa.yaml: generated but missing from the chart"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(
+                "templates/keda-scaledobject.yaml: in the chart, but the generator does not write it"
+            ),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "values.yaml: differs from the generated chart")]
+    fn assert_no_chart_drift_panics_on_drift() {
+        let (contract, dir) = committed_chart();
+        hand_edit(
+            dir.path(),
+            "values.yaml",
+            "replicaCount: 1",
+            "replicaCount: 4",
+        );
+        assert_no_chart_drift(&contract, dir.path(), &[]);
     }
 
     #[test]

@@ -88,8 +88,9 @@ pub enum DeploymentError {
         reason: String,
     },
 
-    /// A committed config artefact drifted from the freshly-generated output.
-    #[error("config artefact drift in {path}:\n{detail}")]
+    /// A committed artefact (config artefacts or a chart) drifted from the
+    /// freshly generated output.
+    #[error("artefact drift in {path}:\n{detail}")]
     Drift {
         /// The artefact path that drifted.
         path: String,

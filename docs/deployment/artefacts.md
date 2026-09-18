@@ -267,6 +267,33 @@ alternatives when committed files carry intentional deviations (e.g.
 CI's prepended builder stages). Each returns the list of
 `ContractMismatch`es rather than a hard diff.
 
+### Keeping a hand-fixed chart under the guard
+
+The committed chart should come straight from `generate_chart()`. When it cannot yet -- a generator defect you have to work round until the fix ships -- pin the hand edit rather than exempting the file. An exemption only proves the file differs from the generator, and a stale edit differs too, so an exempt file rots with the guard green.
+
+```rust
+use std::path::Path;
+use scalo::deployment::{ChartPatch, assert_no_chart_drift};
+
+#[test]
+fn committed_chart_matches_the_generator() {
+    let patches = [ChartPatch {
+        file: "templates/keda-scaledobject.yaml".into(),
+        from: "        tls: disable\n".into(),
+        to: "        tls: enable\n".into(),
+    }];
+    assert_no_chart_drift(&contract(), Path::new("chart"), &patches);
+}
+```
+
+`check_chart_drift()` renders the chart fresh, applies each patch to the file it names, and requires the committed file to match byte for byte. It fails when:
+
+- a committed file differs from the fresh output with its patches applied
+- a patch's `from` no longer occurs in the generated file -- the generator changed under the hand fix, so drop the patch or pin it again
+- a generated file is missing from the chart, or a file in the chart root or `templates/` is one the generator does not write
+
+It renders without identity annotations, the same as a committed chart. Once a scalo release fixes the defect a patch works round, the patch's `from` stops appearing and the check says to drop it.
+
 ---
 
 ## Determinism

@@ -107,8 +107,8 @@ pub use contract_identity::{ContractIdentity, IdentityError, KEY_PREFIX, VERSION
 #[cfg(feature = "config-schema")]
 pub use emit::config_schema_json;
 pub use emit::{
-    assert_listeners_declared, assert_no_config_artifact_drift, check_config_artifact_drift,
-    emit_config_artifacts,
+    ChartPatch, assert_listeners_declared, assert_no_chart_drift, assert_no_config_artifact_drift,
+    check_chart_drift, check_config_artifact_drift, emit_config_artifacts,
 };
 pub use error::{ContractMismatch, DeploymentError};
 pub use generate::{

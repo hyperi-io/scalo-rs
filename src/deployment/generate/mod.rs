@@ -24,6 +24,7 @@ mod manifest;
 pub use argocd::{ArgocdConfig, generate_argocd_application};
 pub use compose::generate_compose_fragment;
 pub use dockerfile::{generate_dockerfile, generate_runtime_stage};
+pub(crate) use helm::chart_files;
 pub use helm::generate_chart;
 pub use manifest::generate_container_manifest;
 
