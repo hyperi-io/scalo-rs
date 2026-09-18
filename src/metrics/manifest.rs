@@ -79,6 +79,9 @@ pub struct ManifestResponse {
     pub namespace: String,
     pub version: String,
     pub commit: String,
+    /// When the running service's registry was created, RFC 3339. Empty in a
+    /// manifest the CLI generates offline, so a regenerated file is the same
+    /// bytes on every run.
     pub registered_at: String,
     pub metrics: Vec<MetricDescriptor>,
 }
@@ -127,6 +130,16 @@ impl MetricRegistry {
         }
     }
 
+    /// Drop the registration time, for a manifest generated offline: nothing
+    /// was registered by a running service, and a time stamped per run would
+    /// make every regenerated artefact differ.
+    #[cfg(any(feature = "cli-service", test))]
+    pub(crate) fn clear_registered_at(&self) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.registered_at.clear();
+        }
+    }
+
     /// Push a metric descriptor into the registry.
     ///
     /// The descriptor's `name` is expected to be BARE (no namespace prefix).
@@ -135,9 +148,10 @@ impl MetricRegistry {
     /// the prefix layer on the global recorder so emitted and manifest names
     /// match.
     ///
-    /// A name already held is replaced in place, the later descriptor winning:
-    /// one name is one series, so the runtime and an app that both describe it
-    /// list it once.
+    /// A name already held keeps its first descriptor: one name is one series,
+    /// and the runtime describes its own metrics before the app does, so an app
+    /// describing a platform metric again cannot strip its labels, group, use
+    /// cases or dashboard hint.
     pub(crate) fn push(&self, mut descriptor: MetricDescriptor) {
         if let Ok(mut inner) = self.inner.write() {
             if !inner.namespace.is_empty() {
@@ -145,20 +159,21 @@ impl MetricRegistry {
             }
             match inner
                 .descriptors
-                .iter_mut()
+                .iter()
                 .find(|held| held.name == descriptor.name)
             {
+                #[cfg_attr(not(feature = "logger"), allow(unused_variables))]
                 Some(held) => {
                     #[cfg(feature = "logger")]
                     if held.metric_type != descriptor.metric_type
                         || held.labels != descriptor.labels
+                        || held.group != descriptor.group
                     {
                         tracing::debug!(
                             metric = %descriptor.name,
-                            "metric described again with a different type or labels, keeping the later one"
+                            "metric described again with a different type, labels or group, keeping the first"
                         );
                     }
-                    *held = descriptor;
                 }
                 None => inner.descriptors.push(descriptor),
             }
@@ -483,30 +498,46 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_push_of_a_held_name_replaces_it() {
+    fn test_registry_push_of_a_held_name_keeps_the_first() {
         for namespace in ["", "acme"] {
             let reg = MetricRegistry::new(namespace);
-            reg.push(counter("records_received_total", &[], "platform"));
+            let mut canonical = counter("records_received_total", &["source"], "platform");
+            canonical.use_cases = vec!["Alert when it stops rising".into()];
+            canonical.dashboard_hint = Some("stat".into());
+            reg.push(canonical);
             reg.push(counter("records_dlq_total", &[], "platform"));
-            reg.push(counter("records_received_total", &["source"], "app"));
+            reg.push(counter("records_received_total", &[], "custom"));
 
             let manifest = reg.manifest();
             let name = prefixed_lookup(namespace, "records_received_total");
             let held: Vec<&MetricDescriptor> =
                 manifest.metrics.iter().filter(|m| m.name == name).collect();
             assert_eq!(held.len(), 1, "{name} listed once under `{namespace}`");
-            assert_eq!(held[0].group, "app", "the later descriptor wins");
+            assert_eq!(held[0].group, "platform", "the first descriptor stands");
             assert_eq!(held[0].labels, vec!["source"]);
+            assert_eq!(held[0].use_cases, vec!["Alert when it stops rising"]);
+            assert_eq!(held[0].dashboard_hint.as_deref(), Some("stat"));
             assert_eq!(
                 manifest.metrics.len(),
                 2,
-                "a replacement is not an addition"
+                "a second description is not an addition"
             );
-            assert_eq!(
-                manifest.metrics[0].name, name,
-                "the replacement keeps the first one's place"
-            );
+            assert_eq!(manifest.metrics[0].name, name, "and keeps its place");
         }
+    }
+
+    #[test]
+    fn test_an_offline_registry_carries_no_registration_time() {
+        let live = MetricRegistry::new("");
+        assert_eq!(
+            live.manifest().registered_at.len(),
+            20,
+            "a live registry is stamped"
+        );
+
+        let offline = MetricRegistry::new("");
+        offline.clear_registered_at();
+        assert_eq!(offline.manifest().registered_at, "");
     }
 
     #[test]

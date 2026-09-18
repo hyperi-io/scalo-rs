@@ -349,8 +349,10 @@ impl ServiceRuntime {
 /// features are compiled in.
 ///
 /// The one list the running service and the `metrics-manifest` and
-/// `generate-artefacts` subcommands all describe, so a manifest names what the
-/// service serves whether or not the app describes anything of its own.
+/// `generate-artefacts` subcommands all describe, so a manifest lists the
+/// runtime set whether or not the app describes anything of its own. The
+/// process, container, HTTP client and memory guard gauges are served but not
+/// described here, so they are not in the manifest (scalo-rs#137).
 #[must_use]
 pub(crate) fn register_runtime_metrics(
     manager: &MetricsManager,

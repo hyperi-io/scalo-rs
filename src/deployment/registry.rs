@@ -117,12 +117,12 @@ pub fn base_image_from_cascade() -> String {
 /// Reads `deployment.base_distro` from the YAML cascade, then falls back to
 /// that key's own ENV-layer spelling, `DEPLOYMENT__BASE_DISTRO`.
 ///
-/// The env fallback is not redundant. Artefact generation runs on a CLI path
-/// that never calls `load_config`, so the cascade is not initialised there and
-/// the YAML lookup always misses -- which would make the remedy named in the
-/// generated Dockerfile's warning ("set `deployment.base_distro`") inert in the
-/// one command that generates Dockerfiles. Reading the ENV layer's key directly
-/// gives the same answer whether or not config happens to be loaded.
+/// The env fallback is not redundant. A Dockerfile generated where the app's
+/// config did not load, or by a caller that never loads it, finds no cascade
+/// and the YAML lookup misses -- which would make the remedy named in the
+/// generated Dockerfile's warning ("set `deployment.base_distro`") inert there.
+/// Reading the ENV layer's key directly gives the same answer whether or not
+/// config happens to be loaded.
 ///
 /// Returns `None` when unset or unrecognised. An unrecognised value is treated
 /// as unset rather than silently substituted, so [`resolve_base_distro`] can

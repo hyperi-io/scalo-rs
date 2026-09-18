@@ -90,13 +90,24 @@ spec, use cases, dashboard hint, app version, git commit, registration timestamp
 ```
 
 `app` is the service name. `namespace` is the `metrics.namespace` prefix every
-name carries, empty (bare names) by default. A name is listed once: describing it
-again replaces the earlier descriptor.
+name carries, empty (bare names) by default. A name is listed once, and the first
+descriptor stands: the runtime describes its own metrics before the app does, so
+an app describing a platform metric again cannot strip its labels, group, use
+cases or dashboard hint. `registered_at` is when the running service's registry
+was created.
+
+The manifest lists what the registry holds, not everything `/metrics` serves:
+the process, container, HTTP client and memory guard gauges are served but not
+yet described (scalo-rs#137).
 
 Two CLI subcommands produce the same JSON without running the service, reading
-`metrics.namespace` from the same config the service loads. `metrics-manifest`
-prints it to stdout, `generate-artefacts` writes `metrics-manifest.json` into its
-output directory, and the two are byte-identical:
+`metrics.namespace` from the same config cascade the service loads.
+`metrics-manifest` prints it to stdout, `generate-artefacts` writes
+`metrics-manifest.json` into its output directory, and the two are
+byte-identical. Neither stamps a time: `registered_at` is empty, so two runs
+over the same build and config give the same bytes. `version` and `commit`
+change with the build, and anything read from the cascade changes with the
+config and environment the command runs under, so a dev box and CI can differ:
 
 ```bash
 my-app metrics-manifest > docs/metrics-manifest.json

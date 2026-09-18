@@ -56,6 +56,11 @@ each name once and under the `metrics.namespace` the service's own
 config sets. CI uses it to check that Prometheus dashboards and alerts
 reference real metrics. Byte-identical to `metrics-manifest` on stdout.
 
+It lists what the scalo registry describes, which is not yet everything
+the service serves: the `process_*`, `container_*`, `http_client_*` and
+memory guard gauges are on `/metrics` but not in the manifest
+(scalo-rs#137).
+
 ```json
 {
   "schema_version": 1,
@@ -301,6 +306,17 @@ It renders without identity annotations, the same as a committed chart. Once a s
 Identical input gives byte-identical output -- no timestamps, no
 random IDs. Two consecutive runs match exactly. This is what makes the
 CI diff check reliable.
+
+The input is more than the source. `generate-artefacts` loads the app's
+config first, once, and every artefact follows that cascade: the
+contract's base image and registry, the metrics namespace, the ArgoCD
+repo URL. So a dev box and CI with different settings files or env
+vars can generate different artefacts from one commit. A config that
+does not load is reported on stderr and the defaults are taken. The
+manifest's `version` and `commit` also change with each build.
+
+A contract with a `default_config` listener no port declares is refused
+before anything is written -- see [contract.md](contract.md#ports).
 
 ---
 
