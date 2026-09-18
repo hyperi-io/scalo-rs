@@ -86,10 +86,41 @@ the exchange is built.
 | `TokenPost` | A form POST of exactly the fields handed to it -- the generic shape |
 | `MetadataServer` | A GET, optionally behind a header (`Metadata-Flavor: Google`) |
 
-`TokenPost` is how a signed client assertion (RFC 7523) or a session
-login reaches a token endpoint: the consumer mints and signs the
-assertion, and hands it in as a rendered form value. No JWT library and
-no key parsing enters scalo.
+`TokenPost` has two shapes. `TokenPost::new` takes a form rendered once
+and posts it unchanged on every exchange, renewals included, so it is for
+a form that is safe to resend: a session login, a client secret.
+`TokenPost::minted` takes a closure that renders the form for every
+exchange, and it is the RFC 7523 path: a signed client assertion carries
+a single-use `jti` and a short `exp`, so each renewal needs a freshly
+minted one. The consumer mints and signs it in the closure, so no JWT
+library and no key parsing enters scalo.
+
+```rust
+use scalo::auth::{AuthError, Cached, TokenPost};
+
+let source = Cached::new(TokenPost::minted(
+    &http,
+    "https://idp.example/oauth2/token",
+    move || {
+        let assertion = sign_assertion().map_err(|_| AuthError::Unavailable {
+            reason: "client assertion could not be signed".into(),
+        })?;
+        Ok(vec![
+            ("grant_type".into(), "client_credentials".into()),
+            (
+                "client_assertion_type".into(),
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into(),
+            ),
+            ("client_assertion".into(), assertion),
+        ])
+    },
+)?);
+```
+
+A render that cannot mint returns an `AuthError`, usually `Unavailable`,
+and the exchange hands it back without posting anything. Fields added
+with `with_form_field` ride along on both shapes, ahead of the minted
+ones.
 
 ### The client an exchange uses
 
@@ -100,7 +131,7 @@ differences.
 - **Redirects refused.** reqwest carries the form and any custom header
   across a cross-origin hop, so a token endpoint that answers 307 would
   otherwise repost the client secret to whatever host it names.
-- **The POST retried only where it is safe to resend.** `ClientCredentials` retries its POST whatever the shared client's `retry_non_idempotent` says: a client-secret POST mints a new credential, so replaying it duplicates nothing. `TokenPost` resends its form as rendered, and a single-use assertion (an RFC 7523 `jti`) is refused on a second sight, so it retries only when the shared client's `retry_non_idempotent` is on.
+- **The POST retried only where it is safe to resend.** `ClientCredentials` retries its POST whatever the shared client's `retry_non_idempotent` says: a client-secret POST mints a new credential, so replaying it duplicates nothing. `TokenPost` retries only when the shared client's `retry_non_idempotent` is on: a retry inside one exchange resends the form it already posted, minted or not, and a single-use assertion (an RFC 7523 `jti`) is refused on a second sight.
 
 Everything else -- timeouts, schedule, user agent -- is the caller's.
 

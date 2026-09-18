@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -613,6 +614,86 @@ async fn a_token_post_sends_the_rendered_form() {
         )),
         "{:?}",
         field_names(&forms[0])
+    );
+}
+
+/// A minted post renders its form on every exchange, so a renewal carries a
+/// fresh single-use assertion rather than the one the endpoint already spent.
+#[tokio::test]
+async fn a_minted_token_post_sends_a_fresh_assertion_on_every_renewal() {
+    let (addr, state) = fixture().await;
+    let minted = AtomicU64::new(0);
+    let source = Cached::new(
+        TokenPost::minted(
+            &client(),
+            format!("http://{addr}/token/due-once"),
+            move || {
+                let jti = minted.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(vec![
+                    (
+                        "grant_type".to_owned(),
+                        "urn:ietf:params:oauth:grant-type:jwt-bearer".to_owned(),
+                    ),
+                    (
+                        "assertion".to_owned(),
+                        format!("header.jti-{jti}.signature"),
+                    ),
+                ])
+            },
+        )
+        .expect("a loopback token endpoint"),
+    );
+
+    // The first token is already past its renewal point when it arrives, so
+    // the second call is a renewal through the cache.
+    let first = source.credential().await.unwrap();
+    let renewed = source.credential().await.unwrap();
+
+    assert_eq!(first.secret.expose(), "tok-1");
+    assert_eq!(renewed.secret.expose(), "tok-2");
+    let assertions: Vec<String> = state
+        .lock()
+        .unwrap()
+        .forms
+        .iter()
+        .filter_map(|form| {
+            form.iter()
+                .find(|(name, _)| name == "assertion")
+                .map(|(_, value)| value.clone())
+        })
+        .collect();
+    assert_eq!(
+        assertions,
+        ["header.jti-1.signature", "header.jti-2.signature"],
+        "each exchange posted its own assertion"
+    );
+}
+
+/// A form the consumer cannot mint is handed back as the consumer's own
+/// failure, and nothing reaches the endpoint.
+#[tokio::test]
+async fn a_form_that_cannot_be_minted_is_an_error_and_posts_nothing() {
+    let (addr, state) = fixture().await;
+    let source = Cached::new(
+        TokenPost::minted(&client(), format!("http://{addr}/token/long"), || {
+            Err(AuthError::Unavailable {
+                reason: "signing key not readable".to_owned(),
+            })
+        })
+        .expect("a loopback token endpoint"),
+    );
+
+    let error = source.credential().await.expect_err("nothing to post");
+
+    assert!(
+        matches!(error, AuthError::Unavailable { .. }),
+        "the render's own failure: {error:?}"
+    );
+    assert!(!error.is_transient());
+    assert_eq!(
+        state.lock().unwrap().token_exchanges,
+        0,
+        "nothing was posted"
     );
 }
 

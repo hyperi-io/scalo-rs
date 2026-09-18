@@ -141,7 +141,7 @@ impl<T: CredentialSource + ?Sized> CredentialSource for &T {
 /// An implementation does no caching and holds no state -- [`Cached`] owns
 /// that. A signing scheme that needs its own crypto (a JWT client assertion, a
 /// provider-specific signature) mints its inputs in the consumer and hands them
-/// to [`TokenPost`], or implements this trait itself.
+/// to [`TokenPost::minted`], or implements this trait itself.
 pub trait Exchange: Send + Sync {
     /// Obtain one credential now.
     ///
@@ -636,22 +636,31 @@ impl Exchange for ClientCredentials {
 
 /// A form POST to a token endpoint, exactly as the consumer renders it.
 ///
-/// This is how a signed client assertion (RFC 7523) or a session login reaches
-/// an endpoint: the consumer mints and signs the assertion and hands it in as a
-/// form value, so no key format or JWT library enters scalo.
+/// [`Self::new`] posts a form rendered once, the same on every exchange, which
+/// suits a form that is safe to resend: a session login, a client secret.
+/// [`Self::minted`] renders the form afresh for every exchange, which is how a
+/// signed client assertion (RFC 7523) reaches an endpoint: the consumer mints
+/// and signs a new assertion each time, so no key format or JWT library enters
+/// scalo.
 ///
-/// The form is resent exactly as rendered, and a single-use assertion in it is
-/// refused on a second sight, so the POST is not retried unless the template's
-/// `retry_non_idempotent` opts in.
+/// A single-use assertion is refused on a second sight, so the POST is not
+/// retried inside one exchange unless the template's `retry_non_idempotent`
+/// opts in.
 pub struct TokenPost {
     http: HttpClient,
     token_url: String,
     form: Vec<(String, String)>,
+    render: Option<Arc<RenderForm>>,
     reading: TokenReading,
 }
 
+/// A consumer's closure that renders a token post's form for one exchange.
+type RenderForm = dyn Fn() -> Result<Vec<(String, String)>, AuthError> + Send + Sync;
+
 impl TokenPost {
-    /// Post to `token_url`. The form starts empty.
+    /// Post to `token_url` a form that is safe to resend: a session login, a
+    /// client secret. The form starts empty and is posted as rendered on every
+    /// exchange, renewals included.
     ///
     /// `http` is the settings the exchange takes, with redirects refused as for
     /// [`ClientCredentials::new`] and its `retry_non_idempotent` deciding
@@ -669,11 +678,43 @@ impl TokenPost {
             http: exchange_client(http, http.config().retry_non_idempotent)?,
             token_url,
             form: Vec::new(),
+            render: None,
             reading: TokenReading::default(),
         })
     }
 
-    /// Add a rendered form field.
+    /// Post to `token_url` a form that `render` mints afresh for every
+    /// exchange: the RFC 7523 client assertion path, where a signed assertion
+    /// carries a single-use `jti` and a short `exp` and so cannot be resent.
+    ///
+    /// `render` runs once per acquisition, renewals included, and its fields
+    /// are posted after any added with [`Self::with_form_field`]. A render that
+    /// cannot mint (a key it cannot read, a signer that failed) returns an
+    /// [`AuthError`], usually [`AuthError::Unavailable`], which the exchange
+    /// hands back without posting anything. `http` is taken as for
+    /// [`Self::new`], so the POST is not retried inside one exchange unless the
+    /// template's `retry_non_idempotent` opts in: a retry would replay the same
+    /// assertion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Endpoint`] when `token_url` is not an https URL or
+    /// a loopback address, and [`AuthError::Client`] when the exchange's own
+    /// client cannot be built.
+    pub fn minted<F>(
+        http: &HttpClient,
+        token_url: impl Into<String>,
+        render: F,
+    ) -> Result<Self, AuthError>
+    where
+        F: Fn() -> Result<Vec<(String, String)>, AuthError> + Send + Sync + 'static,
+    {
+        let mut post = Self::new(http, token_url)?;
+        post.render = Some(Arc::new(render));
+        Ok(post)
+    }
+
+    /// Add a rendered form field, posted unchanged on every exchange.
     #[must_use]
     pub fn with_form_field(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.form.push((name.into(), value.into()));
@@ -700,9 +741,14 @@ impl fmt::Debug for TokenPost {
 
 impl Exchange for TokenPost {
     async fn acquire(&self) -> Result<Credential, AuthError> {
+        let minted = match self.render {
+            Some(ref render) => render()?,
+            None => Vec::new(),
+        };
         let form: Vec<(&str, &str)> = self
             .form
             .iter()
+            .chain(&minted)
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
         let body = post_form(&self.http, &self.token_url, &form).await?;
