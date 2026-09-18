@@ -39,7 +39,8 @@ mod tests {
     use crate::deployment::contract::{
         OciLabels, PortContract, SecretEnvContract, SecretGroupContract,
     };
-    use crate::deployment::keda::KedaContract;
+    use crate::deployment::error::DeploymentError;
+    use crate::deployment::keda::{KafkaLagTrigger, KedaConfig, KedaContract};
     use crate::deployment::native_deps::NativeDepsContract;
 
     fn test_contract() -> DeploymentContract {
@@ -530,7 +531,9 @@ mod tests {
     /// `default (index .Values.config.kafka.topics 0)` which `helm lint`
     /// rejects with `error calling index: index of untyped nil` because
     /// Sprig's `default` evaluates both operands. The render must now
-    /// use a conditional `if/else if/else` block instead.
+    /// use a conditional `if/else if/else` block instead, and take the first
+    /// topic by splitting a joined string, because `index` on a string topic
+    /// yields a byte rather than the topic.
     #[test]
     fn test_keda_scaledobject_topic_lookup_is_lint_safe() {
         let contract = test_contract();
@@ -547,6 +550,10 @@ mod tests {
             ),
             "keda-scaledobject.yaml still uses the eagerly-evaluated `default (index ...)` form:\n{keda_yaml}"
         );
+        assert!(
+            !keda_yaml.contains("(index .Values.config.kafka.topics 0)"),
+            "keda-scaledobject.yaml still indexes the topics value, which breaks on a string:\n{keda_yaml}"
+        );
 
         // New conditional form must appear
         assert!(
@@ -554,9 +561,200 @@ mod tests {
             "keda-scaledobject.yaml missing if/else guard for topic lookup:\n{keda_yaml}"
         );
         assert!(
-            keda_yaml.contains("else if .Values.config.kafka.topics"),
-            "keda-scaledobject.yaml missing fallback branch for config.kafka.topics:\n{keda_yaml}"
+            keda_yaml.contains(r#"{{- $topics := join "," ((.Values.config).kafka).topics }}"#),
+            "keda-scaledobject.yaml does not join the topics value nil-safely:\n{keda_yaml}"
         );
+        assert!(
+            keda_yaml.contains("else if $topics"),
+            "keda-scaledobject.yaml missing fallback branch for the configured topics:\n{keda_yaml}"
+        );
+        assert!(
+            keda_yaml.contains(r#"topic: {{ splitList "," $topics | first | quote }}"#),
+            "keda-scaledobject.yaml does not take the first configured topic:\n{keda_yaml}"
+        );
+    }
+
+    /// Every file `generate_chart` wrote, keyed by its path under the chart root.
+    fn render_chart(contract: &DeploymentContract) -> std::collections::BTreeMap<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        generate_chart(contract, dir.path(), None).unwrap();
+        let mut files = std::collections::BTreeMap::new();
+        for sub in ["", "templates"] {
+            for entry in std::fs::read_dir(dir.path().join(sub)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    let rel = path.strip_prefix(dir.path()).unwrap();
+                    files.insert(
+                        rel.display().to_string(),
+                        std::fs::read_to_string(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    /// `brokers` is a list, and `quote` on a list renders `"[a b]"`, which KEDA
+    /// reads as one host named `[a`, so the list has to be joined first.
+    #[test]
+    fn test_keda_brokers_are_joined_before_quoting() {
+        let files = render_chart(&test_contract());
+        let scaled = &files["templates/keda-scaledobject.yaml"];
+        assert!(
+            scaled.contains(
+                r#"bootstrapServers: {{ join "," ((.Values.config).kafka).brokers | quote }}"#
+            ),
+            "broker list is not joined before quoting:\n{scaled}"
+        );
+        assert!(
+            !scaled.contains(".Values.config.kafka.brokers | quote"),
+            "broker list is still quoted as a list:\n{scaled}"
+        );
+    }
+
+    /// With no kafka secret group there is no TriggerAuthentication, so telling
+    /// KEDA to do SCRAM would leave it authenticating with no credentials.
+    #[test]
+    fn test_keda_sasl_only_with_a_kafka_secret_group() {
+        let with_secret = render_chart(&test_contract());
+        assert!(
+            with_secret["templates/keda-scaledobject.yaml"].contains("sasl: scram_sha512"),
+            "a kafka secret group must still set the SASL mechanism"
+        );
+
+        let mut contract = test_contract();
+        contract.secrets.retain(|g| g.group_name != "kafka");
+        let without_secret = render_chart(&contract);
+        let scaled = &without_secret["templates/keda-scaledobject.yaml"];
+        assert!(
+            !scaled.contains("authenticationRef:"),
+            "no kafka secret group, yet an authenticationRef was emitted:\n{scaled}"
+        );
+        assert!(
+            !scaled.contains("sasl:"),
+            "SASL mechanism emitted with no credentials to go with it:\n{scaled}"
+        );
+        assert!(
+            scaled.contains("tls: disable"),
+            "the tls line is out of scope here and must be left as it was:\n{scaled}"
+        );
+    }
+
+    /// `KedaConfig::enabled` is the documented off switch, so turning it off must
+    /// produce exactly what an absent KEDA contract does.
+    #[test]
+    fn test_keda_config_disabled_generates_what_no_keda_does() {
+        let mut off = test_contract();
+        off.keda = Some(KedaContract::from_config(&KedaConfig {
+            enabled: false,
+            ..KedaConfig::default()
+        }));
+        let mut absent = test_contract();
+        absent.keda = None;
+
+        assert_eq!(render_chart(&off), render_chart(&absent));
+    }
+
+    /// An app whose Kafka settings live under `config.source` has no
+    /// `config.kafka` key at all, so the trigger must not address one.
+    #[test]
+    fn test_keda_trigger_under_source_never_addresses_config_kafka() {
+        let mut contract = test_contract();
+        contract.keda = Some(
+            KedaContract::default().with_kafka_trigger(KafkaLagTrigger::under("config.source")),
+        );
+        let files = render_chart(&contract);
+        let scaled = &files["templates/keda-scaledobject.yaml"];
+
+        assert!(
+            !scaled.contains("config.kafka") && !scaled.contains("(.Values.config).kafka"),
+            "trigger still addresses the kafka section:\n{scaled}"
+        );
+        assert!(scaled.contains(
+            r#"bootstrapServers: {{ join "," ((.Values.config).source).brokers | quote }}"#
+        ));
+        assert!(scaled.contains(
+            "consumerGroup: {{ .Values.keda.kafka.consumerGroup | default ((.Values.config).source).group_id | quote }}"
+        ));
+        assert!(scaled.contains(r#"{{- $topics := join "," ((.Values.config).source).topics }}"#));
+    }
+
+    /// With the Kafka lag trigger off, CPU is the only scaler: no kafka trigger,
+    /// no kafka values, and no ScaledObject unless CPU scaling is on.
+    #[test]
+    fn test_keda_trigger_disabled_scales_on_cpu_only() {
+        let mut contract = test_contract();
+        contract.keda =
+            Some(KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled()));
+        let files = render_chart(&contract);
+
+        let scaled = &files["templates/keda-scaledobject.yaml"];
+        assert!(
+            !scaled.contains("type: kafka"),
+            "kafka trigger emitted:\n{scaled}"
+        );
+        assert!(
+            scaled.contains("- type: cpu"),
+            "cpu trigger missing:\n{scaled}"
+        );
+        assert!(
+            scaled.starts_with("{{- if and .Values.keda.enabled .Values.keda.cpu.enabled }}\n"),
+            "ScaledObject is not gated on CPU scaling:\n{scaled}"
+        );
+
+        // Kept as a stub so the chart's file set is the same either way.
+        let auth = &files["templates/keda-triggerauth.yaml"];
+        assert!(
+            auth.lines().all(|line| line.starts_with('#')),
+            "TriggerAuthentication generated with no Kafka lag trigger:\n{auth}"
+        );
+
+        let values = &files["values.yaml"];
+        assert!(values.contains("keda:\n  enabled: true\n"));
+        assert!(
+            !values.contains("lagThreshold") && !values.contains("  kafka:\n    #"),
+            "keda.kafka offered with no trigger to read it:\n{values}"
+        );
+        assert!(values.contains("  cpu:\n    enabled: true\n"));
+    }
+
+    #[test]
+    fn test_keda_with_no_trigger_at_all_is_rejected() {
+        let mut contract = test_contract();
+        let mut keda = KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled());
+        keda.cpu_enabled = false;
+        contract.keda = Some(keda);
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::InvalidContract { ref field, .. } if field == "keda"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a rejected contract left files behind"
+        );
+    }
+
+    #[test]
+    fn test_keda_trigger_rejects_a_path_the_chart_cannot_address() {
+        let mut contract = test_contract();
+        contract.keda = Some(
+            KedaContract::default().with_kafka_trigger(KafkaLagTrigger::under("config.my-source")),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DeploymentError::InvalidContract { ref field, .. }
+                    if field == "keda.kafka_trigger.brokers_path"
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("config.my-source.brokers"));
     }
 
     /// KEDA's Kafka scaler takes `sasl` (the MECHANISM), `username` and

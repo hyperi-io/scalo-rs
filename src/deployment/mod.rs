@@ -112,7 +112,7 @@ pub use generate::{
     ArgocdConfig, generate_argocd_application, generate_chart, generate_compose_fragment,
     generate_container_manifest, generate_dockerfile, generate_runtime_stage,
 };
-pub use keda::{KedaConfig, KedaContract};
+pub use keda::{KafkaLagTrigger, KedaConfig, KedaContract};
 pub use native_deps::{AptRepoContract, BaseDistro, NativeDepsContract};
 pub use registry::{
     DEFAULT_BASE_DISTRO, DEFAULT_BASE_IMAGE, DEFAULT_IMAGE_REGISTRY, argocd_repo_url_from_cascade,

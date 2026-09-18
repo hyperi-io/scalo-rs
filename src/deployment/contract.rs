@@ -315,6 +315,50 @@ impl DeploymentContract {
         dev.image_profile = ImageProfile::Development;
         dev
     }
+
+    /// The KEDA contract when it turns KEDA on; `None` when absent or disabled.
+    pub(crate) fn enabled_keda(&self) -> Option<&KedaContract> {
+        self.keda.as_ref().filter(|keda| keda.enabled)
+    }
+
+    /// `.Values` paths the generated chart reads that `default_config` does not
+    /// supply.
+    ///
+    /// The chart writes `default_config` under `config`, so only a path under
+    /// `config.` can resolve. A path that resolves to null is reported as well,
+    /// because the chart renders it empty. An empty result means every path the
+    /// chart reads has a value to render.
+    #[must_use]
+    pub fn unresolved_values_paths(&self) -> Vec<String> {
+        self.chart_values_paths()
+            .into_iter()
+            .filter(|path| !self.default_config_supplies(path))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every `.Values` path the generated chart reads from app config, gathered
+    /// from each part of the contract that names one.
+    fn chart_values_paths(&self) -> Vec<&str> {
+        let mut paths = Vec::new();
+        if let Some(keda) = self.enabled_keda()
+            && keda.kafka_trigger.enabled
+        {
+            paths.extend(keda.kafka_trigger.paths());
+        }
+        paths
+    }
+
+    /// True when `path` names a non-null value in `default_config`.
+    fn default_config_supplies(&self, path: &str) -> bool {
+        let (Some(config), Some(rest)) = (&self.default_config, path.strip_prefix("config."))
+        else {
+            return false;
+        };
+        rest.split('.')
+            .try_fold(config, |node, key| node.get(key))
+            .is_some_and(|value| !value.is_null())
+    }
 }
 
 impl Default for HealthContract {
@@ -459,5 +503,94 @@ mod tests {
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
         assert_eq!(contract.config_dir(), "/etc/dfe");
+    }
+
+    /// A contract with KEDA on and the given `default_config`.
+    fn keda_contract(default_config: Option<serde_json::Value>) -> DeploymentContract {
+        DeploymentContract {
+            app_name: "test".into(),
+            config_mount_path: "/etc/test/config.yaml".into(),
+            metrics_port: 9090,
+            health: HealthContract::default(),
+            env_prefix: "T".into(),
+            metric_prefix: "t".into(),
+            keda: Some(KedaContract::default()),
+            binary_name: String::new(),
+            description: String::new(),
+            image_registry: default_image_registry(),
+            extra_ports: vec![],
+            entrypoint_args: vec![],
+            secrets: vec![],
+            default_config,
+            depends_on: vec![],
+            base_image: "ubuntu:24.04".into(),
+            native_deps: NativeDepsContract::default(),
+            image_profile: ImageProfile::default(),
+            schema_version: 3,
+            oci_labels: OciLabels::default(),
+            config_schema: None,
+            capabilities: vec![],
+        }
+    }
+
+    #[test]
+    fn test_unresolved_values_paths_finds_a_missing_path_and_passes_a_present_one() {
+        let contract = keda_contract(Some(serde_json::json!({
+            "kafka": {
+                "brokers": ["kafka:9092"],
+                "group_id": null,
+            }
+        })));
+        // brokers is set; group_id is null and topics is absent, and the chart
+        // would render both empty.
+        assert_eq!(
+            contract.unresolved_values_paths(),
+            vec![
+                "config.kafka.group_id".to_string(),
+                "config.kafka.topics".to_string()
+            ]
+        );
+
+        let complete = keda_contract(Some(serde_json::json!({
+            "kafka": { "brokers": ["kafka:9092"], "group_id": "g", "topics": ["t"] }
+        })));
+        assert!(complete.unresolved_values_paths().is_empty());
+    }
+
+    #[test]
+    fn test_unresolved_values_paths_follows_the_trigger_and_keda_switches() {
+        let source = serde_json::json!({
+            "source": { "brokers": "kafka:9092", "group_id": "g", "topics": "t" }
+        });
+
+        // The default trigger reads config.kafka, which a source-shaped config lacks.
+        assert_eq!(
+            keda_contract(Some(source.clone()))
+                .unresolved_values_paths()
+                .len(),
+            3
+        );
+
+        let mut pointed = keda_contract(Some(source));
+        pointed.keda = pointed.keda.map(|k| {
+            k.with_kafka_trigger(crate::deployment::KafkaLagTrigger::under("config.source"))
+        });
+        assert!(pointed.unresolved_values_paths().is_empty());
+
+        // No config at all resolves nothing.
+        assert_eq!(keda_contract(None).unresolved_values_paths().len(), 3);
+
+        // Nothing is read when the trigger or KEDA itself is off.
+        let mut no_trigger = keda_contract(None);
+        no_trigger.keda = no_trigger
+            .keda
+            .map(|k| k.with_kafka_trigger(crate::deployment::KafkaLagTrigger::disabled()));
+        assert!(no_trigger.unresolved_values_paths().is_empty());
+
+        let mut keda_off = keda_contract(None);
+        if let Some(keda) = keda_off.keda.as_mut() {
+            keda.enabled = false;
+        }
+        assert!(keda_off.unresolved_values_paths().is_empty());
     }
 }

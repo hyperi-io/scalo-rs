@@ -64,6 +64,10 @@ impl Default for KedaConfig {
 /// to convert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KedaContract {
+    /// Whether the chart turns KEDA on. `false` generates exactly what
+    /// `keda: None` does, so there is one meaning for off.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub min_replicas: u32,
     pub max_replicas: u32,
     pub polling_interval: u32,
@@ -72,13 +76,25 @@ pub struct KedaContract {
     pub activation_lag_threshold: u64,
     pub cpu_enabled: bool,
     pub cpu_threshold: u32,
+    /// Where the Kafka lag trigger finds its connection details in the chart's
+    /// values, or that there is no Kafka lag trigger at all.
+    #[serde(default)]
+    pub kafka_trigger: KafkaLagTrigger,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 impl KedaContract {
     /// Build a contract from a [`KedaConfig`].
+    ///
+    /// The Kafka lag trigger reads the default `config.kafka` layout; use
+    /// [`with_kafka_trigger`](Self::with_kafka_trigger) for any other.
     #[must_use]
     pub fn from_config(config: &KedaConfig) -> Self {
         Self {
+            enabled: config.enabled,
             min_replicas: config.min_replicas,
             max_replicas: config.max_replicas,
             polling_interval: config.polling_interval,
@@ -87,7 +103,71 @@ impl KedaContract {
             activation_lag_threshold: config.activation_lag_threshold,
             cpu_enabled: config.cpu_enabled,
             cpu_threshold: config.cpu_threshold,
+            kafka_trigger: KafkaLagTrigger::default(),
         }
+    }
+
+    /// Point the Kafka lag trigger at another values layout, or turn it off.
+    #[must_use]
+    pub fn with_kafka_trigger(mut self, trigger: KafkaLagTrigger) -> Self {
+        self.kafka_trigger = trigger;
+        self
+    }
+}
+
+/// Where the generated Kafka lag trigger reads the broker list, consumer group
+/// and topics in the chart's values.
+///
+/// This describes the chart's layout, not an operator setting, which is why it
+/// lives on the contract and not on [`KedaConfig`]. Each path is a dotted,
+/// `.Values`-relative chain of Go identifiers. The default suits an app whose
+/// config has a top-level `kafka` section; an app that keeps them elsewhere
+/// names that section with [`under`](Self::under).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KafkaLagTrigger {
+    /// Emit the Kafka lag trigger. Off leaves CPU as the only scaler.
+    pub enabled: bool,
+    /// Values path of the broker list, as a list or a comma-separated string.
+    pub brokers_path: String,
+    /// Values path of the consumer group id.
+    pub group_path: String,
+    /// Values path of the topics, as a list or a comma-separated string. KEDA
+    /// watches the first.
+    pub topics_path: String,
+}
+
+impl Default for KafkaLagTrigger {
+    fn default() -> Self {
+        Self::under("config.kafka")
+    }
+}
+
+impl KafkaLagTrigger {
+    /// A trigger reading `brokers`, `group_id` and `topics` under `base`,
+    /// e.g. `config.source`.
+    #[must_use]
+    pub fn under(base: &str) -> Self {
+        Self {
+            enabled: true,
+            brokers_path: format!("{base}.brokers"),
+            group_path: format!("{base}.group_id"),
+            topics_path: format!("{base}.topics"),
+        }
+    }
+
+    /// No Kafka lag trigger, for an app that does not consume from Kafka.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// The three values paths, in brokers, group, topics order.
+    pub(crate) fn paths(&self) -> [&str; 3] {
+        [&self.brokers_path, &self.group_path, &self.topics_path].map(String::as_str)
     }
 }
 
@@ -131,6 +211,49 @@ mod tests {
         let contract = KedaContract::from_config(&cfg);
         assert_eq!(contract.kafka_lag_threshold, 5000);
         assert_eq!(contract.cpu_threshold, 90);
+        assert!(contract.enabled);
+
+        let off = KedaContract::from_config(&KedaConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        assert!(!off.enabled, "from_config dropped KedaConfig::enabled");
+    }
+
+    /// A contract serialised before `enabled` and `kafka_trigger` existed must
+    /// still load, and load as the behaviour it had then.
+    #[test]
+    fn test_keda_contract_without_newer_fields_deserialises_to_defaults() {
+        let json = r#"{
+            "min_replicas": 1, "max_replicas": 10, "polling_interval": 15,
+            "cooldown_period": 300, "kafka_lag_threshold": 1000,
+            "activation_lag_threshold": 0, "cpu_enabled": true, "cpu_threshold": 80
+        }"#;
+        let contract: KedaContract = serde_json::from_str(json).unwrap();
+        assert!(contract.enabled);
+        assert_eq!(contract.kafka_trigger, KafkaLagTrigger::default());
+        assert!(contract.kafka_trigger.enabled);
+        assert_eq!(contract.kafka_trigger.brokers_path, "config.kafka.brokers");
+        assert_eq!(contract.kafka_trigger.group_path, "config.kafka.group_id");
+        assert_eq!(contract.kafka_trigger.topics_path, "config.kafka.topics");
+    }
+
+    #[test]
+    fn test_kafka_lag_trigger_under_and_disabled() {
+        let source = KafkaLagTrigger::under("config.source");
+        assert!(source.enabled);
+        assert_eq!(
+            source.paths(),
+            [
+                "config.source.brokers",
+                "config.source.group_id",
+                "config.source.topics"
+            ]
+        );
+        assert!(!KafkaLagTrigger::disabled().enabled);
+
+        let contract = KedaContract::default().with_kafka_trigger(source.clone());
+        assert_eq!(contract.kafka_trigger, source);
     }
 
     #[test]

@@ -79,6 +79,15 @@ pub enum DeploymentError {
         message: String,
     },
 
+    /// The contract describes an artefact that cannot be generated as asked.
+    #[error("invalid deployment contract field {field}: {reason}")]
+    InvalidContract {
+        /// The contract field at fault (e.g. "keda.kafka_trigger.brokers_path").
+        field: String,
+        /// Why that value cannot be generated.
+        reason: String,
+    },
+
     /// A committed config artefact drifted from the freshly-generated output.
     #[error("config artefact drift in {path}:\n{detail}")]
     Drift {

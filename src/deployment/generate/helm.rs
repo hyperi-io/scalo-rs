@@ -12,8 +12,9 @@ use std::path::Path;
 
 use crate::deployment::contract::DeploymentContract;
 use crate::deployment::error::DeploymentError;
+use crate::deployment::keda::{KafkaLagTrigger, KedaContract};
 
-use super::common::{safe_template_lookup, to_camel_suffix, write_file};
+use super::common::{is_go_identifier, safe_template_lookup, to_camel_suffix, write_file};
 
 // ============================================================================
 // Helm chart
@@ -30,7 +31,10 @@ use super::common::{safe_template_lookup, to_camel_suffix, write_file};
 ///
 /// # Errors
 ///
-/// Returns `DeploymentError` if files or directories cannot be created.
+/// Returns `DeploymentError` if files or directories cannot be created, or
+/// [`DeploymentError::InvalidContract`] if the KEDA contract names a values path
+/// that is not a dotted chain of Go identifiers, or turns off both the Kafka
+/// lag trigger and the CPU trigger while leaving KEDA on.
 pub fn generate_chart(
     contract: &DeploymentContract,
     output_dir: impl AsRef<Path>,
@@ -38,6 +42,16 @@ pub fn generate_chart(
 ) -> Result<(), DeploymentError> {
     let dir = output_dir.as_ref();
     let templates_dir = dir.join("templates");
+
+    // Rendered before anything is written, so a rejected contract leaves no
+    // half-generated chart behind.
+    let keda_templates = match contract.enabled_keda() {
+        Some(keda) => Some((
+            gen_keda_scaledobject_yaml(contract, keda)?,
+            gen_keda_triggerauth_yaml(contract, keda),
+        )),
+        None => None,
+    };
 
     // Create directories
     std::fs::create_dir_all(&templates_dir).map_err(|e| DeploymentError::CreateDir {
@@ -74,15 +88,9 @@ pub fn generate_chart(
     )?;
     write_file(templates_dir.join("hpa.yaml"), &gen_hpa_yaml(contract))?;
 
-    if contract.keda.is_some() {
-        write_file(
-            templates_dir.join("keda-scaledobject.yaml"),
-            &gen_keda_scaledobject_yaml(contract),
-        )?;
-        write_file(
-            templates_dir.join("keda-triggerauth.yaml"),
-            &gen_keda_triggerauth_yaml(contract),
-        )?;
+    if let Some((scaled_object, trigger_auth)) = keda_templates {
+        write_file(templates_dir.join("keda-scaledobject.yaml"), &scaled_object)?;
+        write_file(templates_dir.join("keda-triggerauth.yaml"), &trigger_auth)?;
     }
 
     write_file(templates_dir.join("NOTES.txt"), &gen_notes_txt(contract))?;
@@ -303,7 +311,7 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
     // `helm lint` panics with "nil pointer evaluating interface
     // {}.enabled". When the contract opts out, the block is just
     // `enabled: false`.
-    if let Some(ref keda) = c.keda {
+    if let Some(keda) = c.enabled_keda() {
         out.push_str(&format!(
             "# -- KEDA autoscaling (requires KEDA operator installed)\n\
              keda:\n\
@@ -311,27 +319,34 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
              \x20 minReplicaCount: {min}\n\
              \x20 maxReplicaCount: {max}\n\
              \x20 pollingInterval: {poll}\n\
-             \x20 cooldownPeriod: {cool}\n\
-             \x20 kafka:\n\
-             \x20   # -- Scale when consumer group lag exceeds this per partition\n\
-             \x20   lagThreshold: \"{lag}\"\n\
-             \x20   # -- Wake from zero replicas when lag exceeds this\n\
-             \x20   activationLagThreshold: \"{activation}\"\n\
-             \x20   # -- Override topic (default: first topic from config)\n\
-             \x20   topic: \"\"\n\
-             \x20   # -- Override consumer group (default: from config)\n\
-             \x20   consumerGroup: \"\"\n\
-             \x20 cpu:\n\
-             \x20   enabled: {cpu_enabled}\n\
-             \x20   # -- CPU utilisation percentage threshold\n\
-             \x20   threshold: \"{cpu_threshold}\"\n\
-             \n",
+             \x20 cooldownPeriod: {cool}\n",
             min = keda.min_replicas,
             max = keda.max_replicas,
             poll = keda.polling_interval,
             cool = keda.cooldown_period,
-            lag = keda.kafka_lag_threshold,
-            activation = keda.activation_lag_threshold,
+        ));
+        // No Kafka lag trigger means nothing reads these, so none are offered.
+        if keda.kafka_trigger.enabled {
+            out.push_str(&format!(
+                "\x20 kafka:\n\
+                 \x20   # -- Scale when consumer group lag exceeds this per partition\n\
+                 \x20   lagThreshold: \"{lag}\"\n\
+                 \x20   # -- Wake from zero replicas when lag exceeds this\n\
+                 \x20   activationLagThreshold: \"{activation}\"\n\
+                 \x20   # -- Override topic (default: first topic from config)\n\
+                 \x20   topic: \"\"\n\
+                 \x20   # -- Override consumer group (default: from config)\n\
+                 \x20   consumerGroup: \"\"\n",
+                lag = keda.kafka_lag_threshold,
+                activation = keda.activation_lag_threshold,
+            ));
+        }
+        out.push_str(&format!(
+            "\x20 cpu:\n\
+             \x20   enabled: {cpu_enabled}\n\
+             \x20   # -- CPU utilisation percentage threshold\n\
+             \x20   threshold: \"{cpu_threshold}\"\n\
+             \n",
             cpu_enabled = keda.cpu_enabled,
             cpu_threshold = keda.cpu_threshold,
         ));
@@ -873,23 +888,64 @@ spec:
     )
 }
 
-fn gen_keda_scaledobject_yaml(c: &DeploymentContract) -> String {
+/// Render a dotted `.Values`-relative path as a parenthesised lookup, so a
+/// missing or null parent renders nothing instead of a nil-pointer error.
+///
+/// `config.source.brokers` becomes `((.Values.config).source).brokers`.
+fn nil_safe_values_ref(field: &str, path: &str) -> Result<String, DeploymentError> {
+    let mut lookup = String::from(".Values");
+    for (depth, segment) in path.split('.').enumerate() {
+        if !is_go_identifier(segment) {
+            return Err(DeploymentError::InvalidContract {
+                field: field.to_string(),
+                reason: format!(
+                    "`{path}` is not a dotted path of Go identifiers, so the chart cannot address it"
+                ),
+            });
+        }
+        lookup = if depth == 0 {
+            format!("{lookup}.{segment}")
+        } else {
+            format!("({lookup}).{segment}")
+        };
+    }
+    Ok(lookup)
+}
+
+fn gen_keda_scaledobject_yaml(
+    c: &DeploymentContract,
+    keda: &KedaContract,
+) -> Result<String, DeploymentError> {
     let app = &c.app_name;
+    let kafka_enabled = keda.kafka_trigger.enabled;
 
-    // Find kafka secret group for trigger auth reference
-    let has_kafka_secret = c.secrets.iter().any(|g| g.group_name == "kafka");
+    if !kafka_enabled && !keda.cpu_enabled {
+        return Err(DeploymentError::InvalidContract {
+            field: "keda".to_string(),
+            reason: "the Kafka lag trigger and the CPU trigger are both off, so KEDA would \
+                     have nothing to scale on; set `keda: None` to turn autoscaling off"
+                .to_string(),
+        });
+    }
 
-    let auth_ref = if has_kafka_secret {
-        format!(
-            "      authenticationRef:\n\
-             \x20       name: {{{{ include \"{app}.fullname\" . }}}}-kafka-auth\n"
+    // With no Kafka lag trigger the CPU trigger is the only one, and a
+    // ScaledObject with no triggers is rejected, so it exists only while CPU is on.
+    let (gate, kafka_trigger, cpu_role) = if kafka_enabled {
+        (
+            ".Values.keda.enabled",
+            gen_keda_kafka_trigger(c, &keda.kafka_trigger)?,
+            "secondary scaler",
         )
     } else {
-        String::new()
+        (
+            "and .Values.keda.enabled .Values.keda.cpu.enabled",
+            String::new(),
+            "only scaler",
+        )
     };
 
-    format!(
-        r#"{{{{- if .Values.keda.enabled }}}}
+    Ok(format!(
+        r#"{{{{- if {gate} }}}}
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -904,29 +960,8 @@ spec:
   pollingInterval: {{{{ .Values.keda.pollingInterval }}}}
   cooldownPeriod: {{{{ .Values.keda.cooldownPeriod }}}}
   triggers:
-    # Kafka consumer group lag (primary scaler)
-    - type: kafka
-{auth_ref}      metadata:
-        bootstrapServers: {{{{ .Values.config.kafka.brokers | quote }}}}
-        consumerGroup: {{{{ .Values.keda.kafka.consumerGroup | default .Values.config.kafka.group_id | quote }}}}
-        {{{{- /* `default (index X 0)` would eagerly evaluate `index nil 0` and fail
-            lint when no topics are set. Use explicit conditional instead. */}}}}
-        {{{{- if .Values.keda.kafka.topic }}}}
-        topic: {{{{ .Values.keda.kafka.topic | quote }}}}
-        {{{{- else if .Values.config.kafka.topics }}}}
-        topic: {{{{ (index .Values.config.kafka.topics 0) | quote }}}}
-        {{{{- else }}}}
-        topic: ""
-        {{{{- end }}}}
-        lagThreshold: {{{{ .Values.keda.kafka.lagThreshold | quote }}}}
-        activationLagThreshold: {{{{ .Values.keda.kafka.activationLagThreshold | quote }}}}
-        # `sasl`, not `saslType`: the kafka trigger replaced the old `authMode`
-        # property with `sasl` + `tls`, and an unrecognised key is ignored, so
-        # the mechanism was being supplied nowhere at all.
-        sasl: scram_sha512
-        tls: disable
-    {{{{- if .Values.keda.cpu.enabled }}}}
-    # CPU utilisation (secondary scaler)
+{kafka_trigger}    {{{{- if .Values.keda.cpu.enabled }}}}
+    # CPU utilisation ({cpu_role})
     - type: cpu
       metricType: Utilization
       metadata:
@@ -934,11 +969,69 @@ spec:
     {{{{- end }}}}
 {{{{- end }}}}
 "#,
-    )
+    ))
 }
 
-fn gen_keda_triggerauth_yaml(c: &DeploymentContract) -> String {
+/// The Kafka consumer-group lag trigger, reading its connection details from
+/// the values paths the contract names.
+fn gen_keda_kafka_trigger(
+    c: &DeploymentContract,
+    trigger: &KafkaLagTrigger,
+) -> Result<String, DeploymentError> {
     let app = &c.app_name;
+    let brokers = nil_safe_values_ref("keda.kafka_trigger.brokers_path", &trigger.brokers_path)?;
+    let group = nil_safe_values_ref("keda.kafka_trigger.group_path", &trigger.group_path)?;
+    let topics = nil_safe_values_ref("keda.kafka_trigger.topics_path", &trigger.topics_path)?;
+
+    // A TriggerAuthentication exists only for a kafka secret group, and a SASL
+    // mechanism without its credentials cannot authenticate.
+    let has_kafka_secret = c.secrets.iter().any(|g| g.group_name == "kafka");
+    let (auth_ref, sasl) = if has_kafka_secret {
+        (
+            format!(
+                "      authenticationRef:\n\
+                 \x20       name: {{{{ include \"{app}.fullname\" . }}}}-kafka-auth\n"
+            ),
+            "        # `sasl`, not `saslType`: the kafka trigger replaced the old `authMode`\n\
+             \x20       # property with `sasl` + `tls`, and an unrecognised key is ignored, so\n\
+             \x20       # the mechanism was being supplied nowhere at all.\n\
+             \x20       sasl: scram_sha512\n",
+        )
+    } else {
+        (String::new(), "")
+    };
+
+    Ok(format!(
+        r#"    # Kafka consumer group lag (primary scaler)
+    - type: kafka
+{auth_ref}      metadata:
+        bootstrapServers: {{{{ join "," {brokers} | quote }}}}
+        consumerGroup: {{{{ .Values.keda.kafka.consumerGroup | default {group} | quote }}}}
+        {{{{- /* A conditional, not `default`, which evaluates both operands; and the
+            topics are joined then split, not indexed, as `index` on a string yields a byte. */}}}}
+        {{{{- $topics := join "," {topics} }}}}
+        {{{{- if .Values.keda.kafka.topic }}}}
+        topic: {{{{ .Values.keda.kafka.topic | quote }}}}
+        {{{{- else if $topics }}}}
+        topic: {{{{ splitList "," $topics | first | quote }}}}
+        {{{{- else }}}}
+        topic: ""
+        {{{{- end }}}}
+        lagThreshold: {{{{ .Values.keda.kafka.lagThreshold | quote }}}}
+        activationLagThreshold: {{{{ .Values.keda.kafka.activationLagThreshold | quote }}}}
+{sasl}        tls: disable
+"#,
+    ))
+}
+
+fn gen_keda_triggerauth_yaml(c: &DeploymentContract, keda: &KedaContract) -> String {
+    let app = &c.app_name;
+
+    // Written as a stub rather than omitted, so the chart's file set does not
+    // depend on which triggers are on.
+    if !keda.kafka_trigger.enabled {
+        return "# No Kafka lag trigger -- KEDA TriggerAuthentication not generated\n".to_string();
+    }
 
     // Find the kafka secret group
     let kafka_group = c.secrets.iter().find(|g| g.group_name == "kafka");

@@ -167,8 +167,8 @@ on. Override via `ArgocdConfig`.
 | `templates/configmap.yaml` | `ConfigMap` rendering `values.yaml.config` to mounted file |
 | `templates/secret.yaml` | `Secret` per group (skipped when `existingSecret` is set) |
 | `templates/hpa.yaml` | HPA fallback for clusters without KEDA |
-| `templates/keda-scaledobject.yaml` | KEDA `ScaledObject` -- **only when `contract.keda.is_some()`** |
-| `templates/keda-triggerauth.yaml` | KEDA `TriggerAuthentication` -- **only when `contract.keda.is_some()`** |
+| `templates/keda-scaledobject.yaml` | KEDA `ScaledObject` -- **only when `contract.keda` is `Some` with `enabled: true`** |
+| `templates/keda-triggerauth.yaml` | KEDA `TriggerAuthentication` -- **same condition**; a comment stub when there is no kafka secret group or no Kafka lag trigger |
 | `templates/NOTES.txt` | Post-install hints (port-forward, log tail) |
 
 #### Security contexts on the Deployment
