@@ -39,6 +39,13 @@ use super::error::CliError;
 use super::version::VersionInfo;
 use super::{CommonArgs, StandardCommand, output};
 
+/// The commit the service reports in its app info and manifest, from the
+/// build's `GIT_COMMIT`.
+const BUILD_COMMIT: &str = match option_env!("GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
+
 /// Trait for data-plane service applications.
 ///
 /// Implement this trait to get the standard CLI lifecycle for free.
@@ -123,12 +130,14 @@ pub trait ServiceApp: Sized {
         vec![]
     }
 
-    /// Register all metrics for this service.
+    /// Describe this service's own metrics: its metric groups and anything
+    /// else it emits itself.
     ///
-    /// Called by `metrics-manifest` and `generate-artefacts` subcommands to
-    /// capture the full metric catalogue without starting the service.
-    /// The default implementation is a no-op. Override to register
-    /// `ServiceMetrics`, metric groups, and app-specific metrics.
+    /// Called by the `metrics-manifest` and `generate-artefacts` subcommands to
+    /// capture the full metric catalogue without starting the service. The
+    /// scalo runtime set (`ServiceMetrics`, app info, and the worker pool and
+    /// batch engine sets when compiled in) is always included, so an override
+    /// describes only what the app adds. The default is a no-op.
     #[cfg(any(feature = "metrics", feature = "otel-metrics"))]
     fn register_metrics(&self, _manager: &crate::metrics::MetricsManager) {}
 
@@ -223,11 +232,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
 
         #[cfg(any(feature = "metrics", feature = "otel-metrics"))]
         StandardCommand::MetricsManifest => {
-            let mgr = crate::metrics::MetricsManager::with_config(
-                crate::metrics::MetricsConfig::offline(app.name()),
-            );
-            app.register_metrics(&mgr);
-            let manifest = mgr.registry().manifest();
+            let manifest = build_metrics_manifest(&app, &manifest_manager(&app));
             println!(
                 "{}",
                 serde_json::to_string_pretty(&manifest)
@@ -283,13 +288,12 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             tracing::debug!(?config, "configuration loaded");
 
             // Build ServiceRuntime -- all common infrastructure for free
-            let commit = option_env!("GIT_COMMIT").unwrap_or("unknown");
             let runtime = super::ServiceRuntime::build(
                 app.name(),
                 app.env_prefix(),
                 &args.effective_metrics_addr(),
                 &version_info.version,
-                commit,
+                BUILD_COMMIT,
                 #[cfg(feature = "scaling")]
                 app.scaling_components(&config),
                 #[cfg(feature = "version-check")]
@@ -407,6 +411,68 @@ fn init_logger_for_service(
     Ok(())
 }
 
+/// The manager a manifest subcommand describes into: offline, under the
+/// namespace the running service takes from the same config.
+///
+/// The app's config is loaded first, best-effort, because the namespace lives
+/// in the cascade that load populates. A load that fails is reported on stderr
+/// and the default namespace taken, so stdout stays pure JSON.
+#[cfg(any(feature = "metrics", feature = "otel-metrics"))]
+fn manifest_manager<A: ServiceApp>(app: &A) -> crate::metrics::MetricsManager {
+    if let Err(e) = app.load_config(app.common_args().config.as_deref()) {
+        output::print_warn(&format!(
+            "config did not load, so the manifest takes the default metrics namespace: {e}"
+        ));
+    }
+    let namespace = crate::metrics::MetricsSettings::from_cascade().namespace;
+    crate::metrics::MetricsManager::with_config(crate::metrics::MetricsConfig::offline(&namespace))
+}
+
+/// The manifest a service's subcommands publish: the scalo runtime set, then
+/// whatever the app's [`ServiceApp::register_metrics`] adds.
+///
+/// An app that adds nothing is warned on stderr and the command still
+/// succeeds, because the runtime set alone is a true manifest.
+#[cfg(any(feature = "metrics", feature = "otel-metrics"))]
+fn build_metrics_manifest<A: ServiceApp>(
+    app: &A,
+    mgr: &crate::metrics::MetricsManager,
+) -> crate::metrics::ManifestResponse {
+    let registry = mgr.registry();
+    registry.set_app_name(app.name());
+    let _service =
+        super::runtime::register_runtime_metrics(mgr, &app.version_info().version, BUILD_COMMIT);
+    let scalo_owned = registry.manifest().metrics.len();
+
+    app.register_metrics(mgr);
+
+    let manifest = registry.manifest();
+    if manifest.metrics.len() == scalo_owned {
+        output::print_warn(&format!(
+            "`{}` describes no metrics of its own -- the manifest lists the scalo runtime set \
+             only. Override ServiceApp::register_metrics to add the app's.",
+            app.name()
+        ));
+    }
+    manifest
+}
+
+/// Pretty JSON ending in one newline, the form every artefact scalo writes
+/// takes, so a file regenerated by either command is byte-identical.
+fn artefact_json<T: serde::Serialize>(value: &T, what: &str) -> Result<String, CliError> {
+    serde_json::to_string_pretty(value)
+        .map(ending_in_newline)
+        .map_err(|e| CliError::Service(format!("{what} JSON failed: {e}")))
+}
+
+/// `text` with one trailing newline, added only when it lacks one.
+fn ending_in_newline(mut text: String) -> String {
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
 /// Generate all CI artefacts for this service.
 ///
 /// Produces metrics manifest, deployment contract, and container spec
@@ -425,14 +491,9 @@ fn generate_artefacts<A: ServiceApp>(
     // Metrics manifest
     #[cfg(any(feature = "metrics", feature = "otel-metrics"))]
     {
-        let mgr = crate::metrics::MetricsManager::with_config(
-            crate::metrics::MetricsConfig::offline(app.name()),
-        );
-        app.register_metrics(&mgr);
-        let manifest = mgr.registry().manifest();
+        let manifest = build_metrics_manifest(app, &manifest_manager(app));
         let path = output_dir.join("metrics-manifest.json");
-        let json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| CliError::Service(format!("metrics manifest JSON failed: {e}")))?;
+        let json = artefact_json(&manifest, "metrics manifest")?;
         std::fs::write(&path, &json)
             .map_err(|e| CliError::Service(format!("failed to write {}: {e}", path.display())))?;
         generated.push(format!(
@@ -458,8 +519,7 @@ fn generate_artefacts<A: ServiceApp>(
     if let Some(contract) = deployment_contract {
         // Full deployment contract (secrets, KEDA, Helm, everything)
         let path = output_dir.join("deployment-contract.json");
-        let json = serde_json::to_string_pretty(&contract)
-            .map_err(|e| CliError::Service(format!("deployment contract JSON failed: {e}")))?;
+        let json = artefact_json(&contract, "deployment contract")?;
         std::fs::write(&path, &json)
             .map_err(|e| CliError::Service(format!("failed to write {}: {e}", path.display())))?;
         generated.push("deployment-contract.json".to_string());
@@ -467,6 +527,7 @@ fn generate_artefacts<A: ServiceApp>(
         // Container manifest (minimal subset for CI image builds)
         let cm_path = output_dir.join("container-manifest.json");
         let cm_json = crate::deployment::generate::generate_container_manifest(&contract)
+            .map(ending_in_newline)
             .map_err(|e| CliError::Service(format!("container manifest failed: {e}")))?;
         std::fs::write(&cm_path, &cm_json).map_err(|e| {
             CliError::Service(format!("failed to write {}: {e}", cm_path.display()))
@@ -561,11 +622,150 @@ fn emit_config_schema<A: ServiceApp>(app: &A, dir: &str) -> Result<(), CliError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ServiceRuntime;
+    use crate::metrics::{ManifestResponse, MetricsManager, ServiceMetrics};
 
     #[test]
     fn test_standard_command_default_is_run() {
         // When command() returns None, run_app defaults to Run
         let cmd = StandardCommand::Run;
         assert!(matches!(cmd, StandardCommand::Run));
+    }
+
+    fn common() -> CommonArgs {
+        CommonArgs {
+            config: None,
+            log_level: None,
+            log_format: None,
+            metrics_addr: None,
+            verbose: false,
+            quiet: false,
+        }
+    }
+
+    /// A service that describes nothing of its own.
+    struct BareApp {
+        common: CommonArgs,
+    }
+
+    impl ServiceApp for BareApp {
+        type Config = ();
+
+        fn name(&self) -> &'static str {
+            "bare-app"
+        }
+        fn env_prefix(&self) -> &'static str {
+            "BARE_APP"
+        }
+        fn version_info(&self) -> VersionInfo {
+            VersionInfo::new("bare-app", "1.2.3")
+        }
+        fn common_args(&self) -> &CommonArgs {
+            &self.common
+        }
+        fn load_config(&self, _path: Option<&str>) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn run_service(
+            &self,
+            _config: (),
+            _runtime: ServiceRuntime,
+        ) -> impl std::future::Future<Output = Result<(), CliError>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// A service that describes a counter of its own and, as some consumers
+    /// do, the service set a second time.
+    struct ExtraApp {
+        common: CommonArgs,
+    }
+
+    impl ServiceApp for ExtraApp {
+        type Config = ();
+
+        fn name(&self) -> &'static str {
+            "extra-app"
+        }
+        fn env_prefix(&self) -> &'static str {
+            "EXTRA_APP"
+        }
+        fn version_info(&self) -> VersionInfo {
+            VersionInfo::new("extra-app", "1.2.3")
+        }
+        fn common_args(&self) -> &CommonArgs {
+            &self.common
+        }
+        fn load_config(&self, _path: Option<&str>) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn run_service(
+            &self,
+            _config: (),
+            _runtime: ServiceRuntime,
+        ) -> impl std::future::Future<Output = Result<(), CliError>> + Send {
+            std::future::ready(Ok(()))
+        }
+        fn register_metrics(&self, manager: &MetricsManager) {
+            let _ = manager.counter("extra_widgets_total", "Widgets the app made");
+            let _ = ServiceMetrics::register(manager);
+        }
+    }
+
+    fn names(manifest: &ManifestResponse) -> Vec<&str> {
+        manifest.metrics.iter().map(|m| m.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_manifest_carries_the_runtime_set_when_the_app_adds_nothing() {
+        let mgr = MetricsManager::new_for_test("");
+        let manifest = build_metrics_manifest(&BareApp { common: common() }, &mgr);
+        let names = names(&manifest);
+
+        for expected in [
+            "transport_sent_total",
+            "pipeline_ready",
+            "records_dlq_total",
+        ] {
+            assert!(names.contains(&expected), "{expected} missing: {names:?}");
+        }
+        #[cfg(feature = "worker-pool")]
+        assert!(
+            names.contains(&"worker_pool_active_threads"),
+            "the pool set: {names:?}"
+        );
+        #[cfg(feature = "worker-batch")]
+        assert!(
+            names.contains(&"batch_engine_messages_received_total"),
+            "the engine set: {names:?}"
+        );
+        assert_eq!(manifest.app, "bare-app");
+        #[cfg(feature = "service-metrics")]
+        assert_eq!(manifest.version, "1.2.3", "the app info set carries it");
+    }
+
+    #[test]
+    fn a_manifest_lists_the_apps_own_metrics_and_every_name_once() {
+        let mgr = MetricsManager::new_for_test("");
+        let manifest = build_metrics_manifest(&ExtraApp { common: common() }, &mgr);
+        let names = names(&manifest);
+
+        assert!(names.contains(&"extra_widgets_total"), "{names:?}");
+        assert!(names.contains(&"transport_sent_total"), "{names:?}");
+        let mut once = names.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!(
+            once.len(),
+            names.len(),
+            "a name described twice is listed once: {names:?}"
+        );
+    }
+
+    #[test]
+    fn every_artefact_ends_in_one_newline() {
+        let json = artefact_json(&serde_json::json!({"a": 1}), "probe").unwrap();
+        assert!(json.ends_with("}\n") && !json.ends_with("\n\n"), "{json:?}");
+        assert_eq!(ending_in_newline("x\n".to_owned()), "x\n");
     }
 }

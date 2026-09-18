@@ -49,15 +49,20 @@ chart/
 ### `metrics-manifest.json`
 
 Full metric catalogue: every counter, gauge, histogram, with names,
-types, labels, bucket boundaries. Built from the global
-`MetricRegistry` after the app's `register_metrics()` runs. CI uses it
-to check that Prometheus dashboards and alerts reference real metrics.
+types, labels, bucket boundaries. It is the scalo runtime set --
+`ServiceMetrics`, app info, and the worker pool and batch engine sets
+when compiled in -- plus whatever the app's `register_metrics()` adds,
+each name once and under the `metrics.namespace` the service's own
+config sets. CI uses it to check that Prometheus dashboards and alerts
+reference real metrics. Byte-identical to `metrics-manifest` on stdout.
 
 ```json
 {
-  "service": "dfe-loader",
+  "schema_version": 1,
+  "app": "my-app",
+  "namespace": "",
   "metrics": [
-    { "name": "loader_records_in_total", "kind": "counter", "labels": ["topic"], ... }
+    { "name": "transport_sent_total", "type": "counter", "labels": ["transport"], ... }
   ]
 }
 ```

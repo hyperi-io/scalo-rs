@@ -107,11 +107,11 @@ impl ServiceRuntime {
     ///
     /// Returns `CliError` if the metrics server fails to start.
     pub(crate) async fn build(
-        #[cfg_attr(not(feature = "version-check"), allow(unused_variables))] app_name: &str,
+        app_name: &str,
         env_prefix: &str,
         metrics_addr: &str,
-        #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] version: &str,
-        #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] commit: &str,
+        version: &str,
+        commit: &str,
         #[cfg(feature = "scaling")] scaling_components: Vec<crate::ScalingComponent>,
         #[cfg(feature = "version-check")] version_check_defaults: crate::VersionCheckConfig,
     ) -> Result<Self, CliError> {
@@ -129,13 +129,8 @@ impl ServiceRuntime {
         // name supplies `service.name` when config leaves it unset.
         let metrics_config = crate::metrics::MetricsSettings::from_cascade().into_config(app_name);
         let mut metrics = MetricsManager::with_config(metrics_config);
-        let dfe = Arc::new(crate::metrics::ServiceMetrics::register(&metrics));
-
-        // App info metric (version, commit, service name)
-        #[cfg(feature = "service-metrics")]
-        {
-            let _app_metrics = crate::metrics::groups::AppMetrics::new(&metrics, version, commit);
-        }
+        metrics.registry().set_app_name(app_name);
+        let dfe = Arc::new(register_runtime_metrics(&metrics, version, commit));
 
         // --- Memory guard ---
         #[cfg(feature = "memory")]
@@ -345,4 +340,33 @@ impl ServiceRuntime {
         let cfg = SinkStackConfig::from_cascade_key(cfg_key);
         Ok(SinkStack::new(sender, &cfg))
     }
+}
+
+/// Describe every metric the scalo runtime emits into `manager`: the service
+/// set, the app info set, and the worker pool and batch engine sets when their
+/// features are compiled in.
+///
+/// The one list the running service and the `metrics-manifest` and
+/// `generate-artefacts` subcommands all describe, so a manifest names what the
+/// service serves whether or not the app describes anything of its own.
+#[must_use]
+pub(crate) fn register_runtime_metrics(
+    manager: &MetricsManager,
+    #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] version: &str,
+    #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] commit: &str,
+) -> crate::metrics::ServiceMetrics {
+    let service = crate::metrics::ServiceMetrics::register(manager);
+
+    #[cfg(feature = "service-metrics")]
+    {
+        let _app_metrics = crate::metrics::groups::AppMetrics::new(manager, version, commit);
+    }
+
+    #[cfg(feature = "worker-pool")]
+    crate::worker::metrics::describe(manager);
+
+    #[cfg(feature = "worker-batch")]
+    crate::worker::engine::metrics::describe(manager);
+
+    service
 }

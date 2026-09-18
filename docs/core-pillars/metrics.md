@@ -72,27 +72,35 @@ spec, use cases, dashboard hint, app version, git commit, registration timestamp
 ```json
 {
   "schema_version": 1,
-  "app": "dfe_loader",
+  "app": "my-app",
+  "namespace": "",
   "version": "x.y.z",
   "commit": "<git-sha>",
   "registered_at": "<rfc3339-timestamp>",
   "metrics": [
     {
-      "name": "dfe_loader_transport_sent_total",
+      "name": "transport_sent_total",
       "type": "counter",
-      "description": "Messages sent",
-      "labels": ["transport", "topic"],
-      "group": "transport"
+      "description": "Messages successfully sent to transport",
+      "labels": ["transport"],
+      "group": "platform"
     }
   ]
 }
 ```
 
-The `metrics-manifest` CLI subcommand renders the same JSON to disk without
-running the service -- used in CI to keep `docs/metrics-manifest.json` in sync:
+`app` is the service name. `namespace` is the `metrics.namespace` prefix every
+name carries, empty (bare names) by default. A name is listed once: describing it
+again replaces the earlier descriptor.
+
+Two CLI subcommands produce the same JSON without running the service, reading
+`metrics.namespace` from the same config the service loads. `metrics-manifest`
+prints it to stdout, `generate-artefacts` writes `metrics-manifest.json` into its
+output directory, and the two are byte-identical:
 
 ```bash
-my-app metrics-manifest --output docs/
+my-app metrics-manifest > docs/metrics-manifest.json
+my-app generate-artefacts --output-dir docs/
 ```
 
 Add metadata after registration:
@@ -104,9 +112,12 @@ mgr.set_dashboard_hint("dfe_loader_send_latency_seconds", "heatmap");
 mgr.set_build_info(env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT"));
 ```
 
-`ServiceMetrics::register(&mgr)` (feature `service-metrics`) registers the canonical
-data-plane metric set -- transport, batch engine, worker pool, memory, scaling -- in one call
-so every consumer service exports the same metrics with matching labels.
+`ServiceMetrics::register(&mgr)` describes the canonical data-plane metric set --
+transport, pipeline, records, scaling, spool, security -- in one call so every
+consumer service exports the same metrics with matching labels. The service runtime
+and both manifest subcommands describe it for you, with app info (feature
+`service-metrics`) and the worker pool and batch engine sets when those features are
+compiled in, so a service's `register_metrics` override describes only its own.
 
 ---
 

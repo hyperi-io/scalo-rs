@@ -70,7 +70,13 @@ pub enum MetricType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestResponse {
     pub schema_version: u32,
+    /// The service the manifest describes. Holds the namespace until the
+    /// service runtime or the CLI names the service.
     pub app: String,
+    /// The `{namespace}_` prefix every metric name carries; empty when names
+    /// are bare.
+    #[serde(default)]
+    pub namespace: String,
     pub version: String,
     pub commit: String,
     pub registered_at: String,
@@ -80,6 +86,8 @@ pub struct ManifestResponse {
 /// Inner state of the metric registry.
 struct MetricRegistryInner {
     descriptors: Vec<MetricDescriptor>,
+    /// The prefix `push` puts on every name; empty for bare names.
+    namespace: String,
     app: String,
     version: String,
     commit: String,
@@ -96,12 +104,14 @@ pub struct MetricRegistry {
 }
 
 impl MetricRegistry {
-    /// Create a new registry for the given app namespace.
-    pub(crate) fn new(app: &str) -> Self {
+    /// Create a new registry for the given namespace. The manifest's `app`
+    /// starts as the namespace until `set_app_name` names the service.
+    pub(crate) fn new(namespace: &str) -> Self {
         Self {
             inner: Arc::new(RwLock::new(MetricRegistryInner {
                 descriptors: Vec::new(),
-                app: app.to_string(),
+                namespace: namespace.to_string(),
+                app: namespace.to_string(),
                 version: String::new(),
                 commit: String::new(),
                 registered_at: now_rfc3339(),
@@ -109,19 +119,49 @@ impl MetricRegistry {
         }
     }
 
+    /// Name the service the manifest describes, apart from its namespace.
+    #[cfg(any(feature = "cli-service", test))]
+    pub(crate) fn set_app_name(&self, app: &str) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.app = app.to_string();
+        }
+    }
+
     /// Push a metric descriptor into the registry.
     ///
     /// The descriptor's `name` is expected to be BARE (no namespace prefix).
-    /// When the registry has a non-empty `app` namespace, `{app}_` is prepended
+    /// When the registry has a non-empty namespace, `{namespace}_` is prepended
     /// here -- the single place the manifest applies the namespace, mirroring
     /// the prefix layer on the global recorder so emitted and manifest names
     /// match.
+    ///
+    /// A name already held is replaced in place, the later descriptor winning:
+    /// one name is one series, so the runtime and an app that both describe it
+    /// list it once.
     pub(crate) fn push(&self, mut descriptor: MetricDescriptor) {
         if let Ok(mut inner) = self.inner.write() {
-            if !inner.app.is_empty() {
-                descriptor.name = format!("{}_{}", inner.app, descriptor.name);
+            if !inner.namespace.is_empty() {
+                descriptor.name = format!("{}_{}", inner.namespace, descriptor.name);
             }
-            inner.descriptors.push(descriptor);
+            match inner
+                .descriptors
+                .iter_mut()
+                .find(|held| held.name == descriptor.name)
+            {
+                Some(held) => {
+                    #[cfg(feature = "logger")]
+                    if held.metric_type != descriptor.metric_type
+                        || held.labels != descriptor.labels
+                    {
+                        tracing::debug!(
+                            metric = %descriptor.name,
+                            "metric described again with a different type or labels, keeping the later one"
+                        );
+                    }
+                    *held = descriptor;
+                }
+                None => inner.descriptors.push(descriptor),
+            }
         }
     }
 
@@ -135,11 +175,11 @@ impl MetricRegistry {
 
     /// Set use cases for a metric by BARE name. No-op if not found.
     ///
-    /// Pass the bare metric name (no namespace prefix); `{app}_` is prepended
-    /// here to match the stored descriptor name.
+    /// Pass the bare metric name (no namespace prefix); `{namespace}_` is
+    /// prepended here to match the stored descriptor name.
     pub(crate) fn set_use_cases(&self, metric_name: &str, use_cases: &[&str]) {
         if let Ok(mut inner) = self.inner.write() {
-            let lookup = prefixed_lookup(&inner.app, metric_name);
+            let lookup = prefixed_lookup(&inner.namespace, metric_name);
             if let Some(desc) = inner.descriptors.iter_mut().find(|d| d.name == lookup) {
                 desc.use_cases = use_cases.iter().map(|s| (*s).to_string()).collect();
             } else {
@@ -154,11 +194,11 @@ impl MetricRegistry {
 
     /// Set dashboard hint for a metric by BARE name. No-op if not found.
     ///
-    /// Pass the bare metric name (no namespace prefix); `{app}_` is prepended
-    /// here to match the stored descriptor name.
+    /// Pass the bare metric name (no namespace prefix); `{namespace}_` is
+    /// prepended here to match the stored descriptor name.
     pub(crate) fn set_dashboard_hint(&self, metric_name: &str, hint: &str) {
         if let Ok(mut inner) = self.inner.write() {
-            let lookup = prefixed_lookup(&inner.app, metric_name);
+            let lookup = prefixed_lookup(&inner.namespace, metric_name);
             if let Some(desc) = inner.descriptors.iter_mut().find(|d| d.name == lookup) {
                 desc.dashboard_hint = Some(hint.to_string());
             } else {
@@ -178,6 +218,7 @@ impl MetricRegistry {
         ManifestResponse {
             schema_version: 1,
             app: inner.app.clone(),
+            namespace: inner.namespace.clone(),
             version: inner.version.clone(),
             commit: inner.commit.clone(),
             registered_at: inner.registered_at.clone(),
@@ -186,13 +227,14 @@ impl MetricRegistry {
     }
 }
 
-/// Prepend `{app}_` to a bare metric name, or return it unchanged when `app`
-/// is empty. Used to translate bare lookup keys into stored descriptor names.
-fn prefixed_lookup(app: &str, bare: &str) -> String {
-    if app.is_empty() {
+/// Prepend `{namespace}_` to a bare metric name, or return it unchanged when
+/// `namespace` is empty. Used to translate bare lookup keys into stored
+/// descriptor names.
+fn prefixed_lookup(namespace: &str, bare: &str) -> String {
+    if namespace.is_empty() {
         bare.to_string()
     } else {
-        format!("{app}_{bare}")
+        format!("{namespace}_{bare}")
     }
 }
 
@@ -312,6 +354,7 @@ mod tests {
         let manifest = ManifestResponse {
             schema_version: 1,
             app: "test_app".into(),
+            namespace: String::new(),
             version: "1.0.0".into(),
             commit: "abc123".into(),
             registered_at: "2026-03-31T00:00:00Z".into(),
@@ -423,6 +466,69 @@ mod tests {
         });
         let manifest = reg.manifest();
         assert_eq!(manifest.metrics[0].name, "acme_transport_sent_total");
+    }
+
+    fn counter(name: &str, labels: &[&str], group: &str) -> MetricDescriptor {
+        MetricDescriptor {
+            name: name.into(),
+            metric_type: MetricType::Counter,
+            description: format!("{group} {name}"),
+            unit: String::new(),
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            group: group.into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        }
+    }
+
+    #[test]
+    fn test_registry_push_of_a_held_name_replaces_it() {
+        for namespace in ["", "acme"] {
+            let reg = MetricRegistry::new(namespace);
+            reg.push(counter("records_received_total", &[], "platform"));
+            reg.push(counter("records_dlq_total", &[], "platform"));
+            reg.push(counter("records_received_total", &["source"], "app"));
+
+            let manifest = reg.manifest();
+            let name = prefixed_lookup(namespace, "records_received_total");
+            let held: Vec<&MetricDescriptor> =
+                manifest.metrics.iter().filter(|m| m.name == name).collect();
+            assert_eq!(held.len(), 1, "{name} listed once under `{namespace}`");
+            assert_eq!(held[0].group, "app", "the later descriptor wins");
+            assert_eq!(held[0].labels, vec!["source"]);
+            assert_eq!(
+                manifest.metrics.len(),
+                2,
+                "a replacement is not an addition"
+            );
+            assert_eq!(
+                manifest.metrics[0].name, name,
+                "the replacement keeps the first one's place"
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_names_the_app_apart_from_the_namespace() {
+        let reg = MetricRegistry::new("acme");
+        reg.set_app_name("my-service");
+        reg.push(counter("records_dlq_total", &[], "platform"));
+
+        let manifest = reg.manifest();
+
+        assert_eq!(manifest.app, "my-service");
+        assert_eq!(manifest.namespace, "acme");
+        assert_eq!(manifest.metrics[0].name, "acme_records_dlq_total");
+    }
+
+    #[test]
+    fn test_manifest_without_a_namespace_field_still_parses() {
+        let parsed: ManifestResponse = serde_json::from_str(
+            r#"{"schema_version":1,"app":"a","version":"","commit":"","registered_at":"","metrics":[]}"#,
+        )
+        .unwrap();
+        assert!(parsed.namespace.is_empty());
     }
 
     #[test]

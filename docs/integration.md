@@ -155,8 +155,9 @@ impl ServiceApp for LoaderCli {
     }
 
     fn register_metrics(&self, mgr: &MetricsManager) {
-        ServiceMetrics::register(mgr);
-        // ... app-specific metric registrations
+        // App-specific metrics only: scalo's runtime set (ServiceMetrics,
+        // app info, worker pool, batch engine) is always in the manifest.
+        let _ = BufferMetrics::new(mgr);
     }
 
     fn deployment_contract(&self) -> Option<DeploymentContract> {
