@@ -473,15 +473,44 @@ fn ending_in_newline(mut text: String) -> String {
     text
 }
 
+/// Refuse a contract whose `default_config` binds a listener that no port
+/// declares, or declares with another number, because the artefacts would
+/// ship a pod whose listener nothing routes to.
+#[cfg(feature = "deployment")]
+fn refuse_undeclared_listeners(
+    contract: &crate::deployment::DeploymentContract,
+) -> Result<(), CliError> {
+    let findings = contract.undeclared_listeners();
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let lines: Vec<String> = findings.iter().map(|m| format!("  {m}")).collect();
+    Err(CliError::Service(format!(
+        "{app}: listeners and declared ports disagree, so no artefacts were written -- \
+         declare a port with `bound_from` naming the listen path (with the port it binds), \
+         or add a send-only path to `unbound_listen_paths`:\n{lines}",
+        app = contract.app_name,
+        lines = lines.join("\n"),
+    )))
+}
+
 /// Generate all CI artefacts for this service.
 ///
 /// Produces metrics manifest, deployment contract, and container spec
 /// in the output directory. Files are deterministic -- running twice produces
-/// identical output (no timestamps that change between runs).
+/// identical output (no timestamps that change between runs). A contract with
+/// an undeclared listener is refused before anything is written.
 fn generate_artefacts<A: ServiceApp>(
     app: &A,
     args: &super::commands::GenerateArtefactsArgs,
 ) -> Result<(), CliError> {
+    #[cfg(feature = "deployment")]
+    let deployment_contract = app.deployment_contract();
+    #[cfg(feature = "deployment")]
+    if let Some(contract) = &deployment_contract {
+        refuse_undeclared_listeners(contract)?;
+    }
+
     let output_dir = std::path::Path::new(&args.output_dir);
     std::fs::create_dir_all(output_dir)
         .map_err(|e| CliError::Service(format!("failed to create output dir: {e}")))?;
@@ -503,8 +532,6 @@ fn generate_artefacts<A: ServiceApp>(
     }
 
     // Deployment contract + container manifest
-    #[cfg(feature = "deployment")]
-    let deployment_contract = app.deployment_contract();
     #[cfg(feature = "deployment")]
     if deployment_contract.is_none() {
         output::print_warn(&format!(
@@ -767,5 +794,126 @@ mod tests {
         let json = artefact_json(&serde_json::json!({"a": 1}), "probe").unwrap();
         assert!(json.ends_with("}\n") && !json.ends_with("\n\n"), "{json:?}");
         assert_eq!(ending_in_newline("x\n".to_owned()), "x\n");
+    }
+
+    /// A service whose deployment contract is fixed when it is built.
+    #[cfg(feature = "deployment")]
+    struct ContractApp {
+        common: CommonArgs,
+        contract: crate::deployment::DeploymentContract,
+    }
+
+    #[cfg(feature = "deployment")]
+    impl ServiceApp for ContractApp {
+        type Config = ();
+
+        fn name(&self) -> &'static str {
+            "contract-app"
+        }
+        fn env_prefix(&self) -> &'static str {
+            "CONTRACT_APP"
+        }
+        fn version_info(&self) -> VersionInfo {
+            VersionInfo::new("contract-app", "1.2.3")
+        }
+        fn common_args(&self) -> &CommonArgs {
+            &self.common
+        }
+        fn load_config(&self, _path: Option<&str>) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn run_service(
+            &self,
+            _config: (),
+            _runtime: ServiceRuntime,
+        ) -> impl std::future::Future<Output = Result<(), CliError>> + Send {
+            std::future::ready(Ok(()))
+        }
+        fn deployment_contract(&self) -> Option<crate::deployment::DeploymentContract> {
+            Some(self.contract.clone())
+        }
+    }
+
+    /// An archiver-shaped service: a push listener that binds only on the grpc
+    /// transport, with a null default address, and `extra_ports` beside metrics.
+    #[cfg(feature = "deployment")]
+    fn archiver_app(extra_ports: Vec<crate::deployment::PortContract>) -> ContractApp {
+        use crate::deployment::{
+            DeploymentContract, HealthContract, ImageProfile, NativeDepsContract, OciLabels,
+        };
+        ContractApp {
+            common: common(),
+            contract: DeploymentContract {
+                schema_version: 3,
+                app_name: "contract-app".into(),
+                binary_name: String::new(),
+                description: String::new(),
+                metrics_port: 9090,
+                health: HealthContract::default(),
+                env_prefix: "CONTRACT_APP".into(),
+                metric_prefix: "contract_app".into(),
+                config_mount_path: "/etc/contract-app/config.yaml".into(),
+                image_registry: "ghcr.io/hyperi-io".into(),
+                extra_ports,
+                unbound_listen_paths: vec![],
+                entrypoint_args: vec![],
+                secrets: vec![],
+                default_config: Some(serde_json::json!({
+                    "transport": "kafka",
+                    "grpc": { "listen": null },
+                })),
+                depends_on: vec![],
+                keda: None,
+                base_image: "debian:trixie-slim".into(),
+                native_deps: NativeDepsContract::default(),
+                image_profile: ImageProfile::Production,
+                oci_labels: OciLabels::default(),
+                config_schema: None,
+                capabilities: vec![],
+            },
+        }
+    }
+
+    #[cfg(feature = "deployment")]
+    fn generate_into(app: &ContractApp, dir: &std::path::Path) -> Result<(), CliError> {
+        let args = crate::cli::commands::GenerateArtefactsArgs {
+            output_dir: dir.to_str().expect("a UTF-8 tempdir").to_owned(),
+        };
+        generate_artefacts(app, &args)
+    }
+
+    #[cfg(feature = "deployment")]
+    #[test]
+    fn generate_artefacts_refuses_an_undeclared_listener_before_writing() {
+        let out = tempfile::tempdir().unwrap();
+        let err = generate_into(&archiver_app(vec![]), out.path())
+            .expect_err("an undeclared listener is refused");
+
+        assert!(matches!(err, CliError::Service(_)), "{err:?}");
+        let message = err.to_string();
+        for part in [
+            "listener grpc.listen",
+            "a port whose bound_from names it",
+            "no port declared for null",
+            "unbound_listen_paths",
+        ] {
+            assert!(message.contains(part), "{part:?} missing from: {message}");
+        }
+        let written: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();
+        assert!(
+            written.is_empty(),
+            "written before the refusal: {written:?}"
+        );
+    }
+
+    #[cfg(feature = "deployment")]
+    #[test]
+    fn generate_artefacts_writes_once_the_listener_is_declared() {
+        let push = crate::deployment::PortContract::tcp("push", 50051)
+            .when_equals("config.transport", "grpc")
+            .bound_from("grpc.listen");
+        let out = tempfile::tempdir().unwrap();
+        generate_into(&archiver_app(vec![push]), out.path()).expect("a declared listener passes");
+        assert!(out.path().join("deployment-contract.json").is_file());
     }
 }

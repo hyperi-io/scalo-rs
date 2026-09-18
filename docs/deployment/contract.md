@@ -249,6 +249,8 @@ fn every_listener_has_a_port() {
 }
 ```
 
+`generate-artefacts` runs the same check first and writes nothing while it has a finding.
+
 Neither `bound_from` nor `unbound_listen_paths` changes a byte of any generated artefact.
 
 ---
