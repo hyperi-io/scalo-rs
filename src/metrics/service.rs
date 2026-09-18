@@ -384,7 +384,7 @@ impl ServiceMetrics {
         Self { _private: () }
     }
 
-    // ── Transport ────────────────────────────────────────────────────
+    // -- Transport ----------------------------------------------------
 
     /// Record messages successfully sent to a transport.
     #[inline]
@@ -474,7 +474,7 @@ impl ServiceMetrics {
             .increment(count);
     }
 
-    // ── Pipeline ─────────────────────────────────────────────────────
+    // -- Pipeline -----------------------------------------------------
 
     /// Set pipeline readiness state.
     #[inline]
@@ -488,7 +488,7 @@ impl ServiceMetrics {
         metrics::counter!("pipeline_stall_seconds_total").increment(seconds);
     }
 
-    // ── Records ──────────────────────────────────────────────────────
+    // -- Records ------------------------------------------------------
 
     /// Record incoming records.
     #[inline]
@@ -514,7 +514,7 @@ impl ServiceMetrics {
         metrics::counter!("records_dlq_total").increment(count);
     }
 
-    // ── Scaling ──────────────────────────────────────────────────────
+    // -- Scaling ------------------------------------------------------
 
     /// Set normalised scaling pressure (0-100).
     #[inline]
@@ -534,7 +534,7 @@ impl ServiceMetrics {
         metrics::gauge!("scaling_memory_pressure").set(ratio);
     }
 
-    // ── Spool ────────────────────────────────────────────────────────
+    // -- Spool --------------------------------------------------------
 
     /// Set current spool size in bytes.
     #[inline]
@@ -554,7 +554,7 @@ impl ServiceMetrics {
         metrics::gauge!("spool_disk_available").set(bytes);
     }
 
-    // ── Security ─────────────────────────────────────────────────────
+    // -- Security -----------------------------------------------------
 
     /// Record authentication failure.
     #[inline]

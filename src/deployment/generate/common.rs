@@ -59,15 +59,40 @@ pub(super) fn is_go_identifier(s: &str) -> bool {
 ///
 /// Examples:
 ///   - `safe_template_lookup(".Values.auth", "username")`
-///     → `.Values.auth.username`
+///     -> `.Values.auth.username`
 ///   - `safe_template_lookup(".Values.auth", "bearer-tokens")`
-///     → `(index .Values.auth "bearer-tokens")`
+///     -> `(index .Values.auth "bearer-tokens")`
 pub(super) fn safe_template_lookup(base: &str, key: &str) -> String {
     if is_go_identifier(key) {
         format!("{base}.{key}")
     } else {
         format!("(index {base} \"{key}\")")
     }
+}
+
+/// The `/udp` suffix Docker and Compose need on a UDP port, since a bare port
+/// number means TCP to both; empty for any other protocol.
+pub(super) fn udp_port_suffix(protocol: &str) -> &'static str {
+    if protocol.eq_ignore_ascii_case("udp") {
+        "/udp"
+    } else {
+        ""
+    }
+}
+
+/// `text` with each control character written as its escape, for a contract
+/// value printed onto one line, where a raw newline would start a Dockerfile
+/// instruction or a YAML key of its own.
+pub(super) fn on_one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub(super) fn write_file(path: impl AsRef<Path>, content: &str) -> Result<(), DeploymentError> {

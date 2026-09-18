@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn aad_domain_separation_blocks_cross_module_reuse() {
         let env = seal("k", b"db-password", &aad_for("db_password")).unwrap();
-        // Same cache_key bytes, no domain prefix → must fail.
+        // Same cache_key bytes, no domain prefix -> must fail.
         let err = open("k", env.as_bytes(), b"db_password").unwrap_err();
         assert!(matches!(err, SecretsError::CacheError(_)));
     }

@@ -15,11 +15,11 @@
 //! # Architecture
 //!
 //! ```text
-//! App Config::default()  →  DeploymentContract  →  generate_chart("chart/")
-//!                                                →  generate_dockerfile()
-//!                                                →  generate_compose_fragment()
-//!                                                →  validate_helm_values("chart/")
-//!                                                →  validate_dockerfile("Dockerfile")
+//! App Config::default()  ->  DeploymentContract  ->  generate_chart("chart/")
+//!                                                 ->  generate_dockerfile()
+//!                                                 ->  generate_compose_fragment()
+//!                                                 ->  validate_helm_values("chart/")
+//!                                                 ->  validate_dockerfile("Dockerfile")
 //! ```
 //!
 //! The config cascade (figment) is the SSoT for app defaults. The contract
@@ -46,6 +46,7 @@
 //!     config_mount_path: "/etc/dfe/loader.yaml".into(),
 //!     image_registry: "ghcr.io/hyperi-io".into(),
 //!     extra_ports: vec![],
+//!     unbound_listen_paths: vec![],
 //!     entrypoint_args: vec!["--config".into(), "/etc/dfe/loader.yaml".into()],
 //!     secrets: vec![],
 //!     default_config: None,
@@ -80,12 +81,14 @@
 
 pub mod app_project;
 mod capability;
+mod checks;
 mod contract;
 pub mod contract_identity;
 mod emit;
 mod error;
 pub mod generate;
 mod keda;
+mod listeners;
 mod native_deps;
 mod registry;
 #[cfg(feature = "deployment-smoke")]
@@ -98,21 +101,22 @@ pub mod waves;
 pub use app_project::{AppProjectContract, AppProjectDestination, generate_argocd_app_project};
 pub use capability::{Capability, FieldSpec, FieldType};
 pub use contract::{
-    DeploymentContract, HealthContract, ImageProfile, OciLabels, PortContract, SecretEnvContract,
-    SecretGroupContract,
+    DeploymentContract, HealthContract, ImageProfile, OciLabels, PortCondition, PortContract,
+    SecretEnvContract, SecretGroupContract,
 };
 pub use contract_identity::{ContractIdentity, IdentityError, KEY_PREFIX, VERSION};
 #[cfg(feature = "config-schema")]
 pub use emit::config_schema_json;
 pub use emit::{
-    assert_no_config_artifact_drift, check_config_artifact_drift, emit_config_artifacts,
+    ChartPatch, assert_listeners_declared, assert_no_chart_drift, assert_no_config_artifact_drift,
+    check_chart_drift, check_config_artifact_drift, emit_config_artifacts,
 };
 pub use error::{ContractMismatch, DeploymentError};
 pub use generate::{
     ArgocdConfig, generate_argocd_application, generate_chart, generate_compose_fragment,
     generate_container_manifest, generate_dockerfile, generate_runtime_stage,
 };
-pub use keda::{KedaConfig, KedaContract};
+pub use keda::{KafkaLagTrigger, KedaConfig, KedaContract};
 pub use native_deps::{AptRepoContract, BaseDistro, NativeDepsContract};
 pub use registry::{
     DEFAULT_BASE_DISTRO, DEFAULT_BASE_IMAGE, DEFAULT_IMAGE_REGISTRY, argocd_repo_url_from_cascade,

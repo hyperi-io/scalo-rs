@@ -147,9 +147,9 @@ impl<'a> SecurityEvent<'a> {
     /// per-layer filtering.
     ///
     /// Level mapping:
-    /// - `Success` → `info!`
-    /// - `Failure` / `Denied` → `warn!`
-    /// - `Error` → `error!`
+    /// - `Success` -> `info!`
+    /// - `Failure` / `Denied` -> `warn!`
+    /// - `Error` -> `error!`
     pub fn emit(&self) {
         let source_ip_str = self.source_ip.map(|ip| ip.to_string());
         let source_ip_ref = source_ip_str.as_deref().unwrap_or("-");

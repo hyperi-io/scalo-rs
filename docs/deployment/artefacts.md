@@ -49,15 +49,25 @@ chart/
 ### `metrics-manifest.json`
 
 Full metric catalogue: every counter, gauge, histogram, with names,
-types, labels, bucket boundaries. Built from the global
-`MetricRegistry` after the app's `register_metrics()` runs. CI uses it
-to check that Prometheus dashboards and alerts reference real metrics.
+types, labels, bucket boundaries. It is the scalo runtime set --
+`ServiceMetrics`, app info, and the worker pool and batch engine sets
+when compiled in -- plus whatever the app's `register_metrics()` adds,
+each name once and under the `metrics.namespace` the service's own
+config sets. CI uses it to check that Prometheus dashboards and alerts
+reference real metrics. Byte-identical to `metrics-manifest` on stdout.
+
+It lists what the scalo registry describes, which is not yet everything
+the service serves: the `process_*`, `container_*`, `http_client_*` and
+memory guard gauges are on `/metrics` but not in the manifest
+(scalo-rs#137).
 
 ```json
 {
-  "service": "dfe-loader",
+  "schema_version": 1,
+  "app": "my-app",
+  "namespace": "",
   "metrics": [
-    { "name": "loader_records_in_total", "kind": "counter", "labels": ["topic"], ... }
+    { "name": "transport_sent_total", "type": "counter", "labels": ["transport"], ... }
   ]
 }
 ```
@@ -71,7 +81,10 @@ know what to validate against.
 
 Minimal subset of the contract that CI needs to build the image:
 base image, registry, runtime packages, exposed ports, healthcheck,
-labels. No secrets, no K8s-specific config.
+labels. No secrets, no K8s-specific config. A port gated with `when` is
+not in `expose_ports`; it is listed under `conditional_ports` with its
+condition, a key that appears only when some port is gated (see
+[contract.md](contract.md#ports)). In `expose_ports` a TCP port is a bare number and a UDP port is the string `"514/udp"`, the form the Dockerfile `EXPOSE` line uses.
 
 Produced by `generate_container_manifest(&contract)`. Schema version
 `"1"` (string, separate from the contract schema).
@@ -157,13 +170,13 @@ on. Override via `ArgocdConfig`.
 | `values.yaml` | Configurable defaults -- image, resources, probes, secrets, KEDA, HPA, `otel`, `podSecurityContext` / `securityContext` |
 | `templates/_helpers.tpl` | Standard name helpers + one `<group>SecretName` helper per secret group |
 | `templates/deployment.yaml` | `Deployment` with probes, security contexts, observability env, env from secrets, config mount |
-| `templates/service.yaml` | `Service` exposing metrics port + any `extra_ports` |
+| `templates/service.yaml` | `Service` exposing metrics port + any `extra_ports`; a port gated with `when` renders only while its condition holds, here and in the `Deployment` |
 | `templates/serviceaccount.yaml` | `ServiceAccount` (auto-disable token mount) |
 | `templates/configmap.yaml` | `ConfigMap` rendering `values.yaml.config` to mounted file |
 | `templates/secret.yaml` | `Secret` per group (skipped when `existingSecret` is set) |
 | `templates/hpa.yaml` | HPA fallback for clusters without KEDA |
-| `templates/keda-scaledobject.yaml` | KEDA `ScaledObject` -- **only when `contract.keda.is_some()`** |
-| `templates/keda-triggerauth.yaml` | KEDA `TriggerAuthentication` -- **only when `contract.keda.is_some()`** |
+| `templates/keda-scaledobject.yaml` | KEDA `ScaledObject` -- **only when `contract.keda` is `Some` with `enabled: true`** |
+| `templates/keda-triggerauth.yaml` | KEDA `TriggerAuthentication` -- **same condition**; a comment stub when there is no kafka secret group or no Kafka lag trigger |
 | `templates/NOTES.txt` | Post-install hints (port-forward, log tail) |
 
 #### Security contexts on the Deployment
@@ -259,6 +272,34 @@ alternatives when committed files carry intentional deviations (e.g.
 CI's prepended builder stages). Each returns the list of
 `ContractMismatch`es rather than a hard diff.
 
+### Keeping a hand-fixed chart under the guard
+
+The committed chart should come straight from `generate_chart()`. When it cannot yet -- a generator defect you have to work round until the fix ships -- pin the hand edit rather than exempting the file. An exemption only proves the file differs from the generator, and a stale edit differs too, so an exempt file rots with the guard green.
+
+```rust
+use std::path::Path;
+use scalo::deployment::{ChartPatch, assert_no_chart_drift};
+
+#[test]
+fn committed_chart_matches_the_generator() {
+    let patches = [ChartPatch::new(
+        "templates/keda-scaledobject.yaml",
+        "        tls: disable\n",
+        "        tls: enable\n",
+    )];
+    assert_no_chart_drift(&contract(), Path::new("chart"), &patches);
+}
+```
+
+`check_chart_drift()` renders the chart fresh, applies each patch to the file it names, and requires the committed file to match byte for byte. It fails when:
+
+- a committed file differs from the fresh output with its patches applied -- a difference only in line endings (CRLF) or trailing newlines is named as that
+- a patch's `from` no longer occurs in the generated file -- the generator changed under the hand fix, so drop the patch or pin it again
+- a patch's `from` occurs more than once, so it pins no one edit -- lengthen it until it is unique; the patch replaces that one occurrence
+- a generated file is missing from the chart, or a file in the chart root or `templates/` is one the generator does not write
+
+It renders without identity annotations, the same as a committed chart. Once a scalo release fixes the defect a patch works round, the patch's `from` stops appearing and the check says to drop it.
+
 ---
 
 ## Determinism
@@ -266,6 +307,17 @@ CI's prepended builder stages). Each returns the list of
 Identical input gives byte-identical output -- no timestamps, no
 random IDs. Two consecutive runs match exactly. This is what makes the
 CI diff check reliable.
+
+The input is more than the source. `generate-artefacts` loads the app's
+config first, once, and every artefact follows that cascade: the
+contract's base image and registry, the metrics namespace, the ArgoCD
+repo URL. So a dev box and CI with different settings files or env
+vars can generate different artefacts from one commit. A config that
+does not load is reported on stderr and the defaults are taken. The
+manifest's `version` and `commit` also change with each build.
+
+A contract with a `default_config` listener no port declares is refused
+before anything is written -- see [contract.md](contract.md#ports).
 
 ---
 

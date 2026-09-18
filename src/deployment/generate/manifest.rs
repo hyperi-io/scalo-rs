@@ -6,7 +6,9 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-use crate::deployment::contract::{DeploymentContract, ImageProfile};
+use crate::deployment::contract::{DeploymentContract, ImageProfile, PortContract};
+
+use super::common::udp_port_suffix;
 
 // ============================================================================
 // Container Manifest (CI-consumable JSON)
@@ -19,8 +21,10 @@ use crate::deployment::contract::{DeploymentContract, ImageProfile};
 ///
 /// # Errors
 ///
-/// Returns an error string if JSON serialisation fails.
+/// Returns an error string naming the field at fault if the contract fails
+/// [`DeploymentContract::validate`], or if JSON serialisation fails.
 pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<String, String> {
+    contract.validate().map_err(|e| e.to_string())?;
     let binary = contract.binary();
 
     let apt_repos: Vec<serde_json::Value> = contract
@@ -38,8 +42,21 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         })
         .collect();
 
-    let mut expose_ports: Vec<u16> = vec![contract.metrics_port];
-    expose_ports.extend(contract.extra_ports.iter().map(|p| p.port));
+    // A port with a `when` condition is not exposed, because an image cannot
+    // know whether that listener is on; it is listed with its condition instead.
+    let mut expose_ports = vec![serde_json::Value::from(contract.metrics_port)];
+    let mut conditional_ports = Vec::new();
+    for p in &contract.extra_ports {
+        match &p.when {
+            None => expose_ports.push(expose_entry(p)),
+            Some(when) => conditional_ports.push(serde_json::json!({
+                "name": p.name,
+                "port": p.port,
+                "protocol": p.protocol,
+                "when": when,
+            })),
+        }
+    }
 
     let profile_str = match contract.image_profile {
         ImageProfile::Production => "production",
@@ -52,7 +69,7 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         &contract.oci_labels.title
     };
 
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schema_version": "1",
         "app_name": contract.app_name,
         "binary_name": binary,
@@ -93,7 +110,26 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
             "org.opencontainers.image.licenses": contract.oci_labels.licenses,
         },
     });
+    // Only present when a port is gated, so an ungated contract's manifest is unchanged.
+    if !conditional_ports.is_empty()
+        && let Some(fields) = manifest.as_object_mut()
+    {
+        fields.insert(
+            "conditional_ports".to_string(),
+            serde_json::Value::Array(conditional_ports),
+        );
+    }
 
     serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("container manifest JSON failed: {e}"))
+}
+
+/// A port as `expose_ports` lists it: a bare number for TCP and `<port>/udp`
+/// for UDP, the form the Dockerfile `EXPOSE` line uses, since a consumer reads
+/// a bare number as TCP.
+fn expose_entry(port: &PortContract) -> serde_json::Value {
+    match udp_port_suffix(&port.protocol) {
+        "" => port.port.into(),
+        suffix => format!("{}{suffix}", port.port).into(),
+    }
 }

@@ -7,7 +7,7 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Parse phase: convert raw bytes into a `sonic_rs::Value` using SIMD
-//! acceleration. This is the most CPU-intensive phase (~1-5 µs per message).
+//! acceleration. This is the most CPU-intensive phase (~1-5 us per message).
 //!
 //! - JSON: `sonic_rs::from_slice` (AVX2/NEON SIMD, 2-4x faster than serde_json)
 //! - MsgPack: `rmpv` native decode -> `sonic_rs::Value` via a direct value walker

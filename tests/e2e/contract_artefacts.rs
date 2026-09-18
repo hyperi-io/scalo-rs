@@ -72,8 +72,9 @@ use scalo::deployment::test_support::{
     kubeconform_available, skip, tier_b_enabled, wait_until,
 };
 use scalo::deployment::{
-    ArgocdConfig, ContractIdentity, DeploymentContract, HealthContract, ImageProfile, OciLabels,
-    generate_argocd_application, generate_chart, generate_dockerfile,
+    ArgocdConfig, ContractIdentity, DeploymentContract, HealthContract, ImageProfile,
+    KafkaLagTrigger, KedaContract, OciLabels, PortContract, generate_argocd_application,
+    generate_chart, generate_dockerfile,
 };
 
 // ============================================================================
@@ -93,6 +94,7 @@ fn test_contract() -> DeploymentContract {
         config_mount_path: "/etc/hct/config.yaml".into(),
         image_registry: "ghcr.io/hyperi-io".into(),
         extra_ports: vec![],
+        unbound_listen_paths: vec![],
         entrypoint_args: vec![],
         secrets: vec![],
         base_image: "ubuntu:24.04".into(),
@@ -411,6 +413,402 @@ fn tier_a_chart_lint_and_template() {
             "io.hyperi.contract.image-ref: \"ghcr.io/hyperi-io/hyperi-contract-test:test\""
         )
     );
+}
+
+// ============================================================================
+// Tier A -- KEDA trigger: assert the RENDERED values, not that helm exited 0
+// ============================================================================
+
+/// The fixture contract with KEDA on and `default_config` as the app's config.
+fn keda_contract(default_config: serde_json::Value) -> DeploymentContract {
+    DeploymentContract {
+        keda: Some(KedaContract::default()),
+        default_config: Some(default_config),
+        ..test_contract()
+    }
+}
+
+/// Render only the ScaledObject and return the kafka trigger's metadata.
+/// Panics with helm's stderr if the chart does not render.
+fn rendered_kafka_trigger(
+    contract: &DeploymentContract,
+    extra_args: &[&str],
+) -> serde_yaml_ng::Value {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chart_dir = tmp.path().join("chart");
+    generate_chart(contract, &chart_dir, None).expect("generate_chart");
+
+    let out = Command::new("helm")
+        .args(["template", "test-release"])
+        .arg(&chart_dir)
+        .args(["--show-only", "templates/keda-scaledobject.yaml"])
+        .args(extra_args)
+        .output()
+        .expect("helm template invocation");
+    assert!(
+        out.status.success(),
+        "helm template failed with {extra_args:?}: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_slice(&out.stdout).expect("rendered ScaledObject is YAML");
+    let triggers = doc["spec"]["triggers"]
+        .as_sequence()
+        .expect("ScaledObject has a triggers list");
+    triggers
+        .iter()
+        .find(|t| t["type"].as_str() == Some("kafka"))
+        .expect("ScaledObject has a kafka trigger")["metadata"]
+        .clone()
+}
+
+/// A rendered metadata value as a string; an empty render comes back as null.
+fn rendered_str<'a>(metadata: &'a serde_yaml_ng::Value, key: &str) -> &'a str {
+    metadata[key].as_str().unwrap_or_default()
+}
+
+/// KEDA admits a trigger with an unparseable broker list and simply never
+/// scales, so the rendered values are what has to be checked.
+#[test]
+fn tier_a_keda_trigger_renders_usable_values() {
+    if !helm_available() {
+        skip(
+            "tier-a",
+            "tier_a_keda_trigger_renders_usable_values",
+            "helm CLI not available",
+        );
+        return;
+    }
+
+    let contract = keda_contract(serde_json::json!({
+        "kafka": {
+            "brokers": ["kafka:9092", "kafka2:9092"],
+            "group_id": "hct-group",
+            "topics": ["events", "audit"],
+        }
+    }));
+
+    let metadata = rendered_kafka_trigger(&contract, &[]);
+    assert_eq!(
+        rendered_str(&metadata, "bootstrapServers"),
+        "kafka:9092,kafka2:9092"
+    );
+    assert_eq!(rendered_str(&metadata, "consumerGroup"), "hct-group");
+    assert_eq!(rendered_str(&metadata, "topic"), "events");
+}
+
+/// An app that keeps its Kafka settings under `config.source` has no
+/// `config.kafka` key, and operators set brokers and topics as a list or a
+/// comma-separated string, or null the section out, so every shape must render.
+#[test]
+fn tier_a_keda_trigger_follows_a_source_shaped_config() {
+    if !helm_available() {
+        skip(
+            "tier-a",
+            "tier_a_keda_trigger_follows_a_source_shaped_config",
+            "helm CLI not available",
+        );
+        return;
+    }
+
+    let mut contract = keda_contract(serde_json::json!({
+        "source": {
+            "brokers": ["kafka:9092", "kafka2:9092"],
+            "group_id": "hct-group",
+            "topics": ["events", "audit"],
+        },
+        "sink": { "brokers": ["sink:9092"], "topic": "out" },
+    }));
+    contract.keda = contract
+        .keda
+        .map(|k| k.with_kafka_trigger(KafkaLagTrigger::under("config.source")));
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chart_dir = tmp.path().join("chart");
+    generate_chart(&contract, &chart_dir, None).expect("generate_chart");
+    let lint = Command::new("helm")
+        .arg("lint")
+        .arg(&chart_dir)
+        .output()
+        .expect("helm lint invocation");
+    assert!(
+        lint.status.success(),
+        "helm lint failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&lint.stdout),
+        String::from_utf8_lossy(&lint.stderr),
+    );
+
+    let metadata = rendered_kafka_trigger(&contract, &[]);
+    assert_eq!(
+        rendered_str(&metadata, "bootstrapServers"),
+        "kafka:9092,kafka2:9092"
+    );
+    assert!(
+        !rendered_str(&metadata, "consumerGroup").is_empty(),
+        "consumerGroup rendered empty: {metadata:?}"
+    );
+    assert_eq!(rendered_str(&metadata, "consumerGroup"), "hct-group");
+    assert_eq!(rendered_str(&metadata, "topic"), "events");
+
+    let string_brokers = rendered_kafka_trigger(
+        &contract,
+        &[
+            "--set-json",
+            r#"config.source.brokers="kafka:9092,kafka2:9092""#,
+        ],
+    );
+    assert_eq!(
+        rendered_str(&string_brokers, "bootstrapServers"),
+        "kafka:9092,kafka2:9092"
+    );
+
+    let string_topics = rendered_kafka_trigger(
+        &contract,
+        &["--set-json", r#"config.source.topics="events,audit""#],
+    );
+    assert_eq!(rendered_str(&string_topics, "topic"), "events");
+
+    let no_source = rendered_kafka_trigger(&contract, &["--set-json", "config.source=null"]);
+    assert_eq!(rendered_str(&no_source, "bootstrapServers"), "");
+    assert_eq!(rendered_str(&no_source, "topic"), "");
+}
+
+// ============================================================================
+// Tier A -- gated ports: a port renders only while its listener is on
+// ============================================================================
+
+/// Render one template of `chart_dir` with `extra_args` and parse it.
+/// Panics with helm's stderr if the chart does not render.
+fn render_template(chart_dir: &Path, template: &str, extra_args: &[&str]) -> serde_yaml_ng::Value {
+    let out = Command::new("helm")
+        .args(["template", "test-release"])
+        .arg(chart_dir)
+        .args(["--show-only", template])
+        .args(extra_args)
+        .output()
+        .expect("helm template invocation");
+    assert!(
+        out.status.success(),
+        "helm template {template} failed with {extra_args:?}: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    serde_yaml_ng::from_slice(&out.stdout).expect("rendered template is YAML")
+}
+
+/// The port names the Deployment's container and the Service each render.
+fn rendered_port_names(chart_dir: &Path, extra_args: &[&str]) -> (Vec<String>, Vec<String>) {
+    let names = |ports: &serde_yaml_ng::Value| -> Vec<String> {
+        ports
+            .as_sequence()
+            .expect("a ports list")
+            .iter()
+            .map(|p| p["name"].as_str().expect("a port name").to_string())
+            .collect()
+    };
+    let deployment = render_template(chart_dir, "templates/deployment.yaml", extra_args);
+    let service = render_template(chart_dir, "templates/service.yaml", extra_args);
+    (
+        names(&deployment["spec"]["template"]["spec"]["containers"][0]["ports"]),
+        names(&service["spec"]["ports"]),
+    )
+}
+
+/// A gate on a key the config lacks, or sets to something else, renders
+/// nothing and does not fail the render; setting the key renders the port.
+#[test]
+fn tier_a_chart_renders_a_gated_port_only_when_its_listener_is_on() {
+    if !helm_available() {
+        skip(
+            "tier-a",
+            "tier_a_chart_renders_a_gated_port_only_when_its_listener_is_on",
+            "helm CLI not available",
+        );
+        return;
+    }
+
+    let contract = DeploymentContract {
+        extra_ports: vec![
+            PortContract::tcp("http", 8080),
+            PortContract::tcp("grpc", 6001).when_enabled("config.grpc.enabled"),
+            PortContract::tcp("push", 6000).when_equals("config.source.transport", "direct"),
+            PortContract::tcp("relay", 6002)
+                .when_one_of("config.source.transport", ["direct", "grpc"]),
+        ],
+        // No `source` key at all, and the grpc switch off.
+        default_config: Some(serde_json::json!({ "grpc": { "enabled": false } })),
+        ..test_contract()
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chart_dir = tmp.path().join("chart");
+    generate_chart(&contract, &chart_dir, None).expect("generate_chart");
+
+    let lint = Command::new("helm")
+        .arg("lint")
+        .arg(&chart_dir)
+        .output()
+        .expect("helm lint invocation");
+    assert!(
+        lint.status.success(),
+        "helm lint failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&lint.stdout),
+        String::from_utf8_lossy(&lint.stderr),
+    );
+
+    let cases: [(&[&str], &[&str]); 5] = [
+        (&[], &["metrics", "http"]),
+        (
+            &["--set", "config.source.transport=direct"],
+            &["metrics", "http", "push", "relay"],
+        ),
+        (
+            &["--set", "config.source.transport=grpc"],
+            &["metrics", "http", "relay"],
+        ),
+        (
+            &["--set", "config.grpc.enabled=true"],
+            &["metrics", "http", "grpc"],
+        ),
+        (&["--set-json", "config=null"], &["metrics", "http"]),
+    ];
+    for (args, expected) in cases {
+        let (deployment, service) = rendered_port_names(&chart_dir, args);
+        assert_eq!(deployment, expected, "Deployment ports with {args:?}");
+        assert_eq!(service, expected, "Service ports with {args:?}");
+    }
+}
+
+// ============================================================================
+// Tier A -- replicas: exactly one owner of the replica count
+// ============================================================================
+
+/// What owns the replica count in one render of a chart.
+#[derive(Debug, PartialEq)]
+struct ReplicaOwners {
+    scaled_object: bool,
+    hpa: bool,
+    /// The Deployment's own `replicas`, when it sets one.
+    replicas: Option<u64>,
+}
+
+/// Render the whole chart with `extra_args` and report what owns the replica count.
+fn replica_owners(chart_dir: &Path, extra_args: &[&str]) -> ReplicaOwners {
+    use serde::Deserialize;
+
+    let out = Command::new("helm")
+        .args(["template", "test-release"])
+        .arg(chart_dir)
+        .args(extra_args)
+        .output()
+        .expect("helm template invocation");
+    assert!(
+        out.status.success(),
+        "helm template failed with {extra_args:?}: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let docs: Vec<serde_yaml_ng::Value> = serde_yaml_ng::Deserializer::from_slice(&out.stdout)
+        .map(|doc| serde_yaml_ng::Value::deserialize(doc).expect("rendered document is YAML"))
+        .collect();
+    let of_kind = |kind: &str| docs.iter().find(|d| d["kind"].as_str() == Some(kind));
+    ReplicaOwners {
+        scaled_object: of_kind("ScaledObject").is_some(),
+        hpa: of_kind("HorizontalPodAutoscaler").is_some(),
+        replicas: of_kind("Deployment").expect("a Deployment")["spec"]["replicas"].as_u64(),
+    }
+}
+
+/// A Deployment without `replicas` runs one pod, so whenever neither a
+/// ScaledObject nor the HPA renders the Deployment must set `replicaCount`.
+#[test]
+fn tier_a_chart_sets_replicas_whenever_no_scaler_renders() {
+    if !helm_available() {
+        skip(
+            "tier-a",
+            "tier_a_chart_sets_replicas_whenever_no_scaler_renders",
+            "helm CLI not available",
+        );
+        return;
+    }
+
+    let kafka = keda_contract(serde_json::json!({
+        "kafka": { "brokers": ["kafka:9092"], "group_id": "g", "topics": ["events"] }
+    }));
+    let mut cpu_only = kafka.clone();
+    cpu_only.keda = cpu_only
+        .keda
+        .map(|k| k.with_kafka_trigger(KafkaLagTrigger::disabled()));
+    let no_keda = test_contract();
+
+    let owned_by = |scaled_object, hpa, replicas| ReplicaOwners {
+        scaled_object,
+        hpa,
+        replicas,
+    };
+    let keda_off = ["--set", "keda.enabled=false"];
+    let hpa_on = ["--set", "autoscaling.enabled=true"];
+    let cases: Vec<(&str, &DeploymentContract, Vec<&str>, ReplicaOwners)> = vec![
+        ("kafka", &kafka, vec![], owned_by(true, false, None)),
+        (
+            "kafka",
+            &kafka,
+            keda_off.to_vec(),
+            owned_by(false, false, Some(3)),
+        ),
+        (
+            "kafka",
+            &kafka,
+            [keda_off, hpa_on].concat(),
+            owned_by(false, true, None),
+        ),
+        ("cpu-only", &cpu_only, vec![], owned_by(true, false, None)),
+        (
+            "cpu-only",
+            &cpu_only,
+            vec!["--set", "keda.cpu.enabled=false"],
+            owned_by(false, false, Some(3)),
+        ),
+        (
+            "cpu-only",
+            &cpu_only,
+            vec![
+                "--set",
+                "keda.cpu.enabled=false",
+                "--set",
+                "autoscaling.enabled=true",
+            ],
+            owned_by(false, false, Some(3)),
+        ),
+        (
+            "cpu-only",
+            &cpu_only,
+            [keda_off, hpa_on].concat(),
+            owned_by(false, true, None),
+        ),
+        ("no keda", &no_keda, vec![], owned_by(false, false, Some(3))),
+        (
+            "no keda",
+            &no_keda,
+            hpa_on.to_vec(),
+            owned_by(false, true, None),
+        ),
+        (
+            "no keda",
+            &no_keda,
+            vec!["--set", "keda.enabled=true"],
+            owned_by(false, false, Some(3)),
+        ),
+    ];
+
+    for (label, contract, args, expected) in cases {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let chart_dir = tmp.path().join("chart");
+        generate_chart(contract, &chart_dir, None).expect("generate_chart");
+        let args = [&["--set", "replicaCount=3"][..], &args[..]].concat();
+        assert_eq!(
+            replica_owners(&chart_dir, &args),
+            expected,
+            "{label} contract with {args:?}"
+        );
+    }
 }
 
 // ============================================================================

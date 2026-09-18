@@ -16,10 +16,10 @@
 //! ## Architecture
 //!
 //! ```text
-//! App signals ──→ ScalingPressure ──→ {prefix}_scaling_pressure gauge
-//!                  ├─ Gate: circuit breaker open → 0.0
-//!                  ├─ Gate: memory ≥ threshold → 100.0
-//!                  └─ Weighted composite → 0.0-100.0
+//! App signals --> ScalingPressure --> {prefix}_scaling_pressure gauge
+//!                  |- Gate: circuit breaker open -> 0.0
+//!                  |- Gate: memory >= threshold -> 100.0
+//!                  `- Weighted composite -> 0.0-100.0
 //! ```
 //!
 //! ## Usage
@@ -57,8 +57,8 @@
 //! CPU utilisation). Configure both triggers independently in your
 //! KEDA `ScaledObject`:
 //!
-//! - `scaling_pressure` gauge → Prometheus scaler (app-level signals)
-//! - CPU utilisation → CPU scaler (container-level, via metrics-server)
+//! - `scaling_pressure` gauge -> Prometheus scaler (app-level signals)
+//! - CPU utilisation -> CPU scaler (container-level, via metrics-server)
 //!
 //! KEDA scales to the MAX of all triggers.
 

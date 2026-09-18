@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Live TUI metrics dashboard -- like `vector top` for data-plane services.
+//! Live TUI metrics dashboard for data-plane services.
 //!
 //! Polls a running service's Prometheus `/metrics` endpoint and displays
 //! a sortable, auto-refreshing table of metrics in the terminal.
@@ -14,13 +14,13 @@
 //! ## Usage
 //!
 //! ```bash
-//! dfe-loader top                                  # Interactive TUI (default)
-//! dfe-loader top --metrics-url http://remote:9090 # Remote endpoint
-//! dfe-loader top --interval 5                     # 5-second refresh
-//! dfe-loader top --once                           # Single scrape, table to stdout
-//! dfe-loader top --json                           # Single scrape, JSON to stdout
-//! dfe-loader top --once --filter kafka            # Filter by name substring
-//! dfe-loader top --json --filter "buffer.*rows"   # Filter with wildcard pattern
+//! my-service top                                  # Interactive TUI (default)
+//! my-service top --metrics-url http://remote:9090 # Remote endpoint
+//! my-service top --interval 5                     # 5-second refresh
+//! my-service top --once                           # Single scrape, table to stdout
+//! my-service top --json                           # Single scrape, JSON to stdout
+//! my-service top --once --filter kafka            # Filter by name substring
+//! my-service top --json --filter "buffer.*rows"   # Filter with wildcard pattern
 //! ```
 //!
 //! ## Keybindings (TUI mode)
@@ -28,8 +28,8 @@
 //! | Key | Action |
 //! |-----|--------|
 //! | `q` / `Esc` | Quit |
-//! | `j` / `↓` | Move down |
-//! | `k` / `↑` | Move up |
+//! | `j` / `Down` | Move down |
+//! | `k` / `Up` | Move up |
 //! | `g` / `Home` | Go to top |
 //! | `G` / `End` | Go to bottom |
 //! | `s` | Cycle sort column |

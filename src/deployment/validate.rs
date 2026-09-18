@@ -20,6 +20,10 @@ use super::error::{ContractMismatch, DeploymentError};
 ///
 /// Checks `values.yaml` for port, prometheus annotations, KEDA thresholds,
 /// and the deployment template for health probe paths and env var prefix.
+/// Also reports each values path the generated chart reads that the
+/// contract's own `default_config` never sets, because the chart renders it
+/// empty (see [`DeploymentContract::unresolved_values_paths`]), and a contract
+/// the generators refuse (see [`DeploymentContract::validate`]).
 ///
 /// Returns a list of mismatches (empty = all good).
 ///
@@ -79,8 +83,26 @@ pub fn validate_helm_values(
     validate_prometheus_annotations(&values, contract, &mut mismatches);
 
     // KEDA thresholds
-    if let Some(keda) = &contract.keda {
+    if let Some(keda) = contract.enabled_keda() {
         validate_keda_values(&values, keda, &mut mismatches);
+    }
+
+    // A contract the generators refuse, which a hand-kept chart can still carry
+    if let Err(DeploymentError::InvalidContract { field, reason }) = contract.validate() {
+        mismatches.push(ContractMismatch {
+            field,
+            expected: "a contract the generators accept".into(),
+            actual: reason,
+        });
+    }
+
+    // Values paths the chart reads that the contract's own config never sets
+    for path in contract.unresolved_values_paths() {
+        mismatches.push(ContractMismatch {
+            field: format!("values path {path}"),
+            expected: "a value in default_config".into(),
+            actual: "(not set)".into(),
+        });
     }
 
     // Deployment template (health probes, env prefix, config mount)
@@ -111,11 +133,10 @@ pub fn validate_dockerfile(
     let mut mismatches = Vec::new();
 
     // EXPOSE port
-    let expected_expose = format!("EXPOSE {}", contract.metrics_port);
-    if !content.contains(&expected_expose) {
+    if !exposes_tcp_port(&content, contract.metrics_port) {
         mismatches.push(ContractMismatch {
             field: "Dockerfile EXPOSE".into(),
-            expected: expected_expose,
+            expected: format!("EXPOSE {}", contract.metrics_port),
             actual: extract_line_containing(&content, "EXPOSE"),
         });
     }
@@ -371,6 +392,20 @@ fn read_text(path: &Path) -> Result<String, DeploymentError> {
     })
 }
 
+/// True when an `EXPOSE` instruction lists `port` as a whole token, bare or as
+/// `<port>/tcp`, so `EXPOSE 90901` does not pass for 9090.
+fn exposes_tcp_port(dockerfile: &str, port: u16) -> bool {
+    let bare = port.to_string();
+    let tcp = format!("{port}/tcp");
+    dockerfile.lines().any(|line| {
+        let mut tokens = line.split_whitespace();
+        tokens
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("EXPOSE"))
+            && tokens.any(|token| token == bare || token.eq_ignore_ascii_case(&tcp))
+    })
+}
+
 fn extract_line_containing(content: &str, keyword: &str) -> String {
     content
         .lines()
@@ -401,9 +436,12 @@ mod tests {
             config_mount_path: "/etc/test/config.yaml".into(),
             image_registry: "ghcr.io/hyperi-io".into(),
             extra_ports: vec![],
+            unbound_listen_paths: vec![],
             entrypoint_args: vec!["--config".into(), "/etc/test/config.yaml".into()],
             secrets: vec![],
-            default_config: None,
+            default_config: Some(serde_json::json!({
+                "kafka": { "brokers": ["kafka:9092"], "group_id": "test-app", "topics": ["events"] }
+            })),
             depends_on: vec![],
             keda: Some(KedaContract::default()),
             base_image: "ubuntu:24.04".into(),
@@ -470,6 +508,48 @@ mod tests {
         assert!(mismatches.iter().any(|m| m.field.contains("EXPOSE")));
     }
 
+    /// The metrics port must be a whole token on an EXPOSE line, bare or `/tcp`,
+    /// wherever it sits in the list.
+    #[test]
+    fn test_validate_dockerfile_matches_the_expose_port_as_a_whole_token() {
+        let expose_mismatch = |expose: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let dockerfile = dir.path().join("Dockerfile");
+            std::fs::write(
+                &dockerfile,
+                format!(
+                    "FROM ubuntu:24.04\n\
+                     {expose}\n\
+                     HEALTHCHECK CMD curl -sf http://localhost:9090/livez\n\
+                     CMD [\"--config\", \"/etc/test/config.yaml\"]\n"
+                ),
+            )
+            .unwrap();
+            validate_dockerfile(&test_contract(), &dockerfile)
+                .unwrap()
+                .iter()
+                .any(|m| m.field == "Dockerfile EXPOSE")
+        };
+
+        for wrong in [
+            "EXPOSE 90901",
+            "EXPOSE 19090",
+            "EXPOSE 8080 9090/udp",
+            "# EXPOSE 9090",
+            "LABEL note=\"EXPOSE 9090\"",
+        ] {
+            assert!(expose_mismatch(wrong), "{wrong:?} passed for 9090");
+        }
+        for right in [
+            "EXPOSE 9090",
+            "EXPOSE 8080 9090 514/udp",
+            "EXPOSE 9090/tcp",
+            "expose 9090",
+        ] {
+            assert!(!expose_mismatch(right), "{right:?} failed for 9090");
+        }
+    }
+
     #[test]
     fn test_validate_helm_with_tempdir() {
         let dir = tempfile::tempdir().unwrap();
@@ -527,6 +607,73 @@ mod tests {
         let contract = test_contract();
         let mismatches = validate_helm_values(&contract, chart_dir).unwrap();
         assert!(mismatches.iter().any(|m| m.field == "service.port"));
+    }
+
+    /// The KEDA trigger reads `config.kafka.*`; a config without it renders an
+    /// empty trigger that never scales, so validation has to say so.
+    #[test]
+    fn test_validate_helm_reports_a_values_path_the_config_never_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let chart_dir = dir.path();
+        std::fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test-app\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(chart_dir.join("values.yaml"), "service:\n  port: 9090\n").unwrap();
+
+        let mut contract = test_contract();
+        contract.default_config = Some(serde_json::json!({
+            "source": { "brokers": ["kafka:9092"], "group_id": "g", "topics": ["t"] }
+        }));
+        let fields: Vec<String> = validate_helm_values(&contract, chart_dir)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.field)
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "values path config.kafka.brokers",
+                "values path config.kafka.group_id",
+                "values path config.kafka.topics",
+            ]
+        );
+
+        contract.keda = contract.keda.map(|k| {
+            k.with_kafka_trigger(crate::deployment::KafkaLagTrigger::under("config.source"))
+        });
+        let mismatches = validate_helm_values(&contract, chart_dir).unwrap();
+        assert!(
+            mismatches.is_empty(),
+            "Unexpected mismatches: {mismatches:?}"
+        );
+    }
+
+    /// A contract no generator would render is reported with the rest, so a
+    /// hand-kept chart cannot carry one past the check.
+    #[test]
+    fn test_validate_helm_reports_a_contract_the_generators_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let chart_dir = dir.path();
+        std::fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test-app\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(chart_dir.join("values.yaml"), "service:\n  port: 9090\n").unwrap();
+
+        let mut contract = test_contract();
+        contract.keda = contract.keda.map(|k| {
+            let mut cpu_only = k.with_kafka_trigger(crate::deployment::KafkaLagTrigger::disabled());
+            cpu_only.min_replicas = 0;
+            cpu_only
+        });
+        let mismatches = validate_helm_values(&contract, chart_dir).unwrap();
+        assert!(
+            mismatches.iter().any(|m| m.field == "keda.min_replicas"),
+            "{mismatches:?}"
+        );
     }
 
     #[test]

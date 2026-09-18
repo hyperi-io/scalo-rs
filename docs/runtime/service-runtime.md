@@ -37,10 +37,12 @@ as a warning, not fatal).
 which case nothing is constructed and the data path is byte-identical
 to pre-governor. See [self-regulation.md](../self-regulation.md).
 
-The whole bundle is enabled via the `cli-service` feature, which
-pulls in `metrics + memory + scaling + worker-pool + shutdown +
-governor + lifecycle` so that a single feature flag gives a downstream
-app the full service-runtime profile.
+The bundle is enabled via the `cli-service` feature, which pulls in
+`metrics + memory + scaling + shutdown + governor + sink-stack +
+lifecycle`. The worker pool is opt-in: add `worker-pool` for
+`worker_pool`, or `worker-batch` for it and `batch_engine`, and the
+runtime builds and wires them. Without either, neither field exists and
+rayon is not compiled.
 
 ---
 
@@ -68,7 +70,9 @@ Step by step inside `run_app` for the default `run` subcommand:
 3. Call `app.load_config(args.config.as_deref())` -- apps own this
    step so they can deserialise into their own typed config.
 4. Build `ServiceRuntime`:
-   - Construct `MetricsManager`, register `ServiceMetrics`.
+   - Construct `MetricsManager` under `metrics.namespace`, describe the
+     scalo runtime set (`ServiceMetrics`, app info, worker pool and batch
+     engine metrics when compiled in) -- the same set the manifest lists.
    - Construct `MemoryGuard` from env prefix (cgroup auto-detect).
    - Construct the self-regulation governor from the same guard if
      `governor` is on and not opted out. Built before the worker pool,
@@ -128,7 +132,7 @@ pub trait ServiceApp: Sized {
 
 | Method | Required? | Purpose |
 |--------|-----------|---------|
-| `name` | yes | Service name -- drives metric namespace, log tags |
+| `name` | yes | Service name -- log tags, OTel `service.name`, the manifest's `app`. The metric prefix is `metrics.namespace`, bare by default |
 | `env_prefix` | yes | Prefix for env-var config overrides (`DFE_LOADER_*`) |
 | `version_info` | yes | Version + commit + build timestamp |
 | `common_args` | yes | Returns the embedded `CommonArgs` clap struct |
@@ -137,7 +141,7 @@ pub trait ServiceApp: Sized {
 | `command` | no | Override to expose app-specific subcommands |
 | `work_state` | no (cfg `lifecycle`) | The emptiness predicate: a valid but workless config idles instead of refusing |
 | `scaling_components` | no (cfg `scaling`) | Register app-specific KEDA signals (lag, queue depth) |
-| `register_metrics` | no (cfg `metrics`) | Register app metrics for `metrics-manifest` / `generate-artefacts` |
+| `register_metrics` | no (cfg `metrics`) | Describe the app's own metrics for `metrics-manifest` / `generate-artefacts`. The scalo runtime set is always in the manifest, so an override adds only what the app emits itself |
 | `deployment_contract` | no (cfg `deployment`) | Build the contract for `generate-artefacts` |
 | `version_check_defaults` | no (cfg `version-check`) | Supply the service's releases endpoint; the cascade overlays it, `version_check.enabled: false` always wins |
 
@@ -158,14 +162,15 @@ writing any extra code:
 | `run` | Default -- full lifecycle, ends in `run_service` |
 | `version` | Print `version_info()` and exit |
 | `config-check` | Load logger + config, print summary, exit non-zero on failure |
-| `metrics-manifest` | Build a `MetricsManager`, call `register_metrics`, print manifest JSON, exit |
-| `generate-artefacts --output-dir <dir>` | Emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, `argocd-application.yaml` |
+| `metrics-manifest` | Load config (best-effort, for `metrics.namespace`), describe the scalo runtime set, call `register_metrics`, print manifest JSON to stdout, exit. Warnings go to stderr |
+| `generate-artefacts --output-dir <dir>` | Load config once (best-effort, a failure warned on stderr), then emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, `argocd-application.yaml`. Refuses, writing nothing, a contract whose `default_config` binds a listener no port declares |
 | `top` | Live metrics TUI (when `top` feature is on) |
 
 `config-check` exists so CI can validate config without booting the
 service. `metrics-manifest` and `generate-artefacts` exist so CI can
-generate deployment artefacts deterministically -- same input, same
-output, no timestamps.
+generate deployment artefacts deterministically -- same build and
+config, same output, no timestamps. The artefacts follow the config
+cascade, so different settings or env vars give different artefacts.
 
 ---
 

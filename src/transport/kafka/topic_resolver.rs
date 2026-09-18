@@ -105,7 +105,7 @@ impl std::fmt::Debug for TopicResolver {
                 &self
                     .suppression_rules
                     .iter()
-                    .map(|r| format!("{} → {}", r.preferred_suffix, r.suppressed_suffix))
+                    .map(|r| format!("{} -> {}", r.preferred_suffix, r.suppressed_suffix))
                     .collect::<Vec<_>>(),
             )
             .field(

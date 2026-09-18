@@ -170,13 +170,16 @@ worker = ["worker-batch"]
 worker-msgpack = ["worker", "rmpv"]
 
 # CLI tiers (2.6.0 split):
-# - cli: bare clap types — CommonArgs, StandardCommand, VersionInfo, CliError,
+# - cli: bare clap types -- CommonArgs, StandardCommand, VersionInfo, CliError,
 #   output helpers. Useful for tooling-style CLIs that don't need a metrics
 #   server, worker pool, or memory guard.
 # - cli-service: + ServiceApp trait, run_app, ServiceRuntime (full service app
-#   scaffolding — pulls in metrics + memory + scaling + worker-pool).
+#   scaffolding). Enables metrics, memory, scaling, shutdown, governor,
+#   sink-stack and lifecycle. The adaptive worker pool is not included: add
+#   worker-pool for the pool, or worker-batch for the pool plus the batch
+#   engine, and the runtime builds and wires it.
 cli = ["clap", "tracing"]
-cli-service = ["cli", "metrics", "memory", "scaling", "worker-pool", "shutdown", "governor", "sink-stack", "lifecycle"]
+cli-service = ["cli", "metrics", "memory", "scaling", "shutdown", "governor", "sink-stack", "lifecycle"]
 
 # Idle-until-configured gate: an app deployed before it has work starts, stays
 # Ready, opens no connections, and picks up the first config that gives it work.

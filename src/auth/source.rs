@@ -17,6 +17,7 @@
 //! on a hit it is one atomic load and a pointer clone, and it never parks.
 
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -141,7 +142,7 @@ impl<T: CredentialSource + ?Sized> CredentialSource for &T {
 /// An implementation does no caching and holds no state -- [`Cached`] owns
 /// that. A signing scheme that needs its own crypto (a JWT client assertion, a
 /// provider-specific signature) mints its inputs in the consumer and hands them
-/// to [`TokenPost`], or implements this trait itself.
+/// to [`TokenPost::minted`], or implements this trait itself.
 pub trait Exchange: Send + Sync {
     /// Obtain one credential now.
     ///
@@ -182,11 +183,11 @@ struct Failure {
 /// callers mints once, not a hundred times.
 ///
 /// A failure is shared the same way: the caller that ran the acquisition and
-/// every caller that waited on it report the same failure. A failure the
-/// endpoint answered with is then held for the failure backoff, so a refused
-/// credential is not posted again by every caller in turn, while an endpoint
-/// that could not be reached or ran out of time is tried again by the next
-/// caller, because that is what a retry is for.
+/// every caller that waited on it report the same failure. A refusal is then
+/// held for the failure backoff, so a refused credential is not posted again by
+/// every caller in turn, while a transient failure -- an endpoint that could not
+/// be reached, ran out of time, or answered 408, 429 or 5xx -- is tried again by
+/// the next caller, because that is what a retry is for.
 #[derive(Debug)]
 pub struct Cached<E> {
     current: ArcSwapOption<Credential>,
@@ -212,8 +213,8 @@ impl<E> Cached<E> {
 
     /// How long a refusal, or a response that was not a credential, is reported
     /// to every caller before the endpoint is tried again. Zero exchanges on
-    /// every miss. An endpoint that was unreachable or out of time is not held
-    /// at all.
+    /// every miss. A transient failure (see [`AuthError::is_transient`]) is not
+    /// held at all.
     #[must_use]
     pub fn with_failure_backoff(mut self, backoff: Duration) -> Self {
         self.failure_backoff = backoff;
@@ -537,6 +538,10 @@ impl Exchange for Static {
 ///
 /// Every value is already rendered: templating, secret resolution and any
 /// per-deployment substitution belong to the consumer.
+///
+/// The POST is always retried on the client's schedule, whatever the
+/// template's `retry_non_idempotent` says: the form carries nothing single-use,
+/// so resending it mints a credential and duplicates nothing.
 pub struct ClientCredentials {
     http: HttpClient,
     token_url: String,
@@ -551,8 +556,9 @@ impl ClientCredentials {
     /// Exchange these client credentials at `token_url`.
     ///
     /// `http` is the settings the exchange takes: it builds its own client from
-    /// them, because a token exchange refuses redirects and replays its own
-    /// POST whatever the shared client does.
+    /// them, refusing redirects and always retrying its POST whatever the
+    /// template's `retry_non_idempotent` says, because a client-secret POST is
+    /// safe to resend.
     ///
     /// # Errors
     ///
@@ -568,7 +574,7 @@ impl ClientCredentials {
         let token_url = token_url.into();
         require_secure_endpoint(&token_url)?;
         Ok(Self {
-            http: exchange_client(http)?,
+            http: exchange_client(http, true)?,
             token_url,
             client_id: client_id.into(),
             client_secret,
@@ -636,21 +642,40 @@ impl Exchange for ClientCredentials {
 
 /// A form POST to a token endpoint, exactly as the consumer renders it.
 ///
-/// This is how a signed client assertion (RFC 7523) or a session login reaches
-/// an endpoint: the consumer mints and signs the assertion and hands it in as a
-/// form value, so no key format or JWT library enters scalo.
+/// [`Self::new`] posts a form rendered once, the same on every exchange, which
+/// suits a form that is safe to resend: a session login, a client secret.
+/// [`Self::minted`] renders the form afresh for every exchange, which is how a
+/// signed client assertion (RFC 7523) reaches an endpoint: the consumer mints
+/// and signs a new assertion each time, so no key format or JWT library enters
+/// scalo.
+///
+/// [`Self::new`] retries its POST inside one exchange only when the template's
+/// `retry_non_idempotent` opts in. [`Self::minted`] never does, because a retry
+/// would resend an assertion the endpoint may already have spent. Either way a
+/// transient failure is tried again by the next acquisition, and for a minted
+/// post that acquisition signs a fresh assertion.
 pub struct TokenPost {
     http: HttpClient,
     token_url: String,
     form: Vec<(String, String)>,
+    render: Option<Box<RenderForm>>,
     reading: TokenReading,
 }
 
+/// The form one render mints, boxed so every consumer closure stores as one type.
+type MintedForm = Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, AuthError>> + Send>>;
+
+/// A consumer's closure that renders a token post's form for one exchange.
+type RenderForm = dyn Fn() -> MintedForm + Send + Sync;
+
 impl TokenPost {
-    /// Post to `token_url`. The form starts empty.
+    /// Post to `token_url` a form that is safe to resend: a session login, a
+    /// client secret. The form starts empty and is posted as rendered on every
+    /// exchange, renewals included.
     ///
-    /// `http` is the settings the exchange takes, as for
-    /// [`ClientCredentials::new`].
+    /// `http` is the settings the exchange takes, with redirects refused as for
+    /// [`ClientCredentials::new`] and its `retry_non_idempotent` deciding
+    /// whether the POST is retried.
     ///
     /// # Errors
     ///
@@ -661,14 +686,60 @@ impl TokenPost {
         let token_url = token_url.into();
         require_secure_endpoint(&token_url)?;
         Ok(Self {
-            http: exchange_client(http)?,
+            http: exchange_client(http, http.config().retry_non_idempotent)?,
             token_url,
             form: Vec::new(),
+            render: None,
             reading: TokenReading::default(),
         })
     }
 
-    /// Add a rendered form field.
+    /// Post to `token_url` a form that `render` mints afresh for every
+    /// exchange: the RFC 7523 client assertion path, where a signed assertion
+    /// carries a single-use `jti` and a short `exp` and so cannot be resent.
+    ///
+    /// `render` returns a future, awaited once per acquisition, renewals
+    /// included, and inside the exchange's own deadline, so a signer that waits
+    /// on a KMS or a key fetched over the network holds no runtime thread while
+    /// it does. A render with nothing to await wraps its result:
+    /// `move || std::future::ready(sign())`. Its fields are posted after any
+    /// added with [`Self::with_form_field`]. A render that cannot mint (a key it
+    /// cannot read, a signer that failed) returns an [`AuthError`], usually
+    /// [`AuthError::Unavailable`], which the exchange hands back without posting
+    /// anything.
+    ///
+    /// `http` is the settings the exchange takes, with redirects refused as for
+    /// [`ClientCredentials::new`], but the POST is never retried inside one
+    /// exchange whatever the template's `retry_non_idempotent` says: a retry
+    /// would replay the same assertion. A transient failure is left to the next
+    /// acquisition, which mints a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Endpoint`] when `token_url` is not an https URL or
+    /// a loopback address, and [`AuthError::Client`] when the exchange's own
+    /// client cannot be built.
+    pub fn minted<F, Fut>(
+        http: &HttpClient,
+        token_url: impl Into<String>,
+        render: F,
+    ) -> Result<Self, AuthError>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<(String, String)>, AuthError>> + Send + 'static,
+    {
+        let token_url = token_url.into();
+        require_secure_endpoint(&token_url)?;
+        Ok(Self {
+            http: exchange_client(http, false)?,
+            token_url,
+            form: Vec::new(),
+            render: Some(Box::new(move || -> MintedForm { Box::pin(render()) })),
+            reading: TokenReading::default(),
+        })
+    }
+
+    /// Add a rendered form field, posted unchanged on every exchange.
     #[must_use]
     pub fn with_form_field(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.form.push((name.into(), value.into()));
@@ -695,9 +766,14 @@ impl fmt::Debug for TokenPost {
 
 impl Exchange for TokenPost {
     async fn acquire(&self) -> Result<Credential, AuthError> {
+        let minted = match self.render {
+            Some(ref render) => render().await?,
+            None => Vec::new(),
+        };
         let form: Vec<(&str, &str)> = self
             .form
             .iter()
+            .chain(&minted)
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
         let body = post_form(&self.http, &self.token_url, &form).await?;
@@ -734,7 +810,7 @@ impl MetadataServer {
     /// built.
     pub fn new(http: &HttpClient, url: impl Into<String>) -> Result<Self, AuthError> {
         Ok(Self {
-            http: exchange_client(http)?,
+            http: exchange_client(http, http.config().retry_non_idempotent)?,
             url: url.into(),
             headers: Vec::new(),
             reading: TokenReading::default(),
@@ -798,16 +874,15 @@ impl Exchange for MetadataServer {
 }
 
 /// The client a token exchange uses: the caller's own settings, with redirects
-/// refused and the POST retry opted into.
+/// refused and the POST retried only when `retry_post` says it is safe to resend.
 ///
 /// Redirects are refused because reqwest carries the form and any custom header
 /// across a cross-origin hop, which hands the credential to whatever host the
-/// endpoint names. The retry is the exchange's own decision rather than the
-/// shared client's flag: a token POST mints a new credential instead of
-/// changing state downstream, so replaying it duplicates nothing.
-fn exchange_client(template: &HttpClient) -> Result<HttpClient, AuthError> {
+/// endpoint names. `retry_post` is the exchange's own call, because only the
+/// exchange knows whether its request carries anything single-use.
+fn exchange_client(template: &HttpClient, retry_post: bool) -> Result<HttpClient, AuthError> {
     let config = HttpClientConfig {
-        retry_non_idempotent: true,
+        retry_non_idempotent: retry_post,
         ..template.config().clone()
     };
     HttpClient::with_redirect_policy(config, reqwest::redirect::Policy::none())
@@ -1181,6 +1256,23 @@ mod tests {
         assert!(
             !timed_out.stands_for(3, Duration::from_secs(60)),
             "a transient failure is not held: the next caller tries again"
+        );
+
+        let unavailable = Failure::of(
+            &AuthError::Refused {
+                url: "https://idp.example/token".to_owned(),
+                status: 503,
+                detail: NO_REFUSAL_DETAIL.to_owned(),
+            },
+            3,
+        );
+        assert!(
+            unavailable.stands_for(2, Duration::ZERO),
+            "queued before it finished"
+        );
+        assert!(
+            !unavailable.stands_for(3, Duration::from_secs(60)),
+            "a 503 is not held for the backoff: the next caller asks again"
         );
     }
 

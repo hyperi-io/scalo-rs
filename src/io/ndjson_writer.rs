@@ -15,7 +15,7 @@
 //! ## Two APIs
 //!
 //! - [`NdjsonWriter`] -- synchronous. Acquires a `parking_lot::Mutex` and
-//!   calls `std::io::Write::write_all` directly. Cheap (~µs) but blocks
+//!   calls `std::io::Write::write_all` directly. Cheap (~us) but blocks
 //!   the calling thread. Safe to call from non-async code and tests.
 //! - [`AsyncNdjsonWriter`] -- async wrapper over `Arc<NdjsonWriter>`. Each
 //!   call runs the sync work on a `tokio::task::spawn_blocking` thread,

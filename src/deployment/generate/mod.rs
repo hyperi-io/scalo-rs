@@ -24,6 +24,7 @@ mod manifest;
 pub use argocd::{ArgocdConfig, generate_argocd_application};
 pub use compose::generate_compose_fragment;
 pub use dockerfile::{generate_dockerfile, generate_runtime_stage};
+pub(crate) use helm::chart_files;
 pub use helm::generate_chart;
 pub use manifest::generate_container_manifest;
 
@@ -39,7 +40,8 @@ mod tests {
     use crate::deployment::contract::{
         OciLabels, PortContract, SecretEnvContract, SecretGroupContract,
     };
-    use crate::deployment::keda::KedaContract;
+    use crate::deployment::error::DeploymentError;
+    use crate::deployment::keda::{KafkaLagTrigger, KedaConfig, KedaContract};
     use crate::deployment::native_deps::NativeDepsContract;
 
     fn test_contract() -> DeploymentContract {
@@ -54,6 +56,7 @@ mod tests {
             config_mount_path: "/etc/dfe/loader.yaml".into(),
             image_registry: "ghcr.io/hyperi-io".into(),
             extra_ports: vec![],
+            unbound_listen_paths: vec![],
             entrypoint_args: vec!["--config".into(), "/etc/dfe/loader.yaml".into()],
             secrets: vec![
                 SecretGroupContract {
@@ -248,14 +251,364 @@ mod tests {
     #[test]
     fn test_generate_dockerfile_extra_ports() {
         let mut contract = test_contract();
-        contract.extra_ports = vec![PortContract {
-            name: "http".into(),
-            port: 8080,
-            protocol: "TCP".into(),
-        }];
+        contract.extra_ports = vec![PortContract::tcp("http", 8080)];
 
         let dockerfile = generate_dockerfile(&contract, None);
         assert!(dockerfile.contains("EXPOSE 9090 8080"));
+    }
+
+    /// Mixed TCP and UDP extra ports, the UDP ones spelt in both cases.
+    fn mixed_protocol_ports() -> Vec<PortContract> {
+        vec![
+            PortContract::tcp("http", 8080),
+            PortContract::udp("syslog", 514),
+            PortContract {
+                protocol: "udp".into(),
+                ..PortContract::udp("netflow", 2055)
+            },
+        ]
+    }
+
+    /// EXPOSE without a protocol means TCP, so a UDP port has to say so.
+    #[test]
+    fn test_dockerfile_exposes_udp_ports_as_udp() {
+        let mut contract = test_contract();
+        contract.extra_ports = mixed_protocol_ports();
+
+        let dockerfile = generate_dockerfile(&contract, None);
+        assert!(
+            dockerfile.contains("\nEXPOSE 9090 8080 514/udp 2055/udp\n"),
+            "UDP ports exposed as TCP:\n{dockerfile}"
+        );
+
+        let runtime = generate_runtime_stage(&contract);
+        assert!(
+            runtime.contains("\nEXPOSE 9090 8080 514/udp 2055/udp\n"),
+            "UDP ports exposed as TCP in the runtime stage:\n{runtime}"
+        );
+    }
+
+    /// A compose port with no protocol publishes TCP only, so a UDP listener
+    /// would be unreachable from the host.
+    #[test]
+    fn test_compose_publishes_udp_ports_as_udp() {
+        let mut contract = test_contract();
+        contract.extra_ports = mixed_protocol_ports();
+
+        let compose = generate_compose_fragment(&contract);
+        assert!(
+            compose.contains(
+                "    ports:\n      - \"9090:9090\"\n      - \"8080:8080\"\n      \
+                 - \"514:514/udp\"\n      - \"2055:2055/udp\"\n"
+            ),
+            "UDP ports published as TCP:\n{compose}"
+        );
+    }
+
+    /// A manifest consumer reads a bare port number as TCP, so a UDP port is
+    /// listed in the form the Dockerfile EXPOSE line uses.
+    #[test]
+    fn test_container_manifest_lists_udp_ports_as_udp() {
+        let mut contract = test_contract();
+        contract.extra_ports = mixed_protocol_ports();
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&generate_container_manifest(&contract).unwrap()).unwrap();
+        assert_eq!(
+            manifest["expose_ports"],
+            serde_json::json!([9090, 8080, "514/udp", "2055/udp"])
+        );
+    }
+
+    /// One always-on port, then one gated port per kind of condition.
+    fn gated_ports() -> Vec<PortContract> {
+        vec![
+            PortContract::tcp("http", 8080),
+            PortContract::tcp("grpc", 6000).when_enabled("config.grpc.enabled"),
+            PortContract::tcp("push", 6001).when_equals("config.source.transport", "direct"),
+            PortContract::udp("relay", 6002)
+                .when_one_of("config.source.transport", ["direct", "grpc"]),
+        ]
+    }
+
+    /// A port without `when` must render exactly as it did before gates existed.
+    #[test]
+    fn test_ungated_ports_render_unchanged() {
+        let mut contract = test_contract();
+        contract.extra_ports = vec![
+            PortContract::tcp("http", 8080),
+            PortContract::udp("syslog", 514),
+        ];
+        let files = render_chart(&contract);
+
+        assert!(files["templates/deployment.yaml"].contains(
+            "          ports:\n\
+             \x20           - name: metrics\n\
+             \x20             containerPort: {{ .Values.service.port }}\n\
+             \x20             protocol: TCP\n\
+             \x20           - name: http\n\
+             \x20             containerPort: 8080\n\
+             \x20             protocol: TCP\n\
+             \x20           - name: syslog\n\
+             \x20             containerPort: 514\n\
+             \x20             protocol: UDP\n\
+             \x20         env:\n"
+        ));
+        assert!(files["templates/service.yaml"].contains(
+            "      name: metrics\n\
+             \x20   - port: 8080\n\
+             \x20     targetPort: 8080\n\
+             \x20     protocol: TCP\n\
+             \x20     name: http\n\
+             \x20   - port: 514\n\
+             \x20     targetPort: 514\n\
+             \x20     protocol: UDP\n\
+             \x20     name: syslog\n\
+             \x20 selector:\n"
+        ));
+        for (name, text) in [
+            ("dockerfile", generate_dockerfile(&contract, None)),
+            ("runtime stage", generate_runtime_stage(&contract)),
+        ] {
+            assert!(
+                text.contains("\nEXPOSE 9090 8080 514/udp\n\nHEALTHCHECK"),
+                "{name} EXPOSE changed:\n{text}"
+            );
+            assert!(!text.contains("Conditional listeners"), "{name}:\n{text}");
+        }
+        assert!(generate_compose_fragment(&contract).contains(
+            "    ports:\n      - \"9090:9090\"\n      - \"8080:8080\"\n      \
+             - \"514:514/udp\"\n    volumes:\n"
+        ));
+        let manifest: serde_json::Value =
+            serde_json::from_str(&generate_container_manifest(&contract).unwrap()).unwrap();
+        assert_eq!(
+            manifest["expose_ports"],
+            serde_json::json!([9090, 8080, "514/udp"])
+        );
+        assert!(manifest.get("conditional_ports").is_none());
+    }
+
+    #[test]
+    fn test_chart_gates_each_kind_of_condition() {
+        let mut contract = test_contract();
+        contract.extra_ports = gated_ports();
+        let files = render_chart(&contract);
+
+        let deployment = &files["templates/deployment.yaml"];
+        assert!(
+            deployment.contains(
+                "            - name: http\n\
+                 \x20             containerPort: 8080\n\
+                 \x20             protocol: TCP\n\
+                 \x20           {{- if ((.Values.config).grpc).enabled }}\n\
+                 \x20           - name: grpc\n\
+                 \x20             containerPort: 6000\n\
+                 \x20             protocol: TCP\n\
+                 \x20           {{- end }}\n\
+                 \x20           {{- if eq (toString ((.Values.config).source).transport) \"direct\" }}\n\
+                 \x20           - name: push\n\
+                 \x20             containerPort: 6001\n\
+                 \x20             protocol: TCP\n\
+                 \x20           {{- end }}\n\
+                 \x20           {{- if has (toString ((.Values.config).source).transport) (list \"direct\" \"grpc\") }}\n\
+                 \x20           - name: relay\n\
+                 \x20             containerPort: 6002\n\
+                 \x20             protocol: UDP\n\
+                 \x20           {{- end }}\n\
+                 \x20         env:\n"
+            ),
+            "deployment ports not gated:\n{deployment}"
+        );
+
+        let service = &files["templates/service.yaml"];
+        assert!(
+            service.contains(
+                "    - port: 8080\n\
+                 \x20     targetPort: 8080\n\
+                 \x20     protocol: TCP\n\
+                 \x20     name: http\n\
+                 \x20   {{- if ((.Values.config).grpc).enabled }}\n\
+                 \x20   - port: 6000\n\
+                 \x20     targetPort: 6000\n\
+                 \x20     protocol: TCP\n\
+                 \x20     name: grpc\n\
+                 \x20   {{- end }}\n\
+                 \x20   {{- if eq (toString ((.Values.config).source).transport) \"direct\" }}\n\
+                 \x20   - port: 6001\n\
+                 \x20     targetPort: 6001\n\
+                 \x20     protocol: TCP\n\
+                 \x20     name: push\n\
+                 \x20   {{- end }}\n\
+                 \x20   {{- if has (toString ((.Values.config).source).transport) (list \"direct\" \"grpc\") }}\n\
+                 \x20   - port: 6002\n\
+                 \x20     targetPort: 6002\n\
+                 \x20     protocol: UDP\n\
+                 \x20     name: relay\n\
+                 \x20   {{- end }}\n\
+                 \x20 selector:\n"
+            ),
+            "service ports not gated:\n{service}"
+        );
+    }
+
+    /// A quote in a gate value must not end the template string early.
+    #[test]
+    fn test_chart_gate_value_is_quoted_for_the_template() {
+        let mut contract = test_contract();
+        contract.extra_ports =
+            vec![PortContract::tcp("odd", 7000).when_equals("config.mode", r#"a"b\c"#)];
+        let files = render_chart(&contract);
+        assert!(
+            files["templates/service.yaml"]
+                .contains(r#"{{- if eq (toString (.Values.config).mode) "a\"b\\c" }}"#),
+            "{}",
+            files["templates/service.yaml"]
+        );
+    }
+
+    #[test]
+    fn test_chart_rejects_a_gate_it_cannot_render() {
+        for (port, field) in [
+            (
+                PortContract::tcp("grpc", 6000).when_enabled("config.my-grpc.enabled"),
+                "extra_ports[grpc].when",
+            ),
+            (
+                PortContract::tcp("push", 6001)
+                    .when_one_of("config.source.transport", Vec::<String>::new()),
+                "extra_ports[push].when",
+            ),
+        ] {
+            let mut contract = test_contract();
+            contract.extra_ports = vec![port];
+            let dir = tempfile::tempdir().unwrap();
+            let err = generate_chart(&contract, dir.path(), None).unwrap_err();
+            assert!(
+                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
+                "unexpected error: {err}"
+            );
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "a rejected contract left files behind"
+            );
+        }
+    }
+
+    /// A gated port leaves EXPOSE, since the image cannot know whether its
+    /// listener is on, and is listed in a comment right after the line.
+    #[test]
+    fn test_dockerfile_lists_gated_ports_instead_of_exposing_them() {
+        let mut contract = test_contract();
+        contract.extra_ports = gated_ports();
+        let expected = "\nEXPOSE 9090 8080\n\
+             # Conditional listeners, not EXPOSEd -- publish explicitly when enabled:\n\
+             #   6000/tcp grpc -- when config.grpc.enabled is true\n\
+             #   6001/tcp push -- when config.source.transport is \"direct\"\n\
+             #   6002/udp relay -- when config.source.transport is one of \"direct\", \"grpc\"\n\
+             \nHEALTHCHECK";
+        for (name, text) in [
+            ("dockerfile", generate_dockerfile(&contract, None)),
+            ("runtime stage", generate_runtime_stage(&contract)),
+        ] {
+            assert!(text.contains(expected), "{name}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn test_manifest_lists_gated_ports_apart_from_exposed_ones() {
+        let mut contract = test_contract();
+        contract.extra_ports = gated_ports();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&generate_container_manifest(&contract).unwrap()).unwrap();
+        assert_eq!(manifest["expose_ports"], serde_json::json!([9090, 8080]));
+        assert_eq!(
+            manifest["conditional_ports"],
+            serde_json::json!([
+                { "name": "grpc", "port": 6000, "protocol": "TCP",
+                  "when": { "kind": "enabled", "path": "config.grpc.enabled" } },
+                { "name": "push", "port": 6001, "protocol": "TCP",
+                  "when": { "kind": "equals", "path": "config.source.transport", "value": "direct" } },
+                { "name": "relay", "port": 6002, "protocol": "UDP",
+                  "when": { "kind": "one_of", "path": "config.source.transport",
+                            "values": ["direct", "grpc"] } },
+            ])
+        );
+    }
+
+    /// Compose publishes a gated port only when `default_config` turns its
+    /// listener on; off, or not decidable from the config, leaves a comment.
+    #[test]
+    fn test_compose_publishes_a_gated_port_only_when_its_listener_is_on() {
+        let mut contract = test_contract();
+        contract.extra_ports = vec![
+            PortContract::tcp("grpc", 6000).when_enabled("config.grpc.enabled"),
+            PortContract::tcp("push", 6001).when_equals("config.source.transport", "direct"),
+            PortContract::tcp("otlp", 4317).when_enabled("config.otlp.enabled"),
+            PortContract::udp("flow", 2055).when_enabled("config.flow.enabled"),
+        ];
+        contract.default_config = Some(serde_json::json!({
+            "grpc": { "enabled": true },
+            "source": { "transport": "bus" },
+            "flow": { "enabled": null },
+        }));
+
+        let compose = generate_compose_fragment(&contract);
+        assert!(
+            compose.contains(
+                "    ports:\n      - \"9090:9090\"\n      - \"6000:6000\"\n      \
+                 # - \"6001:6001\"  # only when config.source.transport is \"direct\"; \
+                 uncomment to publish\n      \
+                 # - \"4317:4317\"  # only when config.otlp.enabled is true; uncomment to publish\n      \
+                 # - \"2055:2055/udp\"  # only when config.flow.enabled is true; \
+                 uncomment to publish\n    volumes:\n"
+            ),
+            "{compose}"
+        );
+
+        // With no default config nothing is decidable, so every gated port is a comment.
+        contract.default_config = None;
+        let compose = generate_compose_fragment(&contract);
+        assert!(!compose.contains("      - \"6000:6000\""), "{compose}");
+        assert!(
+            compose.contains("      # - \"6000:6000\"  # only when"),
+            "{compose}"
+        );
+    }
+
+    /// `bound_from` and `unbound_listen_paths` feed only the listener check,
+    /// so no artefact may change with them.
+    #[test]
+    fn test_listener_metadata_changes_no_artefact() {
+        let mut plain = test_contract();
+        plain.extra_ports = gated_ports();
+        plain.default_config = Some(serde_json::json!({
+            "grpc": { "enabled": true, "listen": "0.0.0.0:6000" },
+            "kafka": { "brokers": ["k:9092"], "group_id": "g", "topics": ["t"] },
+        }));
+        let mut annotated = plain.clone();
+        for port in &mut annotated.extra_ports {
+            port.bound_from = Some(format!("{}.listen", port.name));
+        }
+        annotated.unbound_listen_paths = vec!["sink.bind_address".into()];
+
+        assert_eq!(render_chart(&plain), render_chart(&annotated));
+        assert_eq!(
+            generate_dockerfile(&plain, None),
+            generate_dockerfile(&annotated, None)
+        );
+        assert_eq!(
+            generate_runtime_stage(&plain),
+            generate_runtime_stage(&annotated)
+        );
+        assert_eq!(
+            generate_compose_fragment(&plain),
+            generate_compose_fragment(&annotated)
+        );
+        assert_eq!(
+            generate_container_manifest(&plain).unwrap(),
+            generate_container_manifest(&annotated).unwrap()
+        );
     }
 
     #[test]
@@ -525,12 +878,11 @@ mod tests {
         );
     }
 
-    /// Regression for the dfe-receiver canary 2026-05-25 finding:
-    /// keda-scaledobject.yaml previously used
-    /// `default (index .Values.config.kafka.topics 0)` which `helm lint`
-    /// rejects with `error calling index: index of untyped nil` because
-    /// Sprig's `default` evaluates both operands. The render must now
-    /// use a conditional `if/else if/else` block instead.
+    /// `helm lint` rejects `default (index .Values.config.kafka.topics 0)` with
+    /// `index of untyped nil`, because Sprig's `default` evaluates both
+    /// operands, so the topic lookup is an `if/else if/else` block, and it takes
+    /// the first topic by splitting a joined string because `index` on a string
+    /// topic yields a byte rather than the topic.
     #[test]
     fn test_keda_scaledobject_topic_lookup_is_lint_safe() {
         let contract = test_contract();
@@ -547,6 +899,10 @@ mod tests {
             ),
             "keda-scaledobject.yaml still uses the eagerly-evaluated `default (index ...)` form:\n{keda_yaml}"
         );
+        assert!(
+            !keda_yaml.contains("(index .Values.config.kafka.topics 0)"),
+            "keda-scaledobject.yaml still indexes the topics value, which breaks on a string:\n{keda_yaml}"
+        );
 
         // New conditional form must appear
         assert!(
@@ -554,18 +910,428 @@ mod tests {
             "keda-scaledobject.yaml missing if/else guard for topic lookup:\n{keda_yaml}"
         );
         assert!(
-            keda_yaml.contains("else if .Values.config.kafka.topics"),
-            "keda-scaledobject.yaml missing fallback branch for config.kafka.topics:\n{keda_yaml}"
+            keda_yaml.contains(r#"{{- $topics := join "," ((.Values.config).kafka).topics }}"#),
+            "keda-scaledobject.yaml does not join the topics value nil-safely:\n{keda_yaml}"
+        );
+        assert!(
+            keda_yaml.contains("else if $topics"),
+            "keda-scaledobject.yaml missing fallback branch for the configured topics:\n{keda_yaml}"
+        );
+        assert!(
+            keda_yaml.contains(r#"topic: {{ splitList "," $topics | first | quote }}"#),
+            "keda-scaledobject.yaml does not take the first configured topic:\n{keda_yaml}"
         );
     }
 
+    /// Every file `generate_chart` wrote, keyed by its path under the chart root.
+    fn render_chart(contract: &DeploymentContract) -> std::collections::BTreeMap<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        generate_chart(contract, dir.path(), None).unwrap();
+        let mut files = std::collections::BTreeMap::new();
+        for sub in ["", "templates"] {
+            for entry in std::fs::read_dir(dir.path().join(sub)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    let rel = path.strip_prefix(dir.path()).unwrap();
+                    files.insert(
+                        rel.display().to_string(),
+                        std::fs::read_to_string(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    /// `brokers` is a list, and `quote` on a list renders `"[a b]"`, which KEDA
+    /// reads as one host named `[a`, so the list has to be joined first.
+    #[test]
+    fn test_keda_brokers_are_joined_before_quoting() {
+        let files = render_chart(&test_contract());
+        let scaled = &files["templates/keda-scaledobject.yaml"];
+        assert!(
+            scaled.contains(
+                r#"bootstrapServers: {{ join "," ((.Values.config).kafka).brokers | quote }}"#
+            ),
+            "broker list is not joined before quoting:\n{scaled}"
+        );
+        assert!(
+            !scaled.contains(".Values.config.kafka.brokers | quote"),
+            "broker list is still quoted as a list:\n{scaled}"
+        );
+    }
+
+    /// With no kafka secret group there is no TriggerAuthentication, so telling
+    /// KEDA to do SCRAM would leave it authenticating with no credentials.
+    #[test]
+    fn test_keda_sasl_only_with_a_kafka_secret_group() {
+        let with_secret = render_chart(&test_contract());
+        assert!(
+            with_secret["templates/keda-scaledobject.yaml"].contains("sasl: scram_sha512"),
+            "a kafka secret group must still set the SASL mechanism"
+        );
+
+        let mut contract = test_contract();
+        contract.secrets.retain(|g| g.group_name != "kafka");
+        let without_secret = render_chart(&contract);
+        let scaled = &without_secret["templates/keda-scaledobject.yaml"];
+        assert!(
+            !scaled.contains("authenticationRef:"),
+            "no kafka secret group, yet an authenticationRef was emitted:\n{scaled}"
+        );
+        assert!(
+            !scaled.contains("sasl:"),
+            "SASL mechanism emitted with no credentials to go with it:\n{scaled}"
+        );
+        assert!(
+            scaled.contains("tls: disable"),
+            "the tls line is out of scope here and must be left as it was:\n{scaled}"
+        );
+    }
+
+    /// `KedaConfig::enabled` is the documented off switch, so turning it off must
+    /// produce exactly what an absent KEDA contract does.
+    #[test]
+    fn test_keda_config_disabled_generates_what_no_keda_does() {
+        let mut off = test_contract();
+        off.keda = Some(KedaContract::from_config(&KedaConfig {
+            enabled: false,
+            ..KedaConfig::default()
+        }));
+        let mut absent = test_contract();
+        absent.keda = None;
+
+        assert_eq!(render_chart(&off), render_chart(&absent));
+    }
+
+    /// An app whose Kafka settings live under `config.source` has no
+    /// `config.kafka` key at all, so the trigger must not address one.
+    #[test]
+    fn test_keda_trigger_under_source_never_addresses_config_kafka() {
+        let mut contract = test_contract();
+        contract.keda = Some(
+            KedaContract::default().with_kafka_trigger(KafkaLagTrigger::under("config.source")),
+        );
+        let files = render_chart(&contract);
+        let scaled = &files["templates/keda-scaledobject.yaml"];
+
+        assert!(
+            !scaled.contains("config.kafka") && !scaled.contains("(.Values.config).kafka"),
+            "trigger still addresses the kafka section:\n{scaled}"
+        );
+        assert!(scaled.contains(
+            r#"bootstrapServers: {{ join "," ((.Values.config).source).brokers | quote }}"#
+        ));
+        assert!(scaled.contains(
+            "consumerGroup: {{ .Values.keda.kafka.consumerGroup | default ((.Values.config).source).group_id | quote }}"
+        ));
+        assert!(scaled.contains(r#"{{- $topics := join "," ((.Values.config).source).topics }}"#));
+    }
+
+    /// With the Kafka lag trigger off, CPU is the only scaler: no kafka trigger,
+    /// no kafka values, and no ScaledObject unless CPU scaling is on.
+    #[test]
+    fn test_keda_trigger_disabled_scales_on_cpu_only() {
+        let mut contract = test_contract();
+        contract.keda =
+            Some(KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled()));
+        let files = render_chart(&contract);
+
+        let scaled = &files["templates/keda-scaledobject.yaml"];
+        assert!(
+            !scaled.contains("type: kafka"),
+            "kafka trigger emitted:\n{scaled}"
+        );
+        assert!(
+            scaled.contains("- type: cpu"),
+            "cpu trigger missing:\n{scaled}"
+        );
+        assert!(
+            scaled.starts_with("{{- if and .Values.keda.enabled .Values.keda.cpu.enabled }}\n"),
+            "ScaledObject is not gated on CPU scaling:\n{scaled}"
+        );
+
+        // Kept as a stub so the chart's file set is the same either way.
+        let auth = &files["templates/keda-triggerauth.yaml"];
+        assert!(
+            auth.lines().all(|line| line.starts_with('#')),
+            "TriggerAuthentication generated with no Kafka lag trigger:\n{auth}"
+        );
+
+        let values = &files["values.yaml"];
+        assert!(values.contains("keda:\n  enabled: true\n"));
+        assert!(
+            !values.contains("lagThreshold") && !values.contains("  kafka:\n    #"),
+            "keda.kafka offered with no trigger to read it:\n{values}"
+        );
+        assert!(values.contains("  cpu:\n    enabled: true\n"));
+    }
+
+    /// Kubernetes accepts only TCP, UDP and SCTP in upper case, so a contract
+    /// spelling the protocol in lower case must still render a valid manifest.
+    #[test]
+    fn test_chart_writes_port_protocols_in_upper_case() {
+        let mut contract = test_contract();
+        contract.extra_ports = vec![
+            PortContract {
+                protocol: "tcp".into(),
+                ..PortContract::tcp("http", 8080)
+            },
+            PortContract {
+                protocol: "udp".into(),
+                ..PortContract::udp("netflow", 2055)
+            },
+            PortContract {
+                protocol: "Sctp".into(),
+                ..PortContract::tcp("diameter", 3868)
+            },
+        ];
+        let files = render_chart(&contract);
+        for name in ["templates/deployment.yaml", "templates/service.yaml"] {
+            let text = &files[name];
+            let protocols: Vec<&str> = text
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("protocol: "))
+                .collect();
+            assert_eq!(protocols, ["TCP", "TCP", "UDP", "SCTP"], "{name}:\n{text}");
+        }
+    }
+
+    /// A protocol Kubernetes does not take would render a Deployment and
+    /// Service that fail to apply, so the chart is refused before any file.
+    #[test]
+    fn test_chart_rejects_a_protocol_kubernetes_does_not_take() {
+        for protocol in ["http", "grpc", ""] {
+            let mut contract = test_contract();
+            contract.extra_ports = vec![PortContract {
+                protocol: protocol.into(),
+                ..PortContract::tcp("web", 8080)
+            }];
+            let dir = tempfile::tempdir().unwrap();
+            let err = generate_chart(&contract, dir.path(), None)
+                .expect_err("a protocol other than TCP, UDP or SCTP is refused");
+            assert!(
+                matches!(
+                    err,
+                    DeploymentError::InvalidContract { ref field, .. }
+                        if field == "extra_ports[web].protocol"
+                ),
+                "unexpected error for {protocol:?}: {err}"
+            );
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "a rejected contract left files behind"
+            );
+        }
+    }
+
+    /// One extra port per fault the contract check names, with the field it names.
+    fn faulty_ports() -> Vec<(PortContract, &'static str)> {
+        let name = "extra_ports[0].name";
+        vec![
+            (PortContract::tcp("Web", 8080), name),
+            (PortContract::tcp("web_api", 8080), name),
+            (PortContract::tcp("a-port-name-too-long", 8080), name),
+            (PortContract::tcp("8080", 8080), name),
+            (PortContract::tcp("-web", 8080), name),
+            (PortContract::tcp("web-", 8080), name),
+            (PortContract::tcp("we--b", 8080), name),
+            (PortContract::tcp("", 8080), name),
+            (PortContract::tcp("web\nEXPOSE 22", 8080), name),
+            (
+                PortContract {
+                    protocol: "http".into(),
+                    ..PortContract::tcp("web", 8080)
+                },
+                "extra_ports[web].protocol",
+            ),
+            (
+                PortContract::tcp("web", 8080).when_equals("config.mode\nRUN id", "on"),
+                "extra_ports[web].when",
+            ),
+            (
+                PortContract::tcp("web", 8080).when_equals("config.mode", "on\nRUN id"),
+                "extra_ports[web].when",
+            ),
+            (
+                PortContract::tcp("web", 8080).when_one_of("config.mode", ["on", "off\ny: 1"]),
+                "extra_ports[web].when",
+            ),
+            (
+                PortContract::tcp("web", 8080).bound_from("web.listen\r"),
+                "extra_ports[web].bound_from",
+            ),
+        ]
+    }
+
+    /// Every generator that can refuse a contract refuses each fault the one
+    /// contract check names, before it writes anything.
+    #[test]
+    fn test_every_refusing_generator_refuses_a_faulty_port() {
+        for (port, field) in faulty_ports() {
+            let mut contract = test_contract();
+            contract.extra_ports = vec![port];
+
+            let dir = tempfile::tempdir().unwrap();
+            let err = generate_chart(&contract, dir.path(), None).expect_err(field);
+            assert!(
+                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
+                "chart, {field}: {err}"
+            );
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "a rejected contract left files behind"
+            );
+
+            let err = generate_container_manifest(&contract).expect_err(field);
+            assert!(err.contains(field), "container manifest, {field}: {err}");
+
+            let err =
+                crate::deployment::check_chart_drift(&contract, dir.path(), &[]).expect_err(field);
+            assert!(
+                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
+                "chart drift check, {field}: {err}"
+            );
+        }
+    }
+
+    /// The Dockerfile and Compose generators return text rather than a Result,
+    /// so a control character reaching them is written as its escape and
+    /// cannot start an instruction or key of its own.
+    #[test]
+    fn test_text_generators_keep_a_control_character_on_its_comment_line() {
+        let mut contract = test_contract();
+        contract.extra_ports = vec![
+            PortContract::tcp("web\nEXPOSE 22", 8080).when_equals("config.mode", "on\nRUN id"),
+        ];
+        for (name, text) in [
+            ("dockerfile", generate_dockerfile(&contract, None)),
+            ("runtime stage", generate_runtime_stage(&contract)),
+            ("compose", generate_compose_fragment(&contract)),
+        ] {
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.starts_with("EXPOSE 22") || line.starts_with("RUN id")),
+                "{name} carries an injected line:\n{text}"
+            );
+            assert!(text.contains(r#""on\nRUN id""#), "{name}:\n{text}");
+        }
+    }
+
+    /// KEDA's CPU scaler cannot wake a workload from zero on its own, so a
+    /// ScaledObject whose only trigger is CPU is refused a minimum of zero.
+    #[test]
+    fn test_a_cpu_only_scaled_object_cannot_scale_to_zero() {
+        let mut contract = test_contract();
+        let mut keda = KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled());
+        keda.min_replicas = 0;
+        contract.keda = Some(keda);
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::InvalidContract { ref field, .. } if field == "keda.min_replicas"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a rejected contract left files behind"
+        );
+
+        // With the Kafka lag trigger on, lag wakes the workload from zero.
+        let mut lag = test_contract();
+        if let Some(keda) = lag.keda.as_mut() {
+            keda.min_replicas = 0;
+        }
+        generate_chart(&lag, tempfile::tempdir().unwrap().path(), None)
+            .expect("the lag trigger can scale from zero");
+    }
+
+    /// Whatever renders owns the replica count -- the ScaledObject, else the
+    /// HPA -- and the Deployment sets `replicas` exactly when neither does,
+    /// since a Deployment without it runs one pod.
+    #[test]
+    fn test_deployment_replicas_gate_is_the_inverse_of_every_scaler() {
+        let replicas_gate = |contract: &DeploymentContract| {
+            let files = render_chart(contract);
+            files["templates/deployment.yaml"]
+                .lines()
+                .take_while(|line| !line.contains("replicas:"))
+                .last()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+
+        // The Kafka lag trigger renders the ScaledObject whenever KEDA is on,
+        // and the HPA only while it is off, so the gate folds to this.
+        assert_eq!(
+            replicas_gate(&test_contract()),
+            "{{- if not (or .Values.keda.enabled .Values.autoscaling.enabled) }}"
+        );
+
+        let mut cpu_only = test_contract();
+        cpu_only.keda =
+            Some(KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled()));
+        assert_eq!(
+            replicas_gate(&cpu_only),
+            "{{- if not (or (and .Values.keda.enabled .Values.keda.cpu.enabled) \
+             (and .Values.autoscaling.enabled (not .Values.keda.enabled))) }}"
+        );
+
+        let mut no_keda = test_contract();
+        no_keda.keda = None;
+        assert_eq!(
+            replicas_gate(&no_keda),
+            "{{- if not (and .Values.autoscaling.enabled (not .Values.keda.enabled)) }}"
+        );
+    }
+
+    #[test]
+    fn test_keda_with_no_trigger_at_all_is_rejected() {
+        let mut contract = test_contract();
+        let mut keda = KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled());
+        keda.cpu_enabled = false;
+        contract.keda = Some(keda);
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::InvalidContract { ref field, .. } if field == "keda"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a rejected contract left files behind"
+        );
+    }
+
+    #[test]
+    fn test_keda_trigger_rejects_a_path_the_chart_cannot_address() {
+        let mut contract = test_contract();
+        contract.keda = Some(
+            KedaContract::default().with_kafka_trigger(KafkaLagTrigger::under("config.my-source")),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DeploymentError::InvalidContract { ref field, .. }
+                    if field == "keda.kafka_trigger.brokers_path"
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("config.my-source.brokers"));
+    }
+
     /// KEDA's Kafka scaler takes `sasl` (the MECHANISM), `username` and
-    /// `password`. The generator used to hand the username to `sasl` and supply
-    /// no `username` at all, while the trigger set `saslType`, which is not a
-    /// recognised key -- so the mechanism arrived nowhere, no username arrived,
-    /// and `password` was the only correctly wired parameter of the three.
-    /// Authentication could not succeed, so the scaler never read lag and the
-    /// app never scaled. Every DFE app that ships a generated chart had this.
+    /// `password`, and ignores `saslType`, so the TriggerAuthentication binds
+    /// the username to `username` and the trigger names the mechanism under
+    /// `sasl`; wired any other way, authentication fails and the scaler never
+    /// reads lag.
     #[test]
     fn test_keda_kafka_auth_uses_the_parameters_keda_recognises() {
         let contract = test_contract();
@@ -601,18 +1367,17 @@ mod tests {
         );
     }
 
-    /// Regression for the dfe-receiver canary 2026-05-25 finding:
-    /// secret.yaml previously emitted `.Values.x.bearer-tokens` which
-    /// Go templates reject ("bad character U+002D '-'"). The render
-    /// must now use the `(index .Values.x "bearer-tokens")` form.
+    /// Go templates reject a dot-walked `.Values.x.bearer-tokens` ("bad
+    /// character U+002D '-'"), so a hyphenated key renders in the
+    /// `(index .Values.x "bearer-tokens")` form.
     #[test]
     fn test_secret_yaml_handles_hyphenated_key_names() {
         let mut contract = test_contract();
-        // dfe-receiver-style hyphenated key_name (token group)
+        // A hyphenated key_name, as a token group carries.
         contract.secrets.push(SecretGroupContract {
             group_name: "auth".into(),
             env_vars: vec![SecretEnvContract {
-                env_var: "DFE_RECEIVER__AUTH__BEARER_TOKENS".into(),
+                env_var: "MY_APP__AUTH__BEARER_TOKENS".into(),
                 key_name: "bearer-tokens".into(),
                 secret_key: "bearer-tokens".into(),
             }],

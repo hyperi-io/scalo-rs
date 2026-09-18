@@ -10,6 +10,8 @@
 
 use crate::deployment::contract::{DeploymentContract, ImageProfile};
 
+use super::common::{on_one_line, udp_port_suffix};
+
 // ============================================================================
 // Dockerfile
 // ============================================================================
@@ -33,14 +35,7 @@ pub fn generate_dockerfile(
 ) -> String {
     let binary = contract.binary();
 
-    // EXPOSE line: metrics_port + extra ports
-    let expose_ports = {
-        let mut ports = vec![contract.metrics_port.to_string()];
-        for p in &contract.extra_ports {
-            ports.push(p.port.to_string());
-        }
-        ports.join(" ")
-    };
+    let expose_ports = expose_ports(contract);
 
     // CMD line
     let cmd = if contract.entrypoint_args.is_empty() {
@@ -143,13 +138,7 @@ pub fn generate_runtime_stage(contract: &DeploymentContract) -> String {
         &contract.oci_labels.title
     };
 
-    let expose_ports = {
-        let mut ports = vec![contract.metrics_port.to_string()];
-        for p in &contract.extra_ports {
-            ports.push(p.port.to_string());
-        }
-        ports.join(" ")
-    };
+    let expose_ports = expose_ports(contract);
 
     let cmd = if contract.entrypoint_args.is_empty() {
         String::new()
@@ -212,6 +201,38 @@ ENTRYPOINT ["{binary}"]{cmd}
     )
 }
 
+/// The EXPOSE line: the metrics port, then each extra port that always
+/// listens, with UDP ports marked since a bare port number means TCP.
+///
+/// A port with a `when` condition is left out, because an image cannot know
+/// whether that listener is on; a comment after the line lists each one and
+/// its condition instead, with any control character escaped so the entry
+/// stays one comment line.
+fn expose_ports(contract: &DeploymentContract) -> String {
+    let mut ports = vec![contract.metrics_port.to_string()];
+    let mut conditional = Vec::new();
+    for p in &contract.extra_ports {
+        match &p.when {
+            None => ports.push(format!("{}{}", p.port, udp_port_suffix(&p.protocol))),
+            Some(when) => conditional.push(format!(
+                "#   {port}/{proto} {name} -- when {when}",
+                port = p.port,
+                proto = on_one_line(&p.protocol.to_ascii_lowercase()),
+                name = on_one_line(&p.name),
+                when = on_one_line(&when.to_string()),
+            )),
+        }
+    }
+    let mut out = ports.join(" ");
+    if !conditional.is_empty() {
+        out.push_str(
+            "\n# Conditional listeners, not EXPOSEd -- publish explicitly when enabled:\n",
+        );
+        out.push_str(&conditional.join("\n"));
+    }
+    out
+}
+
 /// Diagnostic tools installed in development images.
 const DEV_TOOLS: &[&str] = &[
     "bash",
@@ -268,7 +289,7 @@ fn build_apt_block(
         runtime_pkgs.push(pkg);
     }
 
-    // Build multi-step RUN: base install → repo setup → update → runtime install → cleanup
+    // Build multi-step RUN: base install -> repo setup -> update -> runtime install -> cleanup
     out.push_str("# Runtime shared libraries for dynamically-linked Rust crates.\n");
     // The release these package names are for. Both warnings below name it.
     let release = deps

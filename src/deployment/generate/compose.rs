@@ -10,6 +10,8 @@
 
 use crate::deployment::contract::DeploymentContract;
 
+use super::common::{on_one_line, udp_port_suffix};
+
 // ============================================================================
 // Docker Compose fragment
 // ============================================================================
@@ -53,7 +55,29 @@ pub fn generate_compose_fragment(contract: &DeploymentContract) -> String {
         contract.metrics_port, contract.metrics_port
     ));
     for p in &contract.extra_ports {
-        out.push_str(&format!("      - \"{}:{}\"\n", p.port, p.port));
+        let publish = format!(
+            "- \"{port}:{port}{proto}\"",
+            port = p.port,
+            proto = udp_port_suffix(&p.protocol),
+        );
+        // A gated port is published only when the default config turns its
+        // listener on, since publishing binds a host port whether or not
+        // anything in the container listens on it.
+        match &p.when {
+            Some(when)
+                if contract
+                    .default_config
+                    .as_ref()
+                    .and_then(|config| when.holds_in(config))
+                    != Some(true) =>
+            {
+                out.push_str(&format!(
+                    "      # {publish}  # only when {when}; uncomment to publish\n",
+                    when = on_one_line(&when.to_string()),
+                ));
+            }
+            _ => out.push_str(&format!("      {publish}\n")),
+        }
     }
 
     // Volumes -- config file mount

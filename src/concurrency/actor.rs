@@ -17,10 +17,10 @@
 //! # Shape
 //!
 //! ```text
-//! consumer ──send/try_send──► mpsc bounded ──► actor task ──handle()──► Actor (state)
-//!                                                  ▲
-//!                                                  │ biased select
-//!                                                  │
+//! consumer --send/try_send--> mpsc bounded --> actor task --handle()--> Actor (state)
+//!                                                  ^
+//!                                                  | biased select
+//!                                                  |
 //!                                          CancellationToken + idle ticker
 //! ```
 //!
@@ -308,7 +308,9 @@ mod tests {
         assert_eq!(called.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    // The clock is paused, so time advances only while every task is idle
+    // and the tick count is exact whatever the host is doing.
+    #[tokio::test(start_paused = true)]
     async fn idle_tick_fires_when_no_commands() {
         struct IdleCounter {
             ticks: Arc<AtomicU32>,
@@ -336,6 +338,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(110)).await;
         shutdown.cancel();
         let n = ticks.load(Ordering::SeqCst);
-        assert!((4..=7).contains(&n), "got {n} idle ticks, expected 4-7");
+        assert_eq!(n, 5, "110ms over a 20ms idle interval is five ticks");
     }
 }

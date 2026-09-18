@@ -15,14 +15,16 @@
 //! ## What's included (always)
 //!
 //! - [`MetricsManager`] -- started, serving `/metrics`, `/livez`, `/readyz`
-//! - [`ServiceMetrics`] -- platform `dfe_*` metrics registered
+//! - [`ServiceMetrics`] -- the platform data-plane metrics, registered under
+//!   bare names or the `metrics.namespace` prefix
 //! - [`MemoryGuard`] -- cgroup-aware, auto-detected from env prefix
 //! - [`CancellationToken`] -- signal handler installed with K8s pre-stop delay
 //! - [`RuntimeContext`] -- K8s/Docker/BareMetal metadata
 //!
 //! ## What's included (when features enabled)
 //!
-//! - [`AdaptiveWorkerPool`] -- rayon + tokio hybrid (`worker` feature)
+//! - [`AdaptiveWorkerPool`] -- rayon + tokio hybrid (`worker-pool` feature,
+//!   which `worker-batch` includes)
 //! - [`ScalingPressure`] -- KEDA signals (`scaling` feature)
 //!
 //! ## What stays app-specific
@@ -55,7 +57,9 @@ pub struct ServiceRuntime {
     /// Use for registering app-specific metrics and metric groups.
     pub metrics: MetricsManager,
 
-    /// Platform data-plane metrics (`dfe_*` counters/gauges). Already registered.
+    /// Platform data-plane metrics (transport, pipeline, records, scaling,
+    /// spool), under bare names or the `metrics.namespace` prefix. Already
+    /// registered.
     pub dfe: Arc<crate::metrics::ServiceMetrics>,
 
     /// Cgroup-aware memory guard. Tracks memory usage for backpressure.
@@ -70,8 +74,9 @@ pub struct ServiceRuntime {
     /// Runtime context -- K8s/Docker/BareMetal metadata (pod_name, namespace, etc.).
     pub context: &'static RuntimeContext,
 
-    /// Adaptive worker pool for parallel batch processing (`worker` feature).
-    /// `None` if the `worker` feature is not enabled or config fails.
+    /// Adaptive worker pool for parallel batch processing (`worker-pool`
+    /// feature, which `worker-batch` includes). `None` if the pool could not be
+    /// built from its config.
     #[cfg(feature = "worker-pool")]
     pub worker_pool: Option<Arc<crate::worker::AdaptiveWorkerPool>>,
 
@@ -107,11 +112,11 @@ impl ServiceRuntime {
     ///
     /// Returns `CliError` if the metrics server fails to start.
     pub(crate) async fn build(
-        #[cfg_attr(not(feature = "version-check"), allow(unused_variables))] app_name: &str,
+        app_name: &str,
         env_prefix: &str,
         metrics_addr: &str,
-        #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] version: &str,
-        #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] commit: &str,
+        version: &str,
+        commit: &str,
         #[cfg(feature = "scaling")] scaling_components: Vec<crate::ScalingComponent>,
         #[cfg(feature = "version-check")] version_check_defaults: crate::VersionCheckConfig,
     ) -> Result<Self, CliError> {
@@ -129,13 +134,8 @@ impl ServiceRuntime {
         // name supplies `service.name` when config leaves it unset.
         let metrics_config = crate::metrics::MetricsSettings::from_cascade().into_config(app_name);
         let mut metrics = MetricsManager::with_config(metrics_config);
-        let dfe = Arc::new(crate::metrics::ServiceMetrics::register(&metrics));
-
-        // App info metric (version, commit, service name)
-        #[cfg(feature = "service-metrics")]
-        {
-            let _app_metrics = crate::metrics::groups::AppMetrics::new(&metrics, version, commit);
-        }
+        metrics.registry().set_app_name(app_name);
+        let dfe = Arc::new(register_runtime_metrics(&metrics, version, commit));
 
         // --- Memory guard ---
         #[cfg(feature = "memory")]
@@ -344,5 +344,83 @@ impl ServiceRuntime {
         let sender = std::sync::Arc::new(AnySender::from_config(sender_key).await?);
         let cfg = SinkStackConfig::from_cascade_key(cfg_key);
         Ok(SinkStack::new(sender, &cfg))
+    }
+}
+
+/// Describe every metric the scalo runtime emits into `manager`: the service
+/// set, the app info set, and the worker pool and batch engine sets when their
+/// features are compiled in.
+///
+/// The one list the running service and the `metrics-manifest` and
+/// `generate-artefacts` subcommands all describe, so a manifest lists the
+/// runtime set whether or not the app describes anything of its own. The
+/// process, container, HTTP client and memory guard gauges are served but not
+/// described here, so they are not in the manifest (scalo-rs#137).
+#[must_use]
+pub(crate) fn register_runtime_metrics(
+    manager: &MetricsManager,
+    #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] version: &str,
+    #[cfg_attr(not(feature = "service-metrics"), allow(unused_variables))] commit: &str,
+) -> crate::metrics::ServiceMetrics {
+    let service = crate::metrics::ServiceMetrics::register(manager);
+
+    #[cfg(feature = "service-metrics")]
+    {
+        let _app_metrics = crate::metrics::groups::AppMetrics::new(manager, version, commit);
+    }
+
+    #[cfg(feature = "worker-pool")]
+    crate::worker::metrics::describe(manager);
+
+    #[cfg(feature = "worker-batch")]
+    crate::worker::engine::metrics::describe(manager);
+
+    service
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime builds under whichever pool features are compiled in, and
+    /// its pool metrics are described exactly when those features are on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_runtime_builds_under_current_features() {
+        let runtime = ServiceRuntime::build(
+            "runtime-build-probe",
+            "RUNTIME_BUILD_PROBE",
+            "127.0.0.1:0",
+            "1.2.3",
+            "probe",
+            #[cfg(feature = "scaling")]
+            Vec::new(),
+            #[cfg(feature = "version-check")]
+            crate::VersionCheckConfig::default(),
+        )
+        .await
+        .expect("the runtime builds");
+
+        let manifest = runtime.metrics.registry().manifest();
+        let names: Vec<&str> = manifest.metrics.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"transport_sent_total"), "{names:?}");
+        assert_eq!(
+            names.contains(&"worker_pool_active_threads"),
+            cfg!(feature = "worker-pool"),
+            "pool metrics follow the worker-pool feature: {names:?}"
+        );
+        assert_eq!(
+            names.contains(&"batch_engine_messages_received_total"),
+            cfg!(feature = "worker-batch"),
+            "engine metrics follow the worker-batch feature: {names:?}"
+        );
+        #[cfg(feature = "worker-pool")]
+        assert!(
+            runtime.worker_pool.is_some(),
+            "default config builds a pool"
+        );
+        #[cfg(feature = "worker-batch")]
+        assert!(runtime.batch_engine.is_some(), "and an engine on it");
+
+        runtime.shutdown.cancel();
     }
 }

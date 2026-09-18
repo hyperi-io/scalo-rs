@@ -45,7 +45,7 @@
 //! let result = evaluate(r#"severity == "critical""#, &data).unwrap();
 //! assert_eq!(result, true.into());
 //!
-//! // Boolean condition (missing fields → false)
+//! // Boolean condition (missing fields -> false)
 //! let empty = HashMap::new();
 //! assert!(!evaluate_condition(r#"severity == "critical""#, &empty));
 //!
@@ -95,7 +95,7 @@ fn get_profile_config() -> &'static ProfileConfig {
     DEFAULT_PROFILE_CONFIG.get_or_init(ProfileConfig::default)
 }
 
-// ── Validate ──────────────────────────────────────────────────────
+// -- Validate ------------------------------------------------------
 
 /// Validate an expression for syntax and profile compliance.
 ///
@@ -125,7 +125,7 @@ pub fn validate_with_config(expr: &str, config: &ProfileConfig) -> Vec<String> {
     }
 }
 
-// ── Compile ───────────────────────────────────────────────────────
+// -- Compile -------------------------------------------------------
 
 /// Compile a CEL expression, enforcing the profile.
 ///
@@ -153,7 +153,7 @@ pub fn compile_with_config(expr: &str, config: &ProfileConfig) -> ExpressionResu
     Program::compile(expr).map_err(|e| ExpressionError::Compilation(format!("{e}")))
 }
 
-// ── Evaluate ──────────────────────────────────────────────────────
+// -- Evaluate ------------------------------------------------------
 
 /// Compile and evaluate a CEL expression in one step.
 ///
@@ -193,7 +193,7 @@ pub fn build_context<'a>(
     Ok(context)
 }
 
-// ── Evaluate Condition ────────────────────────────────────────────
+// -- Evaluate Condition --------------------------------------------
 
 /// Evaluate a boolean condition, returning `false` on missing fields.
 ///
@@ -214,12 +214,12 @@ pub fn evaluate_condition<'a>(
         Ok(Value::Int(n)) => n != 0,
         Ok(Value::UInt(n)) => n != 0,
         Ok(Value::Float(f)) => f != 0.0,
-        // Everything else (Null, String, List, Map, errors) → false
+        // Everything else (Null, String, List, Map, errors) -> false
         _ => false,
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────
+// -- Helpers -------------------------------------------------------
 
 /// Convert a `serde_json::Value` to a CEL `Value`.
 fn json_to_cel(json: &JsonValue) -> Value {

@@ -129,8 +129,9 @@ impl HttpError {
             // A body that will not serialise is unchanged by sending the
             // request again.
             Self::Serialize(_) => false,
-            // A credential endpoint that could not be reached may answer the
-            // next attempt; a refusal will not.
+            // A credential endpoint that could not be reached, or answered
+            // 408, 429 or 5xx, may answer the next attempt; any other refusal
+            // will not.
             Self::Sign(e) => e.is_retryable(),
         }
     }

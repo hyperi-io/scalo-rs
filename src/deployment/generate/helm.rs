@@ -10,10 +10,11 @@
 
 use std::path::Path;
 
-use crate::deployment::contract::DeploymentContract;
+use crate::deployment::contract::{DeploymentContract, PortCondition};
 use crate::deployment::error::DeploymentError;
+use crate::deployment::keda::{KafkaLagTrigger, KedaContract};
 
-use super::common::{safe_template_lookup, to_camel_suffix, write_file};
+use super::common::{is_go_identifier, safe_template_lookup, to_camel_suffix, write_file};
 
 // ============================================================================
 // Helm chart
@@ -30,7 +31,11 @@ use super::common::{safe_template_lookup, to_camel_suffix, write_file};
 ///
 /// # Errors
 ///
-/// Returns `DeploymentError` if files or directories cannot be created.
+/// Returns `DeploymentError` if files or directories cannot be created, or
+/// [`DeploymentError::InvalidContract`] if the contract fails
+/// [`DeploymentContract::validate`], the KEDA contract or a port's `when` names
+/// a values path that is not a dotted chain of Go identifiers, or a `one_of`
+/// port condition lists no values.
 pub fn generate_chart(
     contract: &DeploymentContract,
     output_dir: impl AsRef<Path>,
@@ -39,55 +44,64 @@ pub fn generate_chart(
     let dir = output_dir.as_ref();
     let templates_dir = dir.join("templates");
 
-    // Create directories
+    // Rendered before anything is written, so a rejected contract leaves no
+    // half-generated chart behind.
+    let files = chart_files(contract, identity)?;
+
     std::fs::create_dir_all(&templates_dir).map_err(|e| DeploymentError::CreateDir {
         path: templates_dir.display().to_string(),
         source: e,
     })?;
-
-    // Write all chart files
-    write_file(dir.join("Chart.yaml"), &gen_chart_yaml(contract, identity))?;
-    write_file(dir.join("values.yaml"), &gen_values_yaml(contract))?;
-    write_file(
-        templates_dir.join("_helpers.tpl"),
-        &gen_helpers_tpl(contract),
-    )?;
-    write_file(
-        templates_dir.join("deployment.yaml"),
-        &gen_deployment_yaml(contract),
-    )?;
-    write_file(
-        templates_dir.join("service.yaml"),
-        &gen_service_yaml(contract),
-    )?;
-    write_file(
-        templates_dir.join("serviceaccount.yaml"),
-        &gen_serviceaccount_yaml(contract),
-    )?;
-    write_file(
-        templates_dir.join("configmap.yaml"),
-        &gen_configmap_yaml(contract),
-    )?;
-    write_file(
-        templates_dir.join("secret.yaml"),
-        &gen_secret_yaml(contract),
-    )?;
-    write_file(templates_dir.join("hpa.yaml"), &gen_hpa_yaml(contract))?;
-
-    if contract.keda.is_some() {
-        write_file(
-            templates_dir.join("keda-scaledobject.yaml"),
-            &gen_keda_scaledobject_yaml(contract),
-        )?;
-        write_file(
-            templates_dir.join("keda-triggerauth.yaml"),
-            &gen_keda_triggerauth_yaml(contract),
-        )?;
+    for (name, content) in &files {
+        write_file(dir.join(name), content)?;
     }
-
-    write_file(templates_dir.join("NOTES.txt"), &gen_notes_txt(contract))?;
-
     Ok(())
+}
+
+/// Every file of the chart as its path under the chart root and its content,
+/// rendered in memory so a drift check needs no scratch directory.
+///
+/// # Errors
+///
+/// [`DeploymentError::InvalidContract`] for the contracts
+/// [`generate_chart`] rejects.
+pub(crate) fn chart_files(
+    contract: &DeploymentContract,
+    identity: Option<&crate::deployment::ContractIdentity>,
+) -> Result<Vec<(&'static str, String)>, DeploymentError> {
+    contract.validate()?;
+    let gates = port_gates(contract)?;
+    let keda_templates = match contract.enabled_keda() {
+        Some(keda) => Some((
+            gen_keda_scaledobject_yaml(contract, keda)?,
+            gen_keda_triggerauth_yaml(contract, keda),
+        )),
+        None => None,
+    };
+
+    let mut files = vec![
+        ("Chart.yaml", gen_chart_yaml(contract, identity)),
+        ("values.yaml", gen_values_yaml(contract)),
+        ("templates/_helpers.tpl", gen_helpers_tpl(contract)),
+        (
+            "templates/deployment.yaml",
+            gen_deployment_yaml(contract, &gates),
+        ),
+        ("templates/service.yaml", gen_service_yaml(contract, &gates)),
+        (
+            "templates/serviceaccount.yaml",
+            gen_serviceaccount_yaml(contract),
+        ),
+        ("templates/configmap.yaml", gen_configmap_yaml(contract)),
+        ("templates/secret.yaml", gen_secret_yaml(contract)),
+        ("templates/hpa.yaml", gen_hpa_yaml(contract)),
+    ];
+    if let Some((scaled_object, trigger_auth)) = keda_templates {
+        files.push(("templates/keda-scaledobject.yaml", scaled_object));
+        files.push(("templates/keda-triggerauth.yaml", trigger_auth));
+    }
+    files.push(("templates/NOTES.txt", gen_notes_txt(contract)));
+    Ok(files)
 }
 
 // ============================================================================
@@ -139,7 +153,8 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
 
     // Replicas, image, overrides
     out.push_str(&format!(
-        "# -- Number of replicas (ignored when KEDA is enabled)\n\
+        "# -- Number of replicas, ignored while a KEDA ScaledObject or the HPA\n\
+         # fallback renders, because that then owns the replica count.\n\
          replicaCount: 1\n\
          \n\
          image:\n\
@@ -303,7 +318,7 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
     // `helm lint` panics with "nil pointer evaluating interface
     // {}.enabled". When the contract opts out, the block is just
     // `enabled: false`.
-    if let Some(ref keda) = c.keda {
+    if let Some(keda) = c.enabled_keda() {
         out.push_str(&format!(
             "# -- KEDA autoscaling (requires KEDA operator installed)\n\
              keda:\n\
@@ -311,27 +326,34 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
              \x20 minReplicaCount: {min}\n\
              \x20 maxReplicaCount: {max}\n\
              \x20 pollingInterval: {poll}\n\
-             \x20 cooldownPeriod: {cool}\n\
-             \x20 kafka:\n\
-             \x20   # -- Scale when consumer group lag exceeds this per partition\n\
-             \x20   lagThreshold: \"{lag}\"\n\
-             \x20   # -- Wake from zero replicas when lag exceeds this\n\
-             \x20   activationLagThreshold: \"{activation}\"\n\
-             \x20   # -- Override topic (default: first topic from config)\n\
-             \x20   topic: \"\"\n\
-             \x20   # -- Override consumer group (default: from config)\n\
-             \x20   consumerGroup: \"\"\n\
-             \x20 cpu:\n\
-             \x20   enabled: {cpu_enabled}\n\
-             \x20   # -- CPU utilisation percentage threshold\n\
-             \x20   threshold: \"{cpu_threshold}\"\n\
-             \n",
+             \x20 cooldownPeriod: {cool}\n",
             min = keda.min_replicas,
             max = keda.max_replicas,
             poll = keda.polling_interval,
             cool = keda.cooldown_period,
-            lag = keda.kafka_lag_threshold,
-            activation = keda.activation_lag_threshold,
+        ));
+        // No Kafka lag trigger means nothing reads these, so none are offered.
+        if keda.kafka_trigger.enabled {
+            out.push_str(&format!(
+                "\x20 kafka:\n\
+                 \x20   # -- Scale when consumer group lag exceeds this per partition\n\
+                 \x20   lagThreshold: \"{lag}\"\n\
+                 \x20   # -- Wake from zero replicas when lag exceeds this\n\
+                 \x20   activationLagThreshold: \"{activation}\"\n\
+                 \x20   # -- Override topic (default: first topic from config)\n\
+                 \x20   topic: \"\"\n\
+                 \x20   # -- Override consumer group (default: from config)\n\
+                 \x20   consumerGroup: \"\"\n",
+                lag = keda.kafka_lag_threshold,
+                activation = keda.activation_lag_threshold,
+            ));
+        }
+        out.push_str(&format!(
+            "\x20 cpu:\n\
+             \x20   enabled: {cpu_enabled}\n\
+             \x20   # -- CPU utilisation percentage threshold\n\
+             \x20   threshold: \"{cpu_threshold}\"\n\
+             \n",
             cpu_enabled = keda.cpu_enabled,
             cpu_threshold = keda.cpu_threshold,
         ));
@@ -543,8 +565,94 @@ fn gen_observability_env(app: &str) -> String {
     out
 }
 
-fn gen_deployment_yaml(c: &DeploymentContract) -> String {
+/// The template condition each extra port renders under, in `extra_ports`
+/// order; `None` for a port that always listens.
+fn port_gates(c: &DeploymentContract) -> Result<Vec<Option<String>>, DeploymentError> {
+    c.extra_ports
+        .iter()
+        .map(|port| {
+            port.when
+                .as_ref()
+                .map(|when| port_gate(&port.name, when))
+                .transpose()
+        })
+        .collect()
+}
+
+/// Render a port condition as a Go template expression over a nil-safe lookup,
+/// so a missing or null key reads as off rather than failing the render.
+fn port_gate(port: &str, condition: &PortCondition) -> Result<String, DeploymentError> {
+    let field = format!("extra_ports[{port}].when");
+    let lookup = nil_safe_values_ref(&field, condition.path())?;
+    Ok(match condition {
+        PortCondition::Enabled { .. } => lookup,
+        PortCondition::Equals { value, .. } => {
+            format!("eq (toString {lookup}) {}", go_string_literal(value))
+        }
+        PortCondition::OneOf { values, .. } => {
+            if values.is_empty() {
+                return Err(DeploymentError::InvalidContract {
+                    field,
+                    reason: "a one_of condition with no values never holds, so the port would \
+                             never render"
+                        .to_string(),
+                });
+            }
+            let choices: Vec<String> = values.iter().map(|v| go_string_literal(v)).collect();
+            format!("has (toString {lookup}) (list {})", choices.join(" "))
+        }
+    })
+}
+
+/// A double-quoted Go template string for `s`; every JSON string escape is also
+/// a valid Go escape, so a quote or backslash in a value cannot end the literal.
+fn go_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_default()
+}
+
+/// Wrap one rendered list entry in its port's template condition, if it has one.
+fn push_gated(out: &mut String, indent: &str, gate: Option<&String>, entry: &str) {
+    if let Some(gate) = gate {
+        out.push_str(&format!("{indent}{{{{- if {gate} }}}}\n"));
+    }
+    out.push_str(entry);
+    if gate.is_some() {
+        out.push_str(&format!("{indent}{{{{- end }}}}\n"));
+    }
+}
+
+/// When the fallback HPA renders: asked for, and KEDA not in charge.
+const HPA_GATE: &str = "and .Values.autoscaling.enabled (not .Values.keda.enabled)";
+
+/// When the ScaledObject renders. With no Kafka lag trigger the CPU trigger is
+/// the only one, and a ScaledObject with no triggers is rejected, so it exists
+/// only while CPU scaling is on.
+fn scaled_object_gate(keda: &KedaContract) -> &'static str {
+    if keda.kafka_trigger.enabled {
+        ".Values.keda.enabled"
+    } else {
+        "and .Values.keda.enabled .Values.keda.cpu.enabled"
+    }
+}
+
+/// When the Deployment sets `replicas` itself: exactly when neither the
+/// ScaledObject nor the HPA renders, because whichever renders owns the count
+/// and a Deployment without `replicas` runs one pod.
+fn replicas_gate(c: &DeploymentContract) -> String {
+    match c.enabled_keda() {
+        // The HPA renders only while KEDA is off, so beside a ScaledObject
+        // gated on KEDA alone the two conditions fold into one `or`.
+        Some(keda) if keda.kafka_trigger.enabled => {
+            "not (or .Values.keda.enabled .Values.autoscaling.enabled)".to_string()
+        }
+        Some(keda) => format!("not (or ({}) ({HPA_GATE}))", scaled_object_gate(keda)),
+        None => format!("not ({HPA_GATE})"),
+    }
+}
+
+fn gen_deployment_yaml(c: &DeploymentContract, gates: &[Option<String>]) -> String {
     let app = &c.app_name;
+    let replicas_if = replicas_gate(c);
     let mut out = String::with_capacity(4096);
 
     // Header
@@ -556,7 +664,7 @@ metadata:
   labels:
     {{{{- include "{app}.labels" . | nindent 4 }}}}
 spec:
-  {{{{- if not (or .Values.keda.enabled .Values.autoscaling.enabled) }}}}
+  {{{{- if {replicas_if} }}}}
   replicas: {{{{ .Values.replicaCount }}}}
   {{{{- end }}}}
   selector:
@@ -618,24 +726,25 @@ spec:
          \x20             containerPort: {{ .Values.service.port }}\n\
          \x20             protocol: TCP\n",
     );
-    for port in &c.extra_ports {
-        out.push_str(&format!(
+    for (port, gate) in c.extra_ports.iter().zip(gates) {
+        // Kubernetes accepts only TCP, UDP and SCTP, in upper case.
+        let entry = format!(
             "            - name: {name}\n\
              \x20             containerPort: {port}\n\
              \x20             protocol: {proto}\n",
             name = port.name,
             port = port.port,
-            proto = port.protocol,
-        ));
+            proto = port.protocol.to_ascii_uppercase(),
+        );
+        push_gated(&mut out, "            ", gate.as_ref(), &entry);
     }
 
     // Env: observability identity first, then secret-backed credentials.
     out.push_str("          env:\n");
     out.push_str(&gen_observability_env(app));
 
-    // Env vars from secrets. No emptiness guard: it used to suppress the `env:`
-    // header, which now always precedes this, so it would only be wrapping a
-    // loop that already iterates zero times.
+    // Env vars from secrets, under the `env:` header written above whatever
+    // the secret count.
     for group in &c.secrets {
         let helper_name = format!("{}SecretName", to_camel_suffix(&group.group_name));
         out.push_str(&format!(
@@ -707,7 +816,7 @@ spec:
     out
 }
 
-fn gen_service_yaml(c: &DeploymentContract) -> String {
+fn gen_service_yaml(c: &DeploymentContract, gates: &[Option<String>]) -> String {
     let app = &c.app_name;
     let mut out = format!(
         r#"apiVersion: v1
@@ -727,16 +836,17 @@ spec:
     );
 
     // Extra ports
-    for port in &c.extra_ports {
-        out.push_str(&format!(
+    for (port, gate) in c.extra_ports.iter().zip(gates) {
+        let entry = format!(
             "    - port: {port}\n\
              \x20     targetPort: {port}\n\
              \x20     protocol: {proto}\n\
              \x20     name: {name}\n",
             port = port.port,
-            proto = port.protocol,
+            proto = port.protocol.to_ascii_uppercase(),
             name = port.name,
-        ));
+        );
+        push_gated(&mut out, "    ", gate.as_ref(), &entry);
     }
 
     out.push_str(&format!(
@@ -845,7 +955,7 @@ fn gen_secret_yaml(c: &DeploymentContract) -> String {
 fn gen_hpa_yaml(c: &DeploymentContract) -> String {
     let app = &c.app_name;
     format!(
-        r#"{{{{- if and .Values.autoscaling.enabled (not .Values.keda.enabled) }}}}
+        r#"{{{{- if {HPA_GATE} }}}}
 # Standard HPA fallback -- use when KEDA operator is not installed.
 # Mutually exclusive with keda.enabled (KEDA creates its own HPA).
 apiVersion: autoscaling/v2
@@ -873,23 +983,48 @@ spec:
     )
 }
 
-fn gen_keda_scaledobject_yaml(c: &DeploymentContract) -> String {
+/// Render a dotted `.Values`-relative path as a parenthesised lookup, so a
+/// missing or null parent renders nothing instead of a nil-pointer error.
+///
+/// `config.source.brokers` becomes `((.Values.config).source).brokers`.
+fn nil_safe_values_ref(field: &str, path: &str) -> Result<String, DeploymentError> {
+    let mut lookup = String::from(".Values");
+    for (depth, segment) in path.split('.').enumerate() {
+        if !is_go_identifier(segment) {
+            return Err(DeploymentError::InvalidContract {
+                field: field.to_string(),
+                reason: format!(
+                    "`{path}` is not a dotted path of Go identifiers, so the chart cannot address it"
+                ),
+            });
+        }
+        lookup = if depth == 0 {
+            format!("{lookup}.{segment}")
+        } else {
+            format!("({lookup}).{segment}")
+        };
+    }
+    Ok(lookup)
+}
+
+fn gen_keda_scaledobject_yaml(
+    c: &DeploymentContract,
+    keda: &KedaContract,
+) -> Result<String, DeploymentError> {
     let app = &c.app_name;
-
-    // Find kafka secret group for trigger auth reference
-    let has_kafka_secret = c.secrets.iter().any(|g| g.group_name == "kafka");
-
-    let auth_ref = if has_kafka_secret {
-        format!(
-            "      authenticationRef:\n\
-             \x20       name: {{{{ include \"{app}.fullname\" . }}}}-kafka-auth\n"
+    let kafka_enabled = keda.kafka_trigger.enabled;
+    let gate = scaled_object_gate(keda);
+    let (kafka_trigger, cpu_role) = if kafka_enabled {
+        (
+            gen_keda_kafka_trigger(c, &keda.kafka_trigger)?,
+            "secondary scaler",
         )
     } else {
-        String::new()
+        (String::new(), "only scaler")
     };
 
-    format!(
-        r#"{{{{- if .Values.keda.enabled }}}}
+    Ok(format!(
+        r#"{{{{- if {gate} }}}}
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -904,29 +1039,8 @@ spec:
   pollingInterval: {{{{ .Values.keda.pollingInterval }}}}
   cooldownPeriod: {{{{ .Values.keda.cooldownPeriod }}}}
   triggers:
-    # Kafka consumer group lag (primary scaler)
-    - type: kafka
-{auth_ref}      metadata:
-        bootstrapServers: {{{{ .Values.config.kafka.brokers | quote }}}}
-        consumerGroup: {{{{ .Values.keda.kafka.consumerGroup | default .Values.config.kafka.group_id | quote }}}}
-        {{{{- /* `default (index X 0)` would eagerly evaluate `index nil 0` and fail
-            lint when no topics are set. Use explicit conditional instead. */}}}}
-        {{{{- if .Values.keda.kafka.topic }}}}
-        topic: {{{{ .Values.keda.kafka.topic | quote }}}}
-        {{{{- else if .Values.config.kafka.topics }}}}
-        topic: {{{{ (index .Values.config.kafka.topics 0) | quote }}}}
-        {{{{- else }}}}
-        topic: ""
-        {{{{- end }}}}
-        lagThreshold: {{{{ .Values.keda.kafka.lagThreshold | quote }}}}
-        activationLagThreshold: {{{{ .Values.keda.kafka.activationLagThreshold | quote }}}}
-        # `sasl`, not `saslType`: the kafka trigger replaced the old `authMode`
-        # property with `sasl` + `tls`, and an unrecognised key is ignored, so
-        # the mechanism was being supplied nowhere at all.
-        sasl: scram_sha512
-        tls: disable
-    {{{{- if .Values.keda.cpu.enabled }}}}
-    # CPU utilisation (secondary scaler)
+{kafka_trigger}    {{{{- if .Values.keda.cpu.enabled }}}}
+    # CPU utilisation ({cpu_role})
     - type: cpu
       metricType: Utilization
       metadata:
@@ -934,11 +1048,67 @@ spec:
     {{{{- end }}}}
 {{{{- end }}}}
 "#,
-    )
+    ))
 }
 
-fn gen_keda_triggerauth_yaml(c: &DeploymentContract) -> String {
+/// The Kafka consumer-group lag trigger, reading its connection details from
+/// the values paths the contract names.
+fn gen_keda_kafka_trigger(
+    c: &DeploymentContract,
+    trigger: &KafkaLagTrigger,
+) -> Result<String, DeploymentError> {
     let app = &c.app_name;
+    let brokers = nil_safe_values_ref("keda.kafka_trigger.brokers_path", &trigger.brokers_path)?;
+    let group = nil_safe_values_ref("keda.kafka_trigger.group_path", &trigger.group_path)?;
+    let topics = nil_safe_values_ref("keda.kafka_trigger.topics_path", &trigger.topics_path)?;
+
+    // A TriggerAuthentication exists only for a kafka secret group, and a SASL
+    // mechanism without its credentials cannot authenticate.
+    let has_kafka_secret = c.secrets.iter().any(|g| g.group_name == "kafka");
+    let (auth_ref, sasl) = if has_kafka_secret {
+        (
+            format!(
+                "      authenticationRef:\n\
+                 \x20       name: {{{{ include \"{app}.fullname\" . }}}}-kafka-auth\n"
+            ),
+            "        # The kafka trigger reads its SASL mechanism from `sasl` and ignores a key it does not know.\n\
+             \x20       sasl: scram_sha512\n",
+        )
+    } else {
+        (String::new(), "")
+    };
+
+    Ok(format!(
+        r#"    # Kafka consumer group lag (primary scaler)
+    - type: kafka
+{auth_ref}      metadata:
+        bootstrapServers: {{{{ join "," {brokers} | quote }}}}
+        consumerGroup: {{{{ .Values.keda.kafka.consumerGroup | default {group} | quote }}}}
+        {{{{- /* A conditional because `default` evaluates both operands, and the topics are
+            joined then split because `index` on a string yields a byte. */}}}}
+        {{{{- $topics := join "," {topics} }}}}
+        {{{{- if .Values.keda.kafka.topic }}}}
+        topic: {{{{ .Values.keda.kafka.topic | quote }}}}
+        {{{{- else if $topics }}}}
+        topic: {{{{ splitList "," $topics | first | quote }}}}
+        {{{{- else }}}}
+        topic: ""
+        {{{{- end }}}}
+        lagThreshold: {{{{ .Values.keda.kafka.lagThreshold | quote }}}}
+        activationLagThreshold: {{{{ .Values.keda.kafka.activationLagThreshold | quote }}}}
+{sasl}        tls: disable
+"#,
+    ))
+}
+
+fn gen_keda_triggerauth_yaml(c: &DeploymentContract, keda: &KedaContract) -> String {
+    let app = &c.app_name;
+
+    // Written as a stub rather than omitted, so the chart's file set does not
+    // depend on which triggers are on.
+    if !keda.kafka_trigger.enabled {
+        return "# No Kafka lag trigger -- KEDA TriggerAuthentication not generated\n".to_string();
+    }
 
     // Find the kafka secret group
     let kafka_group = c.secrets.iter().find(|g| g.group_name == "kafka");

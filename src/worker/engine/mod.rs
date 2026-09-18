@@ -296,7 +296,7 @@ impl BatchEngine {
     ///
     /// Pipeline phases per chunk:
     /// 1. **Pre-route** -- SIMD field extraction + filter evaluation (sequential, ~100 ns/msg)
-    /// 2. **Parse** -- `sonic_rs::from_slice` + known-field extraction (sequential, ~1-5 µs/msg)
+    /// 2. **Parse** -- `sonic_rs::from_slice` + known-field extraction (sequential, ~1-5 us/msg)
     /// 3. **Transform** -- user closure via rayon `par_iter_mut` (parallel)
     ///
     /// Results contain one entry per non-filtered message. Filtered messages are

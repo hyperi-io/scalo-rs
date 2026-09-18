@@ -137,7 +137,7 @@ impl DirectoryConfigStore {
 
     /// Get the entire contents of a table as a YAML value.
     ///
-    /// Table names may include subdirectory prefixes (e.g. `loaders/dfe-loader`).
+    /// Table names may include subdirectory prefixes (e.g. `loaders/orders-loader`).
     pub async fn get(&self, table: &str) -> DirectoryConfigResult<serde_yaml_ng::Value> {
         validate_table_name(table)?;
         let table = normalize_table_name(table);
@@ -150,7 +150,7 @@ impl DirectoryConfigStore {
 
     /// Get a specific key from a table using dot-notation path.
     ///
-    /// For example, `get_key("loaders/dfe-loader", "kafka.brokers")` navigates
+    /// For example, `get_key("loaders/orders-loader", "kafka.brokers")` navigates
     /// into the nested YAML structure. Dot separates keys, slash separates
     /// subdirectory path components in the table name.
     pub async fn get_key(
@@ -168,7 +168,7 @@ impl DirectoryConfigStore {
 
     /// Deserialise a table into a typed struct.
     ///
-    /// Table names may include subdirectory prefixes (e.g. `loaders/dfe-loader`).
+    /// Table names may include subdirectory prefixes (e.g. `loaders/orders-loader`).
     pub async fn get_as<T: serde::de::DeserializeOwned>(
         &self,
         table: &str,
@@ -353,7 +353,7 @@ impl DirectoryConfigStore {
 
     /// Resolve the on-disk path for a table name.
     ///
-    /// Supports subdirectory table names (e.g. `loaders/dfe-loader`).
+    /// Supports subdirectory table names (e.g. `loaders/orders-loader`).
     /// Checks for `.yaml` first, falls back to `.yml` if it exists.
     /// For new files (writes), always uses `.yaml`.
     fn table_path(&self, table: &str) -> PathBuf {
@@ -421,7 +421,7 @@ impl DirectoryConfigStore {
 /// Validate a table name.
 ///
 /// Table names may contain forward slashes for subdirectory access
-/// (e.g. `loaders/dfe-loader`). Rejects path traversal (`..`),
+/// (e.g. `loaders/orders-loader`). Rejects path traversal (`..`),
 /// leading slashes, backslashes, and empty segments.
 pub(crate) fn validate_table_name(table: &str) -> DirectoryConfigResult<()> {
     let trimmed = table.trim_matches('/');
@@ -482,8 +482,8 @@ fn detect_write_mode(dir: &Path, git_enabled: bool) -> WriteMode {
 /// Load all YAML files from directory (recursively) into cache.
 ///
 /// Table names are derived from relative paths within the root directory.
-/// Files at the root are named by their stem (e.g. `dfe-loader.yaml` → `dfe-loader`).
-/// Files in subdirectories include the path prefix (e.g. `loaders/dfe-loader.yaml` → `loaders/dfe-loader`).
+/// Files at the root are named by their stem (e.g. `orders-loader.yaml` -> `orders-loader`).
+/// Files in subdirectories include the path prefix (e.g. `loaders/orders-loader.yaml` -> `loaders/orders-loader`).
 pub(crate) async fn load_all_tables(
     dir: &Path,
     cache: &TableCache,
@@ -838,8 +838,8 @@ mod tests {
 
     #[test]
     fn test_validate_table_name_valid() {
-        assert!(validate_table_name("dfe-loader").is_ok());
-        assert!(validate_table_name("loaders/dfe-loader").is_ok());
+        assert!(validate_table_name("orders-loader").is_ok());
+        assert!(validate_table_name("loaders/orders-loader").is_ok());
         assert!(validate_table_name("a/b/c").is_ok());
         assert!(validate_table_name("my_table").is_ok());
     }
@@ -879,7 +879,7 @@ mod tests {
     fn test_normalize_table_name() {
         assert_eq!(normalize_table_name("foo"), "foo");
         assert_eq!(normalize_table_name("/foo/"), "foo");
-        assert_eq!(normalize_table_name("loaders/dfe"), "loaders/dfe");
-        assert_eq!(normalize_table_name("/loaders/dfe/"), "loaders/dfe");
+        assert_eq!(normalize_table_name("loaders/orders"), "loaders/orders");
+        assert_eq!(normalize_table_name("/loaders/orders/"), "loaders/orders");
     }
 }

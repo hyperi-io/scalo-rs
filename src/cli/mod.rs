@@ -58,9 +58,10 @@ mod error;
 pub mod output;
 mod version;
 
-// ServiceApp + ServiceRuntime require the full service infrastructure stack
-// (MetricsManager, MemoryGuard, ScalingPressure, AdaptiveWorkerPool).
-// Gated behind `cli-service`. Bare `cli` exposes only the clap types.
+// ServiceApp + ServiceRuntime require the service infrastructure stack
+// (MetricsManager, MemoryGuard, ScalingPressure), plus AdaptiveWorkerPool when
+// `worker-pool` is on. Gated behind `cli-service`. Bare `cli` exposes only the
+// clap types.
 #[cfg(feature = "cli-service")]
 mod app;
 #[cfg(feature = "cli-service")]

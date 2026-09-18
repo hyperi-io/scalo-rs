@@ -466,7 +466,7 @@ mod tests {
         assert!(get_section("anything").is_none());
     }
 
-    // ── Change notification ─────────────────────────────────────
+    // -- Change notification -------------------------------------
 
     #[test]
     fn on_change_fires_on_update() {
@@ -553,7 +553,7 @@ mod tests {
         assert_eq!(get_section("fresh").unwrap().effective["enabled"], true);
     }
 
-    // ── Redaction test structs (module-level to avoid items_after_statements) ──
+    // -- Redaction test structs (module-level to avoid items_after_statements) --
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
     struct MixedCase {
@@ -614,7 +614,7 @@ mod tests {
         normal: String,
     }
 
-    // ── Redaction guarantee tests ──────────────────────────────
+    // -- Redaction guarantee tests ------------------------------
 
     /// Config struct that exercises ALL sensitive field name patterns.
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -816,7 +816,7 @@ mod tests {
         assert!(!dump_str.contains("should_be_redacted"));
     }
 
-    // ── Change notification ─────────────────────────────────────
+    // -- Change notification -------------------------------------
 
     #[test]
     fn multiple_listeners_on_same_key() {

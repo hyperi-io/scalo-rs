@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/deployment/emit.rs
-// Purpose:   Emit + drift-check reflectable config artefacts (scalo-rs#6)
+// Purpose:   Emit + drift-check config artefacts; guard committed charts and listeners
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -25,6 +25,10 @@
 //! copy can be drift-checked against a fresh regeneration -- see
 //! [`assert_no_config_artifact_drift`]. See `docs/reflectable-config-shape.md`
 //! for the cross-language shape shared with scalo-py.
+//!
+//! [`check_chart_drift`] guards a committed Helm chart the same way, with a
+//! [`ChartPatch`] pinning each hand fix, and [`assert_listeners_declared`]
+//! checks the contract's listeners against its ports.
 
 use std::path::{Path, PathBuf};
 
@@ -205,6 +209,251 @@ pub fn assert_no_config_artifact_drift(contract: &DeploymentContract, dir: impl 
     }
 }
 
+/// A hand edit a committed chart file carries on purpose: text the generator
+/// writes (`from`) replaced by what the file holds instead (`to`).
+///
+/// [`check_chart_drift`] applies each patch to the freshly generated file
+/// before comparing, and fails once the generator stops writing `from`, so the
+/// hand fix is pinned to the content it replaces rather than exempted. `from`
+/// must occur exactly once in that file, so one patch pins one edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChartPatch {
+    /// Path under the chart root, e.g. `templates/keda-scaledobject.yaml`.
+    pub file: String,
+    /// Text the generator writes that the hand fix replaces.
+    pub from: String,
+    /// What the committed file holds in its place.
+    pub to: String,
+}
+
+impl ChartPatch {
+    /// A hand fix replacing `from`, which the generator writes once into
+    /// `file`, with `to`.
+    #[must_use]
+    pub fn new(file: impl Into<String>, from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            file: file.into(),
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+}
+
+/// Check that the committed chart under `chart_dir` is exactly what
+/// [`generate_chart`](super::generate_chart) writes for `contract`, with each
+/// of `patches` applied.
+///
+/// Every generated file must be on disk and equal the fresh output after its
+/// patches, each patch's `from` must occur exactly once in the file it names,
+/// and every file in the chart root or `templates/` must be one the generator
+/// writes. The chart is rendered without identity annotations, as a committed
+/// chart is.
+///
+/// # Errors
+///
+/// Returns [`DeploymentError::Drift`] listing every problem found,
+/// [`DeploymentError::InvalidContract`] when the contract cannot generate a
+/// chart, or [`DeploymentError::ReadFile`] when a chart file cannot be read.
+pub fn check_chart_drift(
+    contract: &DeploymentContract,
+    chart_dir: &Path,
+    patches: &[ChartPatch],
+) -> Result<(), DeploymentError> {
+    let fresh = super::generate::chart_files(contract, None)?;
+    let mut problems = Vec::new();
+
+    for patch in patches {
+        if patch.from.is_empty() {
+            problems.push(format!(
+                "{}: a patch has an empty `from`, which pins nothing",
+                patch.file
+            ));
+        } else if !fresh.iter().any(|(name, _)| *name == patch.file) {
+            problems.push(format!(
+                "{}: patch no longer applies -- the generator does not write this file; drop it",
+                patch.file
+            ));
+        }
+    }
+
+    for (name, generated) in &fresh {
+        let mut expected = generated.clone();
+        let mut patches_apply = true;
+        for patch in patches
+            .iter()
+            .filter(|p| p.file == *name && !p.from.is_empty())
+        {
+            match generated.matches(&patch.from).count() {
+                1 => expected = expected.replacen(&patch.from, &patch.to, 1),
+                0 => {
+                    patches_apply = false;
+                    problems.push(format!(
+                        "{name}: patch no longer applies -- drop it (the generator no longer \
+                         writes {:?})",
+                        patch.from.lines().next().unwrap_or_default()
+                    ));
+                }
+                count => {
+                    patches_apply = false;
+                    problems.push(format!(
+                        "{name}: a patch's `from` occurs {count} times in the generated file, \
+                         so it pins no one edit -- lengthen it until it is unique ({:?})",
+                        patch.from.lines().next().unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        let path = chart_dir.join(name);
+        match std::fs::read_to_string(&path) {
+            // A patch that does not apply is the problem to report for this file.
+            Ok(_) if !patches_apply => {}
+            Ok(committed) if committed == expected => {}
+            Ok(committed) => problems.push(format!(
+                "{name}: {}",
+                describe_difference(&expected, &committed)
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                problems.push(format!("{name}: generated but missing from the chart"));
+            }
+            Err(e) => {
+                return Err(DeploymentError::ReadFile {
+                    path: path.display().to_string(),
+                    source: e,
+                });
+            }
+        }
+    }
+
+    for name in files_in_chart(chart_dir)? {
+        if !fresh.iter().any(|(generated, _)| *generated == name) {
+            problems.push(format!(
+                "{name}: in the chart, but the generator does not write it"
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(DeploymentError::Drift {
+        path: chart_dir.display().to_string(),
+        detail: format!(
+            "{}\nRegenerate the chart from the contract, and keep a hand edit only as a \
+             ChartPatch.",
+            problems.join("\n")
+        ),
+    })
+}
+
+/// Panic if the committed chart under `chart_dir` drifts from the generator's
+/// output with `patches` applied. Wraps [`check_chart_drift`] for use directly
+/// in a `#[test]`.
+///
+/// # Panics
+///
+/// Panics listing every problem when the chart drifted, or when the check
+/// itself cannot run.
+pub fn assert_no_chart_drift(
+    contract: &DeploymentContract,
+    chart_dir: &Path,
+    patches: &[ChartPatch],
+) {
+    if let Err(e) = check_chart_drift(contract, chart_dir, patches) {
+        panic!("{e}");
+    }
+}
+
+/// How a committed file differs from the expected content: in its line endings
+/// alone, in its trailing newlines alone, or from a given line.
+///
+/// The first two are named outright because a line-by-line comparison reads
+/// past both and would point at a line beyond the end of the file.
+fn describe_difference(expected: &str, committed: &str) -> String {
+    if committed.contains('\r') && committed.replace("\r\n", "\n") == expected {
+        return "differs only in line endings -- the committed file has CRLF where the \
+                generator writes LF"
+            .to_string();
+    }
+    let trailing = |text: &str| text.len() - text.trim_end_matches('\n').len();
+    if expected.trim_end_matches('\n') == committed.trim_end_matches('\n') {
+        return format!(
+            "differs only in its trailing newlines -- the generator writes {}, the committed \
+             file has {}",
+            trailing(expected),
+            trailing(committed)
+        );
+    }
+    format!(
+        "differs from the generated chart at line {}",
+        first_differing_line(expected, committed)
+    )
+}
+
+/// The 1-based line where `a` and `b` first differ.
+fn first_differing_line(a: &str, b: &str) -> usize {
+    let (mut a_lines, mut b_lines) = (a.lines(), b.lines());
+    let mut line = 1;
+    loop {
+        match (a_lines.next(), b_lines.next()) {
+            (Some(x), Some(y)) if x == y => line += 1,
+            _ => return line,
+        }
+    }
+}
+
+/// Paths, relative to the chart root, of the files in the two directories the
+/// generator writes to: the root and `templates/`.
+fn files_in_chart(chart_dir: &Path) -> Result<Vec<String>, DeploymentError> {
+    let mut found = Vec::new();
+    for sub in ["", "templates"] {
+        let dir = chart_dir.join(sub);
+        let read_error = |e: std::io::Error| DeploymentError::ReadFile {
+            path: dir.display().to_string(),
+            source: e,
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(read_error(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(read_error)?;
+            if entry.path().is_file() {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                found.push(if sub.is_empty() {
+                    file
+                } else {
+                    format!("{sub}/{file}")
+                });
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Panic if `default_config` has a listen address no port declares, or one
+/// that binds a different port than the port claiming it. Wraps
+/// [`DeploymentContract::undeclared_listeners`] for use directly in a `#[test]`.
+///
+/// # Panics
+///
+/// Panics listing every finding when there is at least one.
+pub fn assert_listeners_declared(contract: &DeploymentContract) {
+    let findings = contract.undeclared_listeners();
+    if !findings.is_empty() {
+        let lines: Vec<String> = findings.iter().map(|m| format!("  {m}")).collect();
+        panic!(
+            "{app}: listeners and declared ports disagree -- add a port with \
+             `bound_from`, fix its number, or list a send-only path in \
+             `unbound_listen_paths`:\n{lines}",
+            app = contract.app_name,
+            lines = lines.join("\n"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +473,7 @@ mod tests {
             config_mount_path: "/etc/demo/demo.yaml".into(),
             image_registry: "ghcr.io/hyperi-io".into(),
             extra_ports: vec![],
+            unbound_listen_paths: vec![],
             entrypoint_args: vec![],
             secrets: vec![],
             default_config: None,
@@ -313,5 +563,315 @@ mod tests {
         // Never emitted -> files missing -> drift.
         let err = check_config_artifact_drift(&contract, dir.path()).unwrap_err();
         assert!(matches!(err, DeploymentError::Drift { .. }), "got {err:?}");
+    }
+
+    /// A chart generated into a temp dir, standing in for a committed one.
+    fn committed_chart() -> (DeploymentContract, tempfile::TempDir) {
+        let contract = contract_with_catalog();
+        let dir = tempfile::tempdir().unwrap();
+        crate::deployment::generate_chart(&contract, dir.path(), None).unwrap();
+        (contract, dir)
+    }
+
+    /// Replace `from` with `to` in a committed chart file, as a hand fix would.
+    fn hand_edit(dir: &Path, file: &str, from: &str, to: &str) {
+        let path = dir.join(file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(from), "{file} lacks {from:?}");
+        std::fs::write(&path, text.replace(from, to)).unwrap();
+    }
+
+    fn drift_detail(result: Result<(), DeploymentError>) -> String {
+        match result {
+            Err(DeploymentError::Drift { detail, .. }) => detail,
+            other => panic!("expected drift, got {other:?}"),
+        }
+    }
+
+    const REPLICAS: &str = "  replicas: {{ .Values.replicaCount }}\n";
+
+    fn pin_replicas() -> ChartPatch {
+        ChartPatch {
+            file: "templates/deployment.yaml".into(),
+            from: REPLICAS.into(),
+            to: "  replicas: 2\n".into(),
+        }
+    }
+
+    #[test]
+    fn chart_drift_passes_on_a_fresh_chart() {
+        let (contract, dir) = committed_chart();
+        check_chart_drift(&contract, dir.path(), &[]).unwrap();
+        assert_no_chart_drift(&contract, dir.path(), &[]);
+    }
+
+    #[test]
+    fn chart_drift_passes_a_hand_fix_its_patch_pins() {
+        let (contract, dir) = committed_chart();
+        hand_edit(
+            dir.path(),
+            "templates/deployment.yaml",
+            REPLICAS,
+            "  replicas: 2\n",
+        );
+
+        check_chart_drift(&contract, dir.path(), &[pin_replicas()]).unwrap();
+        // Without the patch the same hand fix is drift.
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[]));
+        assert!(
+            detail
+                .contains("templates/deployment.yaml: differs from the generated chart at line 9"),
+            "{detail}"
+        );
+    }
+
+    /// A patch pins one edit; any other edit to the same file, or to another
+    /// file, is still drift.
+    #[test]
+    fn chart_drift_catches_an_edit_outside_the_patch() {
+        let (contract, dir) = committed_chart();
+        hand_edit(
+            dir.path(),
+            "templates/deployment.yaml",
+            REPLICAS,
+            "  replicas: 2\n",
+        );
+        hand_edit(
+            dir.path(),
+            "templates/deployment.yaml",
+            "periodSeconds: 10",
+            "periodSeconds: 20",
+        );
+        hand_edit(
+            dir.path(),
+            "values.yaml",
+            "replicaCount: 1",
+            "replicaCount: 4",
+        );
+
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[pin_replicas()]));
+        assert!(
+            detail.contains("templates/deployment.yaml: differs from the generated chart"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("values.yaml: differs from the generated chart"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn chart_drift_fails_a_patch_the_generator_has_moved_past() {
+        let (contract, dir) = committed_chart();
+        let stale = ChartPatch {
+            file: "templates/deployment.yaml".into(),
+            from: "  replicas: 3\n".into(),
+            to: "  replicas: 2\n".into(),
+        };
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[stale]));
+        assert!(
+            detail.contains("templates/deployment.yaml: patch no longer applies -- drop it"),
+            "{detail}"
+        );
+
+        for (file, from) in [("templates/pdb.yaml", "x"), ("values.yaml", "")] {
+            let patch = ChartPatch {
+                file: file.into(),
+                from: from.into(),
+                to: "y".into(),
+            };
+            let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[patch]));
+            assert!(detail.starts_with(&format!("{file}: ")), "{detail}");
+        }
+    }
+
+    /// A `from` that occurs more than once pins no one edit, so it is refused
+    /// with the count rather than applied everywhere it matches.
+    #[test]
+    fn chart_drift_refuses_a_patch_whose_from_is_not_unique() {
+        let (contract, dir) = committed_chart();
+        let generated =
+            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
+        let from = "{{- end }}\n";
+        let count = generated.matches(from).count();
+        assert!(count > 1, "the fixture needs a repeated line");
+
+        let patch = ChartPatch {
+            file: "templates/deployment.yaml".into(),
+            from: from.into(),
+            to: "{{- end -}}\n".into(),
+        };
+        hand_edit(
+            dir.path(),
+            "templates/deployment.yaml",
+            from,
+            "{{- end -}}\n",
+        );
+
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[patch]));
+        assert!(
+            detail.contains(&format!(
+                "templates/deployment.yaml: a patch's `from` occurs {count} times"
+            )),
+            "{detail}"
+        );
+    }
+
+    /// A file that differs only in its line endings or trailing newlines says
+    /// so, rather than naming a line past the end of the file.
+    #[test]
+    fn chart_drift_names_a_line_ending_or_trailing_newline_difference() {
+        let (contract, dir) = committed_chart();
+        let values = dir.path().join("values.yaml");
+        let text = std::fs::read_to_string(&values).unwrap();
+        std::fs::write(&values, text.replace('\n', "\r\n")).unwrap();
+        let chart = dir.path().join("Chart.yaml");
+        let text = std::fs::read_to_string(&chart).unwrap();
+        std::fs::write(&chart, format!("{text}\n")).unwrap();
+
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[]));
+        assert!(
+            detail.contains("values.yaml: differs only in line endings"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("Chart.yaml: differs only in its trailing newlines"),
+            "{detail}"
+        );
+    }
+
+    /// A chart file that cannot be read for any reason but absence is an error
+    /// of its own, not a drift finding.
+    #[test]
+    fn chart_drift_hands_back_a_read_error_other_than_absence() {
+        let (contract, dir) = committed_chart();
+        let path = dir.path().join("templates/deployment.yaml");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let err = check_chart_drift(&contract, dir.path(), &[]).unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::ReadFile { ref path, .. } if path.ends_with("templates/deployment.yaml")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn chart_drift_fails_on_a_missing_or_extra_file() {
+        let (contract, dir) = committed_chart();
+        std::fs::remove_file(dir.path().join("templates/hpa.yaml")).unwrap();
+        std::fs::write(
+            dir.path().join("templates/keda-scaledobject.yaml"),
+            "stale\n",
+        )
+        .unwrap();
+
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[]));
+        assert!(
+            detail.contains("templates/hpa.yaml: generated but missing from the chart"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(
+                "templates/keda-scaledobject.yaml: in the chart, but the generator does not write it"
+            ),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "values.yaml: differs from the generated chart")]
+    fn assert_no_chart_drift_panics_on_drift() {
+        let (contract, dir) = committed_chart();
+        hand_edit(
+            dir.path(),
+            "values.yaml",
+            "replicaCount: 1",
+            "replicaCount: 4",
+        );
+        assert_no_chart_drift(&contract, dir.path(), &[]);
+    }
+
+    #[test]
+    fn listeners_declared_passes_when_every_listener_has_a_port() {
+        let mut contract = contract_with_catalog();
+        contract.default_config = Some(serde_json::json!({ "grpc": { "listen": ":6000" } }));
+        contract.extra_ports =
+            vec![crate::deployment::PortContract::tcp("grpc", 6000).bound_from("grpc.listen")];
+        assert_listeners_declared(&contract);
+    }
+
+    #[test]
+    #[should_panic(expected = "listener grpc.listen")]
+    fn listeners_declared_panics_on_an_undeclared_listener() {
+        let mut contract = contract_with_catalog();
+        contract.default_config = Some(serde_json::json!({ "grpc": { "listen": ":6000" } }));
+        assert_listeners_declared(&contract);
+    }
+
+    /// Panic, naming `T` and the first offending char in context, if the
+    /// schema derived for `T` is not pure ASCII.
+    #[cfg(feature = "config-schema")]
+    fn assert_schema_is_ascii<T: schemars::JsonSchema>() {
+        let name = std::any::type_name::<T>();
+        let schema = config_schema_json::<T>();
+        assert!(!schema.is_null(), "schema for {name} failed to serialise");
+        let json = serde_json::to_string(&schema).unwrap();
+        let chars: Vec<char> = json.chars().collect();
+        if let Some(pos) = chars.iter().position(|c| !c.is_ascii()) {
+            let context: String = chars[pos.saturating_sub(40)..(pos + 40).min(chars.len())]
+                .iter()
+                .collect();
+            panic!(
+                "schema for {name} carries non-ASCII {:?} (U+{:04X}) near: {context}",
+                chars[pos],
+                u32::from(chars[pos]),
+            );
+        }
+    }
+
+    /// Doc comments on config types become schema descriptions in every
+    /// consumer's committed artefact, so each root schema must be ASCII.
+    #[cfg(feature = "config-schema")]
+    #[test]
+    fn generated_config_schemas_are_ascii() {
+        #[cfg(feature = "dlq")]
+        assert_schema_is_ascii::<crate::dlq::DlqConfig>();
+        #[cfg(feature = "dlq-kafka")]
+        assert_schema_is_ascii::<crate::dlq::KafkaDlqConfig>();
+        #[cfg(feature = "dlq-kafka")]
+        assert_schema_is_ascii::<crate::dlq::DlqRouting>();
+        #[cfg(feature = "dlq-http")]
+        assert_schema_is_ascii::<crate::dlq::HttpDlqConfig>();
+        #[cfg(feature = "dlq-redis")]
+        assert_schema_is_ascii::<crate::dlq::RedisDlqConfig>();
+        #[cfg(feature = "geoip-download")]
+        assert_schema_is_ascii::<crate::geoip_download::GeoIpConfig>();
+        #[cfg(feature = "memory")]
+        assert_schema_is_ascii::<crate::memory::MemoryGuardConfig>();
+        #[cfg(feature = "scaling")]
+        assert_schema_is_ascii::<crate::scaling::ScalingPressureConfig>();
+        #[cfg(feature = "secrets")]
+        assert_schema_is_ascii::<crate::secrets::CacheConfig>();
+        #[cfg(feature = "tiered-sink")]
+        assert_schema_is_ascii::<crate::tiered_sink::TieredSinkConfig>();
+        #[cfg(any(feature = "spool", feature = "tiered-sink"))]
+        assert_schema_is_ascii::<crate::spool_codec::CorruptionPolicy>();
+        #[cfg(feature = "io")]
+        assert_schema_is_ascii::<crate::io::RotationPeriod>();
+        #[cfg(feature = "transport")]
+        assert_schema_is_ascii::<crate::transport::filter::FilterRule>();
+        #[cfg(feature = "transport-grpc")]
+        assert_schema_is_ascii::<crate::transport::grpc::GrpcConfig>();
+        #[cfg(feature = "transport-kafka")]
+        assert_schema_is_ascii::<crate::transport::kafka::KafkaConfig>();
+        #[cfg(feature = "transport-memory")]
+        assert_schema_is_ascii::<crate::transport::memory::MemoryConfig>();
+        #[cfg(feature = "worker-batch")]
+        assert_schema_is_ascii::<crate::worker::engine::BatchProcessingConfig>();
+        #[cfg(feature = "worker-batch")]
+        assert_schema_is_ascii::<crate::worker::engine::PreRouteFilterConfig>();
+        #[cfg(feature = "worker-batch")]
+        assert_schema_is_ascii::<crate::worker::engine::types::PayloadFormat>();
     }
 }

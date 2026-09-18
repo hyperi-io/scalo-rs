@@ -15,7 +15,7 @@
 //!
 //! - [`FileOutput::write`] / [`FileOutput::write_batch`] are SYNC -- they
 //!   call into the parking_lot-protected `NdjsonWriter` directly. Cheap
-//!   (~µs) but block the calling thread. Safe from sync code, tests, and
+//!   (~us) but block the calling thread. Safe from sync code, tests, and
 //!   pre-runtime startup.
 //! - [`FileOutput::write_async`] / [`FileOutput::write_batch_async`] are
 //!   ASYNC -- they hand the sync work to `tokio::task::spawn_blocking` so
@@ -29,9 +29,9 @@
 //!
 //! ```text
 //! /var/spool/dfe/output/loader/
-//! ├── events.ndjson              # Current file
-//! ├── events.ndjson.20260302T14  # Rotated (hourly)
-//! └── events.ndjson.20260302T13.gz  # Compressed
+//! |-- events.ndjson              # Current file
+//! |-- events.ndjson.20260302T14  # Rotated (hourly)
+//! `-- events.ndjson.20260302T13.gz  # Compressed
 //! ```
 
 use std::sync::Arc;

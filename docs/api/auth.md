@@ -86,10 +86,61 @@ the exchange is built.
 | `TokenPost` | A form POST of exactly the fields handed to it -- the generic shape |
 | `MetadataServer` | A GET, optionally behind a header (`Metadata-Flavor: Google`) |
 
-`TokenPost` is how a signed client assertion (RFC 7523) or a session
-login reaches a token endpoint: the consumer mints and signs the
-assertion, and hands it in as a rendered form value. No JWT library and
-no key parsing enters scalo.
+`TokenPost` has two shapes. `TokenPost::new` takes a form rendered once
+and posts it unchanged on every exchange, renewals included, so it is for
+a form that is safe to resend: a session login, a client secret.
+`TokenPost::minted` takes a closure that renders the form for every
+exchange, and it is the RFC 7523 path: a signed client assertion carries
+a single-use `jti` and a short `exp`, so each renewal needs a freshly
+minted one. The consumer mints and signs it in the closure, so no JWT
+library and no key parsing enters scalo.
+
+The closure returns a future, awaited inside the exchange's own
+deadline, so a signer that calls a KMS or fetches its key over the
+network holds no runtime thread while it waits:
+
+```rust
+use std::sync::Arc;
+
+use scalo::auth::{AuthError, Cached, TokenPost};
+
+let signer = Arc::new(kms_signer);
+let source = Cached::new(TokenPost::minted(
+    &http,
+    "https://idp.example/oauth2/token",
+    move || {
+        let signer = Arc::clone(&signer);
+        async move {
+            let assertion = signer.sign_assertion().await.map_err(|_| {
+                AuthError::Unavailable {
+                    reason: "client assertion could not be signed".into(),
+                }
+            })?;
+            Ok(vec![
+                ("grant_type".into(), "client_credentials".into()),
+                (
+                    "client_assertion_type".into(),
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".into(),
+                ),
+                ("client_assertion".into(), assertion),
+            ])
+        }
+    },
+)?);
+```
+
+A signer with nothing to await wraps its result instead:
+
+```rust
+let source = Cached::new(TokenPost::minted(&http, token_url, move || {
+    std::future::ready(render_assertion_form())
+})?);
+```
+
+A render that cannot mint returns an `AuthError`, usually `Unavailable`,
+and the exchange hands it back without posting anything. Fields added
+with `with_form_field` ride along on both shapes, ahead of the minted
+ones.
 
 ### The client an exchange uses
 
@@ -100,10 +151,7 @@ differences.
 - **Redirects refused.** reqwest carries the form and any custom header
   across a cross-origin hop, so a token endpoint that answers 307 would
   otherwise repost the client secret to whatever host it names.
-- **The POST retried.** A token POST mints a new credential rather than
-  changing state downstream, so replaying it duplicates nothing. That is
-  the exchange's own decision and does not need -- or read -- the shared
-  client's `retry_non_idempotent` flag.
+- **The POST retried only where it is safe to resend.** `ClientCredentials` ALWAYS retries its POST, whatever the shared client's `retry_non_idempotent` says: a client-secret POST mints a new credential, so replaying it duplicates nothing. `TokenPost::new` retries only when the shared client's `retry_non_idempotent` is on, because a retry resends the form it already posted. `TokenPost::minted` NEVER retries inside one exchange, whatever the flag says: a single-use assertion (an RFC 7523 `jti`) is refused on a second sight. A transient failure is left to the next acquisition instead, which mints a fresh assertion.
 
 Everything else -- timeouts, schedule, user agent -- is the caller's.
 
@@ -207,25 +255,26 @@ the acquisition and every caller that waited on it report the same
 failure. A refusal is then held for the failure backoff (a second by
 default, `with_failure_backoff` to change it), so a credential the
 endpoint has just rejected is not posted again by every caller in turn.
-An endpoint that was unreachable or out of time is not held: the next
-caller tries again, because that is what a retry is for. One acquisition
-is also bounded by the exchange's own timeout, so an endpoint that
-accepts the connection and then says nothing cannot park each caller in
-turn for the full timeout.
+A transient failure is not held -- an endpoint that was unreachable, out
+of time, or answered 408, 429 or 5xx -- so the next caller tries again,
+because that is what a retry is for. One acquisition is also bounded by
+the exchange's own timeout, so an endpoint that accepts the connection
+and then says nothing cannot park each caller in turn for the full
+timeout.
 
 A placement hands the failure to the retry loop whole, as
 `SignError::Auth`, so a caller matching on `HttpError::Sign` can read
-the status of a refusal off it. An unreachable or timed-out endpoint is
-transient and the loop re-signs and tries again, whatever the method: a
-request the signer could not sign never left. A refusal is not: it will
-be the same refusal next attempt.
+the status of a refusal off it. A transient failure has the loop re-sign
+and try again, whatever the method: a request the signer could not sign
+never left. Any other refusal is final: it will be the same refusal next
+attempt.
 
 | `AuthError` | Meaning | Transient |
 |---|---|---|
 | `Unreachable` | The endpoint could not be reached, or the transport failed | yes |
 | `TimedOut` | The acquisition did not finish inside the exchange's own deadline | yes |
 | `Shared` | The acquisition this caller waited on failed; carries whether that failure was transient | as the failure it reports |
-| `Refused` | The endpoint answered with a non-2xx status | no |
+| `Refused` | The endpoint answered with a non-2xx status | 408, 429 and 5xx yes; any other status no |
 | `Malformed` | The endpoint answered 2xx with something that is not a credential | no |
 | `Endpoint` | The token URL cannot be used at all (not https, not loopback) | no |
 | `Client` | The exchange's own HTTP client could not be built | no |

@@ -16,6 +16,14 @@ use super::config::BatchProcessingConfig;
 /// descriptors for all operational metrics and immediately emits the current
 /// config thresholds as gauges (for Grafana overlay of scaling decision lines).
 pub fn register(manager: &MetricsManager, config: &BatchProcessingConfig) {
+    describe(manager);
+    emit_thresholds(config);
+}
+
+/// Describe the batch engine's operational metrics, and the self-regulation
+/// ones when `governor` is on, into the manager's manifest registry, with no
+/// engine and no config needed.
+pub fn describe(manager: &MetricsManager) {
     // Counters
     let _ = manager.counter(
         "batch_engine_messages_received_total",
@@ -86,9 +94,6 @@ pub fn register(manager: &MetricsManager, config: &BatchProcessingConfig) {
             "Kafka pause/resume actuator failures (brake degraded)",
         );
     }
-
-    // Config thresholds as gauges (emitted immediately).
-    emit_thresholds(config);
 }
 
 /// Emit config threshold values as gauge metrics.
@@ -117,6 +122,50 @@ mod tests {
         let config = BatchProcessingConfig::default();
         // metrics macros are no-ops when no recorder is installed.
         emit_thresholds(&config);
+    }
+
+    #[test]
+    fn describe_lists_every_name_register_does() {
+        let names = |manager: &MetricsManager| {
+            let mut names: Vec<String> = manager
+                .registry()
+                .manifest()
+                .metrics
+                .into_iter()
+                .map(|m| m.name)
+                .collect();
+            names.sort();
+            names
+        };
+        let described = MetricsManager::new_for_test("");
+        describe(&described);
+        let registered = MetricsManager::new_for_test("");
+        register(&registered, &BatchProcessingConfig::default());
+
+        let mut expected = vec![
+            "batch_engine_messages_received_total",
+            "batch_engine_messages_parsed_total",
+            "batch_engine_messages_filtered_total",
+            "batch_engine_messages_dlq_total",
+            "batch_engine_parse_errors_total",
+            "batch_engine_parse_duration_seconds",
+            "batch_engine_transform_duration_seconds",
+            "batch_engine_chunk_size",
+            "batch_engine_pre_route_duration_seconds",
+            "batch_engine_intern_table_size",
+        ];
+        #[cfg(feature = "governor")]
+        expected.extend([
+            "self_regulation_byte_budget",
+            "self_regulation_recv_block_bytes",
+            "self_regulation_pressure_ratio",
+            "self_regulation_inbound_paused",
+            "self_regulation_inbound_pauses_total",
+            "self_regulation_kafka_gate_errors_total",
+        ]);
+        expected.sort_unstable();
+        assert_eq!(names(&described), expected);
+        assert_eq!(names(&registered), expected);
     }
 
     #[test]

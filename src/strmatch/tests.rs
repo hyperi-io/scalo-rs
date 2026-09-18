@@ -582,15 +582,15 @@ fn haystack_equals_pattern_in_exact_match() {
 
 #[test]
 fn multi_byte_utf8_haystack_does_not_split_literals() {
-    // "café" in UTF-8 = b"caf\xc3\xa9". A search for "f" should hit
-    // position 2; a search for "é" (b"\xc3\xa9") should hit position 3.
+    // "caf" + U+00E9 in UTF-8 = b"caf\xc3\xa9". A search for "f" should hit
+    // position 2; a search for U+00E9 (b"\xc3\xa9") should hit position 3.
     let m = StrMatcher::new("f").unwrap();
     let hit = m.find("café".as_bytes()).unwrap();
     assert_eq!(hit.start, 2);
 
-    let m = StrMatcher::new("\u{e9}").unwrap(); // é
+    let m = StrMatcher::new("\u{e9}").unwrap(); // U+00E9
     assert!(m.tier() == MatcherTier::Byte || m.tier() == MatcherTier::Literal);
-    // The literal byte representation of é is c3 a9; our pattern
+    // The literal byte representation of U+00E9 is c3 a9; our pattern
     // becomes the regex bytes c3 a9 which is a 2-byte literal.
     assert!(m.is_match("café".as_bytes()));
     assert!(!m.is_match("cafe".as_bytes()));
@@ -624,7 +624,7 @@ fn meta_reason_multiline_anchor() {
 
 #[test]
 fn meta_reason_unicode_class() {
-    // \w with default unicode flag → unreducible class.
+    // \w with default unicode flag -> unreducible class.
     let m = StrMatcher::new(r"\w").unwrap();
     assert_eq!(m.tier(), MatcherTier::Regex);
     // Could be "unicode-class" or "character class with too many
@@ -800,7 +800,7 @@ fn set_merged_ac_pattern_indices_survive_across_merge_boundary() {
     assert_eq!(hits[1].pattern_idx, 7);
 }
 
-/// One alternation pattern → N literals, all mapping back to the
+/// One alternation pattern -> N literals, all mapping back to the
 /// same caller index.
 #[test]
 fn set_merged_ac_alternation_patterns_map_to_one_input_index() {
