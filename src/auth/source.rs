@@ -551,8 +551,8 @@ impl ClientCredentials {
     /// Exchange these client credentials at `token_url`.
     ///
     /// `http` is the settings the exchange takes: it builds its own client from
-    /// them, because a token exchange refuses redirects and replays its own
-    /// POST whatever the shared client does.
+    /// them, because this exchange refuses redirects and replays its own POST
+    /// whatever the shared client does, a client-secret POST being safe to resend.
     ///
     /// # Errors
     ///
@@ -568,7 +568,7 @@ impl ClientCredentials {
         let token_url = token_url.into();
         require_secure_endpoint(&token_url)?;
         Ok(Self {
-            http: exchange_client(http)?,
+            http: exchange_client(http, true)?,
             token_url,
             client_id: client_id.into(),
             client_secret,
@@ -639,6 +639,10 @@ impl Exchange for ClientCredentials {
 /// This is how a signed client assertion (RFC 7523) or a session login reaches
 /// an endpoint: the consumer mints and signs the assertion and hands it in as a
 /// form value, so no key format or JWT library enters scalo.
+///
+/// The form is resent exactly as rendered, and a single-use assertion in it is
+/// refused on a second sight, so the POST is not retried unless the template's
+/// `retry_non_idempotent` opts in.
 pub struct TokenPost {
     http: HttpClient,
     token_url: String,
@@ -649,8 +653,9 @@ pub struct TokenPost {
 impl TokenPost {
     /// Post to `token_url`. The form starts empty.
     ///
-    /// `http` is the settings the exchange takes, as for
-    /// [`ClientCredentials::new`].
+    /// `http` is the settings the exchange takes, with redirects refused as for
+    /// [`ClientCredentials::new`] and its `retry_non_idempotent` deciding
+    /// whether the POST is retried.
     ///
     /// # Errors
     ///
@@ -661,7 +666,7 @@ impl TokenPost {
         let token_url = token_url.into();
         require_secure_endpoint(&token_url)?;
         Ok(Self {
-            http: exchange_client(http)?,
+            http: exchange_client(http, http.config().retry_non_idempotent)?,
             token_url,
             form: Vec::new(),
             reading: TokenReading::default(),
@@ -734,7 +739,7 @@ impl MetadataServer {
     /// built.
     pub fn new(http: &HttpClient, url: impl Into<String>) -> Result<Self, AuthError> {
         Ok(Self {
-            http: exchange_client(http)?,
+            http: exchange_client(http, http.config().retry_non_idempotent)?,
             url: url.into(),
             headers: Vec::new(),
             reading: TokenReading::default(),
@@ -798,16 +803,15 @@ impl Exchange for MetadataServer {
 }
 
 /// The client a token exchange uses: the caller's own settings, with redirects
-/// refused and the POST retry opted into.
+/// refused and the POST retried only when `retry_post` says it is safe to resend.
 ///
 /// Redirects are refused because reqwest carries the form and any custom header
 /// across a cross-origin hop, which hands the credential to whatever host the
-/// endpoint names. The retry is the exchange's own decision rather than the
-/// shared client's flag: a token POST mints a new credential instead of
-/// changing state downstream, so replaying it duplicates nothing.
-fn exchange_client(template: &HttpClient) -> Result<HttpClient, AuthError> {
+/// endpoint names. `retry_post` is the exchange's own call, because only the
+/// exchange knows whether its request carries anything single-use.
+fn exchange_client(template: &HttpClient, retry_post: bool) -> Result<HttpClient, AuthError> {
     let config = HttpClientConfig {
-        retry_non_idempotent: true,
+        retry_non_idempotent: retry_post,
         ..template.config().clone()
     };
     HttpClient::with_redirect_policy(config, reqwest::redirect::Policy::none())

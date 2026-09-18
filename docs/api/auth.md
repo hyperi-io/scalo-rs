@@ -100,10 +100,7 @@ differences.
 - **Redirects refused.** reqwest carries the form and any custom header
   across a cross-origin hop, so a token endpoint that answers 307 would
   otherwise repost the client secret to whatever host it names.
-- **The POST retried.** A token POST mints a new credential rather than
-  changing state downstream, so replaying it duplicates nothing. That is
-  the exchange's own decision and does not need -- or read -- the shared
-  client's `retry_non_idempotent` flag.
+- **The POST retried only where it is safe to resend.** `ClientCredentials` retries its POST whatever the shared client's `retry_non_idempotent` says: a client-secret POST mints a new credential, so replaying it duplicates nothing. `TokenPost` resends its form as rendered, and a single-use assertion (an RFC 7523 `jti`) is refused on a second sight, so it retries only when the shared client's `retry_non_idempotent` is on.
 
 Everything else -- timeouts, schedule, user agent -- is the caller's.
 

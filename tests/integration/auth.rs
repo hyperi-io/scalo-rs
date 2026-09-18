@@ -865,8 +865,9 @@ async fn a_redirected_token_exchange_does_not_repost_the_form() {
     );
 }
 
-/// The token POST is retried on the exchange's own client, whatever the shared
-/// client's non-idempotent retry flag says -- and the shared one is off here.
+/// A client-credentials POST is retried on the exchange's own client whatever
+/// the template's non-idempotent retry flag says, because a client secret is
+/// safe to resend -- and the template's flag is off here.
 #[tokio::test]
 async fn the_exchange_retries_its_own_token_post() {
     let (addr, state) = fixture().await;
@@ -879,6 +880,65 @@ async fn the_exchange_retries_its_own_token_post() {
         .credential()
         .await
         .unwrap();
+
+    assert_eq!(credential.secret.expose(), "tok-2");
+    assert_eq!(state.lock().unwrap().token_exchanges, 2);
+}
+
+/// A rendered token POST can carry a single-use assertion, so with the
+/// template's retry flag off it is posted once and the refusal handed back.
+#[tokio::test]
+async fn a_token_post_is_not_replayed_when_the_template_says_not_to() {
+    let (addr, state) = fixture().await;
+    let http = client();
+    assert!(
+        !http.config().retry_non_idempotent,
+        "the template does not replay a POST"
+    );
+
+    let result = Cached::new(
+        TokenPost::new(&http, format!("http://{addr}/token/flaky"))
+            .expect("a loopback token endpoint")
+            .with_form_field("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
+            .with_form_field("assertion", "header.payload.signature"),
+    )
+    .credential()
+    .await;
+
+    assert_eq!(
+        state.lock().unwrap().token_exchanges,
+        1,
+        "the assertion was posted once, not replayed"
+    );
+    let error = result.expect_err("the only answer was a 503");
+    assert!(
+        matches!(error, AuthError::Refused { status: 503, .. }),
+        "{error:?}"
+    );
+}
+
+/// A consumer whose rendered form is safe to resend opts in on the template,
+/// and the exchange then rides out a 503 like any retried call.
+#[tokio::test]
+async fn a_token_post_retries_when_the_template_opts_in() {
+    let (addr, state) = fixture().await;
+    let http = HttpClient::new(HttpClientConfig {
+        retry_non_idempotent: true,
+        min_retry_interval_ms: 1,
+        max_retry_interval_ms: 20,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let credential = Cached::new(
+        TokenPost::new(&http, format!("http://{addr}/token/flaky"))
+            .expect("a loopback token endpoint")
+            .with_form_field("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
+            .with_form_field("assertion", "header.payload.signature"),
+    )
+    .credential()
+    .await
+    .unwrap();
 
     assert_eq!(credential.secret.expose(), "tok-2");
     assert_eq!(state.lock().unwrap().token_exchanges, 2);
