@@ -37,10 +37,12 @@ as a warning, not fatal).
 which case nothing is constructed and the data path is byte-identical
 to pre-governor. See [self-regulation.md](../self-regulation.md).
 
-The whole bundle is enabled via the `cli-service` feature, which
-pulls in `metrics + memory + scaling + worker-pool + shutdown +
-governor + lifecycle` so that a single feature flag gives a downstream
-app the full service-runtime profile.
+The bundle is enabled via the `cli-service` feature, which pulls in
+`metrics + memory + scaling + shutdown + governor + sink-stack +
+lifecycle`. The worker pool is opt-in: add `worker-pool` for
+`worker_pool`, or `worker-batch` for it and `batch_engine`, and the
+runtime builds and wires them. Without either, neither field exists and
+rayon is not compiled.
 
 ---
 

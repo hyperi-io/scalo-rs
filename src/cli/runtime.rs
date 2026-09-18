@@ -22,7 +22,8 @@
 //!
 //! ## What's included (when features enabled)
 //!
-//! - [`AdaptiveWorkerPool`] -- rayon + tokio hybrid (`worker` feature)
+//! - [`AdaptiveWorkerPool`] -- rayon + tokio hybrid (`worker-pool` feature,
+//!   which `worker-batch` includes)
 //! - [`ScalingPressure`] -- KEDA signals (`scaling` feature)
 //!
 //! ## What stays app-specific
@@ -70,8 +71,9 @@ pub struct ServiceRuntime {
     /// Runtime context -- K8s/Docker/BareMetal metadata (pod_name, namespace, etc.).
     pub context: &'static RuntimeContext,
 
-    /// Adaptive worker pool for parallel batch processing (`worker` feature).
-    /// `None` if the `worker` feature is not enabled or config fails.
+    /// Adaptive worker pool for parallel batch processing (`worker-pool`
+    /// feature, which `worker-batch` includes). `None` if the pool could not be
+    /// built from its config.
     #[cfg(feature = "worker-pool")]
     pub worker_pool: Option<Arc<crate::worker::AdaptiveWorkerPool>>,
 
@@ -369,4 +371,51 @@ pub(crate) fn register_runtime_metrics(
     crate::worker::engine::metrics::describe(manager);
 
     service
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime builds under whichever pool features are compiled in, and
+    /// its pool metrics are described exactly when those features are on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_runtime_builds_under_current_features() {
+        let runtime = ServiceRuntime::build(
+            "runtime-build-probe",
+            "RUNTIME_BUILD_PROBE",
+            "127.0.0.1:0",
+            "1.2.3",
+            "probe",
+            #[cfg(feature = "scaling")]
+            Vec::new(),
+            #[cfg(feature = "version-check")]
+            crate::VersionCheckConfig::default(),
+        )
+        .await
+        .expect("the runtime builds");
+
+        let manifest = runtime.metrics.registry().manifest();
+        let names: Vec<&str> = manifest.metrics.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"transport_sent_total"), "{names:?}");
+        assert_eq!(
+            names.contains(&"worker_pool_active_threads"),
+            cfg!(feature = "worker-pool"),
+            "pool metrics follow the worker-pool feature: {names:?}"
+        );
+        assert_eq!(
+            names.contains(&"batch_engine_messages_received_total"),
+            cfg!(feature = "worker-batch"),
+            "engine metrics follow the worker-batch feature: {names:?}"
+        );
+        #[cfg(feature = "worker-pool")]
+        assert!(
+            runtime.worker_pool.is_some(),
+            "default config builds a pool"
+        );
+        #[cfg(feature = "worker-batch")]
+        assert!(runtime.batch_engine.is_some(), "and an engine on it");
+
+        runtime.shutdown.cancel();
+    }
 }

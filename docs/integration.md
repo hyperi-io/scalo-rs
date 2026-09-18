@@ -136,9 +136,13 @@ impl ServiceApp for LoaderCli {
         runtime: ServiceRuntime,
     ) -> Result<(), CliError> {
         // runtime gives you metrics, memory guard, scaling pressure,
-        // worker pool, shutdown token, runtime context — already wired.
-        let shutdown = runtime.shutdown_token();
-        let workers = runtime.worker_pool().expect("cli-service wires this");
+        // shutdown token, runtime context -- already wired -- and the
+        // worker pool when the `worker-pool` feature is on.
+        let shutdown = runtime.shutdown.clone();
+        let workers = runtime
+            .worker_pool
+            .clone()
+            .expect("worker-pool is enabled and its config loaded");
 
         // Build your pipeline using the runtime's primitives.
         let pipeline = LoaderPipeline::new(config, workers);

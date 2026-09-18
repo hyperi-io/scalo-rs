@@ -85,8 +85,8 @@ pub trait ServiceApp: Sized {
     ///
     /// Called after logging, config, and [`ServiceRuntime`](super::ServiceRuntime)
     /// are initialised. The runtime contains all common infrastructure (metrics,
-    /// memory guard, shutdown token, worker pool, scaling pressure). Apps just
-    /// use it -- no boilerplate needed.
+    /// memory guard, shutdown token, scaling pressure, and the worker pool when
+    /// `worker-pool` is on). Apps just use it -- no boilerplate needed.
     ///
     /// # Errors
     ///

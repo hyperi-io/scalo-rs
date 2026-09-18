@@ -81,7 +81,7 @@ flowchart LR
 | Feature | Adds |
 |---------|------|
 | `cli` | `clap`-based `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
-| `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + worker-pool + shutdown + lifecycle`) |
+| `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + shutdown + governor + sink-stack + lifecycle`). The worker pool is opt-in: add `worker-pool`, or `worker-batch` for the pool plus `BatchEngine` |
 | `lifecycle` | Idle-until-configured gate (`WorkState`, `IdleGate`, `pipeline_idle`) — folded into `cli-service` |
 | `top` | Above + `ratatui` TUI metrics dashboard |
 
@@ -209,8 +209,10 @@ Adds `clap` types but no service scaffolding.
 features = ["cli-service", "http-server", "transport-http"]
 ```
 
-`cli-service` brings `metrics`, `memory`, `scaling`, `worker-pool`,
-`shutdown`, `lifecycle`. Add an HTTP transport.
+`cli-service` brings `metrics`, `memory`, `scaling`, `shutdown`,
+`governor`, `sink-stack`, `lifecycle`. Add an HTTP transport. It does
+not bring the worker pool: add `worker-pool` (or `worker-batch`) only
+if the service processes batches on it, and the runtime builds it.
 
 ### Full data-plane service
 
@@ -270,8 +272,10 @@ A handful of dependencies aren't visible from the feature name alone:
   isn't supported.
 - `dlq` requires `concurrency` (for the `BackgroundSink` actor that
   drains queued entries).
-- `cli-service` reaches across the stack — `metrics + memory + scaling
-  + worker-pool + shutdown + lifecycle`.
+- `cli-service` reaches across the stack -- `metrics + memory + scaling
+  + shutdown + governor + sink-stack + lifecycle`. It does not pull
+  `worker-pool`, so rayon is compiled only by a service that asks for
+  `worker-pool` or `worker-batch`.
 - `top` pulls `cli-service` (and through that, the full L2 runtime).
 - `transport-redis` and `dlq-redis` share the `redis` crate; using both
   costs nothing extra beyond using one.
