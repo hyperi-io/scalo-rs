@@ -622,27 +622,10 @@ async fn a_token_post_sends_the_rendered_form() {
 #[tokio::test]
 async fn a_minted_token_post_sends_a_fresh_assertion_on_every_renewal() {
     let (addr, state) = fixture().await;
-    let minted = AtomicU64::new(0);
-    let source = Cached::new(
-        TokenPost::minted(
-            &client(),
-            format!("http://{addr}/token/due-once"),
-            move || {
-                let jti = minted.fetch_add(1, Ordering::Relaxed) + 1;
-                Ok(vec![
-                    (
-                        "grant_type".to_owned(),
-                        "urn:ietf:params:oauth:grant-type:jwt-bearer".to_owned(),
-                    ),
-                    (
-                        "assertion".to_owned(),
-                        format!("header.jti-{jti}.signature"),
-                    ),
-                ])
-            },
-        )
-        .expect("a loopback token endpoint"),
-    );
+    let source = Cached::new(numbered_minted_post(
+        &client(),
+        format!("http://{addr}/token/due-once"),
+    ));
 
     // The first token is already past its renewal point when it arrives, so
     // the second call is a renewal through the cache.
@@ -651,21 +634,63 @@ async fn a_minted_token_post_sends_a_fresh_assertion_on_every_renewal() {
 
     assert_eq!(first.secret.expose(), "tok-1");
     assert_eq!(renewed.secret.expose(), "tok-2");
-    let assertions: Vec<String> = state
-        .lock()
-        .unwrap()
-        .forms
-        .iter()
-        .filter_map(|form| {
-            form.iter()
-                .find(|(name, _)| name == "assertion")
-                .map(|(_, value)| value.clone())
-        })
-        .collect();
     assert_eq!(
-        assertions,
+        posted_assertions(&state),
         ["header.jti-1.signature", "header.jti-2.signature"],
         "each exchange posted its own assertion"
+    );
+}
+
+/// A render that awaits its signer -- a KMS call, a key fetched over the
+/// network -- is awaited by the exchange rather than blocking a thread on it.
+#[tokio::test]
+async fn a_minted_render_can_await_its_signer() {
+    let (addr, state) = fixture().await;
+    let source = Cached::new(
+        TokenPost::minted(&client(), format!("http://{addr}/token/long"), || async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(vec![(
+                "assertion".to_owned(),
+                "header.awaited.signature".to_owned(),
+            )])
+        })
+        .expect("a loopback token endpoint"),
+    );
+
+    let credential = source.credential().await.unwrap();
+
+    assert_eq!(credential.secret.expose(), "tok-1");
+    assert_eq!(posted_assertions(&state), ["header.awaited.signature"]);
+}
+
+/// A render that never finishes is abandoned at the exchange's own deadline,
+/// so a hung signer cannot hold the renewal gate for ever.
+#[tokio::test]
+async fn a_render_that_never_finishes_is_bounded_by_the_exchange_deadline() {
+    let (addr, state) = fixture().await;
+    let http = HttpClient::new(HttpClientConfig {
+        timeout_secs: 1,
+        max_retries: 0,
+        ..Default::default()
+    })
+    .unwrap();
+    let source = Cached::new(
+        TokenPost::minted(&http, format!("http://{addr}/token/long"), || {
+            std::future::pending::<Result<Vec<(String, String)>, AuthError>>()
+        })
+        .expect("a loopback token endpoint"),
+    );
+
+    let error = source
+        .credential()
+        .await
+        .expect_err("the signer never answers");
+
+    assert!(matches!(error, AuthError::TimedOut { .. }), "{error:?}");
+    assert_eq!(
+        state.lock().unwrap().token_exchanges,
+        0,
+        "nothing was posted"
     );
 }
 
@@ -675,7 +700,7 @@ async fn a_minted_token_post_sends_a_fresh_assertion_on_every_renewal() {
 async fn a_form_that_cannot_be_minted_is_an_error_and_posts_nothing() {
     let (addr, state) = fixture().await;
     let source = Cached::new(
-        TokenPost::minted(&client(), format!("http://{addr}/token/long"), || {
+        TokenPost::minted(&client(), format!("http://{addr}/token/long"), || async {
             Err(AuthError::Unavailable {
                 reason: "signing key not readable".to_owned(),
             })
@@ -694,6 +719,146 @@ async fn a_form_that_cannot_be_minted_is_an_error_and_posts_nothing() {
         state.lock().unwrap().token_exchanges,
         0,
         "nothing was posted"
+    );
+}
+
+/// A minted post whose render numbers each assertion it signs, `jti-1` first.
+fn numbered_minted_post(http: &HttpClient, url: String) -> TokenPost {
+    let signed = AtomicU64::new(0);
+    TokenPost::minted(http, url, move || {
+        let jti = signed.fetch_add(1, Ordering::Relaxed) + 1;
+        std::future::ready(Ok(vec![
+            (
+                "grant_type".to_owned(),
+                "urn:ietf:params:oauth:grant-type:jwt-bearer".to_owned(),
+            ),
+            (
+                "assertion".to_owned(),
+                format!("header.jti-{jti}.signature"),
+            ),
+        ]))
+    })
+    .expect("a loopback token endpoint")
+}
+
+/// The `assertion` field of every form the fixture was posted, in order.
+fn posted_assertions(state: &Shared) -> Vec<String> {
+    state
+        .lock()
+        .unwrap()
+        .forms
+        .iter()
+        .filter_map(|form| {
+            form.iter()
+                .find(|(name, _)| name == "assertion")
+                .map(|(_, value)| value.clone())
+        })
+        .collect()
+}
+
+/// A token endpoint answering 503 is worth another attempt, so the next
+/// acquisition posts again at once rather than being handed the 503 for the
+/// failure backoff -- and a minted post signs a fresh assertion for it.
+#[tokio::test]
+async fn a_minted_post_refused_with_503_mints_afresh_on_the_next_acquisition() {
+    let (addr, state) = fixture().await;
+    let source = Cached::new(numbered_minted_post(
+        &client(),
+        format!("http://{addr}/token/flaky"),
+    ));
+
+    let error = source
+        .credential()
+        .await
+        .expect_err("the first answer is a 503");
+    assert!(
+        matches!(error, AuthError::Refused { status: 503, .. }),
+        "{error:?}"
+    );
+    assert!(error.is_transient(), "a 503 says come back");
+
+    let credential = source
+        .credential()
+        .await
+        .expect("the next acquisition posts again inside the failure backoff");
+
+    assert_eq!(credential.secret.expose(), "tok-2");
+    assert_eq!(
+        posted_assertions(&state),
+        ["header.jti-1.signature", "header.jti-2.signature"],
+        "the second post carried a fresh assertion"
+    );
+}
+
+/// A signed request whose token endpoint answers 503 once retries the signing
+/// and succeeds, rather than failing on the token endpoint's say-so.
+#[tokio::test]
+async fn a_token_endpoint_503_does_not_fail_the_signed_request() {
+    let (addr, state) = fixture().await;
+    let placement = HeaderPlacement::bearer(Cached::new(numbered_minted_post(
+        &client(),
+        format!("http://{addr}/token/flaky"),
+    )));
+
+    let response = client()
+        .get_signed(&format!("http://{addr}/api"), &placement)
+        .await
+        .expect("the retry loop signs again");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        posted_assertions(&state),
+        ["header.jti-1.signature", "header.jti-2.signature"]
+    );
+    let recorded = state.lock().unwrap();
+    assert_eq!(recorded.api.len(), 1, "the request left once, signed");
+    assert_eq!(
+        recorded.api[0]
+            .headers
+            .get("authorization")
+            .map(String::as_str),
+        Some("Bearer tok-2")
+    );
+}
+
+/// A minted post is never retried inside one exchange, even on a template that
+/// opts in to replaying a POST: a retry would resend an assertion the endpoint
+/// may already have spent.
+#[tokio::test]
+async fn a_minted_post_is_posted_once_per_acquisition_whatever_the_template() {
+    let (addr, state) = fixture().await;
+    let replaying = HttpClient::new(HttpClientConfig {
+        retry_non_idempotent: true,
+        min_retry_interval_ms: 1,
+        max_retry_interval_ms: 20,
+        ..Default::default()
+    })
+    .unwrap();
+    let source = Cached::new(numbered_minted_post(
+        &replaying,
+        format!("http://{addr}/token/flaky"),
+    ));
+
+    let error = source
+        .credential()
+        .await
+        .expect_err("the one post met a 503");
+    assert!(
+        matches!(error, AuthError::Refused { status: 503, .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        posted_assertions(&state),
+        ["header.jti-1.signature"],
+        "one post, not a same-jti repost"
+    );
+
+    let credential = source.credential().await.unwrap();
+
+    assert_eq!(credential.secret.expose(), "tok-2");
+    assert_eq!(
+        posted_assertions(&state),
+        ["header.jti-1.signature", "header.jti-2.signature"]
     );
 }
 

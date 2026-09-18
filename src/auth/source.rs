@@ -17,6 +17,7 @@
 //! on a hit it is one atomic load and a pointer clone, and it never parks.
 
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -182,11 +183,11 @@ struct Failure {
 /// callers mints once, not a hundred times.
 ///
 /// A failure is shared the same way: the caller that ran the acquisition and
-/// every caller that waited on it report the same failure. A failure the
-/// endpoint answered with is then held for the failure backoff, so a refused
-/// credential is not posted again by every caller in turn, while an endpoint
-/// that could not be reached or ran out of time is tried again by the next
-/// caller, because that is what a retry is for.
+/// every caller that waited on it report the same failure. A refusal is then
+/// held for the failure backoff, so a refused credential is not posted again by
+/// every caller in turn, while a transient failure -- an endpoint that could not
+/// be reached, ran out of time, or answered 408, 429 or 5xx -- is tried again by
+/// the next caller, because that is what a retry is for.
 #[derive(Debug)]
 pub struct Cached<E> {
     current: ArcSwapOption<Credential>,
@@ -212,8 +213,8 @@ impl<E> Cached<E> {
 
     /// How long a refusal, or a response that was not a credential, is reported
     /// to every caller before the endpoint is tried again. Zero exchanges on
-    /// every miss. An endpoint that was unreachable or out of time is not held
-    /// at all.
+    /// every miss. A transient failure (see [`AuthError::is_transient`]) is not
+    /// held at all.
     #[must_use]
     pub fn with_failure_backoff(mut self, backoff: Duration) -> Self {
         self.failure_backoff = backoff;
@@ -537,6 +538,10 @@ impl Exchange for Static {
 ///
 /// Every value is already rendered: templating, secret resolution and any
 /// per-deployment substitution belong to the consumer.
+///
+/// The POST is always retried on the client's schedule, whatever the
+/// template's `retry_non_idempotent` says: the form carries nothing single-use,
+/// so resending it mints a credential and duplicates nothing.
 pub struct ClientCredentials {
     http: HttpClient,
     token_url: String,
@@ -551,8 +556,9 @@ impl ClientCredentials {
     /// Exchange these client credentials at `token_url`.
     ///
     /// `http` is the settings the exchange takes: it builds its own client from
-    /// them, because this exchange refuses redirects and replays its own POST
-    /// whatever the shared client does, a client-secret POST being safe to resend.
+    /// them, refusing redirects and always retrying its POST whatever the
+    /// template's `retry_non_idempotent` says, because a client-secret POST is
+    /// safe to resend.
     ///
     /// # Errors
     ///
@@ -643,19 +649,24 @@ impl Exchange for ClientCredentials {
 /// and signs a new assertion each time, so no key format or JWT library enters
 /// scalo.
 ///
-/// A single-use assertion is refused on a second sight, so the POST is not
-/// retried inside one exchange unless the template's `retry_non_idempotent`
-/// opts in.
+/// [`Self::new`] retries its POST inside one exchange only when the template's
+/// `retry_non_idempotent` opts in. [`Self::minted`] never does, because a retry
+/// would resend an assertion the endpoint may already have spent. Either way a
+/// transient failure is tried again by the next acquisition, and for a minted
+/// post that acquisition signs a fresh assertion.
 pub struct TokenPost {
     http: HttpClient,
     token_url: String,
     form: Vec<(String, String)>,
-    render: Option<Arc<RenderForm>>,
+    render: Option<Box<RenderForm>>,
     reading: TokenReading,
 }
 
+/// The form one render mints, boxed so every consumer closure stores as one type.
+type MintedForm = Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, AuthError>> + Send>>;
+
 /// A consumer's closure that renders a token post's form for one exchange.
-type RenderForm = dyn Fn() -> Result<Vec<(String, String)>, AuthError> + Send + Sync;
+type RenderForm = dyn Fn() -> MintedForm + Send + Sync;
 
 impl TokenPost {
     /// Post to `token_url` a form that is safe to resend: a session login, a
@@ -687,31 +698,45 @@ impl TokenPost {
     /// exchange: the RFC 7523 client assertion path, where a signed assertion
     /// carries a single-use `jti` and a short `exp` and so cannot be resent.
     ///
-    /// `render` runs once per acquisition, renewals included, and its fields
-    /// are posted after any added with [`Self::with_form_field`]. A render that
-    /// cannot mint (a key it cannot read, a signer that failed) returns an
-    /// [`AuthError`], usually [`AuthError::Unavailable`], which the exchange
-    /// hands back without posting anything. `http` is taken as for
-    /// [`Self::new`], so the POST is not retried inside one exchange unless the
-    /// template's `retry_non_idempotent` opts in: a retry would replay the same
-    /// assertion.
+    /// `render` returns a future, awaited once per acquisition, renewals
+    /// included, and inside the exchange's own deadline, so a signer that waits
+    /// on a KMS or a key fetched over the network holds no runtime thread while
+    /// it does. A render with nothing to await wraps its result:
+    /// `move || std::future::ready(sign())`. Its fields are posted after any
+    /// added with [`Self::with_form_field`]. A render that cannot mint (a key it
+    /// cannot read, a signer that failed) returns an [`AuthError`], usually
+    /// [`AuthError::Unavailable`], which the exchange hands back without posting
+    /// anything.
+    ///
+    /// `http` is the settings the exchange takes, with redirects refused as for
+    /// [`ClientCredentials::new`], but the POST is never retried inside one
+    /// exchange whatever the template's `retry_non_idempotent` says: a retry
+    /// would replay the same assertion. A transient failure is left to the next
+    /// acquisition, which mints a new one.
     ///
     /// # Errors
     ///
     /// Returns [`AuthError::Endpoint`] when `token_url` is not an https URL or
     /// a loopback address, and [`AuthError::Client`] when the exchange's own
     /// client cannot be built.
-    pub fn minted<F>(
+    pub fn minted<F, Fut>(
         http: &HttpClient,
         token_url: impl Into<String>,
         render: F,
     ) -> Result<Self, AuthError>
     where
-        F: Fn() -> Result<Vec<(String, String)>, AuthError> + Send + Sync + 'static,
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<(String, String)>, AuthError>> + Send + 'static,
     {
-        let mut post = Self::new(http, token_url)?;
-        post.render = Some(Arc::new(render));
-        Ok(post)
+        let token_url = token_url.into();
+        require_secure_endpoint(&token_url)?;
+        Ok(Self {
+            http: exchange_client(http, false)?,
+            token_url,
+            form: Vec::new(),
+            render: Some(Box::new(move || -> MintedForm { Box::pin(render()) })),
+            reading: TokenReading::default(),
+        })
     }
 
     /// Add a rendered form field, posted unchanged on every exchange.
@@ -742,7 +767,7 @@ impl fmt::Debug for TokenPost {
 impl Exchange for TokenPost {
     async fn acquire(&self) -> Result<Credential, AuthError> {
         let minted = match self.render {
-            Some(ref render) => render()?,
+            Some(ref render) => render().await?,
             None => Vec::new(),
         };
         let form: Vec<(&str, &str)> = self
@@ -1231,6 +1256,23 @@ mod tests {
         assert!(
             !timed_out.stands_for(3, Duration::from_secs(60)),
             "a transient failure is not held: the next caller tries again"
+        );
+
+        let unavailable = Failure::of(
+            &AuthError::Refused {
+                url: "https://idp.example/token".to_owned(),
+                status: 503,
+                detail: NO_REFUSAL_DETAIL.to_owned(),
+            },
+            3,
+        );
+        assert!(
+            unavailable.stands_for(2, Duration::ZERO),
+            "queued before it finished"
+        );
+        assert!(
+            !unavailable.stands_for(3, Duration::from_secs(60)),
+            "a 503 is not held for the backoff: the next caller asks again"
         );
     }
 

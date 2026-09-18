@@ -77,7 +77,8 @@ pub enum AuthError {
         /// What the one acquisition reported.
         message: String,
         /// Whether that failure was one another attempt could get past: the
-        /// endpoint unreachable or out of time, rather than a refusal.
+        /// endpoint unreachable, out of time, or answering 408, 429 or 5xx,
+        /// rather than refusing outright.
         transient: bool,
     },
 
@@ -106,21 +107,28 @@ pub enum AuthError {
 /// [`AuthError::is_transient`] says another attempt could get past it.
 impl AuthError {
     /// Whether another attempt could get past this failure: the endpoint was
-    /// unreachable or out of time, or a waiter was handed such a failure. A
-    /// refusal, a malformed response, an unusable endpoint and a credential the
-    /// consumer could not supply are the same answer next time.
+    /// unreachable or out of time, it answered with a status that says to come
+    /// back (408, 429 or any 5xx), or a waiter was handed such a failure. Any
+    /// other refusal, a malformed response, an unusable endpoint and a
+    /// credential the consumer could not supply are the same answer next time.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Unreachable { .. } | Self::TimedOut { .. } => true,
             Self::Shared { transient, .. } => *transient,
-            Self::Refused { .. }
-            | Self::Malformed { .. }
+            Self::Refused { status, .. } => is_transient_status(*status),
+            Self::Malformed { .. }
             | Self::Endpoint { .. }
             | Self::Client { .. }
             | Self::Unavailable { .. } => false,
         }
     }
+}
+
+/// Whether a token endpoint's refusal status says the same request may succeed
+/// shortly: it timed the request out, it is throttling, or it failed itself.
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
 }
 
 /// The endpoint an error is allowed to name: scheme, host, port and path.
@@ -234,6 +242,26 @@ mod tests {
             waited_on_a_timeout.is_retryable(),
             "a waiter retries the same way the caller that ran the exchange does"
         );
+    }
+
+    #[test]
+    fn a_refusal_that_says_come_back_is_transient_and_any_other_is_not() {
+        let refused = |status| AuthError::Refused {
+            url: "https://idp.example/token".to_owned(),
+            status,
+            detail: "error=temporarily_unavailable".to_owned(),
+        };
+        for status in [408, 429, 500, 502, 503, 504, 599] {
+            assert!(refused(status).is_transient(), "{status} says try again");
+            assert!(
+                SignError::from(refused(status)).is_retryable(),
+                "{status} is worth signing again"
+            );
+        }
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert!(!refused(status).is_transient(), "{status} is final");
+            assert!(!SignError::from(refused(status)).is_retryable());
+        }
     }
 
     #[test]
