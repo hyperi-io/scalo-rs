@@ -149,7 +149,8 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
 
     // Replicas, image, overrides
     out.push_str(&format!(
-        "# -- Number of replicas (ignored when KEDA is enabled)\n\
+        "# -- Number of replicas. Ignored while a KEDA ScaledObject or the HPA\n\
+         # fallback renders, since that then owns the replica count.\n\
          replicaCount: 1\n\
          \n\
          image:\n\
@@ -616,8 +617,38 @@ fn push_gated(out: &mut String, indent: &str, gate: Option<&String>, entry: &str
     }
 }
 
+/// When the fallback HPA renders: asked for, and KEDA not in charge.
+const HPA_GATE: &str = "and .Values.autoscaling.enabled (not .Values.keda.enabled)";
+
+/// When the ScaledObject renders. With no Kafka lag trigger the CPU trigger is
+/// the only one, and a ScaledObject with no triggers is rejected, so it exists
+/// only while CPU scaling is on.
+fn scaled_object_gate(keda: &KedaContract) -> &'static str {
+    if keda.kafka_trigger.enabled {
+        ".Values.keda.enabled"
+    } else {
+        "and .Values.keda.enabled .Values.keda.cpu.enabled"
+    }
+}
+
+/// When the Deployment sets `replicas` itself: exactly when neither the
+/// ScaledObject nor the HPA renders, because whichever renders owns the count
+/// and a Deployment without `replicas` runs one pod.
+fn replicas_gate(c: &DeploymentContract) -> String {
+    match c.enabled_keda() {
+        // The HPA renders only while KEDA is off, so beside a ScaledObject
+        // gated on KEDA alone the two conditions fold into one `or`.
+        Some(keda) if keda.kafka_trigger.enabled => {
+            "not (or .Values.keda.enabled .Values.autoscaling.enabled)".to_string()
+        }
+        Some(keda) => format!("not (or ({}) ({HPA_GATE}))", scaled_object_gate(keda)),
+        None => format!("not ({HPA_GATE})"),
+    }
+}
+
 fn gen_deployment_yaml(c: &DeploymentContract, gates: &[Option<String>]) -> String {
     let app = &c.app_name;
+    let replicas_if = replicas_gate(c);
     let mut out = String::with_capacity(4096);
 
     // Header
@@ -629,7 +660,7 @@ metadata:
   labels:
     {{{{- include "{app}.labels" . | nindent 4 }}}}
 spec:
-  {{{{- if not (or .Values.keda.enabled .Values.autoscaling.enabled) }}}}
+  {{{{- if {replicas_if} }}}}
   replicas: {{{{ .Values.replicaCount }}}}
   {{{{- end }}}}
   selector:
@@ -692,13 +723,14 @@ spec:
          \x20             protocol: TCP\n",
     );
     for (port, gate) in c.extra_ports.iter().zip(gates) {
+        // Kubernetes accepts only TCP, UDP and SCTP, in upper case.
         let entry = format!(
             "            - name: {name}\n\
              \x20             containerPort: {port}\n\
              \x20             protocol: {proto}\n",
             name = port.name,
             port = port.port,
-            proto = port.protocol,
+            proto = port.protocol.to_ascii_uppercase(),
         );
         push_gated(&mut out, "            ", gate.as_ref(), &entry);
     }
@@ -808,7 +840,7 @@ spec:
              \x20     protocol: {proto}\n\
              \x20     name: {name}\n",
             port = port.port,
-            proto = port.protocol,
+            proto = port.protocol.to_ascii_uppercase(),
             name = port.name,
         );
         push_gated(&mut out, "    ", gate.as_ref(), &entry);
@@ -920,7 +952,7 @@ fn gen_secret_yaml(c: &DeploymentContract) -> String {
 fn gen_hpa_yaml(c: &DeploymentContract) -> String {
     let app = &c.app_name;
     format!(
-        r#"{{{{- if and .Values.autoscaling.enabled (not .Values.keda.enabled) }}}}
+        r#"{{{{- if {HPA_GATE} }}}}
 # Standard HPA fallback -- use when KEDA operator is not installed.
 # Mutually exclusive with keda.enabled (KEDA creates its own HPA).
 apiVersion: autoscaling/v2
@@ -988,20 +1020,14 @@ fn gen_keda_scaledobject_yaml(
         });
     }
 
-    // With no Kafka lag trigger the CPU trigger is the only one, and a
-    // ScaledObject with no triggers is rejected, so it exists only while CPU is on.
-    let (gate, kafka_trigger, cpu_role) = if kafka_enabled {
+    let gate = scaled_object_gate(keda);
+    let (kafka_trigger, cpu_role) = if kafka_enabled {
         (
-            ".Values.keda.enabled",
             gen_keda_kafka_trigger(c, &keda.kafka_trigger)?,
             "secondary scaler",
         )
     } else {
-        (
-            "and .Values.keda.enabled .Values.keda.cpu.enabled",
-            String::new(),
-            "only scaler",
-        )
+        (String::new(), "only scaler")
     };
 
     Ok(format!(

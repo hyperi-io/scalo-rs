@@ -678,6 +678,140 @@ fn tier_a_chart_renders_a_gated_port_only_when_its_listener_is_on() {
 }
 
 // ============================================================================
+// Tier A -- replicas: exactly one owner of the replica count
+// ============================================================================
+
+/// What owns the replica count in one render of a chart.
+#[derive(Debug, PartialEq)]
+struct ReplicaOwners {
+    scaled_object: bool,
+    hpa: bool,
+    /// The Deployment's own `replicas`, when it sets one.
+    replicas: Option<u64>,
+}
+
+/// Render the whole chart with `extra_args` and report what owns the replica count.
+fn replica_owners(chart_dir: &Path, extra_args: &[&str]) -> ReplicaOwners {
+    use serde::Deserialize;
+
+    let out = Command::new("helm")
+        .args(["template", "test-release"])
+        .arg(chart_dir)
+        .args(extra_args)
+        .output()
+        .expect("helm template invocation");
+    assert!(
+        out.status.success(),
+        "helm template failed with {extra_args:?}: stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let docs: Vec<serde_yaml_ng::Value> = serde_yaml_ng::Deserializer::from_slice(&out.stdout)
+        .map(|doc| serde_yaml_ng::Value::deserialize(doc).expect("rendered document is YAML"))
+        .collect();
+    let of_kind = |kind: &str| docs.iter().find(|d| d["kind"].as_str() == Some(kind));
+    ReplicaOwners {
+        scaled_object: of_kind("ScaledObject").is_some(),
+        hpa: of_kind("HorizontalPodAutoscaler").is_some(),
+        replicas: of_kind("Deployment").expect("a Deployment")["spec"]["replicas"].as_u64(),
+    }
+}
+
+/// A Deployment without `replicas` runs one pod, so whenever neither a
+/// ScaledObject nor the HPA renders the Deployment must set `replicaCount`.
+#[test]
+fn tier_a_chart_sets_replicas_whenever_no_scaler_renders() {
+    if !helm_available() {
+        skip(
+            "tier-a",
+            "tier_a_chart_sets_replicas_whenever_no_scaler_renders",
+            "helm CLI not available",
+        );
+        return;
+    }
+
+    let kafka = keda_contract(serde_json::json!({
+        "kafka": { "brokers": ["kafka:9092"], "group_id": "g", "topics": ["events"] }
+    }));
+    let mut cpu_only = kafka.clone();
+    cpu_only.keda = cpu_only
+        .keda
+        .map(|k| k.with_kafka_trigger(KafkaLagTrigger::disabled()));
+    let no_keda = test_contract();
+
+    let owned_by = |scaled_object, hpa, replicas| ReplicaOwners {
+        scaled_object,
+        hpa,
+        replicas,
+    };
+    let keda_off = ["--set", "keda.enabled=false"];
+    let hpa_on = ["--set", "autoscaling.enabled=true"];
+    let cases: Vec<(&str, &DeploymentContract, Vec<&str>, ReplicaOwners)> = vec![
+        ("kafka", &kafka, vec![], owned_by(true, false, None)),
+        (
+            "kafka",
+            &kafka,
+            keda_off.to_vec(),
+            owned_by(false, false, Some(3)),
+        ),
+        (
+            "kafka",
+            &kafka,
+            [keda_off, hpa_on].concat(),
+            owned_by(false, true, None),
+        ),
+        ("cpu-only", &cpu_only, vec![], owned_by(true, false, None)),
+        (
+            "cpu-only",
+            &cpu_only,
+            vec!["--set", "keda.cpu.enabled=false"],
+            owned_by(false, false, Some(3)),
+        ),
+        (
+            "cpu-only",
+            &cpu_only,
+            vec![
+                "--set",
+                "keda.cpu.enabled=false",
+                "--set",
+                "autoscaling.enabled=true",
+            ],
+            owned_by(false, false, Some(3)),
+        ),
+        (
+            "cpu-only",
+            &cpu_only,
+            [keda_off, hpa_on].concat(),
+            owned_by(false, true, None),
+        ),
+        ("no keda", &no_keda, vec![], owned_by(false, false, Some(3))),
+        (
+            "no keda",
+            &no_keda,
+            hpa_on.to_vec(),
+            owned_by(false, true, None),
+        ),
+        (
+            "no keda",
+            &no_keda,
+            vec!["--set", "keda.enabled=true"],
+            owned_by(false, false, Some(3)),
+        ),
+    ];
+
+    for (label, contract, args, expected) in cases {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let chart_dir = tmp.path().join("chart");
+        generate_chart(contract, &chart_dir, None).expect("generate_chart");
+        let args = [&["--set", "replicaCount=3"][..], &args[..]].concat();
+        assert_eq!(
+            replica_owners(&chart_dir, &args),
+            expected,
+            "{label} contract with {args:?}"
+        );
+    }
+}
+
+// ============================================================================
 // Tier A -- ArgoCD Application: kubeconform
 // ============================================================================
 

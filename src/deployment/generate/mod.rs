@@ -1054,6 +1054,76 @@ mod tests {
         assert!(values.contains("  cpu:\n    enabled: true\n"));
     }
 
+    /// Kubernetes accepts only TCP, UDP and SCTP in upper case, so a contract
+    /// spelling the protocol in lower case must still render a valid manifest.
+    #[test]
+    fn test_chart_writes_port_protocols_in_upper_case() {
+        let mut contract = test_contract();
+        contract.extra_ports = vec![
+            PortContract {
+                protocol: "tcp".into(),
+                ..PortContract::tcp("http", 8080)
+            },
+            PortContract {
+                protocol: "udp".into(),
+                ..PortContract::udp("netflow", 2055)
+            },
+            PortContract {
+                protocol: "Sctp".into(),
+                ..PortContract::tcp("diameter", 3868)
+            },
+        ];
+        let files = render_chart(&contract);
+        for name in ["templates/deployment.yaml", "templates/service.yaml"] {
+            let text = &files[name];
+            let protocols: Vec<&str> = text
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("protocol: "))
+                .collect();
+            assert_eq!(protocols, ["TCP", "TCP", "UDP", "SCTP"], "{name}:\n{text}");
+        }
+    }
+
+    /// Whatever renders owns the replica count -- the ScaledObject, else the
+    /// HPA -- and the Deployment sets `replicas` exactly when neither does,
+    /// since a Deployment without it runs one pod.
+    #[test]
+    fn test_deployment_replicas_gate_is_the_inverse_of_every_scaler() {
+        let replicas_gate = |contract: &DeploymentContract| {
+            let files = render_chart(contract);
+            files["templates/deployment.yaml"]
+                .lines()
+                .take_while(|line| !line.contains("replicas:"))
+                .last()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+
+        // The Kafka lag trigger renders the ScaledObject whenever KEDA is on,
+        // and the HPA only while it is off, so the gate folds to this.
+        assert_eq!(
+            replicas_gate(&test_contract()),
+            "{{- if not (or .Values.keda.enabled .Values.autoscaling.enabled) }}"
+        );
+
+        let mut cpu_only = test_contract();
+        cpu_only.keda =
+            Some(KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled()));
+        assert_eq!(
+            replicas_gate(&cpu_only),
+            "{{- if not (or (and .Values.keda.enabled .Values.keda.cpu.enabled) \
+             (and .Values.autoscaling.enabled (not .Values.keda.enabled))) }}"
+        );
+
+        let mut no_keda = test_contract();
+        no_keda.keda = None;
+        assert_eq!(
+            replicas_gate(&no_keda),
+            "{{- if not (and .Values.autoscaling.enabled (not .Values.keda.enabled)) }}"
+        );
+    }
+
     #[test]
     fn test_keda_with_no_trigger_at_all_is_rejected() {
         let mut contract = test_contract();

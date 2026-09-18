@@ -110,6 +110,12 @@ coordinators) set `keda: None`, or build the contract from a
 KEDA operator still scale on CPU by setting `autoscaling.enabled: true`
 and `keda.enabled: false`.
 
+The Deployment sets `replicas: <replicaCount>` exactly when neither the
+ScaledObject nor the HPA renders, because whichever renders owns the
+replica count and a Deployment without `replicas` runs one pod. That
+includes a CPU-only chart installed with `keda.cpu.enabled: false`,
+where no ScaledObject renders even though `keda.enabled` is true.
+
 ---
 
 ## Generated `ScaledObject`
