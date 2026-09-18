@@ -10,6 +10,8 @@
 
 use crate::deployment::contract::{DeploymentContract, ImageProfile};
 
+use super::common::udp_port_suffix;
+
 // ============================================================================
 // Dockerfile
 // ============================================================================
@@ -33,14 +35,7 @@ pub fn generate_dockerfile(
 ) -> String {
     let binary = contract.binary();
 
-    // EXPOSE line: metrics_port + extra ports
-    let expose_ports = {
-        let mut ports = vec![contract.metrics_port.to_string()];
-        for p in &contract.extra_ports {
-            ports.push(p.port.to_string());
-        }
-        ports.join(" ")
-    };
+    let expose_ports = expose_ports(contract);
 
     // CMD line
     let cmd = if contract.entrypoint_args.is_empty() {
@@ -143,13 +138,7 @@ pub fn generate_runtime_stage(contract: &DeploymentContract) -> String {
         &contract.oci_labels.title
     };
 
-    let expose_ports = {
-        let mut ports = vec![contract.metrics_port.to_string()];
-        for p in &contract.extra_ports {
-            ports.push(p.port.to_string());
-        }
-        ports.join(" ")
-    };
+    let expose_ports = expose_ports(contract);
 
     let cmd = if contract.entrypoint_args.is_empty() {
         String::new()
@@ -210,6 +199,16 @@ ENTRYPOINT ["{binary}"]{cmd}
         liveness_path = contract.health.liveness_path,
         cmd = cmd,
     )
+}
+
+/// The EXPOSE line's ports: the metrics port, then each extra port, with UDP
+/// ports marked since a bare port number means TCP.
+fn expose_ports(contract: &DeploymentContract) -> String {
+    let mut ports = vec![contract.metrics_port.to_string()];
+    for p in &contract.extra_ports {
+        ports.push(format!("{}{}", p.port, udp_port_suffix(&p.protocol)));
+    }
+    ports.join(" ")
 }
 
 /// Diagnostic tools installed in development images.

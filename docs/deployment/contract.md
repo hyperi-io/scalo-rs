@@ -244,7 +244,7 @@ release-specific and a digest carries no codename.
 | `DeploymentContract::config_filename()` / `config_dir()` | Split `config_mount_path` |
 | `ImageProfile::{Production, Development}` | Profile enum |
 | `HealthContract` | `/livez` / `/readyz` / `/metrics` paths |
-| `PortContract` | Extra container port beyond `metrics_port` |
+| `PortContract` | Extra container port beyond `metrics_port`; a `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` as `514/udp` |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |
 | `SecretEnvContract` | Single env var sourced from a Secret key |
 | `OciLabels` | Static OCI labels (`title`, `description`, `vendor`, `licenses`, `copyright`) |

@@ -259,6 +259,63 @@ mod tests {
         assert!(dockerfile.contains("EXPOSE 9090 8080"));
     }
 
+    /// Mixed TCP and UDP extra ports, the UDP ones spelt in both cases.
+    fn mixed_protocol_ports() -> Vec<PortContract> {
+        vec![
+            PortContract {
+                name: "http".into(),
+                port: 8080,
+                protocol: "TCP".into(),
+            },
+            PortContract {
+                name: "syslog".into(),
+                port: 514,
+                protocol: "UDP".into(),
+            },
+            PortContract {
+                name: "netflow".into(),
+                port: 2055,
+                protocol: "udp".into(),
+            },
+        ]
+    }
+
+    /// EXPOSE without a protocol means TCP, so a UDP port has to say so.
+    #[test]
+    fn test_dockerfile_exposes_udp_ports_as_udp() {
+        let mut contract = test_contract();
+        contract.extra_ports = mixed_protocol_ports();
+
+        let dockerfile = generate_dockerfile(&contract, None);
+        assert!(
+            dockerfile.contains("\nEXPOSE 9090 8080 514/udp 2055/udp\n"),
+            "UDP ports exposed as TCP:\n{dockerfile}"
+        );
+
+        let runtime = generate_runtime_stage(&contract);
+        assert!(
+            runtime.contains("\nEXPOSE 9090 8080 514/udp 2055/udp\n"),
+            "UDP ports exposed as TCP in the runtime stage:\n{runtime}"
+        );
+    }
+
+    /// A compose port with no protocol publishes TCP only, so a UDP listener
+    /// would be unreachable from the host.
+    #[test]
+    fn test_compose_publishes_udp_ports_as_udp() {
+        let mut contract = test_contract();
+        contract.extra_ports = mixed_protocol_ports();
+
+        let compose = generate_compose_fragment(&contract);
+        assert!(
+            compose.contains(
+                "    ports:\n      - \"9090:9090\"\n      - \"8080:8080\"\n      \
+                 - \"514:514/udp\"\n      - \"2055:2055/udp\"\n"
+            ),
+            "UDP ports published as TCP:\n{compose}"
+        );
+    }
+
     #[test]
     fn test_generate_compose_fragment() {
         let contract = test_contract();

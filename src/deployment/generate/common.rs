@@ -70,6 +70,16 @@ pub(super) fn safe_template_lookup(base: &str, key: &str) -> String {
     }
 }
 
+/// The `/udp` suffix Docker and Compose need on a UDP port, since a bare port
+/// number means TCP to both; empty for any other protocol.
+pub(super) fn udp_port_suffix(protocol: &str) -> &'static str {
+    if protocol.eq_ignore_ascii_case("udp") {
+        "/udp"
+    } else {
+        ""
+    }
+}
+
 pub(super) fn write_file(path: impl AsRef<Path>, content: &str) -> Result<(), DeploymentError> {
     let path = path.as_ref();
     std::fs::write(path, content).map_err(|e| DeploymentError::WriteFile {

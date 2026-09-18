@@ -10,6 +10,8 @@
 
 use crate::deployment::contract::DeploymentContract;
 
+use super::common::udp_port_suffix;
+
 // ============================================================================
 // Docker Compose fragment
 // ============================================================================
@@ -53,7 +55,11 @@ pub fn generate_compose_fragment(contract: &DeploymentContract) -> String {
         contract.metrics_port, contract.metrics_port
     ));
     for p in &contract.extra_ports {
-        out.push_str(&format!("      - \"{}:{}\"\n", p.port, p.port));
+        out.push_str(&format!(
+            "      - \"{port}:{port}{proto}\"\n",
+            port = p.port,
+            proto = udp_port_suffix(&p.protocol),
+        ));
     }
 
     // Volumes -- config file mount
