@@ -187,7 +187,7 @@ mod tests {
             env_prefix: "APP".into(),
             metric_prefix: "app".into(),
             config_mount_path: "/etc/app/config.yaml".into(),
-            image_registry: "ghcr.io/hyperi-io".into(),
+            image_registry: "ghcr.io/example".into(),
             extra_ports,
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],
@@ -212,10 +212,10 @@ mod tests {
             .collect()
     }
 
-    /// The archiver binds a push listener only on the grpc transport, and its
-    /// default address is null, yet it must still be declared.
+    /// A push listener bound only on the grpc transport, with a null default
+    /// address, must still be declared.
     #[test]
-    fn test_archiver_shape_needs_its_push_port_declared() {
+    fn test_a_push_listener_gated_on_a_transport_must_be_declared() {
         let config = serde_json::json!({ "transport": "kafka", "grpc": { "listen": null } });
         let bare = contract(config.clone(), vec![]);
         let findings = bare.undeclared_listeners();
@@ -234,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn test_loader_shape_metrics_address_must_match_metrics_port() {
+    fn test_the_metrics_address_must_match_metrics_port() {
         let wrong = contract(
             serde_json::json!({ "metrics": { "address": "0.0.0.0:9091" } }),
             vec![],
@@ -253,8 +253,8 @@ mod tests {
     }
 
     #[test]
-    fn test_vrl_shape_declared_port_must_match_the_address() {
-        let vrl = contract(
+    fn test_a_declared_port_must_match_the_address_it_serves() {
+        let mismatched = contract(
             serde_json::json!({
                 "source": { "transport": "bus", "grpc": { "listen": "0.0.0.0:6000" } }
             }),
@@ -264,7 +264,7 @@ mod tests {
                     .bound_from("source.grpc.listen"),
             ],
         );
-        let findings = vrl.undeclared_listeners();
+        let findings = mismatched.undeclared_listeners();
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].field, "listener source.grpc.listen");
         assert_eq!(findings[0].expected, "port 50051 (extra_ports[push])");
@@ -278,7 +278,7 @@ mod tests {
     /// Syslog binds 514 on TCP and on UDP from two keys; declaring only the
     /// TCP port leaves the UDP listener undeclared.
     #[test]
-    fn test_receiver_shape_finds_the_undeclared_udp_listener() {
+    fn test_a_tcp_and_udp_listener_pair_needs_both_ports() {
         let config = serde_json::json!({
             "syslog": {
                 "enabled": false,

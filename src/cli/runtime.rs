@@ -15,7 +15,8 @@
 //! ## What's included (always)
 //!
 //! - [`MetricsManager`] -- started, serving `/metrics`, `/livez`, `/readyz`
-//! - [`ServiceMetrics`] -- platform `dfe_*` metrics registered
+//! - [`ServiceMetrics`] -- the platform data-plane metrics, registered under
+//!   bare names or the `metrics.namespace` prefix
 //! - [`MemoryGuard`] -- cgroup-aware, auto-detected from env prefix
 //! - [`CancellationToken`] -- signal handler installed with K8s pre-stop delay
 //! - [`RuntimeContext`] -- K8s/Docker/BareMetal metadata
@@ -56,7 +57,9 @@ pub struct ServiceRuntime {
     /// Use for registering app-specific metrics and metric groups.
     pub metrics: MetricsManager,
 
-    /// Platform data-plane metrics (`dfe_*` counters/gauges). Already registered.
+    /// Platform data-plane metrics (transport, pipeline, records, scaling,
+    /// spool), under bare names or the `metrics.namespace` prefix. Already
+    /// registered.
     pub dfe: Arc<crate::metrics::ServiceMetrics>,
 
     /// Cgroup-aware memory guard. Tracks memory usage for backpressure.

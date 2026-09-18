@@ -812,14 +812,14 @@ mod tests {
 
     #[test]
     fn test_port_condition_serde_shape() {
-        let port = PortContract::udp("vrl", 6000)
+        let port = PortContract::udp("relay", 6000)
             .when_one_of("config.source.transport", ["direct", "grpc"])
             .bound_from("source.grpc.listen");
         let json = serde_json::to_value(&port).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
-                "name": "vrl", "port": 6000, "protocol": "UDP",
+                "name": "relay", "port": 6000, "protocol": "UDP",
                 "when": { "kind": "one_of", "path": "config.source.transport",
                           "values": ["direct", "grpc"] },
                 "bound_from": "source.grpc.listen",

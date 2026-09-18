@@ -55,10 +55,10 @@ pub trait ServiceApp: Sized {
     /// Application-specific configuration type.
     type Config: DeserializeOwned + Debug + Send + Sync;
 
-    /// Service name (e.g. "dfe-loader").
+    /// Service name (e.g. "my-service").
     fn name(&self) -> &str;
 
-    /// Environment variable prefix for config cascade (e.g. "DFE_LOADER").
+    /// Environment variable prefix for config cascade (e.g. "MY_SERVICE").
     fn env_prefix(&self) -> &str;
 
     /// Version information for this service.
@@ -859,10 +859,10 @@ mod tests {
         }
     }
 
-    /// An archiver-shaped service: a push listener that binds only on the grpc
-    /// transport, with a null default address, and `extra_ports` beside metrics.
+    /// A service with a push listener that binds only on the grpc transport,
+    /// with a null default address, and `extra_ports` beside metrics.
     #[cfg(feature = "deployment")]
-    fn archiver_app(extra_ports: Vec<crate::deployment::PortContract>) -> ContractApp {
+    fn push_gated_app(extra_ports: Vec<crate::deployment::PortContract>) -> ContractApp {
         use crate::deployment::{
             DeploymentContract, HealthContract, ImageProfile, NativeDepsContract, OciLabels,
         };
@@ -878,7 +878,7 @@ mod tests {
                 env_prefix: "CONTRACT_APP".into(),
                 metric_prefix: "contract_app".into(),
                 config_mount_path: "/etc/contract-app/config.yaml".into(),
-                image_registry: "ghcr.io/hyperi-io".into(),
+                image_registry: "ghcr.io/example".into(),
                 extra_ports,
                 unbound_listen_paths: vec![],
                 entrypoint_args: vec![],
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn generate_artefacts_refuses_an_undeclared_listener_before_writing() {
         let out = tempfile::tempdir().unwrap();
-        let err = generate_into(&archiver_app(vec![]), out.path())
+        let err = generate_into(&push_gated_app(vec![]), out.path())
             .expect_err("an undeclared listener is refused");
 
         assert!(matches!(err, CliError::Service(_)), "{err:?}");
@@ -938,7 +938,7 @@ mod tests {
             .when_equals("config.transport", "grpc")
             .bound_from("grpc.listen");
         let out = tempfile::tempdir().unwrap();
-        let err = generate_into(&archiver_app(vec![port]), out.path())
+        let err = generate_into(&push_gated_app(vec![port]), out.path())
             .expect_err("a port name Kubernetes refuses is refused here first");
 
         assert!(err.to_string().contains("extra_ports[0].name"), "{err}");
@@ -956,7 +956,7 @@ mod tests {
             .when_equals("config.transport", "grpc")
             .bound_from("grpc.listen");
         let out = tempfile::tempdir().unwrap();
-        generate_into(&archiver_app(vec![push]), out.path()).expect("a declared listener passes");
+        generate_into(&push_gated_app(vec![push]), out.path()).expect("a declared listener passes");
         assert!(out.path().join("deployment-contract.json").is_file());
     }
 }

@@ -49,7 +49,7 @@ pub enum StandardCommand {
     ///
     /// Produces metrics manifest, deployment contract, and container spec
     /// in the specified output directory. Use in CI post-build:
-    /// `dfe-loader generate-artefacts --output-dir docs/`
+    /// `my-service generate-artefacts --output-dir docs/`
     #[command(name = "generate-artefacts")]
     GenerateArtefacts(GenerateArtefactsArgs),
 
@@ -59,11 +59,12 @@ pub enum StandardCommand {
     /// derived from the app's `Config` and capability catalog into the target
     /// directory (scalo-rs#6). Also produced by `generate-artefacts`. Use to
     /// refresh the committed contract; a drift test then keeps it honest:
-    /// `dfe-loader config-schema --dir docs/`
+    /// `my-service config-schema --dir docs/`
     #[command(name = "config-schema")]
     ConfigSchema(ConfigSchemaArgs),
 
-    /// Live metrics dashboard (like `vector top`).
+    /// Live metrics dashboard in the terminal: a sortable table polled from the
+    /// service's Prometheus `/metrics` endpoint.
     #[cfg(feature = "top")]
     Top(TopArgs),
 }

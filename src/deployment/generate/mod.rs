@@ -326,7 +326,7 @@ mod tests {
             PortContract::tcp("http", 8080),
             PortContract::tcp("grpc", 6000).when_enabled("config.grpc.enabled"),
             PortContract::tcp("push", 6001).when_equals("config.source.transport", "direct"),
-            PortContract::udp("vrl", 6002)
+            PortContract::udp("relay", 6002)
                 .when_one_of("config.source.transport", ["direct", "grpc"]),
         ]
     }
@@ -412,7 +412,7 @@ mod tests {
                  \x20             protocol: TCP\n\
                  \x20           {{- end }}\n\
                  \x20           {{- if has (toString ((.Values.config).source).transport) (list \"direct\" \"grpc\") }}\n\
-                 \x20           - name: vrl\n\
+                 \x20           - name: relay\n\
                  \x20             containerPort: 6002\n\
                  \x20             protocol: UDP\n\
                  \x20           {{- end }}\n\
@@ -444,7 +444,7 @@ mod tests {
                  \x20   - port: 6002\n\
                  \x20     targetPort: 6002\n\
                  \x20     protocol: UDP\n\
-                 \x20     name: vrl\n\
+                 \x20     name: relay\n\
                  \x20   {{- end }}\n\
                  \x20 selector:\n"
             ),
@@ -505,7 +505,7 @@ mod tests {
              # Conditional listeners, not EXPOSEd -- publish explicitly when enabled:\n\
              #   6000/tcp grpc -- when config.grpc.enabled is true\n\
              #   6001/tcp push -- when config.source.transport is \"direct\"\n\
-             #   6002/udp vrl -- when config.source.transport is one of \"direct\", \"grpc\"\n\
+             #   6002/udp relay -- when config.source.transport is one of \"direct\", \"grpc\"\n\
              \nHEALTHCHECK";
         for (name, text) in [
             ("dockerfile", generate_dockerfile(&contract, None)),
@@ -529,7 +529,7 @@ mod tests {
                   "when": { "kind": "enabled", "path": "config.grpc.enabled" } },
                 { "name": "push", "port": 6001, "protocol": "TCP",
                   "when": { "kind": "equals", "path": "config.source.transport", "value": "direct" } },
-                { "name": "vrl", "port": 6002, "protocol": "UDP",
+                { "name": "relay", "port": 6002, "protocol": "UDP",
                   "when": { "kind": "one_of", "path": "config.source.transport",
                             "values": ["direct", "grpc"] } },
             ])
@@ -878,14 +878,11 @@ mod tests {
         );
     }
 
-    /// Regression for the dfe-receiver canary 2026-05-25 finding:
-    /// keda-scaledobject.yaml previously used
-    /// `default (index .Values.config.kafka.topics 0)` which `helm lint`
-    /// rejects with `error calling index: index of untyped nil` because
-    /// Sprig's `default` evaluates both operands. The render must now
-    /// use a conditional `if/else if/else` block instead, and take the first
-    /// topic by splitting a joined string, because `index` on a string topic
-    /// yields a byte rather than the topic.
+    /// `helm lint` rejects `default (index .Values.config.kafka.topics 0)` with
+    /// `index of untyped nil`, because Sprig's `default` evaluates both
+    /// operands, so the topic lookup is an `if/else if/else` block, and it takes
+    /// the first topic by splitting a joined string because `index` on a string
+    /// topic yields a byte rather than the topic.
     #[test]
     fn test_keda_scaledobject_topic_lookup_is_lint_safe() {
         let contract = test_contract();
@@ -1331,12 +1328,10 @@ mod tests {
     }
 
     /// KEDA's Kafka scaler takes `sasl` (the MECHANISM), `username` and
-    /// `password`. The generator used to hand the username to `sasl` and supply
-    /// no `username` at all, while the trigger set `saslType`, which is not a
-    /// recognised key -- so the mechanism arrived nowhere, no username arrived,
-    /// and `password` was the only correctly wired parameter of the three.
-    /// Authentication could not succeed, so the scaler never read lag and the
-    /// app never scaled. Every DFE app that ships a generated chart had this.
+    /// `password`, and ignores `saslType`, so the TriggerAuthentication binds
+    /// the username to `username` and the trigger names the mechanism under
+    /// `sasl`; wired any other way, authentication fails and the scaler never
+    /// reads lag.
     #[test]
     fn test_keda_kafka_auth_uses_the_parameters_keda_recognises() {
         let contract = test_contract();
@@ -1372,18 +1367,17 @@ mod tests {
         );
     }
 
-    /// Regression for the dfe-receiver canary 2026-05-25 finding:
-    /// secret.yaml previously emitted `.Values.x.bearer-tokens` which
-    /// Go templates reject ("bad character U+002D '-'"). The render
-    /// must now use the `(index .Values.x "bearer-tokens")` form.
+    /// Go templates reject a dot-walked `.Values.x.bearer-tokens` ("bad
+    /// character U+002D '-'"), so a hyphenated key renders in the
+    /// `(index .Values.x "bearer-tokens")` form.
     #[test]
     fn test_secret_yaml_handles_hyphenated_key_names() {
         let mut contract = test_contract();
-        // dfe-receiver-style hyphenated key_name (token group)
+        // A hyphenated key_name, as a token group carries.
         contract.secrets.push(SecretGroupContract {
             group_name: "auth".into(),
             env_vars: vec![SecretEnvContract {
-                env_var: "DFE_RECEIVER__AUTH__BEARER_TOKENS".into(),
+                env_var: "MY_APP__AUTH__BEARER_TOKENS".into(),
                 key_name: "bearer-tokens".into(),
                 secret_key: "bearer-tokens".into(),
             }],
