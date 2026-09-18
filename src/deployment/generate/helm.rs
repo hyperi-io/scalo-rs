@@ -32,11 +32,10 @@ use super::common::{is_go_identifier, safe_template_lookup, to_camel_suffix, wri
 /// # Errors
 ///
 /// Returns `DeploymentError` if files or directories cannot be created, or
-/// [`DeploymentError::InvalidContract`] if the KEDA contract or a port's `when`
-/// names a values path that is not a dotted chain of Go identifiers, a `one_of`
-/// port condition lists no values, a port's protocol is not TCP, UDP or SCTP
-/// (any case), or the KEDA contract turns off both the Kafka lag trigger and
-/// the CPU trigger while leaving KEDA on.
+/// [`DeploymentError::InvalidContract`] if the contract fails
+/// [`DeploymentContract::validate`], the KEDA contract or a port's `when` names
+/// a values path that is not a dotted chain of Go identifiers, or a `one_of`
+/// port condition lists no values.
 pub fn generate_chart(
     contract: &DeploymentContract,
     output_dir: impl AsRef<Path>,
@@ -70,7 +69,7 @@ pub(crate) fn chart_files(
     contract: &DeploymentContract,
     identity: Option<&crate::deployment::ContractIdentity>,
 ) -> Result<Vec<(&'static str, String)>, DeploymentError> {
-    check_port_protocols(contract)?;
+    contract.validate()?;
     let gates = port_gates(contract)?;
     let keda_templates = match contract.enabled_keda() {
         Some(keda) => Some((
@@ -154,8 +153,8 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
 
     // Replicas, image, overrides
     out.push_str(&format!(
-        "# -- Number of replicas. Ignored while a KEDA ScaledObject or the HPA\n\
-         # fallback renders, since that then owns the replica count.\n\
+        "# -- Number of replicas, ignored while a KEDA ScaledObject or the HPA\n\
+         # fallback renders, because that then owns the replica count.\n\
          replicaCount: 1\n\
          \n\
          image:\n\
@@ -566,26 +565,6 @@ fn gen_observability_env(app: &str) -> String {
     out
 }
 
-/// Refuse an extra port whose protocol, compared without case, is not TCP, UDP
-/// or SCTP, since Kubernetes takes no other and the manifests would not apply.
-fn check_port_protocols(c: &DeploymentContract) -> Result<(), DeploymentError> {
-    const KUBERNETES_PROTOCOLS: [&str; 3] = ["TCP", "UDP", "SCTP"];
-    match c.extra_ports.iter().find(|port| {
-        !KUBERNETES_PROTOCOLS
-            .iter()
-            .any(|known| port.protocol.eq_ignore_ascii_case(known))
-    }) {
-        Some(port) => Err(DeploymentError::InvalidContract {
-            field: format!("extra_ports[{}].protocol", port.name),
-            reason: format!(
-                "`{}` is not a protocol Kubernetes takes -- use TCP, UDP or SCTP",
-                port.protocol
-            ),
-        }),
-        None => Ok(()),
-    }
-}
-
 /// The template condition each extra port renders under, in `extra_ports`
 /// order; `None` for a port that always listens.
 fn port_gates(c: &DeploymentContract) -> Result<Vec<Option<String>>, DeploymentError> {
@@ -764,9 +743,8 @@ spec:
     out.push_str("          env:\n");
     out.push_str(&gen_observability_env(app));
 
-    // Env vars from secrets. No emptiness guard: it used to suppress the `env:`
-    // header, which now always precedes this, so it would only be wrapping a
-    // loop that already iterates zero times.
+    // Env vars from secrets, under the `env:` header written above whatever
+    // the secret count.
     for group in &c.secrets {
         let helper_name = format!("{}SecretName", to_camel_suffix(&group.group_name));
         out.push_str(&format!(
@@ -1035,16 +1013,6 @@ fn gen_keda_scaledobject_yaml(
 ) -> Result<String, DeploymentError> {
     let app = &c.app_name;
     let kafka_enabled = keda.kafka_trigger.enabled;
-
-    if !kafka_enabled && !keda.cpu_enabled {
-        return Err(DeploymentError::InvalidContract {
-            field: "keda".to_string(),
-            reason: "the Kafka lag trigger and the CPU trigger are both off, so KEDA would \
-                     have nothing to scale on; set `keda: None` to turn autoscaling off"
-                .to_string(),
-        });
-    }
-
     let gate = scaled_object_gate(keda);
     let (kafka_trigger, cpu_role) = if kafka_enabled {
         (
@@ -1103,9 +1071,7 @@ fn gen_keda_kafka_trigger(
                 "      authenticationRef:\n\
                  \x20       name: {{{{ include \"{app}.fullname\" . }}}}-kafka-auth\n"
             ),
-            "        # `sasl`, not `saslType`: the kafka trigger replaced the old `authMode`\n\
-             \x20       # property with `sasl` + `tls`, and an unrecognised key is ignored, so\n\
-             \x20       # the mechanism was being supplied nowhere at all.\n\
+            "        # The kafka trigger reads its SASL mechanism from `sasl` and ignores a key it does not know.\n\
              \x20       sasl: scram_sha512\n",
         )
     } else {
@@ -1118,8 +1084,8 @@ fn gen_keda_kafka_trigger(
 {auth_ref}      metadata:
         bootstrapServers: {{{{ join "," {brokers} | quote }}}}
         consumerGroup: {{{{ .Values.keda.kafka.consumerGroup | default {group} | quote }}}}
-        {{{{- /* A conditional, not `default`, which evaluates both operands; and the
-            topics are joined then split, not indexed, as `index` on a string yields a byte. */}}}}
+        {{{{- /* A conditional because `default` evaluates both operands, and the topics are
+            joined then split because `index` on a string yields a byte. */}}}}
         {{{{- $topics := join "," {topics} }}}}
         {{{{- if .Values.keda.kafka.topic }}}}
         topic: {{{{ .Values.keda.kafka.topic | quote }}}}

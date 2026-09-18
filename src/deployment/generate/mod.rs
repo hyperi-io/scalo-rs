@@ -1128,6 +1128,129 @@ mod tests {
         }
     }
 
+    /// One extra port per fault the contract check names, with the field it names.
+    fn faulty_ports() -> Vec<(PortContract, &'static str)> {
+        let name = "extra_ports[0].name";
+        vec![
+            (PortContract::tcp("Web", 8080), name),
+            (PortContract::tcp("web_api", 8080), name),
+            (PortContract::tcp("a-port-name-too-long", 8080), name),
+            (PortContract::tcp("8080", 8080), name),
+            (PortContract::tcp("-web", 8080), name),
+            (PortContract::tcp("web-", 8080), name),
+            (PortContract::tcp("we--b", 8080), name),
+            (PortContract::tcp("", 8080), name),
+            (PortContract::tcp("web\nEXPOSE 22", 8080), name),
+            (
+                PortContract {
+                    protocol: "http".into(),
+                    ..PortContract::tcp("web", 8080)
+                },
+                "extra_ports[web].protocol",
+            ),
+            (
+                PortContract::tcp("web", 8080).when_equals("config.mode\nRUN id", "on"),
+                "extra_ports[web].when",
+            ),
+            (
+                PortContract::tcp("web", 8080).when_equals("config.mode", "on\nRUN id"),
+                "extra_ports[web].when",
+            ),
+            (
+                PortContract::tcp("web", 8080).when_one_of("config.mode", ["on", "off\ny: 1"]),
+                "extra_ports[web].when",
+            ),
+            (
+                PortContract::tcp("web", 8080).bound_from("web.listen\r"),
+                "extra_ports[web].bound_from",
+            ),
+        ]
+    }
+
+    /// Every generator that can refuse a contract refuses each fault the one
+    /// contract check names, before it writes anything.
+    #[test]
+    fn test_every_refusing_generator_refuses_a_faulty_port() {
+        for (port, field) in faulty_ports() {
+            let mut contract = test_contract();
+            contract.extra_ports = vec![port];
+
+            let dir = tempfile::tempdir().unwrap();
+            let err = generate_chart(&contract, dir.path(), None).expect_err(field);
+            assert!(
+                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
+                "chart, {field}: {err}"
+            );
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "a rejected contract left files behind"
+            );
+
+            let err = generate_container_manifest(&contract).expect_err(field);
+            assert!(err.contains(field), "container manifest, {field}: {err}");
+
+            let err =
+                crate::deployment::check_chart_drift(&contract, dir.path(), &[]).expect_err(field);
+            assert!(
+                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
+                "chart drift check, {field}: {err}"
+            );
+        }
+    }
+
+    /// The Dockerfile and Compose generators return text rather than a Result,
+    /// so a control character reaching them is written as its escape and
+    /// cannot start an instruction or key of its own.
+    #[test]
+    fn test_text_generators_keep_a_control_character_on_its_comment_line() {
+        let mut contract = test_contract();
+        contract.extra_ports = vec![
+            PortContract::tcp("web\nEXPOSE 22", 8080).when_equals("config.mode", "on\nRUN id"),
+        ];
+        for (name, text) in [
+            ("dockerfile", generate_dockerfile(&contract, None)),
+            ("runtime stage", generate_runtime_stage(&contract)),
+            ("compose", generate_compose_fragment(&contract)),
+        ] {
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.starts_with("EXPOSE 22") || line.starts_with("RUN id")),
+                "{name} carries an injected line:\n{text}"
+            );
+            assert!(text.contains(r#""on\nRUN id""#), "{name}:\n{text}");
+        }
+    }
+
+    /// KEDA's CPU scaler cannot wake a workload from zero on its own, so a
+    /// ScaledObject whose only trigger is CPU is refused a minimum of zero.
+    #[test]
+    fn test_a_cpu_only_scaled_object_cannot_scale_to_zero() {
+        let mut contract = test_contract();
+        let mut keda = KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled());
+        keda.min_replicas = 0;
+        contract.keda = Some(keda);
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::InvalidContract { ref field, .. } if field == "keda.min_replicas"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "a rejected contract left files behind"
+        );
+
+        // With the Kafka lag trigger on, lag wakes the workload from zero.
+        let mut lag = test_contract();
+        if let Some(keda) = lag.keda.as_mut() {
+            keda.min_replicas = 0;
+        }
+        generate_chart(&lag, tempfile::tempdir().unwrap().path(), None)
+            .expect("the lag trigger can scale from zero");
+    }
+
     /// Whatever renders owns the replica count -- the ScaledObject, else the
     /// HPA -- and the Deployment sets `replicas` exactly when neither does,
     /// since a Deployment without it runs one pod.

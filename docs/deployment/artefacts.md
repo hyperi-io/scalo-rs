@@ -282,19 +282,20 @@ use scalo::deployment::{ChartPatch, assert_no_chart_drift};
 
 #[test]
 fn committed_chart_matches_the_generator() {
-    let patches = [ChartPatch {
-        file: "templates/keda-scaledobject.yaml".into(),
-        from: "        tls: disable\n".into(),
-        to: "        tls: enable\n".into(),
-    }];
+    let patches = [ChartPatch::new(
+        "templates/keda-scaledobject.yaml",
+        "        tls: disable\n",
+        "        tls: enable\n",
+    )];
     assert_no_chart_drift(&contract(), Path::new("chart"), &patches);
 }
 ```
 
 `check_chart_drift()` renders the chart fresh, applies each patch to the file it names, and requires the committed file to match byte for byte. It fails when:
 
-- a committed file differs from the fresh output with its patches applied
+- a committed file differs from the fresh output with its patches applied -- a difference only in line endings (CRLF) or trailing newlines is named as that
 - a patch's `from` no longer occurs in the generated file -- the generator changed under the hand fix, so drop the patch or pin it again
+- a patch's `from` occurs more than once, so it pins no one edit -- lengthen it until it is unique; the patch replaces that one occurrence
 - a generated file is missing from the chart, or a file in the chart root or `templates/` is one the generator does not write
 
 It renders without identity annotations, the same as a committed chart. Once a scalo release fixes the defect a patch works round, the patch's `from` stops appearing and the check says to drop it.

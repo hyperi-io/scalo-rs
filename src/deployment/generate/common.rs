@@ -80,6 +80,21 @@ pub(super) fn udp_port_suffix(protocol: &str) -> &'static str {
     }
 }
 
+/// `text` with each control character written as its escape, for a contract
+/// value printed onto one line, where a raw newline would start a Dockerfile
+/// instruction or a YAML key of its own.
+pub(super) fn on_one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub(super) fn write_file(path: impl AsRef<Path>, content: &str) -> Result<(), DeploymentError> {
     let path = path.as_ref();
     std::fs::write(path, content).map_err(|e| DeploymentError::WriteFile {

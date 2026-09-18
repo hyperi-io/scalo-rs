@@ -322,8 +322,14 @@ impl PortContract {
 /// identifier, e.g. `config.source.transport`. The chart reads app config under
 /// `config`, so only a path under `config.` can be checked against
 /// `default_config`. A missing or null value never satisfies a condition.
+///
+/// `Equals` and `OneOf` compare the chart's `toString` of the value, so gate on
+/// a string or boolean setting. A numeric one compares unreliably: Helm reads a
+/// large number in `values.yaml` as a float and prints `1e+06` where the config
+/// says `1000000`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PortCondition {
     /// The value counts as true: anything but false, null, zero or empty.
     Enabled {

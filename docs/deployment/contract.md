@@ -222,6 +222,8 @@ A service with two transports binds its push listener on one of them only. Witho
 
 `path` is a dotted `.Values` path, the same convention as the KEDA trigger's, so app config sits under `config.` -- `config.source.transport`. Each segment must be a Go identifier. A bad segment, or a `one_of` with no values, makes `generate_chart` return `InvalidContract` before it writes anything. A missing or null key reads as off, never as a render error.
 
+Gate `equals` and `one_of` on a string or boolean setting. Both compare the chart's `toString` of the value, and Helm reads a large number in `values.yaml` as a float, so `1000000` in the config prints as `1e+06` and never matches. A numeric gate compares unreliably.
+
 | Artefact | A gated port |
 |---|---|
 | chart `Deployment` + `Service` | wrapped in `{{- if <condition> }}`, so it renders only when the listener is on |
@@ -230,7 +232,17 @@ A service with two transports binds its push listener on one of them only. Witho
 | compose fragment | published when the condition holds for `default_config`; otherwise a commented-out line to uncomment |
 | `unresolved_values_paths()` | reports a gate whose path is absent from `default_config` (null is off, not missing) |
 
-A port without `when` renders exactly as it did before.
+A port without `when` is always on: in every `EXPOSE`, `expose_ports` and published compose port, and in the chart without a condition. A UDP port is written as UDP everywhere -- `514/udp` on `EXPOSE`, in `expose_ports` and on the compose port, since a bare number means TCP -- and the chart writes every protocol upper case (`tcp` renders `TCP`), because Kubernetes takes no other spelling.
+
+### What every port must be
+
+`DeploymentContract::validate()` is the one check the generators that can refuse run first: `generate_chart`, `generate_container_manifest`, `check_chart_drift` and `generate-artefacts` return `InvalidContract` and write nothing when it fails, and `validate_helm_values` reports it. It requires, for each extra port:
+
+- a name Kubernetes takes -- 1 to 15 lowercase letters, digits and single inner hyphens, with at least one letter (`syslog-udp`, not `Syslog_UDP`)
+- a protocol of TCP, UDP or SCTP, in any case
+- no control character in a `when` path or value, or in `bound_from`
+
+`generate_dockerfile`, `generate_runtime_stage` and `generate_compose_fragment` return text rather than a `Result`, so they cannot refuse. They print a gated port's name and condition onto one comment line with any control character escaped, so a newline in a contract value cannot start a Dockerfile instruction or a YAML key. Run `validate()` in a test to catch the contract itself.
 
 ### `bound_from` -- listeners that no port declares
 

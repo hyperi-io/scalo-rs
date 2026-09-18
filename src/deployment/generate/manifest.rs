@@ -21,8 +21,10 @@ use super::common::udp_port_suffix;
 ///
 /// # Errors
 ///
-/// Returns an error string if JSON serialisation fails.
+/// Returns an error string naming the field at fault if the contract fails
+/// [`DeploymentContract::validate`], or if JSON serialisation fails.
 pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<String, String> {
+    contract.validate().map_err(|e| e.to_string())?;
     let binary = contract.binary();
 
     let apt_repos: Vec<serde_json::Value> = contract

@@ -10,7 +10,7 @@
 
 use crate::deployment::contract::{DeploymentContract, ImageProfile};
 
-use super::common::udp_port_suffix;
+use super::common::{on_one_line, udp_port_suffix};
 
 // ============================================================================
 // Dockerfile
@@ -206,7 +206,8 @@ ENTRYPOINT ["{binary}"]{cmd}
 ///
 /// A port with a `when` condition is left out, because an image cannot know
 /// whether that listener is on; a comment after the line lists each one and
-/// its condition instead.
+/// its condition instead, with any control character escaped so the entry
+/// stays one comment line.
 fn expose_ports(contract: &DeploymentContract) -> String {
     let mut ports = vec![contract.metrics_port.to_string()];
     let mut conditional = Vec::new();
@@ -216,8 +217,9 @@ fn expose_ports(contract: &DeploymentContract) -> String {
             Some(when) => conditional.push(format!(
                 "#   {port}/{proto} {name} -- when {when}",
                 port = p.port,
-                proto = p.protocol.to_ascii_lowercase(),
-                name = p.name,
+                proto = on_one_line(&p.protocol.to_ascii_lowercase()),
+                name = on_one_line(&p.name),
+                when = on_one_line(&when.to_string()),
             )),
         }
     }

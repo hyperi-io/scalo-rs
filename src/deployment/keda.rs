@@ -9,7 +9,7 @@
 //! KEDA autoscaling configuration.
 //!
 //! [`KedaConfig`] lives in the app's config cascade so thresholds are
-//! overridable via env vars (e.g., `DFE_LOADER__KEDA__KAFKA_LAG_THRESHOLD=5000`).
+//! overridable via env vars (e.g., `MY_APP__KEDA__KAFKA_LAG_THRESHOLD=5000`).
 //!
 //! [`KedaContract`] is the subset validated against Helm `values.yaml`.
 
@@ -122,9 +122,11 @@ impl KedaContract {
 /// lives on the contract and not on [`KedaConfig`]. Each path is a dotted,
 /// `.Values`-relative chain of Go identifiers. The default suits an app whose
 /// config has a top-level `kafka` section; an app that keeps them elsewhere
-/// names that section with [`under`](Self::under).
+/// names that section with [`under`](Self::under), then sets any path that
+/// sits elsewhere on the value it returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct KafkaLagTrigger {
     /// Emit the Kafka lag trigger. Off leaves CPU as the only scaler.
     pub enabled: bool,

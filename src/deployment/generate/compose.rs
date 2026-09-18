@@ -10,7 +10,7 @@
 
 use crate::deployment::contract::DeploymentContract;
 
-use super::common::udp_port_suffix;
+use super::common::{on_one_line, udp_port_suffix};
 
 // ============================================================================
 // Docker Compose fragment
@@ -72,7 +72,8 @@ pub fn generate_compose_fragment(contract: &DeploymentContract) -> String {
                     != Some(true) =>
             {
                 out.push_str(&format!(
-                    "      # {publish}  # only when {when}; uncomment to publish\n"
+                    "      # {publish}  # only when {when}; uncomment to publish\n",
+                    when = on_one_line(&when.to_string()),
                 ));
             }
             _ => out.push_str(&format!("      {publish}\n")),

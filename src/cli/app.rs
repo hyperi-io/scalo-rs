@@ -513,8 +513,9 @@ fn refuse_undeclared_listeners(
 /// cascade, and a dev box and CI with different config can differ. Writes the
 /// metrics manifest, deployment contract, container manifest, runtime stage and
 /// ArgoCD Application into the output directory. The same build and config give
-/// the same bytes on every run: nothing is stamped per run. A contract with an
-/// undeclared listener is refused before anything is written.
+/// the same bytes on every run: nothing is stamped per run. A contract that
+/// fails [`DeploymentContract::validate`](crate::deployment::DeploymentContract::validate),
+/// or has an undeclared listener, is refused before anything is written.
 fn generate_artefacts<A: ServiceApp>(
     app: &A,
     args: &super::commands::GenerateArtefactsArgs,
@@ -525,6 +526,13 @@ fn generate_artefacts<A: ServiceApp>(
     let deployment_contract = app.deployment_contract();
     #[cfg(feature = "deployment")]
     if let Some(contract) = &deployment_contract {
+        contract.validate().map_err(|e| {
+            CliError::Service(format!(
+                "{app}: the deployment contract is not one every generator can render, so no \
+                 artefacts were written -- {e}",
+                app = contract.app_name,
+            ))
+        })?;
         refuse_undeclared_listeners(contract)?;
     }
 
@@ -916,6 +924,24 @@ mod tests {
         ] {
             assert!(message.contains(part), "{part:?} missing from: {message}");
         }
+        let written: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();
+        assert!(
+            written.is_empty(),
+            "written before the refusal: {written:?}"
+        );
+    }
+
+    #[cfg(feature = "deployment")]
+    #[test]
+    fn generate_artefacts_refuses_a_contract_the_generators_refuse() {
+        let port = crate::deployment::PortContract::tcp("Push_Port", 50051)
+            .when_equals("config.transport", "grpc")
+            .bound_from("grpc.listen");
+        let out = tempfile::tempdir().unwrap();
+        let err = generate_into(&archiver_app(vec![port]), out.path())
+            .expect_err("a port name Kubernetes refuses is refused here first");
+
+        assert!(err.to_string().contains("extra_ports[0].name"), "{err}");
         let written: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();
         assert!(
             written.is_empty(),

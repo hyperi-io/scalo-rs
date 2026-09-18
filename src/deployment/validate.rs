@@ -22,7 +22,8 @@ use super::error::{ContractMismatch, DeploymentError};
 /// and the deployment template for health probe paths and env var prefix.
 /// Also reports each values path the generated chart reads that the
 /// contract's own `default_config` never sets, because the chart renders it
-/// empty (see [`DeploymentContract::unresolved_values_paths`]).
+/// empty (see [`DeploymentContract::unresolved_values_paths`]), and a contract
+/// the generators refuse (see [`DeploymentContract::validate`]).
 ///
 /// Returns a list of mismatches (empty = all good).
 ///
@@ -84,6 +85,15 @@ pub fn validate_helm_values(
     // KEDA thresholds
     if let Some(keda) = contract.enabled_keda() {
         validate_keda_values(&values, keda, &mut mismatches);
+    }
+
+    // A contract the generators refuse, which a hand-kept chart can still carry
+    if let Err(DeploymentError::InvalidContract { field, reason }) = contract.validate() {
+        mismatches.push(ContractMismatch {
+            field,
+            expected: "a contract the generators accept".into(),
+            actual: reason,
+        });
     }
 
     // Values paths the chart reads that the contract's own config never sets
@@ -637,6 +647,32 @@ mod tests {
         assert!(
             mismatches.is_empty(),
             "Unexpected mismatches: {mismatches:?}"
+        );
+    }
+
+    /// A contract no generator would render is reported with the rest, so a
+    /// hand-kept chart cannot carry one past the check.
+    #[test]
+    fn test_validate_helm_reports_a_contract_the_generators_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let chart_dir = dir.path();
+        std::fs::write(
+            chart_dir.join("Chart.yaml"),
+            "apiVersion: v2\nname: test-app\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(chart_dir.join("values.yaml"), "service:\n  port: 9090\n").unwrap();
+
+        let mut contract = test_contract();
+        contract.keda = contract.keda.map(|k| {
+            let mut cpu_only = k.with_kafka_trigger(crate::deployment::KafkaLagTrigger::disabled());
+            cpu_only.min_replicas = 0;
+            cpu_only
+        });
+        let mismatches = validate_helm_values(&contract, chart_dir).unwrap();
+        assert!(
+            mismatches.iter().any(|m| m.field == "keda.min_replicas"),
+            "{mismatches:?}"
         );
     }
 

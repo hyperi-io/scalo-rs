@@ -214,8 +214,10 @@ pub fn assert_no_config_artifact_drift(contract: &DeploymentContract, dir: impl 
 ///
 /// [`check_chart_drift`] applies each patch to the freshly generated file
 /// before comparing, and fails once the generator stops writing `from`, so the
-/// hand fix is pinned to the content it replaces rather than exempted.
+/// hand fix is pinned to the content it replaces rather than exempted. `from`
+/// must occur exactly once in that file, so one patch pins one edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChartPatch {
     /// Path under the chart root, e.g. `templates/keda-scaledobject.yaml`.
     pub file: String,
@@ -225,13 +227,26 @@ pub struct ChartPatch {
     pub to: String,
 }
 
+impl ChartPatch {
+    /// A hand fix replacing `from`, which the generator writes once into
+    /// `file`, with `to`.
+    #[must_use]
+    pub fn new(file: impl Into<String>, from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            file: file.into(),
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+}
+
 /// Check that the committed chart under `chart_dir` is exactly what
 /// [`generate_chart`](super::generate_chart) writes for `contract`, with each
 /// of `patches` applied.
 ///
 /// Every generated file must be on disk and equal the fresh output after its
-/// patches, each patch's `from` must still occur in the file it names, and
-/// every file in the chart root or `templates/` must be one the generator
+/// patches, each patch's `from` must occur exactly once in the file it names,
+/// and every file in the chart root or `templates/` must be one the generator
 /// writes. The chart is rendered without identity annotations, as a committed
 /// chart is.
 ///
@@ -269,25 +284,34 @@ pub fn check_chart_drift(
             .iter()
             .filter(|p| p.file == *name && !p.from.is_empty())
         {
-            if generated.contains(&patch.from) {
-                expected = expected.replace(&patch.from, &patch.to);
-            } else {
-                patches_apply = false;
-                problems.push(format!(
-                    "{name}: patch no longer applies -- drop it (the generator no longer \
-                     writes {:?})",
-                    patch.from.lines().next().unwrap_or_default()
-                ));
+            match generated.matches(&patch.from).count() {
+                1 => expected = expected.replacen(&patch.from, &patch.to, 1),
+                0 => {
+                    patches_apply = false;
+                    problems.push(format!(
+                        "{name}: patch no longer applies -- drop it (the generator no longer \
+                         writes {:?})",
+                        patch.from.lines().next().unwrap_or_default()
+                    ));
+                }
+                count => {
+                    patches_apply = false;
+                    problems.push(format!(
+                        "{name}: a patch's `from` occurs {count} times in the generated file, \
+                         so it pins no one edit -- lengthen it until it is unique ({:?})",
+                        patch.from.lines().next().unwrap_or_default()
+                    ));
+                }
             }
         }
         let path = chart_dir.join(name);
         match std::fs::read_to_string(&path) {
-            // A patch that no longer applies is the problem to report for this file.
+            // A patch that does not apply is the problem to report for this file.
             Ok(_) if !patches_apply => {}
             Ok(committed) if committed == expected => {}
             Ok(committed) => problems.push(format!(
-                "{name}: differs from the generated chart at line {}",
-                first_differing_line(&expected, &committed)
+                "{name}: {}",
+                describe_difference(&expected, &committed)
             )),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 problems.push(format!("{name}: generated but missing from the chart"));
@@ -338,6 +362,32 @@ pub fn assert_no_chart_drift(
     if let Err(e) = check_chart_drift(contract, chart_dir, patches) {
         panic!("{e}");
     }
+}
+
+/// How a committed file differs from the expected content: in its line endings
+/// alone, in its trailing newlines alone, or from a given line.
+///
+/// The first two are named outright because a line-by-line comparison reads
+/// past both and would point at a line beyond the end of the file.
+fn describe_difference(expected: &str, committed: &str) -> String {
+    if committed.contains('\r') && committed.replace("\r\n", "\n") == expected {
+        return "differs only in line endings -- the committed file has CRLF where the \
+                generator writes LF"
+            .to_string();
+    }
+    let trailing = |text: &str| text.len() - text.trim_end_matches('\n').len();
+    if expected.trim_end_matches('\n') == committed.trim_end_matches('\n') {
+        return format!(
+            "differs only in its trailing newlines -- the generator writes {}, the committed \
+             file has {}",
+            trailing(expected),
+            trailing(committed)
+        );
+    }
+    format!(
+        "differs from the generated chart at line {}",
+        first_differing_line(expected, committed)
+    )
 }
 
 /// The 1-based line where `a` and `b` first differ.
@@ -633,6 +683,77 @@ mod tests {
             let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[patch]));
             assert!(detail.starts_with(&format!("{file}: ")), "{detail}");
         }
+    }
+
+    /// A `from` that occurs more than once pins no one edit, so it is refused
+    /// with the count rather than applied everywhere it matches.
+    #[test]
+    fn chart_drift_refuses_a_patch_whose_from_is_not_unique() {
+        let (contract, dir) = committed_chart();
+        let generated =
+            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
+        let from = "{{- end }}\n";
+        let count = generated.matches(from).count();
+        assert!(count > 1, "the fixture needs a repeated line");
+
+        let patch = ChartPatch {
+            file: "templates/deployment.yaml".into(),
+            from: from.into(),
+            to: "{{- end -}}\n".into(),
+        };
+        hand_edit(
+            dir.path(),
+            "templates/deployment.yaml",
+            from,
+            "{{- end -}}\n",
+        );
+
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[patch]));
+        assert!(
+            detail.contains(&format!(
+                "templates/deployment.yaml: a patch's `from` occurs {count} times"
+            )),
+            "{detail}"
+        );
+    }
+
+    /// A file that differs only in its line endings or trailing newlines says
+    /// so, rather than naming a line past the end of the file.
+    #[test]
+    fn chart_drift_names_a_line_ending_or_trailing_newline_difference() {
+        let (contract, dir) = committed_chart();
+        let values = dir.path().join("values.yaml");
+        let text = std::fs::read_to_string(&values).unwrap();
+        std::fs::write(&values, text.replace('\n', "\r\n")).unwrap();
+        let chart = dir.path().join("Chart.yaml");
+        let text = std::fs::read_to_string(&chart).unwrap();
+        std::fs::write(&chart, format!("{text}\n")).unwrap();
+
+        let detail = drift_detail(check_chart_drift(&contract, dir.path(), &[]));
+        assert!(
+            detail.contains("values.yaml: differs only in line endings"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("Chart.yaml: differs only in its trailing newlines"),
+            "{detail}"
+        );
+    }
+
+    /// A chart file that cannot be read for any reason but absence is an error
+    /// of its own, not a drift finding.
+    #[test]
+    fn chart_drift_hands_back_a_read_error_other_than_absence() {
+        let (contract, dir) = committed_chart();
+        let path = dir.path().join("templates/deployment.yaml");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let err = check_chart_drift(&contract, dir.path(), &[]).unwrap_err();
+        assert!(
+            matches!(err, DeploymentError::ReadFile { ref path, .. } if path.ends_with("templates/deployment.yaml")),
+            "{err:?}"
+        );
     }
 
     #[test]

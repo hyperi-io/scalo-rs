@@ -81,6 +81,7 @@
 
 pub mod app_project;
 mod capability;
+mod checks;
 mod contract;
 pub mod contract_identity;
 mod emit;

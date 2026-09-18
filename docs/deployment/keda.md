@@ -47,7 +47,11 @@ pub struct KedaContract {
 
 `min_replicas: 0` enables scale-to-zero -- pods spin down entirely
 when there's nothing to do, KEDA spins them back up when lag exceeds
-`activation_lag_threshold`.
+`activation_lag_threshold`. It needs the Kafka lag trigger: KEDA's CPU
+scaler cannot wake a workload from zero on its own, so a contract with
+the Kafka trigger off and `min_replicas: 0` is refused with
+`InvalidContract` on `keda.min_replicas` by `generate_chart()`, and
+`validate_helm_values()` reports it.
 
 `enabled` comes across from `KedaConfig::enabled`. Off produces exactly
 the chart `keda: None` does, so either way of saying it gives the same
@@ -86,7 +90,12 @@ only while `keda.cpu.enabled` is true, `values.yaml` drops `keda.kafka`,
 and `keda-triggerauth.yaml` is written as a one-line comment so the
 chart's file set stays the same. Turning off the Kafka trigger AND
 `cpu_enabled` is an error -- KEDA would have nothing to scale on. Use
-`keda: None` for that.
+`keda: None` for that. So is the Kafka trigger off with `min_replicas: 0`,
+since CPU alone cannot scale from zero.
+
+`KafkaLagTrigger` is `#[non_exhaustive]`: build it with `under()` or
+`disabled()`, then set any path that sits elsewhere on the value they
+return.
 
 `DeploymentContract::unresolved_values_paths()` lists every trigger path
 that `default_config` does not set (or sets to null), and
@@ -137,10 +146,10 @@ With the default trigger paths:
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
-  name: {{ include "dfe-loader.fullname" . }}
+  name: {{ include "my-app.fullname" . }}
 spec:
   scaleTargetRef:
-    name: {{ include "dfe-loader.fullname" . }}
+    name: {{ include "my-app.fullname" . }}
   minReplicaCount: {{ .Values.keda.minReplicaCount }}
   maxReplicaCount: {{ .Values.keda.maxReplicaCount }}
   pollingInterval: {{ .Values.keda.pollingInterval }}
@@ -148,7 +157,7 @@ spec:
   triggers:
     - type: kafka
       authenticationRef:
-        name: {{ include "dfe-loader.fullname" . }}-kafka-auth
+        name: {{ include "my-app.fullname" . }}-kafka-auth
       metadata:
         bootstrapServers: {{ join "," ((.Values.config).kafka).brokers | quote }}
         consumerGroup: {{ .Values.keda.kafka.consumerGroup | default ((.Values.config).kafka).group_id | quote }}
@@ -234,7 +243,8 @@ gate when both fire:
 Outside the gates, components are weighted (sum to 1.0) and each
 saturates at its configured ceiling. The app surfaces the score as a
 Prometheus gauge (the `ServiceMetrics` helper exposes it as
-`dfe_scaling_pressure`) for KEDA's Prometheus trigger to consume.
+`scaling_pressure`, with the `metrics.namespace` prefix when one is set)
+for KEDA's Prometheus trigger to consume.
 
 ---
 
