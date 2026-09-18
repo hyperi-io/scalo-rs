@@ -305,6 +305,21 @@ mod tests {
         );
     }
 
+    /// A manifest consumer reads a bare port number as TCP, so a UDP port is
+    /// listed in the form the Dockerfile EXPOSE line uses.
+    #[test]
+    fn test_container_manifest_lists_udp_ports_as_udp() {
+        let mut contract = test_contract();
+        contract.extra_ports = mixed_protocol_ports();
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&generate_container_manifest(&contract).unwrap()).unwrap();
+        assert_eq!(
+            manifest["expose_ports"],
+            serde_json::json!([9090, 8080, "514/udp", "2055/udp"])
+        );
+    }
+
     /// One always-on port, then one gated port per kind of condition.
     fn gated_ports() -> Vec<PortContract> {
         vec![
@@ -369,7 +384,7 @@ mod tests {
             serde_json::from_str(&generate_container_manifest(&contract).unwrap()).unwrap();
         assert_eq!(
             manifest["expose_ports"],
-            serde_json::json!([9090, 8080, 514])
+            serde_json::json!([9090, 8080, "514/udp"])
         );
         assert!(manifest.get("conditional_ports").is_none());
     }
@@ -1082,6 +1097,34 @@ mod tests {
                 .filter_map(|line| line.trim().strip_prefix("protocol: "))
                 .collect();
             assert_eq!(protocols, ["TCP", "TCP", "UDP", "SCTP"], "{name}:\n{text}");
+        }
+    }
+
+    /// A protocol Kubernetes does not take would render a Deployment and
+    /// Service that fail to apply, so the chart is refused before any file.
+    #[test]
+    fn test_chart_rejects_a_protocol_kubernetes_does_not_take() {
+        for protocol in ["http", "grpc", ""] {
+            let mut contract = test_contract();
+            contract.extra_ports = vec![PortContract {
+                protocol: protocol.into(),
+                ..PortContract::tcp("web", 8080)
+            }];
+            let dir = tempfile::tempdir().unwrap();
+            let err = generate_chart(&contract, dir.path(), None)
+                .expect_err("a protocol other than TCP, UDP or SCTP is refused");
+            assert!(
+                matches!(
+                    err,
+                    DeploymentError::InvalidContract { ref field, .. }
+                        if field == "extra_ports[web].protocol"
+                ),
+                "unexpected error for {protocol:?}: {err}"
+            );
+            assert!(
+                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                "a rejected contract left files behind"
+            );
         }
     }
 

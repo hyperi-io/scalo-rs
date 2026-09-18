@@ -6,7 +6,9 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-use crate::deployment::contract::{DeploymentContract, ImageProfile};
+use crate::deployment::contract::{DeploymentContract, ImageProfile, PortContract};
+
+use super::common::udp_port_suffix;
 
 // ============================================================================
 // Container Manifest (CI-consumable JSON)
@@ -40,11 +42,11 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
 
     // A port with a `when` condition is not exposed, because an image cannot
     // know whether that listener is on; it is listed with its condition instead.
-    let mut expose_ports: Vec<u16> = vec![contract.metrics_port];
+    let mut expose_ports = vec![serde_json::Value::from(contract.metrics_port)];
     let mut conditional_ports = Vec::new();
     for p in &contract.extra_ports {
         match &p.when {
-            None => expose_ports.push(p.port),
+            None => expose_ports.push(expose_entry(p)),
             Some(when) => conditional_ports.push(serde_json::json!({
                 "name": p.name,
                 "port": p.port,
@@ -118,4 +120,14 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
 
     serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("container manifest JSON failed: {e}"))
+}
+
+/// A port as `expose_ports` lists it: a bare number for TCP and `<port>/udp`
+/// for UDP, the form the Dockerfile `EXPOSE` line uses, since a consumer reads
+/// a bare number as TCP.
+fn expose_entry(port: &PortContract) -> serde_json::Value {
+    match udp_port_suffix(&port.protocol) {
+        "" => port.port.into(),
+        suffix => format!("{}{suffix}", port.port).into(),
+    }
 }

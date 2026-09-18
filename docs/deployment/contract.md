@@ -307,7 +307,7 @@ release-specific and a digest carries no codename.
 | `DeploymentContract::config_filename()` / `config_dir()` | Split `config_mount_path` |
 | `ImageProfile::{Production, Development}` | Profile enum |
 | `HealthContract` | `/livez` / `/readyz` / `/metrics` paths |
-| `PortContract` | Extra container port beyond `metrics_port`; build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` as `514/udp` |
+| `PortContract` | Extra container port beyond `metrics_port`; build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` and `expose_ports` as `514/udp`. `generate_chart` refuses a protocol other than TCP, UDP or SCTP (any case) |
 | `PortCondition` | When a port's listener exists -- see [Ports](#ports) |
 | `DeploymentContract::undeclared_listeners()` / `assert_listeners_declared()` | Listener coverage -- see [Ports](#ports) |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |

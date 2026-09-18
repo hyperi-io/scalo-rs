@@ -79,7 +79,7 @@ base image, registry, runtime packages, exposed ports, healthcheck,
 labels. No secrets, no K8s-specific config. A port gated with `when` is
 not in `expose_ports`; it is listed under `conditional_ports` with its
 condition, a key that appears only when some port is gated (see
-[contract.md](contract.md#ports)).
+[contract.md](contract.md#ports)). In `expose_ports` a TCP port is a bare number and a UDP port is the string `"514/udp"`, the form the Dockerfile `EXPOSE` line uses.
 
 Produced by `generate_container_manifest(&contract)`. Schema version
 `"1"` (string, separate from the contract schema).

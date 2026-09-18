@@ -34,8 +34,9 @@ use super::common::{is_go_identifier, safe_template_lookup, to_camel_suffix, wri
 /// Returns `DeploymentError` if files or directories cannot be created, or
 /// [`DeploymentError::InvalidContract`] if the KEDA contract or a port's `when`
 /// names a values path that is not a dotted chain of Go identifiers, a `one_of`
-/// port condition lists no values, or the KEDA contract turns off both the
-/// Kafka lag trigger and the CPU trigger while leaving KEDA on.
+/// port condition lists no values, a port's protocol is not TCP, UDP or SCTP
+/// (any case), or the KEDA contract turns off both the Kafka lag trigger and
+/// the CPU trigger while leaving KEDA on.
 pub fn generate_chart(
     contract: &DeploymentContract,
     output_dir: impl AsRef<Path>,
@@ -69,6 +70,7 @@ pub(crate) fn chart_files(
     contract: &DeploymentContract,
     identity: Option<&crate::deployment::ContractIdentity>,
 ) -> Result<Vec<(&'static str, String)>, DeploymentError> {
+    check_port_protocols(contract)?;
     let gates = port_gates(contract)?;
     let keda_templates = match contract.enabled_keda() {
         Some(keda) => Some((
@@ -562,6 +564,26 @@ fn gen_observability_env(app: &str) -> String {
          \x20           {{- end }}\n",
     );
     out
+}
+
+/// Refuse an extra port whose protocol, compared without case, is not TCP, UDP
+/// or SCTP, since Kubernetes takes no other and the manifests would not apply.
+fn check_port_protocols(c: &DeploymentContract) -> Result<(), DeploymentError> {
+    const KUBERNETES_PROTOCOLS: [&str; 3] = ["TCP", "UDP", "SCTP"];
+    match c.extra_ports.iter().find(|port| {
+        !KUBERNETES_PROTOCOLS
+            .iter()
+            .any(|known| port.protocol.eq_ignore_ascii_case(known))
+    }) {
+        Some(port) => Err(DeploymentError::InvalidContract {
+            field: format!("extra_ports[{}].protocol", port.name),
+            reason: format!(
+                "`{}` is not a protocol Kubernetes takes -- use TCP, UDP or SCTP",
+                port.protocol
+            ),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The template condition each extra port renders under, in `extra_ports`

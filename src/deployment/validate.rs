@@ -123,11 +123,10 @@ pub fn validate_dockerfile(
     let mut mismatches = Vec::new();
 
     // EXPOSE port
-    let expected_expose = format!("EXPOSE {}", contract.metrics_port);
-    if !content.contains(&expected_expose) {
+    if !exposes_tcp_port(&content, contract.metrics_port) {
         mismatches.push(ContractMismatch {
             field: "Dockerfile EXPOSE".into(),
-            expected: expected_expose,
+            expected: format!("EXPOSE {}", contract.metrics_port),
             actual: extract_line_containing(&content, "EXPOSE"),
         });
     }
@@ -383,6 +382,20 @@ fn read_text(path: &Path) -> Result<String, DeploymentError> {
     })
 }
 
+/// True when an `EXPOSE` instruction lists `port` as a whole token, bare or as
+/// `<port>/tcp`, so `EXPOSE 90901` does not pass for 9090.
+fn exposes_tcp_port(dockerfile: &str, port: u16) -> bool {
+    let bare = port.to_string();
+    let tcp = format!("{port}/tcp");
+    dockerfile.lines().any(|line| {
+        let mut tokens = line.split_whitespace();
+        tokens
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("EXPOSE"))
+            && tokens.any(|token| token == bare || token.eq_ignore_ascii_case(&tcp))
+    })
+}
+
 fn extract_line_containing(content: &str, keyword: &str) -> String {
     content
         .lines()
@@ -483,6 +496,48 @@ mod tests {
         let mismatches = validate_dockerfile(&contract, &dockerfile).unwrap();
         assert!(!mismatches.is_empty());
         assert!(mismatches.iter().any(|m| m.field.contains("EXPOSE")));
+    }
+
+    /// The metrics port must be a whole token on an EXPOSE line, bare or `/tcp`,
+    /// wherever it sits in the list.
+    #[test]
+    fn test_validate_dockerfile_matches_the_expose_port_as_a_whole_token() {
+        let expose_mismatch = |expose: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let dockerfile = dir.path().join("Dockerfile");
+            std::fs::write(
+                &dockerfile,
+                format!(
+                    "FROM ubuntu:24.04\n\
+                     {expose}\n\
+                     HEALTHCHECK CMD curl -sf http://localhost:9090/livez\n\
+                     CMD [\"--config\", \"/etc/test/config.yaml\"]\n"
+                ),
+            )
+            .unwrap();
+            validate_dockerfile(&test_contract(), &dockerfile)
+                .unwrap()
+                .iter()
+                .any(|m| m.field == "Dockerfile EXPOSE")
+        };
+
+        for wrong in [
+            "EXPOSE 90901",
+            "EXPOSE 19090",
+            "EXPOSE 8080 9090/udp",
+            "# EXPOSE 9090",
+            "LABEL note=\"EXPOSE 9090\"",
+        ] {
+            assert!(expose_mismatch(wrong), "{wrong:?} passed for 9090");
+        }
+        for right in [
+            "EXPOSE 9090",
+            "EXPOSE 8080 9090 514/udp",
+            "EXPOSE 9090/tcp",
+            "expose 9090",
+        ] {
+            assert!(!expose_mismatch(right), "{right:?} failed for 9090");
+        }
     }
 
     #[test]
