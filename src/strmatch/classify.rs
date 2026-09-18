@@ -20,7 +20,7 @@
 //!   never invoked at match time.
 //! - **Meta**: anything else. Dispatched via
 //!   `regex_automata::meta::Regex`, which has its own internal
-//!   prefilter pipeline (memchr → Teddy → AC → NFA/DFA).
+//!   prefilter pipeline (memchr -> Teddy -> AC -> NFA/DFA).
 //!
 //! The classifier never returns "this regex is invalid" -- that's the
 //! parser's job. It returns a [`Plan`] and a [`Descriptor`] explaining
@@ -69,7 +69,7 @@ pub struct Descriptor {
 ///
 /// `case_insensitive` is honoured at *match time* via
 /// `aho_corasick::AhoCorasickBuilder::ascii_case_insensitive`, not via
-/// HIR rewriting. We deliberately do NOT wrap the pattern in `(?i:…)`
+/// HIR rewriting. We deliberately do NOT wrap the pattern in `(?i:...)`
 /// before parsing -- that would expand literals into per-byte case
 /// classes and defeat simple-shape detection.
 ///
@@ -414,10 +414,10 @@ fn try_literal_alternation(
     case_insensitive: bool,
 ) -> Option<(AhoCorasick, Anchor, Vec<Vec<u8>>)> {
     // The pattern shape we accept here:
-    //   Alternation([foo, bar])             → Anchor::Anywhere
-    //   Concat([^, Alternation, $])         → Anchor inferred from outer ^/$
-    //   Concat([^, Alternation])            → Anchor::AtStart
-    //   Concat([Alternation, $])            → Anchor::AtEnd
+    //   Alternation([foo, bar])             -> Anchor::Anywhere
+    //   Concat([^, Alternation, $])         -> Anchor inferred from outer ^/$
+    //   Concat([^, Alternation])            -> Anchor::AtStart
+    //   Concat([Alternation, $])            -> Anchor::AtEnd
     // We strip the outer anchors first, then require the inner node to
     // be an Alternation whose branches are all literals (with no
     // additional per-branch anchors, which would conflict with the

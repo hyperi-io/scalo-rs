@@ -15,24 +15,24 @@
 //! ## Design
 //!
 //! ```text
-//!                     ┌─────────────────────────────────────┐
-//!                     │           TieredSink                │
-//!                     │                                     │
-//!    Message ────────►│  try_send() to primary sink        │
-//!                     │         │                           │
-//!                     │         ▼                           │
-//!                     │    ┌─────────┐                      │
-//!                     │    │ Success │──► Done (hot path)   │
-//!                     │    └────┬────┘                      │
-//!                     │         │ Err(Full/Unavailable)     │
-//!                     │         ▼                           │
-//!                     │    ┌─────────┐                      │
-//!                     │    │  Spool  │──► Disk (cold path)  │
-//!                     │    └────┬────┘                      │
-//!                     │         │                           │
-//!                     │    Background drain task            │
-//!                     │    (when primary recovers)          │
-//!                     └─────────────────────────────────────┘
+//!                     +-------------------------------------+
+//!                     |           TieredSink                |
+//!                     |                                     |
+//!    Message -------->|  try_send() to primary sink        |
+//!                     |         |                           |
+//!                     |         v                           |
+//!                     |    +---------+                      |
+//!                     |    | Success |--> Done (hot path)   |
+//!                     |    +----+----+                      |
+//!                     |         | Err(Full/Unavailable)     |
+//!                     |         v                           |
+//!                     |    +---------+                      |
+//!                     |    |  Spool  |--> Disk (cold path)  |
+//!                     |    +----+----+                      |
+//!                     |         |                           |
+//!                     |    Background drain task            |
+//!                     |    (when primary recovers)          |
+//!                     +-------------------------------------+
 //! ```
 //!
 //! ## Features

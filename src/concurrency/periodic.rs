@@ -17,10 +17,10 @@
 //! # Shape
 //!
 //! ```text
-//! tokio::time::interval ──tick──► actor task ──tick()──► PeriodicTask impl
-//!                                     ▲
-//!                                     │ biased select
-//!                                     │
+//! tokio::time::interval --tick--> actor task --tick()--> PeriodicTask impl
+//!                                     ^
+//!                                     | biased select
+//!                                     |
 //!                              CancellationToken
 //! ```
 //!

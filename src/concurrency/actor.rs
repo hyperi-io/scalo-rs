@@ -17,10 +17,10 @@
 //! # Shape
 //!
 //! ```text
-//! consumer ──send/try_send──► mpsc bounded ──► actor task ──handle()──► Actor (state)
-//!                                                  ▲
-//!                                                  │ biased select
-//!                                                  │
+//! consumer --send/try_send--> mpsc bounded --> actor task --handle()--> Actor (state)
+//!                                                  ^
+//!                                                  | biased select
+//!                                                  |
 //!                                          CancellationToken + idle ticker
 //! ```
 //!

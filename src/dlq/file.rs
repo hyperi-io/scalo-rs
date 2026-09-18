@@ -17,9 +17,9 @@
 //!
 //! ```text
 //! /var/spool/data-plane/dlq/loader/
-//! ├── dlq.ndjson              # Current file
-//! ├── dlq.ndjson.20260302T14  # Rotated (hourly)
-//! └── dlq.ndjson.20260302T13.gz  # Compressed
+//! |-- dlq.ndjson              # Current file
+//! |-- dlq.ndjson.20260302T14  # Rotated (hourly)
+//! `-- dlq.ndjson.20260302T13.gz  # Compressed
 //! ```
 
 use tracing::debug;

@@ -12,22 +12,22 @@
 //!
 //! ```text
 //! get_secret(key)
-//!     │
-//!     ├─ Check memory cache
-//!     │   └─ Hit + fresh → Return immediately
-//!     │
-//!     ├─ Check disk cache
-//!     │   └─ Hit + fresh → Update memory, return
-//!     │
-//!     └─ Return None (caller fetches from provider)
+//!     |
+//!     |- Check memory cache
+//!     |   `- Hit + fresh -> Return immediately
+//!     |
+//!     |- Check disk cache
+//!     |   `- Hit + fresh -> Update memory, return
+//!     |
+//!     `- Return None (caller fetches from provider)
 //!
 //! get_stale(key)  // Called on provider failure
-//!     │
-//!     ├─ Check memory cache (within grace period)
-//!     │   └─ Hit → Return with warning
-//!     │
-//!     └─ Check disk cache (within grace period)
-//!         └─ Hit → Return with warning
+//!     |
+//!     |- Check memory cache (within grace period)
+//!     |   `- Hit -> Return with warning
+//!     |
+//!     `- Check disk cache (within grace period)
+//!         `- Hit -> Return with warning
 //! ```
 
 use std::collections::HashMap;

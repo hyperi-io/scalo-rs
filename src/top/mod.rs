@@ -28,8 +28,8 @@
 //! | Key | Action |
 //! |-----|--------|
 //! | `q` / `Esc` | Quit |
-//! | `j` / `↓` | Move down |
-//! | `k` / `↑` | Move up |
+//! | `j` / `Down` | Move down |
+//! | `k` / `Up` | Move up |
 //! | `g` / `Home` | Go to top |
 //! | `G` / `End` | Go to bottom |
 //! | `s` | Cycle sort column |

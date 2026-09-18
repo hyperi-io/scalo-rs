@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/strmatch/mod.rs
-// Purpose:   Public API for the strmatch regex→fast-path matcher
+// Purpose:   Public API for the strmatch regex->fast-path matcher
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -12,11 +12,11 @@
 //! `strmatch` classifies it into one of four tiers and dispatches at
 //! match time via the cheapest engine that's correct:
 //!
-//! - **Byte** (≤ 30 ns) -- direct byte ops: `memchr` / `memchr2` /
+//! - **Byte** (<= 30 ns) -- direct byte ops: `memchr` / `memchr2` /
 //!   `memchr3` / single-byte `starts_with` / `ends_with` / `==`.
-//! - **Literal** (≤ 200 ns) -- single multi-byte literal:
+//! - **Literal** (<= 200 ns) -- single multi-byte literal:
 //!   `memmem::Finder` / multi-byte `starts_with` / `ends_with` / `==`.
-//! - **LiteralSet** (≤ 500 ns) -- `aho-corasick` over ≥ 2 literals
+//! - **LiteralSet** (<= 500 ns) -- `aho-corasick` over >= 2 literals
 //!   (optional uniform anchor checked after the AC scan). Regex engine
 //!   is never invoked.
 //! - **Regex** (engine-bounded) -- fall through to
@@ -100,13 +100,13 @@ use plan::Plan;
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MatcherTier {
-    /// **≤ 30 ns** -- direct byte ops: `memchr` / `memchr2/3` / single-byte
+    /// **<= 30 ns** -- direct byte ops: `memchr` / `memchr2/3` / single-byte
     /// `starts_with` / `ends_with` / `==`.
     Byte,
-    /// **≤ 200 ns** -- single multi-byte literal: `memmem::Finder` /
+    /// **<= 200 ns** -- single multi-byte literal: `memmem::Finder` /
     /// multi-byte `starts_with` / `ends_with` / `==`.
     Literal,
-    /// **≤ 500 ns** -- `aho-corasick` over ≥ 2 literals (optional
+    /// **<= 500 ns** -- `aho-corasick` over >= 2 literals (optional
     /// uniform anchor checked after the AC scan).
     LiteralSet,
     /// **Bounded by the regex engine** -- `regex-automata::meta::Regex`

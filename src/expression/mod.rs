@@ -51,7 +51,7 @@
 //! let result = evaluate("amount > 10000", &data).unwrap();
 //! assert_eq!(result, true.into());
 //!
-//! // Boolean condition (missing fields → false)
+//! // Boolean condition (missing fields -> false)
 //! assert!(!evaluate_condition(r#"severity == "critical""#, &HashMap::new()));
 //!
 //! // Compile for hot-path reuse

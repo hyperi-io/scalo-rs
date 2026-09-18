@@ -314,4 +314,70 @@ mod tests {
         let err = check_config_artifact_drift(&contract, dir.path()).unwrap_err();
         assert!(matches!(err, DeploymentError::Drift { .. }), "got {err:?}");
     }
+
+    /// Panic, naming `T` and the first offending char in context, if the
+    /// schema derived for `T` is not pure ASCII.
+    #[cfg(feature = "config-schema")]
+    fn assert_schema_is_ascii<T: schemars::JsonSchema>() {
+        let name = std::any::type_name::<T>();
+        let schema = config_schema_json::<T>();
+        assert!(!schema.is_null(), "schema for {name} failed to serialise");
+        let json = serde_json::to_string(&schema).unwrap();
+        let chars: Vec<char> = json.chars().collect();
+        if let Some(pos) = chars.iter().position(|c| !c.is_ascii()) {
+            let context: String = chars[pos.saturating_sub(40)..(pos + 40).min(chars.len())]
+                .iter()
+                .collect();
+            panic!(
+                "schema for {name} carries non-ASCII {:?} (U+{:04X}) near: {context}",
+                chars[pos],
+                u32::from(chars[pos]),
+            );
+        }
+    }
+
+    /// Doc comments on config types become schema descriptions in every
+    /// consumer's committed artefact, so each root schema must be ASCII.
+    #[cfg(feature = "config-schema")]
+    #[test]
+    fn generated_config_schemas_are_ascii() {
+        #[cfg(feature = "dlq")]
+        assert_schema_is_ascii::<crate::dlq::DlqConfig>();
+        #[cfg(feature = "dlq-kafka")]
+        assert_schema_is_ascii::<crate::dlq::KafkaDlqConfig>();
+        #[cfg(feature = "dlq-kafka")]
+        assert_schema_is_ascii::<crate::dlq::DlqRouting>();
+        #[cfg(feature = "dlq-http")]
+        assert_schema_is_ascii::<crate::dlq::HttpDlqConfig>();
+        #[cfg(feature = "dlq-redis")]
+        assert_schema_is_ascii::<crate::dlq::RedisDlqConfig>();
+        #[cfg(feature = "geoip-download")]
+        assert_schema_is_ascii::<crate::geoip_download::GeoIpConfig>();
+        #[cfg(feature = "memory")]
+        assert_schema_is_ascii::<crate::memory::MemoryGuardConfig>();
+        #[cfg(feature = "scaling")]
+        assert_schema_is_ascii::<crate::scaling::ScalingPressureConfig>();
+        #[cfg(feature = "secrets")]
+        assert_schema_is_ascii::<crate::secrets::CacheConfig>();
+        #[cfg(feature = "tiered-sink")]
+        assert_schema_is_ascii::<crate::tiered_sink::TieredSinkConfig>();
+        #[cfg(any(feature = "spool", feature = "tiered-sink"))]
+        assert_schema_is_ascii::<crate::spool_codec::CorruptionPolicy>();
+        #[cfg(feature = "io")]
+        assert_schema_is_ascii::<crate::io::RotationPeriod>();
+        #[cfg(feature = "transport")]
+        assert_schema_is_ascii::<crate::transport::filter::FilterRule>();
+        #[cfg(feature = "transport-grpc")]
+        assert_schema_is_ascii::<crate::transport::grpc::GrpcConfig>();
+        #[cfg(feature = "transport-kafka")]
+        assert_schema_is_ascii::<crate::transport::kafka::KafkaConfig>();
+        #[cfg(feature = "transport-memory")]
+        assert_schema_is_ascii::<crate::transport::memory::MemoryConfig>();
+        #[cfg(feature = "worker-batch")]
+        assert_schema_is_ascii::<crate::worker::engine::BatchProcessingConfig>();
+        #[cfg(feature = "worker-batch")]
+        assert_schema_is_ascii::<crate::worker::engine::PreRouteFilterConfig>();
+        #[cfg(feature = "worker-batch")]
+        assert_schema_is_ascii::<crate::worker::engine::types::PayloadFormat>();
+    }
 }

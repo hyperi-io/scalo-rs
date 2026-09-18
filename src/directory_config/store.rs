@@ -482,8 +482,8 @@ fn detect_write_mode(dir: &Path, git_enabled: bool) -> WriteMode {
 /// Load all YAML files from directory (recursively) into cache.
 ///
 /// Table names are derived from relative paths within the root directory.
-/// Files at the root are named by their stem (e.g. `dfe-loader.yaml` → `dfe-loader`).
-/// Files in subdirectories include the path prefix (e.g. `loaders/dfe-loader.yaml` → `loaders/dfe-loader`).
+/// Files at the root are named by their stem (e.g. `dfe-loader.yaml` -> `dfe-loader`).
+/// Files in subdirectories include the path prefix (e.g. `loaders/dfe-loader.yaml` -> `loaders/dfe-loader`).
 pub(crate) async fn load_all_tables(
     dir: &Path,
     cache: &TableCache,

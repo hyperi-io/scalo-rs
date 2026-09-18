@@ -15,8 +15,8 @@
 //!
 //! ## Topic Routing
 //!
-//! - **Per-table**: Destination `acme.auth` → topic `acme.auth.dlq`
-//! - **Common**: All failures → single common topic (e.g. `dfe.dlq`)
+//! - **Per-table**: Destination `acme.auth` -> topic `acme.auth.dlq`
+//! - **Common**: All failures -> single common topic (e.g. `dfe.dlq`)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

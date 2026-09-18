@@ -207,7 +207,7 @@ impl Default for KafkaDlqConfig {
 #[serde(rename_all = "snake_case")]
 pub enum DlqRouting {
     /// Route to topic matching destination with suffix.
-    /// e.g. "acme.auth" → "acme.auth.dlq"
+    /// e.g. "acme.auth" -> "acme.auth.dlq"
     #[default]
     PerTable,
 

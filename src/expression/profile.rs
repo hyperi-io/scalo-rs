@@ -246,7 +246,7 @@ fn is_ident_char(b: u8) -> bool {
 mod tests {
     use super::*;
 
-    // ── Default config (all restricted) ─────────────────────────
+    // -- Default config (all restricted) -------------------------
 
     #[test]
     fn allowed_function_passes() {
@@ -376,7 +376,7 @@ mod tests {
         assert!(check_profile(r#"severity == "critical" && amount > 10000"#).is_empty());
     }
 
-    // ── String literal false-positive prevention ────────────────
+    // -- String literal false-positive prevention ----------------
 
     #[test]
     fn function_name_inside_string_not_flagged() {
@@ -419,7 +419,7 @@ mod tests {
         assert!(errors[0].contains("map()"));
     }
 
-    // ── Config overrides ────────────────────────────────────────
+    // -- Config overrides ----------------------------------------
 
     #[test]
     fn matches_allowed_with_regex_config() {
@@ -477,7 +477,7 @@ mod tests {
         );
     }
 
-    // ── Edge cases ──────────────────────────────────────────────
+    // -- Edge cases ----------------------------------------------
 
     #[test]
     fn identifier_not_followed_by_paren_is_fine() {

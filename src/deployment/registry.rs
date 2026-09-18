@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn cascade_falls_back_to_defaults_when_no_config() {
-        // No config setup → returns defaults.
+        // No config setup -> returns defaults.
         assert_eq!(image_registry_from_cascade(), DEFAULT_IMAGE_REGISTRY);
         assert_eq!(base_image_from_cascade(), DEFAULT_BASE_IMAGE);
     }

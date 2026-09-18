@@ -15,11 +15,11 @@
 //! # Architecture
 //!
 //! ```text
-//! App Config::default()  →  DeploymentContract  →  generate_chart("chart/")
-//!                                                →  generate_dockerfile()
-//!                                                →  generate_compose_fragment()
-//!                                                →  validate_helm_values("chart/")
-//!                                                →  validate_dockerfile("Dockerfile")
+//! App Config::default()  ->  DeploymentContract  ->  generate_chart("chart/")
+//!                                                 ->  generate_dockerfile()
+//!                                                 ->  generate_compose_fragment()
+//!                                                 ->  validate_helm_values("chart/")
+//!                                                 ->  validate_dockerfile("Dockerfile")
 //! ```
 //!
 //! The config cascade (figment) is the SSoT for app defaults. The contract

@@ -25,7 +25,7 @@
 //! # Shape
 //!
 //! ```text
-//! consumer (many) ──try_push──► mpsc bounded ──► actor task ──► drain.write_batch
+//! consumer (many) --try_push--> mpsc bounded --> actor task --> drain.write_batch
 //! ```
 //!
 //! The actor batches messages by size (`batch_size`) or interval
@@ -758,13 +758,13 @@ mod tests {
             sink.try_push(i).expect("queue has space");
         }
         let elapsed = start.elapsed();
-        // Generous: average <50µs per push (way above the ~100ns target,
+        // Generous: average <50us per push (way above the ~100ns target,
         // but the test must be robust against CI noise + multi-thread
         // contention). The bench gives the real performance number.
         let avg_us = elapsed.as_micros() as f64 / 10_000.0;
         assert!(
             avg_us < 50.0,
-            "try_push p_avg = {avg_us}µs (expected <50µs under load with throttled drain)",
+            "try_push p_avg = {avg_us}us (expected <50us under load with throttled drain)",
         );
         shutdown.cancel();
         release.notify_waiters();
@@ -875,7 +875,7 @@ mod tests {
         }
         assert!(
             max_us < 5_000,
-            "max try_push latency was {max_us}µs -- slow drain leaked back to consumer",
+            "max try_push latency was {max_us}us -- slow drain leaked back to consumer",
         );
         shutdown.cancel();
     }

@@ -118,11 +118,11 @@ pub enum AuthFailureReason {
     Expired,
     /// JWT / HMAC signature verification failed.
     InvalidSignature,
-    /// RFC 6749 `invalid_client` — client_id or secret wrong.
+    /// RFC 6749 `invalid_client` -- client_id or secret wrong.
     InvalidClient,
-    /// RFC 6749 `invalid_grant` — grant / code / refresh wrong.
+    /// RFC 6749 `invalid_grant` -- grant / code / refresh wrong.
     InvalidGrant,
-    /// RFC 6749 `invalid_scope` — requested scope rejected.
+    /// RFC 6749 `invalid_scope` -- requested scope rejected.
     InvalidScope,
     /// Token couldn't be parsed (structurally malformed).
     MalformedToken,

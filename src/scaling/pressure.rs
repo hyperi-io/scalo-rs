@@ -29,9 +29,9 @@ use super::config::{ScalingComponent, ScalingPressureConfig};
 /// Active gate preventing normal composite calculation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateType {
-    /// Circuit breaker open → 0.0 (scaling won't help).
+    /// Circuit breaker open -> 0.0 (scaling won't help).
     CircuitBreaker,
-    /// Memory pressure high → 100.0 (scale before OOM).
+    /// Memory pressure high -> 100.0 (scale before OOM).
     MemoryPressure,
 }
 
@@ -177,10 +177,10 @@ impl ScalingPressure {
     /// Calculate composite scaling pressure (0.0-100.0).
     ///
     /// Gate logic:
-    /// 1. Disabled → 0.0
-    /// 2. Circuit breaker open → 0.0
-    /// 3. Memory pressure ≥ threshold → 100.0
-    /// 4. Otherwise → weighted composite capped at 100.0
+    /// 1. Disabled -> 0.0
+    /// 2. Circuit breaker open -> 0.0
+    /// 3. Memory pressure >= threshold -> 100.0
+    /// 4. Otherwise -> weighted composite capped at 100.0
     #[must_use]
     pub fn calculate(&self) -> f64 {
         if !self.enabled {
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn test_single_component_at_saturation() {
         let p = test_pressure();
-        // kafka_lag at saturation (100,000) → contributes weight * 100 = 35.0
+        // kafka_lag at saturation (100,000) -> contributes weight * 100 = 35.0
         p.set_component("kafka_lag", 100_000.0);
         let value = p.calculate();
         assert!(
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn test_single_component_half_saturation() {
         let p = test_pressure();
-        // kafka_lag at 50% saturation → contributes 0.5 * 0.35 * 100 = 17.5
+        // kafka_lag at 50% saturation -> contributes 0.5 * 0.35 * 100 = 17.5
         p.set_component("kafka_lag", 50_000.0);
         let value = p.calculate();
         assert!(

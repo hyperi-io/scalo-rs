@@ -59,9 +59,9 @@ pub(super) fn is_go_identifier(s: &str) -> bool {
 ///
 /// Examples:
 ///   - `safe_template_lookup(".Values.auth", "username")`
-///     → `.Values.auth.username`
+///     -> `.Values.auth.username`
 ///   - `safe_template_lookup(".Values.auth", "bearer-tokens")`
-///     → `(index .Values.auth "bearer-tokens")`
+///     -> `(index .Values.auth "bearer-tokens")`
 pub(super) fn safe_template_lookup(base: &str, key: &str) -> String {
     if is_go_identifier(key) {
         format!("{base}.{key}")

@@ -8,7 +8,7 @@
 
 //! Application trait and lifecycle runner for data-plane services.
 //!
-//! Provides the standard startup sequence: parse → log → config → dispatch.
+//! Provides the standard startup sequence: parse -> log -> config -> dispatch.
 //!
 //! ## Example
 //!
@@ -157,7 +157,7 @@ pub trait ServiceApp: Sized {
 /// Drive the standard data-plane service lifecycle.
 ///
 /// Handles subcommand dispatch:
-/// - `run` (default): init logger → load config → run service
+/// - `run` (default): init logger -> load config -> run service
 /// - `version`: print version info and exit
 /// - `config-check`: load config, validate, print summary
 ///

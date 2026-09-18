@@ -268,7 +268,7 @@ fn build_apt_block(
         runtime_pkgs.push(pkg);
     }
 
-    // Build multi-step RUN: base install → repo setup → update → runtime install → cleanup
+    // Build multi-step RUN: base install -> repo setup -> update -> runtime install -> cleanup
     out.push_str("# Runtime shared libraries for dynamically-linked Rust crates.\n");
     // The release these package names are for. Both warnings below name it.
     let release = deps

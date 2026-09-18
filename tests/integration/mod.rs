@@ -7,6 +7,7 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 // Always-compiled integration tests (core modules only)
+mod doc_ascii;
 mod env;
 mod env_parity;
 
