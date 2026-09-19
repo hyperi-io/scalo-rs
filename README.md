@@ -126,97 +126,15 @@ Pick the slice you need; pay only for what you use.
 
 ## Native System Dependencies
 
-This crate dynamically links against system C libraries for several features.
-**Both build hosts and deployment targets need the appropriate packages.**
+This crate dynamically links against system C libraries, so BOTH the build host
+and the deployment target need packages -- the `-dev` ones to build, the `.so`
+runtimes to run. Which ones depends on the features you enable.
 
-### Build Host (CI / Development)
-
-| Feature | Crate | Build Package | Notes |
-|---------|-------|--------------|-------|
-| `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (>= 2.12.1) | Requires [Confluent APT repo](https://packages.confluent.io/clients/deb) - Ubuntu's default is too old |
-| `directory-config-git` | `libgit2-sys` | `libgit2-dev`, `libssh2-1-dev` | System lib avoids vendored C build |
-| `spool`, `tiered-sink` | `zstd-sys` | `libzstd-dev` | System lib avoids vendored C build |
-| (transitive) | `libz-sys` | `zlib1g-dev` | Used by multiple deps |
-| (transitive) | `openssl-sys` | `libssl-dev` | Dynamic linking via pkg-config |
-| `secrets-aws` | `aws-lc-sys` | - | C/C++ compiled from source (no system lib available); ~20-30s first build, cached by sccache |
-
-For `librdkafka-dev` >= 2.12.1, add the Confluent APT repo. The suite below is
-`bookworm`, which is what a Debian trixie host uses - Confluent publishes no
-trixie suite and the bookworm .deb installs cleanly on trixie. On an Ubuntu
-24.04 host use `noble`:
-
-```bash
-curl -fsSL https://packages.confluent.io/clients/deb/archive.key \
-  | sudo gpg --dearmor -o /usr/share/keyrings/confluent-clients.gpg
-echo "deb [signed-by=/usr/share/keyrings/confluent-clients.gpg] \
-  https://packages.confluent.io/clients/deb bookworm main" \
-  | sudo tee /etc/apt/sources.list.d/confluent-clients.list
-sudo apt-get update
-sudo apt-get install -y librdkafka-dev libssl-dev libsasl2-dev pkg-config
-```
-
-### Deployment Host (Runtime)
-
-The compiled binary links against `.so` files at runtime. Install the
-**runtime** packages (not `-dev`) on deployment hosts or in Docker images.
-
-| Feature | Runtime Package | Shared Object |
-|---------|----------------|---------------|
-| `transport-kafka` | `librdkafka1` (from Confluent repo) | `librdkafka.so.1` |
-| `directory-config-git` | `libgit2-1.9` on trixie, `libgit2-1.7` on noble | `libgit2.so` |
-| `spool`, `tiered-sink` | `libzstd1` | `libzstd.so.1` |
-| (transitive) | `zlib1g` | `libz.so.1` |
-| (transitive) | `libssl3t64` on trixie/noble, `libssl3` on bookworm/jammy | `libssl.so.3` |
-
-Only install what you use. Check the features your binary enables to
-determine which runtime packages are needed.
-
-### Docker Example
-
-This is the shape the `deployment` feature's generator emits, minus the
-generated LABEL and APT blocks. The `WORKDIR /app` in the build stage is what
-makes `/app/target/release/...` resolvable from the runtime stage.
-
-```dockerfile
-# Build stage
-FROM rust:1 AS builder
-WORKDIR /app
-RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev librdkafka-dev libgit2-dev libzstd-dev
-COPY . .
-RUN cargo build --release
-
-# Runtime stage - the contract's base_image (default: the org base, currently
-# Debian trixie slim)
-FROM debian:trixie-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    librdkafka1 libssl3t64 libgit2-1.9 libzstd1 ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /app/target/release/myapp /usr/local/bin/myapp
-RUN chmod +x /usr/local/bin/myapp
-
-RUN useradd --create-home --uid 1000 appuser
-USER appuser
-
-EXPOSE 9090
-
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -sf http://localhost:9090/livez > /dev/null || exit 1
-
-ENTRYPOINT ["myapp"]
-```
-
-`libgit2-1.9` and `libssl3t64` are the trixie package names; on a noble base
-they are `libgit2-1.7` and `libssl3t64`, on bookworm `libgit2-1.5` and
-`libssl3`. The `deployment` feature works these out for you from the
-contract's release - see the release table in
-[docs/deployment/native-deps.md](docs/deployment/native-deps.md), which also
-covers adding the Confluent APT repo to both stages for `librdkafka1`.
-The generator also drops any pre-existing UID 1000 account (ubuntu bases ship
-one) before creating `appuser`; trixie slim does not, so the example skips it.
-Note that Kubernetes ignores `HEALTHCHECK` - it is there for plain Docker and
-Compose. K8s uses the probe paths above.
+The full matrix, the Confluent APT repo a current `librdkafka` needs, the
+per-release package names and a worked Dockerfile are in
+[docs/deployment/native-deps.md](docs/deployment/native-deps.md). The
+`deployment` feature derives all of it from the contract's release, so a
+generated Dockerfile already carries the right names.
 
 ## Health Check Endpoints
 
@@ -302,3 +220,116 @@ config cascade reference.
 - **[scalo-py](https://github.com/hyperi-io/scalo-py)** -- sister library for
   Python services. Same opinions, same patterns, expressive Python ergonomics
   for control planes, APIs, and integration layers.
+
+## Context
+
+### What this is
+
+The Rust half of scalo: a runtime a data-plane service links, not a framework it
+plugs into. Config, logging and metrics are global singletons with no init dance,
+and the transports, spool, tiered sink, DLQ, worker pool, probes and deployment
+contract all sit on top. Published as `scalo` on crates.io under Apache-2.0.
+
+What it is not:
+
+- Not DFE. `.hyperi-ci.yaml` declares neutral branding -- no HyperI or DFE name
+  in code, comments, metrics or on the wire, copyright and attribution aside.
+  scalo-rs#136 tracks the brand strings still in the tree.
+- Not scalo-py's twin. Same conventions, DIFFERENT API, separate repo. Never
+  assume parity between the two.
+- Not a library you bump on its own. Seven repos build against this crate and
+  their Dockerfiles, charts and manifests are written by `scalo::deployment`, so
+  a release here is a fleet move. See "Where this sits".
+
+### Where things live
+
+| Path | What is there |
+|---|---|
+| `src/lib.rs` | Crate entry point and public re-exports. Its module doc is the docs.rs front page |
+| `src/<module>/` | One directory per feature area, layered L1 pillars up to L5 scaffolding. A module never depends upward -- rules in `docs/architecture.md` |
+| `Cargo.toml` `[features]` | The real API surface. `default = ["config", "logger"]` and nothing more |
+| `Cargo.toml` `[package.metadata.docs.rs]` | Hand-enumerated feature list docs.rs builds with. Not derived, not checked by CI |
+| `VERSION` | The released version. `Cargo.toml`'s `version` field is not it |
+| `tests/` | Integration tests, plus `e2e/`, `integration/`, `common/` and `fixtures/` |
+| `benches/` | Criterion benches, declared as `[[bench]]` in `Cargo.toml` |
+| `examples/` | `quickstart` and `full_demo`, plus the `mem_loadgen` and `cpu_loadgen` harnesses that `scripts/operational-*-test.sh` drive under a cgroup cap |
+| `proto/` | `proto/scalo/transport/v1` is ours. `proto/vector/*.proto` is vendored from Vector and stays MPL-2.0 -- see `NOTICE` |
+| `docs/` | `docs/README.md` is the index, `docs/architecture.md` the module map and layering rules |
+| `.hyperi-ci.yaml` | What CI actually runs |
+| `.githooks/commit-msg` | Conventional-commit check, inert until you set `core.hooksPath` |
+
+### Commands that prove a change
+
+| Command | What it is |
+|---|---|
+| `make quality` | `hyperi-ci run quality` |
+| `make test` | `hyperi-ci run test` |
+| `make build` | `hyperi-ci run build` |
+| `hyperi-ci check` | The whole local gate, what `CONTRIBUTING.md` tells a contributor to run before every push |
+
+CI is the shared `hyperi-io/hyperi-ci/.github/workflows/rust-ci.yml@main`, driven
+by `.hyperi-ci.yaml`. Four ways green means less than it looks:
+
+| Green still hides | Because |
+|---|---|
+| A clippy failure, dead code or a broken intra-doc link under a narrow feature set | CI builds and lints with `features: all`, so a subset-only fault never shows. A consumer enabling a narrow set is exactly who hits it (scalo-rs#144) |
+| Anything that depends on a process-global | `nextest: true` forks a process per test, and `coverage: false`, so a single-process runner fails where CI passes (scalo-rs#150) |
+| A docs-only branch push | `.github/workflows/ci.yml` sets `paths-ignore` for `docs/**` and `**.md` on push, so that run is skipped outright. The `pull_request` trigger carries no `paths-ignore`, so the PR does run it |
+| A docs.rs build failure | Nothing in CI builds the hand-written docs.rs feature list (scalo-rs#122) |
+
+`.cargo/config.toml` sets `rustflags = ["-D", "warnings"]`, so any warning fails a
+local build too. An all-features build needs the build-host packages in
+[docs/deployment/native-deps.md](docs/deployment/native-deps.md).
+
+### What tends to bite
+
+| Don't | Do | Why |
+|---|---|---|
+| Read the released version out of `Cargo.toml` | Read `VERSION` | A release commit touches `CHANGELOG.md` and `VERSION` only. `Cargo.toml` still says 2.12.0 where `VERSION` says 2.12.3 |
+| Add a `pub` field to `DeploymentContract`, `PortContract` or `KedaContract` and treat it as a patch | Add it, then regenerate and fix every consumer in the same pass | None of those three is `#[non_exhaustive]`, so a new field breaks every consumer struct literal. `PortCondition`, `KafkaLagTrigger` and `ChartPatch` are. Four consumer repos carried a comment claiming `KedaContract` was, and it never has been |
+| Assert on `render()` in two metrics tests in one process | Assert in one, and drive the rest through the installed global | `set_global_recorder` succeeds once per process. Every later `MetricsManager` warns, keeps the existing recorder and renders an empty string (scalo-rs#150) |
+| Rename or drop a cargo feature and stop there | Edit `[package.metadata.docs.rs].features` in the same commit | That list is hand-written and nothing in CI builds it. The 2.12.3 docs.rs build failed on a name that no longer existed, so the crate had no rendered API docs (scalo-rs#122) |
+| Prove a change with `--all-features` alone | Check the narrow sets a consumer actually declares as well | Clippy, dead-code and intra-doc-link faults live only in the subsets (scalo-rs#144) |
+| Build or test a consumer with only `transport-kafka` | Compile every transport feature | The backend comes from the `transport.type` config key and each backend's config field is `#[cfg(feature)]`-gated, so a narrow binary compiles and tests green, then refuses at runtime with "transport type '...' is not available" |
+| Expect the commit-msg hook to run in a fresh clone | `git config core.hooksPath .githooks` once | `core.hooksPath` is unset by default. The hook file documents that exact line and still nobody runs it |
+| Type a non-ASCII character | `--`, `->`, `...` | It keeps coming back. Non-ASCII is still in `tests/`, `benches/` and about 17 `docs/` files (scalo-rs#143) |
+
+### Where this sits
+
+Generated with `dfe-infra/scripts/dfe-stack suite --consumer scalo-rs` and the
+same command with `--producer scalo-rs`.
+
+**Inbound: nothing.** `--consumer scalo-rs` returns zero edges. This repo depends
+on no other repo in the suite, only on crates.io and the system C libraries in
+[docs/deployment/native-deps.md](docs/deployment/native-deps.md). Bottom of the
+graph, deliberately.
+
+**Outbound: seven repos, each on two edges at once.**
+
+- `cargo-dep` -- the consumer's `Cargo.toml` names `scalo` by range. If the range
+  admits the new version, `cargo update -p scalo` and rebuild. If not, widen the
+  range first.
+- `generated-file` -- files committed in the consumer are written by
+  `scalo::deployment`, each carrying a header that names the generator and the
+  schema version it was emitted at. dfe-loader's `Dockerfile` names
+  `generate_dockerfile()`, schema version 3, and its own regenerate command.
+  Change a generator or its schema and every consumer regenerates.
+
+| Consumer repo | What else moves with it |
+|---|---|
+| dfe-loader | - |
+| dfe-receiver | A second `scalo` range for the test-support feature. Both must move together |
+| dfe-fetcher | - |
+| dfe-archiver | The workspace root declares it and three crates inherit via `workspace = true` |
+| dfe-transform-vrl | A second range for the dev dependency |
+| dfe-transform-vector | A second range for the dev dependency |
+| dfe-transform-elastic | Alpha, outside the default pass, another team's. Its floor is lower than the other six, so it can resolve an older scalo. Do not edit it |
+
+dfe-fetcher, dfe-receiver and dfe-loader each assert that the committed chart
+equals the generator's output, so a scalo bump with no regenerate fails the
+consumer's own suite. That is the guard working, not a flake.
+
+Two edges the suite graph does not declare: dfe-engine reflects on the config
+schema and capability catalogue both scalo halves emit, through one code path,
+and scalo-py mirrors that same shape (`docs/reflectable-config-shape.md`).
+Convention, not a checked dependency.
