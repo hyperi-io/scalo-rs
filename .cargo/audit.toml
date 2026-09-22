@@ -6,18 +6,12 @@
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 
-# Ignored advisories -- transitive deps we cannot fix.
-# Review on each major dependency update (especially sqlx, cel-interpreter).
+# Empty on purpose. An ignore here suppresses a real advisory, so an entry
+# stays only while the crate it names is still in the graph.
+#
+# deny.toml carries the same [advisories] ignore list. Suppressing anything in
+# both files is how a live CVE gets silenced by accident, so put new entries in
+# deny.toml and leave this one empty.
 
 [advisories]
-ignore = [
-    # rsa timing side-channel (Marvin Attack), medium severity.
-    # Transitive: sqlx -> sqlx-mysql -> rsa. We use PostgreSQL only.
-    # No fixed version upstream. Revisit when sqlx drops default MySQL.
-    "RUSTSEC-2023-0071",
-
-    # paste crate unmaintained (no security impact).
-    # Transitive: cel-interpreter -> paste. We cannot control this.
-    # Revisit when cel-interpreter updates or replaces paste.
-    "RUSTSEC-2024-0436",
-]
+ignore = []
