@@ -111,6 +111,8 @@ pub struct BrokerMetrics {
 pub struct StatsContext {
     stats: RwLock<Option<Statistics>>,
     latest_metrics: RwLock<KafkaMetrics>,
+    /// Broker-side delivery outcomes, when this context drives a producer.
+    delivery: super::classify::DeliveryState,
 }
 
 impl Default for StatsContext {
@@ -126,7 +128,17 @@ impl StatsContext {
         Self {
             stats: RwLock::new(None),
             latest_metrics: RwLock::new(KafkaMetrics::default()),
+            delivery: super::classify::DeliveryState::default(),
         }
+    }
+
+    /// Messages the broker refused or never acknowledged.
+    ///
+    /// Only moves when this context drives a producer directly; the
+    /// `FutureProducer` path reports delivery through its own send future.
+    #[must_use]
+    pub fn delivery_failures(&self) -> u64 {
+        self.delivery.failures()
     }
 
     /// Get the latest metrics snapshot (clone).
@@ -359,9 +371,12 @@ impl rdkafka::producer::ProducerContext for StatsContext {
 
     fn delivery(
         &self,
-        _result: &rdkafka::producer::DeliveryResult<'_>,
+        result: &rdkafka::producer::DeliveryResult<'_>,
         _opaque: Self::DeliveryOpaque,
     ) {
+        // A dropped delivery report is a lost record reported as a success, so
+        // record it even though this context exists for the statistics callback.
+        self.delivery.record(result);
     }
 }
 

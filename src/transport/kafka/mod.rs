@@ -50,6 +50,7 @@
 //! ```
 
 mod admin;
+mod classify;
 mod config;
 pub mod contract;
 mod metrics;
@@ -137,6 +138,9 @@ pub struct KafkaTransport {
     closed: AtomicBool,
     /// Shared healthy flag -- read by health registry closure, written by close().
     healthy: Arc<AtomicBool>,
+    /// Latches a sustained retryable send failure so the warn fires on the edge,
+    /// not once per record.
+    send_degraded: classify::DegradedLatch,
     /// Topics we're subscribed to (for cache warming and Debug).
     /// Behind RwLock so recv() can update after topic refresh re-subscribe.
     subscribed_topics: parking_lot::RwLock<Vec<String>>,
@@ -487,6 +491,7 @@ impl KafkaTransport {
             topic_cache: parking_lot::RwLock::new(topic_cache),
             closed: AtomicBool::new(false),
             healthy,
+            send_degraded: classify::DegradedLatch::default(),
             subscribed_topics: parking_lot::RwLock::new(subscribed_topics),
             #[cfg(feature = "governor")]
             group_id: config.group.clone(),
@@ -763,11 +768,13 @@ impl TransportSender for KafkaTransport {
                     ::metrics::counter!("transport_sent_bytes_total", "transport" => "kafka")
                         .increment(payload.len() as u64);
                 }
+                if self.send_degraded.clear() {
+                    tracing::info!(destination, "kafka send recovered");
+                }
                 SendResult::Ok
             }
-            Err((err, _)) => {
-                let err_str = err.to_string();
-                if err_str.contains("queue full") || err_str.contains("Local: Queue full") {
+            Err((err, _)) => match classify::classify_send_failure(&err) {
+                classify::SendFailure::QueueFull => {
                     #[cfg(feature = "metrics")]
                     ::metrics::counter!(
                         "transport_backpressured_total",
@@ -775,16 +782,33 @@ impl TransportSender for KafkaTransport {
                     )
                     .increment(1);
                     SendResult::Backpressured
-                } else {
+                }
+                classify::SendFailure::Retryable => {
                     #[cfg(feature = "metrics")]
                     ::metrics::counter!(
                         "transport_send_errors_total",
                         "transport" => "kafka"
                     )
                     .increment(1);
-                    SendResult::Fatal(TransportError::Send(err_str))
+                    if self.send_degraded.enter() {
+                        tracing::warn!(
+                            destination,
+                            error = %err,
+                            "kafka send failed on a retryable condition; the caller retries"
+                        );
+                    }
+                    SendResult::Backpressured
                 }
-            }
+                classify::SendFailure::Fatal => {
+                    #[cfg(feature = "metrics")]
+                    ::metrics::counter!(
+                        "transport_send_errors_total",
+                        "transport" => "kafka"
+                    )
+                    .increment(1);
+                    SendResult::Fatal(TransportError::Send(err.to_string()))
+                }
+            },
         };
 
         #[cfg(feature = "metrics")]
