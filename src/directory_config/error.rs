@@ -31,6 +31,15 @@ pub enum DirectoryConfigError {
     #[error("key '{key}' not found in table '{table}'")]
     KeyNotFound { table: String, key: String },
 
+    /// A node on the key path holds a non-mapping value, so the key cannot
+    /// be set without destroying it.
+    #[error("cannot set key '{key}' in table '{table}': '{holder}' is not a mapping")]
+    KeyPathConflict {
+        table: String,
+        key: String,
+        holder: String,
+    },
+
     /// Table already exists (on create).
     #[error("table already exists: {0}")]
     TableExists(String),

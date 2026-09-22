@@ -183,7 +183,10 @@ impl DirectoryConfigStore {
 
     /// Set a key in a table. Creates the table file if it doesn't exist.
     ///
-    /// Returns `ReadOnly` error if the store is not writable.
+    /// Returns `ReadOnly` error if the store is not writable, and
+    /// `KeyPathConflict` if a node on the key path holds a non-mapping value.
+    /// A refused write leaves the file, the cache and git untouched and
+    /// broadcasts no change.
     pub async fn set(
         &self,
         table: &str,
@@ -211,8 +214,20 @@ impl DirectoryConfigStore {
             serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new())
         };
 
-        // Set the key (supports dot-notation)
-        set_yaml_key(&mut doc, key, value);
+        // Set the key (supports dot-notation). A conflict placed nothing, so
+        // refuse here rather than commit and broadcast a change that is not
+        // in the file.
+        set_yaml_key(&mut doc, key, value).map_err(|prefix| {
+            DirectoryConfigError::KeyPathConflict {
+                table: table.to_string(),
+                key: key.to_string(),
+                holder: if prefix.is_empty() {
+                    table.to_string()
+                } else {
+                    format!("{table}.{prefix}")
+                },
+            }
+        })?;
 
         // Write with advisory lock
         write_yaml_locked(&file_path, &doc)?;
@@ -674,7 +689,16 @@ fn navigate_yaml(value: &serde_yaml_ng::Value, key: &str) -> Option<serde_yaml_n
 }
 
 /// Set a value at a dot-notation key path in a YAML document.
-fn set_yaml_key(doc: &mut serde_yaml_ng::Value, key: &str, value: serde_yaml_ng::Value) {
+///
+/// A null node is absent, not a value, so it becomes a mapping the same way a
+/// missing one does. Any other non-mapping node on the path is a conflict: the
+/// document is left untouched and the dotted prefix of the offending node is
+/// returned (empty for the document root).
+fn set_yaml_key(
+    doc: &mut serde_yaml_ng::Value,
+    key: &str,
+    value: serde_yaml_ng::Value,
+) -> Result<(), String> {
     let parts: Vec<&str> = key.split('.').collect();
     let mut current = doc;
 
@@ -683,25 +707,31 @@ fn set_yaml_key(doc: &mut serde_yaml_ng::Value, key: &str, value: serde_yaml_ng:
 
         if i == parts.len() - 1 {
             // Last part -- set the value
-            if let serde_yaml_ng::Value::Mapping(map) = current {
-                map.insert(yaml_key, value);
-                return;
-            }
-        } else {
-            // Intermediate part -- navigate or create mapping
-            if !current.is_mapping() {
+            if matches!(current, serde_yaml_ng::Value::Null) {
                 *current = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
             }
-            let map = current.as_mapping_mut().unwrap();
-            if !map.contains_key(&yaml_key) {
-                map.insert(
-                    yaml_key.clone(),
-                    serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new()),
-                );
-            }
-            current = map.get_mut(&yaml_key).unwrap();
+            let serde_yaml_ng::Value::Mapping(map) = current else {
+                return Err(parts[..i].join("."));
+            };
+            map.insert(yaml_key, value);
+            return Ok(());
         }
+
+        // Intermediate part -- navigate or create mapping
+        if !current.is_mapping() {
+            *current = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
+        }
+        let map = current.as_mapping_mut().unwrap();
+        if !map.contains_key(&yaml_key) {
+            map.insert(
+                yaml_key.clone(),
+                serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new()),
+            );
+        }
+        current = map.get_mut(&yaml_key).unwrap();
     }
+
+    Ok(())
 }
 
 /// Remove a key at a dot-notation path. Returns true if the key existed.
@@ -779,7 +809,8 @@ mod tests {
             &mut doc,
             "name",
             serde_yaml_ng::Value::String("test".to_string()),
-        );
+        )
+        .unwrap();
         assert_eq!(
             navigate_yaml(&doc, "name"),
             Some(serde_yaml_ng::Value::String("test".to_string()))
@@ -790,10 +821,125 @@ mod tests {
             &mut doc,
             "database.host",
             serde_yaml_ng::Value::String("localhost".to_string()),
-        );
+        )
+        .unwrap();
         assert_eq!(
             navigate_yaml(&doc, "database.host"),
             Some(serde_yaml_ng::Value::String("localhost".to_string()))
+        );
+    }
+
+    #[test]
+    fn set_yaml_key_refuses_to_overwrite_a_scalar_parent() {
+        // `database: localhost`, then set("database.host"): the leaf's parent
+        // is a scalar, so the value has nowhere to go.
+        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str("database: localhost").unwrap();
+
+        let holder = set_yaml_key(
+            &mut doc,
+            "database.host",
+            serde_yaml_ng::Value::String("10.0.0.1".to_string()),
+        )
+        .expect_err("a scalar parent must refuse the write");
+
+        assert_eq!(holder, "database");
+        assert_eq!(
+            navigate_yaml(&doc, "database"),
+            Some(serde_yaml_ng::Value::String("localhost".to_string())),
+            "a refused write leaves the document alone"
+        );
+    }
+
+    #[test]
+    fn set_yaml_key_refuses_a_non_mapping_document() {
+        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str("- a\n- b").unwrap();
+
+        let holder = set_yaml_key(
+            &mut doc,
+            "name",
+            serde_yaml_ng::Value::String("test".to_string()),
+        )
+        .expect_err("a sequence document must refuse the write");
+
+        assert_eq!(holder, "", "the document root is the blocker");
+        assert!(
+            doc.is_sequence(),
+            "a refused write leaves the document alone"
+        );
+    }
+
+    #[test]
+    fn set_yaml_key_treats_null_as_absent() {
+        // An empty file parses to null, and so does `database:` with no value.
+        // Neither is a value somebody put there, so both are created.
+        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str("").unwrap();
+        set_yaml_key(
+            &mut doc,
+            "name",
+            serde_yaml_ng::Value::String("test".to_string()),
+        )
+        .expect("an empty document accepts a key");
+        assert_eq!(
+            navigate_yaml(&doc, "name"),
+            Some(serde_yaml_ng::Value::String("test".to_string()))
+        );
+
+        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str("database:").unwrap();
+        set_yaml_key(
+            &mut doc,
+            "database.host",
+            serde_yaml_ng::Value::String("localhost".to_string()),
+        )
+        .expect("a null node accepts a nested key");
+        assert_eq!(
+            navigate_yaml(&doc, "database.host"),
+            Some(serde_yaml_ng::Value::String("localhost".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_refuses_a_dropped_write_rather_than_reporting_it_as_done() {
+        // A write that cannot be placed must reach neither the file, the
+        // cache, nor the change subscribers.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.yaml");
+        std::fs::write(&path, "database: localhost\n").unwrap();
+
+        let store = DirectoryConfigStore::new(DirectoryConfigStoreConfig {
+            directory: tmp.path().to_path_buf(),
+            git_enabled: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut changes = store.on_change();
+
+        let result = store
+            .set(
+                "t",
+                "database.host",
+                serde_yaml_ng::Value::String("10.0.0.1".to_string()),
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(DirectoryConfigError::KeyPathConflict { .. })),
+            "expected a refusal, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "database: localhost\n",
+            "the file must be untouched"
+        );
+        assert!(
+            changes.try_recv().is_err(),
+            "no ChangeEvent may be broadcast for a write that did not happen"
+        );
+        assert_eq!(
+            store.get_key("t", "database").await.unwrap(),
+            serde_yaml_ng::Value::String("localhost".to_string()),
+            "the cache must be untouched"
         );
     }
 

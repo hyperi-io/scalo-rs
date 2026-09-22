@@ -57,11 +57,11 @@
 //! // Readiness callback
 //! mgr.set_readiness_check(|| true);
 //!
-//! // Attach scaling pressure (adds /scaling/pressure endpoint)
+//! // Attach scaling pressure (/scaling/pressure starts serving it)
 //! let scaling = Arc::new(ScalingPressure::new(ScalingPressureConfig::default(), vec![]));
 //! mgr.set_scaling_pressure(scaling);
 //!
-//! // Attach memory guard (adds /memory/pressure endpoint)
+//! // Attach memory guard (/memory/pressure starts serving it)
 //! let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig::default()));
 //! mgr.set_memory_guard(guard);
 //!
@@ -107,6 +107,21 @@ pub type ReadinessFn = Arc<dyn Fn() -> bool + Send + Sync>;
 /// the listener has started -- which is the only order an app can achieve when
 /// readiness depends on state built after the runtime.
 type ReadinessSlot = Arc<RwLock<Option<ReadinessFn>>>;
+
+/// Shared slot the running server reads on every `/scaling/pressure`.
+///
+/// Same reason as [`ReadinessSlot`]: the route reads the slot per request
+/// rather than capturing the value when the router is built, so
+/// [`MetricsManager::set_scaling_pressure`] takes effect after the listener
+/// has started.
+#[cfg(all(feature = "metrics", feature = "scaling"))]
+type ScalingPressureSlot = Arc<RwLock<Option<Arc<crate::scaling::ScalingPressure>>>>;
+
+/// Shared slot the running server reads on every `/memory/pressure`.
+///
+/// Late-binding for the same reason as [`ScalingPressureSlot`].
+#[cfg(all(feature = "metrics", feature = "memory"))]
+type MemoryGuardSlot = Arc<RwLock<Option<Arc<crate::memory::MemoryGuard>>>>;
 
 #[cfg(feature = "metrics")]
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -484,9 +499,9 @@ pub struct MetricsManager {
     readiness_fn: ReadinessSlot,
     registry: MetricRegistry,
     #[cfg(all(feature = "metrics", feature = "scaling"))]
-    scaling_pressure: Option<Arc<crate::scaling::ScalingPressure>>,
+    scaling_pressure: ScalingPressureSlot,
     #[cfg(all(feature = "metrics", feature = "memory"))]
-    memory_guard: Option<Arc<crate::memory::MemoryGuard>>,
+    memory_guard: MemoryGuardSlot,
     #[cfg(feature = "otel-metrics")]
     otel_provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
 }
@@ -529,9 +544,9 @@ impl MetricsManager {
             container_metrics: None,
             readiness_fn: ReadinessSlot::default(),
             #[cfg(all(feature = "metrics", feature = "scaling"))]
-            scaling_pressure: None,
+            scaling_pressure: ScalingPressureSlot::default(),
             #[cfg(all(feature = "metrics", feature = "memory"))]
-            memory_guard: None,
+            memory_guard: MemoryGuardSlot::default(),
             #[cfg(feature = "otel-metrics")]
             otel_provider: None,
         }
@@ -571,9 +586,9 @@ impl MetricsManager {
             container_metrics,
             readiness_fn: ReadinessSlot::default(),
             #[cfg(all(feature = "metrics", feature = "scaling"))]
-            scaling_pressure: None,
+            scaling_pressure: ScalingPressureSlot::default(),
             #[cfg(all(feature = "metrics", feature = "memory"))]
-            memory_guard: None,
+            memory_guard: MemoryGuardSlot::default(),
             #[cfg(feature = "otel-metrics")]
             otel_provider: setup.otel_provider,
         }
@@ -836,20 +851,34 @@ impl MetricsManager {
 
     /// Attach a `ScalingPressure` instance.
     ///
-    /// When set and using `start_server_with_routes`, a `/scaling/pressure`
-    /// endpoint is automatically added that returns the current pressure value.
+    /// When set and using `start_server_with_routes`, `/scaling/pressure`
+    /// returns the current pressure value; until then it returns 404.
+    ///
+    /// Takes effect immediately whether or not the server is already running,
+    /// because the route reads a slot rather than a value captured at start.
+    /// An app that builds its pressure after the runtime is up -- the only
+    /// order most apps can achieve -- still gets served.
     #[cfg(all(feature = "metrics", feature = "scaling"))]
     pub fn set_scaling_pressure(&mut self, sp: Arc<crate::scaling::ScalingPressure>) {
-        self.scaling_pressure = Some(sp);
+        *self
+            .scaling_pressure
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sp);
     }
 
     /// Attach a `MemoryGuard` instance.
     ///
-    /// When set and using `start_server_with_routes`, a `/memory/pressure`
-    /// endpoint is automatically added that returns the current memory status.
+    /// When set and using `start_server_with_routes`, `/memory/pressure`
+    /// returns the current memory status; until then it returns 404.
+    ///
+    /// Late-binds the same way [`set_scaling_pressure`](Self::set_scaling_pressure)
+    /// does.
     #[cfg(all(feature = "metrics", feature = "memory"))]
     pub fn set_memory_guard(&mut self, mg: Arc<crate::memory::MemoryGuard>) {
-        self.memory_guard = Some(mg);
+        *self
+            .memory_guard
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(mg);
     }
 
     /// Update process and container metrics.
@@ -934,10 +963,12 @@ impl MetricsManager {
     /// `/metrics`, `/metrics/manifest`, `/livez` and `/readyz`.
     ///
     /// Additionally:
-    /// - If [`set_scaling_pressure`](Self::set_scaling_pressure) was called,
-    ///   adds `/scaling/pressure` returning the current pressure value.
-    /// - If [`set_memory_guard`](Self::set_memory_guard) was called,
-    ///   adds `/memory/pressure` returning memory status JSON.
+    /// - `/scaling/pressure` returns the current pressure value once
+    ///   [`set_scaling_pressure`](Self::set_scaling_pressure) has been called,
+    ///   and 404 until then.
+    /// - `/memory/pressure` returns memory status JSON once
+    ///   [`set_memory_guard`](Self::set_memory_guard) has been called, and 404
+    ///   until then.
     /// - Any routes in `extra_routes` are merged (service-specific endpoints).
     ///
     /// Requires both `metrics` and `http-server` features.
@@ -978,13 +1009,32 @@ impl MetricsManager {
         let update_interval = self.config.update_interval;
         let process_metrics = self.process_metrics.clone();
         let container_metrics = self.container_metrics.clone();
-        let readiness_fn = self.readiness_fn.clone();
 
-        // Build the axum router with built-in + optional + custom routes
-        let metrics_handle = handle.clone();
+        let app = self.build_router(handle, extra_routes);
+
+        tokio::spawn(async move {
+            run_axum_server(
+                listener,
+                app,
+                shutdown_rx,
+                update_interval,
+                process_metrics,
+                container_metrics,
+            )
+            .await;
+        });
+
+        Ok(())
+    }
+
+    /// Build the router `start_server_with_routes` serves: the built-in
+    /// endpoints, the pressure endpoints, then the caller's own routes.
+    #[cfg(all(feature = "metrics", feature = "http-server"))]
+    fn build_router(&self, handle: PrometheusHandle, extra_routes: axum::Router) -> axum::Router {
+        let readiness_fn = self.readiness_fn.clone();
         let registry_handle = self.registry();
 
-        let mut app = axum::Router::new()
+        let app = axum::Router::new()
             .route(
                 "/metrics/manifest",
                 axum::routing::get(move || {
@@ -1000,7 +1050,7 @@ impl MetricsManager {
             .route(
                 "/metrics",
                 axum::routing::get(move || {
-                    let h = metrics_handle.clone();
+                    let h = handle.clone();
                     async move { h.render() }
                 }),
             )
@@ -1024,59 +1074,34 @@ impl MetricsManager {
                 }),
             );
 
-        // Add scaling pressure endpoint if configured
+        // The pressure endpoints are mounted unconditionally and read their
+        // slot per request. Mounting them only for what was attached before
+        // the listener started is what made a post-start attach unreachable.
         #[cfg(feature = "scaling")]
-        if let Some(ref sp) = self.scaling_pressure {
-            let sp = sp.clone();
-            app = app.route(
+        let app = {
+            let slot = self.scaling_pressure.clone();
+            app.route(
                 "/scaling/pressure",
                 axum::routing::get(move || {
-                    let s = sp.clone();
-                    async move { format!("{:.2}", s.calculate()) }
+                    let slot = slot.clone();
+                    async move { scaling_pressure_response(&slot) }
                 }),
-            );
-        }
+            )
+        };
 
-        // Add memory pressure endpoint if configured
         #[cfg(feature = "memory")]
-        if let Some(ref mg) = self.memory_guard {
-            let mg = mg.clone();
-            app = app.route(
+        let app = {
+            let slot = self.memory_guard.clone();
+            app.route(
                 "/memory/pressure",
                 axum::routing::get(move || {
-                    let m = mg.clone();
-                    async move {
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            format!(
-                                r#"{{"under_pressure":{},"ratio":{:.3},"current_bytes":{},"limit_bytes":{}}}"#,
-                                m.under_pressure(),
-                                m.pressure_ratio(),
-                                m.current_bytes(),
-                                m.limit_bytes()
-                            ),
-                        )
-                    }
+                    let slot = slot.clone();
+                    async move { memory_pressure_response(&slot) }
                 }),
-            );
-        }
-
-        // Merge service-specific routes
-        app = app.merge(extra_routes);
-
-        tokio::spawn(async move {
-            run_axum_server(
-                listener,
-                app,
-                shutdown_rx,
-                update_interval,
-                process_metrics,
-                container_metrics,
             )
-            .await;
-        });
+        };
 
-        Ok(())
+        app.merge(extra_routes)
     }
 
     /// Stop the metrics server.
@@ -1334,6 +1359,54 @@ fn readiness_response(rf: ReadinessSlot) -> axum::response::Response {
     }
 }
 
+/// Build the `/scaling/pressure` response, or 404 when nothing is attached.
+///
+/// Reads the slot per request, so a pressure attached after the listener
+/// started is served.
+#[cfg(all(feature = "metrics", feature = "http-server", feature = "scaling"))]
+fn scaling_pressure_response(slot: &ScalingPressureSlot) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let attached = slot
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+
+    match attached {
+        Some(sp) => format!("{:.2}", sp.calculate()).into_response(),
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Build the `/memory/pressure` response, or 404 when nothing is attached.
+///
+/// Reads the slot per request, for the same reason as
+/// [`scaling_pressure_response`].
+#[cfg(all(feature = "metrics", feature = "http-server", feature = "memory"))]
+fn memory_pressure_response(slot: &MemoryGuardSlot) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let attached = slot
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+
+    match attached {
+        Some(mg) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format!(
+                r#"{{"under_pressure":{},"ratio":{:.3},"current_bytes":{},"limit_bytes":{}}}"#,
+                mg.under_pressure(),
+                mg.pressure_ratio(),
+                mg.current_bytes(),
+                mg.limit_bytes()
+            ),
+        )
+            .into_response(),
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Run the axum-based metrics HTTP server with custom routes.
 #[cfg(all(feature = "metrics", feature = "http-server"))]
 async fn run_axum_server(
@@ -1424,6 +1497,84 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .is_none_or(|f| f())
+    }
+
+    /// A Prometheus handle without installing a global recorder.
+    #[cfg(all(feature = "metrics", feature = "http-server"))]
+    fn test_prometheus_handle() -> PrometheusHandle {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle()
+    }
+
+    #[cfg(all(feature = "metrics", feature = "http-server"))]
+    async fn probe(app: &axum::Router, path: &str) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A pressure attached after the router was built must still be served.
+    ///
+    /// `ServiceRuntime::build` starts the listener before an app can build its
+    /// own `ScalingPressure`, so the route has to read the slot per request
+    /// rather than capture what was attached at build time.
+    #[cfg(all(feature = "metrics", feature = "http-server", feature = "scaling"))]
+    #[tokio::test]
+    async fn scaling_pressure_attached_after_the_router_was_built_is_served() {
+        let mut manager = MetricsManager::new_for_test("");
+        let app = manager.build_router(test_prometheus_handle(), axum::Router::new());
+
+        assert_eq!(
+            probe(&app, "/scaling/pressure").await,
+            axum::http::StatusCode::NOT_FOUND,
+            "nothing attached yet"
+        );
+
+        manager.set_scaling_pressure(Arc::new(crate::scaling::ScalingPressure::new(
+            crate::scaling::ScalingPressureConfig::default(),
+            vec![],
+        )));
+
+        assert_eq!(
+            probe(&app, "/scaling/pressure").await,
+            axum::http::StatusCode::OK,
+            "a post-build attach must reach the endpoint"
+        );
+    }
+
+    /// Same defect, same file: `set_memory_guard` is the adjacent line the
+    /// scaling issue describes.
+    #[cfg(all(feature = "metrics", feature = "http-server", feature = "memory"))]
+    #[tokio::test]
+    async fn memory_guard_attached_after_the_router_was_built_is_served() {
+        let mut manager = MetricsManager::new_for_test("");
+        let app = manager.build_router(test_prometheus_handle(), axum::Router::new());
+
+        assert_eq!(
+            probe(&app, "/memory/pressure").await,
+            axum::http::StatusCode::NOT_FOUND,
+            "nothing attached yet"
+        );
+
+        manager.set_memory_guard(Arc::new(crate::memory::MemoryGuard::new(
+            crate::memory::MemoryGuardConfig::default(),
+        )));
+
+        assert_eq!(
+            probe(&app, "/memory/pressure").await,
+            axum::http::StatusCode::OK,
+            "a post-build attach must reach the endpoint"
+        );
     }
 
     #[test]
