@@ -11,6 +11,7 @@
 Thumbs.db
 
 # Local environment files (never commit -- contain secrets)
+.kube/
 .env
 .env.*
 .env.local
