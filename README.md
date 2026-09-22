@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](https://www.apache.org/licenses/LICENSE-2.0)
 <!-- BADGES:END -->
 
-An integrated crate for at scale data plane services. Attach and 'enterprise-up' your application.
+An integrated runtime for at scale data plane services. Attach and 'enterprise-up' your application.
 
 ## Key features
 
