@@ -85,11 +85,27 @@ kafka:
 
 The profile defaults, with the ACTUAL librdkafka property each maps to:
 
-| Profile | GET `fetch.min.bytes` | GET `fetch.wait.max.ms` | GET `max.partition.fetch.bytes` | GET `fetch.max.bytes` | poll cap | SEND `batch.size` | SEND `linger.ms` | SEND codec | SEND `queue.buffering.max.kbytes` |
-|---|---|---|---|---|---|---|---|---|---|
-| `throughput` (default) | 1 MiB | 50 ms | 10 MiB | 100 MiB | 2000 | 128 KiB | 20 ms | lz4 | 64 MiB |
-| `balanced` | 256 KiB | 25 ms | 5 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | lz4 | 32 MiB |
-| `low_latency` | 1 byte | 5 ms | 1 MiB | 10 MiB | 500 | 16 KiB | 0 ms | lz4 | 16 MiB |
+| Profile | GET `fetch.min.bytes` | GET `fetch.wait.max.ms` | GET `max.partition.fetch.bytes` | GET `fetch.max.bytes` | poll cap | SEND `batch.size` | SEND `linger.ms` | SEND codec | SEND `queue.buffering.max.kbytes` | SEND `message.max.bytes` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `throughput` (default) | 1 MiB | 50 ms | 16 MiB | 50 MiB | 2000 | 128 KiB | 20 ms | lz4 | 64 MiB | 16 MiB |
+| `balanced` | 256 KiB | 25 ms | 16 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | lz4 | 32 MiB | 16 MiB |
+| `low_latency` | 1 byte | 5 ms | 16 MiB | 16 MiB | 500 | 16 KiB | 0 ms | lz4 | 16 MiB | 16 MiB |
+
+Two columns do not vary by profile, because they are the record-size chain
+rather than a tuning dial: `message.max.bytes` (the producer's own ceiling,
+which librdkafka defaults to 1,000,000 bytes and enforces LOCALLY, so raising
+the broker alone changes nothing) and `max.partition.fetch.bytes` (a profile
+that fetched less would stall on a maximum-size record). `fetch.max.bytes` stays
+at or under 50 MiB: MSK Express holds the broker's 55 MiB fetch ceiling
+read-only, so a larger ask can never be honoured.
+
+The topic layer of that chain is set where scalo creates the topic:
+`KafkaAdmin::create_topics` gives every topic it creates
+`max.message.bytes = 16 MiB`, since a topic left on the broker's default
+refuses the very records the producer is configured to send. A topic created
+by anything else -- and an already-existing topic, which the idempotent create
+leaves alone -- keeps the ceiling it has, and the broker's own
+`message.max.bytes` still has to be raised to match.
 
 ### librdkafka property names -- mind the differences
 
@@ -112,9 +128,6 @@ and set `sticky.partitioning.linger.ms` equal to the linger window, so
 null-key batches stick to one partition until the batch is full, then rotate.
 The sizing surface sets this to `linger_ms` automatically. It does NOT set
 `partitioner` (keyed `RoutedSender` paths set their own).
-
-`queue.buffering.max.kbytes` is in KiB -- the config struct stores the
-producer buffer in bytes and divides by 1024 when it applies the property.
 
 ---
 
@@ -157,15 +170,53 @@ decompresses transparently regardless of producer codec.
   `partition.assignment.strategy = cooperative-sticky` to avoid
   stop-the-world rebalances. Combined with partition-pause backpressure (see
   [backpressure.md](backpressure.md)), a paused consumer stays IN the group
-  rather than triggering a rebalance.
+  rather than triggering a rebalance. It applies to the `classic` protocol
+  only -- see the section below.
 - **KIP-794 (uniform sticky partitioner)** -- handled via
   `sticky.partitioning.linger.ms` as above, since librdkafka lacks the Java
   `partitioner.ignore.keys`.
-- **KIP-848 (new consumer group protocol)** and **Kafka 4.0** -- the sizing
-  surface is property-name based and forward-compatible: as librdkafka adds
-  support, the raw escape hatch can set the new properties without a scalo
-  change. Share groups (below) are the 4.0 answer to partition-limited
-  scaling.
+- **KIP-392 (fetch from follower)** -- `kafka.client_rack` (env
+  `<PREFIX>_CLIENT_RACK`) sets `client.rack`, so a consumer reads from an
+  in-zone replica instead of the leader. Unset by default; wire it from the
+  K8s `topology.kubernetes.io/zone` label or the EC2 availability zone.
+
+---
+
+## Consumer group protocol (KIP-848) -- on by default
+
+`kafka.consumer_protocol` picks the rebalance protocol and defaults to
+`consumer`, the KIP-848 one. The group coordinator computes the assignment and
+pushes it on the heartbeat, so adding or removing a member costs no
+stop-the-world rebalance -- the difference a KEDA scale event feels.
+
+It needs a Kafka 4.0+ broker, and the transport reaches `classic` two ways:
+
+- **The provider gate.** A provider whose brokers do not implement it at all
+  (`redpanda`, `redpanda-cloud`) resolves to `classic` at construction.
+- **The startup probe.** Otherwise the consumer joins with the consumer
+  protocol and construction waits, up to `kafka.consumer_protocol_probe_ms`
+  (default 5000), for librdkafka's statistics to report the group `up`. A
+  refusal arrives as a FATAL error carrying `UNSUPPORTED_VERSION`,
+  `_UNSUPPORTED_FEATURE` or `UNSUPPORTED_ASSIGNOR`; a broker that answers no
+  ConsumerGroupHeartbeat at all just never joins, which the window catches.
+  Either way the consumer is rebuilt once as `classic`, with a warning naming
+  the brokers and the reason, and the process carries on.
+
+The wait ends the moment the group joins, so a KIP-848 broker pays one
+`statistics.interval.ms` (1 s on the shipped profiles), not the whole window.
+A broker that is unreachable at startup also exhausts the window and falls
+back -- classic works on 4.0 too, so the cost of that misfire is one warning.
+Set the window to `0` to take the requested protocol with no fallback, or
+`consumer_protocol: classic` to opt out. A producer-only transport joins no
+group and never probes.
+
+Under `consumer`, librdkafka refuses the whole client if
+`partition.assignment.strategy`, `session.timeout.ms`,
+`heartbeat.interval.ms` or `group.protocol.type` was set at all -- their
+replacements are broker-side. The config builder therefore strips them after
+every layer has run, including the raw escape hatch, so an override cannot
+break client creation. `group.remote.assignor` is left unset and the broker
+applies its own default, `uniform`.
 
 ---
 

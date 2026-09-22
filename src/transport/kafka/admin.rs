@@ -30,7 +30,7 @@
 //! }
 //! ```
 
-use super::config::KafkaConfig;
+use super::config::{KafkaConfig, MESSAGE_MAX_BYTES};
 use crate::transport::error::{TransportError, TransportResult};
 use rdkafka::admin::{
     AdminClient, AdminOptions, AlterConfig, NewPartitions, NewTopic, ResourceSpecifier,
@@ -54,6 +54,27 @@ pub struct TopicInfo {
     pub partition_count: i32,
     /// Replication factor (from first partition's ISR).
     pub replication_factor: i32,
+}
+
+/// Build the create-topic requests, each carrying the record-size ceiling.
+///
+/// A topic created with no `max.message.bytes` of its own inherits the broker's
+/// `message.max.bytes`, which is 1 MiB on a stock broker -- so the 16 MiB record
+/// the producer is configured to send is refused by the very topic scalo just
+/// created, and the refusal arrives as a dead-lettered record rather than a
+/// configuration error. `max_message_bytes` is a string because librdkafka's
+/// topic config is string-valued, and it has to outlive the returned requests.
+fn create_topic_requests<'a>(
+    topics: &'a [(&'a str, i32, i32)],
+    max_message_bytes: &'a str,
+) -> Vec<NewTopic<'a>> {
+    topics
+        .iter()
+        .map(|(name, partitions, replication)| {
+            NewTopic::new(name, *partitions, TopicReplication::Fixed(*replication))
+                .set("max.message.bytes", max_message_bytes)
+        })
+        .collect()
 }
 
 /// Kafka administrative client.
@@ -309,9 +330,11 @@ impl KafkaAdmin {
 
     // --- Topic Management ---
 
-    /// Create one or more topics.
+    /// Create one or more topics, each accepting a record up to
+    /// [`MESSAGE_MAX_BYTES`].
     ///
-    /// Ignores "topic already exists" errors -- safe to call repeatedly.
+    /// Ignores "topic already exists" errors -- safe to call repeatedly, though
+    /// an existing topic keeps whatever ceiling it was created with.
     ///
     /// # Arguments
     ///
@@ -321,12 +344,8 @@ impl KafkaAdmin {
     ///
     /// Returns error if topic creation fails for reasons other than already existing.
     pub async fn create_topics(&self, topics: &[(&str, i32, i32)]) -> TransportResult<()> {
-        let new_topics: Vec<NewTopic<'_>> = topics
-            .iter()
-            .map(|(name, partitions, replication)| {
-                NewTopic::new(name, *partitions, TopicReplication::Fixed(*replication))
-            })
-            .collect();
+        let max_message_bytes = MESSAGE_MAX_BYTES.to_string();
+        let new_topics = create_topic_requests(topics, &max_message_bytes);
 
         let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(30)));
 
@@ -613,5 +632,36 @@ mod tests {
             replication_factor: 2,
         };
         assert!(format!("{info:?}").contains("test"));
+    }
+
+    /// Without an explicit `max.message.bytes` the new topic inherits the
+    /// broker's 1 MiB default, and the 16 MiB record the producer is
+    /// configured to send is refused by a topic scalo created itself.
+    #[test]
+    fn created_topics_carry_the_chain_wide_record_ceiling() {
+        let ceiling = MESSAGE_MAX_BYTES.to_string();
+        let requests = create_topic_requests(&[("events", 3, 2), ("events-dlq", 1, 1)], &ceiling);
+
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(
+                request.config,
+                vec![("max.message.bytes", ceiling.as_str())],
+                "topic {} must accept the same record the producer sends",
+                request.name
+            );
+        }
+
+        // The rest of the request is unchanged.
+        assert_eq!(requests[0].name, "events");
+        assert_eq!(requests[0].num_partitions, 3);
+        assert!(matches!(
+            requests[0].replication,
+            TopicReplication::Fixed(2)
+        ));
+        assert!(matches!(
+            requests[1].replication,
+            TopicReplication::Fixed(1)
+        ));
     }
 }

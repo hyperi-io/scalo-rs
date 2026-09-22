@@ -145,8 +145,11 @@ pub enum SendResult {
     Backpressured,
     /// Fatal error, cannot continue.
     Fatal(TransportError),
-    /// Message matched an outbound filter with `action: dlq`.
-    /// Caller is responsible for DLQ routing.
+    /// The record was HANDLED rather than sent, and belongs in a dead-letter
+    /// queue: it matched an outbound filter with `action: dlq`, or the
+    /// transport refused it permanently (a payload over the message-size
+    /// ceiling). Caller is responsible for DLQ routing. Never retry it --
+    /// the same bytes produce the same outcome.
     FilteredDlq,
 }
 

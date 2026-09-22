@@ -44,6 +44,95 @@ use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 // ============================================================================
+// Message-size ceiling (one number across the three layers)
+// ============================================================================
+
+/// The largest single record the pipeline carries, in bytes (16 MiB).
+///
+/// This is ONE number shared by three layers that must agree: the broker's
+/// `message.max.bytes` (and `replica.fetch.max.bytes`), the topic's
+/// `max.message.bytes`, and the producer's own `message.max.bytes` set here.
+/// Raise one without the others and the odd layer rejects or stalls -- the
+/// producer refuses locally with `MSG_SIZE_TOO_LARGE`, or the consumer never
+/// fetches the record.
+///
+/// 16 MiB is derived from filebeat's own `message_max_bytes` ceiling of 10 MiB
+/// (it truncates past that, so no input can deliver more) plus headroom for the
+/// ~1.5x growth an enrichment pass adds when it re-enters Kafka. It is a
+/// CEILING, not a tuning dial: the sizing profiles vary batching and latency,
+/// never the largest record the pipeline accepts.
+pub const MESSAGE_MAX_BYTES: i32 = 16_777_216;
+
+// ============================================================================
+// Consumer group protocol (KIP-848)
+// ============================================================================
+
+/// Which consumer-group rebalance protocol the consumer joins with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerProtocol {
+    /// KIP-848: the broker's group coordinator computes the assignment and
+    /// pushes it on the heartbeat, so adding or removing a member costs no
+    /// stop-the-world rebalance -- the difference a KEDA scale event feels.
+    /// Requires a Kafka 4.0+ broker, and the transport falls back to
+    /// [`Classic`](Self::Classic) when the broker will not speak it.
+    #[default]
+    Consumer,
+
+    /// The pre-4.0 protocol: the group leader computes the assignment and
+    /// every member stops consuming while it does.
+    Classic,
+}
+
+impl ConsumerProtocol {
+    /// The librdkafka `group.protocol` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Consumer => "consumer",
+            Self::Classic => "classic",
+        }
+    }
+}
+
+impl FromStr for ConsumerProtocol {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "consumer" => Ok(Self::Consumer),
+            "classic" => Ok(Self::Classic),
+            _ => Err(format!(
+                "unknown kafka consumer protocol {s:?}; expected one of: consumer, classic"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ConsumerProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Consumer properties librdkafka refuses alongside `group.protocol=consumer`.
+///
+/// `rd_kafka_conf_finalize` rejects the whole client if any of these was set at
+/// all -- the value is irrelevant, only that it was touched -- so they are
+/// stripped after every config layer has run rather than skipped in one of
+/// them. Their KIP-848 replacements are broker-side
+/// (`group.consumer.session.timeout.ms`,
+/// `group.consumer.heartbeat.interval.ms`) or renamed
+/// (`partition.assignment.strategy` becomes `group.remote.assignor`).
+pub const CLASSIC_ONLY_CONSUMER_KEYS: &[&str] = &[
+    "partition.assignment.strategy",
+    "session.timeout.ms",
+    "heartbeat.interval.ms",
+    "group.protocol.type",
+];
+
+// ============================================================================
 // Self-Regulation Profile (Kafka sizing surface)
 // ============================================================================
 
@@ -67,24 +156,27 @@ use std::str::FromStr;
 pub enum SelfRegulationProfile {
     /// Maximum throughput: generous byte budgets, tolerates batching delay.
     ///
-    /// Consumer: 1 MiB fetch.min.bytes, 50 ms wait, 10 MiB per-partition,
-    /// 100 MiB total, 2000 poll-safety cap.
-    /// Producer: 128 KiB batch, 20 ms linger, lz4, 64 MiB buffer, 5 in-flight.
+    /// Consumer: 1 MiB fetch.min.bytes, 50 ms wait, 16 MiB per-partition,
+    /// 50 MiB total, 2000 poll-safety cap.
+    /// Producer: 128 KiB batch, 20 ms linger, lz4, 64 MiB buffer, 5 in-flight,
+    /// 16 MiB record ceiling.
     #[default]
     Throughput,
 
     /// Balanced: moderate batching, 5 ms linger, smaller per-partition budget.
     ///
-    /// Consumer: 256 KiB fetch.min.bytes, 25 ms wait, 5 MiB per-partition,
+    /// Consumer: 256 KiB fetch.min.bytes, 25 ms wait, 16 MiB per-partition,
     /// 50 MiB total, 1000 poll-safety cap.
-    /// Producer: 64 KiB batch, 5 ms linger, lz4, 32 MiB buffer, 5 in-flight.
+    /// Producer: 64 KiB batch, 5 ms linger, lz4, 32 MiB buffer, 5 in-flight,
+    /// 16 MiB record ceiling.
     Balanced,
 
     /// Low latency: minimal batching delay, smaller buffers.
     ///
-    /// Consumer: 1 byte fetch.min.bytes, 5 ms wait, 1 MiB per-partition,
-    /// 10 MiB total, 500 poll-safety cap.
-    /// Producer: 16 KiB batch, 0 ms linger, lz4, 16 MiB buffer, 5 in-flight.
+    /// Consumer: 1 byte fetch.min.bytes, 5 ms wait, 16 MiB per-partition,
+    /// 16 MiB total, 500 poll-safety cap.
+    /// Producer: 16 KiB batch, 0 ms linger, lz4, 16 MiB buffer, 5 in-flight,
+    /// 16 MiB record ceiling.
     LowLatency,
 }
 
@@ -98,25 +190,29 @@ impl SelfRegulationProfile {
                 fetch_min_bytes: Some(1_048_576),
                 // 50 ms -- gives broker time to fill the 1 MiB budget.
                 fetch_max_wait_ms: Some(50),
-                // 10 MiB -- generous per-partition ceiling for wide topics.
-                max_partition_fetch_bytes: Some(10_485_760),
-                // 100 MiB -- caps total network fetch per round-trip.
-                fetch_max_bytes: Some(104_857_600),
+                // The record ceiling: a partition must be able to yield one
+                // maximum-size record in a single fetch.
+                max_partition_fetch_bytes: Some(MESSAGE_MAX_BYTES),
+                // 50 MiB -- caps total network fetch per round-trip, and stays
+                // under the 55 MiB the broker holds read-only on MSK Express.
+                fetch_max_bytes: Some(52_428_800),
                 // 2000 -- poll-safety cap enforced by the recv() loop.
                 max_poll_records: Some(2000),
             },
             Self::Balanced => ConsumerKnobs {
                 fetch_min_bytes: Some(262_144), // 256 KiB
                 fetch_max_wait_ms: Some(25),
-                max_partition_fetch_bytes: Some(5_242_880), // 5 MiB
-                fetch_max_bytes: Some(52_428_800),          // 50 MiB
+                max_partition_fetch_bytes: Some(MESSAGE_MAX_BYTES),
+                fetch_max_bytes: Some(52_428_800), // 50 MiB
                 max_poll_records: Some(1000),
             },
             Self::LowLatency => ConsumerKnobs {
-                fetch_min_bytes: Some(1),                   // no batching threshold
-                fetch_max_wait_ms: Some(5),                 // return fast
-                max_partition_fetch_bytes: Some(1_048_576), // 1 MiB
-                fetch_max_bytes: Some(10_485_760),          // 10 MiB
+                fetch_min_bytes: Some(1),   // no batching threshold
+                fetch_max_wait_ms: Some(5), // return fast
+                max_partition_fetch_bytes: Some(MESSAGE_MAX_BYTES),
+                // The smallest total budget that can still carry one
+                // maximum-size record: equal to the per-partition ceiling.
+                fetch_max_bytes: Some(MESSAGE_MAX_BYTES),
                 max_poll_records: Some(500),
             },
         }
@@ -140,6 +236,9 @@ impl SelfRegulationProfile {
                 // Profiles leave idempotence unset; the default (on) is applied
                 // in resolved_producer_map, independent of profile.
                 idempotence: None,
+                // The pipeline-wide record ceiling -- identical on every
+                // profile, see MESSAGE_MAX_BYTES.
+                message_max_bytes: Some(MESSAGE_MAX_BYTES),
             },
             Self::Balanced => ProducerKnobs {
                 batch_size_bytes: Some(65_536), // 64 KiB
@@ -148,6 +247,7 @@ impl SelfRegulationProfile {
                 buffer_memory_bytes: Some(33_554_432), // 32 MiB
                 max_in_flight: Some(5),
                 idempotence: None,
+                message_max_bytes: Some(MESSAGE_MAX_BYTES),
             },
             Self::LowLatency => ProducerKnobs {
                 batch_size_bytes: Some(16_384), // 16 KiB
@@ -156,6 +256,7 @@ impl SelfRegulationProfile {
                 buffer_memory_bytes: Some(16_777_216), // 16 MiB
                 max_in_flight: Some(5),
                 idempotence: None,
+                message_max_bytes: Some(MESSAGE_MAX_BYTES),
             },
         }
     }
@@ -187,14 +288,19 @@ pub struct ConsumerKnobs {
     /// Maximum bytes returned per partition per Fetch request.
     ///
     /// librdkafka: `max.partition.fetch.bytes` (alias `fetch.message.max.bytes`,
-    /// default 1 MiB). Must be >= the topic's `max.message.bytes`.
+    /// default 1 MiB). Must be >= the topic's `max.message.bytes`, so every
+    /// profile sets it to [`MESSAGE_MAX_BYTES`]. librdkafka does grow it on
+    /// sight of a larger record, but the explicit value keeps the consumer's
+    /// memory envelope predictable instead of discovered.
     #[serde(default)]
     pub max_partition_fetch_bytes: Option<i32>,
 
     /// Maximum total bytes returned by the broker for a single Fetch request
     /// across all partitions.
     ///
-    /// librdkafka: `fetch.max.bytes` (default 50 MiB).
+    /// librdkafka: `fetch.max.bytes` (default 50 MiB). Keep it at or under
+    /// 50 MiB: MSK Express holds the broker's own 55 MiB fetch ceiling
+    /// read-only, so asking for more is a number that can never be honoured.
     #[serde(default)]
     pub fetch_max_bytes: Option<i32>,
 
@@ -270,6 +376,18 @@ pub struct ProducerKnobs {
     /// `producer_librdkafka` escape hatch still wins over this.
     #[serde(default)]
     pub idempotence: Option<bool>,
+
+    /// Largest single record the producer will put on the wire, in bytes.
+    ///
+    /// librdkafka: `message.max.bytes`, whose default of 1,000,000 rejects an
+    /// oversize record LOCALLY with `MSG_SIZE_TOO_LARGE` -- the broker never
+    /// sees it, so raising the broker's ceiling alone changes nothing. Three
+    /// layers have to agree: the broker's `message.max.bytes`, the topic's
+    /// `max.message.bytes`, and this. Default on every profile:
+    /// [`MESSAGE_MAX_BYTES`] (16 MiB). `batch.size` is unrelated -- it is a
+    /// soft target and a larger record still ships as its own batch.
+    #[serde(default)]
+    pub message_max_bytes: Option<i32>,
 }
 
 /// Kafka sizing surface: profile + named per-knob overrides + raw escape hatch.
@@ -337,6 +455,7 @@ const GOVERNOR_PRODUCER_KEYS: &[&str] = &[
     "compression.codec",
     "queue.buffering.max.kbytes",
     "max.in.flight.requests.per.connection",
+    "message.max.bytes",
     "partitioner",
     "sticky.partitioning.linger.ms",
     // Effectively-once invariants (v2.10): the sizing surface sets these when
@@ -444,6 +563,11 @@ impl KafkaSizingConfig {
             .buffer_memory_bytes
             .or(profile_knobs.buffer_memory_bytes)
             .unwrap_or(1_073_741_824); // 1 GiB (librdkafka default)
+        let message_max_bytes = self
+            .producer
+            .message_max_bytes
+            .or(profile_knobs.message_max_bytes)
+            .unwrap_or(MESSAGE_MAX_BYTES);
         // Effectively-once (v2.10): idempotence ON by default. It REQUIRES
         // max.in.flight<=5, so when on we clamp the resolved value to 5 (a
         // higher value would make librdkafka reject the producer at init).
@@ -475,6 +599,12 @@ impl KafkaSizingConfig {
         map.insert(
             "max.in.flight.requests.per.connection".to_string(),
             max_in_flight.to_string(),
+        );
+        // The client-side record ceiling. Without it librdkafka rejects
+        // anything over 1,000,000 bytes before the broker is consulted.
+        map.insert(
+            "message.max.bytes".to_string(),
+            message_max_bytes.to_string(),
         );
 
         // Effectively-once (v2.10): enable the idempotent producer by default.
@@ -705,12 +835,19 @@ pub const DEVTEST_PROFILE: &[(&str, &str)] = &[
 /// | Setting | Value | librdkafka default | Why |
 /// |---|---|---|---|
 /// | `linger.ms` | 100 ms | 5 ms | Accumulate larger batches |
-/// | `compression.type` | zstd | none | Best ratio with good CPU |
+/// | `compression.type` | lz4 | none | Matches the sizing surface, which is applied last |
 /// | `socket.nagle.disable` | true | false | Kafka batches at app level |
 /// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable Prometheus metrics |
+///
+/// The codec here has to agree with the sizing profiles: every producer path
+/// applies `sizing.resolved_producer_map()` after this constant, and it sets
+/// `compression.codec = lz4`. A `zstd` here would be dead config that reads as
+/// the effective codec, and anyone who removed the sizing layer to follow it
+/// would recompress every lz4 batch. Opt into zstd per stage with
+/// `kafka.sizing.producer.compression_type`.
 pub const PRODUCER_HIGH_THROUGHPUT: &[(&str, &str)] = &[
     ("linger.ms", "100"),
-    ("compression.type", "zstd"),
+    ("compression.type", "lz4"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
@@ -727,15 +864,19 @@ pub const PRODUCER_HIGH_THROUGHPUT: &[(&str, &str)] = &[
 /// | `acks` | all | all (-1) | Invariant for EOS (explicit) |
 /// | `max.in.flight.requests.per.connection` | 5 | 1000000 | Max for idempotent producer |
 /// | `linger.ms` | 20 ms | 5 ms | Moderate batching |
-/// | `compression.type` | zstd | none | Best ratio |
+/// | `compression.type` | lz4 | none | Matches the sizing surface, which is applied last |
 /// | `socket.nagle.disable` | true | false | Kafka batches at app level |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
+///
+/// Same codec reasoning as [`PRODUCER_HIGH_THROUGHPUT`]: the sizing surface is
+/// applied after this constant and sets `lz4`, so any other value here is dead
+/// config that contradicts the profile.
 pub const PRODUCER_EXACTLY_ONCE: &[(&str, &str)] = &[
     ("enable.idempotence", "true"),
     ("acks", "all"),
     ("max.in.flight.requests.per.connection", "5"),
     ("linger.ms", "20"),
-    ("compression.type", "zstd"),
+    ("compression.type", "lz4"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
@@ -842,6 +983,22 @@ pub struct KafkaConfig {
     #[serde(default = "default_client_id")]
     pub client_id: String,
 
+    /// Rack (availability zone) this client runs in, for fetch-from-follower.
+    ///
+    /// librdkafka: `client.rack` (KIP-392). When it matches a replica's
+    /// `broker.rack` the consumer fetches from that replica instead of the
+    /// partition leader, which halves cross-AZ traffic on a three-AZ MSK or
+    /// Strimzi cluster and removes its inter-AZ charge. `None` (the default)
+    /// leaves the property unset and every fetch goes to the leader.
+    ///
+    /// Wire it from the platform's own zone label -- the K8s
+    /// `topology.kubernetes.io/zone` node label via the downward API, or the
+    /// EC2 instance's availability zone -- into `KAFKA_CLIENT_RACK`. The
+    /// broker side has to be configured for it too: replicas need `broker.rack`
+    /// set and the topic needs `min.insync.replicas` satisfied in-zone.
+    #[serde(default)]
+    pub client_rack: Option<String>,
+
     /// Static group membership id (`group.instance.id`). Opt-in: `None` (the
     /// default) uses dynamic membership.
     ///
@@ -854,6 +1011,34 @@ pub struct KafkaConfig {
     /// fenced -- the value MUST be unique per replica.
     #[serde(default)]
     pub group_instance_id: Option<String>,
+
+    /// Consumer-group rebalance protocol to join with (default: `consumer`,
+    /// KIP-848).
+    ///
+    /// Not every broker speaks it, so the resolved value is
+    /// [`effective_consumer_protocol`](Self::effective_consumer_protocol) --
+    /// a provider known not to implement KIP-848 is forced to `classic`, and
+    /// a broker that refuses it at join time drops the transport back to
+    /// `classic` once, with a warning. Set `classic` to opt out entirely.
+    #[serde(default)]
+    pub consumer_protocol: ConsumerProtocol,
+
+    /// How long construction waits for the broker to accept
+    /// `group.protocol=consumer` before rebuilding the consumer as `classic`,
+    /// in milliseconds.
+    ///
+    /// The wait ends as soon as librdkafka's statistics report the group `up`,
+    /// so on a broker that does speak KIP-848 it costs one
+    /// `statistics.interval.ms` (1 s on the shipped profiles) rather than the
+    /// whole window. A broker that is simply unreachable at startup also
+    /// exhausts the window and falls back -- classic works everywhere, so the
+    /// cost of that misfire is a warning line.
+    ///
+    /// `0` disables the probe: the requested protocol is used as-is with no
+    /// fallback. Only a subscribing consumer probes at all, since a
+    /// producer-only transport joins no group.
+    #[serde(default = "default_consumer_protocol_probe_ms")]
+    pub consumer_protocol_probe_ms: u64,
 
     /// Topics to subscribe to.
     #[serde(default)]
@@ -1107,6 +1292,10 @@ fn default_auto_offset_reset() -> String {
     "earliest".to_string()
 }
 
+fn default_consumer_protocol_probe_ms() -> u64 {
+    5000
+}
+
 impl Default for KafkaConfig {
     fn default() -> Self {
         #[allow(deprecated)]
@@ -1115,7 +1304,10 @@ impl Default for KafkaConfig {
             brokers: default_brokers(),
             group: default_group(),
             client_id: default_client_id(),
+            client_rack: None,
             group_instance_id: None,
+            consumer_protocol: ConsumerProtocol::default(),
+            consumer_protocol_probe_ms: default_consumer_protocol_probe_ms(),
             topics: Vec::new(),
             auto_discover: false,
             topic_include: Vec::new(),
@@ -1326,6 +1518,27 @@ impl KafkaConfig {
         Ok(())
     }
 
+    /// The consumer-group protocol this config will actually join with.
+    ///
+    /// A provider whose brokers do not implement KIP-848 is forced to
+    /// [`ConsumerProtocol::Classic`] here, so it never pays the startup probe
+    /// to learn what is already known. An unrecognised provider name is left
+    /// alone -- [`apply_provider`](Self::apply_provider) is what rejects it.
+    #[must_use]
+    pub fn effective_consumer_protocol(&self) -> ConsumerProtocol {
+        use super::providers::{KafkaProvider, KnownProvider};
+
+        if self.consumer_protocol == ConsumerProtocol::Classic {
+            return ConsumerProtocol::Classic;
+        }
+        match self.provider.as_deref().map(KnownProvider::parse) {
+            Some(Ok(provider)) if !provider.supports_consumer_group_protocol() => {
+                ConsumerProtocol::Classic
+            }
+            _ => ConsumerProtocol::Consumer,
+        }
+    }
+
     /// Validate the Kafka config against the deployment profile.
     ///
     /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
@@ -1475,6 +1688,9 @@ impl KafkaConfig {
     /// - `{PREFIX}_PROFILE` -> profile (production, devtest)
     /// - `{PREFIX}_BOOTSTRAP_SERVERS` -> brokers (legacy: `{PREFIX}_BROKERS`)
     /// - `{PREFIX}_GROUP_ID` -> group
+    /// - `{PREFIX}_CLIENT_RACK` -> client_rack (legacy: `{PREFIX}_AVAILABILITY_ZONE`)
+    /// - `{PREFIX}_CONSUMER_PROTOCOL` -> consumer_protocol (consumer, classic)
+    /// - `{PREFIX}_CONSUMER_PROTOCOL_PROBE_MS` -> consumer_protocol_probe_ms
     /// - `{PREFIX}_PROVIDER` -> provider (derives security_protocol + sasl_mechanism)
     /// - `{PREFIX}_SECURITY_PROTOCOL` -> security_protocol
     /// - `{PREFIX}_SASL_MECHANISM` -> sasl_mechanism
@@ -1523,6 +1739,15 @@ impl KafkaConfig {
             config.client_id = val;
         }
 
+        // Fetch-from-follower (KIP-392). Wired from the platform's zone label;
+        // an empty value is treated as unset so an unpopulated downward-API
+        // variable does not pin every fetch to a rack named "".
+        if let Some(val) = prefixed("CLIENT_RACK", &["AVAILABILITY_ZONE"]).get()
+            && !val.is_empty()
+        {
+            config.client_rack = Some(val);
+        }
+
         // Static group membership id (KIP-345). Opt-in; canonically wired from
         // the pod name (e.g. `<PREFIX>_GROUP_INSTANCE_ID` set to the downward
         // API pod name). An empty value is treated as unset.
@@ -1530,6 +1755,18 @@ impl KafkaConfig {
             && !val.is_empty()
         {
             config.group_instance_id = Some(val);
+        }
+
+        // KIP-848 opt-out and the probe window that guards it.
+        if let Some(val) = prefixed("CONSUMER_PROTOCOL", &[]).get()
+            && let Ok(protocol) = val.parse()
+        {
+            config.consumer_protocol = protocol;
+        }
+        if let Some(val) = prefixed("CONSUMER_PROTOCOL_PROBE_MS", &[]).get()
+            && let Ok(ms) = val.parse()
+        {
+            config.consumer_protocol_probe_ms = ms;
         }
 
         // PROVIDER derives security_protocol + sasl_mechanism at construction (see
@@ -1584,6 +1821,8 @@ impl KafkaConfig {
     /// - `KAFKA_TOPICS`
     /// - `KAFKA_GROUP_ID`
     /// - `KAFKA_CLIENT_ID`
+    /// - `KAFKA_CLIENT_RACK`
+    /// - `KAFKA_CONSUMER_PROTOCOL`
     /// - `KAFKA_PROFILE`
     #[cfg(feature = "config")]
     #[must_use]
@@ -1711,6 +1950,115 @@ mod tests {
         assert!(cfg.apply_provider().is_err());
     }
 
+    /// `client.rack` is opt-in: unset means every fetch goes to the leader,
+    /// which is what a single-AZ or unlabelled deployment wants.
+    #[cfg(feature = "config")]
+    #[test]
+    fn client_rack_is_unset_unless_the_environment_names_one() {
+        assert_eq!(KafkaConfig::default().client_rack, None);
+
+        temp_env::with_var("KAFKA_CLIENT_RACK", Some("ap-southeast-2a"), || {
+            assert_eq!(
+                KafkaConfig::from_env("KAFKA").client_rack.as_deref(),
+                Some("ap-southeast-2a")
+            );
+        });
+
+        // An unpopulated downward-API variable must not pin every fetch to a
+        // rack named "".
+        temp_env::with_var("KAFKA_CLIENT_RACK", Some(""), || {
+            assert_eq!(KafkaConfig::from_env("KAFKA").client_rack, None);
+        });
+    }
+
+    // =========================================================================
+    // Consumer group protocol (KIP-848)
+    // =========================================================================
+
+    /// KIP-848 is on by default; the whole point of the change is that nobody
+    /// has to opt in.
+    #[test]
+    fn consumer_protocol_defaults_to_kip_848() {
+        let cfg = KafkaConfig::default();
+        assert_eq!(cfg.consumer_protocol, ConsumerProtocol::Consumer);
+        assert_eq!(
+            cfg.effective_consumer_protocol(),
+            ConsumerProtocol::Consumer
+        );
+        assert_eq!(ConsumerProtocol::Consumer.as_str(), "consumer");
+        assert_eq!(ConsumerProtocol::Classic.as_str(), "classic");
+    }
+
+    /// Redpanda implements neither KIP-848 nor KIP-932, so naming it as the
+    /// provider resolves to classic without paying the startup probe.
+    #[test]
+    fn redpanda_resolves_to_classic() {
+        for provider in ["redpanda", "redpanda-cloud"] {
+            let cfg = KafkaConfig {
+                provider: Some(provider.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.effective_consumer_protocol(),
+                ConsumerProtocol::Classic,
+                "{provider} answers no ConsumerGroupHeartbeat"
+            );
+        }
+        for provider in ["strimzi", "msk", "confluent-cloud", "plaintext"] {
+            let cfg = KafkaConfig {
+                provider: Some(provider.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.effective_consumer_protocol(),
+                ConsumerProtocol::Consumer,
+                "{provider} is Kafka-protocol"
+            );
+        }
+    }
+
+    /// An explicit `classic` wins over the provider gate: it is the opt-out.
+    #[test]
+    fn explicit_classic_is_never_upgraded() {
+        let cfg = KafkaConfig {
+            consumer_protocol: ConsumerProtocol::Classic,
+            provider: Some("strimzi".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_consumer_protocol(), ConsumerProtocol::Classic);
+    }
+
+    /// An unknown provider is `apply_provider`'s error to raise, not a reason
+    /// to silently downgrade the protocol here.
+    #[test]
+    fn unknown_provider_does_not_downgrade_the_protocol() {
+        let cfg = KafkaConfig {
+            provider: Some("kinesis".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_consumer_protocol(),
+            ConsumerProtocol::Consumer
+        );
+    }
+
+    #[test]
+    fn consumer_protocol_parses_and_serialises_snake_case() {
+        assert_eq!(
+            "classic".parse::<ConsumerProtocol>().unwrap(),
+            ConsumerProtocol::Classic
+        );
+        assert_eq!(
+            "CONSUMER".parse::<ConsumerProtocol>().unwrap(),
+            ConsumerProtocol::Consumer
+        );
+        assert!("eager".parse::<ConsumerProtocol>().is_err());
+        assert_eq!(
+            serde_json::to_string(&ConsumerProtocol::Classic).unwrap(),
+            "\"classic\""
+        );
+    }
+
     #[test]
     fn kafka_config_topic_resolution_defaults() {
         let config = KafkaConfig::default();
@@ -1749,10 +2097,15 @@ mod tests {
         assert_eq!(map["fetch.min.bytes"], "1048576", "1 MiB fetch.min.bytes");
         assert_eq!(map["fetch.wait.max.ms"], "50");
         assert_eq!(
-            map["max.partition.fetch.bytes"], "10485760",
-            "10 MiB per-partition"
+            map["max.partition.fetch.bytes"],
+            MESSAGE_MAX_BYTES.to_string(),
+            "a partition must yield one maximum-size record in a single fetch"
         );
-        assert_eq!(map["fetch.max.bytes"], "104857600", "100 MiB total");
+        assert_eq!(
+            map["fetch.max.bytes"], "52428800",
+            "50 MiB total -- MSK Express holds the broker's 55 MiB fetch \
+             ceiling read-only, so a larger ask can never be honoured"
+        );
         assert_eq!(
             s.effective_poll_cap(),
             2000,
@@ -1766,8 +2119,17 @@ mod tests {
         let map = s.resolved_consumer_map();
         assert_eq!(map["fetch.min.bytes"], "1", "no batching threshold");
         assert_eq!(map["fetch.wait.max.ms"], "5", "return fast");
-        assert_eq!(map["max.partition.fetch.bytes"], "1048576", "1 MiB");
-        assert_eq!(map["fetch.max.bytes"], "10485760", "10 MiB total");
+        assert_eq!(
+            map["max.partition.fetch.bytes"],
+            MESSAGE_MAX_BYTES.to_string(),
+            "low latency still has to be able to fetch a maximum-size record"
+        );
+        assert_eq!(
+            map["fetch.max.bytes"],
+            MESSAGE_MAX_BYTES.to_string(),
+            "the smallest total budget that can still carry one maximum-size \
+             record is the per-partition ceiling itself"
+        );
         assert_eq!(s.effective_poll_cap(), 500);
     }
 
@@ -1784,6 +2146,36 @@ mod tests {
             "balanced fetch.min.bytes={fmb} should be between low_latency({ll_min}) and throughput({tp_min})"
         );
         assert_eq!(s.effective_poll_cap(), 1000);
+    }
+
+    /// The per-partition fetch budget is part of the record-size chain, so it
+    /// does not vary by profile: any profile that fetched less than the record
+    /// ceiling would stall on a maximum-size record.
+    #[test]
+    fn every_profile_fetches_a_whole_maximum_size_record() {
+        for profile in [
+            SelfRegulationProfile::Throughput,
+            SelfRegulationProfile::Balanced,
+            SelfRegulationProfile::LowLatency,
+        ] {
+            let map = sizing_for_profile(profile).resolved_consumer_map();
+            assert_eq!(
+                map["max.partition.fetch.bytes"],
+                MESSAGE_MAX_BYTES.to_string(),
+                "profile {profile:?} must fetch a whole maximum-size record"
+            );
+            let total: i32 = map["fetch.max.bytes"].parse().unwrap();
+            assert!(
+                total >= MESSAGE_MAX_BYTES,
+                "profile {profile:?} fetch.max.bytes={total} is below the \
+                 record ceiling, so one maximum-size record never fits"
+            );
+            assert!(
+                total <= 52_428_800,
+                "profile {profile:?} fetch.max.bytes={total} exceeds 50 MiB, \
+                 over the broker's read-only 55 MiB ceiling on MSK Express"
+            );
+        }
     }
 
     /// Throughput and low_latency must differ on every key consumer knob.
@@ -1821,6 +2213,41 @@ mod tests {
         assert_eq!(map["compression.type"], "lz4");
         let batch: i32 = map["batch.size"].parse().unwrap();
         assert!(batch < 131_072, "low_latency batch should be < throughput");
+    }
+
+    /// The record ceiling is a chain-wide constant, so every profile carries
+    /// the same value -- a profile that batches differently still has to accept
+    /// the same largest record the broker and topic do.
+    #[test]
+    fn every_profile_sets_the_same_message_max_bytes() {
+        for profile in [
+            SelfRegulationProfile::Throughput,
+            SelfRegulationProfile::Balanced,
+            SelfRegulationProfile::LowLatency,
+        ] {
+            let map = sizing_for_profile(profile).resolved_producer_map();
+            assert_eq!(
+                map["message.max.bytes"],
+                MESSAGE_MAX_BYTES.to_string(),
+                "profile {profile:?} must set the 16 MiB record ceiling; \
+                 librdkafka's 1,000,000-byte default rejects locally with \
+                 MSG_SIZE_TOO_LARGE before the broker is consulted"
+            );
+        }
+    }
+
+    /// The ceiling is a dial, not a hard-coded value.
+    #[test]
+    fn explicit_message_max_bytes_beats_the_profile() {
+        let s = KafkaSizingConfig {
+            profile: SelfRegulationProfile::Throughput,
+            producer: ProducerKnobs {
+                message_max_bytes: Some(4_194_304), // 4 MiB
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(s.resolved_producer_map()["message.max.bytes"], "4194304");
     }
 
     /// Throughput and low_latency must differ on every key producer knob.
@@ -2045,6 +2472,29 @@ mod tests {
             assert!(
                 !map["compression.type"].is_empty(),
                 "compression.type must not be empty"
+            );
+        }
+    }
+
+    /// The legacy producer profile constants are applied BEFORE the sizing
+    /// surface on every producer path, so a codec they name that the sizing
+    /// surface then overwrites is dead config -- and one that recompresses
+    /// every lz4 batch is the worst kind of dead config to copy.
+    #[test]
+    fn legacy_producer_profiles_name_the_codec_the_sizing_surface_applies() {
+        let applied_last = sizing_for_profile(SelfRegulationProfile::Throughput)
+            .resolved_producer_map()["compression.type"]
+            .clone();
+
+        for (name, profile) in [
+            ("PRODUCER_HIGH_THROUGHPUT", PRODUCER_HIGH_THROUGHPUT),
+            ("PRODUCER_EXACTLY_ONCE", PRODUCER_EXACTLY_ONCE),
+            ("PRODUCER_LOW_LATENCY", PRODUCER_LOW_LATENCY),
+        ] {
+            let map: HashMap<&str, &str> = profile.iter().copied().collect();
+            assert_eq!(
+                map["compression.type"], applied_last,
+                "{name} contradicts the sizing surface that overwrites it"
             );
         }
     }
