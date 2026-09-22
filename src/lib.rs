@@ -8,7 +8,8 @@
 
 //! # scalo
 //!
-//! The stuff for your app to operate at scale, in one place
+//! An integrated crate for at scale data plane services. Attach and
+//! 'enterprise-up' your application.
 //!
 //! Opinionated, drop-in, working out of the box. The patterns from blog posts, watercooler chats and beers with your Google mates as actual library -- not a framework you assemble from twenty crates and 8 weeks of munging.
 //!
