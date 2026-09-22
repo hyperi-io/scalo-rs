@@ -11,6 +11,7 @@
 Thumbs.db
 
 # Local environment files (never commit -- contain secrets)
+.kube/
 .env
 .env.*
 .env.local
@@ -39,8 +40,9 @@ coverage.lcov
 tarpaulin-report.json
 cobertura.xml
 
-# cargo
-.cargo/
+# cargo -- exclude the CONTENTS, not the directory: git cannot re-include a
+# file inside an excluded directory, so `.cargo/` makes both negations inert.
+.cargo/*
 !.cargo/config.toml
 !.cargo/audit.toml
 
