@@ -41,6 +41,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::metadata::MetadataTopic;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+use rdkafka::types::RDKafkaErrorCode;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -337,8 +338,7 @@ impl KafkaAdmin {
 
         for result in results {
             if let Err((topic_name, err_code)) = result {
-                let err_str = format!("{err_code:?}");
-                if err_str.contains("TopicAlreadyExists") {
+                if err_code == RDKafkaErrorCode::TopicAlreadyExists {
                     continue;
                 }
                 return Err(TransportError::Admin(format!(

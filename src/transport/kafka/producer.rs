@@ -40,11 +40,13 @@
 //! producer.flush(Duration::from_secs(30))?;
 //! ```
 
+use super::classify::{DegradedLatch, DeliveryState, SendFailure, classify_send_failure};
 use super::config::KafkaConfig;
 use crate::transport::error::{TransportError, TransportResult};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{BaseRecord, Producer, ThreadedProducer};
 use rdkafka::util::Timeout;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -98,6 +100,10 @@ impl std::fmt::Display for ProducerProfile {
 pub struct KafkaProducer {
     producer: ThreadedProducer<ProducerContext>,
     profile: ProducerProfile,
+    /// Shared with the rdkafka context, which owns the delivery callback.
+    delivery: Arc<DeliveryState>,
+    /// Latches a sustained retryable enqueue failure to one warn per outage.
+    enqueue_degraded: DegradedLatch,
     // Metrics
     messages_sent: AtomicU64,
     bytes_sent: AtomicU64,
@@ -105,8 +111,10 @@ pub struct KafkaProducer {
 }
 
 /// Producer context for delivery callbacks and metrics.
-#[derive(Clone)]
-pub struct ProducerContext {}
+#[derive(Clone, Default)]
+pub struct ProducerContext {
+    state: Arc<DeliveryState>,
+}
 
 impl rdkafka::ClientContext for ProducerContext {}
 
@@ -115,10 +123,10 @@ impl rdkafka::producer::ProducerContext for ProducerContext {
 
     fn delivery(
         &self,
-        _result: &rdkafka::producer::DeliveryResult<'_>,
+        result: &rdkafka::producer::DeliveryResult<'_>,
         _opaque: Self::DeliveryOpaque,
     ) {
-        // Delivery callback -- metrics hook point.
+        self.state.record(result);
     }
 }
 
@@ -191,7 +199,8 @@ impl KafkaProducer {
             client_config.set(key, value);
         }
 
-        let context = ProducerContext {};
+        let context = ProducerContext::default();
+        let delivery = Arc::clone(&context.state);
         let producer: ThreadedProducer<ProducerContext> = client_config
             .create_with_context(context)
             .map_err(|e| TransportError::Connection(format!("Failed to create producer: {e}")))?;
@@ -199,6 +208,8 @@ impl KafkaProducer {
         Ok(Self {
             producer,
             profile,
+            delivery,
+            enqueue_degraded: DegradedLatch::default(),
             messages_sent: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             errors: AtomicU64::new(0),
@@ -234,8 +245,9 @@ impl KafkaProducer {
     /// # Returns
     ///
     /// * `Ok(())` - Message queued successfully
-    /// * `Err(TransportError::Backpressure)` - Queue full, retry later
-    /// * `Err(TransportError::Send(_))` - Send failed
+    /// * `Err(TransportError::Backpressure)` - Queue full or a retryable broker
+    ///   condition; the message is still deliverable, so retry it
+    /// * `Err(TransportError::Send(_))` - Retrying cannot help
     pub fn send(&self, topic: &str, key: Option<&[u8]>, payload: &[u8]) -> TransportResult<()> {
         let mut record = BaseRecord::to(topic).payload(payload);
         if let Some(k) = key {
@@ -247,15 +259,28 @@ impl KafkaProducer {
                 self.messages_sent.fetch_add(1, Ordering::Relaxed);
                 self.bytes_sent
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                if self.enqueue_degraded.clear() {
+                    tracing::info!(topic, "kafka enqueue recovered");
+                }
                 Ok(())
             }
             Err((err, _)) => {
                 self.errors.fetch_add(1, Ordering::Relaxed);
-                let err_str = err.to_string();
-                if err_str.contains("queue full") || err_str.contains("Local: Queue full") {
-                    Err(TransportError::Backpressure)
-                } else {
-                    Err(TransportError::Send(err_str))
+                match classify_send_failure(&err) {
+                    SendFailure::QueueFull => Err(TransportError::Backpressure),
+                    SendFailure::Retryable => {
+                        // Backpressure is the recoverable outcome the caller
+                        // acts on; the cause only survives in this line.
+                        if self.enqueue_degraded.enter() {
+                            tracing::warn!(
+                                topic,
+                                error = %err,
+                                "kafka enqueue failed on a retryable condition; the caller retries"
+                            );
+                        }
+                        Err(TransportError::Backpressure)
+                    }
+                    SendFailure::Fatal => Err(TransportError::Send(err.to_string())),
                 }
             }
         }
@@ -326,6 +351,15 @@ impl KafkaProducer {
         self.producer.in_flight_count().max(0) as usize
     }
 
+    /// Messages the broker refused or never acknowledged.
+    ///
+    /// Distinct from [`ProducerMetrics::errors`], which counts local enqueue
+    /// failures: a message can queue cleanly and still never reach the broker.
+    #[must_use]
+    pub fn delivery_failures(&self) -> u64 {
+        self.delivery.failures()
+    }
+
     /// Get producer metrics.
     #[allow(clippy::cast_sign_loss)]
     pub fn metrics(&self) -> ProducerMetrics {
@@ -361,8 +395,9 @@ impl std::fmt::Debug for KafkaProducer {
             .field("messages_sent", &self.messages_sent.load(Ordering::Relaxed))
             .field("bytes_sent", &self.bytes_sent.load(Ordering::Relaxed))
             .field("errors", &self.errors.load(Ordering::Relaxed))
+            .field("delivery_failures", &self.delivery.failures())
             .field("in_flight", &self.producer.in_flight_count())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -384,5 +419,45 @@ mod tests {
     #[test]
     fn test_producer_profile_default() {
         assert_eq!(ProducerProfile::default(), ProducerProfile::HighThroughput);
+    }
+
+    /// Produce to a broker that cannot be reached and let `message.timeout.ms`
+    /// expire, so librdkafka fires a real delivery report through the real
+    /// callback. Port 1 on loopback refuses immediately -- no external network.
+    #[test]
+    fn a_message_that_never_reaches_a_broker_is_counted_as_a_delivery_failure() {
+        let mut config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..KafkaConfig::default()
+        };
+        config.sizing.producer.idempotence = Some(false);
+        for (key, value) in [
+            ("message.timeout.ms", "400"),
+            ("statistics.interval.ms", "0"),
+            ("reconnect.backoff.max.ms", "100"),
+            ("log_level", "0"),
+        ] {
+            config
+                .sizing
+                .producer_librdkafka
+                .insert(key.to_string(), value.to_string());
+        }
+
+        let producer = KafkaProducer::new(&config, ProducerProfile::LowLatency)
+            .expect("producer creation does not contact a broker");
+        producer
+            .send("unreachable.topic", None, b"payload")
+            .expect("the message queues locally even with no broker");
+
+        // Flush waits for the delivery report; the timeout above bounds it.
+        producer.flush(Duration::from_secs(5));
+
+        assert_eq!(
+            producer.delivery_failures(),
+            1,
+            "the broker never took the message, so the delivery callback must \
+             record it"
+        );
     }
 }
