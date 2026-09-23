@@ -10,7 +10,7 @@
 //!
 //! `KafkaAdmin` provides programmatic access to managing consumer group offsets,
 //! topic configuration, and partition management. Matches the Python
-//! `hs_pylib.kafka.KafkaAdmin` API.
+//! `scalo.kafka.KafkaAdmin` API.
 //!
 //! ## Example
 //!
