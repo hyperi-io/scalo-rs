@@ -77,6 +77,27 @@ fn create_topic_requests<'a>(
         .collect()
 }
 
+/// Role naming the admin's offset-query consumer in its derived group id.
+const OFFSET_QUERY_GROUP_ROLE: &str = "admin";
+
+/// Build the config for the admin's offset-query consumer.
+///
+/// librdkafka will not build a consumer without a `group.id` and queries that
+/// group's coordinator as soon as it connects, so the id is derived from
+/// `config` (see [`KafkaConfig::internal_group_id`]) rather than a literal the
+/// broker's group ACLs would refuse. The consumer never joins or commits.
+fn offset_query_consumer_config(
+    client_config: &ClientConfig,
+    config: &KafkaConfig,
+) -> ClientConfig {
+    let mut consumer_config = client_config.clone();
+    consumer_config.set(
+        "group.id",
+        config.internal_group_id(OFFSET_QUERY_GROUP_ROLE),
+    );
+    consumer_config
+}
+
 /// Kafka administrative client.
 ///
 /// Provides operations for managing consumer group offsets, topic configuration,
@@ -135,10 +156,7 @@ impl KafkaAdmin {
             TransportError::Connection(format!("Failed to create admin client: {e}"))
         })?;
 
-        // Consumer for offset queries (group.id required but arbitrary).
-        let mut consumer_config = client_config.clone();
-        consumer_config.set("group.id", "__hs_admin_internal");
-        let consumer: BaseConsumer = consumer_config
+        let consumer: BaseConsumer = offset_query_consumer_config(&client_config, config)
             .create()
             .map_err(|e| TransportError::Connection(format!("Failed to create consumer: {e}")))?;
 
@@ -623,6 +641,36 @@ impl std::fmt::Debug for KafkaAdmin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The offset-query consumer asks for its group's coordinator on connect,
+    /// and a DFE broker refuses any group outside the `dfe-` prefix it grants.
+    #[test]
+    fn offset_query_consumer_takes_a_group_under_the_app_prefix() {
+        let config = KafkaConfig {
+            group: "dfe-loader".to_string(),
+            ..Default::default()
+        };
+        let base = ClientConfig::new();
+        let built = offset_query_consumer_config(&base, &config);
+        assert_eq!(built.get("group.id"), Some("dfe-loader-admin"));
+
+        // The admin client's own config carries no group.
+        assert_eq!(base.get("group.id"), None);
+    }
+
+    /// A raw `group.id` override is aimed at the app's own consumer; the
+    /// admin's offset-query consumer keeps its derived id.
+    #[test]
+    fn offset_query_group_id_wins_over_a_raw_override() {
+        let config = KafkaConfig {
+            group: "dfe-archiver".to_string(),
+            ..Default::default()
+        };
+        let mut base = ClientConfig::new();
+        base.set("group.id", "operator-override");
+        let built = offset_query_consumer_config(&base, &config);
+        assert_eq!(built.get("group.id"), Some("dfe-archiver-admin"));
+    }
 
     #[test]
     fn test_topic_info_debug() {

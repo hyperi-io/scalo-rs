@@ -976,6 +976,12 @@ pub struct KafkaConfig {
     pub brokers: Vec<String>,
 
     /// Consumer group ID.
+    ///
+    /// Empty marks a producer-only transport: it subscribes to nothing, even
+    /// when `topics` is set. scalo's own consumer clients (the admin's
+    /// offset-query consumer, the idle consumer of a producer-only transport)
+    /// take a group id derived from this field, or from `client_id` when it is
+    /// empty, so a broker granting groups by prefix covers them too.
     #[serde(default = "default_group")]
     pub group: String,
 
@@ -1040,7 +1046,7 @@ pub struct KafkaConfig {
     #[serde(default = "default_consumer_protocol_probe_ms")]
     pub consumer_protocol_probe_ms: u64,
 
-    /// Topics to subscribe to.
+    /// Topics to subscribe to. Ignored when `group` is empty.
     #[serde(default)]
     pub topics: Vec<String>,
 
@@ -1539,6 +1545,21 @@ impl KafkaConfig {
         }
     }
 
+    /// The group id for one of scalo's own consumer clients, `role` naming it.
+    ///
+    /// librdkafka queries the group coordinator for any consumer carrying a
+    /// `group.id`, and a broker that grants groups by prefix refuses a fixed
+    /// literal, so the id is `<group>-<role>`, falling back to
+    /// `<client_id>-<role>` for a producer-only config.
+    pub(crate) fn internal_group_id(&self, role: &str) -> String {
+        let anchor = [&self.group, &self.client_id]
+            .into_iter()
+            .find(|field| !field.is_empty())
+            .cloned()
+            .unwrap_or_else(default_client_id);
+        format!("{anchor}-{role}")
+    }
+
     /// Validate the Kafka config against the deployment profile.
     ///
     /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
@@ -1834,6 +1855,53 @@ impl KafkaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A DFE broker grants consumer groups by the `dfe-` prefix, so an
+    /// internal client's group id has to start with whatever the app is
+    /// already granted, never with a literal of scalo's own.
+    #[test]
+    fn internal_group_ids_share_the_app_prefix() {
+        let consumer = KafkaConfig {
+            group: "dfe-loader".to_string(),
+            client_id: "dfe-loader".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(consumer.internal_group_id("admin"), "dfe-loader-admin");
+
+        // A producer-only config has no group, so the client id anchors it.
+        let producer = KafkaConfig {
+            group: String::new(),
+            client_id: "dfe-fetcher".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            producer.internal_group_id("producer-only"),
+            "dfe-fetcher-producer-only"
+        );
+
+        // The group wins over the client id when both are set.
+        let both = KafkaConfig {
+            group: "dfe-archiver".to_string(),
+            client_id: "archiver-pod-7".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(both.internal_group_id("admin"), "dfe-archiver-admin");
+    }
+
+    /// With both identifying fields cleared the id is still non-empty --
+    /// librdkafka refuses to build a consumer with an empty `group.id`.
+    #[test]
+    fn internal_group_id_falls_back_to_the_default_client_id() {
+        let bare = KafkaConfig {
+            group: String::new(),
+            client_id: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            bare.internal_group_id("admin"),
+            format!("{}-admin", default_client_id())
+        );
+    }
 
     #[test]
     fn validate_rejects_ssl_skip_verify_in_production() {

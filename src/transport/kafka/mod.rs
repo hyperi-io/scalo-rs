@@ -189,22 +189,22 @@ pub struct KafkaTransport {
     partition_limited_flag: Arc<AtomicBool>,
 }
 
-/// Internal group.id used for the consumer client of a producer-only transport.
-///
-/// librdkafka >= 2.x rejects an empty group.id at consumer creation, so a
-/// producer-only config (empty `config.group`) needs an arbitrary non-empty
-/// stand-in. The consumer never subscribes in that case (topics empty + no
-/// auto_discover), so this group is inert -- no join, no rebalance, no fetch.
-/// Mirrors the admin client's `__hs_admin_internal` pattern.
-const PRODUCER_ONLY_GROUP_ID: &str = "__scalo_producer_only";
+/// Role naming a producer-only transport's idle consumer in its derived group id.
+const PRODUCER_ONLY_GROUP_ROLE: &str = "producer-only";
 
 /// Resolve the group.id to set on the consumer client: the caller's group when
-/// set, else the inert producer-only stand-in (see [`PRODUCER_ONLY_GROUP_ID`]).
-fn effective_consumer_group_id(group: &str) -> &str {
-    if group.is_empty() {
-        PRODUCER_ONLY_GROUP_ID
+/// set, else a stand-in for a producer-only transport.
+///
+/// librdkafka >= 2.x rejects an empty group.id at consumer creation, and the
+/// consumer queries the stand-in's coordinator on connect, so the stand-in is
+/// derived from the config (see [`KafkaConfig::internal_group_id`]) to sit
+/// under the prefix the broker's group ACLs grant. A producer-only transport
+/// never subscribes, so the stand-in group is never joined.
+fn effective_consumer_group_id(config: &KafkaConfig) -> String {
+    if config.group.is_empty() {
+        config.internal_group_id(PRODUCER_ONLY_GROUP_ROLE)
     } else {
-        group
+        config.group.clone()
     }
 }
 
@@ -223,8 +223,8 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
     // available". A producer-only transport legitimately carries no consumer
     // group (callers signal this by clearing `config.group`), but the
     // constructor still builds a consumer client (it is non-optional). See
-    // effective_consumer_group_id for the inert-fallback rationale.
-    client_config.set("group.id", effective_consumer_group_id(&config.group));
+    // effective_consumer_group_id for the stand-in.
+    client_config.set("group.id", effective_consumer_group_id(config));
     // Static membership (KIP-345): opt-in, must be unique per replica.
     if let Some(ref id) = config.group_instance_id {
         client_config.set("group.instance.id", id);
@@ -522,12 +522,21 @@ impl KafkaTransport {
         let consumer = create_consumer(&consumer_config)?;
 
         // Resolve effective topics:
+        // - Empty group -> producer-only: no subscription, whatever `topics` holds
         // - Explicit list -> subscribe to those
         // - Empty + auto_discover -> auto-discover from broker
         // - Empty + !auto_discover -> no subscription (producer-only)
-        let (effective_topics, topic_refresh, shutdown_token) = if config.topics.is_empty()
-            && config.auto_discover
-        {
+        let (effective_topics, topic_refresh, shutdown_token) = if config.group.is_empty() {
+            // Subscribing here would join the producer-only stand-in group.
+            if !config.topics.is_empty() || config.auto_discover {
+                tracing::debug!(
+                    topics = ?config.topics,
+                    "kafka: group is empty, so this transport is producer-only and \
+                     subscribes to nothing"
+                );
+            }
+            (Vec::new(), None, tokio_util::sync::CancellationToken::new())
+        } else if config.topics.is_empty() && config.auto_discover {
             tracing::info!("Topics empty -- auto-discovering from broker");
             let resolver = topic_resolver::TopicResolver::new(config)?;
             let discovered = resolver.resolve()?;
@@ -1678,14 +1687,84 @@ impl std::fmt::Debug for KafkaTransport {
 mod tests {
     use super::*;
 
+    /// A producer-only transport's consumer still asks for its group's
+    /// coordinator, so the stand-in must sit under the prefix a DFE broker
+    /// grants (`dfe-`), and must never be empty (librdkafka >= 2.x refuses).
     #[test]
-    fn test_effective_consumer_group_id_falls_back_for_producer_only() {
-        // Empty group (producer-only) -> inert internal stand-in, never empty
-        // (librdkafka >= 2.x rejects an empty group.id at consumer creation).
-        assert_eq!(effective_consumer_group_id(""), PRODUCER_ONLY_GROUP_ID);
-        assert!(!effective_consumer_group_id("").is_empty());
+    fn producer_only_stand_in_group_derives_from_the_client_id() {
+        let producer = KafkaConfig {
+            group: String::new(),
+            client_id: "dfe-fetcher".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_consumer_group_id(&producer),
+            "dfe-fetcher-producer-only"
+        );
+        let built = consumer_client_config(&producer, ConsumerProtocol::Classic);
+        assert_eq!(built.get("group.id"), Some("dfe-fetcher-producer-only"));
+
         // A real group is passed through unchanged.
-        assert_eq!(effective_consumer_group_id("my-group"), "my-group");
+        let consumer = KafkaConfig {
+            group: "dfe-loader".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(effective_consumer_group_id(&consumer), "dfe-loader");
+    }
+
+    /// Topics on a producer-only config name where it sends, not what it reads:
+    /// subscribing would join the stand-in group and leave an idle member there.
+    /// Broker-free: construction connects lazily and nothing is polled.
+    #[tokio::test]
+    async fn producer_only_transport_subscribes_to_nothing() {
+        let producer = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            client_id: "dfe-transform-vrl-producer-main".to_string(),
+            topics: vec!["syslog_load".to_string()],
+            ..Default::default()
+        };
+        let transport = KafkaTransport::new(&producer)
+            .await
+            .expect("a producer-only transport constructs broker-free");
+        let subscription = transport
+            .consumer
+            .subscription()
+            .expect("librdkafka reports the subscription");
+        assert_eq!(
+            subscription.count(),
+            0,
+            "a producer-only transport joined a group"
+        );
+        assert!(transport.subscribed_topics.read().is_empty());
+    }
+
+    /// The control for the test above: the same topics with a group set DO
+    /// subscribe, so the empty result there is the group check, not a broken
+    /// constructor.
+    #[tokio::test]
+    async fn consumer_transport_subscribes_to_its_topics() {
+        let consumer = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "dfe-loader".to_string(),
+            topics: vec!["syslog_load".to_string()],
+            // No probe: nothing here can reach a broker to report the group up.
+            consumer_protocol_probe_ms: 0,
+            ..Default::default()
+        };
+        let transport = KafkaTransport::new(&consumer)
+            .await
+            .expect("a consumer transport constructs broker-free");
+        let subscription = transport
+            .consumer
+            .subscription()
+            .expect("librdkafka reports the subscription");
+        let topics: Vec<String> = subscription
+            .elements()
+            .iter()
+            .map(|e| e.topic().to_string())
+            .collect();
+        assert_eq!(topics, vec!["syslog_load".to_string()]);
     }
 
     // =========================================================================

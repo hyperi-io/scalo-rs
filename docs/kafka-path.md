@@ -220,6 +220,21 @@ applies its own default, `uniform`.
 
 ---
 
+## Internal consumer groups and broker ACLs
+
+librdkafka will not build a consumer without a `group.id`, and a consumer asks the broker for its group's coordinator as soon as it connects, whether or not it ever subscribes. A broker that grants groups by prefix refuses that lookup for any group outside the prefix, and logs it as `GroupAuthorizationFailed`. So the two consumers scalo builds for its own use take a group id derived from the app's config, never a fixed literal:
+
+| Client | Group id | Joins or commits |
+|---|---|---|
+| `KafkaAdmin` offset-query consumer (also behind topic auto-discovery) | `<group>-admin`, or `<client_id>-admin` when `group` is empty | Never |
+| Idle consumer of a producer-only transport | `<client_id>-producer-only` | Never |
+
+An app granted `dfe-*` with `group: dfe-loader` gets `dfe-loader-admin`, and a producer with `client_id: dfe-fetcher` gets `dfe-fetcher-producer-only`, both inside the grant. With `group` and `client_id` both empty the anchor is the default client id, `scalo`.
+
+An empty `group` is what marks a transport producer-only. It subscribes to nothing even when `topics` is set -- subscribing would join the stand-in group with a member that is never polled.
+
+---
+
 ## Static membership (KIP-345) -- opt-in
 
 `kafka.group_instance_id` (env `<PREFIX>_GROUP_INSTANCE_ID`) sets

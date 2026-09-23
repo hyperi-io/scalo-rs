@@ -604,6 +604,14 @@ and `for_localstack` are unchanged. Anything that relied on the
 `us-east-1` default must name the region it means, in config
 (`secrets.aws.region`) or in `AWS_REGION` / `AWS_DEFAULT_REGION`.
 
+### Internal Kafka group ids derive from the app's config (BEHAVIOUR CHANGE)
+
+The `KafkaAdmin` offset-query consumer used the fixed group id `__hs_admin_internal`, and a producer-only `KafkaTransport` used `__scalo_producer_only`. A broker granting groups by prefix refused both, logging `GroupAuthorizationFailed` on every start. They are now `<group>-admin` (or `<client_id>-admin`) and `<client_id>-producer-only`. See [kafka-path.md](kafka-path.md), "Internal consumer groups and broker ACLs".
+
+Neither consumer ever joined its group or committed an offset, so no offsets are stranded under the old names. A transport with an empty `group` now subscribes to nothing even when `topics` is set; before, it joined `__scalo_producer_only` on those topics.
+
+**Consumer adjustment** -- none in code. A deployment that granted the two literal ids by name, rather than by the app's group prefix, needs its grant to cover the new names.
+
 ---
 
 ## Known open issues (not fixed on this branch)
@@ -626,16 +634,9 @@ transport that discovered nothing consumes nothing until restart.
 
 ### #36 — `KafkaTransport` always allocates both roles
 
-`KafkaTransport::new` builds BOTH a `BaseConsumer` and a
-`FutureProducer` (the producer from its own `ClientConfig`).
-Producer-only callers with empty `group.id` get "rdkafka consumer
-queue not available" because the consumer half still can't construct
-without a group.
+`KafkaTransport::new` builds BOTH a `BaseConsumer` and a `FutureProducer` (the producer from its own `ClientConfig`). A producer-only config (empty `group`) constructs: the idle consumer takes the derived stand-in group `<client_id>-producer-only` and subscribes to nothing. It still connects and looks up that group's coordinator, so the broker has to grant the app's group prefix.
 
-**Workaround:** set `librdkafka_options.group.id` to a dummy
-non-empty value on producer-side configs. The dummy group is
-never used; only present so `BaseConsumer` doesn't fail to
-construct.
+**Workaround:** none needed. Do not set `group.id` in `librdkafka_overrides` on a producer config -- the override replaces the derived stand-in with a group the broker may not grant.
 
 ### #37 — `TransportSender::send(key, payload)` overloads `key` as topic
 
