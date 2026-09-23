@@ -3,6 +3,24 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.4](https://github.com/hyperi-io/scalo-rs/compare/v2.12.3...v2.12.4) (2026-09-23)
+
+### Bug Fixes
+
+* **auth:** assert the credential cache hit allocates nothing ([#128](https://github.com/hyperi-io/scalo-rs/issues/128)) ([eed1354](https://github.com/hyperi-io/scalo-rs/commit/eed13541cc7fe7caeb94212fd66fb8f2d98db4f6))
+* **build:** let the .cargo negations apply ([#153](https://github.com/hyperi-io/scalo-rs/issues/153)) ([6e1f3d6](https://github.com/hyperi-io/scalo-rs/commit/6e1f3d65c880cff435f8bf3f695ac094c77ba01f))
+* **build:** track the .cargo config files ([15feee4](https://github.com/hyperi-io/scalo-rs/commit/15feee48687fcda2104ba4d465163e8dd46bfe67)), closes [#178](https://github.com/hyperi-io/scalo-rs/issues/178)
+* **deps:** empty the dead cargo-audit ignore list ([5fa546c](https://github.com/hyperi-io/scalo-rs/commit/5fa546c7c5e32fe824d197d9bd00d6acd1756289))
+* **deps:** raise floors off three live advisories ([#163](https://github.com/hyperi-io/scalo-rs/issues/163)) ([d19f3af](https://github.com/hyperi-io/scalo-rs/commit/d19f3af35b005fd80e99d1ccdbd153b1864fb6d1))
+* **deps:** raise the floors that cannot resolve ([#166](https://github.com/hyperi-io/scalo-rs/issues/166)) ([cb2526d](https://github.com/hyperi-io/scalo-rs/commit/cb2526d62b3e7b3780a7e363898f7481717dd723)), closes [#164](https://github.com/hyperi-io/scalo-rs/issues/164)
+* **docs:** add the README `## Context` section, and stop duplicating native-deps ([#151](https://github.com/hyperi-io/scalo-rs/issues/151)) ([fa40885](https://github.com/hyperi-io/scalo-rs/commit/fa408858e9454e7ef641f31634b13551d193aef9))
+* **kafka:** classify produce failures by error code, and record deliveries ([2f47b44](https://github.com/hyperi-io/scalo-rs/commit/2f47b449c29b02af6cd007d6a0065ad16421b7ce))
+* **kafka:** KIP-848 by default, the 16 MiB record chain, and the oversize-record loss path ([#74](https://github.com/hyperi-io/scalo-rs/issues/74)) ([6d53e2f](https://github.com/hyperi-io/scalo-rs/commit/6d53e2f48353b38ac650a0001a76425cda285ae4))
+* lead with the hero line, and cut the README to it ([#152](https://github.com/hyperi-io/scalo-rs/issues/152)) ([71c05e6](https://github.com/hyperi-io/scalo-rs/commit/71c05e6722890e331ad8c0334fc4fd0a80c52f1a))
+* **tests:** make the smoke test boot something ([#167](https://github.com/hyperi-io/scalo-rs/issues/167)) ([77153ef](https://github.com/hyperi-io/scalo-rs/commit/77153ef00ea5c7082d7c0d70ab902d16d9ab90cd)), closes [#161](https://github.com/hyperi-io/scalo-rs/issues/161)
+* thirteen consumer fixes, one release ([930c881](https://github.com/hyperi-io/scalo-rs/commit/930c88139c5f9fc596d30d06ebdd55dca88bfb4e)), closes [#124](https://github.com/hyperi-io/scalo-rs/issues/124) [#129](https://github.com/hyperi-io/scalo-rs/issues/129) [#135](https://github.com/hyperi-io/scalo-rs/issues/135) [#133](https://github.com/hyperi-io/scalo-rs/issues/133) [#102](https://github.com/hyperi-io/scalo-rs/issues/102) [#125](https://github.com/hyperi-io/scalo-rs/issues/125) [#139](https://github.com/hyperi-io/scalo-rs/issues/139) [#62](https://github.com/hyperi-io/scalo-rs/issues/62) [#134](https://github.com/hyperi-io/scalo-rs/issues/134) [#140](https://github.com/hyperi-io/scalo-rs/issues/140) [#130](https://github.com/hyperi-io/scalo-rs/issues/130) [#132](https://github.com/hyperi-io/scalo-rs/issues/132) [#127](https://github.com/hyperi-io/scalo-rs/issues/127)
+* two silent failures -- a dropped config write and an inert setter ([#165](https://github.com/hyperi-io/scalo-rs/issues/165)) ([85d1a37](https://github.com/hyperi-io/scalo-rs/commit/85d1a3718ff74da7e16f0a06c0957ac9e4106a37)), closes [#158](https://github.com/hyperi-io/scalo-rs/issues/158) [#157](https://github.com/hyperi-io/scalo-rs/issues/157)
+
 ## [2.12.3](https://github.com/hyperi-io/scalo-rs/compare/v2.12.2...v2.12.3) (2026-09-16)
 
 ### Bug Fixes
