@@ -2554,7 +2554,7 @@ mod tests {
 
     /// The Kafka sizing profile must serialise as snake_case so the
     /// `self_regulation.profile` cascade key reads identically to the governor
-    /// profile (scalo<->pylib config-consistency rule). The doc table at the
+    /// profile (scalo-rs<->scalo-py config-consistency rule). The doc table at the
     /// enum definition uses `low_latency`; this asserts the wire form matches.
     #[test]
     fn sizing_profile_serialises_snake_case() {

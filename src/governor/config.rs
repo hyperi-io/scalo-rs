@@ -274,7 +274,7 @@ mod tests {
 
     /// The governor profile must serialise as snake_case so the
     /// `self_regulation.profile` cascade key reads identically to the Kafka
-    /// sizing profile (scalo<->pylib config-consistency rule).
+    /// sizing profile (scalo-rs<->scalo-py config-consistency rule).
     #[cfg(feature = "config")]
     #[test]
     fn profile_serialises_snake_case() {

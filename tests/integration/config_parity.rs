@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      tests/integration/config_parity.rs
-// Purpose:   Config parity tests against hyperi-pylib
+// Purpose:   Config parity tests against scalo-py
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -11,7 +11,7 @@
 //! Configuration cascade parity tests.
 //!
 //! These tests verify that the 7-layer cascade behaves identically
-//! to hyperi-pylib's config package.
+//! to scalo-py's config package.
 //!
 //! ## Cascade Priority (high to low)
 //!

@@ -10,7 +10,7 @@
 //!
 //! Provides a `StatsContext` implementation that collects librdkafka statistics
 //! and exposes them through a `KafkaMetrics` snapshot. Matches the Python
-//! `hs_pylib.kafka.KafkaMetricsCollector` API.
+//! `scalo.kafka.KafkaMetricsCollector` API.
 //!
 //! ## Usage
 //!

@@ -8,7 +8,7 @@
 
 //! Structured logging with JSON output and sensitive data masking.
 //!
-//! Provides production-ready logging matching hyperi-pylib (Python) and hyperi-golib (Go).
+//! Provides production-ready logging matching scalo-py.
 //! Automatically detects terminal vs container environment for format selection.
 //!
 //! ## Features

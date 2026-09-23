@@ -597,7 +597,7 @@ jemalloc; don't "recommend" mimalloc/snmalloc unless the situational call
 stable toolchain -- no `std::simd`. If the existing choice is already right, say
 so and move on.
 
-**Field notes (from running this on hyperi-rustlib).** A clean codebase yields a
+**Field notes (from running this on scalo-rs, then named hyperi-rustlib).** A clean codebase yields a
 SHORT report -- "conforms, no change" is a valid, valuable result; never
 manufacture remediation to justify a release. Three refinements came out of that
 pass: (1) a library never sets `#[global_allocator]` -- only flag a missing

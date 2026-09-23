@@ -11,7 +11,7 @@
 //! Environment detection parity tests.
 //!
 //! These tests verify that environment detection behaves identically
-//! to hyperi-golib's env package.
+//! to scalo-py's env handling.
 
 use scalo::env::{Environment, get_app_env};
 

@@ -8,9 +8,9 @@
 
 //! Configuration management with 7-layer cascade.
 //!
-//! Provides a hierarchical configuration system matching hyperi-pylib (Python)
-//! and hyperi-golib (Go). Configuration is loaded from multiple sources with
-//! clear priority ordering.
+//! Provides a hierarchical configuration system matching scalo-py.
+//! Configuration is loaded from multiple sources with clear priority
+//! ordering.
 //!
 //! ## Cascade Priority (highest to lowest)
 //!
@@ -140,7 +140,7 @@ pub struct ConfigOptions {
     /// Whether to load home directory `.env` file (`~/.env`).
     ///
     /// Only applies when `load_dotenv` is true.
-    /// Default: false (opt-in, matching hyperi-pylib)
+    /// Default: false (opt-in, matching scalo-py)
     pub load_home_dotenv: bool,
 }
 
