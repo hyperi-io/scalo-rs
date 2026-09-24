@@ -6,12 +6,12 @@ awaits via `token.cancelled().await`. On SIGTERM/SIGINT the handler sleeps for a
 K8s pre-stop delay, then cancels the token. All tasks unblock together, drain
 in-flight work, and exit; the process exits when `main` returns.
 
-The pre-stop delay is the load-bearing detail. Without it the pod starts draining
-before kube-proxy removes it from Service endpoints, so traffic keeps arriving at
-a process no longer accepting work. With it, the pod stays in the endpoint list
-during the delay window, the readiness probe (cleared at the start of the app's
-shutdown wiring) takes it out of rotation, and only then does cancellation
-propagate.
+The pre-stop delay keeps traffic off a pod that has stopped accepting work.
+Kubernetes takes a terminating pod out of Service endpoints itself, and kube-proxy
+picks that up some seconds later. Without the delay the pod drains while traffic
+still arrives. With it, the app keeps serving through that window, and only then
+does cancellation propagate. Nothing in the shutdown path changes `/readyz` --
+see [health.md](health.md).
 
 `ServiceRuntime` from `cli` calls `install_signal_handler` and hands the token to
 `run_service`. Consumer services don't construct the token -- they receive it and `select!`
@@ -33,15 +33,16 @@ The delay runs *before* token cancellation:
 
 ```mermaid
 flowchart TB
-    A["SIGTERM received"] --> B["Clear ready flag<br/>/readyz returns 503 -> kube-proxy removes pod from endpoints"]
-    B --> C["Sleep PRESTOP_DELAY_SECS<br/>in-flight requests drain naturally"]
-    C --> D["Cancel CancellationToken<br/>every select! arm fires; modules drain"]
-    D --> E["main returns<br/>process exits"]
+    A["SIGTERM received"] --> B["Sleep PRESTOP_DELAY_SECS<br/>K8s removes the terminating pod from endpoints; in-flight requests drain"]
+    B --> C["Cancel CancellationToken<br/>every select! arm fires; modules drain"]
+    C --> D["main returns<br/>process exits"]
 ```
 
-The ready-flag clearing (step B) is owned by `ServiceRuntime` / the app's shutdown
-wiring, not `install_signal_handler` -- the shutdown module only does
-signal + delay + cancel. See [../runtime/service-runtime.md](../runtime/service-runtime.md).
+The shutdown module does signal + delay + cancel and nothing else. Neither it nor
+`ServiceRuntime` touches readiness, so `/readyz` answers from the readiness
+callback and the health registry throughout. The one flag that does clear is
+`HttpServer`'s, when the cancelled token stops it -- see [health.md](health.md).
+An app that wants `/readyz` to fail while it drains wires that itself.
 
 When SIGTERM arrives in K8s, the handler increments `pod_eviction_received_total`
 (if `metrics` or `otel-metrics` is on) so eviction events are observable.
@@ -146,7 +147,7 @@ of `main`.
 
 ## Related
 
-- [health.md](health.md) -- ready flag clearing precedes token cancel
+- [health.md](health.md) -- what `/readyz` answers, which shutdown leaves alone
 - [metrics.md](metrics.md) -- `pod_eviction_received_total` on SIGTERM in K8s
 - [../runtime/service-runtime.md](../runtime/service-runtime.md) -- `ServiceRuntime` calls `install_signal_handler`
 - [../auto-wiring.md](../auto-wiring.md), [../feature-flags.md](../feature-flags.md)
