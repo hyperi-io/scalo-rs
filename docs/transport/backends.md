@@ -167,8 +167,11 @@ transport:
       append: true
 ```
 
-- **Cancellation safety**: read/write are guarded by a `tokio::Mutex`
-  — cancellation drops the lock cleanly.
+- **Cancellation safety**: `recv` keeps a partly read line, and any
+  records it has not returned yet, in the transport, so a dropped call
+  loses nothing and the next `recv` returns them. Offsets count every
+  byte of a line read across dropped calls.
+- **Line bytes**: passed through as read; a line need not be UTF-8.
 - **`is_healthy()`**: `!closed` atomic flag.
 
 Source: [../../src/transport/file.rs](../../src/transport/file.rs).
@@ -190,8 +193,11 @@ transport:
       recv_timeout_ms: 100
 ```
 
-- **Cancellation safety**: read path uses `tokio::io::BufReader::read_line`
-  — drop-safe.
+- **Cancellation safety**: `recv` keeps a partly read line, and any
+  records it has not returned yet, in the transport, so a dropped call
+  or an expired `recv_timeout_ms` loses nothing and the next `recv`
+  returns them.
+- **Line bytes**: passed through as read; a line need not be UTF-8.
 - **`is_healthy()`**: `!closed`.
 
 Source: [../../src/transport/pipe.rs](../../src/transport/pipe.rs).

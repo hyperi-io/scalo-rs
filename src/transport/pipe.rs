@@ -33,7 +33,7 @@ use super::work_batch::WorkBatch;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
 /// Commit token for pipe transport.
 ///
@@ -91,13 +91,22 @@ impl PipeTransportConfig {
     }
 }
 
+/// Read side, kept across `recv` calls so a dropped call loses nothing.
+struct ReadState {
+    reader: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
+    /// Bytes of a line still waiting for its newline.
+    line: Vec<u8>,
+    /// Records read but not yet returned.
+    pending: Vec<Message<PipeToken>>,
+}
+
 /// Unix pipe transport (stdin/stdout).
 ///
 /// Send writes newline-delimited payloads to stdout.
 /// Receive reads lines from stdin, each becoming a message.
 /// Commit is a no-op (stdin cannot be rewound).
 pub struct PipeTransport {
-    stdin: tokio::sync::Mutex<BufReader<tokio::io::Stdin>>,
+    stdin: tokio::sync::Mutex<ReadState>,
     stdout: tokio::sync::Mutex<tokio::io::Stdout>,
     sequence: AtomicU64,
     closed: Arc<AtomicBool>,
@@ -127,7 +136,7 @@ impl PipeTransport {
                 "Pipe transport filters failed to compile -- send and recv refuse until the rules are fixed"
             );
         }
-        Self::with_filter_engine(config, filter_engine)
+        Self::with_filter_engine(config, filter_engine, Box::new(tokio::io::stdin()))
     }
 
     /// Create a pipe transport, failing when a filter rule does not compile.
@@ -136,7 +145,25 @@ impl PipeTransport {
     /// backend.
     pub(crate) fn try_new(config: &PipeTransportConfig) -> TransportResult<Self> {
         let filter_engine = Self::compile_filters(config)?;
-        Ok(Self::with_filter_engine(config, Ok(filter_engine)))
+        Ok(Self::with_filter_engine(
+            config,
+            Ok(filter_engine),
+            Box::new(tokio::io::stdin()),
+        ))
+    }
+
+    /// A pipe transport reading `input` in place of stdin.
+    #[cfg(all(test, unix))]
+    fn with_input(
+        config: &PipeTransportConfig,
+        input: impl AsyncRead + Send + Unpin + 'static,
+    ) -> TransportResult<Self> {
+        let filter_engine = Self::compile_filters(config)?;
+        Ok(Self::with_filter_engine(
+            config,
+            Ok(filter_engine),
+            Box::new(input),
+        ))
     }
 
     fn compile_filters(
@@ -152,6 +179,7 @@ impl PipeTransport {
     fn with_filter_engine(
         config: &PipeTransportConfig,
         filter_engine: Result<super::filter::TransportFilterEngine, String>,
+        input: Box<dyn AsyncRead + Send + Unpin>,
     ) -> Self {
         #[cfg(feature = "logger")]
         tracing::info!(
@@ -175,7 +203,11 @@ impl PipeTransport {
         }
 
         Self {
-            stdin: tokio::sync::Mutex::new(BufReader::new(tokio::io::stdin())),
+            stdin: tokio::sync::Mutex::new(ReadState {
+                reader: BufReader::new(input),
+                line: Vec::new(),
+                pending: Vec::new(),
+            }),
             stdout: tokio::sync::Mutex::new(tokio::io::stdout()),
             sequence: AtomicU64::new(0),
             closed,
@@ -276,20 +308,23 @@ impl TransportReceiver for PipeTransport {
         let filter_engine = self.filters()?;
 
         let mut stdin = self.stdin.lock().await;
-        let mut messages = Vec::with_capacity(max.min(100));
-        let mut line_buf = String::new();
+        // `read_until` leaves a partial line in `line` when dropped, and
+        // `pending` holds finished records, so a dropped call resumes here.
+        let ReadState {
+            reader,
+            line,
+            pending,
+        } = &mut *stdin;
 
-        for _ in 0..max {
-            line_buf.clear();
-
+        for _ in pending.len()..max {
             let read_result = if self.recv_timeout_ms == 0 {
                 // Block until data arrives
-                stdin.read_line(&mut line_buf).await
-            } else if messages.is_empty() {
+                reader.read_until(b'\n', line).await
+            } else if pending.is_empty() {
                 // First message: wait up to timeout
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(self.recv_timeout_ms),
-                    stdin.read_line(&mut line_buf),
+                    reader.read_until(b'\n', line),
                 )
                 .await
                 {
@@ -300,7 +335,7 @@ impl TransportReceiver for PipeTransport {
                 // Subsequent messages: non-blocking attempt via short timeout
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(1),
-                    stdin.read_line(&mut line_buf),
+                    reader.read_until(b'\n', line),
                 )
                 .await
                 {
@@ -310,26 +345,30 @@ impl TransportReceiver for PipeTransport {
             };
 
             match read_result {
-                Ok(0) => {
+                Ok(_) if line.is_empty() => {
                     // EOF on stdin
-                    if messages.is_empty() {
+                    if pending.is_empty() {
                         return Err(TransportError::Closed);
                     }
                     break;
                 }
                 Ok(_) => {
-                    // Strip trailing newline
-                    let payload = line_buf.trim_end_matches('\n').trim_end_matches('\r');
-                    if payload.is_empty() {
+                    // Strip the trailing newline and any carriage returns before it
+                    let end = line
+                        .iter()
+                        .rposition(|&b| b != b'\n' && b != b'\r')
+                        .map_or(0, |i| i + 1);
+                    let payload_bytes = bytes::Bytes::copy_from_slice(&line[..end]);
+                    line.clear();
+                    if payload_bytes.is_empty() {
                         continue;
                     }
 
-                    let payload_bytes: bytes::Bytes = payload.as_bytes().to_vec().into();
                     let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
                     let format = PayloadFormat::detect(&payload_bytes);
                     let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
-                    messages.push(Message {
+                    pending.push(Message {
                         key: None,
                         payload: payload_bytes,
                         token: PipeToken { seq },
@@ -342,6 +381,10 @@ impl TransportReceiver for PipeTransport {
                 }
             }
         }
+        // A call with a smaller `max` than the dropped one leaves the rest queued.
+        let rest = pending.split_off(pending.len().min(max));
+        let messages = std::mem::replace(pending, rest);
+        drop(stdin);
 
         // Apply inbound filters via the shared partition helper; DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
@@ -534,6 +577,109 @@ mod tests {
             ),
             other => panic!("send must refuse with the compile error, got: {other:?}"),
         }
+    }
+
+    /// A transport reading the far end of a real OS pipe in place of stdin.
+    #[cfg(unix)]
+    fn piped(recv_timeout_ms: u64) -> (tokio::net::unix::pipe::Sender, PipeTransport) {
+        let (tx, rx) = tokio::net::unix::pipe::pipe().unwrap();
+        let config = PipeTransportConfig {
+            recv_timeout_ms,
+            ..PipeTransportConfig::default()
+        };
+        (tx, PipeTransport::with_input(&config, rx).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn payloads(batch: &WorkBatch<PipeToken>) -> Vec<&[u8]> {
+        batch.records.iter().map(|r| r.payload.as_ref()).collect()
+    }
+
+    /// Drop `recv` after `ms` if it has not returned, as a losing `select!`
+    /// arm does; `None` means it was dropped.
+    #[cfg(unix)]
+    async fn recv_within(
+        transport: &PipeTransport,
+        max: usize,
+        ms: u64,
+    ) -> Option<TransportResult<WorkBatch<PipeToken>>> {
+        tokio::time::timeout(std::time::Duration::from_millis(ms), transport.recv(max))
+            .await
+            .ok()
+    }
+
+    /// A `recv` expected to return, bounded so a lost line fails the test
+    /// rather than hanging it.
+    #[cfg(unix)]
+    async fn recv_now(
+        transport: &PipeTransport,
+        max: usize,
+    ) -> TransportResult<WorkBatch<PipeToken>> {
+        recv_within(transport, max, 5_000)
+            .await
+            .expect("recv returned within 5 s")
+    }
+
+    /// Dropping `recv` mid-line keeps both the line and the record read
+    /// before it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recv_dropped_mid_line_loses_nothing() {
+        let (mut tx, transport) = piped(0);
+
+        tx.write_all(b"{\"n\":1}\n{\"n\":").await.unwrap();
+        assert!(
+            recv_within(&transport, 10, 50).await.is_none(),
+            "recv waits for the rest of the second line"
+        );
+
+        tx.write_all(b"2}\n").await.unwrap();
+        let batch = recv_now(&transport, 2).await.unwrap();
+        assert_eq!(payloads(&batch), [&b"{\"n\":1}"[..], b"{\"n\":2}"]);
+        let seqs: Vec<u64> = batch.commit_tokens.iter().map(|t| t.seq).collect();
+        assert_eq!(seqs, [0, 1]);
+
+        drop(tx);
+        assert!(
+            matches!(recv_now(&transport, 10).await, Err(TransportError::Closed)),
+            "nothing further arrives before EOF"
+        );
+    }
+
+    /// The receive timeout drops the read the same way a caller does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_receive_timeout_keeps_a_partial_line() {
+        let (mut tx, transport) = piped(20);
+
+        tx.write_all(b"{\"part\":").await.unwrap();
+        let first = recv_now(&transport, 10).await.unwrap();
+        assert!(first.records.is_empty(), "the line is not finished yet");
+
+        tx.write_all(b"\"whole\"}\n").await.unwrap();
+        let second = recv_now(&transport, 10).await.unwrap();
+        assert_eq!(payloads(&second), [&b"{\"part\":\"whole\"}"[..]]);
+    }
+
+    /// Records kept from a dropped call come back no more than `max` at a time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn records_kept_from_a_dropped_recv_respect_max() {
+        let (mut tx, transport) = piped(0);
+
+        tx.write_all(b"a\nb\nc\nd").await.unwrap();
+        assert!(
+            recv_within(&transport, 10, 50).await.is_none(),
+            "recv waits for the rest of the fourth line"
+        );
+
+        assert_eq!(
+            payloads(&recv_now(&transport, 2).await.unwrap()),
+            [b"a", b"b"]
+        );
+        assert_eq!(payloads(&recv_now(&transport, 1).await.unwrap()), [b"c"]);
+        tx.write_all(b"\n").await.unwrap();
+        assert_eq!(payloads(&recv_now(&transport, 1).await.unwrap()), [b"d"]);
     }
 
     #[tokio::test]

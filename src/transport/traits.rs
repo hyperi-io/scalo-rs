@@ -299,9 +299,10 @@ pub trait TransportReceiver: TransportBase {
     /// half-consumed at an `.await` -- either gather records synchronously (no
     /// `.await` between taking a record off the wire and returning it) or buffer
     /// internally. The in-tree Kafka (keeps an unfinished poll for the next
-    /// call) and memory (awaits only on an empty buffer) impls satisfy this; a
-    /// custom impl that holds records across an `.await` will drop data on
-    /// cancellation.
+    /// call), memory (awaits only on an empty buffer), and pipe and file (keep
+    /// a partial line and unreturned records for the next call) impls satisfy
+    /// this; a custom impl that holds records across an `.await` will drop data
+    /// on cancellation.
     ///
     /// # Yielding (REQUIRED of implementors)
     ///

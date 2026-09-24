@@ -105,11 +105,16 @@ struct WriteState {
     file: tokio::fs::File,
 }
 
-/// Internal state for the read side.
+/// Internal state for the read side, kept across `recv` calls so a dropped
+/// call loses nothing.
 struct ReadState {
     reader: BufReader<tokio::fs::File>,
+    /// Byte offset just past the last complete line read.
     offset: u64,
-    line_buf: String,
+    /// Bytes of a line still waiting for its newline.
+    line: Vec<u8>,
+    /// Records read but not yet returned.
+    pending: Vec<Message<FileToken>>,
 }
 
 /// NDJSON file transport.
@@ -249,7 +254,8 @@ impl FileTransport {
             *guard = Some(ReadState {
                 reader: BufReader::new(file),
                 offset,
-                line_buf: String::with_capacity(4096),
+                line: Vec::with_capacity(4096),
+                pending: Vec::new(),
             });
         }
         Ok(())
@@ -350,43 +356,55 @@ impl TransportReceiver for FileTransport {
             .as_mut()
             .ok_or_else(|| TransportError::Internal("reader not initialised".into()))?;
 
-        let mut messages = Vec::with_capacity(max.min(100));
+        // `read_until` leaves a partial line in `line` when dropped, and
+        // `pending` holds finished records, so a dropped call resumes here.
+        let ReadState {
+            reader,
+            offset,
+            line,
+            pending,
+        } = state;
 
-        for _ in 0..max {
-            state.line_buf.clear();
-            let bytes_read = state
-                .reader
-                .read_line(&mut state.line_buf)
+        for _ in pending.len()..max {
+            reader
+                .read_until(b'\n', line)
                 .await
                 .map_err(|e| TransportError::Recv(format!("read failed: {e}")))?;
 
-            if bytes_read == 0 {
+            if line.is_empty() {
                 // EOF
                 break;
             }
 
-            state.offset += bytes_read as u64;
+            // Every byte of the line, across dropped calls too, is in `line`.
+            *offset += line.len() as u64;
 
-            // Strip trailing newline
-            let line = state.line_buf.trim_end_matches('\n').trim_end_matches('\r');
-            if line.is_empty() {
+            // Strip the trailing newline and any carriage returns before it
+            let end = line
+                .iter()
+                .rposition(|&b| b != b'\n' && b != b'\r')
+                .map_or(0, |i| i + 1);
+            let payload = bytes::Bytes::copy_from_slice(&line[..end]);
+            line.clear();
+            if payload.is_empty() {
                 continue;
             }
 
-            let payload: bytes::Bytes = line.as_bytes().to_vec().into();
             let format = PayloadFormat::detect(&payload);
             let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
-            messages.push(Message {
+            pending.push(Message {
                 key: None,
                 payload,
-                token: FileToken {
-                    offset: state.offset,
-                },
+                token: FileToken { offset: *offset },
                 timestamp_ms: Some(timestamp_ms),
                 format,
             });
         }
+        // A call with a smaller `max` than the dropped one leaves the rest queued.
+        let rest = pending.split_off(pending.len().min(max));
+        let messages = std::mem::replace(pending, rest);
+        drop(guard);
 
         // Apply inbound filters via the shared partition helper; DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
@@ -598,6 +616,59 @@ mod tests {
 
         let more = reader.recv(10).await.unwrap().records;
         assert!(more.is_empty());
+    }
+
+    /// `recv` dropped after a single poll, as a losing `select!` arm is,
+    /// across lines that straddle the read buffer's fills: every line still
+    /// arrives once, in order, and the last token is the end of the file.
+    #[tokio::test]
+    async fn a_recv_dropped_mid_read_loses_no_lines() {
+        let dir = TempDir::new().unwrap();
+        let lines: Vec<String> = (0..2_000)
+            .map(|n| format!("{{\"n\":{n},\"pad\":\"{}\"}}", "x".repeat(n % 97)))
+            .collect();
+        let path = dir.path().join("dropped.ndjson");
+        let body: String = lines.iter().flat_map(|l| [l.as_str(), "\n"]).collect();
+        std::fs::write(&path, &body).unwrap();
+        let transport = make_transport(&dir, "dropped.ndjson").await;
+
+        let mut got = Vec::new();
+        let mut last_offset = 0;
+        let mut dropped = 0;
+        for _ in 0..10_000 {
+            // `biased` polls recv exactly once before the ready arm drops it.
+            let polled = tokio::select! {
+                biased;
+                batch = transport.recv(10_000) => Some(batch.unwrap()),
+                () = std::future::ready(()) => None,
+            };
+            if let Some(batch) = polled {
+                if batch.records.is_empty() {
+                    break;
+                }
+                got.extend(
+                    batch
+                        .records
+                        .iter()
+                        .map(|r| String::from_utf8(r.payload.to_vec()).unwrap()),
+                );
+                last_offset = batch.commit_tokens.last().unwrap().offset;
+            } else {
+                dropped += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        assert!(dropped > 0, "recv was never dropped mid-read");
+        let first_wrong = got.iter().zip(&lines).position(|(g, l)| g != l);
+        assert_eq!(
+            first_wrong,
+            None,
+            "wrong line: got {:?}",
+            first_wrong.map(|i| &got[i])
+        );
+        assert_eq!(got.len(), lines.len(), "lines received");
+        assert_eq!(last_offset, body.len() as u64, "last token offset");
     }
 
     #[tokio::test]
