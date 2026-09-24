@@ -67,6 +67,12 @@ const MAX_AGE_DAYS_CEILING: u32 = 1_000_000;
 ///
 /// A write `file-rotate` reports `Ok` that did not reach the file, because
 /// it could not open the file for writing, returns `Err`.
+///
+/// External rotation of the current file is unsupported: the writer rotates
+/// it itself. If something else renames it and puts a new file at the path
+/// (logrotate `create`, a second writer), every write until the writer
+/// reopens the path, 250 ms or more after the first, returns `Err` and counts
+/// as failed, although its bytes are in the renamed file.
 pub struct NdjsonWriter {
     writer: Mutex<RotatingTarget>,
     config: FileWriterConfig,

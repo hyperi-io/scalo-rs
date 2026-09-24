@@ -24,6 +24,8 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 
 After a refused write the file backend reopens its file on a later write, waiting 250 ms and doubling up to 30 s while writes keep failing. So a deleted file or a restored directory recovers without a restart. It never recreates a missing directory, because that could put the DLQ on the filesystem under an unmounted volume. While its file is missing it refuses writes before they reach `file-rotate`, whose rotation would otherwise panic -- an abort in a `panic = "abort"` service.
 
+External rotation of the DLQ file (logrotate, say) is unsupported: the backend rotates it itself. If something renames the file and puts a new one at the path, the writes until the next reopen report lost and count in `dropped()`, although their entries are in the renamed file.
+
 Backends are concrete variants of a `DlqBackend` enum (static
 dispatch, no `Box<dyn>`, no `async-trait` macro). Adding a new backend
 means extending the enum in scalo — consumers never construct backend
