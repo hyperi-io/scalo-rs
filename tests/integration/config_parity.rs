@@ -351,7 +351,7 @@ fn test_env_var_nested_key() {
 fn test_env_var_deeply_nested() {
     // Figment's split("__") replaces __ with . for nested keys
     // With prefix "DEEP2_", env var "DEEP2_A__B" becomes "a.b"
-    let _env = EnvGuard::new(&[("DEEP2_CACHE__REDIS__ENABLED", "true")]);
+    let _env = EnvGuard::new(&[("DEEP2_CACHE__DISK__ENABLED", "true")]);
 
     let config = Config::new(ConfigOptions {
         env_prefix: "DEEP2".to_string(),
@@ -359,8 +359,8 @@ fn test_env_var_deeply_nested() {
     })
     .expect("config should load");
 
-    // Three levels: cache.redis.enabled
-    assert_eq!(config.get_bool("cache.redis.enabled"), Some(true));
+    // Three levels: cache.disk.enabled
+    assert_eq!(config.get_bool("cache.disk.enabled"), Some(true));
 }
 
 // ============================================================================

@@ -30,7 +30,7 @@ pub enum DlqError {
     #[error("kafka DLQ error: {0}")]
     Kafka(String),
 
-    /// Generic backend error (HTTP, Redis, etc.).
+    /// Generic backend error (HTTP).
     #[error("DLQ backend error: {0}")]
     BackendError(String),
 

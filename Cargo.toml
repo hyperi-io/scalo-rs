@@ -38,10 +38,10 @@ features = [
     "http", "http-server",
     "transport", "transport-trace",
     "transport-memory", "transport-grpc", "transport-file",
-    "transport-pipe", "transport-http", "transport-redis",
+    "transport-pipe", "transport-http",
     "directory-config",
     "secrets", "secrets-vault",
-    "dlq", "dlq-http", "dlq-redis",
+    "dlq", "dlq-http",
     "output-file",
     "deployment", "config-schema",
     "expression", "version-check",
@@ -195,7 +195,6 @@ io = ["file-rotate", "parking_lot", "chrono", "tracing", "tokio"]
 dlq = ["io", "concurrency", "base64", "serde_json", "tokio", "tokio-util", "tracing"]
 dlq-kafka = ["dlq", "transport-kafka"]
 dlq-http = ["dlq", "reqwest"]
-dlq-redis = ["dlq", "transport-redis"]
 
 # File output sink (local NDJSON file output)
 output-file = ["io", "serde_json", "tracing"]
@@ -250,8 +249,7 @@ transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
 transport-http = ["transport", "http"]
-transport-redis = ["transport", "redis"]
-transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http", "transport-redis"]
+transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http"]
 
 # Secrets management
 secrets = ["tokio", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:rand_core"]
@@ -270,7 +268,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:web
 dangerous-diagnostics = []
 
 # Full feature set
-full = ["config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "dlq-redis", "output-file", "expression", "tls", "geoip-download", "auth"]
+full = ["config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "output-file", "expression", "tls", "geoip-download", "auth"]
 
 [dependencies]
 # Serialisation (always needed)
@@ -391,9 +389,6 @@ rmpv = { version = ">=1.3.1, <2", optional = true }
 
 # Kafka transport (dynamic-linking: use system librdkafka instead of compiling C++ from source)
 rdkafka = { version = ">=0.39.0, <0.40", features = ["dynamic-linking"], optional = true }
-
-# Redis/Valkey Streams transport
-redis = { version = ">=1.0, <2", features = ["tokio-comp", "streams"], optional = true }
 
 # gRPC transport (tonic + prost)
 # tonic-prost is used by the generated code in build.rs (vector.rs ProstCodec),
@@ -527,15 +522,12 @@ rmp-serde = ">=1.3.1, <2"
 # Property-based testing (concurrency-control invariants: finalizer worst-status
 # merge, etc.). MIT/Apache-2.0, 1.11.0 web-checked 2026-06-26.
 proptest = ">=1.11.0, <2"
-# Real-broker fault-injection (NO mocks): spin a Redis/Kafka container and
+# Real-broker fault-injection (NO mocks): spin a Kafka container and
 # stop/start it to drive the spill/circuit/drain + at-least-once paths. The
 # `#[ignore]`d integration tests need a Docker daemon (run on a Docker host).
 # MIT/Apache-2.0, web-checked 2026-06-26.
 testcontainers = ">=0.27.0, <0.28"
-testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["redis", "kafka"] }
-# Direct client for the fault-injection tests to verify stream contents (XLEN /
-# XRANGE) independently of scalo's own transport. Matches the transport's redis.
-redis = { version = ">=1.0, <2", features = ["tokio-comp", "streams"] }
+testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["kafka"] }
 # Query Prometheus's own HTTP API in the scrape test, so the assertion is what
 # Prometheus stored rather than what scalo rendered. Declaration must match the
 # optional `http` dependency exactly -- two different reqwest builds in one

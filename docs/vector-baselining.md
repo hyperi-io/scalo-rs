@@ -305,7 +305,7 @@ https://flink.apache.org/2021/07/07/how-to-identify-the-source-of-backpressure/
 ## 5. Transport, efficiency, allocator
 
 - **Transport**. scalo: config-driven factory (kafka/grpc/http/file/
-  pipe/redis/memory) returning `Box<dyn Transport>`, with a `routed`
+  pipe/memory) returning `Box<dyn Transport>`, with a `routed`
   sender for per-key dispatch (originators only: receiver, fetcher) and a
   filter engine embedded in every backend. Vector: 30+ sources, 49+
   sinks, native to each integration, connected by the topology DAG. Vector

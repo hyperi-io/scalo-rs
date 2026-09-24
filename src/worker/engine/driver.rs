@@ -801,7 +801,7 @@ impl BatchEngine {
         // commit_tokens is the all-filtered case (every record was dropped/
         // DLQ-routed by an inbound filter): those acks must still be committed
         // so the source advances past the filtered records -- returning None
-        // here would strand them (stalled Kafka offset / leaked Redis PEL).
+        // here would strand them (stalled Kafka offset).
         if batch.records.is_empty() && batch.commit_tokens.is_empty() {
             return Ok(None);
         }

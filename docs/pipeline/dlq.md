@@ -10,18 +10,17 @@ The orchestrator is `Dlq` — a clone-cheap handle wrapping a
 `BackgroundSink<DlqEntry>`. Calling `send` queues the entry on an
 in-memory mpsc and returns. A drain task pulled out of the runtime
 loop coalesces queued entries into batches and writes to one or more
-backends. Callers never block on disk, Kafka, HTTP, or Redis I/O.
+backends. Callers never block on disk, Kafka, or HTTP I/O.
 
 ---
 
-## Four backends
+## Three backends
 
 | Backend | Feature | Storage |
 |---------|---------|---------|
 | File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, with rotation (`Hourly` default) and gzip on rotation |
 | Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic — per-table (`acme.auth` → `acme.auth.dlq`) or single common topic |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
-| Redis | `dlq-redis` (needs `transport-redis`) | `XADD` onto a Redis Stream |
 
 Backends are concrete variants of a `DlqBackend` enum (static
 dispatch, no `Box<dyn>`, no `async-trait` macro). Adding a new backend
@@ -34,7 +33,7 @@ types directly.
 
 | Mode | Behaviour |
 |------|-----------|
-| `Cascade` (default) | Try backends in order (Kafka → File → HTTP → Redis), stop on first success |
+| `Cascade` (default) | Try backends in order (Kafka → File → HTTP), stop on first success |
 | `FanOut` | Write to every enabled backend, succeed if any succeed |
 | `FileOnly` | File backend only — no Kafka dependency |
 | `KafkaOnly` | Kafka backend only |
@@ -94,7 +93,7 @@ dlq:
   file:
     enabled: true
     path: /var/spool/dfe/dlq
-    rotation: hourly             # hourly | daily | size
+    rotation: hourly             # hourly | daily
     max_age_days: 30
     compress_rotated: true
   kafka:                         # dlq-kafka feature
@@ -105,11 +104,7 @@ dlq:
     send_timeout_ms: 5000
   http:                          # dlq-http feature
     enabled: false
-    url: https://dlq.example/ingest
-  redis:                         # dlq-redis feature
-    enabled: false
-    url: redis://dlq:6379
-    stream: dfe.dlq
+    endpoint: https://dlq.example/ingest
 ```
 
 ---
@@ -142,9 +137,9 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 | `is_enabled() / mode() / pending() / dropped()` | Introspection — `dropped()` totals queue overflow + disabled-DLQ sends + batches every backend refused (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
 | `DlqEntry::new(service, error_type, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_metadata(...)` | Entry builder |
 | `DlqSource::kafka(topic, partition, offset) / ::http(url) / ...` | Provenance for the entry |
-| `DlqBackend` (enum) | `File / Kafka / Http / Redis` — feature-gated variants |
+| `DlqBackend` (enum) | `File / Kafka / Http` — feature-gated variants |
 | `DlqMode` | `Cascade / FanOut / FileOnly / KafkaOnly` |
-| `DlqError` | `QueueFull / Closed / File / Kafka / Http / Redis / AllBackendsFailed / NotConfigured` |
+| `DlqError` | `Io / Serialization / File / Kafka / BackendError / AllBackendsFailed / NotConfigured / QueueFull / Closed` |
 
 `Dlq` is `Clone` — clones share the same drain. The single-owner
 shutdown handle lives inside `Arc<AsyncMutex<Option<...>>>` so any
@@ -162,7 +157,6 @@ clone can call `shutdown()`.
 - [`../../src/dlq/file.rs`](../../src/dlq/file.rs)
 - [`../../src/dlq/kafka.rs`](../../src/dlq/kafka.rs)
 - [`../../src/dlq/http.rs`](../../src/dlq/http.rs)
-- [`../../src/dlq/redis_dlq.rs`](../../src/dlq/redis_dlq.rs)
 
 ---
 
@@ -172,6 +166,6 @@ clone can call `shutdown()`.
 - [batch-engine.md](batch-engine.md) — parse errors and pre-route DLQ outcomes flow here
 - [../transport/README.md](../transport/README.md) — Kafka backend reuses `KafkaConfig`
 - [../transport/filter-engine.md](../transport/filter-engine.md) — wire-level filter drains DLQ entries here
-- [../feature-flags.md](../feature-flags.md) — `dlq`, `dlq-kafka`, `dlq-http`, `dlq-redis`
+- [../feature-flags.md](../feature-flags.md) — `dlq`, `dlq-kafka`, `dlq-http`
 - [../auto-wiring.md](../auto-wiring.md)
 - [../architecture.md](../architecture.md)

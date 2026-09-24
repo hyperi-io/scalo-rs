@@ -191,7 +191,7 @@ impl RoutedSender {
     ///
     /// `destination` selects the route (falling back to the default);
     /// `key` is what the chosen backend receives as its destination -- the
-    /// Kafka topic, the gRPC metadata routing key, the Redis stream. Use this
+    /// Kafka topic or the gRPC metadata routing key. Use this
     /// wherever the destination NAME and the wire key differ; the bare
     /// [`send`](TransportSender::send) is this call with the two equal.
     pub async fn send_to(&self, destination: &str, key: &str, payload: bytes::Bytes) -> SendResult {

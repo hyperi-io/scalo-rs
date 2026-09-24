@@ -91,10 +91,6 @@ pub struct DlqConfig {
     /// HTTP backend configuration.
     #[cfg(feature = "dlq-http")]
     pub http: super::http::HttpDlqConfig,
-
-    /// Redis backend configuration.
-    #[cfg(feature = "dlq-redis")]
-    pub redis: super::redis_dlq::RedisDlqConfig,
 }
 
 impl Default for DlqConfig {
@@ -110,8 +106,6 @@ impl Default for DlqConfig {
             kafka: KafkaDlqConfig::default(),
             #[cfg(feature = "dlq-http")]
             http: super::http::HttpDlqConfig::default(),
-            #[cfg(feature = "dlq-redis")]
-            redis: super::redis_dlq::RedisDlqConfig::default(),
         }
     }
 }

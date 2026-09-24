@@ -131,7 +131,7 @@ enum SinkMsg<T> {
 ///
 /// **CRITICAL:** drain methods may take time (disk fsync, network
 /// roundtrip). Use true-async I/O (`tokio::fs`, async clients like
-/// `rdkafka` / `reqwest` / `redis`) or `tokio::task::spawn_blocking`
+/// `rdkafka` / `reqwest`) or `tokio::task::spawn_blocking`
 /// for unavoidable sync work. **NEVER** put `std::fs::*` /
 /// `std::io::Write::*` / `std::thread::sleep` directly in `write_batch`
 /// -- that pins the actor task's tokio worker, and `tests/sync_in_async.rs`

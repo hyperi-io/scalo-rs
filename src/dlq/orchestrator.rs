@@ -17,7 +17,7 @@
 //! `try_send` / `send` queue an entry onto the in-memory mpsc and
 //! return. The drain task -- the only place that touches backends --
 //! coalesces queued entries into batches and writes to backends. The
-//! caller never blocks on disk, Kafka, HTTP, or Redis I/O.
+//! caller never blocks on disk, Kafka, or HTTP I/O.
 //!
 //! ## Modes
 //!
@@ -389,21 +389,6 @@ fn build_backends(
             backends.push(DlqBackend::Http(super::http::HttpDlqInner::new(
                 &config.http,
             )?));
-        }
-    }
-
-    // Redis -- feature-gated. Requires async constructor; we build a
-    // tokio runtime handle inline. Spawn() must run inside a tokio
-    // runtime (true for every data-plane service).
-    #[cfg(feature = "dlq-redis")]
-    {
-        if config.redis.enabled {
-            let cfg = config.redis.clone();
-            let inner = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(super::redis_dlq::RedisDlqInner::new(&cfg))
-            })?;
-            backends.push(DlqBackend::Redis(inner));
         }
     }
 

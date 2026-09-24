@@ -43,8 +43,8 @@ above. For raw `Vec<u8>` access, use `moka` directly.
 | Use case | Use instead |
 |----------|-------------|
 | HTTP response cache | A real cache (CDN, proxy) -- those handle revalidation, vary headers, etc. |
-| Distributed cache across pods | Redis (see [../transport/backends.md](../transport/backends.md)) |
-| Session store | Postgres or Redis |
+| Distributed cache across pods | An external shared cache -- scalo ships none |
+| Session store | Postgres |
 | Read-through DB cache | Build it explicitly with `get_or_insert_with` semantics; the basic API here is just get/set |
 | Cross-process state | This is in-process only |
 

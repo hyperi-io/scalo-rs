@@ -91,10 +91,10 @@ pub struct FilteredBatch<T, K> {
     ///
     /// A filtered record WAS handled, so its source ack must still commit.
     /// Dropping these tokens stalls the Kafka offset behind any all-filtered
-    /// stretch (replay storms + phantom KEDA lag) and leaks the Redis PEL
-    /// forever (unbounded growth + duplicate dead-letters on every restart). The
-    /// caller carries them into `WorkBatch.commit_tokens` so the block commit
-    /// covers them once inbound-DLQ routing succeeds.
+    /// stretch (phantom KEDA lag, then a replay storm with duplicate
+    /// dead-letters if the consumer restarts inside it). The caller carries
+    /// them into `WorkBatch.commit_tokens` so the block commit covers them
+    /// once inbound-DLQ routing succeeds.
     pub filtered_tokens: Vec<K>,
 }
 
@@ -482,7 +482,7 @@ mod tests {
     fn partition_batch_carries_filtered_tokens() {
         // Dropped AND DLQ'd messages must surface their commit tokens in
         // filtered_tokens, so the caller can still advance the source past
-        // them (no stalled Kafka offset / leaked Redis PEL on filtered records).
+        // them (no stalled Kafka offset on filtered records).
         struct M {
             payload: Vec<u8>,
             token: u64,

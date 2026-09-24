@@ -9,7 +9,7 @@
 //! # Unified TLS trust
 //!
 //! One place to build a rustls [`ClientConfig`] for every transport that
-//! speaks TLS (HTTP, gRPC, Vault, Redis; Kafka maps the same vocabulary onto
+//! speaks TLS (HTTP, gRPC, Vault; Kafka maps the same vocabulary onto
 //! librdkafka file paths). Collapses the previously ad-hoc per-transport TLS
 //! handling into a single trust model with first-class **private-CA** support
 //! -- the common deployment shape (an internal CA, not the public web

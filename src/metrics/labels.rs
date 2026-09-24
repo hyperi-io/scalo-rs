@@ -30,7 +30,7 @@
 
 /// Transport backend kind. One variant per `transport-*` cargo
 /// feature plus `routed`. Aligns with OTel `messaging.system`
-/// attribute values where they overlap (kafka, redis, http).
+/// attribute values where they overlap (kafka).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
@@ -40,7 +40,6 @@ pub enum TransportKind {
     File,
     Pipe,
     Http,
-    Redis,
     Routed,
 }
 
@@ -55,7 +54,6 @@ impl TransportKind {
             Self::File => "file",
             Self::Pipe => "pipe",
             Self::Http => "http",
-            Self::Redis => "redis",
             Self::Routed => "routed",
         }
     }
@@ -228,7 +226,6 @@ mod tests {
             TransportKind::File.as_label(),
             TransportKind::Pipe.as_label(),
             TransportKind::Http.as_label(),
-            TransportKind::Redis.as_label(),
             TransportKind::Routed.as_label(),
             FlushTrigger::Size.as_label(),
             FlushTrigger::Records.as_label(),

@@ -29,7 +29,7 @@ when the happy path is failing.
 | [tiered-sink.md](tiered-sink.md) | resilient delivery, disk spillover, circuit breaker |
 | [sink-stack.md](sink-stack.md) | timeout / load-shed / concurrency / retry / rate-limit |
 | [spool.md](spool.md) | disk-backed async FIFO |
-| [dlq.md](dlq.md) | file, Kafka, HTTP and Redis backends |
+| [dlq.md](dlq.md) | file, Kafka and HTTP backends |
 | [strmatch.md](strmatch.md) | 4-tier regex to fast-path matcher |
 | [scaling.md](scaling.md) | `ScalingPressure`, KEDA external scaler signal |
 

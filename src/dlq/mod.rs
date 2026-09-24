@@ -19,8 +19,6 @@
 //! - **Kafka**: Routes to Kafka topics with per-table or common
 //!   routing. Requires the `dlq-kafka` feature.
 //! - **HTTP**: POSTs entries as NDJSON. Requires the `dlq-http` feature.
-//! - **Redis**: XADDs entries to a Redis Stream. Requires the
-//!   `dlq-redis` feature.
 //!
 //! Backends are selected and configured via [`DlqConfig`]; consumers
 //! never construct backend types directly. To add a new backend, extend
@@ -69,9 +67,6 @@ mod kafka;
 #[cfg(feature = "dlq-http")]
 mod http;
 
-#[cfg(feature = "dlq-redis")]
-mod redis_dlq;
-
 // Core types (always available with `dlq` feature)
 pub use backend::DlqBackend;
 pub use config::{DlqConfig, DlqMode, FileDlqConfig, RotationPeriod};
@@ -86,10 +81,6 @@ pub use config::{DlqRouting, KafkaDlqConfig};
 // HTTP types (only with `dlq-http` feature)
 #[cfg(feature = "dlq-http")]
 pub use http::HttpDlqConfig;
-
-// Redis types (only with `dlq-redis` feature)
-#[cfg(feature = "dlq-redis")]
-pub use redis_dlq::RedisDlqConfig;
 
 /// Result type for DLQ operations.
 pub type Result<T> = std::result::Result<T, DlqError>;

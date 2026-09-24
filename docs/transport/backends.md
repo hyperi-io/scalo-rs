@@ -1,6 +1,6 @@
 # Backends
 
-Seven concrete backends behind the
+Six concrete backends behind the
 [transport traits](README.md). Each is gated behind its own
 feature flag — apps pull only what they ship.
 
@@ -12,7 +12,6 @@ feature flag — apps pull only what they ship.
 | File | `transport-file` | None | Debugging, audit trails, replay |
 | Pipe | `transport-pipe` | None | Unix pipeline composition |
 | HTTP | `transport-http` | None | Webhook delivery, REST ingest |
-| Redis | `transport-redis` | None (uses `redis` crate) | Edge deployments, lightweight pub/sub |
 
 The Vector-compat shim lives behind `transport-grpc-vector-compat` —
 it isn't a separate backend, it's a wire-protocol overlay on the
@@ -23,7 +22,7 @@ gRPC server.
 ## Two deployment models (Kafka vs gRPC)
 
 The picture below applies to the Kafka and gRPC backends — the other
-five don't make a transit-network choice.
+four don't make a transit-network choice.
 
 | Model | Persistence | Replay | Latency | Failure mode | Use when |
 |-------|-------------|--------|---------|--------------|----------|
@@ -228,43 +227,12 @@ Source: [../../src/transport/http.rs](../../src/transport/http.rs).
 
 ---
 
-## Redis
-
-Redis/Valkey Streams via the `redis` crate. Producer writes via
-`XADD`, consumer uses `XREADGROUP` with consumer-group semantics.
-`commit()` issues `XACK`. Supports `redis://`, `rediss://` (TLS),
-and `unix://`. `max_stream_len` enables approximate trimming via
-`MAXLEN ~`.
-
-```yaml
-transport:
-  output:
-    type: redis
-    redis:
-      url: "redis://valkey:6379"
-      stream: "events.land"
-      group: "dfe"
-      consumer: "dfe-loader-1"
-      max_stream_len: 100000
-      block_ms: 5000
-```
-
-- **Cancellation safety**: the `XREADGROUP` block is a single async
-  call — cancelling drops the connection back to the pool.
-- **`is_healthy()`**: `!closed`.
-- **Outages**: a dropped, refused or timed-out connection makes `send` return `Backpressured`, while `recv` and `commit` return an error. The connection is not re-established: after Redis restarts, `send` stays `Backpressured` and `recv` keeps failing until the transport is rebuilt.
-- **`commit()`**: `XACK` on the configured stream/group.
-
-Source: [../../src/transport/redis_transport.rs](../../src/transport/redis_transport.rs).
-
----
-
 ## Filter wiring
 
 Every backend reads `filters_in` and `filters_out` from its own
 config section and instantiates a [`TransportFilterEngine`](filter-engine.md)
 at construction. No backend-specific filter code — the engine is the
-same across all seven. Tier-1 filters cost ~50-100 ns when present
+same across all six. Tier-1 filters cost ~50-100 ns when present
 and zero when absent.
 
 ---
