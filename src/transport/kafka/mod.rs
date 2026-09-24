@@ -173,7 +173,7 @@ fn block_result(results: Vec<SendResult>) -> SendResult {
 /// High-throughput Kafka transport using rdkafka.
 ///
 /// Optimized for batch-oriented consumption at PB/day scale:
-/// - Uses `BaseConsumer` for direct poll control (see recv() decision note)
+/// - Uses `BaseConsumer` for direct poll control, polled on tokio's blocking pool
 /// - Interns topic strings in a shared cache (read-fast-path per message)
 /// - Drains internal queue with zero-timeout polls
 /// - Minimizes allocations in hot path
@@ -193,8 +193,12 @@ pub struct KafkaTransport {
     /// Persistent topic-string interner. Shared across `recv()` calls so a
     /// newly-discovered topic is interned once (not re-`Arc`'d every batch) --
     /// the previous per-recv clone discarded new entries. RwLock: reads
-    /// dominate (topics repeat), writes only on first sight of a topic.
-    topic_cache: parking_lot::RwLock<HashMap<String, Arc<str>>>,
+    /// dominate (topics repeat), writes only on first sight of a topic. Behind
+    /// an `Arc` because the polls that fill it run on tokio's blocking pool.
+    topic_cache: Arc<parking_lot::RwLock<HashMap<String, Arc<str>>>>,
+    /// The poll of a `recv` that was dropped before it finished, whose records
+    /// the next `recv` returns.
+    in_flight: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Polled>>>,
     closed: AtomicBool,
     /// Shared healthy flag -- read by health registry closure, written by close().
     healthy: Arc<AtomicBool>,
@@ -767,7 +771,8 @@ impl KafkaTransport {
         Ok(Self {
             consumer,
             producer,
-            topic_cache: parking_lot::RwLock::new(topic_cache),
+            topic_cache: Arc::new(parking_lot::RwLock::new(topic_cache)),
+            in_flight: tokio::sync::Mutex::new(None),
             closed: AtomicBool::new(false),
             healthy,
             send_degraded: classify::DegradedLatch::default(),
@@ -1405,7 +1410,9 @@ impl KafkaTransport {
     /// `Bytes` after the polls, and each `Message::payload` is a zero-copy slice
     /// into it. With a byte cap the arena is simply SMALLER -- bounded to
     /// `max_bytes + one record` -- not different in kind.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// The polls themselves run in [`PollJob::run`] on tokio's blocking pool,
+    /// through [`poll_off_runtime`](Self::poll_off_runtime).
     async fn recv_inner(
         &self,
         max_msgs: usize,
@@ -1463,172 +1470,38 @@ impl KafkaTransport {
             }
         }
 
-        let timeout = Duration::from_millis(tuning::POLL_TIMEOUT_MS);
-
-        // DECISION (at-scale hardening 2.6): we KEEP synchronous
-        // `BaseConsumer::poll` inside this async `recv` rather than switching
-        // to `StreamConsumer`. Rationale:
-        //   - librdkafka does the network fetch on its OWN background threads;
-        //     `poll` just dequeues from an in-memory queue. The initial poll
-        //     only blocks the worker (<= POLL_TIMEOUT_MS = 50ms) when the queue
-        //     is EMPTY -- i.e. idle/low-traffic, when nothing else contends.
-        //     Under load the poll returns immediately.
-        //   - The drain loop uses ZERO-timeout polls bounded by MAX_DRAIN_MS
-        //     (100ms); that is useful ingest work, not a block.
-        //   - `StreamConsumer` would change commit/rebalance semantics on the
-        //     critical ingress path -- real regression risk for an unmeasured
-        //     latency benefit. So we MEASURE first (the poll-duration metric
-        //     below); only escalate to spawn_blocking/StreamConsumer if it
-        //     shows real Tokio-worker starvation. See the plan decision ledger.
+        // The poll runs on tokio's blocking pool: its idle wait and its drain
+        // would otherwise hold this worker for up to 150 ms a call, and a loop
+        // that never pends starves every other task on the runtime.
         #[cfg(feature = "metrics")]
         let poll_start = std::time::Instant::now();
-
-        // --- recv-arena ----------------------------------------------------
-        // Instead of `payload.to_vec()` per message (N copies + N heap allocs),
-        // we copy every record's payload ONCE into a single growable arena and
-        // collect OWNED span metadata. After the polls we freeze the arena to
-        // one refcounted `Bytes` and slice it -- so the whole batch shares ONE
-        // allocation. See `build_batch_from_spans` and the per-arm safety note.
-        let span_cap = max_msgs.min(tuning::INITIAL_BATCH_CAPACITY);
-        let mut spans: Vec<Span> = Vec::with_capacity(span_cap);
-        // Arena byte estimate: when a byte cap is set, size the up-front alloc
-        // to the cap (plus a one-record cushion) so the governed arena is right-
-        // sized; otherwise ~256 bytes/record (typical JSON event). It grows as
-        // needed either way. One up-front alloc beats N small ones.
-        let arena_hint = match max_bytes {
-            Some(cap) => usize::try_from(cap)
-                .unwrap_or(usize::MAX)
-                .saturating_add(256),
-            None => span_cap.saturating_mul(256),
-        };
-        let mut arena: Vec<u8> = Vec::with_capacity(arena_hint);
-        let drain_deadline =
-            std::time::Instant::now() + Duration::from_millis(tuning::MAX_DRAIN_MS);
-
-        // Phase 1: Initial poll (drains librdkafka's queue; blocks <= timeout
-        // only when the queue is empty).
-        if let Some(result) = self.consumer.poll(timeout) {
-            match result {
-                Ok(msg) => {
-                    // Extract W3C traceparent from Kafka headers (first message only,
-                    // to associate the batch span with the upstream trace)
-                    #[cfg(feature = "transport-trace")]
-                    if let Some(headers) = msg.headers() {
-                        use rdkafka::message::Headers;
-                        for idx in 0..headers.count() {
-                            if let Some(Ok(header)) = headers.try_get_as::<[u8]>(idx)
-                                && header.key == super::propagation::TRACEPARENT_HEADER
-                            {
-                                if let Some(value) = header.value
-                                    && let Ok(tp) = std::str::from_utf8(value)
-                                    && super::propagation::is_valid_traceparent(tp)
-                                {
-                                    tracing::Span::current().record("traceparent", tp);
-                                }
-                                break;
-                            }
-                        }
-                    }
-
-                    let topic_str = msg.topic();
-                    let topic: Arc<str> = get_or_insert_topic(&self.topic_cache, topic_str);
-                    // SAFETY (lifetime, not unsafe): `msg.payload()` borrows
-                    // librdkafka's internal buffer and is valid ONLY while this
-                    // `BorrowedMessage` lives (until the next poll / its drop).
-                    // We copy it OUT into the arena RIGHT HERE -- this is the
-                    // one unavoidable copy out of the borrowed buffer -- and we
-                    // never store the `&[u8]` or `msg` past this arm.
-                    let start = arena.len();
-                    arena.extend_from_slice(msg.payload().unwrap_or(&[]));
-                    let end = arena.len();
-                    // Extract OWNED metadata before `msg` drops at arm end.
-                    let partition = msg.partition();
-                    let offset = msg.offset();
-                    let timestamp_ms = msg.timestamp().to_millis();
-
-                    spans.push(Span {
-                        key: Some(topic.clone()),
-                        token: KafkaToken::new(topic, partition, offset),
-                        timestamp_ms,
-                        format: PayloadFormat::Auto,
-                        range: start..end,
-                    });
-                    self.recv_state.record_success();
-                }
-                Err(e) => return self.first_poll_failed(e).await,
+        let (arena, spans) = match self.poll_off_runtime(max_msgs, max_bytes).await? {
+            Polled::Empty => {
+                #[cfg(feature = "metrics")]
+                ::metrics::histogram!("kafka_poll_duration_seconds")
+                    .record(poll_start.elapsed().as_secs_f64());
+                return Ok(RecvBatch::from_messages(Vec::new()).into());
             }
-        } else {
-            #[cfg(feature = "metrics")]
-            ::metrics::histogram!("kafka_poll_duration_seconds")
-                .record(poll_start.elapsed().as_secs_f64());
-            // No message available -- empty arena, empty spans, empty batch.
-            return Ok(RecvBatch::from_messages(build_batch_from_spans(
-                bytes::Bytes::new(),
+            Polled::Failed(err) => return self.first_poll_failed(err).await,
+            Polled::Records {
+                arena,
                 spans,
-            ))
-            .into());
-        }
-
-        // Phase 2: drain the queue with zero-timeout polls. librdkafka has
-        // already fetched a batch from the network; we just drain it fast.
-        //
-        // BYTE-AWARE STOP: when `max_bytes` is set, stop
-        // draining once the arena has reached the cap. Phase 1 already took one
-        // record (the floor), so a single oversized record is always returned
-        // and the loop never stalls; the arena is bounded to
-        // `max_bytes + one record`. Without a cap (`None`) this check is skipped
-        // and the drain is record-bounded exactly as before.
-        while spans.len() < max_msgs {
-            if std::time::Instant::now() >= drain_deadline {
-                break;
-            }
-            if arena_byte_limit_reached(arena.len(), spans.len(), max_bytes) {
-                // Arena hit the byte budget -- stop the governed poll here so the
-                // whole-poll arena cannot dwarf the budget. Already drained >= 1
-                // record (floor), so this never stalls.
-                break;
-            }
-
-            match self.consumer.poll(Duration::ZERO) {
-                Some(Ok(msg)) => {
-                    let topic_str = msg.topic();
-                    let topic: Arc<str> = get_or_insert_topic(&self.topic_cache, topic_str);
-                    // Same lifetime contract as Phase 1: copy the borrowed
-                    // payload into the arena HERE, extract owned metadata HERE,
-                    // never let `msg`/`&[u8]` escape this arm.
-                    let start = arena.len();
-                    arena.extend_from_slice(msg.payload().unwrap_or(&[]));
-                    let end = arena.len();
-                    let partition = msg.partition();
-                    let offset = msg.offset();
-                    let timestamp_ms = msg.timestamp().to_millis();
-
-                    spans.push(Span {
-                        key: Some(topic.clone()),
-                        token: KafkaToken::new(topic, partition, offset),
-                        timestamp_ms,
-                        format: PayloadFormat::Auto,
-                        range: start..end,
-                    });
-                }
-                Some(Err(e)) => match classify::classify_recv_failure(&e, self.recv_context()) {
-                    // Another assigned partition may still hold records.
-                    classify::RecvFailure::EndOfPartition => {}
+                stopped_by,
+            } => {
+                self.recv_state.record_success();
+                match stopped_by {
+                    None => {}
                     // Records are in hand; the next call backs off if it persists.
-                    classify::RecvFailure::Transient => {
-                        self.recv_state.record_transient(&e);
-                        break;
-                    }
-                    class @ (classify::RecvFailure::Permanent
-                    | classify::RecvFailure::Unclassified) => {
+                    Some(DrainStop::Transient(e)) => self.recv_state.record_transient(&e),
+                    // Returned by the next call, after these records.
+                    Some(DrainStop::Permanent(e, class)) => {
                         classify::record_permanent_recv_failure(&e, class);
                         *self.deferred_recv_error.lock() = Some(e);
-                        break;
                     }
-                },
-                None => break,
+                }
+                (arena, spans)
             }
-        }
+        };
 
         // Freeze the arena to ONE refcounted Bytes, then rebuild messages as
         // zero-copy slices into it. All borrowed Kafka buffers are long gone --
@@ -1665,6 +1538,38 @@ impl KafkaTransport {
             filtered_tokens,
         }
         .into())
+    }
+
+    /// Run one [`PollJob`] on tokio's blocking pool and wait for it without
+    /// holding a runtime worker.
+    ///
+    /// A call dropped while the job runs -- a `select!` arm that won -- leaves
+    /// the job in `in_flight`, and the next call returns its records instead
+    /// of starting another. librdkafka has already moved past them, so
+    /// dropping them would skip them for this session, and a later commit
+    /// would skip them for good. A job picked up that way keeps the limits of
+    /// the call that started it.
+    async fn poll_off_runtime(
+        &self,
+        max_msgs: usize,
+        max_bytes: Option<u64>,
+    ) -> TransportResult<Polled> {
+        let mut in_flight = self.in_flight.lock().await;
+        let job = in_flight.get_or_insert_with(|| {
+            let job = PollJob {
+                consumer: Arc::clone(&self.consumer),
+                topic_cache: Arc::clone(&self.topic_cache),
+                max_msgs,
+                max_bytes,
+                auto_create_topics: self.auto_create_topics,
+                #[cfg(feature = "transport-trace")]
+                span: tracing::Span::current(),
+            };
+            tokio::task::spawn_blocking(move || job.run())
+        });
+        let polled = job.await;
+        *in_flight = None;
+        polled.map_err(|e| TransportError::Recv(format!("kafka poll task failed: {e}")))
     }
 
     /// Settle a first poll that returned an error: an empty batch after a
@@ -1788,7 +1693,7 @@ fn arena_byte_limit_reached(arena_len: usize, span_count: usize, max_bytes: Opti
 /// `&[u8]` payload it lends are valid only until the next poll / until that
 /// message drops, so every field here is owned (`Arc<str>`, `i64`, indices).
 /// The payload itself has already been copied into the shared arena; `range`
-/// is where. See `recv()` for the poll-arm safety argument.
+/// is where. See `PollJob::run` for the poll-arm safety argument.
 struct Span {
     /// Routing key (interned topic Arc), mirrors `Message::key`.
     key: Option<Arc<str>>,
@@ -1844,6 +1749,188 @@ fn get_or_insert_topic(
     let arc: Arc<str> = Arc::from(topic);
     cache.write().insert(topic.to_string(), arc.clone());
     arc
+}
+
+/// What one [`PollJob`] took off librdkafka's queue.
+enum Polled {
+    /// The first poll waited out its timeout with nothing queued.
+    Empty,
+    /// The first poll failed before any record arrived.
+    Failed(KafkaError),
+    /// At least one record, and what ended the drain early, if anything did.
+    Records {
+        arena: Vec<u8>,
+        spans: Vec<Span>,
+        stopped_by: Option<DrainStop>,
+    },
+}
+
+/// A poll failure that ended the drain after at least one record.
+enum DrainStop {
+    /// A condition librdkafka recovers from; the next call backs off if it persists.
+    Transient(KafkaError),
+    /// A failure no retry clears, returned by the next call.
+    Permanent(KafkaError, classify::RecvFailure),
+}
+
+/// One receive's polls, owning what they touch so they can run on tokio's
+/// blocking pool: the first poll waits up to [`tuning::POLL_TIMEOUT_MS`] on an
+/// empty queue, and the drain runs for up to [`tuning::MAX_DRAIN_MS`].
+struct PollJob {
+    consumer: Arc<BaseConsumer<StatsContext>>,
+    topic_cache: Arc<parking_lot::RwLock<HashMap<String, Arc<str>>>>,
+    max_msgs: usize,
+    max_bytes: Option<u64>,
+    /// The consumer's `allow.auto.create.topics`, for classifying a drain failure.
+    auto_create_topics: bool,
+    /// The caller's span; a pool thread has none of its own to record on.
+    #[cfg(feature = "transport-trace")]
+    span: tracing::Span,
+}
+
+impl PollJob {
+    /// Poll once with the idle timeout, then drain what librdkafka already holds
+    /// with zero-timeout polls.
+    fn run(self) -> Polled {
+        // --- recv-arena ----------------------------------------------------
+        // Instead of `payload.to_vec()` per message (N copies + N heap allocs),
+        // we copy every record's payload ONCE into a single growable arena and
+        // collect OWNED span metadata. After the polls we freeze the arena to
+        // one refcounted `Bytes` and slice it -- so the whole batch shares ONE
+        // allocation. See `build_batch_from_spans` and the per-arm safety note.
+        let span_cap = self.max_msgs.min(tuning::INITIAL_BATCH_CAPACITY);
+        let drain_deadline =
+            std::time::Instant::now() + Duration::from_millis(tuning::MAX_DRAIN_MS);
+
+        // Phase 1: Initial poll (drains librdkafka's queue; blocks <= timeout
+        // only when the queue is empty).
+        let msg = match self
+            .consumer
+            .poll(Duration::from_millis(tuning::POLL_TIMEOUT_MS))
+        {
+            None => return Polled::Empty,
+            Some(Err(e)) => return Polled::Failed(e),
+            Some(Ok(msg)) => msg,
+        };
+
+        // Extract W3C traceparent from Kafka headers (first message only,
+        // to associate the batch span with the upstream trace)
+        #[cfg(feature = "transport-trace")]
+        if let Some(headers) = msg.headers() {
+            use rdkafka::message::Headers;
+            for idx in 0..headers.count() {
+                if let Some(Ok(header)) = headers.try_get_as::<[u8]>(idx)
+                    && header.key == super::propagation::TRACEPARENT_HEADER
+                {
+                    if let Some(value) = header.value
+                        && let Ok(tp) = std::str::from_utf8(value)
+                        && super::propagation::is_valid_traceparent(tp)
+                    {
+                        self.span.record("traceparent", tp);
+                    }
+                    break;
+                }
+            }
+        }
+
+        let mut spans: Vec<Span> = Vec::with_capacity(span_cap);
+        // Arena byte estimate: when a byte cap is set, size the up-front alloc
+        // to the cap (plus a one-record cushion) so the governed arena is right-
+        // sized; otherwise ~256 bytes/record (typical JSON event). It grows as
+        // needed either way. One up-front alloc beats N small ones.
+        let arena_hint = match self.max_bytes {
+            Some(cap) => usize::try_from(cap)
+                .unwrap_or(usize::MAX)
+                .saturating_add(256),
+            None => span_cap.saturating_mul(256),
+        };
+        let mut arena: Vec<u8> = Vec::with_capacity(arena_hint);
+
+        let topic: Arc<str> = get_or_insert_topic(&self.topic_cache, msg.topic());
+        // SAFETY (lifetime, not unsafe): `msg.payload()` borrows librdkafka's
+        // internal buffer and is valid ONLY while this `BorrowedMessage` lives
+        // (until the next poll / its drop). We copy it OUT into the arena RIGHT
+        // HERE -- this is the one unavoidable copy out of the borrowed buffer --
+        // and drop `msg` before the next poll.
+        let start = arena.len();
+        arena.extend_from_slice(msg.payload().unwrap_or(&[]));
+        let end = arena.len();
+        spans.push(Span {
+            key: Some(topic.clone()),
+            token: KafkaToken::new(topic, msg.partition(), msg.offset()),
+            timestamp_ms: msg.timestamp().to_millis(),
+            format: PayloadFormat::Auto,
+            range: start..end,
+        });
+        drop(msg);
+
+        // A record has arrived, which proves the credentials.
+        let ctx = classify::RecvContext {
+            auto_create_topics: self.auto_create_topics,
+            credentials_proven: true,
+        };
+        let mut stopped_by = None;
+
+        // Phase 2: drain the queue with zero-timeout polls. librdkafka has
+        // already fetched a batch from the network; we just drain it fast.
+        //
+        // BYTE-AWARE STOP: when `max_bytes` is set, stop
+        // draining once the arena has reached the cap. Phase 1 already took one
+        // record (the floor), so a single oversized record is always returned
+        // and the loop never stalls; the arena is bounded to
+        // `max_bytes + one record`. Without a cap (`None`) this check is skipped
+        // and the drain is record-bounded exactly as before.
+        while spans.len() < self.max_msgs {
+            if std::time::Instant::now() >= drain_deadline {
+                break;
+            }
+            if arena_byte_limit_reached(arena.len(), spans.len(), self.max_bytes) {
+                // Arena hit the byte budget -- stop the governed poll here so the
+                // whole-poll arena cannot dwarf the budget. Already drained >= 1
+                // record (floor), so this never stalls.
+                break;
+            }
+
+            match self.consumer.poll(Duration::ZERO) {
+                Some(Ok(msg)) => {
+                    let topic: Arc<str> = get_or_insert_topic(&self.topic_cache, msg.topic());
+                    // Same lifetime contract as Phase 1: copy the borrowed
+                    // payload into the arena HERE, extract owned metadata HERE,
+                    // never let `msg`/`&[u8]` escape this arm.
+                    let start = arena.len();
+                    arena.extend_from_slice(msg.payload().unwrap_or(&[]));
+                    let end = arena.len();
+                    spans.push(Span {
+                        key: Some(topic.clone()),
+                        token: KafkaToken::new(topic, msg.partition(), msg.offset()),
+                        timestamp_ms: msg.timestamp().to_millis(),
+                        format: PayloadFormat::Auto,
+                        range: start..end,
+                    });
+                }
+                Some(Err(e)) => match classify::classify_recv_failure(&e, ctx) {
+                    // Another assigned partition may still hold records.
+                    classify::RecvFailure::EndOfPartition => {}
+                    classify::RecvFailure::Transient => {
+                        stopped_by = Some(DrainStop::Transient(e));
+                        break;
+                    }
+                    class @ (classify::RecvFailure::Permanent
+                    | classify::RecvFailure::Unclassified) => {
+                        stopped_by = Some(DrainStop::Permanent(e, class));
+                        break;
+                    }
+                },
+                None => break,
+            }
+        }
+
+        Polled::Records {
+            arena,
+            spans,
+            stopped_by,
+        }
+    }
 }
 
 // --- Inbound gate actuator (governor feature) -------------------------------
@@ -2106,6 +2193,69 @@ mod tests {
         assert!(
             calls < 200,
             "{calls} recv calls in {window:?} -- the failing poll is spinning"
+        );
+    }
+
+    /// A task looping on `recv` hands its thread back between polls, so a timer
+    /// beside it still fires. The broker here accepts the connection and never
+    /// answers, so for librdkafka's 10 s API-version timeout every poll comes
+    /// back empty with no error: a `recv` that never pends keeps the
+    /// current-thread runtime to itself and the timer never fires.
+    #[test]
+    fn an_idle_recv_loop_leaves_the_runtime_free() {
+        let broker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent broker");
+        let address = broker.local_addr().expect("silent broker address");
+        std::thread::spawn(move || {
+            // Held open without a byte, so librdkafka waits instead of failing.
+            let mut held = Vec::new();
+            for stream in broker.incoming() {
+                held.push(stream);
+            }
+        });
+
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            runtime.block_on(async move {
+                let transport = KafkaTransport::new(&KafkaConfig {
+                    brokers: vec![address.to_string()],
+                    group: "scalo-idle-loop".to_string(),
+                    topics: vec!["events".to_string()],
+                    consumer_protocol_probe_ms: 0,
+                    ..Default::default()
+                })
+                .await
+                .expect("a consumer transport constructs against a silent broker");
+                let stop = tokio_util::sync::CancellationToken::new();
+                let stop_loop = stop.clone();
+                let looping = tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = stop_loop.cancelled() => break,
+                            batch = transport.recv(100) => {
+                                let batch = batch.expect("an idle consumer's recv is Ok");
+                                assert!(batch.records.is_empty());
+                            }
+                        }
+                    }
+                });
+                let started = std::time::Instant::now();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = fired_tx.send(started.elapsed());
+                stop.cancel();
+                looping.await.expect("recv loop");
+            });
+        });
+
+        let fired = fired_rx.recv_timeout(Duration::from_secs(3));
+        assert!(
+            fired.is_ok(),
+            "a 100 ms timer beside the recv loop did not fire within 3 s -- the loop is \
+             holding the runtime"
         );
     }
 

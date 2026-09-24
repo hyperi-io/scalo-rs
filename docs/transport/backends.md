@@ -60,8 +60,8 @@ transport:
       sasl_password: ${KAFKA_PASSWORD}
 ```
 
-- **Cancellation safety**: `recv` uses `rdkafka`'s internal poll —
-  safe to drop at any `.await`, including during its outage backoff.
+- **Cancellation safety**: `recv` polls on tokio's blocking pool, so a loop on it never holds a runtime worker. It is safe to drop at any `.await`, including its outage backoff: a poll still running when `recv` is dropped is kept, and the next `recv` returns its records.
+- **Idle wait**: with nothing queued, `recv` waits up to 50 ms for a record, then returns an empty batch.
 - **`send_batch()`**: queues the whole block, then awaits every delivery
   report, so the block costs about one `linger.ms` window. Outbound filters
   apply per record first. `Ok` means every record was confirmed or filtered;

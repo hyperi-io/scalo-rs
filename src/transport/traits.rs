@@ -298,9 +298,16 @@ pub trait TransportReceiver: TransportBase {
     /// the future when shutdown or a ticker wins, so it must not leave records
     /// half-consumed at an `.await` -- either gather records synchronously (no
     /// `.await` between taking a record off the wire and returning it) or buffer
-    /// internally. The in-tree Kafka (synchronous poll) and memory (awaits only
-    /// on an empty buffer) impls satisfy this; a custom impl that holds records
-    /// across an `.await` will drop data on cancellation.
+    /// internally. The in-tree Kafka (keeps an unfinished poll for the next
+    /// call) and memory (awaits only on an empty buffer) impls satisfy this; a
+    /// custom impl that holds records across an `.await` will drop data on
+    /// cancellation.
+    ///
+    /// # Yielding (REQUIRED of implementors)
+    ///
+    /// A `recv` with nothing to return waits by awaiting, never by blocking
+    /// the thread. Callers loop on it, and a `recv` that never pends keeps its
+    /// worker: timers stop and sockets on that runtime go unanswered.
     fn recv(
         &self,
         max: usize,
