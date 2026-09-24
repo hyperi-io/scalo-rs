@@ -102,8 +102,8 @@ impl ServiceMetrics {
             metrics::Unit::Seconds,
             "Time to send a batch to transport"
         );
-        // Byte/event throughput (Vector-modelled; batch-incremented). Bytes are
-        // raw wire bytes (summed payload.len() per WorkBatch), not decoded size.
+        // Byte/event throughput, incremented per batch. Bytes are raw wire
+        // bytes (summed payload.len() per WorkBatch), not decoded size.
         metrics::describe_counter!(
             "transport_sent_bytes_total",
             metrics::Unit::Bytes,
