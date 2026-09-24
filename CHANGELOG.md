@@ -3,6 +3,14 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.5](https://github.com/hyperi-io/scalo-rs/compare/v2.12.4...v2.12.5) (2026-09-24)
+
+### Bug Fixes
+
+* **ci:** move .hyperi-ci.yaml to the release vocabulary ([#173](https://github.com/hyperi-io/scalo-rs/issues/173)) ([abb5e97](https://github.com/hyperi-io/scalo-rs/commit/abb5e97578947b3d43b90e83fd96e3b5044c5457))
+* **docs:** name scalo-py, not pylib or golib ([#169](https://github.com/hyperi-io/scalo-rs/issues/169)) ([25c6582](https://github.com/hyperi-io/scalo-rs/commit/25c658213a43d06e4d6b07465cfd3167e4420dde))
+* **kafka:** derive internal group ids from config ([#171](https://github.com/hyperi-io/scalo-rs/issues/171)) ([387c6b1](https://github.com/hyperi-io/scalo-rs/commit/387c6b1faad66a191d0ef2dc013e7782c7c7e41f)), closes [#106](https://github.com/hyperi-io/scalo-rs/issues/106)
+
 ## [2.12.4](https://github.com/hyperi-io/scalo-rs/compare/v2.12.3...v2.12.4) (2026-09-23)
 
 ### Bug Fixes
