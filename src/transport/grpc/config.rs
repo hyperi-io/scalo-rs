@@ -45,8 +45,9 @@ pub struct GrpcConfig {
     ///
     /// Bounds each `send` and `send_batch` end to end -- DNS, TCP connect, TLS
     /// handshake and the RPC -- so a server that is down or never answers
-    /// returns `Backpressured` at the limit. Also sent as the `grpc-timeout`
-    /// header.
+    /// returns `Backpressured` at the limit. A dial still unfinished at nine
+    /// tenths of it is abandoned, so the next send dials afresh. Also sent as
+    /// the `grpc-timeout` header.
     pub send_timeout_ms: u64,
 
     /// Maximum message size in bytes (both send and receive).

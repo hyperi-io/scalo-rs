@@ -795,28 +795,30 @@ async fn drop_stops_the_server_while_a_client_holds_an_rpc_open() {
     );
 }
 
-/// A listener that completes TCP but never speaks, holding every connection.
-async fn silent_listener() -> std::net::SocketAddr {
+/// A listener that completes TCP but never speaks, holding every connection,
+/// and the number of connections it has accepted.
+async fn silent_listener() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepts);
     tokio::spawn(async move {
         let mut held = Vec::new();
         while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             held.push(stream);
         }
     });
-    addr
+    (addr, accepts)
 }
 
-/// A TLS client to a server that accepts and never answers waits in the TLS
-/// handshake, before the RPC starts; `send_timeout_ms` still ends the send.
-#[tokio::test]
-async fn a_send_to_a_server_that_never_answers_ends_at_send_timeout() {
+/// A TLS client to `addr` that trusts a throwaway CA, with the given send
+/// limit. The CA is read when the transport is built.
+async fn tls_client(addr: std::net::SocketAddr, send_timeout_ms: u64) -> GrpcTransport {
     use std::io::Write;
 
-    let addr = silent_listener().await;
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("self-signed cert");
     let mut ca = tempfile::NamedTempFile::new().expect("ca file");
@@ -827,8 +829,16 @@ async fn a_send_to_a_server_that_never_answers_ends_at_send_timeout() {
     config.tls_enabled = true;
     config.tls_ca_path = Some(ca.path().to_string_lossy().into_owned());
     config.tls_domain = Some("localhost".to_string());
-    config.send_timeout_ms = 300;
-    let client = GrpcTransport::new(&config).await.expect("client");
+    config.send_timeout_ms = send_timeout_ms;
+    GrpcTransport::new(&config).await.expect("client")
+}
+
+/// A TLS client to a server that accepts and never answers waits in the TLS
+/// handshake, before the RPC starts; `send_timeout_ms` still ends the send.
+#[tokio::test]
+async fn a_send_to_a_server_that_never_answers_ends_at_send_timeout() {
+    let (addr, _accepts) = silent_listener().await;
+    let client = tls_client(addr, 300).await;
 
     let started = std::time::Instant::now();
     let single = tokio::time::timeout(
@@ -851,6 +861,36 @@ async fn a_send_to_a_server_that_never_answers_ends_at_send_timeout() {
     assert!(
         elapsed < Duration::from_secs(3),
         "two sends at a 300 ms limit took {elapsed:?}"
+    );
+}
+
+/// A TLS handshake the server never answers is abandoned inside
+/// `send_timeout_ms`, so each send dials afresh rather than queueing behind
+/// the stalled one.
+///
+/// The dial gives up a tenth of the limit before its send does; a 1 s limit
+/// keeps that 100 ms margin clear of scheduler stalls on a busy host.
+#[tokio::test]
+async fn each_send_after_a_stalled_tls_handshake_dials_afresh() {
+    let (addr, accepts) = silent_listener().await;
+    let client = tls_client(addr, 1_000).await;
+
+    for _ in 0..3 {
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send("main", bytes::Bytes::from_static(b"{}")),
+        )
+        .await;
+        assert!(
+            matches!(sent, Ok(SendResult::Backpressured)),
+            "send must end at send_timeout_ms as backpressure, got {sent:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        accepts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "three sends to a server that never answers should each dial it once"
     );
 }
 

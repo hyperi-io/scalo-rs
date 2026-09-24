@@ -681,7 +681,7 @@ The gRPC server acknowledges a record once it is queued for `recv`. `close()` us
 
 - `close()` refuses every push from then on with `Unavailable`, which a sender retries. `recv` returns the records already queued, then `Closed`.
 - `close()` and dropping the transport both stop the server, so the listener is free when `close()` returns. The serve task used to outlive the transport for as long as a client held an RPC open. Open connections still finish their in-flight RPCs.
-- `send` and `send_batch` give up at `send_timeout_ms` end to end. The `grpc-timeout` header did not cover DNS, the TCP connect or the TLS handshake, so a send to a receiver that was down could outlive the limit. The TCP connect is dropped at the limit too.
+- `send` and `send_batch` give up at `send_timeout_ms` end to end. The `grpc-timeout` header did not cover DNS, the TCP connect or the TLS handshake, so a send to a receiver that was down could outlive the limit. A dial whose DNS lookup, TCP connect or TLS handshake has not finished by nine tenths of the limit is now abandoned, so the next send dials afresh. Before, only the TCP connect was bounded, and every later send queued behind a TLS handshake the server never answered.
 - The server no longer counts receipts in `transport_sent_total{transport="grpc"}`. They were counted as sends and as receipts both.
 
 **Consumer adjustment** -- a service that receives over gRPC shuts down with `close()`, then `recv` until `Closed`, then its final flush. One that stops calling `recv` and closes after its flush still loses what was queued. A dashboard that read the server's `transport_sent_total{transport="grpc"}` as its intake reads `transport_received_events_total{transport="grpc"}` instead.

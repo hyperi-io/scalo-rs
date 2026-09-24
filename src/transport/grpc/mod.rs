@@ -234,13 +234,20 @@ impl GrpcTransport {
                     .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
             }
 
-            // Drop a stuck connect at send_timeout_ms so the next send dials
-            // afresh instead of queueing behind it until the OS gives up.
+            // A dial left running when its send gives up hands its failure to
+            // the next send, so the dial ends at nine tenths of the limit.
             if config.send_timeout_ms > 0 {
-                ep = ep.connect_timeout(Duration::from_millis(config.send_timeout_ms));
+                ep = ep.connect_timeout(Duration::from_millis(config.send_timeout_ms) * 9 / 10);
             }
 
-            let channel = ep.connect_lazy();
+            // Given the connector, tonic abandons a dial whose DNS, TCP connect
+            // or TLS handshake outruns the connect timeout, where connect_lazy()
+            // bounds the TCP connect alone and the next send queues behind it.
+            let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
+            // tonic's own settings: an https URI passes through to its TLS layer.
+            tcp.enforce_http(false);
+            tcp.set_nodelay(true);
+            let channel = ep.connect_with_connector_lazy(tcp);
 
             // No encoding limit: tonic's refusal arrives as a stream reset that
             // reads as an outage, so send and send_batch check the size instead.

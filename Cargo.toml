@@ -244,7 +244,7 @@ transport = ["tokio", "serde_json", "rmpv", "chrono", "regex", "memchr", "sonic-
 transport-trace = ["transport", "dep:opentelemetry"]
 transport-memory = ["transport"]
 transport-kafka = ["transport", "rdkafka", "regex", "tokio-util"]
-transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream"]
+transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util"]
 transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
@@ -404,6 +404,10 @@ prost-types = { version = ">=0.14, <0.15", optional = true }
 # The `net` feature does not exist before 0.1.1, and tonic pins the real floor
 # higher again, so this must stay a three-component floor.
 tokio-stream = { version = ">=0.1.16, <0.2", features = ["net"], optional = true }
+# The TCP connector tonic's channel is built on, handed to
+# Endpoint::connect_with_connector_lazy so the connect timeout covers the TLS
+# handshake too. Same crate and features tonic's `channel` feature already pulls.
+hyper-util = { version = ">=0.1.20, <0.2", features = ["client-legacy", "tokio"], optional = true }
 
 # TUI dashboard (ratatui re-exports crossterm)
 ratatui = { version = ">=0.29, <0.32", optional = true }
