@@ -23,22 +23,23 @@
 //!
 //! ```yaml
 //! deployment:
-//!   image_registry: ghcr.io/hyperi-io        # default: ghcr.io/hyperi-io
-//!   base_image: debian:trixie-slim           # default: debian:trixie-slim
-//!   base_distro: trixie                      # default: derived from base_image
+//!   image_registry: ghcr.io/hyperi-io                  # default: ghcr.io/hyperi-io
+//!   base_image: debian:trixie-slim@sha256:<digest>     # default: DEFAULT_BASE_IMAGE
+//!   base_distro: trixie                                # default: derived from base_image
 //! ```
 //!
 //! # Defaults
 //!
 //! - [`DEFAULT_IMAGE_REGISTRY`] = `ghcr.io/hyperi-io` -- where built images go
-//! - [`DEFAULT_BASE_IMAGE`] = `debian:trixie-slim` -- what the runtime stage builds on
+//! - [`DEFAULT_BASE_IMAGE`] = `debian:trixie-slim@sha256:...` -- what the runtime stage builds on
 //! - [`DEFAULT_BASE_DISTRO`] = `trixie` -- which release's package names to emit
 //!
 //! `base_distro` exists because runtime package names are release-specific and
-//! a base image does not always say which release it is. Pin a digest, as the
-//! container standard asks, and the codename is gone from the string entirely.
-//! Set `base_distro` alongside a digest-pinned `base_image` and the generator
-//! has no guessing to do.
+//! a base image does not always say which release it is. A digest-only
+//! reference (`debian@sha256:...`) carries no codename at all. Keep the tag
+//! beside the digest (`debian:trixie-slim@sha256:...`) and the release still
+//! derives, or set `base_distro` alongside the pin and the generator has no
+//! guessing to do.
 //!
 //! When (eventually) a curated GHCR base image lands at
 //! `ghcr.io/hyperi-io/dfe-base:trixie`, ops can override
@@ -59,7 +60,12 @@ pub const DEFAULT_IMAGE_REGISTRY: &str = "ghcr.io/hyperi-io";
 /// trixie CI builders so binaries built on CI run as-is. Override via
 /// `deployment.base_image` in the YAML cascade (keep glibc(runtime) >=
 /// glibc(build); musl/alpine unsupported -- see docs/deployment/native-deps.md).
-pub const DEFAULT_BASE_IMAGE: &str = "debian:trixie-slim";
+///
+/// Pinned to the multi-arch index digest so every build of one scalo release
+/// gets the same bytes on amd64 and arm64. Renovate refreshes the digest.
+// renovate: datasource=docker depName=debian
+pub const DEFAULT_BASE_IMAGE: &str =
+    "debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a";
 
 /// Default distro release the generated runtime package names target.
 ///
@@ -186,7 +192,21 @@ mod tests {
     #[test]
     fn defaults_are_ghcr_friendly() {
         assert_eq!(DEFAULT_IMAGE_REGISTRY, "ghcr.io/hyperi-io");
-        assert_eq!(DEFAULT_BASE_IMAGE, "debian:trixie-slim");
+    }
+
+    #[test]
+    fn default_base_image_is_pinned_by_digest() {
+        // Asserts the shape rather than the digest, which Renovate moves.
+        let digest = DEFAULT_BASE_IMAGE
+            .strip_prefix("debian:trixie-slim@sha256:")
+            .unwrap_or_else(|| panic!("not a digest-pinned trixie-slim: {DEFAULT_BASE_IMAGE}"));
+        assert_eq!(digest.len(), 64, "sha256 digest is 64 hex chars: {digest}");
+        assert!(
+            digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "digest is not lower-case hex: {digest}"
+        );
     }
 
     #[test]

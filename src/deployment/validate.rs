@@ -406,10 +406,12 @@ fn exposes_tcp_port(dockerfile: &str, port: u16) -> bool {
     })
 }
 
+/// The first non-comment line carrying `keyword`, so a lint pragma or note
+/// above an instruction is never reported in its place.
 fn extract_line_containing(content: &str, keyword: &str) -> String {
     content
         .lines()
-        .find(|line| line.contains(keyword))
+        .find(|line| !line.trim_start().starts_with('#') && line.contains(keyword))
         .unwrap_or("(not found)")
         .trim()
         .to_string()
@@ -487,6 +489,34 @@ mod tests {
             mismatches.is_empty(),
             "Unexpected mismatches: {mismatches:?}"
         );
+    }
+
+    /// The generator's own output validates clean, and a mismatch names the
+    /// instruction itself rather than the comment lines above it.
+    #[test]
+    fn test_validate_generated_dockerfile_reports_instructions_not_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let dockerfile = dir.path().join("Dockerfile");
+        let mut contract = test_contract();
+        contract.native_deps = super::super::NativeDepsContract::for_scalo_features(
+            &["transport-kafka"],
+            &contract.base_image,
+        );
+        std::fs::write(
+            &dockerfile,
+            super::super::generate_dockerfile(&contract, None),
+        )
+        .unwrap();
+        let mismatches = validate_dockerfile(&contract, &dockerfile).unwrap();
+        assert!(mismatches.is_empty(), "{mismatches:?}");
+
+        contract.metrics_port = 9191;
+        let mismatches = validate_dockerfile(&contract, &dockerfile).unwrap();
+        let port = mismatches
+            .iter()
+            .find(|m| m.field == "Dockerfile HEALTHCHECK port")
+            .expect("port mismatch reported");
+        assert!(port.actual.starts_with("HEALTHCHECK "), "{port:?}");
     }
 
     #[test]

@@ -2,6 +2,17 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["github>hyperi-io/renovate-config"],
   "minimumReleaseAge": "7 days",
+  "customManagers": [
+    {
+      "description": "Images pinned as image:tag@sha256:digest in a Rust const, the value on the line after a renovate comment or the one after that, where rustfmt moves a long literal. The shared preset's manager captures a bare tag with no digest, so it cannot keep these current. DEFAULT_BASE_IMAGE in src/deployment/registry.rs is the reason it exists: every generated Dockerfile builds FROM it. A tag with no image name before it does not match.",
+      "customType": "regex",
+      "managerFilePatterns": ["/\\.rs$/"],
+      "matchStrings": [
+        "//\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+)\\s+depName=(?<depName>\\S+)[^\\n]*\\n(?:[^\\n\"]*\\n)?[^\\n\"]*\"[^\"@:\\s]+:(?<currentValue>[^\"@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})\""
+      ],
+      "versioningTemplate": "docker"
+    }
+  ],
   "packageRules": [
     {
       "description": "OpenTelemetry SDK + exporters + the tracing bridge move in lockstep -- held at 0.31 until tracing-opentelemetry supports 0.32. Bumping one alone breaks the build.",

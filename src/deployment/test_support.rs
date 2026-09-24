@@ -14,7 +14,8 @@
 //!
 //! * **Tool probes** -- `OnceLock`-cached wrappers (slow probe runs at most
 //!   once per test binary): [`docker_available`], [`helm_available`],
-//!   [`kubeconform_available`], [`kind_available`], [`kubectl_available`].
+//!   [`kubeconform_available`], [`hadolint_available`], [`kind_available`],
+//!   [`kubectl_available`].
 //! * **Skip emission** -- [`skip`] writes the canonical
 //!   `HYPERCI-SKIP[contract-e2e][<tier>]: <test>: <reason>` line to stderr
 //!   AND a side-channel log the CI runner greps + counts for a summary.
@@ -136,6 +137,18 @@ pub fn kubeconform_available() -> bool {
     *OK.get_or_init(|| {
         Command::new("kubeconform")
             .arg("-v")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+/// Returns true iff `hadolint --version` succeeds.
+#[must_use]
+pub fn hadolint_available() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        Command::new("hadolint")
+            .arg("--version")
             .output()
             .is_ok_and(|o| o.status.success())
     })

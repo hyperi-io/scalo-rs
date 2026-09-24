@@ -371,7 +371,7 @@ mod tests {
             ("runtime stage", generate_runtime_stage(&contract)),
         ] {
             assert!(
-                text.contains("\nEXPOSE 9090 8080 514/udp\n\nHEALTHCHECK"),
+                text.contains("\nEXPOSE 9090 8080 514/udp\n\n# Shell form"),
                 "{name} EXPOSE changed:\n{text}"
             );
             assert!(!text.contains("Conditional listeners"), "{name}:\n{text}");
@@ -506,7 +506,7 @@ mod tests {
              #   6000/tcp grpc -- when config.grpc.enabled is true\n\
              #   6001/tcp push -- when config.source.transport is \"direct\"\n\
              #   6002/udp relay -- when config.source.transport is one of \"direct\", \"grpc\"\n\
-             \nHEALTHCHECK";
+             \n# Shell form";
         for (name, text) in [
             ("dockerfile", generate_dockerfile(&contract, None)),
             ("runtime stage", generate_runtime_stage(&contract)),
@@ -768,6 +768,13 @@ mod tests {
         // The image creates and switches to appuser uid 1000; the chart must
         // assert the same uid, not a different one that would fail to start.
         assert!(values.contains("runAsUser: 1000"));
+        for image in [
+            generate_dockerfile(&contract, None),
+            generate_runtime_stage(&contract),
+        ] {
+            assert!(image.contains("useradd --create-home --uid 1000 appuser\n"));
+            assert!(image.contains("\nUSER 1000\n"), "{image}");
+        }
         // Deliberately false: the spool and DLQ write to the container
         // filesystem and the only volume mounted is the read-only config map.
         assert!(values.contains("readOnlyRootFilesystem: false"));
@@ -821,6 +828,52 @@ mod tests {
         let check = dockerfile.find("--with-fingerprint").unwrap();
         let install = dockerfile.find("gpg --dearmor").unwrap();
         assert!(check < install, "key is trusted before it is verified");
+    }
+
+    /// Every line that directly follows a `marker` line in `text`.
+    fn lines_after<'a>(text: &'a str, marker: &str) -> Vec<&'a str> {
+        text.lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| pair[0] == marker)
+            .map(|pair| pair[1])
+            .collect()
+    }
+
+    /// hadolint reads a pragma only from the line directly above the
+    /// instruction it names, so each one is pinned to that instruction, in both
+    /// apt branches and both generators.
+    #[test]
+    fn test_hadolint_pragmas_sit_directly_above_their_instructions() {
+        let plain = test_contract();
+        let mut kafka = test_contract();
+        kafka.native_deps =
+            NativeDepsContract::for_scalo_features(&["transport-kafka"], "ubuntu:24.04");
+
+        for contract in [&plain, &kafka] {
+            let dockerfile = generate_dockerfile(contract, None);
+            let runtime = generate_runtime_stage(contract);
+            for (name, text) in [("dockerfile", &dockerfile), ("runtime stage", &runtime)] {
+                assert_eq!(
+                    lines_after(text, "# hadolint ignore=DL3008"),
+                    ["RUN apt-get update && apt-get install -y --no-install-recommends \\"],
+                    "{name}:\n{text}"
+                );
+                assert_eq!(
+                    lines_after(text, "# hadolint ignore=DL3025"),
+                    ["HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \\"],
+                    "{name}:\n{text}"
+                );
+                let users: Vec<&str> = text.lines().filter(|l| l.starts_with("USER ")).collect();
+                assert_eq!(users, ["USER 1000"], "{name}:\n{text}");
+            }
+            assert_eq!(
+                lines_after(&runtime, "# hadolint ignore=DL3022"),
+                ["COPY --from=builder /app/target/release/dfe-loader /usr/local/bin/dfe-loader"],
+                "{runtime}"
+            );
+            assert!(!dockerfile.contains("DL3022"), "{dockerfile}");
+        }
     }
 
     #[test]

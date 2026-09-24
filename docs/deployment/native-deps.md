@@ -61,8 +61,10 @@ number counts only on the `debian` and `ubuntu` images themselves, because
 `postgres:13-bookworm` is postgres 13 on bookworm, not Debian 13. A
 digest-pinned or rolling tag (`ghcr.io/org/base@sha256:...`, `:stable`), or a
 version tag on some other image (`ghcr.io/org/base:13`), names no release and
-reaches step 4. Pinning a digest is what the container standard asks for, so
-state the release alongside it:
+reaches step 4. The default base, `debian:trixie-slim@sha256:...`, keeps its
+tag beside the digest, so it resolves at step 3. Pinning a digest is what the
+container standard asks for, so with a digest-only reference state the release
+alongside it:
 
 ```yaml
 deployment:
@@ -117,10 +119,18 @@ there is no distro for which we fall back to the native package. Generated
 Dockerfile fragment (suite `bookworm`, from a trixie base):
 
 ```dockerfile
+# Runtime shared libraries for dynamically-linked Rust crates.
+# Apt versions are unpinned because Debian drops superseded ones, so the digest-pinned base is what fixes the release.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl netcat-openbsd iputils-ping gnupg \
-    && curl -fsSL https://packages.confluent.io/clients/deb/archive.key \
-       | gpg --dearmor -o /usr/share/keyrings/confluent-clients.gpg \
+    && curl -fsSL https://packages.confluent.io/clients/deb/archive.key -o /tmp/repo-key.asc \
+    && gpg --show-keys --with-colons --with-fingerprint /tmp/repo-key.asc \
+       > /tmp/repo-key.info \
+    && grep -q "^fpr:::::::::CBBB821E8FAF364F79835C438B1DA6120C2BF624:" /tmp/repo-key.info \
+    && rm -f /tmp/repo-key.info \
+    && gpg --dearmor -o /usr/share/keyrings/confluent-clients.gpg /tmp/repo-key.asc \
+    && rm -f /tmp/repo-key.asc \
     && echo "deb [signed-by=/usr/share/keyrings/confluent-clients.gpg] \
        https://packages.confluent.io/clients/deb bookworm main" \
        > /etc/apt/sources.list.d/confluent-clients.list \
@@ -130,7 +140,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ```
 
 `gnupg` is pulled in automatically whenever a custom repo is needed
-(for `gpg --dearmor`).
+(for the fingerprint check and `gpg --dearmor`).
+
+Package versions are deliberately not pinned, and the `# hadolint ignore=DL3008`
+pragma says so to the linter. Debian's archive drops a superseded version, so a
+pinned one breaks the build within weeks. What makes the install reproducible is
+the digest-pinned base image, which fixes the release.
 
 When the release could not be derived, the same block is preceded by a
 `# WARNING:` comment naming the base image and the release assumed, so a
@@ -156,8 +171,8 @@ packages on the runner.
 scalo links glibc dynamically, so the rule is **glibc(runtime image)
 >= glibc(build host)**. A binary built against a newer glibc fails at
 startup on an older one (`version 'GLIBC_x.yz' not found`). The default
-`base_image` is `debian:trixie-slim` and the CI builders run debian
-trixie too, so build and runtime glibc are identical -- it just works.
+`base_image` is `debian:trixie-slim`, pinned by digest, and the CI builders run
+debian trixie too, so build and runtime glibc are identical -- it just works.
 `librdkafka1` always comes from the Confluent clients repo, on trixie as
 everywhere else. Confluent publishes no trixie suite, so trixie maps to the
 `bookworm` one, and its `librdkafka1` installs cleanly on trixie because the
@@ -186,7 +201,7 @@ host's (debian trixie):
 
 | Runtime image | Safe on a debian-trixie builder? |
 |---|---|
-| `debian:trixie-slim` (default) | yes -- same release |
+| `debian:trixie-slim@sha256:...` (default) | yes -- same release |
 | a newer Debian release | yes -- newer glibc |
 | an OLDER Debian, or Ubuntu | no -- older glibc; build on that base too |
 | distroless `cc-debian*` | no -- see below |
