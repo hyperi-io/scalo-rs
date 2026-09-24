@@ -167,7 +167,10 @@ impl RateLimiter {
     }
 
     /// Emit throttle metrics (no-op without the `metrics` feature).
-    #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        allow(unused_variables, clippy::unused_self)
+    )]
     fn record(&self, waited: Duration) {
         #[cfg(feature = "metrics")]
         if waited > Duration::from_millis(1) {
