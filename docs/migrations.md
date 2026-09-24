@@ -647,7 +647,7 @@ The key was parsed and used nowhere. It is now how long a `flush()` or the shutd
 
 ### A Kafka DLQ loss returns `DlqError::Kafka` (BEHAVIOUR CHANGE)
 
-In v2.12.10 a Kafka loss found by `flush()` came back as `Err(DlqError::File("backend: kafka DLQ error: .."))`. It is `Err(DlqError::Kafka(..))` now, and an HTTP backend error keeps `DlqError::BackendError`. A batch every backend refused is still `DlqError::File`.
+In v2.12.10 a Kafka loss found by `flush()` came back as `Err(DlqError::File("backend: kafka DLQ error: .."))`. It is `Err(DlqError::Kafka(..))` now. A batch every backend refused, whichever backends they were, is still `DlqError::File`.
 
 **Consumer adjustment** -- a caller matching the flush error on `DlqError::File` to spot a lost dead letter matches `DlqError::Kafka` as well.
 
