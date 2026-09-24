@@ -81,7 +81,7 @@ librdkafka reconnects and rejoins by itself, so an outage ends neither the consu
 | `send` / `send_batch` | `Backpressured` once the queue stays full 5 s or a record outlives `message.timeout.ms` (default 300 s) | ACL or permanent topic error: `Fatal`; oversize record: `FilteredDlq` |
 | `commit` | Retried with the same backoff for up to 60 s, never after `close()` | Once that runs out, or when a newer group generation owns the partitions: `TransportError::Commit`, which the `BatchEngine` driver logs and carries on from |
 
-An auth or TLS failure is permanent only until the credentials first work (a broker `UP`, or a record); after that it is a restarting broker. [classify.rs](../../src/transport/kafka/classify.rs) lists the transient codes; an unlisted code is permanent and logged by name. A missing topic is transient only with `allow.auto.create.topics: "true"`. A permanent error met mid-drain comes back on the next `recv`, after the drained records. Counters: [../core-pillars/metrics.md](../core-pillars/metrics.md).
+An auth or TLS failure is permanent only until the credentials first work (a broker `UP`, or a record); after that it is a restarting broker. [classify.rs](../../src/transport/kafka/classify.rs) lists the transient codes; an unlisted code is permanent and logged by name. A missing topic is transient only with `allow.auto.create.topics: "true"`. A permanent error met mid-drain comes back on the next `recv`, after the drained records. The next `recv` clears the errors queued while nothing polled, and any rebalance behind them, backing off once only if no record follows. Counters: [../core-pillars/metrics.md](../core-pillars/metrics.md).
 
 Source: [../../src/transport/kafka/](../../src/transport/kafka/).
 
