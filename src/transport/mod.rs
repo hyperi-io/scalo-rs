@@ -14,18 +14,32 @@
 //! ## Architecture
 //!
 //! ```text
-//! TransportSender (object-safe)     TransportReceiver<Token> (generic)
-//!   send(key, payload)                recv(max) -> Vec<Message<Token>>
-//!   close()                           commit(tokens)
-//!   is_healthy()                      close()
-//!   name()                            is_healthy(), name()
-//!         |                                    |
-//!         +-------- Transport (blanket) -------+
+//!                     TransportBase
+//!       close(), is_healthy(), name(), healthcheck()
+//!              |                            |
+//!     TransportSender                TransportReceiver (type Token)
+//!       send(destination, payload)     recv(max)
+//!       send_batch(records)            recv_limited(limits)
+//!                                      commit(tokens)
+//!              |                            |
+//!              +--- Transport (blanket) ----+
 //! ```
 //!
-//! - **Output stages** (DLQ, forwarding, archiving): use `Box<dyn TransportSender>`
-//! - **Input stages** (receiver, fetcher): use concrete `impl TransportReceiver`
-//! - **Factory**: `sender_from_config()` returns `Box<dyn TransportSender>`
+//! `send` and `send_batch` return [`SendResult`]; `recv` and `recv_limited`
+//! return `TransportResult<WorkBatch<Token>>` (see [`WorkBatch`]).
+//!
+//! None of these traits is object safe: every async method returns
+//! `impl Future`, so `Box<dyn TransportSender>` does not compile. Runtime
+//! selection uses enum dispatch instead.
+//!
+//! - **Output stages** (DLQ, forwarding, archiving): [`AnySender`] when config
+//!   picks the backend, or a generic `S: TransportSender`
+//! - **Input stages** (receiver, fetcher): [`AnyReceiver`] when config picks the
+//!   backend, or a concrete receiver such as `KafkaTransport` when the stage needs
+//!   the backend's own token type
+//! - **Factory**: `AnySender::from_config(key)` and `AnyReceiver::from_config(key)`
+//!   read a [`TransportConfig`] from the cascade; `from_transport_config(&cfg)`
+//!   takes one directly
 //!
 //! ## Transport Selection
 //!
@@ -41,11 +55,11 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use scalo::transport::{TransportSender, TransportConfig};
+//! use scalo::transport::{AnySender, TransportSender};
 //!
-//! // Factory creates the right backend from config
-//! let sender: Box<dyn TransportSender> = transport::sender_from_config("transport.output").await?;
-//! sender.send("events.land", payload).await;
+//! // The factory builds the backend named by `type` under this cascade key
+//! let sender = AnySender::from_config("transport.output").await?;
+//! let result = sender.send("events.land", payload).await; // SendResult
 //! ```
 
 pub mod codec;
