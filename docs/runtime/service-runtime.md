@@ -176,9 +176,11 @@ cascade, so different settings or env vars give different artefacts.
 
 ## Readiness check
 
-The runtime starts the HTTP server with a default readiness check
-that returns true once startup completes. Each app overrides this
-once it knows what "ready" means for its domain:
+The runtime installs no readiness check of its own. Until an app sets
+one, `/readyz` answers from the health registry alone: ready as soon as
+the metrics listener serves and no registered component is unhealthy.
+Each app sets its check once it knows what "ready" means for its
+domain:
 
 ```rust
 async fn run_service(&self, config: Self::Config, mut runtime: ServiceRuntime)

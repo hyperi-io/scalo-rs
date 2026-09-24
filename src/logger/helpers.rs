@@ -57,6 +57,8 @@ pub fn log_sampled(counter: &AtomicU64, sample_rate: u64) -> bool {
 
 /// Log at most once per interval. Returns true if enough time has passed.
 ///
+/// Callers racing into an open window get one `true` between them.
+///
 /// Use for tight recv/poll loop errors: UDP recv, Kafka consumer, health checks.
 ///
 /// # Example
@@ -79,12 +81,11 @@ pub fn log_debounced(last_epoch_ms: &AtomicU64, min_interval_ms: u64) -> bool {
     )
     .unwrap_or(u64::MAX);
     let last = last_epoch_ms.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= min_interval_ms {
-        last_epoch_ms.store(now, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
+    // A racer that read the same `last` fails the exchange, so one caller claims the window.
+    now.saturating_sub(last) >= min_interval_ms
+        && last_epoch_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
 }
 
 #[cfg(test)]
@@ -141,5 +142,32 @@ mod tests {
         assert!(log_debounced(&last, 60_000)); // 60s interval
         // Immediate second call: suppressed (within 60s)
         assert!(!log_debounced(&last, 60_000));
+    }
+
+    /// Callers released together into one open window: exactly one may log.
+    #[test]
+    fn test_debounced_lets_exactly_one_concurrent_caller_through() {
+        const CALLERS: usize = 8;
+        const ROUNDS: usize = 200;
+        for round in 0..ROUNDS {
+            let last = AtomicU64::new(0);
+            let start = std::sync::Barrier::new(CALLERS);
+            let winners = AtomicU64::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..CALLERS {
+                    s.spawn(|| {
+                        start.wait();
+                        if log_debounced(&last, 60_000) {
+                            winners.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                winners.load(Ordering::Relaxed),
+                1,
+                "round {round}: one window, one log line"
+            );
+        }
     }
 }

@@ -64,6 +64,15 @@ const MAX_AGE_DAYS_CEILING: u32 = 1_000_000;
 /// A write is refused, before it reaches `file-rotate`, while the current
 /// file is missing: a rotation in that state panics inside `file-rotate`,
 /// which aborts a service built with `panic = "abort"`.
+///
+/// A write `file-rotate` reports `Ok` that did not reach the file, because
+/// it could not open the file for writing, returns `Err`.
+///
+/// External rotation of the current file is unsupported: the writer rotates
+/// it itself. If something else renames it and puts a new file at the path
+/// (logrotate `create`, a second writer), every write until the writer
+/// reopens the path, 250 ms or more after the first, returns `Err` and counts
+/// as failed, although its bytes are in the renamed file.
 pub struct NdjsonWriter {
     writer: Mutex<RotatingTarget>,
     config: FileWriterConfig,
@@ -135,6 +144,19 @@ fn ensure_dir_usable(dir: &Path) -> Result<(), std::io::Error> {
         ));
     }
     std::fs::read_dir(dir).map(drop)
+}
+
+/// Whether two stats of the target path are one file, so a rotation between them shows.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Whether two stats of the target path are one file, so a rotation between them shows.
+#[cfg(not(unix))]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.created().ok() == b.created().ok()
 }
 
 impl std::fmt::Debug for NdjsonWriter {
@@ -233,9 +255,9 @@ impl NdjsonWriter {
 
     /// Refuse a write while the current file is missing: `file-rotate`
     /// panics when a rotation finds its directory gone or cannot create the file.
-    fn ensure_target_present(&self) -> Result<(), std::io::Error> {
+    fn ensure_target_present(&self) -> Result<std::fs::Metadata, std::io::Error> {
         match std::fs::metadata(&self.file_path) {
-            Ok(meta) if meta.is_file() => Ok(()),
+            Ok(meta) if meta.is_file() => Ok(meta),
             Ok(_) => Err(std::io::Error::other(format!(
                 "{} writer target {} is not a regular file",
                 self.label,
@@ -256,11 +278,11 @@ impl NdjsonWriter {
     fn write_through(&self, bytes: &[u8]) -> Result<(), std::io::Error> {
         let mut target = self.writer.lock();
         self.reopen_if_due(&mut target);
-        let result = self
-            .ensure_target_present()
-            .and_then(|()| target.file.write_all(bytes))
-            .and_then(|()| target.file.flush())
-            .and_then(|()| self.verify_write_landed());
+        let result = self.ensure_target_present().and_then(|before| {
+            target.file.write_all(bytes)?;
+            target.file.flush()?;
+            self.verify_write_landed(&before, bytes.len())
+        });
         match result {
             Ok(()) => {
                 target.record_success();
@@ -274,20 +296,47 @@ impl NdjsonWriter {
         }
     }
 
-    /// Detect a write `file-rotate` swallowed: it reopens the target lazily
-    /// and its `write()` reports `Ok` with the bytes discarded when that open
-    /// fails (e.g. the directory vanished or the filesystem went read-only).
-    /// Rotation happens under the same mutex the caller holds, so after a
-    /// genuinely successful write the current file must exist.
-    fn verify_write_landed(&self) -> Result<(), std::io::Error> {
-        if self.file_path.exists() {
+    /// Detect a write `file-rotate` swallowed. Its `write()` reports `Ok`
+    /// with the bytes discarded whenever it holds no open file: the target
+    /// could not be opened (no write permission, a read-only filesystem), or
+    /// a rotation could not create the next one. Rotation happens under the
+    /// mutex the caller holds, so a write that landed either grew the file
+    /// `before` describes or replaced it with one holding at least `written`
+    /// bytes.
+    fn verify_write_landed(
+        &self,
+        before: &std::fs::Metadata,
+        written: usize,
+    ) -> Result<(), std::io::Error> {
+        let after = match std::fs::metadata(&self.file_path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "{} writer target {} missing after write -- write was silently dropped \
+                         (directory removed or read-only filesystem?)",
+                        self.label,
+                        self.file_path.display()
+                    ),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        let written = u64::try_from(written).unwrap_or(u64::MAX);
+        let landed = if same_file(before, &after) {
+            after.len() >= before.len().saturating_add(written)
+        } else {
+            after.len() >= written
+        };
+        if landed {
             return Ok(());
         }
         Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::WriteZero,
             format!(
-                "{} writer target {} missing after write -- write was silently dropped \
-                 (directory removed or read-only filesystem?)",
+                "{} writer target {} did not take the {written} bytes written -- write was \
+                 silently dropped (file not writable?)",
                 self.label,
                 self.file_path.display()
             ),
@@ -758,6 +807,52 @@ mod tests {
         writer
             .write_line(b"{\"n\":3}\n")
             .expect("write once the directory is readable again");
+    }
+
+    /// True when this process can open a file it has no write permission on.
+    #[cfg(unix)]
+    fn writes_past_permissions(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = dir.join("probe.ro");
+        std::fs::write(&probe, b"").expect("create probe");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+        let writable = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&probe)
+            .is_ok();
+        std::fs::remove_file(&probe).expect("remove probe");
+        writable
+    }
+
+    /// `file-rotate` opens the target without telling us it failed, and then
+    /// reports every write `Ok` with the bytes discarded.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_to_a_file_it_cannot_open_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        if writes_past_permissions(dir.path()) {
+            eprintln!("skipping: this process writes files regardless of their mode");
+            return;
+        }
+        let target = dir.path().join("ro");
+        std::fs::create_dir(&target).expect("create dir");
+        std::fs::write(target.join("out.ndjson"), b"").expect("create file");
+        std::fs::set_permissions(
+            target.join("out.ndjson"),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .expect("chmod file");
+        let writer =
+            NdjsonWriter::new(&test_config(dir.path()), "ro", "out.ndjson", "dlq").expect("create");
+
+        writer
+            .write_line(b"{\"n\":1}\n")
+            .expect_err("a write that reached no file must fail");
+        assert_eq!(writer.lines_written(), 0);
+        assert_eq!(writer.write_errors(), 1);
+        let content = std::fs::read_to_string(target.join("out.ndjson")).expect("read");
+        assert!(content.is_empty(), "nothing landed: {content:?}");
     }
 
     #[test]

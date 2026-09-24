@@ -626,6 +626,8 @@ A refusal is reported once: the first flush after it returns the error and the n
 
 **Consumer adjustment** -- none in code. A flush over the Kafka backend can now take up to 35 s while the broker is slow or down; a timeout around it shorter than that sees its own timeout, and the failure goes to the next flush. A caller that never calls `flush()` sees Kafka delivery failures in `transport_send_errors_total{transport="kafka"}` only, not in `dropped()`.
 
+The 30 s wait and the `File` variant changed after v2.12.10 -- see [`kafka.send_timeout_ms` is the Kafka ack wait](#kafkasend_timeout_ms-is-the-kafka-ack-wait-behaviour-change) and [A Kafka DLQ loss returns `DlqError::Kafka`](#a-kafka-dlq-loss-returns-dlqerrorkafka-behaviour-change).
+
 ### `NdjsonWriter` refuses a write a rotation would panic on (BEHAVIOUR CHANGE)
 
 `file-rotate` 0.8 panics inside a rotation when the output directory is gone and cannot be recreated, or the current file is missing and cannot be created. Services built with `panic = "abort"` died at the next rotation boundary. `NdjsonWriter`, and the DLQ file backend and file output sink built on it, now refuse such a write with an `Err` before calling into `file-rotate`.
@@ -636,6 +638,42 @@ A refusal is reported once: the first flush after it returns the error and the n
 - `max_age_days` is capped at 1,000,000 days; above about 95 million the rotation's age check panicked.
 
 **Consumer adjustment** -- none in code. A write the writer would previously have lost silently or panicked on is now an `Err`.
+
+### `kafka.send_timeout_ms` is the Kafka ack wait (BEHAVIOUR CHANGE)
+
+The key was parsed and used nowhere. It is now how long a `flush()` or the shutdown waits for the broker's acks, replacing the fixed 30 s v2.12.10 shipped. The default stays 5000, so the default wait is 5 s. `0` skips the ack wait, but the purge after it still waits up to 5 s for the purged entries' delivery reports. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
+
+**Consumer adjustment** -- a flush over the Kafka backend now takes up to `send_timeout_ms` plus 5 s while the broker is slow or down, 10 s at the default. A consumer that exposes `KafkaDlqConfig` to its operators can set `send_timeout_ms: 30000` to keep the 30 s wait; one that builds it from `KafkaDlqConfig::default()` gets 5 s until it exposes the field.
+
+### A Kafka DLQ loss returns `DlqError::Kafka` (BEHAVIOUR CHANGE)
+
+In v2.12.10 a Kafka loss found by `flush()` came back as `Err(DlqError::File("backend: kafka DLQ error: .."))`. It is `Err(DlqError::Kafka(..))` now. A batch every backend refused, whichever backends they were, is still `DlqError::File`.
+
+**Consumer adjustment** -- a caller matching the flush error on `DlqError::File` to spot a lost dead letter matches `DlqError::Kafka` as well.
+
+### `Dlq` shutdown waits for Kafka acks and counts what was lost (BEHAVIOUR CHANGE)
+
+Dropping the Kafka producer discards what it still holds, queued or in flight. The drain used to exit without waiting, so every shutdown threw away the entries the broker had not acked yet, and counted none of them. It now waits for the acks the way a `flush()` does before it exits, and counts the entries only Kafka held that the broker refused or never acked in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`. See [pipeline/dlq.md](pipeline/dlq.md#shutdown).
+
+**Consumer adjustment** -- none in code. `shutdown()`, or the drain's exit on the cancelled token, can take `kafka.send_timeout_ms` plus 5 s while the broker is down; fit that inside the pod's termination grace period. `shutdown()` still returns `Ok`; read `dropped()` after it, or call `flush()` first for the loss as an `Err`. The count lands only if the drain finishes: a runtime that shuts down under it drops it mid-wait. A caller that never calls `flush()` now sees Kafka delivery failures in `dropped()` once the DLQ has shut down.
+
+### `NdjsonWriter` refuses a write that reached no file (BEHAVIOUR CHANGE)
+
+`file-rotate` reports `Ok` and discards the bytes when it holds no open file, for instance when the current file exists but cannot be opened for writing. The writer checked only that the file existed, so such a write counted as written. It now checks that the file took the bytes, and returns `Err` with `ErrorKind::WriteZero` when it did not. The DLQ file backend counts the entries lost and schedules a reopen, which succeeds once the file is writable again.
+
+**Consumer adjustment** -- none in code. A write that was lost silently is now an `Err`.
+
+### `KafkaProducer::flush` counts messages only (BEHAVIOUR CHANGE)
+
+`flush` returned librdkafka's out-queue length, which also counts the statistics, error and log events the client has still to serve, so it could report messages outstanding after every message had its delivery report. It now returns the messages sent with no delivery report yet. A failed delivery has its report, so it is not counted; `delivery_failures()` counts those.
+
+**Consumer adjustment** -- none in code. `in_flight_count()` and `ProducerMetrics::in_flight` still return the out-queue length.
+
+### `log_debounced` lets one concurrent caller through per window (behaviour)
+
+`logger::log_debounced` read the last timestamp and then stored the new one, so callers racing into an open window could all log. It claims the window with a compare-exchange, so exactly one of them does.
+
+**Consumer adjustment** -- none.
 
 ---
 

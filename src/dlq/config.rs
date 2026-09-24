@@ -47,7 +47,8 @@ pub enum DlqMode {
     #[default]
     Cascade,
 
-    /// Write to all enabled backends; report any failures.
+    /// Write every batch to all enabled backends. The write succeeds when at
+    /// least one backend takes the whole batch, and fails only when none does.
     FanOut,
 
     /// File backend only (no Kafka dependency).
@@ -177,7 +178,11 @@ pub struct KafkaDlqConfig {
     /// Common topic when routing is `Common` or destination is unknown.
     pub common_topic: String,
 
-    /// Send timeout in milliseconds.
+    /// How long a `flush` or the shutdown waits for the broker to ack the
+    /// entries queued to Kafka, in milliseconds. Entries still unacked then
+    /// are purged and counted as dropped. The purge adds a wait of up to 5 s
+    /// for the purged entries' delivery reports, so `0` skips the ack wait
+    /// but not that one. Default 5000.
     pub send_timeout_ms: u64,
 }
 
@@ -248,6 +253,13 @@ mod tests {
         assert_eq!(parsed.queue_capacity, 50_000);
         assert_eq!(parsed.batch_size, 128);
         assert_eq!(parsed.flush_interval_ms, 250);
+    }
+
+    /// `docs/pipeline/dlq.md` documents this default in its config example.
+    #[cfg(feature = "dlq-kafka")]
+    #[test]
+    fn test_kafka_send_timeout_defaults_to_the_documented_5000_ms() {
+        assert_eq!(KafkaDlqConfig::default().send_timeout_ms, 5000);
     }
 
     #[test]

@@ -351,6 +351,8 @@ impl DegradedLatch {
 #[derive(Debug, Default)]
 pub(crate) struct DeliveryState {
     failures: AtomicU64,
+    /// Delivery reports handled, either outcome.
+    reports: AtomicU64,
     degraded: DegradedLatch,
 }
 
@@ -383,9 +385,15 @@ impl DeliveryState {
         self.failures.load(Ordering::Relaxed)
     }
 
+    /// Delivery reports handled so far, acked and failed alike.
+    pub(crate) fn reports(&self) -> u64 {
+        self.reports.load(Ordering::Relaxed)
+    }
+
     /// Record a delivery report of either outcome.
     pub(crate) fn record(&self, result: &rdkafka::producer::DeliveryResult<'_>) {
         use rdkafka::message::Message as _;
+        self.reports.fetch_add(1, Ordering::Relaxed);
         match result {
             Ok(_) => self.record_success(),
             Err((err, msg)) => self.record_failure(err, msg.topic(), msg.partition()),

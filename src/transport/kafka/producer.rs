@@ -24,20 +24,29 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use scalo::transport::kafka::{KafkaProducer, KafkaConfig, ProducerProfile};
+//! ```rust,no_run
+//! use std::time::Duration;
 //!
+//! use scalo::transport::kafka::{KafkaConfig, KafkaProducer, ProducerProfile};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let messages = vec![String::from("event")];
 //! // High-throughput producer
 //! let config = KafkaConfig::production();
 //! let producer = KafkaProducer::new(&config, ProducerProfile::HighThroughput)?;
 //!
 //! // Send messages (fire-and-forget batching)
-//! for msg in messages {
+//! for msg in &messages {
 //!     producer.send("events", None, msg.as_bytes())?;
 //! }
 //!
-//! // Flush before shutdown
-//! producer.flush(Duration::from_secs(30))?;
+//! // Flush before shutdown; the count is messages with no delivery report
+//! let unreported = producer.flush(Duration::from_secs(30));
+//! if unreported > 0 {
+//!     eprintln!("{unreported} messages had no delivery report at shutdown");
+//! }
+//! # Ok(())
+//! # }
 //! ```
 
 use super::classify::{DegradedLatch, DeliveryState, SendFailure, classify_send_failure};
@@ -344,23 +353,27 @@ impl KafkaProducer {
 
     /// Flush all queued messages.
     ///
-    /// Blocks until all messages are delivered or timeout expires.
+    /// Blocks until every message has its delivery report or timeout expires.
     /// Call this before shutdown to ensure no message loss.
     ///
     /// # Returns
     ///
-    /// Number of messages still in queue (0 if all delivered).
-    #[allow(clippy::cast_sign_loss)]
+    /// Number of messages with no delivery report yet. `0` means every
+    /// message sent so far was either acknowledged or failed -- read
+    /// [`Self::delivery_failures`] for the failures. Statistics, error and log
+    /// events the client has still to serve are not messages and are not
+    /// counted.
     pub fn flush(&self, timeout: Duration) -> usize {
         let _ = self.producer.flush(Timeout::After(timeout));
-        self.producer.in_flight_count().max(0) as usize
+        let unreported = self
+            .messages_sent
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.delivery.reports());
+        usize::try_from(unreported).unwrap_or(usize::MAX)
     }
 
     /// Wait until every queued message has its delivery report handled;
     /// `false` when `timeout` ran out first.
-    ///
-    /// Unlike [`Self::flush`], this counts messages only: statistics and
-    /// error events waiting to be served do not read as outstanding.
     #[cfg(feature = "dlq-kafka")]
     pub(crate) fn drain_within(&self, timeout: Duration) -> bool {
         self.producer.flush(Timeout::After(timeout)).is_ok()
@@ -374,7 +387,13 @@ impl KafkaProducer {
             .purge(rdkafka::producer::PurgeConfig::default().queue().inflight());
     }
 
-    /// Get the number of messages currently in flight.
+    /// librdkafka's out-queue length: messages waiting to be sent or
+    /// acknowledged, plus delivery reports and client events (statistics,
+    /// errors, logs) not yet served.
+    ///
+    /// Not a message count -- it can be non-zero with every message
+    /// delivered. [`Self::flush`] returns the messages with no delivery
+    /// report yet.
     #[allow(clippy::cast_sign_loss)]
     pub fn in_flight_count(&self) -> usize {
         self.producer.in_flight_count().max(0) as usize
@@ -411,7 +430,8 @@ pub struct ProducerMetrics {
     pub bytes_sent: u64,
     /// Total errors encountered.
     pub errors: u64,
-    /// Messages currently in flight.
+    /// librdkafka's out-queue length at the snapshot: messages plus client
+    /// events not yet served. See [`KafkaProducer::in_flight_count`].
     pub in_flight: u64,
     /// Producer profile in use.
     pub profile: ProducerProfile,
@@ -455,26 +475,12 @@ mod tests {
     /// callback. Port 1 on loopback refuses immediately -- no external network.
     #[test]
     fn a_message_that_never_reaches_a_broker_is_counted_as_a_delivery_failure() {
-        let mut config = KafkaConfig {
-            brokers: vec!["127.0.0.1:1".to_string()],
-            group: String::new(),
-            ..KafkaConfig::default()
-        };
-        config.sizing.producer.idempotence = Some(false);
-        for (key, value) in [
+        let producer = unreachable_producer(&[
             ("message.timeout.ms", "400"),
             ("statistics.interval.ms", "0"),
             ("reconnect.backoff.max.ms", "100"),
             ("log_level", "0"),
-        ] {
-            config
-                .sizing
-                .producer_librdkafka
-                .insert(key.to_string(), value.to_string());
-        }
-
-        let producer = KafkaProducer::new(&config, ProducerProfile::LowLatency)
-            .expect("producer creation does not contact a broker");
+        ]);
         producer
             .send("unreachable.topic", None, b"payload")
             .expect("the message queues locally even with no broker");
@@ -487,6 +493,175 @@ mod tests {
             1,
             "the broker never took the message, so the delivery callback must \
              record it"
+        );
+    }
+
+    /// A producer pointed at a port that refuses at once, with `settings` on top.
+    fn unreachable_producer(settings: &[(&str, &str)]) -> KafkaProducer {
+        let mut config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..KafkaConfig::default()
+        };
+        config.sizing.producer.idempotence = Some(false);
+        for (key, value) in settings {
+            config
+                .sizing
+                .producer_librdkafka
+                .insert((*key).to_string(), (*value).to_string());
+        }
+        KafkaProducer::new(&config, ProducerProfile::LowLatency)
+            .expect("producer creation does not contact a broker")
+    }
+
+    #[test]
+    fn flush_returns_the_messages_still_undelivered() {
+        let producer = unreachable_producer(&[("message.timeout.ms", "60000"), ("log_level", "0")]);
+        for _ in 0..3 {
+            producer
+                .send("unreachable.topic", None, b"payload")
+                .expect("queued");
+        }
+        assert_eq!(producer.flush(Duration::from_millis(300)), 3);
+    }
+
+    /// A log writer that parks whichever thread writes to it while shut.
+    #[cfg(feature = "logger")]
+    #[derive(Clone, Default)]
+    struct Gate(Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>);
+
+    #[cfg(feature = "logger")]
+    #[derive(Default)]
+    struct GateState {
+        shut: bool,
+        parked: bool,
+    }
+
+    #[cfg(feature = "logger")]
+    impl Gate {
+        fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
+            self.0
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn set_shut(&self, shut: bool) {
+            self.state().shut = shut;
+            self.0.1.notify_all();
+        }
+
+        fn wait_parked(&self, within: Duration) -> bool {
+            let (state, _) = self
+                .0
+                .1
+                .wait_timeout_while(self.state(), within, |s| !s.parked)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.parked
+        }
+    }
+
+    #[cfg(feature = "logger")]
+    impl std::io::Write for Gate {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut state = self.state();
+            if state.shut {
+                state.parked = true;
+                self.0.1.notify_all();
+            }
+            while state.shut {
+                state = self
+                    .0
+                    .1
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `test` in a child process of this test binary that runs nothing
+    /// else, so a global subscriber another test installed cannot be in the
+    /// way. `name` is the test's own name; the parent fails unless the child
+    /// ran exactly that one test and it passed.
+    #[cfg(feature = "logger")]
+    fn in_own_process(name: &str, test: impl FnOnce()) {
+        const CHILD: &str = "SCALO_TEST_IN_OWN_PROCESS";
+        if std::env::var_os(CHILD).is_some() {
+            test();
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([name, "--exact"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the test in a process of its own");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{name} in its own process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A completed flush counts messages only. The poll thread is parked on a
+    /// log line, so the statistics events it would serve stay queued, and
+    /// `in_flight_count` shows them. The parked thread is rdkafka's, which
+    /// logs through the process-wide `log` logger and never enters a scoped
+    /// subscriber, so the gate has to be the global one.
+    #[cfg(feature = "logger")]
+    #[test]
+    fn a_completed_flush_does_not_count_client_events_as_messages() {
+        let path = concat!(
+            module_path!(),
+            "::a_completed_flush_does_not_count_client_events_as_messages"
+        );
+        let name = path.split_once("::").map_or(path, |(_, name)| name);
+        in_own_process(name, completed_flush_with_client_events_queued);
+    }
+
+    #[cfg(feature = "logger")]
+    fn completed_flush_with_client_events_queued() {
+        let gate = Gate::default();
+        let writer = gate.clone();
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .try_init()
+            .expect("the global subscriber is free in a process running one test");
+        let producer = unreachable_producer(&[("message.timeout.ms", "50")]);
+        producer
+            .send("unreachable.topic", None, b"payload")
+            .expect("queued");
+        assert_eq!(
+            producer.flush(Duration::from_secs(5)),
+            0,
+            "the message's delivery report arrived"
+        );
+
+        gate.set_shut(true);
+        assert!(
+            gate.wait_parked(Duration::from_secs(5)),
+            "the poll thread logged nothing to park on"
+        );
+        // Statistics arrive every second and queue behind the parked thread.
+        std::thread::sleep(Duration::from_millis(2500));
+        let unreported = producer.flush(Duration::from_millis(100));
+        let queued = producer.in_flight_count();
+        gate.set_shut(false);
+
+        assert!(
+            queued > 0,
+            "no client event queued behind the parked thread"
+        );
+        assert_eq!(
+            unreported, 0,
+            "{queued} queued client events are not messages"
         );
     }
 }

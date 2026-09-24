@@ -22,8 +22,10 @@
 //!
 //! `send_batch` only queues to the producer. The barrier's `flush_durable`
 //! waits for the broker's acks, purges what is still unacked after
-//! `ACK_WAIT`, and charges the delivery failures to the entries Kafka
-//! held alone -- see `docs/pipeline/dlq.md`, "The Kafka barrier".
+//! `kafka.send_timeout_ms`, and charges the delivery failures to the entries
+//! Kafka held alone -- see `docs/pipeline/dlq.md`, "The Kafka barrier".
+//! The drain runs the same wait when it closes, because dropping the
+//! producer discards whatever it still holds.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,9 +40,6 @@ use super::config::{DlqRouting, KafkaDlqConfig};
 use super::entry::DlqEntry;
 use super::error::DlqError;
 
-/// How long a barrier waits for the broker to ack everything queued.
-const ACK_WAIT: Duration = Duration::from_secs(30);
-
 /// How long a barrier waits for the reports of the messages it purged.
 const PURGE_REPORT_WAIT: Duration = Duration::from_secs(5);
 
@@ -48,6 +47,8 @@ const PURGE_REPORT_WAIT: Duration = Duration::from_secs(5);
 pub struct KafkaDlqInner {
     /// Shared with the blocking task a barrier waits on.
     producer: Arc<KafkaProducer>,
+    /// How long a barrier waits for the broker to ack everything queued.
+    ack_wait: Duration,
     routing: DlqRouting,
     topic_suffix: String,
     common_topic: String,
@@ -92,12 +93,14 @@ impl KafkaDlqInner {
             routing = ?dlq_config.routing,
             suffix = %dlq_config.topic_suffix,
             common_topic = %dlq_config.common_topic,
+            send_timeout_ms = dlq_config.send_timeout_ms,
             "Kafka DLQ backend initialised"
         );
 
         let failures_seen = producer.delivery_failures();
         Ok(Self {
             producer: Arc::new(producer),
+            ack_wait: Duration::from_millis(dlq_config.send_timeout_ms),
             routing: dlq_config.routing,
             topic_suffix: dlq_config.topic_suffix.clone(),
             common_topic: dlq_config.common_topic.clone(),
@@ -165,11 +168,12 @@ impl KafkaDlqInner {
     /// delivery failures since the previous barrier to the entries only
     /// Kafka holds.
     ///
-    /// The wait runs on the blocking pool for up to 30 s. Whatever is still
-    /// unacked then is purged, which adds up to 5 s, and counted as lost. An
-    /// entry in flight to a stalled broker at the purge can still be written,
-    /// so the count can overstate the loss but never understates it. The loss
-    /// is taken by the drain through `take_durable_losses`.
+    /// The wait runs on the blocking pool for up to `kafka.send_timeout_ms`.
+    /// Whatever is still unacked then is purged, which adds up to 5 s, and
+    /// counted as lost. An entry in flight to a stalled broker at the purge
+    /// can still be written, so the count can overstate the loss but never
+    /// understates it. The loss is taken by the drain through
+    /// `take_durable_losses`.
     ///
     /// # Errors
     ///
@@ -177,8 +181,9 @@ impl KafkaDlqInner {
     /// broker or purged, or the blocking task failed.
     pub async fn flush_durable(&mut self) -> Result<(), DlqError> {
         let producer = Arc::clone(&self.producer);
+        let ack_wait = self.ack_wait;
         let drained = tokio::task::spawn_blocking(move || {
-            if producer.drain_within(ACK_WAIT) {
+            if producer.drain_within(ack_wait) {
                 return true;
             }
             producer.purge_outstanding();
@@ -204,16 +209,23 @@ impl KafkaDlqInner {
         if !drained {
             warn!(
                 pending = self.sole_custody,
-                "Kafka DLQ entries purged but not yet reported; the next flush counts them"
+                "Kafka DLQ entries purged but not yet reported; the next flush or the close counts them"
             );
         }
         if lost > 0 {
             return Err(DlqError::Kafka(format!(
-                "{lost} DLQ entries lost: the broker refused them or did not ack within {}s",
-                ACK_WAIT.as_secs()
+                "{lost} DLQ entries lost: the broker refused them or did not ack within {} ms",
+                self.ack_wait.as_millis()
             )));
         }
         Ok(())
+    }
+
+    /// Entries only Kafka holds whose fate no barrier learned, handed over
+    /// as lost: the drain calls this as it closes, and dropping the producer
+    /// then discards whatever it still holds.
+    pub(crate) fn take_unconfirmed(&mut self) -> u64 {
+        std::mem::take(&mut self.sole_custody)
     }
 
     /// Entries the last failed `send_batch` queued before it stopped.
@@ -242,6 +254,29 @@ impl KafkaDlqInner {
     pub fn write_errors(&self) -> u64 {
         self.write_errors.load(Ordering::Relaxed)
     }
+}
+
+/// A producer config for a broker that refuses at once -- port 1 on
+/// loopback -- so nothing queued is ever acked.
+#[cfg(test)]
+pub(super) fn unreachable_broker() -> KafkaConfig {
+    let mut config = KafkaConfig {
+        brokers: vec!["127.0.0.1:1".to_string()],
+        group: String::new(),
+        ..KafkaConfig::default()
+    };
+    config.sizing.producer.idempotence = Some(false);
+    for (key, value) in [
+        ("statistics.interval.ms", "0"),
+        ("reconnect.backoff.max.ms", "100"),
+        ("log_level", "0"),
+    ] {
+        config
+            .sizing
+            .producer_librdkafka
+            .insert(key.to_string(), value.to_string());
+    }
+    config
 }
 
 #[cfg(test)]
@@ -289,5 +324,32 @@ mod tests {
         };
         let _ = entry;
         assert_eq!(topic, "all-errors.dlq");
+    }
+
+    #[tokio::test]
+    async fn the_ack_wait_is_the_configured_send_timeout() {
+        let dlq_config = KafkaDlqConfig {
+            send_timeout_ms: 400,
+            ..KafkaDlqConfig::default()
+        };
+        let mut backend = KafkaDlqInner::new(&unreachable_broker(), &dlq_config).expect("backend");
+        backend
+            .send_batch(&[DlqEntry::new("svc", "err", b"x".to_vec())])
+            .await
+            .expect("queued");
+
+        let started = std::time::Instant::now();
+        let result = backend.flush_durable().await;
+        let took = started.elapsed();
+        assert!(result.is_err(), "no broker acked the entry: {result:?}");
+        assert!(
+            took >= Duration::from_millis(400),
+            "gave up before the configured wait: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(4),
+            "the configured 400 ms did not bound the wait: {took:?}"
+        );
+        assert_eq!(backend.take_durable_losses(), 1);
     }
 }
