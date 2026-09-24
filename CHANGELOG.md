@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.10](https://github.com/hyperi-io/scalo-rs/compare/v2.12.9...v2.12.10) (2026-09-24)
+
+### Bug Fixes
+
+* **dlq:** durable Kafka flush, no rotation panic ([#194](https://github.com/hyperi-io/scalo-rs/issues/194)) ([ee29ebd](https://github.com/hyperi-io/scalo-rs/commit/ee29ebdba14f7c81df6be0e713d4f65883b93777))
+* **dlq:** flush() fails when any batch since the last flush was refused ([#193](https://github.com/hyperi-io/scalo-rs/issues/193)) ([64e4616](https://github.com/hyperi-io/scalo-rs/commit/64e461688cbf2158b8326ebd560b68f23cc025f3)), closes [#187](https://github.com/hyperi-io/scalo-rs/issues/187)
+
 ## [2.12.9](https://github.com/hyperi-io/scalo-rs/compare/v2.12.8...v2.12.9) (2026-09-24)
 
 ### Bug Fixes
