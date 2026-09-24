@@ -584,23 +584,56 @@ mod tests {
         }
     }
 
+    /// Run `test` in a child process of this test binary that runs nothing
+    /// else, so a global subscriber another test installed cannot be in the
+    /// way. `name` is the test's own name; the parent fails unless the child
+    /// ran exactly that one test and it passed.
+    #[cfg(feature = "logger")]
+    fn in_own_process(name: &str, test: impl FnOnce()) {
+        const CHILD: &str = "SCALO_TEST_IN_OWN_PROCESS";
+        if std::env::var_os(CHILD).is_some() {
+            test();
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([name, "--exact"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the test in a process of its own");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{name} in its own process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// A completed flush counts messages only. The poll thread is parked on a
     /// log line, so the statistics events it would serve stay queued, and
-    /// `in_flight_count` shows them.
+    /// `in_flight_count` shows them. The parked thread is rdkafka's, which
+    /// logs through the process-wide `log` logger and never enters a scoped
+    /// subscriber, so the gate has to be the global one.
     #[cfg(feature = "logger")]
     #[test]
     fn a_completed_flush_does_not_count_client_events_as_messages() {
+        let path = concat!(
+            module_path!(),
+            "::a_completed_flush_does_not_count_client_events_as_messages"
+        );
+        let name = path.split_once("::").map_or(path, |(_, name)| name);
+        in_own_process(name, completed_flush_with_client_events_queued);
+    }
+
+    #[cfg(feature = "logger")]
+    fn completed_flush_with_client_events_queued() {
         let gate = Gate::default();
         let writer = gate.clone();
-        if tracing_subscriber::fmt()
+        tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
             .with_max_level(tracing::Level::INFO)
             .try_init()
-            .is_err()
-        {
-            eprintln!("skipping: another subscriber is already the global default");
-            return;
-        }
+            .expect("the global subscriber is free in a process running one test");
         let producer = unreachable_producer(&[("message.timeout.ms", "50")]);
         producer
             .send("unreachable.topic", None, b"payload")
