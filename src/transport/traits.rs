@@ -24,11 +24,13 @@ pub trait CommitToken: Clone + Send + Sync + Debug + Display + 'static {
     }
 }
 
-/// Result of a [`TransportReceiver::recv`] call.
+/// Filtered receive output a transport assembles before handing it back.
 ///
 /// Carries passing messages AND any filter-routed DLQ entries in one struct, so
-/// a caller cannot lose dead-letters by forgetting a separate drain step. The
-/// caller routes `dlq_entries` onward via its own DLQ handle.
+/// a caller cannot lose dead-letters by forgetting a separate drain step.
+/// [`TransportReceiver::recv`] returns a [`WorkBatch`], which this converts into
+/// via `From`: each message becomes a record, `filtered_tokens` join
+/// `commit_tokens`, and `dlq_entries` carry across for the caller to route.
 #[derive(Debug)]
 pub struct RecvBatch<T: CommitToken> {
     /// Messages that passed all inbound filters (or had no filter match).
@@ -173,9 +175,10 @@ pub async fn boot_healthcheck<T: TransportBase>(
 
 /// Send-side transport.
 ///
-/// The factory returns `AnySender` (enum dispatch) for runtime selection. All
-/// implementations auto-emit `dfe_transport_*` metrics when a `MetricsManager`
-/// recorder is installed.
+/// The factory returns `AnySender` (enum dispatch) for runtime selection. With
+/// the `metrics` feature, the Kafka, gRPC, HTTP, file and pipe backends emit
+/// `transport_*` metrics to the installed recorder, with a `{namespace}_`
+/// prefix only when a metrics namespace is configured.
 pub trait TransportSender: TransportBase {
     /// Send raw bytes to a destination.
     ///
@@ -346,9 +349,9 @@ impl<T: TransportSender + TransportReceiver> Transport for T {}
 
 /// Load a transport config from the cascade under a fixed key.
 ///
-/// Consolidates the byte-identical `from_cascade()` bodies each transport config
-/// used to repeat. Implementors only name their key. Without the `config`
-/// feature the default method returns `Default::default()`.
+/// The shared body behind each transport config's `from_cascade()`.
+/// Implementors only name their key. Without the `config` feature the default
+/// method returns `Default::default()`.
 pub trait FromCascade: Default + serde::Serialize + serde::de::DeserializeOwned + 'static {
     /// Load `Self` from the config cascade under `key`, registering the section
     /// in the global registry; falls back to `Default` if the cascade is

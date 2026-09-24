@@ -285,7 +285,7 @@ impl AnySender {
             #[cfg(feature = "transport-pipe")]
             TransportType::Pipe => {
                 let pipe_config = config.pipe.clone().unwrap_or_default();
-                let transport = super::pipe::PipeTransport::new(&pipe_config);
+                let transport = super::pipe::PipeTransport::try_new(&pipe_config)?;
                 Ok(Self::Pipe(transport))
             }
 
@@ -749,7 +749,7 @@ impl AnyReceiver {
     ///     type: kafka
     ///     kafka:
     ///       brokers: ["kafka:9092"]
-    ///       group_id: "my-consumer"
+    ///       group: "my-consumer"
     /// ```
     ///
     /// ```rust,ignore
@@ -801,7 +801,7 @@ impl AnyReceiver {
             #[cfg(feature = "transport-pipe")]
             TransportType::Pipe => {
                 let pipe_config = config.pipe.clone().unwrap_or_default();
-                let transport = super::pipe::PipeTransport::new(&pipe_config);
+                let transport = super::pipe::PipeTransport::try_new(&pipe_config)?;
                 Ok(Self::Pipe(transport))
             }
 

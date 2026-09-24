@@ -81,7 +81,7 @@ impl EngineError {
 }
 
 /// What a [`BatchEngine`] run loop does with inbound-filter DLQ entries
-/// ([`RecvBatch::dlq_entries`](crate::transport::RecvBatch)).
+/// ([`WorkBatch::dlq_entries`](crate::transport::WorkBatch::dlq_entries)).
 ///
 /// Inbound `action: dlq` filters remove messages from the normal batch; those
 /// entries must go somewhere. The default is [`Reject`](Self::Reject) so a
@@ -94,7 +94,7 @@ pub enum FilterDlqPolicy {
     #[default]
     Reject,
     /// Deliberately discard DLQ entries, counting them in the
-    /// `dfe_engine_filter_dlq_discarded_total` metric. Explicit opt-in.
+    /// `engine_filter_dlq_discarded_total` metric. Explicit opt-in.
     DiscardWithMetric,
     /// Hand each batch's DLQ entries to a sink (e.g. enqueue onto a DLQ
     /// transport, or `tokio::spawn` an async send). Called on the run loop, so

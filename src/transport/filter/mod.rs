@@ -422,7 +422,7 @@ fn warn_msgpack_bypass_once(direction: FilterDirection) {
             direction = %direction,
             "transport filters skipped a MsgPack payload -- \
              filters are JSON-only. Scrape \
-             dfe_transport_filter_msgpack_bypass_total for the rate."
+             transport_filter_msgpack_bypass_total for the rate."
         );
     }
 }

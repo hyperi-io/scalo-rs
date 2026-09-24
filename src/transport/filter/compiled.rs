@@ -110,7 +110,7 @@ impl CompiledFilter {
         if !tier_config.is_tier_allowed(tier, direction) {
             return Err(format!(
                 "classified as {tier} but {tier} filters are not enabled for {direction}. \
-                 Set expression.allow_{} to enable.",
+                 Set transport.filter_tiers.allow_{} to enable.",
                 match (tier, direction) {
                     (FilterTier::Tier2, FilterDirection::In) => "cel_filters_in: true",
                     (FilterTier::Tier2, FilterDirection::Out) => "cel_filters_out: true",
@@ -924,6 +924,33 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Tier 2"), "{err}");
+    }
+
+    /// The rejection names the cascade key an operator sets to open the gate.
+    #[test]
+    fn tier_gate_rejection_names_the_transport_filter_tiers_key() {
+        let cases = [
+            (
+                "severity > 3",
+                FilterDirection::In,
+                "transport.filter_tiers.allow_cel_filters_in: true",
+            ),
+            (
+                r#"tag.matches("^prod-")"#,
+                FilterDirection::Out,
+                "transport.filter_tiers.allow_complex_filters_out: true",
+            ),
+        ];
+        for (expr, direction, key) in cases {
+            let err = CompiledFilter::from_expression(
+                expr,
+                FilterAction::Drop,
+                direction,
+                &TransportFilterTierConfig::default(),
+            )
+            .unwrap_err();
+            assert!(err.contains(key), "{expr}: error must name {key}: {err}");
+        }
     }
 
     #[test]

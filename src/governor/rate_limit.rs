@@ -15,10 +15,10 @@
 //! overload signals (backpressure, per-attempt timeouts); this one *enforces* a
 //! fixed ceiling the operator already knows.
 //!
-//! ## Built on the `governor` crate (no reinvented wheel)
+//! ## Built on the `governor` crate
 //!
-//! Backed by the battle-proven `governor` crate (GCRA -- generic cell rate
-//! algorithm; 64-bit lock-free state, CAS-updated). We import it as `gcra` to
+//! Backed by the `governor` crate's direct rate limiter (GCRA -- generic cell
+//! rate algorithm; 64-bit lock-free state, CAS-updated). We import it as `gcra` to
 //! avoid a name clash with scalo's own `governor` module. This type is a thin
 //! facade so callers depend on a stable scalo API, not the crate directly, and
 //! so a disabled limiter (`rps == 0`) is a true zero-cost no-op.

@@ -102,39 +102,74 @@ pub struct PipeTransport {
     sequence: AtomicU64,
     closed: Arc<AtomicBool>,
     recv_timeout_ms: u64,
-    filter_engine: super::filter::TransportFilterEngine,
+    /// `Err` holds the rule compile error, and send and recv refuse while it stands.
+    filter_engine: Result<super::filter::TransportFilterEngine, String>,
 }
 
 impl PipeTransport {
     /// Create a new pipe transport.
+    ///
+    /// Filter rules compile against the `transport.filter_tiers` gates, as on
+    /// every other backend. A rule that fails to compile leaves the transport
+    /// unhealthy: `send` returns [`SendResult::Fatal`] and `recv` returns
+    /// [`TransportError::Config`], both carrying the compile error, so a `drop`
+    /// or `dlq` rule never silently stops applying. [`AnySender`](super::AnySender)
+    /// and [`AnyReceiver`](super::AnyReceiver) refuse to build such a pipe.
     #[must_use]
     pub fn new(config: &PipeTransportConfig) -> Self {
+        let filter_engine = Self::compile_filters(config).map_err(|e| match e {
+            TransportError::Config(detail) => detail,
+            other => other.to_string(),
+        });
+        if let Err(detail) = &filter_engine {
+            tracing::error!(
+                error = %detail,
+                "Pipe transport filters failed to compile -- send and recv refuse until the rules are fixed"
+            );
+        }
+        Self::with_filter_engine(config, filter_engine)
+    }
+
+    /// Create a pipe transport, failing when a filter rule does not compile.
+    ///
+    /// The factory path, so a bad rule fails construction as on every other
+    /// backend.
+    pub(crate) fn try_new(config: &PipeTransportConfig) -> TransportResult<Self> {
+        let filter_engine = Self::compile_filters(config)?;
+        Ok(Self::with_filter_engine(config, Ok(filter_engine)))
+    }
+
+    fn compile_filters(
+        config: &PipeTransportConfig,
+    ) -> TransportResult<super::filter::TransportFilterEngine> {
+        super::filter::TransportFilterEngine::new(
+            &config.filters_in,
+            &config.filters_out,
+            &crate::transport::filter::TransportFilterTierConfig::from_cascade(),
+        )
+    }
+
+    fn with_filter_engine(
+        config: &PipeTransportConfig,
+        filter_engine: Result<super::filter::TransportFilterEngine, String>,
+    ) -> Self {
         #[cfg(feature = "logger")]
         tracing::info!(
             recv_timeout_ms = config.recv_timeout_ms,
             "Pipe transport opened"
         );
 
-        let filter_engine = super::filter::TransportFilterEngine::new(
-            &config.filters_in,
-            &config.filters_out,
-            &crate::transport::filter::TransportFilterTierConfig::default(),
-        )
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to compile transport filters, filtering disabled");
-            super::filter::TransportFilterEngine::empty()
-        });
-
         let closed = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "health")]
         {
             let h = Arc::clone(&closed);
+            let filters_compiled = filter_engine.is_ok();
             crate::health::HealthRegistry::register("transport:pipe", move || {
-                if h.load(Ordering::Relaxed) {
-                    crate::health::HealthStatus::Unhealthy
-                } else {
+                if filters_compiled && !h.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Healthy
+                } else {
+                    crate::health::HealthStatus::Unhealthy
                 }
             });
         }
@@ -147,6 +182,13 @@ impl PipeTransport {
             recv_timeout_ms: config.recv_timeout_ms,
             filter_engine,
         }
+    }
+
+    /// The compiled filters, or the compile error to refuse traffic with.
+    fn filters(&self) -> TransportResult<&super::filter::TransportFilterEngine> {
+        self.filter_engine
+            .as_ref()
+            .map_err(|detail| TransportError::Config(detail.clone()))
     }
 }
 
@@ -165,7 +207,7 @@ impl TransportBase for PipeTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed)
+        self.filter_engine.is_ok() && !self.closed.load(Ordering::Relaxed)
     }
 
     fn name(&self) -> &'static str {
@@ -178,10 +220,14 @@ impl TransportSender for PipeTransport {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
+        let filter_engine = match self.filters() {
+            Ok(engine) => engine,
+            Err(e) => return SendResult::Fatal(e),
+        };
 
         // Outbound filter check
-        if self.filter_engine.has_outbound_filters() {
-            match self.filter_engine.apply_outbound(&payload) {
+        if filter_engine.has_outbound_filters() {
+            match filter_engine.apply_outbound(&payload) {
                 super::filter::FilterDisposition::Pass => {}
                 super::filter::FilterDisposition::Drop => return SendResult::Ok,
                 super::filter::FilterDisposition::Dlq => return SendResult::FilteredDlq,
@@ -227,6 +273,7 @@ impl TransportReceiver for PipeTransport {
         if self.closed.load(Ordering::Relaxed) {
             return Err(TransportError::Closed);
         }
+        let filter_engine = self.filters()?;
 
         let mut stdin = self.stdin.lock().await;
         let mut messages = Vec::with_capacity(max.min(100));
@@ -298,7 +345,7 @@ impl TransportReceiver for PipeTransport {
 
         // Apply inbound filters via the shared partition helper; DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
-        let batch = self.filter_engine.partition_batch(
+        let batch = filter_engine.partition_batch(
             messages,
             |m| m.payload.as_ref(),
             |m| m.key.clone(),
@@ -436,5 +483,77 @@ mod tests {
         let tokens = vec![PipeToken { seq: 0 }, PipeToken { seq: 1 }];
         let result = transport.commit(&tokens).await;
         assert!(result.is_ok());
+    }
+
+    /// A Tier 2 `dlq` rule: no cascade is installed in a unit test, so the
+    /// default gates apply and reject it.
+    fn config_with_uncompilable_rule() -> PipeTransportConfig {
+        PipeTransportConfig {
+            filters_in: vec![crate::transport::filter::FilterRule {
+                expression: "severity > 3".into(),
+                action: crate::transport::filter::FilterAction::Dlq,
+            }],
+            ..PipeTransportConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn uncompilable_filter_rule_refuses_traffic_instead_of_running_unfiltered() {
+        let transport = PipeTransport::new(&config_with_uncompilable_rule());
+
+        assert!(
+            !transport.is_healthy(),
+            "a pipe whose dlq rule did not compile must report unhealthy"
+        );
+        #[cfg(feature = "health")]
+        assert!(
+            crate::health::HealthRegistry::components()
+                .iter()
+                .any(|(name, status)| {
+                    name == "transport:pipe" && *status == crate::health::HealthStatus::Unhealthy
+                }),
+            "the registered health probe must report the pipe unhealthy"
+        );
+
+        match transport.recv(1).await {
+            Err(TransportError::Config(detail)) => assert!(
+                detail.contains("filter_in[0]"),
+                "recv must carry the compile error, got: {detail}"
+            ),
+            Err(other) => panic!("recv must refuse with the compile error, got: {other}"),
+            Ok(batch) => panic!("recv must refuse, got {} records", batch.records.len()),
+        }
+
+        match transport
+            .send("ignored", bytes::Bytes::from_static(br#"{"severity":5}"#))
+            .await
+        {
+            SendResult::Fatal(TransportError::Config(detail)) => assert!(
+                detail.contains("filter_in[0]"),
+                "send must carry the compile error, got: {detail}"
+            ),
+            other => panic!("send must refuse with the compile error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_refuses_a_pipe_whose_filter_rule_does_not_compile() {
+        let config = crate::transport::TransportConfig {
+            transport_type: crate::transport::TransportType::Pipe,
+            pipe: Some(config_with_uncompilable_rule()),
+            ..crate::transport::TransportConfig::default()
+        };
+
+        let sender = crate::transport::AnySender::from_transport_config(&config).await;
+        assert!(
+            matches!(sender, Err(TransportError::Config(_))),
+            "AnySender must fail construction on a rule that does not compile"
+        );
+
+        let receiver = crate::transport::AnyReceiver::from_transport_config(&config).await;
+        assert!(
+            matches!(receiver, Err(TransportError::Config(_))),
+            "AnyReceiver must fail construction on a rule that does not compile"
+        );
     }
 }
