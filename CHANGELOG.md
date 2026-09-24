@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.6](https://github.com/hyperi-io/scalo-rs/compare/v2.12.5...v2.12.6) (2026-09-24)
+
+### Bug Fixes
+
+* **kafka:** pipeline send_batch instead of awaiting each record ([#174](https://github.com/hyperi-io/scalo-rs/issues/174)) ([ad26203](https://github.com/hyperi-io/scalo-rs/commit/ad262037d10ec737f4d4778a11893514c83c2ece))
+
 ## [2.12.5](https://github.com/hyperi-io/scalo-rs/compare/v2.12.4...v2.12.5) (2026-09-24)
 
 ### Bug Fixes
