@@ -413,9 +413,7 @@ allocator is the binary's choice, and scalo is `#![forbid(unsafe_code)]`).
 
 ### `SinkDrain::flush_durable` (additive, default no-op)
 
-New trait method; existing impls compile unchanged. Custom drains
-that need true durability override (file flushes the writer, Kafka
-calls `producer.flush()`).
+New trait method; existing impls compile unchanged. A drain with a durability step overrides it. The DLQ drain does, running each backend's durable flush -- see [Kafka DLQ `flush()` waits for broker acks](#kafka-dlq-flush-waits-for-broker-acks-behaviour-change).
 
 ### `Dlq` struct (internal layout)
 
@@ -483,11 +481,7 @@ on `flush().await`.
 
 ### Wave 2 — Kafka DLQ `flush_durable` Err on outstanding
 
-`Dlq::flush_durable` (Kafka backend) returns `DlqError::Kafka`
-when the producer flush timeout expires with messages still in
-flight. Previously logged at debug and returned `Ok(())`. Shutdown
-paths that assumed Ok = drained must now treat Err as "DLQ entries
-may be lost".
+The Kafka backend's durable flush returns `DlqError::Kafka` when its wait for acks expires with messages still in flight, where it used to log at debug and return `Ok(())`. Nothing called it until the DLQ drain began to, so `Dlq::flush()` never saw that error -- see [Kafka DLQ `flush()` waits for broker acks](#kafka-dlq-flush-waits-for-broker-acks-behaviour-change).
 
 ### Wave 3 — `CacheConfig.dir_mode` / `.file_mode`
 
@@ -617,9 +611,31 @@ Neither consumer ever joined its group or committed an offset, so no offsets are
 
 `BackgroundSink::flush()`, and `Dlq::flush()` built on it, now return `Err` when any batch written since the previous flush was refused. That covers batches written on the `flush_interval` tick, on a full `batch_size`, and during the shutdown drain. Before, a flush reported only the batch the barrier wrote itself, so those losses showed in `dropped()` alone. See [pipeline/dlq.md](pipeline/dlq.md#queue-admission-semantics).
 
-A refusal is reported once: the first flush after it returns the error and the next starts clean. `dropped()` counts as before. For the Kafka DLQ backend, `Ok` still means the entries were queued to the producer, not acknowledged by the broker.
+A refusal is reported once: the first flush after it returns the error and the next starts clean. `dropped()` counts as before. For the Kafka DLQ backend, what `Ok` means changes as well -- see the next entry.
 
 **Consumer adjustment** -- a `flush().await?` that used to pass over a lost batch now returns `Err(DlqError::File)`, or `Err(SinkError::Drain)` on a `BackgroundSink` used directly. Read it as "entries written since the last flush were lost". A `dropped()` check around the barrier can stay: it also counts queue overflow, which `flush()` does not cover.
+
+### Kafka DLQ `flush()` waits for broker acks (BEHAVIOUR CHANGE)
+
+`Dlq::flush()` over the Kafka backend now returns once the broker has acknowledged every entry the barrier covers, waiting up to 30 s on tokio's blocking pool. Before, `Ok` meant queued to the producer: the drain never ran a backend's durable flush, and a delivery the broker refused reached neither `flush()` nor `dropped()`. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
+
+- A delivery the broker refused since the previous flush fails the flush with `Err(DlqError::File(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
+- Entries still unacknowledged after 30 s are purged from the producer and counted the same way. The purge adds up to 5 s. An entry in flight to a stalled broker at the purge can still be written, so under a stalled broker `dropped()` is an upper bound and re-placing entries reported lost can duplicate them on the DLQ topic. It never under-reports.
+- `Cascade`: when Kafka queues part of a batch and refuses the rest, only the rest goes to the next backend. Before, the whole batch did, so the file held a second copy of the part Kafka took.
+- `FanOut`: a Kafka loss counts only for entries no other backend holds.
+
+**Consumer adjustment** -- none in code. A flush over the Kafka backend can now take up to 35 s while the broker is slow or down; a timeout around it shorter than that sees its own timeout, and the failure goes to the next flush. A caller that never calls `flush()` sees Kafka delivery failures in `transport_send_errors_total{transport="kafka"}` only, not in `dropped()`.
+
+### `NdjsonWriter` refuses a write a rotation would panic on (BEHAVIOUR CHANGE)
+
+`file-rotate` 0.8 panics inside a rotation when the output directory is gone and cannot be recreated, or the current file is missing and cannot be created. Services built with `panic = "abort"` died at the next rotation boundary. `NdjsonWriter`, and the DLQ file backend and file output sink built on it, now refuse such a write with an `Err` before calling into `file-rotate`.
+
+- A write while the current file is missing returns `Err` and schedules a reopen, which runs once the directory is usable again. It never recreates a missing directory, at a rotation boundary included.
+- `NdjsonWriter::new`, and a reopen, refuse a directory that is not a directory or cannot be listed.
+- `NdjsonWriter::new` refuses a filename with no final component (`..`) with `ErrorKind::InvalidInput`.
+- `max_age_days` is capped at 1,000,000 days; above about 95 million the rotation's age check panicked.
+
+**Consumer adjustment** -- none in code. A write the writer would previously have lost silently or panicked on is now an `Err`.
 
 ---
 

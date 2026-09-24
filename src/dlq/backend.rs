@@ -70,24 +70,25 @@ impl DlqBackend {
 
     /// Make every entry written so far DURABLE.
     ///
-    /// Called from the BackgroundSink barrier handler when a consumer
-    /// invokes [`super::orchestrator::Dlq::flush`]. Each backend honours
-    /// the strongest durability it can express:
+    /// Called by the drain at every barrier, so from each
+    /// [`super::orchestrator::Dlq::flush`]. Each backend honours the
+    /// strongest durability it can express:
     ///
     /// - **File**: `flush()` on the rotating writer. `file-rotate`
     ///   doesn't expose the inner `File`, so we can't `fsync()` -- this
     ///   only flushes to the kernel page cache, so power loss before
     ///   write-back can still lose data. Limitation, tracked until
     ///   `file-rotate` exposes a sync hook.
-    /// - **Kafka**: `producer.flush()` -- blocks until every queued
-    ///   message is acked by the broker (per the producer's acks
-    ///   config). The real durability semantic.
+    /// - **Kafka**: waits on the blocking pool, up to 30 s, for the broker
+    ///   to ack every queued entry (per the producer's `acks` config), then
+    ///   purges what is left and counts the entries only Kafka held that
+    ///   the broker refused or never acked.
     /// - **HTTP**: no-op. `send_batch` already awaits the response.
     ///
     /// # Errors
     ///
-    /// Backend-specific. Surfaced to the BackgroundSink barrier
-    /// handler which logs and continues.
+    /// Backend-specific. The barrier returns it from the `Dlq::flush`
+    /// that issued it.
     pub async fn flush_durable(&mut self) -> Result<(), DlqError> {
         match self {
             Self::File(b) => b.flush_durable().await,
@@ -95,6 +96,49 @@ impl DlqBackend {
             Self::Kafka(b) => b.flush_durable().await,
             #[cfg(feature = "dlq-http")]
             Self::Http(_) => Ok(()),
+        }
+    }
+
+    /// Entries the last failed `send_batch` handed on before it stopped.
+    /// Only Kafka queues entry by entry; the others fail a batch whole.
+    #[allow(clippy::match_same_arms, reason = "only Kafka can fail part-way")]
+    pub(crate) fn queued_before_failure(&self) -> usize {
+        match self {
+            Self::File(_) => 0,
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => b.queued_before_failure(),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => 0,
+        }
+    }
+
+    /// Record that another backend also holds `entries` of the last batch,
+    /// so their loss here is not a loss of the dead letter.
+    #[cfg_attr(
+        not(feature = "dlq-kafka"),
+        allow(unused_variables, reason = "only Kafka tracks custody")
+    )]
+    #[allow(clippy::match_same_arms, reason = "only Kafka tracks custody")]
+    pub(crate) fn share_custody(&mut self, entries: usize) {
+        match self {
+            Self::File(_) => {}
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => b.share_custody(entries),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => {}
+        }
+    }
+
+    /// Entries this backend's durable flushes found lost since the last
+    /// call. Only Kafka learns of a loss after the write returned.
+    #[allow(clippy::match_same_arms, reason = "only Kafka loses after a write")]
+    pub(crate) fn take_durable_losses(&mut self) -> u64 {
+        match self {
+            Self::File(_) => 0,
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => b.take_durable_losses(),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => 0,
         }
     }
 
