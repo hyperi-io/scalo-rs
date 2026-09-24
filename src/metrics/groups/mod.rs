@@ -19,11 +19,11 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use scalo::metrics::MetricsManager;
-//! use scalo::metrics::FlushTrigger;
+//! use scalo::metrics::{FlushTrigger, MetricsManager, ServiceMetrics};
 //! use scalo::metrics::groups::*;
 //!
 //! let mgr = MetricsManager::new("loader");
+//! let svc = ServiceMetrics::register(&mgr);
 //! let app = AppMetrics::new(&mgr, env!("CARGO_PKG_VERSION"), "abc123");
 //! let buffer = BufferMetrics::new(&mgr);
 //! let consumer = ConsumerMetrics::new(&mgr);
@@ -31,7 +31,9 @@
 //! let cb = CircuitBreakerMetrics::new(&mgr);
 //! let bp = BackpressureMetrics::new(&mgr);
 //!
-//! app.record_received(100);
+//! // records_received_total is one series; ServiceMetrics counts it.
+//! svc.records_received(100);
+//! app.record_processed(100);
 //! buffer.record_flush(0.042, FlushTrigger::Size);
 //! consumer.set_lag("events", 3, 1500);
 //! sink.record_duration("clickhouse", 0.015);

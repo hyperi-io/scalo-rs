@@ -93,6 +93,12 @@ rule -- bare unless a prefix is supplied). The hardcoded `dfe_` prefix is gone:
   Every metric then renders `dfe_<name>` exactly as before.
 - Set it to your app name for a unified namespace (`myapp_transport_sent_total`).
   Pod/app/instance differentiation comes from scrape/OTel labels, not the name.
+- One namespace covers every family. Before, `ServiceMetrics` carried a fixed
+  `dfe_` and the metric groups carried the namespace, so an app on namespace
+  `dfe_loader` had `dfe_records_received_total` from `ServiceMetrics` and
+  `dfe_loader_records_received_total` from `AppMetrics`. Now both are one series.
+  An app that counted a record through both counts it twice: count it through
+  `ServiceMetrics::records_received` only. No namespace keeps both old spellings.
 
 **Feature renamed:** `metrics-dfe` -> `service-metrics`.
 
