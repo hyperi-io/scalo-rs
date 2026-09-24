@@ -77,6 +77,9 @@ A refusal is reported once. The first barrier the drain processes after
 it returns the error, and the `flush()` after that starts clean. With
 concurrent callers, the other barriers return `Ok`.
 
+A `flush()` dropped before its ack, such as by a timeout around it, does
+not consume the error. The next `flush()` returns it.
+
 What "accepted" means depends on the backend:
 
 | Backend | Accepted means |

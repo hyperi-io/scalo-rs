@@ -334,7 +334,9 @@ impl<T: Send + 'static> BackgroundSink<T> {
     ///
     /// A failure is reported once: the first barrier the actor processes
     /// after it returns the error, and the next barrier starts clean. With
-    /// concurrent callers, the other barriers return `Ok`.
+    /// concurrent callers, the other barriers return `Ok`. If the caller
+    /// dropped its `flush()` future (a timeout, say) before the actor acked
+    /// the barrier, the failure carries to the next barrier instead.
     ///
     /// # Errors
     ///
@@ -422,7 +424,7 @@ async fn actor_loop<T, D>(
                                 &mut drain, std::mem::take(&mut batch),
                                 unreported.take(), &pending, metric_prefix,
                             ).await;
-                            let _ = ack.send(result);
+                            ack_barrier(ack, result, &mut unreported);
                         }
                     }
                 }
@@ -455,7 +457,7 @@ async fn actor_loop<T, D>(
                         &mut drain, std::mem::take(&mut batch),
                         unreported.take(), &pending, metric_prefix,
                     ).await;
-                    let _ = ack.send(result);
+                    ack_barrier(ack, result, &mut unreported);
                 }
                 None => {
                     // No barrier can follow this write; its failure is logged and counted.
@@ -491,6 +493,17 @@ fn hold_first_failure(held: &mut Option<DrainError>, result: Result<(), DrainErr
         && held.is_none()
     {
         *held = Some(e);
+    }
+}
+
+/// Ack a barrier; a failure its caller stopped waiting for stays held for the next barrier.
+fn ack_barrier(
+    ack: oneshot::Sender<Result<(), DrainError>>,
+    result: Result<(), DrainError>,
+    held: &mut Option<DrainError>,
+) {
+    if let Err(unreceived) = ack.send(result) {
+        hold_first_failure(held, unreceived);
     }
 }
 
@@ -1081,5 +1094,59 @@ mod tests {
         let err = barrier.await.expect("flush task").unwrap_err();
         assert!(matches!(err, SinkError::Drain(_)), "got: {err:?}");
         handle.join().await.expect("clean exit");
+    }
+
+    /// Refuses every batch; the first `flush_durable` waits for `gate`.
+    struct RefusingSlowBarrierDrain {
+        gate: Arc<Notify>,
+        attempts: Arc<AtomicU64>,
+        durable_calls: u64,
+    }
+
+    impl SinkDrain<u32> for RefusingSlowBarrierDrain {
+        async fn write_batch(&mut self, _batch: Vec<u32>) -> Result<(), DrainError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(DrainError::Io(std::io::Error::other("refused")))
+        }
+
+        async fn flush_durable(&mut self) -> Result<(), DrainError> {
+            self.durable_calls += 1;
+            if self.durable_calls == 1 {
+                self.gate.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_after_an_abandoned_flush_still_reports_the_refused_write() {
+        let gate = Arc::new(Notify::new());
+        let attempts = Arc::new(AtomicU64::new(0));
+        let shutdown = CancellationToken::new();
+        let cfg = BackgroundSinkConfig {
+            batch_size: 1024,
+            ..fast_config()
+        };
+        let (sink, _handle) = BackgroundSink::spawn(
+            RefusingSlowBarrierDrain {
+                gate: gate.clone(),
+                attempts: attempts.clone(),
+                durable_calls: 0,
+            },
+            cfg,
+            shutdown.clone(),
+        );
+        sink.try_push(1).expect("queue has space");
+        // batch_size is out of reach, so only the tick can have written it.
+        wait_for_attempts(&attempts, 1).await;
+
+        // The caller gives up while the barrier is parked in flush_durable.
+        let abandoned = tokio::time::timeout(Duration::from_millis(50), sink.flush()).await;
+        assert!(abandoned.is_err(), "barrier finished early: {abandoned:?}");
+        gate.notify_one();
+
+        let err = sink.flush().await.unwrap_err();
+        assert!(matches!(err, SinkError::Drain(_)), "got: {err:?}");
+        shutdown.cancel();
     }
 }
