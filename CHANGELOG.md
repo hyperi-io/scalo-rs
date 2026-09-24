@@ -3,6 +3,18 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.9](https://github.com/hyperi-io/scalo-rs/compare/v2.12.8...v2.12.9) (2026-09-24)
+
+### Bug Fixes
+
+* **deployment:** pin base digest, hadolint-clean ([#186](https://github.com/hyperi-io/scalo-rs/issues/186)) ([7fb8e39](https://github.com/hyperi-io/scalo-rs/commit/7fb8e3973af5b9f18bb9ea99ea78dbc78638824e))
+* **kafka:** clear queued poll errors in one receive ([#192](https://github.com/hyperi-io/scalo-rs/issues/192)) ([13c5d96](https://github.com/hyperi-io/scalo-rs/commit/13c5d96a529e4273db39ecc99e71edeef3cb24cd)), closes [#184](https://github.com/hyperi-io/scalo-rs/issues/184)
+* pipe filter tiers and false doc strings ([#182](https://github.com/hyperi-io/scalo-rs/issues/182)) ([f96b72b](https://github.com/hyperi-io/scalo-rs/commit/f96b72b3ef4f2ab69bf3a4557ab7a447dd969a0e))
+* poll Kafka off the runtime so recv yields ([#183](https://github.com/hyperi-io/scalo-rs/issues/183)) ([4ee6573](https://github.com/hyperi-io/scalo-rs/commit/4ee6573b689340527c6ee7d27745398f9b29e6ef))
+* **scripts:** pin loadgen images, run as uid 1000 ([#190](https://github.com/hyperi-io/scalo-rs/issues/190)) ([73e9610](https://github.com/hyperi-io/scalo-rs/commit/73e9610fd4a4d0051c90a24e39c66da22e5455ac))
+* **transport:** cancel-safe pipe and file recv ([#189](https://github.com/hyperi-io/scalo-rs/issues/189)) ([88909b5](https://github.com/hyperi-io/scalo-rs/commit/88909b5fdb6af1ae761daa5ebee55b2984475511))
+* **transport:** dead-letter an over-limit gRPC send instead of retrying it ([#188](https://github.com/hyperi-io/scalo-rs/issues/188)) ([72660b3](https://github.com/hyperi-io/scalo-rs/commit/72660b3863422c71e1610495715237bf307aa3ba))
+
 ## [2.12.8](https://github.com/hyperi-io/scalo-rs/compare/v2.12.7...v2.12.8) (2026-09-24)
 
 ### Bug Fixes
