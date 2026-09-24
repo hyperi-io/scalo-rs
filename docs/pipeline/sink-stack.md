@@ -36,10 +36,10 @@ learns the downstream's safe concurrency from RTT and error feedback.
 
 ARC's `min_limit` floors at 1, so a failing sink can never deadlock the limiter
 at zero. It is the OUTBOUND limiter only, kept distinct from the inbound
-worker-pool AIMD so the two never double-regulate. Caveat: when saturated the
-limiter backpressures (it never drops) but its readiness check busy-polls at the
-limit -- pair ARC with `load_shed` or a non-zero `min_limit` headroom for
-sustained-overload deployments.
+worker-pool AIMD so the two never double-regulate. When saturated the limiter
+backpressures and never drops: a request waiting for a slot parks on a tokio
+semaphore, so it costs no CPU. Pair ARC with `load_shed` where a sustained
+overload should shed requests rather than queue them.
 
 ## Retry and the circuit breaker live outside the stack
 

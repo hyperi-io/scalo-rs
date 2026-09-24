@@ -240,7 +240,8 @@ let engine = BatchEngine::new(cfg)
 ```
 
 The metric `dfe_engine_filter_dlq_unrouted_total` is replaced by
-`dfe_engine_filter_dlq_discarded_total` (emitted only under `DiscardWithMetric`).
+`<namespace>_engine_filter_dlq_discarded_total` (emitted only under
+`DiscardWithMetric`), where `<namespace>` is the app's metrics namespace.
 
 ### `TransportSender::send` takes owned `Bytes` (BREAKING)
 

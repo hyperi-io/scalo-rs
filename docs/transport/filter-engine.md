@@ -292,7 +292,6 @@ Open gaps in the engine, by status:
 | 8 | Log masking for filter expression content | Pending | Expression text logged as-is at startup; expression authors should treat expressions as non-secret |
 | 9 | Pre-quoted bytes fast path for `field == "value"` | Partial | `FieldExists` / `FieldNotExists` already use pre-compiled `memmem::Finder`; `FieldEquals` still uses SIMD extract + string compare |
 | 10 | MsgPack payloads pass unfiltered | Acknowledged | Design choice; a one-shot warning per direction plus `transport_filter_msgpack_bypass_total` make the bypass visible |
-| 11 | Preserve original `expression_text` through reload cycles | Pending | Current code re-allocates on reload; allocator-hygiene item, no functional impact |
 | 12 | Tier 2/3 CEL has no time budget | Partial | `transport.filter_tiers.budget` caps AST size and iteration depth at startup and payload size at evaluation. `program.execute(&ctx)` still runs with no time cap, so a costly filter within those caps can hold the ingest thread. A time cap needs support in the upstream `cel` crate |
 
 The items aren't blockers. Operators should know about #10 if their

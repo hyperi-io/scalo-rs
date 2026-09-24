@@ -144,12 +144,9 @@ impl CompiledFilter {
             ClassifyResult::Tier3 { fields } => {
                 super::budget::check_static_budget(expr, &tier_config.budget)
                     .map_err(|e| e.to_string())?;
-                // `allow_complex_filters_in/out` is the single source
-                // of truth for Tier-3 transport filters -- it implies
-                // the restricted CEL categories at the expression
-                // layer. Two-knob (transport AND expression) was
-                // confusing in practice; the tier gate approved
-                // already, so compile under a permissive profile.
+                // `allow_complex_filters_in/out` already approved this
+                // Tier-3 filter, so it compiles with every restricted CEL
+                // category allowed rather than asking a second switch.
                 let profile = crate::expression::ProfileConfig {
                     allow_regex: true,
                     allow_iteration: true,

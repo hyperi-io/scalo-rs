@@ -327,7 +327,7 @@ impl AdaptiveWorkerPool {
     /// (a `JoinSet`) so a slow item never blocks faster ones, applies an
     /// optional per-item timeout, and stops spawning new work when the policy's
     /// cancellation token fires. Results are returned in input order; each is a
-    /// [`FanOutResult`]. Emits `dfe_fanout_*` metrics (in-flight gauge, timeout/
+    /// [`FanOutResult`]. Emits `<namespace>_fanout_*` metrics (in-flight gauge, timeout/
     /// panic counters, batch-duration histogram) when the `metrics` feature is on.
     pub async fn fan_out_async_with_policy<T, R, E, F, Fut>(
         &self,
