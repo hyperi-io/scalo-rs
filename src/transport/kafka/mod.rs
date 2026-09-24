@@ -87,12 +87,13 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::Message as KafkaMessage;
-use rdkafka::message::OwnedHeaders;
+use rdkafka::message::{BorrowedMessage, OwnedHeaders};
 use rdkafka::producer::future_producer::OwnedDeliveryResult;
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::util::Timeout;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -126,6 +127,10 @@ const QUEUE_FULL_RETRY: Duration = Duration::from_millis(100);
 /// can itself block for about `session.timeout.ms` during an outage, so this
 /// keeps the whole retry well inside the default 300 s `max.poll.interval.ms`.
 const COMMIT_RETRY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Most polls one receive spends on errors queued ahead of its first record;
+/// [`tuning::MAX_DRAIN_MS`] bounds the time they take.
+const ERROR_DRAIN_MAX_POLLS: usize = 1_000;
 
 /// W3C traceparent headers for the active span, when propagation is built in.
 fn trace_headers() -> Option<OwnedHeaders> {
@@ -1482,7 +1487,7 @@ impl KafkaTransport {
                     .record(poll_start.elapsed().as_secs_f64());
                 return Ok(RecvBatch::from_messages(Vec::new()).into());
             }
-            Polled::Failed(err) => return self.first_poll_failed(err).await,
+            Polled::Failed(err, class) => return self.first_poll_failed(err, class).await,
             Polled::Records {
                 arena,
                 spans,
@@ -1562,6 +1567,7 @@ impl KafkaTransport {
                 max_msgs,
                 max_bytes,
                 auto_create_topics: self.auto_create_topics,
+                received_before: self.recv_state.has_received(),
                 #[cfg(feature = "transport-trace")]
                 span: tracing::Span::current(),
             };
@@ -1572,32 +1578,27 @@ impl KafkaTransport {
         polled.map_err(|e| TransportError::Recv(format!("kafka poll task failed: {e}")))
     }
 
-    /// Settle a first poll that returned an error: an empty batch after a
-    /// backoff when it is transient, the error when no retry can clear it.
-    async fn first_poll_failed(&self, err: KafkaError) -> TransportResult<WorkBatch<KafkaToken>> {
-        match classify::classify_recv_failure(&err, self.recv_context()) {
+    /// Settle a poll job that ended on an error before any record: an empty
+    /// batch after a backoff when it is transient, the error when no retry can
+    /// clear it.
+    async fn first_poll_failed(
+        &self,
+        err: KafkaError,
+        class: classify::RecvFailure,
+    ) -> TransportResult<WorkBatch<KafkaToken>> {
+        match class {
             classify::RecvFailure::EndOfPartition => {}
             classify::RecvFailure::Transient => {
                 self.recv_state.record_transient(&err);
-                // Yields to the runtime, so a burst of queued errors cannot spin the caller.
+                // Spaces the polls while the broker stays down, yielding the runtime meanwhile.
                 tokio::time::sleep(self.recv_state.backoff()).await;
             }
-            class @ (classify::RecvFailure::Permanent | classify::RecvFailure::Unclassified) => {
+            classify::RecvFailure::Permanent | classify::RecvFailure::Unclassified => {
                 classify::record_permanent_recv_failure(&err, class);
                 return Err(TransportError::Recv(err.to_string()));
             }
         }
         Ok(RecvBatch::from_messages(Vec::new()).into())
-    }
-
-    /// What classification needs to know about this consumer. Read on the
-    /// failure path only.
-    fn recv_context(&self) -> classify::RecvContext {
-        classify::RecvContext {
-            auto_create_topics: self.auto_create_topics,
-            credentials_proven: self.recv_state.has_received()
-                || self.consumer.context().has_connected(),
-        }
     }
 
     /// WEAKER, opt-in fire-and-forget commit (throughput over correctness).
@@ -1755,8 +1756,10 @@ fn get_or_insert_topic(
 enum Polled {
     /// The first poll waited out its timeout with nothing queued.
     Empty,
-    /// The first poll failed before any record arrived.
-    Failed(KafkaError),
+    /// The job ended on a poll error before any record arrived: a failure no
+    /// retry clears, an end of partition, or the last of a run of transient
+    /// errors.
+    Failed(KafkaError, classify::RecvFailure),
     /// At least one record, and what ended the drain early, if anything did.
     Records {
         arena: Vec<u8>,
@@ -1775,22 +1778,26 @@ enum DrainStop {
 
 /// One receive's polls, owning what they touch so they can run on tokio's
 /// blocking pool: the first poll waits up to [`tuning::POLL_TIMEOUT_MS`] on an
-/// empty queue, and the drain runs for up to [`tuning::MAX_DRAIN_MS`].
+/// empty queue, and every drain after it ends within [`tuning::MAX_DRAIN_MS`]
+/// of the job's start.
 struct PollJob {
     consumer: Arc<BaseConsumer<StatsContext>>,
     topic_cache: Arc<parking_lot::RwLock<HashMap<String, Arc<str>>>>,
     max_msgs: usize,
     max_bytes: Option<u64>,
-    /// The consumer's `allow.auto.create.topics`, for classifying a drain failure.
+    /// The consumer's `allow.auto.create.topics`, for classifying a poll failure.
     auto_create_topics: bool,
+    /// Whether a record reached this consumer before the job started, which
+    /// proves its credentials.
+    received_before: bool,
     /// The caller's span; a pool thread has none of its own to record on.
     #[cfg(feature = "transport-trace")]
     span: tracing::Span,
 }
 
 impl PollJob {
-    /// Poll once with the idle timeout, then drain what librdkafka already holds
-    /// with zero-timeout polls.
+    /// Take the first record, clearing any errors queued ahead of it, then
+    /// drain what librdkafka already holds with zero-timeout polls.
     fn run(self) -> Polled {
         // --- recv-arena ----------------------------------------------------
         // Instead of `payload.to_vec()` per message (N copies + N heap allocs),
@@ -1802,15 +1809,10 @@ impl PollJob {
         let drain_deadline =
             std::time::Instant::now() + Duration::from_millis(tuning::MAX_DRAIN_MS);
 
-        // Phase 1: Initial poll (drains librdkafka's queue; blocks <= timeout
-        // only when the queue is empty).
-        let msg = match self
-            .consumer
-            .poll(Duration::from_millis(tuning::POLL_TIMEOUT_MS))
-        {
-            None => return Polled::Empty,
-            Some(Err(e)) => return Polled::Failed(e),
-            Some(Ok(msg)) => msg,
+        // Phase 1: the first record, or the job's result when none arrives.
+        let msg = match self.first_record(drain_deadline) {
+            ControlFlow::Continue(msg) => msg,
+            ControlFlow::Break(polled) => return polled,
         };
 
         // Extract W3C traceparent from Kafka headers (first message only,
@@ -1930,6 +1932,73 @@ impl PollJob {
             spans,
             stopped_by,
         }
+    }
+
+    /// Wait up to [`tuning::POLL_TIMEOUT_MS`] for the first record, or break
+    /// with the job's result when none arrives.
+    ///
+    /// librdkafka keeps queueing error events while nothing polls, ahead of
+    /// the rebalance events and records that follow. So a transient first
+    /// error starts a drain that clears them, serving each rebalance on the
+    /// way, until a record arrives, a failure no retry clears, or
+    /// `drain_deadline` passes. A drain that ends with no record returns its
+    /// last transient error, and the caller backs off once for the lot.
+    fn first_record(
+        &self,
+        drain_deadline: std::time::Instant,
+    ) -> ControlFlow<Polled, BorrowedMessage<'_>> {
+        let mut last = match self
+            .consumer
+            .poll(Duration::from_millis(tuning::POLL_TIMEOUT_MS))
+        {
+            None => return ControlFlow::Break(Polled::Empty),
+            Some(Ok(msg)) => return ControlFlow::Continue(msg),
+            Some(Err(e)) => match self.classify_before_a_record(&e) {
+                classify::RecvFailure::Transient => e,
+                class => return ControlFlow::Break(Polled::Failed(e, class)),
+            },
+        };
+
+        let mut errors = 1_u32;
+        let mut polls = 0_usize;
+        let outcome = loop {
+            let remaining = drain_deadline.saturating_duration_since(std::time::Instant::now());
+            // librdkafka waits in whole milliseconds, so a shorter wait would spin.
+            if remaining < Duration::from_millis(1) || polls == ERROR_DRAIN_MAX_POLLS {
+                break ControlFlow::Break(Polled::Failed(last, classify::RecvFailure::Transient));
+            }
+            polls += 1;
+            // Not a zero-timeout poll: that returns None for a stats event it
+            // consumed too, which would end the drain short of what follows.
+            match self.consumer.poll(remaining) {
+                // A rebalance or commit result served inside the poll, or the wait ran out.
+                None => {}
+                Some(Ok(msg)) => break ControlFlow::Continue(msg),
+                Some(Err(e)) => match self.classify_before_a_record(&e) {
+                    classify::RecvFailure::EndOfPartition => {}
+                    classify::RecvFailure::Transient => {
+                        errors = errors.saturating_add(1);
+                        last = e;
+                    }
+                    class => break ControlFlow::Break(Polled::Failed(e, class)),
+                },
+            }
+        };
+        if errors > 1 {
+            tracing::debug!(errors, "kafka receive cleared queued poll errors");
+        }
+        outcome
+    }
+
+    /// Classify a poll error met before this job has a record in hand.
+    fn classify_before_a_record(&self, err: &KafkaError) -> classify::RecvFailure {
+        classify::classify_recv_failure(
+            err,
+            classify::RecvContext {
+                auto_create_topics: self.auto_create_topics,
+                credentials_proven: self.received_before || self.consumer.context().has_connected(),
+            },
+        )
     }
 }
 
@@ -2256,6 +2325,68 @@ mod tests {
             fired.is_ok(),
             "a 100 ms timer beside the recv loop did not fire within 3 s -- the loop is \
              holding the runtime"
+        );
+    }
+
+    /// Errors librdkafka queued while nothing polled are cleared by ONE
+    /// receive, so whatever is queued behind them -- a rebalance, a record --
+    /// is reached without a backoff per stale error. Broker-free: one broker
+    /// refuses and the other holds the connection past its 1 s setup timeout,
+    /// which queues three errors, and the 60 s reconnect backoff keeps a fresh
+    /// error out of the check.
+    #[tokio::test]
+    async fn queued_errors_clear_in_one_receive() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent broker");
+        let silent_address = silent.local_addr().expect("silent broker address");
+        std::thread::spawn(move || {
+            // Held open without a byte, so the connection setup times out.
+            let mut held = Vec::new();
+            for stream in silent.incoming() {
+                held.push(stream);
+            }
+        });
+        let config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string(), silent_address.to_string()],
+            group: "scalo-error-backlog".to_string(),
+            topics: vec!["events".to_string()],
+            consumer_protocol_probe_ms: 0,
+            ..Default::default()
+        }
+        .with_overrides(&[
+            // Off, so the first poll's 50 ms is not spent on queued stats events.
+            ("statistics.interval.ms", "0"),
+            ("socket.connection.setup.timeout.ms", "1000"),
+            ("reconnect.backoff.ms", "60000"),
+            ("reconnect.backoff.max.ms", "60000"),
+        ]);
+        let transport = KafkaTransport::new(&config)
+            .await
+            .expect("a consumer transport constructs broker-free");
+        // Both connection failures have queued about 2 s in, while nothing polls.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        let batch = transport
+            .recv(100)
+            .await
+            .expect("a transient backlog must not fail recv");
+        assert!(batch.records.is_empty());
+        assert_eq!(
+            transport.recv_state.failures(),
+            1,
+            "one receive backs off once, however many errors it cleared"
+        );
+
+        let consumer = Arc::clone(&transport.consumer);
+        let left =
+            tokio::task::spawn_blocking(move || match consumer.poll(Duration::from_millis(300)) {
+                Some(Err(e)) => Some(e.to_string()),
+                _ => None,
+            })
+            .await
+            .expect("check poll");
+        assert_eq!(
+            left, None,
+            "an error queued before the receive was still queued after it"
         );
     }
 
