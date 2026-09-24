@@ -117,52 +117,63 @@ impl ServiceMetrics {
             "Source commits that failed after the block was delivered"
         );
 
-        // Push transport descriptors into manifest registry
-        for (name, desc, mt) in [
+        // Push transport descriptors into manifest registry. Labels are every
+        // key an emitter sets: `path` on gRPC RouteBatch sends, `route` on
+        // routed sends, `reason` on pressure sheds.
+        for (name, desc, mt, labels) in [
             (
                 "transport_sent_total",
                 "Messages successfully sent to transport",
                 MetricType::Counter,
+                &["transport", "path", "route"][..],
             ),
             (
                 "transport_send_errors_total",
                 "Messages that failed to send",
                 MetricType::Counter,
+                &["transport"],
             ),
             (
                 "transport_backpressured_total",
                 "Messages delayed due to backpressure",
                 MetricType::Counter,
+                &["transport", "reason"],
             ),
             (
                 "transport_refused_total",
                 "Messages refused by transport (circuit open, capacity)",
                 MetricType::Counter,
+                &["transport"],
             ),
             (
                 "transport_healthy",
                 "Transport health (1=healthy, 0=unhealthy)",
                 MetricType::Gauge,
+                &["transport"],
             ),
             (
                 "transport_queue_size",
                 "Current number of messages in transport queue",
                 MetricType::Gauge,
+                &["transport"],
             ),
             (
                 "transport_queue_capacity",
                 "Maximum transport queue capacity",
                 MetricType::Gauge,
+                &["transport"],
             ),
             (
                 "transport_inflight",
                 "Messages currently in-flight (sent but not acked)",
                 MetricType::Gauge,
+                &["transport"],
             ),
             (
                 "transport_commit_errors_total",
                 "Source commits that failed after the block was delivered",
                 MetricType::Counter,
+                &["transport"],
             ),
         ] {
             reg.push(MetricDescriptor {
@@ -170,7 +181,7 @@ impl ServiceMetrics {
                 metric_type: mt,
                 description: desc.into(),
                 unit: String::new(),
-                labels: vec!["transport".into()],
+                labels: labels.iter().map(|l| (*l).to_string()).collect(),
                 group: "platform".into(),
                 buckets: None,
                 use_cases: vec![],
@@ -200,21 +211,24 @@ impl ServiceMetrics {
             use_cases: vec![],
             dashboard_hint: None,
         });
-        for (name, desc, unit) in [
+        for (name, desc, unit, labels) in [
             (
                 "transport_sent_bytes_total",
                 "Raw bytes written to transport (egress)",
                 "bytes",
+                &["transport", "route"][..],
             ),
             (
                 "transport_received_bytes_total",
                 "Raw bytes read from transport (ingress)",
                 "bytes",
+                &["transport"],
             ),
             (
                 "transport_received_events_total",
                 "Events received off the transport (ingress count)",
                 "",
+                &["transport"],
             ),
         ] {
             reg.push(MetricDescriptor {
@@ -222,7 +236,7 @@ impl ServiceMetrics {
                 metric_type: MetricType::Counter,
                 description: desc.into(),
                 unit: unit.into(),
-                labels: vec!["transport".into()],
+                labels: labels.iter().map(|l| (*l).to_string()).collect(),
                 group: "platform".into(),
                 buckets: None,
                 use_cases: vec![],
@@ -641,13 +655,6 @@ mod tests {
         for m in &manifest.metrics {
             assert_eq!(m.group, "platform");
         }
-        // Transport metrics should have "transport" label
-        let sent = manifest
-            .metrics
-            .iter()
-            .find(|m| m.name == "test_app_transport_sent_total")
-            .unwrap();
-        assert_eq!(sent.labels, vec!["transport"]);
         // Security metrics should have "reason" label
         let auth = manifest
             .metrics
@@ -655,8 +662,25 @@ mod tests {
             .find(|m| m.name == "test_app_auth_failures_total")
             .unwrap();
         assert_eq!(auth.labels, vec!["reason"]);
-        // Outage metrics carry the label each emitter sets.
+        // Each series lists every label key its emitters set: `path` on gRPC
+        // RouteBatch sends, `route` on routed sends, `reason` on pressure sheds.
         for (name, labels) in [
+            (
+                "test_app_transport_sent_total",
+                vec!["transport", "path", "route"],
+            ),
+            (
+                "test_app_transport_sent_bytes_total",
+                vec!["transport", "route"],
+            ),
+            (
+                "test_app_transport_backpressured_total",
+                vec!["transport", "reason"],
+            ),
+            (
+                "test_app_transport_received_events_total",
+                vec!["transport"],
+            ),
             (
                 "test_app_transport_recv_errors_total",
                 vec!["transport", "class"],

@@ -199,8 +199,12 @@ impl MemorySender<'_> {
 }
 
 impl TransportBase for MemoryTransport {
+    /// Stop sending and receiving, keeping every record `send` already
+    /// acknowledged: [`recv`](TransportReceiver::recv) returns them, then
+    /// [`TransportError::Closed`]. Idempotent.
     async fn close(&self) -> TransportResult<()> {
         self.closed.store(true, Ordering::Relaxed);
+        self.receiver.lock().await.close();
         Ok(())
     }
 
@@ -249,52 +253,48 @@ impl TransportSender for MemoryTransport {
 impl TransportReceiver for MemoryTransport {
     type Token = MemoryToken;
 
+    /// Receive up to `max` records.
+    ///
+    /// After [`close`](TransportBase::close) this keeps returning the records
+    /// still queued, then [`TransportError::Closed`] once none are left.
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(TransportError::Closed);
-        }
+        use mpsc::error::TryRecvError;
 
         let mut receiver = self.receiver.lock().await;
         let mut messages = Vec::with_capacity(max.min(100));
 
         for _ in 0..max {
-            let result = if self.recv_timeout_ms == 0 {
+            // The first record waits up to recv_timeout_ms; the rest only take
+            // what is already queued.
+            let internal = if self.recv_timeout_ms == 0 || !messages.is_empty() {
                 match receiver.try_recv() {
-                    Ok(msg) => Some(msg),
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Ok(msg) => msg,
+                    Err(TryRecvError::Disconnected) if messages.is_empty() => {
                         return Err(TransportError::Closed);
                     }
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
-            } else if messages.is_empty() {
+            } else {
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(self.recv_timeout_ms),
                     receiver.recv(),
                 )
                 .await
                 {
-                    Ok(Some(msg)) => Some(msg),
+                    Ok(Some(msg)) => msg,
                     Ok(None) => return Err(TransportError::Closed),
-                    Err(_) => break,
-                }
-            } else {
-                match receiver.try_recv() {
-                    Ok(msg) => Some(msg),
-                    Err(_) => break,
+                    Err(_elapsed) => break,
                 }
             };
-
-            if let Some(internal) = result {
-                let payload = internal.payload;
-                let format = PayloadFormat::detect(&payload);
-                messages.push(Message {
-                    key: internal.key,
-                    payload,
-                    token: MemoryToken { seq: internal.seq },
-                    timestamp_ms: Some(internal.timestamp_ms),
-                    format,
-                });
-            }
+            let payload = internal.payload;
+            let format = PayloadFormat::detect(&payload);
+            messages.push(Message {
+                key: internal.key,
+                payload,
+                token: MemoryToken { seq: internal.seq },
+                timestamp_ms: Some(internal.timestamp_ms),
+                format,
+            });
         }
 
         // Apply inbound filters via the shared partition helper; DLQ entries
@@ -468,6 +468,51 @@ mod tests {
         // Recv should fail
         let result = transport.recv(1).await;
         assert!(result.is_err());
+    }
+
+    /// Every record `send` acknowledged reaches `recv` after `close()`, with a
+    /// blocking and a non-blocking `recv`, then `Closed` stays terminal.
+    #[tokio::test]
+    async fn acked_records_reach_recv_after_close() {
+        for recv_timeout_ms in [100, 0] {
+            let transport = MemoryTransport::new(&MemoryConfig {
+                recv_timeout_ms,
+                ..Default::default()
+            })
+            .expect("memory transport with valid config must construct");
+            for seq in 0..3 {
+                let sent = transport
+                    .send("key", bytes::Bytes::from(format!("{{\"seq\":{seq}}}")))
+                    .await;
+                assert!(sent.is_ok(), "{sent:?}");
+            }
+
+            transport.close().await.unwrap();
+            let mut delivered = 0;
+            let mut ended = None;
+            for _ in 0..100 {
+                match transport.recv(2).await {
+                    Ok(batch) => delivered += batch.records.len(),
+                    Err(e) => {
+                        ended = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            assert!(
+                matches!(ended, Some(TransportError::Closed)),
+                "recv_timeout_ms={recv_timeout_ms}: expected Closed, got {ended:?}"
+            );
+            assert_eq!(
+                delivered, 3,
+                "recv_timeout_ms={recv_timeout_ms}: send acked 3 records, recv returned {delivered}"
+            );
+            assert!(matches!(
+                transport.recv(2).await,
+                Err(TransportError::Closed)
+            ));
+        }
     }
 
     #[tokio::test]

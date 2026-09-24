@@ -67,7 +67,7 @@ memory guard gauges are on `/metrics` but not in the manifest
   "app": "my-app",
   "namespace": "",
   "metrics": [
-    { "name": "transport_sent_total", "type": "counter", "labels": ["transport"], ... }
+    { "name": "transport_sent_total", "type": "counter", "labels": ["transport", "path", "route"], ... }
   ]
 }
 ```

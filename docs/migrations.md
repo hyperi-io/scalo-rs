@@ -669,6 +669,55 @@ Dropping the Kafka producer discards what it still holds, queued or in flight. T
 
 **Consumer adjustment** -- none in code. `in_flight_count()` and `ProducerMetrics::in_flight` still return the out-queue length.
 
+### `BatchEngine` run loops drain the source at shutdown (BEHAVIOUR CHANGE)
+
+`run_governed`, `run_workbatch`, `run_workbatch_parsed` and `run_workbatch_streaming` returned as soon as the shutdown token was cancelled, leaving the source open. A push source (gRPC, HTTP) acknowledges a record once it is queued, so what it held was lost. They now close the source and run what it still returns through `process`, the sink and the commit until `recv` reports `Closed`. See [pipeline/batch-engine.md](pipeline/batch-engine.md#shutdown).
+
+- The source is closed when the method returns. A second `close()` is harmless on every scalo transport.
+- A block the sink refuses transiently (`Backpressure`, `Timeout`) is retried for up to 10 s after the loop sees shutdown, whether it was refused before shutdown or during the drain. Before, retries stopped the moment the token fired, so one busy moment in the sink at shutdown lost everything the source still held.
+- A block the sink still refuses after those 10 s stops the drain, uncommitted; one refused since before the drain began closes the source without a drain. A permanent sink error stops it at once and is returned. A source that returns nothing for 5 s without reporting `Closed` stops it too.
+- A sink that stays busy therefore holds shutdown for up to 10 s longer than before.
+- A Kafka source reports `Closed` at once, so the drain reads nothing from it. A Kafka commit made after the method returns gets one attempt: the transport stops retrying commits once closed.
+
+**Consumer adjustment** -- a service whose sink is the same transport instance as its source builds them separately, since the engine closes the source before the service's final flush. A service that runs a loop again on the same receiver after cancelling a child token builds a new receiver: the first run closed it. A `TransportReceiver` implemented outside scalo returns what it already acknowledged from `recv` after `close()`, then `Closed`, without waiting for new records.
+
+### HTTP server keeps what it acknowledged at `close()` (BEHAVIOUR CHANGE)
+
+The HTTP receive server answers 200 once a record is queued for `recv`. `close()` left the queue open, so a request in flight still got 200, and the next `recv` returned `Closed` with records still queued. See [transport/backends.md](transport/backends.md#http).
+
+- `close()` answers every POST from then on with 503 and `Retry-After: 1`, which a sender retries. `recv` returns the records already queued, then `Closed`.
+- `close()` stops the server, so the listener is free when it returns. Open connections finish their in-flight requests.
+- A POST refused because the receiver is closed is 503, not 410, and still counts in `transport_refused_total{transport="http"}`.
+- The server no longer counts receipts in `transport_sent_total{transport="http"}`. They were counted as sends and as receipts both.
+
+**Consumer adjustment** -- a service that receives over HTTP without a `BatchEngine` run loop shuts down with `close()`, then `recv` until `Closed`, then its final flush. A dashboard that read the server's `transport_sent_total{transport="http"}` as its intake reads `transport_received_events_total{transport="http"}` instead.
+
+### Memory transport keeps what `send` accepted at `close()` (BEHAVIOUR CHANGE)
+
+`recv` after `close()` returned `Closed` with records still queued. It now returns them, then `Closed`, as the HTTP server does.
+
+**Consumer adjustment** -- none.
+
+### Vector-compat `PushEvents` is queued whole or not at all (BEHAVIOUR CHANGE)
+
+The Vector-compat source queued a request's events one at a time, so a request the receiver closed under part-way had its first events queued, and Vector's retry of the whole request delivered them twice. It now converts every event, then reserves room for all of them before queueing any. A refusal because the receiver closed is `Unavailable` with the message `receiver closed`, not `receiver buffer full`, and queues nothing. A request with more events than `recv_buffer_size` is still queued one event at a time. See [transport/backends.md](transport/backends.md#transport-grpc-vector-compat).
+
+**Consumer adjustment** -- none.
+
+### `VectorCompatClient` dials and health checks end at a limit (BEHAVIOUR CHANGE)
+
+The client had no connect timeout, so a dial to a peer that never completed the TCP connect held the caller until the operating system gave up, and every later call queued behind it. A dial whose DNS lookup or TCP connect is unfinished at nine tenths of the gRPC transport's default `send_timeout_ms` (30 s) is now abandoned: the call that started it returns its usual error (`TransportError::Send` from `send_events`, `TransportError::Connection` from `health_check`) and the next call dials afresh. `health_check` is a short probe, so it also gives up at the full 30 s once connected.
+
+`send_events` has no limit once connected. A Vector source with end-to-end acknowledgements holds `PushEvents` open until its own sink has delivered the events, and a sender that cut the RPC off and retried would push the same events again while the first push may still land. A send to a peer that stays connected but never answers waits for as long as the connection stays open.
+
+**Consumer adjustment** -- none in code.
+
+### Transport metric manifest lists every label the transports emit (fix)
+
+The manifest listed only `transport` for every transport series. `transport_sent_total` also carries `path` (gRPC `RouteBatch` sends) and `route` (routed sends), `transport_sent_bytes_total` carries `route`, and `transport_backpressured_total` carries `reason` (pressure sheds).
+
+**Consumer adjustment** -- none in code. A dashboard or alert generated from the manifest can group by the new keys.
+
 ### `log_debounced` lets one concurrent caller through per window (behaviour)
 
 `logger::log_debounced` read the last timestamp and then stored the new one, so callers racing into an open window could all log. It claims the window with a compare-exchange, so exactly one of them does.

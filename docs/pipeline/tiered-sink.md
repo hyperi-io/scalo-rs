@@ -201,7 +201,7 @@ the consumer forgets to call `shutdown().await`.
 
 - [spool.md](spool.md) — the yaque-backed disk queue under the hood
 - [dlq.md](dlq.md) — where to send `SpoolFull` / `Fatal` errors
-- [batch-engine.md](batch-engine.md) — common sink target for `run_async`
+- [batch-engine.md](batch-engine.md) — the run loops this is a common sink for
 - [../transport/README.md](../transport/README.md)
 - [../feature-flags.md](../feature-flags.md) — `tiered-sink`
 - [../auto-wiring.md](../auto-wiring.md)

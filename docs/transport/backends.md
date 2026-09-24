@@ -127,6 +127,10 @@ endpoint without recompile. Enable with `vector_compat: true` in the
 gRPC config — the server then accepts both native and Vector RPCs on
 the same listener. Not a separate backend, not for any other app.
 
+A `PushEvents` request is queued whole or not at all: every event is converted first, then room for all of them is reserved in the receive queue, waiting while it is full. A receiver closed under the request refuses it with `Unavailable` (`receiver closed`), which Vector retries, and none of its events were queued. A request with more events than `recv_buffer_size` cannot be reserved at once, so it is queued one event at a time; if the receiver closes part-way, the events already queued arrive again when Vector retries the request.
+
+`VectorCompatClient` (the sending side) is plaintext only; an `https` endpoint fails on the first RPC. A dial whose DNS lookup or TCP connect is unfinished at nine tenths of the gRPC transport's default `send_timeout_ms` (30 s) is abandoned, so the call that started it returns an error and the next call dials afresh. `health_check`, a short probe, also gives up at the full 30 s. `send_events` has no limit once connected: a Vector source with end-to-end acknowledgements holds `PushEvents` open until its own sink has delivered, and cutting that off to retry would push the same events twice. A send to a peer that stays connected but never answers waits for as long as the connection stays open.
+
 Source: [../../src/transport/vector_compat/](../../src/transport/vector_compat/).
 
 ---
@@ -149,6 +153,7 @@ transport:
 
 - **Cancellation safety**: `recv` is a `select!` on `recv_timeout`
   and channel `recv` — safe to drop.
+- **`close()`**: refuses every `send` from then on, and keeps what `send` already accepted: `recv` returns it, then `TransportError::Closed`.
 - **`is_healthy()`**: `!closed` — atomic flag flipped by `close()`.
 - **`commit()`**: advances an internal `AtomicU64` sequence.
 
@@ -232,6 +237,10 @@ transport:
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
 - **Send failures**: a refused, reset or timed-out connection, and HTTP 408, 429, 502, 503 or 504, are `Backpressured`, so a down endpoint is waited out. Any other non-2xx status, and a request that cannot be built, is `Fatal`.
+- **Acknowledgement**: the server answers 200 once the record is queued for `recv`, not once the consumer reads it. A full queue (`recv_buffer_size`), a held inbound gate, and a closed receiver answer 503 with `Retry-After: 1`.
+- **`close()`**: answers new POSTs with 503, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Open connections finish their in-flight requests on their own, the listener is free when `close()` returns, and a client that never finishes its request does not hold it open. Dropping the transport stops the server too.
+- **Shutdown order**: `close()`, then `recv` until `Closed`, then flush. The `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). Flushing first loses the records still queued.
+- **Counters**: receipts count in `transport_received_*`, never in `transport_sent_total`.
 - **`is_healthy()`**: `!closed`. Does not probe the endpoint.
 
 Source: [../../src/transport/http.rs](../../src/transport/http.rs).

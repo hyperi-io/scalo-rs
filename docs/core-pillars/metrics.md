@@ -82,7 +82,7 @@ spec, use cases, dashboard hint, app version, git commit, registration timestamp
       "name": "transport_sent_total",
       "type": "counter",
       "description": "Messages successfully sent to transport",
-      "labels": ["transport"],
+      "labels": ["transport", "path", "route"],
       "group": "platform"
     }
   ]
