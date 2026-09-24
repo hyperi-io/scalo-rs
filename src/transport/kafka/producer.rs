@@ -387,7 +387,13 @@ impl KafkaProducer {
             .purge(rdkafka::producer::PurgeConfig::default().queue().inflight());
     }
 
-    /// Get the number of messages currently in flight.
+    /// librdkafka's out-queue length: messages waiting to be sent or
+    /// acknowledged, plus delivery reports and client events (statistics,
+    /// errors, logs) not yet served.
+    ///
+    /// Not a message count -- it can be non-zero with every message
+    /// delivered. [`Self::flush`] returns the messages with no delivery
+    /// report yet.
     #[allow(clippy::cast_sign_loss)]
     pub fn in_flight_count(&self) -> usize {
         self.producer.in_flight_count().max(0) as usize
@@ -424,7 +430,8 @@ pub struct ProducerMetrics {
     pub bytes_sent: u64,
     /// Total errors encountered.
     pub errors: u64,
-    /// Messages currently in flight.
+    /// librdkafka's out-queue length at the snapshot: messages plus client
+    /// events not yet served. See [`KafkaProducer::in_flight_count`].
     pub in_flight: u64,
     /// Producer profile in use.
     pub profile: ProducerProfile,
