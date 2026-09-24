@@ -103,11 +103,8 @@ impl MemoryTransport {
     /// # Errors
     ///
     /// Returns [`TransportError`] when any inbound/outbound filter rule
-    /// fails to compile. Previously this produced a `tracing::warn!` and
-    /// silently substituted an empty filter engine; that fail-open
-    /// behaviour hid real misconfiguration (a filter that should have
-    /// blocked traffic would instead let every message through), so the
-    /// constructor now propagates the error to the caller.
+    /// fails to compile, so a misconfigured filter fails construction rather
+    /// than letting every message through.
     pub fn new(config: &MemoryConfig) -> super::error::TransportResult<Self> {
         let (sender, receiver) = mpsc::channel(config.buffer_size);
         let filter_engine = super::filter::TransportFilterEngine::new(
