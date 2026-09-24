@@ -52,7 +52,7 @@ pub enum DrainError {
     Io(#[from] std::io::Error),
 
     /// Backend-specific error wrapped as `Box<dyn Error>`. Backends
-    /// (Kafka, Redis, HTTP) convert their native error types into this
+    /// (Kafka, HTTP) convert their native error types into this
     /// via `From` impls in their own modules.
     #[error("backend: {0}")]
     Backend(Box<dyn StdError + Send + Sync>),

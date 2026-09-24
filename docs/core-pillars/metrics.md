@@ -136,7 +136,7 @@ compiled in, so a service's `register_metrics` override describes only its own.
 
 The transport layer counts both events AND bytes, in both directions, modelled on
 Vector's component instrumentation. All carry the `transport` label (backend kind:
-`kafka` / `grpc` / `http` / `file` / `pipe` / `redis`, plus `routed` for the
+`kafka` / `grpc` / `http` / `file` / `pipe`, plus `routed` for the
 aggregate routed view). Bytes are RAW wire bytes (summed `payload.len()` per
 `WorkBatch`), incremented once per batch send/recv -- not per event.
 

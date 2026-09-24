@@ -91,9 +91,9 @@ flowchart LR
 |---------|------|
 | `transport` | Base trait architecture, factory, `AnySender` |
 | `transport-trace` | Above + W3C traceparent propagation (pulls `opentelemetry`) |
-| `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` / `-redis` | Individual backends — each pulls only its own deps |
+| `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends — each pulls only its own deps |
 | `transport-grpc-vector-compat` | Vector.dev wire-compat for `dfe-transform-vector` |
-| `transport-all` | All seven backends |
+| `transport-all` | All six backends |
 
 Pick backends explicitly. `transport-all` is a convenience for tests; in
 production apps list only what you actually use.
@@ -105,7 +105,6 @@ production apps list only what you actually use.
 | `dlq` | File backend (always available) |
 | `dlq-kafka` | Above + Kafka backend (pulls `transport-kafka`) |
 | `dlq-http` | Above + HTTP backend (pulls `reqwest`) |
-| `dlq-redis` | Above + Redis backend (pulls `transport-redis`) |
 
 ### Secrets
 
@@ -277,8 +276,6 @@ A handful of dependencies aren't visible from the feature name alone:
   `worker-pool`, so rayon is compiled only by a service that asks for
   `worker-pool` or `worker-batch`.
 - `top` pulls `cli-service` (and through that, the full L2 runtime).
-- `transport-redis` and `dlq-redis` share the `redis` crate; using both
-  costs nothing extra beyond using one.
 - `expression` pulls the `cel` crate; needed only if any transport
   filter uses Tier 2 or Tier 3 CEL (see
   [transport/filter-engine.md](transport/filter-engine.md)).

@@ -1,8 +1,8 @@
 # Overview
 
 The transport layer is the boundary between an app and any
-message-shaped backend — Kafka, gRPC, Memory, File, Pipe, HTTP,
-Redis. Apps depend on the traits; the concrete backend is selected
+message-shaped backend — Kafka, gRPC, Memory, File, Pipe,
+HTTP. Apps depend on the traits; the concrete backend is selected
 at runtime from config. Embedded filter engine, embedded metrics,
 embedded propagation — see [filter-engine.md](filter-engine.md) and
 [backends.md](backends.md).
@@ -110,7 +110,6 @@ commit does what's needed:
 |---------|-------------------|
 | Kafka | Commits consumer offsets |
 | gRPC | No-op — no persistence |
-| Redis | `XACK` on the stream |
 | File | Persists read position to `.pos` sidecar |
 | Memory | Advances internal sequence |
 
@@ -184,7 +183,7 @@ sink stages do 1:1. See [routing.md](routing.md).
 | `Message<Token>` | Payload + key + token + timestamp + format |
 | `SendResult` | `Ok` / `Backpressured` / `Fatal(err)` / `FilteredDlq` |
 | `TransportConfig` | Top-level config struct read by the factory |
-| `TransportType` | Enum: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http`, `Redis` |
+| `TransportType` | Enum: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http` |
 
 Source: [../../src/transport/](../../src/transport/) — particularly
 [mod.rs](../../src/transport/mod.rs),
@@ -196,7 +195,7 @@ Source: [../../src/transport/](../../src/transport/) — particularly
 
 ## Related
 
-- [backends.md](backends.md) — seven concrete backends, config and deps
+- [backends.md](backends.md) — six concrete backends, config and deps
 - [filter-engine.md](filter-engine.md) — tiered CEL filtering
 - [routing.md](routing.md) — `RoutedSender` for originators
 - [../auto-wiring.md](../auto-wiring.md) — factory in the pillar model

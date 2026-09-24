@@ -22,7 +22,7 @@ An integrated runtime for at scale data plane services. Attach and 'enterprise-u
 - authentication and secrets integration for most common deployments and services
 - deployment contracts, your code automatically generates docker, and k8s artefacts for deployment consumption
 - memory capping, align your apps throughput to memory caps with back-pressure by default. Avoid OOMs
-- built in transport layer for kafka, valkey/redis and gRPC
+- built in transport layer for kafka and gRPC
 
 ## Quick Start
 

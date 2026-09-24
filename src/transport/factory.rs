@@ -9,7 +9,7 @@
 //! Transport factory for runtime transport selection.
 //!
 //! Creates transport senders from configuration, enabling apps to swap
-//! between Kafka, gRPC, file, pipe, HTTP, or Redis via config change.
+//! between Kafka, gRPC, file, pipe, or HTTP via config change.
 //!
 //! # Usage
 //!
@@ -38,8 +38,7 @@ use super::types::SendResult;
     feature = "transport-memory",
     feature = "transport-pipe",
     feature = "transport-file",
-    feature = "transport-http",
-    feature = "transport-redis"
+    feature = "transport-http"
 ))]
 use super::types::TransportType;
 use super::work_batch::{Record, WorkBatch};
@@ -66,9 +65,6 @@ pub enum AnySender {
 
     #[cfg(feature = "transport-http")]
     Http(super::http::HttpTransport),
-
-    #[cfg(feature = "transport-redis")]
-    Redis(super::redis_transport::RedisTransport),
 }
 
 impl TransportBase for AnySender {
@@ -86,8 +82,6 @@ impl TransportBase for AnySender {
             Self::File(t) => t.close().await,
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.close().await,
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.close().await,
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -109,8 +103,6 @@ impl TransportBase for AnySender {
             Self::File(t) => t.is_healthy(),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.is_healthy(),
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.is_healthy(),
             #[allow(unreachable_patterns)]
             _ => false,
         }
@@ -130,8 +122,6 @@ impl TransportBase for AnySender {
             Self::File(t) => t.name(),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.name(),
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.name(),
             #[allow(unreachable_patterns)]
             _ => "none",
         }
@@ -151,8 +141,6 @@ impl TransportBase for AnySender {
             Self::File(t) => t.healthcheck().await,
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.healthcheck().await,
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.healthcheck().await,
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -169,8 +157,7 @@ impl TransportSender for AnySender {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http",
-            feature = "transport-redis"
+            feature = "transport-http"
         )),
         allow(unused_variables)
     )]
@@ -188,8 +175,6 @@ impl TransportSender for AnySender {
             Self::File(t) => t.send(destination, payload).await,
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.send(destination, payload).await,
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.send(destination, payload).await,
             #[allow(unreachable_patterns)]
             _ => SendResult::Fatal(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -209,8 +194,7 @@ impl TransportSender for AnySender {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http",
-            feature = "transport-redis"
+            feature = "transport-http"
         )),
         allow(unused_variables)
     )]
@@ -228,8 +212,6 @@ impl TransportSender for AnySender {
             Self::File(t) => t.send_batch(records).await,
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.send_batch(records).await,
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.send_batch(records).await,
             #[allow(unreachable_patterns)]
             _ => SendResult::Fatal(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -327,16 +309,6 @@ impl AnySender {
                 Ok(Self::Http(transport))
             }
 
-            #[cfg(feature = "transport-redis")]
-            TransportType::Redis => {
-                let redis_config = config
-                    .redis
-                    .as_ref()
-                    .ok_or_else(|| TransportError::Config("redis config missing".into()))?;
-                let transport = super::redis_transport::RedisTransport::new(redis_config).await?;
-                Ok(Self::Redis(transport))
-            }
-
             // Transport types for modules not yet implemented
             #[allow(unreachable_patterns)]
             other => Err(TransportError::Config(format!(
@@ -386,10 +358,6 @@ pub enum AnyToken {
     #[cfg(feature = "transport-http")]
     /// HTTP sequence token.
     Http(super::http::HttpToken),
-
-    #[cfg(feature = "transport-redis")]
-    /// Redis XACK entry token.
-    Redis(super::redis_transport::RedisToken),
 }
 
 impl std::fmt::Display for AnyToken {
@@ -407,8 +375,6 @@ impl std::fmt::Display for AnyToken {
             Self::File(t) => std::fmt::Display::fmt(t, f),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => std::fmt::Display::fmt(t, f),
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => std::fmt::Display::fmt(t, f),
             #[allow(unreachable_patterns)]
             _ => write!(f, "none"),
         }
@@ -447,9 +413,6 @@ pub enum AnyReceiver {
 
     #[cfg(feature = "transport-http")]
     Http(super::http::HttpTransport),
-
-    #[cfg(feature = "transport-redis")]
-    Redis(super::redis_transport::RedisTransport),
 }
 
 impl TransportBase for AnyReceiver {
@@ -467,8 +430,6 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.close().await,
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.close().await,
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.close().await,
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -490,8 +451,6 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.is_healthy(),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.is_healthy(),
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.is_healthy(),
             #[allow(unreachable_patterns)]
             _ => false,
         }
@@ -511,8 +470,6 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.name(),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.name(),
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.name(),
             #[allow(unreachable_patterns)]
             _ => "none",
         }
@@ -532,8 +489,6 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.healthcheck().await,
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.healthcheck().await,
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => t.healthcheck().await,
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -552,8 +507,7 @@ impl TransportBase for AnyReceiver {
     feature = "transport-memory",
     feature = "transport-pipe",
     feature = "transport-file",
-    feature = "transport-http",
-    feature = "transport-redis"
+    feature = "transport-http"
 ))]
 fn wrap_batch<B: CommitToken>(
     batch: WorkBatch<B>,
@@ -573,8 +527,7 @@ impl TransportReceiver for AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http",
-            feature = "transport-redis"
+            feature = "transport-http"
         )),
         allow(unused_variables)
     )]
@@ -610,11 +563,6 @@ impl TransportReceiver for AnyReceiver {
                 let batch = t.recv(max).await?;
                 Ok(wrap_batch(batch, AnyToken::Http))
             }
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => {
-                let batch = t.recv(max).await?;
-                Ok(wrap_batch(batch, AnyToken::Redis))
-            }
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -634,8 +582,7 @@ impl TransportReceiver for AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http",
-            feature = "transport-redis"
+            feature = "transport-http"
         )),
         allow(unused_variables)
     )]
@@ -674,11 +621,6 @@ impl TransportReceiver for AnyReceiver {
                 let batch = t.recv_limited(limits).await?;
                 Ok(wrap_batch(batch, AnyToken::Http))
             }
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => {
-                let batch = t.recv_limited(limits).await?;
-                Ok(wrap_batch(batch, AnyToken::Redis))
-            }
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -693,8 +635,7 @@ impl TransportReceiver for AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http",
-            feature = "transport-redis"
+            feature = "transport-http"
         )),
         allow(unused_variables)
     )]
@@ -760,15 +701,6 @@ impl TransportReceiver for AnyReceiver {
                 }))
                 .await
             }
-            #[cfg(feature = "transport-redis")]
-            Self::Redis(t) => {
-                t.commit(&extract_tokens(tokens, |tok| match tok {
-                    AnyToken::Redis(r) => Some(r.clone()),
-                    #[allow(unreachable_patterns)]
-                    _ => None,
-                }))
-                .await
-            }
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -798,7 +730,6 @@ fn read_transport_config(key: &str) -> TransportResult<super::TransportConfig> {
     feature = "transport-pipe",
     feature = "transport-file",
     feature = "transport-http",
-    feature = "transport-redis",
 ))]
 fn extract_tokens<T>(tokens: &[AnyToken], pick: impl Fn(&AnyToken) -> Option<T>) -> Vec<T> {
     tokens.iter().filter_map(pick).collect()
@@ -894,16 +825,6 @@ impl AnyReceiver {
                 Ok(Self::Http(transport))
             }
 
-            #[cfg(feature = "transport-redis")]
-            TransportType::Redis => {
-                let redis_config = config
-                    .redis
-                    .as_ref()
-                    .ok_or_else(|| TransportError::Config("redis config missing".into()))?;
-                let transport = super::redis_transport::RedisTransport::new(redis_config).await?;
-                Ok(Self::Redis(transport))
-            }
-
             // Transport types for modules not yet implemented
             #[allow(unreachable_patterns)]
             other => Err(TransportError::Config(format!(
@@ -959,7 +880,7 @@ impl AnyReceiver {
     ///   `with_pressure(Some(governor.pressure()))`, so it sheds with 503 /
     ///   `Status::unavailable` while the pressure latch holds.
     ///
-    /// Backends with no inbound brake (memory, pipe, file, redis) construct
+    /// Backends with no inbound brake (memory, pipe, file) construct
     /// exactly as in [`from_transport_config`](Self::from_transport_config) --
     /// the byte-budget lever already reaches them through the governed driver.
     ///
@@ -1028,8 +949,7 @@ impl AnyReceiver {
             #[cfg(any(
                 feature = "transport-memory",
                 feature = "transport-pipe",
-                feature = "transport-file",
-                feature = "transport-redis"
+                feature = "transport-file"
             ))]
             _ => Self::from_transport_config(config).await,
 

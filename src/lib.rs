@@ -413,10 +413,6 @@ pub use dlq::{DlqRouting, KafkaDlqConfig};
 #[cfg_attr(docsrs, doc(cfg(feature = "dlq-http")))]
 pub use dlq::HttpDlqConfig;
 
-#[cfg(feature = "dlq-redis")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dlq-redis")))]
-pub use dlq::RedisDlqConfig;
-
 #[cfg(feature = "output-file")]
 #[cfg_attr(docsrs, doc(cfg(feature = "output-file")))]
 pub use output::{FileOutput, FileOutputConfig, OutputError};

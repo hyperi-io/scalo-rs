@@ -39,8 +39,7 @@ pub struct RecvBatch<T: CommitToken> {
     ///
     /// Handled records that produced no passing message. Carried into
     /// `WorkBatch.commit_tokens` so the block commit advances the source past
-    /// them -- otherwise an all-filtered stretch stalls the Kafka offset /
-    /// leaks the Redis PEL.
+    /// them -- otherwise an all-filtered stretch stalls the Kafka offset.
     pub filtered_tokens: Vec<T>,
 }
 
@@ -97,7 +96,7 @@ pub trait TransportBase: Send + Sync {
     /// discovered on the first `send`. The DEFAULT delegates to
     /// [`is_healthy`](Self::is_healthy) (passes unless the transport already
     /// knows it is unhealthy); a transport SHOULD override with a real probe
-    /// (Kafka metadata fetch, HTTP GET, Redis PING, file-path writability, ...).
+    /// (Kafka metadata fetch, HTTP GET, file-path writability, ...).
     ///
     /// Shape: a per-component async `Result<()>` probe, run in parallel at boot
     /// by the factory (see [`boot_healthcheck`]).
@@ -186,7 +185,6 @@ pub trait TransportSender: TransportBase {
     /// - gRPC: metadata routing key
     /// - HTTP: URL path suffix or ignored
     /// - File: filename suffix or ignored
-    /// - Redis: stream name
     /// - Pipe: ignored (single stdout)
     fn send(
         &self,
@@ -332,7 +330,6 @@ pub trait TransportReceiver: TransportBase {
     ///
     /// - Kafka: commits consumer offsets
     /// - gRPC: no-op (no persistence)
-    /// - Redis: XACK
     /// - File: advances read position
     /// - Memory: advances internal sequence
     fn commit(&self, tokens: &[Self::Token]) -> impl Future<Output = TransportResult<()>> + Send;
@@ -340,7 +337,7 @@ pub trait TransportReceiver: TransportBase {
 
 /// Combined transport -- implements both send and receive.
 ///
-/// Most concrete impls (Kafka, gRPC, Memory, Redis, File, Pipe) qualify;
+/// Most concrete impls (Kafka, gRPC, Memory, File, Pipe) qualify;
 /// auto-implemented via blanket impl.
 pub trait Transport: TransportSender + TransportReceiver {}
 

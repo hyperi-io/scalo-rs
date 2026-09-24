@@ -29,8 +29,6 @@ pub enum TransportType {
     Pipe,
     /// HTTP/HTTPS (webhook delivery, REST ingest).
     Http,
-    /// Redis/Valkey Streams (lightweight pub/sub).
-    Redis,
 }
 
 impl std::fmt::Display for TransportType {
@@ -42,7 +40,6 @@ impl std::fmt::Display for TransportType {
             Self::File => write!(f, "file"),
             Self::Pipe => write!(f, "pipe"),
             Self::Http => write!(f, "http"),
-            Self::Redis => write!(f, "redis"),
         }
     }
 }
@@ -186,7 +183,7 @@ impl SendResult {
 /// matching `transport_type` is read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransportConfig {
-    /// Transport type (kafka, grpc, memory, file, pipe, http, redis).
+    /// Transport type (kafka, grpc, memory, file, pipe, http).
     #[serde(rename = "type", default)]
     pub transport_type: TransportType,
 
@@ -248,15 +245,6 @@ pub struct TransportConfig {
     #[cfg(not(feature = "transport-http"))]
     #[serde(default, skip)]
     pub http: Option<()>,
-
-    /// Redis/Valkey Streams transport configuration.
-    #[cfg(feature = "transport-redis")]
-    #[serde(default)]
-    pub redis: Option<super::redis_transport::RedisTransportConfig>,
-
-    #[cfg(not(feature = "transport-redis"))]
-    #[serde(default, skip)]
-    pub redis: Option<()>,
 }
 
 #[cfg(test)]

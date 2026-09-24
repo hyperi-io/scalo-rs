@@ -843,8 +843,6 @@ mod tests {
         assert_schema_is_ascii::<crate::dlq::DlqRouting>();
         #[cfg(feature = "dlq-http")]
         assert_schema_is_ascii::<crate::dlq::HttpDlqConfig>();
-        #[cfg(feature = "dlq-redis")]
-        assert_schema_is_ascii::<crate::dlq::RedisDlqConfig>();
         #[cfg(feature = "geoip-download")]
         assert_schema_is_ascii::<crate::geoip_download::GeoIpConfig>();
         #[cfg(feature = "memory")]

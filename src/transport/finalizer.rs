@@ -15,7 +15,7 @@
 //! partial success silently loses the un-delivered pieces on the next restart.
 //!
 //! A [`BatchFinalizer`] is created once per input batch with a callback that
-//! performs the source ack (commit the offsets / XACK / advance the cursor).
+//! performs the source ack (commit the offsets / advance the cursor).
 //! Each fanned-out piece takes a [`PieceFinalizer`] handle and, when its send
 //! resolves, reports a [`DeliveryStatus`]. The finalizer:
 //!

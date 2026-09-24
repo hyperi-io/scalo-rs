@@ -57,7 +57,7 @@ flowchart TB
     end
 
     subgraph Pipeline["Pipeline"]
-        T["Transport (Kafka/gRPC/HTTP/Redis/...)"]
+        T["Transport (Kafka/gRPC/HTTP/...)"]
         TF["TransportFilterEngine"]
         TS["TieredSink"]
         SPL["Spool"]
@@ -126,7 +126,7 @@ Section landing: [runtime/README.md](runtime/README.md)
 ### Transport
 
 - [transport/README.md](transport/README.md) - trait architecture, factory, `AnySender`, commit tokens
-- [transport/backends.md](transport/backends.md) - Kafka, gRPC, Memory, File, Pipe, HTTP, Redis
+- [transport/backends.md](transport/backends.md) - Kafka, gRPC, Memory, File, Pipe, HTTP
 - [transport/filter-engine.md](transport/filter-engine.md) - 3-tier filter (SIMD / compiled CEL / complex CEL)
 - [transport/routing.md](transport/routing.md) - `RoutedSender`, the named sink set: routes, fan-out
 
@@ -147,7 +147,7 @@ Section landing: [pipeline/README.md](pipeline/README.md)
 - [pipeline/worker-pool.md](pipeline/worker-pool.md) - `AdaptiveWorkerPool`, pressure-based scaling
 - [pipeline/tiered-sink.md](pipeline/tiered-sink.md) - resilient delivery, disk spillover, circuit breaker
 - [pipeline/sink-stack.md](pipeline/sink-stack.md) - outbound control stack: timeout / load-shed / concurrency / retry / rate-limit
-- [pipeline/dlq.md](pipeline/dlq.md) - file, Kafka, HTTP, Redis backends
+- [pipeline/dlq.md](pipeline/dlq.md) - file, Kafka, HTTP backends
 - [pipeline/spool.md](pipeline/spool.md) - disk-backed async FIFO (yaque)
 - [pipeline/strmatch.md](pipeline/strmatch.md) - 4-tier regex->fast-path matcher (Byte / Literal / LiteralSet / Regex)
 - [pipeline/scaling.md](pipeline/scaling.md) - `ScalingPressure`, KEDA external scaler signal

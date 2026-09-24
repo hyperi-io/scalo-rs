@@ -24,7 +24,6 @@ use super::error::DlqError;
 /// - [`Self::File`] -- always available
 /// - [`Self::Kafka`] -- `dlq-kafka` feature
 /// - [`Self::Http`] -- `dlq-http` feature
-/// - [`Self::Redis`] -- `dlq-redis` feature
 ///
 /// Each variant's inner struct lives in its sibling module
 /// (`file::FileDlqInner`, `kafka::KafkaDlqInner`, etc.). They are
@@ -42,10 +41,6 @@ pub enum DlqBackend {
     /// HTTP POST backend.
     #[cfg(feature = "dlq-http")]
     Http(super::http::HttpDlqInner),
-
-    /// Redis Streams backend.
-    #[cfg(feature = "dlq-redis")]
-    Redis(super::redis_dlq::RedisDlqInner),
 }
 
 impl std::fmt::Debug for DlqBackend {
@@ -70,8 +65,6 @@ impl DlqBackend {
             Self::Kafka(b) => b.send_batch(batch).await,
             #[cfg(feature = "dlq-http")]
             Self::Http(b) => b.send_batch(batch).await,
-            #[cfg(feature = "dlq-redis")]
-            Self::Redis(b) => b.send_batch(batch).await,
         }
     }
 
@@ -90,7 +83,6 @@ impl DlqBackend {
     ///   message is acked by the broker (per the producer's acks
     ///   config). The real durability semantic.
     /// - **HTTP**: no-op. `send_batch` already awaits the response.
-    /// - **Redis**: no-op. `send_batch` already awaits the XADD pipeline.
     ///
     /// # Errors
     ///
@@ -103,8 +95,6 @@ impl DlqBackend {
             Self::Kafka(b) => b.flush_durable().await,
             #[cfg(feature = "dlq-http")]
             Self::Http(_) => Ok(()),
-            #[cfg(feature = "dlq-redis")]
-            Self::Redis(_) => Ok(()),
         }
     }
 
@@ -117,8 +107,6 @@ impl DlqBackend {
             Self::Kafka(_) => "kafka",
             #[cfg(feature = "dlq-http")]
             Self::Http(_) => "http",
-            #[cfg(feature = "dlq-redis")]
-            Self::Redis(_) => "redis",
         }
     }
 }

@@ -2,7 +2,7 @@
 
 The transport filter engine drops or DLQs messages on the way in or
 the way out of every transport — Kafka, gRPC, Memory, File, Pipe,
-HTTP, Redis — before they reach app code. It's embedded in every
+HTTP — before they reach app code. It's embedded in every
 backend, zero-cost when no rules are configured, and tiered so the
 common case (field-presence or equality on a top-level field) runs at
 ~50-100 ns per message without invoking the CEL engine at all.
@@ -256,7 +256,6 @@ its own config section's `filters_in` / `filters_out` plus the global
 | File | [src/transport/file.rs](../../src/transport/file.rs) |
 | Pipe | [src/transport/pipe.rs](../../src/transport/pipe.rs) |
 | HTTP | [src/transport/http.rs](../../src/transport/http.rs) |
-| Redis | [src/transport/redis_transport.rs](../../src/transport/redis_transport.rs) |
 
 The engine is a no-op when both filter vectors are empty — there's no
 per-message overhead beyond the inlined `has_*_filters` check.

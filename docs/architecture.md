@@ -16,12 +16,12 @@ flowchart TB
         SK["sink-stack<br/>timeout / load-shed / concurrency / retry / rate-limit"]
         BE["worker-batch<br/>BatchEngine"]
         WP["worker-pool<br/>AdaptiveWorkerPool"]
-        DLQ["dlq + kafka / http / redis backends"]
+        DLQ["dlq + kafka / http backends"]
         SPL["spool"]
     end
 
     subgraph L3["L3 - Transport and I/O"]
-        T["transport<br/>Kafka / gRPC / Memory / File / Pipe / HTTP / Redis"]
+        T["transport<br/>Kafka / gRPC / Memory / File / Pipe / HTTP"]
         TF["transport-filter<br/>3-tier filter engine"]
         HS["http-server (axum)"]
         HC["http (reqwest)"]
@@ -103,7 +103,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 
 | Module | Feature | Purpose |
 |--------|---------|---------|
-| `transport` | `transport`, `transport-{kafka,grpc,memory,file,pipe,http,redis}` | Trait architecture (`TransportBase`, `TransportSender`, `TransportReceiver`, `Transport`), `AnySender` enum dispatch, factory |
+| `transport` | `transport`, `transport-{kafka,grpc,memory,file,pipe,http}` | Trait architecture (`TransportBase`, `TransportSender`, `TransportReceiver`, `Transport`), `AnySender` enum dispatch, factory |
 | `transport::filter` | `transport` | 3-tier engine (SIMD field ops / compiled CEL / complex CEL) embedded in every backend |
 | `http_server` | `http-server` | axum-based server, probe wiring, `/config` / `/metrics` / `/metrics/manifest` mount points |
 | `http_client` | `http` | `reqwest` + `reqwest-middleware` + `reqwest-retry` |
@@ -120,7 +120,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | `sink_stack` | `sink-stack` | Outbound control stack - composes timeout, load-shed, concurrency-limit, retry/backoff and rate-limit around a transport sender (tower `ServiceBuilder`); preserves at-least-once |
 | `worker::pool` | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio), pressure-based scaling |
 | `worker::engine` | `worker-batch` | `BatchEngine` - SIMD parse (`sonic-rs`), pre-route filter, field interning |
-| `dlq` | `dlq`, `dlq-kafka`, `dlq-http`, `dlq-redis` | DLQ sink with file always available, Kafka/HTTP/Redis backends opt-in |
+| `dlq` | `dlq`, `dlq-kafka`, `dlq-http` | DLQ sink with file always available, Kafka/HTTP backends opt-in |
 
 ### L5 - App scaffolding
 

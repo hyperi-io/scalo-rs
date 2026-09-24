@@ -73,8 +73,8 @@ but it WAS handled -- so its commit token must still fire. The filter carries
 those tokens (`FilteredBatch.filtered_tokens`, flowed into
 `WorkBatch.commit_tokens`) so the block commit advances the source past them.
 Drop the token instead and an all-filtered stretch FREEZES the Kafka offset
-(replay storm + phantom KEDA lag on restart) and LEAKS the Redis
-consumer-group PEL forever. Handled == committed, even when nothing passed.
+(replay storm + phantom KEDA lag on restart). Handled == committed, even when
+nothing passed.
 
 ---
 

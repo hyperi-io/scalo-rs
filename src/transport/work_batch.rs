@@ -95,7 +95,7 @@ pub struct Record {
     /// Raw payload bytes -- zero-copy / refcounted.
     pub payload: Bytes,
 
-    /// Routing destination (Kafka topic, gRPC routing key, Redis stream, ...).
+    /// Routing destination (Kafka topic, gRPC routing key, ...).
     ///
     /// NOT a Kafka message/partition key -- scalo does not model per-record
     /// partition keys at this layer. The field stays named `key` because

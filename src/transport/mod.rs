@@ -37,7 +37,6 @@
 //! | **File** | Yes | Yes | Debugging, audit trails, replay |
 //! | **Pipe** | Yes | Yes | Unix pipelines, sidecar pattern |
 //! | **HTTP** | Yes | Yes | Webhook delivery, REST ingest |
-//! | **Redis** | Yes | Yes | Edge deployments, lightweight pub/sub |
 //!
 //! ## Example
 //!
@@ -86,9 +85,6 @@ pub mod file;
 #[cfg(feature = "transport-http")]
 pub mod http;
 
-#[cfg(feature = "transport-redis")]
-pub mod redis_transport;
-
 pub mod routed;
 
 // Re-exports -- traits and factory
@@ -124,6 +120,3 @@ pub use file::{FileToken, FileTransport, FileTransportConfig};
 
 #[cfg(feature = "transport-http")]
 pub use http::{HttpToken, HttpTransport, HttpTransportConfig};
-
-#[cfg(feature = "transport-redis")]
-pub use redis_transport::{RedisToken, RedisTransport, RedisTransportConfig};
