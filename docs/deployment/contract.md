@@ -297,14 +297,19 @@ source.
 | Function | Cascade key | Default |
 |----------|-------------|---------|
 | `image_registry_from_cascade()` | `deployment.image_registry` | `ghcr.io/hyperi-io` |
-| `base_image_from_cascade()` | `deployment.base_image` | `debian:trixie-slim` |
+| `base_image_from_cascade()` | `deployment.base_image` | `debian:trixie-slim@sha256:...` (`DEFAULT_BASE_IMAGE`) |
 | `resolve_base_distro(base_image)` | `deployment.base_distro` | derived from `base_image` |
 | `argocd_repo_url_from_cascade(app)` | `deployment.argocd.repo_url` | `https://github.com/hyperi-io/<app>` |
 
+The default base image is pinned to its multi-arch index digest, so every build
+of one scalo release gets the same bytes. Renovate moves the digest.
+
 Overriding `base_image`? Keep `glibc(runtime) >= glibc(build host)` and
 stay off musl (alpine) -- see [native-deps.md](native-deps.md#glibc-keep-runtime--build).
-Pinning it to a digest? Set `base_distro` too - runtime package names are
-release-specific and a digest carries no codename.
+Pin it by digest too, as anything shipped must be. Keep the tag beside the
+digest (`image:tag@sha256:...`) so the release still derives, or set
+`base_distro` - runtime package names are release-specific and a digest-only
+reference carries no codename.
 
 ---
 

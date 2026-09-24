@@ -68,13 +68,13 @@ use std::process::Command;
 use std::time::Duration;
 
 use scalo::deployment::test_support::{
-    docker_available, docker_empty_creds_json, docker_host, ensure_kind_cluster, helm_available,
-    kubeconform_available, skip, tier_b_enabled, wait_until,
+    docker_available, docker_empty_creds_json, docker_host, ensure_kind_cluster,
+    hadolint_available, helm_available, kubeconform_available, skip, tier_b_enabled, wait_until,
 };
 use scalo::deployment::{
     ArgocdConfig, ContractIdentity, DeploymentContract, HealthContract, ImageProfile,
     KafkaLagTrigger, KedaContract, OciLabels, PortContract, generate_argocd_application,
-    generate_chart, generate_dockerfile,
+    generate_chart, generate_dockerfile, generate_runtime_stage,
 };
 
 // ============================================================================
@@ -232,6 +232,22 @@ impl Drop for BuiltImage {
     }
 }
 
+/// `USER` is numeric, so the image's uid must still resolve to `appuser` and
+/// its own group, or file ownership inside the image is wrong.
+fn assert_runs_as_appuser(image: &BuiltImage) {
+    let id = image
+        .docker()
+        .args(["run", "--rm", "--entrypoint", "id", &image.tag])
+        .output()
+        .expect("docker run invocation");
+    let stdout = String::from_utf8_lossy(&id.stdout);
+    assert!(
+        id.status.success() && stdout.starts_with("uid=1000(appuser) gid=1000(appuser)"),
+        "image does not run as appuser: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&id.stderr),
+    );
+}
+
 #[test]
 fn tier_a_dockerfile_builds_and_image_runs() {
     if !docker_available() {
@@ -270,6 +286,7 @@ fn tier_a_dockerfile_builds_and_image_runs() {
         stdout.contains("hyperi-contract-test: ok"),
         "container ran but did not produce expected output: stdout={stdout} stderr={stderr}",
     );
+    assert_runs_as_appuser(&image);
 
     let inspect = image
         .docker()
@@ -346,6 +363,56 @@ fn tier_a_dockerfile_with_native_deps_builds() {
             listed.contains(so),
             "{so} missing from the runtime image -- the package installed but the \
              shared object is not there: {listed}",
+        );
+    }
+    assert_runs_as_appuser(&image);
+}
+
+// ============================================================================
+// Tier A -- Dockerfile lint: hadolint
+// ============================================================================
+
+/// hadolint gates the build under the container standard, so the generated
+/// Dockerfile and runtime fragment must lint clean with no config relaxing it.
+/// The contract carries native deps so the apt block, the one with a pragma,
+/// is in the output.
+#[test]
+fn tier_a_generated_dockerfiles_lint_clean() {
+    if !hadolint_available() {
+        skip(
+            "tier-a",
+            "tier_a_generated_dockerfiles_lint_clean",
+            "hadolint not installed",
+        );
+        return;
+    }
+
+    let mut contract = test_contract();
+    contract.base_image = scalo::deployment::DEFAULT_BASE_IMAGE.to_string();
+    contract.native_deps = scalo::deployment::NativeDepsContract::for_features(
+        &["transport-kafka", "spool"],
+        scalo::deployment::DEFAULT_BASE_DISTRO,
+    );
+
+    // Run from an empty directory so no .hadolint.yaml in the checkout applies.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (file, text) in [
+        ("Dockerfile", generate_dockerfile(&contract, None)),
+        ("Dockerfile.runtime", generate_runtime_stage(&contract)),
+    ] {
+        let path = dir.path().join(file);
+        std::fs::write(&path, &text).expect("write Dockerfile");
+        let lint = Command::new("hadolint")
+            .arg("--no-color")
+            .arg(&path)
+            .current_dir(dir.path())
+            .output()
+            .expect("hadolint invocation");
+        let findings = String::from_utf8_lossy(&lint.stdout);
+        assert!(
+            lint.status.success() && findings.trim().is_empty(),
+            "hadolint findings on generated {file}:\n{findings}{}\n{text}",
+            String::from_utf8_lossy(&lint.stderr),
         );
     }
 }

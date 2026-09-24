@@ -457,11 +457,11 @@ pub struct SecretEnvContract {
 }
 
 fn default_base_image() -> String {
-    "debian:trixie-slim".to_string()
+    super::DEFAULT_BASE_IMAGE.to_string()
 }
 
 fn default_image_registry() -> String {
-    "ghcr.io/hyperi-io".to_string()
+    super::DEFAULT_IMAGE_REGISTRY.to_string()
 }
 
 fn default_protocol() -> String {
