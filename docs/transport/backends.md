@@ -108,6 +108,7 @@ transport:
 - **Cancellation safety**: `recv` reads from an internal mpsc, safe
   to drop. `send` is a single unary RPC — drop cancels cleanly.
 - **Send failures**: `Unavailable`, `ResourceExhausted`, `DeadlineExceeded` (`send_timeout_ms`), and a connection that fails before the server answers are `Backpressured`, so an absent or restarting receiver is waited out. Any other status the server returns is `Fatal`.
+- **Message-size ceiling**: `max_message_size` bounds the encoded request, measured uncompressed, as the receiver's decoder measures it. `send` returns `FilteredDlq` for a record over it without making the RPC, and for a record the receiver refuses with `OutOfRange` (its limit is lower, or gzip grew the frame past it). `send_batch` returns `Fatal` naming the limit for a block over it; send a smaller block.
 - **`is_healthy()`**: `AtomicBool`, also emits `dfe_transport_healthy{transport="grpc"}`
   gauge on every read.
 - **`commit()`**: no-op — gRPC has no persistence to advance.

@@ -84,10 +84,12 @@ pub struct GrpcTransport {
     /// Per-RPC send deadline (milliseconds, 0 = none).
     send_timeout_ms: u64,
 
-    /// tonic's max encoded message size. A batch over this fails the RPC with
-    /// an unretryable `OutOfRange`; we pre-check against it to reject early with
-    /// an actionable error instead.
+    /// Largest encoded message `send` and `send_batch` put on the wire,
+    /// measured uncompressed, as the receiver's decoder measures it.
     max_message_size: usize,
+
+    /// Address the receive server bound (None if client-only mode).
+    local_addr: Option<std::net::SocketAddr>,
 
     /// In-flight send count (for metrics).
     #[cfg(feature = "metrics")]
@@ -194,6 +196,7 @@ impl GrpcTransport {
         let mut receiver = None;
         let mut shutdown_tx = None;
         let mut server_handle = None;
+        let mut local_addr = None;
         let sequence = Arc::new(AtomicU64::new(0));
 
         // Set up client (lazy connection -- doesn't fail until first RPC)
@@ -211,9 +214,10 @@ impl GrpcTransport {
 
             let channel = ep.connect_lazy();
 
+            // No encoding limit: tonic's refusal arrives as a stream reset that
+            // reads as an outage, so send and send_batch check the size instead.
             let mut c = proto::transport_client::TransportClient::new(channel)
-                .max_decoding_message_size(config.max_message_size)
-                .max_encoding_message_size(config.max_message_size);
+                .max_decoding_message_size(config.max_message_size);
 
             if config.compression {
                 c = c
@@ -277,6 +281,9 @@ impl GrpcTransport {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| TransportError::Config(format!("failed to bind {addr}: {e}")))?;
+            local_addr = Some(listener.local_addr().map_err(|e| {
+                TransportError::Config(format!("cannot read the address bound for {addr}: {e}"))
+            })?);
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
             let handle = tokio::spawn(async move {
@@ -327,11 +334,71 @@ impl GrpcTransport {
             recv_timeout_ms: config.recv_timeout_ms,
             send_timeout_ms: config.send_timeout_ms,
             max_message_size: config.max_message_size,
+            local_addr,
             #[cfg(feature = "metrics")]
             inflight: AtomicU64::new(0),
             filter_engine,
         })
     }
+
+    /// The address the receive server is listening on, or `None` in
+    /// client-only mode.
+    ///
+    /// With `listen` set to port 0 this is where the OS-assigned port is read
+    /// back.
+    #[must_use]
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr
+    }
+}
+
+/// Build the `Push` body for one record, metadata included, so its encoded
+/// length is the length tonic checks against `max_message_size`.
+fn push_request(destination: &str, payload: bytes::Bytes) -> proto::PushRequest {
+    let mut metadata = HashMap::new();
+    if !destination.is_empty() {
+        metadata.insert("topic".to_string(), destination.to_string());
+    }
+
+    // Inject W3C traceparent into gRPC metadata.
+    #[cfg(feature = "transport-trace")]
+    if let Some(tp) = super::propagation::current_traceparent() {
+        metadata.insert(super::propagation::TRACEPARENT_HEADER.to_string(), tp);
+    }
+
+    proto::PushRequest {
+        // proto field is `Bytes` (`.bytes(".")` in build.rs) -- move, no copy.
+        payload,
+        format: proto::Format::Auto.into(),
+        metadata,
+    }
+}
+
+/// Whether the receiver's decoder refused the message as over its
+/// `max_message_size`.
+fn refused_for_size(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::OutOfRange
+}
+
+/// The send result for one record over the message-size ceiling: dead-letter
+/// it, because the same bytes are refused on every retry.
+fn too_large_result(
+    destination: &str,
+    encoded_len: usize,
+    limit: usize,
+    detail: &str,
+) -> SendResult {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("transport_message_too_large_total", "transport" => "grpc").increment(1);
+    tracing::warn!(
+        destination,
+        encoded_len,
+        limit,
+        detail,
+        "gRPC: record exceeds max_message_size -- dead-lettering it; raise max_message_size \
+         on the sender and the receiver together"
+    );
+    SendResult::FilteredDlq
 }
 
 /// Whether a failed RPC means the server is down or busy rather than refusing
@@ -383,27 +450,24 @@ impl TransportSender for GrpcTransport {
             ));
         };
 
-        let mut metadata = HashMap::new();
-        if !destination.is_empty() {
-            metadata.insert("topic".to_string(), destination.to_string());
-        }
-
-        // Inject W3C traceparent into gRPC metadata.
-        #[cfg(feature = "transport-trace")]
-        if let Some(tp) = super::propagation::current_traceparent() {
-            metadata.insert(super::propagation::TRACEPARENT_HEADER.to_string(), tp);
-        }
-
         // Capture wire size before `payload` moves into the request.
         #[cfg(feature = "metrics")]
         let payload_len = payload.len();
 
-        let mut request = tonic::Request::new(proto::PushRequest {
-            // proto field is `Bytes` (`.bytes(".")` in build.rs) -- move, no copy.
-            payload,
-            format: proto::Format::Auto.into(),
-            metadata,
-        });
+        // Checked uncompressed, as the receiver decompresses to this limit and
+        // answers a compressed over-limit record with ResourceExhausted.
+        let body = push_request(destination, payload);
+        let encoded_len = prost::Message::encoded_len(&body);
+        if encoded_len > self.max_message_size {
+            return too_large_result(
+                destination,
+                encoded_len,
+                self.max_message_size,
+                "refused before sending",
+            );
+        }
+
+        let mut request = tonic::Request::new(body);
 
         // Bound the RPC so a hung/black-holing server cannot wedge the sender
         // task forever. Sent as the grpc-timeout header.
@@ -428,6 +492,14 @@ impl TransportSender for GrpcTransport {
                 }
                 SendResult::Ok
             }
+            // The receiver's limit can be below ours, and gzip can grow an
+            // at-limit record past it.
+            Err(status) if refused_for_size(&status) => too_large_result(
+                destination,
+                encoded_len,
+                self.max_message_size,
+                status.message(),
+            ),
             Err(status) => failed_rpc_result(&status),
         };
 
@@ -502,24 +574,24 @@ impl TransportSender for GrpcTransport {
         }
         let sent_count = to_send.len();
 
-        // Reject an oversized block early with an actionable error. Over
-        // max_message_size, tonic fails with an opaque OutOfRange that maps to
-        // Fatal and can never succeed on retry; the fix is a smaller block, so
-        // name the limit and point at the byte-budget lever. Payload-only bound
-        // (proto framing adds a little); tonic still backstops the margin.
+        #[cfg(feature = "metrics")]
         let payload_bytes: usize = to_send.iter().map(|r| r.payload.len()).sum();
-        if payload_bytes > self.max_message_size {
+
+        // Map records -> proto Batch. Payloads are MOVED (Bytes handle), opaque.
+        let proto_batch = batch::records_to_proto(to_send);
+
+        // An over-limit block never succeeds on retry and the fix is a smaller
+        // one, so name the limit and the byte-budget lever; checked like `send`.
+        let encoded_len = prost::Message::encoded_len(&proto_batch);
+        if encoded_len > self.max_message_size {
             #[cfg(feature = "metrics")]
             metrics::counter!("transport_oversize_total", "transport" => "grpc").increment(1);
             return SendResult::Fatal(TransportError::Config(format!(
-                "gRPC batch payload {payload_bytes} bytes exceeds max_message_size \
+                "gRPC batch of {encoded_len} encoded bytes exceeds max_message_size \
                  {} -- lower the self-regulation byte budget below the gRPC limit",
                 self.max_message_size
             )));
         }
-
-        // Map records -> proto Batch. Payloads are MOVED (Bytes handle), opaque.
-        let proto_batch = batch::records_to_proto(to_send);
 
         let mut request = tonic::Request::new(proto_batch);
 
@@ -1203,5 +1275,241 @@ mod tests {
                 "{status:?} is the server's answer and should stay fatal"
             );
         }
+    }
+
+    const LIMIT: usize = 1024;
+
+    fn filled(len: usize) -> bytes::Bytes {
+        bytes::Bytes::from(vec![b'x'; len])
+    }
+
+    fn encoded_len(destination: &str, payload_len: usize) -> usize {
+        prost::Message::encoded_len(&push_request(destination, filled(payload_len)))
+    }
+
+    /// The payload length whose `Push` body encodes to exactly `limit` bytes.
+    fn payload_len_encoding_to(destination: &str, limit: usize) -> usize {
+        let len = (0..=limit)
+            .rev()
+            .find(|&n| encoded_len(destination, n) == limit)
+            .expect("some payload length encodes to the limit");
+        assert_eq!(encoded_len(destination, len + 1), limit + 1);
+        len
+    }
+
+    /// A scalo receive server on an OS-assigned loopback port, and its URI.
+    async fn receiver(config: GrpcConfig) -> (GrpcTransport, String) {
+        let server = GrpcTransport::new(&config).await.unwrap();
+        let addr = server.local_addr().expect("server mode binds a listener");
+        (server, format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn a_record_over_the_limit_is_dead_lettered_and_one_at_it_is_sent() {
+        let (server, endpoint) =
+            receiver(GrpcConfig::server("127.0.0.1:0").with_max_message_size(LIMIT)).await;
+        let client =
+            GrpcTransport::new(&GrpcConfig::client(&endpoint).with_max_message_size(LIMIT))
+                .await
+                .unwrap();
+        let at = payload_len_encoding_to("events", LIMIT);
+
+        let over = client.send("events", filled(at + 1)).await;
+        assert!(
+            over.is_filtered_dlq(),
+            "one byte over the limit: got {over:?}"
+        );
+        let at_limit = client.send("events", filled(at)).await;
+        assert!(at_limit.is_ok(), "exactly at the limit: got {at_limit:?}");
+
+        let got = server.recv(10).await.unwrap().records;
+        assert_eq!(
+            got.len(),
+            1,
+            "only the at-limit record reaches the receiver"
+        );
+        assert_eq!(got[0].payload.len(), at);
+
+        client.close().await.unwrap();
+        server.close().await.unwrap();
+    }
+
+    /// Compressed, an over-limit record is small on the wire and the receiver
+    /// refuses it while decompressing, with ResourceExhausted, which reads as
+    /// busy.
+    #[tokio::test]
+    async fn a_compressed_record_over_the_limit_is_dead_lettered() {
+        let (server, endpoint) = receiver(
+            GrpcConfig::server("127.0.0.1:0")
+                .with_max_message_size(LIMIT)
+                .with_compression(),
+        )
+        .await;
+        let client = GrpcTransport::new(
+            &GrpcConfig::client(&endpoint)
+                .with_max_message_size(LIMIT)
+                .with_compression(),
+        )
+        .await
+        .unwrap();
+        let at = payload_len_encoding_to("events", LIMIT);
+
+        let over = client.send("events", filled(4 * LIMIT)).await;
+        assert!(
+            over.is_filtered_dlq(),
+            "compressible, over the limit: got {over:?}"
+        );
+        let at_limit = client.send("events", filled(at)).await;
+        assert!(
+            at_limit.is_ok(),
+            "compressed, at the limit: got {at_limit:?}"
+        );
+
+        let got = server.recv(10).await.unwrap().records;
+        assert_eq!(
+            got.len(),
+            1,
+            "only the at-limit record reaches the receiver"
+        );
+        assert_eq!(got[0].payload.len(), at);
+
+        client.close().await.unwrap();
+        server.close().await.unwrap();
+    }
+
+    /// Bytes gzip cannot shrink (xorshift output), so compressing them grows
+    /// the frame by gzip's own framing.
+    fn incompressible(len: usize) -> bytes::Bytes {
+        let mut state: u32 = 0x9e37_79b9;
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        bytes.into()
+    }
+
+    /// An at-limit record gzip cannot shrink compresses past the limit, and
+    /// is refused for its size rather than retried as an outage.
+    #[tokio::test]
+    async fn a_record_that_compresses_past_the_limit_is_dead_lettered() {
+        let (server, endpoint) = receiver(
+            GrpcConfig::server("127.0.0.1:0")
+                .with_max_message_size(LIMIT)
+                .with_compression(),
+        )
+        .await;
+        let client = GrpcTransport::new(
+            &GrpcConfig::client(&endpoint)
+                .with_max_message_size(LIMIT)
+                .with_compression(),
+        )
+        .await
+        .unwrap();
+        let at = payload_len_encoding_to("events", LIMIT);
+
+        let grown = client.send("events", incompressible(at)).await;
+        assert!(
+            grown.is_filtered_dlq(),
+            "compressed past the limit: got {grown:?}"
+        );
+        let fits = client.send("events", incompressible(LIMIT / 2)).await;
+        assert!(fits.is_ok(), "compressed within the limit: got {fits:?}");
+
+        let got = server.recv(10).await.unwrap().records;
+        assert_eq!(got.len(), 1, "only the record within the limit arrives");
+        assert_eq!(got[0].payload.len(), LIMIT / 2);
+
+        client.close().await.unwrap();
+        server.close().await.unwrap();
+    }
+
+    /// A block whose payloads fit but whose framing does not is refused before
+    /// the RPC; compressed, the receiver would answer ResourceExhausted.
+    #[tokio::test]
+    async fn a_batch_over_the_limit_by_its_framing_alone_is_refused() {
+        let (server, endpoint) = receiver(
+            GrpcConfig::server("127.0.0.1:0")
+                .with_max_message_size(LIMIT)
+                .with_compression(),
+        )
+        .await;
+        let client = GrpcTransport::new(
+            &GrpcConfig::client(&endpoint)
+                .with_max_message_size(LIMIT)
+                .with_compression(),
+        )
+        .await
+        .unwrap();
+        let record = Record {
+            payload: filled(LIMIT - 2),
+            key: None,
+            headers: Vec::new(),
+            metadata: crate::transport::work_batch::RecordMeta {
+                timestamp_ms: None,
+                format: PayloadFormat::Json,
+            },
+        };
+
+        match client.send_batch(&[record]).await {
+            SendResult::Fatal(e) => assert!(
+                e.to_string().contains("max_message_size"),
+                "error should name the limit, got: {e}"
+            ),
+            other => panic!("expected Fatal for a block over the limit, got {other:?}"),
+        }
+        assert!(server.recv(10).await.unwrap().records.is_empty());
+
+        client.close().await.unwrap();
+        server.close().await.unwrap();
+    }
+
+    /// A receiver configured below the sender refuses what the sender allows.
+    #[tokio::test]
+    async fn a_receiver_with_a_lower_limit_dead_letters_the_record() {
+        let (server, endpoint) =
+            receiver(GrpcConfig::server("127.0.0.1:0").with_max_message_size(LIMIT / 2)).await;
+        let client =
+            GrpcTransport::new(&GrpcConfig::client(&endpoint).with_max_message_size(LIMIT))
+                .await
+                .unwrap();
+
+        let refused = client.send("events", filled(LIMIT - 100)).await;
+        assert!(
+            refused.is_filtered_dlq(),
+            "over the receiver's limit only: got {refused:?}"
+        );
+        let small = client.send("events", filled(16)).await;
+        assert!(small.is_ok(), "the sender carries on: got {small:?}");
+
+        client.close().await.unwrap();
+        server.close().await.unwrap();
+    }
+
+    /// An outage stays backpressure at the limit; over it, the record is
+    /// refused without reaching for the network.
+    #[tokio::test]
+    async fn a_down_receiver_is_backpressure_and_an_over_limit_record_is_still_dead_lettered() {
+        let addr = dying_endpoint(false).await;
+        let client = GrpcTransport::new(
+            &GrpcConfig::client(&format!("http://{addr}")).with_max_message_size(LIMIT),
+        )
+        .await
+        .unwrap();
+        let at = payload_len_encoding_to("events", LIMIT);
+
+        let at_limit = client.send("events", filled(at)).await;
+        assert!(
+            at_limit.is_backpressured(),
+            "at the limit, receiver down: got {at_limit:?}"
+        );
+        let over = client.send("events", filled(at + 1)).await;
+        assert!(
+            over.is_filtered_dlq(),
+            "over the limit, receiver down: got {over:?}"
+        );
     }
 }
