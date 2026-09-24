@@ -79,10 +79,10 @@ impl DlqBackend {
     ///   only flushes to the kernel page cache, so power loss before
     ///   write-back can still lose data. Limitation, tracked until
     ///   `file-rotate` exposes a sync hook.
-    /// - **Kafka**: waits on the blocking pool, up to 30 s, for the broker
-    ///   to ack every queued entry (per the producer's `acks` config), then
-    ///   purges what is left and counts the entries only Kafka held that
-    ///   the broker refused or never acked.
+    /// - **Kafka**: waits on the blocking pool, up to `kafka.send_timeout_ms`,
+    ///   for the broker to ack every queued entry (per the producer's `acks`
+    ///   config), then purges what is left and counts the entries only Kafka
+    ///   held that the broker refused or never acked.
     /// - **HTTP**: no-op. `send_batch` already awaits the response.
     ///
     /// # Errors
@@ -137,6 +137,20 @@ impl DlqBackend {
             Self::File(_) => 0,
             #[cfg(feature = "dlq-kafka")]
             Self::Kafka(b) => b.take_durable_losses(),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => 0,
+        }
+    }
+
+    /// Entries still in this backend's hands whose fate is unknown, handed
+    /// over as lost when the drain closes. Only Kafka holds entries past a
+    /// write.
+    #[allow(clippy::match_same_arms, reason = "only Kafka holds past a write")]
+    pub(crate) fn take_unconfirmed(&mut self) -> u64 {
+        match self {
+            Self::File(_) => 0,
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => b.take_unconfirmed(),
             #[cfg(feature = "dlq-http")]
             Self::Http(_) => 0,
         }

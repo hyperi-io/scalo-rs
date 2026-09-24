@@ -28,9 +28,11 @@
 //! ## Shutdown
 //!
 //! On `CancellationToken::cancel()` the drain finishes its in-flight
-//! batch, drains the queue, then exits. Use [`Dlq::shutdown`] for
-//! graceful join. Dropping all `Dlq` handles also triggers a clean
-//! exit (channel closes, drain drains, then exits).
+//! batch, drains the queue, waits for the Kafka backend's acks as a
+//! `flush` would, counts in [`Dlq::dropped`] what nothing confirmed, then
+//! exits. Use [`Dlq::shutdown`] for graceful join. Dropping all `Dlq`
+//! handles also triggers a clean exit (channel closes, drain drains,
+//! then exits).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,12 +96,11 @@ fn drop_log_due(last_epoch_ms: &AtomicU64, min_interval_ms: u64) -> bool {
     )
     .unwrap_or(u64::MAX);
     let last = last_epoch_ms.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= min_interval_ms {
-        last_epoch_ms.store(now, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
+    // A racer that read the same `last` fails the exchange, so one caller claims the window.
+    now.saturating_sub(last) >= min_interval_ms
+        && last_epoch_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
 }
 
 impl std::fmt::Debug for Dlq {
@@ -242,8 +243,8 @@ impl Dlq {
     }
 
     /// Total entries dropped since spawn: queue overflow, sends into a
-    /// disabled DLQ, batches every backend refused, and entries a flush
-    /// found only Kafka held and lost.
+    /// disabled DLQ, batches every backend refused, and entries only Kafka
+    /// held that a flush or the shutdown found lost or never acked.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.sink.as_ref().map_or(0, BackgroundSink::dropped) + self.lost.load(Ordering::Relaxed)
@@ -304,18 +305,19 @@ impl Dlq {
     ///
     /// `Ok` means every batch the drain wrote since the previous flush was
     /// accepted by a backend. For the Kafka backend accepted means acked by
-    /// the broker: the flush waits up to 30 s for that, off the runtime, and
-    /// entries only Kafka held that were refused or never acked count as
-    /// refused. A refused batch is reported by the first flush after it and
-    /// not again; it is also counted in [`Dlq::dropped`]. What "accepted"
-    /// means per backend is in `docs/pipeline/dlq.md`.
+    /// the broker: the flush waits up to `kafka.send_timeout_ms` for that,
+    /// off the runtime, and entries only Kafka held that were refused or
+    /// never acked count as refused. A refused batch is reported by the
+    /// first flush after it and not again; it is also counted in
+    /// [`Dlq::dropped`]. What "accepted" means per backend is in
+    /// `docs/pipeline/dlq.md`.
     ///
     /// # Errors
     ///
     /// `File` if every backend refused a batch written since the previous
-    /// flush, whether the write was size-, tick- or barrier-triggered, or
-    /// the Kafka backend lost entries no other backend holds. `Closed` if
-    /// the drain has exited before this barrier was processed.
+    /// flush, whether the write was size-, tick- or barrier-triggered.
+    /// `Kafka` if the Kafka backend lost entries no other backend holds.
+    /// `Closed` if the drain has exited before this barrier was processed.
     pub async fn flush(&self) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
             return Ok(());
@@ -327,6 +329,12 @@ impl Dlq {
     /// exits), then await the drain. Cancelling here rather than only
     /// awaiting the join is what stops `shutdown` hanging when the
     /// caller has not separately cancelled the token passed to `spawn`.
+    ///
+    /// Before it exits the drain waits for the Kafka backend's acks, up to
+    /// `kafka.send_timeout_ms` plus 5 s when it has to purge, and counts
+    /// the entries only Kafka held that were never acked in
+    /// [`Dlq::dropped`]. A caller that needs that loss as an `Err` calls
+    /// [`Self::flush`] first.
     ///
     /// Idempotent across clones: the join happens once; later calls see
     /// an empty join slot and return Ok.
@@ -352,7 +360,31 @@ fn map_sink_err(e: SinkError) -> DlqError {
     match e {
         SinkError::Overflow => DlqError::QueueFull,
         SinkError::Closed => DlqError::Closed,
-        SinkError::Drain(d) => DlqError::File(d.to_string()),
+        SinkError::Drain(d) => map_drain_err(d),
+    }
+}
+
+/// A Kafka or HTTP backend's own loss keeps its variant; every other drain
+/// failure reads as `File`, as it always has.
+fn map_drain_err(d: DrainError) -> DlqError {
+    let source = match d {
+        DrainError::Backend(source) => source,
+        io @ DrainError::Io(_) => return DlqError::File(io.to_string()),
+    };
+    match source.downcast::<DlqError>() {
+        Ok(own) => match *own {
+            #[cfg(feature = "dlq-kafka")]
+            DlqError::Kafka(msg) => DlqError::Kafka(msg),
+            DlqError::BackendError(msg) => DlqError::BackendError(msg),
+            other @ (DlqError::Io(_)
+            | DlqError::Serialization(_)
+            | DlqError::File(_)
+            | DlqError::AllBackendsFailed(_)
+            | DlqError::NotConfigured
+            | DlqError::QueueFull
+            | DlqError::Closed) => DlqError::File(DrainError::Backend(Box::new(other)).to_string()),
+        },
+        Err(foreign) => DlqError::File(DrainError::Backend(foreign).to_string()),
     }
 }
 
@@ -532,6 +564,25 @@ impl SinkDrain<DlqEntry> for DlqDrain {
         }
         self.note_lost(lost);
         first_err.map_or(Ok(()), |e| Err(DrainError::Backend(Box::new(e))))
+    }
+
+    /// Settle every backend before the drain drops it, and count what no
+    /// backend confirmed: dropping the Kafka producer discards what it holds.
+    async fn close(&mut self) -> Result<(), DrainError> {
+        let settled = self.flush_durable().await;
+        let unconfirmed: u64 = self
+            .backends
+            .iter_mut()
+            .map(DlqBackend::take_unconfirmed)
+            .sum();
+        if unconfirmed > 0 {
+            warn!(
+                unconfirmed,
+                "DLQ entries had no delivery report when the drain closed; counted as dropped"
+            );
+            self.note_lost(unconfirmed);
+        }
+        settled
     }
 }
 
@@ -754,6 +805,96 @@ mod tests {
         }
         assert!(full_count > 0, "expected at least one QueueFull");
         shutdown.cancel();
+    }
+
+    /// `file-rotate` drops a write to a file it could not open and reports
+    /// `Ok`; the loss must still reach `flush()` and `dropped()`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_to_a_dlq_file_it_cannot_open_is_counted_lost() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("svc/dlq.ndjson");
+        std::fs::create_dir(dir.path().join("svc")).expect("create dir");
+        std::fs::write(&file, b"").expect("create file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+        if std::fs::OpenOptions::new().append(true).open(&file).is_ok() {
+            eprintln!("skipping: this process writes files regardless of their mode");
+            return;
+        }
+        let shutdown = CancellationToken::new();
+        let dlq = spawn_dlq(&tmp_config(dir.path()), &shutdown);
+
+        dlq.send(test_entry("err")).await.expect("queued");
+        let flush = dlq.flush().await;
+        assert!(flush.is_err(), "the write reached no file: {flush:?}");
+        assert_eq!(dlq.dropped(), 1);
+        assert_eq!(dlq_lines(dir.path()), 0);
+        shutdown.cancel();
+    }
+
+    /// The Kafka backend against a broker that never acks an entry.
+    #[cfg(feature = "dlq-kafka")]
+    mod no_broker {
+        use super::*;
+        use crate::dlq::config::{DlqRouting, KafkaDlqConfig};
+        use crate::dlq::kafka::unreachable_broker;
+
+        /// Kafka alone, with only the barrier and shutdown writing.
+        fn kafka_only(send_timeout_ms: u64) -> DlqConfig {
+            DlqConfig {
+                mode: DlqMode::KafkaOnly,
+                queue_capacity: 1024,
+                batch_size: 1024,
+                flush_interval_ms: 600_000,
+                file: FileDlqConfig {
+                    enabled: false,
+                    ..FileDlqConfig::default()
+                },
+                kafka: KafkaDlqConfig {
+                    enabled: true,
+                    routing: DlqRouting::Common,
+                    common_topic: "dlq.unreachable".to_string(),
+                    send_timeout_ms,
+                    ..KafkaDlqConfig::default()
+                },
+                ..DlqConfig::default()
+            }
+        }
+
+        fn spawn(send_timeout_ms: u64) -> Dlq {
+            Dlq::spawn(
+                &kafka_only(send_timeout_ms),
+                "svc",
+                Some(&unreachable_broker()),
+                CancellationToken::new(),
+            )
+            .expect("spawn")
+        }
+
+        /// Shutdown drops the producer, which discards what it holds; what no
+        /// broker acked by then must be counted, not lost silently.
+        #[tokio::test]
+        async fn shutdown_counts_the_entries_no_broker_acked() {
+            let dlq = spawn(300);
+            for i in 0..3 {
+                dlq.send(test_entry(&format!("err_{i}")))
+                    .await
+                    .expect("queued");
+            }
+            dlq.shutdown().await.expect("shutdown");
+            assert_eq!(dlq.dropped(), 3, "every unacked entry counted");
+        }
+
+        #[tokio::test]
+        async fn a_kafka_loss_fails_the_flush_as_a_kafka_error() {
+            let dlq = spawn(300);
+            dlq.send(test_entry("err")).await.expect("queued");
+            let flush = dlq.flush().await;
+            assert!(matches!(flush, Err(DlqError::Kafka(_))), "got: {flush:?}");
+            assert_eq!(dlq.dropped(), 1);
+            dlq.shutdown().await.expect("shutdown");
+        }
     }
 
     #[tokio::test]

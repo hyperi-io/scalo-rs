@@ -47,8 +47,19 @@ use tokio_util::sync::CancellationToken;
 const KAFKA_IMAGE_REF: &str =
     "4.3.1@sha256:2885898ba17065023f1bd605f3a81efcfa986014f062b73b91ef5462485f9060";
 
-/// The Kafka backend's barrier waits this long for acks before giving up.
-const FLUSH_BOUND: Duration = Duration::from_secs(30);
+/// An ack wait long enough to outlast a paused broker, or one restarting.
+const LONG_ACK_WAIT: Duration = Duration::from_secs(30);
+
+/// The default `kafka.send_timeout_ms`, the barrier's ack wait.
+fn ack_wait() -> Duration {
+    Duration::from_millis(KafkaDlqConfig::default().send_timeout_ms)
+}
+
+/// `config` with its Kafka ack wait set to [`LONG_ACK_WAIT`].
+fn long_ack_wait(mut config: DlqConfig) -> DlqConfig {
+    config.kafka.send_timeout_ms = u64::try_from(LONG_ACK_WAIT.as_millis()).expect("fits");
+    config
+}
 
 /// Record ceiling of the topics the broker refuses oversize records on.
 const SMALL_TOPIC_MAX_BYTES: &str = "262144";
@@ -253,7 +264,7 @@ async fn a_flush_returns_only_after_the_broker_acks() {
     let (node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
-        &dlq_config(DlqMode::KafkaOnly, topic, None),
+        &long_ack_wait(dlq_config(DlqMode::KafkaOnly, topic, None)),
         &kafka_config(&bootstrap),
     );
     // Connection and topic metadata are paid before the broker is paused.
@@ -274,7 +285,7 @@ async fn a_flush_returns_only_after_the_broker_acks() {
         "flush returned while the paused broker could not have acked anything"
     );
 
-    let result = tokio::time::timeout(FLUSH_BOUND + Duration::from_secs(15), flusher)
+    let result = tokio::time::timeout(LONG_ACK_WAIT + Duration::from_secs(15), flusher)
         .await
         .expect("flush resolves within its bound")
         .expect("flush task");
@@ -291,6 +302,7 @@ async fn a_flush_returns_only_after_the_broker_acks() {
 
 /// With the broker stopped, the flush gives up at its bound, reports the
 /// loss, and counts every entry once -- and not again once the broker returns.
+/// The long ack wait gives the producer time to find the restarted broker.
 #[tokio::test]
 #[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss() {
@@ -298,7 +310,7 @@ async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss
     let (node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
-        &dlq_config(DlqMode::KafkaOnly, topic, None),
+        &long_ack_wait(dlq_config(DlqMode::KafkaOnly, topic, None)),
         &kafka_config(&bootstrap),
     );
     send_all(&dlq, "warm", 1).await;
@@ -313,11 +325,11 @@ async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss
     let took = started.elapsed();
     eprintln!("flush with the broker down returned {result:?} after {took:?}");
     assert!(
-        matches!(result, Err(DlqError::File(_))),
+        matches!(result, Err(DlqError::Kafka(_))),
         "a flush the broker never acked must fail, got {result:?}"
     );
     assert!(
-        took < FLUSH_BOUND + Duration::from_secs(10),
+        took < LONG_ACK_WAIT + Duration::from_secs(10),
         "flush held the caller for {took:?}"
     );
     assert_eq!(dlq.dropped(), ENTRIES as u64, "every unacked entry counted");
@@ -384,7 +396,7 @@ async fn the_runtime_keeps_running_while_a_flush_waits_on_kafka() {
 
     assert!(result.is_err(), "no broker, so the flush fails: {result:?}");
     assert!(
-        took + Duration::from_secs(5) >= FLUSH_BOUND,
+        took >= ack_wait(),
         "the flush returned after {took:?} -- it did not wait on Kafka"
     );
     let possible = u64::try_from(took.as_millis() / 10).unwrap_or(u64::MAX);
@@ -423,7 +435,7 @@ async fn a_delivery_the_broker_refuses_fails_the_flush_and_is_counted_once() {
         started.elapsed()
     );
     assert!(
-        matches!(result, Err(DlqError::File(_))),
+        matches!(result, Err(DlqError::Kafka(_))),
         "a refused delivery must fail the flush, got {result:?}"
     );
     assert_eq!(dlq.dropped(), 2, "each refused record counted");
@@ -473,7 +485,7 @@ async fn fan_out_counts_a_kafka_loss_only_where_no_other_backend_holds_the_entry
     }
     let result = dlq.flush().await;
     assert!(
-        matches!(result, Err(DlqError::File(_))),
+        matches!(result, Err(DlqError::Kafka(_))),
         "Kafka was the only backend to take these, and lost them: {result:?}"
     );
     assert_eq!(dlq.dropped(), 2);
@@ -507,5 +519,98 @@ async fn cascade_hands_the_next_backend_only_what_kafka_refused() {
     assert_eq!(
         read_reasons_async(&bootstrap, topic).await,
         ["first", "second"]
+    );
+}
+
+/// Shutdown with no flush delivers what the producer still held. `linger.ms`
+/// keeps the entries queued in the producer when the drain exits, which is
+/// when dropping the producer discards them.
+#[tokio::test]
+#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
+async fn shutdown_without_a_flush_delivers_what_the_producer_held() {
+    let topic = "dlq.shutdown.healthy";
+    let (_node, bootstrap) = start_kafka().await;
+    create_topic(&bootstrap, topic).await;
+    let mut kafka = kafka_config(&bootstrap);
+    kafka
+        .sizing
+        .producer_librdkafka
+        .insert("linger.ms".to_string(), "3000".to_string());
+    let dlq = spawn_dlq(&dlq_config(DlqMode::KafkaOnly, topic, None), &kafka);
+
+    send_all(&dlq, "held", ENTRIES).await;
+    dlq.shutdown().await.expect("shutdown");
+
+    assert_eq!(dlq.dropped(), 0);
+    let reasons = read_reasons_async(&bootstrap, topic).await;
+    for i in 0..ENTRIES {
+        let want = format!("held-{i}");
+        assert!(reasons.contains(&want), "{want} missing from {reasons:?}");
+    }
+}
+
+/// Shutdown with no flush and the broker stopped counts every entry no broker
+/// acked, within the ack wait plus the purge.
+#[tokio::test]
+#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
+async fn shutdown_without_a_flush_counts_what_a_stopped_broker_never_acked() {
+    let topic = "dlq.shutdown.down";
+    let (node, bootstrap) = start_kafka().await;
+    create_topic(&bootstrap, topic).await;
+    let dlq = spawn_dlq(
+        &dlq_config(DlqMode::KafkaOnly, topic, None),
+        &kafka_config(&bootstrap),
+    );
+    send_all(&dlq, "warm", 1).await;
+    dlq.flush().await.expect("warm-up flush");
+
+    node.stop_with_timeout(Some(0))
+        .await
+        .expect("stop the broker");
+    send_all(&dlq, "lost", ENTRIES).await;
+    let started = Instant::now();
+    dlq.shutdown().await.expect("shutdown");
+    let took = started.elapsed();
+    eprintln!("shutdown with the broker down took {took:?}");
+
+    assert_eq!(dlq.dropped(), ENTRIES as u64, "every unacked entry counted");
+    assert!(
+        took < ack_wait() + Duration::from_secs(10),
+        "shutdown held the caller for {took:?}"
+    );
+}
+
+/// `send_timeout_ms` is the barrier's ack wait: a value other than the
+/// default bounds the flush.
+#[tokio::test]
+#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
+async fn the_configured_send_timeout_bounds_the_flush() {
+    const SEND_TIMEOUT: Duration = Duration::from_secs(15);
+    let topic = "dlq.timeout";
+    let (node, bootstrap) = start_kafka().await;
+    create_topic(&bootstrap, topic).await;
+    let mut config = dlq_config(DlqMode::KafkaOnly, topic, None);
+    config.kafka.send_timeout_ms = u64::try_from(SEND_TIMEOUT.as_millis()).expect("fits");
+    let dlq = spawn_dlq(&config, &kafka_config(&bootstrap));
+    send_all(&dlq, "warm", 1).await;
+    dlq.flush().await.expect("warm-up flush");
+
+    node.stop_with_timeout(Some(0))
+        .await
+        .expect("stop the broker");
+    send_all(&dlq, "lost", ENTRIES).await;
+    let started = Instant::now();
+    let result = dlq.flush().await;
+    let took = started.elapsed();
+    eprintln!("flush with a {SEND_TIMEOUT:?} send timeout returned {result:?} after {took:?}");
+
+    assert!(result.is_err(), "no broker acked these: {result:?}");
+    assert!(
+        took >= SEND_TIMEOUT,
+        "gave up after {took:?}, before the configured wait"
+    );
+    assert!(
+        took < SEND_TIMEOUT + Duration::from_secs(10),
+        "the configured wait did not bound the flush: {took:?}"
     );
 }
