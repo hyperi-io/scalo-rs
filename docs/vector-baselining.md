@@ -305,13 +305,13 @@ https://flink.apache.org/2021/07/07/how-to-identify-the-source-of-backpressure/
 ## 5. Transport, efficiency, allocator
 
 - **Transport**. scalo: config-driven factory (kafka/grpc/http/file/
-  pipe/memory) returning `Box<dyn Transport>`, with a `routed`
+  pipe/memory) returning `AnySender` / `AnyReceiver` enums (enum dispatch, no `dyn`), with a `routed`
   sender for per-key dispatch (originators only: receiver, fetcher) and a
   filter engine embedded in every backend. Vector: 30+ sources, 49+
   sinks, native to each integration, connected by the topology DAG. Vector
   wins breadth massively; scalo wins on "one binary, swap backend by
-  config" and a uniform filter/route layer. (Reminder from CLAUDE.md:
-  scalo transport is config-driven, build with ALL transport features.)
+  config" and a uniform filter/route layer. The `transport-all` feature
+  enables every backend.
 - **Efficiency**. scalo: SIMD parse (sonic-rs), `FieldInterner`
   (DashMap, ~20 ns hit / ~100 ns first-see), SIMD pre-route extract
   (`sonic_rs::get_from_slice`, no full parse), streaming sub-blocks that
@@ -564,7 +564,7 @@ benefit. Ranked by value x fit, effort noted.
   scalo's vertical scaling is present and richer than Vector's. Vector
   just rides Tokio work-stealing across vCPUs. scalo sizes both the Tokio
   runtime and the rayon pool to cgroup-aware `available_parallelism()`
-  (`worker/config.rs:176`) AND runs an adaptive watermark controller on
+  (`worker/config.rs` `detected_parallelism()`) AND runs an adaptive watermark controller on
   top (`worker/scaler.rs`: grow/steady/down/emergency_down bands + a
   memory-pressure cap), nudging a parking semaphore each interval
   (`worker/pool.rs` `Semaphore`). The "vertical only" line in Section 2
