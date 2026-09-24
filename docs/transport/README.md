@@ -20,6 +20,7 @@ classDiagram
         +close()
         +is_healthy()
         +name()
+        +healthcheck()
     }
     class TransportSender {
         <<trait>>
@@ -27,23 +28,23 @@ classDiagram
     }
     class TransportReceiver {
         <<trait>>
-        +recv(max) RecvBatch
+        +recv(max) WorkBatch
         +commit(tokens)
     }
     class Transport {
         <<trait>>
     }
-    TransportBase <|-- TransportSender : "object safe"
-    TransportBase <|-- TransportReceiver : "generic Token, not object safe"
+    TransportBase <|-- TransportSender : "not object safe"
+    TransportBase <|-- TransportReceiver : "per-backend Token, not object safe"
     TransportSender <|-- Transport : "blanket impl"
     TransportReceiver <|-- Transport : "blanket impl"
 ```
 
 | Trait | Purpose | Object-safe? |
 |-------|---------|--------------|
-| `TransportBase` | Lifecycle + introspection — `close()`, `is_healthy()`, `name()` | Yes (no async, no generics) |
+| `TransportBase` | Lifecycle + introspection -- `close()`, `is_healthy()`, `name()`, `healthcheck()` | No -- `close()` and `healthcheck()` return `impl Future` |
 | `TransportSender` | Add `send(destination, payload)` — async fn in trait | Not via `dyn` — see below |
-| `TransportReceiver` | Add `recv` + `commit`, generic `type Token: CommitToken` | Never via `dyn` — the GAT-shaped token kills it |
+| `TransportReceiver` | Add `recv` + `commit`, associated `type Token: CommitToken` | No -- `impl Future` returns, and `Token` differs per backend |
 | `Transport` | Marker — blanket impl for `T: Sender + Receiver` | N/A |
 
 `TransportSender::send` returns `impl Future<Output = SendResult> + Send`
@@ -55,7 +56,7 @@ The fix is **enum dispatch**, not `dyn`.
 
 ---
 
-## `AnySender` — the factory return type
+## `AnySender` and `AnyReceiver` -- the factory return types
 
 ```rust
 use scalo::transport::AnySender;
@@ -76,12 +77,20 @@ work during construction. Forgetting the `.await` is a compile error.
 `from_transport_config(&cfg).await` is the non-cascade variant for
 tests or apps that build the config struct by hand.
 
-Receivers don't get an `AnyReceiver` enum — the `Token` associated
-type is generic per backend and unifying them would either erase the
-token (and lose commit semantics) or require an enum-of-tokens that
-every caller has to match on. Input stages take a concrete
-`KafkaTransport` / `GrpcTransport` / etc. directly. See
-[architecture.md](../architecture.md) for the rationale.
+```rust
+use scalo::transport::{AnyReceiver, TransportReceiver};
+
+let receiver = AnyReceiver::from_config("transport.input").await?;
+let batch = receiver.recv(100).await?;
+// process batch.records and route batch.dlq_entries before committing
+receiver.commit(&batch.commit_tokens).await?;
+```
+
+`AnyReceiver` is the receive-side mirror, with the same `from_config` and `from_transport_config` constructors. `recv` wraps each backend token in the matching `AnyToken` variant, and `commit` routes those tokens back to the backend that issued them. `AnyToken` is `#[non_exhaustive]`, so a `match` on it needs a wildcard arm.
+
+With the `governor` feature, `AnyReceiver::from_config_with_governor(key, &governor)` and `from_transport_config_with_governor(&cfg, &governor)` also wire the inbound brake: Kafka pauses assigned partitions, HTTP sheds with 503 and gRPC with `unavailable`.
+
+An input stage that needs the backend's own token type takes a concrete `KafkaTransport` / `GrpcTransport` / etc. directly.
 
 ---
 
@@ -97,7 +106,7 @@ Every backend defines its own token (`KafkaToken`, `GrpcToken`,
 `FileToken`, etc.). The token carries whatever the backend needs to
 ack the message — Kafka offsets, file byte positions, in-memory
 sequence numbers. The `Display` impl prints a human-readable form
-(e.g. `kafka:events.land[0]@12345`, `file:8192`) for logs and DLQ
+(e.g. `kafka:events.land:0:12345`, `file:8192`) for logs and DLQ
 provenance.
 
 **Commit semantics**: the caller drives commit. Receive a batch,
@@ -115,15 +124,20 @@ commit does what's needed:
 
 ---
 
-## `Message<Token>`
+## `WorkBatch<Token>` -- what `recv` returns
 
 ```rust
-pub struct Message<T: CommitToken> {
-    pub key: Option<Arc<str>>,
-    pub payload: Vec<u8>,
-    pub token: T,
-    pub timestamp_ms: Option<i64>,
-    pub format: PayloadFormat,    // auto-detected JSON vs MsgPack
+pub struct WorkBatch<T: CommitToken> {
+    pub records: Vec<Record>,
+    pub commit_tokens: Vec<T>,              // source acks for the whole block
+    pub dlq_entries: Vec<FilteredDlqEntry>, // inbound `action: dlq` matches
+}
+
+pub struct Record {
+    pub payload: Bytes,                     // refcounted, zero-copy
+    pub key: Option<Arc<str>>,              // routing destination
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub metadata: RecordMeta,               // timestamp_ms + format
 }
 ```
 
@@ -133,6 +147,10 @@ byte (`{`/`[` → JSON; `0x80..0x9f`/`0xdc..0xdf` → MsgPack). See
 [../pipeline/dlq.md](../pipeline/dlq.md) for how messages flow
 into the DLQ when downstream processing fails.
 
+`commit_tokens.len()` is not tied to `records.len()`: it includes the tokens of records an inbound filter removed, and a fan-out transform can change the record count without touching the acks. Commit `commit_tokens` once the whole block is handled.
+
+A backend collects `Message<Token>` values (`key`, `payload: Bytes`, `token`, `timestamp_ms`, `format`) into a `RecvBatch`, which converts into a `WorkBatch` through `From`.
+
 ---
 
 ## Filter engine — embedded, not bolted on
@@ -141,19 +159,17 @@ Every backend wires the filter engine on construction. Inbound
 filters drop or DLQ-stage messages inside `recv()` before the caller
 ever sees them; outbound filters do the same on `send()`. Filters
 that match `action: dlq` don't route to a DLQ directly — they come back
-**inline** in `recv()`'s `RecvBatch.dlq_entries`, which the caller routes:
+**inline** in `recv()`'s `WorkBatch.dlq_entries`, which the caller routes:
 
 ```rust
 let batch = transport.recv(100).await?;
 for entry in batch.dlq_entries {
-    dlq.send(DlqEntry::from(entry)).await?;
+    dlq.send(DlqEntry::new("filter", entry.reason, entry.payload)).await?;
 }
-process(batch.messages).await;
+process(batch.records).await;
 ```
 
-When filters are disabled, `dlq_entries` is empty — backends with no
-filter wiring return `RecvBatch::from_messages(..)`. Full design and tier
-model in [filter-engine.md](filter-engine.md).
+With no inbound filter configured, `dlq_entries` is empty. Full design and tier model in [filter-engine.md](filter-engine.md).
 
 ---
 
@@ -171,15 +187,18 @@ sink stages do 1:1. See [routing.md](routing.md).
 
 | Item | Purpose |
 |------|---------|
-| `TransportBase` | `close`, `is_healthy`, `name` — every backend |
+| `TransportBase` | `close`, `is_healthy`, `name`, `healthcheck` -- every backend |
 | `TransportSender::send(destination, payload)` | Async send, returns `SendResult` |
-| `TransportReceiver::recv(max)` | Async batch receive, returns `RecvBatch<Token>` (`messages` + `dlq_entries`) |
+| `TransportReceiver::recv(max)` | Async batch receive, returns `WorkBatch<Token>` (`records` + `commit_tokens` + `dlq_entries`) |
 | `TransportReceiver::commit(&tokens)` | Ack a slice of tokens through the same transport |
 | `CommitToken` | `Clone + Send + Sync + Debug + Display`, `as_str()` |
 | `Transport` | Blanket impl for any `T: Sender + Receiver` |
 | `AnySender::from_config(key).await` | Cascade factory — **async** |
 | `AnySender::from_transport_config(&cfg).await` | Direct factory for tests |
+| `AnyReceiver::from_config(key).await` | Receive-side cascade factory -- **async**; `from_transport_config` too |
+| `AnyToken` | Type-erased commit token from `AnyReceiver`, `#[non_exhaustive]` |
 | `RoutedSender::from_route_configs(routes, default).await` | Per-key routing factory |
+| `WorkBatch<Token>` / `Record` | What `recv` returns: records + source acks + inline DLQ entries |
 | `Message<Token>` | Payload + key + token + timestamp + format |
 | `SendResult` | `Ok` / `Backpressured` / `Fatal(err)` / `FilteredDlq` |
 | `TransportConfig` | Top-level config struct read by the factory |

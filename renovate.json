@@ -1,6 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["github>hyperi-io/renovate-config"],
+  "minimumReleaseAge": "7 days",
   "packageRules": [
     {
       "description": "OpenTelemetry SDK + exporters + the tracing bridge move in lockstep -- held at 0.31 until tracing-opentelemetry supports 0.32. Bumping one alone breaks the build.",
