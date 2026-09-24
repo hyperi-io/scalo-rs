@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      benches/baseline.rs
-// Purpose:   scalo-side numbers for Vector baselining (see docs/VECTOR-BASELINING.md)
+// Purpose:   scalo-side numbers for Vector baselining (see docs/vector-baselining.md)
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -13,7 +13,7 @@
 //! equivalent -- NOT a competitive bake-off). They run on canonical corpora
 //! (fixed small + large JSON log lines) so the per-DFE-app benches that compare
 //! against the Vector equivalent measure the SAME bytes. See
-//! `docs/VECTOR-BASELINING.md` Section 7 for the full plan; the per-app
+//! `docs/vector-baselining.md` Section 7 for the full plan; the per-app
 //! Vector-equivalent comparisons live in the dfe- app repos.
 //!
 //! Covered here: the [`Record`] wire codec (encode/decode), the serialisation on

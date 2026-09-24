@@ -35,15 +35,15 @@ flowchart LR
     C -->|has, equality, startsWith| T1["Tier 1<br/>SIMD field ops<br/>~50-100 ns"]
     C -->|compound CEL, numeric, size| T2["Tier 2<br/>compiled CEL<br/>~500 ns - 1 us"]
     C -->|matches, filter, map, time fns| T3["Tier 3<br/>complex CEL<br/>~5-50 us"]
-    T2 -.->|gate| G2["expression.allow_cel_filters_in/out"]
-    T3 -.->|gate| G3["expression.allow_complex_filters_in/out"]
+    T2 -.->|gate| G2["transport.filter_tiers.allow_cel_filters_in/out"]
+    T3 -.->|gate| G3["transport.filter_tiers.allow_complex_filters_in/out"]
 ```
 
 | Tier | Cost per message | Operations | Config gate |
 |------|------------------|------------|-------------|
-| **1** | ~50-100 ns | `has(field)`, `!has(field)`, `field == "literal"`, `field != "literal"`, `field.startsWith(...)`, `field.endsWith(...)`, `field.contains(...)` | Always on |
-| **2** | ~500 ns – 1 µs | Compound CEL (`&&`, `||`), numeric comparison, multi-field access, `size()`, nested paths | `expression.allow_cel_filters_in` / `_out` |
-| **3** | ~5-50 µs | `matches()` (regex), `exists()`, `filter()`, `map()`, `all()`, `exists_one()`, `timestamp()`, `duration()` | `expression.allow_complex_filters_in` / `_out` (implies tier-2) |
+| **1** | ~50-100 ns | `has(field)`, `!has(field)`, `field == "literal"`, `field != "literal"`, `field.startsWith(...)`, `field.endsWith(...)`, `field.contains(...)` -- `field` may be a dotted path such as `a.b` | Always on |
+| **2** | ~500 ns - 1 us | Compound CEL (`&&`, `||`), numeric comparison, multi-field access, `size()` | `transport.filter_tiers.allow_cel_filters_in` / `_out` |
+| **3** | ~5-50 us | `matches()` (regex), `exists()`, `filter()`, `map()`, `all()`, `exists_one()`, `timestamp()`, `duration()` | `transport.filter_tiers.allow_complex_filters_in` / `_out` (implies tier-2) |
 
 Tier 1 uses `sonic-rs::get_from_slice` for field extraction plus
 single-segment field-name lookups via pre-compiled
@@ -56,12 +56,14 @@ against fields extracted via SIMD.
 Tier 3 enables CEL's regex / iteration / time profile (which adds
 expensive operations and DoS surface — hence the separate gate).
 
+Tier 2 and Tier 3 need the `expression` Cargo feature. Without it, a rule that classifies above Tier 1 fails at startup.
+
 ---
 
 ## Classification (no AST walking)
 
 `classify()` decides what tier an expression sits in by **text-pattern
-matching**, not AST analysis. Lazy-static regex patterns for each
+matching**, not AST analysis. `LazyLock` regex patterns for each
 tier-1 operation are tried in order of expected frequency
 (`has`, `!has`, `==`, `!=`, `startsWith`, `endsWith`, `contains`). If
 none match, scan for restricted function names — match means tier 3.
@@ -81,20 +83,23 @@ See [src/transport/filter/classify.rs](../../src/transport/filter/classify.rs).
 - **First-match wins.** Filters are evaluated in declared order; the
   first match returns its action and stops the loop. No match → message
   passes.
-- **`drop` action** silently discards. Recorded via the metric
-  `filter_{direction}_{action}_total{tier,rule_index}`.
+- **`drop` action** silently discards. Every match, `drop` or `dlq`, counts
+  in the `transport_filtered_total` counter, labelled `direction` and `action`.
 - **`dlq` action** produces a `FilteredDlqEntry` returned **inline** in
-  `recv()`'s `RecvBatch.dlq_entries` (alongside the passing
-  `RecvBatch.messages`) — the transport does **not** route to a DLQ
+  `recv()`'s `WorkBatch.dlq_entries` (alongside the passing
+  `WorkBatch.records`) -- the transport does **not** route to a DLQ
   directly. The caller routes `batch.dlq_entries` to the DLQ of its
   choice; they cannot be silently lost. (When the `BatchEngine` run
-  loops own the receive, a `FilterDlqPolicy` governs this — `Reject` by
-  default, or `Route`/`DiscardWithMetric`.)
+  loops own the receive, a `FilterDlqPolicy` governs this -- `Reject` by
+  default, or `Route`/`DiscardWithMetric`.) The commit token of a dropped
+  or DLQ'd record stays in `WorkBatch.commit_tokens`, so the block commit
+  moves the source past it.
 - **Inbound and outbound are independent.** Each transport has
   `filters_in` and `filters_out`, evaluated separately.
 - **Startup fails fast** on rules above the allowed tier, on invalid
-  CEL syntax, on empty expressions, or on `dlq` actions when no DLQ is
-  configured.
+  CEL syntax, on empty expressions, and on Tier 2/3 rules over the AST
+  budget (`transport.filter_tiers.budget`). Pipe is the exception -- see
+  [Where it's embedded](#where-its-embedded).
 
 ---
 
@@ -103,27 +108,27 @@ See [src/transport/filter/classify.rs](../../src/transport/filter/classify.rs).
 Two distinct cascade keys gate filter behaviour. Operators have to set
 both correctly because they apply at different layers.
 
-### `transport.<backend>.filters_{in,out}` — the rules themselves
+### `<backend>.filters_{in,out}` -- the rules themselves
 
-Per-transport rule lists. Each rule has an `expression` (CEL text) and
-an `action` (`drop` or `dlq`). Rules apply at the named transport, in
-the named direction.
+Per-transport rule lists, carried on each backend's config struct (`KafkaConfig`, `GrpcConfig`, `MemoryConfig`, `FileTransportConfig`, `PipeTransportConfig`, `HttpTransportConfig`). Each rule has an `expression` (CEL text) and an `action` (`drop`, the default, or `dlq`). Rules apply at the named transport, in the named direction. They sit in the backend section under whatever cascade key the app reads -- here, a receiver built by `AnyReceiver::from_config("transport.input")`:
 
 ```yaml
 transport:
-  kafka:
-    brokers: ["kafka.devex.hyperi.io:9092"]
-    topics: ["events"]
-    filters_in:
-      - expression: 'has(_internal)'
-        action: drop
-      - expression: 'status == "poison"'
-        action: dlq
-      - expression: 'severity > 3 && source != "internal"'
-        action: dlq
-    filters_out:
-      - expression: 'has(debug)'
-        action: drop
+  input:
+    type: kafka
+    kafka:
+      brokers: ["kafka:9092"]
+      topics: ["events"]
+      filters_in:
+        - expression: 'has(_internal)'
+          action: drop
+        - expression: 'status == "poison"'
+          action: dlq
+        - expression: 'severity > 3 && source != "internal"'
+          action: dlq
+      filters_out:
+        - expression: 'has(debug)'
+          action: drop
 ```
 
 ### `transport.filter_tiers.*` — the tier gates
@@ -142,17 +147,17 @@ transport:
 ```
 
 If a configured filter rule classifies above the allowed tier, the
-transport's constructor returns `TransportError::FilterCompile(...)`
-and the transport fails to start. **Fail-loud, not fail-silently** —
-the previous behaviour of substituting an empty filter engine has
-been removed (a misconfigured drop/dlq rule would otherwise let every
-message through).
+transport's constructor returns `TransportError::Config(...)` and the
+transport fails to start. **Fail-loud, not fail-silently** -- a
+misconfigured drop/dlq rule never runs as an empty filter engine that
+lets every message through. Pipe is the exception -- see
+[Where it's embedded](#where-its-embedded).
 
-### `expression.*` — the CEL function gates (layered with the tier gates)
+`transport.filter_tiers.budget` bounds Tier 2/3 cost: `max_ast_nodes` (default 200) and `max_iteration_depth` (default 2) are checked at startup, and `max_payload_bytes` (default 1 MiB) at evaluation. A payload over `max_payload_bytes` skips the CEL rule, which then does not match, and counts in `transport_filter_cel_payload_skip_total` (with the `metrics` feature).
 
-Top-level gate controlling which CEL functions are usable anywhere in
-the app (filters, transforms, validators). Tier 2 and Tier 3 filter
-compilation honour this on top of the tier-gate above.
+### `expression.*` -- the app-wide CEL function profile
+
+The top-level `expression` section sets which CEL functions are usable in the app's own expressions (transforms, validators):
 
 ```yaml
 expression:
@@ -161,20 +166,16 @@ expression:
   allow_time: false         # time-related functions
 ```
 
-### Both layers must allow
+Transport filters meet it in two ways:
 
-A filter rule like `'tag.matches("^prod-")'` compiles successfully
-only when **both**:
+- **Tier 2** compiles under this profile.
+- **Tier 3** compiles with regex, iteration and time all unlocked, so these three flags do not apply to it. The tier gate is the only switch a Tier 3 filter needs.
 
-1. `transport.filter_tiers.allow_complex_filters_in` is `true` (the
-   tier gate — "this transport accepts Tier 3 inbound").
-2. `expression.allow_regex` is `true` (the function gate — "regex is
-   allowed in CEL anywhere in this app").
+The profile's function allowlist applies to both tiers.
 
-Either gate set to `false` rejects the filter at config-load. This
-gives operators two independent levers — they can turn off all regex
-filters across the app with one flag, or turn off Tier 3 for a single
-transport while leaving regex enabled elsewhere.
+### The tier gate decides
+
+A filter rule like `'tag.matches("^prod-")'` classifies as Tier 3 and compiles when `transport.filter_tiers.allow_complex_filters_in` is `true`, whatever `expression.allow_regex` says. Setting `expression.allow_regex: false` does not stop regex transport filters -- close the Tier 3 gate for that.
 
 ### Reload semantics
 
@@ -209,16 +210,16 @@ use scalo::transport::filter::{
 
 // Built once per transport from config:
 let engine = TransportFilterEngine::new(
-    filters_in,
-    filters_out,
-    tier_config,
+    &filters_in,
+    &filters_out,
+    &tier_config,
 )?;
 
 // On the hot path:
-match engine.apply_inbound(&payload, &key) {
+match engine.apply_inbound(&payload) {
     FilterDisposition::Pass => process(payload),
     FilterDisposition::Drop => continue,
-    FilterDisposition::Dlq  => continue,   // returned in RecvBatch.dlq_entries
+    FilterDisposition::Dlq  => continue,   // a transport's recv() returns it in WorkBatch.dlq_entries
 }
 
 // DLQ entries come back inline from recv() -- route them per batch:
@@ -245,8 +246,9 @@ so transport code doesn't fork for the empty case.
 ## Where it's embedded
 
 Every transport backend builds the engine at construction time from
-its own config section's `filters_in` / `filters_out` plus the global
-`expression.*` tier gates:
+its own config section's `filters_in` / `filters_out` plus the
+`transport.filter_tiers` gates, read through
+`TransportFilterTierConfig::from_cascade()`:
 
 | Transport | Source |
 |-----------|--------|
@@ -257,6 +259,8 @@ its own config section's `filters_in` / `filters_out` plus the global
 | Pipe | [src/transport/pipe.rs](../../src/transport/pipe.rs) |
 | HTTP | [src/transport/http.rs](../../src/transport/http.rs) |
 
+Pipe is the exception. It compiles its rules against the default gates (Tier 1 only) rather than `transport.filter_tiers`, and a rule that fails to compile logs a warning and leaves the pipe running with no filters at all, where every other backend fails its constructor.
+
 The engine is a no-op when both filter vectors are empty — there's no
 per-message overhead beyond the inlined `has_*_filters` check.
 
@@ -266,7 +270,10 @@ per-message overhead beyond the inlined `has_*_filters` check.
 
 The engine targets JSON. When `apply_*` sees a payload that looks
 like MsgPack (heuristic detection of MsgPack signature bytes), it
-short-circuits to `Pass` without warning or metric.
+short-circuits to `Pass`. The first bypass in each direction logs a
+warning, and every bypass counts in
+`transport_filter_msgpack_bypass_total{direction}` (with the `metrics`
+feature).
 
 This is a deliberate choice — running JSON-shaped filters against
 binary payloads would either falsely match or always reject. Pipelines
@@ -284,9 +291,9 @@ The post-spec follow-up items from earlier work, with current status:
 | 7 | Constant-time string comparison for sensitive fields | Pending | Low risk; door open for timing attacks on high-entropy field values |
 | 8 | Log masking for filter expression content | Pending | Expression text logged as-is at startup; expression authors should treat expressions as non-secret |
 | 9 | Pre-quoted bytes fast path for `field == "value"` | Partial | `FieldExists` / `FieldNotExists` already use pre-compiled `memmem::Finder`; `FieldEquals` still uses SIMD extract + string compare |
-| 10 | MsgPack payloads silently pass | Acknowledged | Design choice; cheap fix would be a one-shot warn + metric on first MsgPack seen |
+| 10 | MsgPack payloads pass unfiltered | Acknowledged | Design choice; a one-shot warning per direction plus `transport_filter_msgpack_bypass_total` make the bypass visible |
 | 11 | Preserve original `expression_text` through reload cycles | Pending | Current code re-allocates on reload; allocator-hygiene item, no functional impact |
-| 12 | Tier 3 CEL has no evaluation budget | Open | `program.execute(&ctx)` runs with no time/recursion/payload cap. A bad filter can wedge the ingest thread. Needs a static AST budget + payload size cap + degraded-mode fallback, and must land before log-scrub ships (gitleaks rules are regex-heavy by nature) |
+| 12 | Tier 2/3 CEL has no time budget | Partial | `transport.filter_tiers.budget` caps AST size and iteration depth at startup and payload size at evaluation. `program.execute(&ctx)` still runs with no time cap, so a costly filter within those caps can hold the ingest thread. A time cap needs support in the upstream `cel` crate |
 
 The items aren't blockers. Operators should know about #10 if their
 pipeline mixes JSON and MsgPack.
@@ -295,12 +302,12 @@ pipeline mixes JSON and MsgPack.
 
 ## Tests and benchmarks
 
-- Unit tests: 32 across the module (mod, classify, config, compiled, metrics).
-- Integration tests: 54 in `tests/transport_filter.rs` — round-trip,
-  adversarial inputs, Unicode, 1000-rule lists, MsgPack heuristic.
-- Benchmarks: `benches/filter_benchmark.rs` — 8 criterion groups
-  covering no-filter baseline, each tier-1 op, first-match-at-N, tier-2
-  compound, tier-3 regex.
+- Unit tests: 70 across the module (budget, classify, compiled, config, metrics, mod).
+- Integration tests: 54 in `tests/transport_filter.rs` -- round-trip,
+  adversarial inputs, Unicode, 100-rule lists, MsgPack heuristic.
+- Benchmarks: `benches/filter_benchmark.rs` -- 8 criterion groups
+  covering the no-filter baseline, tier-1 `has`, `==`, `startsWith` and a
+  dotted path, first-match-at-N, tier-2 compound, tier-3 regex.
 
 Tier-1 latency confirmed at ~50-100 ns/message on the bench machine.
 

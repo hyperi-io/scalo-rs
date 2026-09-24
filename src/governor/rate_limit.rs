@@ -10,9 +10,10 @@
 //!
 //! A HARD, contractual rate cap for outbound work -- the kind a downstream
 //! states explicitly ("this API allows 100 req/s"). Distinct from the adaptive
-//! sink concurrency controller (planned): that one *discovers* the downstream's
-//! capacity from RTT/errors; this one *enforces* a fixed ceiling the operator
-//! already knows.
+//! sink concurrency controller (`sink_stack::AdaptiveLimiter`, feature
+//! `sink-stack`): that one *discovers* the downstream's safe concurrency from
+//! overload signals (backpressure, per-attempt timeouts); this one *enforces* a
+//! fixed ceiling the operator already knows.
 //!
 //! ## Built on the `governor` crate (no reinvented wheel)
 //!
