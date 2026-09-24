@@ -83,6 +83,9 @@ impl<T: CommitToken> RecvBatch<T> {
 /// Lifecycle and introspection methods shared by senders and receivers.
 pub trait TransportBase: Send + Sync {
     /// Shutdown the transport gracefully.
+    ///
+    /// A receiver stops taking new records and keeps the ones it already
+    /// acknowledged for [`TransportReceiver::recv`]. Idempotent.
     fn close(&self) -> impl Future<Output = TransportResult<()>> + Send;
 
     /// Check if the transport is healthy and connected.
@@ -309,6 +312,16 @@ pub trait TransportReceiver: TransportBase {
     /// A `recv` with nothing to return waits by awaiting, never by blocking
     /// the thread. Callers loop on it, and a `recv` that never pends keeps its
     /// worker: timers stop and sockets on that runtime go unanswered.
+    ///
+    /// # After `close()` (REQUIRED of implementors)
+    ///
+    /// `recv` returns the records the source had already acknowledged to their
+    /// senders, then [`TransportError::Closed`], without waiting for new ones.
+    /// The `BatchEngine` run loops drain a source this way at shutdown, so a
+    /// `recv` that reports `Closed` with acknowledged records still queued
+    /// loses them, and one that keeps waiting holds shutdown 5 s past its last
+    /// record. A source that re-delivers what was not committed (Kafka, file),
+    /// or acknowledges nothing (pipe), may report `Closed` at once.
     fn recv(
         &self,
         max: usize,

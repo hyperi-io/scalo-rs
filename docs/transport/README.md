@@ -122,6 +122,8 @@ commit does what's needed:
 | File | Persists read position to `.pos` sidecar |
 | Memory | Advances internal sequence |
 
+**Closing a receiver**: after `close()`, `recv` returns the records the source had already acknowledged to their senders, then `TransportError::Closed`. A receiving service therefore shuts down with `close()`, then `recv` until `Closed`, then its final flush; the `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). The gRPC and HTTP servers and the memory transport hold acknowledged records until `recv` takes them. Kafka and file report `Closed` at once and re-deliver what was not committed; pipe acknowledges nothing, and reports `Closed` at once too.
+
 ---
 
 ## `WorkBatch<Token>` -- what `recv` returns

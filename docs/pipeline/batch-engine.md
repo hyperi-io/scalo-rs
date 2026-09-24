@@ -17,11 +17,10 @@ and an app-supplied sink.
 | API | Parses? | Transform receives | Use case |
 |-----|---------|--------------------|----------|
 | `process_mid_tier` | Yes (SIMD JSON) | `&mut ParsedMessage` | Loader, archiver, VRL — needs field access |
-| `process_raw` | No | `&RawMessage` | Receiver forwarding, binary protocols, opaque payloads |
+| `process_raw` | No | `&Record` | Receiver forwarding, binary protocols, opaque payloads |
 
-Both chunk the input at `max_chunk_size` (default 10 000), call the
-transform across a rayon pool, and pause between chunks when memory
-pressure is high.
+Both take a `&[Record]` slice, chunk it at `max_chunk_size` (default
+10 000), and call the transform across a rayon pool.
 
 ---
 
@@ -29,7 +28,7 @@ pressure is high.
 
 ```mermaid
 flowchart LR
-    R[RawMessage batch] --> C{routing_field set?}
+    R[Record slice] --> C{routing_field set?}
     C -->|yes| F[Pre-route filter<br/>SIMD field extract<br/>~100 ns/msg]
     C -->|no| P
     F --> P[Parse<br/>sonic_rs::from_slice<br/>~1-5 µs/msg]
@@ -68,25 +67,57 @@ See [`../../src/worker/engine/intern.rs`](../../src/worker/engine/intern.rs).
 
 ---
 
-## Async transport-wired variants
+## Run loops
 
-Four async methods drive the engine from a `TransportReceiver`:
+Four async methods drive the engine from a `TransportReceiver`, one
+`WorkBatch` at a time: `recv`, route inline DLQ entries, `process`, the
+sink, then the commit. They need the `transport` feature.
 
-| Method | Sink | Commit | Ticker |
-|--------|------|--------|--------|
-| `run` | Sync `FnMut(results) -> Result<(), EngineError>` | Auto-committed by engine on sink success | None |
-| `run_raw` | Same | Same | None |
-| `run_async` | Async `FnMut(results, tokens) -> impl Future` | Sink-managed | Optional `(Duration, FnMut() -> impl Future)` |
-| `run_raw_async` | Same | Sink-managed | Optional |
+| Method | `process` receives | The sink gets | Use |
+|--------|--------------------|---------------|-----|
+| `run_governed` | `WorkBatch` | Byte-budget sub-blocks with the governor on, the whole block with it off | The default for a self-regulating app |
+| `run_workbatch` | `WorkBatch` | The whole block | On-demand parse: a transform calls `codec::parse` when it needs a field |
+| `run_workbatch_parsed` | `ParsedBatch` (records, parsed payloads, `FieldInterner`) | The whole block | The driver pre-parses the block on the pool |
+| `run_workbatch_streaming` | `WorkBatch` | Sub-blocks of a caller-supplied byte size | Peak memory bounded to one sub-block |
 
-The async variants give the sink full control over commit semantics —
-the sink receives both the results and the transport commit tokens, so
-it can defer commit until after a downstream write (e.g. ClickHouse
-flush, S3 PUT) rather than after the in-memory buffer push.
+`process` must keep the block's `commit_tokens` (`WorkBatch::map_records`
+does). `CommitMode::Auto` has the engine commit them once the sink takes
+the block; `CommitMode::SinkManaged` leaves the commit to the sink, which
+lets it defer until a downstream write lands. The sub-block paths take
+`Auto` only. The optional ticker fires inside the loop's `biased`
+`select!`, after the shutdown arm.
 
-The optional ticker fires inside the `tokio::select!` loop so flush
-timers and periodic maintenance run without breaking out of the engine
-loop. The select arms are `biased` — shutdown is checked first.
+A `recv` or sink failure that is `Backpressure` or `Timeout` is retried
+after a jittered backoff, 100 ms doubling to 2 s. The refused block is
+held, and nothing later is fetched or committed past it. Any other
+failure stops the loop with the block uncommitted.
+
+### Shutdown
+
+When the shutdown token fires, the loop closes the source and runs every
+block it still returns through `process`, the sink and the commit until
+`recv` reports `TransportError::Closed`. A push source such as the gRPC
+or HTTP server acknowledges a record once it is queued, so a loop that
+stopped at the token lost what the source had acknowledged.
+
+- Kafka, file and pipe sources report `Closed` as soon as they are
+  closed, so the drain reads nothing more. Kafka re-delivers what was not
+  committed after a restart.
+- A block the sink refuses transiently (`Backpressure`, `Timeout`) is
+  retried with the usual backoff for up to 10 s after the loop sees
+  shutdown, whether the sink began refusing before shutdown or during the
+  drain. A sink busy for a moment at shutdown therefore loses nothing.
+- A block the sink still refuses when those 10 s are up stays uncommitted,
+  and the drain stops there, so nothing is committed past it. What the
+  source still holds is not delivered. If the sink was refusing it before
+  the drain began, the source is closed without a drain.
+- A permanent sink error stops the drain at once and is returned as the
+  run's error, as it is before shutdown.
+- A source that returns nothing for 5 s without reporting `Closed` ends
+  the drain.
+
+The source is closed when the method returns, so the app's own final
+flush comes after it. Source: [`driver.rs`](../../src/worker/engine/driver.rs).
 
 ---
 
@@ -148,11 +179,12 @@ pause inside the engine. See [self-regulation.md](../self-regulation.md).
 | `BatchEngine::with_pool(pool, cfg)` | Reuse an existing pool (preferred when `ServiceRuntime` is available) |
 | `BatchEngine::from_cascade(key)` | Load config from the cascade |
 | `process_mid_tier(messages, transform)` | Sync — parse JSON, extract known fields, run transform on `&mut ParsedMessage` via rayon |
-| `process_raw(messages, transform)` | Sync — no parse; run transform on `&RawMessage` via rayon |
-| `run(receiver, shutdown, transform, sink)` | Async loop, sync sink, engine commits tokens |
-| `run_raw(receiver, shutdown, transform, sink)` | Same, raw mode |
-| `run_async(receiver, shutdown, transform, sink, ticker)` | Async loop, async sink, sink-managed commits, optional ticker |
-| `run_raw_async(receiver, shutdown, transform, sink, ticker)` | Same, raw mode |
+| `process_raw(messages, transform)` | Sync — no parse; run transform on `&Record` via rayon |
+| `run_governed(receiver, shutdown, process, sink, commit, ticker)` | Async loop; sub-blocks sized by the governor's byte budget, whole blocks with it off |
+| `run_workbatch(receiver, shutdown, process, sink, commit, ticker)` | Async loop, whole blocks, on-demand parse |
+| `run_workbatch_parsed(receiver, shutdown, process_parsed, sink, commit, ticker)` | Async loop, whole blocks, pre-parsed `ParsedBatch` |
+| `run_workbatch_streaming(receiver, shutdown, process, sink, commit, sub_block_bytes, ticker)` | Async loop, sub-blocks of `sub_block_bytes` |
+| `set_byte_budget(budget)` | Wire the governor's byte budget -- `ServiceRuntime` does this when self-regulation is on |
 | `auto_wire(metrics, memory_guard)` | Called by `ServiceRuntime` — apps never call directly |
 | `stats() -> &Arc<PipelineStats>` | Atomic counters (received, processed, errors, filtered, dlq, bytes) |
 | `pool() -> &Arc<AdaptiveWorkerPool>` | Underlying rayon pool |
@@ -168,6 +200,7 @@ downstream.
 ## Source
 
 - [`../../src/worker/engine/mod.rs`](../../src/worker/engine/mod.rs)
+- [`../../src/worker/engine/driver.rs`](../../src/worker/engine/driver.rs)
 - [`../../src/worker/engine/intern.rs`](../../src/worker/engine/intern.rs)
 - [`../../src/worker/engine/parse.rs`](../../src/worker/engine/parse.rs)
 - [`../../src/worker/engine/pre_route.rs`](../../src/worker/engine/pre_route.rs)
@@ -178,7 +211,7 @@ downstream.
 ## Related
 
 - [worker-pool.md](worker-pool.md) — the rayon-backed pool that runs the transform phase
-- [tiered-sink.md](tiered-sink.md) — common sink target for the async variants
+- [tiered-sink.md](tiered-sink.md) — common sink target for the run loops
 - [../runtime/service-runtime.md](../runtime/service-runtime.md) — auto-wiring entry point
 - [../runtime/memory.md](../runtime/memory.md) — memory guard wired in via `auto_wire`
 - [../transport/README.md](../transport/README.md) — `TransportReceiver` consumed by the async run loops

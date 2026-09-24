@@ -485,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_with_handle() {
         // Test the handle API works with an actual server
-        let config = HttpServerConfig::new("127.0.0.1:18080");
+        let config = HttpServerConfig::new("127.0.0.1:0");
         let server = HttpServer::new(config);
 
         let app = Router::new().route("/", get(|| async { "Hello" }));
@@ -548,7 +548,7 @@ mod tests {
     /// completes. K8s endpoint controller stops routing on the 503.
     #[tokio::test]
     async fn shutdown_signal_flips_ready_before_drain() {
-        let config = HttpServerConfig::new("127.0.0.1:18081");
+        let config = HttpServerConfig::new("127.0.0.1:0");
         let server = HttpServer::new(config);
         let ready = server.ready_flag();
         assert!(ready.load(Ordering::SeqCst), "ready starts true");

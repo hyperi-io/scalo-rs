@@ -567,6 +567,8 @@ struct OrderedReceiver {
     fail_commit_on_seq: Option<u64>,
     /// How many more `recv` calls report the source busy before records flow.
     recv_backpressure: Arc<AtomicU64>,
+    /// Set by `close()`; `recv` then reports `Closed`, as Kafka does.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OrderedReceiver {
@@ -578,6 +580,7 @@ impl OrderedReceiver {
             commit_calls: Arc::new(AtomicUsize::new(0)),
             fail_commit_on_seq: None,
             recv_backpressure: Arc::new(AtomicU64::new(0)),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -586,6 +589,7 @@ impl crate::transport::TransportBase for OrderedReceiver {
     fn close(
         &self,
     ) -> impl std::future::Future<Output = crate::transport::TransportResult<()>> + Send {
+        self.closed.store(true, Ordering::Relaxed);
         std::future::ready(Ok(()))
     }
     fn is_healthy(&self) -> bool {
@@ -607,7 +611,11 @@ impl TransportReceiver for OrderedReceiver {
         let next_seq = Arc::clone(&self.next_seq);
         let total = self.total;
         let recv_backpressure = Arc::clone(&self.recv_backpressure);
+        let closed = self.closed.load(Ordering::Relaxed);
         async move {
+            if closed {
+                return Err(crate::transport::TransportError::Closed);
+            }
             if recv_backpressure
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok()
@@ -905,6 +913,15 @@ async fn shutdown_during_a_sink_outage_leaves_the_block_uncommitted() {
         commit_calls.load(Ordering::Relaxed),
         0,
         "a block the sink never took must not be committed"
+    );
+    assert!(
+        receiver.closed.load(Ordering::Relaxed),
+        "the source is closed on the way out"
+    );
+    assert_eq!(
+        receiver.next_seq.load(Ordering::Relaxed),
+        1,
+        "no block past the refused one is fetched: there is no drain after it"
     );
 }
 
@@ -1990,6 +2007,8 @@ struct ByteAwareSource {
     /// High-water of the bytes handed out in any single recv/recv_limited.
     recv_high_water: Arc<AtomicU64>,
     committed: Arc<AtomicU64>,
+    /// Set by `close()`; `recv` then reports `Closed`, as Kafka does.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl ByteAwareSource {
@@ -1998,6 +2017,7 @@ impl ByteAwareSource {
             remaining: std::sync::Mutex::new(records.into_iter().collect()),
             recv_high_water,
             committed: Arc::new(AtomicU64::new(0)),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2031,6 +2051,18 @@ impl ByteAwareSource {
         let tokens: Vec<MemTok2> = (0..n).map(|i| MemTok2 { seq: base + i }).collect();
         Some(WorkBatch::new(records, tokens))
     }
+
+    /// [`pull`](Self::pull), or `Closed` once `close()` has run.
+    fn pull_unless_closed(
+        &self,
+        max_records: usize,
+        max_bytes: Option<u64>,
+    ) -> crate::transport::TransportResult<Option<WorkBatch<MemTok2>>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(crate::transport::TransportError::Closed);
+        }
+        Ok(self.pull(max_records, max_bytes))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2048,6 +2080,7 @@ impl crate::transport::TransportBase for ByteAwareSource {
     fn close(
         &self,
     ) -> impl std::future::Future<Output = crate::transport::TransportResult<()>> + Send {
+        self.closed.store(true, Ordering::Relaxed);
         std::future::ready(Ok(()))
     }
     fn is_healthy(&self) -> bool {
@@ -2068,9 +2101,9 @@ impl TransportReceiver for ByteAwareSource {
     + Send {
         // RECORD-bounded only -- ignores bytes. This is the pre-fix shape: a
         // single poll can retain bytes >> any budget.
-        let pulled = self.pull(max, None);
+        let pulled = self.pull_unless_closed(max, None);
         async move {
-            match pulled {
+            match pulled? {
                 Some(batch) => Ok(batch),
                 // Exhausted: park forever so the loop only exits on shutdown
                 // (mirrors a quiet source -- never a busy spin).
@@ -2085,9 +2118,9 @@ impl TransportReceiver for ByteAwareSource {
     ) -> impl std::future::Future<Output = crate::transport::TransportResult<WorkBatch<Self::Token>>>
     + Send {
         // BYTE-bounded (floor one record): the fix path.
-        let pulled = self.pull(limits.max_records, Some(limits.max_bytes));
+        let pulled = self.pull_unless_closed(limits.max_records, Some(limits.max_bytes));
         async move {
-            match pulled {
+            match pulled? {
                 Some(batch) => Ok(batch),
                 None => std::future::pending().await,
             }
@@ -2664,4 +2697,578 @@ impl TransportReceiver for OrderedReceiverBad {
         }
         Ok(())
     }
+}
+
+// ---- Shutdown drain ----------------------------------------------------
+
+/// Records a push source holds when shutdown lands after the first block.
+const ACKED: u64 = 5;
+
+/// The payload of the record a push source acknowledged as `seq`.
+fn acked_payload(seq: u64) -> Bytes {
+    Bytes::from(format!(r#"{{"seq":{seq}}}"#))
+}
+
+/// Every payload an [`AckedQueueSource::holding`]`(ACKED)` acknowledged.
+fn acked_payloads() -> Vec<Bytes> {
+    (0..ACKED).map(acked_payload).collect()
+}
+
+/// A run's `ticker` argument with no periodic callback.
+type NoTicker = Option<(
+    Duration,
+    fn() -> std::future::Ready<Result<(), EngineError>>,
+)>;
+
+/// The `ticker` argument for a run with no periodic callback.
+fn no_ticker() -> NoTicker {
+    None
+}
+
+/// A push source shaped like the gRPC and HTTP servers: every record it holds
+/// was acknowledged to its sender when it was queued. `close()` stops intake,
+/// and `recv` returns what is still queued, one record a call, then `Closed`.
+struct AckedQueueSource {
+    queue: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Record>>,
+    /// Keeps intake open until `close()`, as a listening server does.
+    _intake: tokio::sync::mpsc::Sender<Record>,
+    next_seq: AtomicU64,
+    committed: Arc<parking_lot::Mutex<Vec<u64>>>,
+}
+
+impl AckedQueueSource {
+    /// A source already holding `n` acknowledged records, seq 0 onwards.
+    fn holding(n: u64) -> Self {
+        let capacity = usize::try_from(n).expect("small test count").max(1);
+        let (intake, queue) = tokio::sync::mpsc::channel(capacity);
+        for seq in 0..n {
+            intake
+                .try_send(Record {
+                    payload: acked_payload(seq),
+                    key: None,
+                    headers: vec![],
+                    metadata: RecordMeta {
+                        timestamp_ms: None,
+                        format: PayloadFormat::Json,
+                    },
+                })
+                .expect("capacity for every acked record");
+        }
+        Self {
+            queue: tokio::sync::Mutex::new(queue),
+            _intake: intake,
+            next_seq: AtomicU64::new(0),
+            committed: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl crate::transport::TransportBase for AckedQueueSource {
+    async fn close(&self) -> crate::transport::TransportResult<()> {
+        self.queue.lock().await.close();
+        Ok(())
+    }
+    fn is_healthy(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &'static str {
+        "acked-queue-test"
+    }
+}
+
+impl TransportReceiver for AckedQueueSource {
+    type Token = crate::transport::memory::MemoryToken;
+
+    async fn recv(&self, _max: usize) -> crate::transport::TransportResult<WorkBatch<Self::Token>> {
+        let Some(record) = self.queue.lock().await.recv().await else {
+            return Err(crate::transport::TransportError::Closed);
+        };
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        Ok(WorkBatch::new(
+            vec![record],
+            vec![crate::transport::memory::MemoryToken { seq }],
+        ))
+    }
+
+    async fn commit(&self, tokens: &[Self::Token]) -> crate::transport::TransportResult<()> {
+        self.committed.lock().extend(tokens.iter().map(|t| t.seq));
+        Ok(())
+    }
+}
+
+/// A sink that records what it takes and requests shutdown on its first block,
+/// so the run loop stops with acknowledged records still queued at the source.
+fn sink_stopping_after_first_block(
+    shutdown: CancellationToken,
+    sunk: Arc<parking_lot::Mutex<Vec<Bytes>>>,
+) -> impl FnMut(
+    &WorkBatch<crate::transport::memory::MemoryToken>,
+) -> std::future::Ready<Result<(), EngineError>> {
+    move |out| {
+        sunk.lock()
+            .extend(out.records.iter().map(|r| r.payload.clone()));
+        shutdown.cancel();
+        std::future::ready(Ok(()))
+    }
+}
+
+/// Shutdown lands after the first block with four acknowledged records still
+/// queued at a push source: `run_workbatch` closes the source and sinks them.
+#[tokio::test]
+async fn run_workbatch_drains_acked_records_after_shutdown() {
+    let source = AckedQueueSource::holding(ACKED);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let result = default_engine()
+        .run_workbatch(
+            &source,
+            shutdown.clone(),
+            |batch| Ok(batch),
+            sink_stopping_after_first_block(shutdown, Arc::clone(&sunk)),
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        *sunk.lock(),
+        acked_payloads(),
+        "every record the source acknowledged must reach the sink"
+    );
+    assert_eq!(
+        *source.committed.lock(),
+        (0..ACKED).collect::<Vec<_>>(),
+        "and every drained block commits"
+    );
+}
+
+/// The streaming loop drains the same way: every acknowledged record is sunk.
+#[tokio::test]
+async fn run_workbatch_streaming_drains_acked_records_after_shutdown() {
+    let source = AckedQueueSource::holding(ACKED);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let result = default_engine()
+        .run_workbatch_streaming(
+            &source,
+            shutdown.clone(),
+            |batch| Ok(batch),
+            sink_stopping_after_first_block(shutdown, Arc::clone(&sunk)),
+            CommitMode::Auto,
+            64,
+            no_ticker(),
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(*sunk.lock(), acked_payloads());
+}
+
+/// The pre-parsing loop drains the same way: every acknowledged record is sunk.
+#[tokio::test]
+async fn run_workbatch_parsed_drains_acked_records_after_shutdown() {
+    let source = AckedQueueSource::holding(ACKED);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let result = default_engine()
+        .run_workbatch_parsed(
+            &source,
+            shutdown.clone(),
+            |pb: ParsedBatch<'_, _>| {
+                Ok(WorkBatch::new(pb.records, pb.commit_tokens).with_dlq_entries(pb.dlq_entries))
+            },
+            sink_stopping_after_first_block(shutdown, Arc::clone(&sunk)),
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(*sunk.lock(), acked_payloads());
+}
+
+/// `run_governed` with the governor off delegates to `run_workbatch`, drain
+/// included.
+#[cfg(feature = "governor")]
+#[tokio::test]
+async fn run_governed_off_drains_acked_records_after_shutdown() {
+    let source = AckedQueueSource::holding(ACKED);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let result = default_engine()
+        .run_governed(
+            &source,
+            shutdown.clone(),
+            |batch| Ok(batch),
+            sink_stopping_after_first_block(shutdown, Arc::clone(&sunk)),
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(*sunk.lock(), acked_payloads());
+}
+
+/// `run_governed` with the governor on drains through byte-budget sub-blocks.
+#[cfg(feature = "governor")]
+#[tokio::test]
+async fn run_governed_on_drains_acked_records_after_shutdown() {
+    let source = AckedQueueSource::holding(ACKED);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (engine, _gov) = governed_engine();
+
+    let result = engine
+        .run_governed(
+            &source,
+            shutdown.clone(),
+            |batch| Ok(batch),
+            sink_stopping_after_first_block(shutdown, Arc::clone(&sunk)),
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(*sunk.lock(), acked_payloads());
+    assert_eq!(*source.committed.lock(), (0..ACKED).collect::<Vec<_>>());
+}
+
+/// The engine over the real HTTP server: every record the server answered 200
+/// for before shutdown reaches the sink, though the loop had read none of them
+/// when the token fired, and a POST after the run is refused retryably.
+#[cfg(all(
+    feature = "transport-http",
+    feature = "http-server",
+    feature = "governor"
+))]
+#[tokio::test]
+async fn run_governed_drains_an_http_source_at_shutdown() {
+    use crate::transport::TransportSender;
+    use crate::transport::http::{HttpTransport, HttpTransportConfig};
+
+    let source = HttpTransport::new(&HttpTransportConfig {
+        listen: Some("127.0.0.1:0".to_string()),
+        recv_timeout_ms: 100,
+        ..Default::default()
+    })
+    .await
+    .expect("receiver");
+    let addr = source.local_addr().expect("receiver bound");
+    let sender = HttpTransport::new(&HttpTransportConfig::sender(&format!(
+        "http://{addr}/ingest"
+    )))
+    .await
+    .expect("sender");
+    for seq in 0..ACKED {
+        let sent = sender.send("", acked_payload(seq)).await;
+        assert!(sent.is_ok(), "{sent:?}");
+    }
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let taken = Arc::clone(&sunk);
+
+    let result = default_engine()
+        .run_governed(
+            &source,
+            shutdown,
+            |batch| Ok(batch),
+            move |out: &WorkBatch<_>| {
+                taken
+                    .lock()
+                    .extend(out.records.iter().map(|r| r.payload.clone()));
+                std::future::ready(Ok(()))
+            },
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        *sunk.lock(),
+        acked_payloads(),
+        "every record the HTTP server acked must reach the sink"
+    );
+    let after = sender.send("", acked_payload(ACKED)).await;
+    assert!(
+        after.is_backpressured(),
+        "the engine closed the source, so a later POST must be refused retryably, got {after:?}"
+    );
+}
+
+/// The engine over the real gRPC server, the shape of a direct-transport
+/// pipeline: every record the server acked before shutdown reaches the sink,
+/// and a push after the run is refused retryably.
+#[cfg(all(feature = "transport-grpc", feature = "governor"))]
+#[tokio::test]
+async fn run_governed_drains_a_grpc_source_at_shutdown() {
+    use crate::transport::TransportSender;
+    use crate::transport::grpc::{GrpcConfig, GrpcTransport};
+
+    let mut server_config = GrpcConfig::server("127.0.0.1:0");
+    server_config.recv_timeout_ms = 100;
+    let source = GrpcTransport::new(&server_config)
+        .await
+        .expect("gRPC listener");
+    let addr = source.local_addr().expect("listener bound");
+    let sender = GrpcTransport::new(&GrpcConfig::client(&format!("http://{addr}")))
+        .await
+        .expect("gRPC client");
+    for seq in 0..ACKED {
+        let sent = sender.send("main", acked_payload(seq)).await;
+        assert!(sent.is_ok(), "{sent:?}");
+    }
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let taken = Arc::clone(&sunk);
+
+    let result = default_engine()
+        .run_governed(
+            &source,
+            shutdown,
+            |batch| Ok(batch),
+            move |out: &WorkBatch<_>| {
+                taken
+                    .lock()
+                    .extend(out.records.iter().map(|r| r.payload.clone()));
+                std::future::ready(Ok(()))
+            },
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        *sunk.lock(),
+        acked_payloads(),
+        "every record the gRPC server acked must reach the sink"
+    );
+    let after = sender.send("main", acked_payload(ACKED)).await;
+    assert!(
+        after.is_backpressured(),
+        "the engine closed the source, so a later push must be refused retryably, got {after:?}"
+    );
+}
+
+/// What a scripted sink does with its `n`th call (from 1).
+#[derive(Clone, Copy)]
+enum SinkStep {
+    Accept,
+    Busy,
+    Broken,
+}
+
+/// A sink that cancels `shutdown` on its first call and answers each call per
+/// `script`, then `then` for every call past its end, recording every seq it
+/// is offered and every payload it accepts.
+fn scripted_sink(
+    shutdown: CancellationToken,
+    script: &'static [SinkStep],
+    then: SinkStep,
+    offered: Arc<parking_lot::Mutex<Vec<u64>>>,
+    accepted: Arc<parking_lot::Mutex<Vec<Bytes>>>,
+) -> impl FnMut(
+    &WorkBatch<crate::transport::memory::MemoryToken>,
+) -> std::future::Ready<Result<(), EngineError>> {
+    let mut calls = 0_usize;
+    move |out| {
+        calls += 1;
+        shutdown.cancel();
+        offered
+            .lock()
+            .extend(out.commit_tokens.iter().map(|t| t.seq));
+        let step = script.get(calls - 1).copied().unwrap_or(then);
+        std::future::ready(match step {
+            SinkStep::Accept => {
+                accepted
+                    .lock()
+                    .extend(out.records.iter().map(|r| r.payload.clone()));
+                Ok(())
+            }
+            SinkStep::Busy => Err(crate::transport::TransportError::Backpressure.into()),
+            SinkStep::Broken => Err(EngineError::Sink("sink broken".into())),
+        })
+    }
+}
+
+/// Run `run_workbatch` over a push source holding `ACKED` records with a
+/// scripted sink, returning the result, the seqs offered and the payloads
+/// accepted.
+async fn drain_with_script(
+    source: &AckedQueueSource,
+    script: &'static [SinkStep],
+    then: SinkStep,
+) -> (Result<(), EngineError>, Vec<u64>, Vec<Bytes>) {
+    let shutdown = CancellationToken::new();
+    let offered = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let accepted = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let result = default_engine()
+        .run_workbatch(
+            source,
+            shutdown.clone(),
+            |batch| Ok(batch),
+            scripted_sink(
+                shutdown,
+                script,
+                then,
+                Arc::clone(&offered),
+                Arc::clone(&accepted),
+            ),
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await;
+    let offered = offered.lock().clone();
+    let accepted = accepted.lock().clone();
+    (result, offered, accepted)
+}
+
+/// A sink busy for a moment during the drain is retried, not abandoned: every
+/// record the push source acknowledged is still delivered.
+#[tokio::test(start_paused = true)]
+async fn the_drain_retries_a_busy_sink_and_delivers_every_record() {
+    use SinkStep::{Accept, Busy};
+    let source = AckedQueueSource::holding(ACKED);
+
+    let (result, offered, accepted) =
+        drain_with_script(&source, &[Accept, Busy, Busy], Accept).await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        accepted,
+        acked_payloads(),
+        "every acked record is delivered after the sink recovers; offered {offered:?}"
+    );
+    assert_eq!(*source.committed.lock(), (0..ACKED).collect::<Vec<_>>());
+}
+
+/// A block the sink is refusing when shutdown lands keeps being retried, and
+/// the drain follows once it is delivered.
+#[tokio::test(start_paused = true)]
+async fn a_block_refused_as_shutdown_lands_is_retried_then_drained() {
+    use SinkStep::{Accept, Busy};
+    let source = AckedQueueSource::holding(ACKED);
+
+    let (result, offered, accepted) = drain_with_script(&source, &[Busy, Busy], Accept).await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        accepted,
+        acked_payloads(),
+        "the refused block and everything queued behind it are delivered; offered {offered:?}"
+    );
+    assert_eq!(*source.committed.lock(), (0..ACKED).collect::<Vec<_>>());
+}
+
+/// A sink that fails permanently during the drain stops it at once: the run
+/// returns the error and nothing commits past the failed block.
+#[tokio::test(start_paused = true)]
+async fn the_drain_stops_at_once_on_a_permanent_sink_failure() {
+    use SinkStep::{Accept, Broken};
+    let source = AckedQueueSource::holding(ACKED);
+
+    let (result, offered, _accepted) = drain_with_script(&source, &[Accept, Broken], Accept).await;
+
+    assert!(
+        matches!(result, Err(EngineError::Sink(_))),
+        "a permanent sink failure ends the run with its error, got {result:?}"
+    );
+    assert_eq!(offered, vec![0, 1], "seq 1 is offered once, seq 2 never");
+    assert_eq!(
+        *source.committed.lock(),
+        vec![0],
+        "nothing commits past the failed block"
+    );
+}
+
+/// A sink still busy when the retry window after shutdown closes is given up
+/// on at that point: the block stays uncommitted and nothing past it is sunk.
+#[tokio::test(start_paused = true)]
+async fn a_block_still_refused_when_the_retry_window_closes_is_abandoned() {
+    use SinkStep::{Accept, Busy};
+    let source = AckedQueueSource::holding(ACKED);
+    let started = tokio::time::Instant::now();
+
+    let (result, offered, accepted) = drain_with_script(&source, &[Accept], Busy).await;
+    let took = started.elapsed();
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(accepted, vec![acked_payload(0)]);
+    assert!(
+        offered.iter().skip(1).all(|seq| *seq == 1),
+        "only seq 1 is retried, nothing past it is offered: {offered:?}"
+    );
+    assert_eq!(*source.committed.lock(), vec![0]);
+    assert!(
+        took >= SHUTDOWN_RETRY_LIMIT && took < SHUTDOWN_RETRY_LIMIT + Duration::from_secs(1),
+        "retries should end at the {SHUTDOWN_RETRY_LIMIT:?} window, took {took:?}"
+    );
+}
+
+/// A source that ignores `close()` and waits forever cannot hold shutdown:
+/// the drain gives up once nothing has arrived for `DRAIN_IDLE_LIMIT`.
+#[tokio::test(start_paused = true)]
+async fn the_drain_gives_up_on_a_source_that_never_reports_closed() {
+    struct NeverCloses;
+
+    impl crate::transport::TransportBase for NeverCloses {
+        async fn close(&self) -> crate::transport::TransportResult<()> {
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "never-closes-test"
+        }
+    }
+
+    impl TransportReceiver for NeverCloses {
+        type Token = crate::transport::memory::MemoryToken;
+
+        async fn recv(
+            &self,
+            _max: usize,
+        ) -> crate::transport::TransportResult<WorkBatch<Self::Token>> {
+            std::future::pending().await
+        }
+
+        async fn commit(&self, _tokens: &[Self::Token]) -> crate::transport::TransportResult<()> {
+            Ok(())
+        }
+    }
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let started = tokio::time::Instant::now();
+
+    let result = default_engine()
+        .run_workbatch(
+            &NeverCloses,
+            shutdown,
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>| async { Ok(()) },
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await;
+
+    let took = started.elapsed();
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        took >= DRAIN_IDLE_LIMIT && took < DRAIN_IDLE_LIMIT + Duration::from_secs(1),
+        "the drain should give up at {DRAIN_IDLE_LIMIT:?}, took {took:?}"
+    );
 }

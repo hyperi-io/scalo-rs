@@ -49,6 +49,14 @@
 //! `process_mid_tier`, `process_raw` and `ParsedMessage` remain for the
 //! in-process (non-run-loop) callers; only the four legacy run loops were
 //! removed by the 0.7b flip.
+//!
+//! ## Shutdown
+//!
+//! When the shutdown token fires, a run loop closes its source and drives what
+//! the source still holds through `process`, `sink` and the commit until `recv`
+//! returns [`TransportError::Closed`]. A push source such as the gRPC or HTTP
+//! server acknowledges a record once it is queued, so a loop that stopped at the
+//! token lost what the source had acknowledged.
 
 use std::time::Duration;
 
@@ -57,7 +65,9 @@ use tokio_util::sync::CancellationToken;
 use super::{BatchEngine, EngineError};
 use crate::backoff::Backoff;
 use crate::transport::codec::{self, ParsedPayload};
-use crate::transport::{Record, TransportReceiver, TransportResult, WorkBatch};
+use crate::transport::{
+    Record, RecvLimits, TransportError, TransportReceiver, TransportResult, WorkBatch,
+};
 
 /// When the driver commits the input source acks.
 ///
@@ -206,8 +216,111 @@ where
 enum Delivery {
     /// The sink took it.
     Sunk,
-    /// Shutdown arrived while the sink was refusing it; it stays uncommitted.
+    /// The sink was still refusing it when the retry window after shutdown
+    /// closed; it stays uncommitted.
     Abandoned,
+}
+
+/// How long the shutdown drain waits on a source that has stopped returning
+/// records, so one that never reports `Closed` cannot hold shutdown.
+#[cfg(feature = "transport")]
+const DRAIN_IDLE_LIMIT: Duration = Duration::from_secs(5);
+
+/// How long after shutdown a block the sink refuses transiently is still
+/// retried, so a sink busy at that moment does not lose what the source acked.
+#[cfg(feature = "transport")]
+const SHUTDOWN_RETRY_LIMIT: Duration = Duration::from_secs(10);
+
+/// When a run loop stops retrying a block the sink refuses transiently:
+/// never before shutdown, and [`SHUTDOWN_RETRY_LIMIT`] after the loop first
+/// sees it.
+#[cfg(feature = "transport")]
+struct RetryWindow<'a> {
+    shutdown: &'a CancellationToken,
+    shutdown_seen: std::sync::OnceLock<tokio::time::Instant>,
+}
+
+#[cfg(feature = "transport")]
+impl<'a> RetryWindow<'a> {
+    fn new(shutdown: &'a CancellationToken) -> Self {
+        Self {
+            shutdown,
+            shutdown_seen: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Start the window from now, unless a retry already saw shutdown.
+    fn mark_shutdown_seen(&self) {
+        self.shutdown_seen.get_or_init(tokio::time::Instant::now);
+    }
+
+    /// Resolves once the window has closed.
+    async fn closed(&self) {
+        self.shutdown.cancelled().await;
+        let seen = *self.shutdown_seen.get_or_init(tokio::time::Instant::now);
+        tokio::time::sleep_until(seen + SHUTDOWN_RETRY_LIMIT).await;
+    }
+}
+
+/// The receive call a run loop makes.
+#[cfg(feature = "transport")]
+#[derive(Clone, Copy)]
+enum RecvCap {
+    /// `recv(max)`.
+    Records(usize),
+    /// `recv_limited(limits)`.
+    Limits(RecvLimits),
+}
+
+/// How a run loop hands a block to its sink.
+#[cfg(feature = "transport")]
+#[derive(Clone, Copy)]
+enum BlockShape {
+    /// The whole block in one sink call.
+    Whole,
+    /// Sub-blocks of about this many payload bytes, committed once at the end.
+    SubBlocks(u64),
+}
+
+/// Receive one block the way the run loop that owns `cap` does.
+#[cfg(feature = "transport")]
+async fn recv_capped<R: TransportReceiver>(
+    receiver: &R,
+    cap: RecvCap,
+) -> TransportResult<WorkBatch<R::Token>> {
+    match cap {
+        RecvCap::Records(max) => receiver.recv(max).await,
+        RecvCap::Limits(limits) => receiver.recv_limited(limits).await,
+    }
+}
+
+/// Close the source at shutdown; a failure is logged, since shutdown goes on.
+#[cfg(feature = "transport")]
+async fn close_source<R: TransportReceiver>(receiver: &R) {
+    if let Err(e) = receiver.close().await {
+        tracing::warn!(
+            error = %e,
+            transport = receiver.name(),
+            "Closing the source at shutdown failed"
+        );
+    }
+}
+
+/// End a run whose block the sink was still refusing when the retry window
+/// after shutdown closed.
+///
+/// The block stays uncommitted, and the source is closed without a drain: a
+/// later block sunk and committed would advance an ordered source past it.
+#[cfg(feature = "transport")]
+async fn stop_after_abandoned<R: TransportReceiver>(receiver: &R) -> Result<(), EngineError> {
+    tracing::warn!(
+        transport = receiver.name(),
+        retry_limit = ?SHUTDOWN_RETRY_LIMIT,
+        "The sink still refused a block when the retry window after shutdown closed; \
+         closing the source without a drain, and the block stays uncommitted"
+    );
+    close_source(receiver).await;
+    Ok(())
 }
 
 /// Sleep for `wait`, or return `false` as soon as shutdown is requested.
@@ -271,12 +384,13 @@ async fn settle_recv<T: crate::transport::CommitToken>(
 }
 
 /// Sink `batch`, holding it and retrying while the sink reports a transient
-/// failure, so no later block is fetched or committed past it.
+/// failure, so no later block is fetched or committed past it. Retries stop
+/// when `retry` closes.
 #[cfg(feature = "transport")]
 async fn sink_until_delivered<T, Sink, SinkFut>(
     sink: &mut Sink,
     batch: &WorkBatch<T>,
-    shutdown: &CancellationToken,
+    retry: &RetryWindow<'_>,
 ) -> Result<Delivery, EngineError>
 where
     T: crate::transport::CommitToken,
@@ -293,8 +407,10 @@ where
             Err(e) if e.is_transient() => {
                 failures = failures.saturating_add(1);
                 note_transient("sink", &e, failures);
-                if !wait_unless_shutdown(shutdown, Backoff::TRANSIENT.delay(failures)).await {
-                    return Ok(Delivery::Abandoned);
+                tokio::select! {
+                    biased;
+                    () = retry.closed() => return Ok(Delivery::Abandoned),
+                    () = tokio::time::sleep(Backoff::TRANSIENT.delay(failures)) => {}
                 }
             }
             Err(e) => return Err(e),
@@ -338,7 +454,27 @@ impl BatchEngine {
     /// - `ticker` is an optional `(interval, fn)` that fires on the interval
     ///   inside the select loop (flush timers, periodic maintenance).
     ///
-    /// Stops cleanly when `shutdown` is cancelled.
+    /// # Shutdown
+    ///
+    /// When `shutdown` is cancelled the loop closes `receiver`, then runs every
+    /// block it still returns through `process`, `sink` and the commit until
+    /// `recv` returns [`TransportError::Closed`]. A push source such as the gRPC
+    /// or HTTP server acknowledges a record once it is queued, so stopping
+    /// without the drain loses what it acknowledged.
+    ///
+    /// A block the sink refuses transiently (`Backpressure`, `Timeout`) is
+    /// retried with the usual backoff for up to 10 s after the loop sees
+    /// shutdown, whether the refusal came before shutdown or during the drain.
+    /// The drain ends early:
+    ///
+    /// - at a block the sink still refuses when those 10 s are up: it stays
+    ///   uncommitted, nothing is committed past it, and if it was refused before
+    ///   the drain began the source is closed without one;
+    /// - at a permanent sink error, at once, returned as the run's error;
+    /// - once `recv` has returned nothing for 5 s without reporting `Closed`.
+    ///
+    /// The source is closed when this returns, so the caller's own final flush
+    /// comes after.
     ///
     /// # Errors
     ///
@@ -351,10 +487,10 @@ impl BatchEngine {
     ///
     /// A transient failure never stops the loop. `recv` returning, or `sink`
     /// returning `EngineError::Transport` carrying,
-    /// [`TransportError::Backpressure`](crate::TransportError::Backpressure) or
-    /// [`TransportError::Timeout`](crate::TransportError::Timeout) is retried
-    /// after a jittered backoff (100 ms doubling to 2 s) until it clears or
-    /// `shutdown` fires. A sink should map
+    /// [`TransportError::Backpressure`] or [`TransportError::Timeout`] is retried
+    /// after a jittered backoff (100 ms doubling to 2 s) until it clears. A
+    /// `recv` stops retrying when `shutdown` fires, a sink 10 s after it. A sink
+    /// should map
     /// [`SendResult::Backpressured`](crate::transport::SendResult::Backpressured)
     /// to `Err(TransportError::Backpressure.into())` to get this; an
     /// [`EngineError::Sink`] is treated as permanent.
@@ -399,6 +535,7 @@ impl BatchEngine {
         );
 
         let mut ticker = LoopTicker::new(ticker);
+        let retry = RetryWindow::new(&shutdown);
         let mut recv_failures = 0_u32;
 
         loop {
@@ -407,7 +544,17 @@ impl BatchEngine {
 
                 () = shutdown.cancelled() => {
                     tracing::info!("BatchEngine (workbatch) shutting down");
-                    return Ok(());
+                    return self
+                        .drain_on_shutdown(
+                            receiver,
+                            RecvCap::Records(self.config.max_chunk_size),
+                            BlockShape::Whole,
+                            &process,
+                            &mut sink,
+                            commit,
+                            &retry,
+                        )
+                        .await;
                 }
 
                 () = ticker.wait() => ticker.fire("workbatch").await,
@@ -421,8 +568,12 @@ impl BatchEngine {
                     let Some(batch) = self.ingest_workbatch(work_batch)? else {
                         continue;
                     };
-                    self.drive_block(receiver, batch, &process, &mut sink, commit, &shutdown)
-                        .await?;
+                    let Delivery::Sunk = self
+                        .drive_block(receiver, batch, &process, &mut sink, commit, &retry)
+                        .await?
+                    else {
+                        return stop_after_abandoned(receiver).await;
+                    };
                 }
             }
         }
@@ -452,6 +603,9 @@ impl BatchEngine {
     ///
     /// Fan-out WITHIN a sub-block's `process` is fine (records grow); the source
     /// acks are still the batch's input tokens, committed once at the end.
+    ///
+    /// Shutdown drains the source as [`run_workbatch`](Self::run_workbatch)
+    /// does, in sub-blocks of `sub_block_bytes`.
     ///
     /// # Errors
     ///
@@ -493,6 +647,7 @@ impl BatchEngine {
         );
 
         let mut ticker = LoopTicker::new(ticker);
+        let retry = RetryWindow::new(&shutdown);
         let mut recv_failures = 0_u32;
 
         loop {
@@ -501,7 +656,17 @@ impl BatchEngine {
 
                 () = shutdown.cancelled() => {
                     tracing::info!("BatchEngine (workbatch streaming) shutting down");
-                    return Ok(());
+                    return self
+                        .drain_on_shutdown(
+                            receiver,
+                            RecvCap::Records(self.config.max_chunk_size),
+                            BlockShape::SubBlocks(sub_block_bytes),
+                            &process,
+                            &mut sink,
+                            commit,
+                            &retry,
+                        )
+                        .await;
                 }
 
                 () = ticker.wait() => ticker.fire("workbatch streaming").await,
@@ -515,10 +680,15 @@ impl BatchEngine {
                     let Some(batch) = self.ingest_workbatch(work_batch)? else {
                         continue;
                     };
-                    self.drive_block_streaming(
-                        receiver, batch, &process, &mut sink, commit, sub_block_bytes, &shutdown,
-                    )
-                    .await?;
+                    let Delivery::Sunk = self
+                        .drive_block_streaming(
+                            receiver, batch, &process, &mut sink, commit, sub_block_bytes,
+                            &retry,
+                        )
+                        .await?
+                    else {
+                        return stop_after_abandoned(receiver).await;
+                    };
                 }
             }
         }
@@ -551,6 +721,10 @@ impl BatchEngine {
     /// SEPARATELY into the receive transport, not here -- this method is the
     /// driver-side lever (sub-block sizing + AIMD), the gate is the
     /// transport-side brake. The two share the same `UnifiedPressure`.
+    ///
+    /// Shutdown drains the source as [`run_workbatch`](Self::run_workbatch)
+    /// does; with the governor on, through the byte budget in force when
+    /// shutdown lands.
     ///
     /// # Errors
     ///
@@ -601,6 +775,7 @@ impl BatchEngine {
         );
 
         let mut ticker = LoopTicker::new(ticker);
+        let retry = RetryWindow::new(&shutdown);
 
         // Track the previous block's arrival instant so we can feed the AIMD
         // loop a real ingest inter-arrival interval.
@@ -629,7 +804,17 @@ impl BatchEngine {
 
                 () = shutdown.cancelled() => {
                     tracing::info!("BatchEngine (governed) shutting down");
-                    return Ok(());
+                    return self
+                        .drain_on_shutdown(
+                            receiver,
+                            RecvCap::Limits(recv_limits),
+                            BlockShape::SubBlocks(budget.byte_budget()),
+                            &process,
+                            &mut sink,
+                            commit,
+                            &retry,
+                        )
+                        .await;
                 }
 
                 () = ticker.wait() => ticker.fire("governed").await,
@@ -660,10 +845,15 @@ impl BatchEngine {
                     let sub_block_bytes = budget.byte_budget();
 
                     let process_start = std::time::Instant::now();
-                    self.drive_block_streaming(
-                        receiver, batch, &process, &mut sink, commit, sub_block_bytes, &shutdown,
-                    )
-                    .await?;
+                    let Delivery::Sunk = self
+                        .drive_block_streaming(
+                            receiver, batch, &process, &mut sink, commit, sub_block_bytes,
+                            &retry,
+                        )
+                        .await?
+                    else {
+                        return stop_after_abandoned(receiver).await;
+                    };
                     let process_time = process_start.elapsed();
 
                     // Fold the OBSERVED actual block bytes into the AIMD loop. A
@@ -710,6 +900,9 @@ impl BatchEngine {
     /// the parse-failure contract. `process_parsed` returns the final
     /// [`WorkBatch`] and MUST preserve the input `commit_tokens`.
     ///
+    /// Shutdown drains the source as [`run_workbatch`](Self::run_workbatch)
+    /// does, parsing each drained block the same way.
+    ///
     /// # Errors
     ///
     /// Same as [`run_workbatch`](Self::run_workbatch).
@@ -740,7 +933,17 @@ impl BatchEngine {
         );
 
         let mut ticker = LoopTicker::new(ticker);
+        let retry = RetryWindow::new(&shutdown);
         let mut recv_failures = 0_u32;
+
+        // Wrap the parse-then-process so drive_block stays generic.
+        // parse_block honours ParseErrorAction: FailBatch surfaces a terminal
+        // EngineError here (no commit), Dlq carries entries forward for the
+        // driver to route, Skip drops silently+counted.
+        let parse = |b: WorkBatch<R::Token>| -> Result<WorkBatch<R::Token>, EngineError> {
+            let parsed = self.parse_block(b)?;
+            process_parsed(parsed)
+        };
 
         loop {
             tokio::select! {
@@ -748,7 +951,17 @@ impl BatchEngine {
 
                 () = shutdown.cancelled() => {
                     tracing::info!("BatchEngine (workbatch parsed) shutting down");
-                    return Ok(());
+                    return self
+                        .drain_on_shutdown(
+                            receiver,
+                            RecvCap::Records(self.config.max_chunk_size),
+                            BlockShape::Whole,
+                            &parse,
+                            &mut sink,
+                            commit,
+                            &retry,
+                        )
+                        .await;
                 }
 
                 () = ticker.wait() => ticker.fire("workbatch parsed").await,
@@ -762,16 +975,12 @@ impl BatchEngine {
                     let Some(batch) = self.ingest_workbatch(recv_batch)? else {
                         continue;
                     };
-                    // Wrap the parse-then-process so drive_block stays generic.
-                    // parse_block honours ParseErrorAction: FailBatch surfaces a
-                    // terminal EngineError here (no commit), Dlq carries entries
-                    // forward for the driver to route, Skip drops silently+counted.
-                    let parse = |b: WorkBatch<R::Token>| -> Result<WorkBatch<R::Token>, EngineError> {
-                        let parsed = self.parse_block(b)?;
-                        process_parsed(parsed)
+                    let Delivery::Sunk = self
+                        .drive_block(receiver, batch, &parse, &mut sink, commit, &retry)
+                        .await?
+                    else {
+                        return stop_after_abandoned(receiver).await;
                     };
-                    self.drive_block(receiver, batch, &parse, &mut sink, commit, &shutdown)
-                        .await?;
                 }
             }
         }
@@ -808,11 +1017,110 @@ impl BatchEngine {
         Ok(Some(batch))
     }
 
+    /// Close `receiver`, then drive every block it still returns through
+    /// `process`, `sink` and the commit until `recv` reports
+    /// [`TransportError::Closed`].
+    ///
+    /// The shutdown half of every run loop -- see
+    /// [`run_workbatch`](Self::run_workbatch) for the contract. An empty batch
+    /// is not the end: a source may be finishing a queue write it reserved
+    /// before the close. The wait on an idle source is bounded by
+    /// [`DRAIN_IDLE_LIMIT`], and a sink's transient refusals are retried until
+    /// `retry` closes.
+    #[cfg(feature = "transport")]
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_on_shutdown<R, P, Sink, SinkFut>(
+        &self,
+        receiver: &R,
+        cap: RecvCap,
+        shape: BlockShape,
+        process: &P,
+        sink: &mut Sink,
+        commit: CommitMode,
+        retry: &RetryWindow<'_>,
+    ) -> Result<(), EngineError>
+    where
+        R: TransportReceiver,
+        P: Fn(WorkBatch<R::Token>) -> Result<WorkBatch<R::Token>, EngineError>,
+        Sink: FnMut(&WorkBatch<R::Token>) -> SinkFut,
+        SinkFut: std::future::Future<Output = Result<(), EngineError>>,
+    {
+        retry.mark_shutdown_seen();
+        close_source(receiver).await;
+
+        let mut drained = 0_usize;
+        let mut idle_since = tokio::time::Instant::now();
+        let mut idle_polls = 0_u32;
+        loop {
+            let remaining = DRAIN_IDLE_LIMIT.saturating_sub(idle_since.elapsed());
+            let batch = match tokio::time::timeout(remaining, recv_capped(receiver, cap)).await {
+                Ok(Err(TransportError::Closed)) => break,
+                Ok(Err(e)) if e.is_recoverable() => None,
+                Ok(Err(e)) => return Err(EngineError::Transport(e)),
+                Ok(Ok(batch)) => self.ingest_workbatch(batch)?,
+                Err(_elapsed) => None,
+            };
+
+            if let Some(batch) = batch {
+                let records = batch.records.len();
+                let delivery = match shape {
+                    BlockShape::Whole => {
+                        self.drive_block(receiver, batch, process, sink, commit, retry)
+                            .await?
+                    }
+                    BlockShape::SubBlocks(bytes) => {
+                        self.drive_block_streaming(
+                            receiver, batch, process, sink, commit, bytes, retry,
+                        )
+                        .await?
+                    }
+                };
+                if let Delivery::Abandoned = delivery {
+                    tracing::warn!(
+                        transport = receiver.name(),
+                        drained,
+                        retry_limit = ?SHUTDOWN_RETRY_LIMIT,
+                        "Shutdown drain stopped at a block the sink still refused when the \
+                         retry window closed; it stays uncommitted, and what the source \
+                         still holds is not delivered"
+                    );
+                    return Ok(());
+                }
+                drained = drained.saturating_add(records);
+                idle_since = tokio::time::Instant::now();
+                idle_polls = 0;
+                continue;
+            }
+
+            let remaining = DRAIN_IDLE_LIMIT.saturating_sub(idle_since.elapsed());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    transport = receiver.name(),
+                    drained,
+                    idle_limit = ?DRAIN_IDLE_LIMIT,
+                    "Shutdown drain gave up: the source returned nothing and never reported Closed"
+                );
+                return Ok(());
+            }
+            idle_polls = idle_polls.saturating_add(1);
+            tokio::time::sleep(Backoff::TRANSIENT.delay(idle_polls).min(remaining)).await;
+        }
+
+        tracing::info!(
+            transport = receiver.name(),
+            drained,
+            "Shutdown drain complete"
+        );
+        Ok(())
+    }
+
     /// Drive ONE block through `ingress lease -> process -> sink -> commit`.
     ///
     /// Shared by both [`run_workbatch`](Self::run_workbatch) and
     /// [`run_workbatch_parsed`](Self::run_workbatch_parsed); the only difference
-    /// between the two is the `process` closure they pass.
+    /// between the two is the `process` closure they pass. Returns
+    /// [`Delivery::Abandoned`] when the sink still refused the block as `retry`
+    /// closed, which leaves it uncommitted.
     #[cfg(feature = "transport")]
     async fn drive_block<R, P, Sink, SinkFut>(
         &self,
@@ -821,8 +1129,8 @@ impl BatchEngine {
         process: &P,
         sink: &mut Sink,
         commit: CommitMode,
-        shutdown: &CancellationToken,
-    ) -> Result<(), EngineError>
+        retry: &RetryWindow<'_>,
+    ) -> Result<Delivery, EngineError>
     where
         R: TransportReceiver,
         P: Fn(WorkBatch<R::Token>) -> Result<WorkBatch<R::Token>, EngineError>,
@@ -889,10 +1197,10 @@ impl BatchEngine {
         // path gets this for free: a zero-record block runs zero sub-blocks and
         // still commits once at the end.)
         if !out_batch.records.is_empty() {
-            match sink_until_delivered(sink, &out_batch, shutdown).await {
+            match sink_until_delivered(sink, &out_batch, retry).await {
                 Ok(Delivery::Sunk) => {}
                 // Uncommitted, so the source re-delivers it.
-                Ok(Delivery::Abandoned) => return Ok(()),
+                Ok(Delivery::Abandoned) => return Ok(Delivery::Abandoned),
                 Err(e) => {
                     tracing::error!(error = %e, "Sink failed (workbatch) -- terminal, stopping the run loop (ack barrier)");
                     return Err(e);
@@ -908,7 +1216,7 @@ impl BatchEngine {
                 // The sink owns the commit -- the engine does not commit here.
             }
         }
-        Ok(())
+        Ok(Delivery::Sunk)
     }
 
     /// Drive ONE block through streaming sub-blocks: peak in-flight memory is
@@ -929,7 +1237,9 @@ impl BatchEngine {
     /// [`drive_block`](Self::drive_block)). The commit (under
     /// [`CommitMode::Auto`]) fires EXACTLY ONCE after the final sub-block is
     /// delivered, with ALL the batch's input source acks; a commit failure is
-    /// logged and counted, and the loop carries on.
+    /// logged and counted, and the loop carries on. Returns
+    /// [`Delivery::Abandoned`] when the sink still refused a sub-block as
+    /// `retry` closed, leaving the whole block uncommitted.
     #[cfg(feature = "transport")]
     #[allow(clippy::too_many_arguments)]
     async fn drive_block_streaming<R, P, Sink, SinkFut>(
@@ -940,8 +1250,8 @@ impl BatchEngine {
         sink: &mut Sink,
         commit: CommitMode,
         sub_block_bytes: u64,
-        shutdown: &CancellationToken,
-    ) -> Result<(), EngineError>
+        retry: &RetryWindow<'_>,
+    ) -> Result<Delivery, EngineError>
     where
         R: TransportReceiver,
         P: Fn(WorkBatch<R::Token>) -> Result<WorkBatch<R::Token>, EngineError>,
@@ -996,10 +1306,10 @@ impl BatchEngine {
             // Sink this sub-block, holding it through a transient failure. Any
             // other failure stops the block and the run loop uncommitted, so a
             // later block's ordered commit never advances past it (ack barrier).
-            match sink_until_delivered(sink, &out_sub, shutdown).await {
+            match sink_until_delivered(sink, &out_sub, retry).await {
                 Ok(Delivery::Sunk) => {}
                 // Uncommitted, so the source re-delivers the whole block.
-                Ok(Delivery::Abandoned) => return Ok(()),
+                Ok(Delivery::Abandoned) => return Ok(Delivery::Abandoned),
                 Err(e) => {
                     tracing::error!(error = %e, "Sink failed (workbatch streaming) -- terminal, stopping the run loop (ack barrier)");
                     return Err(e);
@@ -1015,7 +1325,7 @@ impl BatchEngine {
                 // The sink owns the commit -- the engine does not commit here.
             }
         }
-        Ok(())
+        Ok(Delivery::Sunk)
     }
 
     /// Collect a [`SubBlockDrain`] into a `Vec<Vec<Record>>` (test convenience).

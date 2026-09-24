@@ -20,6 +20,13 @@
 //! configurable path. Incoming payloads are queued into a bounded
 //! `tokio::sync::mpsc` channel. `recv()` drains from this channel.
 //!
+//! ## Shutdown
+//!
+//! The server answers 200 once a record is queued for `recv`, so a receiving
+//! service shuts down in this order: `close()`, then `recv` until it returns
+//! `TransportError::Closed`, then its final flush. `close()` answers new POSTs
+//! with 503, which senders retry.
+//!
 //! ## Example
 //!
 //! ```rust,ignore
@@ -49,6 +56,10 @@ use std::sync::Arc;
 #[cfg(feature = "http-server")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The spawned axum serve loop.
+#[cfg(feature = "http-server")]
+type ServerTask = tokio::task::JoinHandle<std::io::Result<()>>;
 
 /// Commit token for HTTP transport.
 ///
@@ -237,17 +248,15 @@ pub struct HttpTransport {
     #[cfg(feature = "http-server")]
     local_addr: Option<std::net::SocketAddr>,
 
-    /// Shutdown signal for the server task.
-    ///
-    /// Behind a `parking_lot::Mutex` for interior mutability: `close(&self)`
-    /// fires it to stop the embedded server promptly (graceful shutdown),
-    /// rather than waiting for `Drop`. `take()` makes both paths idempotent.
+    /// Graceful-shutdown signal for the server task. Behind a
+    /// `Mutex<Option<..>>` so `close(&self)` can take and fire it.
     #[cfg(feature = "http-server")]
     shutdown_tx: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 
-    /// Server background task handle.
+    /// Server task. `close()` awaits it and `Drop` aborts it: a dropped
+    /// `JoinHandle` only detaches the task.
     #[cfg(feature = "http-server")]
-    _server_handle: Option<tokio::task::JoinHandle<()>>,
+    server_task: parking_lot::Mutex<Option<ServerTask>>,
 
     /// Whether the transport is closed.
     closed: Arc<AtomicBool>,
@@ -376,7 +385,6 @@ impl HttpTransport {
                     sd_rx.await.ok();
                 })
                 .await
-                .ok();
             });
 
             (
@@ -434,7 +442,7 @@ impl HttpTransport {
             #[cfg(feature = "http-server")]
             shutdown_tx: parking_lot::Mutex::new(shutdown_tx),
             #[cfg(feature = "http-server")]
-            _server_handle: server_handle,
+            server_task: parking_lot::Mutex::new(server_handle),
             closed,
             #[cfg(feature = "http-server")]
             recv_timeout_ms: config.recv_timeout_ms,
@@ -448,6 +456,29 @@ impl HttpTransport {
     #[must_use]
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.local_addr
+    }
+
+    /// Stop the receive server without waiting on its clients.
+    ///
+    /// The graceful signal has every open connection finish its in-flight
+    /// request in axum's own per-connection tasks, which outlive the serve task.
+    /// Aborting the serve task frees the listener at once, so a client that
+    /// never completes its request cannot hold `close()` open.
+    #[cfg(feature = "http-server")]
+    async fn stop_server(&self) {
+        if let Some(tx) = self.shutdown_tx.lock().take() {
+            let _ = tx.send(());
+        }
+        let Some(task) = self.server_task.lock().take() else {
+            return;
+        };
+        task.abort();
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "HTTP: server ended with an error"),
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => tracing::warn!(error = %e, "HTTP: server task panicked"),
+        }
     }
 }
 
@@ -492,6 +523,9 @@ struct ReceiverState {
 }
 
 /// POST handler that accepts raw bytes and queues them into the mpsc channel.
+///
+/// Answers 200 once the record is queued. A full queue, a held inbound gate
+/// and a closed receiver answer 503, which a sender retries.
 #[cfg(feature = "http-server")]
 async fn ingest_handler(
     axum::extract::State(state): axum::extract::State<ReceiverState>,
@@ -555,7 +589,6 @@ async fn ingest_handler(
         Ok(()) => {
             #[cfg(feature = "metrics")]
             {
-                metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
                 metrics::counter!("transport_received_bytes_total", "transport" => "http")
                     .increment(body_len as u64);
                 metrics::counter!("transport_received_events_total", "transport" => "http")
@@ -568,10 +601,11 @@ async fn ingest_handler(
             metrics::counter!("transport_backpressured_total", "transport" => "http").increment(1);
             shed_503()
         }
+        // A closed receiver is shutting down: 503 so the sender retries, not drops.
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
             #[cfg(feature = "metrics")]
             metrics::counter!("transport_refused_total", "transport" => "http").increment(1);
-            axum::http::StatusCode::GONE.into_response()
+            shed_503()
         }
     }
 }
@@ -589,13 +623,24 @@ fn shed_503() -> axum::response::Response {
 }
 
 impl TransportBase for HttpTransport {
+    /// Stop sending and receiving, keeping every record already acknowledged.
+    ///
+    /// A POST that arrives from here on is answered 503, which a sender
+    /// retries. Records the server already answered 200 for stay queued: call
+    /// [`recv`](TransportReceiver::recv) until it returns
+    /// [`TransportError::Closed`] or they are lost. Open connections finish
+    /// their in-flight requests on their own, and the listener is free when this
+    /// returns. Waits for a `recv` in progress (at most `recv_timeout_ms`).
+    /// Idempotent.
     async fn close(&self) -> TransportResult<()> {
         self.closed.store(true, Ordering::Relaxed);
-        // Stop the embedded server now (graceful shutdown) rather than on Drop.
-        // take() => idempotent: a later close()/drop() is a no-op.
+
         #[cfg(feature = "http-server")]
-        if let Some(tx) = self.shutdown_tx.lock().take() {
-            let _ = tx.send(());
+        {
+            if let Some(receiver) = &self.receiver {
+                receiver.lock().await.close();
+            }
+            self.stop_server().await;
         }
         Ok(())
     }
@@ -736,14 +781,19 @@ impl TransportSender for HttpTransport {
 impl TransportReceiver for HttpTransport {
     type Token = HttpToken;
 
+    /// Receive up to `max` records the server has acked.
+    ///
+    /// After [`close`](TransportBase::close) this keeps returning the records
+    /// still queued, then [`TransportError::Closed`] once none are left.
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(TransportError::Closed);
-        }
-
         #[cfg(feature = "http-server")]
         {
+            use tokio::sync::mpsc::error::TryRecvError;
+
             let Some(receiver) = &self.receiver else {
+                if self.closed.load(Ordering::Relaxed) {
+                    return Err(TransportError::Closed);
+                }
                 return Err(TransportError::Config(
                     "no listen address configured for receiving".into(),
                 ));
@@ -753,37 +803,29 @@ impl TransportReceiver for HttpTransport {
             let mut messages = Vec::with_capacity(max.min(100));
 
             for _ in 0..max {
-                let result = if self.recv_timeout_ms == 0 {
+                // The first record waits up to recv_timeout_ms; the rest only take
+                // what is already queued.
+                let msg = if self.recv_timeout_ms == 0 || !messages.is_empty() {
                     match rx.try_recv() {
-                        Ok(msg) => Some(msg),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        Ok(msg) => msg,
+                        Err(TryRecvError::Disconnected) if messages.is_empty() => {
                             return Err(TransportError::Closed);
                         }
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                     }
-                } else if messages.is_empty() {
-                    // First message: wait with timeout
+                } else {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(self.recv_timeout_ms),
                         rx.recv(),
                     )
                     .await
                     {
-                        Ok(Some(msg)) => Some(msg),
+                        Ok(Some(msg)) => msg,
                         Ok(None) => return Err(TransportError::Closed),
-                        Err(_) => break, // Timeout
-                    }
-                } else {
-                    // Subsequent: non-blocking drain
-                    match rx.try_recv() {
-                        Ok(msg) => Some(msg),
-                        Err(_) => break,
+                        Err(_elapsed) => break,
                     }
                 };
-
-                if let Some(msg) = result {
-                    messages.push(msg);
-                }
+                messages.push(msg);
             }
 
             // Apply inbound filters via the shared partition helper; DLQ
@@ -814,6 +856,9 @@ impl TransportReceiver for HttpTransport {
         #[cfg(not(feature = "http-server"))]
         {
             let _ = max;
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(TransportError::Closed);
+            }
             Err(TransportError::Config(
                 "HTTP receive requires the 'http-server' feature".into(),
             ))
@@ -828,9 +873,10 @@ impl TransportReceiver for HttpTransport {
 
 impl Drop for HttpTransport {
     fn drop(&mut self) {
+        // Abort explicitly: dropping the handle would detach the serve task.
         #[cfg(feature = "http-server")]
-        if let Some(tx) = self.shutdown_tx.lock().take() {
-            let _ = tx.send(());
+        if let Some(task) = self.server_task.get_mut().take() {
+            task.abort();
         }
     }
 }
@@ -1229,6 +1275,345 @@ mod tests {
             assert!(records.is_empty(), "shed request must not be queued");
             receiver.close().await.unwrap();
         }
+    }
+
+    /// A receive-only config on a free loopback port.
+    #[cfg(feature = "http-server")]
+    fn receiver_config(recv_timeout_ms: u64) -> HttpTransportConfig {
+        HttpTransportConfig {
+            listen: Some("127.0.0.1:0".to_string()),
+            recv_timeout_ms,
+            ..Default::default()
+        }
+    }
+
+    /// A sender posting to `receiver`'s ingest path.
+    #[cfg(feature = "http-server")]
+    async fn sender_to(receiver: &HttpTransport) -> HttpTransport {
+        let addr = receiver.local_addr().expect("receiver bound");
+        HttpTransport::new(&HttpTransportConfig::sender(&format!(
+            "http://{addr}/ingest"
+        )))
+        .await
+        .expect("sender")
+    }
+
+    /// Receive until the transport reports `Closed`, counting records. Bounded,
+    /// so a recv that never ends fails the test instead of hanging it.
+    #[cfg(feature = "http-server")]
+    async fn drain_until_closed(receiver: &HttpTransport) -> Result<usize, String> {
+        let mut delivered = 0;
+        for _ in 0..1000 {
+            match receiver.recv(100).await {
+                Ok(batch) => delivered += batch.records.len(),
+                Err(TransportError::Closed) => return Ok(delivered),
+                Err(e) => return Err(format!("recv failed after {delivered} records: {e}")),
+            }
+        }
+        Err(format!(
+            "recv never reported Closed; {delivered} records so far"
+        ))
+    }
+
+    /// Send the head of a POST and part of its body, holding the request open.
+    #[cfg(feature = "http-server")]
+    async fn partial_post(
+        addr: std::net::SocketAddr,
+        body: &[u8],
+        sent: usize,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let head = format!(
+            "POST /ingest HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write request head");
+        stream
+            .write_all(&body[..sent])
+            .await
+            .expect("write part of the body");
+        stream
+    }
+
+    /// Read a response's status line, bounded so a silent server fails the test.
+    #[cfg(feature = "http-server")]
+    async fn status_line(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let read = async {
+            while !buf.windows(2).any(|w| w == b"\r\n") {
+                let n = stream.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .expect("the server answered within 5 s");
+        let text = String::from_utf8_lossy(&buf);
+        text.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// Every record the server acked reaches `recv`, even when `close()` comes
+    /// before the consumer read it -- with a blocking and a non-blocking `recv`.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn acked_records_reach_recv_after_close() {
+        for recv_timeout_ms in [100, 0] {
+            let receiver = HttpTransport::new(&receiver_config(recv_timeout_ms))
+                .await
+                .expect("receiver");
+            let sender = sender_to(&receiver).await;
+            for seq in 0..3 {
+                let sent = sender
+                    .send("", bytes::Bytes::from(format!("{{\"seq\":{seq}}}")))
+                    .await;
+                assert!(sent.is_ok(), "{sent:?}");
+            }
+
+            receiver.close().await.expect("close");
+            let delivered = drain_until_closed(&receiver).await;
+            assert_eq!(
+                delivered,
+                Ok(3),
+                "recv_timeout_ms={recv_timeout_ms}: the server acked 3 records and recv \
+                 returned {delivered:?} of them after close()"
+            );
+            assert!(
+                matches!(receiver.recv(10).await, Err(TransportError::Closed)),
+                "Closed must stay terminal once drained"
+            );
+            let _ = sender.close().await;
+        }
+    }
+
+    /// A POST whose body is still arriving when `close()` runs is answered 503,
+    /// which the sender retries, never 200: nothing is left to deliver it.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn a_request_in_flight_at_close_is_refused_not_acked() {
+        use tokio::io::AsyncWriteExt;
+
+        let receiver = HttpTransport::new(&receiver_config(100))
+            .await
+            .expect("receiver");
+        let addr = receiver.local_addr().expect("receiver bound");
+        let body = br#"{"late":1}"#;
+        let mut stream = partial_post(addr, body, 4).await;
+        // Let the server read the head and start waiting on the body.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        receiver.close().await.expect("close");
+        stream.write_all(&body[4..]).await.expect("finish the body");
+        let status = status_line(&mut stream).await;
+
+        assert!(
+            status.starts_with("HTTP/1.1 503"),
+            "a request that completes after close() must be refused with 503, got {status:?}"
+        );
+        assert_eq!(
+            drain_until_closed(&receiver).await,
+            Ok(0),
+            "nothing sent after close() may be queued"
+        );
+    }
+
+    /// A handler that finds the receive queue closed answers 503 with a
+    /// `Retry-After`, the status a sender retries, not 410.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn a_closed_queue_answers_retryable_503() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        rx.close();
+        let state = ReceiverState {
+            sender: tx,
+            sequence: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "governor")]
+            pressure: None,
+        };
+
+        let response = ingest_handler(
+            axum::extract::State(state),
+            axum::extract::ConnectInfo("127.0.0.1:9".parse().expect("addr")),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// `close()` stops the server even while a client holds a request open,
+    /// without waiting on that client, and the listener is free when it returns.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn close_stops_the_server_while_a_client_holds_a_request_open() {
+        let receiver = HttpTransport::new(&receiver_config(100))
+            .await
+            .expect("receiver");
+        let addr = receiver.local_addr().expect("receiver bound");
+        let _stalled = partial_post(addr, br#"{"stalled":1}"#, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let started = std::time::Instant::now();
+        let closing =
+            tokio::time::timeout(std::time::Duration::from_secs(5), receiver.close()).await;
+        let took = started.elapsed();
+        assert!(
+            matches!(closing, Ok(Ok(()))),
+            "close() waited on the stalled client, got {closing:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "close() took {took:?}"
+        );
+        let rebind = HttpTransportConfig {
+            listen: Some(addr.to_string()),
+            ..Default::default()
+        };
+        assert!(
+            HttpTransport::new(&rebind).await.is_ok(),
+            "{addr} still bound when close() returned -- the server outlived close()"
+        );
+    }
+
+    /// Dropping the transport without `close()` stops the server too.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn drop_stops_the_server_while_a_client_holds_a_request_open() {
+        let receiver = HttpTransport::new(&receiver_config(100))
+            .await
+            .expect("receiver");
+        let addr = receiver.local_addr().expect("receiver bound");
+        let _stalled = partial_post(addr, br#"{"stalled":1}"#, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        drop(receiver);
+        let rebind = HttpTransportConfig {
+            listen: Some(addr.to_string()),
+            ..Default::default()
+        };
+        let mut free = false;
+        for _ in 0..40 {
+            if HttpTransport::new(&rebind).await.is_ok() {
+                free = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(free, "{addr} still bound 2 s after drop");
+    }
+
+    /// Senders still posting while the server closes: every record acked to
+    /// them is one `recv` returns, whichever side of `close()` it landed on.
+    #[cfg(feature = "http-server")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_acked_record_is_delivered_when_close_races_the_senders() {
+        use std::sync::atomic::AtomicBool;
+
+        let receiver = HttpTransport::new(&receiver_config(100))
+            .await
+            .expect("receiver");
+        let sender = Arc::new(sender_to(&receiver).await);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut senders = tokio::task::JoinSet::new();
+        for task in 0..4_u32 {
+            let sender = Arc::clone(&sender);
+            let stop = Arc::clone(&stop);
+            senders.spawn(async move {
+                let mut acked = 0_usize;
+                let mut seq = task * 1_000_000;
+                while !stop.load(Ordering::Relaxed) {
+                    let payload = bytes::Bytes::from(format!("{{\"seq\":{seq}}}"));
+                    if sender.send("", payload).await.is_ok() {
+                        acked += 1;
+                    }
+                    seq += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                acked
+            });
+        }
+
+        // Acks pile up unread, as behind a consumer that stopped calling recv.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        receiver.close().await.expect("close");
+        let delivered = drain_until_closed(&receiver).await.expect("drain");
+        stop.store(true, Ordering::Relaxed);
+
+        let mut acked = 0;
+        while let Some(count) = senders.join_next().await {
+            acked += count.expect("sender task");
+        }
+        assert!(acked > 0, "the senders never got an ack");
+        assert_eq!(
+            delivered, acked,
+            "{acked} records acked to the senders, {delivered} returned by recv"
+        );
+    }
+
+    /// Accepted HTTP records count as received, never as sent: in one process
+    /// the sender's counts are the only sends.
+    #[cfg(all(feature = "http-server", feature = "metrics"))]
+    #[tokio::test]
+    async fn receipts_count_as_received_not_sent() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // Current-thread runtime: the server's tasks run on this thread and see it.
+        let _local = metrics::set_default_local_recorder(&recorder);
+
+        let receiver = HttpTransport::new(&receiver_config(1000))
+            .await
+            .expect("receiver");
+        let sender = sender_to(&receiver).await;
+        for seq in 0..2 {
+            let sent = sender
+                .send("", bytes::Bytes::from(format!("{{\"seq\":{seq}}}")))
+                .await;
+            assert!(sent.is_ok(), "{sent:?}");
+        }
+        assert_eq!(receiver.recv(10).await.expect("recv").records.len(), 2);
+
+        let rendered = handle.render();
+        let value = |name: &str| -> Option<f64> {
+            rendered
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{transport=\"http\"}}")))
+                .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+        };
+        assert_eq!(
+            value("transport_sent_total"),
+            Some(2.0),
+            "two POSTs were sent:\n{rendered}"
+        );
+        assert_eq!(
+            value("transport_received_events_total"),
+            Some(2.0),
+            "two records were received:\n{rendered}"
+        );
+
+        let _ = sender.close().await;
+        let _ = receiver.close().await;
     }
 
     #[test]
