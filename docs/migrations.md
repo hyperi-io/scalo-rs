@@ -617,26 +617,45 @@ A refusal is reported once: the first flush after it returns the error and the n
 
 ### Kafka DLQ `flush()` waits for broker acks (BEHAVIOUR CHANGE)
 
-`Dlq::flush()` over the Kafka backend now returns once the broker has acknowledged every entry the barrier covers, waiting up to `kafka.send_timeout_ms` (default 5000 ms) on tokio's blocking pool. Before, `Ok` meant queued to the producer: the drain never ran a backend's durable flush, and a delivery the broker refused reached neither `flush()` nor `dropped()`. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
+`Dlq::flush()` over the Kafka backend now returns once the broker has acknowledged every entry the barrier covers, waiting up to 30 s on tokio's blocking pool. Before, `Ok` meant queued to the producer: the drain never ran a backend's durable flush, and a delivery the broker refused reached neither `flush()` nor `dropped()`. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
 
-- A delivery the broker refused since the previous flush fails the flush with `Err(DlqError::Kafka(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
-- Entries still unacknowledged after `send_timeout_ms` are purged from the producer and counted the same way. The purge adds up to 5 s. An entry in flight to a stalled broker at the purge can still be written, so under a stalled broker `dropped()` is an upper bound and re-placing entries reported lost can duplicate them on the DLQ topic. It never under-reports.
+- A delivery the broker refused since the previous flush fails the flush with `Err(DlqError::File(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
+- Entries still unacknowledged after 30 s are purged from the producer and counted the same way. The purge adds up to 5 s. An entry in flight to a stalled broker at the purge can still be written, so under a stalled broker `dropped()` is an upper bound and re-placing entries reported lost can duplicate them on the DLQ topic. It never under-reports.
 - `Cascade`: when Kafka queues part of a batch and refuses the rest, only the rest goes to the next backend. Before, the whole batch did, so the file held a second copy of the part Kafka took.
 - `FanOut`: a Kafka loss counts only for entries no other backend holds.
 
-**Consumer adjustment** -- a caller matching the flush error on `DlqError::File` to spot a lost dead letter also matches `DlqError::Kafka`. A flush over the Kafka backend can take `send_timeout_ms` plus 5 s while the broker is slow or down; a timeout around it shorter than that sees its own timeout, and the failure goes to the next flush. A caller that never calls `flush()` sees Kafka delivery failures in `dropped()` once the DLQ shuts down -- see the next entry.
+**Consumer adjustment** -- none in code. A flush over the Kafka backend can now take up to 35 s while the broker is slow or down; a timeout around it shorter than that sees its own timeout, and the failure goes to the next flush. A caller that never calls `flush()` sees Kafka delivery failures in `transport_send_errors_total{transport="kafka"}` only, not in `dropped()`.
+
+The 30 s wait and the `File` variant changed after v2.12.10 -- see [`kafka.send_timeout_ms` is the Kafka ack wait](#kafkasend_timeout_ms-is-the-kafka-ack-wait-behaviour-change) and [A Kafka DLQ loss returns `DlqError::Kafka`](#a-kafka-dlq-loss-returns-dlqerrorkafka-behaviour-change).
+
+### `NdjsonWriter` refuses a write a rotation would panic on (BEHAVIOUR CHANGE)
+
+`file-rotate` 0.8 panics inside a rotation when the output directory is gone and cannot be recreated, or the current file is missing and cannot be created. Services built with `panic = "abort"` died at the next rotation boundary. `NdjsonWriter`, and the DLQ file backend and file output sink built on it, now refuse such a write with an `Err` before calling into `file-rotate`.
+
+- A write while the current file is missing returns `Err` and schedules a reopen, which runs once the directory is usable again. It never recreates a missing directory, at a rotation boundary included.
+- `NdjsonWriter::new`, and a reopen, refuse a directory that is not a directory or cannot be listed.
+- `NdjsonWriter::new` refuses a filename with no final component (`..`) with `ErrorKind::InvalidInput`.
+- `max_age_days` is capped at 1,000,000 days; above about 95 million the rotation's age check panicked.
+
+**Consumer adjustment** -- none in code. A write the writer would previously have lost silently or panicked on is now an `Err`.
+
+### `kafka.send_timeout_ms` is the Kafka ack wait (BEHAVIOUR CHANGE)
+
+The key was parsed and used nowhere. It is now how long a `flush()` or the shutdown waits for the broker's acks, replacing the fixed 30 s v2.12.10 shipped. The default stays 5000, so the default wait is 5 s. `0` purges without waiting. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
+
+**Consumer adjustment** -- a deployment that relied on the 30 s wait sets `dlq.kafka.send_timeout_ms: 30000`. A flush over the Kafka backend now takes up to `send_timeout_ms` plus 5 s while the broker is slow or down.
+
+### A Kafka DLQ loss returns `DlqError::Kafka` (BEHAVIOUR CHANGE)
+
+In v2.12.10 a Kafka loss found by `flush()` came back as `Err(DlqError::File("backend: kafka DLQ error: .."))`. It is `Err(DlqError::Kafka(..))` now, and an HTTP backend error keeps `DlqError::BackendError`. A batch every backend refused is still `DlqError::File`.
+
+**Consumer adjustment** -- a caller matching the flush error on `DlqError::File` to spot a lost dead letter matches `DlqError::Kafka` as well.
 
 ### `Dlq` shutdown waits for Kafka acks and counts what was lost (BEHAVIOUR CHANGE)
 
 Dropping the Kafka producer discards what it still holds, queued or in flight. The drain used to exit without waiting, so every shutdown threw away the entries the broker had not acked yet, and counted none of them. It now waits for the acks the way a `flush()` does before it exits, and counts the entries only Kafka held that the broker refused or never acked in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`. See [pipeline/dlq.md](pipeline/dlq.md#shutdown).
 
-**Consumer adjustment** -- none in code. `shutdown()`, or the drain's exit on the cancelled token, can take `kafka.send_timeout_ms` plus 5 s while the broker is down; fit that inside the pod's termination grace period. `shutdown()` still returns `Ok`; read `dropped()` after it, or call `flush()` first for the loss as an `Err`. The count lands only if the drain finishes: a runtime that shuts down under it drops it mid-wait.
-
-### `kafka.send_timeout_ms` is the Kafka ack wait (BEHAVIOUR CHANGE)
-
-The key was parsed and used nowhere. It is now how long a `flush()` or the shutdown waits for the broker's acks, replacing a fixed 30 s. The default stays 5000, so the default wait is 5 s. `0` purges without waiting.
-
-**Consumer adjustment** -- a deployment that relied on the 30 s wait sets `dlq.kafka.send_timeout_ms: 30000`.
+**Consumer adjustment** -- none in code. `shutdown()`, or the drain's exit on the cancelled token, can take `kafka.send_timeout_ms` plus 5 s while the broker is down; fit that inside the pod's termination grace period. `shutdown()` still returns `Ok`; read `dropped()` after it, or call `flush()` first for the loss as an `Err`. The count lands only if the drain finishes: a runtime that shuts down under it drops it mid-wait. A caller that never calls `flush()` now sees Kafka delivery failures in `dropped()` once the DLQ has shut down.
 
 ### `NdjsonWriter` refuses a write that reached no file (BEHAVIOUR CHANGE)
 
@@ -655,17 +674,6 @@ The key was parsed and used nowhere. It is now how long a `flush()` or the shutd
 `logger::log_debounced` read the last timestamp and then stored the new one, so callers racing into an open window could all log. It claims the window with a compare-exchange, so exactly one of them does.
 
 **Consumer adjustment** -- none.
-
-### `NdjsonWriter` refuses a write a rotation would panic on (BEHAVIOUR CHANGE)
-
-`file-rotate` 0.8 panics inside a rotation when the output directory is gone and cannot be recreated, or the current file is missing and cannot be created. Services built with `panic = "abort"` died at the next rotation boundary. `NdjsonWriter`, and the DLQ file backend and file output sink built on it, now refuse such a write with an `Err` before calling into `file-rotate`.
-
-- A write while the current file is missing returns `Err` and schedules a reopen, which runs once the directory is usable again. It never recreates a missing directory, at a rotation boundary included.
-- `NdjsonWriter::new`, and a reopen, refuse a directory that is not a directory or cannot be listed.
-- `NdjsonWriter::new` refuses a filename with no final component (`..`) with `ErrorKind::InvalidInput`.
-- `max_age_days` is capped at 1,000,000 days; above about 95 million the rotation's age check panicked.
-
-**Consumer adjustment** -- none in code. A write the writer would previously have lost silently or panicked on is now an `Err`.
 
 ---
 
