@@ -22,10 +22,17 @@
 //! `GrpcConfig::vector_compat` is true, the server also accepts
 //! `vector.Vector/PushEvents` RPCs from legacy Vector sinks.
 //!
+//! ## Shutdown
+//!
+//! The server acknowledges a record once it is queued for `recv`, so a
+//! receiving service shuts down in this order: `close()`, then `recv` until it
+//! returns `TransportError::Closed`, then its final flush. `close()` refuses
+//! new pushes with `Unavailable`, which senders retry.
+//!
 //! ## Example
 //!
 //! ```rust,ignore
-//! use scalo::transport::{GrpcTransport, GrpcConfig, TransportReceiver};
+//! use scalo::transport::{GrpcTransport, GrpcConfig, TransportBase, TransportError, TransportReceiver};
 //!
 //! // Server mode (receive from remote senders)
 //! let config = GrpcConfig::server("0.0.0.0:6000");
@@ -34,6 +41,16 @@
 //! let records = transport.recv(100).await?.records;
 //! // commit is a no-op for gRPC (no persistence)
 //! transport.commit(&[]).await?;
+//!
+//! // Shutdown: stop intake, then take everything already acknowledged.
+//! transport.close().await?;
+//! loop {
+//!     match transport.recv(100).await {
+//!         Ok(batch) => { /* process batch.records */ }
+//!         Err(TransportError::Closed) => break,
+//!         Err(e) => return Err(e.into()),
+//!     }
+//! }
 //! ```
 
 pub mod batch;
@@ -51,8 +68,12 @@ use super::work_batch::{Record, WorkBatch};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
+
+/// The spawned tonic serve loop.
+type ServerTask = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
 
 /// gRPC transport for inter-service communication.
 ///
@@ -65,12 +86,13 @@ pub struct GrpcTransport {
     /// Receiver channel (None if client-only mode).
     receiver: Option<tokio::sync::Mutex<mpsc::Receiver<Message<GrpcToken>>>>,
 
-    /// Shutdown signal for the server task. Behind a `Mutex<Option<..>>` so
-    /// `close(&self)` (not just `Drop`) can take and fire it.
+    /// Graceful-shutdown signal for the server task. Behind a
+    /// `Mutex<Option<..>>` so `close(&self)` can take and fire it.
     shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
 
-    /// Server background task handle (kept alive, aborted on drop).
-    _server_handle: Option<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
+    /// Server task. `close()` awaits it and `Drop` aborts it: a dropped
+    /// `JoinHandle` only detaches the task, leaving the listener bound.
+    server_task: parking_lot::Mutex<Option<ServerTask>>,
 
     /// Whether the transport is closed.
     closed: AtomicBool,
@@ -81,7 +103,7 @@ pub struct GrpcTransport {
     /// Receive timeout (milliseconds).
     recv_timeout_ms: u64,
 
-    /// Per-RPC send deadline (milliseconds, 0 = none).
+    /// Send deadline, end to end (milliseconds, 0 = none).
     send_timeout_ms: u64,
 
     /// Largest encoded message `send` and `send_batch` put on the wire,
@@ -212,7 +234,20 @@ impl GrpcTransport {
                     .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
             }
 
-            let channel = ep.connect_lazy();
+            // A dial left running when its send gives up hands its failure to
+            // the next send, so the dial ends at nine tenths of the limit.
+            if config.send_timeout_ms > 0 {
+                ep = ep.connect_timeout(Duration::from_millis(config.send_timeout_ms) * 9 / 10);
+            }
+
+            // Given the connector, tonic abandons a dial whose DNS, TCP connect
+            // or TLS handshake outruns the connect timeout, where connect_lazy()
+            // bounds the TCP connect alone and the next send queues behind it.
+            let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
+            // tonic's own settings: an https URI passes through to its TLS layer.
+            tcp.enforce_http(false);
+            tcp.set_nodelay(true);
+            let channel = ep.connect_with_connector_lazy(tcp);
 
             // No encoding limit: tonic's refusal arrives as a stream reset that
             // reads as an outage, so send and send_batch check the size instead.
@@ -328,7 +363,7 @@ impl GrpcTransport {
             client,
             receiver,
             shutdown_tx: parking_lot::Mutex::new(shutdown_tx),
-            _server_handle: server_handle,
+            server_task: parking_lot::Mutex::new(server_handle),
             closed: AtomicBool::new(false),
             healthy,
             recv_timeout_ms: config.recv_timeout_ms,
@@ -349,6 +384,50 @@ impl GrpcTransport {
     #[must_use]
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.local_addr
+    }
+
+    /// Run one RPC under `send_timeout_ms`, end to end.
+    ///
+    /// The `grpc-timeout` header only starts counting once the request is on a
+    /// connection, so DNS, the TCP connect and the TLS handshake are bounded
+    /// here. Running out reads as `DeadlineExceeded`, which is backpressure.
+    async fn within_send_timeout<T>(
+        &self,
+        rpc: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        if self.send_timeout_ms == 0 {
+            return rpc.await;
+        }
+        tokio::time::timeout(Duration::from_millis(self.send_timeout_ms), rpc)
+            .await
+            .unwrap_or_else(|_elapsed| {
+                Err(Status::deadline_exceeded(format!(
+                    "no answer within send_timeout_ms ({} ms)",
+                    self.send_timeout_ms
+                )))
+            })
+    }
+
+    /// Stop the receive server without waiting on its clients.
+    ///
+    /// The graceful signal has every open connection finish its in-flight RPCs
+    /// in tonic's own per-connection tasks, which outlive the serve task.
+    /// Aborting the serve task frees the listener at once, so a client that
+    /// never completes its RPC cannot hold `close()` open.
+    async fn stop_server(&self) {
+        if let Some(tx) = self.shutdown_tx.lock().take() {
+            let _ = tx.send(());
+        }
+        let Some(task) = self.server_task.lock().take() else {
+            return;
+        };
+        task.abort();
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "gRPC: server ended with an error"),
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => tracing::warn!(error = %e, "gRPC: server task panicked"),
+        }
     }
 }
 
@@ -469,10 +548,9 @@ impl TransportSender for GrpcTransport {
 
         let mut request = tonic::Request::new(body);
 
-        // Bound the RPC so a hung/black-holing server cannot wedge the sender
-        // task forever. Sent as the grpc-timeout header.
+        // The grpc-timeout header tells the server the deadline.
         if self.send_timeout_ms > 0 {
-            request.set_timeout(std::time::Duration::from_millis(self.send_timeout_ms));
+            request.set_timeout(Duration::from_millis(self.send_timeout_ms));
         }
 
         #[cfg(feature = "metrics")]
@@ -482,7 +560,8 @@ impl TransportSender for GrpcTransport {
         self.inflight.fetch_add(1, Ordering::Relaxed);
 
         // tonic clients are cheaply cloneable (shared channel)
-        let result = match client.clone().push(request).await {
+        let mut client = client.clone();
+        let result = match self.within_send_timeout(client.push(request)).await {
             Ok(_) => {
                 #[cfg(feature = "metrics")]
                 {
@@ -606,7 +685,7 @@ impl TransportSender for GrpcTransport {
         }
 
         if self.send_timeout_ms > 0 {
-            request.set_timeout(std::time::Duration::from_millis(self.send_timeout_ms));
+            request.set_timeout(Duration::from_millis(self.send_timeout_ms));
         }
 
         #[cfg(feature = "metrics")]
@@ -614,7 +693,8 @@ impl TransportSender for GrpcTransport {
         #[cfg(feature = "metrics")]
         self.inflight.fetch_add(1, Ordering::Relaxed);
 
-        let result = match client.clone().route_batch(request).await {
+        let mut client = client.clone();
+        let result = match self.within_send_timeout(client.route_batch(request)).await {
             Ok(response) => {
                 // Server is all-or-nothing today, but the proto permits partial
                 // acceptance. Treating ANY Ok as full success would fire every
@@ -668,16 +748,23 @@ impl TransportSender for GrpcTransport {
 }
 
 impl TransportBase for GrpcTransport {
+    /// Stop sending and receiving, keeping every record already acknowledged.
+    ///
+    /// A push that arrives from here on is refused with `Unavailable`, which a
+    /// sender retries. Records the server already acked stay queued: call
+    /// [`recv`](TransportReceiver::recv) until it returns
+    /// [`TransportError::Closed`] or they are lost. Open connections finish
+    /// their in-flight RPCs on their own, and the listener is free when this
+    /// returns. Waits for a `recv` in progress (at most `recv_timeout_ms`).
+    /// Idempotent.
     async fn close(&self) -> TransportResult<()> {
         self.closed.store(true, Ordering::Relaxed);
         self.healthy.store(false, Ordering::Relaxed);
 
-        // Actually stop the server: fire the shutdown oneshot so
-        // serve_with_incoming_shutdown completes and the listener is freed.
-        // Idempotent -- a second close() (or Drop) finds None.
-        if let Some(tx) = self.shutdown_tx.lock().take() {
-            let _ = tx.send(());
+        if let Some(receiver) = &self.receiver {
+            receiver.lock().await.close();
         }
+        self.stop_server().await;
         Ok(())
     }
 
@@ -700,12 +787,15 @@ impl TransportBase for GrpcTransport {
 impl TransportReceiver for GrpcTransport {
     type Token = GrpcToken;
 
+    /// Receive up to `max` records the server has acked.
+    ///
+    /// After [`close`](TransportBase::close) this keeps returning the records
+    /// still queued, then [`TransportError::Closed`] once none are left.
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(TransportError::Closed);
-        }
-
         let Some(receiver) = &self.receiver else {
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(TransportError::Closed);
+            }
             return Err(TransportError::Config(
                 "no listen address configured for receiving".into(),
             ));
@@ -715,38 +805,30 @@ impl TransportReceiver for GrpcTransport {
         let mut messages = Vec::with_capacity(max.min(100));
 
         for _ in 0..max {
-            let result = if self.recv_timeout_ms == 0 {
-                // Non-blocking
+            // The first record waits up to recv_timeout_ms; the rest only take
+            // what is already queued.
+            let msg = if self.recv_timeout_ms == 0 || !messages.is_empty() {
                 match rx.try_recv() {
-                    Ok(msg) => Some(msg),
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Ok(msg) => msg,
+                    Err(mpsc::error::TryRecvError::Disconnected) if messages.is_empty() => {
                         return Err(TransportError::Closed);
                     }
-                }
-            } else if messages.is_empty() {
-                // First message: wait with timeout
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(self.recv_timeout_ms),
-                    rx.recv(),
-                )
-                .await
-                {
-                    Ok(Some(msg)) => Some(msg),
-                    Ok(None) => return Err(TransportError::Closed),
-                    Err(_) => break, // Timeout
+                    Err(
+                        mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected,
+                    ) => {
+                        break;
+                    }
                 }
             } else {
-                // Subsequent: non-blocking drain
-                match rx.try_recv() {
-                    Ok(msg) => Some(msg),
-                    Err(_) => break,
+                match tokio::time::timeout(Duration::from_millis(self.recv_timeout_ms), rx.recv())
+                    .await
+                {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => return Err(TransportError::Closed),
+                    Err(_elapsed) => break,
                 }
             };
-
-            if let Some(msg) = result {
-                messages.push(msg);
-            }
+            messages.push(msg);
         }
 
         // Apply inbound filters via the shared partition helper; DLQ entries
@@ -778,11 +860,10 @@ impl TransportReceiver for GrpcTransport {
 
 impl Drop for GrpcTransport {
     fn drop(&mut self) {
-        // Fire the shutdown signal if close() didn't already (idempotent).
-        if let Some(tx) = self.shutdown_tx.lock().take() {
-            let _ = tx.send(());
+        // Abort explicitly: dropping the handle would detach the serve task.
+        if let Some(task) = self.server_task.get_mut().take() {
+            task.abort();
         }
-        // Server handle will be dropped, which aborts the task
     }
 }
 
@@ -855,7 +936,6 @@ impl proto::transport_server::Transport for TransportServiceImpl {
             Ok(()) => {
                 #[cfg(feature = "metrics")]
                 {
-                    metrics::counter!("transport_sent_total", "transport" => "grpc").increment(1);
                     metrics::counter!("transport_received_bytes_total", "transport" => "grpc")
                         .increment(payload_len as u64);
                     metrics::counter!("transport_received_events_total", "transport" => "grpc")
@@ -981,12 +1061,6 @@ impl proto::transport_server::Transport for TransportServiceImpl {
 
         #[cfg(feature = "metrics")]
         {
-            metrics::counter!(
-                "transport_sent_total",
-                "transport" => "grpc",
-                "path" => "batch"
-            )
-            .increment(accepted);
             metrics::counter!("transport_received_bytes_total", "transport" => "grpc")
                 .increment(batch_bytes as u64);
             metrics::counter!("transport_received_events_total", "transport" => "grpc")

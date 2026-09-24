@@ -107,10 +107,14 @@ transport:
 
 - **Cancellation safety**: `recv` reads from an internal mpsc, safe
   to drop. `send` is a single unary RPC — drop cancels cleanly.
+- **Send deadline**: `send_timeout_ms` (default 30 s, `0` for none) bounds each `send` and `send_batch` end to end, DNS, connect and TLS handshake included, and a send past it is `Backpressured`. A dial whose DNS lookup, TCP connect or TLS handshake has not finished by nine tenths of the limit is abandoned, so the send that started it reports the failure and the next send dials afresh.
 - **Send failures**: `Unavailable`, `ResourceExhausted`, `DeadlineExceeded` (`send_timeout_ms`), and a connection that fails before the server answers are `Backpressured`, so an absent or restarting receiver is waited out. Any other status the server returns is `Fatal`.
 - **Message-size ceiling**: `max_message_size` bounds the encoded request, measured uncompressed, as the receiver's decoder measures it. `send` returns `FilteredDlq` for a record over it without making the RPC, and for a record the receiver refuses with `OutOfRange` (its limit is lower, or gzip grew the frame past it). `send_batch` returns `Fatal` naming the limit for a block over it; send a smaller block.
-- **`is_healthy()`**: `AtomicBool`, also emits `dfe_transport_healthy{transport="grpc"}`
-  gauge on every read.
+- **Acknowledgement**: the server answers once the records are queued for `recv`, not once the consumer reads them. A full queue (`recv_buffer_size`) answers `ResourceExhausted`.
+- **`close()`**: refuses new pushes with `Unavailable`, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Open connections finish their in-flight RPCs on their own, the listener is free when `close()` returns, and a client that never finishes its RPC does not hold it open. Dropping the transport stops the server too.
+- **Shutdown order**: `close()`, then `recv` until `Closed`, then flush. A service that stops calling `recv` before it returns `Closed` loses the records still queued, whenever it closes.
+- **Counters**: receipts count in `transport_received_*`, never in `transport_sent_total`.
+- **`is_healthy()`**: `false` after `close()`. Also sets the `transport_healthy{transport="grpc"}` gauge on every read.
 - **`commit()`**: no-op — gRPC has no persistence to advance.
 
 Source: [../../src/transport/grpc/](../../src/transport/grpc/).

@@ -41,10 +41,13 @@ pub struct GrpcConfig {
     /// Receive timeout in milliseconds (0 = non-blocking).
     pub recv_timeout_ms: u64,
 
-    /// Per-RPC send deadline in milliseconds (0 = no deadline).
+    /// Send deadline in milliseconds (0 = no deadline). Default 30s.
     ///
-    /// Bounds a single `push` so a hung/black-holing server cannot block a
-    /// sender task forever. Applied as the `grpc-timeout` header. Default 30s.
+    /// Bounds each `send` and `send_batch` end to end -- DNS, TCP connect, TLS
+    /// handshake and the RPC -- so a server that is down or never answers
+    /// returns `Backpressured` at the limit. A dial still unfinished at nine
+    /// tenths of it is abandoned, so the next send dials afresh. Also sent as
+    /// the `grpc-timeout` header.
     pub send_timeout_ms: u64,
 
     /// Maximum message size in bytes (both send and receive).
