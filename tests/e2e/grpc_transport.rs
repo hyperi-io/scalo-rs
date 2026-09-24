@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use scalo::transport::grpc::{GrpcConfig, GrpcTransport};
 use scalo::transport::{
-    PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportReceiver,
-    TransportSender,
+    PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportError,
+    TransportReceiver, TransportSender,
 };
 
 /// Find an available port for testing.
@@ -547,6 +547,359 @@ async fn test_route_batch_empty() {
     assert!(
         matches!(result, SendResult::Ok),
         "empty send_batch should succeed: {result:?}"
+    );
+
+    let _ = client.close().await;
+    let _ = server.close().await;
+}
+
+fn json_record(seq: u32) -> Record {
+    Record {
+        payload: bytes::Bytes::from(format!("{{\"seq\":{seq}}}")),
+        key: Some(Arc::from("main")),
+        headers: Vec::new(),
+        metadata: RecordMeta {
+            timestamp_ms: None,
+            format: PayloadFormat::Json,
+        },
+    }
+}
+
+/// Receive until the transport reports `Closed`, counting records. Bounded, so
+/// a recv that never ends fails the test instead of hanging it.
+async fn drain_until_closed(server: &GrpcTransport) -> Result<usize, String> {
+    let mut delivered = 0;
+    for _ in 0..1000 {
+        match server.recv(100).await {
+            Ok(batch) => delivered += batch.records.len(),
+            Err(TransportError::Closed) => return Ok(delivered),
+            Err(e) => return Err(format!("recv failed after {delivered} records: {e}")),
+        }
+    }
+    Err(format!(
+        "recv never reported Closed; {delivered} records so far"
+    ))
+}
+
+/// Every record the server acked reaches `recv`, even when `close()` comes
+/// before the consumer read it -- with a blocking and a non-blocking `recv`.
+#[tokio::test]
+async fn acked_records_reach_recv_after_close() {
+    for recv_timeout_ms in [100, 0] {
+        let port = find_available_port().await;
+        let addr = format!("127.0.0.1:{port}");
+        let mut server_config = GrpcConfig::server(&addr);
+        server_config.recv_timeout_ms = recv_timeout_ms;
+        let server = GrpcTransport::new(&server_config).await.expect("server");
+        let client = GrpcTransport::new(&GrpcConfig::client(&format!("http://{addr}")))
+            .await
+            .expect("client");
+
+        let batch = client
+            .send_batch(&[json_record(162), json_record(163)])
+            .await;
+        assert!(matches!(batch, SendResult::Ok), "{batch:?}");
+        let single = client
+            .send("main", bytes::Bytes::from_static(b"{\"seq\":164}"))
+            .await;
+        assert!(matches!(single, SendResult::Ok), "{single:?}");
+
+        server.close().await.expect("close");
+        let delivered = drain_until_closed(&server).await;
+        assert_eq!(
+            delivered,
+            Ok(3),
+            "recv_timeout_ms={recv_timeout_ms}: the server acked 3 records and recv \
+             returned {delivered:?} of them after close()"
+        );
+        assert!(
+            matches!(server.recv(100).await, Err(TransportError::Closed)),
+            "Closed must stay terminal once drained"
+        );
+        let _ = client.close().await;
+    }
+}
+
+/// Senders still pushing while the server closes: every record acked to them
+/// is one `recv` returns, whichever side of `close()` its RPC landed on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_acked_record_is_delivered_when_close_races_the_senders() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let port = find_available_port().await;
+    let (server, client) = create_pair(port).await;
+    let client = Arc::new(client);
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut senders = tokio::task::JoinSet::new();
+    for sender in 0..4_u32 {
+        let client = Arc::clone(&client);
+        let stop = Arc::clone(&stop);
+        senders.spawn(async move {
+            let mut acked = 0_usize;
+            let mut seq = sender * 1_000_000;
+            while !stop.load(Ordering::Relaxed) {
+                if client
+                    .send_batch(&[json_record(seq), json_record(seq + 1)])
+                    .await
+                    .is_ok()
+                {
+                    acked += 2;
+                }
+                seq += 2;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            acked
+        });
+    }
+
+    // Acks pile up unread, as behind a consumer that stopped calling recv.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.close().await.expect("close");
+    let delivered = drain_until_closed(&server).await.expect("drain");
+    stop.store(true, Ordering::Relaxed);
+
+    let mut acked = 0;
+    while let Some(count) = senders.join_next().await {
+        acked += count.expect("sender task");
+    }
+    assert!(acked > 0, "the senders never got an ack");
+    assert_eq!(
+        delivered, acked,
+        "{acked} records acked to the senders, {delivered} returned by recv"
+    );
+}
+
+/// A push that reaches the server after `close()` is refused with a status the
+/// sender retries, never acked: nothing is left to deliver it.
+#[tokio::test]
+async fn a_push_after_close_is_refused_not_acked() {
+    let port = find_available_port().await;
+    let (server, client) = create_pair(port).await;
+
+    // Warm the connection, so the push after close() rides an open HTTP/2
+    // connection rather than a fresh connect the stopped listener refuses.
+    let warm = client
+        .send("main", bytes::Bytes::from_static(b"{\"warm\":1}"))
+        .await;
+    assert!(matches!(warm, SendResult::Ok), "{warm:?}");
+    assert_eq!(server.recv(10).await.expect("recv").records.len(), 1);
+
+    server.close().await.expect("close");
+    let after = client
+        .send("main", bytes::Bytes::from_static(b"{\"after\":1}"))
+        .await;
+    let batch_after = client.send_batch(&[json_record(1)]).await;
+
+    let delivered = drain_until_closed(&server).await;
+    assert!(
+        after.is_backpressured(),
+        "a push after close() must come back retryable, got {after:?}"
+    );
+    assert!(
+        batch_after.is_backpressured(),
+        "a RouteBatch after close() must come back retryable, got {batch_after:?}"
+    );
+    assert_eq!(delivered, Ok(0), "nothing sent after close() may be queued");
+
+    let _ = client.close().await;
+}
+
+/// A loopback client that opens one Push stream and never sends its body, so
+/// the server holds an in-flight RPC for as long as the socket stays open.
+async fn stalled_push_stream(addr: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+
+    fn literal(out: &mut Vec<u8>, value: &str) {
+        out.push(u8::try_from(value.len()).expect("short header value"));
+        out.extend_from_slice(value.as_bytes());
+    }
+    // HPACK: indexed :method POST and :scheme http, then literal values for
+    // :path, :authority and content-type against their static-table names.
+    let mut block = vec![0x83, 0x86, 0x04];
+    literal(&mut block, "/scalo.transport.v1.Transport/Push");
+    block.push(0x01);
+    literal(&mut block, addr);
+    block.extend_from_slice(&[0x0f, 0x10]);
+    literal(&mut block, "application/grpc");
+
+    let mut frames = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    // Empty SETTINGS, then HEADERS on stream 1 with END_HEADERS and no
+    // END_STREAM: the request body never follows.
+    frames.extend_from_slice(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0]);
+    let len = u32::try_from(block.len())
+        .expect("short header block")
+        .to_be_bytes();
+    frames.extend_from_slice(&[len[1], len[2], len[3], 0x01, 0x04, 0, 0, 0, 1]);
+    frames.extend_from_slice(&block);
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(&frames).await.expect("write request head");
+    stream
+}
+
+/// Poll-rebind `addr` for up to 2 s; true once a new server can bind it.
+async fn port_is_free(addr: &str) -> bool {
+    for _ in 0..40 {
+        if GrpcTransport::new(&GrpcConfig::server(addr)).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// `close()` stops the server even while a client holds an RPC open: the
+/// in-flight RPC gets `send_timeout_ms` to finish, then the server is aborted.
+#[tokio::test]
+async fn close_stops_the_server_while_a_client_holds_an_rpc_open() {
+    let port = find_available_port().await;
+    let addr = format!("127.0.0.1:{port}");
+    let mut config = GrpcConfig::server(&addr);
+    config.send_timeout_ms = 200;
+    let server = GrpcTransport::new(&config).await.expect("server");
+    let _stalled = stalled_push_stream(&addr).await;
+    // Let the server read the request head and start the handler.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let closing = tokio::time::timeout(Duration::from_secs(5), server.close()).await;
+    assert!(
+        matches!(closing, Ok(Ok(()))),
+        "close() must return within its bound, got {closing:?}"
+    );
+    assert!(
+        port_is_free(&addr).await,
+        "port {port} still bound after close() -- the server outlived close()"
+    );
+}
+
+/// Dropping the transport without `close()` stops the server too: a dropped
+/// `JoinHandle` detaches its task, so the serve task is aborted explicitly.
+#[tokio::test]
+async fn drop_stops_the_server_while_a_client_holds_an_rpc_open() {
+    let port = find_available_port().await;
+    let addr = format!("127.0.0.1:{port}");
+    let server = GrpcTransport::new(&GrpcConfig::server(&addr))
+        .await
+        .expect("server");
+    let _stalled = stalled_push_stream(&addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    drop(server);
+    assert!(
+        port_is_free(&addr).await,
+        "port {port} still bound after drop -- the serve task outlived the transport"
+    );
+}
+
+/// A listener that completes TCP but never speaks, holding every connection.
+async fn silent_listener() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    addr
+}
+
+/// A TLS client to a server that accepts and never answers waits in the TLS
+/// handshake, before the RPC starts; `send_timeout_ms` still ends the send.
+#[tokio::test]
+async fn a_send_to_a_server_that_never_answers_ends_at_send_timeout() {
+    use std::io::Write;
+
+    let addr = silent_listener().await;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("self-signed cert");
+    let mut ca = tempfile::NamedTempFile::new().expect("ca file");
+    ca.write_all(cert.cert.pem().as_bytes()).expect("write ca");
+    ca.flush().expect("flush ca");
+
+    let mut config = GrpcConfig::client(&format!("https://{addr}"));
+    config.tls_enabled = true;
+    config.tls_ca_path = Some(ca.path().to_string_lossy().into_owned());
+    config.tls_domain = Some("localhost".to_string());
+    config.send_timeout_ms = 300;
+    let client = GrpcTransport::new(&config).await.expect("client");
+
+    let started = std::time::Instant::now();
+    let single = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.send("main", bytes::Bytes::from_static(b"{}")),
+    )
+    .await;
+    let batch =
+        tokio::time::timeout(Duration::from_secs(5), client.send_batch(&[json_record(1)])).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(single, Ok(SendResult::Backpressured)),
+        "send must end at send_timeout_ms as backpressure, got {single:?}"
+    );
+    assert!(
+        matches!(batch, Ok(SendResult::Backpressured)),
+        "send_batch must end at send_timeout_ms as backpressure, got {batch:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "two sends at a 300 ms limit took {elapsed:?}"
+    );
+}
+
+/// Accepted gRPC records count as received, never as sent: in one process the
+/// sender's counts are the only sends.
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn receipts_count_as_received_not_sent() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    // Current-thread runtime: the server's tasks run on this thread and see it.
+    let _local = metrics::set_default_local_recorder(&recorder);
+
+    let port = find_available_port().await;
+    let (server, client) = create_pair(port).await;
+    let single = client
+        .send("main", bytes::Bytes::from_static(b"{\"seq\":1}"))
+        .await;
+    assert!(matches!(single, SendResult::Ok), "{single:?}");
+    let batch = client.send_batch(&[json_record(2), json_record(3)]).await;
+    assert!(matches!(batch, SendResult::Ok), "{batch:?}");
+    assert_eq!(server.recv(10).await.expect("recv").records.len(), 3);
+
+    let rendered = handle.render();
+    let value = |name: &str, labels: &[&str]| -> Option<f64> {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with(&format!("{name}{{")))
+            .filter(|line| {
+                let set = &line[name.len()..line.find('}').map_or(line.len(), |i| i + 1)];
+                labels.iter().all(|l| set.contains(l)) && set.matches('=').count() == labels.len()
+            })
+            .find_map(|line| line.rsplit(' ').next()?.parse().ok())
+    };
+
+    assert_eq!(
+        value("transport_sent_total", &["transport=\"grpc\""]),
+        Some(1.0),
+        "one Push was sent:\n{rendered}"
+    );
+    assert_eq!(
+        value(
+            "transport_sent_total",
+            &["transport=\"grpc\"", "path=\"batch\""]
+        ),
+        Some(2.0),
+        "one RouteBatch of two records was sent:\n{rendered}"
+    );
+    assert_eq!(
+        value("transport_received_events_total", &["transport=\"grpc\""]),
+        Some(3.0),
+        "three records were received:\n{rendered}"
     );
 
     let _ = client.close().await;
