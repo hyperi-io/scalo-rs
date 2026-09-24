@@ -62,7 +62,7 @@ transport:
 ```
 
 - **Cancellation safety**: `recv` uses `rdkafka`'s internal poll —
-  safe to drop at any `.await`.
+  safe to drop at any `.await`, including during its outage backoff.
 - **`send_batch()`**: queues every record of the block, then awaits all the
   delivery reports, so the block costs about one `linger.ms` window rather
   than one per record. Outbound filters apply per record before queueing.
@@ -70,11 +70,22 @@ transport:
   otherwise it is the first `Backpressured`/`Fatal` in record order, and any
   subset of the block may already be on the broker -- retry the whole block
   (at-least-once). Records carry their `key` as the topic and no headers.
-- **`is_healthy()`**: tracks an `AtomicBool` flipped to `false` on
-  fatal producer/consumer error or on `close()`. Does not probe the
-  broker per call.
-- **`commit()`**: commits consumer offsets via `rdkafka`'s store-offset
-  + commit-async path.
+- **`is_healthy()`**: an `AtomicBool` flipped to `false` by `close()` only. It never probes the broker, and a broker outage does not flip it.
+- **`commit()`**: synchronous (`CommitMode::Sync`), so a broker rejection reaches the caller. `commit_weak_async()` is the fire-and-forget form.
+
+### Broker outages
+
+librdkafka reconnects and rejoins by itself, so an outage ends neither the consumer nor the producer.
+
+| Call | Broker unavailable | Returned as an error |
+|------|--------------------|----------------------|
+| `recv` | Empty batch; the next poll waits a jittered backoff, 100 ms doubling to 2 s | Auth or ACL failure, a missing topic the consumer may not create, bad config, a librdkafka fatal error: `TransportError::Recv` |
+| `send` / `send_batch` | `Backpressured` once the queue stays full 5 s or a record outlives `message.timeout.ms` (default 300 s) | ACL or permanent topic error: `Fatal`; oversize record: `FilteredDlq` |
+| `commit` | Not covered: waits for the coordinator, then fails | `TransportError::Commit`, terminal in the `BatchEngine` driver |
+
+`classify_recv_failure` in [classify.rs](../../src/transport/kafka/classify.rs) lists the transient poll errors. A missing topic is transient only with `allow.auto.create.topics: "true"` in `librdkafka_overrides`; `_PARTITION_EOF` is not an error. A permanent error met mid-drain comes back on the next `recv`, after the drained records.
+
+`transport_recv_errors_total{transport="kafka",class}` counts poll errors as `transient` or `permanent`. An outage logs one warning at the start and `kafka consume resumed` when records flow again.
 
 Source: [../../src/transport/kafka/](../../src/transport/kafka/).
 
@@ -100,6 +111,7 @@ transport:
 
 - **Cancellation safety**: `recv` reads from an internal mpsc, safe
   to drop. `send` is a single unary RPC — drop cancels cleanly.
+- **Send failures**: `Unavailable`, `ResourceExhausted`, `DeadlineExceeded` (`send_timeout_ms`), and a connection that fails before the server answers are `Backpressured`, so an absent or restarting receiver is waited out. Any other status the server returns is `Fatal`.
 - **`is_healthy()`**: `AtomicBool`, also emits `dfe_transport_healthy{transport="grpc"}`
   gauge on every read.
 - **`commit()`**: no-op — gRPC has no persistence to advance.
@@ -212,6 +224,7 @@ transport:
 - **Cancellation safety**: send is `reqwest`'s async path — drop
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
+- **Send failures**: a refused, reset or timed-out connection, and HTTP 408, 429, 502, 503 or 504, are `Backpressured`, so a down endpoint is waited out. Any other non-2xx status, and a request that cannot be built, is `Fatal`.
 - **`is_healthy()`**: `!closed`. Does not probe the endpoint.
 
 Source: [../../src/transport/http.rs](../../src/transport/http.rs).
@@ -241,8 +254,8 @@ transport:
 
 - **Cancellation safety**: the `XREADGROUP` block is a single async
   call — cancelling drops the connection back to the pool.
-- **`is_healthy()`**: `!closed`. Connection failures surface via
-  `SendResult::Fatal` on the next send.
+- **`is_healthy()`**: `!closed`.
+- **Outages**: a dropped, refused or timed-out connection makes `send` return `Backpressured`, while `recv` and `commit` return an error. The connection is not re-established: after Redis restarts, `send` stays `Backpressured` and `recv` keeps failing until the transport is rebuilt.
 - **`commit()`**: `XACK` on the configured stream/group.
 
 Source: [../../src/transport/redis_transport.rs](../../src/transport/redis_transport.rs).

@@ -609,6 +609,19 @@ impl TransportBase for HttpTransport {
     }
 }
 
+/// Response statuses that mean the endpoint, or the gateway in front of it, is
+/// busy or down rather than refusing this request, so the send is retried.
+fn downstream_unavailable(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
 impl TransportSender for HttpTransport {
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
@@ -673,10 +686,7 @@ impl TransportSender for HttpTransport {
                 }
                 SendResult::Ok
             }
-            Ok(resp)
-                if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    || resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
-            {
+            Ok(resp) if downstream_unavailable(resp.status()) => {
                 #[cfg(feature = "logger")]
                 tracing::warn!(status = %resp.status(), url = %url, "HTTP transport: backpressure");
 
@@ -705,7 +715,13 @@ impl TransportSender for HttpTransport {
                 #[cfg(feature = "metrics")]
                 metrics::counter!("transport_send_errors_total", "transport" => "http")
                     .increment(1);
-                SendResult::Fatal(TransportError::Send(format!("HTTP request failed: {e}")))
+                // Only a request that could never be built or followed is permanent;
+                // refused, reset and timed-out connections clear when the endpoint returns.
+                if e.is_builder() || e.is_redirect() {
+                    SendResult::Fatal(TransportError::Send(format!("HTTP request failed: {e}")))
+                } else {
+                    SendResult::Backpressured
+                }
             }
         };
 
@@ -895,6 +911,102 @@ mod tests {
             .send("test", bytes::Bytes::from_static(b"data"))
             .await;
         assert!(result.is_fatal());
+    }
+
+    /// An endpoint that is down is waited out, not treated as a dead transport.
+    #[tokio::test]
+    async fn a_refused_connection_is_backpressure_not_fatal() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("bind an ephemeral port")
+            .port();
+        // The listener is dropped above, so the port now refuses connections.
+        let transport = HttpTransport::new(&HttpTransportConfig::sender(&format!(
+            "http://127.0.0.1:{port}"
+        )))
+        .await
+        .unwrap();
+        let result = transport
+            .send("ingest", bytes::Bytes::from_static(b"{}"))
+            .await;
+        assert!(
+            result.is_backpressured(),
+            "a refused connection must be retried, got {result:?}"
+        );
+    }
+
+    /// Whether `buf` holds a full request head and the body it declares.
+    fn request_complete(buf: &[u8]) -> bool {
+        let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let body_len = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        buf.len() >= head_end + 4 + body_len
+    }
+
+    /// A loopback endpoint that answers every request with `status`.
+    async fn status_endpoint(status: u16) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                // Read the whole request so the reply never races the upload.
+                let mut buf = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if request_complete(&buf) {
+                        break;
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status} Canned\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    /// Busy and gateway statuses mean the endpoint is not there right now; any
+    /// other failure status is the endpoint refusing this request.
+    #[tokio::test]
+    async fn only_busy_and_gateway_statuses_are_backpressure() {
+        for (status, retried) in [
+            (408, true),
+            (429, true),
+            (502, true),
+            (503, true),
+            (504, true),
+            (400, false),
+            (404, false),
+            (500, false),
+        ] {
+            let addr = status_endpoint(status).await;
+            let transport =
+                HttpTransport::new(&HttpTransportConfig::sender(&format!("http://{addr}")))
+                    .await
+                    .unwrap();
+            let result = transport
+                .send("ingest", bytes::Bytes::from_static(b"{}"))
+                .await;
+            if retried {
+                assert!(result.is_backpressured(), "HTTP {status}: got {result:?}");
+            } else {
+                assert!(result.is_fatal(), "HTTP {status}: got {result:?}");
+            }
+        }
     }
 
     #[tokio::test]

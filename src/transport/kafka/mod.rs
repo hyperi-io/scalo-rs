@@ -195,6 +195,13 @@ pub struct KafkaTransport {
     /// Latches a sustained retryable send failure so the warn fires on the edge,
     /// not once per record.
     send_degraded: classify::DegradedLatch,
+    /// Transient poll-failure count, backoff and outage log latch.
+    recv_state: classify::RecvState,
+    /// A permanent poll error met mid-drain, held for the next `recv` so the
+    /// records drained before it still reach the caller.
+    deferred_recv_error: parking_lot::Mutex<Option<KafkaError>>,
+    /// The consumer's `allow.auto.create.topics`: whether a missing topic can clear.
+    auto_create_topics: bool,
     /// Topics we're subscribed to (for cache warming and Debug).
     /// Behind RwLock so recv() can update after topic refresh re-subscribe.
     subscribed_topics: parking_lot::RwLock<Vec<String>>,
@@ -570,6 +577,8 @@ impl KafkaTransport {
         // Consumer and producer each get their own context instance.
         let protocol = config.effective_consumer_protocol();
         let consumer_config = consumer_client_config(config, protocol);
+        // librdkafka defaults this off, so only an explicit `true` counts.
+        let auto_create_topics = consumer_config.get("allow.auto.create.topics") == Some("true");
         let probe_window = protocol_probe_window(config, protocol, &consumer_config);
         let consumer = create_consumer(&consumer_config)?;
 
@@ -756,6 +765,9 @@ impl KafkaTransport {
             closed: AtomicBool::new(false),
             healthy,
             send_degraded: classify::DegradedLatch::default(),
+            recv_state: classify::RecvState::default(),
+            deferred_recv_error: parking_lot::Mutex::new(None),
+            auto_create_topics,
             subscribed_topics: parking_lot::RwLock::new(subscribed_topics),
             #[cfg(feature = "governor")]
             group_id: config.group.clone(),
@@ -1275,6 +1287,17 @@ impl TransportReceiver for KafkaTransport {
     /// - Pre-populates topic cache to avoid allocations
     ///
     /// For PB/day workloads, call with `max = 10_000` or higher.
+    ///
+    /// ## Broker outages
+    ///
+    /// A broker, network, coordinator or group-membership failure never ends
+    /// the consumer. The poll is retried on the next call after a jittered
+    /// backoff (100 ms doubling to 2 s), the call returns an empty batch, and
+    /// librdkafka reconnects and rejoins by itself. Only a failure no retry can
+    /// clear -- authentication, authorisation, a missing topic the consumer may
+    /// not create, invalid configuration, or a librdkafka fatal error -- is
+    /// returned as [`TransportError::Recv`]. One met after records were already
+    /// drained is returned by the next call, so those records are not lost.
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
         // Record-bounded poll only -- byte-identical to before. The byte-aware
         // governed path goes through `recv_limited`.
@@ -1360,6 +1383,10 @@ impl KafkaTransport {
     ) -> TransportResult<WorkBatch<KafkaToken>> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(TransportError::Closed);
+        }
+
+        if let Some(err) = self.deferred_recv_error.lock().take() {
+            return Err(TransportError::Recv(err.to_string()));
         }
 
         // Inbound gate (governor feature, opt-in). Evaluate the gate so it
@@ -1496,10 +1523,9 @@ impl KafkaTransport {
                         format: PayloadFormat::Auto,
                         range: start..end,
                     });
+                    self.recv_state.record_success();
                 }
-                Err(e) => {
-                    return Err(TransportError::Recv(e.to_string()));
-                }
+                Err(e) => return self.first_poll_failed(e).await,
             }
         } else {
             #[cfg(feature = "metrics")]
@@ -1556,10 +1582,20 @@ impl KafkaTransport {
                     });
                 }
                 Some(Err(e)) => {
-                    if spans.is_empty() {
-                        return Err(TransportError::Recv(e.to_string()));
+                    match classify::classify_recv_failure(&e, self.auto_create_topics) {
+                        // Another assigned partition may still hold records.
+                        classify::RecvFailure::EndOfPartition => {}
+                        // Records are in hand; the next call backs off if it persists.
+                        classify::RecvFailure::Transient => {
+                            self.recv_state.record_transient(&e);
+                            break;
+                        }
+                        classify::RecvFailure::Permanent => {
+                            classify::record_permanent_recv_failure();
+                            *self.deferred_recv_error.lock() = Some(e);
+                            break;
+                        }
                     }
-                    break;
                 }
                 None => break,
             }
@@ -1600,6 +1636,24 @@ impl KafkaTransport {
             filtered_tokens,
         }
         .into())
+    }
+
+    /// Settle a first poll that returned an error: an empty batch after a
+    /// backoff when it is transient, the error when no retry can clear it.
+    async fn first_poll_failed(&self, err: KafkaError) -> TransportResult<WorkBatch<KafkaToken>> {
+        match classify::classify_recv_failure(&err, self.auto_create_topics) {
+            classify::RecvFailure::EndOfPartition => {}
+            classify::RecvFailure::Transient => {
+                self.recv_state.record_transient(&err);
+                // Yields to the runtime, so a burst of queued errors cannot spin the caller.
+                tokio::time::sleep(self.recv_state.backoff()).await;
+            }
+            classify::RecvFailure::Permanent => {
+                classify::record_permanent_recv_failure();
+                return Err(TransportError::Recv(err.to_string()));
+            }
+        }
+        Ok(RecvBatch::from_messages(Vec::new()).into())
     }
 
     /// WEAKER, opt-in fire-and-forget commit (throughput over correctness).
@@ -1976,6 +2030,44 @@ mod tests {
             .map(|e| e.topic().to_string())
             .collect();
         assert_eq!(topics, vec!["syslog_load".to_string()]);
+    }
+
+    /// A consumer whose only broker refuses connections keeps getting empty
+    /// batches: librdkafka's transport errors are absorbed, never returned.
+    /// Broker-free: port 1 on loopback refuses every connect.
+    #[tokio::test]
+    async fn an_unreachable_broker_never_fails_recv() {
+        let consumer = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "scalo-unreachable".to_string(),
+            topics: vec!["events".to_string()],
+            consumer_protocol_probe_ms: 0,
+            ..Default::default()
+        };
+        let transport = KafkaTransport::new(&consumer)
+            .await
+            .expect("a consumer transport constructs broker-free");
+
+        let window = Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let mut calls = 0_u32;
+        while started.elapsed() < window {
+            let batch = transport
+                .recv(100)
+                .await
+                .expect("an unreachable broker must not end the consumer");
+            assert!(batch.records.is_empty());
+            calls += 1;
+        }
+        assert!(
+            transport.recv_state.failures() > 0,
+            "librdkafka surfaced no transport error, so the transient path went untested"
+        );
+        // Each call blocks in the poll or the backoff, so the loop cannot spin.
+        assert!(
+            calls < 200,
+            "{calls} recv calls in {window:?} -- the failing poll is spinning"
+        );
     }
 
     // =========================================================================
