@@ -149,7 +149,7 @@ dlq:
     routing: per_table           # per_table | common
     topic_suffix: .dlq
     common_topic: dfe.dlq
-    send_timeout_ms: 5000        # ack wait for flush() and shutdown; 0 purges at once
+    send_timeout_ms: 5000        # ack wait for flush() and shutdown; the purge after it adds up to 5 s
   http:                          # dlq-http feature
     enabled: false
     endpoint: https://dlq.example/ingest

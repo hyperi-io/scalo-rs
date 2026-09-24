@@ -180,8 +180,9 @@ pub struct KafkaDlqConfig {
 
     /// How long a `flush` or the shutdown waits for the broker to ack the
     /// entries queued to Kafka, in milliseconds. Entries still unacked then
-    /// are purged and counted as dropped. `0` purges without waiting.
-    /// Default 5000.
+    /// are purged and counted as dropped. The purge adds a wait of up to 5 s
+    /// for the purged entries' delivery reports, so `0` skips the ack wait
+    /// but not that one. Default 5000.
     pub send_timeout_ms: u64,
 }
 

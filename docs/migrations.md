@@ -641,9 +641,9 @@ The 30 s wait and the `File` variant changed after v2.12.10 -- see [`kafka.send_
 
 ### `kafka.send_timeout_ms` is the Kafka ack wait (BEHAVIOUR CHANGE)
 
-The key was parsed and used nowhere. It is now how long a `flush()` or the shutdown waits for the broker's acks, replacing the fixed 30 s v2.12.10 shipped. The default stays 5000, so the default wait is 5 s. `0` purges without waiting. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
+The key was parsed and used nowhere. It is now how long a `flush()` or the shutdown waits for the broker's acks, replacing the fixed 30 s v2.12.10 shipped. The default stays 5000, so the default wait is 5 s. `0` skips the ack wait, but the purge after it still waits up to 5 s for the purged entries' delivery reports. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
 
-**Consumer adjustment** -- a deployment that relied on the 30 s wait sets `dlq.kafka.send_timeout_ms: 30000`. A flush over the Kafka backend now takes up to `send_timeout_ms` plus 5 s while the broker is slow or down.
+**Consumer adjustment** -- a flush over the Kafka backend now takes up to `send_timeout_ms` plus 5 s while the broker is slow or down, 10 s at the default. A consumer that exposes `KafkaDlqConfig` to its operators can set `send_timeout_ms: 30000` to keep the 30 s wait; one that builds it from `KafkaDlqConfig::default()` gets 5 s until it exposes the field.
 
 ### A Kafka DLQ loss returns `DlqError::Kafka` (BEHAVIOUR CHANGE)
 
