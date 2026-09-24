@@ -749,27 +749,30 @@ async fn port_is_free(addr: &str) -> bool {
     false
 }
 
-/// `close()` stops the server even while a client holds an RPC open: the
-/// in-flight RPC gets `send_timeout_ms` to finish, then the server is aborted.
+/// `close()` stops the server even while a client holds an RPC open, without
+/// waiting on that client, and the listener is free when it returns.
 #[tokio::test]
 async fn close_stops_the_server_while_a_client_holds_an_rpc_open() {
     let port = find_available_port().await;
     let addr = format!("127.0.0.1:{port}");
-    let mut config = GrpcConfig::server(&addr);
-    config.send_timeout_ms = 200;
-    let server = GrpcTransport::new(&config).await.expect("server");
+    let server = GrpcTransport::new(&GrpcConfig::server(&addr))
+        .await
+        .expect("server");
     let _stalled = stalled_push_stream(&addr).await;
     // Let the server read the request head and start the handler.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    let started = std::time::Instant::now();
     let closing = tokio::time::timeout(Duration::from_secs(5), server.close()).await;
+    let took = started.elapsed();
     assert!(
         matches!(closing, Ok(Ok(()))),
-        "close() must return within its bound, got {closing:?}"
+        "close() waited on the stalled client, got {closing:?}"
     );
+    assert!(took < Duration::from_secs(1), "close() took {took:?}");
     assert!(
-        port_is_free(&addr).await,
-        "port {port} still bound after close() -- the server outlived close()"
+        GrpcTransport::new(&GrpcConfig::server(&addr)).await.is_ok(),
+        "port {port} still bound when close() returned -- the server outlived close()"
     );
 }
 

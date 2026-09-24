@@ -680,7 +680,7 @@ Dropping the Kafka producer discards what it still holds, queued or in flight. T
 The gRPC server acknowledges a record once it is queued for `recv`. `close()` used to make the next `recv` return `Closed` with records still queued, and kept acknowledging pushes until the serve task noticed the shutdown, so a sender saw `Ok` for records nothing delivered. See [transport/backends.md](transport/backends.md#grpc).
 
 - `close()` refuses every push from then on with `Unavailable`, which a sender retries. `recv` returns the records already queued, then `Closed`.
-- `close()` waits up to `send_timeout_ms` for in-flight RPCs, then stops the server, so the listener is free when it returns. Dropping the transport stops the server at once, where the serve task used to outlive it while a client held an RPC open.
+- `close()` and dropping the transport both stop the server, so the listener is free when `close()` returns. The serve task used to outlive the transport for as long as a client held an RPC open. Open connections still finish their in-flight RPCs.
 - `send` and `send_batch` give up at `send_timeout_ms` end to end. The `grpc-timeout` header did not cover DNS, the TCP connect or the TLS handshake, so a send to a receiver that was down could outlive the limit. The TCP connect is dropped at the limit too.
 - The server no longer counts receipts in `transport_sent_total{transport="grpc"}`. They were counted as sends and as receipts both.
 

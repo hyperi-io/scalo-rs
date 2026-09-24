@@ -103,8 +103,7 @@ pub struct GrpcTransport {
     /// Receive timeout (milliseconds).
     recv_timeout_ms: u64,
 
-    /// Send deadline, end to end (milliseconds, 0 = none). Also how long
-    /// `close()` waits for in-flight inbound RPCs.
+    /// Send deadline, end to end (milliseconds, 0 = none).
     send_timeout_ms: u64,
 
     /// Largest encoded message `send` and `send_batch` put on the wire,
@@ -402,28 +401,21 @@ impl GrpcTransport {
             })
     }
 
-    /// Stop the receive server: signal a graceful shutdown, give in-flight
-    /// RPCs `send_timeout_ms` to finish, then abort the serve task.
+    /// Stop the receive server without waiting on its clients.
+    ///
+    /// The graceful signal has every open connection finish its in-flight RPCs
+    /// in tonic's own per-connection tasks, which outlive the serve task.
+    /// Aborting the serve task frees the listener at once, so a client that
+    /// never completes its RPC cannot hold `close()` open.
     async fn stop_server(&self) {
         if let Some(tx) = self.shutdown_tx.lock().take() {
             let _ = tx.send(());
         }
-        let Some(mut task) = self.server_task.lock().take() else {
+        let Some(task) = self.server_task.lock().take() else {
             return;
         };
-        let grace = Duration::from_millis(self.send_timeout_ms);
-        let joined = match tokio::time::timeout(grace, &mut task).await {
-            Ok(joined) => joined,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    grace_ms = self.send_timeout_ms,
-                    "gRPC: in-flight RPCs outlived close() -- stopping the server anyway"
-                );
-                task.abort();
-                task.await
-            }
-        };
-        match joined {
+        task.abort();
+        match task.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "gRPC: server ended with an error"),
             Err(e) if e.is_cancelled() => {}
@@ -754,10 +746,10 @@ impl TransportBase for GrpcTransport {
     /// A push that arrives from here on is refused with `Unavailable`, which a
     /// sender retries. Records the server already acked stay queued: call
     /// [`recv`](TransportReceiver::recv) until it returns
-    /// [`TransportError::Closed`] or they are lost. In-flight RPCs get up to
-    /// `send_timeout_ms` to finish before the server is stopped, and the
-    /// listener is free when this returns. Waits for a `recv` in progress
-    /// (at most `recv_timeout_ms`). Idempotent.
+    /// [`TransportError::Closed`] or they are lost. Open connections finish
+    /// their in-flight RPCs on their own, and the listener is free when this
+    /// returns. Waits for a `recv` in progress (at most `recv_timeout_ms`).
+    /// Idempotent.
     async fn close(&self) -> TransportResult<()> {
         self.closed.store(true, Ordering::Relaxed);
         self.healthy.store(false, Ordering::Relaxed);
