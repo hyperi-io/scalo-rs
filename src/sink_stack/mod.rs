@@ -33,10 +33,10 @@
 //! ARC discovers the downstream's safe concurrency from RTT/error feedback
 //! (`min_limit` floors at 1 so a failing sink can never deadlock at zero). It is
 //! the OUTBOUND sink limiter only -- kept distinct from the inbound worker-AIMD
-//! so the two never double-regulate. NOTE: the limiter backpressures (never
-//! drops) when saturated, but its readiness check currently busy-polls while at
-//! the limit; pair it with `load_shed` (or a non-zero `min_limit` headroom) for
-//! sustained-overload deployments.
+//! so the two never double-regulate. At the limit an attempt parks on the
+//! limiter's semaphore queue (no spin) for up to the attempt timeout, then fails
+//! as transient backpressure that the retry loop re-sends -- saturation delays
+//! delivery, never drops it.
 //!
 //! Retry/backoff wraps the whole composed service as the OUTERMOST control,
 //! driven by `backon` (a closure-shaped retry loop -- the natural fit, and the
@@ -303,9 +303,10 @@ impl SinkStack {
                 .boxed_clone()
         };
 
-        // load-shed (optional, outermost in-attempt control): when the
-        // concurrency gate (static or adaptive) is full, shed immediately
-        // instead of queueing. Both arms box to the same service type.
+        // load-shed (optional, outermost in-attempt control): sheds when the
+        // static concurrency gate is full. The adaptive gate always reports
+        // ready and waits in `call`, so it never trips a shed. Both arms box to
+        // the same service type.
         let svc = if cfg.load_shed {
             ServiceBuilder::new()
                 .load_shed()

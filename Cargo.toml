@@ -574,7 +574,7 @@ name = "engine_benchmark"
 harness = false
 required-features = ["worker", "transport"]
 
-# scalo-side numbers for Vector baselining (docs/VECTOR-BASELINING.md).
+# scalo-side numbers for Vector baselining (docs/vector-baselining.md).
 [[bench]]
 name = "baseline"
 harness = false

@@ -91,9 +91,10 @@ impl std::fmt::Display for FilterDirection {
 
 /// Tier gate configuration -- controls which filter tiers are enabled.
 ///
-/// Lives under the `expression` config cascade key alongside `ProfileConfig`.
-/// Separate struct because it serves a different purpose (transport-level
-/// gating vs expression-level function restriction).
+/// Lives under the `transport.filter_tiers` config cascade key, read by
+/// [`from_cascade`](Self::from_cascade). The `expression` key holds the
+/// separate `ProfileConfig`, which restricts CEL functions app-wide rather
+/// than gating transport filter tiers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)] // 4 independent boolean tier gates (in/out x cel/complex)
 pub struct TransportFilterTierConfig {

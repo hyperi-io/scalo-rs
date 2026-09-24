@@ -98,7 +98,8 @@ See [src/transport/filter/classify.rs](../../src/transport/filter/classify.rs).
   `filters_in` and `filters_out`, evaluated separately.
 - **Startup fails fast** on rules above the allowed tier, on invalid
   CEL syntax, on empty expressions, and on Tier 2/3 rules over the AST
-  budget (`transport.filter_tiers.budget`). Pipe is the exception -- see
+  budget (`transport.filter_tiers.budget`). A pipe built directly with
+  `PipeTransport::new` starts but refuses traffic -- see
   [Where it's embedded](#where-its-embedded).
 
 ---
@@ -150,8 +151,8 @@ If a configured filter rule classifies above the allowed tier, the
 transport's constructor returns `TransportError::Config(...)` and the
 transport fails to start. **Fail-loud, not fail-silently** -- a
 misconfigured drop/dlq rule never runs as an empty filter engine that
-lets every message through. Pipe is the exception -- see
-[Where it's embedded](#where-its-embedded).
+lets every message through. `PipeTransport::new` refuses traffic
+instead -- see [Where it's embedded](#where-its-embedded).
 
 `transport.filter_tiers.budget` bounds Tier 2/3 cost: `max_ast_nodes` (default 200) and `max_iteration_depth` (default 2) are checked at startup, and `max_payload_bytes` (default 1 MiB) at evaluation. A payload over `max_payload_bytes` skips the CEL rule, which then does not match, and counts in `transport_filter_cel_payload_skip_total` (with the `metrics` feature).
 
@@ -188,9 +189,8 @@ to those keys does **not** propagate to an already-running transport
 This is intentional: a misconfigured reload that flips a gate would
 otherwise tear down a working transport mid-stream. Operators wanting
 the new gate config to take effect should restart the service (or, in
-K8s, roll the pod). Per-rule reload (adding/removing rules while
-keeping the same tier policy) is a separate workstream not yet
-shipped.
+K8s, roll the pod). Rule lists load the same way, so a rule change
+needs a restart too.
 
 A first-time deployment should start with all gates off — only Tier 1
 filters work. Flip a gate on once Tier 2 or Tier 3 is genuinely needed
@@ -259,7 +259,7 @@ its own config section's `filters_in` / `filters_out` plus the
 | Pipe | [src/transport/pipe.rs](../../src/transport/pipe.rs) |
 | HTTP | [src/transport/http.rs](../../src/transport/http.rs) |
 
-Pipe is the exception. It compiles its rules against the default gates (Tier 1 only) rather than `transport.filter_tiers`, and a rule that fails to compile logs a warning and leaves the pipe running with no filters at all, where every other backend fails its constructor.
+`PipeTransport::new` returns the transport rather than a `Result`, so a rule that fails to compile cannot fail its constructor. The pipe starts unhealthy instead: `send` returns `SendResult::Fatal` and `recv` returns `TransportError::Config`, both carrying the compile error, until it is rebuilt with valid rules. `AnySender` and `AnyReceiver` fail construction on the same rule, as for every other backend.
 
 The engine is a no-op when both filter vectors are empty — there's no
 per-message overhead beyond the inlined `has_*_filters` check.
@@ -276,15 +276,15 @@ warning, and every bypass counts in
 feature).
 
 This is a deliberate choice — running JSON-shaped filters against
-binary payloads would either falsely match or always reject. Pipelines
-that need to filter MsgPack should either upgrade their filters once a
-MsgPack evaluator ships, or convert to JSON upstream.
+binary payloads would either falsely match or always reject. The engine
+has no MsgPack evaluator, so a pipeline that needs to filter MsgPack
+converts it to JSON upstream.
 
 ---
 
 ## Known limitations
 
-The post-spec follow-up items from earlier work, with current status:
+Open gaps in the engine, by status:
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|
