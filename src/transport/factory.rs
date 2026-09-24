@@ -198,8 +198,9 @@ impl TransportSender for AnySender {
     }
 
     /// Forward [`send_batch`](TransportSender::send_batch) to the active
-    /// backend. gRPC uses its native single-RPC `RouteBatch` override; every
-    /// other backend uses the trait's per-record default (see the at-least-once
+    /// backend. gRPC uses its native single-RPC `RouteBatch` override and Kafka
+    /// queues the whole block before awaiting any delivery report; every other
+    /// backend uses the trait's per-record default (see the at-least-once
     /// partial-send caveat on the trait method).
     #[cfg_attr(
         not(any(
