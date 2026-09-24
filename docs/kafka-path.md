@@ -33,7 +33,10 @@ tuning mistake. Each governs a different hop.
   [backpressure.md](backpressure.md)). GET and SEND are static librdkafka
   knobs; PROCESS moves with pressure.
 - **SEND** is producer-side accumulation, mirror of GET. `linger.ms` is the
-  time bound; `batch.size` is the byte bound.
+  time bound; `batch.size` is the byte bound. Accumulation only happens when
+  records are queued together: `KafkaTransport::send_batch` queues the whole
+  block before awaiting any delivery report, whereas a loop that awaits each
+  `send` pays one `linger.ms` window per record.
 
 The poll-safety cap (`max_poll_records`) is a fourth, count-based limit. It
 is NOT a librdkafka property -- there is no broker knob for it. It is a

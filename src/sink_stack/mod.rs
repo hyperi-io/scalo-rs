@@ -53,8 +53,10 @@
 //! - A fatal error stops immediately (no point retrying a permanent failure).
 //! - The method returns a [`SendResult`]; the caller fires its commit tokens
 //!   only on [`SendResult::Ok`], exactly as for a bare `send_batch`. Retries
-//!   may re-deliver a partially-sent prefix (at-least-once: duplicates, never
-//!   loss) -- identical to the transport's own `send_batch` contract.
+//!   may re-deliver records a failed attempt already sent -- a prefix for the
+//!   per-record default, any subset for Kafka's pipelined override
+//!   (at-least-once: duplicates, never loss) -- identical to the transport's
+//!   own `send_batch` contract.
 
 mod adaptive;
 mod config;

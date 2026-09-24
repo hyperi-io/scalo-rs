@@ -532,7 +532,7 @@ proptest = ">=1.11.0, <2"
 # `#[ignore]`d integration tests need a Docker daemon (run on a Docker host).
 # MIT/Apache-2.0, web-checked 2026-06-26.
 testcontainers = ">=0.27.0, <0.28"
-testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["redis"] }
+testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["redis", "kafka"] }
 # Direct client for the fault-injection tests to verify stream contents (XLEN /
 # XRANGE) independently of scalo's own transport. Matches the transport's redis.
 redis = { version = ">=1.0, <2", features = ["tokio-comp", "streams"] }

@@ -81,12 +81,14 @@ pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
 use super::error::{TransportError, TransportResult};
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
-use super::work_batch::WorkBatch;
+use super::work_batch::{Record, WorkBatch};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
-use rdkafka::error::RDKafkaErrorCode;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::Message as KafkaMessage;
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::message::OwnedHeaders;
+use rdkafka::producer::future_producer::OwnedDeliveryResult;
+use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::util::Timeout;
 use std::collections::HashMap;
@@ -110,6 +112,56 @@ pub mod tuning {
 
     /// Pre-allocated message vector capacity.
     pub const INITIAL_BATCH_CAPACITY: usize = 10_000;
+}
+
+/// How long a send keeps re-offering a record to a full producer queue before
+/// reporting `Backpressured`.
+const QUEUE_FULL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pause between re-offers while the producer queue is full.
+const QUEUE_FULL_RETRY: Duration = Duration::from_millis(100);
+
+/// W3C traceparent headers for the active span, when propagation is built in.
+fn trace_headers() -> Option<OwnedHeaders> {
+    #[cfg(feature = "transport-trace")]
+    {
+        super::propagation::current_traceparent().map(|tp| {
+            OwnedHeaders::new().insert(rdkafka::message::Header {
+                key: super::propagation::TRACEPARENT_HEADER,
+                value: Some(tp.as_str()),
+            })
+        })
+    }
+    #[cfg(not(feature = "transport-trace"))]
+    {
+        None
+    }
+}
+
+/// Build one produce record for `destination`, carrying `headers` when set.
+fn produce_record<'a>(
+    destination: &'a str,
+    payload: &'a [u8],
+    headers: Option<&OwnedHeaders>,
+) -> FutureRecord<'a, str, [u8]> {
+    let record = FutureRecord::to(destination).payload(payload);
+    match headers {
+        Some(h) => record.headers(h.clone()),
+        None => record,
+    }
+}
+
+/// Fold per-record results into the block's result: the first `Backpressured`
+/// or `Fatal` in record order, else `Ok`.
+///
+/// `Ok` (sent or dropped by a filter) and `FilteredDlq` are handled records, so
+/// they never fail the block. Any other result means at least one record is
+/// unconfirmed, and the caller must retry the block rather than commit it.
+fn block_result(results: Vec<SendResult>) -> SendResult {
+    results
+        .into_iter()
+        .find(|r| matches!(r, SendResult::Backpressured | SendResult::Fatal(_)))
+        .unwrap_or(SendResult::Ok)
 }
 
 /// High-throughput Kafka transport using rdkafka.
@@ -917,6 +969,147 @@ impl KafkaTransport {
     }
 }
 
+/// Produce-path steps shared by `send` and `send_batch`, so both paths filter,
+/// classify and count a record the same way.
+impl KafkaTransport {
+    /// The settled result for a record the outbound filters keep off the wire,
+    /// or `None` when it passes.
+    fn outbound_disposition(&self, payload: &[u8]) -> Option<SendResult> {
+        if !self.filter_engine.has_outbound_filters() {
+            return None;
+        }
+        match self.filter_engine.apply_outbound(payload) {
+            super::filter::FilterDisposition::Pass => None,
+            super::filter::FilterDisposition::Drop => Some(SendResult::Ok),
+            super::filter::FilterDisposition::Dlq => Some(SendResult::FilteredDlq),
+        }
+    }
+
+    /// Offer one record to the producer queue without waiting for delivery.
+    ///
+    /// A full queue is re-offered every [`QUEUE_FULL_RETRY`] for up to
+    /// [`QUEUE_FULL_TIMEOUT`], the same policy `send` gets from rdkafka. `Err`
+    /// carries the settled result of a record the producer refused.
+    async fn enqueue(
+        &self,
+        destination: &str,
+        payload: &[u8],
+        headers: Option<&OwnedHeaders>,
+    ) -> Result<DeliveryFuture, SendResult> {
+        let mut queue_full_since: Option<std::time::Instant> = None;
+        loop {
+            match self
+                .producer
+                .send_result(produce_record(destination, payload, headers))
+            {
+                Ok(delivery) => return Ok(delivery),
+                Err((err, _)) => {
+                    let queue_full =
+                        classify::classify_send_failure(&err) == classify::SendFailure::QueueFull;
+                    let since = *queue_full_since.get_or_insert_with(std::time::Instant::now);
+                    if queue_full && since.elapsed() < QUEUE_FULL_TIMEOUT {
+                        tokio::time::sleep(QUEUE_FULL_RETRY).await;
+                        continue;
+                    }
+                    return Err(self.failure_result(destination, payload.len(), &err));
+                }
+            }
+        }
+    }
+
+    /// Turn one delivery report into the caller's result.
+    fn delivery_result(
+        &self,
+        destination: &str,
+        bytes: usize,
+        report: OwnedDeliveryResult,
+    ) -> SendResult {
+        match report {
+            Ok(_) => {
+                #[cfg(feature = "metrics")]
+                {
+                    ::metrics::counter!("transport_sent_total", "transport" => "kafka")
+                        .increment(1);
+                    ::metrics::counter!("transport_sent_bytes_total", "transport" => "kafka")
+                        .increment(bytes as u64);
+                }
+                if self.send_degraded.clear() {
+                    tracing::info!(destination, "kafka send recovered");
+                }
+                SendResult::Ok
+            }
+            Err((err, _)) => self.failure_result(destination, bytes, &err),
+        }
+    }
+
+    /// Classify a failed produce, at enqueue or in the delivery report.
+    fn failure_result(&self, destination: &str, bytes: usize, err: &KafkaError) -> SendResult {
+        match classify::classify_send_failure(err) {
+            classify::SendFailure::QueueFull => {
+                #[cfg(feature = "metrics")]
+                ::metrics::counter!(
+                    "transport_backpressured_total",
+                    "transport" => "kafka"
+                )
+                .increment(1);
+                SendResult::Backpressured
+            }
+            classify::SendFailure::TooLarge => {
+                let refused = TransportError::MessageTooLarge {
+                    bytes,
+                    detail: err.to_string(),
+                };
+                #[cfg(feature = "metrics")]
+                ::metrics::counter!(
+                    "transport_message_too_large_total",
+                    "transport" => "kafka"
+                )
+                .increment(1);
+                tracing::warn!(
+                    destination,
+                    error = %refused,
+                    "kafka: record exceeds message.max.bytes -- dead-lettering it; \
+                     raise the producer, broker and topic ceilings together"
+                );
+                SendResult::FilteredDlq
+            }
+            classify::SendFailure::Retryable => {
+                #[cfg(feature = "metrics")]
+                ::metrics::counter!(
+                    "transport_send_errors_total",
+                    "transport" => "kafka"
+                )
+                .increment(1);
+                if self.send_degraded.enter() {
+                    tracing::warn!(
+                        destination,
+                        error = %err,
+                        "kafka send failed on a retryable condition; the caller retries"
+                    );
+                }
+                SendResult::Backpressured
+            }
+            classify::SendFailure::Fatal => {
+                #[cfg(feature = "metrics")]
+                ::metrics::counter!(
+                    "transport_send_errors_total",
+                    "transport" => "kafka"
+                )
+                .increment(1);
+                SendResult::Fatal(TransportError::Send(err.to_string()))
+            }
+        }
+    }
+}
+
+/// One record's progress through `send_batch`.
+enum Offered {
+    /// Resolved without a delivery report: filtered, or refused at enqueue.
+    Settled(SendResult),
+    /// Queued; the delivery report arrives on the future.
+    Queued(DeliveryFuture),
+}
+
 impl TransportBase for KafkaTransport {
     async fn close(&self) -> TransportResult<()> {
         self.closed.store(true, Ordering::Relaxed);
@@ -941,106 +1134,23 @@ impl TransportSender for KafkaTransport {
             return SendResult::Fatal(TransportError::Closed);
         }
 
-        if self.filter_engine.has_outbound_filters() {
-            match self.filter_engine.apply_outbound(&payload) {
-                super::filter::FilterDisposition::Pass => {}
-                super::filter::FilterDisposition::Drop => return SendResult::Ok,
-                super::filter::FilterDisposition::Dlq => return SendResult::FilteredDlq,
-            }
+        if let Some(settled) = self.outbound_disposition(&payload) {
+            return settled;
         }
 
-        let record: FutureRecord<'_, str, [u8]> =
-            FutureRecord::to(destination).payload(payload.as_ref());
-
-        // Inject W3C traceparent into Kafka headers for distributed tracing.
-        #[cfg(feature = "transport-trace")]
-        let record = if let Some(tp) = super::propagation::current_traceparent() {
-            let headers = rdkafka::message::OwnedHeaders::new().insert(rdkafka::message::Header {
-                key: super::propagation::TRACEPARENT_HEADER,
-                value: Some(tp.as_str()),
-            });
-            record.headers(headers)
-        } else {
-            record
-        };
+        let headers = trace_headers();
+        let record = produce_record(destination, &payload, headers.as_ref());
 
         #[cfg(feature = "metrics")]
         let start = std::time::Instant::now();
 
-        let result = match self
-            .producer
-            .send(record, Timeout::After(Duration::from_secs(5)))
-            .await
-        {
-            Ok(_) => {
-                #[cfg(feature = "metrics")]
-                {
-                    ::metrics::counter!("transport_sent_total", "transport" => "kafka")
-                        .increment(1);
-                    ::metrics::counter!("transport_sent_bytes_total", "transport" => "kafka")
-                        .increment(payload.len() as u64);
-                }
-                if self.send_degraded.clear() {
-                    tracing::info!(destination, "kafka send recovered");
-                }
-                SendResult::Ok
-            }
-            Err((err, _)) => match classify::classify_send_failure(&err) {
-                classify::SendFailure::QueueFull => {
-                    #[cfg(feature = "metrics")]
-                    ::metrics::counter!(
-                        "transport_backpressured_total",
-                        "transport" => "kafka"
-                    )
-                    .increment(1);
-                    SendResult::Backpressured
-                }
-                classify::SendFailure::TooLarge => {
-                    let refused = TransportError::MessageTooLarge {
-                        bytes: payload.len(),
-                        detail: err.to_string(),
-                    };
-                    #[cfg(feature = "metrics")]
-                    ::metrics::counter!(
-                        "transport_message_too_large_total",
-                        "transport" => "kafka"
-                    )
-                    .increment(1);
-                    tracing::warn!(
-                        destination,
-                        error = %refused,
-                        "kafka: record exceeds message.max.bytes -- dead-lettering it; \
-                         raise the producer, broker and topic ceilings together"
-                    );
-                    SendResult::FilteredDlq
-                }
-                classify::SendFailure::Retryable => {
-                    #[cfg(feature = "metrics")]
-                    ::metrics::counter!(
-                        "transport_send_errors_total",
-                        "transport" => "kafka"
-                    )
-                    .increment(1);
-                    if self.send_degraded.enter() {
-                        tracing::warn!(
-                            destination,
-                            error = %err,
-                            "kafka send failed on a retryable condition; the caller retries"
-                        );
-                    }
-                    SendResult::Backpressured
-                }
-                classify::SendFailure::Fatal => {
-                    #[cfg(feature = "metrics")]
-                    ::metrics::counter!(
-                        "transport_send_errors_total",
-                        "transport" => "kafka"
-                    )
-                    .increment(1);
-                    SendResult::Fatal(TransportError::Send(err.to_string()))
-                }
-            },
-        };
+        let result = self.delivery_result(
+            destination,
+            payload.len(),
+            self.producer
+                .send(record, Timeout::After(QUEUE_FULL_TIMEOUT))
+                .await,
+        );
 
         #[cfg(feature = "metrics")]
         ::metrics::histogram!(
@@ -1050,6 +1160,107 @@ impl TransportSender for KafkaTransport {
         .record(start.elapsed().as_secs_f64());
 
         result
+    }
+
+    /// Offer every record of the block to the producer, then await all the
+    /// delivery reports.
+    ///
+    /// Overrides the trait's per-record default, which waited out each record's
+    /// delivery before offering the next and so paid one `linger.ms` window per
+    /// record. Here the whole block is queued first, so librdkafka fills its
+    /// MessageSets from it and the block costs roughly one linger window plus
+    /// the broker round-trip. Records keep the default's routing: each goes to
+    /// its own `key` (empty when `None`), payload only, headers not sent.
+    ///
+    /// ## Result -- never `Ok` unless every record is handled
+    ///
+    /// - Outbound filters apply per record before it is queued, exactly as in
+    ///   [`send`](TransportSender::send): `Drop` and `FilteredDlq` records never
+    ///   reach the wire and do not fail the block, and neither does a record
+    ///   over `message.max.bytes`.
+    /// - A record the producer refuses at enqueue (after the same queue-full
+    ///   wait `send` allows) stops further offers.
+    /// - Every queued record's report is awaited, even after a failure, so the
+    ///   result describes the whole block and a caller retry never overlaps it.
+    /// - The result is the first `Backpressured` or `Fatal` in record order,
+    ///   else `Ok`. `Ok` means every record was confirmed by the broker or
+    ///   handled by a filter.
+    ///
+    /// ## At-least-once caveat -- a failed block can be partly delivered
+    ///
+    /// Records are in flight together, so when one fails any subset of the
+    /// others may already be confirmed (the default could only leave a prefix).
+    /// The caller retries the whole block: duplicates, never loss. Per-partition
+    /// order follows offer order while the idempotent producer is on (the
+    /// default); with `idempotence: false`, a broker retry can reorder records
+    /// within a partition.
+    async fn send_batch(&self, records: &[Record]) -> SendResult {
+        if records.is_empty() {
+            return SendResult::Ok;
+        }
+        if self.closed.load(Ordering::Relaxed) {
+            return SendResult::Fatal(TransportError::Closed);
+        }
+
+        let headers = trace_headers();
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
+
+        let mut offered = Vec::with_capacity(records.len());
+        for record in records {
+            // A block of tens of thousands must not hold the runtime worker between awaits.
+            tokio::task::coop::consume_budget().await;
+            if let Some(settled) = self.outbound_disposition(&record.payload) {
+                offered.push(Offered::Settled(settled));
+                continue;
+            }
+            let destination = record.key.as_deref().unwrap_or("");
+            match self
+                .enqueue(destination, &record.payload, headers.as_ref())
+                .await
+            {
+                Ok(delivery) => offered.push(Offered::Queued(delivery)),
+                Err(settled) => {
+                    let stop = matches!(settled, SendResult::Backpressured | SendResult::Fatal(_));
+                    offered.push(Offered::Settled(settled));
+                    // Records after a refusal are never offered; the refusal
+                    // pushed above already fails the block.
+                    if stop {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(offered.len());
+        for (record, offer) in records.iter().zip(offered) {
+            // Resolved reports are Ready at once, so this loop needs the same budget.
+            tokio::task::coop::consume_budget().await;
+            let result = match offer {
+                Offered::Settled(settled) => settled,
+                Offered::Queued(delivery) => {
+                    let destination = record.key.as_deref().unwrap_or("");
+                    let result = match delivery.await {
+                        Ok(report) => {
+                            self.delivery_result(destination, record.payload.len(), report)
+                        }
+                        // A report lost with the producer is an unknown outcome, never a delivery.
+                        Err(_) => SendResult::Fatal(TransportError::Send(
+                            "kafka delivery report lost: producer dropped".into(),
+                        )),
+                    };
+                    #[cfg(feature = "metrics")]
+                    ::metrics::histogram!(
+                        "transport_send_duration_seconds",
+                        "transport" => "kafka"
+                    )
+                    .record(start.elapsed().as_secs_f64());
+                    result
+                }
+            };
+            results.push(result);
+        }
+        block_result(results)
     }
 }
 
@@ -1967,6 +2178,142 @@ mod tests {
             "the refused size belongs in the message: {err}"
         );
         assert!(!TransportError::Send("boom".into()).is_undeliverable());
+    }
+
+    // ---- send_batch: block result and broker-free failure paths -------------
+
+    fn batch_record(payload: &'static [u8]) -> Record {
+        Record {
+            payload: bytes::Bytes::from_static(payload),
+            key: Some(Arc::from("events.load")),
+            headers: Vec::new(),
+            metadata: crate::transport::RecordMeta {
+                timestamp_ms: None,
+                format: PayloadFormat::Json,
+            },
+        }
+    }
+
+    /// A producer-only transport pointed at a port nothing listens on, so no
+    /// record it queues can ever be confirmed.
+    fn unreachable_config() -> KafkaConfig {
+        KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn block_result_is_ok_only_when_every_record_is_handled() {
+        assert!(block_result(Vec::new()).is_ok(), "an empty block is Ok");
+        assert!(
+            block_result(vec![
+                SendResult::Ok,
+                SendResult::FilteredDlq,
+                SendResult::Ok
+            ])
+            .is_ok(),
+            "sent, dropped and dead-lettered records are all handled"
+        );
+        // One unconfirmed record among a thousand confirmed ones fails the
+        // block, so the caller retries it rather than committing past it.
+        let mut results: Vec<SendResult> = (0..999).map(|_| SendResult::Ok).collect();
+        results.push(SendResult::Backpressured);
+        assert!(block_result(results).is_backpressured());
+    }
+
+    #[test]
+    fn block_result_reports_the_first_failure_in_record_order() {
+        let first_backpressured = block_result(vec![
+            SendResult::Ok,
+            SendResult::Backpressured,
+            SendResult::Fatal(TransportError::Closed),
+        ]);
+        assert!(first_backpressured.is_backpressured());
+
+        let first_fatal = block_result(vec![
+            SendResult::FilteredDlq,
+            SendResult::Fatal(TransportError::Closed),
+            SendResult::Backpressured,
+        ]);
+        assert!(first_fatal.is_fatal());
+    }
+
+    #[tokio::test]
+    async fn send_batch_of_nothing_is_ok_and_after_close_is_fatal() {
+        let transport = KafkaTransport::new(&unreachable_config())
+            .await
+            .expect("a producer-only transport constructs broker-free");
+        assert!(transport.send_batch(&[]).await.is_ok());
+
+        transport.close().await.expect("close");
+        let result = transport.send_batch(&[batch_record(b"{\"a\":1}")]).await;
+        assert!(
+            matches!(result, SendResult::Fatal(TransportError::Closed)),
+            "a closed transport must refuse the block, got {result:?}"
+        );
+    }
+
+    /// Filtered records never reach the producer. With no broker, a queued
+    /// record could not resolve inside the deadline, so an `Ok` in time proves
+    /// every record was filtered before it was offered.
+    #[tokio::test]
+    async fn send_batch_filters_every_record_before_queueing_it() {
+        let config = KafkaConfig {
+            filters_out: vec![
+                crate::transport::filter::FilterRule {
+                    expression: "has(drop_me)".to_string(),
+                    action: crate::transport::filter::FilterAction::Drop,
+                },
+                crate::transport::filter::FilterRule {
+                    expression: "has(dead)".to_string(),
+                    action: crate::transport::filter::FilterAction::Dlq,
+                },
+            ],
+            ..unreachable_config()
+        };
+        let transport = KafkaTransport::new(&config).await.expect("construct");
+        let records = [
+            batch_record(b"{\"drop_me\":1}"),
+            batch_record(b"{\"dead\":1}"),
+            batch_record(b"{\"drop_me\":2}"),
+        ];
+        let result = tokio::time::timeout(Duration::from_secs(5), transport.send_batch(&records))
+            .await
+            .expect("a filtered record was queued and waited on a broker that does not exist");
+        assert!(
+            result.is_ok(),
+            "filtered records are handled, got {result:?}"
+        );
+    }
+
+    /// A record the broker never confirms fails the block, and the filtered
+    /// records beside it cannot mask that.
+    #[tokio::test]
+    async fn send_batch_is_not_ok_when_a_delivery_fails() {
+        let config = KafkaConfig {
+            filters_out: vec![crate::transport::filter::FilterRule {
+                expression: "has(drop_me)".to_string(),
+                action: crate::transport::filter::FilterAction::Drop,
+            }],
+            ..unreachable_config()
+        }
+        .with_override("message.timeout.ms", "1000");
+        let transport = KafkaTransport::new(&config).await.expect("construct");
+        let records = [
+            batch_record(b"{\"drop_me\":1}"),
+            batch_record(b"{\"a\":1}"),
+            batch_record(b"{\"drop_me\":2}"),
+            batch_record(b"{\"a\":2}"),
+        ];
+        let result = tokio::time::timeout(Duration::from_secs(20), transport.send_batch(&records))
+            .await
+            .expect("the delivery reports must arrive once message.timeout.ms expires");
+        assert!(
+            result.is_backpressured(),
+            "an unconfirmed record must fail the block as retryable, got {result:?}"
+        );
     }
 
     #[test]

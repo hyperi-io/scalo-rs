@@ -63,6 +63,13 @@ transport:
 
 - **Cancellation safety**: `recv` uses `rdkafka`'s internal poll —
   safe to drop at any `.await`.
+- **`send_batch()`**: queues every record of the block, then awaits all the
+  delivery reports, so the block costs about one `linger.ms` window rather
+  than one per record. Outbound filters apply per record before queueing.
+  The result is `Ok` only when every record was confirmed or filtered;
+  otherwise it is the first `Backpressured`/`Fatal` in record order, and any
+  subset of the block may already be on the broker -- retry the whole block
+  (at-least-once). Records carry their `key` as the topic and no headers.
 - **`is_healthy()`**: tracks an `AtomicBool` flipped to `false` on
   fatal producer/consumer error or on `close()`. Does not probe the
   broker per call.

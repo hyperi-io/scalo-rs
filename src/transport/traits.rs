@@ -198,8 +198,10 @@ pub trait TransportSender: TransportBase {
     ///
     /// The default sends each record individually via [`send`](Self::send),
     /// using the record's own `key` as the destination (empty when `None`) and
-    /// payload (a refcount bump, not a copy). Transports with a native batch RPC (e.g. gRPC's
-    /// `RouteBatch`) override this. Commit tokens and inline-DLQ entries are NOT
+    /// payload (a refcount bump, not a copy), awaiting each before the next.
+    /// Transports that can do better override this: gRPC sends the block as one
+    /// `RouteBatch` RPC, and Kafka queues the whole block before awaiting any
+    /// delivery report. Commit tokens and inline-DLQ entries are NOT
     /// sent -- they are the SENDER's local concern; fire the commit tokens
     /// locally after this returns [`SendResult::Ok`].
     ///
