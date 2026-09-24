@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.8](https://github.com/hyperi-io/scalo-rs/compare/v2.12.7...v2.12.8) (2026-09-24)
+
+### Bug Fixes
+
+* remove the Redis transport and DLQ backend ([#179](https://github.com/hyperi-io/scalo-rs/issues/179)) ([846fa93](https://github.com/hyperi-io/scalo-rs/commit/846fa93e05cb9caa45768882a94d0458682c401b))
+
 ## [2.12.7](https://github.com/hyperi-io/scalo-rs/compare/v2.12.6...v2.12.7) (2026-09-24)
 
 ### Bug Fixes
