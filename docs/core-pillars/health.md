@@ -17,7 +17,7 @@ exists only to detect a deadlocked process.
 | Endpoint | Semantics | Fails when | K8s action |
 |---|---|---|---|
 | `/livez` | Liveness -- process alive | Never (always 200) | Kill + restart pod |
-| `/readyz` | Readiness -- deps OK + ready flag | Registry unhealthy OR readiness callback false OR ready flag cleared | Remove from Service endpoints (no traffic), don't restart |
+| `/readyz` | Readiness -- deps OK + app says ready | Registry has an `Unhealthy` component OR the readiness callback returns false | Remove from Service endpoints (no traffic), don't restart |
 
 That is the whole surface. There are no aliases and no startup endpoint --
 every retired path returns 404. A `startupProbe` targets `/livez`.
@@ -48,9 +48,18 @@ is the half that does the work -- it converts a stale probe from a silent
 success into an immediate, obvious failure, and it stops an alias creeping back
 in later.
 
-Readiness aggregates the registry AND the explicit ready flag. The shutdown
-handler clears the flag before draining, so K8s pulls the pod from Service
-endpoints before in-flight work ends. See [shutdown.md](shutdown.md).
+Readiness is the registry AND the callback set with
+`mgr.set_readiness_check`. No callback counts as ready, and without the
+`health` feature there is no registry half, so a bare `MetricsManager`
+answers 200. `MetricsManager` has no ready flag and no `set_ready`.
+
+Nothing in the metrics server changes readiness at shutdown. The ready flag
+belongs to `HttpServer`, the separate optional listener: with `health` on it
+registers that flag as the `http_server` component and clears it when its own
+shutdown signal fires -- for `serve` with the `shutdown` feature, the global
+token, after the pre-stop delay. An app that wants `/readyz`
+to go 503 while it drains makes its callback, or a registered component,
+report it. See [shutdown.md](shutdown.md).
 
 ---
 
@@ -159,14 +168,16 @@ does not serve `/metrics`.
 
 ## Wire-up checklist
 
-1. Construct `MetricsManager`. Call `mgr.set_readiness_check(|| ...)` for an extra
-   callback gate (ANDed with the registry).
+1. Construct `MetricsManager`.
 2. Modules `HealthRegistry::register()` at construction.
-3. Call `mgr.set_ready()` once init is complete (DB connected, Kafka
-   subscribed, config loaded) -- `/readyz` flips to 200 and traffic arrives.
+3. Call `mgr.set_readiness_check(|| ...)` with what "ready" means for the app
+   (DB connected, Kafka subscribed, config loaded). It is ANDed with the
+   registry and takes effect whether or not the server is running. Until it
+   is set only the registry decides, so an app that must not take traffic
+   before init sets a callback that returns false until then.
 4. Start the server via `mgr.start_server` / `mgr.start_server_with_routes`.
-5. On SIGTERM the shutdown handler clears the ready flag, waits the pre-stop
-   delay, then cancels the global token. See [shutdown.md](shutdown.md).
+5. On SIGTERM the shutdown handler waits the pre-stop delay, then cancels the
+   global token; it does not touch readiness. See [shutdown.md](shutdown.md).
 
 ---
 
@@ -198,6 +209,6 @@ callback reading an `AtomicU8` and flip it between states. See
 ## Related
 
 - [metrics.md](metrics.md) -- `/readyz` is served by the metrics HTTP server
-- [shutdown.md](shutdown.md) -- ready flag clearing before drain
+- [shutdown.md](shutdown.md) -- the pre-stop delay before the token is cancelled
 - [../auto-wiring.md](../auto-wiring.md), [../feature-flags.md](../feature-flags.md) -- `health`
 - Source: [`src/health/mod.rs`](../../src/health/mod.rs), [`src/health/registry.rs`](../../src/health/registry.rs)
