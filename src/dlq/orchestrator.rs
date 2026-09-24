@@ -298,11 +298,19 @@ impl Dlq {
         Ok(())
     }
 
-    /// Block until every entry queued before this call is durably
-    /// written by the drain.
+    /// Block until the drain has written every entry queued before this
+    /// call, and report whether any of those writes was refused.
+    ///
+    /// `Ok` means every batch the drain wrote since the previous flush was
+    /// accepted by a backend. A refused batch is reported by the first
+    /// flush after it and not again; it is also counted in
+    /// [`Dlq::dropped`]. What "accepted" means per backend is in
+    /// `docs/pipeline/dlq.md`.
     ///
     /// # Errors
     ///
+    /// `File` if every backend refused a batch written since the previous
+    /// flush, whether the write was size-, tick- or barrier-triggered.
     /// `Closed` if the drain has exited before this barrier was
     /// processed.
     pub async fn flush(&self) -> Result<(), DlqError> {
@@ -516,6 +524,37 @@ mod tests {
             .with_source(DlqSource::kafka("events", 1, 42))
     }
 
+    fn spawn_dlq(cfg: &DlqConfig, shutdown: &CancellationToken) -> Dlq {
+        Dlq::spawn(
+            cfg,
+            "svc",
+            #[cfg(feature = "dlq-kafka")]
+            None,
+            #[cfg(not(feature = "dlq-kafka"))]
+            None,
+            shutdown.clone(),
+        )
+        .expect("spawn")
+    }
+
+    /// Replace the service directory with a regular file so every file-backend write fails.
+    fn break_file_backend(dir: &std::path::Path) {
+        std::fs::remove_dir_all(dir.join("svc")).expect("remove dlq dir");
+        std::fs::write(dir.join("svc"), b"not a directory").expect("plant file");
+    }
+
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    fn dlq_lines(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("svc/dlq.ndjson")).map_or(0, |body| body.lines().count())
+    }
+
     #[tokio::test]
     async fn disabled_dlq_accepts_silently() {
         let dlq = Dlq::disabled();
@@ -548,21 +587,8 @@ mod tests {
     async fn failed_writer_surfaces_drop_counter() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shutdown = CancellationToken::new();
-        let dlq = Dlq::spawn(
-            &tmp_config(dir.path()),
-            "svc",
-            #[cfg(feature = "dlq-kafka")]
-            None,
-            #[cfg(not(feature = "dlq-kafka"))]
-            None,
-            shutdown.clone(),
-        )
-        .expect("spawn");
-
-        // Break the writer AFTER spawn: replace the service directory with a
-        // regular file so every subsequent open/write fails.
-        std::fs::remove_dir_all(dir.path().join("svc")).expect("remove dlq dir");
-        std::fs::write(dir.path().join("svc"), b"not a directory").expect("plant file");
+        let dlq = spawn_dlq(&tmp_config(dir.path()), &shutdown);
+        break_file_backend(dir.path());
 
         dlq.send(test_entry("err")).await.expect("queued");
         let flush = dlq.flush().await;
@@ -575,20 +601,84 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Issue #187: a batch the backend refused on a tick write must fail
+    /// the flush that covers it, and only that flush.
+    #[tokio::test]
+    async fn flush_fails_when_a_tick_write_was_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = tmp_config(dir.path());
+        cfg.batch_size = 1024;
+        cfg.flush_interval_ms = 20;
+        let shutdown = CancellationToken::new();
+        let dlq = spawn_dlq(&cfg, &shutdown);
+        break_file_backend(dir.path());
+
+        dlq.send(test_entry("err")).await.expect("queued");
+        // batch_size is out of reach, so only the tick can have written it.
+        wait_until("tick write refused", || dlq.dropped() >= 1).await;
+
+        let flush = dlq.flush().await;
+        assert!(matches!(flush, Err(DlqError::File(_))), "got: {flush:?}");
+        dlq.flush()
+            .await
+            .expect("a loss is reported by one flush only");
+        shutdown.cancel();
+    }
+
+    /// Issue #187: a batch the backend refused on a size-triggered write
+    /// must fail the flush that covers it.
+    #[tokio::test]
+    async fn flush_fails_when_a_size_write_was_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = tmp_config(dir.path());
+        cfg.batch_size = 2;
+        cfg.flush_interval_ms = 60_000;
+        let shutdown = CancellationToken::new();
+        let dlq = spawn_dlq(&cfg, &shutdown);
+        break_file_backend(dir.path());
+
+        dlq.send(test_entry("a")).await.expect("queued");
+        dlq.send(test_entry("b")).await.expect("queued");
+        // The tick is a minute away, so only the size trigger can have written it.
+        wait_until("size write refused", || dlq.dropped() >= 2).await;
+
+        let flush = dlq.flush().await;
+        assert!(matches!(flush, Err(DlqError::File(_))), "got: {flush:?}");
+        dlq.flush()
+            .await
+            .expect("a loss is reported by one flush only");
+        shutdown.cancel();
+    }
+
+    /// Size and tick writes that land must not fail the flush that covers them.
+    #[tokio::test]
+    async fn flush_is_ok_when_tick_and_size_writes_landed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = tmp_config(dir.path());
+        cfg.batch_size = 2;
+        cfg.flush_interval_ms = 20;
+        let shutdown = CancellationToken::new();
+        let dlq = spawn_dlq(&cfg, &shutdown);
+
+        for i in 0..3 {
+            dlq.send(test_entry(&format!("err_{i}")))
+                .await
+                .expect("send");
+        }
+        // Two entries go on the size trigger, the third waits for the tick.
+        wait_until("all three entries written", || dlq_lines(dir.path()) == 3).await;
+
+        dlq.flush().await.expect("every write landed");
+        assert_eq!(dlq.dropped(), 0);
+        shutdown.cancel();
+        dlq.shutdown().await.expect("clean shutdown");
+    }
+
     #[tokio::test]
     async fn file_only_writes_and_flushes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shutdown = CancellationToken::new();
-        let dlq = Dlq::spawn(
-            &tmp_config(dir.path()),
-            "svc",
-            #[cfg(feature = "dlq-kafka")]
-            None,
-            #[cfg(not(feature = "dlq-kafka"))]
-            None,
-            shutdown.clone(),
-        )
-        .expect("spawn");
+        let dlq = spawn_dlq(&tmp_config(dir.path()), &shutdown);
 
         for i in 0..5 {
             dlq.send(test_entry(&format!("err_{i}")))
@@ -614,16 +704,7 @@ mod tests {
         cfg.batch_size = 1024;
         cfg.flush_interval_ms = 60_000; // drain rarely fires
         let shutdown = CancellationToken::new();
-        let dlq = Dlq::spawn(
-            &cfg,
-            "svc",
-            #[cfg(feature = "dlq-kafka")]
-            None,
-            #[cfg(not(feature = "dlq-kafka"))]
-            None,
-            shutdown.clone(),
-        )
-        .expect("spawn");
+        let dlq = spawn_dlq(&cfg, &shutdown);
 
         let mut full_count = 0;
         for i in 0..50 {
@@ -639,16 +720,7 @@ mod tests {
     async fn dlq_clone_shares_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shutdown = CancellationToken::new();
-        let dlq = Dlq::spawn(
-            &tmp_config(dir.path()),
-            "svc",
-            #[cfg(feature = "dlq-kafka")]
-            None,
-            #[cfg(not(feature = "dlq-kafka"))]
-            None,
-            shutdown.clone(),
-        )
-        .expect("spawn");
+        let dlq = spawn_dlq(&tmp_config(dir.path()), &shutdown);
 
         let dlq2 = dlq.clone();
         dlq.send(test_entry("a")).await.expect("send a");

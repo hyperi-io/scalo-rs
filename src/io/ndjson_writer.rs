@@ -32,21 +32,33 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use file_rotate::suffix::AppendTimestamp;
 use file_rotate::suffix::FileLimit;
 use file_rotate::{ContentLimit, FileRotate, compression::Compression};
 use parking_lot::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::config::{FileWriterConfig, RotationPeriod};
+
+/// Shortest wait between reopen attempts after a failed write.
+const REOPEN_BACKOFF_MIN: Duration = Duration::from_millis(250);
+
+/// Longest wait between reopen attempts while writes keep failing.
+const REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// NDJSON file writer with automatic rotation and metrics.
 ///
 /// Each line written is expected to be a complete JSON object (NDJSON format).
 /// The writer handles file rotation, optional compression, and age-based cleanup.
+///
+/// After a failed write the writer reopens its target on a later write, with
+/// backoff, so a deleted file or a restored directory stops refusing writes
+/// before the next rotation. It never recreates a missing directory.
 pub struct NdjsonWriter {
-    writer: Mutex<FileRotate<AppendTimestamp>>,
+    writer: Mutex<RotatingTarget>,
+    config: FileWriterConfig,
     label: String,
     output_path: PathBuf,
     /// Current (non-rotated) output file, probed after each write because
@@ -55,6 +67,54 @@ pub struct NdjsonWriter {
     file_path: PathBuf,
     lines_written: AtomicU64,
     write_errors: AtomicU64,
+}
+
+/// The open rotating file plus the reopen schedule that follows a failed write.
+struct RotatingTarget {
+    file: FileRotate<AppendTimestamp>,
+    /// When the next reopen may run; `None` while writes are landing.
+    reopen_at: Option<Instant>,
+    backoff: Duration,
+}
+
+impl RotatingTarget {
+    fn record_success(&mut self) {
+        self.reopen_at = None;
+        self.backoff = REOPEN_BACKOFF_MIN;
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        if self.reopen_at.is_none() {
+            self.reopen_at = Some(now + self.backoff);
+        }
+    }
+
+    fn reopen_due(&self, now: Instant) -> bool {
+        self.reopen_at.is_some_and(|at| now >= at)
+    }
+
+    fn schedule_next_reopen(&mut self, now: Instant) {
+        self.backoff = (self.backoff * 2).min(REOPEN_BACKOFF_MAX);
+        self.reopen_at = Some(now + self.backoff);
+    }
+}
+
+fn open_rotating(file_path: &Path, config: &FileWriterConfig) -> FileRotate<AppendTimestamp> {
+    let content_limit = match config.rotation {
+        RotationPeriod::Hourly => ContentLimit::Time(file_rotate::TimeFrequency::Hourly),
+        RotationPeriod::Daily => ContentLimit::Time(file_rotate::TimeFrequency::Daily),
+    };
+
+    let max_age = chrono::Duration::days(i64::from(config.max_age_days));
+    let suffix_scheme = AppendTimestamp::default(FileLimit::Age(max_age));
+
+    let compression = if config.compress_rotated {
+        Compression::OnRotate(6)
+    } else {
+        Compression::None
+    };
+
+    FileRotate::new(file_path, suffix_scheme, content_limit, compression, None)
 }
 
 impl std::fmt::Debug for NdjsonWriter {
@@ -94,22 +154,7 @@ impl NdjsonWriter {
         std::fs::create_dir_all(&dir)?;
 
         let file_path = dir.join(filename);
-
-        let content_limit = match config.rotation {
-            RotationPeriod::Hourly => ContentLimit::Time(file_rotate::TimeFrequency::Hourly),
-            RotationPeriod::Daily => ContentLimit::Time(file_rotate::TimeFrequency::Daily),
-        };
-
-        let max_age = chrono::Duration::days(i64::from(config.max_age_days));
-        let suffix_scheme = AppendTimestamp::default(FileLimit::Age(max_age));
-
-        let compression = if config.compress_rotated {
-            Compression::OnRotate(6)
-        } else {
-            Compression::None
-        };
-
-        let writer = FileRotate::new(&file_path, suffix_scheme, content_limit, compression, None);
+        let file = open_rotating(&file_path, config);
 
         debug!(
             label = label,
@@ -120,13 +165,63 @@ impl NdjsonWriter {
         );
 
         Ok(Self {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(RotatingTarget {
+                file,
+                reopen_at: None,
+                backoff: REOPEN_BACKOFF_MIN,
+            }),
+            config: config.clone(),
             label: label.to_string(),
             output_path: dir,
             file_path,
             lines_written: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
         })
+    }
+
+    /// Replace the rotating file when a reopen is due, dropping the handle
+    /// the failed write went to.
+    fn reopen_if_due(&self, target: &mut RotatingTarget) {
+        let now = Instant::now();
+        if !target.reopen_due(now) {
+            return;
+        }
+        target.schedule_next_reopen(now);
+        // A missing directory may be an unmounted volume; recreating it would
+        // write the DLQ onto whatever filesystem sits underneath.
+        if !self.output_path.is_dir() {
+            warn!(
+                label = %self.label,
+                path = %self.output_path.display(),
+                "{} writer directory missing; not reopening",
+                self.label,
+            );
+            return;
+        }
+        target.file = open_rotating(&self.file_path, &self.config);
+        debug!(label = %self.label, path = %self.file_path.display(), "{} writer reopened", self.label);
+    }
+
+    /// Write `bytes` through the rotating file and confirm they reached the target.
+    fn write_through(&self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        let mut target = self.writer.lock();
+        self.reopen_if_due(&mut target);
+        let result = target
+            .file
+            .write_all(bytes)
+            .and_then(|()| target.file.flush())
+            .and_then(|()| self.verify_write_landed());
+        match result {
+            Ok(()) => {
+                target.record_success();
+                Ok(())
+            }
+            Err(e) => {
+                target.record_failure(Instant::now());
+                self.write_errors.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 
     /// Detect a write `file-rotate` swallowed: it reopens the target lazily
@@ -154,15 +249,7 @@ impl NdjsonWriter {
     /// The data is written as-is -- caller is responsible for serialisation
     /// and newline termination.
     pub fn write_line(&self, line: &[u8]) -> Result<(), std::io::Error> {
-        let mut writer = self.writer.lock();
-        if let Err(e) = writer
-            .write_all(line)
-            .and_then(|()| writer.flush())
-            .and_then(|()| self.verify_write_landed())
-        {
-            self.write_errors.fetch_add(1, Ordering::Relaxed);
-            return Err(e);
-        }
+        self.write_through(line)?;
         self.lines_written.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -172,15 +259,7 @@ impl NdjsonWriter {
     /// The buffer should already have newlines between entries. The `count`
     /// parameter is used for metrics tracking.
     pub fn write_buf(&self, buf: &[u8], count: u64) -> Result<(), std::io::Error> {
-        let mut writer = self.writer.lock();
-        if let Err(e) = writer
-            .write_all(buf)
-            .and_then(|()| writer.flush())
-            .and_then(|()| self.verify_write_landed())
-        {
-            self.write_errors.fetch_add(1, Ordering::Relaxed);
-            return Err(e);
-        }
+        self.write_through(buf)?;
         self.lines_written.fetch_add(count, Ordering::Relaxed);
         Ok(())
     }
@@ -198,8 +277,8 @@ impl NdjsonWriter {
     /// Returns the underlying `std::io::Error` if the flush fails. The
     /// internal `write_errors` counter is incremented.
     pub fn flush(&self) -> Result<(), std::io::Error> {
-        let mut writer = self.writer.lock();
-        if let Err(e) = writer.flush() {
+        let mut target = self.writer.lock();
+        if let Err(e) = target.file.flush() {
             self.write_errors.fetch_add(1, Ordering::Relaxed);
             return Err(e);
         }
@@ -417,6 +496,58 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(writer.lines_written(), 0);
         assert_eq!(writer.write_errors(), 1);
+    }
+
+    #[test]
+    fn test_writer_reopens_once_its_directory_is_restored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path());
+        let writer = NdjsonWriter::new(&config, "back", "out.ndjson", "dlq").expect("create");
+        writer.write_line(b"{\"n\":1}\n").expect("healthy write");
+
+        std::fs::remove_dir_all(dir.path().join("back")).expect("remove dir");
+        writer.write_line(b"{\"n\":2}\n").unwrap_err();
+        std::fs::create_dir_all(dir.path().join("back")).expect("restore dir");
+        std::thread::sleep(REOPEN_BACKOFF_MIN);
+
+        writer
+            .write_line(b"{\"n\":3}\n")
+            .expect("write after the directory is restored");
+        let content = std::fs::read_to_string(dir.path().join("back/out.ndjson")).expect("read");
+        assert_eq!(content, "{\"n\":3}\n");
+    }
+
+    #[test]
+    fn test_writer_reopens_after_its_file_is_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path());
+        let writer = NdjsonWriter::new(&config, "del", "out.ndjson", "dlq").expect("create");
+        writer.write_line(b"{\"n\":1}\n").expect("healthy write");
+
+        std::fs::remove_file(dir.path().join("del/out.ndjson")).expect("delete file");
+        writer.write_line(b"{\"n\":2}\n").unwrap_err();
+        std::thread::sleep(REOPEN_BACKOFF_MIN);
+
+        writer
+            .write_line(b"{\"n\":3}\n")
+            .expect("write after the file is deleted");
+        let content = std::fs::read_to_string(dir.path().join("del/out.ndjson")).expect("read");
+        assert_eq!(content, "{\"n\":3}\n");
+    }
+
+    #[test]
+    fn test_writer_does_not_recreate_a_missing_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path());
+        let writer = NdjsonWriter::new(&config, "gone", "out.ndjson", "dlq").expect("create");
+
+        std::fs::remove_dir_all(dir.path().join("gone")).expect("remove dir");
+        writer.write_line(b"{\"n\":1}\n").unwrap_err();
+        std::thread::sleep(REOPEN_BACKOFF_MIN);
+        writer.write_line(b"{\"n\":2}\n").unwrap_err();
+
+        assert!(!dir.path().join("gone").exists());
+        assert_eq!(writer.write_errors(), 2);
     }
 
     #[test]

@@ -21,6 +21,8 @@
 //!   space. Use when the caller can yield.
 //! - [`BackgroundSink::flush`] is `async` and resolves only after every
 //!   message accepted before this call is durably written by the drain.
+//!   It returns `Err` if any batch written since the previous flush
+//!   failed, whether that write was size-, tick- or barrier-triggered.
 //!
 //! # Shape
 //!
@@ -116,8 +118,8 @@ pub enum Overflow {
 /// messages share the queue and are processed in FIFO order.
 ///
 /// `Barrier` ack carries `Result<(), DrainError>` so flush() reports
-/// drain / flush_durable failures back to the caller instead of
-/// silently lying that everything before the barrier was durable.
+/// every write and flush_durable failure since the previous barrier
+/// instead of claiming that everything before the barrier was durable.
 enum SinkMsg<T> {
     Data(T),
     Barrier(oneshot::Sender<Result<(), DrainError>>),
@@ -138,8 +140,9 @@ enum SinkMsg<T> {
 /// will fail the lint.
 pub trait SinkDrain<T: Send>: Send + 'static {
     /// Flush a batch. Implementer chooses the async I/O strategy.
-    /// Returned `Err` is logged + counted by the actor; the actor
-    /// continues draining subsequent batches.
+    /// Returned `Err` is logged + counted by the actor and reported by
+    /// the next [`BackgroundSink::flush`]; the actor continues draining
+    /// subsequent batches.
     ///
     /// Takes `&mut self` -- drains typically own mutable I/O state
     /// (file handles, connection pools, write buffers). The actor
@@ -328,6 +331,17 @@ impl<T: Send + 'static> BackgroundSink<T> {
     /// messages that were dropped via overflow -- those were never in
     /// the queue. If you need lossless flush semantics, use
     /// `Overflow::Block` + `push_blocking`.
+    ///
+    /// A failure is reported once: the first barrier the actor processes
+    /// after it returns the error, and the next barrier starts clean. With
+    /// concurrent callers, the other barriers return `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// `Drain` with the first failure since the previous barrier: a
+    /// size- or tick-triggered batch write, the barrier's own batch
+    /// write, or the drain's `flush_durable`. `Closed` if the actor
+    /// exited before processing the barrier.
     pub async fn flush(&self) -> Result<(), SinkError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
@@ -367,6 +381,8 @@ async fn actor_loop<T, D>(
     D: SinkDrain<T>,
 {
     let mut batch: Vec<T> = Vec::with_capacity(config.batch_size);
+    // First write failure since the last barrier; the next barrier reports it.
+    let mut unreported: Option<DrainError> = None;
     let mut tick = interval(config.flush_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // Consume the immediate first tick; otherwise interval fires at t=0.
@@ -382,38 +398,35 @@ async fn actor_loop<T, D>(
                 // message sit in a channel we observed as empty.
                 rx.close();
 
-                // Flush whatever's already accumulated. Drop the
-                // result -- non-barrier writes log + count failures
-                // internally; we're already shutting down.
                 if !batch.is_empty() {
-                    let _ = write_batch_with_metrics(
+                    let result = write_batch_with_metrics(
                         &mut drain, std::mem::take(&mut batch),
                         &pending, metric_prefix,
                     ).await;
+                    hold_first_failure(&mut unreported, result);
                 }
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
                         SinkMsg::Data(t) => {
                             batch.push(t);
                             if batch.len() >= config.batch_size {
-                                let _ = write_batch_with_metrics(
+                                let result = write_batch_with_metrics(
                                     &mut drain, std::mem::take(&mut batch),
                                     &pending, metric_prefix,
                                 ).await;
+                                hold_first_failure(&mut unreported, result);
                             }
                         }
                         SinkMsg::Barrier(ack) => {
-                            // Flush + durable, then ack with the
-                            // composite Result. Acking Ok on a failed
-                            // drain is the durability lie F2 fixes.
                             let result = barrier_drain(
                                 &mut drain, std::mem::take(&mut batch),
-                                &pending, metric_prefix,
+                                unreported.take(), &pending, metric_prefix,
                             ).await;
                             let _ = ack.send(result);
                         }
                     }
                 }
+                // No barrier can follow this write; its failure is logged and counted.
                 if !batch.is_empty() {
                     let _ = write_batch_with_metrics(
                         &mut drain, std::mem::take(&mut batch),
@@ -430,20 +443,22 @@ async fn actor_loop<T, D>(
                 Some(SinkMsg::Data(t)) => {
                     batch.push(t);
                     if batch.len() >= config.batch_size {
-                        let _ = write_batch_with_metrics(
+                        let result = write_batch_with_metrics(
                             &mut drain, std::mem::take(&mut batch),
                             &pending, metric_prefix,
                         ).await;
+                        hold_first_failure(&mut unreported, result);
                     }
                 }
                 Some(SinkMsg::Barrier(ack)) => {
                     let result = barrier_drain(
                         &mut drain, std::mem::take(&mut batch),
-                        &pending, metric_prefix,
+                        unreported.take(), &pending, metric_prefix,
                     ).await;
                     let _ = ack.send(result);
                 }
                 None => {
+                    // No barrier can follow this write; its failure is logged and counted.
                     if !batch.is_empty() {
                         let _ = write_batch_with_metrics(
                             &mut drain, std::mem::take(&mut batch),
@@ -459,22 +474,32 @@ async fn actor_loop<T, D>(
 
             _ = tick.tick() => {
                 if !batch.is_empty() {
-                    let _ = write_batch_with_metrics(
+                    let result = write_batch_with_metrics(
                         &mut drain, std::mem::take(&mut batch),
                         &pending, metric_prefix,
                     ).await;
+                    hold_first_failure(&mut unreported, result);
                 }
             }
         }
     }
 }
 
-/// Run the batch write + drain.flush_durable() and report the
-/// first error back through the barrier ack. Acking `Ok(())` when
-/// either step failed is the durability-lie F2 fixes.
+/// Keep the first failure; later ones are already logged and counted by the write.
+fn hold_first_failure(held: &mut Option<DrainError>, result: Result<(), DrainError>) {
+    if let Err(e) = result
+        && held.is_none()
+    {
+        *held = Some(e);
+    }
+}
+
+/// Write the barrier's batch and run `flush_durable`, then ack the first
+/// failure since the previous barrier: `prior`, the write, or the flush.
 async fn barrier_drain<T, D: SinkDrain<T>>(
     drain: &mut D,
     batch: Vec<T>,
+    prior: Option<DrainError>,
     pending: &AtomicUsize,
     metric_prefix: Option<&'static str>,
 ) -> Result<(), DrainError>
@@ -487,7 +512,10 @@ where
         write_batch_with_metrics(drain, batch, pending, metric_prefix).await
     };
     let durable_result = drain.flush_durable().await;
-    write_result.and(durable_result)
+    match prior {
+        Some(e) => Err(e),
+        None => write_result.and(durable_result),
+    }
 }
 
 async fn write_batch_with_metrics<T, D: SinkDrain<T>>(
@@ -918,5 +946,140 @@ mod tests {
         let err = sink.flush().await.unwrap_err();
         assert!(matches!(err, SinkError::Drain(_)), "got: {err:?}");
         shutdown.cancel();
+    }
+
+    /// Refuses every batch and counts the attempts.
+    struct RefusingDrain {
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl SinkDrain<u32> for RefusingDrain {
+        async fn write_batch(&mut self, _batch: Vec<u32>) -> Result<(), DrainError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(DrainError::Io(std::io::Error::other("refused")))
+        }
+    }
+
+    async fn wait_for_attempts(attempts: &AtomicU64, want: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while attempts.load(Ordering::SeqCst) < want {
+            assert!(
+                Instant::now() < deadline,
+                "drain saw {} of {want} writes",
+                attempts.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_reports_a_refused_tick_write_once() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let shutdown = CancellationToken::new();
+        let cfg = BackgroundSinkConfig {
+            batch_size: 1024,
+            ..fast_config()
+        };
+        let (sink, _handle) = BackgroundSink::spawn(
+            RefusingDrain {
+                attempts: attempts.clone(),
+            },
+            cfg,
+            shutdown.clone(),
+        );
+        sink.try_push(1).expect("queue has space");
+        // batch_size is out of reach, so only the tick can have written it.
+        wait_for_attempts(&attempts, 1).await;
+
+        let err = sink.flush().await.unwrap_err();
+        assert!(matches!(err, SinkError::Drain(_)), "got: {err:?}");
+        sink.flush()
+            .await
+            .expect("a loss is reported by one flush only");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn flush_reports_a_refused_size_write_once() {
+        let attempts = Arc::new(AtomicU64::new(0));
+        let shutdown = CancellationToken::new();
+        let cfg = BackgroundSinkConfig {
+            batch_size: 2,
+            flush_interval: Duration::from_mins(1),
+            ..fast_config()
+        };
+        let (sink, _handle) = BackgroundSink::spawn(
+            RefusingDrain {
+                attempts: attempts.clone(),
+            },
+            cfg,
+            shutdown.clone(),
+        );
+        sink.try_push(1).expect("queue has space");
+        sink.try_push(2).expect("queue has space");
+        // The tick is a minute away, so only the size trigger can have written it.
+        wait_for_attempts(&attempts, 1).await;
+
+        let err = sink.flush().await.unwrap_err();
+        assert!(matches!(err, SinkError::Drain(_)), "got: {err:?}");
+        sink.flush()
+            .await
+            .expect("a loss is reported by one flush only");
+        shutdown.cancel();
+    }
+
+    /// Lets the first write through once `gate` fires, then refuses every later batch.
+    struct FailAfterFirstDrain {
+        gate: Arc<Notify>,
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl SinkDrain<u32> for FailAfterFirstDrain {
+        async fn write_batch(&mut self, _batch: Vec<u32>) -> Result<(), DrainError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.gate.notified().await;
+                return Ok(());
+            }
+            Err(DrainError::Io(std::io::Error::other("refused")))
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_reports_a_write_refused_during_shutdown_drain() {
+        let gate = Arc::new(Notify::new());
+        let attempts = Arc::new(AtomicU64::new(0));
+        let shutdown = CancellationToken::new();
+        let cfg = BackgroundSinkConfig {
+            batch_size: 1,
+            flush_interval: Duration::from_mins(1),
+            ..fast_config()
+        };
+        let (sink, handle) = BackgroundSink::spawn(
+            FailAfterFirstDrain {
+                gate: gate.clone(),
+                attempts: attempts.clone(),
+            },
+            cfg,
+            shutdown.clone(),
+        );
+        sink.try_push(1).expect("queue has space");
+        // The actor is now parked inside the first write.
+        wait_for_attempts(&attempts, 1).await;
+        sink.try_push(2).expect("queue has space");
+        let flusher = sink.clone();
+        let barrier = tokio::spawn(async move { flusher.flush().await });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.tx.max_capacity() - sink.tx.capacity() < 2 {
+            assert!(Instant::now() < deadline, "barrier never queued");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Message 2 and the barrier are now handled by the shutdown drain.
+        shutdown.cancel();
+        gate.notify_one();
+
+        let err = barrier.await.expect("flush task").unwrap_err();
+        assert!(matches!(err, SinkError::Drain(_)), "got: {err:?}");
+        handle.join().await.expect("clean exit");
     }
 }
