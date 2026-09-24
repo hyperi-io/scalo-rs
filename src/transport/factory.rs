@@ -1282,17 +1282,13 @@ mod governor_tests {
 
     /// A factory-built HTTP receiver MUST shed with 503 under pressure (governor
     /// pinned HIGH); the shed request never reaches the queue.
-    #[cfg(feature = "transport-http")]
+    #[cfg(all(feature = "transport-http", feature = "http-server"))]
     #[tokio::test]
     async fn http_governed_receiver_sheds_under_pressure() {
         use crate::transport::traits::{TransportBase, TransportReceiver};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-
         let http_cfg = crate::transport::http::HttpTransportConfig {
-            listen: Some(addr.to_string()),
+            listen: Some("127.0.0.1:0".to_string()),
             recv_timeout_ms: 200,
             ..Default::default()
         };
@@ -1311,6 +1307,13 @@ mod governor_tests {
         let receiver = AnyReceiver::from_transport_config_with_governor(&cfg, &gov)
             .await
             .expect("governed http receiver must construct");
+        // Irrefutable when transport-http is the only variant compiled in.
+        #[allow(irrefutable_let_patterns)]
+        let addr = if let AnyReceiver::Http(ref http) = receiver {
+            http.local_addr().expect("receiver bound")
+        } else {
+            panic!("must be Http variant");
+        };
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let client = reqwest::Client::new();

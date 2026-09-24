@@ -44,7 +44,7 @@ features = [
 ```
 
 `cli-service` is doing most of the work — see
-[feature-flags.md](feature-flags.md#cli-service) for what it pulls in
+[feature-flags.md](feature-flags.md#cli) for what it pulls in
 transitively.
 
 A tooling-style CLI that doesn't need a metrics server or worker pool
@@ -218,7 +218,7 @@ config/
 
 The cascade searches `./`, `./config/`, `/config/`,
 `~/.config/dfe-loader/` for each file in turn. See
-[core-pillars/config.md](core-pillars/config.md#cascade) for the full
+[core-pillars/config.md](core-pillars/config.md#cascade-order-highest-priority-first) for the full
 priority order.
 
 ---

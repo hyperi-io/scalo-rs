@@ -233,6 +233,10 @@ pub struct HttpTransport {
     #[cfg(feature = "http-server")]
     receiver: Option<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Message<HttpToken>>>>,
 
+    /// Address the embedded server bound, with any port-0 request resolved.
+    #[cfg(feature = "http-server")]
+    local_addr: Option<std::net::SocketAddr>,
+
     /// Shutdown signal for the server task.
     ///
     /// Behind a `parking_lot::Mutex` for interior mutability: `close(&self)`
@@ -334,7 +338,9 @@ impl HttpTransport {
             .map_err(|e| TransportError::Config(format!("failed to create HTTP client: {e}")))?;
 
         #[cfg(feature = "http-server")]
-        let (receiver, shutdown_tx, server_handle) = if let Some(listen) = &config.listen {
+        let (receiver, local_addr, shutdown_tx, server_handle) = if let Some(listen) =
+            &config.listen
+        {
             let addr: std::net::SocketAddr = listen
                 .parse()
                 .map_err(|e| TransportError::Config(format!("invalid listen address: {e}")))?;
@@ -357,6 +363,9 @@ impl HttpTransport {
             let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
                 TransportError::Connection(format!("failed to bind to {addr}: {e}"))
             })?;
+            let bound = listener.local_addr().map_err(|e| {
+                TransportError::Connection(format!("failed to read bound address for {addr}: {e}"))
+            })?;
 
             let handle = tokio::spawn(async move {
                 axum::serve(
@@ -370,9 +379,14 @@ impl HttpTransport {
                 .ok();
             });
 
-            (Some(tokio::sync::Mutex::new(rx)), Some(sd_tx), Some(handle))
+            (
+                Some(tokio::sync::Mutex::new(rx)),
+                Some(bound),
+                Some(sd_tx),
+                Some(handle),
+            )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         // When the governor feature is on but http-server is off there is no
@@ -416,6 +430,8 @@ impl HttpTransport {
             #[cfg(feature = "http-server")]
             receiver,
             #[cfg(feature = "http-server")]
+            local_addr,
+            #[cfg(feature = "http-server")]
             shutdown_tx: parking_lot::Mutex::new(shutdown_tx),
             #[cfg(feature = "http-server")]
             _server_handle: server_handle,
@@ -424,6 +440,14 @@ impl HttpTransport {
             recv_timeout_ms: config.recv_timeout_ms,
             filter_engine,
         })
+    }
+
+    /// Address the embedded receive server is listening on, or `None` when
+    /// `listen` is unset. Configure `listen` with port 0 to take any free port.
+    #[cfg(feature = "http-server")]
+    #[must_use]
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr
     }
 }
 
@@ -888,19 +912,17 @@ mod tests {
     #[cfg(feature = "http-server")]
     #[tokio::test]
     async fn send_and_receive_roundtrip() {
-        // Start receiver on a random available port
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener); // Free the port for the transport to bind
-
+        // Port 0 binds a free port atomically; a probe-then-rebind races
+        // parallel tests for the same port.
         let recv_config = HttpTransportConfig {
-            listen: Some(addr.to_string()),
+            listen: Some("127.0.0.1:0".to_string()),
             recv_path: "/ingest".to_string(),
             recv_buffer_size: 100,
             recv_timeout_ms: 1000,
             ..Default::default()
         };
         let receiver = HttpTransport::new(&recv_config).await.unwrap();
+        let addr = receiver.local_addr().expect("receiver bound");
 
         // Give the server a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -931,16 +953,13 @@ mod tests {
     #[cfg(feature = "http-server")]
     #[tokio::test]
     async fn receive_rejects_empty_body() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-
         let recv_config = HttpTransportConfig {
-            listen: Some(addr.to_string()),
+            listen: Some("127.0.0.1:0".to_string()),
             recv_timeout_ms: 200,
             ..Default::default()
         };
         let receiver = HttpTransport::new(&recv_config).await.unwrap();
+        let addr = receiver.local_addr().expect("receiver bound");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Send empty body
@@ -965,17 +984,14 @@ mod tests {
     #[cfg(feature = "http-server")]
     #[tokio::test]
     async fn receive_rejects_oversized_body() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-
         let recv_config = HttpTransportConfig {
-            listen: Some(addr.to_string()),
+            listen: Some("127.0.0.1:0".to_string()),
             recv_timeout_ms: 200,
             max_body_bytes: 1024, // 1 KiB cap
             ..Default::default()
         };
         let receiver = HttpTransport::new(&recv_config).await.unwrap();
+        let addr = receiver.local_addr().expect("receiver bound");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // POST 8 KiB -- over the 1 KiB cap.
@@ -1018,15 +1034,13 @@ mod tests {
 
         // --- None default: POST accepted (200) ---
         {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            drop(listener);
             let cfg = HttpTransportConfig {
-                listen: Some(addr.to_string()),
+                listen: Some("127.0.0.1:0".to_string()),
                 recv_timeout_ms: 200,
                 ..Default::default()
             };
             let receiver = HttpTransport::new(&cfg).await.unwrap();
+            let addr = receiver.local_addr().expect("receiver bound");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let client = reqwest::Client::new();
@@ -1065,17 +1079,15 @@ mod tests {
             // Sanity: the latch is armed.
             assert!(pressure.should_hold(), "pinned-high governor must hold");
 
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            drop(listener);
             let cfg = HttpTransportConfig {
-                listen: Some(addr.to_string()),
+                listen: Some("127.0.0.1:0".to_string()),
                 recv_timeout_ms: 200,
                 ..Default::default()
             };
             let receiver = HttpTransport::with_pressure(&cfg, Some(Arc::clone(&pressure)))
                 .await
                 .unwrap();
+            let addr = receiver.local_addr().expect("receiver bound");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let client = reqwest::Client::new();
