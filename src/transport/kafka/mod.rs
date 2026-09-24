@@ -82,6 +82,7 @@ use super::error::{TransportError, TransportResult};
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::{Record, WorkBatch};
+use crate::backoff::Backoff;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -120,6 +121,11 @@ const QUEUE_FULL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pause between re-offers while the producer queue is full.
 const QUEUE_FULL_RETRY: Duration = Duration::from_millis(100);
+
+/// How long `commit` keeps retrying a transient failure. One synchronous commit
+/// can itself block for about `session.timeout.ms` during an outage, so this
+/// keeps the whole retry well inside the default 300 s `max.poll.interval.ms`.
+const COMMIT_RETRY_WINDOW: Duration = Duration::from_secs(60);
 
 /// W3C traceparent headers for the active span, when propagation is built in.
 fn trace_headers() -> Option<OwnedHeaders> {
@@ -1325,36 +1331,60 @@ impl TransportReceiver for KafkaTransport {
     /// partition is committed (the offset list is built by
     /// `highest_offsets_per_partition`, which is unit-tested broker-free).
     ///
-    /// ## Observable (synchronous) commit -- the ack barrier requires it
+    /// ## Observable (synchronous) commit
     ///
-    /// This is the ENGINE-CRITICAL commit: the `BatchEngine` governed driver
-    /// treats a commit failure as a TERMINAL ack-barrier error (it stops the run
-    /// loop so no later block's ordered commit advances the watermark past
-    /// un-acked offsets). For that to hold, a broker commit failure MUST be
-    /// visible to the driver. rdkafka's `CommitMode::Async` returns `Ok` as soon
-    /// as the request is ENQUEUED -- a broker-side rejection is never surfaced to
-    /// the caller, so a fire-and-forget async commit would silently swallow the
-    /// failure and DEFEAT the ack barrier. We therefore use the OBSERVABLE
-    /// [`CommitMode::Sync`]: it blocks until the broker acks (or errors), so the
-    /// driver sees the real outcome. The synchronous round-trip is the correct
-    /// default for at-least-once; an app that wants the weaker
-    /// throughput-over-correctness async commit can opt in explicitly via
-    /// [`commit_weak_async`](Self::commit_weak_async) (NOT used by the governed
-    /// driver -- it is documented as weaker).
+    /// [`CommitMode::Sync`] waits for the broker's answer, so a failed commit
+    /// is reported rather than swallowed; rdkafka's `CommitMode::Async` returns
+    /// `Ok` once the request is queued. The blocking call runs on tokio's
+    /// blocking pool, never on a runtime worker. An app that wants the weaker
+    /// fire-and-forget commit opts in with
+    /// [`commit_weak_async`](Self::commit_weak_async).
+    ///
+    /// ## Broker outages
+    ///
+    /// A commit that fails while the coordinator or broker is unavailable is
+    /// retried after a jittered backoff (100 ms doubling to 2 s) for up to 60 s,
+    /// and never after `close()`. A failure no retry can land -- the partitions
+    /// now belong to a newer group generation, or an authorisation error -- is
+    /// returned at once. The `BatchEngine` driver logs a failed commit and
+    /// carries on: the block was already delivered, and the next commit is
+    /// cumulative, so a failed commit costs duplicates on restart, never data.
     async fn commit(&self, tokens: &[Self::Token]) -> TransportResult<()> {
         if tokens.is_empty() {
             return Ok(());
         }
 
-        let tpl = build_commit_tpl(tokens)?;
+        let mut tpl = build_commit_tpl(tokens)?;
+        let started = std::time::Instant::now();
+        let mut failures = 0_u32;
+        loop {
+            let consumer = Arc::clone(&self.consumer);
+            let (returned, result) = tokio::task::spawn_blocking(move || {
+                let result = consumer.commit(&tpl, CommitMode::Sync);
+                (tpl, result)
+            })
+            .await
+            .map_err(|e| TransportError::Commit(format!("commit task failed: {e}")))?;
+            tpl = returned;
 
-        // OBSERVABLE commit: block until the broker acks so a commit failure is
-        // visible to the driver (the ack barrier depends on this).
-        self.consumer
-            .commit(&tpl, CommitMode::Sync)
-            .map_err(|e| TransportError::Commit(e.to_string()))?;
-
-        Ok(())
+            let Err(err) = result else {
+                return Ok(());
+            };
+            if !classify::commit_is_retryable(&err)
+                || started.elapsed() >= COMMIT_RETRY_WINDOW
+                || self.shutdown_token.is_cancelled()
+            {
+                return Err(TransportError::Commit(err.to_string()));
+            }
+            failures = failures.saturating_add(1);
+            tracing::debug!(error = %err, failures, "kafka commit failed; retrying");
+            tokio::select! {
+                () = self.shutdown_token.cancelled() => {
+                    return Err(TransportError::Commit(err.to_string()));
+                }
+                () = tokio::time::sleep(Backoff::TRANSIENT.delay(failures)) => {}
+            }
+        }
     }
 }
 
@@ -1581,22 +1611,21 @@ impl KafkaTransport {
                         range: start..end,
                     });
                 }
-                Some(Err(e)) => {
-                    match classify::classify_recv_failure(&e, self.auto_create_topics) {
-                        // Another assigned partition may still hold records.
-                        classify::RecvFailure::EndOfPartition => {}
-                        // Records are in hand; the next call backs off if it persists.
-                        classify::RecvFailure::Transient => {
-                            self.recv_state.record_transient(&e);
-                            break;
-                        }
-                        classify::RecvFailure::Permanent => {
-                            classify::record_permanent_recv_failure();
-                            *self.deferred_recv_error.lock() = Some(e);
-                            break;
-                        }
+                Some(Err(e)) => match classify::classify_recv_failure(&e, self.recv_context()) {
+                    // Another assigned partition may still hold records.
+                    classify::RecvFailure::EndOfPartition => {}
+                    // Records are in hand; the next call backs off if it persists.
+                    classify::RecvFailure::Transient => {
+                        self.recv_state.record_transient(&e);
+                        break;
                     }
-                }
+                    class @ (classify::RecvFailure::Permanent
+                    | classify::RecvFailure::Unclassified) => {
+                        classify::record_permanent_recv_failure(&e, class);
+                        *self.deferred_recv_error.lock() = Some(e);
+                        break;
+                    }
+                },
                 None => break,
             }
         }
@@ -1641,19 +1670,29 @@ impl KafkaTransport {
     /// Settle a first poll that returned an error: an empty batch after a
     /// backoff when it is transient, the error when no retry can clear it.
     async fn first_poll_failed(&self, err: KafkaError) -> TransportResult<WorkBatch<KafkaToken>> {
-        match classify::classify_recv_failure(&err, self.auto_create_topics) {
+        match classify::classify_recv_failure(&err, self.recv_context()) {
             classify::RecvFailure::EndOfPartition => {}
             classify::RecvFailure::Transient => {
                 self.recv_state.record_transient(&err);
                 // Yields to the runtime, so a burst of queued errors cannot spin the caller.
                 tokio::time::sleep(self.recv_state.backoff()).await;
             }
-            classify::RecvFailure::Permanent => {
-                classify::record_permanent_recv_failure();
+            class @ (classify::RecvFailure::Permanent | classify::RecvFailure::Unclassified) => {
+                classify::record_permanent_recv_failure(&err, class);
                 return Err(TransportError::Recv(err.to_string()));
             }
         }
         Ok(RecvBatch::from_messages(Vec::new()).into())
+    }
+
+    /// What classification needs to know about this consumer. Read on the
+    /// failure path only.
+    fn recv_context(&self) -> classify::RecvContext {
+        classify::RecvContext {
+            auto_create_topics: self.auto_create_topics,
+            credentials_proven: self.recv_state.has_received()
+                || self.consumer.context().has_connected(),
+        }
     }
 
     /// WEAKER, opt-in fire-and-forget commit (throughput over correctness).

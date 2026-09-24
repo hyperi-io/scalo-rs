@@ -565,6 +565,8 @@ struct OrderedReceiver {
     /// If set, `commit` returns an error (broker commit failure) for any
     /// block whose highest token seq equals this value.
     fail_commit_on_seq: Option<u64>,
+    /// How many more `recv` calls report the source busy before records flow.
+    recv_backpressure: Arc<AtomicU64>,
 }
 
 impl OrderedReceiver {
@@ -575,6 +577,7 @@ impl OrderedReceiver {
             committed_hwm: Arc::new(AtomicU64::new(u64::MAX)),
             commit_calls: Arc::new(AtomicUsize::new(0)),
             fail_commit_on_seq: None,
+            recv_backpressure: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -603,7 +606,14 @@ impl TransportReceiver for OrderedReceiver {
     + Send {
         let next_seq = Arc::clone(&self.next_seq);
         let total = self.total;
+        let recv_backpressure = Arc::clone(&self.recv_backpressure);
         async move {
+            if recv_backpressure
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(crate::transport::TransportError::Backpressure);
+            }
             let seq = next_seq.fetch_add(1, Ordering::Relaxed);
             if seq >= total {
                 // Exhausted: block forever so the loop only exits on shutdown
@@ -637,8 +647,17 @@ impl TransportReceiver for OrderedReceiver {
                 "broker commit failed for seq {max_seq}"
             )));
         }
-        // Cumulative: watermark = max(current, this block's highest seq).
-        self.committed_hwm.fetch_max(max_seq, Ordering::Relaxed);
+        // Cumulative: watermark = max(current, this block's highest seq), with
+        // the u64::MAX "nothing committed" sentinel replaced by the first commit.
+        let _ = self
+            .committed_hwm
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current == u64::MAX {
+                    max_seq
+                } else {
+                    current.max(max_seq)
+                })
+            });
         Ok(())
     }
 }
@@ -717,32 +736,33 @@ async fn sink_error_blocks_later_ordered_commits() {
     );
 }
 
-/// Ack-barrier on COMMIT failure. The sink succeeds but the COMMIT for
-/// token 0's block fails (broker commit error). The engine must treat this
-/// as a terminal ack-barrier failure and NOT advance to fetch+commit
-/// token 1 past the failed offset.
+/// A failed COMMIT does not stop the loop. Token 0's block was delivered
+/// before its commit failed, and commits are cumulative, so the commit of
+/// token 2 covers it: nothing is skipped, and at worst a restart re-delivers.
 #[tokio::test]
-async fn commit_error_blocks_later_ordered_commits() {
+async fn a_commit_error_is_reported_and_the_loop_carries_on() {
     let mut receiver = OrderedReceiver::new(3);
     receiver.fail_commit_on_seq = Some(0);
     let committed = Arc::clone(&receiver.committed_hwm);
+    let commit_calls = Arc::clone(&receiver.commit_calls);
 
     let engine = default_engine();
     let shutdown = CancellationToken::new();
     cancel_after(shutdown.clone(), 500);
 
-    let sink_calls = Arc::new(AtomicUsize::new(0));
-    let sc = Arc::clone(&sink_calls);
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let s = Arc::clone(&sunk);
 
     let result = engine
         .run_workbatch(
             &receiver,
             shutdown,
             |batch| Ok(batch),
-            move |_out: &WorkBatch<_>| {
-                let sc = Arc::clone(&sc);
+            move |out: &WorkBatch<_>| {
+                let s = Arc::clone(&s);
+                let seqs: Vec<u64> = out.commit_tokens.iter().map(|t| t.seq).collect();
                 async move {
-                    sc.fetch_add(1, Ordering::Relaxed);
+                    s.lock().extend(seqs);
                     Ok(())
                 }
             },
@@ -754,22 +774,231 @@ async fn commit_error_blocks_later_ordered_commits() {
         )
         .await;
 
-    // Commit of token 0 failed -> watermark unmoved, run terminates, token 1
-    // is never fetched/committed past the failed offset.
+    assert!(
+        result.is_ok(),
+        "a failed commit must not end the run: {result:?}"
+    );
+    assert_eq!(
+        *sunk.lock(),
+        vec![0, 1, 2],
+        "every block delivered once, in order"
+    );
+    assert_eq!(
+        commit_calls.load(Ordering::Relaxed),
+        3,
+        "every block's commit was attempted"
+    );
     assert_eq!(
         committed.load(Ordering::Relaxed),
-        u64::MAX,
-        "failed commit must not leave a later commit to advance past it"
+        2,
+        "the later cumulative commit covers the block whose own commit failed"
+    );
+}
+
+/// The driver-level outage test: the sink reports backpressure for 30 s. The
+/// run survives, holds token 0's block the whole time -- nothing later is
+/// fetched or committed past it -- then delivers it and every later block.
+#[tokio::test(start_paused = true)]
+async fn a_backpressured_sink_is_waited_out_and_the_block_delivered() {
+    let receiver = OrderedReceiver::new(3);
+    let committed = Arc::clone(&receiver.committed_hwm);
+    let commit_calls = Arc::clone(&receiver.commit_calls);
+
+    let engine = default_engine();
+    let shutdown = CancellationToken::new();
+    let outage = Duration::from_secs(30);
+    cancel_after(shutdown.clone(), 60_000);
+
+    let recovers_at = tokio::time::Instant::now() + outage;
+    let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let delivered = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (a, d) = (Arc::clone(&attempts), Arc::clone(&delivered));
+    let committed_during_outage = Arc::clone(&committed);
+
+    let result = engine
+        .run_workbatch(
+            &receiver,
+            shutdown,
+            |batch| Ok(batch),
+            move |out: &WorkBatch<_>| {
+                let (a, d) = (Arc::clone(&a), Arc::clone(&d));
+                let committed = Arc::clone(&committed_during_outage);
+                let seqs: Vec<u64> = out.commit_tokens.iter().map(|t| t.seq).collect();
+                async move {
+                    a.lock().extend(seqs.iter().copied());
+                    if tokio::time::Instant::now() < recovers_at {
+                        assert_eq!(
+                            committed.load(Ordering::Relaxed),
+                            u64::MAX,
+                            "nothing may commit while token 0's block is undelivered"
+                        );
+                        return Err(crate::transport::TransportError::Backpressure.into());
+                    }
+                    d.lock().extend(seqs);
+                    Ok(())
+                }
+            },
+            CommitMode::Auto,
+            None::<(
+                Duration,
+                fn() -> std::future::Ready<Result<(), EngineError>>,
+            )>,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "a backpressured sink must not end the run: {result:?}"
+    );
+    let attempts = attempts.lock().clone();
+    let retries = attempts.iter().filter(|seq| **seq == 0).count();
+    assert!(
+        retries > 5,
+        "token 0's block should be re-sunk through the outage, got {retries} attempts"
     );
     assert!(
-        result.is_err(),
-        "commit failure must be a terminal ack-barrier error"
+        retries < 60,
+        "{retries} attempts in {outage:?} -- the retry is not backing off"
+    );
+    assert!(
+        attempts.iter().take(retries).all(|seq| *seq == 0),
+        "no later block reached the sink before token 0 was delivered: {attempts:?}"
     );
     assert_eq!(
-        sink_calls.load(Ordering::Relaxed),
-        1,
-        "loop must stop at the failed commit -- token 1 must not be processed"
+        *delivered.lock(),
+        vec![0, 1, 2],
+        "every block delivered, in order"
     );
+    assert_eq!(committed.load(Ordering::Relaxed), 2);
+    assert_eq!(commit_calls.load(Ordering::Relaxed), 3);
+}
+
+/// Shutdown during a sink outage ends the run cleanly and leaves the held
+/// block uncommitted, so the source re-delivers it.
+#[tokio::test(start_paused = true)]
+async fn shutdown_during_a_sink_outage_leaves_the_block_uncommitted() {
+    let receiver = OrderedReceiver::new(3);
+    let commit_calls = Arc::clone(&receiver.commit_calls);
+
+    let engine = default_engine();
+    let shutdown = CancellationToken::new();
+    cancel_after(shutdown.clone(), 5_000);
+
+    let result = engine
+        .run_workbatch(
+            &receiver,
+            shutdown,
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>| async {
+                Err(crate::transport::TransportError::Backpressure.into())
+            },
+            CommitMode::Auto,
+            None::<(
+                Duration,
+                fn() -> std::future::Ready<Result<(), EngineError>>,
+            )>,
+        )
+        .await;
+
+    assert!(result.is_ok(), "shutdown ends the run cleanly: {result:?}");
+    assert_eq!(
+        commit_calls.load(Ordering::Relaxed),
+        0,
+        "a block the sink never took must not be committed"
+    );
+}
+
+/// A source reporting backpressure is polled again after a backoff, not
+/// treated as the end of the run.
+#[tokio::test(start_paused = true)]
+async fn a_backpressured_recv_is_waited_out() {
+    let receiver = OrderedReceiver::new(2);
+    receiver.recv_backpressure.store(8, Ordering::Relaxed);
+    let committed = Arc::clone(&receiver.committed_hwm);
+    let recv_backpressure = Arc::clone(&receiver.recv_backpressure);
+
+    let engine = default_engine();
+    let shutdown = CancellationToken::new();
+    cancel_after(shutdown.clone(), 60_000);
+
+    let result = engine
+        .run_workbatch(
+            &receiver,
+            shutdown,
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>| async { Ok(()) },
+            CommitMode::Auto,
+            None::<(
+                Duration,
+                fn() -> std::future::Ready<Result<(), EngineError>>,
+            )>,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "a backpressured source must not end the run: {result:?}"
+    );
+    assert_eq!(recv_backpressure.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        committed.load(Ordering::Relaxed),
+        1,
+        "both records flowed once the source recovered"
+    );
+}
+
+/// Streaming variant: a backpressured sub-block is held and re-sunk; the
+/// block commits once, after its final sub-block is delivered.
+#[tokio::test(start_paused = true)]
+async fn streaming_backpressured_sub_block_is_held_and_retried() {
+    let receiver = OrderedReceiver::new(3);
+    let committed = Arc::clone(&receiver.committed_hwm);
+
+    let engine = default_engine();
+    let shutdown = CancellationToken::new();
+    cancel_after(shutdown.clone(), 60_000);
+
+    let recovers_at = tokio::time::Instant::now() + Duration::from_secs(10);
+    let delivered = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let d = Arc::clone(&delivered);
+
+    let result = engine
+        .run_workbatch_streaming(
+            &receiver,
+            shutdown,
+            |batch| Ok(batch),
+            move |out: &WorkBatch<_>| {
+                let d = Arc::clone(&d);
+                let payloads: Vec<Bytes> = out.records.iter().map(|r| r.payload.clone()).collect();
+                async move {
+                    if tokio::time::Instant::now() < recovers_at {
+                        return Err(crate::transport::TransportError::Timeout.into());
+                    }
+                    d.lock().extend(payloads);
+                    Ok(())
+                }
+            },
+            CommitMode::Auto,
+            64,
+            None::<(
+                Duration,
+                fn() -> std::future::Ready<Result<(), EngineError>>,
+            )>,
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    let delivered: Vec<Bytes> = delivered.lock().clone();
+    assert_eq!(
+        delivered,
+        vec![
+            Bytes::from_static(br#"{"seq":0}"#),
+            Bytes::from_static(br#"{"seq":1}"#),
+            Bytes::from_static(br#"{"seq":2}"#),
+        ],
+        "every sub-block delivered once, in order"
+    );
+    assert_eq!(committed.load(Ordering::Relaxed), 2);
 }
 
 /// Streaming variant of the ack barrier: a sink error on token 0's block

@@ -103,8 +103,15 @@ Commit discipline holds across the split:
   sub-block never multiplies the source acks.
 - The whole block's source acks commit EXACTLY ONCE, after the FINAL
   sub-block's sink returns `Ok` (under `CommitMode::Auto`).
-- A sink error on ANY sub-block stops the block and skips the commit, so the
-  WHOLE block is re-delivered. At-least-once holds even mid-stream.
+- A transient sink error (`TransportError::Backpressure` or `Timeout`) holds
+  the sub-block and re-sends it with backoff, so nothing later is fetched or
+  committed past it. A sink gets this by mapping `SendResult::Backpressured`
+  to `Err(TransportError::Backpressure.into())`; an `EngineError::Sink` counts
+  as permanent. Any other sink error stops the block and skips the
+  commit, so the WHOLE block is re-delivered. At-least-once holds even
+  mid-stream.
+- A failed commit is logged and counted, and the loop carries on: the block
+  was delivered, and the next cumulative commit covers it.
 
 Under low pressure the budget is big: the whole block is a single sub-block, no
 per-record overhead -- the streaming path collapses to the whole-batch path.

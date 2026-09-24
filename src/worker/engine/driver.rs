@@ -55,8 +55,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::{BatchEngine, EngineError};
+use crate::backoff::Backoff;
 use crate::transport::codec::{self, ParsedPayload};
-use crate::transport::{Record, TransportReceiver, WorkBatch};
+use crate::transport::{Record, TransportReceiver, TransportResult, WorkBatch};
 
 /// When the driver commits the input source acks.
 ///
@@ -65,8 +66,9 @@ use crate::transport::{Record, TransportReceiver, WorkBatch};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitMode {
     /// At-least-once: after the sink returns `Ok` for the WHOLE out-batch, the
-    /// engine calls `receiver.commit(&out_batch.commit_tokens)`. A sink error
-    /// skips the commit so the block is re-delivered. This is the engine-commits
+    /// engine calls `receiver.commit(&out_batch.commit_tokens)`. A transient
+    /// sink error holds the block and retries it; a permanent one skips the
+    /// commit so the block is re-delivered. This is the engine-commits
     /// behaviour of the former mid-tier / raw run loops, lifted onto the block.
     Auto,
     /// The sink owns the commit -- the engine does NOT commit. The sink is
@@ -199,6 +201,126 @@ where
     }
 }
 
+/// What became of a block the driver tried to sink.
+#[cfg(feature = "transport")]
+enum Delivery {
+    /// The sink took it.
+    Sunk,
+    /// Shutdown arrived while the sink was refusing it; it stays uncommitted.
+    Abandoned,
+}
+
+/// Sleep for `wait`, or return `false` as soon as shutdown is requested.
+#[cfg(feature = "transport")]
+async fn wait_unless_shutdown(shutdown: &CancellationToken, wait: Duration) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        () = tokio::time::sleep(wait) => true,
+    }
+}
+
+/// Count and report one transient failure of a run-loop `stage`; warn on the
+/// first of a run only.
+#[cfg(feature = "transport")]
+fn note_transient(stage: &'static str, error: &dyn std::fmt::Display, failures: u32) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("pipeline_retries_total", "stage" => stage).increment(1);
+    if failures == 1 {
+        tracing::warn!(
+            stage,
+            error = %error,
+            "run loop step failed on a transient condition; retrying with backoff"
+        );
+    } else {
+        tracing::debug!(stage, error = %error, failures, "run loop step still failing");
+    }
+}
+
+/// Report the first success after a run of transient failures.
+#[cfg(feature = "transport")]
+fn note_recovered(stage: &'static str, failures: u32) {
+    if failures > 0 {
+        tracing::info!(stage, failures, "run loop step recovered");
+    }
+}
+
+/// Settle one recv result: the batch, `None` after waiting out a transient
+/// failure (or on shutdown), or the error that ends the loop.
+#[cfg(feature = "transport")]
+async fn settle_recv<T: crate::transport::CommitToken>(
+    result: TransportResult<WorkBatch<T>>,
+    failures: &mut u32,
+    shutdown: &CancellationToken,
+) -> Result<Option<WorkBatch<T>>, EngineError> {
+    match result {
+        Ok(batch) => {
+            note_recovered("recv", *failures);
+            *failures = 0;
+            Ok(Some(batch))
+        }
+        Err(e) if e.is_recoverable() => {
+            *failures = failures.saturating_add(1);
+            note_transient("recv", &e, *failures);
+            // Shutdown is picked up by the loop's next select.
+            wait_unless_shutdown(shutdown, Backoff::TRANSIENT.delay(*failures)).await;
+            Ok(None)
+        }
+        Err(e) => Err(EngineError::Transport(e)),
+    }
+}
+
+/// Sink `batch`, holding it and retrying while the sink reports a transient
+/// failure, so no later block is fetched or committed past it.
+#[cfg(feature = "transport")]
+async fn sink_until_delivered<T, Sink, SinkFut>(
+    sink: &mut Sink,
+    batch: &WorkBatch<T>,
+    shutdown: &CancellationToken,
+) -> Result<Delivery, EngineError>
+where
+    T: crate::transport::CommitToken,
+    Sink: FnMut(&WorkBatch<T>) -> SinkFut,
+    SinkFut: std::future::Future<Output = Result<(), EngineError>>,
+{
+    let mut failures = 0_u32;
+    loop {
+        match sink(batch).await {
+            Ok(()) => {
+                note_recovered("sink", failures);
+                return Ok(Delivery::Sunk);
+            }
+            Err(e) if e.is_transient() => {
+                failures = failures.saturating_add(1);
+                note_transient("sink", &e, failures);
+                if !wait_unless_shutdown(shutdown, Backoff::TRANSIENT.delay(failures)).await {
+                    return Ok(Delivery::Abandoned);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Commit `tokens`, logging and counting a failure instead of ending the loop.
+///
+/// The block was already delivered and source commits are cumulative, so the
+/// next successful commit covers it; a lost commit costs re-delivery after a
+/// restart, never data.
+#[cfg(feature = "transport")]
+async fn commit_or_report<R: TransportReceiver>(receiver: &R, tokens: &[R::Token]) {
+    if let Err(e) = receiver.commit(tokens).await {
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_commit_errors_total", "transport" => receiver.name())
+            .increment(1);
+        tracing::warn!(
+            error = %e,
+            transport = receiver.name(),
+            "Commit failed; carrying on -- the block was delivered and the next commit covers it"
+        );
+    }
+}
+
 impl BatchEngine {
     /// Unified on-demand `WorkBatch` driver -- the default data-plane loop.
     ///
@@ -220,19 +342,36 @@ impl BatchEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Transport`] if `recv` fails fatally,
+    /// Returns [`EngineError::Transport`] if `recv` fails permanently,
     /// [`EngineError::FilterDlqUnrouted`] if inline-DLQ entries appear under the
-    /// default [`FilterDlqPolicy::Reject`](super::FilterDlqPolicy::Reject), or
-    /// the error returned by `process`.
+    /// default [`FilterDlqPolicy::Reject`](super::FilterDlqPolicy::Reject), the
+    /// error returned by `process`, or a permanent sink error.
     ///
-    /// A sink error (and, under [`CommitMode::Auto`], a commit error) is
-    /// TERMINAL: it stops the run loop and propagates. This is the ack barrier
-    /// for the ORDERED/cumulative source commit (Kafka "commit up to offset N"):
-    /// the failed block's tokens are NOT committed, and -- crucially -- no LATER
-    /// block is fetched and committed past them, which would silently skip the
-    /// never-sent records (data loss). On restart the source re-delivers from
-    /// the last committed watermark, preserving at-least-once. The app owns
-    /// restart/retry policy.
+    /// ## Outages are waited out, not fatal
+    ///
+    /// A transient failure never stops the loop. `recv` returning, or `sink`
+    /// returning `EngineError::Transport` carrying,
+    /// [`TransportError::Backpressure`](crate::TransportError::Backpressure) or
+    /// [`TransportError::Timeout`](crate::TransportError::Timeout) is retried
+    /// after a jittered backoff (100 ms doubling to 2 s) until it clears or
+    /// `shutdown` fires. A sink should map
+    /// [`SendResult::Backpressured`](crate::transport::SendResult::Backpressured)
+    /// to `Err(TransportError::Backpressure.into())` to get this; an
+    /// [`EngineError::Sink`] is treated as permanent.
+    ///
+    /// While the sink refuses a block, that block is held and re-sunk: no later
+    /// block is fetched or committed past it, which would advance the ordered,
+    /// cumulative source commit (Kafka "commit up to offset N") over records
+    /// never sent. A permanent sink error stops the loop with the block
+    /// uncommitted, so the source re-delivers it after a restart. A Kafka
+    /// consumer held past `max.poll.interval.ms` leaves its group and rejoins
+    /// on the next `recv`, so its partitions may be re-delivered: duplicates,
+    /// never loss.
+    ///
+    /// Under [`CommitMode::Auto`] a commit error is logged and counted in
+    /// `transport_commit_errors_total`, and the loop carries on: the block was
+    /// already delivered and the next commit is cumulative, so a lost commit
+    /// costs re-delivery after a restart, never data.
     #[cfg(feature = "transport")]
     #[allow(clippy::too_many_arguments)]
     pub async fn run_workbatch<R, P, Sink, SinkFut, Ticker, TickerFut>(
@@ -260,6 +399,7 @@ impl BatchEngine {
         );
 
         let mut ticker = LoopTicker::new(ticker);
+        let mut recv_failures = 0_u32;
 
         loop {
             tokio::select! {
@@ -273,11 +413,16 @@ impl BatchEngine {
                 () = ticker.wait() => ticker.fire("workbatch").await,
 
                 recv_result = receiver.recv(self.config.max_chunk_size) => {
-                    let work_batch = recv_result.map_err(EngineError::Transport)?;
+                    let Some(work_batch) =
+                        settle_recv(recv_result, &mut recv_failures, &shutdown).await?
+                    else {
+                        continue;
+                    };
                     let Some(batch) = self.ingest_workbatch(work_batch)? else {
                         continue;
                     };
-                    self.drive_block(receiver, batch, &process, &mut sink, commit).await?;
+                    self.drive_block(receiver, batch, &process, &mut sink, commit, &shutdown)
+                        .await?;
                 }
             }
         }
@@ -348,6 +493,7 @@ impl BatchEngine {
         );
 
         let mut ticker = LoopTicker::new(ticker);
+        let mut recv_failures = 0_u32;
 
         loop {
             tokio::select! {
@@ -361,12 +507,16 @@ impl BatchEngine {
                 () = ticker.wait() => ticker.fire("workbatch streaming").await,
 
                 recv_result = receiver.recv(self.config.max_chunk_size) => {
-                    let work_batch = recv_result.map_err(EngineError::Transport)?;
+                    let Some(work_batch) =
+                        settle_recv(recv_result, &mut recv_failures, &shutdown).await?
+                    else {
+                        continue;
+                    };
                     let Some(batch) = self.ingest_workbatch(work_batch)? else {
                         continue;
                     };
                     self.drive_block_streaming(
-                        receiver, batch, &process, &mut sink, commit, sub_block_bytes,
+                        receiver, batch, &process, &mut sink, commit, sub_block_bytes, &shutdown,
                     )
                     .await?;
                 }
@@ -455,6 +605,7 @@ impl BatchEngine {
         // Track the previous block's arrival instant so we can feed the AIMD
         // loop a real ingest inter-arrival interval.
         let mut last_recv: Option<std::time::Instant> = None;
+        let mut recv_failures = 0_u32;
 
         loop {
             // The recv limits bound a single poll by BOTH:
@@ -490,7 +641,11 @@ impl BatchEngine {
                         .unwrap_or_default();
                     last_recv = Some(now);
 
-                    let work_batch = recv_result.map_err(EngineError::Transport)?;
+                    let Some(work_batch) =
+                        settle_recv(recv_result, &mut recv_failures, &shutdown).await?
+                    else {
+                        continue;
+                    };
                     let block_bytes = work_batch.total_payload_bytes() as u64;
                     let Some(batch) = self.ingest_workbatch(work_batch)? else {
                         // Empty block: still fold the timing so a quiet pipeline
@@ -506,7 +661,7 @@ impl BatchEngine {
 
                     let process_start = std::time::Instant::now();
                     self.drive_block_streaming(
-                        receiver, batch, &process, &mut sink, commit, sub_block_bytes,
+                        receiver, batch, &process, &mut sink, commit, sub_block_bytes, &shutdown,
                     )
                     .await?;
                     let process_time = process_start.elapsed();
@@ -585,6 +740,7 @@ impl BatchEngine {
         );
 
         let mut ticker = LoopTicker::new(ticker);
+        let mut recv_failures = 0_u32;
 
         loop {
             tokio::select! {
@@ -598,7 +754,11 @@ impl BatchEngine {
                 () = ticker.wait() => ticker.fire("workbatch parsed").await,
 
                 recv_result = receiver.recv(self.config.max_chunk_size) => {
-                    let recv_batch = recv_result.map_err(EngineError::Transport)?;
+                    let Some(recv_batch) =
+                        settle_recv(recv_result, &mut recv_failures, &shutdown).await?
+                    else {
+                        continue;
+                    };
                     let Some(batch) = self.ingest_workbatch(recv_batch)? else {
                         continue;
                     };
@@ -610,7 +770,8 @@ impl BatchEngine {
                         let parsed = self.parse_block(b)?;
                         process_parsed(parsed)
                     };
-                    self.drive_block(receiver, batch, &parse, &mut sink, commit).await?;
+                    self.drive_block(receiver, batch, &parse, &mut sink, commit, &shutdown)
+                        .await?;
                 }
             }
         }
@@ -660,6 +821,7 @@ impl BatchEngine {
         process: &P,
         sink: &mut Sink,
         commit: CommitMode,
+        shutdown: &CancellationToken,
     ) -> Result<(), EngineError>
     where
         R: TransportReceiver,
@@ -712,43 +874,36 @@ impl BatchEngine {
             }
         }
 
-        // Sink the WHOLE out-batch. Commit only fires after this returns Ok.
+        // Sink the WHOLE out-batch. Commit only fires after it is delivered.
         //
-        // ACK BARRIER (at-least-once on an ORDERED commit): a sink failure is a
-        // TERMINAL error -- it stops the run loop. The source commit is ordered
-        // and CUMULATIVE (Kafka "commit up to offset N"); if the loop merely
-        // logged and continued, the NEXT block's commit would advance the
-        // committed watermark PAST this block's never-sent offsets, silently
-        // skipping records (data loss). Stopping the loop leaves THIS block's
-        // tokens uncommitted, so the source re-delivers from the last committed
-        // watermark on restart -- no later block can commit ahead of the
-        // failure. The app owns restart/retry policy; the engine never invents
-        // a silent skip.
+        // ACK BARRIER (at-least-once on an ORDERED commit): the source commit is
+        // CUMULATIVE (Kafka "commit up to offset N"), so no later block may be
+        // fetched and committed while this one is undelivered -- its commit
+        // would advance the watermark past this block's records. A transient
+        // sink failure therefore holds THIS block and re-sinks it with backoff;
+        // any other sink failure stops the run loop with the block uncommitted.
         // Skip the sink when there is nothing to send (e.g. every record in the
         // block was filtered out): the sink has no work, but the block's
         // commit_tokens -- which include the filtered records' acks -- must still
         // be committed below so the source advances past them. (The streaming
         // path gets this for free: a zero-record block runs zero sub-blocks and
         // still commits once at the end.)
-        if !out_batch.records.is_empty()
-            && let Err(e) = sink(&out_batch).await
-        {
-            tracing::error!(error = %e, "Sink failed (workbatch) -- terminal, stopping the run loop (ack barrier)");
-            return Err(e);
+        if !out_batch.records.is_empty() {
+            match sink_until_delivered(sink, &out_batch, shutdown).await {
+                Ok(Delivery::Sunk) => {}
+                // Uncommitted, so the source re-delivers it.
+                Ok(Delivery::Abandoned) => return Ok(()),
+                Err(e) => {
+                    tracing::error!(error = %e, "Sink failed (workbatch) -- terminal, stopping the run loop (ack barrier)");
+                    return Err(e);
+                }
+            }
         }
 
         // Commit EXACTLY the input source acks -- never the (possibly fanned-out)
         // output record count. This is the at-least-once block contract.
         match commit {
-            CommitMode::Auto => {
-                // A commit failure is ALSO a terminal ack-barrier failure: a
-                // failed ordered commit must not be followed by a later block's
-                // commit advancing the watermark past these uncommitted offsets.
-                if let Err(e) = receiver.commit(&out_batch.commit_tokens).await {
-                    tracing::error!(error = %e, "Commit failed (workbatch) -- terminal, stopping the run loop (ack barrier)");
-                    return Err(EngineError::Transport(e));
-                }
-            }
+            CommitMode::Auto => commit_or_report(receiver, &out_batch.commit_tokens).await,
             CommitMode::SinkManaged => {
                 // The sink owns the commit -- the engine does not commit here.
             }
@@ -767,15 +922,16 @@ impl BatchEngine {
     /// the high-water lease never exceeds one sub-block's bytes -- NOT the whole
     /// block.
     ///
-    /// On ANY sub-block sink error the block stops and the commit is skipped (the
-    /// WHOLE block is re-delivered -- at-least-once). The error is TERMINAL: it
-    /// propagates out and stops the run loop, so no LATER block's ordered commit
-    /// can advance the cumulative watermark past these never-committed offsets
-    /// (the ack barrier -- see [`drive_block`](Self::drive_block)). The commit
-    /// (under [`CommitMode::Auto`]) fires EXACTLY ONCE after the final
-    /// sub-block's sink returns `Ok`, with ALL the batch's input source acks; a
-    /// commit failure is likewise terminal.
+    /// A transient sub-block sink failure holds that sub-block and re-sinks it
+    /// with backoff. Any other sink failure stops the block and the run loop with
+    /// the commit skipped, so the WHOLE block is re-delivered and no LATER
+    /// block's ordered commit can advance past it (the ack barrier -- see
+    /// [`drive_block`](Self::drive_block)). The commit (under
+    /// [`CommitMode::Auto`]) fires EXACTLY ONCE after the final sub-block is
+    /// delivered, with ALL the batch's input source acks; a commit failure is
+    /// logged and counted, and the loop carries on.
     #[cfg(feature = "transport")]
+    #[allow(clippy::too_many_arguments)]
     async fn drive_block_streaming<R, P, Sink, SinkFut>(
         &self,
         receiver: &R,
@@ -784,6 +940,7 @@ impl BatchEngine {
         sink: &mut Sink,
         commit: CommitMode,
         sub_block_bytes: u64,
+        shutdown: &CancellationToken,
     ) -> Result<(), EngineError>
     where
         R: TransportReceiver,
@@ -836,28 +993,24 @@ impl BatchEngine {
                 }
             }
 
-            // Sink this sub-block. A sink error stops the block and skips the
-            // commit so the WHOLE block is re-delivered. TERMINAL (ack barrier):
-            // propagate so the run loop stops -- a later block's ordered commit
-            // must never advance the cumulative watermark past this block's
-            // uncommitted offsets.
-            if let Err(e) = sink(&out_sub).await {
-                tracing::error!(error = %e, "Sink failed (workbatch streaming) -- terminal, stopping the run loop (ack barrier)");
-                return Err(e);
+            // Sink this sub-block, holding it through a transient failure. Any
+            // other failure stops the block and the run loop uncommitted, so a
+            // later block's ordered commit never advances past it (ack barrier).
+            match sink_until_delivered(sink, &out_sub, shutdown).await {
+                Ok(Delivery::Sunk) => {}
+                // Uncommitted, so the source re-delivers the whole block.
+                Ok(Delivery::Abandoned) => return Ok(()),
+                Err(e) => {
+                    tracing::error!(error = %e, "Sink failed (workbatch streaming) -- terminal, stopping the run loop (ack barrier)");
+                    return Err(e);
+                }
             }
             // _sub_lease drops here -> bytes released before the next sub-block.
         }
 
-        // All sub-blocks sunk Ok. Commit EXACTLY the input source acks ONCE.
+        // All sub-blocks delivered. Commit EXACTLY the input source acks ONCE.
         match commit {
-            CommitMode::Auto => {
-                // Commit failure is terminal (ack barrier) -- same reasoning as
-                // the sink-error path above.
-                if let Err(e) = receiver.commit(&commit_tokens).await {
-                    tracing::error!(error = %e, "Commit failed (workbatch streaming) -- terminal, stopping the run loop (ack barrier)");
-                    return Err(EngineError::Transport(e));
-                }
-            }
+            CommitMode::Auto => commit_or_report(receiver, &commit_tokens).await,
             CommitMode::SinkManaged => {
                 // The sink owns the commit -- the engine does not commit here.
             }

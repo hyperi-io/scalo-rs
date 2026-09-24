@@ -69,6 +69,17 @@ pub enum EngineError {
     SinkManagedUnsupported,
 }
 
+#[cfg(feature = "transport")]
+impl EngineError {
+    /// Whether the run loop waits this failure out rather than stopping: a
+    /// source or downstream reporting it is busy or away
+    /// ([`TransportError::Backpressure`](crate::TransportError::Backpressure)
+    /// or [`TransportError::Timeout`](crate::TransportError::Timeout)).
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self, Self::Transport(e) if e.is_recoverable())
+    }
+}
+
 /// What a [`BatchEngine`] run loop does with inbound-filter DLQ entries
 /// ([`RecvBatch::dlq_entries`](crate::transport::RecvBatch)).
 ///

@@ -63,15 +63,14 @@ transport:
 
 - **Cancellation safety**: `recv` uses `rdkafka`'s internal poll —
   safe to drop at any `.await`, including during its outage backoff.
-- **`send_batch()`**: queues every record of the block, then awaits all the
-  delivery reports, so the block costs about one `linger.ms` window rather
-  than one per record. Outbound filters apply per record before queueing.
-  The result is `Ok` only when every record was confirmed or filtered;
-  otherwise it is the first `Backpressured`/`Fatal` in record order, and any
-  subset of the block may already be on the broker -- retry the whole block
-  (at-least-once). Records carry their `key` as the topic and no headers.
-- **`is_healthy()`**: an `AtomicBool` flipped to `false` by `close()` only. It never probes the broker, and a broker outage does not flip it.
-- **`commit()`**: synchronous (`CommitMode::Sync`), so a broker rejection reaches the caller. `commit_weak_async()` is the fire-and-forget form.
+- **`send_batch()`**: queues the whole block, then awaits every delivery
+  report, so the block costs about one `linger.ms` window. Outbound filters
+  apply per record first. `Ok` means every record was confirmed or filtered;
+  otherwise it is the first `Backpressured`/`Fatal` in record order and part
+  of the block may be on the broker -- retry it whole (at-least-once).
+  Records carry their `key` as the topic and no headers.
+- **`is_healthy()`**: `false` after `close()` only; a broker outage does not flip it.
+- **`commit()`**: synchronous (`CommitMode::Sync`) on tokio's blocking pool, so a broker rejection reaches the caller. `commit_weak_async()` is the fire-and-forget form.
 
 ### Broker outages
 
@@ -79,13 +78,11 @@ librdkafka reconnects and rejoins by itself, so an outage ends neither the consu
 
 | Call | Broker unavailable | Returned as an error |
 |------|--------------------|----------------------|
-| `recv` | Empty batch; the next poll waits a jittered backoff, 100 ms doubling to 2 s | Auth or ACL failure, a missing topic the consumer may not create, bad config, a librdkafka fatal error: `TransportError::Recv` |
+| `recv` | Empty batch; the next poll waits a jittered backoff, 100 ms doubling to 2 s | ACL failure, a missing topic the consumer may not create, bad config, a librdkafka fatal error, an unlisted code: `TransportError::Recv` |
 | `send` / `send_batch` | `Backpressured` once the queue stays full 5 s or a record outlives `message.timeout.ms` (default 300 s) | ACL or permanent topic error: `Fatal`; oversize record: `FilteredDlq` |
-| `commit` | Not covered: waits for the coordinator, then fails | `TransportError::Commit`, terminal in the `BatchEngine` driver |
+| `commit` | Retried with the same backoff for up to 60 s, never after `close()` | Once that runs out, or when a newer group generation owns the partitions: `TransportError::Commit`, which the `BatchEngine` driver logs and carries on from |
 
-`classify_recv_failure` in [classify.rs](../../src/transport/kafka/classify.rs) lists the transient poll errors. A missing topic is transient only with `allow.auto.create.topics: "true"` in `librdkafka_overrides`; `_PARTITION_EOF` is not an error. A permanent error met mid-drain comes back on the next `recv`, after the drained records.
-
-`transport_recv_errors_total{transport="kafka",class}` counts poll errors as `transient` or `permanent`. An outage logs one warning at the start and `kafka consume resumed` when records flow again.
+An auth or TLS failure is permanent only until the credentials first work (a broker `UP`, or a record); after that it is a restarting broker. [classify.rs](../../src/transport/kafka/classify.rs) lists the transient codes; an unlisted code is permanent and logged by name. A missing topic is transient only with `allow.auto.create.topics: "true"`. A permanent error met mid-drain comes back on the next `recv`, after the drained records. Counters: [../core-pillars/metrics.md](../core-pillars/metrics.md).
 
 Source: [../../src/transport/kafka/](../../src/transport/kafka/).
 

@@ -106,6 +106,15 @@ pub mod sensitive;
 #[cfg(any(feature = "transport", feature = "worker-batch"))]
 pub(crate) mod parse_guard;
 
+// Retry backoff, compiled only with a feature that retries.
+#[cfg(any(
+    feature = "otel-metrics",
+    feature = "otel-tracing",
+    feature = "transport-kafka",
+    all(feature = "worker-batch", feature = "transport")
+))]
+pub(crate) mod backoff;
+
 #[cfg(feature = "runtime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 pub mod runtime;

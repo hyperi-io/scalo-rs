@@ -82,6 +82,23 @@ async fn create_topic(bootstrap: &str) {
         .create_topics(&[(TOPIC, 1, 1)])
         .await
         .expect("create topic");
+    // A consumer that subscribes before the broker's metadata lists the new
+    // topic is told it does not exist, which ends it.
+    tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while admin
+            .describe_topic(TOPIC)
+            .map_or(true, |t| t.partition_count == 0)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "topic {TOPIC} never appeared in the broker's metadata"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+    .await
+    .expect("metadata wait");
 }
 
 fn consumer_config(bootstrap: &str, group: &str, protocol: ConsumerProtocol) -> KafkaConfig {
@@ -225,6 +242,52 @@ async fn a_consumer_rides_out_a_broker_outage() {
 #[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_classic_consumer_rides_out_a_broker_outage() {
     ride_out_an_outage(ConsumerProtocol::Classic, "outage-classic").await;
+}
+
+/// A commit caught by an outage retries for its window and then reports the
+/// failure, rather than holding the caller until the broker returns; the
+/// consumer carries on once it does.
+#[tokio::test]
+#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
+async fn a_commit_during_an_outage_reports_instead_of_hanging() {
+    let (node, bootstrap) = start_kafka().await;
+    create_topic(&bootstrap).await;
+    let producer = raw_producer(&bootstrap);
+    let consumer = KafkaTransport::new(&consumer_config(
+        &bootstrap,
+        "outage-commit",
+        ConsumerProtocol::Consumer,
+    ))
+    .await
+    .expect("kafka consumer");
+
+    let before = produce(&producer, "before").await;
+    let tokens = consume_all(&consumer, &before, Duration::from_secs(60)).await;
+
+    node.stop_with_timeout(Some(0))
+        .await
+        .expect("stop the broker");
+    let started = Instant::now();
+    let result = consumer.commit(&tokens).await;
+    let took = started.elapsed();
+    eprintln!("commit during the outage returned {result:?} after {took:?}");
+    assert!(
+        matches!(result, Err(TransportError::Commit(_))),
+        "a commit the broker never answered must be reported, got {result:?}"
+    );
+    // The 60 s retry window plus one synchronous attempt still in flight.
+    assert!(
+        took < Duration::from_secs(150),
+        "commit held the caller for {took:?}"
+    );
+
+    (*node).start().await.expect("restart the broker");
+    let after = produce(&producer, "after").await;
+    let tokens = consume_all(&consumer, &after, Duration::from_secs(120)).await;
+    consumer
+        .commit(&tokens)
+        .await
+        .expect("commit after the outage");
 }
 
 /// A topic that does not exist, with the consumer barred from creating it, is

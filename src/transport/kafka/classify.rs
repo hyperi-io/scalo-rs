@@ -29,6 +29,8 @@ use rdkafka::types::RDKafkaErrorCode;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::backoff::Backoff;
+
 /// What a caller should do about a failed Kafka produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendFailure {
@@ -97,31 +99,47 @@ pub(crate) enum RecvFailure {
     /// A broker, network, coordinator or group-membership condition that
     /// librdkafka recovers from by itself. The caller keeps polling.
     Transient,
-    /// Retrying cannot help -- authentication, authorisation, a missing topic,
-    /// invalid configuration, or an error librdkafka flags as fatal.
+    /// Retrying cannot help -- authentication on first contact, authorisation,
+    /// a missing topic, invalid configuration, or an error flagged fatal.
     Permanent,
+    /// A code this module does not classify. Treated as permanent, and logged
+    /// by name so it can be classified.
+    Unclassified,
+}
+
+/// What the consumer knows when it classifies a poll failure.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RecvContext {
+    /// The consumer's `allow.auto.create.topics`: only with it on does a
+    /// missing topic clear without operator action.
+    pub(crate) auto_create_topics: bool,
+    /// Whether this consumer has reached a broker with its credentials before.
+    /// An authentication or TLS failure after that is most likely a restarting
+    /// broker; before it, a misconfiguration that should fail fast.
+    pub(crate) credentials_proven: bool,
 }
 
 /// Classify a consume-side failure returned by a poll.
-///
-/// `auto_create_topics` is the consumer's `allow.auto.create.topics`: only with
-/// it on does a missing topic clear without operator action.
-pub(crate) fn classify_recv_failure(err: &KafkaError, auto_create_topics: bool) -> RecvFailure {
+pub(crate) fn classify_recv_failure(err: &KafkaError, ctx: RecvContext) -> RecvFailure {
     match err {
         KafkaError::PartitionEOF(_) => RecvFailure::EndOfPartition,
         // librdkafka raises the fatal flag when the client can no longer be used.
         KafkaError::MessageConsumptionFatal(_) => RecvFailure::Permanent,
-        _ => {
-            match err.rdkafka_error_code() {
-                Some(code) if is_retryable(code) || is_consumer_retryable(code) => {
-                    RecvFailure::Transient
-                }
-                Some(
-                    RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic,
-                ) if auto_create_topics => RecvFailure::Transient,
-                _ => RecvFailure::Permanent,
+        _ => match err.rdkafka_error_code() {
+            Some(code) if is_retryable(code) || is_consumer_retryable(code) => {
+                RecvFailure::Transient
             }
-        }
+            Some(RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic)
+                if ctx.auto_create_topics =>
+            {
+                RecvFailure::Transient
+            }
+            Some(code) if is_auth_failure(code) && ctx.credentials_proven => RecvFailure::Transient,
+            Some(code) if is_auth_failure(code) || is_recv_permanent(code) => {
+                RecvFailure::Permanent
+            }
+            _ => RecvFailure::Unclassified,
+        },
     }
 }
 
@@ -153,18 +171,68 @@ fn is_consumer_retryable(code: RDKafkaErrorCode) -> bool {
     )
 }
 
-/// First wait after a transient poll failure.
-const RECV_BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// Authentication and TLS handshake failures: permanent on first contact,
+/// transient once the same credentials have worked.
+fn is_auth_failure(code: RDKafkaErrorCode) -> bool {
+    matches!(
+        code,
+        RDKafkaErrorCode::Authentication
+            | RDKafkaErrorCode::SSL
+            | RDKafkaErrorCode::SaslAuthenticationFailed
+            | RDKafkaErrorCode::IllegalSASLState
+            | RDKafkaErrorCode::UnsupportedSASLMechanism
+    )
+}
 
-/// Ceiling on the wait between failing polls, kept far inside
-/// `max.poll.interval.ms` so the backoff can never evict the member.
-const RECV_BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// Consume-side codes that need operator action whatever the consumer's history.
+fn is_recv_permanent(code: RDKafkaErrorCode) -> bool {
+    matches!(
+        code,
+        // Authorisation: an ACL has to change.
+        RDKafkaErrorCode::TopicAuthorizationFailed
+            | RDKafkaErrorCode::GroupAuthorizationFailed
+            | RDKafkaErrorCode::ClusterAuthorizationFailed
+            // Missing topic or partition.
+            | RDKafkaErrorCode::UnknownTopicOrPartition
+            | RDKafkaErrorCode::UnknownTopic
+            | RDKafkaErrorCode::UnknownPartition
+            // Configuration the broker or client refuses.
+            | RDKafkaErrorCode::InvalidArgument
+            | RDKafkaErrorCode::InvalidConfig
+            | RDKafkaErrorCode::InvalidGroupId
+            | RDKafkaErrorCode::InvalidSessionTimeout
+            | RDKafkaErrorCode::InconsistentGroupProtocol
+            | RDKafkaErrorCode::UnsupportedVersion
+            | RDKafkaErrorCode::UnsupportedFeature
+            | RDKafkaErrorCode::UnsupportedAssignor
+            // The client is finished or replaced.
+            | RDKafkaErrorCode::Fatal
+            | RDKafkaErrorCode::Fenced
+            | RDKafkaErrorCode::FencedInstanceId
+            // Offsets the operator chose not to reset automatically.
+            | RDKafkaErrorCode::AutoOffsetReset
+            | RDKafkaErrorCode::OffsetOutOfRange
+            | RDKafkaErrorCode::LogTruncation
+    )
+}
 
-/// Jitter applied either side of the wait, as a percentage.
-const RECV_BACKOFF_JITTER_PCT: u64 = 20;
-
-/// Consecutive failures after which the wait stops doubling; bounds the shift.
-const RECV_BACKOFF_MAX_DOUBLINGS: u32 = 16;
+/// Whether a failed synchronous commit can succeed if it is retried.
+///
+/// The generation-fencing codes are excluded: they mean the offsets belong to
+/// an assignment this member no longer holds, so no retry can land them.
+pub(crate) fn commit_is_retryable(err: &KafkaError) -> bool {
+    err.rdkafka_error_code().is_some_and(|code| {
+        is_retryable(code)
+            || matches!(
+                code,
+                RDKafkaErrorCode::WaitingForCoordinator
+                    | RDKafkaErrorCode::CoordinatorLoadInProgress
+                    | RDKafkaErrorCode::RebalanceInProgress
+                    | RDKafkaErrorCode::TimedOutQueue
+                    | RDKafkaErrorCode::Retry
+            )
+    })
+}
 
 /// Poll-failure state for one consumer: counts transient failures, spaces the
 /// polls that follow them, and reports an outage once rather than per poll.
@@ -173,6 +241,8 @@ pub(crate) struct RecvState {
     /// Transient failures since the last record arrived; drives the backoff.
     consecutive: AtomicU32,
     degraded: DegradedLatch,
+    /// Set by the first record, which proves the credentials were accepted.
+    received: AtomicBool,
 }
 
 impl RecvState {
@@ -194,17 +264,27 @@ impl RecvState {
         }
     }
 
-    /// Report the first record after a run of transient failures.
+    /// Note a received record: report the first after a run of transient
+    /// failures, and remember that the credentials work.
     pub(crate) fn record_success(&self) {
+        // Load first: this runs once per poll and the flag is set only once.
+        if !self.received.load(Ordering::Relaxed) {
+            self.received.store(true, Ordering::Relaxed);
+        }
         if self.degraded.clear() {
             let failures = self.consecutive.swap(0, Ordering::Relaxed);
             tracing::info!(failures, "kafka consume resumed");
         }
     }
 
+    /// Whether a record has ever arrived on this consumer.
+    pub(crate) fn has_received(&self) -> bool {
+        self.received.load(Ordering::Relaxed)
+    }
+
     /// How long to wait before the next poll after the current run of failures.
     pub(crate) fn backoff(&self) -> Duration {
-        recv_backoff(self.consecutive.load(Ordering::Relaxed))
+        Backoff::TRANSIENT.delay(self.consecutive.load(Ordering::Relaxed))
     }
 
     /// Transient failures in the current run.
@@ -214,9 +294,18 @@ impl RecvState {
     }
 }
 
-/// Count a permanent poll failure; the caller receives and logs the error.
-pub(crate) fn record_permanent_recv_failure() {
+/// Count a poll failure that ends the consumer, and name a code this module
+/// does not classify so it can be added.
+pub(crate) fn record_permanent_recv_failure(err: &KafkaError, class: RecvFailure) {
     count_recv_error("permanent");
+    if class == RecvFailure::Unclassified {
+        tracing::error!(
+            code = ?err.rdkafka_error_code(),
+            error = %err,
+            "kafka consume failed with a librdkafka code the transport does not classify; \
+             treating it as permanent"
+        );
+    }
 }
 
 /// Count one poll failure by class.
@@ -230,35 +319,6 @@ fn count_recv_error(class: &'static str) {
     .increment(1);
     #[cfg(not(feature = "metrics"))]
     let _ = class;
-}
-
-/// Exponential wait for the `failures`-th consecutive transient failure, with
-/// jitter, never above [`RECV_BACKOFF_MAX`].
-fn recv_backoff(failures: u32) -> Duration {
-    let doublings = failures.saturating_sub(1).min(RECV_BACKOFF_MAX_DOUBLINGS);
-    let wait = RECV_BACKOFF_BASE
-        .saturating_mul(2_u32.saturating_pow(doublings))
-        .min(RECV_BACKOFF_MAX);
-    // Clamped again: jitter widens either side, so a wait at the ceiling could pass it.
-    jitter(wait).min(RECV_BACKOFF_MAX)
-}
-
-/// Spread a wait by +/-[`RECV_BACKOFF_JITTER_PCT`] so consumers that lost the
-/// same broker do not poll it in lockstep.
-///
-/// Seeded from the clock rather than an RNG: two processes only need different
-/// offsets, which does not justify a dependency.
-fn jitter(base: Duration) -> Duration {
-    let base_millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
-    let span = base_millis / 100 * RECV_BACKOFF_JITTER_PCT;
-    if span == 0 {
-        return base;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()));
-    let offset = nanos % (span * 2);
-    Duration::from_millis(base_millis.saturating_add(offset).saturating_sub(span))
 }
 
 /// Edge latch for a sustained failure, so an outage logs once instead of once
@@ -462,6 +522,18 @@ mod tests {
 
     // ---- consume side ------------------------------------------------------
 
+    /// A consumer that has not yet reached a broker with its credentials.
+    const FIRST_CONTACT: RecvContext = RecvContext {
+        auto_create_topics: false,
+        credentials_proven: false,
+    };
+
+    /// A consumer whose credentials a broker has already accepted.
+    const PROVEN: RecvContext = RecvContext {
+        auto_create_topics: false,
+        credentials_proven: true,
+    };
+
     #[test]
     fn an_unavailable_broker_never_ends_the_consumer() {
         // Each of these ended a running pipeline when every poll error was
@@ -493,7 +565,7 @@ mod tests {
         ] {
             let err = KafkaError::MessageConsumption(code);
             assert_eq!(
-                classify_recv_failure(&err, false),
+                classify_recv_failure(&err, FIRST_CONTACT),
                 RecvFailure::Transient,
                 "{code:?} should keep the consumer polling"
             );
@@ -519,7 +591,7 @@ mod tests {
         ] {
             let err = KafkaError::MessageConsumption(code);
             assert_eq!(
-                classify_recv_failure(&err, false),
+                classify_recv_failure(&err, FIRST_CONTACT),
                 RecvFailure::Permanent,
                 "{code:?} should end the consumer"
             );
@@ -527,84 +599,160 @@ mod tests {
     }
 
     #[test]
-    fn the_fatal_flag_wins_over_a_transient_code() {
-        // librdkafka can flag any code fatal; the client is unusable after it.
-        let err = KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::BrokerTransportFailure);
-        assert_eq!(classify_recv_failure(&err, false), RecvFailure::Permanent);
-        assert_eq!(classify_recv_failure(&err, true), RecvFailure::Permanent);
-    }
-
-    #[test]
-    fn a_missing_topic_clears_only_when_the_consumer_may_create_it() {
+    fn an_auth_failure_fails_fast_on_first_contact() {
+        // Nothing has accepted these credentials yet: a misconfiguration.
         for code in [
-            RDKafkaErrorCode::UnknownTopicOrPartition,
-            RDKafkaErrorCode::UnknownTopic,
+            RDKafkaErrorCode::Authentication,
+            RDKafkaErrorCode::SSL,
+            RDKafkaErrorCode::SaslAuthenticationFailed,
+            RDKafkaErrorCode::IllegalSASLState,
+            RDKafkaErrorCode::UnsupportedSASLMechanism,
         ] {
             let err = KafkaError::MessageConsumption(code);
-            assert_eq!(classify_recv_failure(&err, false), RecvFailure::Permanent);
-            assert_eq!(classify_recv_failure(&err, true), RecvFailure::Transient);
+            assert_eq!(
+                classify_recv_failure(&err, FIRST_CONTACT),
+                RecvFailure::Permanent,
+                "{code:?} on first contact should end the consumer"
+            );
         }
-        // Auto-create never excuses an authorisation failure.
+    }
+
+    #[test]
+    fn an_auth_failure_after_the_credentials_worked_is_a_restarting_broker() {
+        for code in [
+            RDKafkaErrorCode::Authentication,
+            RDKafkaErrorCode::SSL,
+            RDKafkaErrorCode::SaslAuthenticationFailed,
+            RDKafkaErrorCode::IllegalSASLState,
+            RDKafkaErrorCode::UnsupportedSASLMechanism,
+        ] {
+            let err = KafkaError::MessageConsumption(code);
+            assert_eq!(
+                classify_recv_failure(&err, PROVEN),
+                RecvFailure::Transient,
+                "{code:?} after the credentials worked should keep the consumer polling"
+            );
+        }
+        // Authorisation is an ACL decision, not a restart, so it stays permanent.
         let denied = KafkaError::MessageConsumption(RDKafkaErrorCode::TopicAuthorizationFailed);
-        assert_eq!(classify_recv_failure(&denied, true), RecvFailure::Permanent);
-    }
-
-    #[test]
-    fn end_of_partition_is_not_a_failure() {
         assert_eq!(
-            classify_recv_failure(&KafkaError::PartitionEOF(3), false),
-            RecvFailure::EndOfPartition
-        );
-    }
-
-    #[test]
-    fn a_poll_error_carrying_no_code_is_permanent() {
-        assert_eq!(
-            classify_recv_failure(&KafkaError::Canceled, false),
+            classify_recv_failure(&denied, PROVEN),
             RecvFailure::Permanent
         );
     }
 
     #[test]
-    fn recv_backoff_doubles_and_stops_at_the_ceiling() {
-        // Jitter is +/-20%, so compare against the band rather than a point.
-        let first = recv_backoff(1);
-        let second = recv_backoff(2);
-        assert!(
-            first >= Duration::from_millis(80) && first <= Duration::from_millis(120),
-            "first wait {first:?} outside the band around 100ms"
+    fn the_fatal_flag_wins_over_a_transient_code() {
+        // librdkafka can flag any code fatal; the client is unusable after it.
+        let err = KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::BrokerTransportFailure);
+        assert_eq!(
+            classify_recv_failure(&err, FIRST_CONTACT),
+            RecvFailure::Permanent
         );
-        assert!(
-            second >= Duration::from_millis(160) && second <= Duration::from_millis(240),
-            "second wait {second:?} outside the band around 200ms"
-        );
-        for failures in [6_u32, 50, u32::MAX] {
-            let wait = recv_backoff(failures);
-            assert!(
-                wait <= RECV_BACKOFF_MAX,
-                "wait {wait:?} after {failures} failures exceeded the ceiling"
+        assert_eq!(classify_recv_failure(&err, PROVEN), RecvFailure::Permanent);
+    }
+
+    #[test]
+    fn a_missing_topic_clears_only_when_the_consumer_may_create_it() {
+        let may_create = RecvContext {
+            auto_create_topics: true,
+            credentials_proven: false,
+        };
+        for code in [
+            RDKafkaErrorCode::UnknownTopicOrPartition,
+            RDKafkaErrorCode::UnknownTopic,
+        ] {
+            let err = KafkaError::MessageConsumption(code);
+            assert_eq!(
+                classify_recv_failure(&err, FIRST_CONTACT),
+                RecvFailure::Permanent
             );
+            assert_eq!(
+                classify_recv_failure(&err, may_create),
+                RecvFailure::Transient
+            );
+        }
+        // Auto-create never excuses an authorisation failure.
+        let denied = KafkaError::MessageConsumption(RDKafkaErrorCode::TopicAuthorizationFailed);
+        assert_eq!(
+            classify_recv_failure(&denied, may_create),
+            RecvFailure::Permanent
+        );
+    }
+
+    #[test]
+    fn end_of_partition_is_not_a_failure() {
+        assert_eq!(
+            classify_recv_failure(&KafkaError::PartitionEOF(3), FIRST_CONTACT),
+            RecvFailure::EndOfPartition
+        );
+    }
+
+    #[test]
+    fn an_unlisted_code_is_unclassified_and_ends_the_consumer_by_name() {
+        // Unclassified is handled as permanent, with its own log line.
+        for err in [
+            KafkaError::MessageConsumption(RDKafkaErrorCode::BadMessage),
+            KafkaError::MessageConsumption(RDKafkaErrorCode::InvalidRecord),
+            KafkaError::Canceled,
+        ] {
+            assert_eq!(
+                classify_recv_failure(&err, PROVEN),
+                RecvFailure::Unclassified,
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_commit_is_retried_only_while_the_offsets_can_still_land() {
+        for code in [
+            RDKafkaErrorCode::WaitingForCoordinator,
+            RDKafkaErrorCode::CoordinatorNotAvailable,
+            RDKafkaErrorCode::NotCoordinator,
+            RDKafkaErrorCode::CoordinatorLoadInProgress,
+            RDKafkaErrorCode::RebalanceInProgress,
+            RDKafkaErrorCode::RequestTimedOut,
+            RDKafkaErrorCode::BrokerTransportFailure,
+            RDKafkaErrorCode::AllBrokersDown,
+        ] {
             assert!(
-                wait >= RECV_BACKOFF_MAX * 4 / 5,
-                "wait {wait:?} after {failures} failures fell below the ceiling band"
+                commit_is_retryable(&KafkaError::ConsumerCommit(code)),
+                "{code:?} should be retried"
+            );
+        }
+        // A new generation owns the partitions: retrying cannot land these offsets.
+        for code in [
+            RDKafkaErrorCode::IllegalGeneration,
+            RDKafkaErrorCode::UnknownMemberId,
+            RDKafkaErrorCode::FencedMemberEpoch,
+            RDKafkaErrorCode::StaleMemberEpoch,
+            RDKafkaErrorCode::GroupAuthorizationFailed,
+        ] {
+            assert!(
+                !commit_is_retryable(&KafkaError::ConsumerCommit(code)),
+                "{code:?} should not be retried"
             );
         }
     }
 
     #[test]
     fn recv_state_backs_off_through_an_outage_and_resets_on_recovery() {
+        let ceiling = Duration::from_secs(2);
         let state = RecvState::default();
         let err = KafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown);
         for _ in 0..10 {
             state.record_transient(&err);
         }
         assert!(
-            state.backoff() >= RECV_BACKOFF_MAX * 4 / 5,
+            state.backoff() >= ceiling * 4 / 5 && state.backoff() <= ceiling,
             "a sustained outage backs off to the ceiling, got {:?}",
             state.backoff()
         );
         assert!(!state.degraded.enter(), "the outage stays latched");
+        assert!(!state.has_received());
         state.record_success();
+        assert!(state.has_received(), "a record proves the credentials");
         assert_eq!(state.consecutive.load(Ordering::Relaxed), 0);
         assert!(
             state.backoff() <= Duration::from_millis(120),
