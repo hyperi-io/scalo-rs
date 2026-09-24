@@ -37,6 +37,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::statistics::Statistics;
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Kafka metrics snapshot. Mirrors the Python `KafkaMetrics` dataclass.
 #[derive(Debug, Clone, Default)]
@@ -113,6 +114,9 @@ pub struct StatsContext {
     latest_metrics: RwLock<KafkaMetrics>,
     /// Broker-side delivery outcomes, when this context drives a producer.
     delivery: super::classify::DeliveryState,
+    /// Set once statistics report a broker `UP`, which librdkafka reaches only
+    /// after the TLS and SASL handshakes succeed.
+    connected: AtomicBool,
 }
 
 impl Default for StatsContext {
@@ -129,7 +133,14 @@ impl StatsContext {
             stats: RwLock::new(None),
             latest_metrics: RwLock::new(KafkaMetrics::default()),
             delivery: super::classify::DeliveryState::default(),
+            connected: AtomicBool::new(false),
         }
+    }
+
+    /// Whether any broker has ever reached `UP`, meaning this client's
+    /// credentials were accepted at least once.
+    pub(crate) fn has_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
     }
 
     /// Messages the broker refused or never acknowledged.
@@ -234,6 +245,11 @@ impl StatsContext {
 
 impl ClientContext for StatsContext {
     fn stats(&self, statistics: Statistics) {
+        if !self.connected.load(Ordering::Relaxed)
+            && statistics.brokers.values().any(|b| b.state == "UP")
+        {
+            self.connected.store(true, Ordering::Relaxed);
+        }
         let metrics = Self::convert_stats(&statistics);
 
         if let Ok(mut lock) = self.latest_metrics.write() {

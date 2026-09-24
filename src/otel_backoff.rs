@@ -26,21 +26,15 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::backoff::Backoff;
+
 /// Ceiling on the wait between attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(900);
-
-/// Jitter applied either side of the computed wait, as a percentage.
-const JITTER_PCT: u64 = 20;
-
-/// Consecutive failures after which the wait stops doubling.
-///
-/// Bounds the shift so the doubling cannot overflow.
-const MAX_DOUBLINGS: u32 = 16;
 
 /// Tracks consecutive export failures and how long to stay quiet.
 #[derive(Debug)]
 pub(crate) struct BackoffGate {
-    base: Duration,
+    schedule: Backoff,
     state: Mutex<GateState>,
 }
 
@@ -57,7 +51,7 @@ impl BackoffGate {
     /// A gate whose first wait after a failure is `base`.
     pub(crate) fn new(base: Duration) -> Self {
         Self {
-            base: base.max(Duration::from_millis(100)),
+            schedule: Backoff::new(base.max(Duration::from_millis(100)), MAX_BACKOFF),
             state: Mutex::new(GateState {
                 consecutive_failures: 0,
                 blocked_until: None,
@@ -124,14 +118,7 @@ impl BackoffGate {
 
     /// Exponential wait for the given failure count, with jitter.
     fn wait_for(&self, failures: u32) -> Duration {
-        let doublings = failures.saturating_sub(1).min(MAX_DOUBLINGS);
-        let scaled = self
-            .base
-            .saturating_mul(2_u32.saturating_pow(doublings))
-            .min(MAX_BACKOFF);
-        // Clamped again after jitter: jitter widens either side, so applying
-        // it to a value already at the ceiling would push past it.
-        jitter(scaled).min(MAX_BACKOFF)
+        self.schedule.delay(failures)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
@@ -139,25 +126,6 @@ impl BackoffGate {
         // adjusting counters; the numbers are advisory, so carry on with them.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
-}
-
-/// Spread a wait by +/-[`JITTER_PCT`] so a fleet does not retry in lockstep.
-///
-/// Seeded from the wall clock rather than an RNG: the only requirement is
-/// that two processes do not pick the same offset, and no dependency should
-/// be added for that.
-fn jitter(base: Duration) -> Duration {
-    let base_millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
-    let span = base_millis / 100 * JITTER_PCT;
-    if span == 0 {
-        return base;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()));
-    let offset = nanos % (span * 2);
-    let millis = base_millis.saturating_add(offset).saturating_sub(span);
-    Duration::from_millis(millis)
 }
 
 /// Wraps the OTLP metric exporter so failures back off.

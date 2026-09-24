@@ -108,6 +108,14 @@ impl ServiceMetrics {
             "transport_received_events_total",
             "Events received off the transport (ingress count)"
         );
+        metrics::describe_counter!(
+            "transport_recv_errors_total",
+            "Receive failures by class (transient: retried, permanent: returned)"
+        );
+        metrics::describe_counter!(
+            "transport_commit_errors_total",
+            "Source commits that failed after the block was delivered"
+        );
 
         // Push transport descriptors into manifest registry
         for (name, desc, mt) in [
@@ -151,6 +159,11 @@ impl ServiceMetrics {
                 "Messages currently in-flight (sent but not acked)",
                 MetricType::Gauge,
             ),
+            (
+                "transport_commit_errors_total",
+                "Source commits that failed after the block was delivered",
+                MetricType::Counter,
+            ),
         ] {
             reg.push(MetricDescriptor {
                 name: name.into(),
@@ -164,6 +177,18 @@ impl ServiceMetrics {
                 dashboard_hint: None,
             });
         }
+        reg.push(MetricDescriptor {
+            name: "transport_recv_errors_total".into(),
+            metric_type: MetricType::Counter,
+            description: "Receive failures by class (transient: retried, permanent: returned)"
+                .into(),
+            unit: String::new(),
+            labels: vec!["transport".into(), "class".into()],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
         reg.push(MetricDescriptor {
             name: "transport_send_duration_seconds".into(),
             metric_type: MetricType::Histogram,
@@ -218,6 +243,22 @@ impl ServiceMetrics {
             "pipeline_idle",
             "Service has no work configured (1=idle, 0=working)"
         );
+        metrics::describe_counter!(
+            "pipeline_retries_total",
+            "Run-loop steps retried after a transient source or sink failure"
+        );
+
+        reg.push(MetricDescriptor {
+            name: "pipeline_retries_total".into(),
+            metric_type: MetricType::Counter,
+            description: "Run-loop steps retried after a transient source or sink failure".into(),
+            unit: String::new(),
+            labels: vec!["stage".into()],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
 
         reg.push(MetricDescriptor {
             name: "pipeline_idle".into(),
@@ -614,6 +655,22 @@ mod tests {
             .find(|m| m.name == "test_app_auth_failures_total")
             .unwrap();
         assert_eq!(auth.labels, vec!["reason"]);
+        // Outage metrics carry the label each emitter sets.
+        for (name, labels) in [
+            (
+                "test_app_transport_recv_errors_total",
+                vec!["transport", "class"],
+            ),
+            ("test_app_transport_commit_errors_total", vec!["transport"]),
+            ("test_app_pipeline_retries_total", vec!["stage"]),
+        ] {
+            let found = manifest
+                .metrics
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the manifest"));
+            assert_eq!(found.labels, labels, "{name}");
+        }
     }
 
     #[tokio::test]

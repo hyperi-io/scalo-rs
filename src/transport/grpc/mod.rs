@@ -334,6 +334,34 @@ impl GrpcTransport {
     }
 }
 
+/// Whether a failed RPC means the server is down or busy rather than refusing
+/// the request.
+///
+/// A transient code qualifies, and so does any status carrying a source error:
+/// tonic attaches one only when the client's own connection failed, so the
+/// server never answered. A status the server sent carries none.
+/// `DeadlineExceeded` is `send_timeout_ms` firing on a slow or hung server.
+fn downstream_unavailable(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::ResourceExhausted | tonic::Code::DeadlineExceeded
+    ) || std::error::Error::source(status).is_some()
+}
+
+/// The send result for a failed RPC: backpressure while the server is down or
+/// busy, so the caller retries rather than drops.
+fn failed_rpc_result(status: &tonic::Status) -> SendResult {
+    if downstream_unavailable(status) {
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_backpressured_total", "transport" => "grpc").increment(1);
+        SendResult::Backpressured
+    } else {
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_send_errors_total", "transport" => "grpc").increment(1);
+        SendResult::Fatal(TransportError::Send(status.message().to_string()))
+    }
+}
+
 impl TransportSender for GrpcTransport {
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
@@ -400,30 +428,7 @@ impl TransportSender for GrpcTransport {
                 }
                 SendResult::Ok
             }
-            Err(status) => match status.code() {
-                // Transient -- backpressure so the caller retries, not drop.
-                // DeadlineExceeded = send_timeout_ms fired (slow/hung server).
-                tonic::Code::Unavailable
-                | tonic::Code::ResourceExhausted
-                | tonic::Code::DeadlineExceeded => {
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!(
-                        "transport_backpressured_total",
-                        "transport" => "grpc"
-                    )
-                    .increment(1);
-                    SendResult::Backpressured
-                }
-                _ => {
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!(
-                        "transport_send_errors_total",
-                        "transport" => "grpc"
-                    )
-                    .increment(1);
-                    SendResult::Fatal(TransportError::Send(status.message().to_string()))
-                }
-            },
+            Err(status) => failed_rpc_result(&status),
         };
 
         #[cfg(feature = "metrics")]
@@ -573,28 +578,7 @@ impl TransportSender for GrpcTransport {
                     SendResult::Ok
                 }
             }
-            Err(status) => match status.code() {
-                tonic::Code::Unavailable
-                | tonic::Code::ResourceExhausted
-                | tonic::Code::DeadlineExceeded => {
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!(
-                        "transport_backpressured_total",
-                        "transport" => "grpc"
-                    )
-                    .increment(1);
-                    SendResult::Backpressured
-                }
-                _ => {
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!(
-                        "transport_send_errors_total",
-                        "transport" => "grpc"
-                    )
-                    .increment(1);
-                    SendResult::Fatal(TransportError::Send(status.message().to_string()))
-                }
-            },
+            Err(status) => failed_rpc_result(&status),
         };
 
         #[cfg(feature = "metrics")]
@@ -1138,5 +1122,86 @@ mod tests {
         // Close
         transport.close().await.unwrap();
         assert!(!transport.is_healthy());
+    }
+
+    /// A loopback endpoint whose peer dies on every connection, optionally
+    /// after reading the client's first bytes.
+    async fn dying_endpoint(read_first: bool) -> std::net::SocketAddr {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                if read_first {
+                    let mut buf = [0_u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                }
+                drop(stream);
+            }
+        });
+        addr
+    }
+
+    /// A server that dies mid-connection is down, not refusing the request:
+    /// both shapes returned Fatal before, which ended the sender over an outage.
+    #[tokio::test]
+    async fn a_server_dying_mid_connection_is_backpressure_not_fatal() {
+        for read_first in [false, true] {
+            let addr = dying_endpoint(read_first).await;
+            let client = GrpcTransport::new(&GrpcConfig::client(&format!("http://{addr}")))
+                .await
+                .unwrap();
+            let one = client.send("topic", bytes::Bytes::from_static(b"{}")).await;
+            assert!(
+                one.is_backpressured(),
+                "send, read_first={read_first}: got {one:?}"
+            );
+            let rec = Record {
+                payload: bytes::Bytes::from_static(b"{}"),
+                key: None,
+                headers: Vec::new(),
+                metadata: crate::transport::work_batch::RecordMeta {
+                    timestamp_ms: None,
+                    format: PayloadFormat::Json,
+                },
+            };
+            let batch = client.send_batch(&[rec]).await;
+            assert!(
+                batch.is_backpressured(),
+                "send_batch, read_first={read_first}: got {batch:?}"
+            );
+        }
+    }
+
+    /// A status the server sent is its answer and keeps its code's meaning; a
+    /// status tonic raised for the client's own connection is an outage.
+    #[test]
+    fn only_transient_codes_and_connection_failures_are_backpressure() {
+        for status in [
+            tonic::Status::unavailable("down"),
+            tonic::Status::resource_exhausted("full"),
+            tonic::Status::deadline_exceeded("slow"),
+            tonic::Status::from_error(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset by peer",
+            ))),
+        ] {
+            assert!(
+                failed_rpc_result(&status).is_backpressured(),
+                "{status:?} should be retried"
+            );
+        }
+        for status in [
+            tonic::Status::invalid_argument("bad record"),
+            tonic::Status::permission_denied("no"),
+            tonic::Status::unknown("server bug"),
+            tonic::Status::internal("server bug"),
+        ] {
+            assert!(
+                failed_rpc_result(&status).is_fatal(),
+                "{status:?} is the server's answer and should stay fatal"
+            );
+        }
     }
 }

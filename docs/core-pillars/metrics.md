@@ -155,6 +155,18 @@ Graph volume with a rate query, e.g. egress bytes/sec by backend:
 sum by (transport) (rate(transport_sent_bytes_total[1m]))
 ```
 
+### Outages
+
+A source or sink that goes away is waited out rather than ending the app, and these count what that cost:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `transport_recv_errors_total` | `transport`, `class` | receive failures; `class="transient"` were retried, `class="permanent"` were returned. Kafka emits it |
+| `transport_commit_errors_total` | `transport` | source commits that failed after the block was delivered; the `BatchEngine` driver counts them and carries on |
+| `pipeline_retries_total` | `stage` | `BatchEngine` run-loop steps retried after a transient failure, `stage` being `recv` or `sink` |
+
+A rising `transport_recv_errors_total{class="transient"}` or `pipeline_retries_total` with flat throughput is an outage being ridden out. Behaviour per backend: [../transport/backends.md](../transport/backends.md).
+
 ---
 
 ## Endpoints
