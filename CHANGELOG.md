@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.7](https://github.com/hyperi-io/scalo-rs/compare/v2.12.6...v2.12.7) (2026-09-24)
+
+### Bug Fixes
+
+* **transport:** a transient broker outage no longer ends the consumer ([#177](https://github.com/hyperi-io/scalo-rs/issues/177)) ([2aabeb3](https://github.com/hyperi-io/scalo-rs/commit/2aabeb3e415cfb7fc7084c08d01cbb598b5a8416)), closes [#176](https://github.com/hyperi-io/scalo-rs/issues/176) [#176](https://github.com/hyperi-io/scalo-rs/issues/176)
+* **transport:** bind http test receivers on port 0 with no rebind race ([#175](https://github.com/hyperi-io/scalo-rs/issues/175)) ([07c693f](https://github.com/hyperi-io/scalo-rs/commit/07c693f8be99cf0eef114097f608ede04fba5e2d))
+
 ## [2.12.6](https://github.com/hyperi-io/scalo-rs/compare/v2.12.5...v2.12.6) (2026-09-24)
 
 ### Bug Fixes
