@@ -22,6 +22,12 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 | Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic — per-table (`acme.auth` → `acme.auth.dlq`) or single common topic |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
 
+After a refused write the file backend reopens its file on a later
+write, waiting 250 ms and doubling up to 30 s while writes keep failing.
+So a deleted file or a restored directory recovers without a restart. It
+never recreates a missing directory, because that could put the DLQ on
+the filesystem under an unmounted volume.
+
 Backends are concrete variants of a `DlqBackend` enum (static
 dispatch, no `Box<dyn>`, no `async-trait` macro). Adding a new backend
 means extending the enum in scalo — consumers never construct backend
@@ -47,19 +53,48 @@ need every entry mirrored to two destinations.
 ## Queue-admission semantics
 
 `send` / `try_send` return as soon as the entry is on the in-memory
-queue — **not** when it's durably written. This is the queue-admission
-contract:
+queue -- **not** when a backend has it. `flush` is the barrier that
+says whether the backends took everything:
 
 ```rust
 dlq.send(entry).await?;     // queued (non-blocking)
-dlq.flush().await?;          // wait for the drain to flush every entry
-                             // queued before this barrier
+dlq.flush().await?;         // every entry queued before this call is
+                            // written, and no write was refused
 ```
 
-For at-least-once guarantees against backend failure, the caller
-must `flush().await` before declaring the entry safe. Most callers
-don't need to — DLQ delivery is best-effort by design and the drain
-will eventually flush.
+`flush()` returns once the drain has written every entry queued before
+the call. It returns `Ok` only if every batch the drain wrote since the
+previous `flush()` was accepted by a backend. That covers all three
+write triggers: a full batch (`batch_size`), the `flush_interval_ms`
+tick, and the batch the barrier itself writes.
+
+If every backend refused a batch, the next `flush()` returns
+`Err(DlqError::File(..))`. The drain does not retry refused entries.
+They are counted in `dropped()` and in
+`dlq_dropped_total{reason="backends_failed"}`.
+
+A refusal is reported once. The first barrier the drain processes after
+it returns the error, and the `flush()` after that starts clean. With
+concurrent callers, the other barriers return `Ok`.
+
+A `flush()` dropped before its ack, such as by a timeout around it, does
+not consume the error. The next `flush()` returns it.
+
+What "accepted" means depends on the backend:
+
+| Backend | Accepted means |
+|---------|----------------|
+| File | Written to the kernel page cache. No `fsync`, so power loss before write-back can still lose it |
+| Kafka | Queued to the producer. `flush()` does not wait for the broker to acknowledge it, and a delivery the broker later refuses is not reported by `flush()` or `dropped()` |
+| HTTP | The endpoint returned a 2xx status |
+
+An entry refused at admission (`try_send` returning `QueueFull`) never
+reached the queue, so `flush()` does not cover it -- `dropped()` does.
+
+For at-least-once handling, `flush().await` before treating a dead
+letter as safe, and read `Err` as "entries written since the last flush
+were lost". Most callers don't need to -- DLQ delivery is best-effort
+by design and the drain will eventually write.
 
 `try_send` returns `Err(DlqError::QueueFull)` immediately when the
 in-memory queue is full (`Overflow::Drop`). The drop counter is
@@ -115,7 +150,7 @@ Earlier releases exposed `Dlq::file_only` / `Dlq::with_kafka` constructors
 and a `DlqBackend` trait object. Both are gone — every backend mix now goes
 through `Dlq::spawn` with `DlqMode` selecting routing, and `DlqBackend` is an
 enum (static dispatch). The orchestrator gained `try_send` (non-blocking,
-`QueueFull` on overflow), `flush` (durable-write barrier), and `shutdown`
+`QueueFull` on overflow), `flush` (write barrier), and `shutdown`
 (drain + join). `send` semantics changed from "wait for durable write" to
 queue-admission — see [Queue-admission semantics](#queue-admission-semantics).
 
@@ -132,7 +167,7 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 | `try_send(entry) -> Result<(), DlqError>` | Sync-shape queue submission; `QueueFull` on overflow |
 | `send(entry).await` | Async submission that awaits queue space |
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
-| `flush().await` | Barrier — wait until every entry queued before this call is durably written |
+| `flush().await` | Barrier -- wait until every entry queued before this call is written; `Err` if any batch written since the previous flush was refused by every backend (see [Queue-admission semantics](#queue-admission-semantics)) |
 | `shutdown().await` | Wait for drain task to exit cleanly |
 | `is_enabled() / mode() / pending() / dropped()` | Introspection — `dropped()` totals queue overflow + disabled-DLQ sends + batches every backend refused (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
 | `DlqEntry::new(service, error_type, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_metadata(...)` | Entry builder |

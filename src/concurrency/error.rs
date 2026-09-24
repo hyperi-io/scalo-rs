@@ -30,11 +30,12 @@ pub enum SinkError {
     #[error("background sink actor has exited")]
     Closed,
 
-    /// A drain implementation reported an error during a batch write.
-    /// The actor logs + counts these and continues; this variant is
-    /// only surfaced if the caller asks the sink for a propagated error
-    /// (rare -- drain failures are usually observed via the
-    /// `<prefix>_write_errors_total` metric).
+    /// A drain batch write or `flush_durable` failed.
+    /// [`super::BackgroundSink::flush`] returns the first such failure
+    /// since the previous flush, whether the write was size-, tick-,
+    /// shutdown- or barrier-triggered. The actor logs every failed batch
+    /// write, counts it in `<prefix>_write_errors_total` when a metric
+    /// prefix is set, and keeps draining.
     #[error("drain failure: {0}")]
     Drain(#[from] DrainError),
 }
