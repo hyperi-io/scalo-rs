@@ -35,7 +35,7 @@ The Kafka backend queues entries to the producer on every write and learns their
 
 - The wait runs on tokio's blocking pool, so a slow or absent broker holds no runtime worker. It lasts up to 30 s, plus up to 5 s when it has to purge.
 - A delivery the broker refused since the previous `flush()` fails this one and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
-- Entries still unacknowledged after 30 s are purged from the producer, so they cannot land later, and are counted the same way.
+- Entries still unacknowledged after 30 s are purged from the producer and counted the same way. The purge bounds the wait, but an entry already in flight to a stalled broker, not a dead one, can still be written after it. So under a stalled broker `dropped()` is an upper bound, and a caller that re-places entries reported lost can write duplicates to the DLQ topic. It never under-reports.
 - `Cascade`: when Kafka queues part of a batch and refuses the rest (an entry over the producer's `message.max.bytes`, say), only the rest goes on to the next backend.
 - `FanOut`: a Kafka loss counts only for entries no other backend took. When one barrier covers both kinds and Kafka lost some, the loss is charged to the entries Kafka held alone first, so the count can overstate the loss but never understate it.
 

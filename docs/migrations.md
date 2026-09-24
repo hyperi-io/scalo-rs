@@ -620,7 +620,7 @@ A refusal is reported once: the first flush after it returns the error and the n
 `Dlq::flush()` over the Kafka backend now returns once the broker has acknowledged every entry the barrier covers, waiting up to 30 s on tokio's blocking pool. Before, `Ok` meant queued to the producer: the drain never ran a backend's durable flush, and a delivery the broker refused reached neither `flush()` nor `dropped()`. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
 
 - A delivery the broker refused since the previous flush fails the flush with `Err(DlqError::File(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
-- Entries still unacknowledged after 30 s are purged from the producer, so they cannot land later, and counted the same way. The purge adds up to 5 s.
+- Entries still unacknowledged after 30 s are purged from the producer and counted the same way. The purge adds up to 5 s. An entry in flight to a stalled broker at the purge can still be written, so under a stalled broker `dropped()` is an upper bound and re-placing entries reported lost can duplicate them on the DLQ topic. It never under-reports.
 - `Cascade`: when Kafka queues part of a batch and refuses the rest, only the rest goes to the next backend. Before, the whole batch did, so the file held a second copy of the part Kafka took.
 - `FanOut`: a Kafka loss counts only for entries no other backend holds.
 

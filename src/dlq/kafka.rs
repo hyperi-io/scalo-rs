@@ -166,9 +166,10 @@ impl KafkaDlqInner {
     /// Kafka holds.
     ///
     /// The wait runs on the blocking pool for up to 30 s. Whatever is still
-    /// unacked then is purged, so it cannot land after being reported lost,
-    /// which adds up to 5 s. The loss is taken by the drain through
-    /// `take_durable_losses`.
+    /// unacked then is purged, which adds up to 5 s, and counted as lost. An
+    /// entry in flight to a stalled broker at the purge can still be written,
+    /// so the count can overstate the loss but never understates it. The loss
+    /// is taken by the drain through `take_durable_losses`.
     ///
     /// # Errors
     ///

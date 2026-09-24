@@ -367,7 +367,7 @@ impl KafkaProducer {
     }
 
     /// Discard every message still queued or in flight. Each gets a failed
-    /// delivery report, so it cannot land later.
+    /// delivery report, but one already in flight can still reach the broker.
     #[cfg(feature = "dlq-kafka")]
     pub(crate) fn purge_outstanding(&self) {
         self.producer
