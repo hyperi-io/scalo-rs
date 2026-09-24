@@ -22,16 +22,24 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 | Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic — per-table (`acme.auth` → `acme.auth.dlq`) or single common topic |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
 
-After a refused write the file backend reopens its file on a later
-write, waiting 250 ms and doubling up to 30 s while writes keep failing.
-So a deleted file or a restored directory recovers without a restart. It
-never recreates a missing directory, because that could put the DLQ on
-the filesystem under an unmounted volume.
+After a refused write the file backend reopens its file on a later write, waiting 250 ms and doubling up to 30 s while writes keep failing. So a deleted file or a restored directory recovers without a restart. It never recreates a missing directory, because that could put the DLQ on the filesystem under an unmounted volume. While its file is missing it refuses writes before they reach `file-rotate`, whose rotation would otherwise panic -- an abort in a `panic = "abort"` service.
 
 Backends are concrete variants of a `DlqBackend` enum (static
 dispatch, no `Box<dyn>`, no `async-trait` macro). Adding a new backend
 means extending the enum in scalo — consumers never construct backend
 types directly.
+
+### The Kafka barrier
+
+The Kafka backend queues entries to the producer on every write and learns their fate only from the broker, so `flush()` waits for the broker's acks -- `acks=all` unless the sizing surface turns idempotence off:
+
+- The wait runs on tokio's blocking pool, so a slow or absent broker holds no runtime worker. It lasts up to 30 s, plus up to 5 s when it has to purge.
+- A delivery the broker refused since the previous `flush()` fails this one and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
+- Entries still unacknowledged after 30 s are purged from the producer, so they cannot land later, and are counted the same way.
+- `Cascade`: when Kafka queues part of a batch and refuses the rest (an entry over the producer's `message.max.bytes`, say), only the rest goes on to the next backend.
+- `FanOut`: a Kafka loss counts only for entries no other backend took. When one barrier covers both kinds and Kafka lost some, the loss is charged to the entries Kafka held alone first, so the count can overstate the loss but never understate it.
+
+Delivery failures are read at the barrier. A caller that never calls `flush()` sees them in `transport_send_errors_total{transport="kafka"}` and the producer's WARN log, not in `dropped()`.
 
 ---
 
@@ -44,9 +52,7 @@ types directly.
 | `FileOnly` | File backend only — no Kafka dependency |
 | `KafkaOnly` | Kafka backend only |
 
-Cascade is the production default — Kafka primary, file fallback for
-when the broker is unreachable. FanOut is for compliance setups that
-need every entry mirrored to two destinations.
+Cascade is the production default -- Kafka primary, file fallback for entries the producer refuses to queue: a full producer queue, or an entry over its `message.max.bytes`. An unreachable broker is not one of them. The producer queues regardless, so those entries never reach the file, and the next `flush()` reports them lost (see [The Kafka barrier](#the-kafka-barrier)). FanOut is for compliance setups that need every entry mirrored to two destinations, and is the mode that keeps a copy on disk through a broker outage.
 
 ---
 
@@ -85,8 +91,8 @@ What "accepted" means depends on the backend:
 | Backend | Accepted means |
 |---------|----------------|
 | File | Written to the kernel page cache. No `fsync`, so power loss before write-back can still lose it |
-| Kafka | Queued to the producer. `flush()` does not wait for the broker to acknowledge it, and a delivery the broker later refuses is not reported by `flush()` or `dropped()` |
-| HTTP | The endpoint returned a 2xx status |
+| Kafka | Acknowledged by the broker, under the producer's `acks` setting. The barrier waits up to 30 s -- see [The Kafka barrier](#the-kafka-barrier) |
+| HTTP | The endpoint returned a 2xx status. The barrier adds no wait: the write already waited for the response |
 
 An entry refused at admission (`try_send` returning `QueueFull`) never
 reached the queue, so `flush()` does not cover it -- `dropped()` does.
@@ -113,6 +119,8 @@ then exits. Triggered by either:
 
 Then `Dlq::shutdown().await` joins the drain task. Idempotent — safe
 to call from any clone.
+
+Shutdown does not wait for the broker. Entries the Kafka producer still holds when the drain exits are discarded without being counted in `dropped()`, so call `flush()` before `shutdown()`.
 
 ---
 
@@ -167,9 +175,9 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 | `try_send(entry) -> Result<(), DlqError>` | Sync-shape queue submission; `QueueFull` on overflow |
 | `send(entry).await` | Async submission that awaits queue space |
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
-| `flush().await` | Barrier -- wait until every entry queued before this call is written; `Err` if any batch written since the previous flush was refused by every backend (see [Queue-admission semantics](#queue-admission-semantics)) |
+| `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka; `Err` if any batch written since the previous flush was refused by every backend, or Kafka lost entries only it held (see [Queue-admission semantics](#queue-admission-semantics)) |
 | `shutdown().await` | Wait for drain task to exit cleanly |
-| `is_enabled() / mode() / pending() / dropped()` | Introspection — `dropped()` totals queue overflow + disabled-DLQ sends + batches every backend refused (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
+| `is_enabled() / mode() / pending() / dropped()` | Introspection — `dropped()` totals queue overflow + disabled-DLQ sends + batches every backend refused + Kafka entries a barrier found lost (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
 | `DlqEntry::new(service, error_type, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_metadata(...)` | Entry builder |
 | `DlqSource::kafka(topic, partition, offset) / ::http(url) / ...` | Provenance for the entry |
 | `DlqBackend` (enum) | `File / Kafka / Http` — feature-gated variants |

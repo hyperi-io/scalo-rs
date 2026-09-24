@@ -48,6 +48,10 @@ const REOPEN_BACKOFF_MIN: Duration = Duration::from_millis(250);
 /// Longest wait between reopen attempts while writes keep failing.
 const REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Retention ceiling in days; `file-rotate`'s age check panics on a
+/// `DateTime` underflow past about 95 million.
+const MAX_AGE_DAYS_CEILING: u32 = 1_000_000;
+
 /// NDJSON file writer with automatic rotation and metrics.
 ///
 /// Each line written is expected to be a complete JSON object (NDJSON format).
@@ -56,6 +60,10 @@ const REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// After a failed write the writer reopens its target on a later write, with
 /// backoff, so a deleted file or a restored directory stops refusing writes
 /// before the next rotation. It never recreates a missing directory.
+///
+/// A write is refused, before it reaches `file-rotate`, while the current
+/// file is missing: a rotation in that state panics inside `file-rotate`,
+/// which aborts a service built with `panic = "abort"`.
 pub struct NdjsonWriter {
     writer: Mutex<RotatingTarget>,
     config: FileWriterConfig,
@@ -105,7 +113,7 @@ fn open_rotating(file_path: &Path, config: &FileWriterConfig) -> FileRotate<Appe
         RotationPeriod::Daily => ContentLimit::Time(file_rotate::TimeFrequency::Daily),
     };
 
-    let max_age = chrono::Duration::days(i64::from(config.max_age_days));
+    let max_age = chrono::Duration::days(i64::from(config.max_age_days.min(MAX_AGE_DAYS_CEILING)));
     let suffix_scheme = AppendTimestamp::default(FileLimit::Age(max_age));
 
     let compression = if config.compress_rotated {
@@ -115,6 +123,18 @@ fn open_rotating(file_path: &Path, config: &FileWriterConfig) -> FileRotate<Appe
     };
 
     FileRotate::new(file_path, suffix_scheme, content_limit, compression, None)
+}
+
+/// Refuse a directory `FileRotate::new` would panic on: it unwraps
+/// `create_dir_all` and `read_dir` on the directory it writes into.
+fn ensure_dir_usable(dir: &Path) -> Result<(), std::io::Error> {
+    if !std::fs::metadata(dir)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    std::fs::read_dir(dir).map(drop)
 }
 
 impl std::fmt::Debug for NdjsonWriter {
@@ -143,7 +163,8 @@ impl NdjsonWriter {
     ///
     /// # Errors
     ///
-    /// Returns `std::io::Error` if the output directory cannot be created.
+    /// Returns `std::io::Error` if the output directory cannot be created
+    /// or listed, or `filename` names no file (`..`, say).
     pub fn new(
         config: &FileWriterConfig,
         subdir: &str,
@@ -151,9 +172,16 @@ impl NdjsonWriter {
         label: &str,
     ) -> Result<Self, std::io::Error> {
         let dir = config.path.join(subdir);
-        std::fs::create_dir_all(&dir)?;
-
         let file_path = dir.join(filename);
+        // `file-rotate` expects a final path component and panics without one.
+        if file_path.file_name().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{label} writer filename {filename:?} names no file"),
+            ));
+        }
+        std::fs::create_dir_all(&dir)?;
+        ensure_dir_usable(&dir)?;
         let file = open_rotating(&file_path, config);
 
         debug!(
@@ -189,11 +217,12 @@ impl NdjsonWriter {
         target.schedule_next_reopen(now);
         // A missing directory may be an unmounted volume; recreating it would
         // write the DLQ onto whatever filesystem sits underneath.
-        if !self.output_path.is_dir() {
+        if let Err(e) = ensure_dir_usable(&self.output_path) {
             warn!(
                 label = %self.label,
                 path = %self.output_path.display(),
-                "{} writer directory missing; not reopening",
+                error = %e,
+                "{} writer directory unusable; not reopening",
                 self.label,
             );
             return;
@@ -202,13 +231,34 @@ impl NdjsonWriter {
         debug!(label = %self.label, path = %self.file_path.display(), "{} writer reopened", self.label);
     }
 
+    /// Refuse a write while the current file is missing: `file-rotate`
+    /// panics when a rotation finds its directory gone or cannot create the file.
+    fn ensure_target_present(&self) -> Result<(), std::io::Error> {
+        match std::fs::metadata(&self.file_path) {
+            Ok(meta) if meta.is_file() => Ok(()),
+            Ok(_) => Err(std::io::Error::other(format!(
+                "{} writer target {} is not a regular file",
+                self.label,
+                self.file_path.display()
+            ))),
+            Err(e) => Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{} writer target {} unusable, write refused: {e}",
+                    self.label,
+                    self.file_path.display()
+                ),
+            )),
+        }
+    }
+
     /// Write `bytes` through the rotating file and confirm they reached the target.
     fn write_through(&self, bytes: &[u8]) -> Result<(), std::io::Error> {
         let mut target = self.writer.lock();
         self.reopen_if_due(&mut target);
-        let result = target
-            .file
-            .write_all(bytes)
+        let result = self
+            .ensure_target_present()
+            .and_then(|()| target.file.write_all(bytes))
             .and_then(|()| target.file.flush())
             .and_then(|()| self.verify_write_landed());
         match result {
@@ -493,7 +543,7 @@ mod tests {
         std::fs::write(dir.path().join("gone"), b"not a directory").expect("plant file");
 
         let err = writer.write_line(b"{\"msg\":\"lost\"}\n").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory);
         assert_eq!(writer.lines_written(), 0);
         assert_eq!(writer.write_errors(), 1);
     }
@@ -548,6 +598,174 @@ mod tests {
 
         assert!(!dir.path().join("gone").exists());
         assert_eq!(writer.write_errors(), 2);
+    }
+
+    /// Restores a directory's mode on drop, so the tempdir is removed after a panic too.
+    #[cfg(unix)]
+    struct ModeGuard(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl ModeGuard {
+        fn set(path: &std::path::Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            Self(path.to_path_buf())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// A writer whose current file was last written two days ago, so its next
+    /// write crosses the daily rotation boundary.
+    fn writer_due_to_rotate(config: &FileWriterConfig, subdir: &str) -> NdjsonWriter {
+        let dir = config.path.join(subdir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let file = std::fs::File::create(dir.join("out.ndjson")).expect("create file");
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86_400))
+            .expect("age the file");
+        drop(file);
+        NdjsonWriter::new(config, subdir, "out.ndjson", "dlq").expect("create")
+    }
+
+    #[test]
+    fn test_rotation_into_a_directory_replaced_by_a_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = writer_due_to_rotate(&test_config(dir.path()), "swap");
+
+        std::fs::remove_dir_all(dir.path().join("swap")).expect("remove dir");
+        std::fs::write(dir.path().join("swap"), b"not a directory").expect("plant file");
+
+        writer.write_line(b"{\"n\":1}\n").unwrap_err();
+        writer.write_line(b"{\"n\":2}\n").unwrap_err();
+        assert_eq!(writer.write_errors(), 2);
+        assert_eq!(writer.lines_written(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rotation_into_a_read_only_directory_is_refused_then_recovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = writer_due_to_rotate(&test_config(dir.path()), "ro");
+        let target = dir.path().join("ro");
+
+        std::fs::remove_file(target.join("out.ndjson")).expect("remove file");
+        let guard = ModeGuard::set(&target, 0o555);
+        writer.write_line(b"{\"n\":1}\n").unwrap_err();
+
+        drop(guard);
+        std::thread::sleep(REOPEN_BACKOFF_MIN);
+        writer
+            .write_line(b"{\"n\":2}\n")
+            .expect("write once the directory is writable again");
+        let content = std::fs::read_to_string(target.join("out.ndjson")).expect("read");
+        assert_eq!(content, "{\"n\":2}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rotation_after_the_directory_and_its_parent_went_away_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = writer_due_to_rotate(&test_config(dir.path()), "parent/child");
+        let parent = dir.path().join("parent");
+
+        std::fs::remove_dir_all(parent.join("child")).expect("remove dir");
+        let _guard = ModeGuard::set(&parent, 0o555);
+
+        writer.write_line(b"{\"n\":1}\n").unwrap_err();
+        assert!(!parent.join("child").exists());
+    }
+
+    #[test]
+    fn test_rotation_does_not_recreate_a_removed_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = writer_due_to_rotate(&test_config(dir.path()), "gone");
+
+        std::fs::remove_dir_all(dir.path().join("gone")).expect("remove dir");
+
+        writer.write_line(b"{\"n\":1}\n").unwrap_err();
+        assert!(
+            !dir.path().join("gone").exists(),
+            "a rotation must not recreate a directory that may be an unmounted volume"
+        );
+    }
+
+    #[test]
+    fn test_rotation_with_an_unbounded_max_age_does_not_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = FileWriterConfig {
+            max_age_days: u32::MAX,
+            ..test_config(dir.path())
+        };
+        let writer = writer_due_to_rotate(&config, "forever");
+
+        writer.write_line(b"{\"n\":1}\n").expect("rotate and write");
+        let content = std::fs::read_to_string(dir.path().join("forever/out.ndjson")).expect("read");
+        assert_eq!(content, "{\"n\":1}\n");
+    }
+
+    /// True when this process can list a directory it has no read permission on.
+    #[cfg(unix)]
+    fn reads_past_permissions(dir: &std::path::Path) -> bool {
+        let probe = dir.join("probe");
+        std::fs::create_dir(&probe).expect("create probe");
+        let _guard = ModeGuard::set(&probe, 0o300);
+        std::fs::read_dir(&probe).is_ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_writer_on_an_unreadable_directory_is_refused_at_construction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        if reads_past_permissions(dir.path()) {
+            eprintln!("skipping: this process reads directories regardless of their mode");
+            return;
+        }
+        let target = dir.path().join("wo");
+        std::fs::create_dir(&target).expect("create dir");
+        let _guard = ModeGuard::set(&target, 0o300);
+
+        let err = NdjsonWriter::new(&test_config(dir.path()), "wo", "out.ndjson", "dlq")
+            .expect_err("an unreadable directory is refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_writer_does_not_reopen_into_an_unreadable_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        if reads_past_permissions(dir.path()) {
+            eprintln!("skipping: this process reads directories regardless of their mode");
+            return;
+        }
+        let config = test_config(dir.path());
+        let writer = NdjsonWriter::new(&config, "wo", "out.ndjson", "dlq").expect("create");
+        let target = dir.path().join("wo");
+
+        std::fs::remove_file(target.join("out.ndjson")).expect("remove file");
+        writer.write_line(b"{\"n\":1}\n").unwrap_err();
+        let guard = ModeGuard::set(&target, 0o300);
+        std::thread::sleep(REOPEN_BACKOFF_MIN);
+        writer.write_line(b"{\"n\":2}\n").unwrap_err();
+
+        drop(guard);
+        std::thread::sleep(REOPEN_BACKOFF_MIN * 2);
+        writer
+            .write_line(b"{\"n\":3}\n")
+            .expect("write once the directory is readable again");
+    }
+
+    #[test]
+    fn test_writer_refuses_a_filename_with_no_final_component() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = NdjsonWriter::new(&test_config(dir.path()), "svc", "..", "dlq")
+            .expect_err("a filename of `..` names no file");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

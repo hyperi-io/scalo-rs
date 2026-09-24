@@ -17,10 +17,19 @@
 //!
 //! - **Per-table**: Destination `acme.auth` -> topic `acme.auth.dlq`
 //! - **Common**: All failures -> single common topic (e.g. `acme.dlq`)
+//!
+//! ## Durability
+//!
+//! `send_batch` only queues to the producer. The barrier's `flush_durable`
+//! waits for the broker's acks, purges what is still unacked after
+//! `ACK_WAIT`, and charges the delivery failures to the entries Kafka
+//! held alone -- see `docs/pipeline/dlq.md`, "The Kafka barrier".
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::transport::KafkaConfig;
 use crate::transport::kafka::{KafkaProducer, ProducerProfile};
@@ -29,14 +38,29 @@ use super::config::{DlqRouting, KafkaDlqConfig};
 use super::entry::DlqEntry;
 use super::error::DlqError;
 
+/// How long a barrier waits for the broker to ack everything queued.
+const ACK_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a barrier waits for the reports of the messages it purged.
+const PURGE_REPORT_WAIT: Duration = Duration::from_secs(5);
+
 /// Kafka backend -- internal variant carried by [`super::DlqBackend::Kafka`].
 pub struct KafkaDlqInner {
-    producer: KafkaProducer,
+    /// Shared with the blocking task a barrier waits on.
+    producer: Arc<KafkaProducer>,
     routing: DlqRouting,
     topic_suffix: String,
     common_topic: String,
     entries_written: AtomicU64,
     write_errors: AtomicU64,
+    /// Queued entries no other backend holds, whose fate no barrier has counted.
+    sole_custody: u64,
+    /// Entries the last `send_batch` queued before it failed.
+    queued_before_failure: usize,
+    /// Producer delivery failures already charged by a barrier.
+    failures_seen: u64,
+    /// Entries the last barrier found lost, until the drain takes them.
+    durable_losses: u64,
 }
 
 impl std::fmt::Debug for KafkaDlqInner {
@@ -71,13 +95,18 @@ impl KafkaDlqInner {
             "Kafka DLQ backend initialised"
         );
 
+        let failures_seen = producer.delivery_failures();
         Ok(Self {
-            producer,
+            producer: Arc::new(producer),
             routing: dlq_config.routing,
             topic_suffix: dlq_config.topic_suffix.clone(),
             common_topic: dlq_config.common_topic.clone(),
             entries_written: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
+            sole_custody: 0,
+            queued_before_failure: 0,
+            failures_seen,
+            durable_losses: 0,
         })
     }
 
@@ -94,7 +123,18 @@ impl KafkaDlqInner {
     /// Send a batch. Per-entry topic resolution + non-blocking producer
     /// queue. The producer's background delivery thread does the network
     /// I/O -- `send()` is sync-shaped and returns immediately.
+    ///
+    /// On `Err` the entries before the one that failed are already queued;
+    /// `queued_before_failure` says how many.
     pub async fn send_batch(&mut self, batch: &[DlqEntry]) -> Result<(), DlqError> {
+        let mut queued = 0;
+        let result = self.enqueue(batch, &mut queued);
+        self.sole_custody += queued as u64;
+        self.queued_before_failure = if result.is_err() { queued } else { 0 };
+        result
+    }
+
+    fn enqueue(&self, batch: &[DlqEntry], queued: &mut usize) -> Result<(), DlqError> {
         for entry in batch {
             let topic = self.resolve_topic(entry);
             let payload = serde_json::to_vec(entry)
@@ -102,6 +142,7 @@ impl KafkaDlqInner {
 
             match self.producer.send(&topic, None, &payload) {
                 Ok(()) => {
+                    *queued += 1;
                     self.entries_written.fetch_add(1, Ordering::Relaxed);
                     debug!(topic = %topic, reason = %entry.reason, "DLQ entry queued to Kafka");
                 }
@@ -120,32 +161,73 @@ impl KafkaDlqInner {
         Ok(())
     }
 
-    /// Block until every entry queued by `send_batch` is acked by the
-    /// broker (per the producer's `acks` config). `send_batch` is
-    /// sync-shaped -- without this flush the orchestrator barrier would
-    /// ack `Dlq::flush()` callers while entries are merely queued, not
-    /// durable.
+    /// Wait for the broker to ack every queued entry, then charge the
+    /// delivery failures since the previous barrier to the entries only
+    /// Kafka holds.
+    ///
+    /// The wait runs on the blocking pool for up to 30 s. Whatever is still
+    /// unacked then is purged, so it cannot land after being reported lost,
+    /// which adds up to 5 s. The loss is taken by the drain through
+    /// `take_durable_losses`.
     ///
     /// # Errors
     ///
-    /// `DlqError::Kafka` when the flush timeout expires with messages
-    /// still outstanding. Returning `Ok(())` regardless would let a
-    /// process exit lose in-flight entries.
+    /// `DlqError::Kafka` when any entry only Kafka held was refused by the
+    /// broker or purged, or the blocking task failed.
     pub async fn flush_durable(&mut self) -> Result<(), DlqError> {
-        // Bounded wait -- typical producer flush completes in
-        // milliseconds; a 30s ceiling avoids wedging the actor on a
-        // hard-to-reach broker.
-        let outstanding = self.producer.flush(std::time::Duration::from_secs(30));
-        if outstanding > 0 {
+        let producer = Arc::clone(&self.producer);
+        let drained = tokio::task::spawn_blocking(move || {
+            if producer.drain_within(ACK_WAIT) {
+                return true;
+            }
+            producer.purge_outstanding();
+            producer.drain_within(PURGE_REPORT_WAIT)
+        })
+        .await
+        .map_err(|e| DlqError::Kafka(format!("DLQ durable flush task failed: {e}")))?;
+
+        let failures = self.producer.delivery_failures();
+        let failed = failures.saturating_sub(self.failures_seen);
+        self.failures_seen = failures;
+        let lost = failed.min(self.sole_custody);
+        // Unreported entries stay in custody for the next barrier to charge.
+        self.sole_custody = if drained { 0 } else { self.sole_custody - lost };
+        self.durable_losses += lost;
+
+        if failed > lost {
             debug!(
-                outstanding,
-                "Kafka DLQ flush timed out with messages still in flight"
+                failed,
+                lost, "Kafka lost DLQ entries another backend also holds"
             );
+        }
+        if !drained {
+            warn!(
+                pending = self.sole_custody,
+                "Kafka DLQ entries purged but not yet reported; the next flush counts them"
+            );
+        }
+        if lost > 0 {
             return Err(DlqError::Kafka(format!(
-                "flush_durable timed out with {outstanding} messages still in flight"
+                "{lost} DLQ entries lost: the broker refused them or did not ack within {}s",
+                ACK_WAIT.as_secs()
             )));
         }
         Ok(())
+    }
+
+    /// Entries the last failed `send_batch` queued before it stopped.
+    pub(crate) fn queued_before_failure(&self) -> usize {
+        self.queued_before_failure
+    }
+
+    /// Record that another backend also holds `entries` of the last batch.
+    pub(crate) fn share_custody(&mut self, entries: usize) {
+        self.sole_custody = self.sole_custody.saturating_sub(entries as u64);
+    }
+
+    /// Entries the barriers since the last call found lost.
+    pub(crate) fn take_durable_losses(&mut self) -> u64 {
+        std::mem::take(&mut self.durable_losses)
     }
 
     /// Number of entries successfully queued.

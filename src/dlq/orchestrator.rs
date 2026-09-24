@@ -21,8 +21,8 @@
 //!
 //! ## Modes
 //!
-//! - `Cascade` / `FileOnly` / `KafkaOnly` -- try backends in order,
-//!   stop on first success.
+//! - `Cascade` / `FileOnly` / `KafkaOnly` -- try backends in order;
+//!   each entry goes to the first backend that takes it.
 //! - `FanOut` -- send to all backends, succeed if any succeed.
 //!
 //! ## Shutdown
@@ -242,7 +242,8 @@ impl Dlq {
     }
 
     /// Total entries dropped since spawn: queue overflow, sends into a
-    /// disabled DLQ, and batches every backend refused.
+    /// disabled DLQ, batches every backend refused, and entries a flush
+    /// found only Kafka held and lost.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.sink.as_ref().map_or(0, BackgroundSink::dropped) + self.lost.load(Ordering::Relaxed)
@@ -302,17 +303,19 @@ impl Dlq {
     /// call, and report whether any of those writes was refused.
     ///
     /// `Ok` means every batch the drain wrote since the previous flush was
-    /// accepted by a backend. A refused batch is reported by the first
-    /// flush after it and not again; it is also counted in
-    /// [`Dlq::dropped`]. What "accepted" means per backend is in
-    /// `docs/pipeline/dlq.md`.
+    /// accepted by a backend. For the Kafka backend accepted means acked by
+    /// the broker: the flush waits up to 30 s for that, off the runtime, and
+    /// entries only Kafka held that were refused or never acked count as
+    /// refused. A refused batch is reported by the first flush after it and
+    /// not again; it is also counted in [`Dlq::dropped`]. What "accepted"
+    /// means per backend is in `docs/pipeline/dlq.md`.
     ///
     /// # Errors
     ///
     /// `File` if every backend refused a batch written since the previous
-    /// flush, whether the write was size-, tick- or barrier-triggered.
-    /// `Closed` if the drain has exited before this barrier was
-    /// processed.
+    /// flush, whether the write was size-, tick- or barrier-triggered, or
+    /// the Kafka backend lost entries no other backend holds. `Closed` if
+    /// the drain has exited before this barrier was processed.
     pub async fn flush(&self) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
             return Ok(());
@@ -415,21 +418,90 @@ struct DlqDrain {
 }
 
 impl DlqDrain {
-    /// Count and shout a batch the actor is about to discard because every
-    /// backend refused it.
-    fn note_lost(&self, count: usize) {
+    /// Count and shout dead letters no backend holds: a batch every backend
+    /// refused, or entries a barrier found only Kafka held and lost.
+    fn note_lost(&self, count: u64) {
         if count == 0 {
             return;
         }
-        let count = count as u64;
         let total = self.lost.fetch_add(count, Ordering::Relaxed) + count;
         ::metrics::counter!("dlq_dropped_total", "reason" => "backends_failed").increment(count);
         if drop_log_due(&self.lost_log_ms, DROP_LOG_INTERVAL_MS) {
             error!(
                 count,
-                total, "every DLQ backend refused the batch -- dead letters are being DROPPED"
+                total, "no DLQ backend holds these entries -- dead letters are being DROPPED"
             );
         }
+    }
+
+    /// Each entry goes to the first backend that takes it, so a backend that
+    /// queued part of the batch before failing hands on only the rest.
+    async fn write_cascade(&mut self, batch: &[DlqEntry]) -> Result<(), DrainError> {
+        let mut rest = batch;
+        let mut last_err: Option<DlqError> = None;
+        for backend in &mut self.backends {
+            match backend.send_batch(rest).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let taken = backend.queued_before_failure().min(rest.len());
+                    rest = &rest[taken..];
+                    warn!(
+                        backend = backend.name(),
+                        error = %e,
+                        count = rest.len(),
+                        "DLQ backend failed in cascade, trying next"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        // The actor discards the batch on Err -- count the loss.
+        self.note_lost(rest.len() as u64);
+        let msg = last_err.map_or_else(|| "no backends configured".to_string(), |e| e.to_string());
+        Err(DrainError::Backend(Box::new(DlqError::AllBackendsFailed(
+            msg,
+        ))))
+    }
+
+    /// Every backend gets the whole batch; an entry is safe while any holds it.
+    async fn write_fan_out(&mut self, batch: &[DlqEntry]) -> Result<(), DrainError> {
+        // Per backend: entries it holds, and whether it took the whole batch.
+        let mut outcomes: Vec<(usize, bool)> = Vec::with_capacity(self.backends.len());
+        let mut errs: Vec<String> = Vec::new();
+        for backend in &mut self.backends {
+            match backend.send_batch(batch).await {
+                Ok(()) => outcomes.push((batch.len(), true)),
+                Err(e) => {
+                    warn!(
+                        backend = backend.name(),
+                        error = %e,
+                        count = batch.len(),
+                        "DLQ backend failed in fan-out"
+                    );
+                    errs.push(format!("{}:{}", backend.name(), e));
+                    outcomes.push((backend.queued_before_failure(), false));
+                }
+            }
+        }
+        let whole = outcomes
+            .iter()
+            .filter(|(_, took_whole)| *took_whole)
+            .count();
+        if whole > 0 {
+            for (backend, &(held, took_whole)) in self.backends.iter_mut().zip(&outcomes) {
+                if whole > usize::from(took_whole) {
+                    backend.share_custody(held);
+                }
+            }
+            return Ok(());
+        }
+        // Entries a backend queued before failing stay in its custody.
+        let kept = outcomes.iter().map(|(held, _)| *held).max().unwrap_or(0);
+        // The actor discards the batch on Err -- count the loss.
+        self.note_lost(batch.len().saturating_sub(kept) as u64);
+        Err(DrainError::Backend(Box::new(DlqError::AllBackendsFailed(
+            errs.join("; "),
+        ))))
     }
 }
 
@@ -438,60 +510,28 @@ impl SinkDrain<DlqEntry> for DlqDrain {
         if batch.is_empty() {
             return Ok(());
         }
-
         match self.mode {
             DlqMode::Cascade | DlqMode::FileOnly | DlqMode::KafkaOnly => {
-                let mut last_err: Option<DlqError> = None;
-                for backend in &mut self.backends {
-                    match backend.send_batch(&batch).await {
-                        Ok(()) => return Ok(()),
-                        Err(e) => {
-                            warn!(
-                                backend = backend.name(),
-                                error = %e,
-                                count = batch.len(),
-                                "DLQ backend failed in cascade, trying next"
-                            );
-                            last_err = Some(e);
-                        }
-                    }
-                }
-                // The actor discards the batch on Err -- count the loss.
-                self.note_lost(batch.len());
-                let msg = last_err
-                    .map_or_else(|| "no backends configured".to_string(), |e| e.to_string());
-                Err(DrainError::Backend(Box::new(DlqError::AllBackendsFailed(
-                    msg,
-                ))))
+                self.write_cascade(&batch).await
             }
-            DlqMode::FanOut => {
-                let mut any_ok = false;
-                let mut errs: Vec<String> = Vec::new();
-                for backend in &mut self.backends {
-                    match backend.send_batch(&batch).await {
-                        Ok(()) => any_ok = true,
-                        Err(e) => {
-                            warn!(
-                                backend = backend.name(),
-                                error = %e,
-                                count = batch.len(),
-                                "DLQ backend failed in fan-out"
-                            );
-                            errs.push(format!("{}:{}", backend.name(), e));
-                        }
-                    }
-                }
-                if any_ok {
-                    Ok(())
-                } else {
-                    // The actor discards the batch on Err -- count the loss.
-                    self.note_lost(batch.len());
-                    Err(DrainError::Backend(Box::new(DlqError::AllBackendsFailed(
-                        errs.join("; "),
-                    ))))
-                }
+            DlqMode::FanOut => self.write_fan_out(&batch).await,
+        }
+    }
+
+    /// Run every backend's durable flush and count what they found lost.
+    async fn flush_durable(&mut self) -> Result<(), DrainError> {
+        let mut first_err: Option<DlqError> = None;
+        let mut lost = 0;
+        for backend in &mut self.backends {
+            let result = backend.flush_durable().await;
+            lost += backend.take_durable_losses();
+            if let Err(e) = result {
+                warn!(backend = backend.name(), error = %e, "DLQ backend durable flush failed");
+                first_err.get_or_insert(e);
             }
         }
+        self.note_lost(lost);
+        first_err.map_or(Ok(()), |e| Err(DrainError::Backend(Box::new(e))))
     }
 }
 

@@ -356,6 +356,24 @@ impl KafkaProducer {
         self.producer.in_flight_count().max(0) as usize
     }
 
+    /// Wait until every queued message has its delivery report handled;
+    /// `false` when `timeout` ran out first.
+    ///
+    /// Unlike [`Self::flush`], this counts messages only: statistics and
+    /// error events waiting to be served do not read as outstanding.
+    #[cfg(feature = "dlq-kafka")]
+    pub(crate) fn drain_within(&self, timeout: Duration) -> bool {
+        self.producer.flush(Timeout::After(timeout)).is_ok()
+    }
+
+    /// Discard every message still queued or in flight. Each gets a failed
+    /// delivery report, so it cannot land later.
+    #[cfg(feature = "dlq-kafka")]
+    pub(crate) fn purge_outstanding(&self) {
+        self.producer
+            .purge(rdkafka::producer::PurgeConfig::default().queue().inflight());
+    }
+
     /// Get the number of messages currently in flight.
     #[allow(clippy::cast_sign_loss)]
     pub fn in_flight_count(&self) -> usize {
