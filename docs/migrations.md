@@ -613,6 +613,14 @@ Neither consumer ever joined its group or committed an offset, so no offsets are
 
 **Consumer adjustment** -- none in code. A deployment that granted the two literal ids by name, rather than by the app's group prefix, needs its grant to cover the new names.
 
+### `flush()` reports refused tick, size and shutdown writes (BEHAVIOUR CHANGE)
+
+`BackgroundSink::flush()`, and `Dlq::flush()` built on it, now return `Err` when any batch written since the previous flush was refused. That covers batches written on the `flush_interval` tick, on a full `batch_size`, and during the shutdown drain. Before, a flush reported only the batch the barrier wrote itself, so those losses showed in `dropped()` alone. See [pipeline/dlq.md](pipeline/dlq.md#queue-admission-semantics).
+
+A refusal is reported once: the first flush after it returns the error and the next starts clean. `dropped()` counts as before. For the Kafka DLQ backend, `Ok` still means the entries were queued to the producer, not acknowledged by the broker.
+
+**Consumer adjustment** -- a `flush().await?` that used to pass over a lost batch now returns `Err(DlqError::File)`, or `Err(SinkError::Drain)` on a `BackgroundSink` used directly. Read it as "entries written since the last flush were lost". A `dropped()` check around the barrier can stay: it also counts queue overflow, which `flush()` does not cover.
+
 ---
 
 ## Known open issues (not fixed on this branch)

@@ -42,13 +42,26 @@ subsystem that needs durable side-channel writes without blocking the
 hot path.
 
 ```rust
-use scalo::concurrency::{BackgroundSink, BackgroundSinkConfig, SinkDrain, Overflow};
+use scalo::concurrency::{BackgroundSink, BackgroundSinkConfig, DrainError, Overflow, SinkDrain};
+use tokio::io::AsyncWriteExt;
 
 struct NdjsonDrain { path: PathBuf }
 
 impl SinkDrain<Event> for NdjsonDrain {
-    async fn drain(&mut self, batch: Vec<Event>) -> Result<(), anyhow::Error> {
-        // write batch to disk
+    async fn write_batch(&mut self, batch: Vec<Event>) -> Result<(), DrainError> {
+        let mut buf = Vec::new();
+        for event in &batch {
+            serde_json::to_writer(&mut buf, event).map_err(|e| DrainError::Backend(Box::new(e)))?;
+            buf.push(b'\n');
+        }
+        // async file I/O only -- a std::fs call here stalls the actor's runtime thread
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await?;
+        file.write_all(&buf).await?;
+        Ok(())
     }
 }
 
@@ -74,6 +87,7 @@ let pending = sink.pending();
 
 // On shutdown:
 sink.flush().await?;
+shutdown_token.cancel();
 handle.join().await?;
 ```
 
@@ -187,7 +201,7 @@ join.join().await?;
 | `BackgroundSink::spawn(drain, config, shutdown)` | Spawn the actor task; returns `(BackgroundSink, BackgroundSinkHandle)` |
 | `.try_push(msg)` | Hot-path push, returns immediately |
 | `.push_blocking(msg)` | Await capacity |
-| `.flush()` | Wait for the queue to drain |
+| `.flush()` | Wait until every message queued before the call is written, then run `flush_durable`; `Err(SinkError::Drain)` with the first failure since the previous flush -- a size, tick, shutdown or barrier batch write, or `flush_durable`. Reported once: the next flush starts clean |
 | `.dropped() -> u64` | Count of dropped messages (overflow) |
 | `.pending() -> usize` | Current queue depth |
 | `BackgroundSinkHandle::join()` | Await the actor task exit (single-owner) |
