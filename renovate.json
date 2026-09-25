@@ -15,9 +15,9 @@
   ],
   "packageRules": [
     {
-      "description": "OpenTelemetry SDK + exporters + the tracing bridge move in lockstep -- held at 0.31 until tracing-opentelemetry supports 0.32. Bumping one alone breaks the build.",
+      "description": "OpenTelemetry SDK + exporters + the tracing bridge + the metrics bridge move in lockstep -- held at 0.31 while metrics-exporter-opentelemetry requires it. Bumping one alone breaks the build.",
       "matchManagers": ["cargo"],
-      "matchPackageNames": ["/^opentelemetry/", "tracing-opentelemetry"],
+      "matchPackageNames": ["/^opentelemetry/", "tracing-opentelemetry", "metrics-exporter-opentelemetry"],
       "groupName": "opentelemetry"
     },
     {
@@ -33,9 +33,9 @@
       "groupName": "aws-sdk"
     },
     {
-      "description": "metrics facade + exporters version together.",
+      "description": "metrics facade + exporters version together. The OpenTelemetry exporter follows the opentelemetry group instead.",
       "matchManagers": ["cargo"],
-      "matchPackageNames": ["/^metrics/"],
+      "matchPackageNames": ["/^metrics/", "!metrics-exporter-opentelemetry"],
       "groupName": "metrics"
     },
     {
