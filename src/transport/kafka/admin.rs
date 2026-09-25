@@ -30,7 +30,7 @@
 //! }
 //! ```
 
-use super::config::{KafkaConfig, MESSAGE_MAX_BYTES};
+use super::config::{KafkaConfig, MESSAGE_MAX_BYTES, raw_layer};
 use crate::transport::error::{TransportError, TransportResult};
 use rdkafka::admin::{
     AdminClient, AdminOptions, AlterConfig, NewPartitions, NewTopic, ResourceSpecifier,
@@ -77,6 +77,47 @@ fn create_topic_requests<'a>(
         .collect()
 }
 
+/// Build the admin client's config: connection and security, then the profile
+/// defaults and `librdkafka_overrides`, whose keys replace the other librdkafka
+/// name for their property.
+fn admin_client_config(config: &KafkaConfig) -> ClientConfig {
+    let mut client_config = ClientConfig::new();
+
+    client_config.set("bootstrap.servers", config.brokers.join(","));
+    client_config.set("client.id", &config.client_id);
+
+    // Security.
+    client_config.set("security.protocol", &config.security_protocol);
+    if let Some(ref mechanism) = config.sasl_mechanism {
+        client_config.set("sasl.mechanism", mechanism);
+    }
+    if let Some(ref username) = config.sasl_username {
+        client_config.set("sasl.username", username);
+    }
+    if let Some(ref password) = config.sasl_password {
+        client_config.set("sasl.password", password.expose());
+    }
+
+    // TLS.
+    if let Some(ref ca) = config.ssl_ca_location {
+        client_config.set("ssl.ca.location", ca);
+    }
+    if let Some(ref cert) = config.ssl_certificate_location {
+        client_config.set("ssl.certificate.location", cert);
+    }
+    if let Some(ref key) = config.ssl_key_location {
+        client_config.set("ssl.key.location", key);
+    }
+    if config.ssl_skip_verify {
+        client_config.set("enable.ssl.certificate.verification", "false");
+    }
+
+    // Profile defaults and user overrides.
+    let rdkafka_config = config.build_librdkafka_config();
+    super::apply_layer(&mut client_config, &raw_layer(&rdkafka_config));
+    client_config
+}
+
 /// Role naming the admin's offset-query consumer in its derived group id.
 const OFFSET_QUERY_GROUP_ROLE: &str = "admin";
 
@@ -115,42 +156,7 @@ impl KafkaAdmin {
     ///
     /// Returns error if admin client creation fails.
     pub fn new(config: &KafkaConfig) -> TransportResult<Self> {
-        let mut client_config = ClientConfig::new();
-
-        client_config.set("bootstrap.servers", config.brokers.join(","));
-        client_config.set("client.id", &config.client_id);
-
-        // Security.
-        client_config.set("security.protocol", &config.security_protocol);
-        if let Some(ref mechanism) = config.sasl_mechanism {
-            client_config.set("sasl.mechanism", mechanism);
-        }
-        if let Some(ref username) = config.sasl_username {
-            client_config.set("sasl.username", username);
-        }
-        if let Some(ref password) = config.sasl_password {
-            client_config.set("sasl.password", password.expose());
-        }
-
-        // TLS.
-        if let Some(ref ca) = config.ssl_ca_location {
-            client_config.set("ssl.ca.location", ca);
-        }
-        if let Some(ref cert) = config.ssl_certificate_location {
-            client_config.set("ssl.certificate.location", cert);
-        }
-        if let Some(ref key) = config.ssl_key_location {
-            client_config.set("ssl.key.location", key);
-        }
-        if config.ssl_skip_verify {
-            client_config.set("enable.ssl.certificate.verification", "false");
-        }
-
-        // Profile defaults and user overrides.
-        let rdkafka_config = config.build_librdkafka_config();
-        for (key, value) in &rdkafka_config {
-            client_config.set(key, value);
-        }
+        let client_config = admin_client_config(config);
 
         let admin: AdminClient<DefaultClientContext> = client_config.create().map_err(|e| {
             TransportError::Connection(format!("Failed to create admin client: {e}"))
@@ -670,6 +676,37 @@ mod tests {
         base.set("group.id", "operator-override");
         let built = offset_query_consumer_config(&base, &config);
         assert_eq!(built.get("group.id"), Some("dfe-archiver-admin"));
+    }
+
+    /// The admin lays `librdkafka_overrides` over its connection settings, so
+    /// an override by the other librdkafka name replaces the configured one,
+    /// and the offset-query consumer inherits the result.
+    #[test]
+    fn admin_overrides_replace_the_other_librdkafka_name() {
+        let mut config = KafkaConfig {
+            security_protocol: "sasl_ssl".to_string(),
+            sasl_mechanism: Some("PLAIN".to_string()),
+            ..Default::default()
+        };
+        config
+            .librdkafka_overrides
+            .insert("sasl.mechanisms".to_string(), "SCRAM-SHA-256".to_string());
+        config
+            .librdkafka_overrides
+            .insert("fetch.message.max.bytes".to_string(), "2097152".to_string());
+
+        let admin = admin_client_config(&config);
+        assert_eq!(admin.get("sasl.mechanism"), None);
+        assert_eq!(
+            super::super::librdkafka_resolves(&admin, "sasl.mechanisms"),
+            "SCRAM-SHA-256"
+        );
+
+        let consumer = offset_query_consumer_config(&admin, &config);
+        assert_eq!(
+            super::super::librdkafka_resolves(&consumer, "fetch.message.max.bytes"),
+            "2097152"
+        );
     }
 
     #[test]

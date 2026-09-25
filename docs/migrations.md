@@ -807,9 +807,9 @@ The producer profile constants `PRODUCER_HIGH_THROUGHPUT`, `PRODUCER_EXACTLY_ONC
 
 ### `KafkaProducer` applies `librdkafka_overrides` last (BEHAVIOUR CHANGE)
 
-`KafkaProducer::new` applied `kafka.librdkafka_overrides` before the sizing surface, so a codec, linger or batch key set there was overwritten by the sizing value. It now applies them after, as `KafkaTransport` does. The order on both paths is: profile constants, sizing profile, named sizing knobs, `sizing.producer_librdkafka`, then `librdkafka_overrides`. A raw key also replaces its librdkafka alias from the layers below it (`compression.codec` and `compression.type`, `queue.buffering.max.ms` and `linger.ms`), since rdkafka passes both names to librdkafka in hash order.
+`KafkaProducer::new` applied `kafka.librdkafka_overrides` before the sizing surface, so a codec, linger or batch key set there was overwritten by the sizing value. It now applies them after, as `KafkaTransport` does. The order on both paths is: profile constants, sizing profile, named sizing knobs, `sizing.producer_librdkafka`, then `librdkafka_overrides`. On every producer and consumer path, and on `KafkaAdmin`, a key also replaces the other librdkafka name for its property from the layers below it (`fetch.message.max.bytes` and `max.partition.fetch.bytes`, `request.required.acks` and `acks`, `compression.codec` and `compression.type`, among others), since rdkafka passes both names to librdkafka in hash order and the value that ran was chance.
 
-**Consumer adjustment** -- a `KafkaProducer` whose `librdkafka_overrides` set a sizing key now runs that value. The Kafka DLQ backend builds on `KafkaProducer`, so its producer follows the same order. A service that copies the old order into its own producer config moves `librdkafka_overrides` after `sizing.resolved_producer_map()`.
+**Consumer adjustment** -- a `KafkaProducer` whose `librdkafka_overrides` set a sizing key now runs that value. An override by librdkafka's other name for a property scalo sets, such as `fetch.message.max.bytes`, now always wins where it used to win at random. The Kafka DLQ backend builds on `KafkaProducer`, so its producer follows the same order. A service that copies the old order into its own producer config moves `librdkafka_overrides` after `sizing.resolved_producer_map()`.
 
 ### Smaller additions
 

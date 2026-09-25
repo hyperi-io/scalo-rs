@@ -282,10 +282,14 @@ keys), the code logs ONE warning per key so the operator knows the governor's
 assumptions changed. An invalid key silently no-ops in librdkafka -- check
 spelling.
 
-A raw producer key replaces its librdkafka alias from the layers below it:
-`compression.codec` for `compression.type`, `queue.buffering.max.ms` for
-`linger.ms`, and the reverse. rdkafka hands its settings to librdkafka in hash
-order, so leaving both names in place would let chance pick the winner.
+A raw key, producer or consumer, replaces the other librdkafka name for its
+property from the layers below it: `fetch.message.max.bytes` for
+`max.partition.fetch.bytes`, `request.required.acks` for `acks`,
+`compression.codec` for `compression.type`, and the reverse. rdkafka hands its
+settings to librdkafka in hash order, so leaving both names in place would let
+chance pick the winner. The table is `LIBRDKAFKA_ALIASES` in
+`src/transport/kafka/config.rs`. `enable.auto.commit` is not in it: set on a
+client it is a global property, and `auto.commit.enable` a separate topic one.
 
 The producer is built from a SEPARATE `ClientConfig`, not the consumer's:
 consumer-only keys (`group.id`, `session.timeout.ms`, fetch sizes) would make

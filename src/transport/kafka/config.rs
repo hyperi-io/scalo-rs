@@ -450,6 +450,9 @@ pub struct KafkaSizingConfig {
     ///
     /// Keys must be valid librdkafka property names (e.g. `fetch.wait.max.ms`).
     /// An invalid key silently no-ops in librdkafka -- double-check spelling.
+    /// A key replaces the other librdkafka name for its property from the
+    /// layers below it (`fetch.message.max.bytes` for
+    /// `max.partition.fetch.bytes`).
     #[serde(default)]
     pub consumer_librdkafka: BTreeMap<String, String>,
 
@@ -458,9 +461,9 @@ pub struct KafkaSizingConfig {
     /// them.
     ///
     /// Keys must be valid librdkafka property names (e.g. `linger.ms`). A key
-    /// replaces its librdkafka alias from the layers below it
-    /// (`compression.codec` for `compression.type`, `queue.buffering.max.ms`
-    /// for `linger.ms`).
+    /// replaces the other librdkafka name for its property from the layers
+    /// below it (`compression.codec` for `compression.type`,
+    /// `request.required.acks` for `acks`).
     #[serde(default)]
     pub producer_librdkafka: BTreeMap<String, String>,
 }
@@ -505,6 +508,9 @@ impl KafkaSizingConfig {
     /// Resolve the effective consumer librdkafka key/value map.
     ///
     /// Precedence: profile defaults < named knobs < raw `consumer_librdkafka`.
+    /// A raw key replaces its librdkafka alias from the layers below it, so
+    /// `fetch.message.max.bytes` there removes the named
+    /// `max.partition.fetch.bytes`.
     ///
     /// This is a PURE function -- suitable for unit testing without a live
     /// broker. The caller feeds the returned map into `ClientConfig::set`.
@@ -546,7 +552,6 @@ impl KafkaSizingConfig {
         );
         map.insert("fetch.max.bytes".to_string(), fetch_max_bytes.to_string());
 
-        // Apply the raw escape hatch last -- it wins.
         for (k, v) in &self.consumer_librdkafka {
             if GOVERNOR_CONSUMER_KEYS.contains(&k.as_str()) {
                 tracing::warn!(
@@ -555,9 +560,8 @@ impl KafkaSizingConfig {
                     "kafka sizing: raw consumer_librdkafka overrides a governor key"
                 );
             }
-            map.insert(k.clone(), v.clone());
         }
-
+        overlay_raw_layers(&mut map, &[raw_layer(&self.consumer_librdkafka)]);
         map
     }
 
@@ -598,7 +602,9 @@ impl KafkaSizingConfig {
                 );
             }
         }
-        overlay_raw_producer_layers(&mut map, &[raw_layer(&self.producer_librdkafka), outer]);
+        let layers = [raw_layer(&self.producer_librdkafka), outer];
+        overlay_raw_layers(&mut map, &layers);
+        settle_compression_level(&mut map, &layers);
         map
     }
 
@@ -718,7 +724,7 @@ impl KafkaSizingConfig {
 }
 
 // ============================================================================
-// Raw producer layers
+// Raw override layers
 // ============================================================================
 
 /// One raw librdkafka override layer, as key/value pairs.
@@ -733,44 +739,69 @@ pub(crate) fn raw_layer<'a>(
         .collect()
 }
 
-/// Producer property names librdkafka treats as one property.
-const PRODUCER_KEY_ALIASES: &[(&str, &str)] = &[
-    ("compression.type", "compression.codec"),
+/// librdkafka's aliases, each as (alias, property), for the pairs that
+/// resolve to one property when set on a client config.
+///
+/// rdkafka hands its settings to librdkafka in hash order, so a property left
+/// under both names runs whichever came last by chance. `enable.auto.commit`
+/// is absent: set on a client config it is the global property, and its
+/// alias `auto.commit.enable` is a different, topic-level one.
+pub(crate) const LIBRDKAFKA_ALIASES: &[(&str, &str)] = &[
+    ("bootstrap.servers", "metadata.broker.list"),
+    ("max.in.flight", "max.in.flight.requests.per.connection"),
+    ("sasl.mechanism", "sasl.mechanisms"),
+    (
+        "sasl.oauthbearer.client.credentials.client.id",
+        "sasl.oauthbearer.client.id",
+    ),
+    (
+        "sasl.oauthbearer.client.credentials.client.secret",
+        "sasl.oauthbearer.client.secret",
+    ),
+    ("max.partition.fetch.bytes", "fetch.message.max.bytes"),
     ("linger.ms", "queue.buffering.max.ms"),
+    ("retries", "message.send.max.retries"),
+    ("compression.type", "compression.codec"),
+    ("acks", "request.required.acks"),
+    ("delivery.timeout.ms", "message.timeout.ms"),
 ];
 
 /// The other librdkafka name for `key`, when it has one.
-fn producer_key_alias(key: &str) -> Option<&'static str> {
-    PRODUCER_KEY_ALIASES.iter().find_map(|&(a, b)| {
-        if key == a {
-            Some(b)
-        } else if key == b {
-            Some(a)
+pub(crate) fn librdkafka_alias(key: &str) -> Option<&'static str> {
+    LIBRDKAFKA_ALIASES.iter().find_map(|&(alias, property)| {
+        if key == alias {
+            Some(property)
+        } else if key == property {
+            Some(alias)
         } else {
             None
         }
     })
 }
 
-/// Lay raw override layers over a producer map, lowest first.
+/// Lay raw override layers over a resolved map, lowest first.
 ///
-/// A key a layer names drops its alias from the layers below, because rdkafka
-/// hands its settings to librdkafka in hash order and two names for one
-/// property would leave the winner to chance. zstd then gets
-/// [`ZSTD_COMPRESSION_LEVEL`] unless some layer named a level.
-fn overlay_raw_producer_layers(map: &mut BTreeMap<String, String>, layers: &[RawLayer<'_>]) {
-    let mut level_named = false;
+/// A key a layer names drops its alias from the layers below it. A layer that
+/// names both itself is left as it stands.
+fn overlay_raw_layers(map: &mut BTreeMap<String, String>, layers: &[RawLayer<'_>]) {
     for layer in layers {
         for &(key, value) in layer {
-            if let Some(alias) = producer_key_alias(key)
+            if let Some(alias) = librdkafka_alias(key)
                 && !layer.iter().any(|&(k, _)| k == alias)
             {
                 map.remove(alias);
             }
-            level_named |= key == "compression.level";
             map.insert(key.to_string(), value.to_string());
         }
     }
+}
+
+/// Give zstd [`ZSTD_COMPRESSION_LEVEL`] unless one of `layers` named a level.
+fn settle_compression_level(map: &mut BTreeMap<String, String>, layers: &[RawLayer<'_>]) {
+    let level_named = layers
+        .iter()
+        .flatten()
+        .any(|&(k, _)| k == "compression.level");
     let codec = map
         .get("compression.type")
         .or_else(|| map.get("compression.codec"));
@@ -2752,6 +2783,52 @@ mod tests {
         assert!(!map.contains_key("compression.level"));
         assert_eq!(map["queue.buffering.max.ms"], "50");
         assert!(!map.contains_key("linger.ms"));
+    }
+
+    /// The idempotent producer's `acks=all` sits under its librdkafka name, so
+    /// a raw `request.required.acks` replaces it rather than racing it.
+    #[test]
+    fn a_raw_acks_alias_replaces_the_idempotence_acks() {
+        let s = KafkaSizingConfig {
+            producer: ProducerKnobs {
+                idempotence: Some(false),
+                ..Default::default()
+            },
+            producer_librdkafka: BTreeMap::from([(
+                "request.required.acks".to_string(),
+                "1".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let map = s.resolved_producer_map();
+        assert_eq!(map["request.required.acks"], "1");
+        assert!(!map.contains_key("acks"));
+    }
+
+    /// A raw fetch ceiling by the other librdkafka name replaces the named
+    /// knob's rather than racing it.
+    #[test]
+    fn a_raw_consumer_alias_replaces_the_named_fetch_ceiling() {
+        let s = KafkaSizingConfig {
+            consumer_librdkafka: BTreeMap::from([(
+                "fetch.message.max.bytes".to_string(),
+                "4194304".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let map = s.resolved_consumer_map();
+        assert_eq!(map["fetch.message.max.bytes"], "4194304");
+        assert!(!map.contains_key("max.partition.fetch.bytes"));
+    }
+
+    /// Every pair in the alias table resolves in both directions.
+    #[test]
+    fn the_alias_table_maps_each_name_to_the_other() {
+        for &(alias, property) in LIBRDKAFKA_ALIASES {
+            assert_eq!(librdkafka_alias(alias), Some(property));
+            assert_eq!(librdkafka_alias(property), Some(alias));
+        }
+        assert_eq!(librdkafka_alias("fetch.min.bytes"), None);
     }
 
     /// `librdkafka_overrides` is laid over the sizing raw map, so it wins a
