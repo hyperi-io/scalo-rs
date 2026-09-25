@@ -413,6 +413,72 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
     client_config
 }
 
+/// Build a producer's librdkafka config: connection and security, then
+/// `profile_defaults`, then [`KafkaConfig::resolved_producer_settings`].
+///
+/// Every producer scalo builds comes from here, so every one resolves a key
+/// in the same order: profile defaults < sizing profile < named sizing knobs
+/// < `sizing.producer_librdkafka` < `librdkafka_overrides`. The producer gets
+/// a config of its own because consumer-only keys (`group.id`, `fetch.*`,
+/// `session.timeout.ms`) would make librdkafka ignore the producer sizing.
+pub(super) fn producer_client_config(
+    config: &KafkaConfig,
+    profile_defaults: &[(&str, &str)],
+) -> ClientConfig {
+    let mut client_config = ClientConfig::new();
+    client_config.set("bootstrap.servers", config.brokers.join(","));
+    client_config.set("client.id", &config.client_id);
+    client_config.set("security.protocol", &config.security_protocol);
+    if let Some(ref mechanism) = config.sasl_mechanism {
+        client_config.set("sasl.mechanism", mechanism);
+    }
+    if let Some(ref username) = config.sasl_username {
+        client_config.set("sasl.username", username);
+    }
+    if let Some(ref password) = config.sasl_password {
+        client_config.set("sasl.password", password.expose());
+    }
+    if let Some(ref ca) = config.ssl_ca_location {
+        client_config.set("ssl.ca.location", ca);
+    }
+    if let Some(ref cert) = config.ssl_certificate_location {
+        client_config.set("ssl.certificate.location", cert);
+    }
+    if let Some(ref key) = config.ssl_key_location {
+        client_config.set("ssl.key.location", key);
+    }
+    if config.ssl_skip_verify {
+        client_config.set("enable.ssl.certificate.verification", "false");
+    }
+    for (key, value) in profile_defaults {
+        client_config.set(*key, *value);
+    }
+    for (key, value) in config.resolved_producer_settings() {
+        client_config.set(key, value);
+    }
+    client_config
+}
+
+/// The `KafkaTransport` producer's config, with statistics on when no layer
+/// set an interval, since the transport's metrics read them.
+fn transport_producer_config(config: &KafkaConfig) -> ClientConfig {
+    let mut producer_config = producer_client_config(config, &[]);
+    if producer_config.get("statistics.interval.ms").is_none() {
+        producer_config.set("statistics.interval.ms", "5000");
+    }
+    producer_config
+}
+
+/// The value librdkafka itself resolves `key` to once it has taken `built`.
+#[cfg(test)]
+pub(super) fn librdkafka_resolves(built: &ClientConfig, key: &str) -> String {
+    built
+        .create_native_config()
+        .expect("librdkafka takes every key the config sets")
+        .get(key)
+        .expect("librdkafka knows the key")
+}
+
 /// Set `group.protocol` and strip what that protocol forbids.
 ///
 /// `group.remote.assignor` is deliberately left unset: with no client-side
@@ -703,51 +769,7 @@ impl KafkaTransport {
             topic_cache.insert(topic.clone(), Arc::from(topic.as_str()));
         }
 
-        // Build a SEPARATE producer ClientConfig. Creating the producer from the
-        // CONSUMER client_config (which carries group.id, fetch.*,
-        // session.timeout, ...) made it ignore the documented producer sizing --
-        // it ran librdkafka producer DEFAULTS (no compression vs lz4, linger 5ms
-        // vs 20ms, batch 1 MiB vs 128 KiB, queue 1 GiB vs 64 MiB; an unbounded
-        // 1 GiB producer queue defeats container memory budgeting) and logged
-        // "X is a consumer property" warnings. Apply the connection settings +
-        // the producer sizing surface to a fresh config instead.
-        let mut producer_config = ClientConfig::new();
-        producer_config.set("bootstrap.servers", config.brokers.join(","));
-        producer_config.set("security.protocol", &config.security_protocol);
-        if let Some(ref mechanism) = config.sasl_mechanism {
-            producer_config.set("sasl.mechanism", mechanism);
-        }
-        if let Some(ref username) = config.sasl_username {
-            producer_config.set("sasl.username", username);
-        }
-        if let Some(ref password) = config.sasl_password {
-            producer_config.set("sasl.password", password.expose());
-        }
-        if let Some(ref ca) = config.ssl_ca_location {
-            producer_config.set("ssl.ca.location", ca);
-        }
-        if let Some(ref cert) = config.ssl_certificate_location {
-            producer_config.set("ssl.certificate.location", cert);
-        }
-        if let Some(ref key) = config.ssl_key_location {
-            producer_config.set("ssl.key.location", key);
-        }
-        if config.ssl_skip_verify {
-            producer_config.set("enable.ssl.certificate.verification", "false");
-        }
-        producer_config.set("client.id", &config.client_id);
-        // Producer sizing surface (compression, batch.size, linger.ms,
-        // queue.buffering.max.kbytes, sticky.partitioning.linger.ms).
-        for (key, value) in config.sizing.resolved_producer_map() {
-            producer_config.set(key, value);
-        }
-        // librdkafka_overrides remain the highest-priority layer.
-        for (key, value) in &config.librdkafka_overrides {
-            producer_config.set(key, value);
-        }
-        if producer_config.get("statistics.interval.ms").is_none() {
-            producer_config.set("statistics.interval.ms", "5000");
-        }
+        let producer_config = transport_producer_config(config);
         let message_max_bytes = producer_config
             .get("message.max.bytes")
             .and_then(|v| v.parse::<usize>().ok())
@@ -2842,6 +2864,57 @@ mod tests {
         };
         let built = consumer_client_config(&no_stats, ConsumerProtocol::Consumer);
         assert!(protocol_probe_window(&no_stats, ConsumerProtocol::Consumer, &built).is_none());
+    }
+
+    // =========================================================================
+    // Producer config (the KafkaTransport path)
+    // =========================================================================
+
+    /// The transport producer runs the sizing default, and librdkafka takes it.
+    #[test]
+    fn transport_producer_defaults_to_zstd_at_level_3() {
+        let built = transport_producer_config(&KafkaConfig::default());
+        assert_eq!(built.get("compression.type"), Some("zstd"));
+        assert_eq!(built.get("compression.level"), Some("3"));
+        assert_eq!(librdkafka_resolves(&built, "compression.codec"), "zstd");
+        assert_eq!(librdkafka_resolves(&built, "compression.level"), "3");
+    }
+
+    /// `librdkafka_overrides` is the last layer: its codec wins over the zstd
+    /// default and over `sizing.producer_librdkafka`, and the zstd level goes
+    /// with the codec it replaced.
+    #[test]
+    fn transport_producer_takes_the_raw_codec_override() {
+        let mut config = KafkaConfig::default();
+        config
+            .sizing
+            .producer_librdkafka
+            .insert("compression.type".to_string(), "gzip".to_string());
+        config
+            .librdkafka_overrides
+            .insert("compression.type".to_string(), "lz4".to_string());
+        let built = transport_producer_config(&config);
+        assert_eq!(built.get("compression.type"), Some("lz4"));
+        assert_eq!(built.get("compression.level"), None);
+        assert_eq!(librdkafka_resolves(&built, "compression.codec"), "lz4");
+        assert_eq!(
+            librdkafka_resolves(&built, "compression.level"),
+            "-1",
+            "lz4 runs at librdkafka's own level, not the zstd one"
+        );
+    }
+
+    /// An override by the alias name wins however rdkafka orders the keys:
+    /// the name the sizing surface set is gone, not merely outranked.
+    #[test]
+    fn transport_producer_takes_an_override_by_the_alias_name() {
+        let mut config = KafkaConfig::default();
+        config
+            .librdkafka_overrides
+            .insert("compression.codec".to_string(), "lz4".to_string());
+        let built = transport_producer_config(&config);
+        assert_eq!(built.get("compression.type"), None);
+        assert_eq!(librdkafka_resolves(&built, "compression.codec"), "lz4");
     }
 
     /// An oversize record is a poison record, not a transport failure: it is

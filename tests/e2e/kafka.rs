@@ -252,10 +252,10 @@ fn test_kafka_config_with_producer_defaults() {
     let config = KafkaConfig::default().with_producer_defaults();
     let built = config.build_librdkafka_config();
 
-    // lz4, the codec the sizing surface applies after this layer on every
-    // producer path -- see PRODUCER_HIGH_THROUGHPUT.
-    assert_eq!(built.get("compression.type"), Some(&"lz4".to_string()));
-    assert_eq!(built.get("linger.ms"), Some(&"100".to_string()));
+    // The sizing surface owns batching and codec on every producer path, so
+    // the profile constant names neither -- see PRODUCER_HIGH_THROUGHPUT.
+    assert_eq!(built.get("compression.type"), None);
+    assert_eq!(built.get("linger.ms"), None);
     assert_eq!(built.get("socket.nagle.disable"), Some(&"true".to_string()));
     assert_eq!(
         built.get("statistics.interval.ms"),
