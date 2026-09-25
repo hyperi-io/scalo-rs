@@ -69,7 +69,7 @@ fn format_from_proto(format: i32) -> PayloadFormat {
 ///
 /// The payload `Bytes` handle is MOVED onto the proto field (no copy). `key`
 /// `None` becomes the empty string; `Some(k)` carries the key text.
-fn record_to_proto(record: Record) -> proto::Record {
+pub(crate) fn record_to_proto(record: Record) -> proto::Record {
     let (timestamp_ms, has_timestamp_ms) = match record.metadata.timestamp_ms {
         Some(ts) => (ts, true),
         None => (0, false),
