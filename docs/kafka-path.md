@@ -79,9 +79,9 @@ kafka:
     consumer:
       fetch_min_bytes: 2097152      # 2 MiB, overrides the profile default
     producer:
-      compression_type: zstd        # opt into zstd for storage-bound topics
+      compression_type: lz4         # the default is zstd at level 3
     consumer_librdkafka:
-      fetch.wait.max.ms: "75"       # raw override -- wins over everything
+      fetch.wait.max.ms: "75"       # raw override -- wins over the knobs
     producer_librdkafka:
       linger.ms: "50"
 ```
@@ -90,9 +90,9 @@ The profile defaults, with the ACTUAL librdkafka property each maps to:
 
 | Profile | GET `fetch.min.bytes` | GET `fetch.wait.max.ms` | GET `max.partition.fetch.bytes` | GET `fetch.max.bytes` | poll cap | SEND `batch.size` | SEND `linger.ms` | SEND codec | SEND `queue.buffering.max.kbytes` | SEND `message.max.bytes` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `throughput` (default) | 1 MiB | 50 ms | 16 MiB | 50 MiB | 2000 | 128 KiB | 20 ms | lz4 | 64 MiB | 16 MiB |
-| `balanced` | 256 KiB | 25 ms | 16 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | lz4 | 32 MiB | 16 MiB |
-| `low_latency` | 1 byte | 5 ms | 16 MiB | 16 MiB | 500 | 16 KiB | 0 ms | lz4 | 16 MiB | 16 MiB |
+| `throughput` (default) | 1 MiB | 50 ms | 16 MiB | 50 MiB | 2000 | 128 KiB | 20 ms | zstd, level 3 | 64 MiB | 16 MiB |
+| `balanced` | 256 KiB | 25 ms | 16 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | zstd, level 3 | 32 MiB | 16 MiB |
+| `low_latency` | 1 byte | 5 ms | 16 MiB | 16 MiB | 500 | 16 KiB | 0 ms | zstd, level 3 | 16 MiB | 16 MiB |
 
 Two columns do not vary by profile, because they are the record-size chain
 rather than a tuning dial: `message.max.bytes` (the producer's own ceiling,
@@ -153,17 +153,17 @@ Target `0.7` keeps the consumer ~70% busy with 30% headroom for a fetch burst.
 
 ## Wire compression
 
-All profiles default the producer to `lz4` -- the best throughput/ratio
-tradeoff for the hot path. Match the codec to the topic:
+Every profile produces with `zstd` at `compression.level` 3. The profiles differ in batching and latency, never in codec. Level 3 is also the level librdkafka picks for zstd when none is set.
 
-- **`lz4`** (default) -- fast, good ratio. Right for most transform /
-  forwarding topics.
-- **`zstd`** -- better ratio, higher CPU. Opt in for storage-bound topics
-  (archiver, long-retention land/load) that can absorb the CPU to save disk
-  and network.
+Change it per stage:
 
-Set per stage via `kafka.sizing.producer.compression_type`. The consumer
-decompresses transparently regardless of producer codec.
+- **Codec** -- `kafka.sizing.producer.compression_type` (`lz4`, `gzip`, `snappy` or `none`). Another codec runs at librdkafka's own default level for it.
+- **zstd level** -- `compression.level` in `kafka.sizing.producer_librdkafka`. librdkafka takes -1 to 12.
+- **Either, over everything** -- `kafka.librdkafka_overrides`, applied after the whole sizing surface.
+
+The level follows the codec. scalo sets 3 only while the resolved codec is zstd and no raw map names a level, because librdkafka reads the level against whichever codec is set, and lz4 switches to its slow high-compression mode from 3.
+
+Every image that runs a scalo producer or consumer needs a librdkafka built with zstd. Without it the producer fails at creation on this default, and a consumer cannot read the batches. The consumer decompresses whatever codec the producer used, so no consumer setting changes.
 
 ---
 
@@ -276,17 +276,24 @@ Full resolution precedence (lowest to highest):
    the sizing surface too (it is the broad client-config override, not part of
    the sizing surface)
 
-When a raw override touches a property the sizing governor depends on (the
+When a sizing raw map touches a property the sizing governor depends on (the
 fetch byte sizes, `enable.auto.commit`, the producer batch/linger/compression
 keys), the code logs ONE warning per key so the operator knows the governor's
 assumptions changed. An invalid key silently no-ops in librdkafka -- check
 spelling.
 
+A raw producer key replaces its librdkafka alias from the layers below it:
+`compression.codec` for `compression.type`, `queue.buffering.max.ms` for
+`linger.ms`, and the reverse. rdkafka hands its settings to librdkafka in hash
+order, so leaving both names in place would let chance pick the winner.
+
 The producer is built from a SEPARATE `ClientConfig`, not the consumer's:
 consumer-only keys (`group.id`, `session.timeout.ms`, fetch sizes) would make
-librdkafka ignore the producer sizing surface otherwise. The producer config
-carries security + the producer sizing map; `kafka.librdkafka_overrides`
-applies last to both halves.
+librdkafka ignore the producer sizing surface otherwise. Both producer paths,
+`KafkaTransport` and the standalone `KafkaProducer`, build it the same way:
+connection and security, the `KafkaProducer` profile's few keys, the producer
+sizing map, then `kafka.librdkafka_overrides`. On the consumer half
+`kafka.librdkafka_overrides` is applied after the sizing surface too.
 
 ---
 
