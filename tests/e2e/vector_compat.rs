@@ -496,6 +496,62 @@ async fn test_vector_compat_client_send() {
     let _ = server.close().await;
 }
 
+/// An armed server holds a `PushEvents` until its events are released, as it
+/// holds a native push, and a failed delivery makes Vector retry.
+#[tokio::test]
+async fn held_push_events_wait_for_release() {
+    use scalo::transport::DeliveryStatus;
+
+    let config = GrpcConfig::server("127.0.0.1:0").with_vector_compat();
+    let server = std::sync::Arc::new(
+        GrpcTransport::builder(&config)
+            .start()
+            .await
+            .expect("vector-compat server"),
+    );
+    server
+        .ack_control()
+        .expect("a receive server can hold")
+        .arm();
+    let uri = format!("http://{}", server.local_addr().expect("bound"));
+    let client =
+        std::sync::Arc::new(VectorCompatClient::connect_lazy(&uri).expect("VectorCompatClient"));
+    let events: Vec<serde_json::Value> = (0..3)
+        .map(|i| serde_json::json!({ "message": format!("event-{i}") }))
+        .collect();
+
+    for (outcome, delivered) in [
+        (DeliveryStatus::Delivered, true),
+        (DeliveryStatus::Errored, false),
+    ] {
+        let pushing = tokio::spawn({
+            let client = std::sync::Arc::clone(&client);
+            let events = events.clone();
+            async move { client.send_events(&events).await }
+        });
+        let mut batch = server.recv(3).await.expect("recv");
+        while batch.records.len() < 3 {
+            let more = server.recv(3).await.expect("recv");
+            batch.records.extend(more.records);
+            batch.commit_tokens.extend(more.commit_tokens);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!pushing.is_finished(), "answered before release");
+
+        server
+            .release(&batch.commit_tokens, outcome)
+            .await
+            .expect("release");
+        let answer = tokio::time::timeout(Duration::from_secs(2), pushing)
+            .await
+            .expect("answered once released")
+            .expect("push task");
+        assert_eq!(answer.is_ok(), delivered, "{outcome:?}: {answer:?}");
+    }
+
+    let _ = server.close().await;
+}
+
 /// Test: VectorCompatClient sends events to a Vector binary running as source.
 ///
 /// Starts Vector with a `vector` source (acting as server) and a `file` sink,
