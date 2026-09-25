@@ -62,6 +62,7 @@
 //! let result = sender.send("events.land", payload).await; // SendResult
 //! ```
 
+pub mod ack;
 pub mod codec;
 mod detect;
 mod error;
@@ -102,6 +103,10 @@ pub mod http;
 pub mod routed;
 
 // Re-exports -- traits and factory
+pub use ack::{
+    AckControl, AckKind, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, HeldAcks,
+    SinkConfirmation, SourceAck,
+};
 pub use codec::{CodecError, FieldRef, ParsedPayload, parse};
 pub use error::{TransportError, TransportResult};
 pub use factory::{AnyReceiver, AnySender, AnyToken};
