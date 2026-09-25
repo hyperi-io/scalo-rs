@@ -170,6 +170,19 @@ impl DlqBackend {
         }
     }
 
+    /// The largest serialised entry this backend can ever hold, or `None` when
+    /// it has no ceiling of its own.
+    #[allow(clippy::match_same_arms, reason = "only Kafka has a ceiling")]
+    pub(crate) fn entry_ceiling(&self) -> Option<usize> {
+        match self {
+            Self::File(_) => None,
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => Some(b.entry_ceiling()),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => None,
+        }
+    }
+
     /// Backend name for log / metric labels.
     #[must_use]
     pub fn name(&self) -> &'static str {

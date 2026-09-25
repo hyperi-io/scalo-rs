@@ -48,7 +48,9 @@ The key sits beside the transport's own section: `AnyReceiver::from_config(key)`
 
 ## Dead letters
 
-With `BatchEngine::with_dlq(Arc<Dlq>)`, a block's dead letters -- inbound filter matches, entries `process` adds, and records the sink would refuse -- are one piece, written with `Dlq::write_confirmed`. It reports `Rejected` once a DLQ backend holds them and `Errored` when the DLQ refuses them, so the source is never released for a dead letter the DLQ does not hold. The answer covers this block's own write, so a refusal of another writer's entries never reaches it ([dlq.md](dlq.md#queue-admission-semantics)). A disabled DLQ reports `Dropped` and counts each in `pipeline_dead_letters_dropped_total{reason}`, where `reason` is `dead_letter` for one an inbound filter or `process` produced.
+With `BatchEngine::with_dlq(Arc<Dlq>)`, a block's dead letters -- inbound filter matches, entries `process` adds, and records the sink would refuse -- are one piece, written with `Dlq::write_confirmed`. It reports `Rejected` once a DLQ backend holds them, so the source is never released for a dead letter the DLQ does not hold. A write that fails is retried with backoff (`pipeline_retries_total{stage="dlq"}`) while the block stays held, until it lands, the hold deadline comes, or the retry window after shutdown closes. It reports `Errored` at once only when the DLQ's drain has exited. The answer covers this block's own write, so a refusal of another writer's entries never reaches it ([dlq.md](dlq.md#queue-admission-semantics)).
+
+An entry no DLQ backend can ever hold -- over a Kafka-only DLQ's `message.max.bytes` once its payload is base64-encoded -- is left out of the write (`Dlq::refusal`), dropped, and counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`, and its piece reports `Dropped`. No retry could land it, and holding it would pin a Kafka partition's commit for good. A disabled DLQ reports `Dropped` and counts each in `pipeline_dead_letters_dropped_total{reason}`, where `reason` is `dead_letter` for one an inbound filter or `process` produced.
 
 A sender names the records it would dead-letter rather than send (`TransportSender::dead_letter_reason`): Kafka names a record over `message.max.bytes` less 128 bytes of framing, gRPC one over `max_message_size` on its own, and both an outbound `dlq` filter match. The sender answers such a record `FilteredDlq`, or leaves it out of a gRPC block, without writing it anywhere, and `send_batch` counts it handled, so `.sender(&sender)` has the loop take them out of the block before the sink is called. Without a DLQ they go through `FilterDlqPolicy::Route` when one is set. Otherwise they are dropped, counted in `pipeline_dead_letters_dropped_total{reason}`, and the block releases `Dropped`, never `Delivered`.
 
@@ -72,6 +74,8 @@ At start the loop sets `pipeline_delivery_guarantee{guarantee, reason}` to 1:
 | `best_effort` | `unarmed` | A push source with acknowledgements on, run by a loop that does not arm it, so it answers at enqueue |
 
 A write to a sink that cannot confirm still counts as delivered: the metric reports the weaker guarantee rather than refusing to run. The other run loops set only the `unarmed` row.
+
+An app with several listeners, each its own source and sink pair, publishes one series per listener with `EffectiveGuarantee::of(source, sink).publish_for(listener)`, which adds a `listener` label. `publish()` sets the series without it, as the pipeline does.
 
 ---
 

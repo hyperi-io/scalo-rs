@@ -1149,7 +1149,8 @@ impl TransportSender for GrpcTransport {
     /// again (at-least-once). A record over the limit on its own is left out
     /// and counted in `transport_message_too_large_total`, as
     /// [`send`](TransportSender::send) refuses it, and when every record is,
-    /// the result is `FilteredDlq`. [`dead_letter_reason`] names such a record
+    /// the result is `FilteredDlq`. Either way it is dropped, and counted in
+    /// `pipeline_dead_letters_dropped_total`. [`dead_letter_reason`] names such a record
     /// before the send, so a caller holding a source acknowledgement
     /// dead-letters it instead.
     ///
@@ -1196,6 +1197,8 @@ impl TransportSender for GrpcTransport {
         // is one the receiver's decoder refuses.
         let (batches, left_out) = batches_within(to_send, self.max_message_size);
         if batches.is_empty() {
+            // Callers take `FilteredDlq` as handled, so these are dropped too.
+            count_left_out(left_out);
             return SendResult::FilteredDlq;
         }
         for batch in batches {
@@ -1285,8 +1288,8 @@ fn batches_within(records: Vec<Record>, limit: usize) -> (Vec<proto::Batch>, u64
     (batches, left_out)
 }
 
-/// Count records `send_batch` left out of a block it sent: they were dropped,
-/// not dead-lettered, so they count with the dead letters dropped.
+/// Count records `send_batch` left out of a block: they were dropped, not
+/// dead-lettered, so they count with the dead letters dropped.
 fn count_left_out(left_out: u64) {
     #[cfg(feature = "metrics")]
     if left_out > 0 {

@@ -50,6 +50,8 @@ struct Run {
     held: Vec<Held>,
     unreleased: usize,
     unreleased_bytes: u64,
+    /// Offsets released `Errored` and not released since.
+    withheld: usize,
     received: Instant,
 }
 
@@ -72,6 +74,9 @@ impl Run {
             entry.released = true;
             self.unreleased -= 1;
             self.unreleased_bytes = self.unreleased_bytes.saturating_sub(entry.bytes);
+            if entry.withheld {
+                self.withheld -= 1;
+            }
         }
         true
     }
@@ -79,7 +84,11 @@ impl Run {
     /// Mark `offset` released `Errored`: it stays held.
     fn withhold(&mut self, offset: i64) {
         if let Ok(at) = self.held.binary_search_by_key(&offset, |h| h.offset) {
-            self.held[at].withheld = true;
+            let entry = &mut self.held[at];
+            if !entry.withheld && !entry.released {
+                self.withheld += 1;
+            }
+            entry.withheld = true;
         }
     }
 
@@ -95,6 +104,9 @@ impl Run {
             if !dropped.released {
                 self.unreleased -= 1;
                 self.unreleased_bytes = self.unreleased_bytes.saturating_sub(dropped.bytes);
+                if dropped.withheld {
+                    self.withheld -= 1;
+                }
             }
         }
     }
@@ -207,6 +219,7 @@ impl KafkaAcks {
             hold.register(Run {
                 unreleased: held.len(),
                 unreleased_bytes: held.iter().map(|h| h.bytes).sum(),
+                withheld: 0,
                 held,
                 received: now,
             });
@@ -281,6 +294,22 @@ impl KafkaAcks {
                 .min()
         };
         Self::note_released(tokens.len(), DeliveryStatus::Errored, oldest);
+        self.publish_held();
+    }
+
+    /// Offsets released `Errored` and still held: each pins its partition's
+    /// commit until a restart or a revoke.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        allow(dead_code, reason = "published as a gauge only")
+    )]
+    fn withheld(&self) -> u64 {
+        self.partitions
+            .lock()
+            .values()
+            .flat_map(|p| p.runs.iter())
+            .map(|r| r.withheld as u64)
+            .sum()
     }
 
     /// Apply ownership changes in the order librdkafka served them, and return
@@ -383,6 +412,8 @@ impl KafkaAcks {
             ::metrics::gauge!("transport_ack_held", "transport" => "kafka").set(held.count as f64);
             ::metrics::gauge!("transport_ack_held_bytes", "transport" => "kafka")
                 .set(held.bytes as f64);
+            ::metrics::gauge!("transport_ack_withheld", "transport" => "kafka")
+                .set(self.withheld() as f64);
         }
     }
 }
@@ -700,6 +731,95 @@ mod tests {
         }));
         assert!(caught.is_err(), "the first panic is caught, not aborted on");
         assert_eq!(acks.held().count, 0, "the revoke in the drop still applied");
+    }
+
+    /// A recorder that keeps the `transport_ack_withheld` gauge and drops the rest.
+    #[cfg(feature = "metrics")]
+    #[derive(Default)]
+    struct WithheldGauge(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+    #[cfg(feature = "metrics")]
+    impl WithheldGauge {
+        /// The gauge as the whole count it carries.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        fn count(&self) -> u64 {
+            f64::from_bits(self.0.load(Ordering::Acquire)) as u64
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    impl ::metrics::Recorder for WithheldGauge {
+        fn describe_counter(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Counter {
+            ::metrics::Counter::noop()
+        }
+        fn register_gauge(
+            &self,
+            key: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Gauge {
+            if key.name() == "transport_ack_withheld" {
+                ::metrics::Gauge::from_arc(std::sync::Arc::clone(&self.0))
+            } else {
+                ::metrics::Gauge::noop()
+            }
+        }
+        fn register_histogram(
+            &self,
+            _: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Histogram {
+            ::metrics::Histogram::noop()
+        }
+    }
+
+    /// An `Errored` release pins its partition's commit, so the gauge an
+    /// alert watches counts it until a revoke drops it.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_withheld_offset_is_counted_until_its_partition_goes() {
+        let recorder = WithheldGauge::default();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+        let acks = KafkaAcks::default();
+        let block = register(&acks, 0, 0..10);
+        acks.withhold(&block[3..5]);
+        assert_eq!(recorder.count(), 2, "two offsets withheld");
+
+        assert_eq!(targets(&acks, &block[..3]), vec![3]);
+        let later = register(&acks, 0, 10..20);
+        assert!(targets(&acks, &block[5..]).is_empty());
+        assert!(
+            targets(&acks, &later).is_empty(),
+            "the commit is pinned at the withheld offset"
+        );
+        assert_eq!(recorder.count(), 2, "still pinned after later releases");
+
+        acks.rebalanced(vec![change(1, true, 0)]);
+        assert_eq!(recorder.count(), 0, "a revoke hands them to the next owner");
     }
 
     #[test]

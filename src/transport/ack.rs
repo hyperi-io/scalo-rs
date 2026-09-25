@@ -193,17 +193,20 @@ pub enum SinkConfirmation {
     Remote,
 }
 
-/// Why a sender would dead-letter a record instead of sending it.
+/// Why a sender would dead-letter a record instead of sending it, or why no
+/// DLQ backend can ever hold an entry.
 ///
 /// Returned by
-/// [`TransportSender::dead_letter_reason`](super::TransportSender::dead_letter_reason).
+/// [`TransportSender::dead_letter_reason`](super::TransportSender::dead_letter_reason),
+/// and by `Dlq::refusal` with the `dlq` feature.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DeadLetterReason {
-    /// The record is over the sender's size ceiling.
+    /// The record is over the sender's size ceiling, or the entry over every
+    /// DLQ backend's.
     #[error("record of {bytes} bytes is over the sender's {limit}-byte ceiling")]
     TooLarge {
-        /// The record's payload bytes.
+        /// The record's payload bytes, or the entry's serialised bytes.
         bytes: usize,
         /// The ceiling it is measured against.
         limit: usize,
@@ -342,6 +345,25 @@ impl EffectiveGuarantee {
         tracing::info!(
             guarantee = self.guarantee.as_str(),
             reason = self.reason.as_str(),
+            "pipeline delivery guarantee"
+        );
+    }
+
+    /// As [`publish`](Self::publish), with a `listener` label, for an app
+    /// that runs one source and sink pair per listener.
+    pub fn publish_for(self, listener: &str) {
+        #[cfg(feature = "metrics")]
+        metrics::gauge!(
+            "pipeline_delivery_guarantee",
+            "guarantee" => self.guarantee.as_str(),
+            "reason" => self.reason.as_str(),
+            "listener" => listener.to_owned()
+        )
+        .set(1.0);
+        tracing::info!(
+            guarantee = self.guarantee.as_str(),
+            reason = self.reason.as_str(),
+            listener,
             "pipeline delivery guarantee"
         );
     }

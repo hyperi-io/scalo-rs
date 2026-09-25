@@ -23,7 +23,8 @@ use crate::transport::grpc::{GrpcConfig, lazy_channel};
 /// Converts JSON values to Vector's protobuf `EventWrapper` format
 /// and sends them via `PushEvents`.
 ///
-/// Bounded by the gRPC transport's default `send_timeout_ms` (30 s): a dial
+/// Bounded by the gRPC transport's default `send_timeout_ms` (30 s), or the
+/// limit given to [`connect_lazy_within`](Self::connect_lazy_within): a dial
 /// whose DNS lookup or TCP connect is unfinished at nine tenths of it is
 /// abandoned, so the call that started it fails and the next dials afresh, and
 /// `health_check` gives up at it. `send_events` has no limit once connected: a
@@ -55,7 +56,14 @@ impl VectorCompatClient {
 
     /// [`connect_lazy`](Self::connect_lazy) with the dial and health-check limit
     /// set to `send_timeout_ms` (0 = none).
-    fn connect_lazy_within(endpoint: &str, send_timeout_ms: u64) -> TransportResult<Self> {
+    ///
+    /// A caller holding its own source's answer sets this below that hold, so
+    /// a stalled dial fails while the source can still answer its sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the endpoint URI is invalid.
+    pub fn connect_lazy_within(endpoint: &str, send_timeout_ms: u64) -> TransportResult<Self> {
         // Bound the response decode size. `usize::MAX` contradicts the never-OOM
         // doctrine -- even a (trusted) Vector server response should not be able
         // to drive an unbounded allocation. 64 MiB is far above any real ack

@@ -228,6 +228,11 @@ impl KafkaDlqInner {
         std::mem::take(&mut self.sole_custody)
     }
 
+    /// The largest serialised entry the producer takes.
+    pub(crate) fn entry_ceiling(&self) -> usize {
+        self.producer.payload_ceiling()
+    }
+
     /// Entries only Kafka holds whose fate no barrier has learned yet.
     pub(crate) fn unsettled(&self) -> u64 {
         self.sole_custody

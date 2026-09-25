@@ -237,6 +237,8 @@ chosen backend's `SendResult` unchanged — backpressure, fatal, and
 filter-DLQ propagate up. Caller distinguishes by matching on the
 result.
 
+That holds for `send` and `send_to`. The block and fan-out forms (`send_batch`, `send_fanout`, `send_batch_fanout`) count a `FilteredDlq` answer as handled and return `Ok`, as the `TransportSender::send_batch` contract says, so the caller never sees it. To dead-letter those records instead, screen the block first: `dead_letter_reason` answers for the route each record's key selects, and `BatchEngine::pipeline(..).sender(&routed)` does that screening and routes the records to its DLQ. `confirms_delivery` is the weakest across every route and the default.
+
 ---
 
 ## API surface
@@ -250,6 +252,8 @@ result.
 | `RoutedSender::send_fanout(&[destination], key, payload).await` | One payload to every named destination |
 | `RoutedSender::send_batch(records).await` | A block grouped by destination, one call per group |
 | `RoutedSender::send_batch_fanout(&[destination], records).await` | The whole block to every named destination |
+| `RoutedSender::dead_letter_reason(record)` | The screen of the route the record's key selects |
+| `RoutedSender::confirms_delivery()` | The weakest confirmation across every route and the default |
 | `RoutedSender::route_keys() -> Vec<&str>` | List configured route keys |
 | `RoutedSender::has_route(key) -> bool` | Check if a specific key has a route |
 | `RoutedSender::has_default() -> bool` | Check if a default sender is wired |

@@ -3845,6 +3845,43 @@ async fn a_pipeline_that_declares_nothing_reports_best_effort() {
     );
 }
 
+/// An app with a source and sink pair per listener publishes one series per
+/// listener, told apart by the `listener` label.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_guarantee_published_for_a_listener_carries_its_name() {
+    use crate::transport::ack::EffectiveGuarantee;
+
+    let capture = GaugeCapture::default();
+    let _recorder = metrics::set_default_local_recorder(&capture);
+    let source = HeldSource::new(AckKind::Pull, Vec::new());
+    EffectiveGuarantee::of(source.ack_control(), SinkConfirmation::Remote).publish_for("syslog");
+    EffectiveGuarantee::of(None, SinkConfirmation::Remote).publish_for("netflow");
+
+    assert_eq!(
+        capture.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "at_least_once"),
+                ("reason", "confirmed"),
+                ("listener", "syslog")
+            ]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        capture.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "best_effort"),
+                ("reason", "source_cannot_ack"),
+                ("listener", "netflow")
+            ]
+        ),
+        Some(1.0)
+    );
+}
+
 #[tokio::test]
 async fn acknowledgements_disabled_releases_at_receipt() {
     let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1]]).acks_disabled();
@@ -4118,11 +4155,12 @@ async fn an_oversize_record_is_dropped_and_counted_never_delivered() {
         .await
         .expect("clean shutdown");
 
+    // One lock: a second in the failure message would deadlock on the first.
+    let sunk = sunk.lock().clone();
     assert_eq!(
-        sunk.lock().len(),
+        sunk.len(),
         2,
-        "the two good records reach the sink, the oversize one never does: {:?}",
-        sunk.lock()
+        "the two good records reach the sink, the oversize one never does: {sunk:?}"
     );
     assert_eq!(
         source.released(),
@@ -4138,10 +4176,80 @@ async fn an_oversize_record_is_dropped_and_counted_never_delivered() {
     );
 }
 
+/// A routed sender answers the screen for the route each record's key selects,
+/// so its Kafka route's ceiling reaches the pipeline. The default route has no
+/// ceiling, so a key the routed sender ignored would send the record.
+#[cfg(all(feature = "metrics", feature = "transport-kafka"))]
+#[tokio::test(flavor = "current_thread")]
+async fn an_oversize_record_through_a_routed_sender_is_screened_by_its_route() {
+    use crate::transport::factory::AnySender;
+    use crate::transport::routed::RoutedSender;
+
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let routes = std::collections::HashMap::from([(
+        "events.land".to_string(),
+        AnySender::Kafka(small_ceiling_kafka_sender().await),
+    )]);
+    let sender = RoutedSender::new(routes, Some(AnySender::Memory(mem_transport(50))));
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&sunk);
+    let stop = shutdown.clone();
+
+    default_engine()
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .sender(&sender)
+        .run(
+            |batch| {
+                let grown = grow_seq_one_past_the_ceiling(batch)?;
+                Ok(grown.map_records(|records| {
+                    records
+                        .into_iter()
+                        .map(|mut record| {
+                            record.key = Some(Arc::from("events.land"));
+                            record
+                        })
+                        .collect()
+                }))
+            },
+            move |out: &WorkBatch<_>| {
+                seen.lock()
+                    .extend(out.records.iter().map(|r| r.payload.len()));
+                stop.cancel();
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect("clean shutdown");
+
+    // One lock: a second in the failure message would deadlock on the first.
+    let sunk = sunk.lock().clone();
+    assert_eq!(
+        sunk.len(),
+        2,
+        "the oversize record never reaches the sink: {sunk:?}"
+    );
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Dropped)]
+    );
+    assert_eq!(
+        capture.counter(
+            "pipeline_dead_letters_dropped_total",
+            &[("reason", "too_large")]
+        ),
+        1
+    );
+}
+
 /// A gRPC `send_batch` outside the pipeline leaves a record over its ceiling
 /// out of a block it otherwise sends: that record is dropped, so it counts
 /// with the dropped dead letters. A block of nothing but such records is
-/// answered `FilteredDlq`, which tells the caller, so it is not counted.
+/// answered `FilteredDlq`, which every caller takes as handled, so those
+/// count too.
 #[cfg(all(feature = "metrics", feature = "transport-grpc"))]
 #[tokio::test(flavor = "current_thread")]
 async fn a_record_grpc_send_batch_leaves_out_counts_as_a_dropped_dead_letter() {
@@ -4183,12 +4291,12 @@ async fn a_record_grpc_send_batch_leaves_out_counts_as_a_dropped_dead_letter() {
     assert_eq!(received, 2, "the two records within the ceiling arrive");
     assert_eq!(dropped(), 1, "the one left out is counted dropped");
 
-    let refused = client.send_batch(&[record(LIMIT)]).await;
+    let refused = client.send_batch(&[record(LIMIT), record(LIMIT)]).await;
     assert!(refused.is_filtered_dlq(), "{refused:?}");
     assert_eq!(
         dropped(),
-        1,
-        "a record the caller is told about is not counted"
+        3,
+        "a block left out whole counts each record it drops"
     );
 }
 
@@ -4303,41 +4411,125 @@ fn dead_letter_seq_one(
     Ok(batch.with_dlq_entries(dead))
 }
 
+/// A DLQ write that fails is retried with the block held, never released
+/// `Errored` while the loop runs: once the DLQ takes it, the block releases
+/// `Rejected`.
 #[cfg(feature = "dlq")]
 #[tokio::test]
-async fn dlq_routed_record_releases_after_the_dlq_confirms() {
-    // A DLQ that refuses the write: the block is not released.
+async fn a_refused_dlq_write_is_retried_with_the_block_held() {
     let refusing = tempfile::tempdir().expect("tempdir");
     let dlq_shutdown = CancellationToken::new();
     let dlq = file_dlq(refusing.path(), &dlq_shutdown);
-    tokio::fs::remove_dir_all(refusing.path().join("svc"))
+    let svc = refusing.path().join("svc");
+    tokio::fs::remove_dir_all(&svc)
         .await
         .expect("remove dlq dir");
-    tokio::fs::write(refusing.path().join("svc"), b"not a directory")
+    tokio::fs::write(&svc, b"not a directory")
         .await
         .expect("plant file");
+    let mended = svc.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::fs::remove_file(&mended)
+            .await
+            .expect("remove planted file");
+        tokio::fs::create_dir(&mended)
+            .await
+            .expect("recreate dlq dir");
+    });
     let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
 
-    let result = default_engine()
-        .with_dlq(dlq)
-        .pipeline(&source)
-        .run(dead_letter_seq_one, |_out: &WorkBatch<_>| {
-            std::future::ready(Ok(()))
-        })
-        .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        default_engine()
+            .with_dlq(dlq)
+            .pipeline(&source)
+            .shutdown(shutdown)
+            .run(dead_letter_seq_one, move |_out: &WorkBatch<_>| {
+                stop.cancel();
+                std::future::ready(Ok(()))
+            }),
+    )
+    .await
+    .expect("the DLQ recovers inside the wait")
+    .expect("clean shutdown");
 
-    assert!(
-        result.is_err(),
-        "the refused dead letter stops the loop: {result:?}"
-    );
     assert_eq!(
         source.released(),
-        vec![(vec![0, 1, 2], DeliveryStatus::Errored)]
+        vec![(vec![0, 1, 2], DeliveryStatus::Rejected)],
+        "held through the refusals, released once the DLQ holds it"
     );
-    assert!(
-        source.commits.lock().is_empty(),
-        "a dead letter the DLQ does not hold never releases its source"
+    assert_eq!(dlq_lines(refusing.path()).await, 1);
+    dlq_shutdown.cancel();
+}
+
+/// An entry no DLQ backend can ever hold is dropped and counted, not retried:
+/// a Kafka-only DLQ whose ceiling the base64 entry is over.
+#[cfg(all(feature = "dlq-kafka", feature = "metrics"))]
+#[tokio::test(flavor = "current_thread")]
+async fn a_dead_letter_no_dlq_backend_can_hold_is_dropped_and_counted() {
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let mut kafka =
+        crate::transport::kafka::KafkaConfig::for_testing("127.0.0.1:1", "", Vec::new());
+    kafka.sizing.producer.message_max_bytes =
+        Some(i32::try_from(SMALL_CEILING).expect("fits an i32"));
+    let config = crate::dlq::DlqConfig {
+        mode: crate::dlq::DlqMode::KafkaOnly,
+        file: crate::dlq::FileDlqConfig {
+            enabled: false,
+            ..crate::dlq::FileDlqConfig::default()
+        },
+        kafka: crate::dlq::KafkaDlqConfig {
+            enabled: true,
+            ..crate::dlq::KafkaDlqConfig::default()
+        },
+        ..crate::dlq::DlqConfig::default()
+    };
+    let dlq_shutdown = CancellationToken::new();
+    let dlq = crate::dlq::Dlq::spawn(&config, "svc", Some(&kafka), dlq_shutdown.clone())
+        .expect("spawn dlq");
+    let sender = small_ceiling_kafka_sender().await;
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        default_engine()
+            .with_dlq(Arc::new(dlq))
+            .pipeline(&source)
+            .shutdown(shutdown)
+            .sender(&sender)
+            .run(grow_seq_one_past_the_ceiling, move |_out: &WorkBatch<_>| {
+                stop.cancel();
+                std::future::ready(Ok(()))
+            }),
+    )
+    .await
+    .expect("a refusal is not retried")
+    .expect("clean shutdown");
+
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Dropped)]
     );
+    assert_eq!(
+        capture.counter(
+            "pipeline_dead_letters_dropped_total",
+            &[("reason", "too_large")]
+        ),
+        1
+    );
+    dlq_shutdown.cancel();
+}
+
+#[cfg(feature = "dlq")]
+#[tokio::test]
+async fn dlq_routed_record_releases_after_the_dlq_confirms() {
+    let dlq_shutdown = CancellationToken::new();
 
     // A DLQ that takes it: released Rejected once the write is confirmed.
     let holding = tempfile::tempdir().expect("tempdir");

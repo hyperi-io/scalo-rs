@@ -595,7 +595,10 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                 }),
         );
         self.screen_out(&mut out.records, &mut dead);
-        self.dead_letter(dead, pieces).await?;
+        match self.dead_letter(dead, pieces, give_up).await? {
+            SinkEnd::Sunk => {}
+            end => return Ok(end),
+        }
         if out.records.is_empty() {
             return Ok(SinkEnd::Sunk);
         }
@@ -635,7 +638,10 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         SinkFut: std::future::Future<Output = Result<(), EngineError>>,
     {
         let WorkBatch { records, .. } = batch;
-        self.dead_letter(dead, pieces).await?;
+        match self.dead_letter(dead, pieces, give_up).await? {
+            SinkEnd::Sunk => {}
+            end => return Ok(end),
+        }
         let mut sub_blocks = SubBlockDrain::new(records, sub_block_bytes);
         while let Some(sub_records) = sub_blocks.next_sub_block() {
             let sub_block: WorkBatch<R::Token> = WorkBatch::from_records(sub_records);
@@ -650,7 +656,10 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                 })
                 .collect();
             self.screen_out(&mut out.records, &mut dead);
-            self.dead_letter(dead, pieces).await?;
+            match self.dead_letter(dead, pieces, give_up).await? {
+                SinkEnd::Sunk => {}
+                end => return Ok(end),
+            }
             if out.records.is_empty() {
                 continue;
             }
@@ -694,7 +703,12 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
     }
 
     /// Write `dead` as one piece of the block: `Rejected` once the DLQ holds it,
-    /// `Errored` when it refuses.
+    /// `Dropped` for an entry no DLQ backend can ever hold.
+    ///
+    /// A DLQ write that fails is retried with backoff, holding the block, until
+    /// it lands, the hold deadline comes (`Expired`, the piece `Errored`), or
+    /// the retry window after shutdown closes (`Abandoned`). A DLQ whose drain
+    /// has exited answers `Errored` at once.
     ///
     /// Without a DLQ, entries from filters and `process` go through the
     /// [`FilterDlqPolicy`] as the other run loops route them, and records the
@@ -705,47 +719,23 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         &self,
         dead: Vec<DeadLetter>,
         pieces: &BlockPieces<'_>,
-    ) -> Result<(), EngineError> {
+        give_up: Option<tokio::time::Instant>,
+    ) -> Result<SinkEnd, EngineError> {
         if dead.is_empty() {
-            return Ok(());
+            return Ok(SinkEnd::Sunk);
         }
         let piece = pieces.piece();
 
         #[cfg(feature = "dlq")]
         if let Some(dlq) = &self.engine.dlq {
-            let dropped_reasons: Vec<&'static str> = if dlq.is_enabled() {
-                Vec::new()
-            } else {
-                dead.iter()
-                    .map(|d| d.screened.unwrap_or(PRODUCED_DEAD_LETTER))
-                    .collect()
-            };
-            let entries: Vec<crate::dlq::DlqEntry> = dead
-                .into_iter()
-                .map(|d| {
-                    let entry =
-                        crate::dlq::DlqEntry::new(DLQ_SERVICE, d.entry.reason, d.entry.payload);
-                    match d.entry.key {
-                        Some(key) => entry.with_destination(key.as_ref()),
-                        None => entry,
-                    }
-                })
-                .collect();
-            piece.report(match dlq.write_confirmed(entries).await {
-                Ok(()) if dlq.is_enabled() => DeliveryStatus::Rejected,
-                Ok(()) => {
-                    for reason in dropped_reasons {
-                        count_dropped_dead_letter(reason);
-                    }
-                    DeliveryStatus::Dropped
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "The DLQ refused dead letters; the block is not released");
-                    DeliveryStatus::Errored
-                }
-            });
-            return Ok(());
+            let (status, end) = self.dead_letter_to(dlq, dead, give_up).await;
+            if let Some(status) = status {
+                piece.report(status);
+            }
+            return Ok(end);
         }
+        #[cfg(not(feature = "dlq"))]
+        let _ = give_up;
 
         let (screened, routed): (Vec<DeadLetter>, Vec<DeadLetter>) =
             dead.into_iter().partition(|d| d.screened.is_some());
@@ -777,7 +767,82 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
             }
         }
         piece.report(status);
-        Ok(())
+        Ok(SinkEnd::Sunk)
+    }
+
+    /// The DLQ half of [`dead_letter`](Self::dead_letter): the piece's status,
+    /// `None` when the block is abandoned, and how the write ended.
+    #[cfg(feature = "dlq")]
+    async fn dead_letter_to(
+        &self,
+        dlq: &crate::dlq::Dlq,
+        dead: Vec<DeadLetter>,
+        give_up: Option<tokio::time::Instant>,
+    ) -> (Option<DeliveryStatus>, SinkEnd) {
+        let enabled = dlq.is_enabled();
+        let mut status = DeliveryStatus::Delivered;
+        let mut disabled_reasons: Vec<&'static str> = Vec::new();
+        let mut entries: Vec<crate::dlq::DlqEntry> = Vec::with_capacity(dead.len());
+        for d in dead {
+            let entry = crate::dlq::DlqEntry::new(DLQ_SERVICE, d.entry.reason, d.entry.payload);
+            let entry = match d.entry.key {
+                Some(key) => entry.with_destination(key.as_ref()),
+                None => entry,
+            };
+            if !enabled {
+                disabled_reasons.push(d.screened.unwrap_or(PRODUCED_DEAD_LETTER));
+            } else if let Some(refused) = dlq.refusal(&entry) {
+                count_dropped_dead_letter(refused.as_str());
+                tracing::warn!(
+                    reason = refused.as_str(),
+                    "No DLQ backend can hold this dead letter; it is dropped"
+                );
+                status = status.max(DeliveryStatus::Dropped);
+                continue;
+            }
+            entries.push(entry);
+        }
+        if entries.is_empty() {
+            return (Some(status), SinkEnd::Sunk);
+        }
+
+        let mut failures = 0_u32;
+        loop {
+            let attempt = dlq.write_confirmed(entries.clone());
+            let written = match give_up {
+                Some(at) => match tokio::time::timeout_at(at, attempt).await {
+                    Ok(written) => written,
+                    Err(_elapsed) => return (Some(DeliveryStatus::Errored), SinkEnd::Expired),
+                },
+                None => attempt.await,
+            };
+            match written {
+                Ok(()) if enabled => {
+                    note_recovered("dlq", failures);
+                    return (Some(status.max(DeliveryStatus::Rejected)), SinkEnd::Sunk);
+                }
+                Ok(()) => {
+                    for reason in disabled_reasons {
+                        count_dropped_dead_letter(reason);
+                    }
+                    return (Some(status.max(DeliveryStatus::Dropped)), SinkEnd::Sunk);
+                }
+                Err(e @ crate::dlq::DlqError::Closed) => {
+                    tracing::warn!(error = %e, "The DLQ has shut down; the block is not released");
+                    return (Some(DeliveryStatus::Errored), SinkEnd::Sunk);
+                }
+                Err(e) => {
+                    failures = failures.saturating_add(1);
+                    note_transient("dlq", &e, failures);
+                    tokio::select! {
+                        biased;
+                        () = self.retry.closed() => return (None, SinkEnd::Abandoned),
+                        () = until(give_up) => return (Some(DeliveryStatus::Errored), SinkEnd::Expired),
+                        () = tokio::time::sleep(Backoff::TRANSIENT.delay(failures)) => {}
+                    }
+                }
+            }
+        }
     }
 
     /// Sink `batch`, retrying a transient failure, until it is taken, the hold

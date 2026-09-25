@@ -78,6 +78,30 @@ pub struct Dlq {
     lost: Arc<AtomicU64>,
     /// Debounce clock (epoch ms) for the dead-letter-drop ERROR log.
     lost_log_ms: Arc<AtomicU64>,
+    /// The largest serialised entry any backend can hold, when every backend
+    /// has a ceiling.
+    #[cfg_attr(
+        not(feature = "transport"),
+        allow(dead_code, reason = "read by `refusal` only")
+    )]
+    ceiling: Option<usize>,
+}
+
+/// Counts the bytes written to it, to size an entry without keeping its body.
+#[cfg(feature = "transport")]
+#[derive(Default)]
+struct ByteCount(usize);
+
+#[cfg(feature = "transport")]
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Minimum interval between dead-letter-drop ERROR logs; the counters
@@ -133,6 +157,7 @@ impl Dlq {
             cancel: CancellationToken::new(),
             lost: Arc::new(AtomicU64::new(0)),
             lost_log_ms: Arc::new(AtomicU64::new(0)),
+            ceiling: None,
         }
     }
 
@@ -172,6 +197,12 @@ impl Dlq {
 
         let names: Vec<&'static str> = backends.iter().map(DlqBackend::name).collect();
         debug!(mode = ?config.mode, backends = ?names, "DLQ initialised");
+        // An entry is refused for good only when every backend would refuse it.
+        let ceiling = backends
+            .iter()
+            .map(DlqBackend::entry_ceiling)
+            .collect::<Option<Vec<usize>>>()
+            .and_then(|ceilings| ceilings.into_iter().max());
 
         let lost = Arc::new(AtomicU64::new(0));
         let lost_log_ms = Arc::new(AtomicU64::new(0));
@@ -205,6 +236,7 @@ impl Dlq {
             cancel,
             lost,
             lost_log_ms,
+            ceiling,
         })
     }
 
@@ -347,6 +379,30 @@ impl Dlq {
             return Ok(());
         };
         sink.write_confirmed(entries).await.map_err(map_sink_err)
+    }
+
+    /// Why no backend of this DLQ can ever hold `entry`, or `None` when one
+    /// can, or the DLQ is disabled.
+    ///
+    /// Only a Kafka backend has a ceiling: `message.max.bytes`, measured
+    /// against the entry as it is written, base64 payload included. A file or
+    /// HTTP backend beside it takes what Kafka refuses, so the DLQ refuses an
+    /// entry only when every backend does. A caller holding a source
+    /// acknowledgement leaves such an entry out of
+    /// [`write_confirmed`](Self::write_confirmed) and releases it `Dropped`:
+    /// no retry can land it. Every other `write_confirmed` error can clear, so
+    /// that caller holds the block and writes again. A broker or topic ceiling
+    /// below the producer's is not seen here, and fails the write instead.
+    #[cfg(feature = "transport")]
+    #[must_use]
+    pub fn refusal(&self, entry: &DlqEntry) -> Option<crate::transport::DeadLetterReason> {
+        let limit = self.ceiling?;
+        let mut size = ByteCount::default();
+        serde_json::to_writer(&mut size, entry).ok()?;
+        (size.0 > limit).then_some(crate::transport::DeadLetterReason::TooLarge {
+            bytes: size.0,
+            limit,
+        })
     }
 
     /// Cancel the internal child token (drain flushes its batch and
@@ -966,6 +1022,48 @@ mod tests {
             }
             dlq.shutdown().await.expect("shutdown");
             assert_eq!(dlq.dropped(), 3, "every unacked entry counted");
+        }
+
+        /// Only an entry every backend would refuse is refused: Kafka alone
+        /// refuses one over its ceiling, and a file backend beside it takes it.
+        #[tokio::test]
+        async fn an_entry_over_the_only_backends_ceiling_is_refused() {
+            let mut kafka = unreachable_broker();
+            kafka.sizing.producer.message_max_bytes = Some(2_000_000);
+            // Within the ceiling as raw bytes, over it once base64 grows it by a third.
+            let over = DlqEntry::new("svc", "err", vec![b'x'; 1_600_000]);
+            let under = DlqEntry::new("svc", "err", vec![b'x'; 100]);
+
+            let alone = Dlq::spawn(
+                &kafka_only(300),
+                "svc",
+                Some(&kafka),
+                CancellationToken::new(),
+            )
+            .expect("spawn");
+            let refused = alone.refusal(&over);
+            assert!(
+                matches!(
+                    refused,
+                    Some(crate::transport::DeadLetterReason::TooLarge { bytes, limit })
+                        if limit == 2_000_000 - 128 && bytes > limit
+                ),
+                "base64 grows the payload past the ceiling: {refused:?}"
+            );
+            assert_eq!(alone.refusal(&under), None);
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut both = kafka_only(300);
+            both.mode = DlqMode::Cascade;
+            both.file = tmp_config(dir.path()).file;
+            let cascade =
+                Dlq::spawn(&both, "svc", Some(&kafka), CancellationToken::new()).expect("spawn");
+            assert_eq!(
+                cascade.refusal(&over),
+                None,
+                "the file backend takes what Kafka refuses"
+            );
+            assert_eq!(Dlq::disabled().refusal(&over), None);
         }
 
         #[tokio::test]
