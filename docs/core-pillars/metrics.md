@@ -178,6 +178,7 @@ A source or sink that goes away is waited out rather than ending the app, and th
 | `transport_recv_errors_total` | `transport`, `class` | receive failures; `class="transient"` were retried, `class="permanent"` were returned. Kafka emits it |
 | `transport_commit_errors_total` | `transport` | source commits that failed after the block was delivered; the `BatchEngine` driver counts them and carries on |
 | `pipeline_retries_total` | `stage` | `BatchEngine` run-loop steps retried after a transient failure, `stage` being `recv` or `sink` |
+| `transport_redelivered_total` | `transport`, `reason` | sends retried after an outcome the receiver may still deliver, so possible duplicates: `reason="hold_expired"` when a held response ran out of budget, `reason="deadline"` when the send's deadline passed. gRPC emits it |
 
 A rising `transport_recv_errors_total{class="transient"}` or `pipeline_retries_total` with flat throughput is an outage being ridden out. Behaviour per backend: [../transport/backends.md](../transport/backends.md).
 

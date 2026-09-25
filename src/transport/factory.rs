@@ -1026,8 +1026,8 @@ impl AnyReceiver {
         }
     }
 
-    /// Apply the `<key>.<type>.acknowledgements` section to a Kafka source, and
-    /// warn once when one sits under a pipe or memory source.
+    /// Apply the `<key>.<type>.acknowledgements` section to a Kafka or gRPC
+    /// source, and warn once when one sits under a pipe or memory source.
     #[cfg(feature = "config")]
     fn apply_acknowledgements(self, key: &str) -> TransportResult<Self> {
         match self {
@@ -1035,6 +1035,11 @@ impl AnyReceiver {
             Self::Kafka(t) => Ok(match acknowledgements_section(key, "kafka")? {
                 Some(acks) => Self::Kafka(t.with_acknowledgements(acks)),
                 None => Self::Kafka(t),
+            }),
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => Ok(match acknowledgements_section(key, "grpc")? {
+                Some(acks) => Self::Grpc(t.with_acknowledgements(acks)),
+                None => Self::Grpc(t),
             }),
             #[cfg(feature = "transport-memory")]
             Self::Memory(t) => {

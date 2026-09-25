@@ -26,6 +26,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+use crate::transport::ack::{AckControl, AckKind, HeldAcks};
 use crate::transport::finalizer::DeliveryStatus;
 
 /// The held-byte ceiling when no memory guard sizes it.
@@ -58,19 +59,6 @@ pub(crate) fn hold_budget(max_hold: Duration, sender_deadline: Option<Duration>)
     };
     let margin = (deadline / 10).max(MIN_MARGIN).min(deadline / 2);
     max_hold.min(deadline.saturating_sub(margin))
-}
-
-/// What the registry reports about the responses it holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HeldSnapshot {
-    /// Responses held.
-    pub(crate) count: usize,
-    /// Payload bytes those responses carried.
-    pub(crate) bytes: u64,
-    /// How long the oldest has been held.
-    pub(crate) oldest: Option<Duration>,
-    /// The earliest instant by which one of them must be answered.
-    pub(crate) earliest_deadline: Option<std::time::Instant>,
 }
 
 /// How a registry is set up.
@@ -109,22 +97,20 @@ impl Entry {
         index < self.len
     }
 
-    /// Mark record `index` released with `status`; true when it was the last
-    /// one outstanding.
-    fn mark(&mut self, index: u64, status: DeliveryStatus) -> bool {
+    /// Mark record `index` released with `status`: `None` when it already
+    /// was, else whether it was the last one outstanding.
+    fn mark(&mut self, index: u64, status: DeliveryStatus) -> Option<bool> {
         let (Ok(word), bit) = (usize::try_from(index / 64), 1_u64 << (index % 64)) else {
-            return false;
+            return None;
         };
-        let Some(slot) = self.released.get_mut(word) else {
-            return false;
-        };
+        let slot = self.released.get_mut(word)?;
         if *slot & bit != 0 {
-            return false;
+            return None;
         }
         *slot |= bit;
         self.remaining -= 1;
         self.worst = self.worst.max(status);
-        self.remaining == 0
+        Some(self.remaining == 0)
     }
 }
 
@@ -134,9 +120,11 @@ pub(crate) struct PendingRegistry {
     /// Entries held, read without the lock so a release with nothing held
     /// returns at once.
     count: AtomicUsize,
+    /// Records not yet released across every entry, changed under the lock.
+    records: AtomicU64,
     /// Bytes held across every entry, shared with the pressure source.
     held_bytes: Arc<AtomicU64>,
-    enabled: bool,
+    enabled: AtomicBool,
     armed: AtomicBool,
     max_held_bytes: u64,
     max_hold: Duration,
@@ -150,8 +138,9 @@ impl PendingRegistry {
         Self {
             entries: parking_lot::Mutex::new(BTreeMap::new()),
             count: AtomicUsize::new(0),
+            records: AtomicU64::new(0),
             held_bytes: Arc::new(AtomicU64::new(0)),
-            enabled: settings.enabled,
+            enabled: AtomicBool::new(settings.enabled),
             armed: AtomicBool::new(false),
             max_held_bytes: settings.max_held_bytes,
             max_hold: settings.max_hold,
@@ -161,19 +150,14 @@ impl PendingRegistry {
         }
     }
 
-    /// Whether the transport holds responses once armed.
-    pub(crate) fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    /// Hold responses from now on: the caller releases every token it takes.
-    pub(crate) fn arm(&self) {
-        self.armed.store(true, Ordering::Release);
+    /// Hold responses once armed, or answer every request at enqueue.
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
     }
 
     /// Whether a request arriving now is held until release.
     pub(crate) fn holding(&self) -> bool {
-        self.enabled && self.armed.load(Ordering::Acquire)
+        self.enabled.load(Ordering::Acquire) && self.armed.load(Ordering::Acquire)
     }
 
     /// The held-byte counter, for a pressure source reading it.
@@ -226,22 +210,31 @@ impl PendingRegistry {
         let finished = {
             let mut entries = self.entries.lock();
             let mut completed = Vec::new();
+            let mut marked = 0_u64;
             for seq in seqs {
                 let Some((&base, entry)) = entries.range_mut(..=seq).next_back() else {
                     continue;
                 };
                 let index = seq - base;
-                if entry.covers(index) && entry.mark(index, status) {
-                    completed.push(base);
+                if !entry.covers(index) {
+                    continue;
+                }
+                if let Some(last) = entry.mark(index, status) {
+                    marked += 1;
+                    if last {
+                        completed.push(base);
+                    }
                 }
             }
             let finished: Vec<Entry> = completed
                 .into_iter()
                 .filter_map(|base| entries.remove(&base))
                 .collect();
+            self.records.fetch_sub(marked, Ordering::Relaxed);
             self.count.store(entries.len(), Ordering::Release);
             finished
         };
+        self.publish();
         for entry in finished {
             self.finish(entry);
         }
@@ -265,24 +258,25 @@ impl PendingRegistry {
             .map(Instant::into_std)
     }
 
-    /// What is held now.
-    pub(crate) fn snapshot(&self) -> HeldSnapshot {
+    /// What is held now: records not yet released, and the bytes, age and
+    /// earliest answer deadline of the requests carrying them.
+    pub(crate) fn snapshot(&self) -> HeldAcks {
         let entries = self.entries.lock();
         let now = Instant::now();
-        HeldSnapshot {
-            count: entries.len(),
-            bytes: self.held_bytes.load(Ordering::Acquire),
-            oldest: entries
+        HeldAcks::new(
+            entries.values().map(|e| e.remaining).sum(),
+            self.held_bytes.load(Ordering::Acquire),
+            entries
                 .values()
                 .map(|e| e.admitted)
                 .min()
                 .map(|t| now.saturating_duration_since(t)),
-            earliest_deadline: entries
+            entries
                 .values()
                 .map(|e| e.deadline)
                 .min()
                 .map(Instant::into_std),
-        }
+        )
     }
 
     /// Answer every held request `Shutdown` and free what it held.
@@ -290,6 +284,7 @@ impl PendingRegistry {
         let drained = {
             let mut entries = self.entries.lock();
             self.count.store(0, Ordering::Release);
+            self.records.store(0, Ordering::Relaxed);
             std::mem::take(&mut *entries)
         };
         for entry in drained.into_values() {
@@ -332,9 +327,10 @@ impl PendingRegistry {
                 return;
             };
             entry.responder = None;
-            for index in from..entry.len {
-                entry.mark(index, DeliveryStatus::Errored);
-            }
+            let marked = (from..entry.len)
+                .filter(|&index| entry.mark(index, DeliveryStatus::Errored).is_some())
+                .count();
+            self.records.fetch_sub(marked as u64, Ordering::Relaxed);
             let done = if entry.remaining == 0 {
                 entries.remove(&base)
             } else {
@@ -381,7 +377,7 @@ impl PendingRegistry {
         #[cfg(feature = "metrics")]
         {
             metrics::gauge!("transport_ack_held", "transport" => self.label)
-                .set(self.count.load(Ordering::Acquire) as f64);
+                .set(self.records.load(Ordering::Relaxed) as f64);
             metrics::gauge!("transport_ack_held_bytes", "transport" => self.label)
                 .set(self.held_bytes.load(Ordering::Acquire) as f64);
         }
@@ -419,6 +415,28 @@ impl PendingRegistry {
         .increment(1);
         #[cfg(not(feature = "metrics"))]
         let _ = reason;
+    }
+}
+
+impl AckControl for PendingRegistry {
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
+    fn kind(&self) -> AckKind {
+        AckKind::Push
+    }
+
+    fn held(&self) -> HeldAcks {
+        self.snapshot()
     }
 }
 
@@ -470,6 +488,7 @@ impl Reservation {
         {
             let mut entries = registry.entries.lock();
             entries.insert(base, entry);
+            registry.records.fetch_add(len, Ordering::Relaxed);
             registry.count.store(entries.len(), Ordering::Release);
         }
         registry.publish();
@@ -623,6 +642,11 @@ mod tests {
 
         registry.release([0, 0, 0], DeliveryStatus::Delivered);
         assert_eq!(registry.snapshot().count, 1, "one record is still out");
+        assert_eq!(
+            registry.records.load(Ordering::Relaxed),
+            1,
+            "the gauge's count agrees"
+        );
         registry.release([1], DeliveryStatus::Delivered);
 
         assert_eq!(
@@ -696,7 +720,7 @@ mod tests {
             Duration::from_secs(1),
             DeliveryStatus::Delivered,
         );
-        assert_eq!(registry.snapshot().count, 1);
+        assert_eq!(registry.snapshot().count, 4, "four records held");
         drop(held);
         assert_eq!(registry.snapshot().count, 0);
         assert_eq!(registry.snapshot().bytes, 0);
@@ -713,7 +737,7 @@ mod tests {
         );
         held.refuse_from(2);
         drop(held);
-        assert_eq!(registry.snapshot().count, 1, "records 0 and 1 are queued");
+        assert_eq!(registry.snapshot().count, 2, "records 0 and 1 are queued");
         registry.release([0, 1], DeliveryStatus::Delivered);
         assert_eq!(registry.snapshot().count, 0);
         assert_eq!(registry.snapshot().bytes, 0);

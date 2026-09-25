@@ -126,6 +126,10 @@ impl ServiceMetrics {
             "transport_commit_errors_total",
             "Source commits that failed after the block was delivered"
         );
+        metrics::describe_counter!(
+            "transport_redelivered_total",
+            "Sends retried after an outcome the receiver may still deliver (possible duplicates)"
+        );
 
         // Push transport descriptors into manifest registry. Labels are every
         // key an emitter sets: `path` on gRPC RouteBatch sends, `reason` on
@@ -198,6 +202,19 @@ impl ServiceMetrics {
                 dashboard_hint: None,
             });
         }
+        reg.push(MetricDescriptor {
+            name: "transport_redelivered_total".into(),
+            metric_type: MetricType::Counter,
+            description:
+                "Sends retried after an outcome the receiver may still deliver (possible duplicates)"
+                    .into(),
+            unit: String::new(),
+            labels: vec!["transport".into(), "reason".into()],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
         reg.push(MetricDescriptor {
             name: "transport_recv_errors_total".into(),
             metric_type: MetricType::Counter,
