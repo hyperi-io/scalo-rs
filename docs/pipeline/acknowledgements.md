@@ -26,6 +26,8 @@ Once every piece has reported, the loop calls `TransportReceiver::release` once 
 
 A push source gives each block a hold deadline (`TransportReceiver::hold_deadline`). A block the sink is still refusing 100 ms before it is released `Errored`, so the sender is answered before its own deadline and retries, and the loop moves to the next block. A pull source has no deadline and keeps the hold-and-retry of the other run loops.
 
+A block the loop stops holding before it is released -- a panic in `process` or the sink, or the run future dropped mid-block by a `select!` or an aborted task -- is released `Errored` as it goes. A push source answers its sender at once and frees the bytes the request held, rather than keeping them until the transport is dropped.
+
 ---
 
 ## The acknowledgements key
@@ -46,9 +48,11 @@ The key sits beside the transport's own section: `AnyReceiver::from_config(key)`
 
 ## Dead letters
 
-With `BatchEngine::with_dlq(Arc<Dlq>)`, a block's dead letters -- inbound filter matches, entries `process` adds, and records the sink would refuse -- are one piece, written with `Dlq::send_batch` then `Dlq::flush`. It reports `Rejected` once the flush confirms the write and `Errored` when the DLQ refuses it, so the source is never released for a dead letter the DLQ does not hold. A disabled DLQ reports `Dropped`.
+With `BatchEngine::with_dlq(Arc<Dlq>)`, a block's dead letters -- inbound filter matches, entries `process` adds, and records the sink would refuse -- are one piece, written with `Dlq::write_confirmed`. It reports `Rejected` once a DLQ backend holds them and `Errored` when the DLQ refuses them, so the source is never released for a dead letter the DLQ does not hold. The answer covers this block's own write, so a refusal of another writer's entries never reaches it ([dlq.md](dlq.md#queue-admission-semantics)). A disabled DLQ reports `Dropped` and counts each in `pipeline_dead_letters_dropped_total{reason}`, where `reason` is `dead_letter` for one an inbound filter or `process` produced.
 
-A sender names the records it would dead-letter rather than send (`TransportSender::dead_letter_reason`): Kafka names a record over `message.max.bytes` less 128 bytes of framing, and an outbound `dlq` filter match. The sender answers such a record `FilteredDlq` without writing it anywhere, and `send_batch` counts it handled, so `.sender(&sender)` has the loop take them out of the block before the sink is called. Without a DLQ they go through `FilterDlqPolicy::Route` when one is set. Otherwise they are dropped, counted in `pipeline_dead_letters_dropped_total{reason}`, and the block releases `Dropped`, never `Delivered`.
+A sender names the records it would dead-letter rather than send (`TransportSender::dead_letter_reason`): Kafka names a record over `message.max.bytes` less 128 bytes of framing, gRPC one over `max_message_size` on its own, and both an outbound `dlq` filter match. The sender answers such a record `FilteredDlq`, or leaves it out of a gRPC block, without writing it anywhere, and `send_batch` counts it handled, so `.sender(&sender)` has the loop take them out of the block before the sink is called. Without a DLQ they go through `FilterDlqPolicy::Route` when one is set. Otherwise they are dropped, counted in `pipeline_dead_letters_dropped_total{reason}`, and the block releases `Dropped`, never `Delivered`.
+
+An app whose sink writes to a scalo transport passes that transport with `.sender(&sender)`. Without it nothing screens the block: `send_batch` drops such a record and the block releases `Delivered`. The loop then logs one WARN at start and reports the reason `unscreened` (below). `.sender` stays optional so a sink that is not a transport -- a database writer that refuses a record itself -- declares what it confirms with `.sink_confirms(..)` instead.
 
 Without a DLQ, entries from filters and `process` go through the `FilterDlqPolicy` as in the other run loops. `Route` reports `Rejected` once its closure returns `Ok`, which does not prove the entry is durable. `with_dlq` does.
 
@@ -62,6 +66,7 @@ At start the loop sets `pipeline_delivery_guarantee{guarantee, reason}` to 1:
 |-------------|----------|------|
 | `at_least_once` | `confirmed` | The source holds its ack and the sink confirms remotely (`SinkConfirmation::Remote`: Kafka, gRPC) |
 | `at_least_once_local` | `sink_confirms_locally` | The sink confirms a durable local write |
+| `at_least_once` or `at_least_once_local` | `unscreened` | As above, but no `.sender(&sender)` screens the block, so a transport sink drops a record it would dead-letter and its block releases `Delivered` |
 | `best_effort` | `sink_cannot_confirm` | The sink's `Ok` proves nothing more. `.sink_confirms(..)` declares a custom sink that does |
 | `best_effort` | `acks_disabled` | `acknowledgements.enabled: false` |
 | `best_effort` | `source_cannot_ack` | Pipe or memory source |
@@ -87,6 +92,8 @@ let piece = ack.piece(); // one per table, file or destination
 piece.report(DeliveryStatus::Delivered);
 ack.release().await?; // seals, awaits the pieces, releases the source
 ```
+
+A `SourceAck` dropped before its `release` completes -- a panic, or the loop's future dropped mid-block -- releases its block `Errored`, as the pipeline does.
 
 An app's own listener uses `scalo::transport::ack::Tickets`:
 

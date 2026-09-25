@@ -232,11 +232,11 @@ impl BatchEngine {
 
     /// Write dead letters to `dlq` in the [`pipeline`](Self::pipeline) loop.
     ///
-    /// Each dead letter is a piece of its block: it reports `Rejected` once
-    /// [`Dlq::flush`](crate::dlq::Dlq::flush) confirms the write, and `Errored`
-    /// when the DLQ refuses it, so the source is released only once the dead
-    /// letter is held. The other run loops keep routing through
-    /// [`FilterDlqPolicy`].
+    /// Each block's dead letters are a piece of it: they report `Rejected` once
+    /// [`Dlq::write_confirmed`](crate::dlq::Dlq::write_confirmed) confirms a
+    /// backend holds them, and `Errored` when the DLQ refuses them, so the
+    /// source is released only once the dead letters are held. The other run
+    /// loops keep routing through [`FilterDlqPolicy`].
     #[cfg(all(feature = "transport", feature = "dlq"))]
     #[must_use]
     pub fn with_dlq(mut self, dlq: Arc<crate::dlq::Dlq>) -> Self {

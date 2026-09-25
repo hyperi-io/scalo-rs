@@ -189,14 +189,14 @@ What a source holds until delivery, and the guarantee the pipeline gives ([../pi
 | Metric | Labels | Meaning |
 |---|---|---|
 | `pipeline_delivery_guarantee` | `guarantee`, `reason` | 1 for the guarantee the pipeline gives: `at_least_once`, `at_least_once_local` or `best_effort`, and why |
-| `pipeline_dead_letters_dropped_total` | `reason` | records the sink would refuse, dropped because no DLQ is configured |
+| `pipeline_dead_letters_dropped_total` | `reason` | dead letters dropped with nowhere to go: the pipeline has no DLQ or a disabled one, or a gRPC `send_batch` left a record over its size ceiling out of a block it sent. `reason` is `too_large`, `outbound_filter`, or `dead_letter` for one an inbound filter or `process` produced |
 | `transport_ack_held` / `transport_ack_held_bytes` | `transport` | records and payload bytes whose acknowledgement is held |
-| `transport_ack_released_total` | `transport`, `outcome` | records released, by merged status |
+| `transport_ack_released_total` | `transport`, `outcome` | releases, by merged status: records for Kafka, requests for gRPC and `Tickets` |
 | `transport_ack_latency_seconds` | `transport`, `outcome` | receipt to release |
 | `transport_ack_refused_total` | `transport`, `reason` | requests refused before their acknowledgement was held |
 | `transport_redelivered_total` | `transport`, `reason` | sends retried after the receiver may already have taken them |
 
-Kafka emits the `transport_ack_*` series once armed, and `Tickets` emits them for an app's own listener.
+Kafka emits the `transport_ack_*` series once armed. An armed gRPC server emits them with `transport="grpc"`, one count per request, from admission to answer. Its outcomes and refusal reasons are in [../transport/backends.md](../transport/backends.md#held-responses). `Tickets` emits them for an app's own listener, under the name it was given.
 
 ---
 
@@ -208,7 +208,7 @@ Kafka emits the `transport_ack_*` series once armed, and `Tickets` emits them fo
 | `/metrics/manifest` | JSON catalogue |
 | `/livez` | `{"status":"alive"}` -- process alive |
 | `/readyz` | 200 if readiness callback + [`HealthRegistry`](health.md) both pass, else 503 |
-| `/scaling/pressure` | Float `0.0-1.0` (feature `scaling` + `set_scaling_pressure`) |
+| `/scaling/pressure` | Float `0.00-100.00` (feature `scaling` + `set_scaling_pressure`) |
 | `/memory/pressure` | JSON ratio + bytes (feature `memory` + `set_memory_guard`) |
 
 `/metrics/manifest` is matched before `/metrics` in the prefix-match handler --

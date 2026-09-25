@@ -88,9 +88,11 @@ server when `MetricsManager::set_scaling_pressure` has been called
 (which `ServiceRuntime` does automatically). Body is a plain text
 float — `format!("{:.2}", pressure.calculate())`.
 
-KEDA's Prometheus scaler queries the same value via the
-`dfe_scaling_pressure` gauge published into the Prometheus registry.
-Two surfaces, one number — pick whichever your KEDA setup expects.
+The `dfe_scaling_pressure` gauge carries the same number only once the
+app sets it: nothing copies `calculate()` into the gauge. An app whose
+KEDA Prometheus scaler reads the gauge calls
+`ServiceMetrics::scaling_pressure(pressure.calculate())` on a tick. Until
+it does, the gauge carries nothing from `ScalingPressure`.
 
 ```yaml
 # KEDA ScaledObject excerpt

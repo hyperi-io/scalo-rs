@@ -49,11 +49,22 @@ impl Spool {
     /// cannot be opened and was not quarantined (see
     /// [`CorruptionPolicy`]).
     pub async fn open(config: SpoolConfig) -> Result<Self> {
-        let (sender, receiver) = open_queue(&config.path, config.on_corruption)?;
-
-        // yaque exposes no count API -- parse segment files to count items
-        // between the receiver position and the end.
-        let len = count_existing_items(&config.path).unwrap_or(0);
+        // Reads the process table, may wait out a lock mid-write, and walks
+        // segment files, so it runs off the runtime.
+        let path = config.path.clone();
+        let policy = config.on_corruption;
+        let (sender, receiver, len) = tokio::task::spawn_blocking(move || {
+            let (sender, receiver) = open_queue(&path, policy)?;
+            // yaque exposes no count API -- parse segment files to count items
+            // between the receiver position and the end.
+            let len = count_existing_items(&path).unwrap_or(0);
+            Ok::<_, SpoolError>((sender, receiver, len))
+        })
+        .await
+        .map_err(|e| SpoolError::Open {
+            path: config.path.display().to_string(),
+            message: format!("spool open task failed: {e}"),
+        })??;
 
         Ok(Self {
             queue: Some(Queue { sender, receiver }),

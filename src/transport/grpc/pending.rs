@@ -52,8 +52,24 @@ pub(crate) enum Outcome {
 
 /// The longest a response is held: `max_hold`, or the sender's deadline less a
 /// margin of a tenth of it, at least 1 s and at most half the deadline.
+///
+/// The budget an armed server gives each push, for an app's own listener to
+/// give the same: read the deadline with
+/// [`sender_deadline`](super::sender_deadline), and answer before the budget
+/// runs out, since tonic cuts a handler at the sender's deadline with
+/// `Cancelled`, which a sender cannot tell from a crash.
+///
+/// ```
+/// use std::time::Duration;
+/// use scalo::transport::grpc::hold_budget;
+///
+/// let max_hold = Duration::from_secs(25);
+/// assert_eq!(hold_budget(max_hold, None), max_hold);
+/// // A 10 s deadline keeps a 1 s margin.
+/// assert_eq!(hold_budget(max_hold, Some(Duration::from_secs(10))), Duration::from_secs(9));
+/// ```
 #[must_use]
-pub(crate) fn hold_budget(max_hold: Duration, sender_deadline: Option<Duration>) -> Duration {
+pub fn hold_budget(max_hold: Duration, sender_deadline: Option<Duration>) -> Duration {
     let Some(deadline) = sender_deadline else {
         return max_hold;
     };

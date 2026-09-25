@@ -89,6 +89,17 @@ concurrent callers, the other barriers return `Ok`.
 A `flush()` dropped before its ack, such as by a timeout around it, does
 not consume the error. The next `flush()` returns it.
 
+A caller that must know whether ITS entries are held, rather than whether
+anything written since the last barrier was refused, uses
+`write_confirmed(entries)`. The drain writes those entries as a batch of
+their own, runs the durable flush, and answers that caller alone: a
+refusal of anyone else's write stays for the next `flush()`, and this
+caller's refusal goes to this caller only. The durable flush covers every
+earlier write too, so a loss it finds is returned to the caller and held
+for the next `flush()` as well. A Kafka backend that purged entries it has
+not heard back about yet fails the confirmed write. The pipeline's
+`with_dlq` writes each block's dead letters this way.
+
 What "accepted" means depends on the backend:
 
 | Backend | Accepted means |
@@ -181,6 +192,7 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 | `send(entry).await` | Async submission that awaits queue space |
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
 | `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka; `Err(File)` if any batch written since the previous flush was refused by every backend, `Err(Kafka)` if Kafka lost entries only it held (see [Queue-admission semantics](#queue-admission-semantics)) |
+| `write_confirmed(entries).await` | Write these entries as a batch of their own and answer whether a backend holds them, to this caller alone (see [Queue-admission semantics](#queue-admission-semantics)) |
 | `shutdown().await` | Stop the drain and join it; the drain first waits for Kafka acks and counts what none confirmed in `dropped()` (see [Shutdown](#shutdown)) |
 | `is_enabled() / mode() / pending() / dropped()` | Introspection — `dropped()` totals queue overflow + disabled-DLQ sends + batches every backend refused + Kafka entries a barrier or the shutdown found lost (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
 | `DlqEntry::new(service, error_type, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_metadata(...)` | Entry builder |

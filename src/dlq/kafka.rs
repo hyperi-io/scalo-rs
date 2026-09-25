@@ -228,6 +228,11 @@ impl KafkaDlqInner {
         std::mem::take(&mut self.sole_custody)
     }
 
+    /// Entries only Kafka holds whose fate no barrier has learned yet.
+    pub(crate) fn unsettled(&self) -> u64 {
+        self.sole_custody
+    }
+
     /// Entries the last failed `send_batch` queued before it stopped.
     pub(crate) fn queued_before_failure(&self) -> usize {
         self.queued_before_failure

@@ -142,6 +142,20 @@ impl DlqBackend {
         }
     }
 
+    /// Entries in this backend's hands whose fate it has not heard, without
+    /// handing them over. Only Kafka holds entries past a write, and after a
+    /// durable flush only those it purged and has no report for yet.
+    #[allow(clippy::match_same_arms, reason = "only Kafka holds past a write")]
+    pub(crate) fn unsettled(&self) -> u64 {
+        match self {
+            Self::File(_) => 0,
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => b.unsettled(),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => 0,
+        }
+    }
+
     /// Entries still in this backend's hands whose fate is unknown, handed
     /// over as lost when the drain closes. Only Kafka holds entries past a
     /// write.

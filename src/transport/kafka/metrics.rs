@@ -36,8 +36,8 @@ use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
 use rdkafka::statistics::Statistics;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 /// Kafka metrics snapshot. Mirrors the Python `KafkaMetrics` dataclass.
 #[derive(Debug, Clone, Default)]
@@ -119,6 +119,9 @@ pub struct StatsContext {
     connected: AtomicBool,
     /// Records past this consumer's read position, summed over its partitions.
     position_lag: AtomicI64,
+    /// Partitions a rebalance took away since the transport last looked.
+    /// std's lock keeps the context unwind-safe, as its other fields are.
+    revoked: Mutex<Vec<(String, i32)>>,
 }
 
 impl Default for StatsContext {
@@ -137,7 +140,18 @@ impl StatsContext {
             delivery: super::classify::DeliveryState::default(),
             connected: AtomicBool::new(false),
             position_lag: AtomicI64::new(0),
+            revoked: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Partitions a rebalance took from this consumer since the last call.
+    pub(crate) fn take_revoked(&self) -> Vec<(String, i32)> {
+        std::mem::take(
+            &mut *self
+                .revoked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Records past this consumer's read position, summed over its partitions,
@@ -397,8 +411,27 @@ impl StatsContext {
     }
 }
 
-// StatsContext can be used as a ConsumerContext and ProducerContext
-impl rdkafka::consumer::ConsumerContext for StatsContext {}
+/// Records each revoked partition before librdkafka unassigns it, so the
+/// transport stops holding offsets this member can no longer commit.
+impl rdkafka::consumer::ConsumerContext for StatsContext {
+    fn pre_rebalance(
+        &self,
+        _consumer: &rdkafka::consumer::BaseConsumer<Self>,
+        rebalance: &rdkafka::consumer::Rebalance<'_>,
+    ) {
+        if let rdkafka::consumer::Rebalance::Revoke(partitions) = rebalance {
+            self.revoked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(
+                    partitions
+                        .elements()
+                        .iter()
+                        .map(|p| (p.topic().to_string(), p.partition())),
+                );
+        }
+    }
+}
 
 impl rdkafka::producer::ProducerContext for StatsContext {
     type DeliveryOpaque = ();

@@ -329,7 +329,8 @@ impl ServiceMetrics {
             ),
             (
                 "pipeline_dead_letters_dropped_total",
-                "Records the sink would dead-letter, dropped because no DLQ is configured",
+                "Dead letters dropped with nowhere to go: no DLQ, a disabled DLQ, or a record \
+                 a gRPC send_batch left out of a block it sent",
                 MetricType::Counter,
                 "",
                 &["reason"],

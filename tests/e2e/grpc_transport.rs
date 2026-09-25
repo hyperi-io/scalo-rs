@@ -1554,6 +1554,95 @@ mod engine_driven {
         );
     }
 
+    /// How a pipeline holding a block stops before releasing it.
+    #[derive(Debug, Clone, Copy)]
+    enum Stop {
+        /// The run future is dropped mid-block.
+        Dropped,
+        /// `process` panics.
+        ProcessPanics,
+        /// The sink panics.
+        SinkPanics,
+    }
+
+    /// A pipeline over an armed server with a one-second hold budget, stopped
+    /// by `stop` while it holds one push: the push's answer, then what the
+    /// server still holds.
+    async fn held_after(stop: Stop) -> (SendResult, scalo::transport::HeldAcks) {
+        let config = GrpcConfig::server("127.0.0.1:0");
+        let server = Arc::new(
+            GrpcTransport::builder(&config)
+                .armed(true)
+                .max_hold(Duration::from_secs(1))
+                .start()
+                .await
+                .expect("server"),
+        );
+        let client = client_of(&server).await;
+        let push = pushing(&client, b"{\"held\":1}");
+        let sinking = Arc::new(tokio::sync::Notify::new());
+
+        let run = {
+            let server = Arc::clone(&server);
+            let sinking = Arc::clone(&sinking);
+            async move {
+                let engine = BatchEngine::new(BatchProcessingConfig::default());
+                engine
+                    .pipeline(&*server)
+                    .run(
+                        move |batch: WorkBatch<GrpcToken>| {
+                            assert!(!matches!(stop, Stop::ProcessPanics), "process panicked");
+                            Ok(batch)
+                        },
+                        move |_out: &WorkBatch<GrpcToken>| {
+                            sinking.notify_one();
+                            async move {
+                                assert!(!matches!(stop, Stop::SinkPanics), "the sink panicked");
+                                std::future::pending::<Result<(), EngineError>>().await
+                            }
+                        },
+                    )
+                    .await
+            }
+        };
+        match stop {
+            Stop::Dropped => tokio::select! {
+                ended = run => panic!("the pipeline ended: {ended:?}"),
+                () = sinking.notified() => {}
+            },
+            Stop::ProcessPanics | Stop::SinkPanics => {
+                let joined = tokio::spawn(run).await;
+                assert!(
+                    joined.as_ref().is_err_and(tokio::task::JoinError::is_panic),
+                    "{stop:?}: {joined:?}"
+                );
+            }
+        }
+
+        // Answered at once once released, or at the one-second budget if not.
+        let answered = answer(push).await;
+        (answered, server.ack_control().expect("held").held())
+    }
+
+    /// A pipeline that stops mid-block releases it `Errored`, so the push is
+    /// answered and the bytes it held are free at once, not when the
+    /// transport is dropped.
+    #[tokio::test]
+    async fn a_pipeline_stopped_mid_block_frees_what_its_push_held() {
+        for stop in [Stop::Dropped, Stop::ProcessPanics, Stop::SinkPanics] {
+            let (answered, held) = held_after(stop).await;
+            assert!(
+                matches!(answered, SendResult::Backpressured),
+                "{stop:?}: {answered:?}"
+            );
+            assert_eq!(
+                (held.count, held.bytes),
+                (0, 0),
+                "{stop:?}: the held push still reserves its bytes: {held:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn with_acknowledgements_off_the_engine_answers_at_enqueue() {
         let config = GrpcConfig::server("127.0.0.1:0");

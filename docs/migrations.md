@@ -773,13 +773,25 @@ The service runtime builds the app metric set, with the `info` gauge, and a serv
 
 `BatchEngine::pipeline(&receiver)...run(process, sink)` is a new run loop that holds each block's source acknowledgement until every piece built from the block has reported, then releases it once through the new `TransportReceiver::release`. A Kafka source's commit waits for the sink, and an `Errored` block is never committed past. The key is `acknowledgements.enabled` on the transport's own section (default `true`), read by `AnyReceiver::from_config` from `<key>.kafka.acknowledgements` and set on an explicit transport with `KafkaTransport::with_acknowledgements`. `BatchEngine::with_dlq` makes a dead letter a piece that releases its source only once the DLQ confirms the write. See [pipeline/acknowledgements.md](pipeline/acknowledgements.md).
 
-The new trait methods are provided, so no implementor changes: `TransportReceiver::{ack_control, release, hold_deadline}`, `TransportSender::{confirms_delivery, dead_letter_reason}`. `run_governed` and the other run loops behave as before. A push source with acknowledgements on that they run reports `pipeline_delivery_guarantee{guarantee="best_effort",reason="unarmed"}`.
+The new trait methods are provided, so no implementor changes: `TransportReceiver::{ack_control, release, hold_deadline}`, `TransportSender::{confirms_delivery, dead_letter_reason}`. `run_governed` and the other run loops behave as before, except that a push source with acknowledgements on that they run logs one WARN at start, since it still answers its senders at enqueue, and reports `pipeline_delivery_guarantee{guarantee="best_effort",reason="unarmed"}`.
+
+An armed gRPC server answers a push only once its records are released. Build it armed, `GrpcTransport::builder(..).armed(true)` or `AnyReceiver::from_config_armed(key)`, so no push is answered before a pipeline runs. A pipeline with no `.sender(&sender)` logs one WARN at start and reports the reason `unscreened`: nothing takes a record the sink's transport would dead-letter out of the block.
 
 A `KafkaTransport` armed through `AckControl::arm` commits each partition only up to its lowest offset handed out and not yet released, for `commit` as for `release`. An unarmed one commits as before.
 
 `StatsContext::total_position_lag` and `KafkaTransport::total_position_lag` count records past the consumer's read position, which a held commit does not inflate. `total_consumer_lag` still counts from the committed offset.
 
 **Consumer adjustment** -- none to keep today's behaviour. To hold acknowledgements, move from `run_governed` to `pipeline(..)`, call `.sender(&sender)` for a transport sink, and give the loop a DLQ with `with_dlq`. A hand-rolled loop arms the source before its first `recv` and releases each block through `SourceAck`.
+
+### gRPC `send_batch` splits a block over `max_message_size` (BEHAVIOUR CHANGE)
+
+2.12 returned `Fatal` for a block over `max_message_size` and sent none of it. `send_batch` now sends it as several requests, each within the limit. A record over the limit on its own no longer fails the block: it is left out, the rest is sent and the result is `Ok`, and the record is dropped, counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`. A block of nothing but such records returns `FilteredDlq`.
+
+**Consumer adjustment** -- a caller that dead-letters oversize records takes out every record `dead_letter_reason` names before calling `send_batch`, as the pipeline's `.sender(&sender)` does. A caller that retried a `Fatal` block in smaller pieces no longer needs to.
+
+### `Dlq::write_confirmed` and `BackgroundSink::write_confirmed` (additive)
+
+`write_confirmed(entries)` writes one caller's entries as a batch of their own and reports that write to that caller alone. `flush()` keeps its contract: a refusal goes to the first barrier after it, whoever issued it. The pipeline's DLQ piece writes through `write_confirmed`, so one block's refusal never reaches another's. A custom `SinkDrain` may override the new provided `settled()` (default `true`) to fail a confirmed write whose fate it has not heard yet.
 
 ---
 

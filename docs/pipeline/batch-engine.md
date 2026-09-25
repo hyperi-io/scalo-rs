@@ -136,6 +136,8 @@ engine
 
 Each sink call, the block's dead letters and any piece the sink takes itself are pieces of the block, and the source is released once, with their merged status. `acknowledgements.enabled: false` releases at receipt. Pieces, hold deadlines, `with_dlq`, the `pipeline_delivery_guarantee` metric and the hand-rolled `SourceAck`: [acknowledgements.md](acknowledgements.md).
 
+An app whose sink writes to a scalo transport passes it with `.sender(&sender)`. That is what takes a record the transport would dead-letter -- over its size ceiling, or matched by an outbound `dlq` filter -- out of the block, so it reaches the DLQ instead of being dropped by `send_batch` while its block releases `Delivered`. A pipeline without a sender logs one WARN at start and reports `pipeline_delivery_guarantee` with the reason `unscreened`.
+
 ---
 
 ## Auto-wiring

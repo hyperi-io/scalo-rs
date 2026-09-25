@@ -213,12 +213,15 @@ pub enum DeadLetterReason {
     OutboundFilter,
 }
 
+/// The `reason` label of a record over a sender's size ceiling.
+pub(crate) const TOO_LARGE: &str = "too_large";
+
 impl DeadLetterReason {
     /// The `reason` label value.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::TooLarge { .. } => "too_large",
+            Self::TooLarge { .. } => TOO_LARGE,
             Self::OutboundFilter => "outbound_filter",
         }
     }
@@ -269,6 +272,10 @@ pub enum GuaranteeReason {
     /// A push source with acknowledgements on that no caller armed, so it
     /// still answers at enqueue.
     Unarmed,
+    /// The sink confirms, but no sender screens the block, so a transport
+    /// sink drops a record it would dead-letter and the block counts it
+    /// delivered.
+    Unscreened,
 }
 
 impl GuaranteeReason {
@@ -282,6 +289,7 @@ impl GuaranteeReason {
             Self::SourceCannotAck => "source_cannot_ack",
             Self::SinkCannotConfirm => "sink_cannot_confirm",
             Self::Unarmed => "unarmed",
+            Self::Unscreened => "unscreened",
         }
     }
 }
@@ -324,6 +332,20 @@ impl EffectiveGuarantee {
                 reason: GuaranteeReason::SinkConfirmsLocally,
             },
             SinkConfirmation::None => best_effort(GuaranteeReason::SinkCannotConfirm),
+        }
+    }
+
+    /// This guarantee for a sink no sender screens: an at-least-once
+    /// guarantee keeps its level and gives [`GuaranteeReason::Unscreened`] as
+    /// the reason, and a best-effort one is unchanged.
+    #[must_use]
+    pub fn unscreened(self) -> Self {
+        match self.guarantee {
+            DeliveryGuarantee::AtLeastOnce | DeliveryGuarantee::AtLeastOnceLocal => Self {
+                reason: GuaranteeReason::Unscreened,
+                ..self
+            },
+            DeliveryGuarantee::BestEffort => self,
         }
     }
 
@@ -370,6 +392,33 @@ pub(crate) fn give_up_at(deadline: Instant) -> tokio::time::Instant {
     )
 }
 
+/// Release `tokens` `Errored` from a `Drop`, for a unit abandoned before its
+/// own release: a panic, or a future dropped mid-way.
+///
+/// Drop cannot await, so the release is polled once. That is enough for a
+/// push source, which answers its held senders synchronously inside
+/// `release`, and a pull source withholds an unreleased token anyway.
+pub(crate) fn release_abandoned<R: TransportReceiver>(receiver: &R, tokens: &[R::Token]) {
+    let release = std::pin::pin!(receiver.release(tokens, DeliveryStatus::Errored));
+    let polled = release.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+    // A subscriber that panics while this thread unwinds aborts the process.
+    if std::thread::panicking() {
+        return;
+    }
+    match polled {
+        std::task::Poll::Ready(Ok(())) => {}
+        std::task::Poll::Ready(Err(e)) => tracing::warn!(
+            error = %e,
+            transport = receiver.name(),
+            "Releasing an abandoned block failed"
+        ),
+        std::task::Poll::Pending => tracing::debug!(
+            transport = receiver.name(),
+            "An abandoned block's release did not finish in one poll; it stays unreleased"
+        ),
+    }
+}
+
 /// Await the merged status, giving up as `Errored` at `deadline` minus
 /// [`HOLD_RELEASE_MARGIN`].
 pub(crate) async fn await_merged(
@@ -405,13 +454,19 @@ pub(crate) async fn await_merged(
 /// ```
 ///
 /// A piece dropped without a report counts as `Errored`. For a push source the
-/// wait ends at its hold deadline, and the block is released `Errored`.
+/// wait ends at its hold deadline, and the block is released `Errored`. A
+/// `SourceAck` dropped before its release completes -- a panic, or a loop
+/// future dropped mid-block -- releases the block `Errored` as it goes, so a
+/// push source answers its senders at once.
 #[must_use = "a SourceAck that is never released holds its source acknowledgement"]
 pub struct SourceAck<'r, R: TransportReceiver> {
     receiver: &'r R,
     tokens: Vec<R::Token>,
-    finalizer: BatchFinalizer,
-    merged: tokio::sync::oneshot::Receiver<DeliveryStatus>,
+    /// Present until `release` takes it.
+    finalizer: Option<BatchFinalizer>,
+    merged: Option<tokio::sync::oneshot::Receiver<DeliveryStatus>>,
+    /// Set once `release` has released the tokens.
+    released: bool,
 }
 
 impl<'r, R: TransportReceiver> SourceAck<'r, R> {
@@ -421,15 +476,24 @@ impl<'r, R: TransportReceiver> SourceAck<'r, R> {
         Self {
             receiver,
             tokens,
-            finalizer,
-            merged,
+            finalizer: Some(finalizer),
+            merged: Some(merged),
+            released: false,
         }
     }
 
     /// A piece for one downstream delivery covering part of the block.
+    ///
+    /// # Panics
+    ///
+    /// Never: the finalizer is taken only by [`release`](Self::release),
+    /// which consumes the ack.
     #[must_use]
     pub fn piece(&self) -> PieceFinalizer {
-        self.finalizer.piece()
+        self.finalizer
+            .as_ref()
+            .map(BatchFinalizer::piece)
+            .expect("finalizer present until release consumes the ack")
     }
 
     /// The tokens this ack releases.
@@ -446,12 +510,27 @@ impl<'r, R: TransportReceiver> SourceAck<'r, R> {
     /// The receiver's release error. The merged status is not returned then:
     /// a failed Kafka commit is covered by the next one, a failed push answer
     /// leaves the sender to retry.
-    pub async fn release(self) -> TransportResult<DeliveryStatus> {
+    pub async fn release(mut self) -> TransportResult<DeliveryStatus> {
         let deadline = self.receiver.hold_deadline(&self.tokens);
-        self.finalizer.seal();
-        let status = await_merged(self.merged, deadline).await;
-        self.receiver.release(&self.tokens, status).await?;
+        if let Some(finalizer) = self.finalizer.take() {
+            finalizer.seal();
+        }
+        let status = match self.merged.take() {
+            Some(merged) => await_merged(merged, deadline).await,
+            None => DeliveryStatus::Errored,
+        };
+        let released = self.receiver.release(&self.tokens, status).await;
+        self.released = true;
+        released?;
         Ok(status)
+    }
+}
+
+impl<R: TransportReceiver> Drop for SourceAck<'_, R> {
+    fn drop(&mut self) {
+        if !self.released {
+            release_abandoned(self.receiver, &self.tokens);
+        }
     }
 }
 
@@ -460,6 +539,7 @@ impl<R: TransportReceiver> std::fmt::Debug for SourceAck<'_, R> {
         f.debug_struct("SourceAck")
             .field("tokens", &self.tokens.len())
             .field("finalizer", &self.finalizer)
+            .field("released", &self.released)
             .finish_non_exhaustive()
     }
 }
@@ -791,6 +871,7 @@ impl std::fmt::Debug for Ticket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ticket")
             .field("bytes", &self.bytes)
+            .field("admitted", &self.admitted)
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
@@ -877,6 +958,30 @@ mod tests {
         assert_eq!(
             of(Some(&unarmed_pull), SinkConfirmation::None),
             (G::BestEffort, R::SinkCannotConfirm)
+        );
+    }
+
+    #[test]
+    fn an_unscreened_sink_keeps_its_level_and_names_the_gap() {
+        use DeliveryGuarantee as G;
+        use GuaranteeReason as R;
+        let pull = control(true, true, AckKind::Pull);
+        let unscreened = |sink| {
+            let g = EffectiveGuarantee::of(Some(&pull as &dyn AckControl), sink).unscreened();
+            (g.guarantee, g.reason)
+        };
+        assert_eq!(
+            unscreened(SinkConfirmation::Remote),
+            (G::AtLeastOnce, R::Unscreened)
+        );
+        assert_eq!(
+            unscreened(SinkConfirmation::Local),
+            (G::AtLeastOnceLocal, R::Unscreened)
+        );
+        assert_eq!(
+            unscreened(SinkConfirmation::None),
+            (G::BestEffort, R::SinkCannotConfirm),
+            "a best-effort guarantee keeps the reason it already has"
         );
     }
 

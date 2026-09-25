@@ -34,7 +34,7 @@ use super::{BatchEngine, EngineError, FilterDlqPolicy};
 use crate::backoff::Backoff;
 use crate::transport::ack::{
     AckControl, AckKind, DeadLetterReason, EffectiveGuarantee, SinkConfirmation, await_merged,
-    give_up_at, merged_channel,
+    give_up_at, merged_channel, release_abandoned,
 };
 use crate::transport::filter::FilteredDlqEntry;
 use crate::transport::{
@@ -169,9 +169,8 @@ where
 {
     /// Run the loop until shutdown or a permanent error.
     ///
-    /// `process` and `sink` are those of
-    /// [`run_governed`](BatchEngine::run_governed); each sink call is one
-    /// piece of its block.
+    /// `process` and `sink` take the shapes `run_governed` takes, and each
+    /// sink call is one piece of its block.
     ///
     /// # Errors
     ///
@@ -226,7 +225,19 @@ where
         if let (AckMode::Hold, Some(control)) = (mode, control) {
             control.arm();
         }
-        EffectiveGuarantee::of(control, confirms).publish();
+        let guarantee = EffectiveGuarantee::of(control, confirms);
+        if screen.is_some() {
+            guarantee.publish();
+        } else {
+            guarantee.unscreened().publish();
+            tracing::warn!(
+                transport = receiver.name(),
+                "BatchEngine (pipeline) has no sender, so nothing screens its blocks: a record a \
+                 Kafka or gRPC sink would dead-letter (over its size ceiling, or matched by an \
+                 outbound dlq filter) is dropped by send_batch and its block released as \
+                 delivered. Pass .sender(&sender)"
+            );
+        }
 
         #[cfg(feature = "governor")]
         let budget = engine.byte_budget.clone();
@@ -380,6 +391,74 @@ struct DeadLetter {
     screened: Option<&'static str>,
 }
 
+/// The `reason` of a dropped dead letter an inbound filter or `process`
+/// produced, rather than one the sink would refuse.
+const PRODUCED_DEAD_LETTER: &str = "dead_letter";
+
+/// Count one dead letter dropped with nowhere to go.
+fn count_dropped_dead_letter(reason: &'static str) {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("pipeline_dead_letters_dropped_total", "reason" => reason).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = reason;
+}
+
+/// Release `tokens` with `status`. A failure is logged and counted, since the
+/// block is already delivered or already abandoned.
+async fn release_source<R: TransportReceiver>(
+    receiver: &R,
+    tokens: &[R::Token],
+    status: DeliveryStatus,
+) {
+    if let Err(e) = receiver.release(tokens, status).await {
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_commit_errors_total", "transport" => receiver.name())
+            .increment(1);
+        tracing::warn!(
+            error = %e,
+            transport = receiver.name(),
+            "Releasing the source failed; carrying on"
+        );
+    }
+}
+
+/// A block's source tokens, from before `process` runs until the block is
+/// released.
+///
+/// A held block dropped unreleased -- a panic in `process` or the sink, or a
+/// run future dropped mid-block -- is released `Errored`, so a push source
+/// answers its sender and frees what the request held instead of keeping it
+/// until the transport goes.
+struct HeldBlock<'r, R: TransportReceiver> {
+    receiver: &'r R,
+    tokens: Vec<R::Token>,
+    /// Released `Errored` on drop, until the block is released or let go.
+    held: bool,
+}
+
+impl<R: TransportReceiver> HeldBlock<'_, R> {
+    /// Release the block with `status`. It stays held until the release
+    /// completes.
+    async fn release(mut self, status: DeliveryStatus) {
+        release_source(self.receiver, &self.tokens, status).await;
+        self.held = false;
+    }
+
+    /// Leave the release to the sink (`SinkManaged`) or to the receipt
+    /// release that already happened.
+    fn let_go(mut self) {
+        self.held = false;
+    }
+}
+
+impl<R: TransportReceiver> Drop for HeldBlock<'_, R> {
+    fn drop(&mut self) {
+        if self.held {
+            release_abandoned(self.receiver, &self.tokens);
+        }
+    }
+}
+
 /// Everything a block needs from the run it belongs to.
 struct BlockRun<'r, R> {
     engine: &'r BatchEngine,
@@ -416,6 +495,17 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         };
         let give_up = hold_deadline.map(give_up_at);
 
+        // The whole-block sink sees the tokens, which `SinkManaged` releases from, and sub-blocks carry none.
+        let tokens = match sub_block_bytes {
+            None => batch.commit_tokens.clone(),
+            Some(_) => std::mem::take(&mut batch.commit_tokens),
+        };
+        let block = HeldBlock {
+            receiver: self.receiver,
+            tokens,
+            held: self.mode == AckMode::Hold,
+        };
+
         let (finalizer, merged) = merged_channel();
         let pieces = BlockPieces {
             finalizer: &finalizer,
@@ -438,30 +528,33 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                     .await
             }
         };
-        let (tokens, end) = match driven {
-            Ok(done) => done,
-            Err((tokens, e)) => {
-                self.release_errored(&tokens).await;
+        let end = match driven {
+            Ok(end) => end,
+            Err(e) => {
+                self.release_errored(block).await;
                 return Err(e);
             }
         };
         if let SinkEnd::Abandoned = end {
-            self.release_errored(&tokens).await;
+            self.release_errored(block).await;
             return Ok(Delivery::Abandoned);
         }
 
         finalizer.seal();
         let status = tokio::select! {
             biased;
-            status = await_merged(merged, hold_deadline) => status,
-            () = self.retry.closed() => {
-                self.release_errored(&tokens).await;
-                return Ok(Delivery::Abandoned);
-            }
+            status = await_merged(merged, hold_deadline) => Some(status),
+            () = self.retry.closed() => None,
+        };
+        let Some(status) = status else {
+            self.release_errored(block).await;
+            return Ok(Delivery::Abandoned);
         };
 
         if matches!(self.commit, CommitMode::Auto) && self.mode != AckMode::AtReceipt {
-            self.release(&tokens, status).await;
+            block.release(status).await;
+        } else {
+            block.let_go();
         }
         if status == DeliveryStatus::Errored && !self.push && self.mode != AckMode::AtReceipt {
             return Err(EngineError::Sink(
@@ -482,7 +575,7 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         sink: &mut Sink,
         pieces: &BlockPieces<'_>,
         give_up: Option<tokio::time::Instant>,
-    ) -> Result<(Vec<R::Token>, SinkEnd), (Vec<R::Token>, EngineError)>
+    ) -> Result<SinkEnd, EngineError>
     where
         P: Fn(WorkBatch<R::Token>) -> Result<WorkBatch<R::Token>, EngineError>,
         Sink: FnMut(&WorkBatch<R::Token>, &BlockPieces<'_>) -> SinkFut,
@@ -490,11 +583,7 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
     {
         #[cfg(feature = "memory")]
         let _lease = self.engine.lease_ingress_batch(&batch);
-        let tokens = batch.commit_tokens.clone();
-        let mut out = match process(batch) {
-            Ok(out) => out,
-            Err(e) => return Err((tokens, e)),
-        };
+        let mut out = process(batch)?;
         dead.extend(
             std::mem::take(&mut out.dlq_entries)
                 .into_iter()
@@ -504,26 +593,24 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                 }),
         );
         self.screen_out(&mut out.records, &mut dead);
-        if let Err(e) = self.dead_letter(dead, pieces).await {
-            return Err((tokens, e));
-        }
+        self.dead_letter(dead, pieces).await?;
         if out.records.is_empty() {
-            return Ok((tokens, SinkEnd::Sunk));
+            return Ok(SinkEnd::Sunk);
         }
         let piece = pieces.piece();
         match self.sink_held(sink, &out, pieces, give_up).await {
             Ok(SinkEnd::Sunk) => {
                 piece.report(DeliveryStatus::Delivered);
-                Ok((tokens, SinkEnd::Sunk))
+                Ok(SinkEnd::Sunk)
             }
             Ok(SinkEnd::Expired) => {
                 piece.report(DeliveryStatus::Errored);
-                Ok((tokens, SinkEnd::Expired))
+                Ok(SinkEnd::Expired)
             }
-            Ok(SinkEnd::Abandoned) => Ok((tokens, SinkEnd::Abandoned)),
+            Ok(SinkEnd::Abandoned) => Ok(SinkEnd::Abandoned),
             Err(e) => {
                 tracing::error!(error = %e, "Sink failed (pipeline) -- terminal, stopping the run loop");
-                Err((tokens, e))
+                Err(e)
             }
         }
     }
@@ -539,29 +626,20 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         sink: &mut Sink,
         pieces: &BlockPieces<'_>,
         give_up: Option<tokio::time::Instant>,
-    ) -> Result<(Vec<R::Token>, SinkEnd), (Vec<R::Token>, EngineError)>
+    ) -> Result<SinkEnd, EngineError>
     where
         P: Fn(WorkBatch<R::Token>) -> Result<WorkBatch<R::Token>, EngineError>,
         Sink: FnMut(&WorkBatch<R::Token>, &BlockPieces<'_>) -> SinkFut,
         SinkFut: std::future::Future<Output = Result<(), EngineError>>,
     {
-        let WorkBatch {
-            records,
-            commit_tokens: tokens,
-            ..
-        } = batch;
-        if let Err(e) = self.dead_letter(dead, pieces).await {
-            return Err((tokens, e));
-        }
+        let WorkBatch { records, .. } = batch;
+        self.dead_letter(dead, pieces).await?;
         let mut sub_blocks = SubBlockDrain::new(records, sub_block_bytes);
         while let Some(sub_records) = sub_blocks.next_sub_block() {
             let sub_block: WorkBatch<R::Token> = WorkBatch::from_records(sub_records);
             #[cfg(feature = "memory")]
             let _lease = self.engine.lease_ingress_batch(&sub_block);
-            let mut out = match process(sub_block) {
-                Ok(out) => out,
-                Err(e) => return Err((tokens, e)),
-            };
+            let mut out = process(sub_block)?;
             let mut dead: Vec<DeadLetter> = std::mem::take(&mut out.dlq_entries)
                 .into_iter()
                 .map(|entry| DeadLetter {
@@ -570,9 +648,7 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                 })
                 .collect();
             self.screen_out(&mut out.records, &mut dead);
-            if let Err(e) = self.dead_letter(dead, pieces).await {
-                return Err((tokens, e));
-            }
+            self.dead_letter(dead, pieces).await?;
             if out.records.is_empty() {
                 continue;
             }
@@ -581,16 +657,16 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                 Ok(SinkEnd::Sunk) => piece.report(DeliveryStatus::Delivered),
                 Ok(SinkEnd::Expired) => {
                     piece.report(DeliveryStatus::Errored);
-                    return Ok((tokens, SinkEnd::Expired));
+                    return Ok(SinkEnd::Expired);
                 }
-                Ok(SinkEnd::Abandoned) => return Ok((tokens, SinkEnd::Abandoned)),
+                Ok(SinkEnd::Abandoned) => return Ok(SinkEnd::Abandoned),
                 Err(e) => {
                     tracing::error!(error = %e, "Sink failed (pipeline streaming) -- terminal, stopping the run loop");
-                    return Err((tokens, e));
+                    return Err(e);
                 }
             }
         }
-        Ok((tokens, SinkEnd::Sunk))
+        Ok(SinkEnd::Sunk)
     }
 
     /// Move out of `records` every record the sink would dead-letter.
@@ -621,7 +697,8 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
     /// Without a DLQ, entries from filters and `process` go through the
     /// [`FilterDlqPolicy`] as the other run loops route them, and records the
     /// sink would refuse are dropped and counted in
-    /// `pipeline_dead_letters_dropped_total`.
+    /// `pipeline_dead_letters_dropped_total`. A disabled DLQ drops them all and
+    /// counts each there.
     async fn dead_letter(
         &self,
         dead: Vec<DeadLetter>,
@@ -634,6 +711,13 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
 
         #[cfg(feature = "dlq")]
         if let Some(dlq) = &self.engine.dlq {
+            let dropped_reasons: Vec<&'static str> = if dlq.is_enabled() {
+                Vec::new()
+            } else {
+                dead.iter()
+                    .map(|d| d.screened.unwrap_or(PRODUCED_DEAD_LETTER))
+                    .collect()
+            };
             let entries: Vec<crate::dlq::DlqEntry> = dead
                 .into_iter()
                 .map(|d| {
@@ -645,13 +729,14 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                     }
                 })
                 .collect();
-            let written = match dlq.send_batch(entries).await {
-                Ok(()) => dlq.flush().await,
-                Err(e) => Err(e),
-            };
-            piece.report(match written {
+            piece.report(match dlq.write_confirmed(entries).await {
                 Ok(()) if dlq.is_enabled() => DeliveryStatus::Rejected,
-                Ok(()) => DeliveryStatus::Dropped,
+                Ok(()) => {
+                    for reason in dropped_reasons {
+                        count_dropped_dead_letter(reason);
+                    }
+                    DeliveryStatus::Dropped
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "The DLQ refused dead letters; the block is not released");
                     DeliveryStatus::Errored
@@ -680,12 +765,7 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                 status = status.max(DeliveryStatus::Rejected);
             } else {
                 for dropped in &screened {
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!(
-                        "pipeline_dead_letters_dropped_total",
-                        "reason" => dropped.screened.unwrap_or("unknown")
-                    )
-                    .increment(1);
+                    count_dropped_dead_letter(dropped.screened.unwrap_or(PRODUCED_DEAD_LETTER));
                     tracing::warn!(
                         reason = %dropped.entry.reason,
                         "No DLQ is configured: a record the sink would refuse is dropped"
@@ -741,26 +821,18 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         }
     }
 
-    /// Release `tokens` with `status`; a failure is logged and counted, since
-    /// the block is already delivered or already abandoned.
+    /// Release `tokens` with `status`, as [`release_source`] does.
     async fn release(&self, tokens: &[R::Token], status: DeliveryStatus) {
-        if let Err(e) = self.receiver.release(tokens, status).await {
-            #[cfg(feature = "metrics")]
-            metrics::counter!("transport_commit_errors_total", "transport" => self.receiver.name())
-                .increment(1);
-            tracing::warn!(
-                error = %e,
-                transport = self.receiver.name(),
-                "Releasing the source failed; carrying on"
-            );
-        }
+        release_source(self.receiver, tokens, status).await;
     }
 
     /// Release a held block `Errored`, so a push source answers its sender at
     /// once rather than at the deadline.
-    async fn release_errored(&self, tokens: &[R::Token]) {
+    async fn release_errored(&self, block: HeldBlock<'_, R>) {
         if self.mode == AckMode::Hold {
-            self.release(tokens, DeliveryStatus::Errored).await;
+            block.release(DeliveryStatus::Errored).await;
+        } else {
+            block.let_go();
         }
     }
 

@@ -325,6 +325,30 @@ impl Dlq {
         sink.flush().await.map_err(map_sink_err)
     }
 
+    /// Write `entries` and confirm them: `Ok` only once a backend holds every
+    /// one, in the sense [`flush`](Self::flush) gives "accepted".
+    ///
+    /// The entries are written as one batch of their own, and the answer is
+    /// about that batch, so a concurrent caller's refusal never reaches this
+    /// call and this call's refusal never reaches another caller's `flush`.
+    /// The durable flush after the write (the Kafka ack wait) covers every
+    /// earlier write too, so a loss it finds is returned here and to the next
+    /// `flush` as well. A disabled DLQ counts the entries in
+    /// [`dropped`](Self::dropped) and returns `Ok`, as `send` does.
+    ///
+    /// # Errors
+    ///
+    /// `File` or `Kafka` when no backend holds the entries, the durable flush
+    /// after them found a loss, or the Kafka backend purged entries it has
+    /// not yet heard back about. `Closed` if the drain has exited.
+    pub async fn write_confirmed(&self, entries: Vec<DlqEntry>) -> Result<(), DlqError> {
+        let Some(sink) = self.sink.as_ref() else {
+            self.note_dropped(entries.len() as u64);
+            return Ok(());
+        };
+        sink.write_confirmed(entries).await.map_err(map_sink_err)
+    }
+
     /// Cancel the internal child token (drain flushes its batch and
     /// exits), then await the drain. Cancelling here rather than only
     /// awaiting the join is what stops `shutdown` hanging when the
@@ -566,6 +590,11 @@ impl SinkDrain<DlqEntry> for DlqDrain {
         first_err.map_or(Ok(()), |e| Err(DrainError::Backend(Box::new(e))))
     }
 
+    /// Settled once no backend holds entries whose fate it has not heard.
+    fn settled(&self) -> bool {
+        self.backends.iter().all(|b| b.unsettled() == 0)
+    }
+
     /// Settle every backend before the drain drops it, and count what no
     /// backend confirmed: dropping the Kafka producer discards what it holds.
     async fn close(&mut self) -> Result<(), DrainError> {
@@ -666,9 +695,62 @@ mod tests {
         dlq.send_batch(vec![test_entry("c"), test_entry("d")])
             .await
             .expect("noop batch");
-        assert_eq!(dlq.dropped(), 4, "every routed entry counts as dropped");
+        dlq.write_confirmed(vec![test_entry("e")])
+            .await
+            .expect("noop confirmed write");
+        assert_eq!(dlq.dropped(), 5, "every routed entry counts as dropped");
         // Clones share the counter, matching the shared drain contract.
-        assert_eq!(dlq.clone().dropped(), 4);
+        assert_eq!(dlq.clone().dropped(), 5);
+    }
+
+    /// Put back the service directory [`break_file_backend`] replaced.
+    fn mend_file_backend(dir: &std::path::Path) {
+        std::fs::remove_file(dir.join("svc")).expect("remove planted file");
+        std::fs::create_dir(dir.join("svc")).expect("recreate dlq dir");
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_write_no_backend_holds_is_refused_to_its_caller_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shutdown = CancellationToken::new();
+        let dlq = spawn_dlq(&tmp_config(dir.path()), &shutdown);
+        break_file_backend(dir.path());
+
+        let refused = dlq.write_confirmed(vec![test_entry("mine")]).await;
+        assert!(
+            matches!(refused, Err(DlqError::File(_))),
+            "got: {refused:?}"
+        );
+        assert_eq!(dlq.dropped(), 1, "the refused entry is counted lost");
+        dlq.flush()
+            .await
+            .expect("the refusal went to the caller that wrote it, not to a flusher");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn another_writers_refusal_never_reaches_a_confirmed_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shutdown = CancellationToken::new();
+        let dlq = spawn_dlq(&tmp_config(dir.path()), &shutdown);
+        break_file_backend(dir.path());
+        dlq.send(test_entry("queued")).await.expect("queued");
+        // The 20 ms tick writes it, and the broken backend refuses it.
+        wait_until("tick write refused", || dlq.dropped() >= 1).await;
+
+        mend_file_backend(dir.path());
+        // The file backend reopens on a write once its 250 ms backoff has run.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        dlq.write_confirmed(vec![test_entry("mine")])
+            .await
+            .expect("a backend holds this caller's entry");
+        assert_eq!(dlq_lines(dir.path()), 1);
+        let flush = dlq.flush().await;
+        assert!(
+            matches!(flush, Err(DlqError::File(_))),
+            "the writer whose entry was refused still hears of it: {flush:?}"
+        );
+        shutdown.cancel();
     }
 
     /// Issue #22: a file backend whose writes fail (the read-only-rootfs

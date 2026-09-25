@@ -1612,7 +1612,11 @@ impl KafkaTransport {
         // that never pends starves every other task on the runtime.
         #[cfg(feature = "metrics")]
         let poll_start = std::time::Instant::now();
-        let (arena, spans) = match self.poll_off_runtime(max_msgs, max_bytes).await? {
+        let polled = self.poll_off_runtime(max_msgs, max_bytes).await?;
+        // Rebalances run inside the poll, so what one revoked is known before
+        // anything this poll read is held.
+        self.acks.forget(self.consumer.context().take_revoked());
+        let (arena, spans) = match polled {
             Polled::Empty => {
                 #[cfg(feature = "metrics")]
                 ::metrics::histogram!("kafka_poll_duration_seconds")
@@ -3324,5 +3328,55 @@ mod tests {
         *topics.write() = vec!["events_load".to_string(), "logs_load".to_string()];
         assert_eq!(topics.read().len(), 2);
         assert_eq!(topics.read()[1], "logs_load");
+    }
+
+    /// A revoke librdkafka reports during a poll ends the transport's hold on
+    /// that partition's offsets once the poll returns.
+    #[tokio::test]
+    async fn a_recv_after_a_revoke_holds_nothing_for_the_revoked_partition() {
+        use rdkafka::consumer::{ConsumerContext, Rebalance};
+
+        // No topics: a broker-free consumer, built without a subscribe.
+        let transport = KafkaTransport::new(&KafkaConfig::for_testing(
+            "127.0.0.1:1",
+            "revoke-test",
+            Vec::new(),
+        ))
+        .await
+        .expect("broker-free kafka transport");
+        transport.acks.arm();
+        let tokens: Vec<KafkaToken> = (0..10)
+            .map(|offset| KafkaToken::new(Arc::from("events"), 0, offset))
+            .collect();
+        transport.acks.register(tokens.iter().map(|t| (t, 10)));
+        transport.acks.withhold(&tokens);
+
+        let mut revoked = TopicPartitionList::new();
+        revoked.add_partition("events", 0);
+        transport
+            .consumer
+            .context()
+            .pre_rebalance(&transport.consumer, &Rebalance::Revoke(&revoked));
+        assert_eq!(
+            transport.acks.held().count,
+            10,
+            "held until the poll the revoke arrived in returns"
+        );
+
+        // Whatever the broker-free poll returns, the revoke it carried is applied.
+        let _ = transport.recv(10).await;
+        assert_eq!(transport.acks.held().count, 0);
+        assert!(transport.consumer.context().take_revoked().is_empty());
+
+        let mut assigned = TopicPartitionList::new();
+        assigned.add_partition("events", 1);
+        transport
+            .consumer
+            .context()
+            .pre_rebalance(&transport.consumer, &Rebalance::Assign(&assigned));
+        assert!(
+            transport.consumer.context().take_revoked().is_empty(),
+            "an assignment revokes nothing"
+        );
     }
 }

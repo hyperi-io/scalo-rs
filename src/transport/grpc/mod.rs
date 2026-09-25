@@ -69,6 +69,7 @@ pub mod proto;
 pub mod token;
 
 pub use config::GrpcConfig;
+pub use pending::hold_budget;
 pub use token::GrpcToken;
 
 use super::ack::{
@@ -201,7 +202,23 @@ pub(crate) fn note_refusal(pending: Option<&PendingRegistry>, reason: &'static s
 
 /// The deadline a sender set in its `grpc-timeout` header, read as tonic's
 /// server reads it: at most 8 digits and a unit of H, M, S, m, u or n.
-pub(crate) fn sender_deadline(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
+///
+/// `None` when the header is absent or malformed. An app's own gRPC listener
+/// that holds its answer passes this to [`hold_budget`] to answer before the
+/// sender gives up.
+///
+/// ```
+/// use std::time::Duration;
+/// use scalo::transport::grpc::sender_deadline;
+///
+/// let mut metadata = tonic::metadata::MetadataMap::new();
+/// assert_eq!(sender_deadline(&metadata), None);
+/// metadata.insert("grpc-timeout", "1500m".parse()?);
+/// assert_eq!(sender_deadline(&metadata), Some(Duration::from_millis(1500)));
+/// # Ok::<(), tonic::metadata::errors::InvalidMetadataValue>(())
+/// ```
+#[must_use]
+pub fn sender_deadline(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
     let value = metadata.get("grpc-timeout")?.to_str().ok()?;
     let split = value.len().checked_sub(1)?;
     let (digits, unit) = value.split_at(split);
@@ -1177,7 +1194,7 @@ impl TransportSender for GrpcTransport {
 
         // A block over the ceiling goes as several requests in order, so none
         // is one the receiver's decoder refuses.
-        let batches = batches_within(to_send, self.max_message_size);
+        let (batches, left_out) = batches_within(to_send, self.max_message_size);
         if batches.is_empty() {
             return SendResult::FilteredDlq;
         }
@@ -1187,6 +1204,8 @@ impl TransportSender for GrpcTransport {
                 return result;
             }
         }
+        // Counted once the block is sent, so a retried block counts its drops once.
+        count_left_out(left_out);
         SendResult::Ok
     }
 
@@ -1221,14 +1240,15 @@ impl TransportSender for GrpcTransport {
 }
 
 /// Split `records` into `Batch` bodies that each encode within `limit`, in
-/// order.
+/// order, and count the records left out.
 ///
 /// A record over the limit on its own is left out, as `send` leaves it out:
 /// the same bytes are refused on every retry.
-fn batches_within(records: Vec<Record>, limit: usize) -> Vec<proto::Batch> {
+fn batches_within(records: Vec<Record>, limit: usize) -> (Vec<proto::Batch>, u64) {
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut current_len = 0;
+    let mut left_out = 0_u64;
     for record in records {
         let destination = record.key.clone();
         let record = batch::record_to_proto(record);
@@ -1236,12 +1256,18 @@ fn batches_within(records: Vec<Record>, limit: usize) -> Vec<proto::Batch> {
         // the record itself, so the parts sum to the body's encoded length.
         let framed = prost::encoding::message::encoded_len(1, &record);
         if framed > limit {
-            too_large_result(
-                destination.as_deref().unwrap_or(""),
-                framed,
+            #[cfg(feature = "metrics")]
+            metrics::counter!("transport_message_too_large_total", "transport" => "grpc")
+                .increment(1);
+            tracing::warn!(
+                destination = destination.as_deref().unwrap_or(""),
+                encoded_len = framed,
                 limit,
-                "refused before sending",
+                "gRPC send_batch: a record over max_message_size on its own is left out of the \
+                 block; the block's other records are sent and this one is dropped. Screen the \
+                 block with dead_letter_reason to dead-letter it instead"
             );
+            left_out += 1;
             continue;
         }
         if current_len + framed > limit {
@@ -1256,7 +1282,22 @@ fn batches_within(records: Vec<Record>, limit: usize) -> Vec<proto::Batch> {
     if !current.is_empty() {
         batches.push(proto::Batch { records: current });
     }
-    batches
+    (batches, left_out)
+}
+
+/// Count records `send_batch` left out of a block it sent: they were dropped,
+/// not dead-lettered, so they count with the dead letters dropped.
+fn count_left_out(left_out: u64) {
+    #[cfg(feature = "metrics")]
+    if left_out > 0 {
+        metrics::counter!(
+            "pipeline_dead_letters_dropped_total",
+            "reason" => super::ack::TOO_LARGE
+        )
+        .increment(left_out);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = left_out;
 }
 
 impl GrpcTransport {
@@ -1576,10 +1617,13 @@ impl TransportServiceImpl {
         }
     }
 
-    /// Count a refusal of a push while responses are held.
+    /// Count a refusal of a push while responses are held: `closed` for a
+    /// closed receiver, `full` for a receive queue with no room.
     fn refused(&self, status: Status) -> Status {
-        if status.code() == tonic::Code::Unavailable {
-            note_refusal(self.pending.as_deref(), "closed");
+        match status.code() {
+            tonic::Code::Unavailable => note_refusal(self.pending.as_deref(), "closed"),
+            tonic::Code::ResourceExhausted => note_refusal(self.pending.as_deref(), "full"),
+            _ => {}
         }
         status
     }
@@ -1643,7 +1687,7 @@ impl proto::transport_server::Transport for TransportServiceImpl {
                     );
                 }
             }
-            Err(mpsc::error::TrySendError::Full(_)) => return Err(receiver_full()),
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(self.refused(receiver_full())),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 return Err(self.refused(receiver_closed()));
             }
@@ -1725,7 +1769,9 @@ impl proto::transport_server::Transport for TransportServiceImpl {
             // loop could enqueue some then fail mid-batch, stranding a prefix.
             let permits = match self.sender.try_reserve_many(count) {
                 Ok(permits) => permits,
-                Err(mpsc::error::TrySendError::Full(())) => return Err(receiver_full()),
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    return Err(self.refused(receiver_full()));
+                }
                 Err(mpsc::error::TrySendError::Closed(())) => {
                     return Err(self.refused(receiver_closed()));
                 }
@@ -2597,7 +2643,8 @@ mod tests {
         let records: Vec<Record> = (0..40).map(|_| json_record(b"0123456789abcdef")).collect();
         let whole = prost::Message::encoded_len(&batch::records_to_proto(records.clone()));
         let limit = whole / 3;
-        let batches = batches_within(records, limit);
+        let (batches, left_out) = batches_within(records, limit);
+        assert_eq!(left_out, 0);
         assert!(batches.len() >= 3, "{} batches", batches.len());
         let total: usize = batches.iter().map(|b| b.records.len()).sum();
         assert_eq!(total, 40, "no record lost in the split");

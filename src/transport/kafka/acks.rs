@@ -250,6 +250,24 @@ impl KafkaAcks {
         Self::note_released(tokens.len(), DeliveryStatus::Errored, oldest);
     }
 
+    /// Drop every offset held for `revoked` partitions, and where their commit
+    /// stood.
+    ///
+    /// A rebalance that takes a partition away ends this member's claim on its
+    /// offsets: another member reads and commits it from then on, so an offset
+    /// held here would block every commit if the partition came back.
+    pub(super) fn forget(&self, revoked: Vec<(String, i32)>) {
+        if revoked.is_empty() {
+            return;
+        }
+        let mut partitions = self.partitions.lock();
+        for (topic, partition) in revoked {
+            partitions.remove(&(Arc::<str>::from(topic), partition));
+        }
+        drop(partitions);
+        self.publish_held();
+    }
+
     /// Record the commits that landed.
     pub(super) fn committed(&self, targets: &[(PartitionKey, i64)]) {
         let mut partitions = self.partitions.lock();
@@ -436,6 +454,37 @@ mod tests {
         assert!(
             targets(&acks, &tokens[..2]).is_empty(),
             "a repeat release below the commit asks for nothing"
+        );
+    }
+
+    /// An Errored block on a partition that is revoked, committed past by the
+    /// member that took it, then handed back: the old hold must not block the
+    /// commits of what is read after.
+    #[test]
+    fn a_revoked_partition_holds_nothing_when_it_comes_back() {
+        let acks = KafkaAcks::default();
+        let withheld = register(&acks, 0, 0..10);
+        acks.withhold(&withheld);
+        let other = register(&acks, 1, 0..5);
+
+        acks.forget(vec![("events".to_string(), 0)]);
+        assert_eq!(acks.held().count, 5, "only partition 1 is still held");
+
+        // Another member committed partition 0 up to 20 while it had it.
+        let reread = register(&acks, 0, 20..30);
+        assert_eq!(targets(&acks, &reread), vec![30]);
+        assert_eq!(targets(&acks, &other), vec![5], "partition 1 is untouched");
+    }
+
+    #[test]
+    fn without_a_revoke_the_withheld_block_holds_the_commit() {
+        let acks = KafkaAcks::default();
+        let withheld = register(&acks, 0, 0..10);
+        acks.withhold(&withheld);
+        let reread = register(&acks, 0, 20..30);
+        assert!(
+            targets(&acks, &reread).is_empty(),
+            "an Errored offset this member still owns holds the commit below it"
         );
     }
 

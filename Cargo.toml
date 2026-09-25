@@ -132,7 +132,7 @@ auth = [
     "reqwest/form",
 ]
 http-server = ["axum", "tower", "tower-http", "tokio", "tracing"]
-spool = ["yaque", "zstd", "dep:crc32c", "chrono"]
+spool = ["yaque", "zstd", "dep:crc32c", "chrono", "tokio"]
 tiered-sink = ["transport", "yaque", "zstd", "lz4_flex", "snap", "tokio", "libc", "tracing", "dep:crc32c", "chrono"]
 
 # Outbound sink-control stack: composes timeout + load-shed + concurrency-limit
