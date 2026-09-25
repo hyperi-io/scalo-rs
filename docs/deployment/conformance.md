@@ -25,7 +25,7 @@ async fn every_acknowledged_record_arrives() {
 }
 ```
 
-`run_pull` feeds a `PullSource`: a partitioned log with cumulative per-partition commits, the shape of a Kafka topic. A restarted instance reads from the committed offsets. `run_push` feeds a `PushSource`, the shape of a gRPC or HTTP server. Its client resends each request until it is answered with success. The source holds each answer until `release` once armed, and answers at enqueue when it is not armed. An app whose dead-letter or filter path accounts for a record records it with `ledger.dead_lettered(marker)` or `ledger.dropped(marker, reason)`.
+`run_pull` feeds a `PullSource`: a partitioned log with cumulative per-partition commits, the shape of a Kafka topic. A restarted instance reads from the committed offsets. `run_push` feeds a `PushSource`, the shape of a gRPC or HTTP server. Its client resends each request until it is answered with success. The source holds each answer until `release` once armed, and answers at enqueue when it is not armed. `Case` builds it armed, as an app that releases every token must build its push transport (`GrpcTransport::builder(&cfg).armed(true)`, `AnyReceiver::from_config_armed(key)`): a source armed only when its pipeline starts answers whatever arrived before that at enqueue, and a kill loses those records. `Case::push_armed(false)` runs the unarmed default. An app whose dead-letter or filter path accounts for a record records it with `ledger.dead_lettered(marker)` or `ledger.dropped(marker, reason)`.
 
 ## Faults
 

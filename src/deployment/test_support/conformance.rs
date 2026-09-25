@@ -457,9 +457,11 @@ struct HeldRequest {
 /// A push source (the shape of a gRPC or HTTP server) holding each request's
 /// answer until every record in it is released.
 ///
-/// Unarmed, it answers success at enqueue, which is how a push hop loses what
-/// it acknowledged when it is killed. A dropped source drops its held answers,
-/// and the client resends those requests.
+/// Unarmed, the default as for the transports, it answers success at enqueue,
+/// which is how a push hop loses what it acknowledged when it is killed. An app
+/// that releases every token builds it [`armed`](Self::armed), so nothing that
+/// arrives before its pipeline runs is answered early. A dropped source drops
+/// its held answers, and the client resends those requests.
 #[derive(Debug)]
 pub struct PushSource {
     queue: Mutex<VecDeque<(bytes::Bytes, PushToken)>>,
@@ -492,6 +494,13 @@ impl PushSource {
     #[must_use]
     pub fn with_acknowledgements(mut self, acknowledgements: AcknowledgementsConfig) -> Self {
         self.acknowledgements = acknowledgements;
+        self
+    }
+
+    /// Arm it at construction, before any request can reach it.
+    #[must_use]
+    pub fn armed(self, armed: bool) -> Self {
+        self.armed.store(armed, Ordering::Release);
         self
     }
 
@@ -1011,12 +1020,16 @@ pub struct Case {
     pub request_size: usize,
     /// How long a push source holds an answer.
     pub hold: Duration,
+    /// Whether each push source is built armed, as an app that releases every
+    /// token builds its source. Default `true`.
+    pub push_armed: bool,
     /// How long the final drain may take before the run is judged as it stands.
     pub drain_within: Duration,
 }
 
 impl Case {
-    /// A case with 200 records over 2 partitions, 10 records per request.
+    /// A case with 200 records over 2 partitions, 10 records per request, and
+    /// push sources built armed.
     #[must_use]
     pub fn new(fault: Fault) -> Self {
         Self {
@@ -1025,8 +1038,18 @@ impl Case {
             partitions: 2,
             request_size: 10,
             hold: Duration::from_secs(5),
+            push_armed: true,
             drain_within: Duration::from_secs(30),
         }
+    }
+
+    /// Build each push source armed (`true`, the default) or with the
+    /// transports' unarmed default, which answers at enqueue until the
+    /// pipeline arms it.
+    #[must_use]
+    pub fn push_armed(mut self, armed: bool) -> Self {
+        self.push_armed = armed;
+        self
     }
 
     /// Drive `records` marked records.
@@ -1125,7 +1148,7 @@ impl Case {
         let endpoints = Endpoints::default();
         let start = |id: usize| {
             let shutdown = CancellationToken::new();
-            let source = Arc::new(PushSource::new(self.hold));
+            let source = Arc::new(PushSource::new(self.hold).armed(self.push_armed));
             endpoints.add(Arc::clone(&source));
             let instance = Instance::spawn(
                 shutdown.clone(),
@@ -1348,8 +1371,8 @@ mod tests {
             .unwrap();
         assert_eq!(held.await, Ok(false), "an errored record fails the request");
 
-        let dropped = PushSource::new(Duration::from_secs(5));
-        dropped.arm();
+        let dropped = PushSource::new(Duration::from_secs(5)).armed(true);
+        assert!(dropped.is_armed(), "armed at construction");
         let orphan = dropped.push(marked_payloads(1));
         drop(dropped);
         assert!(
