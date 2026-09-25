@@ -523,16 +523,59 @@ impl GrpcTransportBuilder<'_> {
     }
 }
 
-/// The default held-byte ceiling: a quarter of the memory guard's limit, else
-/// 256 MiB.
-fn default_max_held_bytes(
-    #[cfg(feature = "memory")] guard: Option<&Arc<crate::memory::MemoryGuard>>,
-) -> u64 {
-    #[cfg(feature = "memory")]
-    if let Some(guard) = guard {
-        return (guard.limit_bytes() / 4).max(1);
+impl GrpcTransportBuilder<'_> {
+    /// The registry a receive server holds responses in; `None` in client-only
+    /// mode.
+    fn hold_registry(&self) -> Option<Arc<PendingRegistry>> {
+        self.config.listen.as_ref()?;
+        #[cfg(feature = "memory")]
+        let guard_limit = self.memory_guard.as_ref().map(|g| g.limit_bytes());
+        #[cfg(not(feature = "memory"))]
+        let guard_limit: Option<u64> = None;
+        Some(Arc::new(PendingRegistry::new(pending::HoldSettings {
+            enabled: self.acknowledgements,
+            // A quarter of the memory guard's limit, else a fixed default.
+            max_held_bytes: self.max_held_bytes.unwrap_or_else(|| {
+                guard_limit.map_or(pending::DEFAULT_MAX_HELD_BYTES, |limit| (limit / 4).max(1))
+            }),
+            max_hold: self.max_hold,
+            label: "grpc",
+            #[cfg(feature = "memory")]
+            guard: self.memory_guard.clone(),
+        })))
     }
-    pending::DEFAULT_MAX_HELD_BYTES
+}
+
+/// The lazily connected client for `endpoint`, with the configured TLS,
+/// deadlines and compression.
+fn build_client(
+    config: &GrpcConfig,
+    endpoint: &str,
+) -> TransportResult<proto::transport_client::TransportClient<tonic::transport::Channel>> {
+    let mut ep = tonic::transport::Channel::from_shared(endpoint.to_string())
+        .map_err(|e| TransportError::Config(format!("invalid endpoint: {e}")))?;
+
+    // Client TLS. tonic owns its TLS stack, so we map the unified
+    // vocabulary onto ClientTlsConfig (private CA, mTLS identity, SNI).
+    if config.tls_enabled {
+        ep = ep
+            .tls_config(build_grpc_client_tls(config)?)
+            .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
+    }
+
+    let channel = lazy_channel(ep, config.send_timeout_ms);
+
+    // No encoding limit: tonic's refusal arrives as a stream reset that
+    // reads as an outage, so send and send_batch check the size instead.
+    let mut client = proto::transport_client::TransportClient::new(channel)
+        .max_decoding_message_size(config.max_message_size);
+
+    if config.compression {
+        client = client
+            .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+    }
+    Ok(client)
 }
 
 impl GrpcTransport {
@@ -595,59 +638,22 @@ impl GrpcTransport {
 
     async fn new_inner(options: GrpcTransportBuilder<'_>) -> TransportResult<Self> {
         let config = options.config;
+        let pending = options.hold_registry();
         #[cfg(feature = "governor")]
         let pressure = options.pressure;
-        let mut client = None;
         let mut receiver = None;
         let mut shutdown_tx = None;
         let mut server_handle = None;
         let mut local_addr = None;
         let sequence = Arc::new(AtomicU64::new(0));
         let oversize = Arc::new(OversizeSlot::default());
-        let pending = config.listen.as_ref().map(|_| {
-            Arc::new(PendingRegistry::new(pending::HoldSettings {
-                enabled: options.acknowledgements,
-                max_held_bytes: options.max_held_bytes.unwrap_or_else(|| {
-                    default_max_held_bytes(
-                        #[cfg(feature = "memory")]
-                        options.memory_guard.as_ref(),
-                    )
-                }),
-                max_hold: options.max_hold,
-                label: "grpc",
-                #[cfg(feature = "memory")]
-                guard: options.memory_guard.clone(),
-            }))
-        });
 
         // Set up client (lazy connection -- doesn't fail until first RPC)
-        if let Some(endpoint) = &config.endpoint {
-            let mut ep = tonic::transport::Channel::from_shared(endpoint.clone())
-                .map_err(|e| TransportError::Config(format!("invalid endpoint: {e}")))?;
-
-            // Client TLS. tonic owns its TLS stack, so we map the unified
-            // vocabulary onto ClientTlsConfig (private CA, mTLS identity, SNI).
-            if config.tls_enabled {
-                ep = ep
-                    .tls_config(build_grpc_client_tls(config)?)
-                    .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
-            }
-
-            let channel = lazy_channel(ep, config.send_timeout_ms);
-
-            // No encoding limit: tonic's refusal arrives as a stream reset that
-            // reads as an outage, so send and send_batch check the size instead.
-            let mut c = proto::transport_client::TransportClient::new(channel)
-                .max_decoding_message_size(config.max_message_size);
-
-            if config.compression {
-                c = c
-                    .send_compressed(tonic::codec::CompressionEncoding::Gzip)
-                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
-            }
-
-            client = Some(c);
-        }
+        let client = config
+            .endpoint
+            .as_ref()
+            .map(|e| build_client(config, e))
+            .transpose()?;
 
         // Set up server
         if let Some(listen) = &config.listen {
@@ -1564,7 +1570,11 @@ impl proto::transport_server::Transport for TransportServiceImpl {
         let records = batch::proto_batch_to_records(proto_batch);
         let count = records.len();
         let accepted = count as u64;
+        // Nothing to hold or queue, but a closed receiver still says so.
         if records.is_empty() {
+            if self.sender.is_closed() {
+                return Err(self.refused(receiver_closed()));
+            }
             return Ok(Response::new(proto::BatchAck { accepted }));
         }
         // Sum raw wire bytes BEFORE the records move into the channel below.
