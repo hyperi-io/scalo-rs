@@ -273,6 +273,9 @@ pub struct KafkaTransport {
     /// directions.
     #[cfg(all(feature = "governor", feature = "health"))]
     partition_limited_flag: Arc<AtomicBool>,
+    /// Asks the broker for the log end of an assignment the gate has paused.
+    #[cfg(feature = "governor")]
+    paused_ends: PausedEnds,
     /// Source acknowledgement config, arming and held offsets.
     acks: acks::KafkaAcks,
     /// The producer's `message.max.bytes`, for screening records before a send.
@@ -816,6 +819,8 @@ impl KafkaTransport {
             partition_limited_warn: PartitionLimitedDiagnostic::default(),
             #[cfg(all(feature = "governor", feature = "health"))]
             partition_limited_flag,
+            #[cfg(feature = "governor")]
+            paused_ends: PausedEnds::new(&consumer_config),
             acks: acks::KafkaAcks::default(),
             message_max_bytes,
         })
@@ -1585,11 +1590,17 @@ impl KafkaTransport {
             if gate.is_held()
                 && let Ok(tpl) = self.consumer.assignment()
                 && tpl.count() > 0
-                && let Err(e) = self.consumer.pause(&tpl)
             {
-                tracing::debug!(error = %e, "kafka gate: re-pause under hold failed");
+                match self.consumer.pause(&tpl) {
+                    Ok(()) => self.consumer.context().set_paused(true),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "kafka gate: re-pause under hold failed");
+                    }
+                }
             }
         }
+        #[cfg(feature = "governor")]
+        self.paused_ends.refresh(&self.consumer);
 
         // Check for topic changes from the background refresh loop
         if let Some(ref refresh) = self.topic_refresh
@@ -2207,12 +2218,13 @@ struct KafkaGateActuator {
 impl crate::governor::GateActuator for KafkaGateActuator {
     fn pause(&self) {
         match self.consumer.assignment() {
-            Ok(tpl) => {
-                if let Err(e) = self.consumer.pause(&tpl) {
+            Ok(tpl) => match self.consumer.pause(&tpl) {
+                Ok(()) => self.consumer.context().set_paused(true),
+                Err(e) => {
                     tracing::warn!(error = %e, "kafka gate: pause(assignment) failed");
                     gate_actuator_error("pause");
                 }
-            }
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "kafka gate: assignment() failed on pause");
                 gate_actuator_error("pause");
@@ -2222,18 +2234,121 @@ impl crate::governor::GateActuator for KafkaGateActuator {
 
     fn resume(&self) {
         match self.consumer.assignment() {
-            Ok(tpl) => {
-                if let Err(e) = self.consumer.resume(&tpl) {
+            Ok(tpl) => match self.consumer.resume(&tpl) {
+                Ok(()) => self.consumer.context().set_paused(false),
+                Err(e) => {
                     tracing::warn!(error = %e, "kafka gate: resume(assignment) failed");
                     gate_actuator_error("resume");
                 }
-            }
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "kafka gate: assignment() failed on resume");
                 gate_actuator_error("resume");
             }
         }
     }
+}
+
+/// Least time between two asks for a paused assignment's log end.
+#[cfg(feature = "governor")]
+const PAUSED_END_FLOOR: Duration = Duration::from_secs(1);
+
+/// Longest an ask for a paused assignment's log end waits on the broker.
+#[cfg(feature = "governor")]
+const PAUSED_END_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Keeps the lag of a paused assignment moving.
+///
+/// librdkafka learns a partition's log end only from a fetch reply, and never
+/// fetches a partition that is paused, so while the gate holds the lag it
+/// reports stops rising however much is written. This asks the broker for the
+/// ends instead, in one `ListOffsets` per leader, once per statistics interval
+/// and no more often than [`PAUSED_END_FLOOR`], with one ask in flight at most.
+#[cfg(feature = "governor")]
+struct PausedEnds {
+    /// How often to ask, or `None` when statistics, and so lag, are off.
+    every: Option<Duration>,
+    /// When the last ask started.
+    asked: parking_lot::Mutex<Option<std::time::Instant>>,
+    in_flight: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "governor")]
+impl PausedEnds {
+    fn new(consumer_config: &ClientConfig) -> Self {
+        let every = consumer_config
+            .get("statistics.interval.ms")
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(|ms| Duration::from_millis(ms).max(PAUSED_END_FLOOR));
+        Self {
+            every,
+            asked: parking_lot::Mutex::new(None),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Ask the broker for the paused assignment's ends on the blocking pool,
+    /// when one is due. Called from every `recv`, which the run loop keeps
+    /// making while the gate holds.
+    fn refresh(&self, consumer: &Arc<BaseConsumer<StatsContext>>) {
+        let Some(every) = self.every else {
+            return;
+        };
+        if !consumer.context().is_paused() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        {
+            let mut asked = self.asked.lock();
+            if asked.is_some_and(|at| now.saturating_duration_since(at) < every)
+                || self.in_flight.swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+            *asked = Some(now);
+        }
+        let consumer = Arc::clone(consumer);
+        let in_flight = Arc::clone(&self.in_flight);
+        runtime.spawn_blocking(move || {
+            if let Some(ends) = assignment_ends(&consumer) {
+                consumer.context().set_paused_ends(ends);
+            }
+            in_flight.store(false, Ordering::Release);
+        });
+    }
+}
+
+/// The log end of every partition assigned to `consumer`, from the broker.
+#[cfg(feature = "governor")]
+fn assignment_ends(consumer: &BaseConsumer<StatsContext>) -> Option<HashMap<(String, i32), i64>> {
+    let mut assignment = consumer.assignment().ok()?;
+    if assignment.count() == 0 {
+        return Some(HashMap::new());
+    }
+    // A ListOffsets for timestamp -1 answers with the end, as the watermark query does.
+    assignment.set_all_offsets(Offset::End).ok()?;
+    let found = match consumer.offsets_for_times(assignment, PAUSED_END_TIMEOUT) {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::debug!(error = %e, "kafka: asking the broker for a paused assignment's end failed");
+            return None;
+        }
+    };
+    Some(
+        found
+            .elements()
+            .iter()
+            .filter(|e| e.error().is_ok())
+            .filter_map(|e| match e.offset() {
+                Offset::Offset(end) => Some(((e.topic().to_string(), e.partition()), end)),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Count a kafka gate pause/resume failure. A sustained failure silently

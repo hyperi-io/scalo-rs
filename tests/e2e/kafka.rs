@@ -694,36 +694,30 @@ async fn test_kafka_consumer_lag() {
     }
 }
 
-/// Held source acknowledgements against a real broker in a container.
+/// A real broker in a container, for the tests below.
 ///
 /// Built with the `testcontainers` feature, which CI's Test job enables, and
 /// needs a Docker daemon.
-#[cfg(all(feature = "testcontainers", feature = "worker-batch"))]
-mod held_acknowledgements {
-    use std::collections::BTreeSet;
+#[cfg(feature = "testcontainers")]
+mod broker {
+    use std::ops::Range;
     use std::time::{Duration, Instant};
 
     use rdkafka::ClientConfig;
     use rdkafka::consumer::{BaseConsumer, Consumer};
     use rdkafka::producer::{FutureProducer, FutureRecord};
     use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
-    use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaToken, KafkaTransport};
-    use scalo::transport::{AcknowledgementsConfig, WorkBatch};
-    use scalo::worker::{BatchEngine, BatchProcessingConfig, EngineError};
+    use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
     use testcontainers_modules::kafka::apache::{self, Kafka};
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-    use tokio_util::sync::CancellationToken;
 
     /// Kafka to test against, pinned by digest.
     // renovate: datasource=docker depName=apache/kafka-native
     const KAFKA_IMAGE_REF: &str =
         "4.3.1@sha256:2885898ba17065023f1bd605f3a81efcfa986014f062b73b91ef5462485f9060";
 
-    /// Records written to each test topic.
-    const RECORDS: usize = 20;
-
-    async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
+    pub(super) async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
         let node = Kafka::default()
             .with_tag(KAFKA_IMAGE_REF)
             .start()
@@ -736,9 +730,8 @@ mod held_acknowledgements {
         (node, format!("127.0.0.1:{port}"))
     }
 
-    /// Create a one-partition `topic`, write `{"seq":N}` for N in `0..RECORDS`,
-    /// and wait for every delivery.
-    async fn topic_with_records(bootstrap: &str, topic: &'static str) {
+    /// Create a one-partition `topic` and wait for its metadata.
+    pub(super) async fn create_topic(bootstrap: &str, topic: &'static str) {
         let admin = KafkaAdmin::new(&KafkaConfig {
             brokers: vec![bootstrap.to_string()],
             group: String::new(),
@@ -762,12 +755,16 @@ mod held_acknowledgements {
         })
         .await
         .expect("metadata wait");
+    }
 
+    /// Write `{"seq":N}` to `topic` for each N in `seqs`, and wait for every
+    /// delivery.
+    pub(super) async fn produce(bootstrap: &str, topic: &str, seqs: Range<usize>) {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap)
             .create()
             .expect("raw producer");
-        for seq in 0..RECORDS {
+        for seq in seqs {
             let payload = format!("{{\"seq\":{seq}}}");
             producer
                 .send(
@@ -779,20 +776,24 @@ mod held_acknowledgements {
         }
     }
 
-    async fn consumer(bootstrap: &str, topic: &str, group: &str) -> KafkaTransport {
-        KafkaTransport::new(&KafkaConfig {
+    pub(super) fn consumer_config(bootstrap: &str, topic: &str, group: &str) -> KafkaConfig {
+        KafkaConfig {
             brokers: vec![bootstrap.to_string()],
             group: group.to_string(),
             topics: vec![topic.to_string()],
             ..Default::default()
-        })
-        .await
-        .expect("kafka consumer")
+        }
+    }
+
+    pub(super) async fn consumer(bootstrap: &str, topic: &str, group: &str) -> KafkaTransport {
+        KafkaTransport::new(&consumer_config(bootstrap, topic, group))
+            .await
+            .expect("kafka consumer")
     }
 
     /// The offset `group` last committed on partition 0 of `topic`, asked of
     /// the broker by a client that joins no group.
-    async fn committed(bootstrap: &str, group: &str, topic: &str) -> Option<i64> {
+    pub(super) async fn committed(bootstrap: &str, group: &str, topic: &str) -> Option<i64> {
         let (bootstrap, group, topic) =
             (bootstrap.to_string(), group.to_string(), topic.to_string());
         tokio::task::spawn_blocking(move || {
@@ -814,6 +815,30 @@ mod held_acknowledgements {
         })
         .await
         .expect("offset task")
+    }
+}
+
+/// Held source acknowledgements against a real broker in a container.
+#[cfg(all(feature = "testcontainers", feature = "worker-batch"))]
+mod held_acknowledgements {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use scalo::transport::kafka::{KafkaToken, KafkaTransport};
+    use scalo::transport::{AcknowledgementsConfig, WorkBatch};
+    use scalo::worker::{BatchEngine, BatchProcessingConfig, EngineError};
+    use tokio_util::sync::CancellationToken;
+
+    use super::broker::{committed, consumer, create_topic, produce, start_kafka};
+
+    /// Records written to each test topic.
+    const RECORDS: usize = 20;
+
+    /// Create a one-partition `topic` and write `{"seq":N}` for N in
+    /// `0..RECORDS`.
+    async fn topic_with_records(bootstrap: &str, topic: &'static str) {
+        create_topic(bootstrap, topic).await;
+        produce(bootstrap, topic, 0..RECORDS).await;
     }
 
     fn seq_of(payload: &[u8]) -> usize {
@@ -922,6 +947,123 @@ mod held_acknowledgements {
             Some(i64::try_from(taken).expect("fits")),
             "with acknowledgements off the block is committed before the sink runs, \
              so the kill loses it"
+        );
+    }
+}
+
+/// Consumer lag against a real broker. The committed offset, the offset read
+/// to and the log end are three offsets, and the end must keep moving while
+/// the self-regulation gate holds the partition paused.
+#[cfg(all(feature = "testcontainers", feature = "governor"))]
+mod lag {
+    use std::time::{Duration, Instant};
+
+    use scalo::transport::TransportReceiver;
+    use scalo::transport::kafka::{KafkaToken, KafkaTransport, total_consumer_lag};
+
+    use super::broker::{consumer_config, create_topic, produce, start_kafka};
+
+    /// Records written before the consumer starts, all of which it reads.
+    const READ: usize = 20;
+    /// Of those, the records it commits.
+    const COMMITTED: usize = 5;
+    /// Records written while the partition is paused.
+    const WRITTEN_PAUSED: usize = 30;
+
+    /// A consumer whose statistics, and so its lag, refresh every 200 ms.
+    async fn lag_consumer(bootstrap: &str, topic: &str, group: &str) -> KafkaTransport {
+        let mut config = consumer_config(bootstrap, topic, group);
+        config
+            .librdkafka_overrides
+            .insert("statistics.interval.ms".to_string(), "200".to_string());
+        KafkaTransport::new(&config).await.expect("kafka consumer")
+    }
+
+    /// Lag behind the committed offset, and behind the read position.
+    fn lags(transport: &KafkaTransport) -> (i64, i64) {
+        (
+            total_consumer_lag(&transport.stats()),
+            transport.total_position_lag(),
+        )
+    }
+
+    /// Read until `tokens` holds `total` records.
+    async fn read_to(transport: &KafkaTransport, tokens: &mut Vec<KafkaToken>, total: usize) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while tokens.len() < total {
+            assert!(
+                Instant::now() < deadline,
+                "read {} of {total} records within 60 s",
+                tokens.len()
+            );
+            let batch = transport.recv(total - tokens.len()).await.expect("recv");
+            tokens.extend(batch.commit_tokens);
+        }
+    }
+
+    /// Poll as the run loop does, which serves the statistics, until the
+    /// lags read `want` or 30 s pass. Returns the last reading. Nothing more
+    /// may be read meanwhile.
+    async fn settle(transport: &KafkaTransport, want: (i64, i64)) -> (i64, i64) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let batch = transport.recv(100).await.expect("recv");
+            assert!(
+                batch.records.is_empty(),
+                "read {} records the test did not expect",
+                batch.records.len()
+            );
+            let now = lags(transport);
+            if now == want || Instant::now() >= deadline {
+                return now;
+            }
+        }
+    }
+
+    fn offset(count: usize) -> i64 {
+        i64::try_from(count).expect("fits an i64")
+    }
+
+    #[tokio::test]
+    async fn lag_counts_from_the_commit_and_the_read_position_and_rises_while_paused() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "lag";
+        create_topic(&bootstrap, topic).await;
+        produce(&bootstrap, topic, 0..READ).await;
+        let transport = lag_consumer(&bootstrap, topic, "lag-group").await;
+
+        let mut tokens = Vec::new();
+        read_to(&transport, &mut tokens, READ).await;
+        transport
+            .commit(&tokens[..COMMITTED])
+            .await
+            .expect("commit");
+        let (committed, read) = (offset(COMMITTED), offset(READ));
+        let want = (read - committed, 0);
+        assert_eq!(
+            settle(&transport, want).await,
+            want,
+            "end {read}, read to {read}, committed {committed}"
+        );
+
+        transport.gate_actuator().pause();
+        produce(&bootstrap, topic, READ..READ + WRITTEN_PAUSED).await;
+        let end = read + offset(WRITTEN_PAUSED);
+        let want = (end - committed, end - read);
+        assert_eq!(
+            settle(&transport, want).await,
+            want,
+            "paused: end {end}, read to {read}, committed {committed}. The end must keep \
+             moving while nothing is fetched"
+        );
+
+        transport.gate_actuator().resume();
+        read_to(&transport, &mut tokens, READ + WRITTEN_PAUSED).await;
+        let want = (end - committed, 0);
+        assert_eq!(
+            settle(&transport, want).await,
+            want,
+            "resumed and read to the end: end {end}, read to {end}, committed {committed}"
         );
     }
 }

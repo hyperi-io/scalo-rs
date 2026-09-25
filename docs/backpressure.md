@@ -136,6 +136,8 @@ not a permanently-paused intake.
 
 A paused source grows consumer lag (Kafka) or queue depth (other sources). KEDA
 reads that lag via `ScalingPressure`'s external-scaler signal and adds replicas.
+
+librdkafka learns a partition's log end only from a fetch reply, and fetches nothing it has paused, so on its own the lag it reports freezes the moment the gate pauses intake. While the gate holds, the Kafka transport asks the broker for the assignment's ends instead: one `ListOffsets` per leader, once per `statistics.interval.ms` and no more often than once a second. `total_consumer_lag`, `total_position_lag` and the `rdkafka_topic_partition_consumer_lag` gauge keep rising with what producers write.
 The two levers compose:
 
 - **InboundGate** is the fast, local, per-pod brake -- milliseconds, no new

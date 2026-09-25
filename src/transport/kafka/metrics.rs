@@ -126,6 +126,11 @@ pub struct StatsContext {
     /// Ownership changes served so far, so a record can be ordered against
     /// them.
     rebalances: AtomicU64,
+    /// Whether the inbound gate has this consumer's assignment paused.
+    paused: AtomicBool,
+    /// Log ends asked of the broker while paused, since librdkafka learns a
+    /// partition's end only from a fetch and fetches nothing it has paused.
+    paused_ends: RwLock<HashMap<(String, i32), i64>>,
 }
 
 /// A change a rebalance made to what this consumer owns.
@@ -155,6 +160,35 @@ impl StatsContext {
             position_lag: AtomicI64::new(0),
             rebalanced: Mutex::new(Vec::new()),
             rebalances: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
+            paused_ends: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Record that the inbound gate paused or resumed the assignment. A
+    /// resume drops the ends asked of the broker: fetches report the end
+    /// again from then on.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+        if !paused && let Ok(mut ends) = self.paused_ends.write() {
+            ends.clear();
+        }
+    }
+
+    /// Whether the inbound gate has the assignment paused.
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// The log ends the broker reported for the paused assignment, used by
+    /// every statistics callback until the next refresh or a resume.
+    pub(crate) fn set_paused_ends(&self, ends: HashMap<(String, i32), i64>) {
+        // Checked under the lock `set_paused` clears under, so a refresh that
+        // lands after a resume leaves nothing behind.
+        if let Ok(mut held) = self.paused_ends.write()
+            && self.is_paused()
+        {
+            *held = ends;
         }
     }
 
@@ -232,8 +266,9 @@ impl StatsContext {
         self.stats.read().ok().and_then(|s| s.clone())
     }
 
-    /// Convert raw statistics to our metrics format.
-    fn convert_stats(stats: &Statistics) -> KafkaMetrics {
+    /// Convert raw statistics to our metrics format, taking each partition's
+    /// end as the later of the statistics' and `asked_ends`.
+    fn convert_stats(stats: &Statistics, asked_ends: &HashMap<(String, i32), i64>) -> KafkaMetrics {
         let mut metrics = KafkaMetrics {
             messages_sent: stats.txmsgs,
             messages_received: stats.rxmsgs,
@@ -271,12 +306,17 @@ impl StatsContext {
         for (topic_name, topic) in &stats.topics {
             for (partition_id, partition) in &topic.partitions {
                 let key = (topic_name.clone(), *partition_id);
+                let asked_end = asked_ends.get(&key).copied();
 
                 // Consumer lag
-                if partition.consumer_lag >= 0 {
-                    metrics
-                        .partition_lag
-                        .insert(key.clone(), partition.consumer_lag);
+                let consumer_lag = match asked_end {
+                    Some(end) if partition.committed_offset >= 0 => {
+                        partition.consumer_lag.max(end - partition.committed_offset)
+                    }
+                    _ => partition.consumer_lag,
+                };
+                if consumer_lag >= 0 {
+                    metrics.partition_lag.insert(key.clone(), consumer_lag);
                 }
 
                 // Committed offset
@@ -287,10 +327,10 @@ impl StatsContext {
                 }
 
                 // High watermark
-                if partition.hi_offset >= 0 {
-                    metrics
-                        .partition_high_watermark
-                        .insert(key, partition.hi_offset);
+                let hi_offset =
+                    asked_end.map_or(partition.hi_offset, |end| partition.hi_offset.max(end));
+                if hi_offset >= 0 {
+                    metrics.partition_high_watermark.insert(key, hi_offset);
                 }
             }
         }
@@ -313,9 +353,14 @@ impl ClientContext for StatsContext {
         {
             self.connected.store(true, Ordering::Relaxed);
         }
-        let metrics = Self::convert_stats(&statistics);
+        let asked_ends = self
+            .paused_ends
+            .read()
+            .map(|ends| ends.clone())
+            .unwrap_or_default();
+        let metrics = Self::convert_stats(&statistics, &asked_ends);
         self.position_lag
-            .store(position_lag(&statistics), Ordering::Relaxed);
+            .store(position_lag(&statistics, &asked_ends), Ordering::Relaxed);
 
         if let Ok(mut lock) = self.latest_metrics.write() {
             *lock = metrics;
@@ -500,7 +545,12 @@ pub fn total_consumer_lag(metrics: &KafkaMetrics) -> i64 {
 /// librdkafka measures `consumer_lag` from the committed offset to the end the
 /// consumer may read to (the last stable offset under `read_committed`, the
 /// high watermark otherwise), so that end is `consumer_lag + committed_offset`.
-fn partition_position_lag(p: &rdkafka::statistics::Partition) -> Option<i64> {
+/// `asked_end`, the end the broker reported for a paused partition, wins when
+/// it is later.
+fn partition_position_lag(
+    p: &rdkafka::statistics::Partition,
+    asked_end: Option<i64>,
+) -> Option<i64> {
     let position = if p.app_offset >= 0 {
         p.app_offset
     } else if p.committed_offset >= 0 {
@@ -508,24 +558,36 @@ fn partition_position_lag(p: &rdkafka::statistics::Partition) -> Option<i64> {
     } else {
         return None;
     };
-    let end = if p.consumer_lag >= 0 && p.committed_offset >= 0 {
-        p.consumer_lag + p.committed_offset
+    let reported = if p.consumer_lag >= 0 && p.committed_offset >= 0 {
+        Some(p.consumer_lag + p.committed_offset)
     } else if p.hi_offset >= 0 {
-        p.hi_offset
+        Some(p.hi_offset)
     } else {
-        return None;
+        None
+    };
+    let end = match (reported, asked_end) {
+        (Some(reported), Some(asked)) => reported.max(asked),
+        (Some(end), None) | (None, Some(end)) => end,
+        (None, None) => return None,
     };
     Some((end - position).max(0))
 }
 
 /// Records past the read position, summed over every partition being read.
-fn position_lag(stats: &Statistics) -> i64 {
+fn position_lag(stats: &Statistics, asked_ends: &HashMap<(String, i32), i64>) -> i64 {
     stats
         .topics
-        .values()
-        .flat_map(|topic| topic.partitions.iter())
-        .filter(|(id, _)| **id >= 0)
-        .filter_map(|(_, p)| partition_position_lag(p))
+        .iter()
+        .flat_map(|(name, topic)| topic.partitions.iter().map(move |p| (name, p)))
+        .filter(|(_, (id, _))| **id >= 0)
+        .filter_map(|(name, (id, p))| {
+            let asked_end = if asked_ends.is_empty() {
+                None
+            } else {
+                asked_ends.get(&(name.clone(), *id)).copied()
+            };
+            partition_position_lag(p, asked_end)
+        })
         .sum()
 }
 
@@ -604,5 +666,74 @@ mod tests {
     fn test_stats_context_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<StatsContext>();
+    }
+
+    /// Statistics for one partition of `events`, committed to 5 and read to
+    /// 20, whose last fetch saw the end at 20.
+    fn stats_read_to_20() -> Statistics {
+        let partition = rdkafka::statistics::Partition {
+            partition: 0,
+            app_offset: 20,
+            committed_offset: 5,
+            hi_offset: 20,
+            consumer_lag: 15,
+            ..Default::default()
+        };
+        let topic = rdkafka::statistics::Topic {
+            topic: "events".to_string(),
+            partitions: HashMap::from([(0, partition)]),
+            ..Default::default()
+        };
+        Statistics {
+            topics: HashMap::from([("events".to_string(), topic)]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lag_counts_from_the_commit_and_the_read_position() {
+        let stats = stats_read_to_20();
+        let none = HashMap::new();
+        assert_eq!(
+            total_consumer_lag(&StatsContext::convert_stats(&stats, &none)),
+            15
+        );
+        assert_eq!(position_lag(&stats, &none), 0);
+    }
+
+    #[test]
+    fn an_end_asked_of_the_broker_moves_the_lag_the_last_fetch_left_behind() {
+        let stats = stats_read_to_20();
+        let asked = HashMap::from([(("events".to_string(), 0), 50)]);
+        let metrics = StatsContext::convert_stats(&stats, &asked);
+        assert_eq!(total_consumer_lag(&metrics), 45, "end 50 less committed 5");
+        assert_eq!(
+            metrics.partition_high_watermark[&("events".to_string(), 0)],
+            50
+        );
+        assert_eq!(position_lag(&stats, &asked), 30, "end 50 less read-to 20");
+
+        let behind = HashMap::from([(("events".to_string(), 0), 10)]);
+        assert_eq!(
+            position_lag(&stats, &behind),
+            0,
+            "an end older than the fetch's never lowers it"
+        );
+    }
+
+    #[test]
+    fn a_resume_drops_the_asked_ends_and_a_late_answer_is_ignored() {
+        let context = StatsContext::new();
+        let ends = || HashMap::from([(("events".to_string(), 0), 50)]);
+        context.set_paused_ends(ends());
+        assert!(
+            context.paused_ends.read().expect("lock").is_empty(),
+            "not paused, so nothing is kept"
+        );
+        context.set_paused(true);
+        context.set_paused_ends(ends());
+        assert_eq!(context.paused_ends.read().expect("lock").len(), 1);
+        context.set_paused(false);
+        assert!(context.paused_ends.read().expect("lock").is_empty());
     }
 }

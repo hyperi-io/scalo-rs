@@ -779,7 +779,7 @@ An armed gRPC server answers a push only once its records are released. Build it
 
 A `KafkaTransport` armed through `AckControl::arm` commits each partition only up to its lowest offset handed out and not yet released, for `commit` as for `release`. An unarmed one commits as before.
 
-`StatsContext::total_position_lag` and `KafkaTransport::total_position_lag` count records past the consumer's read position, which a held commit does not inflate. `total_consumer_lag` still counts from the committed offset.
+`StatsContext::total_position_lag` and `KafkaTransport::total_position_lag` count records past the consumer's read position, which a held commit does not inflate. `total_consumer_lag` still counts from the committed offset. While the inbound gate holds the assignment paused, both used to stop rising, since librdkafka fetches nothing it has paused and learns the log end only from fetches. The transport now asks the broker for the end once per statistics interval while paused, so both keep rising with what producers write.
 
 **Consumer adjustment** -- none to keep today's behaviour. To hold acknowledgements, move from `run_governed` to `pipeline(..)`, call `.sender(&sender)` for a transport sink, and give the loop a DLQ with `with_dlq`. A hand-rolled loop arms the source before its first `recv` and releases each block through `SourceAck`.
 
