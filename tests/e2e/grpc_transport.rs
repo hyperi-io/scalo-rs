@@ -363,9 +363,9 @@ async fn create_pair_with_capacity(port: u16, capacity: usize) -> (GrpcTransport
 }
 
 /// Atomicity: a `RouteBatch` larger than the free receiver capacity must be
-/// rejected ALL-OR-NOTHING. With a capacity-1 channel and a 2-record batch, the
-/// RPC errors (Backpressured) AND the receiver accepts ZERO records -- no
-/// partial-acceptance window. This is the contract the doc-comment on
+/// rejected ALL-OR-NOTHING. With one of two slots taken and a 2-record batch,
+/// the RPC errors (Backpressured) AND the receiver accepts ZERO of its records
+/// -- no partial-acceptance window. This is the contract the doc-comment on
 /// `send_batch` claims ("no partial-send window: the block is accepted or not
 /// as a unit"). The failure mode it pins: the server enqueues record 0 then
 /// errors on record 1, leaving 1 record stranded in the channel = partial
@@ -373,7 +373,11 @@ async fn create_pair_with_capacity(port: u16, capacity: usize) -> (GrpcTransport
 #[tokio::test]
 async fn test_route_batch_is_atomic_under_capacity() {
     let port = find_available_port().await;
-    let (server, client) = create_pair_with_capacity(port, 1).await;
+    let (server, client) = create_pair_with_capacity(port, 2).await;
+    let ahead = client
+        .send("events", bytes::Bytes::from_static(b"{\"ahead\":1}"))
+        .await;
+    assert!(matches!(ahead, SendResult::Ok), "{ahead:?}");
 
     let records = vec![
         Record {
@@ -396,23 +400,24 @@ async fn test_route_batch_is_atomic_under_capacity() {
         },
     ];
 
-    // Batch of 2 into a capacity-1 channel: cannot fit, must reject atomically.
+    // Batch of 2 with one slot free: cannot fit, must reject atomically.
     let result = client.send_batch(&records).await;
     assert!(
         matches!(result, SendResult::Backpressured),
         "over-capacity batch must surface as backpressure, got {result:?}"
     );
 
-    // The receiver must have accepted ZERO records -- not 1 (partial). Drain
-    // non-blocking; any record present proves a partial-acceptance window.
+    // The receiver must hold only the record queued ahead -- none of the
+    // batch. Any batch record present proves a partial-acceptance window.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let received = server.recv(10).await.expect("recv should succeed").records;
     assert_eq!(
         received.len(),
-        0,
+        1,
         "atomic batch must accept 0 records on rejection, got {} (partial acceptance)",
-        received.len()
+        received.len().saturating_sub(1)
     );
+    assert_eq!(received[0].payload.as_ref(), b"{\"ahead\":1}");
 
     let _ = client.close().await;
     let _ = server.close().await;
@@ -703,6 +708,103 @@ async fn a_push_after_close_is_refused_not_acked() {
     assert_eq!(delivered, Ok(0), "nothing sent after close() may be queued");
 
     let _ = client.close().await;
+}
+
+/// Send `records` as one block, taking what the server queued between tries.
+/// Returns the tries it took to land, or `None` if it never did.
+async fn land_block(
+    server: &GrpcTransport,
+    client: &GrpcTransport,
+    records: &[Record],
+    taken: &mut Vec<Record>,
+) -> Option<usize> {
+    for attempt in 1..=5 {
+        if matches!(client.send_batch(records).await, SendResult::Ok) {
+            return Some(attempt);
+        }
+        taken.extend(server.recv(100).await.expect("recv").records);
+    }
+    None
+}
+
+/// A `RouteBatch` with more records than `recv_buffer_size` lands whole on the
+/// first try, and `recv` hands all of it over in order, across calls and after
+/// `close()`.
+#[tokio::test]
+async fn a_batch_larger_than_the_receive_buffer_lands_whole() {
+    let port = find_available_port().await;
+    let (server, client) = create_pair_with_capacity(port, 4).await;
+    let block: Vec<Record> = (0..10).map(json_record).collect();
+
+    let mut taken = Vec::new();
+    let tries = land_block(&server, &client, &block, &mut taken).await;
+    assert_eq!(
+        tries,
+        Some(1),
+        "a 10-record block into a 4-record buffer never landed in 5 tries"
+    );
+    assert!(taken.is_empty(), "nothing lands before the block does");
+
+    let first = server.recv(3).await.expect("recv").records;
+    server.close().await.expect("close");
+    let mut delivered = first;
+    loop {
+        match server.recv(3).await {
+            Ok(batch) => delivered.extend(batch.records),
+            Err(TransportError::Closed) => break,
+            Err(e) => panic!("recv failed after {} records: {e}", delivered.len()),
+        }
+    }
+    let payloads: Vec<_> = delivered.iter().map(|r| r.payload.clone()).collect();
+    let sent: Vec<_> = block.iter().map(|r| r.payload.clone()).collect();
+    assert_eq!(
+        payloads, sent,
+        "every record of the block, once each, in order"
+    );
+
+    let _ = client.close().await;
+}
+
+/// One oversize block waits at a time: a second is refused whole while the
+/// first is still queued, and lands once `recv` has taken the first.
+#[tokio::test]
+async fn a_second_oversize_block_waits_for_the_first_to_be_taken() {
+    let port = find_available_port().await;
+    let (server, client) = create_pair_with_capacity(port, 2).await;
+    let first: Vec<Record> = (0..5).map(json_record).collect();
+    let second: Vec<Record> = (100..105).map(json_record).collect();
+
+    let landed = client.send_batch(&first).await;
+    assert!(matches!(landed, SendResult::Ok), "first block: {landed:?}");
+    let refused = client.send_batch(&second).await;
+    assert!(
+        matches!(refused, SendResult::Backpressured),
+        "second block while the first is queued: {refused:?}"
+    );
+    // A single record still has the record buffer to itself.
+    let single = client
+        .send("main", bytes::Bytes::from_static(b"{\"single\":1}"))
+        .await;
+    assert!(
+        matches!(single, SendResult::Ok),
+        "single record: {single:?}"
+    );
+
+    let taken = server.recv(100).await.expect("recv").records;
+    assert_eq!(
+        taken.len(),
+        6,
+        "the first block and the single record, none of the refused block"
+    );
+    let landed = client.send_batch(&second).await;
+    assert!(
+        matches!(landed, SendResult::Ok),
+        "second block once the first was taken: {landed:?}"
+    );
+    assert_eq!(server.recv(100).await.expect("recv").records.len(), 5);
+
+    let _ = client.close().await;
+    let _ = server.close().await;
 }
 
 /// A loopback client that opens one Push stream and never sends its body, so

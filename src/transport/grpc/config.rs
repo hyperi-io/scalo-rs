@@ -8,6 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default send limit, and the HTTP/2 PING period for a client with none.
+pub(crate) const DEFAULT_SEND_TIMEOUT_MS: u64 = 30_000;
+
 /// gRPC transport configuration.
 ///
 /// Supports client mode (sending), server mode (receiving), or both.
@@ -36,6 +39,9 @@ pub struct GrpcConfig {
     pub endpoint: Option<String>,
 
     /// Receive buffer size (messages buffered from incoming RPCs).
+    ///
+    /// A `RouteBatch` with more records than this is held whole beside the
+    /// buffer, one batch at a time.
     pub recv_buffer_size: usize,
 
     /// Receive timeout in milliseconds (0 = non-blocking).
@@ -48,6 +54,11 @@ pub struct GrpcConfig {
     /// returns `Backpressured` at the limit. A dial still unfinished at nine
     /// tenths of it is abandoned, so the next send dials afresh. Also sent as
     /// the `grpc-timeout` header.
+    ///
+    /// A connection that has read nothing for this long is sent an HTTP/2
+    /// PING, and closed if the PING goes unanswered for as long again (30s
+    /// each when 0), so a server that stays connected but stops answering is
+    /// dropped and the next send dials afresh.
     pub send_timeout_ms: u64,
 
     /// Maximum message size in bytes (both send and receive).
@@ -98,7 +109,7 @@ impl Default for GrpcConfig {
             endpoint: None,
             recv_buffer_size: 10_000,
             recv_timeout_ms: 100,
-            send_timeout_ms: 30_000, // 30s -- bound a single push RPC
+            send_timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
             max_message_size: 16 * 1024 * 1024, // 16 MB
             compression: false,
             tls_enabled: false,

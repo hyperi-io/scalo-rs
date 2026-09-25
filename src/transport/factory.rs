@@ -1165,7 +1165,7 @@ mod governor_tests {
         use crate::transport::traits::{TransportBase, TransportSender};
         use crate::transport::types::SendResult;
 
-        let server_cfg = crate::transport::grpc::GrpcConfig::server("127.0.0.1:16188");
+        let server_cfg = crate::transport::grpc::GrpcConfig::server("127.0.0.1:0");
         let cfg = crate::transport::TransportConfig {
             transport_type: crate::transport::types::TransportType::Grpc,
             grpc: Some(server_cfg),
@@ -1181,10 +1181,16 @@ mod governor_tests {
         let server = AnyReceiver::from_transport_config_with_governor(&cfg, &gov)
             .await
             .expect("governed grpc receiver must construct");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Irrefutable when transport-grpc is the only variant compiled in.
+        #[allow(irrefutable_let_patterns)]
+        let addr = if let AnyReceiver::Grpc(ref grpc) = server {
+            grpc.local_addr().expect("receiver bound")
+        } else {
+            panic!("must be Grpc variant");
+        };
 
         let client = crate::transport::grpc::GrpcTransport::new(
-            &crate::transport::grpc::GrpcConfig::client("http://127.0.0.1:16188"),
+            &crate::transport::grpc::GrpcConfig::client(&format!("http://{addr}")),
         )
         .await
         .expect("grpc client");

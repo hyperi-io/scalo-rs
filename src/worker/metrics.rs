@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-use crate::metrics::MetricsManager;
+use crate::metrics::{MetricDescriptor, MetricType, MetricsManager};
 
 use super::config::WorkerPoolConfig;
 
@@ -63,11 +63,32 @@ pub fn describe(manager: &MetricsManager) {
         "worker_pool_semaphore_wait_seconds",
         "Time waiting for semaphore permit",
     );
-    let _ = manager.counter("worker_pool_scale_events_total", "Scaling events");
+    describe_scale_events(manager);
     let _ = manager.gauge(
         "worker_pool_async_inflight",
         "Current async fan-out tasks in flight",
     );
+}
+
+/// Describe `worker_pool_scale_events_total` with its `direction` label.
+///
+/// The scaler emits it only with a direction, so this registers no series:
+/// a handle from `manager.counter` would add an unlabelled one stuck at 0.
+fn describe_scale_events(manager: &MetricsManager) {
+    const NAME: &str = "worker_pool_scale_events_total";
+    const DESCRIPTION: &str = "Scaling events";
+    metrics::describe_counter!(NAME, DESCRIPTION);
+    manager.registry().push(MetricDescriptor {
+        name: NAME.into(),
+        metric_type: MetricType::Counter,
+        description: DESCRIPTION.into(),
+        unit: String::new(),
+        labels: vec!["direction".into()],
+        group: "custom".into(),
+        buckets: None,
+        use_cases: vec![],
+        dashboard_hint: None,
+    });
 }
 
 /// Emit threshold gauge values (called at startup and on config reload).
@@ -128,5 +149,36 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(names(&described), expected);
         assert_eq!(names(&registered), expected);
+    }
+
+    /// Scale events are emitted only with their `direction`, so describing
+    /// them adds no unlabelled series beside the labelled ones.
+    #[test]
+    fn scale_events_are_described_with_their_label_and_no_bare_series() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let manager = MetricsManager::new_for_test("");
+
+        describe(&manager);
+        metrics::counter!("worker_pool_scale_events_total", "direction" => "up").increment(1);
+
+        let rendered = handle.render();
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("worker_pool_scale_events_total"))
+            .collect();
+        assert_eq!(
+            series,
+            vec!["worker_pool_scale_events_total{direction=\"up\"} 1"],
+            "{rendered}"
+        );
+        let manifest = manager.registry().manifest();
+        let described = manifest
+            .metrics
+            .iter()
+            .find(|m| m.name == "worker_pool_scale_events_total")
+            .expect("described");
+        assert_eq!(described.labels, vec!["direction".to_string()]);
     }
 }

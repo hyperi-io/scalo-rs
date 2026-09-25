@@ -78,6 +78,11 @@
 //! back-pressures its ingest). Bounded retry with backoff is
 //! [`SinkStack`](crate::sink_stack::SinkStack)'s job and composes on top --
 //! `RoutedSender` implements [`TransportSender`], so a stack wraps it.
+//!
+//! # Metrics
+//!
+//! A routed record is counted once, by the transport that sends it and only
+//! once it has landed; the routed layer adds no `transport_sent_*` series.
 
 use std::collections::HashMap;
 
@@ -171,8 +176,7 @@ impl RoutedSender {
     /// is no default -- the same resolution [`send_to`](Self::send_to) uses.
     #[must_use]
     pub fn is_destination_healthy(&self, destination: &str) -> bool {
-        self.resolve(destination)
-            .is_some_and(|(_, sender)| sender.is_healthy())
+        self.resolve(destination).is_some_and(AnySender::is_healthy)
     }
 
     /// Whether AT LEAST ONE configured sender is healthy. Readiness gates that
@@ -199,10 +203,9 @@ impl RoutedSender {
             return SendResult::Fatal(TransportError::Closed);
         }
 
-        let Some((route_name, sender)) = self.resolve(destination) else {
+        let Some(sender) = self.resolve(destination) else {
             return unroutable(destination);
         };
-        record_route_send(route_name, payload.len());
         sender.send(key, payload).await
     }
 
@@ -249,12 +252,9 @@ impl RoutedSender {
         }
 
         for destination in destinations {
-            let Some((route_name, sender)) = self.resolve(destination) else {
+            let Some(sender) = self.resolve(destination) else {
                 return unroutable(destination);
             };
-            for record in records {
-                record_route_send(route_name, record.payload.len());
-            }
             match sender.send_batch(records).await {
                 SendResult::Ok | SendResult::FilteredDlq => {}
                 other => return other,
@@ -263,15 +263,9 @@ impl RoutedSender {
         SendResult::Ok
     }
 
-    /// Resolve which route + sender handles a given key. Returns the
-    /// configured route name (or `"default"` for the fallback) so
-    /// metrics can label by route, not by per-message key (F7).
-    fn resolve(&self, key: &str) -> Option<(&str, &AnySender)> {
-        if let Some((name, sender)) = self.routes.get_key_value(key) {
-            Some((name.as_str(), sender))
-        } else {
-            self.default.as_ref().map(|s| ("default", s))
-        }
+    /// The sender a key routes to: its route, else the default.
+    fn resolve(&self, key: &str) -> Option<&AnySender> {
+        self.routes.get(key).or(self.default.as_ref())
     }
 }
 
@@ -314,9 +308,9 @@ fn unroutable(destination: &str) -> SendResult {
 /// Send a block by destination GROUP: one `send_batch` per resolved route,
 /// never one send per record.
 ///
-/// `resolve` maps a record's wire key to `(route name, sender)` -- the same
-/// resolution [`RoutedSender::send`] uses, passed in so the grouping is
-/// testable against any sender.
+/// `resolve` maps a record's wire key to its sender -- the same resolution
+/// [`RoutedSender::send`] uses, passed in so the grouping is testable against
+/// any sender.
 ///
 /// Every record is resolved BEFORE anything reaches a sender: an unroutable
 /// record fails the whole block with nothing sent, so a retry cannot re-deliver
@@ -329,30 +323,27 @@ fn unroutable(destination: &str) -> SendResult {
 async fn send_grouped<'a, S, F>(records: &[Record], resolve: F) -> SendResult
 where
     S: TransportSender + 'a,
-    F: Fn(&str) -> Option<(&'a str, &'a S)>,
+    F: Fn(&str) -> Option<&'a S>,
 {
-    // Grouping is by SENDER identity, not by route name: an unknown key and a
-    // route literally named `default` share the label but are different sinks.
-    let mut one_route: Option<(&'a str, &'a S)> = None;
+    // Grouping is by SENDER identity: an unknown key and a route literally
+    // named `default` are different sinks.
+    let mut one_sender: Option<&'a S> = None;
     let mut mixed = false;
     for record in records {
         let destination = record.key.as_deref().unwrap_or("");
         let Some(resolved) = resolve(destination) else {
             return unroutable(destination);
         };
-        match one_route {
-            None => one_route = Some(resolved),
-            Some((_, sender)) => mixed |= !std::ptr::eq(sender, resolved.1),
+        match one_sender {
+            None => one_sender = Some(resolved),
+            Some(sender) => mixed |= !std::ptr::eq(sender, resolved),
         }
     }
 
-    let Some((first_route, first_sender)) = one_route else {
+    let Some(first_sender) = one_sender else {
         return SendResult::Ok; // empty block
     };
     if !mixed {
-        for record in records {
-            record_route_send(first_route, record.payload.len());
-        }
         // A whole block the sink filtered to DLQ is HANDLED, not failed --
         // the same normalisation the multi-group loop below performs.
         return match first_sender.send_batch(records).await {
@@ -363,52 +354,26 @@ where
 
     // Mixed block: one Vec per sink, input order preserved within each group.
     // Record::clone bumps the payload refcount rather than copying it.
-    let mut groups: Vec<(&'a str, &'a S, Vec<Record>)> = Vec::new();
+    let mut groups: Vec<(&'a S, Vec<Record>)> = Vec::new();
     for record in records {
         let destination = record.key.as_deref().unwrap_or("");
-        let Some((route_name, sender)) = resolve(destination) else {
+        let Some(sender) = resolve(destination) else {
             return unroutable(destination);
         };
-        if let Some((_, _, group)) = groups.iter_mut().find(|(_, s, _)| std::ptr::eq(*s, sender)) {
+        if let Some((_, group)) = groups.iter_mut().find(|(s, _)| std::ptr::eq(*s, sender)) {
             group.push(record.clone());
         } else {
-            groups.push((route_name, sender, vec![record.clone()]));
+            groups.push((sender, vec![record.clone()]));
         }
     }
 
-    for (route_name, sender, group) in groups {
-        for record in &group {
-            record_route_send(route_name, record.payload.len());
-        }
+    for (sender, group) in groups {
         match sender.send_batch(&group).await {
             SendResult::Ok | SendResult::FilteredDlq => {}
             other => return other,
         }
     }
     SendResult::Ok
-}
-
-/// Count one routed send. The route label is the CONFIGURED route name (or
-/// `"default"`), never the per-message key: cardinality is bounded by the
-/// routing table size, not by message count.
-fn record_route_send(route_name: &str, payload_len: usize) {
-    #[cfg(feature = "metrics")]
-    {
-        metrics::counter!(
-            "transport_sent_total",
-            "transport" => "routed",
-            "route" => route_name.to_string()
-        )
-        .increment(1);
-        metrics::counter!(
-            "transport_sent_bytes_total",
-            "transport" => "routed",
-            "route" => route_name.to_string()
-        )
-        .increment(payload_len as u64);
-    }
-    #[cfg(not(feature = "metrics"))]
-    let _ = (route_name, payload_len);
 }
 
 impl TransportSender for RoutedSender {
@@ -711,11 +676,8 @@ mod tests {
         routes: &'a HashMap<String, CountingSender>,
         default: Option<&'a CountingSender>,
         key: &str,
-    ) -> Option<(&'a str, &'a CountingSender)> {
-        routes.get_key_value(key).map_or_else(
-            || default.map(|s| ("default", s)),
-            |(name, sender)| Some((name.as_str(), sender)),
-        )
+    ) -> Option<&'a CountingSender> {
+        routes.get(key).or(default)
     }
 
     #[tokio::test]
@@ -838,8 +800,8 @@ mod tests {
         );
     }
 
-    /// A route literally NAMED `default` and the fallback share the metric
-    /// label but are different sinks, so grouping must split them.
+    /// A route literally NAMED `default` and the fallback are different
+    /// sinks, so grouping must split them.
     #[tokio::test]
     async fn send_batch_splits_a_default_named_route_from_the_fallback() {
         let mut routes = HashMap::new();
@@ -946,23 +908,71 @@ mod tests {
         );
     }
 
-    /// Regression: `resolve` returns the configured route
-    /// name (or `"default"`), not the per-message key. Metric labels
-    /// stay bounded by the routing table size, not by message count.
-    #[test]
-    #[cfg(feature = "transport-memory")]
-    fn resolve_returns_route_name_not_message_key() {
+    /// A routed record counts once in `transport_sent_total`, in the series of
+    /// the transport that sent it, and only once it has landed.
+    #[cfg(all(feature = "transport-grpc", feature = "metrics"))]
+    #[tokio::test]
+    async fn a_routed_send_counts_once_and_only_when_it_lands() {
+        use crate::transport::grpc::{GrpcConfig, GrpcTransport};
+        use crate::transport::traits::TransportReceiver;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // Current-thread runtime: the server's tasks run on this thread and see it.
+        let _local = metrics::set_default_local_recorder(&recorder);
+
+        let server = GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0"))
+            .await
+            .expect("server");
+        let addr = server.local_addr().expect("server bound");
+        let live = GrpcTransport::new(&GrpcConfig::client(&format!("http://{addr}")))
+            .await
+            .expect("client");
+        // Nothing listens on port 1, so every send there is refused.
+        let dead = GrpcTransport::new(&GrpcConfig::client("http://127.0.0.1:1"))
+            .await
+            .expect("client");
         let mut route_map = HashMap::new();
-        route_map.insert("events.land".into(), make_memory_sender());
-        let sender = RoutedSender::new(route_map, Some(make_memory_sender()));
+        route_map.insert("loader".to_string(), AnySender::Grpc(live));
+        route_map.insert("archiver".to_string(), AnySender::Grpc(dead));
+        let sender = RoutedSender::new(route_map, None);
 
-        // Match: route name equals the configured key.
-        let (name, _) = sender.resolve("events.land").unwrap();
-        assert_eq!(name, "events.land");
+        let one = sender
+            .send("loader", bytes::Bytes::from_static(b"{\"a\":1}"))
+            .await;
+        assert!(one.is_ok(), "{one:?}");
+        let refused = sender
+            .send("archiver", bytes::Bytes::from_static(b"{\"a\":2}"))
+            .await;
+        assert!(refused.is_backpressured(), "{refused:?}");
+        let block = vec![
+            rec(Some("loader"), b"{\"b\":1}"),
+            rec(Some("loader"), b"{\"b\":2}"),
+        ];
+        let batch = sender.send_batch(&block).await;
+        assert!(batch.is_ok(), "{batch:?}");
+        assert_eq!(server.recv(10).await.expect("recv").records.len(), 3);
 
-        // Miss: falls through to "default" -- bounded label, not the
-        // arbitrary inbound key.
-        let (name, _) = sender.resolve("arbitrary-user-key-12345").unwrap();
-        assert_eq!(name, "default");
+        let rendered = handle.render();
+        // Counters render as whole numbers.
+        let total = |name: &str| -> u64 {
+            let labelled = format!("{name}{{");
+            let bare = format!("{name} ");
+            rendered
+                .lines()
+                .filter(|line| line.starts_with(&labelled) || line.starts_with(&bare))
+                .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+                .sum()
+        };
+        assert_eq!(
+            total("transport_sent_total"),
+            3,
+            "three records landed, one refused:\n{rendered}"
+        );
+        assert_eq!(
+            total("transport_sent_bytes_total"),
+            21,
+            "three 7-byte records landed:\n{rendered}"
+        );
     }
 }

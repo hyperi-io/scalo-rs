@@ -16,7 +16,7 @@ use std::time::Duration;
 use super::convert::json_to_event_wrapper;
 use super::proto::vector;
 use crate::transport::error::{TransportError, TransportResult};
-use crate::transport::grpc::GrpcConfig;
+use crate::transport::grpc::{GrpcConfig, lazy_channel};
 
 /// Client that sends events to a Vector source via gRPC.
 ///
@@ -29,7 +29,10 @@ use crate::transport::grpc::GrpcConfig;
 /// `health_check` gives up at it. `send_events` has no limit once connected: a
 /// source that acknowledges end to end holds the RPC until its own sink
 /// delivers, and cutting that off would push the same events again while the
-/// first push may still land.
+/// first push may still land. A connection that has read nothing for 30 s is
+/// sent an HTTP/2 PING and closed if the PING goes unanswered for 30 s more,
+/// so a send to a peer that stops answering ends with an error and the next
+/// dials afresh.
 pub struct VectorCompatClient {
     client: vector::vector_client::VectorClient<tonic::transport::Channel>,
 
@@ -59,23 +62,9 @@ impl VectorCompatClient {
         // response and matches the generous end of the transport size envelope.
         const MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 
-        let mut ep = tonic::transport::Channel::from_shared(endpoint.to_string())
+        let ep = tonic::transport::Channel::from_shared(endpoint.to_string())
             .map_err(|e| TransportError::Config(format!("invalid Vector endpoint: {e}")))?;
-
-        // A dial left running hands its failure to the next call, so it ends at
-        // nine tenths of the limit.
-        if send_timeout_ms > 0 {
-            ep = ep.connect_timeout(Duration::from_millis(send_timeout_ms) * 9 / 10);
-        }
-
-        // Given the connector, tonic abandons a dial whose DNS or TCP connect
-        // outruns the connect timeout, where connect_lazy() bounds the TCP
-        // connect alone and the next send queues behind it.
-        let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
-        // tonic's own settings: an https URI passes through to its TLS layer.
-        tcp.enforce_http(false);
-        tcp.set_nodelay(true);
-        let channel = ep.connect_with_connector_lazy(tcp);
+        let channel = lazy_channel(ep, send_timeout_ms);
 
         let client = vector::vector_client::VectorClient::new(channel)
             .max_decoding_message_size(MAX_DECODE_BYTES)
@@ -91,13 +80,13 @@ impl VectorCompatClient {
     /// Send JSON values as Vector log events.
     ///
     /// Each JSON value is wrapped as a Vector `Log` event inside an `EventWrapper`.
-    /// Waits as long as the source holds the RPC once connected; only the dial
-    /// is limited.
+    /// Waits as long as the source holds the RPC and still answers HTTP/2
+    /// PINGs; only the dial is limited.
     ///
     /// # Errors
     ///
     /// Returns error if the gRPC call fails, including a dial abandoned at the
-    /// dial limit.
+    /// dial limit and a connection closed for an unanswered PING.
     pub async fn send_events(&self, values: &[serde_json::Value]) -> TransportResult<()> {
         let events: Vec<_> = values.iter().map(json_to_event_wrapper).collect();
 
@@ -306,6 +295,57 @@ mod tests {
             (1, 1),
             "each event reaches the receiver once"
         );
+        let _ = server.close().await;
+    }
+
+    /// A send on a connection whose peer stops answering at the HTTP/2 level
+    /// ends once a PING goes unanswered, and the next send dials afresh. A
+    /// source that holds the RPC while it still answers PINGs is not cut.
+    #[tokio::test]
+    async fn a_send_to_a_peer_that_stops_answering_ends_and_the_next_redials() {
+        use crate::transport::grpc::GrpcTransport;
+        use crate::transport::grpc::test_peers::FreezingProxy;
+        use crate::transport::{TransportBase, TransportReceiver};
+
+        let server = GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0").with_vector_compat())
+            .await
+            .expect("Vector-compat server");
+        let proxy = FreezingProxy::start(server.local_addr().expect("server bound")).await;
+        let client =
+            VectorCompatClient::connect_lazy_within(&format!("http://{}", proxy.addr), 300)
+                .expect("client");
+
+        client
+            .send_events(&[serde_json::json!({ "seq": 1 })])
+            .await
+            .expect("before the freeze");
+        proxy.freeze();
+        let stalled = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send_events(&[serde_json::json!({ "seq": 2 })]),
+        )
+        .await;
+        assert!(
+            matches!(stalled, Ok(Err(TransportError::Send(_)))),
+            "a send on a connection whose peer stopped answering must end as an error, \
+             got {stalled:?}"
+        );
+
+        let fresh = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send_events(&[serde_json::json!({ "seq": 3 })]),
+        )
+        .await;
+        assert!(
+            matches!(fresh, Ok(Ok(()))),
+            "the next send dials afresh, got {fresh:?}"
+        );
+        assert_eq!(
+            proxy.accepted(),
+            2,
+            "one connection before the freeze, one after"
+        );
+        assert_eq!(server.recv(10).await.expect("recv").records.len(), 2);
         let _ = server.close().await;
     }
 

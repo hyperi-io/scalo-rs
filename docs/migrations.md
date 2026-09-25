@@ -155,11 +155,7 @@ with no per-record overhead.
 ### Originator brake / token wiring (BEHAVIOUR CHANGE)
 
 Data-originator stages get the inbound brake wired into the receive transport:
-Kafka pauses ASSIGNED partitions (member stays in group, no rebalance);
-HTTP/gRPC returns 503 / `UNAVAILABLE`; the fetcher pauses its poll. Each pairs
-with the at-least-once commit token (offset / responder / cursor) so a paused
-intake never advances the source position. `SelfRegulationGovernor::attach_kafka_gate`
-is the one-call form of the gate dance. See [backpressure.md](backpressure.md).
+Kafka pauses ASSIGNED partitions (member stays in group, no rebalance), HTTP/gRPC returns 503 / `UNAVAILABLE`, and the fetcher pauses its poll. Kafka pairs the brake with its offset and the fetcher with its cursor, so a paused intake never advances the source position. HTTP and gRPC have no source position: a refused request is the sender's to retry, and an accepted one is acknowledged once queued, with `commit` a no-op. `SelfRegulationGovernor::attach_kafka_gate` is the one-call form of the gate dance. See [backpressure.md](backpressure.md).
 
 **App adoption is TWO steps, not one.** The default-on governor only
 engages end-to-end if the app adopts BOTH the driver method AND the
@@ -714,7 +710,7 @@ The client had no connect timeout, so a dial to a peer that never completed the 
 
 ### Transport metric manifest lists every label the transports emit (fix)
 
-The manifest listed only `transport` for every transport series. `transport_sent_total` also carries `path` (gRPC `RouteBatch` sends) and `route` (routed sends), `transport_sent_bytes_total` carries `route`, and `transport_backpressured_total` carries `reason` (pressure sheds).
+The manifest listed only `transport` for every transport series. `transport_sent_total` also carries `path` (gRPC `RouteBatch` sends), and `transport_backpressured_total` carries `reason` (pressure sheds).
 
 **Consumer adjustment** -- none in code. A dashboard or alert generated from the manifest can group by the new keys.
 
@@ -734,6 +730,44 @@ The gRPC server acknowledges a record once it is queued for `recv`. `close()` us
 - The server no longer counts receipts in `transport_sent_total{transport="grpc"}`. They were counted as sends and as receipts both.
 
 **Consumer adjustment** -- a service that receives over gRPC shuts down with `close()`, then `recv` until `Closed`, then its final flush. One that stops calling `recv` and closes after its flush still loses what was queued. A dashboard that read the server's `transport_sent_total{transport="grpc"}` as its intake reads `transport_received_events_total{transport="grpc"}` instead.
+
+### gRPC `RouteBatch` larger than `recv_buffer_size` lands whole (BEHAVIOUR CHANGE)
+
+The server reserves queue room for a whole batch before it queues any of it, and the bounded queue refuses a reservation larger than its capacity every time. A batch with more records than the receiver's `recv_buffer_size` was answered `ResourceExhausted` on every try, and the sender retried it forever. Such a batch is now held whole in a slot beside the queue, one batch at a time: it lands in one step, or is refused with nothing queued while an earlier one is still waiting. `recv` hands it over before the queue. See [transport/backends.md](transport/backends.md#grpc).
+
+**Consumer adjustment** -- none. A receiver now holds up to `recv_buffer_size` records plus one such batch.
+
+### gRPC `Cancelled` is backpressure (BEHAVIOUR CHANGE)
+
+A server that cuts an RPC at its deadline answers `Cancelled`, as tonic's server does at the `grpc-timeout` a scalo sender sets. `send` and `send_batch` returned `Fatal` for it, which stops a `BatchEngine` run loop over a slow receiver. They now return `Backpressured`, and the record is retried.
+
+**Consumer adjustment** -- none.
+
+### gRPC clients drop a connection whose peer stops answering (BEHAVIOUR CHANGE)
+
+Neither `GrpcTransport` nor `VectorCompatClient` sent HTTP/2 PINGs, so a peer that stayed connected but stopped answering kept the connection, and every later send rode it. Both now PING a connection that has read nothing for `send_timeout_ms`, and close it when the PING goes unanswered for as long again, so the next send dials afresh. The limit is 30 s for `VectorCompatClient`, and for a `GrpcTransport` with `send_timeout_ms: 0`. A `VectorCompatClient::send_events` on such a connection now returns an error instead of waiting while the connection stays open. See [transport/backends.md](transport/backends.md#grpc).
+
+**Consumer adjustment** -- none.
+
+### Vector-compat `PushEvents` follows the pressure governor and counts receipts (BEHAVIOUR CHANGE)
+
+A Vector-compat push skipped the pressure governor and counted in no `transport_received_*` series. With `GrpcTransport::with_pressure`, a `PushEvents` is now refused with `Unavailable` while the governor holds intake, as a native push is, and the events it queues count in `transport_received_events_total{transport="grpc"}` and `transport_received_bytes_total{transport="grpc"}`, the bytes being the JSON queued for `recv`. A push refused because the receiver closed counts in `transport_refused_total{transport="grpc"}`.
+
+**Consumer adjustment** -- none in code. A dashboard on the gRPC receive counters now includes Vector-compat traffic.
+
+### `RoutedSender` no longer counts sends of its own (BEHAVIOUR CHANGE)
+
+`RoutedSender` counted every record in `transport_sent_total{transport="routed",route=...}` and `transport_sent_bytes_total{transport="routed",route=...}` before handing it on, and the transport it handed it to counted the record again once it landed. `sum(transport_sent_total)` doubled routed traffic, and a record the route refused counted as sent. The routed series are gone: each record counts once, in the series of the transport that sent it, and only once it has landed. The manifest drops the `route` label from both.
+
+**Consumer adjustment** -- none in code. A dashboard that read `transport="routed"` or grouped by `route` reads the sending transport's series instead.
+
+### App info is emitted once (BEHAVIOUR CHANGE)
+
+The service runtime builds the app metric set, with the `info` gauge, and a service that built `AppMetrics` itself as well added a second `info` series with its own `version` and `commit`. `AppMetrics::new` now emits `info` and records the build info only for the first set built on a `MetricsManager`, which is the runtime's, so a scrape carries one `info` series. The runtime's `commit` is the one the app names in `VersionInfo::with_commit`, else the build's `GIT_COMMIT`, else `unknown`.
+
+`worker_pool_scale_events_total` is described with its `direction` label and no longer also emitted as an unlabelled series stuck at 0.
+
+**Consumer adjustment** -- a service that wants its commit in `info` names it in `ServiceApp::version_info` with `with_commit`, or builds with `GIT_COMMIT` set. Its own `AppMetrics::new` call can stay; it no longer changes `info`.
 
 ---
 

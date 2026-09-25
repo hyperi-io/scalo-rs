@@ -27,7 +27,7 @@ transport's intake. Only the actuator differs:
 | Stage | Brake mechanism | Commit / ack token | Lossless? |
 |---|---|---|---|
 | Loader / transform (Kafka in) | Pause ASSIGNED partitions (member stays in group, no rebalance) | Kafka offset, committed after send | Yes -- offsets not advanced, re-delivered |
-| Receiver (HTTP / gRPC in) | Return 503 / `UNAVAILABLE` to the caller | HTTP responder / gRPC status | Only if the upstream RETRIES the rejected request |
+| Receiver (HTTP / gRPC in) | Return 503 / `UNAVAILABLE` to the caller | None: the response acknowledges the sender once the record is queued for `recv`, and `commit` is a no-op | Only if the upstream RETRIES the rejected request |
 | Fetcher (poll a source) | Pause-fetch (stop the poll loop) | Fetch cursor | Yes -- cursor not advanced, re-fetched |
 
 The hysteresis band (`pause_above` / `resume_below`) stops flapping: once
