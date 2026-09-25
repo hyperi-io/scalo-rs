@@ -53,7 +53,8 @@ pub struct VectorCompatService {
     sender: mpsc::Sender<Message<GrpcToken>>,
     sequence: Arc<AtomicU64>,
     /// Asserted unwind-safe so the service stays `UnwindSafe` as it was: the
-    /// registry's lock does not poison, so a caught panic leaves it usable.
+    /// registry settles every entry, byte and sender before the metrics
+    /// recorder, its only call that can panic.
     pending: AssertUnwindSafe<Option<Arc<PendingRegistry>>>,
 }
 
