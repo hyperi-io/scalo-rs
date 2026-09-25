@@ -3845,6 +3845,58 @@ async fn a_pipeline_that_declares_nothing_reports_best_effort() {
     );
 }
 
+/// The labels of the `pipeline_delivery_guarantee` series a remote-confirming
+/// pull pipeline publishes, named `listener` or not named at all.
+#[cfg(feature = "metrics")]
+async fn guarantee_series(listener: Option<&str>) -> Vec<Vec<(String, String)>> {
+    let capture = GaugeCapture::default();
+    let _recorder = metrics::set_default_local_recorder(&capture);
+    let source = HeldSource::new(AckKind::Pull, Vec::new());
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let engine = default_engine();
+    let pipeline = engine
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .sink_confirms(SinkConfirmation::Remote);
+    let pipeline = match listener {
+        Some(name) => pipeline.listener(name),
+        None => pipeline,
+    };
+    pipeline
+        .run(
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("clean shutdown");
+    capture.gauge_series("pipeline_delivery_guarantee")
+}
+
+/// A pipeline named with `.listener` publishes its guarantee under that
+/// label and no unlabelled series beside it; one not named publishes the
+/// unlabelled series as before.
+#[cfg(feature = "metrics")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_pipeline_named_for_its_listener_labels_its_guarantee() {
+    let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+    assert_eq!(
+        guarantee_series(Some("syslog")).await,
+        vec![vec![
+            pair("guarantee", "at_least_once"),
+            pair("listener", "syslog"),
+            pair("reason", "confirmed"),
+        ]]
+    );
+    assert_eq!(
+        guarantee_series(None).await,
+        vec![vec![
+            pair("guarantee", "at_least_once"),
+            pair("reason", "confirmed"),
+        ]]
+    );
+}
+
 /// An app with a source and sink pair per listener publishes one series per
 /// listener, told apart by the `listener` label.
 #[cfg(feature = "metrics")]
@@ -3935,6 +3987,24 @@ impl GaugeCapture {
             .iter()
             .find(|(key, _)| key.name() == name && has_labels(key, labels))
             .map(|(_, cell)| f64::from_bits(cell.load(Ordering::Acquire)))
+    }
+
+    /// The labels of every gauge series named `name`, each sorted by key.
+    fn gauge_series(&self, name: &str) -> Vec<Vec<(String, String)>> {
+        self.gauges
+            .lock()
+            .expect("capture lock")
+            .keys()
+            .filter(|key| key.name() == name)
+            .map(|key| {
+                let mut labels: Vec<(String, String)> = key
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                labels
+            })
+            .collect()
     }
 
     fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {

@@ -801,6 +801,8 @@ A `KafkaTransport` armed through `AckControl::arm` commits each partition only u
 
 - `RoutedSender` forwards `dead_letter_reason` to the route a record's key selects, and reports the weakest `confirms_delivery` across its routes, so `.sender(&routed)` screens and reports as the routes do.
 - `VectorCompatClient::connect_lazy_within(endpoint, send_timeout_ms)` sets the dial, health-check and PING limit that `connect_lazy` fixes at 30 s.
+- `VectorCompatClient::send_events_status` fails with the gRPC status, and `VectorCompatClient::is_permanent_rejection` names the refusals no resend clears (`DataLoss`, `InvalidArgument`, `OutOfRange`), so a transform stops resending events a Vector sink rejected. `send_events` is unchanged.
+- `Pipeline::listener(name)` publishes the pipeline's `pipeline_delivery_guarantee` with a `listener` label, for an app that runs several pipelines.
 - `EffectiveGuarantee::publish_for(listener)` publishes `pipeline_delivery_guarantee` with a `listener` label, for an app with one source and sink pair per listener.
 
 ---

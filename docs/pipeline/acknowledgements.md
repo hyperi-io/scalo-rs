@@ -75,7 +75,7 @@ At start the loop sets `pipeline_delivery_guarantee{guarantee, reason}` to 1:
 
 A write to a sink that cannot confirm still counts as delivered: the metric reports the weaker guarantee rather than refusing to run. The other run loops set only the `unarmed` row.
 
-An app with several listeners, each its own source and sink pair, publishes one series per listener with `EffectiveGuarantee::of(source, sink).publish_for(listener)`, which adds a `listener` label. `publish()` sets the series without it, as the pipeline does.
+An app with several listeners, each its own source and sink pair, publishes one series per listener with a `listener` label. A pipeline gets one from `.listener(name)` on the builder. An app's own loop calls `EffectiveGuarantee::of(source, sink).publish_for(listener)`. A pipeline with no `.listener` publishes the series without the label, as `publish()` does, so an app that runs several pipelines names each one.
 
 ---
 

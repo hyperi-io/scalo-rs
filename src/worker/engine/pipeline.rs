@@ -66,6 +66,8 @@ pub struct Pipeline<'a, R, T = NoTicker> {
     confirms: Option<SinkConfirmation>,
     screen: Option<Screen<'a>>,
     ticker: Option<(Duration, T)>,
+    /// The `listener` label of this pipeline's `pipeline_delivery_guarantee`.
+    listener: Option<String>,
 }
 
 /// Hands a sink more pieces of the block it is writing: one per destination it
@@ -110,6 +112,7 @@ impl BatchEngine {
             confirms: None,
             screen: None,
             ticker: None,
+            listener: None,
         }
     }
 }
@@ -147,6 +150,14 @@ impl<'a, R: TransportReceiver, T> Pipeline<'a, R, T> {
         self
     }
 
+    /// Name this pipeline's listener: `pipeline_delivery_guarantee` then
+    /// carries a `listener` label, so an app running several pipelines
+    /// publishes one series per listener rather than one unlabelled series.
+    pub fn listener(mut self, name: impl Into<String>) -> Self {
+        self.listener = Some(name.into());
+        self
+    }
+
     /// Run `tick` every `every` inside the loop (flush timers, maintenance).
     pub fn ticker<F, Fut>(self, every: Duration, tick: F) -> Pipeline<'a, R, F>
     where
@@ -161,6 +172,7 @@ impl<'a, R: TransportReceiver, T> Pipeline<'a, R, T> {
             confirms: self.confirms,
             screen: self.screen,
             ticker: Some((every, tick)),
+            listener: self.listener,
         }
     }
 }
@@ -222,6 +234,7 @@ where
             confirms,
             screen,
             ticker,
+            listener,
         } = self;
 
         let control = receiver.ack_control();
@@ -229,7 +242,11 @@ where
         if let (AckMode::Hold, Some(control)) = (mode, control) {
             control.arm();
         }
-        EffectiveGuarantee::of(control, confirms.unwrap_or_default()).publish();
+        let guarantee = EffectiveGuarantee::of(control, confirms.unwrap_or_default());
+        match &listener {
+            Some(name) => guarantee.publish_for(name),
+            None => guarantee.publish(),
+        }
         if confirms.is_none() {
             tracing::warn!(
                 transport = receiver.name(),

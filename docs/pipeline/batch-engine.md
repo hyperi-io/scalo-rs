@@ -138,6 +138,8 @@ Each sink call, the block's dead letters and any piece the sink takes itself are
 
 An app whose sink writes to a scalo transport passes it with `.sender(&sender)`. That is what takes a record the transport would dead-letter -- over its size ceiling, or matched by an outbound `dlq` filter -- out of the block, so it reaches the DLQ instead of being dropped by `send_batch` while its block releases `Delivered`. A sink that is not a transport declares what its `Ok` proves with `.sink_confirms(..)` instead. A pipeline with neither logs one WARN at start and reports `best_effort` / `sink_cannot_confirm`.
 
+An app that runs several pipelines names each with `.listener(name)`, so each publishes its `pipeline_delivery_guarantee` with a `listener` label instead of all of them writing one unlabelled series.
+
 ---
 
 ## Auto-wiring

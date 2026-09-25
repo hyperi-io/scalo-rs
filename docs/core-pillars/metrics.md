@@ -188,7 +188,7 @@ What a source holds until delivery, and the guarantee the pipeline gives ([../pi
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `pipeline_delivery_guarantee` | `guarantee`, `reason`, optional `listener` | 1 for the guarantee the pipeline gives: `at_least_once`, `at_least_once_local` or `best_effort`, and why. `listener` names the listener when an app publishes one series per listener (`EffectiveGuarantee::publish_for`) |
+| `pipeline_delivery_guarantee` | `guarantee`, `reason`, optional `listener` | 1 for the guarantee the pipeline gives: `at_least_once`, `at_least_once_local` or `best_effort`, and why. `listener` names the listener when an app publishes one series per listener: a pipeline built with `.listener(name)`, or `EffectiveGuarantee::publish_for` |
 | `pipeline_dead_letters_dropped_total` | `reason` | dead letters dropped with nowhere to go: the pipeline has no DLQ or a disabled one, or a gRPC `send_batch` left a record over its size ceiling out of a block. `reason` is `too_large`, `outbound_filter`, or `dead_letter` for one an inbound filter or `process` produced |
 | `transport_ack_held` / `transport_ack_held_bytes` | `transport` | records and payload bytes whose acknowledgement is held |
 | `transport_ack_withheld` | `transport` | Kafka offsets released `Errored` and still held. Each pins its partition's commit until a restart or a revoke, so alert on it staying above 0 |

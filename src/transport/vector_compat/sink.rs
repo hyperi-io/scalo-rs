@@ -94,19 +94,61 @@ impl VectorCompatClient {
     /// # Errors
     ///
     /// Returns error if the gRPC call fails, including a dial abandoned at the
-    /// dial limit and a connection closed for an unanswered PING.
+    /// dial limit and a connection closed for an unanswered PING. The error
+    /// does not say whether a resend can succeed: a caller that needs to know
+    /// uses [`send_events_status`](Self::send_events_status).
     pub async fn send_events(&self, values: &[serde_json::Value]) -> TransportResult<()> {
+        self.send_events_status(values)
+            .await
+            .map_err(|e| TransportError::Send(format!("Vector PushEvents failed: {e}")))
+    }
+
+    /// [`send_events`](Self::send_events), failing with the gRPC status, so a
+    /// caller can tell a refusal no resend clears from a failure that can
+    /// clear, with [`is_permanent_rejection`](Self::is_permanent_rejection).
+    ///
+    /// # Errors
+    ///
+    /// The status the source answered with, or the client's own failure (a
+    /// dial abandoned at the dial limit, a connection closed for an unanswered
+    /// PING) as a status carrying its source error.
+    pub async fn send_events_status(
+        &self,
+        values: &[serde_json::Value],
+    ) -> Result<(), tonic::Status> {
         let events: Vec<_> = values.iter().map(json_to_event_wrapper).collect();
-
-        let request = vector::PushEventsRequest { events };
-
         self.client
             .clone()
-            .push_events(request)
-            .await
-            .map_err(|e| TransportError::Send(format!("Vector PushEvents failed: {e}")))?;
-
+            .push_events(vector::PushEventsRequest { events })
+            .await?;
         Ok(())
+    }
+
+    /// Whether a failed push is a refusal that no resend of the same events
+    /// can clear.
+    ///
+    /// Permanent:
+    ///
+    /// - `DataLoss`: Vector's `vector` source answers it when a sink it feeds
+    ///   rejected the events.
+    /// - `InvalidArgument`: the source cannot use the request.
+    /// - `OutOfRange`: the request is over the source's message-size limit.
+    ///
+    /// Every other code can clear, so the caller holds the events and sends
+    /// them again: `Unavailable` and `ResourceExhausted` (the source is down,
+    /// busy or shutting down), `DeadlineExceeded` and `Cancelled` (the send
+    /// ran out of time, and the source may still take it), and the codes that
+    /// name a configuration fault rather than these events (`Unimplemented`,
+    /// `PermissionDenied`, `Unauthenticated`), whose events are lost if they
+    /// are dropped. A status carrying a source error is the client's own
+    /// connection failing, never a refusal.
+    #[must_use]
+    pub fn is_permanent_rejection(status: &tonic::Status) -> bool {
+        std::error::Error::source(status).is_none()
+            && matches!(
+                status.code(),
+                tonic::Code::DataLoss | tonic::Code::InvalidArgument | tonic::Code::OutOfRange
+            )
     }
 
     /// Check if the remote Vector source is healthy.
@@ -355,6 +397,101 @@ mod tests {
         );
         assert_eq!(server.recv(10).await.expect("recv").records.len(), 2);
         let _ = server.close().await;
+    }
+
+    /// A Vector source that answers every push with a status of this code.
+    struct Refusing(tonic::Code);
+
+    #[tonic::async_trait]
+    impl vector::vector_server::Vector for Refusing {
+        async fn push_events(
+            &self,
+            _request: tonic::Request<vector::PushEventsRequest>,
+        ) -> Result<tonic::Response<vector::PushEventsResponse>, tonic::Status> {
+            Err(tonic::Status::new(self.0, "refused"))
+        }
+
+        async fn health_check(
+            &self,
+            _request: tonic::Request<vector::HealthCheckRequest>,
+        ) -> Result<tonic::Response<vector::HealthCheckResponse>, tonic::Status> {
+            Ok(tonic::Response::new(vector::HealthCheckResponse {
+                status: vector::ServingStatus::Serving.into(),
+            }))
+        }
+    }
+
+    /// Serve [`Refusing`] with `code` on a loopback port.
+    async fn refusing_source(code: tonic::Code) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // The client sends gzip, as Vector's source accepts it.
+        let service = vector::vector_server::VectorServer::new(Refusing(code))
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        addr
+    }
+
+    /// A refusal no resend clears is told apart from a failure that can clear,
+    /// so a caller holding its source can drop or dead-letter the one and
+    /// resend the other.
+    #[tokio::test]
+    async fn a_push_refused_for_good_is_told_from_one_that_can_clear() {
+        for (code, permanent) in [
+            (tonic::Code::DataLoss, true),
+            (tonic::Code::InvalidArgument, true),
+            (tonic::Code::OutOfRange, true),
+            (tonic::Code::Unavailable, false),
+            (tonic::Code::ResourceExhausted, false),
+            (tonic::Code::Unimplemented, false),
+        ] {
+            let addr = refusing_source(code).await;
+            let client = VectorCompatClient::connect_lazy_within(&format!("http://{addr}"), 5_000)
+                .expect("client");
+            let status = client
+                .send_events_status(&[serde_json::json!({ "seq": 1 })])
+                .await
+                .expect_err("the source refuses every push");
+            assert_eq!(status.code(), code, "{status:?}");
+            assert_eq!(
+                VectorCompatClient::is_permanent_rejection(&status),
+                permanent,
+                "{code:?}"
+            );
+            assert!(
+                matches!(
+                    client.send_events(&[serde_json::json!({ "seq": 2 })]).await,
+                    Err(TransportError::Send(_))
+                ),
+                "send_events keeps its error for every code"
+            );
+        }
+    }
+
+    /// The client's own connection failing is never a refusal, whatever code
+    /// tonic gives it.
+    #[tokio::test]
+    async fn a_push_that_never_reached_a_source_is_not_a_refusal() {
+        let (addr, _accepts) = silent_listener().await;
+        let client = VectorCompatClient::connect_lazy_within(&format!("https://{addr}"), 5_000)
+            .expect("client");
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.send_events_status(&[serde_json::json!({ "seq": 1 })]),
+        )
+        .await
+        .expect("the TLS refusal is immediate")
+        .expect_err("no TLS on this client");
+        assert!(
+            !VectorCompatClient::is_permanent_rejection(&status),
+            "{status:?}"
+        );
     }
 
     /// The client carries no TLS, so tonic refuses an `https` endpoint once the

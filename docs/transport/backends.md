@@ -156,6 +156,19 @@ Armed, a `PushEvents` is held like a native push, over the same registry, ceilin
 
 `VectorCompatClient` (the sending side) is plaintext only; an `https` endpoint fails on the first RPC. A dial whose DNS lookup or TCP connect is unfinished at nine tenths of the gRPC transport's default `send_timeout_ms` (30 s) is abandoned, so the call that started it returns an error and the next call dials afresh. `health_check`, a short probe, also gives up at the full 30 s. `send_events` has no limit once connected: a Vector source with end-to-end acknowledgements holds `PushEvents` open until its own sink has delivered, and cutting that off to retry would push the same events twice. The client sends an HTTP/2 PING once a connection has read nothing for 30 s and closes the connection when the PING goes unanswered for 30 s more, so a send to a peer that stays connected but stops answering returns an error, and the next call dials afresh. A peer that holds the RPC and still answers the PING is waited on. `VectorCompatClient::connect_lazy_within(endpoint, send_timeout_ms)` sets that limit instead of 30 s, for the dial, the health check and the PING alike (0 = none, with the PING at 30 s). A transform that holds its own source's answer sets it below that hold, so a stalled dial fails while the source can still answer its sender.
 
+`send_events` fails with `TransportError::Send`, which does not say whether a resend can succeed. `send_events_status` fails with the gRPC status instead, and `VectorCompatClient::is_permanent_rejection(&status)` names the refusals no resend clears:
+
+| Code | Permanent | Why |
+|---|---|---|
+| `DataLoss` | yes | Vector's `vector` source answers it when a sink it feeds rejected the events |
+| `InvalidArgument` | yes | the source cannot use the request |
+| `OutOfRange` | yes | the request is over the source's message-size limit |
+| `Unavailable`, `ResourceExhausted` | no | the source is down, busy or shutting down |
+| `DeadlineExceeded`, `Cancelled` | no | the send ran out of time, and the source may still take it |
+| any other, `Unimplemented`, `PermissionDenied`, `Unauthenticated` included | no | a configuration fault, not these events: dropping them would lose them |
+
+A status carrying a source error is the client's own connection failing, and is never permanent. A caller holding its source releases a permanent refusal `Rejected` (dead-lettered) or `Dropped`, and holds and resends everything else.
+
 Source: [../../src/transport/vector_compat/](../../src/transport/vector_compat/).
 
 ---
