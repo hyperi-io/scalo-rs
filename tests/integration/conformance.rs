@@ -7,8 +7,8 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Every record whose source ack is released arrives, under each fault the
-//! harness injects: the engine pipeline builder over a pull-shaped source, and
-//! a hand-rolled `SourceAck` loop over a push-shaped one.
+//! harness injects: the engine pipeline builder over a pull-shaped and a
+//! push-shaped source, and a hand-rolled `SourceAck` loop over the push one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,6 +148,12 @@ async fn push(fault: Fault) -> Verdict {
         .await
 }
 
+async fn push_via_builder(fault: Fault) -> Verdict {
+    Case::new(fault)
+        .run_push(|source, sink, ledger, shutdown| engine_pipeline(source, sink, ledger, shutdown))
+        .await
+}
+
 /// Nothing acknowledged is lost, and after the restart every record was acknowledged.
 #[track_caller]
 fn assert_conforms(verdict: &Verdict) {
@@ -206,6 +212,31 @@ async fn source_ack_push_record_rejected_mid_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_ack_push_two_instances_over_one_source() {
     assert_conforms(&push(Fault::TwoInstances).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_push_graceful_stop_under_traffic() {
+    assert_conforms(&push_via_builder(Fault::GracefulStop).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_push_kill_mid_batch() {
+    assert_conforms(&push_via_builder(Fault::KillMidBatch).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_push_downstream_refusing() {
+    assert_conforms(&push_via_builder(Fault::DownstreamRefusing).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_push_record_rejected_mid_stream() {
+    assert_conforms(&push_via_builder(Fault::RejectMidStream).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_push_two_instances_over_one_source() {
+    assert_conforms(&push_via_builder(Fault::TwoInstances).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -253,8 +253,6 @@ diagnostic, smoke-test, or specialty:
 - `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, and with `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)).
 - `config-postgres` — PostgreSQL-backed config source. Built-for, not
   built-with — the YAML cascade already handles centralised config.
-- `transport-grpc-vector-compat` — wire-compat for the Vector.dev
-  anomaly; only `dfe-transform-vector` needs it.
 - `worker-msgpack` — MsgPack batch serialisation for the worker pool.
   Specialty use.
 - `testcontainers` -- builds scalo's own real-broker tests, which start Kafka
