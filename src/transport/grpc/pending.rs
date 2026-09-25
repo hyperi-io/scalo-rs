@@ -696,6 +696,30 @@ mod tests {
         );
     }
 
+    /// With acknowledgements off, the engine releases at receipt tokens this
+    /// registry never held: below, between and past what it holds, or with
+    /// nothing held at all.
+    #[tokio::test]
+    async fn releasing_seqs_never_held_is_a_no_op() {
+        let registry = registry(1024);
+        registry.release([0, 1, 2], DeliveryStatus::Errored);
+        let later = held(&registry, 20, 1, 5);
+        let first = held(&registry, 10, 2, 10);
+
+        registry.release([0, 9, 12, 15, 21, u64::MAX], DeliveryStatus::Errored);
+        let snapshot = registry.snapshot();
+        assert_eq!((snapshot.count, snapshot.bytes), (3, 15), "{snapshot:?}");
+
+        registry.release([10, 11, 20], DeliveryStatus::Delivered);
+        for held in [first, later] {
+            assert_eq!(
+                held.outcome().await,
+                Outcome::Released(DeliveryStatus::Delivered),
+                "the stray Errored releases touched nothing"
+            );
+        }
+    }
+
     #[test]
     fn the_ceiling_refuses_past_it_and_always_admits_when_nothing_is_held() {
         let registry = registry(100);

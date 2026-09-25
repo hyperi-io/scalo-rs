@@ -1379,3 +1379,123 @@ async fn a_dropped_responder_never_answers_ok() {
     assert_eq!(control.held().count, 0);
     assert_eq!(control.held().bytes, 0);
 }
+
+/// The engine's pipeline loop driving a gRPC receive server end to end: it
+/// arms the server, sinks each block, and releases it with the sink's outcome.
+#[cfg(feature = "worker-batch")]
+mod engine_driven {
+    use super::*;
+    use scalo::worker::engine::BlockPieces;
+    use scalo::worker::{BatchEngine, BatchProcessingConfig, EngineError};
+    use tokio_util::sync::CancellationToken;
+
+    /// A record the sink fails, as a fan-out destination that did not take it.
+    const FAIL: &[u8] = b"{\"fail\":true}";
+
+    /// Run the pipeline over `server` until `shutdown`, failing every block
+    /// that carries a [`FAIL`] record through a piece reported `Errored`.
+    fn run_pipeline(
+        server: Arc<GrpcTransport>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<(), EngineError>> {
+        tokio::spawn(async move {
+            let engine = BatchEngine::new(BatchProcessingConfig::default());
+            engine
+                .pipeline(&*server)
+                .shutdown(shutdown)
+                .run_with_pieces(
+                    Ok,
+                    |out: &WorkBatch<GrpcToken>, pieces: &BlockPieces<'_>| {
+                        let failed = out.records.iter().any(|r| r.payload.as_ref() == FAIL);
+                        if failed {
+                            pieces.piece().report(DeliveryStatus::Errored);
+                        }
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await
+        })
+    }
+
+    /// Wait until the pipeline has armed `server`, as it does before its
+    /// first `recv`.
+    async fn armed_by_the_pipeline(server: &GrpcTransport) {
+        let control = server.ack_control().expect("a receive server can hold");
+        for _ in 0..200 {
+            if control.is_armed() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the pipeline never armed the server");
+    }
+
+    #[tokio::test]
+    async fn the_engine_answers_a_held_push_from_the_sink_outcome() {
+        let server = Arc::new(
+            GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0"))
+                .await
+                .expect("server"),
+        );
+        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        let shutdown = CancellationToken::new();
+        let running = run_pipeline(Arc::clone(&server), shutdown.clone());
+        armed_by_the_pipeline(&server).await;
+        let client = GrpcTransport::new(&GrpcConfig::client(&uri))
+            .await
+            .expect("client");
+
+        // Sink Ok: the answer is OK, and only once the engine released it.
+        let delivered = client.send("main", filled(8)).await;
+        assert!(matches!(delivered, SendResult::Ok), "{delivered:?}");
+
+        // A piece reported Errored: the answer is Unavailable, and the loop
+        // goes on to the next push.
+        let failed = client.send("main", bytes::Bytes::from_static(FAIL)).await;
+        assert!(matches!(failed, SendResult::Backpressured), "{failed:?}");
+        let after = client.send("main", filled(8)).await;
+        assert!(matches!(after, SendResult::Ok), "{after:?}");
+
+        shutdown.cancel();
+        running
+            .await
+            .expect("pipeline task")
+            .expect("clean shutdown");
+        let held = server.ack_control().expect("held").held();
+        assert_eq!((held.count, held.bytes), (0, 0), "{held:?}");
+    }
+
+    #[tokio::test]
+    async fn with_acknowledgements_off_the_engine_answers_at_enqueue() {
+        let config = GrpcConfig::server("127.0.0.1:0");
+        let server = Arc::new(
+            GrpcTransport::builder(&config)
+                .acknowledgements(AcknowledgementsConfig::new(false))
+                .start()
+                .await
+                .expect("server"),
+        );
+        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        let shutdown = CancellationToken::new();
+        // Releases at receipt tokens the server never held, which it ignores.
+        let running = run_pipeline(Arc::clone(&server), shutdown.clone());
+        let client = GrpcTransport::new(&GrpcConfig::client(&uri))
+            .await
+            .expect("client");
+
+        let result = client.send("main", bytes::Bytes::from_static(FAIL)).await;
+        assert!(
+            matches!(result, SendResult::Ok),
+            "answered at enqueue, before the sink failed it: {result:?}"
+        );
+
+        shutdown.cancel();
+        running
+            .await
+            .expect("pipeline task")
+            .expect("clean shutdown");
+        let control = server.ack_control().expect("control");
+        assert!(!control.is_armed(), "a disabled source is not armed");
+        assert_eq!(control.held().count, 0);
+    }
+}
