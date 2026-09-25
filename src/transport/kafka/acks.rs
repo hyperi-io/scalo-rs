@@ -14,8 +14,13 @@
 //! every offset `recv` hands out and commits each partition only up to its
 //! lowest offset not yet released. An offset released `Errored` stays held, so
 //! the commit never passes it: it is read again after a restart or rebalance.
+//!
+//! A partition a rebalance takes away is its next owner's to commit. From the
+//! revoke until an assignment gives it back, nothing of it is held or
+//! committed here, and an offset handed out before the revoke commits nothing
+//! when it is released, even after the partition comes back.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -24,6 +29,7 @@ use crate::transport::ack::{AckControl, AckKind, AcknowledgementsConfig, HeldAck
 use crate::transport::finalizer::DeliveryStatus;
 
 use super::KafkaToken;
+use super::metrics::Rebalanced;
 
 /// A partition, keyed as the tokens carry it.
 type PartitionKey = (Arc<str>, i32);
@@ -34,6 +40,8 @@ struct Held {
     offset: i64,
     bytes: u64,
     released: bool,
+    /// Released `Errored`: still held, and its holder will not release it again.
+    withheld: bool,
 }
 
 /// The offsets of one partition from one `recv`, ascending.
@@ -68,6 +76,13 @@ impl Run {
         true
     }
 
+    /// Mark `offset` released `Errored`: it stays held.
+    fn withhold(&mut self, offset: i64) {
+        if let Ok(at) = self.held.binary_search_by_key(&offset, |h| h.offset) {
+            self.held[at].withheld = true;
+        }
+    }
+
     /// The lowest offset not yet released.
     fn first_unreleased(&self) -> Option<i64> {
         self.held.iter().find(|h| !h.released).map(|h| h.offset)
@@ -93,6 +108,12 @@ struct PartitionHold {
     highest_released: Option<i64>,
     /// The next-to-read offset last committed; commits never go below it.
     committed_next: Option<i64>,
+    /// Revoked and not assigned again: nothing is held or committed for it.
+    unowned: bool,
+    /// Offsets handed out before the last revoke and not released or withheld
+    /// since. The next owner reads them again, so one release of each is the
+    /// old copy's and commits nothing, even once the partition comes back.
+    stale: BTreeSet<i64>,
 }
 
 impl PartitionHold {
@@ -168,6 +189,7 @@ impl KafkaAcks {
                     offset: token.offset,
                     bytes,
                     released: false,
+                    withheld: false,
                 });
         }
         if by_partition.is_empty() {
@@ -177,13 +199,17 @@ impl KafkaAcks {
         for (key, mut held) in by_partition {
             held.sort_unstable_by_key(|h| h.offset);
             held.dedup_by_key(|h| h.offset);
-            let run = Run {
+            let hold = partitions.entry(key).or_default();
+            // A partition this member lost holds nothing: its next owner reads it.
+            if hold.unowned {
+                continue;
+            }
+            hold.register(Run {
                 unreleased: held.len(),
                 unreleased_bytes: held.iter().map(|h| h.bytes).sum(),
                 held,
                 received: now,
-            };
-            partitions.entry(key).or_default().register(run);
+            });
         }
         drop(partitions);
         self.publish_held();
@@ -207,6 +233,11 @@ impl KafkaAcks {
         for token in tokens {
             let key = (Arc::clone(&token.topic), token.partition);
             let hold = partitions.entry(key.clone()).or_default();
+            // A lost partition commits nothing, and a stale offset's first release is the old copy's.
+            let stale = hold.stale.remove(&token.offset);
+            if hold.unowned || stale {
+                continue;
+            }
             if let Some(run) = hold
                 .runs
                 .iter()
@@ -235,37 +266,76 @@ impl KafkaAcks {
     /// Record an `Errored` release: the offsets stay held.
     pub(super) fn withhold(&self, tokens: &[KafkaToken]) {
         let oldest = {
-            let partitions = self.partitions.lock();
+            let mut partitions = self.partitions.lock();
             tokens
                 .iter()
                 .filter_map(|t| {
-                    let hold = partitions.get(&(Arc::clone(&t.topic), t.partition))?;
-                    hold.runs
-                        .iter()
-                        .find(|r| r.first() <= t.offset && t.offset <= r.last())
-                        .map(|r| r.received)
+                    let hold = partitions.get_mut(&(Arc::clone(&t.topic), t.partition))?;
+                    let run = hold
+                        .runs
+                        .iter_mut()
+                        .find(|r| r.first() <= t.offset && t.offset <= r.last())?;
+                    run.withhold(t.offset);
+                    Some(run.received)
                 })
                 .min()
         };
         Self::note_released(tokens.len(), DeliveryStatus::Errored, oldest);
     }
 
-    /// Drop every offset held for `revoked` partitions, and where their commit
-    /// stood.
+    /// Apply ownership changes in the order librdkafka served them, and return
+    /// the number of each revoked partition's last revoke.
     ///
-    /// A rebalance that takes a partition away ends this member's claim on its
-    /// offsets: another member reads and commits it from then on, so an offset
-    /// held here would block every commit if the partition came back.
-    pub(super) fn forget(&self, revoked: Vec<(String, i32)>) {
-        if revoked.is_empty() {
-            return;
+    /// A revoke ends this member's claim on the partition: its next owner
+    /// reads it again from the committed offset, which is below every offset
+    /// held here. So the held offsets and the commit floor go, the offsets
+    /// handed out and not yet released turn stale, and the partition holds and
+    /// commits nothing until an assignment gives it back.
+    pub(super) fn rebalanced(&self, changes: Vec<(u64, Rebalanced)>) -> HashMap<PartitionKey, u64> {
+        let mut revoked_at = HashMap::new();
+        if changes.is_empty() {
+            return revoked_at;
         }
         let mut partitions = self.partitions.lock();
-        for (topic, partition) in revoked {
-            partitions.remove(&(Arc::<str>::from(topic), partition));
+        for (number, change) in changes {
+            match change {
+                Rebalanced::Revoked(lost) => {
+                    for (topic, partition) in lost {
+                        let key = (Arc::<str>::from(topic), partition);
+                        let old = partitions.remove(&key).unwrap_or_default();
+                        let mut stale = old.stale;
+                        // A withheld offset's holder already released it, so only the rest await a release.
+                        stale.extend(
+                            old.runs
+                                .iter()
+                                .flat_map(|r| r.held.iter())
+                                .filter(|h| !h.released && !h.withheld)
+                                .map(|h| h.offset),
+                        );
+                        partitions.insert(
+                            key.clone(),
+                            PartitionHold {
+                                unowned: true,
+                                stale,
+                                ..PartitionHold::default()
+                            },
+                        );
+                        revoked_at.insert(key, number);
+                    }
+                }
+                Rebalanced::Assigned(given) => {
+                    for (topic, partition) in given {
+                        partitions
+                            .entry((Arc::<str>::from(topic), partition))
+                            .or_default()
+                            .unowned = false;
+                    }
+                }
+            }
         }
         drop(partitions);
         self.publish_held();
+        revoked_at
     }
 
     /// Record the commits that landed.
@@ -273,13 +343,18 @@ impl KafkaAcks {
         let mut partitions = self.partitions.lock();
         for (key, next) in targets {
             let hold = partitions.entry(key.clone()).or_default();
-            hold.committed_next = Some(hold.committed_next.map_or(*next, |c| c.max(*next)));
+            let next = hold.committed_next.map_or(*next, |c| c.max(*next));
+            hold.committed_next = Some(next);
+            // A stale offset below the commit can no longer move it.
+            hold.stale = hold.stale.split_off(&next);
         }
     }
 
+    /// Count a release, never while unwinding: a recorder that panics then
+    /// aborts the process, and an abandoned block is released from a drop.
     fn note_released(count: usize, outcome: DeliveryStatus, oldest: Option<Instant>) {
         #[cfg(feature = "metrics")]
-        {
+        if !std::thread::panicking() {
             let label = outcome_label(outcome);
             ::metrics::counter!(
                 "transport_ack_released_total",
@@ -300,9 +375,10 @@ impl KafkaAcks {
         let _ = (count, outcome, oldest);
     }
 
+    /// Record the held gauges, never while unwinding, as `note_released`.
     fn publish_held(&self) {
         #[cfg(feature = "metrics")]
-        {
+        if !std::thread::panicking() {
             let held = self.held();
             ::metrics::gauge!("transport_ack_held", "transport" => "kafka").set(held.count as f64);
             ::metrics::gauge!("transport_ack_held_bytes", "transport" => "kafka")
@@ -457,6 +533,16 @@ mod tests {
         );
     }
 
+    fn change(number: u64, revoked: bool, partition: i32) -> (u64, Rebalanced) {
+        let partitions = vec![("events".to_string(), partition)];
+        let change = if revoked {
+            Rebalanced::Revoked(partitions)
+        } else {
+            Rebalanced::Assigned(partitions)
+        };
+        (number, change)
+    }
+
     /// An Errored block on a partition that is revoked, committed past by the
     /// member that took it, then handed back: the old hold must not block the
     /// commits of what is read after.
@@ -467,13 +553,153 @@ mod tests {
         acks.withhold(&withheld);
         let other = register(&acks, 1, 0..5);
 
-        acks.forget(vec![("events".to_string(), 0)]);
+        let revoked_at = acks.rebalanced(vec![change(1, true, 0)]);
+        assert_eq!(revoked_at.get(&(Arc::from("events"), 0)), Some(&1));
         assert_eq!(acks.held().count, 5, "only partition 1 is still held");
+        acks.rebalanced(vec![change(2, false, 0)]);
 
         // Another member committed partition 0 up to 20 while it had it.
         let reread = register(&acks, 0, 20..30);
         assert_eq!(targets(&acks, &reread), vec![30]);
         assert_eq!(targets(&acks, &other), vec![5], "partition 1 is untouched");
+    }
+
+    /// The Errored floor of a revoked partition is gone, so records of it
+    /// released after the revoke -- read in the same poll as the revoke, or
+    /// held by a loop across it -- must commit nothing: a commit past the
+    /// Errored offsets, landing before the next owner fetches its start,
+    /// loses them.
+    #[test]
+    fn a_revoked_partition_commits_nothing_until_it_is_assigned_again() {
+        let acks = KafkaAcks::default();
+        let withheld = register(&acks, 0, 0..10);
+        acks.withhold(&withheld);
+        let read_before_the_revoke = register(&acks, 0, 10..15);
+        let other = register(&acks, 1, 0..5);
+
+        acks.rebalanced(vec![change(1, true, 0)]);
+        assert!(
+            targets(&acks, &read_before_the_revoke).is_empty(),
+            "no commit past the Errored floor"
+        );
+        let served_after = register(&acks, 0, 15..20);
+        assert_eq!(acks.held().count, 5, "a lost partition holds nothing");
+        assert!(targets(&acks, &served_after).is_empty());
+        assert_eq!(targets(&acks, &other), vec![5], "partition 1 commits");
+
+        acks.rebalanced(vec![change(2, false, 0)]);
+        let reread = register(&acks, 0, 0..20);
+        assert_eq!(
+            targets(&acks, &reread),
+            vec![20],
+            "assigned again, it commits what it reads again: the old copies of 10..15 \
+             were released while it was lost, so they take no release from the new ones"
+        );
+    }
+
+    /// Revoked and assigned back in one rebalance, as the eager protocol does:
+    /// a block handed out before holds offsets the consumer reads again, and
+    /// its release must not release the copies read again.
+    #[test]
+    fn a_block_held_across_a_revoke_and_reassign_never_releases_the_copy_read_again() {
+        let acks = KafkaAcks::default();
+        let in_flight = register(&acks, 0, 10..15);
+        acks.rebalanced(vec![change(1, true, 0), change(2, false, 0)]);
+        let read_again = register(&acks, 0, 5..20);
+
+        assert!(targets(&acks, &in_flight).is_empty());
+        assert_eq!(
+            targets(&acks, &read_again[..5]),
+            vec![10],
+            "10..15 read again are still held: the old copies' release did not release them"
+        );
+        assert_eq!(targets(&acks, &read_again[5..]), vec![20]);
+    }
+
+    /// A recorder whose every metric panics.
+    #[cfg(feature = "metrics")]
+    struct PanickingRecorder;
+
+    #[cfg(feature = "metrics")]
+    impl ::metrics::Recorder for PanickingRecorder {
+        fn describe_counter(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Counter {
+            panic!("recorder refuses counters");
+        }
+        fn register_gauge(
+            &self,
+            _: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Gauge {
+            panic!("recorder refuses gauges");
+        }
+        fn register_histogram(
+            &self,
+            _: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Histogram {
+            panic!("recorder refuses histograms");
+        }
+    }
+
+    /// Releases the tokens it holds `Errored` when dropped, as the pipeline's
+    /// guard does for a block abandoned by a panic.
+    #[cfg(feature = "metrics")]
+    struct ReleasedOnDrop<'a> {
+        acks: &'a KafkaAcks,
+        tokens: Vec<KafkaToken>,
+    }
+
+    #[cfg(feature = "metrics")]
+    impl Drop for ReleasedOnDrop<'_> {
+        fn drop(&mut self) {
+            self.acks.withhold(&self.tokens);
+            let _ = self.acks.release(&self.tokens, DeliveryStatus::Delivered);
+            self.acks.rebalanced(vec![change(9, true, 0)]);
+        }
+    }
+
+    /// A metric recorder that panics while a release runs from a drop during
+    /// an unwind would abort the process: nothing records then.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_release_during_an_unwind_records_no_metric() {
+        let acks = KafkaAcks::default();
+        let tokens = register(&acks, 0, 0..3);
+        let _local = ::metrics::set_default_local_recorder(&PanickingRecorder);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ReleasedOnDrop {
+                acks: &acks,
+                tokens,
+            };
+            panic!("the block's process panicked");
+        }));
+        assert!(caught.is_err(), "the first panic is caught, not aborted on");
+        assert_eq!(acks.held().count, 0, "the revoke in the drop still applied");
     }
 
     #[test]

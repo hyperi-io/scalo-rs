@@ -399,6 +399,17 @@ pub trait TransportReceiver: TransportBase {
     /// [`DeliveryStatus::should_commit`] holds and does nothing otherwise. A
     /// push source answers its held senders here.
     ///
+    /// # One poll from a drop (REQUIRED of implementors)
+    ///
+    /// A block abandoned by a panic or a dropped future is released `Errored`
+    /// from a `Drop`, which cannot await, so that future is polled ONCE and
+    /// then dropped. An `Errored` release must do its work before its first
+    /// `.await`: the in-tree push sources answer their senders synchronously,
+    /// and Kafka records the withheld offsets synchronously. A release that
+    /// returns `Pending` on its first poll is not driven further from a drop:
+    /// the block stays unreleased, logged at WARN, and a push sender waits out
+    /// its hold budget.
+    ///
     /// # Errors
     ///
     /// The commit's error.

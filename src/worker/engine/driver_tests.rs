@@ -3768,92 +3768,81 @@ async fn a_panic_in_process_or_the_sink_releases_the_block_errored() {
     }
 }
 
+/// The guarantee a pull pipeline publishes when its sink declares `declared`
+/// through `sink_confirms`, or nothing at all, with no sender.
 #[cfg(feature = "metrics")]
-#[tokio::test(flavor = "current_thread")]
-async fn a_pipeline_with_no_sender_reports_its_sink_unscreened() {
+async fn guarantee_published(declared: Option<SinkConfirmation>) -> Arc<GaugeCapture> {
     let capture = Arc::new(GaugeCapture::default());
-    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let recorder = metrics::set_default_local_recorder(&*capture);
     let source = HeldSource::new(AckKind::Pull, Vec::new());
     let shutdown = CancellationToken::new();
     shutdown.cancel();
-
-    default_engine()
-        .pipeline(&source)
-        .shutdown(shutdown)
-        .sink_confirms(SinkConfirmation::Remote)
+    let engine = default_engine();
+    let pipeline = engine.pipeline(&source).shutdown(shutdown);
+    let pipeline = match declared {
+        Some(confirms) => pipeline.sink_confirms(confirms),
+        None => pipeline,
+    };
+    pipeline
         .run(
             |batch| Ok(batch),
             |_out: &WorkBatch<_>| std::future::ready(Ok(())),
         )
         .await
         .expect("clean shutdown");
+    drop(recorder);
+    capture
+}
 
+/// A sink that is not a transport declares what its `Ok` proves: it has no
+/// transport screen to miss, so it is taken at its word.
+#[cfg(feature = "metrics")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_sink_that_declares_its_confirmation_is_taken_at_its_word() {
+    let remote = guarantee_published(Some(SinkConfirmation::Remote)).await;
     assert_eq!(
-        capture.gauge(
-            "pipeline_delivery_guarantee",
-            &[("guarantee", "at_least_once"), ("reason", "unscreened")]
-        ),
-        Some(1.0),
-        "no sender screens the sink, and the gauge says so"
-    );
-    assert_eq!(
-        capture.gauge(
+        remote.gauge(
             "pipeline_delivery_guarantee",
             &[("guarantee", "at_least_once"), ("reason", "confirmed")]
         ),
-        None
+        Some(1.0)
+    );
+    let local = guarantee_published(Some(SinkConfirmation::Local)).await;
+    assert_eq!(
+        local.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "at_least_once_local"),
+                ("reason", "sink_confirms_locally")
+            ]
+        ),
+        Some(1.0)
     );
 }
 
-#[cfg(feature = "logger")]
+/// With neither a sender nor a declared confirmation, the sink's `Ok` proves
+/// nothing and nothing screens the blocks: best effort.
+#[cfg(feature = "metrics")]
 #[tokio::test(flavor = "current_thread")]
-async fn a_pipeline_with_no_sender_warns_once_at_start() {
-    use std::io::Write;
-
-    #[derive(Clone)]
-    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
-    impl Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let captured = Captured(Arc::new(parking_lot::Mutex::new(Vec::new())));
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let source = HeldSource::new(AckKind::Pull, vec![vec![0], vec![1]]);
-    let shutdown = CancellationToken::new();
-    let stop = shutdown.clone();
-    default_engine()
-        .pipeline(&source)
-        .shutdown(shutdown)
-        .run(
-            |batch| Ok(batch),
-            move |out: &WorkBatch<crate::transport::memory::MemoryToken>| {
-                if out.commit_tokens.iter().any(|t| t.seq == 1) {
-                    stop.cancel();
-                }
-                std::future::ready(Ok(()))
-            },
-        )
-        .await
-        .expect("clean shutdown");
-
-    let logged = String::from_utf8_lossy(&captured.0.lock()).into_owned();
+async fn a_pipeline_that_declares_nothing_reports_best_effort() {
+    let undeclared = guarantee_published(None).await;
     assert_eq!(
-        logged.matches("has no sender").count(),
-        1,
-        "one startup WARN names the gap, however many blocks run: {logged}"
+        undeclared.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "best_effort"),
+                ("reason", "sink_cannot_confirm")
+            ]
+        ),
+        Some(1.0)
     );
-    assert!(logged.contains("WARN"), "{logged}");
+    assert_eq!(
+        undeclared.gauge(
+            "pipeline_delivery_guarantee",
+            &[("guarantee", "at_least_once")]
+        ),
+        None
+    );
 }
 
 #[tokio::test]

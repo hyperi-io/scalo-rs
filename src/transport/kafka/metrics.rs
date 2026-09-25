@@ -36,7 +36,7 @@ use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
 use rdkafka::statistics::Statistics;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 /// Kafka metrics snapshot. Mirrors the Python `KafkaMetrics` dataclass.
@@ -119,9 +119,22 @@ pub struct StatsContext {
     connected: AtomicBool,
     /// Records past this consumer's read position, summed over its partitions.
     position_lag: AtomicI64,
-    /// Partitions a rebalance took away since the transport last looked.
-    /// std's lock keeps the context unwind-safe, as its other fields are.
-    revoked: Mutex<Vec<(String, i32)>>,
+    /// Ownership changes since the transport last looked, each numbered as
+    /// `rebalances` counted it. std's lock keeps the context unwind-safe, as
+    /// its other fields are.
+    rebalanced: Mutex<Vec<(u64, Rebalanced)>>,
+    /// Ownership changes served so far, so a record can be ordered against
+    /// them.
+    rebalances: AtomicU64,
+}
+
+/// A change a rebalance made to what this consumer owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Rebalanced {
+    /// These partitions were taken from this consumer.
+    Revoked(Vec<(String, i32)>),
+    /// These partitions were given to this consumer.
+    Assigned(Vec<(String, i32)>),
 }
 
 impl Default for StatsContext {
@@ -140,18 +153,38 @@ impl StatsContext {
             delivery: super::classify::DeliveryState::default(),
             connected: AtomicBool::new(false),
             position_lag: AtomicI64::new(0),
-            revoked: Mutex::new(Vec::new()),
+            rebalanced: Mutex::new(Vec::new()),
+            rebalances: AtomicU64::new(0),
         }
     }
 
-    /// Partitions a rebalance took from this consumer since the last call.
-    pub(crate) fn take_revoked(&self) -> Vec<(String, i32)> {
+    /// Ownership changes served so far. A record polled now carries this
+    /// count, so it orders against [`take_rebalanced`](Self::take_rebalanced):
+    /// librdkafka runs a rebalance inside the poll, before the poll returns.
+    pub(crate) fn rebalances(&self) -> u64 {
+        self.rebalances.load(Ordering::Acquire)
+    }
+
+    /// Ownership changes since the last call, in the order they were served,
+    /// each with its number.
+    pub(crate) fn take_rebalanced(&self) -> Vec<(u64, Rebalanced)> {
         std::mem::take(
             &mut *self
-                .revoked
+                .rebalanced
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Record one ownership change, numbered under the lock so the log and
+    /// the count agree.
+    fn note_rebalanced(&self, change: Rebalanced) {
+        let mut log = self
+            .rebalanced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let number = self.rebalances.fetch_add(1, Ordering::AcqRel) + 1;
+        log.push((number, change));
     }
 
     /// Records past this consumer's read position, summed over its partitions,
@@ -411,24 +444,28 @@ impl StatsContext {
     }
 }
 
-/// Records each revoked partition before librdkafka unassigns it, so the
-/// transport stops holding offsets this member can no longer commit.
+/// Records each revoke and assignment, in order, before librdkafka applies
+/// it, so the transport never holds or commits for a partition it lost.
 impl rdkafka::consumer::ConsumerContext for StatsContext {
     fn pre_rebalance(
         &self,
         _consumer: &rdkafka::consumer::BaseConsumer<Self>,
         rebalance: &rdkafka::consumer::Rebalance<'_>,
     ) {
-        if let rdkafka::consumer::Rebalance::Revoke(partitions) = rebalance {
-            self.revoked
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(
-                    partitions
-                        .elements()
-                        .iter()
-                        .map(|p| (p.topic().to_string(), p.partition())),
-                );
+        let partitions = |list: &rdkafka::TopicPartitionList| {
+            list.elements()
+                .iter()
+                .map(|p| (p.topic().to_string(), p.partition()))
+                .collect()
+        };
+        match rebalance {
+            rdkafka::consumer::Rebalance::Revoke(list) => {
+                self.note_rebalanced(Rebalanced::Revoked(partitions(list)));
+            }
+            rdkafka::consumer::Rebalance::Assign(list) => {
+                self.note_rebalanced(Rebalanced::Assigned(partitions(list)));
+            }
+            rdkafka::consumer::Rebalance::Error(_) => {}
         }
     }
 }

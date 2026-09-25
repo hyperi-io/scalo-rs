@@ -272,10 +272,6 @@ pub enum GuaranteeReason {
     /// A push source with acknowledgements on that no caller armed, so it
     /// still answers at enqueue.
     Unarmed,
-    /// The sink confirms, but no sender screens the block, so a transport
-    /// sink drops a record it would dead-letter and the block counts it
-    /// delivered.
-    Unscreened,
 }
 
 impl GuaranteeReason {
@@ -289,7 +285,6 @@ impl GuaranteeReason {
             Self::SourceCannotAck => "source_cannot_ack",
             Self::SinkCannotConfirm => "sink_cannot_confirm",
             Self::Unarmed => "unarmed",
-            Self::Unscreened => "unscreened",
         }
     }
 }
@@ -332,20 +327,6 @@ impl EffectiveGuarantee {
                 reason: GuaranteeReason::SinkConfirmsLocally,
             },
             SinkConfirmation::None => best_effort(GuaranteeReason::SinkCannotConfirm),
-        }
-    }
-
-    /// This guarantee for a sink no sender screens: an at-least-once
-    /// guarantee keeps its level and gives [`GuaranteeReason::Unscreened`] as
-    /// the reason, and a best-effort one is unchanged.
-    #[must_use]
-    pub fn unscreened(self) -> Self {
-        match self.guarantee {
-            DeliveryGuarantee::AtLeastOnce | DeliveryGuarantee::AtLeastOnceLocal => Self {
-                reason: GuaranteeReason::Unscreened,
-                ..self
-            },
-            DeliveryGuarantee::BestEffort => self,
         }
     }
 
@@ -412,9 +393,10 @@ pub(crate) fn release_abandoned<R: TransportReceiver>(receiver: &R, tokens: &[R:
             transport = receiver.name(),
             "Releasing an abandoned block failed"
         ),
-        std::task::Poll::Pending => tracing::debug!(
+        std::task::Poll::Pending => tracing::warn!(
             transport = receiver.name(),
-            "An abandoned block's release did not finish in one poll; it stays unreleased"
+            "An abandoned block's release did not finish in one poll, so it stays unreleased: \
+             TransportReceiver::release must do an Errored release before its first await"
         ),
     }
 }
@@ -958,30 +940,6 @@ mod tests {
         assert_eq!(
             of(Some(&unarmed_pull), SinkConfirmation::None),
             (G::BestEffort, R::SinkCannotConfirm)
-        );
-    }
-
-    #[test]
-    fn an_unscreened_sink_keeps_its_level_and_names_the_gap() {
-        use DeliveryGuarantee as G;
-        use GuaranteeReason as R;
-        let pull = control(true, true, AckKind::Pull);
-        let unscreened = |sink| {
-            let g = EffectiveGuarantee::of(Some(&pull as &dyn AckControl), sink).unscreened();
-            (g.guarantee, g.reason)
-        };
-        assert_eq!(
-            unscreened(SinkConfirmation::Remote),
-            (G::AtLeastOnce, R::Unscreened)
-        );
-        assert_eq!(
-            unscreened(SinkConfirmation::Local),
-            (G::AtLeastOnceLocal, R::Unscreened)
-        );
-        assert_eq!(
-            unscreened(SinkConfirmation::None),
-            (G::BestEffort, R::SinkCannotConfirm),
-            "a best-effort guarantee keeps the reason it already has"
         );
     }
 

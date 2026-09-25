@@ -61,7 +61,9 @@ pub struct Pipeline<'a, R, T = NoTicker> {
     receiver: &'a R,
     shutdown: CancellationToken,
     commit: CommitMode,
-    confirms: SinkConfirmation,
+    /// What the sink's `Ok` proves: set by `sender`, or declared with
+    /// `sink_confirms` for a sink that is not a transport.
+    confirms: Option<SinkConfirmation>,
     screen: Option<Screen<'a>>,
     ticker: Option<(Duration, T)>,
 }
@@ -105,7 +107,7 @@ impl BatchEngine {
             receiver,
             shutdown: CancellationToken::new(),
             commit: CommitMode::Auto,
-            confirms: SinkConfirmation::None,
+            confirms: None,
             screen: None,
             ticker: None,
         }
@@ -127,10 +129,12 @@ impl<'a, R: TransportReceiver, T> Pipeline<'a, R, T> {
         self
     }
 
-    /// What the sink's `Ok` proves, for `pipeline_delivery_guarantee`. Set by
-    /// [`sender`](Self::sender) for a transport sink.
+    /// What the `Ok` of a sink that is not a transport proves, for
+    /// `pipeline_delivery_guarantee`: a database writer that refuses a record
+    /// itself, say. A transport sink uses [`sender`](Self::sender) instead,
+    /// which sets this and screens the blocks too.
     pub fn sink_confirms(mut self, confirms: SinkConfirmation) -> Self {
-        self.confirms = confirms;
+        self.confirms = Some(confirms);
         self
     }
 
@@ -138,7 +142,7 @@ impl<'a, R: TransportReceiver, T> Pipeline<'a, R, T> {
     /// records it would dead-letter instead of sending, which the loop routes
     /// to the DLQ itself.
     pub fn sender<S: TransportSender>(mut self, sender: &'a S) -> Self {
-        self.confirms = sender.confirms_delivery();
+        self.confirms = Some(sender.confirms_delivery());
         self.screen = Some(Box::new(move |record| sender.dead_letter_reason(record)));
         self
     }
@@ -225,17 +229,15 @@ where
         if let (AckMode::Hold, Some(control)) = (mode, control) {
             control.arm();
         }
-        let guarantee = EffectiveGuarantee::of(control, confirms);
-        if screen.is_some() {
-            guarantee.publish();
-        } else {
-            guarantee.unscreened().publish();
+        EffectiveGuarantee::of(control, confirms.unwrap_or_default()).publish();
+        if confirms.is_none() {
             tracing::warn!(
                 transport = receiver.name(),
-                "BatchEngine (pipeline) has no sender, so nothing screens its blocks: a record a \
-                 Kafka or gRPC sink would dead-letter (over its size ceiling, or matched by an \
-                 outbound dlq filter) is dropped by send_batch and its block released as \
-                 delivered. Pass .sender(&sender)"
+                "BatchEngine (pipeline) has neither a sender nor a declared sink confirmation, so \
+                 nothing screens its blocks: a record a Kafka or gRPC sink would dead-letter (over \
+                 its size ceiling, or matched by an outbound dlq filter) is dropped by send_batch \
+                 and its block released as delivered. Pass .sender(&sender) for a transport sink, \
+                 or .sink_confirms(..) for one that is not"
             );
         }
 

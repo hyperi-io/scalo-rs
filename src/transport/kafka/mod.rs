@@ -1613,10 +1613,12 @@ impl KafkaTransport {
         #[cfg(feature = "metrics")]
         let poll_start = std::time::Instant::now();
         let polled = self.poll_off_runtime(max_msgs, max_bytes).await?;
-        // Rebalances run inside the poll, so what one revoked is known before
+        // Rebalances run inside the poll, so what one changed is known before
         // anything this poll read is held.
-        self.acks.forget(self.consumer.context().take_revoked());
-        let (arena, spans) = match polled {
+        let revoked_at = self
+            .acks
+            .rebalanced(self.consumer.context().take_rebalanced());
+        let (arena, mut spans) = match polled {
             Polled::Empty => {
                 #[cfg(feature = "metrics")]
                 ::metrics::histogram!("kafka_poll_duration_seconds")
@@ -1643,6 +1645,9 @@ impl KafkaTransport {
                 (arena, spans)
             }
         };
+        if self.acks.is_armed() {
+            drop_read_before_revoke(&mut spans, &revoked_at);
+        }
 
         // Freeze the arena to ONE refcounted Bytes, then rebuild messages as
         // zero-copy slices into it. All borrowed Kafka buffers are long gone --
@@ -1853,6 +1858,9 @@ struct Span {
     format: PayloadFormat,
     /// Half-open byte range of this record's payload within the frozen arena.
     range: core::ops::Range<usize>,
+    /// Ownership changes served before the poll that returned this record
+    /// returned, which orders the record against a revoke in the same job.
+    rebalances: u64,
 }
 
 /// Rebuild a batch of `Message`s from a frozen recv-arena and its spans.
@@ -1878,6 +1886,33 @@ fn build_batch_from_spans(arena: bytes::Bytes, spans: Vec<Span>) -> Vec<Message<
             format: span.format,
         })
         .collect()
+}
+
+/// Leave out every record read before a revoke of its partition in the same
+/// poll job.
+///
+/// Its partition's next owner reads it again from the committed offset, which
+/// is below it, so leaving it out loses nothing. Handed out, its release would
+/// be a release for a partition this member no longer holds, which, once the
+/// partition came back in the same job, would commit past an offset the
+/// member released `Errored` before the revoke.
+fn drop_read_before_revoke(spans: &mut Vec<Span>, revoked_at: &HashMap<(Arc<str>, i32), u64>) {
+    if revoked_at.is_empty() {
+        return;
+    }
+    let before = spans.len();
+    spans.retain(|span| {
+        revoked_at
+            .get(&(Arc::clone(&span.token.topic), span.token.partition))
+            .is_none_or(|&revoke| span.rebalances >= revoke)
+    });
+    let dropped = before - spans.len();
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            "kafka: records read before their partition was revoked are left for its next owner"
+        );
+    }
 }
 
 /// Get or insert topic Arc into cache.
@@ -2010,6 +2045,7 @@ impl PollJob {
             timestamp_ms: msg.timestamp().to_millis(),
             format: PayloadFormat::Auto,
             range: start..end,
+            rebalances: self.consumer.context().rebalances(),
         });
         drop(msg);
 
@@ -2055,6 +2091,7 @@ impl PollJob {
                         timestamp_ms: msg.timestamp().to_millis(),
                         format: PayloadFormat::Auto,
                         range: start..end,
+                        rebalances: self.consumer.context().rebalances(),
                     });
                 }
                 Some(Err(e)) => match classify::classify_recv_failure(&e, ctx) {
@@ -2974,6 +3011,7 @@ mod tests {
                 timestamp_ms: Some(1_000 + offset),
                 format: PayloadFormat::Auto,
                 range: start..end,
+                rebalances: 0,
             });
         }
         (bytes::Bytes::from(arena), spans)
@@ -3330,13 +3368,8 @@ mod tests {
         assert_eq!(topics.read()[1], "logs_load");
     }
 
-    /// A revoke librdkafka reports during a poll ends the transport's hold on
-    /// that partition's offsets once the poll returns.
-    #[tokio::test]
-    async fn a_recv_after_a_revoke_holds_nothing_for_the_revoked_partition() {
-        use rdkafka::consumer::{ConsumerContext, Rebalance};
-
-        // No topics: a broker-free consumer, built without a subscribe.
+    /// A broker-free, armed transport: no topics, so it never subscribes.
+    async fn armed_without_a_broker() -> KafkaTransport {
         let transport = KafkaTransport::new(&KafkaConfig::for_testing(
             "127.0.0.1:1",
             "revoke-test",
@@ -3345,18 +3378,80 @@ mod tests {
         .await
         .expect("broker-free kafka transport");
         transport.acks.arm();
-        let tokens: Vec<KafkaToken> = (0..10)
-            .map(|offset| KafkaToken::new(Arc::from("events"), 0, offset))
-            .collect();
-        transport.acks.register(tokens.iter().map(|t| (t, 10)));
-        transport.acks.withhold(&tokens);
+        transport
+    }
 
-        let mut revoked = TopicPartitionList::new();
-        revoked.add_partition("events", 0);
+    fn tokens(partition: i32, offsets: std::ops::Range<i64>) -> Vec<KafkaToken> {
+        offsets
+            .map(|offset| KafkaToken::new(Arc::from("events"), partition, offset))
+            .collect()
+    }
+
+    /// Serve a rebalance on `transport`'s context, as librdkafka does inside
+    /// a poll.
+    fn serve(transport: &KafkaTransport, revoke: bool, partition: i32) {
+        use rdkafka::consumer::{ConsumerContext, Rebalance};
+        let mut list = TopicPartitionList::new();
+        list.add_partition("events", partition);
+        let rebalance = if revoke {
+            Rebalance::Revoke(&list)
+        } else {
+            Rebalance::Assign(&list)
+        };
         transport
             .consumer
             .context()
-            .pre_rebalance(&transport.consumer, &Rebalance::Revoke(&revoked));
+            .pre_rebalance(&transport.consumer, &rebalance);
+    }
+
+    /// A record of `token`, polled now: it carries the rebalances served so far.
+    fn polled(transport: &KafkaTransport, token: KafkaToken) -> Span {
+        Span {
+            key: Some(Arc::clone(&token.topic)),
+            token,
+            timestamp_ms: None,
+            format: PayloadFormat::Auto,
+            range: 0..0,
+            rebalances: transport.consumer.context().rebalances(),
+        }
+    }
+
+    /// The tail of a `recv`: apply the job's rebalances, then leave out what
+    /// was read before a revoke and hold the rest.
+    fn settle(transport: &KafkaTransport, mut spans: Vec<Span>) -> Vec<KafkaToken> {
+        let revoked_at = transport
+            .acks
+            .rebalanced(transport.consumer.context().take_rebalanced());
+        drop_read_before_revoke(&mut spans, &revoked_at);
+        let kept: Vec<KafkaToken> = spans.into_iter().map(|s| s.token).collect();
+        transport.acks.register(kept.iter().map(|t| (t, 10)));
+        kept
+    }
+
+    fn committed_to(
+        transport: &KafkaTransport,
+        released: &[KafkaToken],
+        partition: i32,
+    ) -> Vec<i64> {
+        let targets = transport.acks.release(released, DeliveryStatus::Delivered);
+        transport.acks.committed(&targets);
+        targets
+            .into_iter()
+            .filter(|((_, p), _)| *p == partition)
+            .map(|(_, next)| next)
+            .collect()
+    }
+
+    /// A revoke librdkafka reports during a poll ends the transport's hold on
+    /// that partition's offsets once the poll returns.
+    #[tokio::test]
+    async fn a_recv_after_a_revoke_holds_nothing_for_the_revoked_partition() {
+        let transport = armed_without_a_broker().await;
+        let withheld = tokens(0, 0..10);
+        transport.acks.register(withheld.iter().map(|t| (t, 10)));
+        transport.acks.withhold(&withheld);
+
+        serve(&transport, true, 0);
         assert_eq!(
             transport.acks.held().count,
             10,
@@ -3366,17 +3461,82 @@ mod tests {
         // Whatever the broker-free poll returns, the revoke it carried is applied.
         let _ = transport.recv(10).await;
         assert_eq!(transport.acks.held().count, 0);
-        assert!(transport.consumer.context().take_revoked().is_empty());
+        assert!(transport.consumer.context().take_rebalanced().is_empty());
+    }
 
-        let mut assigned = TopicPartitionList::new();
-        assigned.add_partition("events", 1);
-        transport
-            .consumer
-            .context()
-            .pre_rebalance(&transport.consumer, &Rebalance::Assign(&assigned));
+    /// Records of a partition read in the same poll job as its revoke, after
+    /// an Errored block on it: the revoke took the Errored floor away, so
+    /// neither they nor anything else commit the partition until it is
+    /// assigned again.
+    #[tokio::test]
+    async fn records_read_in_the_job_that_revokes_their_partition_commit_nothing() {
+        let transport = armed_without_a_broker().await;
+        let withheld = tokens(0, 0..10);
+        transport.acks.register(withheld.iter().map(|t| (t, 10)));
+        transport.acks.withhold(&withheld);
+
+        let later = tokens(0, 10..15);
+        let mut job: Vec<Span> = later
+            .iter()
+            .map(|t| polled(&transport, t.clone()))
+            .collect();
+        serve(&transport, true, 0);
+        job.push(polled(&transport, tokens(1, 0..1).remove(0)));
+        let handed_out = settle(&transport, job);
+        assert_eq!(
+            handed_out.iter().map(|t| t.partition).collect::<Vec<_>>(),
+            vec![1],
+            "partition 0's records read before its revoke are its next owner's"
+        );
+
         assert!(
-            transport.consumer.context().take_revoked().is_empty(),
-            "an assignment revokes nothing"
+            committed_to(&transport, &later, 0).is_empty(),
+            "no commit of partition 0 past its Errored floor"
+        );
+        assert_eq!(committed_to(&transport, &handed_out, 1), vec![1]);
+
+        serve(&transport, false, 0);
+        let read_again = settle(
+            &transport,
+            tokens(0, 0..10)
+                .into_iter()
+                .map(|t| polled(&transport, t))
+                .collect(),
+        );
+        assert_eq!(
+            committed_to(&transport, &read_again, 0),
+            vec![10],
+            "assigned again, it commits what it reads again"
+        );
+    }
+
+    /// Revoked and assigned back inside one job, as the eager protocol does:
+    /// what was read before the revoke is left out, and what was read after is
+    /// held from where the consumer reads again.
+    #[tokio::test]
+    async fn a_revoke_and_reassign_in_one_job_keeps_only_what_was_read_after() {
+        let transport = armed_without_a_broker().await;
+        let withheld = tokens(0, 0..10);
+        transport.acks.register(withheld.iter().map(|t| (t, 10)));
+        transport.acks.withhold(&withheld);
+
+        let mut job: Vec<Span> = tokens(0, 10..15)
+            .into_iter()
+            .map(|t| polled(&transport, t))
+            .collect();
+        serve(&transport, true, 0);
+        serve(&transport, false, 0);
+        job.extend(tokens(0, 0..3).into_iter().map(|t| polled(&transport, t)));
+        let handed_out = settle(&transport, job);
+
+        assert_eq!(
+            handed_out.iter().map(|t| t.offset).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            committed_to(&transport, &handed_out, 0),
+            vec![3],
+            "the commit follows what was read again, never past 3"
         );
     }
 }

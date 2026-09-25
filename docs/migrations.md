@@ -775,7 +775,7 @@ The service runtime builds the app metric set, with the `info` gauge, and a serv
 
 The new trait methods are provided, so no implementor changes: `TransportReceiver::{ack_control, release, hold_deadline}`, `TransportSender::{confirms_delivery, dead_letter_reason}`. `run_governed` and the other run loops behave as before, except that a push source with acknowledgements on that they run logs one WARN at start, since it still answers its senders at enqueue, and reports `pipeline_delivery_guarantee{guarantee="best_effort",reason="unarmed"}`.
 
-An armed gRPC server answers a push only once its records are released. Build it armed, `GrpcTransport::builder(..).armed(true)` or `AnyReceiver::from_config_armed(key)`, so no push is answered before a pipeline runs. A pipeline with no `.sender(&sender)` logs one WARN at start and reports the reason `unscreened`: nothing takes a record the sink's transport would dead-letter out of the block.
+An armed gRPC server answers a push only once its records are released. Build it armed, `GrpcTransport::builder(..).armed(true)` or `AnyReceiver::from_config_armed(key)`, so no push is answered before a pipeline runs. A pipeline with neither `.sender(&sender)` nor `.sink_confirms(..)` logs one WARN at start and reports `best_effort` / `sink_cannot_confirm`: nothing takes a record the sink's transport would dead-letter out of the block.
 
 A `KafkaTransport` armed through `AckControl::arm` commits each partition only up to its lowest offset handed out and not yet released, for `commit` as for `release`. An unarmed one commits as before.
 
