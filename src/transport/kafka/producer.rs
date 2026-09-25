@@ -133,7 +133,8 @@ pub struct KafkaProducer {
     delivery: Arc<DeliveryState>,
     /// Latches a sustained retryable enqueue failure to one warn per outage.
     enqueue_degraded: DegradedLatch,
-    /// The effective `message.max.bytes`.
+    /// The effective `message.max.bytes`, which only the Kafka DLQ reads.
+    #[cfg(feature = "dlq-kafka")]
     message_max_bytes: usize,
     // Metrics
     messages_sent: AtomicU64,
@@ -174,6 +175,7 @@ impl KafkaProducer {
     /// Returns error if producer creation fails.
     pub fn new(config: &KafkaConfig, profile: ProducerProfile) -> TransportResult<Self> {
         let client_config = client_config(config, profile);
+        #[cfg(feature = "dlq-kafka")]
         let message_max_bytes = client_config
             .get("message.max.bytes")
             .and_then(|v| v.parse::<usize>().ok())
@@ -189,6 +191,7 @@ impl KafkaProducer {
             profile,
             delivery,
             enqueue_degraded: DegradedLatch::default(),
+            #[cfg(feature = "dlq-kafka")]
             message_max_bytes,
             messages_sent: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -198,6 +201,7 @@ impl KafkaProducer {
 
     /// The largest payload `send` takes: `message.max.bytes` less the framing
     /// librdkafka adds to a record with no key and no headers.
+    #[cfg(feature = "dlq-kafka")]
     pub(crate) fn payload_ceiling(&self) -> usize {
         self.message_max_bytes
             .saturating_sub(super::RECORD_WIRE_OVERHEAD)
@@ -490,6 +494,26 @@ mod tests {
             assert_eq!(
                 super::super::librdkafka_resolves(&built, "compression.codec"),
                 "lz4",
+                "{profile}"
+            );
+        }
+    }
+
+    /// Three profiles set `acks` under that name, below the overrides, so an
+    /// override by librdkafka's own name has to replace it to win.
+    #[test]
+    fn every_profile_takes_an_acks_override_by_the_alias_name() {
+        let mut config = KafkaConfig::default();
+        config.sizing.producer.idempotence = Some(false);
+        config
+            .librdkafka_overrides
+            .insert("request.required.acks".to_string(), "0".to_string());
+        for profile in PROFILES {
+            let built = client_config(&config, profile);
+            assert_eq!(built.get("acks"), None, "{profile}");
+            assert_eq!(
+                super::super::librdkafka_resolves(&built, "request.required.acks"),
+                "0",
                 "{profile}"
             );
         }

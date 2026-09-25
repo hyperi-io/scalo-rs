@@ -127,9 +127,11 @@ pub struct StatsContext {
     /// them.
     rebalances: AtomicU64,
     /// Whether the inbound gate has this consumer's assignment paused.
+    #[cfg(feature = "governor")]
     paused: AtomicBool,
     /// Log ends asked of the broker while paused, since librdkafka learns a
     /// partition's end only from a fetch and fetches nothing it has paused.
+    #[cfg(feature = "governor")]
     paused_ends: RwLock<HashMap<(String, i32), i64>>,
 }
 
@@ -160,7 +162,9 @@ impl StatsContext {
             position_lag: AtomicI64::new(0),
             rebalanced: Mutex::new(Vec::new()),
             rebalances: AtomicU64::new(0),
+            #[cfg(feature = "governor")]
             paused: AtomicBool::new(false),
+            #[cfg(feature = "governor")]
             paused_ends: RwLock::new(HashMap::new()),
         }
     }
@@ -168,6 +172,7 @@ impl StatsContext {
     /// Record that the inbound gate paused or resumed the assignment. A
     /// resume drops the ends asked of the broker: fetches report the end
     /// again from then on.
+    #[cfg(feature = "governor")]
     pub(crate) fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Release);
         if !paused && let Ok(mut ends) = self.paused_ends.write() {
@@ -176,12 +181,14 @@ impl StatsContext {
     }
 
     /// Whether the inbound gate has the assignment paused.
+    #[cfg(feature = "governor")]
     pub(crate) fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
     }
 
     /// The log ends the broker reported for the paused assignment, used by
     /// every statistics callback until the next refresh or a resume.
+    #[cfg(feature = "governor")]
     pub(crate) fn set_paused_ends(&self, ends: HashMap<(String, i32), i64>) {
         // Checked under the lock `set_paused` clears under, so a refresh that
         // lands after a resume leaves nothing behind.
@@ -353,11 +360,15 @@ impl ClientContext for StatsContext {
         {
             self.connected.store(true, Ordering::Relaxed);
         }
+        // Only the inbound gate pauses an assignment, so only it asks for ends.
+        #[cfg(feature = "governor")]
         let asked_ends = self
             .paused_ends
             .read()
             .map(|ends| ends.clone())
             .unwrap_or_default();
+        #[cfg(not(feature = "governor"))]
+        let asked_ends = HashMap::new();
         let metrics = Self::convert_stats(&statistics, &asked_ends);
         self.position_lag
             .store(position_lag(&statistics, &asked_ends), Ordering::Relaxed);
@@ -721,6 +732,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "governor")]
     #[test]
     fn a_resume_drops_the_asked_ends_and_a_late_answer_is_ignored() {
         let context = StatsContext::new();

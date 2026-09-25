@@ -79,6 +79,8 @@ pub use providers::{
 pub use token::KafkaToken;
 pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
 
+use config::{librdkafka_alias, raw_layer};
+
 use super::ack::{
     AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
 };
@@ -350,29 +352,27 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
 
     // Profile defaults (overridable by librdkafka_overrides).
     let rdkafka_config = config.build_librdkafka_config();
-    for (key, value) in &rdkafka_config {
-        client_config.set(key, value);
-    }
+    apply_layer(&mut client_config, &raw_layer(&rdkafka_config));
 
     // Sizing surface:
     //   profile defaults < named consumer knobs < sizing.consumer_librdkafka
-    for (key, value) in config.sizing.resolved_consumer_map() {
-        client_config.set(key, value);
-    }
+    let sizing = config.sizing.resolved_consumer_map();
+    apply_layer(&mut client_config, &raw_layer(&sizing));
 
     // Re-apply librdkafka_overrides LAST so they remain the highest-priority
     // layer the docs promise (config.rs precedence list). build_librdkafka_config
     // above also applied them, but the sizing surface in between would
     // otherwise clobber any fetch.* key an operator set via an override --
     // silently reverting a deployment's tuning on upgrade.
-    for (key, value) in &config.librdkafka_overrides {
-        client_config.set(key, value);
-    }
+    apply_layer(&mut client_config, &raw_layer(&config.librdkafka_overrides));
 
     // Security.
     client_config.set("security.protocol", &config.security_protocol);
     if let Some(ref mechanism) = config.sasl_mechanism {
-        client_config.set("sasl.mechanism", mechanism);
+        apply_layer(
+            &mut client_config,
+            &[("sasl.mechanism", mechanism.as_str())],
+        );
     }
     if let Some(ref username) = config.sasl_username {
         client_config.set("sasl.username", username);
@@ -450,13 +450,27 @@ pub(super) fn producer_client_config(
     if config.ssl_skip_verify {
         client_config.set("enable.ssl.certificate.verification", "false");
     }
-    for (key, value) in profile_defaults {
-        client_config.set(*key, *value);
-    }
-    for (key, value) in config.resolved_producer_settings() {
+    apply_layer(&mut client_config, profile_defaults);
+    let settings = config.resolved_producer_settings();
+    apply_layer(&mut client_config, &raw_layer(&settings));
+    client_config
+}
+
+/// Set every key of `layer` over `client_config`, each replacing the other
+/// librdkafka name for its property set before it.
+///
+/// rdkafka hands a client config to librdkafka in hash order, so a property
+/// left under both names would run whichever came last by chance. A layer
+/// that names both itself is left as it stands.
+pub(super) fn apply_layer(client_config: &mut ClientConfig, layer: &[(&str, &str)]) {
+    for &(key, value) in layer {
+        if let Some(alias) = librdkafka_alias(key)
+            && !layer.iter().any(|&(k, _)| k == alias)
+        {
+            client_config.remove(alias);
+        }
         client_config.set(key, value);
     }
-    client_config
 }
 
 /// The `KafkaTransport` producer's config, with statistics on when no layer
@@ -2901,6 +2915,98 @@ mod tests {
             librdkafka_resolves(&built, "compression.level"),
             "-1",
             "lz4 runs at librdkafka's own level, not the zstd one"
+        );
+    }
+
+    /// An `acks` override by librdkafka's own name replaces the idempotence
+    /// `acks=all`, so the value an operator set is the one librdkafka runs.
+    #[test]
+    fn transport_producer_takes_an_acks_override_by_the_alias_name() {
+        let mut config = KafkaConfig::default();
+        config.sizing.producer.idempotence = Some(false);
+        config
+            .librdkafka_overrides
+            .insert("request.required.acks".to_string(), "1".to_string());
+        let built = transport_producer_config(&config);
+        assert_eq!(built.get("acks"), None);
+        assert_eq!(librdkafka_resolves(&built, "request.required.acks"), "1");
+    }
+
+    // =========================================================================
+    // Consumer config: one property under two librdkafka names
+    // =========================================================================
+
+    /// The default fetch ceiling reaches librdkafka as the record ceiling.
+    #[test]
+    fn consumer_fetches_a_whole_maximum_size_record_by_default() {
+        let built = consumer_client_config(&KafkaConfig::default(), ConsumerProtocol::Classic);
+        assert_eq!(
+            librdkafka_resolves(&built, "fetch.message.max.bytes"),
+            MESSAGE_MAX_BYTES.to_string()
+        );
+    }
+
+    /// The explicit field and the sizing surface both set
+    /// `max.partition.fetch.bytes`, so an override by the other name wins only
+    /// once both are gone.
+    #[test]
+    fn consumer_takes_a_fetch_override_by_the_alias_name() {
+        let mut config = KafkaConfig::default();
+        config
+            .librdkafka_overrides
+            .insert("fetch.message.max.bytes".to_string(), "2097152".to_string());
+        let built = consumer_client_config(&config, ConsumerProtocol::Classic);
+        assert_eq!(built.get("max.partition.fetch.bytes"), None);
+        assert_eq!(
+            librdkafka_resolves(&built, "fetch.message.max.bytes"),
+            "2097152"
+        );
+    }
+
+    /// The sizing raw map replaces the explicit field's name too, and
+    /// `librdkafka_overrides` still wins over it.
+    #[test]
+    fn consumer_fetch_alias_follows_the_layer_order() {
+        let mut config = KafkaConfig::default();
+        config
+            .sizing
+            .consumer_librdkafka
+            .insert("fetch.message.max.bytes".to_string(), "4194304".to_string());
+        let built = consumer_client_config(&config, ConsumerProtocol::Classic);
+        assert_eq!(built.get("max.partition.fetch.bytes"), None);
+        assert_eq!(
+            librdkafka_resolves(&built, "fetch.message.max.bytes"),
+            "4194304"
+        );
+
+        config.librdkafka_overrides.insert(
+            "max.partition.fetch.bytes".to_string(),
+            "8388608".to_string(),
+        );
+        let built = consumer_client_config(&config, ConsumerProtocol::Classic);
+        assert_eq!(built.get("fetch.message.max.bytes"), None);
+        assert_eq!(
+            librdkafka_resolves(&built, "fetch.message.max.bytes"),
+            "8388608"
+        );
+    }
+
+    /// The consumer sets security after the overrides, so the configured
+    /// mechanism replaces an override by the other name.
+    #[test]
+    fn consumer_security_replaces_an_override_by_the_alias_name() {
+        let mut config = KafkaConfig {
+            sasl_mechanism: Some("SCRAM-SHA-512".to_string()),
+            ..Default::default()
+        };
+        config
+            .librdkafka_overrides
+            .insert("sasl.mechanisms".to_string(), "PLAIN".to_string());
+        let built = consumer_client_config(&config, ConsumerProtocol::Classic);
+        assert_eq!(built.get("sasl.mechanisms"), None);
+        assert_eq!(
+            librdkafka_resolves(&built, "sasl.mechanisms"),
+            "SCRAM-SHA-512"
         );
     }
 
