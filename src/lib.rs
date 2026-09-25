@@ -369,8 +369,8 @@ pub use scaling::{
 #[cfg(feature = "governor")]
 #[cfg_attr(docsrs, doc(cfg(feature = "governor")))]
 pub use governor::{
-    Admit, ByteBudgetConfig, ByteBudgetController, GateActuator, Hysteresis, InboundGate,
-    MemoryPressureSource, NoopActuator, ObservingActuator, Pressure, PressureSource,
+    AckHeldSource, Admit, ByteBudgetConfig, ByteBudgetController, GateActuator, Hysteresis,
+    InboundGate, MemoryPressureSource, NoopActuator, ObservingActuator, Pressure, PressureSource,
     RateLimitConfig, RateLimiter, SelfRegulationConfig, SelfRegulationGovernor,
     SelfRegulationProfile, UnifiedPressure, UnifiedPressureSnapshot,
 };
