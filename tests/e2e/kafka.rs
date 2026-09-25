@@ -717,12 +717,22 @@ mod broker {
     const KAFKA_IMAGE_REF: &str =
         "4.3.1@sha256:2885898ba17065023f1bd605f3a81efcfa986014f062b73b91ef5462485f9060";
 
+    /// Container starts to try: on a busy CI runner a broker started alongside
+    /// others can exit before it logs that it is ready.
+    const START_ATTEMPTS: u32 = 3;
+
     pub(super) async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
-        let node = Kafka::default()
-            .with_tag(KAFKA_IMAGE_REF)
-            .start()
-            .await
-            .expect("start kafka container");
+        let mut attempt = 1;
+        let node = loop {
+            match Kafka::default().with_tag(KAFKA_IMAGE_REF).start().await {
+                Ok(node) => break node,
+                Err(e) if attempt < START_ATTEMPTS => {
+                    eprintln!("kafka container attempt {attempt} did not start: {e}");
+                    attempt += 1;
+                }
+                Err(e) => panic!("start kafka container: {e}"),
+            }
+        };
         let port = node
             .get_host_port_ipv4(apache::KAFKA_PORT)
             .await
