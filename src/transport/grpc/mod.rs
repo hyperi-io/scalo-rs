@@ -478,7 +478,7 @@ impl std::fmt::Debug for GrpcTransportBuilder<'_> {
 impl GrpcTransportBuilder<'_> {
     /// The `acknowledgements` section. Enabled (the default), the receive
     /// server holds each response until its records are released, once a
-    /// caller arms it; disabled, it answers once they are queued.
+    /// caller arms it. Disabled, it answers once they are queued.
     pub fn acknowledgements(mut self, acknowledgements: AcknowledgementsConfig) -> Self {
         self.acknowledgements = acknowledgements;
         self
@@ -502,7 +502,7 @@ impl GrpcTransportBuilder<'_> {
     }
 
     /// Refuse a push with `ResourceExhausted` once the responses held carry
-    /// this many payload bytes; one push is always admitted while none is
+    /// this many payload bytes. One push is always admitted while none is
     /// held. Default: a quarter of the memory guard's limit, else 256 MiB.
     pub fn max_held_bytes(mut self, bytes: u64) -> Self {
         self.max_held_bytes = Some(bytes);
@@ -518,8 +518,8 @@ impl GrpcTransportBuilder<'_> {
     }
 
     /// How long [`close`](TransportBase::close) leaves held responses to be
-    /// released before answering the rest `Unavailable`. Default 20 s; keep it
-    /// under the pod's termination grace period.
+    /// released before answering the rest `Unavailable`. Default 20 s, which
+    /// the pod's termination grace period must cover.
     pub fn drain_deadline(mut self, drain_deadline: Duration) -> Self {
         self.drain_deadline = drain_deadline;
         self
@@ -678,7 +678,7 @@ impl GrpcTransport {
             let (sd_tx, sd_rx) = oneshot::channel();
 
             // Held bytes near the ceiling hold the same latch the governor's
-            // other sources do; nothing is held while unarmed or disabled.
+            // other sources do. Nothing is held while unarmed or disabled.
             #[cfg(feature = "governor")]
             if let (Some(pressure), Some(pending)) = (&pressure, &pending) {
                 pressure.attach_source(Arc::new(crate::governor::AckHeldSource::new(
@@ -1106,8 +1106,12 @@ impl TransportSender for GrpcTransport {
     /// ones accepted, and the caller's retry of the whole block sends them
     /// again (at-least-once). A record over the limit on its own is left out
     /// and counted in `transport_message_too_large_total`, as
-    /// [`send`](TransportSender::send) refuses it; when every record is,
-    /// the result is `FilteredDlq`.
+    /// [`send`](TransportSender::send) refuses it, and when every record is,
+    /// the result is `FilteredDlq`. [`dead_letter_reason`] names such a record
+    /// before the send, so a caller holding a source acknowledgement
+    /// dead-letters it instead.
+    ///
+    /// [`dead_letter_reason`]: TransportSender::dead_letter_reason
     ///
     /// # Errors / result
     ///
@@ -1146,9 +1150,8 @@ impl TransportSender for GrpcTransport {
             return SendResult::Ok;
         }
 
-        // A block over the ceiling goes as several requests, none of which the
-        // receiver's decoder refuses; they go in order, and a retry after one
-        // fails re-sends those already accepted (at-least-once).
+        // A block over the ceiling goes as several requests in order, so none
+        // is one the receiver's decoder refuses.
         let batches = batches_within(to_send, self.max_message_size);
         if batches.is_empty() {
             return SendResult::FilteredDlq;
@@ -1888,7 +1891,7 @@ mod tests {
     #[tokio::test]
     async fn send_batch_leaves_out_a_record_over_the_limit_on_its_own() {
         // The same bytes are refused on every retry, so the record is left
-        // out before any connection, as `send` refuses it; no server needed.
+        // out before any connection, as `send` refuses it, so no server runs.
         let config = GrpcConfig::client("http://127.0.0.1:1").with_max_message_size(64);
         let transport = GrpcTransport::new(&config).await.unwrap();
         let rec = Record {
@@ -2413,7 +2416,7 @@ mod tests {
     }
 
     /// A record whose payload fits but whose framing does not is left out
-    /// before the RPC; compressed, the receiver would answer ResourceExhausted.
+    /// before the RPC. Compressed, the receiver would answer ResourceExhausted.
     #[tokio::test]
     async fn a_record_over_the_limit_by_its_framing_alone_is_left_out() {
         let (server, endpoint) = receiver(

@@ -42,7 +42,7 @@ const MIN_MARGIN: Duration = Duration::from_secs(1);
 /// How a held request ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// Every record was released; the worst status among them.
+    /// Every record was released, with the worst status among them.
     Released(DeliveryStatus),
     /// The hold budget ran out before every record was released.
     Expired,
@@ -301,7 +301,7 @@ impl PendingRegistry {
     }
 
     /// Take the responder of the request at `base` so its handler answers it
-    /// as expired; false when release answered it first.
+    /// as expired, or false when release answered it first.
     fn expire(&self, base: u64) -> bool {
         let admitted = {
             let mut entries = self.entries.lock();
@@ -537,8 +537,8 @@ impl Held {
         self.progress += 1;
     }
 
-    /// Records from `index` on never reached the queue; the caller answers the
-    /// request itself.
+    /// Records from `index` on never reached the queue, and the caller answers
+    /// the request itself.
     pub(crate) fn refuse_from(&mut self, index: u64) {
         self.registry.refuse_from(self.base, index);
         self.queued = true;
