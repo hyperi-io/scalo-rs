@@ -49,6 +49,7 @@
 //! }
 //! ```
 
+mod acks;
 mod admin;
 mod classify;
 mod config;
@@ -78,7 +79,11 @@ pub use providers::{
 pub use token::KafkaToken;
 pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
 
+use super::ack::{
+    AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
+};
 use super::error::{TransportError, TransportResult};
+use super::finalizer::DeliveryStatus;
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::{Record, WorkBatch};
@@ -122,6 +127,13 @@ const QUEUE_FULL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pause between re-offers while the producer queue is full.
 const QUEUE_FULL_RETRY: Duration = Duration::from_millis(100);
+
+/// librdkafka's `message.max.bytes` when the producer config leaves it unset.
+const LIBRDKAFKA_MESSAGE_MAX_BYTES: usize = 1_000_000;
+
+/// Room librdkafka adds to a record's payload when it checks
+/// `message.max.bytes`: the record's framing plus a trace header.
+const RECORD_WIRE_OVERHEAD: usize = 128;
 
 /// How long `commit` keeps retrying a transient failure. One synchronous commit
 /// can itself block for about `session.timeout.ms` during an outage, so this
@@ -261,6 +273,10 @@ pub struct KafkaTransport {
     /// directions.
     #[cfg(all(feature = "governor", feature = "health"))]
     partition_limited_flag: Arc<AtomicBool>,
+    /// Source acknowledgement config, arming and held offsets.
+    acks: acks::KafkaAcks,
+    /// The producer's `message.max.bytes`, for screening records before a send.
+    message_max_bytes: usize,
 }
 
 /// Role naming a producer-only transport's idle consumer in its derived group id.
@@ -729,6 +745,10 @@ impl KafkaTransport {
         if producer_config.get("statistics.interval.ms").is_none() {
             producer_config.set("statistics.interval.ms", "5000");
         }
+        let message_max_bytes = producer_config
+            .get("message.max.bytes")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(LIBRDKAFKA_MESSAGE_MAX_BYTES);
 
         // Create producer with StatsContext for metrics collection.
         let producer: FutureProducer<StatsContext> = producer_config
@@ -796,7 +816,20 @@ impl KafkaTransport {
             partition_limited_warn: PartitionLimitedDiagnostic::default(),
             #[cfg(all(feature = "governor", feature = "health"))]
             partition_limited_flag,
+            acks: acks::KafkaAcks::default(),
+            message_max_bytes,
         })
+    }
+
+    /// Set the `acknowledgements` config (default: enabled).
+    ///
+    /// A transport built from an explicit [`KafkaConfig`] takes its
+    /// `acknowledgements` section here; `AnyReceiver::from_config` reads it
+    /// from `<key>.kafka.acknowledgements`.
+    #[must_use]
+    pub fn with_acknowledgements(mut self, config: AcknowledgementsConfig) -> Self {
+        self.acks.set_config(config);
+        self
     }
 
     /// Attach an [`InboundGate`](crate::governor::InboundGate) to this
@@ -865,6 +898,14 @@ impl KafkaTransport {
     #[must_use]
     pub fn stats(&self) -> KafkaMetrics {
         self.consumer.context().get_metrics()
+    }
+
+    /// Records past this consumer's read position, summed over its partitions:
+    /// unread backlog, which a commit held for delivery does not inflate. See
+    /// [`StatsContext::total_position_lag`].
+    #[must_use]
+    pub fn total_position_lag(&self) -> i64 {
+        self.consumer.context().total_position_lag()
     }
 
     /// Run the `kafka_partition_limited` DIAGNOSTIC against the live group
@@ -1290,6 +1331,33 @@ impl TransportSender for KafkaTransport {
         }
         block_result(results)
     }
+
+    /// The broker acknowledged the record under the producer's `acks`.
+    fn confirms_delivery(&self) -> SinkConfirmation {
+        SinkConfirmation::Remote
+    }
+
+    /// A record over `message.max.bytes`, less the framing librdkafka adds,
+    /// or one an outbound `dlq` filter matches.
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        let limit = self.message_max_bytes.saturating_sub(RECORD_WIRE_OVERHEAD);
+        if record.payload.len() > limit {
+            return Some(DeadLetterReason::TooLarge {
+                bytes: record.payload.len(),
+                limit,
+            });
+        }
+        match self.outbound_disposition(&record.payload) {
+            Some(SendResult::FilteredDlq) => Some(DeadLetterReason::OutboundFilter),
+            _ => None,
+        }
+    }
+}
+
+impl AcknowledgingReceiver for KafkaTransport {
+    fn acknowledgements(&self) -> AcknowledgementsConfig {
+        self.acks.config()
+    }
 }
 
 impl TransportReceiver for KafkaTransport {
@@ -1359,12 +1427,78 @@ impl TransportReceiver for KafkaTransport {
     /// returned at once. The `BatchEngine` driver logs a failed commit and
     /// carries on: the block was already delivered, and the next commit is
     /// cumulative, so a failed commit costs duplicates on restart, never data.
+    ///
+    /// ## Once armed
+    ///
+    /// After [`AckControl::arm`], a commit is a release of `tokens` as
+    /// delivered: each partition commits only up to its lowest offset handed
+    /// out and not yet released, whatever order releases arrive in.
     async fn commit(&self, tokens: &[Self::Token]) -> TransportResult<()> {
         if tokens.is_empty() {
             return Ok(());
         }
+        if self.acks.is_armed() {
+            return self
+                .release_delivered(tokens, DeliveryStatus::Delivered)
+                .await;
+        }
+        self.commit_tpl(build_commit_tpl(tokens)?).await
+    }
 
-        let mut tpl = build_commit_tpl(tokens)?;
+    fn ack_control(&self) -> Option<&dyn AckControl> {
+        Some(&self.acks)
+    }
+
+    /// Commit per partition up to the lowest offset not yet released, once
+    /// armed; unarmed, the default: commit when the outcome allows it.
+    ///
+    /// An `Errored` release commits nothing, and once armed keeps its offsets
+    /// held, so no later release commits past them.
+    async fn release(
+        &self,
+        tokens: &[Self::Token],
+        outcome: DeliveryStatus,
+    ) -> TransportResult<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if !outcome.should_commit() {
+            self.acks.withhold(tokens);
+            return Ok(());
+        }
+        if self.acks.is_armed() {
+            return self.release_delivered(tokens, outcome).await;
+        }
+        self.commit_tpl(build_commit_tpl(tokens)?).await
+    }
+}
+
+impl KafkaTransport {
+    /// Release `tokens` through the held-offset record and commit what that
+    /// allows.
+    async fn release_delivered(
+        &self,
+        tokens: &[KafkaToken],
+        outcome: DeliveryStatus,
+    ) -> TransportResult<()> {
+        let _serial = self.acks.serialise_commit().await;
+        let targets = self.acks.release(tokens, outcome);
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut tpl = TopicPartitionList::new();
+        for ((topic, partition), next) in &targets {
+            tpl.add_partition_offset(topic.as_ref(), *partition, Offset::Offset(*next))
+                .map_err(|e| TransportError::Commit(format!("Failed to build TPL: {e}")))?;
+        }
+        self.commit_tpl(tpl).await?;
+        self.acks.committed(&targets);
+        Ok(())
+    }
+
+    /// Commit `tpl` synchronously, retrying a transient failure; see
+    /// [`commit`](TransportReceiver::commit).
+    async fn commit_tpl(&self, mut tpl: TopicPartitionList) -> TransportResult<()> {
         let started = std::time::Instant::now();
         let mut failures = 0_u32;
         loop {
@@ -1396,9 +1530,7 @@ impl TransportReceiver for KafkaTransport {
             }
         }
     }
-}
 
-impl KafkaTransport {
     /// Shared poll + recv-arena body for [`recv`](TransportReceiver::recv) and
     /// [`recv_limited`](TransportReceiver::recv_limited).
     ///
@@ -1535,6 +1667,17 @@ impl KafkaTransport {
                 .increment(bytes as u64);
             ::metrics::counter!("transport_received_events_total", "transport" => "kafka")
                 .increment(messages.len() as u64);
+        }
+
+        // Once armed every offset handed out is held until released, so a
+        // release out of order never commits past one still in flight.
+        if self.acks.is_armed() {
+            self.acks.register(
+                messages
+                    .iter()
+                    .map(|m| (&m.token, m.payload.len() as u64))
+                    .chain(filtered_tokens.iter().map(|t| (t, 0))),
+            );
         }
 
         Ok(RecvBatch {

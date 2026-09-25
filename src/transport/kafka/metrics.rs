@@ -37,7 +37,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::statistics::Statistics;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 /// Kafka metrics snapshot. Mirrors the Python `KafkaMetrics` dataclass.
 #[derive(Debug, Clone, Default)]
@@ -117,6 +117,8 @@ pub struct StatsContext {
     /// Set once statistics report a broker `UP`, which librdkafka reaches only
     /// after the TLS and SASL handshakes succeed.
     connected: AtomicBool,
+    /// Records past this consumer's read position, summed over its partitions.
+    position_lag: AtomicI64,
 }
 
 impl Default for StatsContext {
@@ -134,7 +136,21 @@ impl StatsContext {
             latest_metrics: RwLock::new(KafkaMetrics::default()),
             delivery: super::classify::DeliveryState::default(),
             connected: AtomicBool::new(false),
+            position_lag: AtomicI64::new(0),
         }
+    }
+
+    /// Records past this consumer's read position, summed over its partitions,
+    /// as of the last statistics callback.
+    ///
+    /// [`total_consumer_lag`] counts from the COMMITTED offset, so a commit held
+    /// until delivery reads as backlog there. This counts from where the
+    /// consumer has read to: unread backlog, whatever the commit policy. A
+    /// scaling signal that should not grow while acknowledgements are held
+    /// reads this one.
+    #[must_use]
+    pub fn total_position_lag(&self) -> i64 {
+        self.position_lag.load(Ordering::Relaxed)
     }
 
     /// Whether any broker has ever reached `UP`, meaning this client's
@@ -251,6 +267,8 @@ impl ClientContext for StatsContext {
             self.connected.store(true, Ordering::Relaxed);
         }
         let metrics = Self::convert_stats(&statistics);
+        self.position_lag
+            .store(position_lag(&statistics), Ordering::Relaxed);
 
         if let Ok(mut lock) = self.latest_metrics.write() {
             *lock = metrics;
@@ -398,10 +416,47 @@ impl rdkafka::producer::ProducerContext for StatsContext {
 
 /// Calculate total consumer lag across all partitions.
 ///
-/// Helper function to sum lag from a `KafkaMetrics` snapshot.
+/// Helper function to sum lag from a `KafkaMetrics` snapshot. This is lag
+/// behind the COMMITTED offset; see [`StatsContext::total_position_lag`] for
+/// lag behind the read position.
 #[must_use]
 pub fn total_consumer_lag(metrics: &KafkaMetrics) -> i64 {
     metrics.partition_lag.values().sum()
+}
+
+/// One partition's records past the consumer's read position, or `None` for a
+/// partition this consumer is not reading.
+///
+/// librdkafka measures `consumer_lag` from the committed offset to the end the
+/// consumer may read to (the last stable offset under `read_committed`, the
+/// high watermark otherwise), so that end is `consumer_lag + committed_offset`.
+fn partition_position_lag(p: &rdkafka::statistics::Partition) -> Option<i64> {
+    let position = if p.app_offset >= 0 {
+        p.app_offset
+    } else if p.committed_offset >= 0 {
+        p.committed_offset
+    } else {
+        return None;
+    };
+    let end = if p.consumer_lag >= 0 && p.committed_offset >= 0 {
+        p.consumer_lag + p.committed_offset
+    } else if p.hi_offset >= 0 {
+        p.hi_offset
+    } else {
+        return None;
+    };
+    Some((end - position).max(0))
+}
+
+/// Records past the read position, summed over every partition being read.
+fn position_lag(stats: &Statistics) -> i64 {
+    stats
+        .topics
+        .values()
+        .flat_map(|topic| topic.partitions.iter())
+        .filter(|(id, _)| **id >= 0)
+        .filter_map(|(_, p)| partition_position_lag(p))
+        .sum()
 }
 
 /// Get brokers in "UP" state.
