@@ -128,14 +128,14 @@ impl ServiceMetrics {
         );
 
         // Push transport descriptors into manifest registry. Labels are every
-        // key an emitter sets: `path` on gRPC RouteBatch sends, `route` on
-        // routed sends, `reason` on pressure sheds.
+        // key an emitter sets: `path` on gRPC RouteBatch sends, `reason` on
+        // pressure sheds.
         for (name, desc, mt, labels) in [
             (
                 "transport_sent_total",
                 "Messages successfully sent to transport",
                 MetricType::Counter,
-                &["transport", "path", "route"][..],
+                &["transport", "path"][..],
             ),
             (
                 "transport_send_errors_total",
@@ -226,7 +226,7 @@ impl ServiceMetrics {
                 "transport_sent_bytes_total",
                 "Raw bytes written to transport (egress)",
                 "bytes",
-                &["transport", "route"][..],
+                &["transport"][..],
             ),
             (
                 "transport_received_bytes_total",
@@ -681,16 +681,10 @@ mod tests {
             .unwrap();
         assert_eq!(auth.labels, vec!["reason"]);
         // Each series lists every label key its emitters set: `path` on gRPC
-        // RouteBatch sends, `route` on routed sends, `reason` on pressure sheds.
+        // RouteBatch sends, `reason` on pressure sheds.
         for (name, labels) in [
-            (
-                "test_app_transport_sent_total",
-                vec!["transport", "path", "route"],
-            ),
-            (
-                "test_app_transport_sent_bytes_total",
-                vec!["transport", "route"],
-            ),
+            ("test_app_transport_sent_total", vec!["transport", "path"]),
+            ("test_app_transport_sent_bytes_total", vec!["transport"]),
             (
                 "test_app_transport_backpressured_total",
                 vec!["transport", "reason"],

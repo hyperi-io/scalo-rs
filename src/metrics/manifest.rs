@@ -94,6 +94,8 @@ struct MetricRegistryInner {
     app: String,
     version: String,
     commit: String,
+    /// Whether an app metric set has recorded the build info.
+    build_info_claimed: bool,
     registered_at: String,
 }
 
@@ -117,6 +119,7 @@ impl MetricRegistry {
                 app: namespace.to_string(),
                 version: String::new(),
                 commit: String::new(),
+                build_info_claimed: false,
                 registered_at: now_rfc3339(),
             })),
         }
@@ -186,6 +189,22 @@ impl MetricRegistry {
             inner.version = version.to_string();
             inner.commit = commit.to_string();
         }
+    }
+
+    /// Record the build info for the first app metric set built on this
+    /// registry. Returns whether this call did, so that set alone emits it.
+    #[cfg(feature = "service-metrics")]
+    pub(crate) fn claim_build_info(&self, version: &str, commit: &str) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        if inner.build_info_claimed {
+            return false;
+        }
+        inner.build_info_claimed = true;
+        inner.version = version.to_string();
+        inner.commit = commit.to_string();
+        true
     }
 
     /// Set use cases for a metric by BARE name. No-op if not found.

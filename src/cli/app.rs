@@ -39,12 +39,16 @@ use super::error::CliError;
 use super::version::VersionInfo;
 use super::{CommonArgs, StandardCommand, output};
 
-/// The commit the service reports in its app info and manifest, from the
-/// build's `GIT_COMMIT`.
+/// The build's `GIT_COMMIT`, for a service whose `VersionInfo` names none.
 const BUILD_COMMIT: &str = match option_env!("GIT_COMMIT") {
     Some(commit) => commit,
     None => "unknown",
 };
+
+/// The commit the service reports in its app info and manifest.
+fn build_commit(version_info: &VersionInfo) -> &str {
+    version_info.commit.as_deref().unwrap_or(BUILD_COMMIT)
+}
 
 /// Trait for data-plane service applications.
 ///
@@ -292,7 +296,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
                 app.env_prefix(),
                 &args.effective_metrics_addr(),
                 &version_info.version,
-                BUILD_COMMIT,
+                build_commit(&version_info),
                 #[cfg(feature = "scaling")]
                 app.scaling_components(&config),
                 #[cfg(feature = "version-check")]
@@ -451,8 +455,12 @@ fn build_metrics_manifest<A: ServiceApp>(
 ) -> crate::metrics::ManifestResponse {
     let registry = mgr.registry();
     registry.set_app_name(app.name());
-    let _service =
-        super::runtime::register_runtime_metrics(mgr, &app.version_info().version, BUILD_COMMIT);
+    let version_info = app.version_info();
+    let _service = super::runtime::register_runtime_metrics(
+        mgr,
+        &version_info.version,
+        build_commit(&version_info),
+    );
     let scalo_owned = registry.manifest().metrics.len();
 
     app.register_metrics(mgr);
@@ -762,6 +770,47 @@ mod tests {
             let _ = manager.counter("extra_widgets_total", "Widgets the app made");
             let _ = ServiceMetrics::register(manager);
         }
+    }
+
+    /// A service that names the commit it was built from.
+    struct CommittedApp {
+        common: CommonArgs,
+    }
+
+    impl ServiceApp for CommittedApp {
+        type Config = ();
+
+        fn name(&self) -> &'static str {
+            "committed-app"
+        }
+        fn env_prefix(&self) -> &'static str {
+            "COMMITTED_APP"
+        }
+        fn version_info(&self) -> VersionInfo {
+            VersionInfo::new("committed-app", "1.2.3").with_commit("abc1234")
+        }
+        fn common_args(&self) -> &CommonArgs {
+            &self.common
+        }
+        fn load_config(&self, _path: Option<&str>) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn run_service(
+            &self,
+            _config: (),
+            _runtime: ServiceRuntime,
+        ) -> impl std::future::Future<Output = Result<(), CliError>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// The app info the runtime publishes carries the commit the app names.
+    #[cfg(feature = "service-metrics")]
+    #[test]
+    fn the_manifest_carries_the_commit_the_app_names() {
+        let mgr = MetricsManager::new_for_test("");
+        let manifest = build_metrics_manifest(&CommittedApp { common: common() }, &mgr);
+        assert_eq!(manifest.commit, "abc1234");
     }
 
     fn names(manifest: &ManifestResponse) -> Vec<&str> {

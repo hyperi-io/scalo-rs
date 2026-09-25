@@ -43,20 +43,22 @@ pub struct AppMetrics {
 impl AppMetrics {
     /// Create and register app metrics.
     ///
-    /// `version` and `commit` are emitted as labels on the `info` gauge.
+    /// `version` and `commit` are emitted as labels on the `info` gauge by the
+    /// first set built on `manager`, which in a service is the runtime's; a
+    /// later set leaves `info` and the manifest's build info as they are.
     #[must_use]
     pub fn new(manager: &MetricsManager, version: &str, commit: &str) -> Self {
-        manager.set_build_info(version, commit);
-
         // Info metric for service discovery. Names are BARE -- the prefix layer
         // on the global recorder and the registry apply the namespace.
         metrics::describe_gauge!("info", "Application info for service discovery");
-        metrics::gauge!(
-            "info",
-            "version" => version.to_string(),
-            "commit" => commit.to_string()
-        )
-        .set(1.0);
+        if manager.registry().claim_build_info(version, commit) {
+            metrics::gauge!(
+                "info",
+                "version" => version.to_string(),
+                "commit" => commit.to_string()
+            )
+            .set(1.0);
+        }
         manager.registry().push(MetricDescriptor {
             name: "info".into(),
             metric_type: MetricType::Gauge,
@@ -307,5 +309,27 @@ mod tests {
             85,
             "absolute keeps the running maximum"
         );
+    }
+
+    /// The runtime builds the app set first; an app building it again adds no
+    /// second `info` series and leaves the build info the runtime set.
+    #[test]
+    fn a_second_app_set_emits_no_second_info_series() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let manager = MetricsManager::new_for_test("");
+
+        let _runtime = AppMetrics::new(&manager, "1.2.3", "abc1234");
+        let _app = AppMetrics::new(&manager, "1.2.3", "dev");
+
+        let rendered = handle.render();
+        let info: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("info{"))
+            .collect();
+        assert_eq!(info.len(), 1, "one info series:\n{rendered}");
+        assert!(info[0].contains("commit=\"abc1234\""), "{}", info[0]);
+        assert_eq!(manager.registry().manifest().commit, "abc1234");
     }
 }

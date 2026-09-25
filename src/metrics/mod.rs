@@ -1133,8 +1133,9 @@ impl MetricsManager {
     /// Set application version and git commit for the manifest.
     ///
     /// Uses interior mutability (writes through the registry's `Arc<RwLock>`),
-    /// so only `&self` is needed. Called automatically by
-    /// [`groups::AppMetrics::new()`] if the `service-metrics` feature is enabled.
+    /// so only `&self` is needed. The first `groups::AppMetrics::new()` on this
+    /// manager records it too (`service-metrics` feature); this call overrides
+    /// the manifest's copy only, not the `info` gauge.
     pub fn set_build_info(&self, version: &str, commit: &str) {
         self.registry.set_build_info(version, commit);
     }

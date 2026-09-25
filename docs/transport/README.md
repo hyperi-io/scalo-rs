@@ -109,11 +109,7 @@ sequence numbers. The `Display` impl prints a human-readable form
 (e.g. `kafka:events.land:0:12345`, `file:8192`) for logs and DLQ
 provenance.
 
-**Commit semantics**: the caller drives commit. Receive a batch,
-process it, then call `commit(&tokens)` with the tokens from the
-acknowledged subset. Token routing back through the same transport is
-the contract — commits don't cross transports. Each backend's
-commit does what's needed:
+**Commit semantics**: the caller drives commit. Receive a batch, process it, and once every record in it has been delivered or dead-lettered, call `commit(&tokens)` with all of the batch's tokens. Commit no subset while any record of the batch is still undelivered: Kafka commits the highest offset each partition's tokens carry, so a subset commits past an earlier record of that partition the sink has not taken. Token routing back through the same transport is the contract — commits don't cross transports. Each backend's commit does what's needed:
 
 | Backend | `commit()` effect |
 |---------|-------------------|

@@ -82,7 +82,7 @@ spec, use cases, dashboard hint, app version, git commit, registration timestamp
       "name": "transport_sent_total",
       "type": "counter",
       "description": "Messages successfully sent to transport",
-      "labels": ["transport", "path", "route"],
+      "labels": ["transport", "path"],
       "group": "platform"
     }
   ]
@@ -140,6 +140,8 @@ for one event double the count:
 | `records_received_total` | `ServiceMetrics::records_received`, once per record | `AppMetrics::record_received`, or an `increment` on `AppMetrics::records_received`. That field is the same series, for an app that sets the total with `absolute` |
 | `transport_*` for a scalo transport | the transport itself, under its own `transport` label | the matching `ServiceMetrics::transport_*` method |
 | `transport_*` for a sink or source scalo does not provide | the `ServiceMetrics::transport_*` methods | -- |
+| `transport_sent_*` for a record a `RoutedSender` sends | the transport it routes to, once the record has landed | the `RoutedSender`, which adds no series |
+| `info` | the first `AppMetrics::new` on a `MetricsManager`, which in a service is the runtime's | a later `AppMetrics::new`, which leaves it alone |
 
 A counter emitted both with and without labels is two series under one name, and a
 `sum()` across labels adds them. Emit it one way.
@@ -148,11 +150,7 @@ A counter emitted both with and without labels is two series under one name, and
 
 ## Transport throughput
 
-The transport layer counts both events AND bytes, in both directions.
-All carry the `transport` label (backend kind:
-`kafka` / `grpc` / `http` / `file` / `pipe`, plus `routed` for the
-aggregate routed view). Bytes are RAW wire bytes (summed `payload.len()` per
-`WorkBatch`), incremented once per batch send/recv -- not per event.
+The transport layer counts both events AND bytes, in both directions. All carry the `transport` label (backend kind: `kafka` / `grpc` / `http` / `file` / `pipe`). A record sent through a `RoutedSender` counts once, under the transport that sent it, and only once it has landed. Bytes are RAW wire bytes (summed `payload.len()` per `WorkBatch`), incremented once per batch send/recv -- not per event.
 
 | Metric | Direction | Meaning |
 |---|---|---|
