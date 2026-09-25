@@ -71,7 +71,9 @@ pub mod token;
 pub use config::GrpcConfig;
 pub use token::GrpcToken;
 
-use super::ack::{AckControl, AcknowledgementsConfig, AcknowledgingReceiver, SinkConfirmation};
+use super::ack::{
+    AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
+};
 use super::error::{TransportError, TransportResult};
 use super::finalizer::DeliveryStatus;
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
@@ -1173,14 +1175,15 @@ impl TransportSender for GrpcTransport {
 
     /// A record over `max_message_size` on its own, as a field of a
     /// `RouteBatch`, or one an outbound `dlq` filter matches.
-    fn dead_letter_reason(&self, record: &Record) -> Option<String> {
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        // Measured as `send_batch` measures it: encoded, as a field of a batch.
         let framed =
             prost::encoding::message::encoded_len(1, &batch::record_to_proto(record.clone()));
         if framed > self.max_message_size {
-            return Some(format!(
-                "record of {framed} encoded bytes is over the gRPC max_message_size ({})",
-                self.max_message_size
-            ));
+            return Some(DeadLetterReason::TooLarge {
+                bytes: framed,
+                limit: self.max_message_size,
+            });
         }
         if self.filter_engine.has_outbound_filters()
             && matches!(
@@ -1188,7 +1191,7 @@ impl TransportSender for GrpcTransport {
                 super::filter::FilterDisposition::Dlq
             )
         {
-            return Some("outbound filter routed it to the DLQ".into());
+            return Some(DeadLetterReason::OutboundFilter);
         }
         None
     }
