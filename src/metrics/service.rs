@@ -322,15 +322,16 @@ impl ServiceMetrics {
         for (name, desc, mt, unit, labels) in [
             (
                 "pipeline_delivery_guarantee",
-                "Delivery guarantee the pipeline gives (1 = active), with the reason",
+                "Delivery guarantee the pipeline gives (1 = active), with the reason, and \
+                 the listener when the app names one",
                 MetricType::Gauge,
                 "",
-                &["guarantee", "reason"][..],
+                &["guarantee", "reason", "listener"][..],
             ),
             (
                 "pipeline_dead_letters_dropped_total",
-                "Dead letters dropped with nowhere to go: no DLQ, a disabled DLQ, or a record \
-                 a gRPC send_batch left out of a block it sent",
+                "Dead letters dropped with nowhere to go: no DLQ, a disabled DLQ, a record \
+                 a gRPC send_batch left out of a block, or one a downstream peer refused for good",
                 MetricType::Counter,
                 "",
                 &["reason"],
@@ -347,6 +348,14 @@ impl ServiceMetrics {
                 "Payload bytes whose source acknowledgement is held until delivery",
                 MetricType::Gauge,
                 "bytes",
+                &["transport"],
+            ),
+            (
+                "transport_ack_withheld",
+                "Kafka offsets released Errored and still held: each pins its partition's \
+                 commit until a restart or a revoke",
+                MetricType::Gauge,
+                "",
                 &["transport"],
             ),
             (
@@ -781,7 +790,7 @@ mod tests {
             ("test_app_pipeline_retries_total", vec!["stage"]),
             (
                 "test_app_pipeline_delivery_guarantee",
-                vec!["guarantee", "reason"],
+                vec!["guarantee", "reason", "listener"],
             ),
             (
                 "test_app_pipeline_dead_letters_dropped_total",
@@ -789,6 +798,7 @@ mod tests {
             ),
             ("test_app_transport_ack_held", vec!["transport"]),
             ("test_app_transport_ack_held_bytes", vec!["transport"]),
+            ("test_app_transport_ack_withheld", vec!["transport"]),
             (
                 "test_app_transport_ack_released_total",
                 vec!["transport", "outcome"],

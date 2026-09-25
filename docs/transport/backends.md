@@ -167,7 +167,7 @@ Armed, a `PushEvents` is held like a native push, over the same registry, ceilin
 | `DeadlineExceeded`, `Cancelled` | no | the send ran out of time, and the source may still take it |
 | any other, `Unimplemented`, `PermissionDenied`, `Unauthenticated` included | no | a configuration fault, not these events: dropping them would lose them |
 
-A status carrying a source error is the client's own connection failing, and is never permanent. A caller holding its source releases a permanent refusal `Rejected` (dead-lettered) or `Dropped`, and holds and resends everything else.
+A status carrying a source error is the client's own connection failing, and is never permanent. A caller holding its source releases a permanent refusal `Rejected` (dead-lettered) or `Dropped`, and holds and resends everything else. One it drops counts in `pipeline_dead_letters_dropped_total{reason="rejected"}`, the `transport::DEAD_LETTER_REJECTED` label.
 
 Source: [../../src/transport/vector_compat/](../../src/transport/vector_compat/).
 

@@ -219,6 +219,13 @@ pub enum DeadLetterReason {
 /// The `reason` label of a record over a sender's size ceiling.
 pub(crate) const TOO_LARGE: &str = "too_large";
 
+/// The `reason` label of `pipeline_dead_letters_dropped_total` for a record a
+/// downstream peer refused for good, such as a Vector-compat source answering
+/// `DataLoss`, `InvalidArgument` or `OutOfRange`
+/// (`VectorCompatClient::is_permanent_rejection`). An app that drops such a
+/// record counts it under this reason.
+pub const DEAD_LETTER_REJECTED: &str = "rejected";
+
 impl DeadLetterReason {
     /// The `reason` label value.
     #[must_use]
@@ -893,6 +900,17 @@ mod tests {
         assert!(!off.enabled);
         let empty: AcknowledgementsConfig = serde_json::from_str("{}").expect("parses");
         assert!(empty.enabled, "an empty section keeps the default");
+    }
+
+    /// The documented label values of `pipeline_dead_letters_dropped_total`.
+    #[test]
+    fn dropped_dead_letter_reasons_are_the_documented_labels() {
+        assert_eq!(DEAD_LETTER_REJECTED, "rejected");
+        assert_eq!(
+            DeadLetterReason::TooLarge { bytes: 2, limit: 1 }.as_str(),
+            "too_large"
+        );
+        assert_eq!(DeadLetterReason::OutboundFilter.as_str(), "outbound_filter");
     }
 
     struct Control {
