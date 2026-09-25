@@ -59,43 +59,28 @@ pub struct TieredSink<S: TransportSender> {
 impl<S: TransportSender + 'static> TieredSink<S> {
     /// Create a new TieredSink wrapping the given sender.
     ///
+    /// Lock files left by a process that was killed are cleared on open, so a
+    /// restart after a hard kill replays the spill cache. A spill cache another
+    /// live sink holds is refused: give each sink its own `spool_path`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the spool file cannot be opened.
+    /// Returns [`TieredSinkError::SpoolOpen`] if the spill cache is locked by a
+    /// live owner, or cannot be opened and was not quarantined (see
+    /// `TieredSinkConfig::on_corruption`).
     pub async fn new(sink: S, config: TieredSinkConfig) -> Result<Self> {
-        let (sender, receiver) = match yaque::channel(&config.spool_path) {
-            Ok(channel) => channel,
-            // The spill cache won't open (corrupt segments / metadata). Under the
-            // default Quarantine policy, move it aside (forensics preserved) and
-            // start fresh so a poisoned cache can never wedge startup.
-            Err(e) if config.on_corruption == crate::spool_codec::CorruptionPolicy::Quarantine => {
-                let moved =
-                    crate::spool_codec::quarantine_dir(&config.spool_path).map_err(|qe| {
-                        TieredSinkError::SpoolOpen {
-                            path: config.spool_path.display().to_string(),
-                            message: format!("quarantine failed: {qe}"),
-                        }
-                    })?;
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    path = %config.spool_path.display(),
-                    quarantined = ?moved,
-                    error = %e,
-                    "spill cache could not be opened; quarantined and starting fresh"
-                );
-                let _ = moved;
-                yaque::channel(&config.spool_path).map_err(|e2| TieredSinkError::SpoolOpen {
-                    path: config.spool_path.display().to_string(),
-                    message: e2.to_string(),
-                })?
-            }
-            Err(e) => {
-                return Err(TieredSinkError::SpoolOpen {
-                    path: config.spool_path.display().to_string(),
-                    message: e.to_string(),
-                });
-            }
+        // Reads the process table and may wait out a lock mid-write, so it runs off the runtime.
+        let open_path = config.spool_path.clone();
+        let policy = config.on_corruption;
+        let spool_open_err = |message: String| TieredSinkError::SpoolOpen {
+            path: config.spool_path.display().to_string(),
+            message,
         };
+        let (sender, receiver) =
+            tokio::task::spawn_blocking(move || crate::spool_codec::open_queue(&open_path, policy))
+                .await
+                .map_err(|e| spool_open_err(format!("spool open task failed: {e}")))?
+                .map_err(|e| spool_open_err(e.to_string()))?;
 
         let sink = Arc::new(sink);
         let spool_sender = Arc::new(Mutex::new(sender));
@@ -1340,6 +1325,384 @@ mod tests {
         let tiered = Arc::try_unwrap(tiered)
             .map_err(|_| "outstanding Arc refs")
             .unwrap();
+        tiered.shutdown().await;
+    }
+
+    /// The yaque lock files a spool directory can hold.
+    const LOCKS: [&str; 2] = ["send.lock", "recv.lock"];
+
+    /// Config that spills every record: the sink is down and one failure opens the circuit.
+    fn spilling_config(path: &std::path::Path) -> TieredSinkConfig {
+        let mut config = TieredSinkConfig::new(path);
+        config.circuit_failure_threshold = 1;
+        config.circuit_reset_timeout_ms = 50;
+        config.drain_interval_ms = 5;
+        config
+    }
+
+    /// Spill `payloads` into a spool at `path`, then close it cleanly.
+    async fn spill(path: &std::path::Path, payloads: &[Vec<u8>]) {
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let tiered = TieredSink::new(sink, spilling_config(path)).await.unwrap();
+        for p in payloads {
+            tiered.send(&rec(p)).await.unwrap();
+        }
+        assert_eq!(tiered.spool_len().await, payloads.len());
+        tiered.shutdown().await;
+    }
+
+    /// Reopen the spool at `path` against a healthy sink and wait for the drain.
+    async fn reopen_and_drain(path: &std::path::Path, expect: usize) -> Vec<Vec<u8>> {
+        let tiered = TieredSink::new(TestSink::new(), spilling_config(path))
+            .await
+            .unwrap();
+        assert_eq!(
+            tiered.spool_len().await,
+            expect,
+            "spooled records recovered"
+        );
+        for _ in 0..200 {
+            if tiered.spool_is_empty().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = tiered.inner().received_payloads().await;
+        tiered.shutdown().await;
+        got
+    }
+
+    fn payloads(n: usize) -> Vec<Vec<u8>> {
+        (0..n).map(|i| format!("rec-{i:02}").into_bytes()).collect()
+    }
+
+    /// Entries of `dir` whose name starts with `prefix`.
+    fn entries_with_prefix(dir: &std::path::Path, prefix: &str) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path())
+            .collect()
+    }
+
+    /// The pid of a process that has exited and been reaped.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Backdate a lock file past the window in which its owner could still be writing it.
+    fn backdate(lock: &std::path::Path) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// Kills the child process on drop so a failing assert never leaks it.
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Env var that turns the dead-owner test into the child that gets SIGKILLed.
+    const KILL_CHILD_DIR: &str = "SCALO_TEST_SPOOL_KILL_CHILD_DIR";
+
+    #[tokio::test]
+    async fn a_lock_left_by_a_dead_pid_does_not_block_reopen() {
+        // Child half: spill, signal the parent, then wait to be killed with the spool open.
+        if let Ok(dir) = std::env::var(KILL_CHILD_DIR) {
+            let dir = std::path::PathBuf::from(dir);
+            let sink = TestSink::new();
+            sink.set_available(false);
+            let tiered = TieredSink::new(sink, spilling_config(&dir.join("spool")))
+                .await
+                .unwrap();
+            for p in payloads(5) {
+                tiered.send(&rec(&p)).await.unwrap();
+            }
+            std::fs::write(dir.join("ready"), b"1").unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            drop(tiered);
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        let test_name = format!(
+            "{}::a_lock_left_by_a_dead_pid_does_not_block_reopen",
+            module_path!().split_once("::").unwrap().1
+        );
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test_name.as_str(), "--exact", "--nocapture"])
+            .env(KILL_CHILD_DIR, dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = KillOnDrop(child);
+        let child_pid = child.0.id();
+        for _ in 0..3000 {
+            if dir.path().join("ready").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(dir.path().join("ready").exists(), "child never spilled");
+
+        // SIGKILL: no destructor runs, so both lock files stay behind.
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        for lock in LOCKS {
+            let contents = std::fs::read_to_string(spool.join(lock)).unwrap();
+            assert!(
+                contents.starts_with(&format!("pid={child_pid}\n")),
+                "{lock} left by the killed child: {contents:?}"
+            );
+        }
+
+        assert_eq!(
+            reopen_and_drain(&spool, 5).await,
+            payloads(5),
+            "every record spilled before the kill is replayed after the restart"
+        );
+        assert!(
+            entries_with_prefix(&spool, "corrupt-").is_empty(),
+            "nothing quarantined"
+        );
+        assert!(
+            entries_with_prefix(dir.path(), "spool.corrupt-").is_empty(),
+            "nothing quarantined"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_lock_file_is_treated_as_stale() {
+        // A kill between the lock's create and its write leaves an empty file.
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        spill(&spool, &payloads(3)).await;
+        for lock in LOCKS {
+            std::fs::write(spool.join(lock), b"").unwrap();
+            backdate(&spool.join(lock));
+        }
+        assert_eq!(reopen_and_drain(&spool, 3).await, payloads(3));
+
+        // A lock with no parseable owner is stale too.
+        spill(&spool, &payloads(2)).await;
+        std::fs::write(spool.join("send.lock"), b"pid=\ntoken=x").unwrap();
+        backdate(&spool.join("send.lock"));
+        assert_eq!(reopen_and_drain(&spool, 2).await, payloads(2));
+        assert!(
+            entries_with_prefix(&spool, "corrupt-").is_empty(),
+            "nothing quarantined"
+        );
+    }
+
+    #[test]
+    fn a_stale_version_lock_does_not_hang_open() {
+        // yaque spins on version/lock without a timeout, so a leftover one hangs every open.
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        runtime().block_on(spill(&spool, &payloads(2)));
+        let lock = spool.join("version").join("lock");
+        std::fs::write(&lock, format!("pid={}\ntoken=7\n", dead_pid())).unwrap();
+
+        // The open runs on its own thread so a spinning open fails the test instead of hanging it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let opener_spool = spool.clone();
+        std::thread::spawn(move || {
+            let drained = runtime().block_on(reopen_and_drain(&opener_spool, 2));
+            let _ = tx.send(drained);
+        });
+        let drained = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("open must not spin on a lock left by a dead process");
+        assert_eq!(drained, payloads(2));
+    }
+
+    #[tokio::test]
+    async fn a_live_lock_held_by_another_open_is_not_stolen() {
+        // Two sinks on one spool path in one process: the second must fail, never quarantine.
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let first = TieredSink::new(sink, spilling_config(&spool))
+            .await
+            .unwrap();
+        for p in payloads(4) {
+            first.send(&rec(&p)).await.unwrap();
+        }
+
+        let second = TieredSink::new(TestSink::new(), spilling_config(&spool)).await;
+        match second {
+            Err(TieredSinkError::SpoolOpen { message, .. }) => {
+                assert!(message.contains("locked"), "names the lock: {message}");
+            }
+            Err(e) => panic!("expected SpoolOpen, got {e}"),
+            Ok(_) => panic!("a second open of a live spool must be refused"),
+        }
+        assert!(
+            entries_with_prefix(&spool, "corrupt-").is_empty(),
+            "nothing quarantined"
+        );
+        assert!(
+            entries_with_prefix(dir.path(), "spool.corrupt-").is_empty(),
+            "nothing quarantined"
+        );
+
+        // The first owner still has every record and still drains them.
+        assert_eq!(first.spool_len().await, 4);
+        first.inner().set_available(true);
+        for _ in 0..200 {
+            if first.spool_is_empty().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(first.inner().received_payloads().await, payloads(4));
+        first.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_lock_held_by_a_live_process_is_not_stolen() {
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        spill(&spool, &payloads(3)).await;
+        let owner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let owner = KillOnDrop(owner);
+        std::fs::write(
+            spool.join("recv.lock"),
+            format!("pid={}\ntoken=42\n", owner.0.id()),
+        )
+        .unwrap();
+
+        let reopened = TieredSink::new(TestSink::new(), spilling_config(&spool)).await;
+        assert!(
+            matches!(reopened, Err(TieredSinkError::SpoolOpen { .. })),
+            "a lock whose owner is alive must refuse the open"
+        );
+        assert!(
+            spool.join("recv.lock").exists(),
+            "the live owner's lock stays"
+        );
+        assert!(
+            entries_with_prefix(&spool, "corrupt-").is_empty(),
+            "nothing quarantined"
+        );
+
+        // Once the owner is gone the same spool opens with every record intact.
+        drop(owner);
+        assert_eq!(reopen_and_drain(&spool, 3).await, payloads(3));
+    }
+
+    #[tokio::test]
+    async fn a_lock_being_written_is_not_mistaken_for_stale() {
+        // An empty lock younger than the write window is re-read before it is judged.
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        spill(&spool, &payloads(1)).await;
+        let owner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let owner = KillOnDrop(owner);
+        let lock = spool.join("send.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let owner_pid = owner.0.id();
+        let writer = {
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::fs::write(&lock, format!("pid={owner_pid}\ntoken=9\n")).unwrap();
+            })
+        };
+
+        let reopened = TieredSink::new(TestSink::new(), spilling_config(&spool)).await;
+        writer.join().unwrap();
+        assert!(
+            matches!(reopened, Err(TieredSinkError::SpoolOpen { .. })),
+            "the owner finished writing its lock, so the open is refused"
+        );
+        assert!(lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quarantine_works_when_the_spool_path_is_a_mount_point() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // Restores the parent's permissions so the tempdir can be removed.
+        struct Writable(std::path::PathBuf);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("mnt");
+        let spool = parent.join("spool");
+        spill(&spool, &payloads(2)).await;
+        // A truncated receiver position makes the queue refuse to open: real corruption.
+        std::fs::write(spool.join("recv-metadata"), [0u8; 3]).unwrap();
+        let inode = std::fs::metadata(&spool).unwrap().ino();
+
+        // A read-only parent makes rename(2) of the spool path fail, as it does on a mount point.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = Writable(parent.clone());
+
+        let tiered = TieredSink::new(TestSink::new(), spilling_config(&spool))
+            .await
+            .expect("a corrupt spool on a mount point is quarantined in place");
+        assert_eq!(
+            std::fs::metadata(&spool).unwrap().ino(),
+            inode,
+            "the spool path itself is never renamed"
+        );
+        let quarantined = entries_with_prefix(&spool, "corrupt-");
+        assert_eq!(quarantined.len(), 1, "contents moved into one subdirectory");
+        assert!(
+            quarantined[0].join("recv-metadata").exists(),
+            "the corrupt queue is preserved for forensics"
+        );
+        assert!(quarantined[0].join("0.q").exists());
+
+        // The fresh queue in the same path spills and drains normally.
+        tiered.inner().set_available(false);
+        tiered.send(&rec(b"after")).await.unwrap();
+        tiered.inner().set_available(true);
+        for _ in 0..200 {
+            if tiered.spool_is_empty().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            tiered.inner().received_payloads().await,
+            vec![b"after".to_vec()]
+        );
         tiered.shutdown().await;
     }
 }

@@ -64,6 +64,31 @@ item count after a restart — yaque doesn't expose a length API.
 - `clear()` walks the queue and commits every item — empties without
   touching the filesystem directly.
 
+### Locks after a hard kill
+
+yaque keeps `send.lock`, `recv.lock` and `version/lock` in the queue directory, each holding `pid=<pid>` and a random per-process `token`. A clean stop removes them. A kill -9 leaves them behind, and without recovery every restart would refuse the queue.
+
+`Spool::open` and `TieredSink::new` (shared code in `src/spool_codec.rs`) handle each leftover lock before opening:
+
+| Lock file | Action |
+|-----------|--------|
+| Owner pid not running, or equal to this process's pid with another token (a restarted container reusing its pid) | Removed, counted in `spool_stale_locks_cleared_total{lock,reason="dead_owner"}`, one warn with the path |
+| Empty or unparseable (killed between create and write) | Re-read after 500 ms if younger than that, then removed as `reason="unparseable"` |
+| Owner pid running, or this process's own open queue | Open refused with `Open` / `SpoolOpen` naming the lock. Never quarantined |
+
+Two sinks or spools on one path in one process, or two processes sharing one volume, therefore fail at start instead of writing one queue twice. Give each its own path.
+
+The liveness check reads the process table of the current pid namespace. Two pods sharing a `ReadWriteMany` volume cannot see each other's processes, so they must not share a spool path.
+
+### Quarantine
+
+When a queue still will not open after the lock check, or a CRC check fails on read, `on_corruption` decides (default `quarantine`):
+
+- `quarantine` moves the queue's files into a new `corrupt-YYYYMMDD-HHMMSS-<nanos>-<n>/` subdirectory of the spool path and opens a fresh queue in place. The path itself is never renamed, so this works when the path is a mount point (an `emptyDir` or PVC mounted exactly at `spool_path`). Counted in `spool_quarantined_total{trigger="open_failed|crc_mismatch"}`, one warn with the path.
+- `fail` returns the error.
+
+Permission, full-disk, read-only and quota errors are returned under either policy, because moving the queue aside would orphan records that are still readable. Quarantined subdirectories are kept for forensics and are not counted against `max_size_bytes`. Remove them by hand once inspected.
+
 ---
 
 ## Compression
@@ -177,7 +202,7 @@ arrives). `pop_front` is the try-style alternative that returns
 | `file_size()` | Directory size in bytes |
 | `clear()` | Drain every item; resets count |
 | `config() -> &SpoolConfig` | Active config |
-| `SpoolError` | `Open / Queue / Compression / Decompression / Io / MaxItemsReached / MaxSizeReached` |
+| `SpoolError` | `Open / Queue / Compression / Decompression / Io / MaxItemsReached / MaxSizeReached / Corrupted` |
 
 ---
 

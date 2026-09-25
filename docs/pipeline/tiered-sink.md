@@ -134,6 +134,8 @@ Hitting any limit causes `send` to return
 `TieredSinkError::SpoolFull` or `DiskUnavailable`. The caller decides
 what to do — typical pattern is to route to the DLQ.
 
+`TieredSink::new` clears spool locks a killed process left behind and refuses a `spool_path` another live sink holds, so each sink needs its own path. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. See [spool.md](spool.md#locks-after-a-hard-kill).
+
 ---
 
 ## Configuration

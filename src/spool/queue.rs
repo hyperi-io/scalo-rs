@@ -17,57 +17,46 @@ use yaque::{Receiver, Sender};
 /// Crash-safe writes, survives restarts. Built on
 /// [yaque](https://crates.io/crates/yaque) (transactional persistent queue).
 pub struct Spool {
-    sender: Sender,
-    receiver: Receiver,
+    /// `None` only after a failed recovery, which leaves the spool closed.
+    queue: Option<Queue>,
     config: SpoolConfig,
     len: usize,
+}
+
+/// The open yaque handles; each holds a lock file in the queue directory.
+struct Queue {
+    sender: Sender,
+    receiver: Receiver,
+}
+
+/// The open queue, or an error once a failed recovery has closed it.
+fn live(queue: &mut Option<Queue>) -> Result<&mut Queue> {
+    queue.as_mut().ok_or_else(|| {
+        SpoolError::Queue("spool is closed: recovery from a corrupt cache failed".into())
+    })
 }
 
 impl Spool {
     /// Open the queue at the configured path, creating it if absent.
     ///
+    /// Lock files left by a process that was killed are cleared first, so a
+    /// restart after a hard kill finds its queue. A queue another live process
+    /// (or another open `Spool` in this one) holds is refused.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the queue cannot be opened or created.
+    /// Returns [`SpoolError::Open`] if the queue is locked by a live owner, or
+    /// cannot be opened and was not quarantined (see
+    /// [`CorruptionPolicy`]).
     pub async fn open(config: SpoolConfig) -> Result<Self> {
-        let (sender, receiver) = match yaque::channel(&config.path) {
-            Ok(channel) => channel,
-            // The cache won't open (corrupt segments / metadata). Under the
-            // default Quarantine policy, move it aside and start fresh so a
-            // poisoned spill cache can never wedge startup.
-            Err(e) if config.on_corruption == CorruptionPolicy::Quarantine => {
-                let moved = quarantine_dir(&config.path)?;
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    path = %config.path.display(),
-                    quarantined = ?moved,
-                    error = %e,
-                    "spool cache could not be opened; quarantined and starting fresh"
-                );
-                // `moved` + `e` are read only by the tracing warn! above; reference
-                // both so the no-tracing build (feature `spool` without `tracing`)
-                // doesn't flag them as unused under -D warnings.
-                let _ = (&moved, &e);
-                yaque::channel(&config.path).map_err(|e2| SpoolError::Open {
-                    path: config.path.display().to_string(),
-                    message: e2.to_string(),
-                })?
-            }
-            Err(e) => {
-                return Err(SpoolError::Open {
-                    path: config.path.display().to_string(),
-                    message: e.to_string(),
-                });
-            }
-        };
+        let (sender, receiver) = open_queue(&config.path, config.on_corruption)?;
 
         // yaque exposes no count API -- parse segment files to count items
         // between the receiver position and the end.
         let len = count_existing_items(&config.path).unwrap_or(0);
 
         Ok(Self {
-            sender,
-            receiver,
+            queue: Some(Queue { sender, receiver }),
             config,
             len,
         })
@@ -75,29 +64,21 @@ impl Spool {
 
     /// Quarantine the current (corrupt) cache and reopen a fresh empty queue.
     ///
-    /// Renames the cache directory aside to `<path>.corrupt-YYYYMMDD-HHMMSS`
-    /// (forensics preserved) and rebuilds the sender/receiver on a fresh queue.
+    /// Moves the queue's files into a timestamped `corrupt-*` subdirectory of
+    /// the spool path (forensics preserved) and opens a fresh queue in place.
     /// Used by the read paths when a CRC check fails under the Quarantine policy.
-    /// Returns the quarantined path (if the dir existed).
+    /// Returns the quarantine subdirectory, if anything was moved.
     fn recover(&mut self, reason: &str) -> Result<Option<std::path::PathBuf>> {
-        let moved = quarantine_dir(&self.config.path)?;
-        let (sender, receiver) =
-            yaque::channel(&self.config.path).map_err(|e| SpoolError::Open {
-                path: self.config.path.display().to_string(),
-                message: e.to_string(),
-            })?;
-        // Reassigning drops the old handles (closing the now-renamed dir's files).
-        self.sender = sender;
-        self.receiver = receiver;
+        // yaque handles save state and delete their locks by path on drop, so they close first.
+        self.queue = None;
         self.len = 0;
-        #[cfg(feature = "tracing")]
-        tracing::warn!(
-            path = %self.config.path.display(),
-            quarantined = ?moved,
+        let moved = crate::spool_codec::quarantine(
+            &self.config.path,
+            crate::spool_codec::QuarantineTrigger::CrcMismatch,
             reason,
-            "spool corruption detected; quarantined and started fresh"
-        );
-        let _ = reason;
+        )?;
+        let (sender, receiver) = open_queue(&self.config.path, CorruptionPolicy::Fail)?;
+        self.queue = Some(Queue { sender, receiver });
         Ok(moved)
     }
 
@@ -145,7 +126,8 @@ impl Spool {
         };
         let to_write = Self::frame(self.config.crc, body);
 
-        self.sender
+        live(&mut self.queue)?
+            .sender
             .send(to_write)
             .await
             .map_err(|e| SpoolError::Queue(e.to_string()))?;
@@ -186,7 +168,7 @@ impl Spool {
     pub async fn peek(&mut self) -> Result<Option<Vec<u8>>> {
         // `step` is owned, so the receiver borrow (held by the guard + the match
         // scrutinee) is fully released before any `recover_on_read` call.
-        let step: Option<Result<Vec<u8>>> = match self.receiver.try_recv() {
+        let step: Option<Result<Vec<u8>>> = match live(&mut self.queue)?.receiver.try_recv() {
             Ok(guard) => {
                 let outcome = Self::unframe(self.config.crc, guard.to_vec())
                     .and_then(|body| Self::decode(self.config.compress, body));
@@ -210,7 +192,7 @@ impl Spool {
     ///
     /// Returns an error if an I/O error occurs.
     pub async fn pop(&mut self) -> Result<()> {
-        match self.receiver.try_recv() {
+        match live(&mut self.queue)?.receiver.try_recv() {
             Ok(guard) => {
                 guard
                     .commit()
@@ -229,7 +211,7 @@ impl Spool {
     ///
     /// Returns an error if decompression fails or an I/O error occurs.
     pub async fn pop_front(&mut self) -> Result<Option<Vec<u8>>> {
-        let step: Option<Result<Vec<u8>>> = match self.receiver.try_recv() {
+        let step: Option<Result<Vec<u8>>> = match live(&mut self.queue)?.receiver.try_recv() {
             Ok(guard) => {
                 let decoded = Self::unframe(self.config.crc, guard.to_vec())
                     .and_then(|body| Self::decode(self.config.compress, body));
@@ -265,7 +247,7 @@ impl Spool {
     ///
     /// Returns an error if decompression fails or an I/O error occurs.
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
-        let guard = self
+        let guard = live(&mut self.queue)?
             .receiver
             .recv()
             .await
@@ -318,8 +300,9 @@ impl Spool {
     /// Returns an error if an I/O error occurs.
     pub fn clear(&mut self) -> Result<()> {
         // yaque has no built-in clear -- drain by committing every item.
+        let queue = live(&mut self.queue)?;
         loop {
-            match self.receiver.try_recv() {
+            match queue.receiver.try_recv() {
                 Ok(guard) => {
                     guard
                         .commit()
@@ -386,10 +369,12 @@ impl Spool {
     }
 }
 
-/// Rename a corrupt cache directory aside (shared logic), mapping any I/O error
-/// into [`SpoolError`].
-fn quarantine_dir(path: &Path) -> Result<Option<std::path::PathBuf>> {
-    Ok(crate::spool_codec::quarantine_dir(path)?)
+/// Open the yaque queue through the shared lock-recovery + quarantine path.
+fn open_queue(path: &Path, policy: CorruptionPolicy) -> Result<(Sender, Receiver)> {
+    crate::spool_codec::open_queue(path, policy).map_err(|e| SpoolError::Open {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })
 }
 
 /// Count items in a yaque queue dir by walking segment files.
@@ -776,19 +761,18 @@ mod tests {
             "Quarantine recovers to a fresh empty queue"
         );
 
-        // The corrupt directory was preserved aside with a timestamped name.
-        let quarantined = std::fs::read_dir(dir.path())
+        // The corrupt queue was preserved in a timestamped subdirectory of the path.
+        let quarantined: Vec<_> = std::fs::read_dir(&path)
             .unwrap()
             .filter_map(std::result::Result::ok)
-            .any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("spill-cache.corrupt-")
-            });
-        assert!(
-            quarantined,
-            "corrupt cache must be renamed aside, not deleted"
+            .filter(|e| e.file_name().to_string_lossy().starts_with("corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "corrupt cache must be moved aside, not deleted"
         );
+        assert!(quarantined[0].path().join("0.q").exists());
 
         // The fresh queue is fully usable.
         spool.push(b"after recovery").await.unwrap();
@@ -796,6 +780,74 @@ mod tests {
             spool.pop_front().await.unwrap(),
             Some(b"after recovery".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn test_recovered_queue_keeps_its_locks_and_position() {
+        // The corrupt queue's handles close before the fresh queue opens, so their
+        // drop can neither delete the fresh locks nor overwrite its saved position.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("spill-cache");
+        {
+            let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
+                .await
+                .unwrap();
+            spool.push(b"consumed first").await.unwrap();
+            spool.push(b"poisoned record").await.unwrap();
+            assert_eq!(
+                spool.pop_front().await.unwrap(),
+                Some(b"consumed first".to_vec())
+            );
+        }
+        // Flip the last byte, which belongs to the second record.
+        let seg = path.join("0.q");
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&seg, &bytes).unwrap();
+
+        let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
+            .await
+            .unwrap();
+        assert_eq!(spool.pop_front().await.unwrap(), None, "recovered to empty");
+        assert!(path.join("send.lock").exists(), "fresh sender lock held");
+        assert!(path.join("recv.lock").exists(), "fresh receiver lock held");
+        assert!(
+            matches!(
+                Spool::open(SpoolConfig::new(&path).crc(true)).await,
+                Err(SpoolError::Open { .. })
+            ),
+            "a second open of the recovered queue is refused"
+        );
+
+        spool.push(b"after recovery").await.unwrap();
+        drop(spool);
+        let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            spool.pop_front().await.unwrap(),
+            Some(b"after recovery".to_vec()),
+            "the fresh queue's position survives a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reopens_after_a_stale_lock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stale-lock-queue");
+        {
+            let mut spool = Spool::create(&path).await.unwrap();
+            spool.push(b"kept").await.unwrap();
+        }
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(path.join("send.lock"), format!("pid={dead}\ntoken=1\n")).unwrap();
+        std::fs::write(path.join("recv.lock"), format!("pid={dead}\ntoken=1\n")).unwrap();
+
+        let mut spool = Spool::create(&path).await.unwrap();
+        assert_eq!(spool.pop_front().await.unwrap(), Some(b"kept".to_vec()));
     }
 
     #[tokio::test]

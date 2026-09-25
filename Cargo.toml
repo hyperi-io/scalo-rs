@@ -424,8 +424,9 @@ libc = { version = ">=0.2.177, <0.3", optional = true }
 flate2 = { version = ">=1.1.9, <2", optional = true }
 tar = { version = ">=0.4.46, <0.5", optional = true }
 
-# Spool (disk-backed async queue) - yaque is async-native and maintained
-yaque = { version = ">=0.6.6, <0.7", optional = true }
+# Spool (disk-backed async queue). yaque's last release is 0.6.6 (2023-11-04,
+# crates.io API checked 2026-09-25). `recovery` clears locks a killed process left.
+yaque = { version = ">=0.6.6, <0.7", optional = true, features = ["recovery"] }
 zstd = { version = ">=0.13.3, <0.14", optional = true }
 # Per-record spool integrity (hardware-accelerated CRC32C). Apache-2.0/MIT,
 # 0.6.8 web-checked 2026-06-26. Closes the payload-integrity gap the queue's
