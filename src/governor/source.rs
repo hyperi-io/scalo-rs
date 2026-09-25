@@ -112,7 +112,7 @@ pub struct AckHeldSource {
 }
 
 impl AckHeldSource {
-    /// Read `held` bytes against `ceiling`; a zero ceiling reads full as soon
+    /// Read `held` bytes against `ceiling`. A zero ceiling reads full as soon
     /// as anything is held.
     #[must_use]
     pub fn new(held: Arc<AtomicU64>, ceiling: u64) -> Self {
