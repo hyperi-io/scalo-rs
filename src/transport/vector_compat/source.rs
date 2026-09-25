@@ -20,6 +20,7 @@ use crate::transport::grpc::{
     GrpcToken, admit, answer, note_refusal, receiver_closed, sender_deadline,
 };
 use crate::transport::types::{Message, PayloadFormat};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc;
@@ -51,7 +52,9 @@ use tonic::{Request, Response, Status};
 pub struct VectorCompatService {
     sender: mpsc::Sender<Message<GrpcToken>>,
     sequence: Arc<AtomicU64>,
-    pending: Option<Arc<PendingRegistry>>,
+    /// Asserted unwind-safe so the service stays `UnwindSafe` as it was: the
+    /// registry's lock does not poison, so a caught panic leaves it usable.
+    pending: AssertUnwindSafe<Option<Arc<PendingRegistry>>>,
 }
 
 impl VectorCompatService {
@@ -63,7 +66,7 @@ impl VectorCompatService {
         Self {
             sender,
             sequence,
-            pending: None,
+            pending: AssertUnwindSafe(None),
         }
     }
 
@@ -77,7 +80,7 @@ impl VectorCompatService {
         Self {
             sender,
             sequence,
-            pending,
+            pending: AssertUnwindSafe(pending),
         }
     }
 
