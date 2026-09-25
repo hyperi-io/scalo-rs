@@ -3,6 +3,15 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.12.11](https://github.com/hyperi-io/scalo-rs/compare/v2.12.10...v2.12.11) (2026-09-25)
+
+### Bug Fixes
+
+* **dlq:** settle Kafka at shutdown, wire send_timeout_ms, follow-ups ([#195](https://github.com/hyperi-io/scalo-rs/issues/195)) ([96aa959](https://github.com/hyperi-io/scalo-rs/commit/96aa9597ae9861e34a1b1e1b24cf3584201bfe4c))
+* gRPC resilience and metric double counts ([#199](https://github.com/hyperi-io/scalo-rs/issues/199)) ([b25afc5](https://github.com/hyperi-io/scalo-rs/commit/b25afc539a007eb522d39e1d39969d36b2d2e66e))
+* **grpc:** keep acked records at close ([#196](https://github.com/hyperi-io/scalo-rs/issues/196)) ([ddff0c8](https://github.com/hyperi-io/scalo-rs/commit/ddff0c8d05eb3b8e58d22ebb416907b394abb2c8))
+* keep acked records at shutdown ([#198](https://github.com/hyperi-io/scalo-rs/issues/198)) ([159e411](https://github.com/hyperi-io/scalo-rs/commit/159e4117369d9fcba5f79808fbe1d140d85b84ae)), closes [#196](https://github.com/hyperi-io/scalo-rs/issues/196) [#196](https://github.com/hyperi-io/scalo-rs/issues/196)
+
 ## [2.12.10](https://github.com/hyperi-io/scalo-rs/compare/v2.12.9...v2.12.10) (2026-09-24)
 
 ### Bug Fixes
