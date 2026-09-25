@@ -55,9 +55,7 @@ other. The driver commits source acks ONLY after the whole out-batch is sent
 would lose or double-count data. The two are designed together:
 
 - **Brake** decides whether to pull the next unit of work.
-- **Commit token** decides when the source ack fires -- always after a
-  successful send, never before. A send failure skips the commit, so the
-  block is re-delivered (at-least-once: duplicates, never loss).
+- **Commit token** decides when the source ack fires -- always after a successful send, never before. A block the sink refuses transiently is held and sent again. One it refuses permanently, or still refuses 10 s after shutdown, is left uncommitted: a source that re-delivers what was not committed (Kafka, file) sends it again after a restart, duplicates never loss. A push source (gRPC, HTTP) answered each sender when it queued the record and its commit is a no-op, so nothing re-delivers a block left uncommitted there, and it is lost.
 
 Commit tokens live on the `WorkBatch`, not on the record, and their count is
 decoupled from the record count. A transform that fans `N` records out to

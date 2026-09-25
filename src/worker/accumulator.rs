@@ -138,9 +138,11 @@ impl<T: Send + 'static> BatchAccumulator<T> {
 ///
 /// Push-ingest transports (HTTP, gRPC) accumulate [`Record`]s via a
 /// `BatchAccumulator<Record>`, then bridge the drained block to the engine's
-/// canonical [`WorkBatch`] currency. The `commit_tokens` are supplied by the
-/// caller because the push source owns the ack (an HTTP responder, a gRPC
-/// stream slot) -- the accumulator carries only the payload records.
+/// canonical [`WorkBatch`] currency. The caller supplies the `commit_tokens`,
+/// the source's own sequence tokens (`HttpToken`, `GrpcToken`) for the records
+/// drained -- the accumulator carries only the payload records. A push source
+/// answered each sender when it queued the record, and its commit is a no-op,
+/// so these tokens acknowledge nothing further.
 ///
 /// [`Record`]: crate::transport::Record
 /// [`WorkBatch`]: crate::transport::WorkBatch
