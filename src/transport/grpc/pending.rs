@@ -115,6 +115,11 @@ impl Entry {
 }
 
 /// Held push responses, keyed by the first sequence number of each request.
+///
+/// Unwind-safe by construction, which `VectorCompatService` asserts: every
+/// change to the map, the counters, the held bytes and the senders completes
+/// before a metrics call, the only call here that can panic, and the lock does
+/// not poison.
 pub(crate) struct PendingRegistry {
     entries: parking_lot::Mutex<BTreeMap<u64, Entry>>,
     /// Entries held, read without the lock so a release with nothing held
@@ -191,11 +196,13 @@ impl PendingRegistry {
         if let Some(guard) = &self.guard {
             guard.add_bytes(bytes);
         }
-        self.publish();
-        Some(Reservation {
+        // Built before the gauges, so a panic there still returns the bytes.
+        let reservation = Reservation {
             registry: Arc::clone(self),
             bytes,
-        })
+        };
+        self.publish();
+        Some(reservation)
     }
 
     /// Release records by sequence number with `status`, answering every
@@ -234,9 +241,8 @@ impl PendingRegistry {
             self.count.store(entries.len(), Ordering::Release);
             finished
         };
-        self.publish();
-        for entry in finished {
-            self.finish(entry);
+        if !finished.is_empty() {
+            self.settle(finished, |entry| Outcome::Released(entry.worst));
         }
     }
 
@@ -287,16 +293,35 @@ impl PendingRegistry {
             self.records.store(0, Ordering::Relaxed);
             std::mem::take(&mut *entries)
         };
-        for entry in drained.into_values() {
-            self.give_back(entry.bytes);
-            if let Some(responder) = entry.responder {
-                let outcome = if responder.send(Outcome::Shutdown).is_ok() {
-                    "shutdown"
+        if !drained.is_empty() {
+            self.settle(drained.into_values().collect(), |_| Outcome::Shutdown);
+        }
+    }
+
+    /// Free the bytes of entries already out of the map, answer every sender
+    /// still waiting, and only then record metrics.
+    ///
+    /// A metrics recorder is the one call here that can panic, so a panic
+    /// caught around it finds the ceiling, the memory guard and every sender
+    /// already settled.
+    fn settle(&self, entries: Vec<Entry>, outcome: impl Fn(&Entry) -> Outcome) {
+        self.return_bytes(entries.iter().map(|e| e.bytes).sum());
+        let answered: Vec<(&'static str, Instant)> = entries
+            .into_iter()
+            .filter_map(|mut entry| {
+                let answer = outcome(&entry);
+                let responder = entry.responder.take()?;
+                let label = if responder.send(answer).is_ok() {
+                    outcome_label(answer)
                 } else {
                     "orphaned"
                 };
-                self.count_answer(outcome, entry.admitted);
-            }
+                Some((label, entry.admitted))
+            })
+            .collect();
+        self.publish();
+        for (label, admitted) in answered {
+            self.count_answer(label, admitted);
         }
     }
 
@@ -340,26 +365,14 @@ impl PendingRegistry {
             done
         };
         if let Some(entry) = done {
-            self.give_back(entry.bytes);
+            self.return_bytes(entry.bytes);
         }
+        self.publish();
     }
 
-    /// Free a finished entry and answer its sender, if it still waits.
-    fn finish(&self, entry: Entry) {
-        self.give_back(entry.bytes);
-        let Some(responder) = entry.responder else {
-            return;
-        };
-        let outcome = if responder.send(Outcome::Released(entry.worst)).is_ok() {
-            status_label(entry.worst)
-        } else {
-            "orphaned"
-        };
-        self.count_answer(outcome, entry.admitted);
-    }
-
-    /// Return `bytes` to the ceiling and the memory guard.
-    fn give_back(&self, bytes: u64) {
+    /// Return `bytes` to the ceiling and the memory guard: atomics only, so it
+    /// cannot panic.
+    fn return_bytes(&self, bytes: u64) {
         let _ = self
             .held_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
@@ -369,13 +382,13 @@ impl PendingRegistry {
         if let Some(guard) = &self.guard {
             guard.release(bytes);
         }
-        self.publish();
     }
 
-    /// Record the held gauges.
+    /// Record the held gauges, never while unwinding: a recorder that panics
+    /// then would abort the process.
     fn publish(&self) {
         #[cfg(feature = "metrics")]
-        {
+        if !std::thread::panicking() {
             metrics::gauge!("transport_ack_held", "transport" => self.label)
                 .set(self.records.load(Ordering::Relaxed) as f64);
             metrics::gauge!("transport_ack_held_bytes", "transport" => self.label)
@@ -383,10 +396,10 @@ impl PendingRegistry {
         }
     }
 
-    /// Count one answered or abandoned request.
+    /// Count one answered or abandoned request, never while unwinding.
     fn count_answer(&self, outcome: &'static str, admitted: Instant) {
         #[cfg(feature = "metrics")]
-        {
+        if !std::thread::panicking() {
             metrics::counter!(
                 "transport_ack_released_total",
                 "transport" => self.label,
@@ -440,13 +453,15 @@ impl AckControl for PendingRegistry {
     }
 }
 
-/// The `outcome` label for a released request.
-fn status_label(status: DeliveryStatus) -> &'static str {
-    match status {
-        DeliveryStatus::Delivered => "delivered",
-        DeliveryStatus::Dropped => "dropped",
-        DeliveryStatus::Rejected => "rejected",
-        DeliveryStatus::Errored => "errored",
+/// The `outcome` label for an answered request.
+fn outcome_label(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Released(DeliveryStatus::Delivered) => "delivered",
+        Outcome::Released(DeliveryStatus::Dropped) => "dropped",
+        Outcome::Released(DeliveryStatus::Rejected) => "rejected",
+        Outcome::Released(DeliveryStatus::Errored) => "errored",
+        Outcome::Expired => "expired",
+        Outcome::Shutdown => "shutdown",
     }
 }
 
@@ -472,7 +487,10 @@ impl Reservation {
     ) -> Held {
         let (responder, answer) = oneshot::channel();
         let admitted = Instant::now();
-        let deadline = admitted + budget;
+        // A budget too large to add is a year, not a panic per request.
+        let deadline = admitted
+            .checked_add(budget)
+            .unwrap_or_else(|| admitted + Duration::from_secs(365 * 24 * 3_600));
         let words = usize::try_from(len.div_ceil(64)).unwrap_or(usize::MAX);
         let entry = Entry {
             len,
@@ -491,22 +509,25 @@ impl Reservation {
             registry.records.fetch_add(len, Ordering::Relaxed);
             registry.count.store(entries.len(), Ordering::Release);
         }
-        registry.publish();
-        Held {
+        // Built before the gauges, so a panic there still removes the entry.
+        let held = Held {
             registry,
             base,
             deadline,
             answer,
             progress: 0,
             queued: false,
-        }
+        };
+        held.registry.publish();
+        held
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.bytes > 0 {
-            self.registry.give_back(self.bytes);
+            self.registry.return_bytes(self.bytes);
+            self.registry.publish();
         }
     }
 }
@@ -775,6 +796,96 @@ mod tests {
         assert!(both < only_late);
         assert_eq!(registry.deadline([9]), None);
         drop(early);
+    }
+
+    /// A recorder whose counters panic, as a caller's recorder might.
+    #[cfg(feature = "metrics")]
+    struct PanickingCounters;
+
+    #[cfg(feature = "metrics")]
+    impl metrics::Recorder for PanickingCounters {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            panic!("recorder refuses counters");
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// A panic caught around a release finds every sender answered and every
+    /// byte returned: the state the registry relies on is settled before the
+    /// one call that can panic, the metrics recorder.
+    #[cfg(feature = "metrics")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panic_caught_around_a_release_leaves_the_registry_settled() {
+        let registry = registry(1024);
+        let first = held(&registry, 0, 1, 10);
+        let second = held(&registry, 1, 1, 20);
+
+        let caught = {
+            let _local = metrics::set_default_local_recorder(&PanickingCounters);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                registry.release([0, 1], DeliveryStatus::Delivered);
+            }))
+        };
+        assert!(caught.is_err(), "the recorder panicked");
+
+        assert_eq!(
+            first.outcome().await,
+            Outcome::Released(DeliveryStatus::Delivered)
+        );
+        assert_eq!(
+            second.outcome().await,
+            Outcome::Released(DeliveryStatus::Delivered)
+        );
+        let held = registry.snapshot();
+        assert_eq!((held.count, held.bytes), (0, 0));
+        assert_eq!(registry.count.load(Ordering::Acquire), 0);
+        assert_eq!(registry.records.load(Ordering::Relaxed), 0);
+        assert!(registry.reserve(1024).is_some(), "the ceiling is whole");
+    }
+
+    #[test]
+    fn a_huge_budget_holds_for_a_year_rather_than_panicking() {
+        let registry = registry(1024);
+        let _held =
+            registry
+                .reserve(1)
+                .expect("room")
+                .hold(0, 1, Duration::MAX, DeliveryStatus::Delivered);
+        assert!(registry.deadline([0]).is_some());
     }
 
     #[test]
