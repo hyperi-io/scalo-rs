@@ -257,6 +257,8 @@ diagnostic, smoke-test, or specialty:
   anomaly; only `dfe-transform-vector` needs it.
 - `worker-msgpack` — MsgPack batch serialisation for the worker pool.
   Specialty use.
+- `testcontainers` -- builds scalo's own real-broker tests, which start Kafka
+  in a container and need a Docker daemon. Adds no code to the library.
 
 Enable these explicitly when you need them.
 

@@ -944,6 +944,7 @@ fn read_transport_config(key: &str) -> TransportResult<super::TransportConfig> {
 ///
 /// A section present but not parseable.
 #[cfg(feature = "config")]
+#[cfg_attr(not(feature = "transport-kafka"), allow(dead_code))]
 pub(crate) fn acknowledgements_section(
     key: &str,
     backend: &str,
@@ -962,7 +963,10 @@ pub(crate) fn acknowledgements_section(
 
 /// Warn, once per process, that an `acknowledgements` section sits under a
 /// backend with no acknowledgement to hold.
-#[cfg(feature = "config")]
+#[cfg(all(
+    feature = "config",
+    any(feature = "transport-memory", feature = "transport-pipe")
+))]
 fn warn_acknowledgements_ignored(key: &str, backend: &str) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1029,6 +1033,14 @@ impl AnyReceiver {
     /// Apply the `<key>.<type>.acknowledgements` section to a Kafka source, and
     /// warn once when one sits under a pipe or memory source.
     #[cfg(feature = "config")]
+    #[cfg_attr(
+        not(any(
+            feature = "transport-kafka",
+            feature = "transport-memory",
+            feature = "transport-pipe"
+        )),
+        allow(unused_variables)
+    )]
     fn apply_acknowledgements(self, key: &str) -> TransportResult<Self> {
         match self {
             #[cfg(feature = "transport-kafka")]

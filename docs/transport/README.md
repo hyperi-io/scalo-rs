@@ -118,6 +118,8 @@ provenance.
 | File | Persists read position to `.pos` sidecar |
 | Memory | Advances internal sequence |
 
+**Releasing**: `release(&tokens, status)` is `commit` with the merged delivery status of every piece built from the tokens' records. `Delivered`, `Dropped` and `Rejected` release the source, and `Errored` withholds it so the records are delivered again. The default commits when the status allows it. A source that can hold its acknowledgement exposes `ack_control()` (`AckControl`: `enabled`, `arm`, `held`) and names a `hold_deadline` where a sender waits on it. Kafka armed commits each partition only up to its lowest offset not yet released, so releases may arrive in any order. The `BatchEngine` pipeline builder drives all of this ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md)), and a hand-rolled loop uses `SourceAck`. Each ack-capable backend reads `acknowledgements.enabled` (default `true`) from `<key>.<type>.acknowledgements`, beside its own section.
+
 **Closing a receiver**: after `close()`, `recv` returns the records the source had already acknowledged to their senders, then `TransportError::Closed`. A receiving service therefore shuts down with `close()`, then `recv` until `Closed`, then its final flush; the `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). The gRPC and HTTP servers and the memory transport hold acknowledged records until `recv` takes them. Kafka and file report `Closed` at once and re-deliver what was not committed; pipe acknowledges nothing, and reports `Closed` at once too.
 
 ---
@@ -189,6 +191,10 @@ sink stages do 1:1. See [routing.md](routing.md).
 | `TransportSender::send(destination, payload)` | Async send, returns `SendResult` |
 | `TransportReceiver::recv(max)` | Async batch receive, returns `WorkBatch<Token>` (`records` + `commit_tokens` + `dlq_entries`) |
 | `TransportReceiver::commit(&tokens)` | Ack a slice of tokens through the same transport |
+| `TransportReceiver::release(&tokens, status)` | Ack with the merged delivery status, which `Errored` withholds |
+| `TransportReceiver::ack_control()` / `hold_deadline(&tokens)` | Acknowledgement controls, and when a waiting sender must be answered |
+| `TransportSender::confirms_delivery()` / `dead_letter_reason(&record)` | What an `Ok` proves, and which records the sender would dead-letter |
+| `ack::{AcknowledgementsConfig, SourceAck, Tickets}` | The `acknowledgements` key, the hand-rolled release, listener admission |
 | `CommitToken` | `Clone + Send + Sync + Debug + Display`, `as_str()` |
 | `Transport` | Blanket impl for any `T: Sender + Receiver` |
 | `AnySender::from_config(key).await` | Cascade factory — **async** |

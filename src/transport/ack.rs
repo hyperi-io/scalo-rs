@@ -20,7 +20,7 @@
 //! - [`AcknowledgementsConfig`] -- the `acknowledgements.enabled` key, default
 //!   on, present only on ack-capable transports.
 //! - [`AckControl`] -- the run-time view a caller queries through
-//!   [`TransportReceiver::ack_control`](super::TransportReceiver::ack_control):
+//!   [`TransportReceiver::ack_control`]:
 //!   enabled, arm, held.
 //! - [`AcknowledgingReceiver`] -- the type-level capability. Kafka and gRPC
 //!   implement it, pipe and memory do not.
@@ -31,7 +31,7 @@
 //!   `pipeline_delivery_guarantee`.
 //!
 //! The `BatchEngine` pipeline builder drives all of this for an engine-run app;
-//! see `docs/pipeline/batch-engine.md`.
+//! see `docs/pipeline/acknowledgements.md`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -144,7 +144,7 @@ impl HeldAcks {
 /// The run-time acknowledgement controls of a receiver.
 ///
 /// Object-safe, so a caller generic over any
-/// [`TransportReceiver`](super::TransportReceiver) reaches it through
+/// [`TransportReceiver`] reaches it through
 /// [`ack_control`](super::TransportReceiver::ack_control) without naming the
 /// transport.
 pub trait AckControl: Send + Sync {
@@ -349,7 +349,7 @@ impl EffectiveGuarantee {
 // ---------------------------------------------------------------------------
 
 /// A merged status delivered once every piece of a unit has reported.
-fn merged_channel() -> (
+pub(crate) fn merged_channel() -> (
     BatchFinalizer,
     tokio::sync::oneshot::Receiver<DeliveryStatus>,
 ) {
@@ -360,24 +360,29 @@ fn merged_channel() -> (
     (finalizer, rx)
 }
 
-/// Await the merged status, giving up as `Errored` at `deadline` minus
-/// [`HOLD_RELEASE_MARGIN`].
-async fn await_merged(
-    merged: tokio::sync::oneshot::Receiver<DeliveryStatus>,
-    deadline: Option<Instant>,
-) -> (DeliveryStatus, bool) {
-    let Some(deadline) = deadline else {
-        return (merged.await.unwrap_or(DeliveryStatus::Errored), false);
-    };
-    let give_up = tokio::time::Instant::from_std(
+/// When a wait on a unit with hold deadline `deadline` gives up:
+/// [`HOLD_RELEASE_MARGIN`] before it.
+pub(crate) fn give_up_at(deadline: Instant) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(
         deadline
             .checked_sub(HOLD_RELEASE_MARGIN)
             .unwrap_or(deadline),
-    );
-    match tokio::time::timeout_at(give_up, merged).await {
-        Ok(status) => (status.unwrap_or(DeliveryStatus::Errored), false),
-        Err(_elapsed) => (DeliveryStatus::Errored, true),
-    }
+    )
+}
+
+/// Await the merged status, giving up as `Errored` at `deadline` minus
+/// [`HOLD_RELEASE_MARGIN`].
+pub(crate) async fn await_merged(
+    merged: tokio::sync::oneshot::Receiver<DeliveryStatus>,
+    deadline: Option<Instant>,
+) -> DeliveryStatus {
+    let status = match deadline {
+        Some(deadline) => tokio::time::timeout_at(give_up_at(deadline), merged)
+            .await
+            .unwrap_or(Ok(DeliveryStatus::Errored)),
+        None => merged.await,
+    };
+    status.unwrap_or(DeliveryStatus::Errored)
 }
 
 /// Holds one received block's source acknowledgement until every piece built
@@ -444,7 +449,7 @@ impl<'r, R: TransportReceiver> SourceAck<'r, R> {
     pub async fn release(self) -> TransportResult<DeliveryStatus> {
         let deadline = self.receiver.hold_deadline(&self.tokens);
         self.finalizer.seal();
-        let (status, _expired) = await_merged(self.merged, deadline).await;
+        let status = await_merged(self.merged, deadline).await;
         self.receiver.release(&self.tokens, status).await?;
         Ok(status)
     }

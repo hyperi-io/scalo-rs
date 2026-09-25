@@ -181,6 +181,22 @@ A source or sink that goes away is waited out rather than ending the app, and th
 
 A rising `transport_recv_errors_total{class="transient"}` or `pipeline_retries_total` with flat throughput is an outage being ridden out. Behaviour per backend: [../transport/backends.md](../transport/backends.md).
 
+### Acknowledgements
+
+What a source holds until delivery, and the guarantee the pipeline gives ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md)):
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `pipeline_delivery_guarantee` | `guarantee`, `reason` | 1 for the guarantee the pipeline gives: `at_least_once`, `at_least_once_local` or `best_effort`, and why |
+| `pipeline_dead_letters_dropped_total` | `reason` | records the sink would refuse, dropped because no DLQ is configured |
+| `transport_ack_held` / `transport_ack_held_bytes` | `transport` | records and payload bytes whose acknowledgement is held |
+| `transport_ack_released_total` | `transport`, `outcome` | records released, by merged status |
+| `transport_ack_latency_seconds` | `transport`, `outcome` | receipt to release |
+| `transport_ack_refused_total` | `transport`, `reason` | requests refused before their acknowledgement was held |
+| `transport_redelivered_total` | `transport`, `reason` | sends retried after the receiver may already have taken them |
+
+Kafka emits the `transport_ack_*` series once armed, and `Tickets` emits them for an app's own listener.
+
 ---
 
 ## Endpoints
