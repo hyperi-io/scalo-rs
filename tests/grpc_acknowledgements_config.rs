@@ -56,8 +56,8 @@ async fn a_factory_built_grpc_receiver_honours_its_acknowledgements_section() {
     })
     .expect("config setup");
 
-    // The section says off: armed or not, the push is answered at enqueue.
-    let off = AnyReceiver::from_config("transport.off")
+    // The section says off: built armed, the push is still answered at enqueue.
+    let off = AnyReceiver::from_config_armed("transport.off")
         .await
         .expect("receiver");
     let control = off.ack_control().expect("gRPC can hold");
@@ -65,21 +65,20 @@ async fn a_factory_built_grpc_receiver_honours_its_acknowledgements_section() {
         !control.enabled(),
         "the section turned acknowledgements off"
     );
-    control.arm();
     let answered = tokio::time::timeout(Duration::from_secs(2), push(&off).await)
         .await
         .expect("answered at enqueue")
         .expect("push task");
     assert!(matches!(answered, SendResult::Ok), "{answered:?}");
 
-    // No section: acknowledgements default on, and an armed server holds the
-    // push until its record is released.
-    let held = AnyReceiver::from_config("transport.held")
+    // No section: acknowledgements default on, and built armed the server
+    // holds the very first push, with no `arm` call after construction.
+    let held = AnyReceiver::from_config_armed("transport.held")
         .await
         .expect("receiver");
     let control = held.ack_control().expect("gRPC can hold");
     assert!(control.enabled(), "acknowledgements default on");
-    control.arm();
+    assert!(control.is_armed(), "armed before it listened");
     let pushing = push(&held).await;
     let mut batch = held.recv(1).await.expect("recv");
     while batch.records.is_empty() {
@@ -93,6 +92,13 @@ async fn a_factory_built_grpc_receiver_honours_its_acknowledgements_section() {
     let answered = pushing.await.expect("push task");
     assert!(matches!(answered, SendResult::Ok), "{answered:?}");
 
+    // Built the plain way, the same key is unarmed until a caller arms it.
+    let plain = AnyReceiver::from_config("transport.held")
+        .await
+        .expect("receiver");
+    assert!(!plain.ack_control().expect("gRPC can hold").is_armed());
+
     let _ = off.close().await;
     let _ = held.close().await;
+    let _ = plain.close().await;
 }

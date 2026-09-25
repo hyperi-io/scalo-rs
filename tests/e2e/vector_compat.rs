@@ -503,16 +503,14 @@ async fn held_push_events_wait_for_release() {
     use scalo::transport::DeliveryStatus;
 
     let config = GrpcConfig::server("127.0.0.1:0").with_vector_compat();
+    // Built armed: the Vector-compat listener shares the native one's hold.
     let server = std::sync::Arc::new(
         GrpcTransport::builder(&config)
+            .armed(true)
             .start()
             .await
             .expect("vector-compat server"),
     );
-    server
-        .ack_control()
-        .expect("a receive server can hold")
-        .arm();
     let uri = format!("http://{}", server.local_addr().expect("bound"));
     let client =
         std::sync::Arc::new(VectorCompatClient::connect_lazy(&uri).expect("VectorCompatClient"));

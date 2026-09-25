@@ -126,7 +126,9 @@ Source: [../../src/transport/grpc/](../../src/transport/grpc/).
 
 ### Held responses
 
-A server armed by a caller that releases every token it takes answers a push only once its records are released: `OK` when every one was delivered, dropped by policy or dead-lettered, `Unavailable` when any was not, which senders retry. A caller that never arms it keeps the answer at enqueue, so an existing service is not stalled by a release it never makes. The `BatchEngine` pipeline builder arms it ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md)).
+A server armed by a caller that releases every token it takes answers a push only once its records are released: `OK` when every one was delivered, dropped by policy or dead-lettered, `Unavailable` when any was not, which senders retry. A caller that never arms it keeps the answer at enqueue, so an existing service is not stalled by a release it never makes.
+
+- **Arming**: an app that releases every token it takes, through the `BatchEngine` pipeline builder or `SourceAck`, builds its server armed: `GrpcTransport::builder(..).armed(true)`, or `AnyReceiver::from_config_armed(key)` / `from_config_with_governor_armed(key, governor)`. The server is then armed before it listens, so the first push that can arrive, native or Vector-compat, is held. Arming later with `AckControl::arm`, as the pipeline also does, leaves every push before that call answered at enqueue and unprotected. On an armed server `arm` changes nothing.
 
 - **Config**: `acknowledgements.enabled` (default `true`) from `<key>.grpc.acknowledgements` when the factory builds the receiver, else `acknowledgements` on `GrpcTransport::builder` or `with_acknowledgements`. Disabled, the server answers at enqueue even when armed, and a release of its tokens does nothing. The limits below are set on the builder.
 - **Sink confirmation**: as a sender, `confirms_delivery()` is `Remote`, and `dead_letter_reason` names a record over `max_message_size` on its own, measured as `send_batch` measures it, and an outbound `dlq` filter match.

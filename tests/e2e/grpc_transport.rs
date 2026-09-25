@@ -1081,15 +1081,12 @@ async fn test_recv_timeout_returns_empty() {
 async fn armed_server(max_held_bytes: u64, drain_deadline: Duration) -> (GrpcTransport, String) {
     let config = GrpcConfig::server("127.0.0.1:0");
     let server = GrpcTransport::builder(&config)
+        .armed(true)
         .max_held_bytes(max_held_bytes)
         .drain_deadline(drain_deadline)
         .start()
         .await
         .expect("server");
-    server
-        .ack_control()
-        .expect("a receive server can hold")
-        .arm();
     let uri = format!("http://{}", server.local_addr().expect("bound"));
     (server, uri)
 }
@@ -1417,44 +1414,87 @@ mod engine_driven {
         })
     }
 
-    /// Wait until the pipeline has armed `server`, as it does before its
-    /// first `recv`.
-    async fn armed_by_the_pipeline(server: &GrpcTransport) {
-        let control = server.ack_control().expect("a receive server can hold");
-        for _ in 0..200 {
-            if control.is_armed() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the pipeline never armed the server");
+    /// A client whose sends run in tasks of their own.
+    async fn client_of(server: &GrpcTransport) -> Arc<GrpcTransport> {
+        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        Arc::new(
+            GrpcTransport::new(&GrpcConfig::client(&uri))
+                .await
+                .expect("client"),
+        )
     }
 
-    #[tokio::test]
-    async fn the_engine_answers_a_held_push_from_the_sink_outcome() {
+    /// Push `payload` in a task of its own.
+    fn pushing(
+        client: &Arc<GrpcTransport>,
+        payload: &'static [u8],
+    ) -> tokio::task::JoinHandle<SendResult> {
+        let client = Arc::clone(client);
+        tokio::spawn(async move {
+            client
+                .send("main", bytes::Bytes::from_static(payload))
+                .await
+        })
+    }
+
+    /// Wait for a push's answer, which comes only once the pipeline runs.
+    async fn answer(task: tokio::task::JoinHandle<SendResult>) -> SendResult {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("answered once the pipeline runs")
+            .expect("push task")
+    }
+
+    /// A server built armed, and a client of it.
+    async fn armed_pair() -> (Arc<GrpcTransport>, Arc<GrpcTransport>) {
+        let config = GrpcConfig::server("127.0.0.1:0");
         let server = Arc::new(
-            GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0"))
+            GrpcTransport::builder(&config)
+                .armed(true)
+                .start()
                 .await
                 .expect("server"),
         );
-        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        let client = client_of(&server).await;
+        (server, client)
+    }
+
+    /// Pushes answered before a pipeline runs would be acknowledged with
+    /// nothing to deliver them.
+    async fn assert_unanswered(pushes: &[&tokio::task::JoinHandle<SendResult>]) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            pushes.iter().all(|p| !p.is_finished()),
+            "a push was answered before anything could deliver it"
+        );
+    }
+
+    /// A server built armed holds the pushes that reach it before any pipeline
+    /// runs, and the pipeline answers them from the sink's outcome once it
+    /// starts: OK when delivered.
+    #[tokio::test]
+    async fn pushes_before_the_pipeline_runs_are_held_and_answered_by_it() {
+        let (server, client) = armed_pair().await;
+        let early = pushing(&client, b"{\"early\":1}");
+        let early_too = pushing(&client, b"{\"early\":2}");
+        assert_unanswered(&[&early, &early_too]).await;
+
         let shutdown = CancellationToken::new();
         let running = run_pipeline(Arc::clone(&server), shutdown.clone());
-        armed_by_the_pipeline(&server).await;
-        let client = GrpcTransport::new(&GrpcConfig::client(&uri))
-            .await
-            .expect("client");
+        for task in [early, early_too] {
+            let delivered = answer(task).await;
+            assert!(matches!(delivered, SendResult::Ok), "{delivered:?}");
+        }
 
-        // Sink Ok: the answer is OK, and only once the engine released it.
-        let delivered = client.send("main", filled(8)).await;
-        assert!(matches!(delivered, SendResult::Ok), "{delivered:?}");
-
-        // A piece reported Errored: the answer is Unavailable, and the loop
-        // goes on to the next push.
-        let failed = client.send("main", bytes::Bytes::from_static(FAIL)).await;
-        assert!(matches!(failed, SendResult::Backpressured), "{failed:?}");
-        let after = client.send("main", filled(8)).await;
-        assert!(matches!(after, SendResult::Ok), "{after:?}");
+        // Once running, the pipeline's own arm changed nothing: later pushes
+        // are held and answered the same way.
+        let later = answer(pushing(&client, b"{\"later\":1}")).await;
+        assert!(matches!(later, SendResult::Ok), "{later:?}");
+        let later_failed = answer(pushing(&client, FAIL)).await;
+        assert!(
+            matches!(later_failed, SendResult::Backpressured),
+            "{later_failed:?}"
+        );
 
         shutdown.cancel();
         running
@@ -1463,6 +1503,55 @@ mod engine_driven {
             .expect("clean shutdown");
         let held = server.ack_control().expect("held").held();
         assert_eq!((held.count, held.bytes), (0, 0), "{held:?}");
+    }
+
+    /// A push held before the pipeline runs, which the sink then fails, is
+    /// answered Unavailable, never OK.
+    #[tokio::test]
+    async fn a_push_before_the_pipeline_runs_that_the_sink_fails_is_answered_unavailable() {
+        let (server, client) = armed_pair().await;
+        let early = pushing(&client, FAIL);
+        assert_unanswered(&[&early]).await;
+
+        let shutdown = CancellationToken::new();
+        let running = run_pipeline(Arc::clone(&server), shutdown.clone());
+        let failed = answer(early).await;
+        assert!(matches!(failed, SendResult::Backpressured), "{failed:?}");
+
+        shutdown.cancel();
+        running
+            .await
+            .expect("pipeline task")
+            .expect("clean shutdown");
+    }
+
+    /// A server built armed and killed before any pipeline released its
+    /// pushes never answers them OK.
+    #[tokio::test]
+    async fn pushes_held_by_a_server_that_is_killed_are_never_answered_ok() {
+        let config = GrpcConfig::server("127.0.0.1:0");
+        let server = GrpcTransport::builder(&config)
+            .armed(true)
+            .start()
+            .await
+            .expect("server");
+        let client = client_of(&server).await;
+        let early = pushing(&client, b"{\"early\":1}");
+        let mut queued = server.recv(1).await.expect("recv");
+        while queued.records.is_empty() {
+            queued = server.recv(1).await.expect("recv");
+        }
+        assert!(!early.is_finished(), "held while queued");
+
+        drop(server);
+        let result = tokio::time::timeout(Duration::from_secs(5), early)
+            .await
+            .expect("answered once the server is gone")
+            .expect("push task");
+        assert!(
+            !matches!(result, SendResult::Ok),
+            "a push the server never delivered was answered OK"
+        );
     }
 
     #[tokio::test]

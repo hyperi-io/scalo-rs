@@ -167,7 +167,7 @@ pub(crate) fn receiver_closed() -> Status {
 
 /// The pressure governor a receive server sheds on, carried to the
 /// Vector-compat handler as a request extension.
-#[cfg(feature = "governor")]
+#[cfg(all(feature = "governor", feature = "transport-grpc-vector-compat"))]
 #[derive(Clone)]
 pub(crate) struct InboundGate(pub(crate) Arc<crate::governor::UnifiedPressure>);
 
@@ -444,9 +444,14 @@ fn build_grpc_client_tls(
 /// carry: acknowledgements, the pressure governor, and the limits on
 /// responses held until their records are released.
 ///
+/// An app that releases every token it takes, through the `BatchEngine`
+/// pipeline builder or `SourceAck`, builds its receive server armed, so no
+/// push is answered before it is delivered:
+///
 /// ```rust,ignore
 /// let transport = GrpcTransport::builder(&config)
 ///     .acknowledgements(app_config.acknowledgements)
+///     .armed(true)
 ///     .pressure(governor.pressure())
 ///     .memory_guard(guard)
 ///     .start()
@@ -456,6 +461,7 @@ fn build_grpc_client_tls(
 pub struct GrpcTransportBuilder<'a> {
     config: &'a GrpcConfig,
     acknowledgements: AcknowledgementsConfig,
+    armed: bool,
     #[cfg(feature = "governor")]
     pressure: Option<Arc<crate::governor::UnifiedPressure>>,
     #[cfg(feature = "memory")]
@@ -470,6 +476,7 @@ impl std::fmt::Debug for GrpcTransportBuilder<'_> {
         f.debug_struct("GrpcTransportBuilder")
             .field("config", self.config)
             .field("acknowledgements", &self.acknowledgements)
+            .field("armed", &self.armed)
             .field("max_held_bytes", &self.max_held_bytes)
             .field("max_hold", &self.max_hold)
             .field("drain_deadline", &self.drain_deadline)
@@ -483,6 +490,20 @@ impl GrpcTransportBuilder<'_> {
     /// caller arms it. Disabled, it answers once they are queued.
     pub fn acknowledgements(mut self, acknowledgements: AcknowledgementsConfig) -> Self {
         self.acknowledgements = acknowledgements;
+        self
+    }
+
+    /// Arm the receive server before it listens, so the first push that can
+    /// arrive, native or Vector-compat, is held until released.
+    ///
+    /// Set it only when the caller releases every token it takes, through the
+    /// `BatchEngine` pipeline builder or `SourceAck`: a held push nobody
+    /// releases is answered `Unavailable` at its hold budget. Unarmed (the
+    /// default), pushes are answered once queued until a caller calls
+    /// [`AckControl::arm`], which leaves every push before that call
+    /// unprotected. A later `arm` on an armed server changes nothing.
+    pub fn armed(mut self, armed: bool) -> Self {
+        self.armed = armed;
         self
     }
 
@@ -549,6 +570,7 @@ impl GrpcTransportBuilder<'_> {
         let guard_limit: Option<u64> = None;
         Some(Arc::new(PendingRegistry::new(pending::HoldSettings {
             enabled: self.acknowledgements.enabled,
+            armed: self.armed,
             // A quarter of the memory guard's limit, else a fixed default.
             max_held_bytes: self.max_held_bytes.unwrap_or_else(|| {
                 guard_limit.map_or(pending::DEFAULT_MAX_HELD_BYTES, |limit| (limit / 4).max(1))
@@ -614,6 +636,7 @@ impl GrpcTransport {
         GrpcTransportBuilder {
             config,
             acknowledgements: AcknowledgementsConfig::default(),
+            armed: false,
             #[cfg(feature = "governor")]
             pressure: None,
             #[cfg(feature = "memory")]
@@ -2479,12 +2502,12 @@ mod tests {
     async fn armed(max_held_bytes: u64, drain_deadline: Duration) -> (GrpcTransport, String) {
         let config = GrpcConfig::server("127.0.0.1:0");
         let server = GrpcTransport::builder(&config)
+            .armed(true)
             .max_held_bytes(max_held_bytes)
             .drain_deadline(drain_deadline)
             .start()
             .await
             .unwrap();
-        server.pending.as_ref().unwrap().arm();
         let uri = format!("http://{}", server.local_addr().unwrap());
         (server, uri)
     }

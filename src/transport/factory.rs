@@ -961,6 +961,28 @@ pub(crate) fn acknowledgements_section(
         .map_err(|e| TransportError::Config(format!("failed to read {section}: {e}")))
 }
 
+/// A gRPC receive server built from `config`, with its
+/// `<key>.grpc.acknowledgements` section, armed before it listens.
+#[cfg(all(feature = "config", feature = "transport-grpc"))]
+async fn armed_grpc(
+    config: &super::TransportConfig,
+    key: &str,
+    wire: impl FnOnce(super::grpc::GrpcTransportBuilder<'_>) -> super::grpc::GrpcTransportBuilder<'_>,
+) -> TransportResult<super::grpc::GrpcTransport> {
+    let grpc_config = config
+        .grpc
+        .as_ref()
+        .ok_or_else(|| TransportError::Config("grpc config missing".into()))?;
+    let acknowledgements = acknowledgements_section(key, "grpc")?.unwrap_or_default();
+    wire(
+        super::grpc::GrpcTransport::builder(grpc_config)
+            .acknowledgements(acknowledgements)
+            .armed(true),
+    )
+    .start()
+    .await
+}
+
 /// Warn, once per process, that an `acknowledgements` section sits under a
 /// backend with no acknowledgement to hold.
 #[cfg(all(
@@ -1028,6 +1050,69 @@ impl AnyReceiver {
             let _ = key;
             Self::from_transport_config(&super::TransportConfig::default()).await
         }
+    }
+
+    /// Like [`from_config`](Self::from_config), for a caller that releases
+    /// every token it takes (the `BatchEngine` pipeline builder or
+    /// `SourceAck`): the source is armed before it can take a record.
+    ///
+    /// A gRPC receive server is built armed, before it listens, so no push is
+    /// answered at enqueue in the gap before the caller's own `arm`. Other
+    /// sources are armed straight after construction, before any `recv`.
+    /// A source with `acknowledgements.enabled: false` is left unarmed.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_config`](Self::from_config).
+    #[cfg(feature = "config")]
+    pub async fn from_config_armed(key: &str) -> TransportResult<Self> {
+        let config = read_transport_config(key)?;
+        #[cfg(feature = "transport-grpc")]
+        if config.transport_type == TransportType::Grpc {
+            return armed_grpc(&config, key, |builder| builder)
+                .await
+                .map(Self::Grpc);
+        }
+        Ok(Self::from_transport_config(&config)
+            .await?
+            .apply_acknowledgements(key)?
+            .armed())
+    }
+
+    /// The governed sibling of [`from_config_armed`](Self::from_config_armed)
+    /// (`governor` feature): wired to `governor` as
+    /// [`from_config_with_governor`](Self::from_config_with_governor) wires it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_config`](Self::from_config).
+    #[cfg(all(feature = "config", feature = "governor"))]
+    pub async fn from_config_with_governor_armed(
+        key: &str,
+        governor: &crate::SelfRegulationGovernor,
+    ) -> TransportResult<Self> {
+        let config = read_transport_config(key)?;
+        #[cfg(feature = "transport-grpc")]
+        if config.transport_type == TransportType::Grpc {
+            return armed_grpc(&config, key, |builder| {
+                builder.pressure(governor.pressure())
+            })
+            .await
+            .map(Self::Grpc);
+        }
+        Ok(Self::from_transport_config_with_governor(&config, governor)
+            .await?
+            .apply_acknowledgements(key)?
+            .armed())
+    }
+
+    /// Arm a source whose acknowledgements are on.
+    #[cfg(feature = "config")]
+    fn armed(self) -> Self {
+        if let Some(control) = self.ack_control().filter(|c| c.enabled()) {
+            control.arm();
+        }
+        self
     }
 
     /// Apply the `<key>.<type>.acknowledgements` section to a Kafka or gRPC

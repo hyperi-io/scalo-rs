@@ -123,7 +123,7 @@ pub use work_batch::{FramingError, Record, RecordCodecError, RecordMeta, WorkBat
 pub use kafka::{KafkaConfig, KafkaToken, KafkaTransport};
 
 #[cfg(feature = "transport-grpc")]
-pub use grpc::{GrpcConfig, GrpcToken, GrpcTransport};
+pub use grpc::{GrpcConfig, GrpcToken, GrpcTransport, GrpcTransportBuilder};
 
 #[cfg(feature = "transport-grpc-vector-compat")]
 pub use vector_compat::{VectorCompatClient, VectorCompatService};

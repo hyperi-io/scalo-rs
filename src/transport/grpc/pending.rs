@@ -65,6 +65,8 @@ pub(crate) fn hold_budget(max_hold: Duration, sender_deadline: Option<Duration>)
 pub(crate) struct HoldSettings {
     /// Whether the transport holds responses at all once armed.
     pub(crate) enabled: bool,
+    /// Armed from the start, so the first request that can arrive is held.
+    pub(crate) armed: bool,
     /// Held bytes past which a request is refused.
     pub(crate) max_held_bytes: u64,
     /// The longest a response is held.
@@ -146,7 +148,7 @@ impl PendingRegistry {
             records: AtomicU64::new(0),
             held_bytes: Arc::new(AtomicU64::new(0)),
             enabled: AtomicBool::new(settings.enabled),
-            armed: AtomicBool::new(false),
+            armed: AtomicBool::new(settings.armed),
             max_held_bytes: settings.max_held_bytes,
             max_hold: settings.max_hold,
             label: settings.label,
@@ -166,11 +168,13 @@ impl PendingRegistry {
     }
 
     /// The held-byte counter, for a pressure source reading it.
+    #[cfg(feature = "governor")]
     pub(crate) fn held_bytes(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.held_bytes)
     }
 
     /// Held bytes past which a request is refused.
+    #[cfg(feature = "governor")]
     pub(crate) fn max_held_bytes(&self) -> u64 {
         self.max_held_bytes
     }
@@ -554,12 +558,14 @@ impl Held {
     }
 
     /// One more record, in sequence order, is in the receive queue.
+    #[cfg(feature = "transport-grpc-vector-compat")]
     pub(crate) fn advance(&mut self) {
         self.progress += 1;
     }
 
     /// Records from `index` on never reached the queue, and the caller answers
     /// the request itself.
+    #[cfg(any(test, feature = "transport-grpc-vector-compat"))]
     pub(crate) fn refuse_from(&mut self, index: u64) {
         self.registry.refuse_from(self.base, index);
         self.queued = true;
@@ -591,16 +597,15 @@ mod tests {
     use super::*;
 
     fn registry(max_held_bytes: u64) -> Arc<PendingRegistry> {
-        let registry = Arc::new(PendingRegistry::new(HoldSettings {
+        Arc::new(PendingRegistry::new(HoldSettings {
             enabled: true,
+            armed: true,
             max_held_bytes,
             max_hold: DEFAULT_MAX_HOLD,
             label: "test",
             #[cfg(feature = "memory")]
             guard: None,
-        }));
-        registry.arm();
-        registry
+        }))
     }
 
     fn held(registry: &Arc<PendingRegistry>, base: u64, len: u64, bytes: u64) -> Held {
@@ -912,26 +917,37 @@ mod tests {
         assert!(registry.deadline([0]).is_some());
     }
 
+    fn settings(enabled: bool, armed: bool) -> HoldSettings {
+        HoldSettings {
+            enabled,
+            armed,
+            max_held_bytes: 1,
+            max_hold: DEFAULT_MAX_HOLD,
+            label: "test",
+            #[cfg(feature = "memory")]
+            guard: None,
+        }
+    }
+
     #[test]
     fn a_disabled_or_unarmed_registry_holds_nothing() {
-        let unarmed = PendingRegistry::new(HoldSettings {
-            enabled: true,
-            max_held_bytes: 1,
-            max_hold: DEFAULT_MAX_HOLD,
-            label: "test",
-            #[cfg(feature = "memory")]
-            guard: None,
-        });
+        let unarmed = PendingRegistry::new(settings(true, false));
         assert!(!unarmed.holding());
-        let disabled = PendingRegistry::new(HoldSettings {
-            enabled: false,
-            max_held_bytes: 1,
-            max_hold: DEFAULT_MAX_HOLD,
-            label: "test",
-            #[cfg(feature = "memory")]
-            guard: None,
-        });
+        assert!(!unarmed.is_armed());
+        let disabled = PendingRegistry::new(settings(false, true));
         disabled.arm();
         assert!(!disabled.holding());
+    }
+
+    /// Built armed, a registry holds from its first request, and a later
+    /// `arm`, as the pipeline makes, changes nothing.
+    #[test]
+    fn a_registry_built_armed_holds_from_the_start_and_arm_is_idempotent() {
+        let armed = PendingRegistry::new(settings(true, true));
+        assert!(armed.holding());
+        assert!(armed.is_armed());
+        armed.arm();
+        armed.arm();
+        assert!(armed.holding());
     }
 }

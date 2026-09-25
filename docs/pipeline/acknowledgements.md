@@ -36,9 +36,9 @@ kafka:
     enabled: true   # the default
 ```
 
-The key sits beside the transport's own section: `AnyReceiver::from_config(key)` reads `<key>.kafka.acknowledgements`, and a transport built from an explicit config takes it with `KafkaTransport::with_acknowledgements`. Pipe and memory have no acknowledgement to hold, and the factory warns once when the key sits under either.
+The key sits beside the transport's own section: `AnyReceiver::from_config(key)` reads `<key>.kafka.acknowledgements` or `<key>.grpc.acknowledgements`, and a transport built from an explicit config takes it with `KafkaTransport::with_acknowledgements` or `GrpcTransport::builder(..).acknowledgements(..)`. Pipe and memory have no acknowledgement to hold, and the factory warns once when the key sits under either.
 
-- **On:** the loop arms the source (`AckControl::arm`) before the first `recv`. Kafka then commits each partition only up to its lowest offset not yet released, whatever order releases arrive in, and an `Errored` offset holds the commit below it. A push source answers its sender only on release.
+- **On:** the loop arms the source (`AckControl::arm`) before the first `recv`. Kafka then commits each partition only up to its lowest offset not yet released, whatever order releases arrive in, and an `Errored` offset holds the commit below it. A push source answers its sender only on release, once armed. Before that it answers at enqueue, so a push that arrives between the server starting and the loop's `arm` is acknowledged with nothing to deliver it. Build a push source armed instead: `GrpcTransport::builder(..).armed(true)`, or `AnyReceiver::from_config_armed(key)` and `from_config_with_governor_armed(key, governor)`. The loop's own `arm` then changes nothing.
 - **Off:** the source is released at receipt, before the block is processed. A crash or a failed delivery loses what was released.
 - **A source with no acknowledgement:** released after the pieces, as the other run loops commit.
 
