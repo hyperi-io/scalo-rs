@@ -22,11 +22,20 @@
 //! `GrpcConfig::vector_compat` is true, the server also accepts
 //! `vector.Vector/PushEvents` RPCs from legacy Vector sinks.
 //!
+//! ## Held responses
+//!
+//! Once a caller that releases every token it takes arms the server, a push is
+//! answered only when its records are released: `OK` when they were
+//! delivered, dropped by policy or dead-lettered, `Unavailable` when they were
+//! not, which senders retry. A response still held when its hold budget runs
+//! out, or at the drain deadline after `close()`, is answered `Unavailable`
+//! too. Unarmed, or with acknowledgements disabled, the server answers once
+//! the records are queued for `recv`.
+//!
 //! ## Shutdown
 //!
-//! The server acknowledges a record once it is queued for `recv`, so a
-//! receiving service shuts down in this order: `close()`, then `recv` until it
-//! returns `TransportError::Closed`, then its final flush. `close()` refuses
+//! A receiving service shuts down in this order: `close()`, then `recv` until
+//! it returns `TransportError::Closed`, then its final flush. `close()` refuses
 //! new pushes with `Unavailable`, which senders retry.
 //!
 //! ## Example
@@ -55,22 +64,40 @@
 
 pub mod batch;
 pub mod config;
+pub(crate) mod pending;
 pub mod proto;
 pub mod token;
 
 pub use config::GrpcConfig;
 pub use token::GrpcToken;
 
+use super::ack::{
+    AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
+};
 use super::error::{TransportError, TransportResult};
+use super::finalizer::DeliveryStatus;
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::{Record, WorkBatch};
+use pending::{Held, Outcome, PendingRegistry};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
+
+/// Trailer on a push an armed server held past its hold budget: its records
+/// may still be delivered, so the sender's retry can duplicate them.
+pub(crate) const HOLD_EXPIRED: &str = "scalo-hold-expired";
+
+/// How long a sender refused at the held-byte ceiling is asked to wait, sent
+/// as `grpc-retry-pushback-ms`.
+const RETRY_PUSHBACK_MS: u64 = 1_000;
+
+/// How long `close()` leaves held responses to be released before answering
+/// the rest `Unavailable`, inside Kubernetes' default 30 s grace period.
+const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The spawned tonic serve loop.
 type ServerTask = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
@@ -140,7 +167,7 @@ pub(crate) fn receiver_closed() -> Status {
 
 /// The pressure governor a receive server sheds on, carried to the
 /// Vector-compat handler as a request extension.
-#[cfg(feature = "governor")]
+#[cfg(all(feature = "governor", feature = "transport-grpc-vector-compat"))]
 #[derive(Clone)]
 pub(crate) struct InboundGate(pub(crate) Arc<crate::governor::UnifiedPressure>);
 
@@ -149,6 +176,7 @@ pub(crate) struct InboundGate(pub(crate) Arc<crate::governor::UnifiedPressure>);
 #[cfg(feature = "governor")]
 pub(crate) fn shed_if_held(
     pressure: Option<&Arc<crate::governor::UnifiedPressure>>,
+    pending: Option<&PendingRegistry>,
 ) -> Result<(), Status> {
     if pressure.is_some_and(|p| p.should_hold()) {
         #[cfg(feature = "metrics")]
@@ -158,9 +186,105 @@ pub(crate) fn shed_if_held(
             "reason" => "pressure"
         )
         .increment(1);
+        note_refusal(pending, "pressure");
         return Err(Status::unavailable("under pressure -- inbound held"));
     }
     Ok(())
+}
+
+/// Count a push refused before it was held, while responses are held.
+pub(crate) fn note_refusal(pending: Option<&PendingRegistry>, reason: &'static str) {
+    if let Some(pending) = pending.filter(|p| p.holding()) {
+        pending.count_refused(reason);
+    }
+}
+
+/// The deadline a sender set in its `grpc-timeout` header, read as tonic's
+/// server reads it: at most 8 digits and a unit of H, M, S, m, u or n.
+pub(crate) fn sender_deadline(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
+    let value = metadata.get("grpc-timeout")?.to_str().ok()?;
+    let split = value.len().checked_sub(1)?;
+    let (digits, unit) = value.split_at(split);
+    if digits.is_empty() || digits.len() > 8 {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n * 3_600),
+        "M" => Duration::from_secs(n * 60),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
+}
+
+/// The answer to a push the held-byte ceiling has no room for:
+/// `ResourceExhausted`, with the wait a sender's retry policy honours.
+fn held_ceiling_full() -> Status {
+    #[cfg(feature = "metrics")]
+    metrics::counter!(
+        "transport_backpressured_total",
+        "transport" => "grpc",
+        "reason" => "ceiling"
+    )
+    .increment(1);
+    let mut status = Status::resource_exhausted("held responses at the held-byte ceiling");
+    status.metadata_mut().insert(
+        "grpc-retry-pushback-ms",
+        tonic::metadata::MetadataValue::from(RETRY_PUSHBACK_MS),
+    );
+    status
+}
+
+/// Take the sequence range for a request of `len` records carrying `bytes`
+/// and, while responses are held, reserve its bytes and hold it.
+///
+/// The request starts at `floor`: `Dropped` when some of its input was skipped
+/// rather than queued.
+pub(crate) fn admit(
+    pending: Option<&Arc<PendingRegistry>>,
+    sequence: &AtomicU64,
+    sender_deadline: Option<Duration>,
+    len: u64,
+    bytes: u64,
+    floor: DeliveryStatus,
+) -> Result<(u64, Option<Held>), Status> {
+    let Some(pending) = pending.filter(|p| p.holding()) else {
+        return Ok((sequence.fetch_add(len, Ordering::Relaxed), None));
+    };
+    let Some(reservation) = pending.reserve(bytes) else {
+        pending.count_refused("ceiling");
+        return Err(held_ceiling_full());
+    };
+    let base = sequence.fetch_add(len, Ordering::Relaxed);
+    let budget = pending.budget(sender_deadline);
+    Ok((base, Some(reservation.hold(base, len, budget, floor))))
+}
+
+/// Answer a held request from its outcome: `OK` once every record was
+/// delivered, dropped by policy or dead-lettered, `Unavailable` otherwise.
+pub(crate) fn answer<T>(outcome: Outcome, response: T) -> Result<Response<T>, Status> {
+    match outcome {
+        Outcome::Released(
+            DeliveryStatus::Delivered | DeliveryStatus::Dropped | DeliveryStatus::Rejected,
+        ) => Ok(Response::new(response)),
+        Outcome::Released(DeliveryStatus::Errored) => Err(Status::unavailable(
+            "records not delivered downstream -- retry",
+        )),
+        Outcome::Expired => {
+            let mut status =
+                Status::unavailable("records not released within the hold budget -- retry");
+            status
+                .metadata_mut()
+                .insert(HOLD_EXPIRED, tonic::metadata::MetadataValue::from(1_u32));
+            Err(status)
+        }
+        Outcome::Shutdown => Err(Status::unavailable(
+            "receiver shut down before its records were released -- retry",
+        )),
+    }
 }
 
 /// Count records the receive server queued for `recv`.
@@ -222,6 +346,16 @@ pub struct GrpcTransport {
 
     /// A `RouteBatch` too large for the receiver channel, waiting for `recv`.
     oversize: Arc<OversizeSlot>,
+
+    /// Responses held until their records are released (None if client-only
+    /// mode).
+    pending: Option<Arc<PendingRegistry>>,
+
+    /// The `acknowledgements` section this transport was built with.
+    acknowledgements: AcknowledgementsConfig,
+
+    /// How long `close()` leaves held responses to be released.
+    drain_deadline: Duration,
 
     /// Graceful-shutdown signal for the server task. Behind a
     /// `Mutex<Option<..>>` so `close(&self)` can take and fire it.
@@ -306,6 +440,181 @@ fn build_grpc_client_tls(
     Ok(tls)
 }
 
+/// Builds a [`GrpcTransport`] with the settings [`GrpcConfig`] does not
+/// carry: acknowledgements, the pressure governor, and the limits on
+/// responses held until their records are released.
+///
+/// An app that releases every token it takes, through the `BatchEngine`
+/// pipeline builder or `SourceAck`, builds its receive server armed, so no
+/// push is answered before it is delivered:
+///
+/// ```rust,ignore
+/// let transport = GrpcTransport::builder(&config)
+///     .acknowledgements(app_config.acknowledgements)
+///     .armed(true)
+///     .pressure(governor.pressure())
+///     .memory_guard(guard)
+///     .start()
+///     .await?;
+/// ```
+#[must_use = "the transport starts only when `start` is awaited"]
+pub struct GrpcTransportBuilder<'a> {
+    config: &'a GrpcConfig,
+    acknowledgements: AcknowledgementsConfig,
+    armed: bool,
+    #[cfg(feature = "governor")]
+    pressure: Option<Arc<crate::governor::UnifiedPressure>>,
+    #[cfg(feature = "memory")]
+    memory_guard: Option<Arc<crate::memory::MemoryGuard>>,
+    max_held_bytes: Option<u64>,
+    max_hold: Duration,
+    drain_deadline: Duration,
+}
+
+impl std::fmt::Debug for GrpcTransportBuilder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrpcTransportBuilder")
+            .field("config", self.config)
+            .field("acknowledgements", &self.acknowledgements)
+            .field("armed", &self.armed)
+            .field("max_held_bytes", &self.max_held_bytes)
+            .field("max_hold", &self.max_hold)
+            .field("drain_deadline", &self.drain_deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GrpcTransportBuilder<'_> {
+    /// The `acknowledgements` section. Enabled (the default), the receive
+    /// server holds each response until its records are released, once a
+    /// caller arms it. Disabled, it answers once they are queued.
+    pub fn acknowledgements(mut self, acknowledgements: AcknowledgementsConfig) -> Self {
+        self.acknowledgements = acknowledgements;
+        self
+    }
+
+    /// Arm the receive server before it listens, so the first push that can
+    /// arrive, native or Vector-compat, is held until released.
+    ///
+    /// Set it only when the caller releases every token it takes, through the
+    /// `BatchEngine` pipeline builder or `SourceAck`: a held push nobody
+    /// releases is answered `Unavailable` at its hold budget. Unarmed (the
+    /// default), pushes are answered once queued until a caller calls
+    /// [`AckControl::arm`], which leaves every push before that call
+    /// unprotected. A later `arm` on an armed server changes nothing.
+    pub fn armed(mut self, armed: bool) -> Self {
+        self.armed = armed;
+        self
+    }
+
+    /// Shed pushes with `Unavailable` while `pressure` holds, and hold its
+    /// latch while held responses near the held-byte ceiling (`governor`
+    /// feature).
+    #[cfg(feature = "governor")]
+    pub fn pressure(mut self, pressure: Arc<crate::governor::UnifiedPressure>) -> Self {
+        self.pressure = Some(pressure);
+        self
+    }
+
+    /// Lease held bytes on `guard` from admission to answer, and size the
+    /// default held-byte ceiling at a quarter of its limit (`memory` feature).
+    #[cfg(feature = "memory")]
+    pub fn memory_guard(mut self, guard: Arc<crate::memory::MemoryGuard>) -> Self {
+        self.memory_guard = Some(guard);
+        self
+    }
+
+    /// Refuse a push with `ResourceExhausted` once the responses held carry
+    /// this many payload bytes. One push is always admitted while none is
+    /// held. Default: a quarter of the memory guard's limit, else 256 MiB.
+    pub fn max_held_bytes(mut self, bytes: u64) -> Self {
+        self.max_held_bytes = Some(bytes);
+        self
+    }
+
+    /// The longest a response is held, and the whole budget for a sender that
+    /// sets no deadline. A sender's `grpc-timeout` shortens it to leave a
+    /// margin of a tenth of the deadline, at least 1 s. Default 25 s.
+    pub fn max_hold(mut self, max_hold: Duration) -> Self {
+        self.max_hold = max_hold;
+        self
+    }
+
+    /// How long [`close`](TransportBase::close) leaves held responses to be
+    /// released before answering the rest `Unavailable`. Default 20 s, which
+    /// the pod's termination grace period must cover.
+    pub fn drain_deadline(mut self, drain_deadline: Duration) -> Self {
+        self.drain_deadline = drain_deadline;
+        self
+    }
+
+    /// Bind the receive server and build the client, as configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the listen address is invalid or the server fails to
+    /// start.
+    pub async fn start(self) -> TransportResult<GrpcTransport> {
+        GrpcTransport::new_inner(self).await
+    }
+}
+
+impl GrpcTransportBuilder<'_> {
+    /// The registry a receive server holds responses in; `None` in client-only
+    /// mode.
+    fn hold_registry(&self) -> Option<Arc<PendingRegistry>> {
+        self.config.listen.as_ref()?;
+        #[cfg(feature = "memory")]
+        let guard_limit = self.memory_guard.as_ref().map(|g| g.limit_bytes());
+        #[cfg(not(feature = "memory"))]
+        let guard_limit: Option<u64> = None;
+        Some(Arc::new(PendingRegistry::new(pending::HoldSettings {
+            enabled: self.acknowledgements.enabled,
+            armed: self.armed,
+            // A quarter of the memory guard's limit, else a fixed default.
+            max_held_bytes: self.max_held_bytes.unwrap_or_else(|| {
+                guard_limit.map_or(pending::DEFAULT_MAX_HELD_BYTES, |limit| (limit / 4).max(1))
+            }),
+            max_hold: self.max_hold,
+            label: "grpc",
+            #[cfg(feature = "memory")]
+            guard: self.memory_guard.clone(),
+        })))
+    }
+}
+
+/// The lazily connected client for `endpoint`, with the configured TLS,
+/// deadlines and compression.
+fn build_client(
+    config: &GrpcConfig,
+    endpoint: &str,
+) -> TransportResult<proto::transport_client::TransportClient<tonic::transport::Channel>> {
+    let mut ep = tonic::transport::Channel::from_shared(endpoint.to_string())
+        .map_err(|e| TransportError::Config(format!("invalid endpoint: {e}")))?;
+
+    // Client TLS. tonic owns its TLS stack, so we map the unified
+    // vocabulary onto ClientTlsConfig (private CA, mTLS identity, SNI).
+    if config.tls_enabled {
+        ep = ep
+            .tls_config(build_grpc_client_tls(config)?)
+            .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
+    }
+
+    let channel = lazy_channel(ep, config.send_timeout_ms);
+
+    // No encoding limit: tonic's refusal arrives as a stream reset that
+    // reads as an outage, so send and send_batch check the size instead.
+    let mut client = proto::transport_client::TransportClient::new(channel)
+        .max_decoding_message_size(config.max_message_size);
+
+    if config.compression {
+        client = client
+            .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+    }
+    Ok(client)
+}
+
 impl GrpcTransport {
     /// Create a new gRPC transport.
     ///
@@ -319,12 +628,23 @@ impl GrpcTransport {
     ///
     /// Returns error if the listen address is invalid or the server fails to start.
     pub async fn new(config: &GrpcConfig) -> TransportResult<Self> {
-        Self::new_inner(
+        Self::builder(config).start().await
+    }
+
+    /// A builder for the settings `config` does not carry.
+    pub fn builder(config: &GrpcConfig) -> GrpcTransportBuilder<'_> {
+        GrpcTransportBuilder {
             config,
+            acknowledgements: AcknowledgementsConfig::default(),
+            armed: false,
             #[cfg(feature = "governor")]
-            None,
-        )
-        .await
+            pressure: None,
+            #[cfg(feature = "memory")]
+            memory_guard: None,
+            max_held_bytes: None,
+            max_hold: pending::DEFAULT_MAX_HOLD,
+            drain_deadline: DEFAULT_DRAIN_DEADLINE,
+        }
     }
 
     /// Create a gRPC transport bound to a pressure governor (`governor`
@@ -334,7 +654,8 @@ impl GrpcTransport {
     /// before enqueuing each inbound Push / batch record: while
     /// [`UnifiedPressure::should_hold`](crate::governor::UnifiedPressure::should_hold)
     /// holds, the RPC is rejected with `Status::unavailable` (the gRPC analogue
-    /// of HTTP 503). `None` is equivalent to [`new`](Self::new).
+    /// of HTTP 503). `None` is equivalent to [`new`](Self::new). The same as
+    /// [`builder`](Self::builder) with [`pressure`](GrpcTransportBuilder::pressure).
     ///
     /// # Errors
     ///
@@ -344,14 +665,20 @@ impl GrpcTransport {
         config: &GrpcConfig,
         pressure: Option<Arc<crate::governor::UnifiedPressure>>,
     ) -> TransportResult<Self> {
-        Self::new_inner(config, pressure).await
+        let builder = Self::builder(config);
+        match pressure {
+            Some(pressure) => builder.pressure(pressure),
+            None => builder,
+        }
+        .start()
+        .await
     }
 
-    async fn new_inner(
-        config: &GrpcConfig,
-        #[cfg(feature = "governor")] pressure: Option<Arc<crate::governor::UnifiedPressure>>,
-    ) -> TransportResult<Self> {
-        let mut client = None;
+    async fn new_inner(options: GrpcTransportBuilder<'_>) -> TransportResult<Self> {
+        let config = options.config;
+        let pending = options.hold_registry();
+        #[cfg(feature = "governor")]
+        let pressure = options.pressure;
         let mut receiver = None;
         let mut shutdown_tx = None;
         let mut server_handle = None;
@@ -360,33 +687,11 @@ impl GrpcTransport {
         let oversize = Arc::new(OversizeSlot::default());
 
         // Set up client (lazy connection -- doesn't fail until first RPC)
-        if let Some(endpoint) = &config.endpoint {
-            let mut ep = tonic::transport::Channel::from_shared(endpoint.clone())
-                .map_err(|e| TransportError::Config(format!("invalid endpoint: {e}")))?;
-
-            // Client TLS. tonic owns its TLS stack, so we map the unified
-            // vocabulary onto ClientTlsConfig (private CA, mTLS identity, SNI).
-            if config.tls_enabled {
-                ep = ep
-                    .tls_config(build_grpc_client_tls(config)?)
-                    .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
-            }
-
-            let channel = lazy_channel(ep, config.send_timeout_ms);
-
-            // No encoding limit: tonic's refusal arrives as a stream reset that
-            // reads as an outage, so send and send_batch check the size instead.
-            let mut c = proto::transport_client::TransportClient::new(channel)
-                .max_decoding_message_size(config.max_message_size);
-
-            if config.compression {
-                c = c
-                    .send_compressed(tonic::codec::CompressionEncoding::Gzip)
-                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
-            }
-
-            client = Some(c);
-        }
+        let client = config
+            .endpoint
+            .as_ref()
+            .map(|e| build_client(config, e))
+            .transpose()?;
 
         // Set up server
         if let Some(listen) = &config.listen {
@@ -397,11 +702,22 @@ impl GrpcTransport {
             let (tx, rx) = mpsc::channel(config.recv_buffer_size);
             let (sd_tx, sd_rx) = oneshot::channel();
 
+            // Held bytes near the ceiling hold the same latch the governor's
+            // other sources do. Nothing is held while unarmed or disabled.
+            #[cfg(feature = "governor")]
+            if let (Some(pressure), Some(pending)) = (&pressure, &pending) {
+                pressure.attach_source(Arc::new(crate::governor::AckHeldSource::new(
+                    pending.held_bytes(),
+                    pending.max_held_bytes(),
+                )));
+            }
+
             // Native service
             let dfe_svc = TransportServiceImpl {
                 sender: tx.clone(),
                 sequence: sequence.clone(),
                 oversize: Arc::clone(&oversize),
+                pending: pending.clone(),
                 #[cfg(feature = "governor")]
                 pressure: pressure.clone(),
             };
@@ -417,8 +733,11 @@ impl GrpcTransport {
 
             #[cfg(feature = "transport-grpc-vector-compat")]
             let router = if config.vector_compat {
-                let vector_svc =
-                    super::vector_compat::source::VectorCompatService::new(tx, sequence.clone());
+                let vector_svc = super::vector_compat::source::VectorCompatService::with_hold(
+                    tx,
+                    sequence.clone(),
+                    pending.clone(),
+                );
                 let vector_server =
                     super::vector_compat::proto::vector::vector_server::VectorServer::new(
                         vector_svc,
@@ -505,6 +824,9 @@ impl GrpcTransport {
             client,
             receiver,
             oversize,
+            pending,
+            acknowledgements: options.acknowledgements,
+            drain_deadline: options.drain_deadline,
             shutdown_tx: parking_lot::Mutex::new(shutdown_tx),
             server_task: parking_lot::Mutex::new(server_handle),
             closed: AtomicBool::new(false),
@@ -517,6 +839,19 @@ impl GrpcTransport {
             inflight: AtomicU64::new(0),
             filter_engine,
         })
+    }
+
+    /// Apply an `acknowledgements` section after construction, as the factory
+    /// does from `<key>.grpc.acknowledgements`.
+    ///
+    /// Takes effect for requests arriving from then on.
+    #[must_use]
+    pub fn with_acknowledgements(mut self, acknowledgements: AcknowledgementsConfig) -> Self {
+        self.acknowledgements = acknowledgements;
+        if let Some(pending) = &self.pending {
+            pending.set_enabled(acknowledgements.enabled);
+        }
+        self
     }
 
     /// The address the receive server is listening on, or `None` in
@@ -642,12 +977,36 @@ fn downstream_unavailable(status: &tonic::Status) -> bool {
     ) || std::error::Error::source(status).is_some()
 }
 
+/// Why a failed send may still be delivered by the receiver, so the caller's
+/// retry can duplicate it: a response held past its budget, or a deadline
+/// that ran out after the request may have been accepted.
+#[cfg(feature = "metrics")]
+fn redelivery_reason(status: &tonic::Status) -> Option<&'static str> {
+    if status.metadata().get(HOLD_EXPIRED).is_some() {
+        return Some("hold_expired");
+    }
+    match status.code() {
+        tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => Some("deadline"),
+        _ => None,
+    }
+}
+
 /// The send result for a failed RPC: backpressure while the server is down or
 /// busy, so the caller retries rather than drops.
 fn failed_rpc_result(status: &tonic::Status) -> SendResult {
     if downstream_unavailable(status) {
         #[cfg(feature = "metrics")]
-        metrics::counter!("transport_backpressured_total", "transport" => "grpc").increment(1);
+        {
+            metrics::counter!("transport_backpressured_total", "transport" => "grpc").increment(1);
+            if let Some(reason) = redelivery_reason(status) {
+                metrics::counter!(
+                    "transport_redelivered_total",
+                    "transport" => "grpc",
+                    "reason" => reason
+                )
+                .increment(1);
+            }
+        }
         SendResult::Backpressured
     } else {
         #[cfg(feature = "metrics")]
@@ -762,9 +1121,22 @@ impl TransportSender for GrpcTransport {
     /// `try_reserve_many`) before enqueuing any record -- no partial-send
     /// window. A batch with more records than the receiver's
     /// `recv_buffer_size` never fits the channel, so it is held whole in a slot
-    /// of its own, one batch at a time. `Backpressured` means ZERO records were
-    /// admitted, so the caller retries the whole block (at-least-once) with no
-    /// duplicate prefix.
+    /// of its own, one batch at a time.
+    ///
+    /// ## Blocks over `max_message_size`
+    ///
+    /// A block that encodes past `max_message_size` goes as several
+    /// `RouteBatch` RPCs, in order, each within the limit. Each is accepted
+    /// whole or not at all, but a failure after the first leaves the earlier
+    /// ones accepted, and the caller's retry of the whole block sends them
+    /// again (at-least-once). A record over the limit on its own is left out
+    /// and counted in `transport_message_too_large_total`, as
+    /// [`send`](TransportSender::send) refuses it, and when every record is,
+    /// the result is `FilteredDlq`. [`dead_letter_reason`] names such a record
+    /// before the send, so a caller holding a source acknowledgement
+    /// dead-letters it instead.
+    ///
+    /// [`dead_letter_reason`]: TransportSender::dead_letter_reason
     ///
     /// # Errors / result
     ///
@@ -802,26 +1174,101 @@ impl TransportSender for GrpcTransport {
         if to_send.is_empty() {
             return SendResult::Ok;
         }
-        let sent_count = to_send.len();
 
-        #[cfg(feature = "metrics")]
-        let payload_bytes: usize = to_send.iter().map(|r| r.payload.len()).sum();
-
-        // Map records -> proto Batch. Payloads are MOVED (Bytes handle), opaque.
-        let proto_batch = batch::records_to_proto(to_send);
-
-        // An over-limit block never succeeds on retry and the fix is a smaller
-        // one, so name the limit and the byte-budget lever; checked like `send`.
-        let encoded_len = prost::Message::encoded_len(&proto_batch);
-        if encoded_len > self.max_message_size {
-            #[cfg(feature = "metrics")]
-            metrics::counter!("transport_oversize_total", "transport" => "grpc").increment(1);
-            return SendResult::Fatal(TransportError::Config(format!(
-                "gRPC batch of {encoded_len} encoded bytes exceeds max_message_size \
-                 {} -- lower the self-regulation byte budget below the gRPC limit",
-                self.max_message_size
-            )));
+        // A block over the ceiling goes as several requests in order, so none
+        // is one the receiver's decoder refuses.
+        let batches = batches_within(to_send, self.max_message_size);
+        if batches.is_empty() {
+            return SendResult::FilteredDlq;
         }
+        for batch in batches {
+            let result = self.send_route_batch(client, batch).await;
+            if !result.is_ok() {
+                return result;
+            }
+        }
+        SendResult::Ok
+    }
+
+    /// The receive server answers only once the records are queued, or, armed,
+    /// once they are released.
+    fn confirms_delivery(&self) -> SinkConfirmation {
+        SinkConfirmation::Remote
+    }
+
+    /// A record over `max_message_size` on its own, as a field of a
+    /// `RouteBatch`, or one an outbound `dlq` filter matches.
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        // Measured as `send_batch` measures it: encoded, as a field of a batch.
+        let framed =
+            prost::encoding::message::encoded_len(1, &batch::record_to_proto(record.clone()));
+        if framed > self.max_message_size {
+            return Some(DeadLetterReason::TooLarge {
+                bytes: framed,
+                limit: self.max_message_size,
+            });
+        }
+        if self.filter_engine.has_outbound_filters()
+            && matches!(
+                self.filter_engine.apply_outbound(&record.payload),
+                super::filter::FilterDisposition::Dlq
+            )
+        {
+            return Some(DeadLetterReason::OutboundFilter);
+        }
+        None
+    }
+}
+
+/// Split `records` into `Batch` bodies that each encode within `limit`, in
+/// order.
+///
+/// A record over the limit on its own is left out, as `send` leaves it out:
+/// the same bytes are refused on every retry.
+fn batches_within(records: Vec<Record>, limit: usize) -> Vec<proto::Batch> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_len = 0;
+    for record in records {
+        let destination = record.key.clone();
+        let record = batch::record_to_proto(record);
+        // The record as a field of `Batch`: its tag, its length prefix, then
+        // the record itself, so the parts sum to the body's encoded length.
+        let framed = prost::encoding::message::encoded_len(1, &record);
+        if framed > limit {
+            too_large_result(
+                destination.as_deref().unwrap_or(""),
+                framed,
+                limit,
+                "refused before sending",
+            );
+            continue;
+        }
+        if current_len + framed > limit {
+            batches.push(proto::Batch {
+                records: std::mem::take(&mut current),
+            });
+            current_len = 0;
+        }
+        current_len += framed;
+        current.push(record);
+    }
+    if !current.is_empty() {
+        batches.push(proto::Batch { records: current });
+    }
+    batches
+}
+
+impl GrpcTransport {
+    /// Send one `Batch` body as a `RouteBatch` RPC under `send_timeout_ms`.
+    async fn send_route_batch(
+        &self,
+        client: &proto::transport_client::TransportClient<tonic::transport::Channel>,
+        proto_batch: proto::Batch,
+    ) -> SendResult {
+        let sent_count = proto_batch.records.len();
+        #[cfg(feature = "metrics")]
+        let payload_bytes: usize = proto_batch.records.iter().map(|r| r.payload.len()).sum();
 
         let mut request = tonic::Request::new(proto_batch);
 
@@ -902,14 +1349,16 @@ impl TransportBase for GrpcTransport {
     /// Stop sending and receiving, keeping every record already acknowledged.
     ///
     /// A push that arrives from here on is refused with `Unavailable`, which a
-    /// sender retries. Records the server already acked stay queued: call
+    /// sender retries. Records already queued stay queued: call
     /// [`recv`](TransportReceiver::recv) until it returns
-    /// [`TransportError::Closed`] or they are lost. Open connections finish
-    /// their in-flight RPCs on their own, and the listener is free when this
+    /// [`TransportError::Closed`] or they are lost. Held responses are
+    /// answered as their records are released, and any still held at the drain
+    /// deadline are answered `Unavailable`. Open connections finish their
+    /// in-flight RPCs on their own, and the listener is free when this
     /// returns. Waits for a `recv` in progress (at most `recv_timeout_ms`).
     /// Idempotent.
     async fn close(&self) -> TransportResult<()> {
-        self.closed.store(true, Ordering::Relaxed);
+        let first = !self.closed.swap(true, Ordering::AcqRel);
         self.healthy.store(false, Ordering::Relaxed);
 
         // The slot first: once recv sees the channel closed, nothing more can
@@ -919,6 +1368,18 @@ impl TransportBase for GrpcTransport {
             receiver.lock().await.close();
         }
         self.stop_server().await;
+
+        if first && let Some(pending) = &self.pending {
+            // Weak, so a transport dropped before the deadline is not kept.
+            let pending = Arc::downgrade(pending);
+            let drain_deadline = self.drain_deadline;
+            tokio::spawn(async move {
+                tokio::time::sleep(drain_deadline).await;
+                if let Some(pending) = pending.upgrade() {
+                    pending.shutdown();
+                }
+            });
+        }
         Ok(())
     }
 
@@ -1027,6 +1488,41 @@ impl TransportReceiver for GrpcTransport {
         // Acknowledgement is implicit in the Push RPC response.
         Ok(())
     }
+
+    /// The held-response controls of the receive server; `None` in
+    /// client-only mode.
+    fn ack_control(&self) -> Option<&dyn AckControl> {
+        self.pending.as_deref().map(|p| p as &dyn AckControl)
+    }
+
+    /// Answer the held requests whose last records these are: `OK` for
+    /// `Delivered`, `Dropped` and `Rejected`, `Unavailable` for `Errored`,
+    /// which the sender retries. Tokens of requests answered at enqueue, or
+    /// released already, are ignored.
+    async fn release(
+        &self,
+        tokens: &[Self::Token],
+        outcome: DeliveryStatus,
+    ) -> TransportResult<()> {
+        if let Some(pending) = &self.pending {
+            pending.release(tokens.iter().map(|t| t.seq), outcome);
+        }
+        Ok(())
+    }
+
+    /// The earliest instant by which a held request among `tokens` must be
+    /// answered: its hold budget from admission.
+    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<std::time::Instant> {
+        self.pending
+            .as_ref()?
+            .deadline(tokens.iter().map(|t| t.seq))
+    }
+}
+
+impl AcknowledgingReceiver for GrpcTransport {
+    fn acknowledgements(&self) -> AcknowledgementsConfig {
+        self.acknowledgements
+    }
 }
 
 impl Drop for GrpcTransport {
@@ -1034,6 +1530,10 @@ impl Drop for GrpcTransport {
         // Abort explicitly: dropping the handle would detach the serve task.
         if let Some(task) = self.server_task.get_mut().take() {
             task.abort();
+        }
+        // Nothing can release a held record once the transport is gone.
+        if let Some(pending) = &self.pending {
+            pending.shutdown();
         }
     }
 }
@@ -1047,6 +1547,8 @@ struct TransportServiceImpl {
     sequence: Arc<AtomicU64>,
     /// Where a `RouteBatch` too large for `sender` waits for `recv`.
     oversize: Arc<OversizeSlot>,
+    /// Responses held until their records are released.
+    pending: Option<Arc<PendingRegistry>>,
     /// Optional pressure governor (`governor` feature). `None` -> handlers
     /// never consult it. `Some` rejects an inbound Push / batch record with
     /// `Status::unavailable` while [`UnifiedPressure::should_hold`] holds --
@@ -1056,8 +1558,8 @@ struct TransportServiceImpl {
 }
 
 impl TransportServiceImpl {
-    /// Wrap one `RouteBatch` record for `recv`, taking the next sequence.
-    fn message(&self, record: Record) -> Message<GrpcToken> {
+    /// Wrap one `RouteBatch` record for `recv` under sequence number `seq`.
+    fn message(record: Record, seq: u64) -> Message<GrpcToken> {
         // Auto means the sender did not pin a format. Detect from the lead
         // byte so the receiver gets a concrete hint; does NOT parse/decode.
         let format = if record.metadata.format == PayloadFormat::Auto {
@@ -1068,10 +1570,18 @@ impl TransportServiceImpl {
         Message {
             key: record.key,
             payload: record.payload,
-            token: GrpcToken::new(self.sequence.fetch_add(1, Ordering::Relaxed)),
+            token: GrpcToken::new(seq),
             timestamp_ms: record.metadata.timestamp_ms,
             format,
         }
+    }
+
+    /// Count a refusal of a push while responses are held.
+    fn refused(&self, status: Status) -> Status {
+        if status.code() == tonic::Code::Unavailable {
+            note_refusal(self.pending.as_deref(), "closed");
+        }
+        status
     }
 }
 
@@ -1083,10 +1593,18 @@ impl proto::transport_server::Transport for TransportServiceImpl {
     ) -> Result<Response<proto::PushResponse>, Status> {
         // Shed before doing any work while the governor holds intake.
         #[cfg(feature = "governor")]
-        shed_if_held(self.pressure.as_ref())?;
+        shed_if_held(self.pressure.as_ref(), self.pending.as_deref())?;
 
+        let deadline = sender_deadline(request.metadata());
         let req = request.into_inner();
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let (seq, held) = admit(
+            self.pending.as_ref(),
+            &self.sequence,
+            deadline,
+            1,
+            req.payload.len() as u64,
+            DeliveryStatus::Delivered,
+        )?;
 
         // Extract W3C traceparent from incoming gRPC metadata.
         #[cfg(feature = "transport-trace")]
@@ -1124,10 +1642,20 @@ impl proto::transport_server::Transport for TransportServiceImpl {
                             .saturating_sub(self.sender.capacity()) as f64,
                     );
                 }
-                Ok(Response::new(proto::PushResponse { accepted: 1 }))
             }
-            Err(mpsc::error::TrySendError::Full(_)) => Err(receiver_full()),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(receiver_closed()),
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(receiver_full()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(self.refused(receiver_closed()));
+            }
+        }
+
+        let response = proto::PushResponse { accepted: 1 };
+        match held {
+            Some(mut held) => {
+                held.queued();
+                answer(held.outcome().await, response)
+            }
+            None => Ok(Response::new(response)),
         }
     }
 
@@ -1137,7 +1665,7 @@ impl proto::transport_server::Transport for TransportServiceImpl {
     ) -> Result<Response<proto::BatchAck>, Status> {
         // Shed the whole batch while the governor holds intake.
         #[cfg(feature = "governor")]
-        shed_if_held(self.pressure.as_ref())?;
+        shed_if_held(self.pressure.as_ref(), self.pending.as_deref())?;
 
         // Extract W3C traceparent BEFORE consuming the request body.
         #[cfg(feature = "transport-trace")]
@@ -1150,45 +1678,76 @@ impl proto::transport_server::Transport for TransportServiceImpl {
             tracing::Span::current().record("traceparent", tp);
         }
 
+        let deadline = sender_deadline(request.metadata());
         let proto_batch = request.into_inner();
 
         // Decode proto Batch -> scalo Records (payloads zero-copy `Bytes`,
         // codec NOT invoked). recv() delivers them unchanged, from the channel
         // the single-message Push path uses or from the oversize slot.
         let records = batch::proto_batch_to_records(proto_batch);
-        let accepted = records.len() as u64;
+        let count = records.len();
+        let accepted = count as u64;
+        // Nothing to hold or queue, but a closed receiver still says so.
+        if records.is_empty() {
+            if self.sender.is_closed() {
+                return Err(self.refused(receiver_closed()));
+            }
+            return Ok(Response::new(proto::BatchAck { accepted }));
+        }
         // Sum raw wire bytes BEFORE the records move into the channel below.
-        #[cfg(feature = "metrics")]
         let batch_bytes: usize = records.iter().map(|r| r.payload.len()).sum();
+        // One contiguous sequence range per request, so a held request is
+        // found from any of its tokens.
+        let (base, held) = admit(
+            self.pending.as_ref(),
+            &self.sequence,
+            deadline,
+            accepted,
+            batch_bytes as u64,
+            DeliveryStatus::Delivered,
+        )?;
+        let messages = records
+            .into_iter()
+            .zip(base..)
+            .map(|(record, seq)| Self::message(record, seq));
 
         // A batch the channel can never hold at once waits whole in its own
         // slot, admitted in one step or refused, like one that fits.
-        if records.len() > self.sender.max_capacity() {
-            let batch = records.into_iter().map(|r| self.message(r)).collect();
-            self.oversize.admit(batch)?;
+        if count > self.sender.max_capacity() {
+            self.oversize
+                .admit(messages.collect())
+                .map_err(|status| self.refused(status))?;
         } else {
             // ATOMICITY: reserve channel capacity for the WHOLE batch via
             // `try_reserve_many` BEFORE enqueuing ANY record. Cannot fit ->
             // reject all-or-nothing, so a retry re-sends the full block with no
             // partial-acceptance / duplicate window. A per-record `try_send`
             // loop could enqueue some then fail mid-batch, stranding a prefix.
-            // An empty batch reserves zero permits (no-op).
-            let permits = match self.sender.try_reserve_many(records.len()) {
+            let permits = match self.sender.try_reserve_many(count) {
                 Ok(permits) => permits,
                 Err(mpsc::error::TrySendError::Full(())) => return Err(receiver_full()),
-                Err(mpsc::error::TrySendError::Closed(())) => return Err(receiver_closed()),
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    return Err(self.refused(receiver_closed()));
+                }
             };
 
             // Capacity now held for every record -- enqueuing is infallible.
-            for (permit, record) in permits.zip(records) {
-                permit.send(self.message(record));
+            for (permit, message) in permits.zip(messages) {
+                permit.send(message);
             }
         }
 
         #[cfg(feature = "metrics")]
         count_received(accepted, batch_bytes);
 
-        Ok(Response::new(proto::BatchAck { accepted }))
+        let response = proto::BatchAck { accepted };
+        match held {
+            Some(mut held) => {
+                held.queued();
+                answer(held.outcome().await, response)
+            }
+            None => Ok(Response::new(response)),
+        }
     }
 
     async fn health_check(
@@ -1356,11 +1915,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_batch_rejects_oversize_block() {
-        // Over max_message_size, reject with a clear Fatal naming the limit
-        // BEFORE the RPC -- tonic would otherwise return an opaque OutOfRange
-        // (also Fatal) that can never succeed on retry. The size check fires
-        // before any connection, so no server is needed.
+    async fn send_batch_leaves_out_a_record_over_the_limit_on_its_own() {
+        // The same bytes are refused on every retry, so the record is left
+        // out before any connection, as `send` refuses it, so no server runs.
         let config = GrpcConfig::client("http://127.0.0.1:1").with_max_message_size(64);
         let transport = GrpcTransport::new(&config).await.unwrap();
         let rec = Record {
@@ -1372,13 +1929,11 @@ mod tests {
                 format: PayloadFormat::Json,
             },
         };
-        match transport.send_batch(&[rec]).await {
-            SendResult::Fatal(e) => assert!(
-                e.to_string().contains("max_message_size"),
-                "error should name the limit, got: {e}"
-            ),
-            other => panic!("expected Fatal for oversize block, got {other:?}"),
-        }
+        let result = transport.send_batch(&[rec]).await;
+        assert!(
+            result.is_filtered_dlq(),
+            "the only record, over the limit: got {result:?}"
+        );
     }
 
     #[test]
@@ -1886,10 +2441,10 @@ mod tests {
         server.close().await.unwrap();
     }
 
-    /// A block whose payloads fit but whose framing does not is refused before
-    /// the RPC; compressed, the receiver would answer ResourceExhausted.
+    /// A record whose payload fits but whose framing does not is left out
+    /// before the RPC. Compressed, the receiver would answer ResourceExhausted.
     #[tokio::test]
-    async fn a_batch_over_the_limit_by_its_framing_alone_is_refused() {
+    async fn a_record_over_the_limit_by_its_framing_alone_is_left_out() {
         let (server, endpoint) = receiver(
             GrpcConfig::server("127.0.0.1:0")
                 .with_max_message_size(LIMIT)
@@ -1913,13 +2468,8 @@ mod tests {
             },
         };
 
-        match client.send_batch(&[record]).await {
-            SendResult::Fatal(e) => assert!(
-                e.to_string().contains("max_message_size"),
-                "error should name the limit, got: {e}"
-            ),
-            other => panic!("expected Fatal for a block over the limit, got {other:?}"),
-        }
+        let result = client.send_batch(&[record]).await;
+        assert!(result.is_filtered_dlq(), "got {result:?}");
         assert!(server.recv(10).await.unwrap().records.is_empty());
 
         client.close().await.unwrap();
@@ -1946,6 +2496,159 @@ mod tests {
 
         client.close().await.unwrap();
         server.close().await.unwrap();
+    }
+
+    /// An armed receive server holding at most `max_held_bytes`, and its URI.
+    async fn armed(max_held_bytes: u64, drain_deadline: Duration) -> (GrpcTransport, String) {
+        let config = GrpcConfig::server("127.0.0.1:0");
+        let server = GrpcTransport::builder(&config)
+            .armed(true)
+            .max_held_bytes(max_held_bytes)
+            .drain_deadline(drain_deadline)
+            .start()
+            .await
+            .unwrap();
+        let uri = format!("http://{}", server.local_addr().unwrap());
+        (server, uri)
+    }
+
+    /// Release every token of `batch` with `status`, as the engine does.
+    fn release(server: &GrpcTransport, batch: &WorkBatch<GrpcToken>, status: DeliveryStatus) {
+        server
+            .pending
+            .as_ref()
+            .unwrap()
+            .release(batch.commit_tokens.iter().map(|t| t.seq), status);
+    }
+
+    /// Receive until `n` records have arrived.
+    async fn recv_n(server: &GrpcTransport, n: usize) -> WorkBatch<GrpcToken> {
+        let mut all = server.recv(n).await.unwrap();
+        while all.records.len() < n {
+            let more = server.recv(n - all.records.len()).await.unwrap();
+            all.records.extend(more.records);
+            all.commit_tokens.extend(more.commit_tokens);
+        }
+        all
+    }
+
+    #[tokio::test]
+    async fn a_held_block_takes_one_contiguous_range_and_waits_for_release() {
+        let (server, uri) = armed(1 << 20, DEFAULT_DRAIN_DEADLINE).await;
+        let client = Arc::new(GrpcTransport::new(&GrpcConfig::client(&uri)).await.unwrap());
+        let sending = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .send_batch(&[json_record(b"{}"), json_record(b"{}"), json_record(b"{}")])
+                    .await
+            }
+        });
+
+        let batch = recv_n(&server, 3).await;
+        let seqs: Vec<u64> = batch.commit_tokens.iter().map(|t| t.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2], "one contiguous range per request");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!sending.is_finished(), "answered before release");
+
+        release(&server, &batch, DeliveryStatus::Delivered);
+        let result = tokio::time::timeout(Duration::from_secs(2), sending)
+            .await
+            .expect("answered once released")
+            .unwrap();
+        assert!(result.is_ok(), "released Delivered: got {result:?}");
+        assert_eq!(server.pending.as_ref().unwrap().snapshot().count, 0);
+    }
+
+    #[tokio::test]
+    async fn the_held_byte_ceiling_answers_with_a_retry_pushback() {
+        let (server, uri) = armed(1 << 10, DEFAULT_DRAIN_DEADLINE).await;
+        let client = Arc::new(GrpcTransport::new(&GrpcConfig::client(&uri)).await.unwrap());
+        let first = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.send("events", filled(1 << 10)).await }
+        });
+        let held = recv_n(&server, 1).await;
+
+        let mut raw = proto::transport_client::TransportClient::connect(uri)
+            .await
+            .unwrap();
+        let status = raw
+            .push(push_request("events", filled(8)))
+            .await
+            .expect_err("past the ceiling");
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+        assert_eq!(
+            status
+                .metadata()
+                .get("grpc-retry-pushback-ms")
+                .and_then(|v| v.to_str().ok()),
+            Some("1000")
+        );
+
+        release(&server, &held, DeliveryStatus::Delivered);
+        assert!(first.await.unwrap().is_ok());
+    }
+
+    /// The parts `batches_within` adds up are the body's own encoded length,
+    /// so every split request fits the limit it was cut to.
+    #[test]
+    fn split_batches_each_encode_within_the_limit() {
+        let records: Vec<Record> = (0..40).map(|_| json_record(b"0123456789abcdef")).collect();
+        let whole = prost::Message::encoded_len(&batch::records_to_proto(records.clone()));
+        let limit = whole / 3;
+        let batches = batches_within(records, limit);
+        assert!(batches.len() >= 3, "{} batches", batches.len());
+        let total: usize = batches.iter().map(|b| b.records.len()).sum();
+        assert_eq!(total, 40, "no record lost in the split");
+        for b in &batches {
+            assert!(prost::Message::encoded_len(b) <= limit);
+        }
+        let framed: usize = batches[0]
+            .records
+            .iter()
+            .map(|r| prost::encoding::message::encoded_len(1, r))
+            .sum();
+        assert_eq!(framed, prost::Message::encoded_len(&batches[0]));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_hold_expiry_or_a_deadline_is_a_possible_redelivery() {
+        let mut expired = tonic::Status::unavailable("held");
+        expired
+            .metadata_mut()
+            .insert(HOLD_EXPIRED, tonic::metadata::MetadataValue::from(1_u32));
+        assert_eq!(redelivery_reason(&expired), Some("hold_expired"));
+        assert_eq!(
+            redelivery_reason(&tonic::Status::deadline_exceeded("slow")),
+            Some("deadline")
+        );
+        assert_eq!(
+            redelivery_reason(&tonic::Status::cancelled("Timeout expired")),
+            Some("deadline")
+        );
+        assert_eq!(redelivery_reason(&tonic::Status::unavailable("down")), None);
+        assert_eq!(
+            redelivery_reason(&tonic::Status::resource_exhausted("full")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_sender_deadline_is_read_as_tonic_reads_it() {
+        let deadline = |value: &str| {
+            let mut metadata = tonic::metadata::MetadataMap::new();
+            metadata.insert("grpc-timeout", value.parse().unwrap());
+            sender_deadline(&metadata)
+        };
+        assert_eq!(deadline("2S"), Some(Duration::from_secs(2)));
+        assert_eq!(deadline("1500m"), Some(Duration::from_millis(1_500)));
+        assert_eq!(deadline("1H"), Some(Duration::from_secs(3_600)));
+        assert_eq!(deadline("S"), None);
+        assert_eq!(deadline("123456789S"), None, "at most 8 digits");
+        assert_eq!(deadline("5x"), None);
+        assert_eq!(sender_deadline(&tonic::metadata::MetadataMap::new()), None);
     }
 
     /// An outage stays backpressure at the limit; over it, the record is

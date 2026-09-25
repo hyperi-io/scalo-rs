@@ -47,6 +47,17 @@ limit, not a bug.
 
 ---
 
+## Held responses
+
+An armed gRPC receive server answers a push only once its records are released, so a sender told `OK` is never relying on a copy that lives only in this process. What the server holds meanwhile has two brakes, and both are this gate:
+
+- The held-byte ceiling refuses a push with `ResourceExhausted` and a retry pushback once held responses carry `max_held_bytes` of payload. One push is always admitted while nothing is held.
+- An `AckHeldSource` reports held bytes, as a fraction of that ceiling, into the same `UnifiedPressure` latch as memory, as a HARD source. Near the ceiling the latch holds: Kafka partitions pause and pushes are refused `Unavailable`.
+
+Held bytes are also leased on the memory guard from admission to answer, so the memory source sees records waiting in the receive queue, not only those the engine has taken. Detail: [transport/backends.md](transport/backends.md#held-responses).
+
+---
+
 ## The brake / commit-token table
 
 The brake is one half of the at-least-once contract; the commit token is the

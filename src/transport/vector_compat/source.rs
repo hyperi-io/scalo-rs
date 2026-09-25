@@ -14,10 +14,15 @@
 
 use super::convert::event_wrapper_to_json;
 use super::proto::vector;
-use crate::transport::grpc::{GrpcToken, receiver_closed};
+use crate::transport::finalizer::DeliveryStatus;
+use crate::transport::grpc::pending::PendingRegistry;
+use crate::transport::grpc::{
+    GrpcToken, admit, answer, note_refusal, receiver_closed, sender_deadline,
+};
 use crate::transport::types::{Message, PayloadFormat};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
@@ -37,9 +42,20 @@ use tonic::{Request, Response, Status};
 /// Queued events count in `transport_received_*{transport="grpc"}`. A
 /// `GrpcTransport` built with a pressure governor refuses these requests with
 /// `Unavailable` while the governor holds intake, as it refuses a native push.
+///
+/// Built by an armed `GrpcTransport`, a request is answered only once its
+/// events are released, over the native pushes' registry and ceiling: `OK`
+/// when they were delivered, dropped or dead-lettered, `Unavailable`, which
+/// Vector retries, when they were not. Metric events are skipped rather than
+/// queued, and a request that skipped any is released no better than
+/// `Dropped`.
 pub struct VectorCompatService {
     sender: mpsc::Sender<Message<GrpcToken>>,
     sequence: Arc<AtomicU64>,
+    /// Asserted unwind-safe so the service stays `UnwindSafe` as it was: the
+    /// registry settles every entry, byte and sender before the metrics
+    /// recorder, its only call that can panic.
+    pending: AssertUnwindSafe<Option<Arc<PendingRegistry>>>,
 }
 
 impl VectorCompatService {
@@ -48,18 +64,42 @@ impl VectorCompatService {
     /// Uses the same sender/sequence as the native transport server so
     /// both native and Vector-compat events arrive in the same channel.
     pub fn new(sender: mpsc::Sender<Message<GrpcToken>>, sequence: Arc<AtomicU64>) -> Self {
-        Self { sender, sequence }
+        Self {
+            sender,
+            sequence,
+            pending: AssertUnwindSafe(None),
+        }
     }
 
-    /// Wrap one converted event for the receive queue, taking the next sequence.
-    fn message(&self, payload: bytes::Bytes) -> Message<GrpcToken> {
+    /// Like [`new`](Self::new), holding responses in the native server's
+    /// registry once it is armed.
+    pub(crate) fn with_hold(
+        sender: mpsc::Sender<Message<GrpcToken>>,
+        sequence: Arc<AtomicU64>,
+        pending: Option<Arc<PendingRegistry>>,
+    ) -> Self {
+        Self {
+            sender,
+            sequence,
+            pending: AssertUnwindSafe(pending),
+        }
+    }
+
+    /// Wrap one converted event for the receive queue under sequence `seq`.
+    fn message(payload: bytes::Bytes, seq: u64) -> Message<GrpcToken> {
         Message {
             key: None, // Vector events don't carry a topic key
             payload,
-            token: GrpcToken::new(self.sequence.fetch_add(1, Ordering::Relaxed)),
+            token: GrpcToken::new(seq),
             timestamp_ms: None,
             format: PayloadFormat::Json,
         }
+    }
+
+    /// The answer for a request the receiver closed under.
+    fn closed(&self) -> Status {
+        note_refusal(self.pending.as_deref(), "closed");
+        receiver_closed()
     }
 }
 
@@ -76,8 +116,10 @@ impl vector::vector_server::Vector for VectorCompatService {
                 .extensions()
                 .get::<crate::transport::grpc::InboundGate>()
                 .map(|gate| &gate.0),
+            self.pending.as_deref(),
         )?;
 
+        let deadline = sender_deadline(request.metadata());
         let req = request.into_inner();
 
         // Convert every event before queueing any, so a failure queues nothing.
@@ -95,38 +137,66 @@ impl vector::vector_server::Vector for VectorCompatService {
             return Ok(Response::new(vector::PushEventsResponse {}));
         }
 
-        if payloads.len() > self.sender.max_capacity() {
+        let count = payloads.len();
+        let bytes = payloads.iter().map(bytes::Bytes::len).sum::<usize>();
+        let floor = if count < req.events.len() {
+            DeliveryStatus::Dropped
+        } else {
+            DeliveryStatus::Delivered
+        };
+        let (base, mut held) = admit(
+            self.pending.as_ref(),
+            &self.sequence,
+            deadline,
+            count as u64,
+            bytes as u64,
+            floor,
+        )?;
+
+        if count > self.sender.max_capacity() {
             // Too many to reserve at once: queue as room frees up.
-            for payload in payloads {
+            for (index, payload) in (0_u64..).zip(payloads) {
                 #[cfg(feature = "metrics")]
                 let bytes = payload.len();
-                self.sender
-                    .send(self.message(payload))
+                if self
+                    .sender
+                    .send(Self::message(payload, base + index))
                     .await
-                    .map_err(|_| receiver_closed())?;
+                    .is_err()
+                {
+                    if let Some(held) = held.as_mut() {
+                        held.refuse_from(index);
+                    }
+                    return Err(self.closed());
+                }
+                if let Some(held) = held.as_mut() {
+                    held.advance();
+                }
                 #[cfg(feature = "metrics")]
                 crate::transport::grpc::count_received(1, bytes);
             }
         } else {
-            #[cfg(feature = "metrics")]
-            let (events, bytes) = (
-                payloads.len() as u64,
-                payloads.iter().map(bytes::Bytes::len).sum::<usize>(),
-            );
             let permits = self
                 .sender
-                .reserve_many(payloads.len())
+                .reserve_many(count)
                 .await
-                .map_err(|_| receiver_closed())?;
+                .map_err(|_| self.closed())?;
             // Room is held for every event, so queueing cannot fail part-way.
-            for (permit, payload) in permits.zip(payloads) {
-                permit.send(self.message(payload));
+            for (permit, (payload, seq)) in permits.zip(payloads.into_iter().zip(base..)) {
+                permit.send(Self::message(payload, seq));
             }
             #[cfg(feature = "metrics")]
-            crate::transport::grpc::count_received(events, bytes);
+            crate::transport::grpc::count_received(count as u64, bytes);
         }
 
-        Ok(Response::new(vector::PushEventsResponse {}))
+        let response = vector::PushEventsResponse {};
+        match held {
+            Some(mut held) => {
+                held.queued();
+                answer(held.outcome().await, response)
+            }
+            None => Ok(Response::new(response)),
+        }
     }
 
     async fn health_check(
