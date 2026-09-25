@@ -166,7 +166,7 @@ impl<T: crate::transport::CommitToken> ParsedBatch<'_, T> {
 /// the flush interval, not per block), so this extraction does not touch the
 /// hot recv path.
 #[cfg(feature = "transport")]
-struct LoopTicker<F> {
+pub(super) struct LoopTicker<F> {
     interval: Option<tokio::time::Interval>,
     callback: Option<F>,
 }
@@ -177,7 +177,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), EngineError>>,
 {
-    fn new(ticker: Option<(Duration, F)>) -> Self {
+    pub(super) fn new(ticker: Option<(Duration, F)>) -> Self {
         // Start the first tick one period out (not immediately) so the loop
         // does not fire a tick before it has polled the source once.
         let interval = ticker
@@ -192,7 +192,7 @@ where
     /// Yield when the next tick is due, or never if no ticker is configured.
     /// Cancel-safe: `Interval::tick` is cancel-safe and the no-ticker arm pends,
     /// so this sits directly in `tokio::select!`.
-    async fn wait(&mut self) {
+    pub(super) async fn wait(&mut self) {
         match self.interval.as_mut() {
             Some(i) => {
                 i.tick().await;
@@ -202,7 +202,7 @@ where
     }
 
     /// Run the ticker callback; a callback error is logged, not fatal.
-    async fn fire(&mut self, label: &str) {
+    pub(super) async fn fire(&mut self, label: &str) {
         if let Some(f) = self.callback.as_mut()
             && let Err(e) = f().await
         {
@@ -213,7 +213,7 @@ where
 
 /// What became of a block the driver tried to sink.
 #[cfg(feature = "transport")]
-enum Delivery {
+pub(super) enum Delivery {
     /// The sink took it.
     Sunk,
     /// The sink was still refusing it when the retry window after shutdown
@@ -224,25 +224,25 @@ enum Delivery {
 /// How long the shutdown drain waits on a source that has stopped returning
 /// records, so one that never reports `Closed` cannot hold shutdown.
 #[cfg(feature = "transport")]
-const DRAIN_IDLE_LIMIT: Duration = Duration::from_secs(5);
+pub(super) const DRAIN_IDLE_LIMIT: Duration = Duration::from_secs(5);
 
 /// How long after shutdown a block the sink refuses transiently is still
 /// retried, so a sink busy at that moment does not lose what the source acked.
 #[cfg(feature = "transport")]
-const SHUTDOWN_RETRY_LIMIT: Duration = Duration::from_secs(10);
+pub(super) const SHUTDOWN_RETRY_LIMIT: Duration = Duration::from_secs(10);
 
 /// When a run loop stops retrying a block the sink refuses transiently:
 /// never before shutdown, and [`SHUTDOWN_RETRY_LIMIT`] after the loop first
 /// sees it.
 #[cfg(feature = "transport")]
-struct RetryWindow<'a> {
+pub(super) struct RetryWindow<'a> {
     shutdown: &'a CancellationToken,
     shutdown_seen: std::sync::OnceLock<tokio::time::Instant>,
 }
 
 #[cfg(feature = "transport")]
 impl<'a> RetryWindow<'a> {
-    fn new(shutdown: &'a CancellationToken) -> Self {
+    pub(super) fn new(shutdown: &'a CancellationToken) -> Self {
         Self {
             shutdown,
             shutdown_seen: std::sync::OnceLock::new(),
@@ -250,12 +250,12 @@ impl<'a> RetryWindow<'a> {
     }
 
     /// Start the window from now, unless a retry already saw shutdown.
-    fn mark_shutdown_seen(&self) {
+    pub(super) fn mark_shutdown_seen(&self) {
         self.shutdown_seen.get_or_init(tokio::time::Instant::now);
     }
 
     /// Resolves once the window has closed.
-    async fn closed(&self) {
+    pub(super) async fn closed(&self) {
         self.shutdown.cancelled().await;
         let seen = *self.shutdown_seen.get_or_init(tokio::time::Instant::now);
         tokio::time::sleep_until(seen + SHUTDOWN_RETRY_LIMIT).await;
@@ -265,10 +265,11 @@ impl<'a> RetryWindow<'a> {
 /// The receive call a run loop makes.
 #[cfg(feature = "transport")]
 #[derive(Clone, Copy)]
-enum RecvCap {
+pub(super) enum RecvCap {
     /// `recv(max)`.
     Records(usize),
-    /// `recv_limited(limits)`.
+    /// `recv_limited(limits)`, the governed loops' byte-bounded receive.
+    #[cfg_attr(not(feature = "governor"), allow(dead_code))]
     Limits(RecvLimits),
 }
 
@@ -284,7 +285,7 @@ enum BlockShape {
 
 /// Receive one block the way the run loop that owns `cap` does.
 #[cfg(feature = "transport")]
-async fn recv_capped<R: TransportReceiver>(
+pub(super) async fn recv_capped<R: TransportReceiver>(
     receiver: &R,
     cap: RecvCap,
 ) -> TransportResult<WorkBatch<R::Token>> {
@@ -296,7 +297,7 @@ async fn recv_capped<R: TransportReceiver>(
 
 /// Close the source at shutdown; a failure is logged, since shutdown goes on.
 #[cfg(feature = "transport")]
-async fn close_source<R: TransportReceiver>(receiver: &R) {
+pub(super) async fn close_source<R: TransportReceiver>(receiver: &R) {
     if let Err(e) = receiver.close().await {
         tracing::warn!(
             error = %e,
@@ -312,7 +313,9 @@ async fn close_source<R: TransportReceiver>(receiver: &R) {
 /// The block stays uncommitted, and the source is closed without a drain: a
 /// later block sunk and committed would advance an ordered source past it.
 #[cfg(feature = "transport")]
-async fn stop_after_abandoned<R: TransportReceiver>(receiver: &R) -> Result<(), EngineError> {
+pub(super) async fn stop_after_abandoned<R: TransportReceiver>(
+    receiver: &R,
+) -> Result<(), EngineError> {
     tracing::warn!(
         transport = receiver.name(),
         retry_limit = ?SHUTDOWN_RETRY_LIMIT,
@@ -336,7 +339,7 @@ async fn wait_unless_shutdown(shutdown: &CancellationToken, wait: Duration) -> b
 /// Count and report one transient failure of a run-loop `stage`; warn on the
 /// first of a run only.
 #[cfg(feature = "transport")]
-fn note_transient(stage: &'static str, error: &dyn std::fmt::Display, failures: u32) {
+pub(super) fn note_transient(stage: &'static str, error: &dyn std::fmt::Display, failures: u32) {
     #[cfg(feature = "metrics")]
     metrics::counter!("pipeline_retries_total", "stage" => stage).increment(1);
     if failures == 1 {
@@ -350,9 +353,32 @@ fn note_transient(stage: &'static str, error: &dyn std::fmt::Display, failures: 
     }
 }
 
+/// Report a push source with acknowledgements on that this loop runs unarmed,
+/// so it answers its senders at enqueue: `pipeline_delivery_guarantee` names
+/// it `best_effort` / `unarmed`.
+#[cfg(feature = "transport")]
+fn note_unarmed<R: TransportReceiver>(receiver: &R) {
+    let Some(control) = receiver.ack_control() else {
+        return;
+    };
+    if control.enabled() && !control.is_armed() && control.kind() == crate::transport::AckKind::Push
+    {
+        tracing::warn!(
+            transport = receiver.name(),
+            "acknowledgements are on, but this run loop does not arm the source, so it \
+             answers its senders at enqueue; BatchEngine::pipeline holds them until delivery"
+        );
+        crate::transport::ack::EffectiveGuarantee::of(
+            Some(control),
+            crate::transport::SinkConfirmation::None,
+        )
+        .publish();
+    }
+}
+
 /// Report the first success after a run of transient failures.
 #[cfg(feature = "transport")]
-fn note_recovered(stage: &'static str, failures: u32) {
+pub(super) fn note_recovered(stage: &'static str, failures: u32) {
     if failures > 0 {
         tracing::info!(stage, failures, "run loop step recovered");
     }
@@ -361,7 +387,7 @@ fn note_recovered(stage: &'static str, failures: u32) {
 /// Settle one recv result: the batch, `None` after waiting out a transient
 /// failure (or on shutdown), or the error that ends the loop.
 #[cfg(feature = "transport")]
-async fn settle_recv<T: crate::transport::CommitToken>(
+pub(super) async fn settle_recv<T: crate::transport::CommitToken>(
     result: TransportResult<WorkBatch<T>>,
     failures: &mut u32,
     shutdown: &CancellationToken,
@@ -533,6 +559,7 @@ impl BatchEngine {
             ticker = ticker.is_some(),
             "BatchEngine (workbatch) starting"
         );
+        note_unarmed(receiver);
 
         let mut ticker = LoopTicker::new(ticker);
         let retry = RetryWindow::new(&shutdown);
@@ -645,6 +672,7 @@ impl BatchEngine {
             ticker = ticker.is_some(),
             "BatchEngine (workbatch streaming) starting"
         );
+        note_unarmed(receiver);
 
         let mut ticker = LoopTicker::new(ticker);
         let retry = RetryWindow::new(&shutdown);
@@ -773,6 +801,7 @@ impl BatchEngine {
             start_byte_budget = budget.byte_budget(),
             "BatchEngine (governed) starting -- self-regulation ON"
         );
+        note_unarmed(receiver);
 
         let mut ticker = LoopTicker::new(ticker);
         let retry = RetryWindow::new(&shutdown);
@@ -931,6 +960,7 @@ impl BatchEngine {
             ticker = ticker.is_some(),
             "BatchEngine (workbatch parsed) starting"
         );
+        note_unarmed(receiver);
 
         let mut ticker = LoopTicker::new(ticker);
         let retry = RetryWindow::new(&shutdown);
@@ -1479,7 +1509,7 @@ impl BatchEngine {
 /// sub-block vector is allocated at a time -- the one the loop is about to lease
 /// and sink -- so the SPLIT no longer defeats the streaming peak-memory bound.
 #[cfg(feature = "transport")]
-struct SubBlockDrain {
+pub(super) struct SubBlockDrain {
     /// Source records, drained in order. `peeked` holds a record we pulled but
     /// could not fit into the sub-block being built (it starts the next one).
     iter: std::vec::IntoIter<Record>,
@@ -1489,7 +1519,7 @@ struct SubBlockDrain {
 
 #[cfg(feature = "transport")]
 impl SubBlockDrain {
-    fn new(records: Vec<Record>, target_bytes: u64) -> Self {
+    pub(super) fn new(records: Vec<Record>, target_bytes: u64) -> Self {
         Self {
             iter: records.into_iter(),
             peeked: None,
@@ -1499,7 +1529,7 @@ impl SubBlockDrain {
 
     /// Yield the next consecutive sub-block, or `None` when the source is
     /// exhausted. Allocates exactly ONE sub-block `Vec` per call.
-    fn next_sub_block(&mut self) -> Option<Vec<Record>> {
+    pub(super) fn next_sub_block(&mut self) -> Option<Vec<Record>> {
         // Start with the record carried over from the previous call (if any),
         // else pull the first record of this sub-block from the source.
         let first = self.peeked.take().or_else(|| self.iter.next())?;

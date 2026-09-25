@@ -22,7 +22,7 @@ pub use config::{BatchProcessingConfig, ParseErrorAction, PreRouteFilterConfig};
 pub use driver::{CommitMode, ParsedBatch};
 pub use intern::FieldInterner;
 #[cfg(feature = "transport")]
-pub use pipeline::{NoTicker, Pipeline};
+pub use pipeline::{BlockPieces, NoTicker, Pipeline};
 pub use types::{MessageMetadata, ParsedMessage, PreRouteResult};
 
 /// Errors returned by the [`BatchEngine`] `WorkBatch` drivers

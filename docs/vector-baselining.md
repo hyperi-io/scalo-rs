@@ -664,7 +664,7 @@ worth it for a hot-path runtime. Global cgroup memory + PSI is enough.
 
 ### Already covered (no action - Vector parity or better)
 
-- At-least-once with fan-out accounting: scalo's WorkBatch commit-token model (`transport/work_batch.rs`) decouples acks from record count and is fan-out-safe. The ack reaches the source only on the Kafka path, where the offset is committed once the sink has taken the block. A push source (gRPC, HTTP, Vector-compat) acknowledges its sender once a record is queued for `recv`, and its `commit` is a no-op, so its acknowledgement is not end to end.
+- At-least-once with fan-out accounting: scalo's WorkBatch commit-token model (`transport/work_batch.rs`) decouples acks from record count and is fan-out-safe. Under the `BatchEngine` pipeline builder a block's source ack is released only once every piece built from it reports (`transport/finalizer.rs`), dead letters included once the DLQ confirms them, and an `Errored` piece withholds it. A Kafka source commits each partition only up to its lowest unreleased offset. A push source is end to end only where it holds its answer until release. One that does not, or one run by the other run loops, acknowledges its sender once a record is queued. See `docs/pipeline/acknowledgements.md`.
 - Restart durability: in the Kafka-mediated mode, Kafka IS the WAL
   (replay from offset; offset commits only after sink success). Vector
   needs a disk buffer to get this; scalo gets it free on the Kafka path.

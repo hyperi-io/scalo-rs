@@ -316,8 +316,9 @@ pub enum RecordCodecError {
 /// commit`. The `commit_tokens` are the INPUT source acks -- fired once after
 /// the WHOLE block is sent (at-least-once). `T` generalises the source ack: a
 /// Kafka offset, a file position, or a sequence number for a push source
-/// (gRPC, HTTP), whose sender was answered when the record was queued and whose
-/// commit is a no-op.
+/// (gRPC, HTTP). A push source answers its sender when the record is queued,
+/// or, once armed, when the token is released
+/// ([`TransportReceiver::release`](super::TransportReceiver::release)).
 ///
 /// `commit_tokens.len()` is intentionally decoupled from `records.len()`: a
 /// fan-out transform may grow or shrink the record count while the commit

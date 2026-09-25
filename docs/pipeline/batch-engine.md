@@ -121,6 +121,23 @@ flush comes after it. Source: [`driver.rs`](../../src/worker/engine/driver.rs).
 
 ---
 
+## Delivery guarantee: the pipeline builder
+
+The run loops above commit a block once its sink returns. A push source (the gRPC server) has already answered its sender by then, so what it held in memory is lost on a crash. `BatchEngine::pipeline` is the run loop that holds each block's source acknowledgement until every piece built from the block is delivered, whatever the source.
+
+```rust
+engine
+    .pipeline(&receiver)
+    .shutdown(shutdown)
+    .sender(&sender) // what the sink confirms, and what it would refuse
+    .run(|batch| Ok(batch), |out| send(out))
+    .await?;
+```
+
+Each sink call, the block's dead letters and any piece the sink takes itself are pieces of the block, and the source is released once, with their merged status. `acknowledgements.enabled: false` releases at receipt. Pieces, hold deadlines, `with_dlq`, the `pipeline_delivery_guarantee` metric and the hand-rolled `SourceAck`: [acknowledgements.md](acknowledgements.md).
+
+---
+
 ## Auto-wiring
 
 `ServiceRuntime` builds the engine when the `worker-batch` feature is
@@ -184,6 +201,8 @@ pause inside the engine. See [self-regulation.md](../self-regulation.md).
 | `run_workbatch(receiver, shutdown, process, sink, commit, ticker)` | Async loop, whole blocks, on-demand parse |
 | `run_workbatch_parsed(receiver, shutdown, process_parsed, sink, commit, ticker)` | Async loop, whole blocks, pre-parsed `ParsedBatch` |
 | `run_workbatch_streaming(receiver, shutdown, process, sink, commit, sub_block_bytes, ticker)` | Async loop, sub-blocks of `sub_block_bytes` |
+| `pipeline(&receiver)` ... `.run(process, sink)` / `.run_with_pieces(process, sink)` | Governed loop that holds each block's source acknowledgement until every piece is delivered ([acknowledgements.md](acknowledgements.md)) |
+| `with_dlq(Arc<Dlq>)` | Dead letters of the `pipeline` loop, confirmed by the DLQ before the source is released |
 | `set_byte_budget(budget)` | Wire the governor's byte budget -- `ServiceRuntime` does this when self-regulation is on |
 | `auto_wire(metrics, memory_guard)` | Called by `ServiceRuntime` — apps never call directly |
 | `stats() -> &Arc<PipelineStats>` | Atomic counters (received, processed, errors, filtered, dlq, bytes) |

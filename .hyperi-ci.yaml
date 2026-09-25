@@ -25,6 +25,9 @@ test:
     # Require process-per-test isolation rather than taking whatever the
     # runner has installed.
     nextest: true
+    # Every feature, `testcontainers` included, so the real-broker tests run on
+    # the Test job's Docker-capable runner.
+    features: all
 build:
   enabled: true
   strategies:

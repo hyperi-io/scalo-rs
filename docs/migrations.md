@@ -769,6 +769,18 @@ The service runtime builds the app metric set, with the `info` gauge, and a serv
 
 **Consumer adjustment** -- a service that wants its commit in `info` names it in `ServiceApp::version_info` with `with_commit`, or builds with `GIT_COMMIT` set. Its own `AppMetrics::new` call can stay; it no longer changes `info`.
 
+### Source acknowledgements held until delivery (additive, opt-in per run loop)
+
+`BatchEngine::pipeline(&receiver)...run(process, sink)` is a new run loop that holds each block's source acknowledgement until every piece built from the block has reported, then releases it once through the new `TransportReceiver::release`. A Kafka source's commit waits for the sink, and an `Errored` block is never committed past. The key is `acknowledgements.enabled` on the transport's own section (default `true`), read by `AnyReceiver::from_config` from `<key>.kafka.acknowledgements` and set on an explicit transport with `KafkaTransport::with_acknowledgements`. `BatchEngine::with_dlq` makes a dead letter a piece that releases its source only once the DLQ confirms the write. See [pipeline/acknowledgements.md](pipeline/acknowledgements.md).
+
+The new trait methods are provided, so no implementor changes: `TransportReceiver::{ack_control, release, hold_deadline}`, `TransportSender::{confirms_delivery, dead_letter_reason}`. `run_governed` and the other run loops behave as before. A push source with acknowledgements on that they run reports `pipeline_delivery_guarantee{guarantee="best_effort",reason="unarmed"}`.
+
+A `KafkaTransport` armed through `AckControl::arm` commits each partition only up to its lowest offset handed out and not yet released, for `commit` as for `release`. An unarmed one commits as before.
+
+`StatsContext::total_position_lag` and `KafkaTransport::total_position_lag` count records past the consumer's read position, which a held commit does not inflate. `total_consumer_lag` still counts from the committed offset.
+
+**Consumer adjustment** -- none to keep today's behaviour. To hold acknowledgements, move from `run_governed` to `pipeline(..)`, call `.sender(&sender)` for a transport sink, and give the loop a DLQ with `with_dlq`. A hand-rolled loop arms the source before its first `recv` and releases each block through `SourceAck`.
+
 ---
 
 ## Known open issues (not fixed on this branch)

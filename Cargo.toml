@@ -213,6 +213,10 @@ deployment-smoke = ["deployment"]
 # contract-artefact e2e tests. See src/deployment/test_support.rs.
 deployment-test-support = ["deployment"]
 
+# Real-broker tests against testcontainers. Needs a Docker daemon at test time;
+# CI's Test job builds with every feature, so it runs them.
+testcontainers = []
+
 # Reflectable config schema + capability catalog (scalo-rs#6). Derives a JSON
 # Schema of the app `Config` via schemars and carries a hand-authored capability
 # catalog the control plane reflects on to build per-endpoint CRUD forms.
