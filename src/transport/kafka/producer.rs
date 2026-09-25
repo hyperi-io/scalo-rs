@@ -10,17 +10,22 @@
 //!
 //! # Performance Characteristics
 //!
-//! - **Batch-first design**: Accumulates messages into large batches (256KB default)
+//! - **Batch-first design**: batching, codec and queue size come from the
+//!   sizing surface ([`KafkaSizingConfig`](super::KafkaSizingConfig)). The
+//!   default `throughput` profile batches 128 KiB over 20 ms, compresses with
+//!   zstd at level 3 and caps the queue at 64 MiB.
 //! - **Non-blocking sends**: Fire-and-forget with delivery callbacks
-//! - **High parallelism**: Up to 10 in-flight requests per connection
-//! - **LZ4 compression**: Best throughput/ratio tradeoff
-//! - **1GB producer queue**: Buffers up to 1M messages
+//! - **Idempotent by default**: 5 in-flight requests per connection, `acks=all`
 //!
 //! # Profiles
 //!
-//! - **high_throughput**: Maximum throughput, at-least-once delivery
+//! A [`ProducerProfile`] adds the few settings the sizing surface leaves alone.
+//! Every setting resolves in one order: profile < sizing profile < named sizing
+//! knobs < `sizing.producer_librdkafka` < `librdkafka_overrides`.
+//!
+//! - **high_throughput**: Nagle off, statistics on
 //! - **exactly_once**: Idempotent producer with ordering guarantees
-//! - **low_latency**: Minimal batching for real-time use cases
+//! - **low_latency**: Leader-ack only when idempotence is off
 //!
 //! # Example
 //!
@@ -60,33 +65,48 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Producer profile for different use cases.
+///
+/// A profile sets only what the sizing surface leaves alone; batch size,
+/// linger, codec and queue size come from `KafkaConfig::sizing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProducerProfile {
     /// Maximum throughput, at-least-once delivery.
     ///
-    /// - 256KB batches, 100ms linger
-    /// - 1GB producer queue
-    /// - 10 in-flight requests
-    /// - LZ4 compression
+    /// Nagle off and statistics on ([`PRODUCER_HIGH_THROUGHPUT`](super::PRODUCER_HIGH_THROUGHPUT)).
     #[default]
     HighThroughput,
 
     /// Exactly-once semantics with ordering guarantees.
     ///
-    /// - Idempotence enabled
-    /// - Max 5 in-flight requests
-    /// - Infinite retries (bounded by timeout)
+    /// - Idempotence enabled, `acks=all`, max 5 in-flight requests
+    /// - Holds only while `sizing.producer.idempotence` is unset or `true`
     ExactlyOnce,
 
-    /// Minimal latency for real-time use cases.
+    /// Leader-ack for real-time use cases.
     ///
-    /// - No batching (linger=0)
-    /// - acks=1 for faster response
-    /// - Smaller buffers
+    /// - `acks=1`, taking effect only with `sizing.producer.idempotence: false`
+    /// - Pair with the `low_latency` sizing profile for no batching delay
     LowLatency,
 
     /// Development/testing settings.
     DevTest,
+}
+
+impl ProducerProfile {
+    /// The librdkafka settings this profile lays under the sizing surface.
+    fn settings(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::HighThroughput => super::config::PRODUCER_HIGH_THROUGHPUT,
+            Self::ExactlyOnce => super::config::PRODUCER_EXACTLY_ONCE,
+            Self::LowLatency => super::config::PRODUCER_LOW_LATENCY,
+            Self::DevTest => super::config::PRODUCER_DEVTEST,
+        }
+    }
+}
+
+/// The librdkafka config `KafkaProducer::new` builds a producer from.
+fn client_config(config: &KafkaConfig, profile: ProducerProfile) -> ClientConfig {
+    super::producer_client_config(config, profile.settings())
 }
 
 impl std::fmt::Display for ProducerProfile {
@@ -153,63 +173,7 @@ impl KafkaProducer {
     ///
     /// Returns error if producer creation fails.
     pub fn new(config: &KafkaConfig, profile: ProducerProfile) -> TransportResult<Self> {
-        let mut client_config = ClientConfig::new();
-
-        // Required settings
-        client_config.set("bootstrap.servers", config.brokers.join(","));
-        client_config.set("client.id", &config.client_id);
-
-        // Security settings
-        client_config.set("security.protocol", &config.security_protocol);
-        if let Some(ref mechanism) = config.sasl_mechanism {
-            client_config.set("sasl.mechanism", mechanism);
-        }
-        if let Some(ref username) = config.sasl_username {
-            client_config.set("sasl.username", username);
-        }
-        if let Some(ref password) = config.sasl_password {
-            client_config.set("sasl.password", password.expose());
-        }
-
-        // TLS settings
-        if let Some(ref ca) = config.ssl_ca_location {
-            client_config.set("ssl.ca.location", ca);
-        }
-        if let Some(ref cert) = config.ssl_certificate_location {
-            client_config.set("ssl.certificate.location", cert);
-        }
-        if let Some(ref key) = config.ssl_key_location {
-            client_config.set("ssl.key.location", key);
-        }
-        if config.ssl_skip_verify {
-            client_config.set("enable.ssl.certificate.verification", "false");
-        }
-
-        // Apply profile defaults
-        let profile_settings = match profile {
-            ProducerProfile::HighThroughput => super::config::PRODUCER_HIGH_THROUGHPUT,
-            ProducerProfile::ExactlyOnce => super::config::PRODUCER_EXACTLY_ONCE,
-            ProducerProfile::LowLatency => super::config::PRODUCER_LOW_LATENCY,
-            ProducerProfile::DevTest => super::config::PRODUCER_DEVTEST,
-        };
-
-        for (key, value) in profile_settings {
-            client_config.set(*key, *value);
-        }
-
-        // Legacy overrides (highest priority in the old system).
-        for (key, value) in &config.librdkafka_overrides {
-            client_config.set(key, value);
-        }
-
-        // Sizing surface (producer side), applied AFTER legacy so it wins:
-        //   profile defaults < named producer knobs < sizing.producer_librdkafka
-        // The raw sizing.producer_librdkafka map wins over everything
-        // (applied last inside resolved_producer_map()).
-        for (key, value) in config.sizing.resolved_producer_map() {
-            client_config.set(key, value);
-        }
-
+        let client_config = client_config(config, profile);
         let message_max_bytes = client_config
             .get("message.max.bytes")
             .and_then(|v| v.parse::<usize>().ok())
@@ -482,6 +446,78 @@ mod tests {
     #[test]
     fn test_producer_profile_default() {
         assert_eq!(ProducerProfile::default(), ProducerProfile::HighThroughput);
+    }
+
+    const PROFILES: [ProducerProfile; 4] = [
+        ProducerProfile::HighThroughput,
+        ProducerProfile::ExactlyOnce,
+        ProducerProfile::LowLatency,
+        ProducerProfile::DevTest,
+    ];
+
+    /// Every profile produces with the sizing default, and librdkafka takes it.
+    #[test]
+    fn every_profile_defaults_to_zstd_at_level_3() {
+        for profile in PROFILES {
+            let built = client_config(&KafkaConfig::default(), profile);
+            assert_eq!(built.get("compression.type"), Some("zstd"), "{profile}");
+            assert_eq!(built.get("compression.level"), Some("3"), "{profile}");
+            assert_eq!(
+                super::super::librdkafka_resolves(&built, "compression.codec"),
+                "zstd",
+                "{profile}"
+            );
+        }
+    }
+
+    /// `librdkafka_overrides` is the last layer on this path too: its codec
+    /// wins over the zstd default and over `sizing.producer_librdkafka`, and
+    /// the zstd level goes with the codec it replaced.
+    #[test]
+    fn every_profile_takes_the_raw_codec_override() {
+        let mut config = KafkaConfig::default();
+        config
+            .sizing
+            .producer_librdkafka
+            .insert("compression.type".to_string(), "gzip".to_string());
+        config
+            .librdkafka_overrides
+            .insert("compression.type".to_string(), "lz4".to_string());
+        for profile in PROFILES {
+            let built = client_config(&config, profile);
+            assert_eq!(built.get("compression.type"), Some("lz4"), "{profile}");
+            assert_eq!(built.get("compression.level"), None, "{profile}");
+            assert_eq!(
+                super::super::librdkafka_resolves(&built, "compression.codec"),
+                "lz4",
+                "{profile}"
+            );
+        }
+    }
+
+    /// An override of any key the sizing surface sets wins here, as it does
+    /// on the transport path.
+    #[test]
+    fn an_override_wins_over_a_sizing_key() {
+        let mut config = KafkaConfig::default();
+        config
+            .librdkafka_overrides
+            .insert("linger.ms".to_string(), "250".to_string());
+        let built = client_config(&config, ProducerProfile::HighThroughput);
+        assert_eq!(built.get("linger.ms"), Some("250"));
+    }
+
+    /// Building a producer on the default config proves the librdkafka this
+    /// process links takes zstd at level 3.
+    #[test]
+    fn a_producer_builds_on_the_zstd_default() {
+        let config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..KafkaConfig::default()
+        };
+        KafkaProducer::new(&config, ProducerProfile::HighThroughput)
+            .expect("librdkafka refuses zstd only when built without it");
     }
 
     /// Produce to a broker that cannot be reached and let `message.timeout.ms`
