@@ -250,6 +250,7 @@ diagnostic, smoke-test, or specialty:
 
 - `deployment-smoke` — runs `docker build` + `docker run` as part of
   tests. Requires a Docker daemon.
+- `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, and with `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)).
 - `config-postgres` — PostgreSQL-backed config source. Built-for, not
   built-with — the YAML cascade already handles centralised config.
 - `transport-grpc-vector-compat` — wire-compat for the Vector.dev

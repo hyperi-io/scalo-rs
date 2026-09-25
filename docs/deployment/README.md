@@ -14,6 +14,7 @@ so a reviewer sees the diff when the contract changes.
 | [artefacts.md](artefacts.md) | what each generator emits, file by file |
 | [native-deps.md](native-deps.md) | feature to APT package map, base release resolution |
 | [keda.md](keda.md) | `KedaContract`, scaler triggers, fallback HPA |
+| [conformance.md](conformance.md) | test harness: every acknowledged record arrives, under injected faults |
 
 Two things bite people, both covered in [native-deps.md](native-deps.md):
 runtime package names are release-specific, and a digest-pinned base image
