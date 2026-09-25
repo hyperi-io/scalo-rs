@@ -234,9 +234,12 @@ impl BatchEngine {
     ///
     /// Each block's dead letters are a piece of it: they report `Rejected` once
     /// [`Dlq::write_confirmed`](crate::dlq::Dlq::write_confirmed) confirms a
-    /// backend holds them, and `Errored` when the DLQ refuses them, so the
-    /// source is released only once the dead letters are held. The other run
-    /// loops keep routing through [`FilterDlqPolicy`].
+    /// backend holds them, so the source is released only once the dead letters
+    /// are held. A dead letter no backend can hold
+    /// ([`Dlq::refusal`](crate::dlq::Dlq::refusal)) is dropped and counted, a
+    /// failed write is retried with the block held, and only a closed DLQ
+    /// reports `Errored`. The other run loops keep routing through
+    /// [`FilterDlqPolicy`].
     #[cfg(all(feature = "transport", feature = "dlq"))]
     #[must_use]
     pub fn with_dlq(mut self, dlq: Arc<crate::dlq::Dlq>) -> Self {
