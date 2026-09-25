@@ -20,8 +20,9 @@
 //! let mgr = MetricsManager::new("myapp");
 //! let svc = ServiceMetrics::register(&mgr);
 //!
-//! svc.transport_sent(TransportKind::Kafka, 100);
 //! svc.records_received(500);
+//! // A sink scalo does not provide, such as a database client over HTTP.
+//! svc.transport_sent(TransportKind::Http, 100);
 //! svc.scaling_pressure(42.0);
 //! ```
 
@@ -32,6 +33,15 @@ use super::manifest::{MetricDescriptor, MetricType};
 ///
 /// Construct via [`ServiceMetrics::register`] -- describes all metrics with the
 /// global recorder AND pushes descriptors into the manifest registry.
+///
+/// ## Count each thing once
+///
+/// scalo's Kafka, gRPC, HTTP, file and pipe transports record their own
+/// `transport_*` series under their own `transport` label. The `transport_*`
+/// methods here are for a sink or source scalo does not provide, such as a
+/// database client; calling them after a scalo transport's send or receive
+/// counts that traffic twice. `records_received_total` is counted here, not
+/// also through `AppMetrics`.
 pub struct ServiceMetrics {
     /// Prevent external construction.
     _private: (),
@@ -92,8 +102,8 @@ impl ServiceMetrics {
             metrics::Unit::Seconds,
             "Time to send a batch to transport"
         );
-        // Byte/event throughput (Vector-modelled; batch-incremented). Bytes are
-        // raw wire bytes (summed payload.len() per WorkBatch), not decoded size.
+        // Byte/event throughput, incremented per batch. Bytes are raw wire
+        // bytes (summed payload.len() per WorkBatch), not decoded size.
         metrics::describe_counter!(
             "transport_sent_bytes_total",
             metrics::Unit::Bytes,
@@ -441,7 +451,8 @@ impl ServiceMetrics {
 
     // -- Transport ----------------------------------------------------
 
-    /// Record messages successfully sent to a transport.
+    /// Record messages successfully sent to a transport that is not a scalo
+    /// transport (see [`ServiceMetrics`]).
     #[inline]
     pub fn transport_sent(&self, transport: super::TransportKind, count: u64) {
         metrics::counter!("transport_sent_total", "transport" => transport.as_label())
@@ -506,7 +517,8 @@ impl ServiceMetrics {
     }
 
     /// Record raw bytes written to a transport (egress). Sum `payload.len()`
-    /// across a `WorkBatch` and call once per send, not per record.
+    /// across a `WorkBatch` and call once per send, not per record, and only
+    /// for a sink that is not a scalo transport (see [`ServiceMetrics`]).
     #[inline]
     pub fn transport_sent_bytes(&self, transport: super::TransportKind, bytes: u64) {
         metrics::counter!("transport_sent_bytes_total", "transport" => transport.as_label())
@@ -514,7 +526,8 @@ impl ServiceMetrics {
     }
 
     /// Record raw bytes read off a transport (ingress). Call once per received
-    /// batch with the summed `payload.len()`.
+    /// batch with the summed `payload.len()`, and only for a source that is not
+    /// a scalo transport (see [`ServiceMetrics`]).
     #[inline]
     pub fn transport_received_bytes(&self, transport: super::TransportKind, bytes: u64) {
         metrics::counter!("transport_received_bytes_total", "transport" => transport.as_label())
@@ -522,7 +535,8 @@ impl ServiceMetrics {
     }
 
     /// Record events received off a transport (ingress count). Call once per
-    /// received batch with the record count.
+    /// received batch with the record count, and only for a source that is not
+    /// a scalo transport (see [`ServiceMetrics`]).
     #[inline]
     pub fn transport_received_events(&self, transport: super::TransportKind, count: u64) {
         metrics::counter!("transport_received_events_total", "transport" => transport.as_label())
@@ -545,7 +559,11 @@ impl ServiceMetrics {
 
     // -- Records ------------------------------------------------------
 
-    /// Record incoming records.
+    /// Record incoming records, once per record.
+    ///
+    /// Owns `records_received_total`. `AppMetrics` (feature `service-metrics`)
+    /// holds a handle on the same series, so counting a record here and there
+    /// as well adds it twice.
     #[inline]
     pub fn records_received(&self, count: u64) {
         metrics::counter!("records_received_total").increment(count);

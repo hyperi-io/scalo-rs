@@ -130,12 +130,26 @@ and both manifest subcommands describe it for you, with app info (feature
 `service-metrics`) and the worker pool and batch engine sets when those features are
 compiled in, so a service's `register_metrics` override describes only its own.
 
+### Count each thing once
+
+A name with no labels is one series, whichever handle writes it, so two call sites
+for one event double the count:
+
+| Series | Counted by | Not also by |
+|---|---|---|
+| `records_received_total` | `ServiceMetrics::records_received`, once per record | `AppMetrics::record_received`, or an `increment` on `AppMetrics::records_received`. That field is the same series, for an app that sets the total with `absolute` |
+| `transport_*` for a scalo transport | the transport itself, under its own `transport` label | the matching `ServiceMetrics::transport_*` method |
+| `transport_*` for a sink or source scalo does not provide | the `ServiceMetrics::transport_*` methods | -- |
+
+A counter emitted both with and without labels is two series under one name, and a
+`sum()` across labels adds them. Emit it one way.
+
 ---
 
 ## Transport throughput
 
-The transport layer counts both events AND bytes, in both directions, modelled on
-Vector's component instrumentation. All carry the `transport` label (backend kind:
+The transport layer counts both events AND bytes, in both directions.
+All carry the `transport` label (backend kind:
 `kafka` / `grpc` / `http` / `file` / `pipe`, plus `routed` for the
 aggregate routed view). Bytes are RAW wire bytes (summed `payload.len()` per
 `WorkBatch`), incremented once per batch send/recv -- not per event.
@@ -149,6 +163,8 @@ aggregate routed view). Bytes are RAW wire bytes (summed `payload.len()` per
 
 Transport-level ingress counts raw wire receipt (post-filter, pre-decode) and is
 distinct from the pipeline-level `records_received_total` (post-decode records).
+scalo's transports record these series themselves, so an app using one does not
+call the matching `ServiceMetrics::transport_*` method as well.
 Graph volume with a rate query, e.g. egress bytes/sec by backend:
 
 ```promql
