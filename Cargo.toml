@@ -159,9 +159,10 @@ scaling = ["parking_lot", "tracing"]
 # Adaptive worker pool tiers (2.6.0 split):
 # - worker-pool: just AdaptiveWorkerPool (rayon + tokio + sysinfo)
 # - worker-batch: + BatchEngine (sonic-rs SIMD JSON, dashmap interning, bytes)
+#   and the parse_guard depth pre-check (wide)
 # - worker: back-compat alias for worker-batch (candidate for post-GA deprecation)
 worker-pool = ["rayon", "config", "metrics", "tokio", "tokio-util", "sysinfo", "parking_lot", "tracing"]
-worker-batch = ["worker-pool", "sonic-rs", "dashmap", "bytes"]
+worker-batch = ["worker-pool", "sonic-rs", "dashmap", "bytes", "dep:wide"]
 worker = ["worker-batch"]
 
 # Worker pool with msgpack batch serialisation support.
@@ -244,7 +245,7 @@ config-reload = ["config", "parking_lot", "tokio", "tracing"]
 # - transport-trace: + W3C traceparent propagation via opentelemetry
 # Apps that send/receive but don't propagate distributed-trace context
 # avoid pulling in the OpenTelemetry SDK.
-transport = ["tokio", "serde_json", "rmpv", "chrono", "regex", "memchr", "sonic-rs", "parking_lot", "tracing", "metrics-core", "bytes"]
+transport = ["tokio", "serde_json", "rmpv", "chrono", "regex", "memchr", "sonic-rs", "parking_lot", "tracing", "metrics-core", "bytes", "dep:wide"]
 transport-trace = ["transport", "dep:opentelemetry"]
 transport-memory = ["transport"]
 transport-kafka = ["transport", "rdkafka", "regex", "tokio-util"]
@@ -447,6 +448,11 @@ snap = { version = ">=1.1.1, <2", optional = true }
 # SIMD JSON (BatchEngine — 2-4x faster than serde_json)
 sonic-rs = { version = ">=0.5, <1", optional = true }
 
+# Safe SIMD byte compares for the parse_guard depth pre-check; the unsafe lives in
+# wide/safe_arch, since this crate denies unsafe_code. Zlib OR Apache-2.0 OR MIT,
+# 1.7.1 released 2026-09-14 (crates.io API checked 2026-09-26).
+wide = { version = ">=1.7.1, <2", optional = true }
+
 # Regex (topic resolver include/exclude filters, strmatch)
 regex = { version = ">=1.11, <2", optional = true }
 regex-automata = { version = ">=0.4.8, <0.5", optional = true }
@@ -593,6 +599,11 @@ required-features = ["transport"]
 name = "filter_benchmark"
 harness = false
 required-features = ["transport-memory"]
+
+[[bench]]
+name = "parse_guard"
+harness = false
+required-features = ["transport"]
 
 [[bench]]
 name = "concurrency_patterns"

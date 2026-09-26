@@ -67,7 +67,7 @@ flowchart LR
 | Feature | Adds |
 |---------|------|
 | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio) with pressure-based scaling |
-| `worker-batch` | Above + `BatchEngine` (SIMD JSON via `sonic-rs`, field interning via `dashmap`) |
+| `worker-batch` | Above + `BatchEngine` (SIMD JSON via `sonic-rs`, field interning via `dashmap`) and the `parse_guard` JSON depth pre-check (`wide`) |
 | `worker` | Alias for `worker-batch` — back-compat |
 
 ### CLI
@@ -89,7 +89,7 @@ flowchart LR
 
 | Feature | Adds |
 |---------|------|
-| `transport` | Base trait architecture, factory, `AnySender` |
+| `transport` | Base trait architecture, factory, `AnySender`, and the `parse_guard` JSON depth pre-check (`wide`) |
 | `transport-trace` | Above + W3C traceparent propagation (pulls `opentelemetry`) |
 | `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends — each pulls only its own deps |
 | `transport-grpc-vector-compat` | Vector.dev wire-compat for `dfe-transform-vector` |
@@ -268,6 +268,7 @@ A handful of dependencies aren't visible from the feature name alone:
 
 - `worker-batch` pulls `worker-pool` and `metrics`. `BatchEngine` is
   metric-aware.
+- `parse_guard` -- `json_depth_within` and `MAX_PARSE_DEPTH`, the nesting-depth check to run before parsing untrusted JSON -- compiles with `transport` or `worker-batch`, and both pull `wide` for its SIMD byte compares. There is no feature for the guard alone.
 - `tiered-sink` pulls `tokio` and the spill cache's own crates (`yaque`,
   `zstd`), not the `spool` feature: `TieredSink` keeps its own cache, and
   the standalone `Spool` type needs `spool`.
