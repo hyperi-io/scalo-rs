@@ -162,11 +162,15 @@ impl KafkaDlqInner {
             self.durable_losses += charged;
             return;
         }
-        // Cascade queues nothing another backend holds, so every failure is in sole custody.
-        for message in undelivered
-            .into_iter()
-            .take(usize::try_from(charged).unwrap_or(usize::MAX))
-        {
+        // Cascade queues nothing another backend holds, so every failure goes on: a
+        // count past custody can cost a duplicate in the next backend, never a loss.
+        if failed > charged {
+            warn!(
+                failed,
+                charged, "Kafka DLQ reported more failed deliveries than it held; handing on all"
+            );
+        }
+        for message in undelivered {
             let cause = if message.timed_out {
                 Unacked::AckTimeout
             } else {

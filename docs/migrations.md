@@ -615,8 +615,8 @@ A refusal is reported once: the first flush after it returns the error and the n
 
 `Dlq::flush()` over the Kafka backend now returns once the broker has acknowledged every entry the barrier covers, waiting up to 30 s on tokio's blocking pool. Before, `Ok` meant queued to the producer: the drain never ran a backend's durable flush, and a delivery the broker refused reached neither `flush()` nor `dropped()`. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
 
-- A delivery the broker refused since the previous flush fails the flush with `Err(DlqError::File(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
-- Entries still unacknowledged after 30 s are purged from the producer and counted the same way. The purge adds up to 5 s. An entry in flight to a stalled broker at the purge can still be written, so under a stalled broker `dropped()` is an upper bound and re-placing entries reported lost can duplicate them on the DLQ topic. It never under-reports.
+- In `KafkaOnly`, `FanOut`, or `Cascade` with nothing after Kafka, a delivery the broker refused since the previous flush fails the flush with `Err(DlqError::File(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write. In `Cascade` with a backend after Kafka it goes to that backend instead -- see [Cascade hands a failed Kafka delivery to the next backend](#cascade-hands-a-failed-kafka-delivery-to-the-next-backend-behaviour-change).
+- Entries still unacknowledged after 30 s are purged from the producer and handled the same way. The purge adds up to 5 s. An entry in flight to a stalled broker at the purge can still be written, so under a stalled broker `dropped()` is an upper bound and re-placing entries reported lost can duplicate them on the DLQ topic. It never under-reports.
 - `Cascade`: when Kafka queues part of a batch and refuses the rest, only the rest goes to the next backend. Before, the whole batch did, so the file held a second copy of the part Kafka took.
 - `FanOut`: a Kafka loss counts only for entries no other backend holds.
 
@@ -649,9 +649,20 @@ In v2.12.10 a Kafka loss found by `flush()` came back as `Err(DlqError::File("ba
 
 ### `Dlq` shutdown waits for Kafka acks and counts what was lost (BEHAVIOUR CHANGE)
 
-Dropping the Kafka producer discards what it still holds, queued or in flight. The drain used to exit without waiting, so every shutdown threw away the entries the broker had not acked yet, and counted none of them. It now waits for the acks the way a `flush()` does before it exits, and counts the entries only Kafka held that the broker refused or never acked in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`. See [pipeline/dlq.md](pipeline/dlq.md#shutdown).
+Dropping the Kafka producer discards what it still holds, queued or in flight. The drain used to exit without waiting, so every shutdown threw away the entries the broker had not acked yet, and counted none of them. It now waits for the acks the way a `flush()` does before it exits. Entries only Kafka held that the broker refused or never acked go to the next backend in `Cascade` with a backend after Kafka, and are counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}` otherwise. See [pipeline/dlq.md](pipeline/dlq.md#shutdown).
 
 **Consumer adjustment** -- none in code. `shutdown()`, or the drain's exit on the cancelled token, can take `kafka.send_timeout_ms` plus 5 s while the broker is down; fit that inside the pod's termination grace period. `shutdown()` still returns `Ok`; read `dropped()` after it, or call `flush()` first for the loss as an `Err`. The count lands only if the drain finishes: a runtime that shuts down under it drops it mid-wait. A caller that never calls `flush()` now sees Kafka delivery failures in `dropped()` once the DLQ has shut down.
+
+### Cascade hands a failed Kafka delivery to the next backend (BEHAVIOUR CHANGE)
+
+In `Cascade` with a backend after Kafka, the default, an entry the producer queued but the broker refused or never acked is no longer counted lost. The DLQ producer keeps its payload, and the drain offers it to the next backend at the next `flush()` or shutdown, which purge what is unacked, or at the next write once librdkafka has failed the delivery (`message.timeout.ms`, 300 s unless set). Before, an unreachable broker lost every such entry with the file backend sitting behind it. See [pipeline/dlq.md](pipeline/dlq.md#modes).
+
+- `dlq_cascade_fallthrough_total{from, to, reason}` counts each entry that falls through and lands. `reason` is `write_refused`, `delivery_failed` or `ack_timeout`.
+- `dropped()` and `dlq_dropped_total{reason="backends_failed"}` move when the next backend refuses it too, and for an entry purged at shutdown whose delivery report does not arrive within 5 s, because its payload only comes with the report.
+- A purged entry the broker was still writing can land on the topic and in the file. A duplicate, never a gap.
+- `KafkaOnly`, `FanOut` and `Cascade` with nothing after Kafka are unchanged.
+
+**Consumer adjustment** -- none in code. A `flush()` in cascade mode that returned `Err(DlqError::Kafka(..))` over an unreachable broker now returns `Ok` once the next backend holds the entries. Alert on `dlq_cascade_fallthrough_total{reason="ack_timeout", to="file"}` for a broker outage the file backend is covering.
 
 ### `NdjsonWriter` refuses a write that reached no file (BEHAVIOUR CHANGE)
 

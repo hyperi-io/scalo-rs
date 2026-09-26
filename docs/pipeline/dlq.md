@@ -56,7 +56,7 @@ Delivery failures are read at every write, at the barrier and at [shutdown](#shu
 | `FileOnly` | File backend only — no Kafka dependency |
 | `KafkaOnly` | Kafka backend only |
 
-Cascade is the production default -- Kafka primary, file fallback. An entry falls through to the file when the producer refuses to queue it (a full producer queue, or an entry over its `message.max.bytes`), and when the producer queued it but the broker refused it or never acked it. So an unreachable broker loses no dead letters while the file backend takes them: they land in the file at the next write, `flush()` or shutdown (see [The Kafka barrier](#the-kafka-barrier)). FanOut is for compliance setups that need every entry mirrored to two destinations.
+Cascade is the production default -- Kafka primary, file fallback. An entry falls through to the file when the producer refuses to queue it (a full producer queue, or an entry over its `message.max.bytes`), and when the producer queued it but the broker refused it or never acked it. So an unreachable broker loses no dead letters while the file backend takes them: they land in the file at the next `flush()` or shutdown, which purge what is unacked, or at the next write once librdkafka has failed the delivery (`message.timeout.ms`, 300 s unless set). See [The Kafka barrier](#the-kafka-barrier). FanOut is for compliance setups that need every entry mirrored to two destinations.
 
 ```mermaid
 flowchart LR
