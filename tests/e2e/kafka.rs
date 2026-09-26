@@ -148,6 +148,8 @@ fn test_kafka_build_librdkafka_config_priority() {
 
 // --- Basic Config Tests ---
 
+// Placeholder SASL credentials: these tests check the built config and reach no broker.
+
 #[test]
 fn test_kafka_config_defaults() {
     let config = KafkaConfig::default();

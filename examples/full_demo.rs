@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = RuntimePaths::discover();
     println!("Config directory: {}", paths.config_dir.display());
     println!("Data directory: {}", paths.data_dir.display());
+    // The directory's path, not its contents.
     println!("Secrets directory: {}", paths.secrets_dir.display());
     println!("Logs directory: {}", paths.logs_dir.display());
     println!("Temp directory: {}", paths.temp_dir.display());

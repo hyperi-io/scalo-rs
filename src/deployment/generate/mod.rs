@@ -1439,6 +1439,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         generate_chart(&contract, dir.path(), None).unwrap();
 
+        // A Helm template of key names and .Values references, holding no secret value.
         let secret_yaml =
             std::fs::read_to_string(dir.path().join("templates/secret.yaml")).unwrap();
         let deployment_yaml =
