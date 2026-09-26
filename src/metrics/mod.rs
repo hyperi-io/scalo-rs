@@ -14,8 +14,8 @@
 //!
 //! Counter/Gauge/Histogram types, automatic process + cgroup container metrics,
 //! built-in HTTP server, liveness/readiness probes, optional scaling-pressure and
-//! memory-guard endpoints, custom routes via
-//! [`start_server_with_routes`](MetricsManager::start_server_with_routes).
+//! memory-guard endpoints, custom routes via `start_server_with_routes` on
+//! [`MetricsManager`] (`metrics` + `http-server` features).
 //!
 //! ## Basic Example
 //!
@@ -900,9 +900,12 @@ impl MetricsManager {
     /// `/metrics/manifest`, `/livez` and `/readyz` -- no aliases, and no
     /// startup route (a `startupProbe` targets `/livez`).
     ///
-    /// Not to be confused with [`HttpServer`](crate::http_server), which is an
-    /// optional extra listener for the app's own routes and does not serve
-    /// `/metrics`.
+    #[cfg_attr(
+        feature = "http-server",
+        doc = "Not to be confused with [`HttpServer`](crate::http_server::HttpServer), \
+               which is an optional extra listener for the app's own routes and does not \
+               serve `/metrics`."
+    )]
     ///
     /// Only available when the `metrics` feature is enabled (for scraping).
     ///
