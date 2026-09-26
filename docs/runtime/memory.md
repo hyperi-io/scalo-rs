@@ -113,6 +113,25 @@ admission.
 
 ---
 
+## Allocator
+
+scalo picks no allocator. Every HyperI Rust binary picks jemalloc, and here is why.
+
+- One allocator across the fleet. One set of heap stats, one profiling story, no per-project bake-offs. That is the HyperI Rust standard (`standards/languages/rust.md`, allocator section) and DFE policy since 2026-04-17.
+- We read jemalloc's own numbers. The dfe-loader and dfe-archiver memory guards read `stats.allocated` through `tikv-jemalloc-ctl`. So jemalloc is not just the allocator. It is the meter.
+
+Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project carries it on as `tikv-jemallocator`, from the same repo: https://github.com/tikv/jemallocator. As of 2026-09-26 `tikv-jemalloc-sys` is at 0.7.1, published 2026-05-25. So `tikv-` is the maintained line, not a side fork.
+
+Three crates, three jobs:
+
+- `tikv-jemalloc-sys` -- 'build jemalloc and link it in'. It compiles jemalloc's C source and statically links it into the binary. Nothing depends on it directly, it comes in under the other two. The version names the upstream build: `0.7.1+5.3.1-0-g81034ce1` is jemalloc 5.3.1 at that commit.
+- `tikv-jemallocator` -- the `#[global_allocator]` shim.
+- `tikv-jemalloc-ctl` -- 'ask jemalloc how much it holds'. Turn on its `stats` feature or there are no stats to read.
+
+Why not a native Rust allocator? Rust ships none of its own. Without jemalloc a binary gets the platform's C `malloc`, glibc on Linux. So the real choice is which C allocator, and the standard picks jemalloc for its heap stats and profiling, which mimalloc and snmalloc do not match.
+
+---
+
 ## Thresholds
 
 ```yaml

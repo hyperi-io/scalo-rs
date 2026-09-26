@@ -797,6 +797,20 @@ A `KafkaTransport` armed through `AckControl::arm` commits each partition only u
 
 **Consumer adjustment** -- a hand-rolled loop that writes dead letters with `write_confirmed` screens each entry with `refusal` first and releases the refused ones `Dropped`, then retries the write on any error but `DlqError::Closed` rather than releasing `Errored`. See [pipeline/dlq.md](pipeline/dlq.md#queue-admission-semantics).
 
+### Kafka producers default to zstd at level 3 (BEHAVIOUR CHANGE)
+
+Every sizing profile now produces with `compression.type=zstd` and `compression.level=3`, where it produced with `lz4`. The profiles still differ in batching and latency. The level is set only while the resolved codec is zstd and no raw map names one, and any other codec runs at librdkafka's own default level for it. See [kafka-path.md](kafka-path.md#wire-compression).
+
+The producer profile constants `PRODUCER_HIGH_THROUGHPUT`, `PRODUCER_EXACTLY_ONCE` and `PRODUCER_LOW_LATENCY` no longer carry `linger.ms` or `compression.type`. Every producer path laid the sizing surface over them, so neither ever took effect there.
+
+**Consumer adjustment** -- every image that runs a scalo producer or consumer needs a librdkafka built with zstd: without it the producer fails at creation, and a consumer cannot read the batches. A stage that should stay on lz4 sets `kafka.sizing.producer.compression_type: lz4`. Code that builds its own producer config from those constants gets librdkafka's own `linger.ms` and codec unless it builds through `producer_client_config`, which lays the sizing surface over them.
+
+### `KafkaProducer` applies `librdkafka_overrides` last (BEHAVIOUR CHANGE)
+
+`KafkaProducer::new` applied `kafka.librdkafka_overrides` before the sizing surface, so a codec, linger or batch key set there was overwritten by the sizing value. It now applies them after, as `KafkaTransport` does. The order on both paths is: profile constants, sizing profile, named sizing knobs, `sizing.producer_librdkafka`, then `librdkafka_overrides`. On every producer and consumer path, and on `KafkaAdmin`, a key also replaces the other librdkafka name for its property from the layers below it (`fetch.message.max.bytes` and `max.partition.fetch.bytes`, `request.required.acks` and `acks`, `compression.codec` and `compression.type`, among others), since rdkafka passes both names to librdkafka in hash order and the value that ran was chance.
+
+**Consumer adjustment** -- a `KafkaProducer` whose `librdkafka_overrides` set a sizing key now runs that value. An override by librdkafka's other name for a property scalo sets, such as `fetch.message.max.bytes`, now always wins where it used to win at random. The Kafka DLQ backend builds on `KafkaProducer`, so its producer follows the same order. A service that builds its own producer config, to own the delivery context, builds it with the new public `transport::kafka::producer_client_config(&config, profile_defaults)`, passing its own keys as `profile_defaults`. Copying the order is not enough: moving `librdkafka_overrides` after `sizing.resolved_producer_map()` still leaves a property set under both librdkafka names to hash order.
+
 ### Smaller additions
 
 - `RoutedSender` forwards `dead_letter_reason` to the route a record's key selects, and reports the weakest `confirms_delivery` across its routes, so `.sender(&routed)` screens and reports as the routes do.

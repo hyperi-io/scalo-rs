@@ -88,12 +88,14 @@ pub(crate) mod otel;
 #[cfg(feature = "otel-metrics")]
 pub mod otel_types;
 
+#[cfg(feature = "metrics")]
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use metrics::{Counter, Gauge, Histogram, Unit};
 use thiserror::Error;
+#[cfg(feature = "metrics")]
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 

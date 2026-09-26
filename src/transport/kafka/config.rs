@@ -12,8 +12,11 @@
 //!
 //! Kafka uses a profile-based configuration system where:
 //! 1. A **profile** provides opinionated librdkafka defaults for a use case
-//! 2. **User config** can override any librdkafka setting via `librdkafka_overrides`
-//! 3. Overrides always win over profile defaults
+//! 2. The **sizing surface** ([`KafkaSizingConfig`]) sets batching, codec and
+//!    delivery settings over it
+//! 3. **User config** can override any librdkafka setting via `librdkafka_overrides`
+//! 4. Overrides always win: every producer and consumer path applies
+//!    `librdkafka_overrides` after the profile and the sizing surface
 //!
 //! ## Available Profiles
 //!
@@ -62,6 +65,24 @@ use std::str::FromStr;
 /// CEILING, not a tuning dial: the sizing profiles vary batching and latency,
 /// never the largest record the pipeline accepts.
 pub const MESSAGE_MAX_BYTES: i32 = 16_777_216;
+
+// ============================================================================
+// Producer codec
+// ============================================================================
+
+/// The codec every sizing profile produces with.
+///
+/// Every app image has to link a librdkafka built with zstd: without it,
+/// producer creation fails on this default, and a consumer cannot read the
+/// batches it writes.
+pub(crate) const DEFAULT_PRODUCER_CODEC: &str = "zstd";
+
+/// The `compression.level` zstd runs at unless a raw map names one.
+///
+/// librdkafka reads a level against whichever codec is set, and lz4 switches
+/// to its slow high-compression mode from 3, so the level is only ever set
+/// while the codec is zstd.
+pub(crate) const ZSTD_COMPRESSION_LEVEL: &str = "3";
 
 // ============================================================================
 // Consumer group protocol (KIP-848)
@@ -140,10 +161,12 @@ pub const CLASSIC_ONLY_CONSUMER_KEYS: &[&str] = &[
 ///
 /// The profile sets default values for all named knobs below. An explicit
 /// per-knob value in [`KafkaSizingConfig`] always wins over the profile
-/// default. The raw librdkafka escape hatch in [`KafkaConfig`] wins over
-/// everything.
+/// default. The raw librdkafka maps win over both, and
+/// [`KafkaConfig::librdkafka_overrides`] is applied after all of them.
 ///
-/// Profiles target the BYTE-level throughput budget and latency envelope:
+/// Profiles target the BYTE-level throughput budget and latency envelope.
+/// They differ in batching and latency only: every profile produces with
+/// `zstd` at `compression.level` 3.
 ///
 /// | Profile | Use case |
 /// |---|---|
@@ -158,8 +181,8 @@ pub enum SelfRegulationProfile {
     ///
     /// Consumer: 1 MiB fetch.min.bytes, 50 ms wait, 16 MiB per-partition,
     /// 50 MiB total, 2000 poll-safety cap.
-    /// Producer: 128 KiB batch, 20 ms linger, lz4, 64 MiB buffer, 5 in-flight,
-    /// 16 MiB record ceiling.
+    /// Producer: 128 KiB batch, 20 ms linger, zstd level 3, 64 MiB buffer,
+    /// 5 in-flight, 16 MiB record ceiling.
     #[default]
     Throughput,
 
@@ -167,16 +190,16 @@ pub enum SelfRegulationProfile {
     ///
     /// Consumer: 256 KiB fetch.min.bytes, 25 ms wait, 16 MiB per-partition,
     /// 50 MiB total, 1000 poll-safety cap.
-    /// Producer: 64 KiB batch, 5 ms linger, lz4, 32 MiB buffer, 5 in-flight,
-    /// 16 MiB record ceiling.
+    /// Producer: 64 KiB batch, 5 ms linger, zstd level 3, 32 MiB buffer,
+    /// 5 in-flight, 16 MiB record ceiling.
     Balanced,
 
     /// Low latency: minimal batching delay, smaller buffers.
     ///
     /// Consumer: 1 byte fetch.min.bytes, 5 ms wait, 16 MiB per-partition,
     /// 16 MiB total, 500 poll-safety cap.
-    /// Producer: 16 KiB batch, 0 ms linger, lz4, 16 MiB buffer, 5 in-flight,
-    /// 16 MiB record ceiling.
+    /// Producer: 16 KiB batch, 0 ms linger, zstd level 3, 16 MiB buffer,
+    /// 5 in-flight, 16 MiB record ceiling.
     LowLatency,
 }
 
@@ -227,8 +250,8 @@ impl SelfRegulationProfile {
                 batch_size_bytes: Some(131_072),
                 // 20 ms -- enough time to fill the 128 KiB batch.
                 linger_ms: Some(20),
-                // lz4 default; zstd is opt-in for storage-bound topics.
-                compression_type: Some("lz4".to_string()),
+                // The same codec on every profile; the level follows it.
+                compression_type: Some(DEFAULT_PRODUCER_CODEC.to_string()),
                 // 64 MiB total producer queue (queue.buffering.max.kbytes in KiB).
                 buffer_memory_bytes: Some(67_108_864),
                 // 5 in-flight per connection -- matches exactly-once safe limit.
@@ -243,7 +266,7 @@ impl SelfRegulationProfile {
             Self::Balanced => ProducerKnobs {
                 batch_size_bytes: Some(65_536), // 64 KiB
                 linger_ms: Some(5),
-                compression_type: Some("lz4".to_string()),
+                compression_type: Some(DEFAULT_PRODUCER_CODEC.to_string()),
                 buffer_memory_bytes: Some(33_554_432), // 32 MiB
                 max_in_flight: Some(5),
                 idempotence: None,
@@ -252,7 +275,7 @@ impl SelfRegulationProfile {
             Self::LowLatency => ProducerKnobs {
                 batch_size_bytes: Some(16_384), // 16 KiB
                 linger_ms: Some(0),             // send immediately
-                compression_type: Some("lz4".to_string()),
+                compression_type: Some(DEFAULT_PRODUCER_CODEC.to_string()),
                 buffer_memory_bytes: Some(16_777_216), // 16 MiB
                 max_in_flight: Some(5),
                 idempotence: None,
@@ -341,8 +364,11 @@ pub struct ProducerKnobs {
     ///
     /// librdkafka: `compression.type` (alias for `compression.codec`).
     /// Valid values: `none`, `gzip`, `snappy`, `lz4`, `zstd`.
-    /// Default (all profiles): `lz4` -- best throughput/ratio tradeoff.
-    /// Use `zstd` for storage-bound topics that can absorb the CPU cost.
+    /// Default (all profiles): `zstd` at `compression.level` 3.
+    ///
+    /// The level is set only while the resolved codec is `zstd`, so another
+    /// codec named here runs at librdkafka's own default level for it. To run
+    /// zstd at another level, set `compression.level` in `producer_librdkafka`.
     #[serde(default)]
     pub compression_type: Option<String>,
 
@@ -392,11 +418,13 @@ pub struct ProducerKnobs {
 
 /// Kafka sizing surface: profile + named per-knob overrides + raw escape hatch.
 ///
-/// Resolution precedence (lowest to highest):
+/// Resolution precedence (lowest to highest), the same on every producer and
+/// consumer path:
 /// 1. `SelfRegulationProfile` defaults
 /// 2. Named knobs in `consumer` / `producer` (explicit `Some(v)` wins)
-/// 3. Raw librdkafka maps `consumer_librdkafka` / `producer_librdkafka` (wins
-///    over everything, applied last via `ClientConfig::set`)
+/// 3. Raw librdkafka maps `consumer_librdkafka` / `producer_librdkafka`
+/// 4. [`KafkaConfig::librdkafka_overrides`], which the transport applies after
+///    this whole surface
 ///
 /// The raw maps are logged (one line per key) when they override a property
 /// that the sizing surface depends on (the fetch byte sizes and
@@ -416,16 +444,26 @@ pub struct KafkaSizingConfig {
     #[serde(default)]
     pub producer: ProducerKnobs,
 
-    /// Raw librdkafka consumer properties applied LAST, winning over everything.
+    /// Raw librdkafka consumer properties, winning over the profile and the
+    /// named knobs. [`KafkaConfig::librdkafka_overrides`] is applied after
+    /// them.
     ///
     /// Keys must be valid librdkafka property names (e.g. `fetch.wait.max.ms`).
     /// An invalid key silently no-ops in librdkafka -- double-check spelling.
+    /// A key replaces the other librdkafka name for its property from the
+    /// layers below it (`fetch.message.max.bytes` for
+    /// `max.partition.fetch.bytes`).
     #[serde(default)]
     pub consumer_librdkafka: BTreeMap<String, String>,
 
-    /// Raw librdkafka producer properties applied LAST, winning over everything.
+    /// Raw librdkafka producer properties, winning over the profile and the
+    /// named knobs. Only [`KafkaConfig::librdkafka_overrides`] is applied after
+    /// them.
     ///
-    /// Keys must be valid librdkafka property names (e.g. `linger.ms`).
+    /// Keys must be valid librdkafka property names (e.g. `linger.ms`). A key
+    /// replaces the other librdkafka name for its property from the layers
+    /// below it (`compression.codec` for `compression.type`,
+    /// `request.required.acks` for `acks`).
     #[serde(default)]
     pub producer_librdkafka: BTreeMap<String, String>,
 }
@@ -453,6 +491,7 @@ const GOVERNOR_PRODUCER_KEYS: &[&str] = &[
     "queue.buffering.max.ms",
     "compression.type",
     "compression.codec",
+    "compression.level",
     "queue.buffering.max.kbytes",
     "max.in.flight.requests.per.connection",
     "message.max.bytes",
@@ -469,6 +508,9 @@ impl KafkaSizingConfig {
     /// Resolve the effective consumer librdkafka key/value map.
     ///
     /// Precedence: profile defaults < named knobs < raw `consumer_librdkafka`.
+    /// A raw key replaces its librdkafka alias from the layers below it, so
+    /// `fetch.message.max.bytes` there removes the named
+    /// `max.partition.fetch.bytes`.
     ///
     /// This is a PURE function -- suitable for unit testing without a live
     /// broker. The caller feeds the returned map into `ClientConfig::set`.
@@ -510,7 +552,6 @@ impl KafkaSizingConfig {
         );
         map.insert("fetch.max.bytes".to_string(), fetch_max_bytes.to_string());
 
-        // Apply the raw escape hatch last -- it wins.
         for (k, v) in &self.consumer_librdkafka {
             if GOVERNOR_CONSUMER_KEYS.contains(&k.as_str()) {
                 tracing::warn!(
@@ -519,15 +560,20 @@ impl KafkaSizingConfig {
                     "kafka sizing: raw consumer_librdkafka overrides a governor key"
                 );
             }
-            map.insert(k.clone(), v.clone());
         }
-
+        overlay_raw_layers(&mut map, &[raw_layer(&self.consumer_librdkafka)]);
         map
     }
 
     /// Resolve the effective producer librdkafka key/value map.
     ///
     /// Precedence: profile defaults < named knobs < raw `producer_librdkafka`.
+    /// The transport applies [`KafkaConfig::librdkafka_overrides`] after this
+    /// map on every producer path.
+    ///
+    /// `compression.level` follows the codec: 3 while the resolved codec is
+    /// `zstd` and no raw map names a level, unset for any other codec. A raw
+    /// key also replaces its librdkafka alias from the layers below it.
     ///
     /// KIP-794 note: librdkafka does not support `partitioner.ignore.keys` (a
     /// Java-client-only property). The librdkafka equivalent for uniform sticky
@@ -540,6 +586,30 @@ impl KafkaSizingConfig {
     /// This is a PURE function -- suitable for unit testing without a live broker.
     #[must_use]
     pub fn resolved_producer_map(&self) -> BTreeMap<String, String> {
+        self.producer_map_under(Vec::new())
+    }
+
+    /// The producer map with `outer`, a raw layer applied after
+    /// `producer_librdkafka`, laid over it.
+    pub(crate) fn producer_map_under(&self, outer: RawLayer<'_>) -> BTreeMap<String, String> {
+        let mut map = self.named_producer_map();
+        for (k, v) in &self.producer_librdkafka {
+            if GOVERNOR_PRODUCER_KEYS.contains(&k.as_str()) {
+                tracing::warn!(
+                    key = k.as_str(),
+                    value = v.as_str(),
+                    "kafka sizing: raw producer_librdkafka overrides a governor key"
+                );
+            }
+        }
+        let layers = [raw_layer(&self.producer_librdkafka), outer];
+        overlay_raw_layers(&mut map, &layers);
+        settle_compression_level(&mut map, &layers);
+        map
+    }
+
+    /// The producer map from the profile and the named knobs alone.
+    fn named_producer_map(&self) -> BTreeMap<String, String> {
         let profile_knobs = self.profile.producer_defaults();
 
         let batch_size_bytes = self
@@ -611,9 +681,8 @@ impl KafkaSizingConfig {
         // Dedups producer-retry writes in the broker at near-zero cost. It
         // REQUIRES acks=all (forced here) and retries>0 (librdkafka default is
         // high, left alone). Opt out with producer.idempotence=Some(false), or
-        // override either key via the raw producer_librdkafka escape hatch
-        // below (which wins). Disabling restores the prior leader-/profile-ack
-        // behaviour.
+        // override either key via a raw map, which is laid over this one and
+        // wins. Disabling restores the prior leader-/profile-ack behaviour.
         if idempotence {
             map.insert("enable.idempotence".to_string(), "true".to_string());
             map.insert("acks".to_string(), "all".to_string());
@@ -637,18 +706,6 @@ impl KafkaSizingConfig {
             linger_ms.to_string(),
         );
 
-        // Apply the raw escape hatch last -- it wins.
-        for (k, v) in &self.producer_librdkafka {
-            if GOVERNOR_PRODUCER_KEYS.contains(&k.as_str()) {
-                tracing::warn!(
-                    key = k.as_str(),
-                    value = v.as_str(),
-                    "kafka sizing: raw producer_librdkafka overrides a governor key"
-                );
-            }
-            map.insert(k.clone(), v.clone());
-        }
-
         map
     }
 
@@ -663,6 +720,96 @@ impl KafkaSizingConfig {
             .max_poll_records
             .or(self.profile.consumer_defaults().max_poll_records)
             .unwrap_or(10_000)
+    }
+}
+
+// ============================================================================
+// Raw override layers
+// ============================================================================
+
+/// One raw librdkafka override layer, as key/value pairs.
+pub(crate) type RawLayer<'a> = Vec<(&'a str, &'a str)>;
+
+/// A raw override map as a [`RawLayer`].
+pub(crate) fn raw_layer<'a>(
+    map: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> RawLayer<'a> {
+    map.into_iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect()
+}
+
+/// librdkafka's aliases, each as (alias, property), for the pairs that
+/// resolve to one property when set on a client config.
+///
+/// rdkafka hands its settings to librdkafka in hash order, so a property left
+/// under both names runs whichever came last by chance. `enable.auto.commit`
+/// is absent: set on a client config it is the global property, and its
+/// alias `auto.commit.enable` is a different, topic-level one.
+pub(crate) const LIBRDKAFKA_ALIASES: &[(&str, &str)] = &[
+    ("bootstrap.servers", "metadata.broker.list"),
+    ("max.in.flight", "max.in.flight.requests.per.connection"),
+    ("sasl.mechanism", "sasl.mechanisms"),
+    (
+        "sasl.oauthbearer.client.credentials.client.id",
+        "sasl.oauthbearer.client.id",
+    ),
+    (
+        "sasl.oauthbearer.client.credentials.client.secret",
+        "sasl.oauthbearer.client.secret",
+    ),
+    ("max.partition.fetch.bytes", "fetch.message.max.bytes"),
+    ("linger.ms", "queue.buffering.max.ms"),
+    ("retries", "message.send.max.retries"),
+    ("compression.type", "compression.codec"),
+    ("acks", "request.required.acks"),
+    ("delivery.timeout.ms", "message.timeout.ms"),
+];
+
+/// The other librdkafka name for `key`, when it has one.
+pub(crate) fn librdkafka_alias(key: &str) -> Option<&'static str> {
+    LIBRDKAFKA_ALIASES.iter().find_map(|&(alias, property)| {
+        if key == alias {
+            Some(property)
+        } else if key == property {
+            Some(alias)
+        } else {
+            None
+        }
+    })
+}
+
+/// Lay raw override layers over a resolved map, lowest first.
+///
+/// A key a layer names drops its alias from the layers below it. A layer that
+/// names both itself is left as it stands.
+fn overlay_raw_layers(map: &mut BTreeMap<String, String>, layers: &[RawLayer<'_>]) {
+    for layer in layers {
+        for &(key, value) in layer {
+            if let Some(alias) = librdkafka_alias(key)
+                && !layer.iter().any(|&(k, _)| k == alias)
+            {
+                map.remove(alias);
+            }
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+}
+
+/// Give zstd [`ZSTD_COMPRESSION_LEVEL`] unless one of `layers` named a level.
+fn settle_compression_level(map: &mut BTreeMap<String, String>, layers: &[RawLayer<'_>]) {
+    let level_named = layers
+        .iter()
+        .flatten()
+        .any(|&(k, _)| k == "compression.level");
+    let codec = map
+        .get("compression.type")
+        .or_else(|| map.get("compression.codec"));
+    if !level_named && codec.is_some_and(|c| c.eq_ignore_ascii_case(DEFAULT_PRODUCER_CODEC)) {
+        map.insert(
+            "compression.level".to_string(),
+            ZSTD_COMPRESSION_LEVEL.to_string(),
+        );
     }
 }
 
@@ -829,86 +976,72 @@ pub const DEVTEST_PROFILE: &[(&str, &str)] = &[
 
 /// High-throughput producer -- lean baseline.
 ///
-/// Only settings that differ from librdkafka defaults.
-/// Services override via `librdkafka_overrides`.
+/// Only settings that differ from librdkafka defaults and that the sizing
+/// surface leaves alone. Batching, codec, queue size and delivery settings
+/// come from [`KafkaSizingConfig`], which every producer path applies after
+/// this constant. Services override via `librdkafka_overrides`.
 ///
 /// | Setting | Value | librdkafka default | Why |
 /// |---|---|---|---|
-/// | `linger.ms` | 100 ms | 5 ms | Accumulate larger batches |
-/// | `compression.type` | lz4 | none | Matches the sizing surface, which is applied last |
 /// | `socket.nagle.disable` | true | false | Kafka batches at app level |
 /// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable Prometheus metrics |
-///
-/// The codec here has to agree with the sizing profiles: every producer path
-/// applies `sizing.resolved_producer_map()` after this constant, and it sets
-/// `compression.codec = lz4`. A `zstd` here would be dead config that reads as
-/// the effective codec, and anyone who removed the sizing layer to follow it
-/// would recompress every lz4 batch. Opt into zstd per stage with
-/// `kafka.sizing.producer.compression_type`.
 pub const PRODUCER_HIGH_THROUGHPUT: &[(&str, &str)] = &[
-    ("linger.ms", "100"),
-    ("compression.type", "lz4"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
 
 /// Exactly-once producer -- idempotence + ordering.
 ///
-/// Only settings that differ from librdkafka defaults.
-/// `acks=all` and `max.in.flight=5` are already defaults but explicit
-/// here because they are *invariants* for exactly-once correctness.
+/// The delivery invariants are explicit here. The sizing surface, applied
+/// after this constant, also sets `enable.idempotence` and
+/// `max.in.flight.requests.per.connection` on every path, and `acks` while
+/// idempotence is on. The table holds while `sizing.producer.idempotence` is
+/// unset or `true`, the default; with it `false` the producer is not
+/// idempotent whatever this profile says. Batching and codec come from the
+/// sizing surface.
 ///
 /// | Setting | Value | librdkafka default | Why |
 /// |---|---|---|---|
 /// | `enable.idempotence` | true | false | Exactly-once within partition |
 /// | `acks` | all | all (-1) | Invariant for EOS (explicit) |
 /// | `max.in.flight.requests.per.connection` | 5 | 1000000 | Max for idempotent producer |
-/// | `linger.ms` | 20 ms | 5 ms | Moderate batching |
-/// | `compression.type` | lz4 | none | Matches the sizing surface, which is applied last |
 /// | `socket.nagle.disable` | true | false | Kafka batches at app level |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
-///
-/// Same codec reasoning as [`PRODUCER_HIGH_THROUGHPUT`]: the sizing surface is
-/// applied after this constant and sets `lz4`, so any other value here is dead
-/// config that contradicts the profile.
 pub const PRODUCER_EXACTLY_ONCE: &[(&str, &str)] = &[
     ("enable.idempotence", "true"),
     ("acks", "all"),
     ("max.in.flight.requests.per.connection", "5"),
-    ("linger.ms", "20"),
-    ("compression.type", "lz4"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
 
-/// Low-latency producer -- minimal delay, leader-ack only.
+/// Low-latency producer -- leader-ack only.
 ///
-/// Only settings that differ from librdkafka defaults.
+/// `acks=1` takes effect only with `sizing.producer.idempotence: false`: the
+/// idempotent producer, on by default, requires `acks=all`, and the sizing
+/// surface sets it after this constant. The batching delay comes from the
+/// sizing profile, and `low_latency` lingers 0 ms.
 ///
 /// | Setting | Value | librdkafka default | Why |
 /// |---|---|---|---|
 /// | `acks` | 1 | all (-1) | Leader ack only for speed |
-/// | `linger.ms` | 0 ms | 5 ms | Send immediately |
-/// | `compression.type` | lz4 | none | LZ4 is fastest codec |
 /// | `socket.nagle.disable` | true | false | No TCP coalescing |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
 pub const PRODUCER_LOW_LATENCY: &[(&str, &str)] = &[
     ("acks", "1"),
-    ("linger.ms", "0"),
-    ("compression.type", "lz4"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
 
-/// DevTest producer -- fast acks, no compression.
+/// DevTest producer -- fast acks.
 ///
-/// Only settings that differ from librdkafka defaults.
+/// `acks=1` takes effect only with `sizing.producer.idempotence: false`, as
+/// for [`PRODUCER_LOW_LATENCY`]. Batching and codec come from the sizing
+/// surface.
 ///
 /// | Setting | Value | librdkafka default | Why |
 /// |---|---|---|---|
 /// | `acks` | 1 | all (-1) | Faster for dev |
-/// | `linger.ms` | 5 ms | 5 ms | Default is fine for dev |
-/// | `compression.type` | none | none | No overhead in dev |
 /// | `socket.nagle.disable` | true | false | No TCP coalescing |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics in dev |
 pub const PRODUCER_DEVTEST: &[(&str, &str)] = &[
@@ -1196,9 +1329,9 @@ pub struct KafkaConfig {
     ///     consumer:
     ///       fetch_min_bytes: 2097152  # 2 MiB, overrides profile default
     ///     producer:
-    ///       compression_type: zstd    # opt into zstd for storage-bound topics
+    ///       compression_type: lz4     # the default is zstd at level 3
     ///     consumer_librdkafka:
-    ///       fetch.wait.max.ms: "75"   # raw override wins over everything
+    ///       fetch.wait.max.ms: "75"   # raw override wins over the knobs
     ///     producer_librdkafka:
     ///       linger.ms: "50"
     /// ```
@@ -1207,8 +1340,10 @@ pub struct KafkaConfig {
 
     /// Librdkafka configuration overrides.
     ///
-    /// These settings override both the profile defaults and explicit config fields.
-    /// Use this to customize any librdkafka setting not exposed as an explicit field.
+    /// These settings override the profile defaults, the explicit config
+    /// fields and the whole sizing surface: every producer and consumer path
+    /// applies them after all three. Use this to customize any librdkafka
+    /// setting not exposed as an explicit field.
     ///
     /// Example:
     /// ```yaml
@@ -1433,6 +1568,13 @@ impl KafkaConfig {
         }
 
         config
+    }
+
+    /// The producer settings every producer path applies after its profile
+    /// constants: the sizing surface, then `librdkafka_overrides`, which wins.
+    pub(crate) fn resolved_producer_settings(&self) -> BTreeMap<String, String> {
+        self.sizing
+            .producer_map_under(raw_layer(&self.librdkafka_overrides))
     }
 
     /// Add a librdkafka override.
@@ -2267,7 +2409,8 @@ mod tests {
         let map = s.resolved_producer_map();
         assert_eq!(map["batch.size"], "131072", "128 KiB batch");
         assert_eq!(map["linger.ms"], "20");
-        assert_eq!(map["compression.type"], "lz4");
+        assert_eq!(map["compression.type"], "zstd");
+        assert_eq!(map["compression.level"], "3");
         // 64 MiB -> 65536 KiB
         assert_eq!(map["queue.buffering.max.kbytes"], "65536");
         assert_eq!(map["max.in.flight.requests.per.connection"], "5");
@@ -2278,7 +2421,8 @@ mod tests {
         let s = sizing_for_profile(SelfRegulationProfile::LowLatency);
         let map = s.resolved_producer_map();
         assert_eq!(map["linger.ms"], "0", "send immediately");
-        assert_eq!(map["compression.type"], "lz4");
+        assert_eq!(map["compression.type"], "zstd");
+        assert_eq!(map["compression.level"], "3");
         let batch: i32 = map["batch.size"].parse().unwrap();
         assert!(batch < 131_072, "low_latency batch should be < throughput");
     }
@@ -2435,14 +2579,18 @@ mod tests {
             profile: SelfRegulationProfile::Throughput,
             producer: ProducerKnobs {
                 linger_ms: Some(99), // override the 20 ms throughput default
-                compression_type: Some("zstd".to_string()),
+                compression_type: Some("lz4".to_string()),
                 ..Default::default()
             },
             ..Default::default()
         };
         let map = s.resolved_producer_map();
         assert_eq!(map["linger.ms"], "99");
-        assert_eq!(map["compression.type"], "zstd");
+        assert_eq!(map["compression.type"], "lz4");
+        assert!(
+            !map.contains_key("compression.level"),
+            "the zstd level must not follow the codec to lz4"
+        );
         // sticky linger tracks the overridden linger_ms.
         assert_eq!(map["sticky.partitioning.linger.ms"], "99");
         // batch.size still comes from the throughput profile.
@@ -2498,6 +2646,7 @@ mod tests {
             map["compression.type"], "gzip",
             "raw producer_librdkafka compression must win"
         );
+        assert!(!map.contains_key("compression.level"));
     }
 
     // --- KIP-794 / sticky partitioner ---
@@ -2523,47 +2672,230 @@ mod tests {
         );
     }
 
-    // --- compression.type present and consistent ---
+    // --- the producer codec and its level ---
 
+    /// The profiles differ in batching and latency, never in codec.
     #[test]
-    fn compression_type_present_in_all_profiles() {
+    fn every_profile_produces_zstd_at_level_3() {
         for profile in [
             SelfRegulationProfile::Throughput,
             SelfRegulationProfile::Balanced,
             SelfRegulationProfile::LowLatency,
         ] {
             let map = sizing_for_profile(profile).resolved_producer_map();
+            assert_eq!(map["compression.type"], "zstd", "profile {profile:?}");
+            assert_eq!(map["compression.level"], "3", "profile {profile:?}");
+        }
+    }
+
+    /// A level means something different to each codec, and lz4 turns to its
+    /// slow high-compression mode at 3, so no other codec inherits it.
+    #[test]
+    fn a_named_codec_other_than_zstd_gets_no_level() {
+        for codec in ["lz4", "gzip", "snappy", "none"] {
+            let s = KafkaSizingConfig {
+                producer: ProducerKnobs {
+                    compression_type: Some(codec.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let map = s.resolved_producer_map();
+            assert_eq!(map["compression.type"], codec);
             assert!(
-                map.contains_key("compression.type"),
-                "profile {profile:?} must set compression.type"
-            );
-            assert!(
-                !map["compression.type"].is_empty(),
-                "compression.type must not be empty"
+                !map.contains_key("compression.level"),
+                "{codec} must run at librdkafka's own level for it"
             );
         }
     }
 
-    /// The legacy producer profile constants are applied BEFORE the sizing
-    /// surface on every producer path, so a codec they name that the sizing
-    /// surface then overwrites is dead config -- and one that recompresses
-    /// every lz4 batch is the worst kind of dead config to copy.
+    /// A raw codec override is the one the producer runs, so the zstd level
+    /// goes with the zstd codec it replaced.
     #[test]
-    fn legacy_producer_profiles_name_the_codec_the_sizing_surface_applies() {
-        let applied_last = sizing_for_profile(SelfRegulationProfile::Throughput)
-            .resolved_producer_map()["compression.type"]
-            .clone();
+    fn a_raw_codec_override_drops_the_zstd_level() {
+        let s = KafkaSizingConfig {
+            producer_librdkafka: BTreeMap::from([(
+                "compression.type".to_string(),
+                "lz4".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let map = s.resolved_producer_map();
+        assert_eq!(map["compression.type"], "lz4");
+        assert!(!map.contains_key("compression.level"));
+    }
 
+    /// A raw layer that picks zstd over a named codec gets the zstd level too.
+    #[test]
+    fn a_raw_zstd_override_gets_the_zstd_level() {
+        let s = KafkaSizingConfig {
+            producer: ProducerKnobs {
+                compression_type: Some("lz4".to_string()),
+                ..Default::default()
+            },
+            producer_librdkafka: BTreeMap::from([(
+                "compression.type".to_string(),
+                "zstd".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(s.resolved_producer_map()["compression.level"], "3");
+    }
+
+    /// A level an operator names is theirs, whatever the codec.
+    #[test]
+    fn a_raw_level_is_kept() {
+        let zstd_six = KafkaSizingConfig {
+            producer_librdkafka: BTreeMap::from([(
+                "compression.level".to_string(),
+                "6".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let map = zstd_six.resolved_producer_map();
+        assert_eq!(map["compression.type"], "zstd");
+        assert_eq!(map["compression.level"], "6");
+
+        let lz4_one = KafkaSizingConfig {
+            producer_librdkafka: BTreeMap::from([
+                ("compression.type".to_string(), "lz4".to_string()),
+                ("compression.level".to_string(), "1".to_string()),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(lz4_one.resolved_producer_map()["compression.level"], "1");
+    }
+
+    /// rdkafka hands its settings to librdkafka in hash order, so a raw key
+    /// left beside its alias from a lower layer wins only by chance.
+    #[test]
+    fn a_raw_alias_replaces_the_lower_layer_name() {
+        let s = KafkaSizingConfig {
+            producer_librdkafka: BTreeMap::from([
+                ("compression.codec".to_string(), "lz4".to_string()),
+                ("queue.buffering.max.ms".to_string(), "50".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let map = s.resolved_producer_map();
+        assert_eq!(map["compression.codec"], "lz4");
+        assert!(!map.contains_key("compression.type"));
+        assert!(!map.contains_key("compression.level"));
+        assert_eq!(map["queue.buffering.max.ms"], "50");
+        assert!(!map.contains_key("linger.ms"));
+    }
+
+    /// The idempotent producer's `acks=all` sits under its librdkafka name, so
+    /// a raw `request.required.acks` replaces it rather than racing it.
+    #[test]
+    fn a_raw_acks_alias_replaces_the_idempotence_acks() {
+        let s = KafkaSizingConfig {
+            producer: ProducerKnobs {
+                idempotence: Some(false),
+                ..Default::default()
+            },
+            producer_librdkafka: BTreeMap::from([(
+                "request.required.acks".to_string(),
+                "1".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let map = s.resolved_producer_map();
+        assert_eq!(map["request.required.acks"], "1");
+        assert!(!map.contains_key("acks"));
+    }
+
+    /// A raw fetch ceiling by the other librdkafka name replaces the named
+    /// knob's rather than racing it.
+    #[test]
+    fn a_raw_consumer_alias_replaces_the_named_fetch_ceiling() {
+        let s = KafkaSizingConfig {
+            consumer_librdkafka: BTreeMap::from([(
+                "fetch.message.max.bytes".to_string(),
+                "4194304".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let map = s.resolved_consumer_map();
+        assert_eq!(map["fetch.message.max.bytes"], "4194304");
+        assert!(!map.contains_key("max.partition.fetch.bytes"));
+    }
+
+    /// Every pair in the alias table resolves in both directions.
+    #[test]
+    fn the_alias_table_maps_each_name_to_the_other() {
+        for &(alias, property) in LIBRDKAFKA_ALIASES {
+            assert_eq!(librdkafka_alias(alias), Some(property));
+            assert_eq!(librdkafka_alias(property), Some(alias));
+        }
+        assert_eq!(librdkafka_alias("fetch.min.bytes"), None);
+    }
+
+    /// `librdkafka_overrides` is laid over the sizing raw map, so it wins a
+    /// key both set, and it takes the codec level with it.
+    #[test]
+    fn librdkafka_overrides_win_over_producer_librdkafka() {
+        let mut config = KafkaConfig::default();
+        config
+            .sizing
+            .producer_librdkafka
+            .insert("compression.type".to_string(), "gzip".to_string());
+        config
+            .librdkafka_overrides
+            .insert("compression.type".to_string(), "lz4".to_string());
+        let settings = config.resolved_producer_settings();
+        assert_eq!(settings["compression.type"], "lz4");
+        assert!(!settings.contains_key("compression.level"));
+
+        // An override by the alias name clears the sizing name below it.
+        let mut by_alias = KafkaConfig::default();
+        by_alias
+            .librdkafka_overrides
+            .insert("compression.codec".to_string(), "snappy".to_string());
+        let settings = by_alias.resolved_producer_settings();
+        assert_eq!(settings["compression.codec"], "snappy");
+        assert!(!settings.contains_key("compression.type"));
+        assert!(!settings.contains_key("compression.level"));
+    }
+
+    /// With no overrides the settings are the sizing surface's own.
+    #[test]
+    fn resolved_producer_settings_without_overrides_is_the_sizing_map() {
+        let config = KafkaConfig::default();
+        assert_eq!(
+            config.resolved_producer_settings(),
+            config.sizing.resolved_producer_map()
+        );
+    }
+
+    /// The producer profile constants are laid under the sizing surface, so a
+    /// batching or codec key in one would read as a setting and never take
+    /// effect.
+    #[test]
+    fn producer_profiles_leave_batching_and_codec_to_the_sizing_surface() {
+        const SIZING_OWNED: &[&str] = &[
+            "batch.size",
+            "linger.ms",
+            "queue.buffering.max.ms",
+            "compression.type",
+            "compression.codec",
+            "compression.level",
+            "queue.buffering.max.kbytes",
+            "message.max.bytes",
+            "sticky.partitioning.linger.ms",
+        ];
         for (name, profile) in [
             ("PRODUCER_HIGH_THROUGHPUT", PRODUCER_HIGH_THROUGHPUT),
             ("PRODUCER_EXACTLY_ONCE", PRODUCER_EXACTLY_ONCE),
             ("PRODUCER_LOW_LATENCY", PRODUCER_LOW_LATENCY),
+            ("PRODUCER_DEVTEST", PRODUCER_DEVTEST),
         ] {
-            let map: HashMap<&str, &str> = profile.iter().copied().collect();
-            assert_eq!(
-                map["compression.type"], applied_last,
-                "{name} contradicts the sizing surface that overwrites it"
-            );
+            for (key, _) in profile {
+                assert!(
+                    !SIZING_OWNED.contains(key),
+                    "{name} names {key}, which the sizing surface always sets"
+                );
+            }
         }
     }
 
