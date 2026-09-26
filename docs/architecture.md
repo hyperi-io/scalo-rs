@@ -106,7 +106,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | `transport` | `transport`, `transport-{kafka,grpc,memory,file,pipe,http}` | Trait architecture (`TransportBase`, `TransportSender`, `TransportReceiver`, `Transport`), `AnySender` enum dispatch, factory |
 | `transport::filter` | `transport` | 3-tier engine (SIMD field ops / compiled CEL / complex CEL) embedded in every backend |
 | `http_server` | `http-server` | axum-based server, probe wiring, `/config` / `/metrics` / `/metrics/manifest` mount points |
-| `http_client` | `http` | `reqwest` + `reqwest-middleware` + `reqwest-retry` |
+| `http_client` | `http` | `reqwest`, with retry and backoff from `backon` |
 | `secrets` | `secrets`, `secrets-vault`, `secrets-aws` | `SecretsManager` trait, OpenBao/Vault and AWS Secrets Manager backends |
 | `directory_config` | `directory-config`, `directory-config-git` | YAML directory store with optional `git2` |
 | `output` | `output-file` | NDJSON file output sink |
@@ -173,16 +173,13 @@ A handful of dependencies aren't visible from layer naming alone:
 
 - `worker-batch` depends on `worker-pool` (the engine sits on top of the
   pool), which in turn depends on `metrics` and `config`.
-- `tiered-sink` is L4 but pulls `spool` (also L4) directly, plus an L3
-  transport from outside its own crate.
+- `tiered-sink` does not enable `spool`. It runs its own `yaque` queue through the crate-private `spool_codec` it shares with `spool`, plus an L3 transport.
 - `dlq` requires `concurrency` (L2) for the `BackgroundSink` actor that
   drains queued entries.
 - `transport-trace` is the *only* feature that pulls in the OpenTelemetry
   SDK on the transport side. Apps that send/receive without distributed
   tracing avoid that dep entirely.
-- `cli-service` (L5) reaches across the whole stack - it pulls
-  `metrics + memory + scaling + worker-pool + shutdown` because
-  `ServiceRuntime::new` wires all of them.
+- `cli-service` (L5) reaches across the whole stack - it pulls `cli + metrics + memory + scaling + shutdown + governor + sink-stack + lifecycle` because `ServiceRuntime::new` wires all of them. It does not pull `worker-pool`; an app that runs one declares it.
 
 Read [feature-flags.md](feature-flags.md) for the full feature-to-feature
 edges and [auto-wiring.md](auto-wiring.md) for which dependencies are
