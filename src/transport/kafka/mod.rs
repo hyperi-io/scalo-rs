@@ -413,15 +413,28 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
     client_config
 }
 
-/// Build a producer's librdkafka config: connection and security, then
-/// `profile_defaults`, then [`KafkaConfig::resolved_producer_settings`].
+/// Build the librdkafka config every scalo producer runs on: connection and
+/// security, `profile_defaults`, the sizing surface, then `librdkafka_overrides`,
+/// each key replacing its other librdkafka name set earlier.
 ///
-/// Every producer scalo builds comes from here, so every one resolves a key
-/// in the same order: profile defaults < sizing profile < named sizing knobs
-/// < `sizing.producer_librdkafka` < `librdkafka_overrides`. The producer gets
-/// a config of its own because consumer-only keys (`group.id`, `fetch.*`,
-/// `session.timeout.ms`) would make librdkafka ignore the producer sizing.
-pub(super) fn producer_client_config(
+/// # Examples
+///
+/// ```
+/// use scalo::transport::kafka::{KafkaConfig, PRODUCER_HIGH_THROUGHPUT, producer_client_config};
+///
+/// // An override wins over the sizing surface under either librdkafka name.
+/// let config = KafkaConfig::default()
+///     .with_override("linger.ms", "5")
+///     .with_override("compression.codec", "lz4");
+/// let client = producer_client_config(&config, PRODUCER_HIGH_THROUGHPUT);
+///
+/// assert_eq!(client.get("linger.ms"), Some("5"));
+/// assert_eq!(client.get("compression.codec"), Some("lz4"));
+/// assert_eq!(client.get("compression.type"), None);
+/// assert_eq!(client.get("socket.nagle.disable"), Some("true"));
+/// ```
+#[must_use]
+pub fn producer_client_config(
     config: &KafkaConfig,
     profile_defaults: &[(&str, &str)],
 ) -> ClientConfig {
