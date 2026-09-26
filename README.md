@@ -26,9 +26,8 @@ An integrated runtime for at scale data plane services. Attach and 'enterprise-u
 
 ## Quick Start
 
-```toml
-[dependencies]
-scalo = "2"
+```sh
+cargo add scalo
 ```
 
 Default features are `config` and `logger`. Add the rest explicitly -- pick the

@@ -880,7 +880,7 @@ automountServiceAccountToken: false
 fn gen_configmap_yaml(c: &DeploymentContract) -> String {
     let app = &c.app_name;
 
-    let mut out = format!(
+    format!(
         r#"apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -893,10 +893,7 @@ data:
 "#,
         app = app,
         filename = c.config_filename(),
-    );
-
-    let _ = &mut out; // keep borrow checker happy
-    out
+    )
 }
 
 fn gen_secret_yaml(c: &DeploymentContract) -> String {

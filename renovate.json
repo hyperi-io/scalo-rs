@@ -18,31 +18,36 @@
       "description": "OpenTelemetry SDK + exporters + the tracing bridge + the metrics bridge move in lockstep -- held at 0.31 while metrics-exporter-opentelemetry requires it. Bumping one alone breaks the build.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["/^opentelemetry/", "tracing-opentelemetry", "metrics-exporter-opentelemetry"],
-      "groupName": "opentelemetry"
+      "groupName": "opentelemetry",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "tonic + prost are generated-and-linked together (build.rs codegen); never bump one without the other.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["/^tonic/", "/^prost/"],
-      "groupName": "tonic-prost"
+      "groupName": "tonic-prost",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "AWS SDK crates (aws-config, aws-sdk-*) share a release train and must move together.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["/^aws-/"],
-      "groupName": "aws-sdk"
+      "groupName": "aws-sdk",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "metrics facade + exporters version together. The OpenTelemetry exporter follows the opentelemetry group instead.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["/^metrics/", "!metrics-exporter-opentelemetry"],
-      "groupName": "metrics"
+      "groupName": "metrics",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "tracing core + subscriber + throttle.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["tracing", "tracing-subscriber", "tracing-throttle"],
-      "groupName": "tracing"
+      "groupName": "tracing",
+      "minimumReleaseAge": "7 days"
     }
   ]
 }

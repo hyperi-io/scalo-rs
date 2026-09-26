@@ -10,8 +10,7 @@
 
 # Category 4 (OSS): public, Apache-2.0, publishes to crates.io, neutral
 # branding -- scalo carries no HyperI brand furniture. Declared rather than
-# inferred: the prefix is a hint, never authority. The repo itself stays
-# private until the consuming apps have migrated; the crate is already public.
+# inferred: the prefix is a hint, never authority.
 classification: oss
 
 language: rust
