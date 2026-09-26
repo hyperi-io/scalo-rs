@@ -104,7 +104,16 @@ jemalloc `stats.allocated` reader (advance the epoch inside the
 closure), or any `fn() -> usize`. scalo itself depends on no
 allocator -- the choice is the binary's.
 
-### Allocator: why jemalloc, and why the tikv- crates
+`try_reserve(n)` is a projected-admission check (`usage() + n <=
+limit`) against whichever source is in force, and does NOT mutate the
+reservation counter -- the kernel uncharges the bytes when they are
+freed, so no `release` is needed to keep the check honest. It does
+charge the ledger, so callers behind it in the same cache window see the
+admission.
+
+---
+
+## Allocator
 
 scalo picks no allocator. Every HyperI Rust binary picks jemalloc, and here is why.
 
@@ -120,13 +129,6 @@ Three crates, three jobs:
 - `tikv-jemalloc-ctl` -- 'ask jemalloc how much it holds'. Turn on its `stats` feature or there are no stats to read.
 
 Why not a native Rust allocator? Rust ships none of its own. Without jemalloc a binary gets the platform's C `malloc`, glibc on Linux. So the real choice is which C allocator, and the standard picks jemalloc for its heap stats and profiling, which mimalloc and snmalloc do not match.
-
-`try_reserve(n)` is a projected-admission check (`usage() + n <=
-limit`) against whichever source is in force, and does NOT mutate the
-reservation counter -- the kernel uncharges the bytes when they are
-freed, so no `release` is needed to keep the check honest. It does
-charge the ledger, so callers behind it in the same cache window see the
-admission.
 
 ---
 
