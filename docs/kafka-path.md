@@ -291,13 +291,7 @@ chance pick the winner. The table is `LIBRDKAFKA_ALIASES` in
 `src/transport/kafka/config.rs`. `enable.auto.commit` is not in it: set on a
 client it is a global property, and `auto.commit.enable` a separate topic one.
 
-The producer is built from a SEPARATE `ClientConfig`, not the consumer's:
-consumer-only keys (`group.id`, `session.timeout.ms`, fetch sizes) would make
-librdkafka ignore the producer sizing surface otherwise. Both producer paths,
-`KafkaTransport` and the standalone `KafkaProducer`, build it the same way:
-connection and security, the `KafkaProducer` profile's few keys, the producer
-sizing map, then `kafka.librdkafka_overrides`. On the consumer half
-`kafka.librdkafka_overrides` is applied after the sizing surface too.
+The producer is built from a SEPARATE `ClientConfig`, not the consumer's: consumer-only keys (`group.id`, `session.timeout.ms`, fetch sizes) would make librdkafka ignore the producer sizing surface otherwise. Both producer paths, `KafkaTransport` and the standalone `KafkaProducer`, build it the same way: connection and security, the `KafkaProducer` profile's few keys, the producer sizing map, then `kafka.librdkafka_overrides`, with the alias replacement above at each layer. That builder is public as `transport::kafka::producer_client_config(&config, profile_defaults)`, for an app that owns its producer context: it passes its own profile keys as `profile_defaults`, and an operator's override still wins over them. On the consumer half `kafka.librdkafka_overrides` is applied after the sizing surface too.
 
 ---
 
