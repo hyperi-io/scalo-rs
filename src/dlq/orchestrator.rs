@@ -1054,6 +1054,132 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Keeps every counter written on the thread it is the local recorder of.
+    #[derive(Default)]
+    struct Counters(std::sync::Mutex<Vec<(::metrics::Key, Arc<AtomicU64>)>>);
+
+    impl Counters {
+        /// The value of the `name` series carrying exactly `labels`.
+        fn value(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+            let held = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held.iter()
+                .filter(|(key, _)| {
+                    key.name() == name
+                        && key.labels().count() == labels.len()
+                        && labels
+                            .iter()
+                            .all(|(k, v)| key.labels().any(|l| l.key() == *k && l.value() == *v))
+                })
+                .map(|(_, cell)| cell.load(Ordering::Relaxed))
+                .sum()
+        }
+
+        /// Every value of the `name` series, whatever its labels.
+        fn total(&self, name: &str) -> u64 {
+            let held = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held.iter()
+                .filter(|(key, _)| key.name() == name)
+                .map(|(_, cell)| cell.load(Ordering::Relaxed))
+                .sum()
+        }
+    }
+
+    impl ::metrics::Recorder for Counters {
+        fn describe_counter(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: ::metrics::KeyName,
+            _: Option<::metrics::Unit>,
+            _: ::metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Counter {
+            let mut held = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((_, cell)) = held.iter().find(|(k, _)| k == key) {
+                return ::metrics::Counter::from_arc(Arc::clone(cell));
+            }
+            let cell = Arc::new(AtomicU64::new(0));
+            held.push((key.clone(), Arc::clone(&cell)));
+            ::metrics::Counter::from_arc(cell)
+        }
+
+        fn register_gauge(
+            &self,
+            _: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Gauge {
+            ::metrics::Gauge::noop()
+        }
+
+        fn register_histogram(
+            &self,
+            _: &::metrics::Key,
+            _: &::metrics::Metadata<'_>,
+        ) -> ::metrics::Histogram {
+            ::metrics::Histogram::noop()
+        }
+    }
+
+    /// A full queue counts its refusals under the `reason` label every other
+    /// DLQ drop carries, so `dlq_dropped_total` never splits into an
+    /// unlabelled series beside the labelled ones.
+    #[tokio::test]
+    async fn a_full_queue_counts_its_refusals_as_overflow() {
+        let counters = Counters::default();
+        let _local = ::metrics::set_default_local_recorder(&counters);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = tmp_config(dir.path());
+        cfg.queue_capacity = 2;
+        cfg.batch_size = 1024;
+        cfg.flush_interval_ms = 60_000;
+        let shutdown = CancellationToken::new();
+        let dlq = spawn_dlq(&cfg, &shutdown);
+
+        let mut full_count = 0;
+        for i in 0..50 {
+            if let Err(DlqError::QueueFull) = dlq.try_send(test_entry(&format!("err_{i}"))) {
+                full_count += 1;
+            }
+        }
+
+        assert!(full_count > 0, "expected at least one QueueFull");
+        let overflow = [("reason", "overflow")];
+        assert_eq!(counters.value("dlq_dropped_total", &overflow), full_count);
+        assert_eq!(
+            counters.total("dlq_dropped_total"),
+            full_count,
+            "no series without the reason label"
+        );
+        shutdown.cancel();
+    }
+
     /// `file-rotate` drops a write to a file it could not open and reports
     /// `Ok`; the loss must still reach `flush()` and `dropped()`.
     #[cfg(unix)]
@@ -1202,99 +1328,6 @@ mod tests {
                 CancellationToken::new(),
             )
             .expect("spawn")
-        }
-
-        /// Keeps every counter written on the thread it is the local recorder of.
-        #[derive(Default)]
-        struct Counters(std::sync::Mutex<Vec<(::metrics::Key, Arc<AtomicU64>)>>);
-
-        impl Counters {
-            /// The value of the `name` series carrying exactly `labels`.
-            fn value(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
-                let held = self
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                held.iter()
-                    .filter(|(key, _)| {
-                        key.name() == name
-                            && key.labels().count() == labels.len()
-                            && labels.iter().all(|(k, v)| {
-                                key.labels().any(|l| l.key() == *k && l.value() == *v)
-                            })
-                    })
-                    .map(|(_, cell)| cell.load(Ordering::Relaxed))
-                    .sum()
-            }
-
-            /// Every value of the `name` series, whatever its labels.
-            fn total(&self, name: &str) -> u64 {
-                let held = self
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                held.iter()
-                    .filter(|(key, _)| key.name() == name)
-                    .map(|(_, cell)| cell.load(Ordering::Relaxed))
-                    .sum()
-            }
-        }
-
-        impl ::metrics::Recorder for Counters {
-            fn describe_counter(
-                &self,
-                _: ::metrics::KeyName,
-                _: Option<::metrics::Unit>,
-                _: ::metrics::SharedString,
-            ) {
-            }
-            fn describe_gauge(
-                &self,
-                _: ::metrics::KeyName,
-                _: Option<::metrics::Unit>,
-                _: ::metrics::SharedString,
-            ) {
-            }
-            fn describe_histogram(
-                &self,
-                _: ::metrics::KeyName,
-                _: Option<::metrics::Unit>,
-                _: ::metrics::SharedString,
-            ) {
-            }
-
-            fn register_counter(
-                &self,
-                key: &::metrics::Key,
-                _: &::metrics::Metadata<'_>,
-            ) -> ::metrics::Counter {
-                let mut held = self
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some((_, cell)) = held.iter().find(|(k, _)| k == key) {
-                    return ::metrics::Counter::from_arc(Arc::clone(cell));
-                }
-                let cell = Arc::new(AtomicU64::new(0));
-                held.push((key.clone(), Arc::clone(&cell)));
-                ::metrics::Counter::from_arc(cell)
-            }
-
-            fn register_gauge(
-                &self,
-                _: &::metrics::Key,
-                _: &::metrics::Metadata<'_>,
-            ) -> ::metrics::Gauge {
-                ::metrics::Gauge::noop()
-            }
-
-            fn register_histogram(
-                &self,
-                _: &::metrics::Key,
-                _: &::metrics::Metadata<'_>,
-            ) -> ::metrics::Histogram {
-                ::metrics::Histogram::noop()
-            }
         }
 
         const FALLTHROUGH: &str = "dlq_cascade_fallthrough_total";

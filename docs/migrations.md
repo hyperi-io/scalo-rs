@@ -829,6 +829,7 @@ The producer profile constants `PRODUCER_HIGH_THROUGHPUT`, `PRODUCER_EXACTLY_ONC
 - `VectorCompatClient::send_events_status` fails with the gRPC status, and `VectorCompatClient::is_permanent_rejection` names the refusals no resend clears (`DataLoss`, `InvalidArgument`, `OutOfRange`), so a transform stops resending events a Vector sink rejected. `send_events` is unchanged. One it drops counts in `pipeline_dead_letters_dropped_total` under `transport::DEAD_LETTER_REJECTED` (`reason="rejected"`).
 - `Pipeline::listener(name)` publishes the pipeline's `pipeline_delivery_guarantee` with a `listener` label, for an app that runs several pipelines.
 - `EffectiveGuarantee::publish_for(listener)` publishes `pipeline_delivery_guarantee` with a `listener` label, for an app with one source and sink pair per listener.
+- `BackgroundSink` counts a push its full queue refuses in `<prefix>_dropped_total{reason="overflow"}`, where the series had no label. For the DLQ that is `dlq_dropped_total`, whose other drops already carry `reason`, so the metric no longer mixes a labelled and an unlabelled series. A query that sums the metric is unchanged. One that matched the unlabelled series by exact labels now needs `reason="overflow"`.
 
 ---
 

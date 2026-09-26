@@ -80,7 +80,7 @@ pub struct BackgroundSinkConfig {
     /// Optional Prometheus metric prefix. When `Some("dlq_file")`,
     /// the sink auto-registers and emits:
     ///   - `<prefix>_pushed_total`         (counter)
-    ///   - `<prefix>_dropped_total`        (counter, only `Overflow::Drop`)
+    ///   - `<prefix>_dropped_total`        (counter, `reason="overflow"`, only `Overflow::Drop`)
     ///   - `<prefix>_writes_total`         (counter, per batch)
     ///   - `<prefix>_write_errors_total`   (counter, per failed batch)
     ///   - `<prefix>_pending`              (gauge, current queue depth)
@@ -241,7 +241,7 @@ impl<T: Send + 'static> BackgroundSink<T> {
             );
             metrics::describe_counter!(
                 format!("{prefix}_dropped_total"),
-                "Messages dropped due to queue overflow"
+                "Messages dropped, by reason; this sink adds reason=overflow"
             );
             metrics::describe_counter!(
                 format!("{prefix}_writes_total"),
@@ -309,7 +309,8 @@ impl<T: Send + 'static> BackgroundSink<T> {
                         self.pending.fetch_sub(1, Ordering::Relaxed);
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                         if let Some(p) = self.metric_prefix {
-                            metrics::counter!(format!("{p}_dropped_total")).increment(1);
+                            metrics::counter!(format!("{p}_dropped_total"), "reason" => "overflow")
+                                .increment(1);
                         }
                         Err(SinkError::Overflow)
                     }
