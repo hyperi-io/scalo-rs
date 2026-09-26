@@ -333,6 +333,7 @@ async fn one_exchange_serves_concurrent_callers() {
     }
 
     assert_eq!(secrets.len(), 32);
+    // Tokens minted by the loopback fixture, printed only when the assertion fails.
     assert!(
         secrets.iter().all(|s| s == "tok-1"),
         "every caller got the one minted token: {secrets:?}"

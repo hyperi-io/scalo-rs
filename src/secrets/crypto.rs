@@ -103,6 +103,7 @@ impl Envelope {
 /// `encryption_key` can be any length (passphrase or pre-existing
 /// 32-byte key encoded as text); HKDF normalises it.
 fn derive_key(user_key: &str) -> [u8; 32] {
+    // Output buffer, not a key: HKDF-Expand overwrites all 32 bytes or the expect below panics.
     let mut out = [0u8; 32];
     // HKDF-Extract + HKDF-Expand. Both calls are infallible for our
     // sizes (32-byte output well below the 8160-byte limit).
@@ -123,6 +124,7 @@ pub(super) fn seal(user_key: &str, plaintext: &[u8], aad: &[u8]) -> SecretsResul
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let cipher = Aes256Gcm::new(key);
 
+    // Output buffer, not a nonce: OsRng::fill_bytes overwrites every byte or panics.
     let mut nonce_bytes = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);

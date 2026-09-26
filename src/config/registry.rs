@@ -771,6 +771,7 @@ mod tests {
         let dump_str = serde_json::to_string(&dump).unwrap();
 
         for secret in &secrets {
+            // Fixture values, printed only once redaction has already failed.
             assert!(
                 !dump_str.contains(secret),
                 "SECRET LEAKED in dump_effective(): '{secret}' found in output"
