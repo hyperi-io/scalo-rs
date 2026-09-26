@@ -318,6 +318,95 @@ impl ServiceMetrics {
             dashboard_hint: None,
         });
 
+        // --- Source acknowledgements ---
+        for (name, desc, mt, unit, labels) in [
+            (
+                "pipeline_delivery_guarantee",
+                "Delivery guarantee the pipeline gives (1 = active), with the reason, and \
+                 the listener when the app names one",
+                MetricType::Gauge,
+                "",
+                &["guarantee", "reason", "listener"][..],
+            ),
+            (
+                "pipeline_dead_letters_dropped_total",
+                "Dead letters dropped with nowhere to go: no DLQ, a disabled DLQ, a record \
+                 a gRPC send_batch left out of a block, or one a downstream peer refused for good",
+                MetricType::Counter,
+                "",
+                &["reason"],
+            ),
+            (
+                "transport_ack_held",
+                "Records whose source acknowledgement is held until delivery",
+                MetricType::Gauge,
+                "",
+                &["transport"],
+            ),
+            (
+                "transport_ack_held_bytes",
+                "Payload bytes whose source acknowledgement is held until delivery",
+                MetricType::Gauge,
+                "bytes",
+                &["transport"],
+            ),
+            (
+                "transport_ack_withheld",
+                "Kafka offsets released Errored and still held: each pins its partition's \
+                 commit until a restart or a revoke",
+                MetricType::Gauge,
+                "",
+                &["transport"],
+            ),
+            (
+                "transport_ack_released_total",
+                "Records whose source acknowledgement was released, by outcome",
+                MetricType::Counter,
+                "",
+                &["transport", "outcome"],
+            ),
+            (
+                "transport_ack_refused_total",
+                "Requests refused before their acknowledgement was held, by reason",
+                MetricType::Counter,
+                "",
+                &["transport", "reason"],
+            ),
+            (
+                "transport_ack_latency_seconds",
+                "Time from receipt to the release of a source acknowledgement",
+                MetricType::Histogram,
+                "seconds",
+                &["transport", "outcome"],
+            ),
+            (
+                "transport_redelivered_total",
+                "Sends retried after the receiver may already have taken them",
+                MetricType::Counter,
+                "",
+                &["transport", "reason"],
+            ),
+        ] {
+            match mt {
+                MetricType::Gauge => metrics::describe_gauge!(name, desc),
+                MetricType::Histogram => {
+                    metrics::describe_histogram!(name, metrics::Unit::Seconds, desc);
+                }
+                MetricType::Counter => metrics::describe_counter!(name, desc),
+            }
+            reg.push(MetricDescriptor {
+                name: name.into(),
+                metric_type: mt,
+                description: desc.into(),
+                unit: unit.into(),
+                labels: labels.iter().map(|l| (*l).to_string()).collect(),
+                group: "platform".into(),
+                buckets: None,
+                use_cases: vec![],
+                dashboard_hint: None,
+            });
+        }
+
         // --- Records ---
         metrics::describe_counter!(
             "records_received_total",
@@ -699,6 +788,33 @@ mod tests {
             ),
             ("test_app_transport_commit_errors_total", vec!["transport"]),
             ("test_app_pipeline_retries_total", vec!["stage"]),
+            (
+                "test_app_pipeline_delivery_guarantee",
+                vec!["guarantee", "reason", "listener"],
+            ),
+            (
+                "test_app_pipeline_dead_letters_dropped_total",
+                vec!["reason"],
+            ),
+            ("test_app_transport_ack_held", vec!["transport"]),
+            ("test_app_transport_ack_held_bytes", vec!["transport"]),
+            ("test_app_transport_ack_withheld", vec!["transport"]),
+            (
+                "test_app_transport_ack_released_total",
+                vec!["transport", "outcome"],
+            ),
+            (
+                "test_app_transport_ack_refused_total",
+                vec!["transport", "reason"],
+            ),
+            (
+                "test_app_transport_ack_latency_seconds",
+                vec!["transport", "outcome"],
+            ),
+            (
+                "test_app_transport_redelivered_total",
+                vec!["transport", "reason"],
+            ),
         ] {
             let found = manifest
                 .metrics

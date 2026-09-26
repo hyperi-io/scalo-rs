@@ -23,6 +23,10 @@
 //!   message accepted before this call is durably written by the drain.
 //!   It returns `Err` if any batch written since the previous flush
 //!   failed, whether that write was size-, tick- or barrier-triggered.
+//! - [`BackgroundSink::write_confirmed`] is `async` and writes the caller's
+//!   own messages as a batch of their own, then reports that batch's
+//!   outcome to that caller alone, so concurrent callers never take each
+//!   other's refusal.
 //!
 //! # Shape
 //!
@@ -120,9 +124,11 @@ pub enum Overflow {
 /// `Barrier` ack carries `Result<(), DrainError>` so flush() reports
 /// every write and flush_durable failure since the previous barrier
 /// instead of claiming that everything before the barrier was durable.
+/// `Confirmed` carries one caller's messages and the ack for their own write.
 enum SinkMsg<T> {
     Data(T),
     Barrier(oneshot::Sender<Result<(), DrainError>>),
+    Confirmed(Vec<T>, oneshot::Sender<Result<(), DrainError>>),
 }
 
 /// A drain consumes batches of messages and writes them to the backend.
@@ -163,6 +169,17 @@ pub trait SinkDrain<T: Send>: Send + 'static {
     /// (fsync, Kafka producer flush, etc.) override.
     fn flush_durable(&mut self) -> impl Future<Output = Result<(), DrainError>> + Send {
         std::future::ready(Ok(()))
+    }
+
+    /// Whether every message written so far has a known fate once
+    /// `flush_durable` returns. A [`BackgroundSink::write_confirmed`] caller
+    /// is told its write failed when this is `false`, since what it wrote may
+    /// be among the unknown.
+    ///
+    /// Default: `true`. A drain whose durable flush can end with writes still
+    /// unreported (a producer purged but not yet heard from) overrides it.
+    fn settled(&self) -> bool {
+        true
     }
 
     /// One-shot close at actor shutdown. Default: no-op.
@@ -358,6 +375,44 @@ impl<T: Send + 'static> BackgroundSink<T> {
             .map_err(SinkError::Drain)
     }
 
+    /// Write `items` as a batch of their own, run the drain's durable flush,
+    /// and report the outcome of that write to this caller alone.
+    ///
+    /// Messages queued before this call are written first, and a failure of
+    /// theirs stays for the next [`flush`](Self::flush), so a concurrent
+    /// caller's refusal never reaches this one and this one's never reaches
+    /// theirs. The durable flush covers every earlier write too, so a failure
+    /// there is reported here and held for the next `flush` as well: it may be
+    /// either caller's.
+    ///
+    /// # Errors
+    ///
+    /// `Drain` when the drain refused `items`, the durable flush after them
+    /// failed, or the drain could not say what became of them
+    /// ([`SinkDrain::settled`]). `Closed` if the actor exited first.
+    pub async fn write_confirmed(&self, items: Vec<T>) -> Result<(), SinkError> {
+        let count = items.len();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        // Counted before the send, for the reason `try_push` gives.
+        self.pending.fetch_add(count, Ordering::Relaxed);
+        if self
+            .tx
+            .send(SinkMsg::Confirmed(items, ack_tx))
+            .await
+            .is_err()
+        {
+            self.pending.fetch_sub(count, Ordering::Relaxed);
+            return Err(SinkError::Closed);
+        }
+        if let Some(p) = self.metric_prefix {
+            metrics::counter!(format!("{p}_pushed_total")).increment(count as u64);
+        }
+        ack_rx
+            .await
+            .map_err(|_| SinkError::Closed)?
+            .map_err(SinkError::Drain)
+    }
+
     /// Total messages dropped due to overflow since spawn.
     #[must_use]
     pub fn dropped(&self) -> u64 {
@@ -426,6 +481,14 @@ async fn actor_loop<T, D>(
                             ).await;
                             ack_barrier(ack, result, &mut unreported);
                         }
+                        SinkMsg::Confirmed(items, ack) => {
+                            let result = confirmed_write(
+                                &mut drain, std::mem::take(&mut batch), items,
+                                &mut unreported, &pending, metric_prefix,
+                            ).await;
+                            // A caller gone before its answer took nobody else's refusal with it.
+                            let _ = ack.send(result);
+                        }
                     }
                 }
                 // No barrier can follow this write; its failure is logged and counted.
@@ -458,6 +521,14 @@ async fn actor_loop<T, D>(
                         unreported.take(), &pending, metric_prefix,
                     ).await;
                     ack_barrier(ack, result, &mut unreported);
+                }
+                Some(SinkMsg::Confirmed(items, ack)) => {
+                    let result = confirmed_write(
+                        &mut drain, std::mem::take(&mut batch), items,
+                        &mut unreported, &pending, metric_prefix,
+                    ).await;
+                    // A caller gone before its answer took nobody else's refusal with it.
+                    let _ = ack.send(result);
                 }
                 None => {
                     // No barrier can follow this write; its failure is logged and counted.
@@ -529,6 +600,46 @@ where
         Some(e) => Err(e),
         None => write_result.and(durable_result),
     }
+}
+
+/// Write the batch already queued, then `own` on its own, then run
+/// `flush_durable`, and return the outcome of `own` alone.
+///
+/// The queued batch's failure is held for the next barrier, since it belongs
+/// to whoever queued it. A durable-flush failure is returned AND held: the
+/// flush covers every earlier write, so it may belong to either.
+async fn confirmed_write<T, D: SinkDrain<T>>(
+    drain: &mut D,
+    queued: Vec<T>,
+    own: Vec<T>,
+    held: &mut Option<DrainError>,
+    pending: &AtomicUsize,
+    metric_prefix: Option<&'static str>,
+) -> Result<(), DrainError>
+where
+    T: Send,
+{
+    if !queued.is_empty() {
+        let result = write_batch_with_metrics(drain, queued, pending, metric_prefix).await;
+        hold_first_failure(held, result);
+    }
+    let written = if own.is_empty() {
+        Ok(())
+    } else {
+        write_batch_with_metrics(drain, own, pending, metric_prefix).await
+    };
+    let durable = drain.flush_durable().await;
+    if let Err(e) = &durable {
+        hold_first_failure(held, Err(DrainError::Backend(e.to_string().into())));
+    }
+    let settled = if drain.settled() {
+        Ok(())
+    } else {
+        Err(DrainError::Backend(
+            "the drain has not heard what became of every write yet".into(),
+        ))
+    };
+    written.and(durable).and(settled)
 }
 
 async fn write_batch_with_metrics<T, D: SinkDrain<T>>(
@@ -1147,6 +1258,148 @@ mod tests {
 
         let err = sink.flush().await.unwrap_err();
         assert!(matches!(err, SinkError::Drain(_)), "got: {err:?}");
+        shutdown.cancel();
+    }
+
+    /// The message [`PoisonDrain`] refuses.
+    const POISON: u32 = 13;
+
+    /// Refuses every batch holding [`POISON`] and takes the rest.
+    struct PoisonDrain;
+
+    impl SinkDrain<u32> for PoisonDrain {
+        async fn write_batch(&mut self, batch: Vec<u32>) -> Result<(), DrainError> {
+            if batch.contains(&POISON) {
+                return Err(DrainError::Io(std::io::Error::other("poison")));
+            }
+            Ok(())
+        }
+    }
+
+    /// No size or tick write, so only a barrier or a confirmed write writes.
+    fn quiet_config() -> BackgroundSinkConfig {
+        BackgroundSinkConfig {
+            batch_size: 1024,
+            flush_interval: Duration::from_mins(1),
+            ..fast_config()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_confirmed_write_reports_only_its_own_refusal() {
+        let shutdown = CancellationToken::new();
+        let (sink, _handle) = BackgroundSink::spawn(PoisonDrain, quiet_config(), shutdown.clone());
+        // Two tasks on four workers race to the queue, so either may land first.
+        for round in 0..50 {
+            let refused = tokio::spawn({
+                let sink = sink.clone();
+                async move { sink.write_confirmed(vec![POISON]).await }
+            });
+            let taken = tokio::spawn({
+                let sink = sink.clone();
+                async move { sink.write_confirmed(vec![1, 2]).await }
+            });
+            let (refused, taken) = (refused.await, taken.await);
+            let refused = refused.expect("refused task");
+            assert!(
+                matches!(refused, Err(SinkError::Drain(_))),
+                "round {round}: the refused caller was told {refused:?}"
+            );
+            taken.expect("taken task").unwrap_or_else(|e| {
+                panic!("round {round}: the other caller took a refusal that was not its own: {e}")
+            });
+        }
+        sink.flush()
+            .await
+            .expect("a refusal a confirmed caller was told is not reported again");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_refusal_queued_before_a_confirmed_write_stays_for_the_next_flush() {
+        let shutdown = CancellationToken::new();
+        let (sink, _handle) = BackgroundSink::spawn(PoisonDrain, quiet_config(), shutdown.clone());
+        sink.try_push(POISON).expect("queue has space");
+
+        sink.write_confirmed(vec![1])
+            .await
+            .expect("the confirmed caller's own write was taken");
+        let err = sink.flush().await.unwrap_err();
+        assert!(matches!(err, SinkError::Drain(_)), "got: {err:?}");
+        sink.flush()
+            .await
+            .expect("a loss is reported by one flush only");
+        shutdown.cancel();
+    }
+
+    /// Takes every write, and fails its first durable flush.
+    struct FirstDurableFails {
+        durable_calls: u64,
+    }
+
+    impl SinkDrain<u32> for FirstDurableFails {
+        async fn write_batch(&mut self, _batch: Vec<u32>) -> Result<(), DrainError> {
+            Ok(())
+        }
+
+        async fn flush_durable(&mut self) -> Result<(), DrainError> {
+            self.durable_calls += 1;
+            if self.durable_calls == 1 {
+                return Err(DrainError::Io(std::io::Error::other("durable-fail")));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_durable_failure_reaches_the_confirmed_caller_and_the_next_flush() {
+        let shutdown = CancellationToken::new();
+        let (sink, _handle) = BackgroundSink::spawn(
+            FirstDurableFails { durable_calls: 0 },
+            quiet_config(),
+            shutdown.clone(),
+        );
+        let confirmed = sink.write_confirmed(vec![1]).await;
+        assert!(
+            matches!(confirmed, Err(SinkError::Drain(_))),
+            "{confirmed:?}"
+        );
+        let flushed = sink.flush().await;
+        assert!(
+            matches!(flushed, Err(SinkError::Drain(_))),
+            "the failure may be an earlier writer's, so a flush hears of it too: {flushed:?}"
+        );
+        sink.flush().await.expect("reported once to the flushers");
+        shutdown.cancel();
+    }
+
+    /// Takes every write, but never learns what became of them.
+    struct Unsettled;
+
+    impl SinkDrain<u32> for Unsettled {
+        async fn write_batch(&mut self, _batch: Vec<u32>) -> Result<(), DrainError> {
+            Ok(())
+        }
+
+        fn settled(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_write_the_drain_cannot_vouch_for_fails() {
+        let shutdown = CancellationToken::new();
+        let (sink, _handle) = BackgroundSink::spawn(Unsettled, quiet_config(), shutdown.clone());
+        let confirmed = sink.write_confirmed(vec![1]).await;
+        assert!(
+            matches!(confirmed, Err(SinkError::Drain(_))),
+            "{confirmed:?}"
+        );
+        assert_eq!(
+            sink.pending(),
+            0,
+            "the written messages left the queue count"
+        );
         shutdown.cancel();
     }
 }

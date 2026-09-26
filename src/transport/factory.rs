@@ -29,7 +29,9 @@
 //! sender.send("events.land", payload).await;
 //! ```
 
+use super::ack::{AckControl, DeadLetterReason, SinkConfirmation};
 use super::error::{TransportError, TransportResult};
+use super::finalizer::DeliveryStatus;
 use super::traits::{CommitToken, TransportBase, TransportReceiver, TransportSender};
 use super::types::SendResult;
 #[cfg(any(
@@ -216,6 +218,55 @@ impl TransportSender for AnySender {
             _ => SendResult::Fatal(TransportError::Config(
                 "no transport variant enabled".into(),
             )),
+        }
+    }
+
+    fn confirms_delivery(&self) -> SinkConfirmation {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => t.confirms_delivery(),
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => t.confirms_delivery(),
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => t.confirms_delivery(),
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => t.confirms_delivery(),
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => t.confirms_delivery(),
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => t.confirms_delivery(),
+            #[allow(unreachable_patterns)]
+            _ => SinkConfirmation::None,
+        }
+    }
+
+    #[cfg_attr(
+        not(any(
+            feature = "transport-kafka",
+            feature = "transport-grpc",
+            feature = "transport-memory",
+            feature = "transport-pipe",
+            feature = "transport-file",
+            feature = "transport-http"
+        )),
+        allow(unused_variables)
+    )]
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => t.dead_letter_reason(record),
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => t.dead_letter_reason(record),
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => t.dead_letter_reason(record),
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => t.dead_letter_reason(record),
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => t.dead_letter_reason(record),
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => t.dead_letter_reason(record),
+            #[allow(unreachable_patterns)]
+            _ => None,
         }
     }
 }
@@ -707,6 +758,171 @@ impl TransportReceiver for AnyReceiver {
             )),
         }
     }
+
+    fn ack_control(&self) -> Option<&dyn AckControl> {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => t.ack_control(),
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => t.ack_control(),
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => t.ack_control(),
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => t.ack_control(),
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => t.ack_control(),
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => t.ack_control(),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(
+        not(any(
+            feature = "transport-kafka",
+            feature = "transport-grpc",
+            feature = "transport-memory",
+            feature = "transport-pipe",
+            feature = "transport-file",
+            feature = "transport-http"
+        )),
+        allow(unused_variables)
+    )]
+    async fn release(&self, tokens: &[AnyToken], outcome: DeliveryStatus) -> TransportResult<()> {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => {
+                t.release(
+                    &extract_tokens(tokens, |tok| match tok {
+                        AnyToken::Kafka(k) => Some(k.clone()),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }),
+                    outcome,
+                )
+                .await
+            }
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => {
+                t.release(
+                    &extract_tokens(tokens, |tok| match tok {
+                        AnyToken::Grpc(g) => Some(g.clone()),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }),
+                    outcome,
+                )
+                .await
+            }
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => {
+                t.release(
+                    &extract_tokens(tokens, |tok| match tok {
+                        AnyToken::Memory(m) => Some(*m),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }),
+                    outcome,
+                )
+                .await
+            }
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => {
+                t.release(
+                    &extract_tokens(tokens, |tok| match tok {
+                        AnyToken::Pipe(p) => Some(*p),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }),
+                    outcome,
+                )
+                .await
+            }
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => {
+                t.release(
+                    &extract_tokens(tokens, |tok| match tok {
+                        AnyToken::File(f) => Some(*f),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }),
+                    outcome,
+                )
+                .await
+            }
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => {
+                t.release(
+                    &extract_tokens(tokens, |tok| match tok {
+                        AnyToken::Http(h) => Some(h.clone()),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }),
+                    outcome,
+                )
+                .await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(TransportError::Config(
+                "no transport variant enabled".into(),
+            )),
+        }
+    }
+
+    #[cfg_attr(
+        not(any(
+            feature = "transport-kafka",
+            feature = "transport-grpc",
+            feature = "transport-memory",
+            feature = "transport-pipe",
+            feature = "transport-file",
+            feature = "transport-http"
+        )),
+        allow(unused_variables)
+    )]
+    fn hold_deadline(&self, tokens: &[AnyToken]) -> Option<std::time::Instant> {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {
+                AnyToken::Kafka(k) => Some(k.clone()),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })),
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {
+                AnyToken::Grpc(g) => Some(g.clone()),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })),
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {
+                AnyToken::Memory(m) => Some(*m),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })),
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {
+                AnyToken::Pipe(p) => Some(*p),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })),
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {
+                AnyToken::File(f) => Some(*f),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })),
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {
+                AnyToken::Http(h) => Some(h.clone()),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
 }
 
 /// Read a [`TransportConfig`](super::TransportConfig) from the global cascade
@@ -717,6 +933,71 @@ fn read_transport_config(key: &str) -> TransportResult<super::TransportConfig> {
         .ok_or_else(|| TransportError::Config("config not initialised".into()))?;
     cfg.unmarshal_key::<super::TransportConfig>(key)
         .map_err(|e| TransportError::Config(format!("failed to read {key}: {e}")))
+}
+
+/// The `<key>.<type>.acknowledgements` section, `None` when it is absent.
+///
+/// It sits beside the backend's own section rather than inside its config
+/// struct, so adding it changed no public struct.
+///
+/// # Errors
+///
+/// A section present but not parseable.
+#[cfg(feature = "config")]
+#[cfg_attr(not(feature = "transport-kafka"), allow(dead_code))]
+pub(crate) fn acknowledgements_section(
+    key: &str,
+    backend: &str,
+) -> TransportResult<Option<super::ack::AcknowledgementsConfig>> {
+    let Some(cfg) = crate::config::try_get() else {
+        return Ok(None);
+    };
+    let section = format!("{key}.{backend}.acknowledgements");
+    if !cfg.contains(&section) {
+        return Ok(None);
+    }
+    cfg.unmarshal_key_registered::<super::ack::AcknowledgementsConfig>(&section)
+        .map(Some)
+        .map_err(|e| TransportError::Config(format!("failed to read {section}: {e}")))
+}
+
+/// A gRPC receive server built from `config`, with its
+/// `<key>.grpc.acknowledgements` section, armed before it listens.
+#[cfg(all(feature = "config", feature = "transport-grpc"))]
+async fn armed_grpc(
+    config: &super::TransportConfig,
+    key: &str,
+    wire: impl FnOnce(super::grpc::GrpcTransportBuilder<'_>) -> super::grpc::GrpcTransportBuilder<'_>,
+) -> TransportResult<super::grpc::GrpcTransport> {
+    let grpc_config = config
+        .grpc
+        .as_ref()
+        .ok_or_else(|| TransportError::Config("grpc config missing".into()))?;
+    let acknowledgements = acknowledgements_section(key, "grpc")?.unwrap_or_default();
+    wire(
+        super::grpc::GrpcTransport::builder(grpc_config)
+            .acknowledgements(acknowledgements)
+            .armed(true),
+    )
+    .start()
+    .await
+}
+
+/// Warn, once per process, that an `acknowledgements` section sits under a
+/// backend with no acknowledgement to hold.
+#[cfg(all(
+    feature = "config",
+    any(feature = "transport-memory", feature = "transport-pipe")
+))]
+fn warn_acknowledgements_ignored(key: &str, backend: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            section = %format!("{key}.{backend}.acknowledgements"),
+            "acknowledgements has no effect here: this source has no acknowledgement \
+             to hold, so the pipeline reports best effort"
+        );
+    }
 }
 
 /// Collect the tokens of one `AnyToken` variant from a mixed slice. The
@@ -757,15 +1038,127 @@ impl AnyReceiver {
     /// ```
     pub async fn from_config(key: &str) -> TransportResult<Self> {
         #[cfg(feature = "config")]
-        let config = read_transport_config(key)?;
+        {
+            let config = read_transport_config(key)?;
+            Self::from_transport_config(&config)
+                .await?
+                .apply_acknowledgements(key)
+        }
 
         #[cfg(not(feature = "config"))]
-        let config = {
+        {
             let _ = key;
-            super::TransportConfig::default()
-        };
+            Self::from_transport_config(&super::TransportConfig::default()).await
+        }
+    }
 
-        Self::from_transport_config(&config).await
+    /// Like [`from_config`](Self::from_config), for a caller that releases
+    /// every token it takes (the `BatchEngine` pipeline builder or
+    /// `SourceAck`): the source is armed before it can take a record.
+    ///
+    /// A gRPC receive server is built armed, before it listens, so no push is
+    /// answered at enqueue in the gap before the caller's own `arm`. Other
+    /// sources are armed straight after construction, before any `recv`.
+    /// A source with `acknowledgements.enabled: false` is left unarmed.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_config`](Self::from_config).
+    #[cfg(feature = "config")]
+    pub async fn from_config_armed(key: &str) -> TransportResult<Self> {
+        let config = read_transport_config(key)?;
+        #[cfg(feature = "transport-grpc")]
+        if config.transport_type == TransportType::Grpc {
+            return armed_grpc(&config, key, |builder| builder)
+                .await
+                .map(Self::Grpc);
+        }
+        Ok(Self::from_transport_config(&config)
+            .await?
+            .apply_acknowledgements(key)?
+            .armed())
+    }
+
+    /// The governed sibling of [`from_config_armed`](Self::from_config_armed)
+    /// (`governor` feature): wired to `governor` as
+    /// [`from_config_with_governor`](Self::from_config_with_governor) wires it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_config`](Self::from_config).
+    #[cfg(all(feature = "config", feature = "governor"))]
+    pub async fn from_config_with_governor_armed(
+        key: &str,
+        governor: &crate::SelfRegulationGovernor,
+    ) -> TransportResult<Self> {
+        let config = read_transport_config(key)?;
+        #[cfg(feature = "transport-grpc")]
+        if config.transport_type == TransportType::Grpc {
+            return armed_grpc(&config, key, |builder| {
+                builder.pressure(governor.pressure())
+            })
+            .await
+            .map(Self::Grpc);
+        }
+        Ok(Self::from_transport_config_with_governor(&config, governor)
+            .await?
+            .apply_acknowledgements(key)?
+            .armed())
+    }
+
+    /// Arm a source whose acknowledgements are on.
+    #[cfg(feature = "config")]
+    fn armed(self) -> Self {
+        if let Some(control) = self.ack_control().filter(|c| c.enabled()) {
+            control.arm();
+        }
+        self
+    }
+
+    /// Apply the `<key>.<type>.acknowledgements` section to a Kafka or gRPC
+    /// source, and warn once when one sits under a pipe or memory source.
+    #[cfg(feature = "config")]
+    #[cfg_attr(
+        not(any(
+            feature = "transport-kafka",
+            feature = "transport-memory",
+            feature = "transport-pipe"
+        )),
+        allow(unused_variables)
+    )]
+    fn apply_acknowledgements(self, key: &str) -> TransportResult<Self> {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => Ok(match acknowledgements_section(key, "kafka")? {
+                Some(acks) => Self::Kafka(t.with_acknowledgements(acks)),
+                None => Self::Kafka(t),
+            }),
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => Ok(match acknowledgements_section(key, "grpc")? {
+                Some(acks) => Self::Grpc(t.with_acknowledgements(acks)),
+                None => Self::Grpc(t),
+            }),
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => {
+                if crate::config::try_get()
+                    .is_some_and(|c| c.contains(&format!("{key}.memory.acknowledgements")))
+                {
+                    warn_acknowledgements_ignored(key, "memory");
+                }
+                Ok(Self::Memory(t))
+            }
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => {
+                if crate::config::try_get()
+                    .is_some_and(|c| c.contains(&format!("{key}.pipe.acknowledgements")))
+                {
+                    warn_acknowledgements_ignored(key, "pipe");
+                }
+                Ok(Self::Pipe(t))
+            }
+            #[allow(unreachable_patterns)]
+            other => Ok(other),
+        }
     }
 
     /// Create a receiver from an explicit `TransportConfig`.
@@ -855,15 +1248,19 @@ impl AnyReceiver {
         governor: &crate::SelfRegulationGovernor,
     ) -> TransportResult<Self> {
         #[cfg(feature = "config")]
-        let config = read_transport_config(key)?;
+        {
+            let config = read_transport_config(key)?;
+            Self::from_transport_config_with_governor(&config, governor)
+                .await?
+                .apply_acknowledgements(key)
+        }
 
         #[cfg(not(feature = "config"))]
-        let config = {
+        {
             let _ = key;
-            super::TransportConfig::default()
-        };
-
-        Self::from_transport_config_with_governor(&config, governor).await
+            Self::from_transport_config_with_governor(&super::TransportConfig::default(), governor)
+                .await
+        }
     }
 
     /// Create a governed receiver from an explicit `TransportConfig`

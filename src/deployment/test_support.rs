@@ -59,6 +59,10 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(all(feature = "transport", feature = "worker-batch"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "transport", feature = "worker-batch"))))]
+pub mod conformance;
+
 // ============================================================================
 // Tool probes -- thin, cached, no panic.
 // ============================================================================

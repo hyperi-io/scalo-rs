@@ -113,6 +113,8 @@ pub struct KafkaProducer {
     delivery: Arc<DeliveryState>,
     /// Latches a sustained retryable enqueue failure to one warn per outage.
     enqueue_degraded: DegradedLatch,
+    /// The effective `message.max.bytes`.
+    message_max_bytes: usize,
     // Metrics
     messages_sent: AtomicU64,
     bytes_sent: AtomicU64,
@@ -208,6 +210,10 @@ impl KafkaProducer {
             client_config.set(key, value);
         }
 
+        let message_max_bytes = client_config
+            .get("message.max.bytes")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(super::LIBRDKAFKA_MESSAGE_MAX_BYTES);
         let context = ProducerContext::default();
         let delivery = Arc::clone(&context.state);
         let producer: ThreadedProducer<ProducerContext> = client_config
@@ -219,10 +225,18 @@ impl KafkaProducer {
             profile,
             delivery,
             enqueue_degraded: DegradedLatch::default(),
+            message_max_bytes,
             messages_sent: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             errors: AtomicU64::new(0),
         })
+    }
+
+    /// The largest payload `send` takes: `message.max.bytes` less the framing
+    /// librdkafka adds to a record with no key and no headers.
+    pub(crate) fn payload_ceiling(&self) -> usize {
+        self.message_max_bytes
+            .saturating_sub(super::RECORD_WIRE_OVERHEAD)
     }
 
     /// Create a high-throughput producer (convenience method).

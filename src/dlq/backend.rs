@@ -142,6 +142,20 @@ impl DlqBackend {
         }
     }
 
+    /// Entries in this backend's hands whose fate it has not heard, without
+    /// handing them over. Only Kafka holds entries past a write, and after a
+    /// durable flush only those it purged and has no report for yet.
+    #[allow(clippy::match_same_arms, reason = "only Kafka holds past a write")]
+    pub(crate) fn unsettled(&self) -> u64 {
+        match self {
+            Self::File(_) => 0,
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => b.unsettled(),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => 0,
+        }
+    }
+
     /// Entries still in this backend's hands whose fate is unknown, handed
     /// over as lost when the drain closes. Only Kafka holds entries past a
     /// write.
@@ -153,6 +167,19 @@ impl DlqBackend {
             Self::Kafka(b) => b.take_unconfirmed(),
             #[cfg(feature = "dlq-http")]
             Self::Http(_) => 0,
+        }
+    }
+
+    /// The largest serialised entry this backend can ever hold, or `None` when
+    /// it has no ceiling of its own.
+    #[allow(clippy::match_same_arms, reason = "only Kafka has a ceiling")]
+    pub(crate) fn entry_ceiling(&self) -> Option<usize> {
+        match self {
+            Self::File(_) => None,
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => Some(b.entry_ceiling()),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => None,
         }
     }
 

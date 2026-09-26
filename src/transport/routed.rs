@@ -70,6 +70,14 @@
 //! record. [`send_batch_fanout`](RoutedSender::send_batch_fanout) is the batch
 //! form of `send_fanout`.
 //!
+//! # Screening and confirmation
+//!
+//! [`dead_letter_reason`](TransportSender::dead_letter_reason) answers for the
+//! route a record's key selects, so a pipeline given a routed sender screens
+//! each record against its own route's ceiling and filters.
+//! [`confirms_delivery`](TransportSender::confirms_delivery) is the weakest
+//! across every route and the default.
+//!
 //! # Backpressure
 //!
 //! A routed send NEVER retries and NEVER routes to a DLQ: it returns the
@@ -86,6 +94,7 @@
 
 use std::collections::HashMap;
 
+use super::ack::{DeadLetterReason, SinkConfirmation};
 use super::error::{TransportError, TransportResult};
 use super::factory::AnySender;
 use super::traits::{TransportBase, TransportSender};
@@ -407,6 +416,36 @@ impl TransportSender for RoutedSender {
         }
         send_grouped(records, |destination| self.resolve(destination)).await
     }
+
+    /// The weakest confirmation across every route and the default, since a
+    /// block can reach any of them.
+    fn confirms_delivery(&self) -> SinkConfirmation {
+        weakest(
+            self.routes
+                .values()
+                .chain(self.default.as_ref())
+                .map(AnySender::confirms_delivery),
+        )
+    }
+
+    /// The answer of the sender this record's key routes to, as `send_batch`
+    /// resolves it. An unroutable record has none: it fails the block instead.
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        self.resolve(record.key.as_deref().unwrap_or(""))?
+            .dead_letter_reason(record)
+    }
+}
+
+/// The weakest of `confirmations`, or `None` when there are none.
+fn weakest(confirmations: impl Iterator<Item = SinkConfirmation>) -> SinkConfirmation {
+    let rank = |c: &SinkConfirmation| match c {
+        SinkConfirmation::None => 0,
+        SinkConfirmation::Local => 1,
+        SinkConfirmation::Remote => 2,
+    };
+    confirmations
+        .min_by_key(rank)
+        .unwrap_or(SinkConfirmation::None)
 }
 
 #[cfg(test)]
@@ -451,6 +490,41 @@ mod tests {
 
         assert!(sender.is_healthy());
         assert_eq!(sender.name(), "routed");
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "transport-memory", feature = "transport-grpc"))]
+    async fn a_routed_sender_confirms_only_what_every_route_confirms() {
+        use crate::transport::grpc::{GrpcConfig, GrpcTransport};
+        // A lazily dialled client: nothing is sent, so no server is needed.
+        let grpc = || async {
+            AnySender::Grpc(
+                GrpcTransport::new(&GrpcConfig::client("http://127.0.0.1:1"))
+                    .await
+                    .expect("grpc client"),
+            )
+        };
+
+        let all_remote = RoutedSender::new(
+            HashMap::from([("a".into(), grpc().await)]),
+            Some(grpc().await),
+        );
+        assert_eq!(all_remote.confirms_delivery(), SinkConfirmation::Remote);
+
+        let one_unconfirmed = RoutedSender::new(
+            HashMap::from([("a".into(), grpc().await)]),
+            Some(make_memory_sender()),
+        );
+        assert_eq!(
+            one_unconfirmed.confirms_delivery(),
+            SinkConfirmation::None,
+            "a block can reach the memory default, which confirms nothing"
+        );
+
+        assert_eq!(
+            RoutedSender::new(HashMap::new(), None).confirms_delivery(),
+            SinkConfirmation::None
+        );
     }
 
     #[tokio::test]

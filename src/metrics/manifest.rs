@@ -95,6 +95,7 @@ struct MetricRegistryInner {
     version: String,
     commit: String,
     /// Whether an app metric set has recorded the build info.
+    #[cfg(feature = "service-metrics")]
     build_info_claimed: bool,
     registered_at: String,
 }
@@ -119,6 +120,7 @@ impl MetricRegistry {
                 app: namespace.to_string(),
                 version: String::new(),
                 commit: String::new(),
+                #[cfg(feature = "service-metrics")]
                 build_info_claimed: false,
                 registered_at: now_rfc3339(),
             })),

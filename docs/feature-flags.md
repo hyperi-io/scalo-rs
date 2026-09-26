@@ -250,12 +250,13 @@ diagnostic, smoke-test, or specialty:
 
 - `deployment-smoke` — runs `docker build` + `docker run` as part of
   tests. Requires a Docker daemon.
+- `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, and with `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)).
 - `config-postgres` — PostgreSQL-backed config source. Built-for, not
   built-with — the YAML cascade already handles centralised config.
-- `transport-grpc-vector-compat` — wire-compat for the Vector.dev
-  anomaly; only `dfe-transform-vector` needs it.
 - `worker-msgpack` — MsgPack batch serialisation for the worker pool.
   Specialty use.
+- `testcontainers` -- builds scalo's own real-broker tests, which start Kafka
+  in a container and need a Docker daemon. Adds no code to the library.
 
 Enable these explicitly when you need them.
 
@@ -267,8 +268,11 @@ A handful of dependencies aren't visible from the feature name alone:
 
 - `worker-batch` pulls `worker-pool` and `metrics`. `BatchEngine` is
   metric-aware.
-- `tiered-sink` pulls `spool` and `tokio`. Composing without `spool`
-  isn't supported.
+- `tiered-sink` pulls `tokio` and the spill cache's own crates (`yaque`,
+  `zstd`), not the `spool` feature: `TieredSink` keeps its own cache, and
+  the standalone `Spool` type needs `spool`.
+- `spool` pulls `tokio`: `Spool::open` opens the queue on tokio's blocking
+  pool, so it needs a tokio runtime.
 - `dlq` requires `concurrency` (for the `BackgroundSink` actor that
   drains queued entries).
 - `cli-service` reaches across the stack -- `metrics + memory + scaling

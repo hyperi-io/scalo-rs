@@ -62,6 +62,7 @@
 //! let result = sender.send("events.land", payload).await; // SendResult
 //! ```
 
+pub mod ack;
 pub mod codec;
 mod detect;
 mod error;
@@ -102,6 +103,10 @@ pub mod http;
 pub mod routed;
 
 // Re-exports -- traits and factory
+pub use ack::{
+    AckControl, AckKind, AcknowledgementsConfig, AcknowledgingReceiver, DEAD_LETTER_REJECTED,
+    DeadLetterReason, HeldAcks, SinkConfirmation, SourceAck,
+};
 pub use codec::{CodecError, FieldRef, ParsedPayload, parse};
 pub use error::{TransportError, TransportResult};
 pub use factory::{AnyReceiver, AnySender, AnyToken};
@@ -118,7 +123,7 @@ pub use work_batch::{FramingError, Record, RecordCodecError, RecordMeta, WorkBat
 pub use kafka::{KafkaConfig, KafkaToken, KafkaTransport};
 
 #[cfg(feature = "transport-grpc")]
-pub use grpc::{GrpcConfig, GrpcToken, GrpcTransport};
+pub use grpc::{GrpcConfig, GrpcToken, GrpcTransport, GrpcTransportBuilder};
 
 #[cfg(feature = "transport-grpc-vector-compat")]
 pub use vector_compat::{VectorCompatClient, VectorCompatService};

@@ -18,10 +18,10 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use scalo::transport::grpc::{GrpcConfig, GrpcTransport};
+use scalo::transport::grpc::{GrpcConfig, GrpcToken, GrpcTransport};
 use scalo::transport::{
-    PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportError,
-    TransportReceiver, TransportSender,
+    AcknowledgementsConfig, DeliveryStatus, PayloadFormat, Record, RecordMeta, SendResult,
+    TransportBase, TransportError, TransportReceiver, TransportSender, WorkBatch,
 };
 
 /// Find an available port for testing.
@@ -1072,4 +1072,608 @@ async fn test_recv_timeout_returns_empty() {
     );
 
     let _ = server.close().await;
+}
+
+// --- Held responses ---
+
+/// A receive server armed, as the engine arms it, holding at most
+/// `max_held_bytes`, and its URI.
+async fn armed_server(max_held_bytes: u64, drain_deadline: Duration) -> (GrpcTransport, String) {
+    let config = GrpcConfig::server("127.0.0.1:0");
+    let server = GrpcTransport::builder(&config)
+        .armed(true)
+        .max_held_bytes(max_held_bytes)
+        .drain_deadline(drain_deadline)
+        .start()
+        .await
+        .expect("server");
+    let uri = format!("http://{}", server.local_addr().expect("bound"));
+    (server, uri)
+}
+
+/// Receive until `n` records have arrived.
+async fn recv_all(server: &GrpcTransport, n: usize) -> WorkBatch<GrpcToken> {
+    let mut all = server.recv(n).await.expect("recv");
+    while all.records.len() < n {
+        let more = server.recv(n - all.records.len()).await.expect("recv");
+        all.records.extend(more.records);
+        all.commit_tokens.extend(more.commit_tokens);
+    }
+    all
+}
+
+fn filled(len: usize) -> bytes::Bytes {
+    bytes::Bytes::from(vec![b'x'; len])
+}
+
+/// A client whose sends run in their own tasks, so the test can watch them.
+async fn spawned_client(uri: &str) -> Arc<GrpcTransport> {
+    Arc::new(
+        GrpcTransport::new(&GrpcConfig::client(uri))
+            .await
+            .expect("client"),
+    )
+}
+
+#[tokio::test]
+async fn held_push_waits_for_release() {
+    let (server, uri) = armed_server(1 << 20, Duration::from_secs(20)).await;
+    let client = spawned_client(&uri).await;
+    let sending = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.send_batch(&[json_record(1), json_record(2)]).await }
+    });
+
+    let batch = recv_all(&server, 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !sending.is_finished(),
+        "the push was answered before its records were released"
+    );
+
+    server
+        .release(&batch.commit_tokens, DeliveryStatus::Delivered)
+        .await
+        .expect("release");
+    let result = tokio::time::timeout(Duration::from_secs(1), sending)
+        .await
+        .expect("answered once released")
+        .expect("send task");
+    assert!(matches!(result, SendResult::Ok), "{result:?}");
+    assert_eq!(server.ack_control().expect("held").held().count, 0);
+}
+
+#[tokio::test]
+async fn held_push_answers_unavailable_on_errored_release() {
+    let (server, uri) = armed_server(1 << 20, Duration::from_secs(20)).await;
+    let client = spawned_client(&uri).await;
+    let sending = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.send("main", filled(8)).await }
+    });
+
+    let batch = recv_all(&server, 1).await;
+    server
+        .release(&batch.commit_tokens, DeliveryStatus::Errored)
+        .await
+        .expect("release");
+    let result = sending.await.expect("send task");
+    assert!(
+        matches!(result, SendResult::Backpressured),
+        "an Errored release must make the sender retry: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn held_push_answers_before_the_client_deadline() {
+    use scalo::transport::grpc::proto;
+
+    let (server, uri) = armed_server(1 << 20, Duration::from_secs(20)).await;
+
+    // Through the transport: a 2 s send limit ends in a retry, not an OK.
+    let mut config = GrpcConfig::client(&uri);
+    config.send_timeout_ms = 2_000;
+    let client = GrpcTransport::new(&config).await.expect("client");
+    let started = std::time::Instant::now();
+    let result = client.send("main", filled(8)).await;
+    assert!(matches!(result, SendResult::Backpressured), "{result:?}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // On the wire: Unavailable with the expiry trailer, never Cancelled or
+    // DeadlineExceeded, which a sender cannot tell from a crash.
+    let mut raw = proto::transport_client::TransportClient::connect(uri)
+        .await
+        .expect("raw client");
+    let mut request = tonic::Request::new(proto::PushRequest {
+        payload: filled(8),
+        format: proto::Format::Auto.into(),
+        metadata: std::collections::HashMap::new(),
+    });
+    request.set_timeout(Duration::from_secs(2));
+    let started = std::time::Instant::now();
+    let status = raw.push(request).await.expect_err("never released");
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert_eq!(
+        status
+            .metadata()
+            .get("scalo-hold-expired")
+            .and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "{status:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // The records stay held until released, then free their bytes.
+    let batch = recv_all(&server, 2).await;
+    server
+        .release(&batch.commit_tokens, DeliveryStatus::Delivered)
+        .await
+        .expect("release");
+    assert_eq!(server.ack_control().expect("held").held().bytes, 0);
+}
+
+#[tokio::test]
+async fn admission_refuses_past_the_held_byte_ceiling() {
+    const CEILING: u64 = 1 << 20;
+    let (server, uri) = armed_server(CEILING, Duration::from_secs(20)).await;
+    let client = spawned_client(&uri).await;
+
+    let first = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.send("main", filled(800 << 10)).await }
+    });
+    let held = recv_all(&server, 1).await;
+    let second = client.send("main", filled(800 << 10)).await;
+    assert!(
+        matches!(second, SendResult::Backpressured),
+        "past the ceiling: {second:?}"
+    );
+    let control = server.ack_control().expect("held");
+    assert!(control.held().bytes <= CEILING, "{:?}", control.held());
+
+    server
+        .release(&held.commit_tokens, DeliveryStatus::Delivered)
+        .await
+        .expect("release");
+    assert!(matches!(first.await.expect("send"), SendResult::Ok));
+
+    // Nothing held: one push over the ceiling on its own is admitted.
+    let oversized = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.send("main", filled(2 << 20)).await }
+    });
+    let batch = recv_all(&server, 1).await;
+    server
+        .release(&batch.commit_tokens, DeliveryStatus::Delivered)
+        .await
+        .expect("release");
+    assert!(matches!(oversized.await.expect("send"), SendResult::Ok));
+}
+
+#[tokio::test]
+async fn disabled_or_unarmed_push_is_answered_at_enqueue() {
+    // Unarmed: acknowledgements default on, but nobody promised to release.
+    let unarmed = GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0"))
+        .await
+        .expect("server");
+    // Armed, but acknowledgements disabled.
+    let config = GrpcConfig::server("127.0.0.1:0");
+    let disabled = GrpcTransport::builder(&config)
+        .acknowledgements(AcknowledgementsConfig::new(false))
+        .start()
+        .await
+        .expect("server");
+    disabled.ack_control().expect("control").arm();
+    assert!(!disabled.ack_control().expect("control").enabled());
+
+    for server in [unarmed, disabled] {
+        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        let client = GrpcTransport::new(&GrpcConfig::client(&uri))
+            .await
+            .expect("client");
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), client.send_batch(&[json_record(1)]))
+                .await
+                .expect("answered at enqueue, no release needed");
+        assert!(matches!(result, SendResult::Ok), "{result:?}");
+        assert_eq!(server.recv(10).await.expect("recv").records.len(), 1);
+        assert_eq!(server.ack_control().expect("control").held().count, 0);
+    }
+}
+
+#[tokio::test]
+async fn oversize_block_is_split_by_encoded_size() {
+    const LIMIT: usize = 1024;
+    let server =
+        GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0").with_max_message_size(LIMIT))
+            .await
+            .expect("server");
+    let uri = format!("http://{}", server.local_addr().expect("bound"));
+    let client = GrpcTransport::new(&GrpcConfig::client(&uri).with_max_message_size(LIMIT))
+        .await
+        .expect("client");
+    let records: Vec<Record> = (0..10)
+        .map(|_| Record {
+            payload: filled(300),
+            key: None,
+            headers: Vec::new(),
+            metadata: RecordMeta {
+                timestamp_ms: None,
+                format: PayloadFormat::Json,
+            },
+        })
+        .collect();
+
+    // Ten 300-byte records encode past 1 KiB, so they go as several requests.
+    let result = client.send_batch(&records).await;
+    assert!(matches!(result, SendResult::Ok), "{result:?}");
+    assert_eq!(recv_all(&server, 10).await.records.len(), 10);
+
+    // A record over the limit on its own is named for the dead-letter queue.
+    let lone = Record {
+        payload: filled(LIMIT),
+        ..records[0].clone()
+    };
+    assert!(client.dead_letter_reason(&lone).is_some());
+    assert!(client.dead_letter_reason(&records[0]).is_none());
+}
+
+#[tokio::test]
+async fn close_answers_held_pushes_unavailable_at_the_drain_deadline() {
+    let (server, uri) = armed_server(1 << 20, Duration::from_millis(300)).await;
+    let client = spawned_client(&uri).await;
+    let sending = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.send("main", filled(8)).await }
+    });
+    let _never_released = recv_all(&server, 1).await;
+
+    server.close().await.expect("close");
+    let result = tokio::time::timeout(Duration::from_secs(5), sending)
+        .await
+        .expect("answered at the drain deadline, not after the 25 s hold budget")
+        .expect("send task");
+    assert!(matches!(result, SendResult::Backpressured), "{result:?}");
+    assert_eq!(server.ack_control().expect("held").held().count, 0);
+}
+
+#[tokio::test]
+async fn a_dropped_responder_never_answers_ok() {
+    // The process goes away with a push held: never OK.
+    let (server, uri) = armed_server(1 << 20, Duration::from_secs(20)).await;
+    let client = spawned_client(&uri).await;
+    let sending = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.send("main", filled(8)).await }
+    });
+    let _held = recv_all(&server, 1).await;
+    drop(server);
+    let result = tokio::time::timeout(Duration::from_secs(5), sending)
+        .await
+        .expect("answered once the server is gone")
+        .expect("send task");
+    assert!(
+        !matches!(result, SendResult::Ok),
+        "a push whose server went away was answered OK"
+    );
+
+    // The sender goes away with a push held: its records still release and
+    // free what they held, and the next push is held as normal.
+    let (server, uri) = armed_server(1 << 20, Duration::from_secs(20)).await;
+    let client = spawned_client(&uri).await;
+    let abandoned = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.send("main", filled(8)).await }
+    });
+    let batch = recv_all(&server, 1).await;
+    abandoned.abort();
+    let _ = abandoned.await;
+    server
+        .release(&batch.commit_tokens, DeliveryStatus::Delivered)
+        .await
+        .expect("release");
+    let control = server.ack_control().expect("held");
+    assert_eq!(control.held().count, 0);
+    assert_eq!(control.held().bytes, 0);
+}
+
+/// The engine's pipeline loop driving a gRPC receive server end to end: it
+/// arms the server, sinks each block, and releases it with the sink's outcome.
+#[cfg(feature = "worker-batch")]
+mod engine_driven {
+    use super::*;
+    use scalo::worker::engine::BlockPieces;
+    use scalo::worker::{BatchEngine, BatchProcessingConfig, EngineError};
+    use tokio_util::sync::CancellationToken;
+
+    /// A record the sink fails, as a fan-out destination that did not take it.
+    const FAIL: &[u8] = b"{\"fail\":true}";
+
+    /// Run the pipeline over `server` until `shutdown`, failing every block
+    /// that carries a [`FAIL`] record through a piece reported `Errored`.
+    fn run_pipeline(
+        server: Arc<GrpcTransport>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<Result<(), EngineError>> {
+        tokio::spawn(async move {
+            let engine = BatchEngine::new(BatchProcessingConfig::default());
+            engine
+                .pipeline(&*server)
+                .shutdown(shutdown)
+                .run_with_pieces(
+                    Ok,
+                    |out: &WorkBatch<GrpcToken>, pieces: &BlockPieces<'_>| {
+                        let failed = out.records.iter().any(|r| r.payload.as_ref() == FAIL);
+                        if failed {
+                            pieces.piece().report(DeliveryStatus::Errored);
+                        }
+                        std::future::ready(Ok(()))
+                    },
+                )
+                .await
+        })
+    }
+
+    /// A client whose sends run in tasks of their own.
+    async fn client_of(server: &GrpcTransport) -> Arc<GrpcTransport> {
+        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        Arc::new(
+            GrpcTransport::new(&GrpcConfig::client(&uri))
+                .await
+                .expect("client"),
+        )
+    }
+
+    /// Push `payload` in a task of its own.
+    fn pushing(
+        client: &Arc<GrpcTransport>,
+        payload: &'static [u8],
+    ) -> tokio::task::JoinHandle<SendResult> {
+        let client = Arc::clone(client);
+        tokio::spawn(async move {
+            client
+                .send("main", bytes::Bytes::from_static(payload))
+                .await
+        })
+    }
+
+    /// Wait for a push's answer, which comes only once the pipeline runs.
+    async fn answer(task: tokio::task::JoinHandle<SendResult>) -> SendResult {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("answered once the pipeline runs")
+            .expect("push task")
+    }
+
+    /// A server built armed, and a client of it.
+    async fn armed_pair() -> (Arc<GrpcTransport>, Arc<GrpcTransport>) {
+        let config = GrpcConfig::server("127.0.0.1:0");
+        let server = Arc::new(
+            GrpcTransport::builder(&config)
+                .armed(true)
+                .start()
+                .await
+                .expect("server"),
+        );
+        let client = client_of(&server).await;
+        (server, client)
+    }
+
+    /// Pushes answered before a pipeline runs would be acknowledged with
+    /// nothing to deliver them.
+    async fn assert_unanswered(pushes: &[&tokio::task::JoinHandle<SendResult>]) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            pushes.iter().all(|p| !p.is_finished()),
+            "a push was answered before anything could deliver it"
+        );
+    }
+
+    /// A server built armed holds the pushes that reach it before any pipeline
+    /// runs, and the pipeline answers them from the sink's outcome once it
+    /// starts: OK when delivered.
+    #[tokio::test]
+    async fn pushes_before_the_pipeline_runs_are_held_and_answered_by_it() {
+        let (server, client) = armed_pair().await;
+        let early = pushing(&client, b"{\"early\":1}");
+        let early_too = pushing(&client, b"{\"early\":2}");
+        assert_unanswered(&[&early, &early_too]).await;
+
+        let shutdown = CancellationToken::new();
+        let running = run_pipeline(Arc::clone(&server), shutdown.clone());
+        for task in [early, early_too] {
+            let delivered = answer(task).await;
+            assert!(matches!(delivered, SendResult::Ok), "{delivered:?}");
+        }
+
+        // Once running, the pipeline's own arm changed nothing: later pushes
+        // are held and answered the same way.
+        let later = answer(pushing(&client, b"{\"later\":1}")).await;
+        assert!(matches!(later, SendResult::Ok), "{later:?}");
+        let later_failed = answer(pushing(&client, FAIL)).await;
+        assert!(
+            matches!(later_failed, SendResult::Backpressured),
+            "{later_failed:?}"
+        );
+
+        shutdown.cancel();
+        running
+            .await
+            .expect("pipeline task")
+            .expect("clean shutdown");
+        let held = server.ack_control().expect("held").held();
+        assert_eq!((held.count, held.bytes), (0, 0), "{held:?}");
+    }
+
+    /// A push held before the pipeline runs, which the sink then fails, is
+    /// answered Unavailable, never OK.
+    #[tokio::test]
+    async fn a_push_before_the_pipeline_runs_that_the_sink_fails_is_answered_unavailable() {
+        let (server, client) = armed_pair().await;
+        let early = pushing(&client, FAIL);
+        assert_unanswered(&[&early]).await;
+
+        let shutdown = CancellationToken::new();
+        let running = run_pipeline(Arc::clone(&server), shutdown.clone());
+        let failed = answer(early).await;
+        assert!(matches!(failed, SendResult::Backpressured), "{failed:?}");
+
+        shutdown.cancel();
+        running
+            .await
+            .expect("pipeline task")
+            .expect("clean shutdown");
+    }
+
+    /// A server built armed and killed before any pipeline released its
+    /// pushes never answers them OK.
+    #[tokio::test]
+    async fn pushes_held_by_a_server_that_is_killed_are_never_answered_ok() {
+        let config = GrpcConfig::server("127.0.0.1:0");
+        let server = GrpcTransport::builder(&config)
+            .armed(true)
+            .start()
+            .await
+            .expect("server");
+        let client = client_of(&server).await;
+        let early = pushing(&client, b"{\"early\":1}");
+        let mut queued = server.recv(1).await.expect("recv");
+        while queued.records.is_empty() {
+            queued = server.recv(1).await.expect("recv");
+        }
+        assert!(!early.is_finished(), "held while queued");
+
+        drop(server);
+        let result = tokio::time::timeout(Duration::from_secs(5), early)
+            .await
+            .expect("answered once the server is gone")
+            .expect("push task");
+        assert!(
+            !matches!(result, SendResult::Ok),
+            "a push the server never delivered was answered OK"
+        );
+    }
+
+    /// How a pipeline holding a block stops before releasing it.
+    #[derive(Debug, Clone, Copy)]
+    enum Stop {
+        /// The run future is dropped mid-block.
+        Dropped,
+        /// `process` panics.
+        ProcessPanics,
+        /// The sink panics.
+        SinkPanics,
+    }
+
+    /// A pipeline over an armed server with a one-second hold budget, stopped
+    /// by `stop` while it holds one push: the push's answer, then what the
+    /// server still holds.
+    async fn held_after(stop: Stop) -> (SendResult, scalo::transport::HeldAcks) {
+        let config = GrpcConfig::server("127.0.0.1:0");
+        let server = Arc::new(
+            GrpcTransport::builder(&config)
+                .armed(true)
+                .max_hold(Duration::from_secs(1))
+                .start()
+                .await
+                .expect("server"),
+        );
+        let client = client_of(&server).await;
+        let push = pushing(&client, b"{\"held\":1}");
+        let sinking = Arc::new(tokio::sync::Notify::new());
+
+        let run = {
+            let server = Arc::clone(&server);
+            let sinking = Arc::clone(&sinking);
+            async move {
+                let engine = BatchEngine::new(BatchProcessingConfig::default());
+                engine
+                    .pipeline(&*server)
+                    .run(
+                        move |batch: WorkBatch<GrpcToken>| {
+                            assert!(!matches!(stop, Stop::ProcessPanics), "process panicked");
+                            Ok(batch)
+                        },
+                        move |_out: &WorkBatch<GrpcToken>| {
+                            sinking.notify_one();
+                            async move {
+                                assert!(!matches!(stop, Stop::SinkPanics), "the sink panicked");
+                                std::future::pending::<Result<(), EngineError>>().await
+                            }
+                        },
+                    )
+                    .await
+            }
+        };
+        match stop {
+            Stop::Dropped => tokio::select! {
+                ended = run => panic!("the pipeline ended: {ended:?}"),
+                () = sinking.notified() => {}
+            },
+            Stop::ProcessPanics | Stop::SinkPanics => {
+                let joined = tokio::spawn(run).await;
+                assert!(
+                    joined.as_ref().is_err_and(tokio::task::JoinError::is_panic),
+                    "{stop:?}: {joined:?}"
+                );
+            }
+        }
+
+        // Answered at once once released, or at the one-second budget if not.
+        let answered = answer(push).await;
+        (answered, server.ack_control().expect("held").held())
+    }
+
+    /// A pipeline that stops mid-block releases it `Errored`, so the push is
+    /// answered and the bytes it held are free at once, not when the
+    /// transport is dropped.
+    #[tokio::test]
+    async fn a_pipeline_stopped_mid_block_frees_what_its_push_held() {
+        for stop in [Stop::Dropped, Stop::ProcessPanics, Stop::SinkPanics] {
+            let (answered, held) = held_after(stop).await;
+            assert!(
+                matches!(answered, SendResult::Backpressured),
+                "{stop:?}: {answered:?}"
+            );
+            assert_eq!(
+                (held.count, held.bytes),
+                (0, 0),
+                "{stop:?}: the held push still reserves its bytes: {held:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn with_acknowledgements_off_the_engine_answers_at_enqueue() {
+        let config = GrpcConfig::server("127.0.0.1:0");
+        let server = Arc::new(
+            GrpcTransport::builder(&config)
+                .acknowledgements(AcknowledgementsConfig::new(false))
+                .start()
+                .await
+                .expect("server"),
+        );
+        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        let shutdown = CancellationToken::new();
+        // Releases at receipt tokens the server never held, which it ignores.
+        let running = run_pipeline(Arc::clone(&server), shutdown.clone());
+        let client = GrpcTransport::new(&GrpcConfig::client(&uri))
+            .await
+            .expect("client");
+
+        let result = client.send("main", bytes::Bytes::from_static(FAIL)).await;
+        assert!(
+            matches!(result, SendResult::Ok),
+            "answered at enqueue, before the sink failed it: {result:?}"
+        );
+
+        shutdown.cancel();
+        running
+            .await
+            .expect("pipeline task")
+            .expect("clean shutdown");
+        let control = server.ack_control().expect("control");
+        assert!(!control.is_armed(), "a disabled source is not armed");
+        assert_eq!(control.held().count, 0);
+    }
 }

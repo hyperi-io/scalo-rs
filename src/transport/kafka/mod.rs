@@ -49,6 +49,7 @@
 //! }
 //! ```
 
+mod acks;
 mod admin;
 mod classify;
 mod config;
@@ -78,7 +79,11 @@ pub use providers::{
 pub use token::KafkaToken;
 pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
 
+use super::ack::{
+    AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
+};
 use super::error::{TransportError, TransportResult};
+use super::finalizer::DeliveryStatus;
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::{Record, WorkBatch};
@@ -122,6 +127,13 @@ const QUEUE_FULL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pause between re-offers while the producer queue is full.
 const QUEUE_FULL_RETRY: Duration = Duration::from_millis(100);
+
+/// librdkafka's `message.max.bytes` when the producer config leaves it unset.
+const LIBRDKAFKA_MESSAGE_MAX_BYTES: usize = 1_000_000;
+
+/// Room librdkafka adds to a record's payload when it checks
+/// `message.max.bytes`: the record's framing plus a trace header.
+const RECORD_WIRE_OVERHEAD: usize = 128;
 
 /// How long `commit` keeps retrying a transient failure. One synchronous commit
 /// can itself block for about `session.timeout.ms` during an outage, so this
@@ -261,6 +273,13 @@ pub struct KafkaTransport {
     /// directions.
     #[cfg(all(feature = "governor", feature = "health"))]
     partition_limited_flag: Arc<AtomicBool>,
+    /// Asks the broker for the log end of an assignment the gate has paused.
+    #[cfg(feature = "governor")]
+    paused_ends: PausedEnds,
+    /// Source acknowledgement config, arming and held offsets.
+    acks: acks::KafkaAcks,
+    /// The producer's `message.max.bytes`, for screening records before a send.
+    message_max_bytes: usize,
 }
 
 /// Role naming a producer-only transport's idle consumer in its derived group id.
@@ -729,6 +748,10 @@ impl KafkaTransport {
         if producer_config.get("statistics.interval.ms").is_none() {
             producer_config.set("statistics.interval.ms", "5000");
         }
+        let message_max_bytes = producer_config
+            .get("message.max.bytes")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(LIBRDKAFKA_MESSAGE_MAX_BYTES);
 
         // Create producer with StatsContext for metrics collection.
         let producer: FutureProducer<StatsContext> = producer_config
@@ -796,7 +819,22 @@ impl KafkaTransport {
             partition_limited_warn: PartitionLimitedDiagnostic::default(),
             #[cfg(all(feature = "governor", feature = "health"))]
             partition_limited_flag,
+            #[cfg(feature = "governor")]
+            paused_ends: PausedEnds::new(&consumer_config),
+            acks: acks::KafkaAcks::default(),
+            message_max_bytes,
         })
+    }
+
+    /// Set the `acknowledgements` config (default: enabled).
+    ///
+    /// A transport built from an explicit [`KafkaConfig`] takes its
+    /// `acknowledgements` section here; `AnyReceiver::from_config` reads it
+    /// from `<key>.kafka.acknowledgements`.
+    #[must_use]
+    pub fn with_acknowledgements(mut self, config: AcknowledgementsConfig) -> Self {
+        self.acks.set_config(config);
+        self
     }
 
     /// Attach an [`InboundGate`](crate::governor::InboundGate) to this
@@ -865,6 +903,14 @@ impl KafkaTransport {
     #[must_use]
     pub fn stats(&self) -> KafkaMetrics {
         self.consumer.context().get_metrics()
+    }
+
+    /// Records past this consumer's read position, summed over its partitions:
+    /// unread backlog, which a commit held for delivery does not inflate. See
+    /// [`StatsContext::total_position_lag`].
+    #[must_use]
+    pub fn total_position_lag(&self) -> i64 {
+        self.consumer.context().total_position_lag()
     }
 
     /// Run the `kafka_partition_limited` DIAGNOSTIC against the live group
@@ -1290,6 +1336,33 @@ impl TransportSender for KafkaTransport {
         }
         block_result(results)
     }
+
+    /// The broker acknowledged the record under the producer's `acks`.
+    fn confirms_delivery(&self) -> SinkConfirmation {
+        SinkConfirmation::Remote
+    }
+
+    /// A record over `message.max.bytes`, less the framing librdkafka adds,
+    /// or one an outbound `dlq` filter matches.
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        let limit = self.message_max_bytes.saturating_sub(RECORD_WIRE_OVERHEAD);
+        if record.payload.len() > limit {
+            return Some(DeadLetterReason::TooLarge {
+                bytes: record.payload.len(),
+                limit,
+            });
+        }
+        match self.outbound_disposition(&record.payload) {
+            Some(SendResult::FilteredDlq) => Some(DeadLetterReason::OutboundFilter),
+            _ => None,
+        }
+    }
+}
+
+impl AcknowledgingReceiver for KafkaTransport {
+    fn acknowledgements(&self) -> AcknowledgementsConfig {
+        self.acks.config()
+    }
 }
 
 impl TransportReceiver for KafkaTransport {
@@ -1359,12 +1432,78 @@ impl TransportReceiver for KafkaTransport {
     /// returned at once. The `BatchEngine` driver logs a failed commit and
     /// carries on: the block was already delivered, and the next commit is
     /// cumulative, so a failed commit costs duplicates on restart, never data.
+    ///
+    /// ## Once armed
+    ///
+    /// After [`AckControl::arm`], a commit is a release of `tokens` as
+    /// delivered: each partition commits only up to its lowest offset handed
+    /// out and not yet released, whatever order releases arrive in.
     async fn commit(&self, tokens: &[Self::Token]) -> TransportResult<()> {
         if tokens.is_empty() {
             return Ok(());
         }
+        if self.acks.is_armed() {
+            return self
+                .release_delivered(tokens, DeliveryStatus::Delivered)
+                .await;
+        }
+        self.commit_tpl(build_commit_tpl(tokens)?).await
+    }
 
-        let mut tpl = build_commit_tpl(tokens)?;
+    fn ack_control(&self) -> Option<&dyn AckControl> {
+        Some(&self.acks)
+    }
+
+    /// Commit per partition up to the lowest offset not yet released, once
+    /// armed; unarmed, the default: commit when the outcome allows it.
+    ///
+    /// An `Errored` release commits nothing, and once armed keeps its offsets
+    /// held, so no later release commits past them.
+    async fn release(
+        &self,
+        tokens: &[Self::Token],
+        outcome: DeliveryStatus,
+    ) -> TransportResult<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if !outcome.should_commit() {
+            self.acks.withhold(tokens);
+            return Ok(());
+        }
+        if self.acks.is_armed() {
+            return self.release_delivered(tokens, outcome).await;
+        }
+        self.commit_tpl(build_commit_tpl(tokens)?).await
+    }
+}
+
+impl KafkaTransport {
+    /// Release `tokens` through the held-offset record and commit what that
+    /// allows.
+    async fn release_delivered(
+        &self,
+        tokens: &[KafkaToken],
+        outcome: DeliveryStatus,
+    ) -> TransportResult<()> {
+        let _serial = self.acks.serialise_commit().await;
+        let targets = self.acks.release(tokens, outcome);
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut tpl = TopicPartitionList::new();
+        for ((topic, partition), next) in &targets {
+            tpl.add_partition_offset(topic.as_ref(), *partition, Offset::Offset(*next))
+                .map_err(|e| TransportError::Commit(format!("Failed to build TPL: {e}")))?;
+        }
+        self.commit_tpl(tpl).await?;
+        self.acks.committed(&targets);
+        Ok(())
+    }
+
+    /// Commit `tpl` synchronously, retrying a transient failure; see
+    /// [`commit`](TransportReceiver::commit).
+    async fn commit_tpl(&self, mut tpl: TopicPartitionList) -> TransportResult<()> {
         let started = std::time::Instant::now();
         let mut failures = 0_u32;
         loop {
@@ -1396,9 +1535,7 @@ impl TransportReceiver for KafkaTransport {
             }
         }
     }
-}
 
-impl KafkaTransport {
     /// Shared poll + recv-arena body for [`recv`](TransportReceiver::recv) and
     /// [`recv_limited`](TransportReceiver::recv_limited).
     ///
@@ -1453,11 +1590,17 @@ impl KafkaTransport {
             if gate.is_held()
                 && let Ok(tpl) = self.consumer.assignment()
                 && tpl.count() > 0
-                && let Err(e) = self.consumer.pause(&tpl)
             {
-                tracing::debug!(error = %e, "kafka gate: re-pause under hold failed");
+                match self.consumer.pause(&tpl) {
+                    Ok(()) => self.consumer.context().set_paused(true),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "kafka gate: re-pause under hold failed");
+                    }
+                }
             }
         }
+        #[cfg(feature = "governor")]
+        self.paused_ends.refresh(&self.consumer);
 
         // Check for topic changes from the background refresh loop
         if let Some(ref refresh) = self.topic_refresh
@@ -1480,7 +1623,13 @@ impl KafkaTransport {
         // that never pends starves every other task on the runtime.
         #[cfg(feature = "metrics")]
         let poll_start = std::time::Instant::now();
-        let (arena, spans) = match self.poll_off_runtime(max_msgs, max_bytes).await? {
+        let polled = self.poll_off_runtime(max_msgs, max_bytes).await?;
+        // Rebalances run inside the poll, so what one changed is known before
+        // anything this poll read is held.
+        let revoked_at = self
+            .acks
+            .rebalanced(self.consumer.context().take_rebalanced());
+        let (arena, mut spans) = match polled {
             Polled::Empty => {
                 #[cfg(feature = "metrics")]
                 ::metrics::histogram!("kafka_poll_duration_seconds")
@@ -1507,6 +1656,9 @@ impl KafkaTransport {
                 (arena, spans)
             }
         };
+        if self.acks.is_armed() {
+            drop_read_before_revoke(&mut spans, &revoked_at);
+        }
 
         // Freeze the arena to ONE refcounted Bytes, then rebuild messages as
         // zero-copy slices into it. All borrowed Kafka buffers are long gone --
@@ -1535,6 +1687,17 @@ impl KafkaTransport {
                 .increment(bytes as u64);
             ::metrics::counter!("transport_received_events_total", "transport" => "kafka")
                 .increment(messages.len() as u64);
+        }
+
+        // Once armed every offset handed out is held until released, so a
+        // release out of order never commits past one still in flight.
+        if self.acks.is_armed() {
+            self.acks.register(
+                messages
+                    .iter()
+                    .map(|m| (&m.token, m.payload.len() as u64))
+                    .chain(filtered_tokens.iter().map(|t| (t, 0))),
+            );
         }
 
         Ok(RecvBatch {
@@ -1706,6 +1869,9 @@ struct Span {
     format: PayloadFormat,
     /// Half-open byte range of this record's payload within the frozen arena.
     range: core::ops::Range<usize>,
+    /// Ownership changes served before the poll that returned this record
+    /// returned, which orders the record against a revoke in the same job.
+    rebalances: u64,
 }
 
 /// Rebuild a batch of `Message`s from a frozen recv-arena and its spans.
@@ -1731,6 +1897,33 @@ fn build_batch_from_spans(arena: bytes::Bytes, spans: Vec<Span>) -> Vec<Message<
             format: span.format,
         })
         .collect()
+}
+
+/// Leave out every record read before a revoke of its partition in the same
+/// poll job.
+///
+/// Its partition's next owner reads it again from the committed offset, which
+/// is below it, so leaving it out loses nothing. Handed out, its release would
+/// be a release for a partition this member no longer holds, which, once the
+/// partition came back in the same job, would commit past an offset the
+/// member released `Errored` before the revoke.
+fn drop_read_before_revoke(spans: &mut Vec<Span>, revoked_at: &HashMap<(Arc<str>, i32), u64>) {
+    if revoked_at.is_empty() {
+        return;
+    }
+    let before = spans.len();
+    spans.retain(|span| {
+        revoked_at
+            .get(&(Arc::clone(&span.token.topic), span.token.partition))
+            .is_none_or(|&revoke| span.rebalances >= revoke)
+    });
+    let dropped = before - spans.len();
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            "kafka: records read before their partition was revoked are left for its next owner"
+        );
+    }
 }
 
 /// Get or insert topic Arc into cache.
@@ -1863,6 +2056,7 @@ impl PollJob {
             timestamp_ms: msg.timestamp().to_millis(),
             format: PayloadFormat::Auto,
             range: start..end,
+            rebalances: self.consumer.context().rebalances(),
         });
         drop(msg);
 
@@ -1908,6 +2102,7 @@ impl PollJob {
                         timestamp_ms: msg.timestamp().to_millis(),
                         format: PayloadFormat::Auto,
                         range: start..end,
+                        rebalances: self.consumer.context().rebalances(),
                     });
                 }
                 Some(Err(e)) => match classify::classify_recv_failure(&e, ctx) {
@@ -2023,12 +2218,13 @@ struct KafkaGateActuator {
 impl crate::governor::GateActuator for KafkaGateActuator {
     fn pause(&self) {
         match self.consumer.assignment() {
-            Ok(tpl) => {
-                if let Err(e) = self.consumer.pause(&tpl) {
+            Ok(tpl) => match self.consumer.pause(&tpl) {
+                Ok(()) => self.consumer.context().set_paused(true),
+                Err(e) => {
                     tracing::warn!(error = %e, "kafka gate: pause(assignment) failed");
                     gate_actuator_error("pause");
                 }
-            }
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "kafka gate: assignment() failed on pause");
                 gate_actuator_error("pause");
@@ -2038,18 +2234,121 @@ impl crate::governor::GateActuator for KafkaGateActuator {
 
     fn resume(&self) {
         match self.consumer.assignment() {
-            Ok(tpl) => {
-                if let Err(e) = self.consumer.resume(&tpl) {
+            Ok(tpl) => match self.consumer.resume(&tpl) {
+                Ok(()) => self.consumer.context().set_paused(false),
+                Err(e) => {
                     tracing::warn!(error = %e, "kafka gate: resume(assignment) failed");
                     gate_actuator_error("resume");
                 }
-            }
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "kafka gate: assignment() failed on resume");
                 gate_actuator_error("resume");
             }
         }
     }
+}
+
+/// Least time between two asks for a paused assignment's log end.
+#[cfg(feature = "governor")]
+const PAUSED_END_FLOOR: Duration = Duration::from_secs(1);
+
+/// Longest an ask for a paused assignment's log end waits on the broker.
+#[cfg(feature = "governor")]
+const PAUSED_END_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Keeps the lag of a paused assignment moving.
+///
+/// librdkafka learns a partition's log end only from a fetch reply, and never
+/// fetches a partition that is paused, so while the gate holds the lag it
+/// reports stops rising however much is written. This asks the broker for the
+/// ends instead, in one `ListOffsets` per leader, once per statistics interval
+/// and no more often than [`PAUSED_END_FLOOR`], with one ask in flight at most.
+#[cfg(feature = "governor")]
+struct PausedEnds {
+    /// How often to ask, or `None` when statistics, and so lag, are off.
+    every: Option<Duration>,
+    /// When the last ask started.
+    asked: parking_lot::Mutex<Option<std::time::Instant>>,
+    in_flight: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "governor")]
+impl PausedEnds {
+    fn new(consumer_config: &ClientConfig) -> Self {
+        let every = consumer_config
+            .get("statistics.interval.ms")
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(|ms| Duration::from_millis(ms).max(PAUSED_END_FLOOR));
+        Self {
+            every,
+            asked: parking_lot::Mutex::new(None),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Ask the broker for the paused assignment's ends on the blocking pool,
+    /// when one is due. Called from every `recv`, which the run loop keeps
+    /// making while the gate holds.
+    fn refresh(&self, consumer: &Arc<BaseConsumer<StatsContext>>) {
+        let Some(every) = self.every else {
+            return;
+        };
+        if !consumer.context().is_paused() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        {
+            let mut asked = self.asked.lock();
+            if asked.is_some_and(|at| now.saturating_duration_since(at) < every)
+                || self.in_flight.swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+            *asked = Some(now);
+        }
+        let consumer = Arc::clone(consumer);
+        let in_flight = Arc::clone(&self.in_flight);
+        runtime.spawn_blocking(move || {
+            if let Some(ends) = assignment_ends(&consumer) {
+                consumer.context().set_paused_ends(ends);
+            }
+            in_flight.store(false, Ordering::Release);
+        });
+    }
+}
+
+/// The log end of every partition assigned to `consumer`, from the broker.
+#[cfg(feature = "governor")]
+fn assignment_ends(consumer: &BaseConsumer<StatsContext>) -> Option<HashMap<(String, i32), i64>> {
+    let mut assignment = consumer.assignment().ok()?;
+    if assignment.count() == 0 {
+        return Some(HashMap::new());
+    }
+    // A ListOffsets for timestamp -1 answers with the end, as the watermark query does.
+    assignment.set_all_offsets(Offset::End).ok()?;
+    let found = match consumer.offsets_for_times(assignment, PAUSED_END_TIMEOUT) {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::debug!(error = %e, "kafka: asking the broker for a paused assignment's end failed");
+            return None;
+        }
+    };
+    Some(
+        found
+            .elements()
+            .iter()
+            .filter(|e| e.error().is_ok())
+            .filter_map(|e| match e.offset() {
+                Offset::Offset(end) => Some(((e.topic().to_string(), e.partition()), end)),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Count a kafka gate pause/resume failure. A sustained failure silently
@@ -2827,6 +3126,7 @@ mod tests {
                 timestamp_ms: Some(1_000 + offset),
                 format: PayloadFormat::Auto,
                 range: start..end,
+                rebalances: 0,
             });
         }
         (bytes::Bytes::from(arena), spans)
@@ -3181,5 +3481,177 @@ mod tests {
         *topics.write() = vec!["events_load".to_string(), "logs_load".to_string()];
         assert_eq!(topics.read().len(), 2);
         assert_eq!(topics.read()[1], "logs_load");
+    }
+
+    /// A broker-free, armed transport: no topics, so it never subscribes.
+    async fn armed_without_a_broker() -> KafkaTransport {
+        let transport = KafkaTransport::new(&KafkaConfig::for_testing(
+            "127.0.0.1:1",
+            "revoke-test",
+            Vec::new(),
+        ))
+        .await
+        .expect("broker-free kafka transport");
+        transport.acks.arm();
+        transport
+    }
+
+    fn tokens(partition: i32, offsets: std::ops::Range<i64>) -> Vec<KafkaToken> {
+        offsets
+            .map(|offset| KafkaToken::new(Arc::from("events"), partition, offset))
+            .collect()
+    }
+
+    /// Serve a rebalance on `transport`'s context, as librdkafka does inside
+    /// a poll.
+    fn serve(transport: &KafkaTransport, revoke: bool, partition: i32) {
+        use rdkafka::consumer::{ConsumerContext, Rebalance};
+        let mut list = TopicPartitionList::new();
+        list.add_partition("events", partition);
+        let rebalance = if revoke {
+            Rebalance::Revoke(&list)
+        } else {
+            Rebalance::Assign(&list)
+        };
+        transport
+            .consumer
+            .context()
+            .pre_rebalance(&transport.consumer, &rebalance);
+    }
+
+    /// A record of `token`, polled now: it carries the rebalances served so far.
+    fn polled(transport: &KafkaTransport, token: KafkaToken) -> Span {
+        Span {
+            key: Some(Arc::clone(&token.topic)),
+            token,
+            timestamp_ms: None,
+            format: PayloadFormat::Auto,
+            range: 0..0,
+            rebalances: transport.consumer.context().rebalances(),
+        }
+    }
+
+    /// The tail of a `recv`: apply the job's rebalances, then leave out what
+    /// was read before a revoke and hold the rest.
+    fn settle(transport: &KafkaTransport, mut spans: Vec<Span>) -> Vec<KafkaToken> {
+        let revoked_at = transport
+            .acks
+            .rebalanced(transport.consumer.context().take_rebalanced());
+        drop_read_before_revoke(&mut spans, &revoked_at);
+        let kept: Vec<KafkaToken> = spans.into_iter().map(|s| s.token).collect();
+        transport.acks.register(kept.iter().map(|t| (t, 10)));
+        kept
+    }
+
+    fn committed_to(
+        transport: &KafkaTransport,
+        released: &[KafkaToken],
+        partition: i32,
+    ) -> Vec<i64> {
+        let targets = transport.acks.release(released, DeliveryStatus::Delivered);
+        transport.acks.committed(&targets);
+        targets
+            .into_iter()
+            .filter(|((_, p), _)| *p == partition)
+            .map(|(_, next)| next)
+            .collect()
+    }
+
+    /// A revoke librdkafka reports during a poll ends the transport's hold on
+    /// that partition's offsets once the poll returns.
+    #[tokio::test]
+    async fn a_recv_after_a_revoke_holds_nothing_for_the_revoked_partition() {
+        let transport = armed_without_a_broker().await;
+        let withheld = tokens(0, 0..10);
+        transport.acks.register(withheld.iter().map(|t| (t, 10)));
+        transport.acks.withhold(&withheld);
+
+        serve(&transport, true, 0);
+        assert_eq!(
+            transport.acks.held().count,
+            10,
+            "held until the poll the revoke arrived in returns"
+        );
+
+        // Whatever the broker-free poll returns, the revoke it carried is applied.
+        let _ = transport.recv(10).await;
+        assert_eq!(transport.acks.held().count, 0);
+        assert!(transport.consumer.context().take_rebalanced().is_empty());
+    }
+
+    /// Records of a partition read in the same poll job as its revoke, after
+    /// an Errored block on it: the revoke took the Errored floor away, so
+    /// neither they nor anything else commit the partition until it is
+    /// assigned again.
+    #[tokio::test]
+    async fn records_read_in_the_job_that_revokes_their_partition_commit_nothing() {
+        let transport = armed_without_a_broker().await;
+        let withheld = tokens(0, 0..10);
+        transport.acks.register(withheld.iter().map(|t| (t, 10)));
+        transport.acks.withhold(&withheld);
+
+        let later = tokens(0, 10..15);
+        let mut job: Vec<Span> = later
+            .iter()
+            .map(|t| polled(&transport, t.clone()))
+            .collect();
+        serve(&transport, true, 0);
+        job.push(polled(&transport, tokens(1, 0..1).remove(0)));
+        let handed_out = settle(&transport, job);
+        assert_eq!(
+            handed_out.iter().map(|t| t.partition).collect::<Vec<_>>(),
+            vec![1],
+            "partition 0's records read before its revoke are its next owner's"
+        );
+
+        assert!(
+            committed_to(&transport, &later, 0).is_empty(),
+            "no commit of partition 0 past its Errored floor"
+        );
+        assert_eq!(committed_to(&transport, &handed_out, 1), vec![1]);
+
+        serve(&transport, false, 0);
+        let read_again = settle(
+            &transport,
+            tokens(0, 0..10)
+                .into_iter()
+                .map(|t| polled(&transport, t))
+                .collect(),
+        );
+        assert_eq!(
+            committed_to(&transport, &read_again, 0),
+            vec![10],
+            "assigned again, it commits what it reads again"
+        );
+    }
+
+    /// Revoked and assigned back inside one job, as the eager protocol does:
+    /// what was read before the revoke is left out, and what was read after is
+    /// held from where the consumer reads again.
+    #[tokio::test]
+    async fn a_revoke_and_reassign_in_one_job_keeps_only_what_was_read_after() {
+        let transport = armed_without_a_broker().await;
+        let withheld = tokens(0, 0..10);
+        transport.acks.register(withheld.iter().map(|t| (t, 10)));
+        transport.acks.withhold(&withheld);
+
+        let mut job: Vec<Span> = tokens(0, 10..15)
+            .into_iter()
+            .map(|t| polled(&transport, t))
+            .collect();
+        serve(&transport, true, 0);
+        serve(&transport, false, 0);
+        job.extend(tokens(0, 0..3).into_iter().map(|t| polled(&transport, t)));
+        let handed_out = settle(&transport, job);
+
+        assert_eq!(
+            handed_out.iter().map(|t| t.offset).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            committed_to(&transport, &handed_out, 0),
+            vec![3],
+            "the commit follows what was read again, never past 3"
+        );
     }
 }

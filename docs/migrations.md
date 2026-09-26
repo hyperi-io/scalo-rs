@@ -769,6 +769,42 @@ The service runtime builds the app metric set, with the `info` gauge, and a serv
 
 **Consumer adjustment** -- a service that wants its commit in `info` names it in `ServiceApp::version_info` with `with_commit`, or builds with `GIT_COMMIT` set. Its own `AppMetrics::new` call can stay; it no longer changes `info`.
 
+### Source acknowledgements held until delivery (additive, opt-in per run loop)
+
+`BatchEngine::pipeline(&receiver)...run(process, sink)` is a new run loop that holds each block's source acknowledgement until every piece built from the block has reported, then releases it once through the new `TransportReceiver::release`. A Kafka source's commit waits for the sink, and an `Errored` block is never committed past. The key is `acknowledgements.enabled` on the transport's own section (default `true`), read by `AnyReceiver::from_config` from `<key>.kafka.acknowledgements` and set on an explicit transport with `KafkaTransport::with_acknowledgements`. `BatchEngine::with_dlq` makes a dead letter a piece that releases its source only once the DLQ confirms the write. See [pipeline/acknowledgements.md](pipeline/acknowledgements.md).
+
+The new trait methods are provided, so no implementor changes: `TransportReceiver::{ack_control, release, hold_deadline}`, `TransportSender::{confirms_delivery, dead_letter_reason}`. `run_governed` and the other run loops behave as before, except that a push source with acknowledgements on that they run logs one WARN at start, since it still answers its senders at enqueue, and reports `pipeline_delivery_guarantee{guarantee="best_effort",reason="unarmed"}`.
+
+An armed gRPC server answers a push only once its records are released. Build it armed, `GrpcTransport::builder(..).armed(true)` or `AnyReceiver::from_config_armed(key)`, so no push is answered before a pipeline runs. A pipeline with neither `.sender(&sender)` nor `.sink_confirms(..)` logs one WARN at start and reports `best_effort` / `sink_cannot_confirm`: nothing takes a record the sink's transport would dead-letter out of the block.
+
+A `KafkaTransport` armed through `AckControl::arm` commits each partition only up to its lowest offset handed out and not yet released, for `commit` as for `release`. An unarmed one commits as before.
+
+`StatsContext::total_position_lag` and `KafkaTransport::total_position_lag` count records past the consumer's read position, which a held commit does not inflate. `total_consumer_lag` still counts from the committed offset. While the inbound gate holds the assignment paused, both used to stop rising, since librdkafka fetches nothing it has paused and learns the log end only from fetches. The transport now asks the broker for the end once per statistics interval while paused, so both keep rising with what producers write.
+
+**Consumer adjustment** -- none to keep today's behaviour. To hold acknowledgements, move from `run_governed` to `pipeline(..)`, call `.sender(&sender)` for a transport sink, and give the loop a DLQ with `with_dlq`. A hand-rolled loop arms the source before its first `recv` and releases each block through `SourceAck`.
+
+### gRPC `send_batch` splits a block over `max_message_size` (BEHAVIOUR CHANGE)
+
+2.12 returned `Fatal` for a block over `max_message_size` and sent none of it. `send_batch` now sends it as several requests, each within the limit. A record over the limit on its own no longer fails the block: it is left out, the rest is sent and the result is `Ok`, and the record is dropped, counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`. A block of nothing but such records returns `FilteredDlq`, and its records count there too.
+
+**Consumer adjustment** -- a caller that dead-letters oversize records takes out every record `dead_letter_reason` names before calling `send_batch`, as the pipeline's `.sender(&sender)` does. A caller that retried a `Fatal` block in smaller pieces no longer needs to.
+
+### `Dlq::write_confirmed` and `BackgroundSink::write_confirmed` (additive)
+
+`write_confirmed(entries)` writes one caller's entries as a batch of their own and reports that write to that caller alone. `flush()` keeps its contract: a refusal goes to the first barrier after it, whoever issued it. The pipeline's DLQ piece writes through `write_confirmed`, so one block's refusal never reaches another's. A custom `SinkDrain` may override the new provided `settled()` (default `true`) to fail a confirmed write whose fate it has not heard yet.
+
+`Dlq::refusal(&entry)` names an entry no backend can ever hold: over a Kafka-only DLQ's `message.max.bytes` once base64-encoded. The pipeline drops such an entry, counts it in `pipeline_dead_letters_dropped_total{reason="too_large"}` and releases its piece `Dropped`. Any other failed DLQ write it retries with backoff while the block stays held, where it used to release the block `Errored`. A Kafka partition an `Errored` release pins is counted in the new `transport_ack_withheld` gauge.
+
+**Consumer adjustment** -- a hand-rolled loop that writes dead letters with `write_confirmed` screens each entry with `refusal` first and releases the refused ones `Dropped`, then retries the write on any error but `DlqError::Closed` rather than releasing `Errored`. See [pipeline/dlq.md](pipeline/dlq.md#queue-admission-semantics).
+
+### Smaller additions
+
+- `RoutedSender` forwards `dead_letter_reason` to the route a record's key selects, and reports the weakest `confirms_delivery` across its routes, so `.sender(&routed)` screens and reports as the routes do.
+- `VectorCompatClient::connect_lazy_within(endpoint, send_timeout_ms)` sets the dial, health-check and PING limit that `connect_lazy` fixes at 30 s.
+- `VectorCompatClient::send_events_status` fails with the gRPC status, and `VectorCompatClient::is_permanent_rejection` names the refusals no resend clears (`DataLoss`, `InvalidArgument`, `OutOfRange`), so a transform stops resending events a Vector sink rejected. `send_events` is unchanged. One it drops counts in `pipeline_dead_letters_dropped_total` under `transport::DEAD_LETTER_REJECTED` (`reason="rejected"`).
+- `Pipeline::listener(name)` publishes the pipeline's `pipeline_delivery_guarantee` with a `listener` label, for an app that runs several pipelines.
+- `EffectiveGuarantee::publish_for(listener)` publishes `pipeline_delivery_guarantee` with a `listener` label, for an app with one source and sink pair per listener.
+
 ---
 
 ## Known open issues (not fixed on this branch)

@@ -11,6 +11,9 @@
 //! These tests require a running Kafka broker. They are ignored by default.
 //! Run with: `TEST_KAFKA_BROKERS=localhost:9092 cargo test --features transport-kafka -- --ignored`
 //!
+//! The held-acknowledgement tests start their own broker in a container instead:
+//! they build with the `testcontainers` feature and need a Docker daemon.
+//!
 //! Or set up via environment variables:
 //! - `TEST_KAFKA_BROKERS`: Kafka broker addresses (default: localhost:9092)
 //! - `TEST_KAFKA_TOPIC`: Test topic name (default: scalo-test)
@@ -688,5 +691,389 @@ async fn test_kafka_consumer_lag() {
         }
     } else {
         eprintln!("Could not get lag (may need messages in topic)");
+    }
+}
+
+/// A real broker in a container, for the tests below.
+///
+/// Built with the `testcontainers` feature, which CI's Test job enables, and
+/// needs a Docker daemon.
+#[cfg(feature = "testcontainers")]
+mod broker {
+    use std::ops::Range;
+    use std::time::{Duration, Instant};
+
+    use rdkafka::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+    use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
+    use testcontainers_modules::kafka::apache::{self, Kafka};
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+
+    /// Kafka to test against, pinned by digest.
+    // renovate: datasource=docker depName=apache/kafka-native
+    const KAFKA_IMAGE_REF: &str =
+        "4.3.1@sha256:2885898ba17065023f1bd605f3a81efcfa986014f062b73b91ef5462485f9060";
+
+    /// Container starts to try: on a busy CI runner a broker started alongside
+    /// others can exit before it logs that it is ready.
+    const START_ATTEMPTS: u32 = 3;
+
+    pub(super) async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
+        let mut attempt = 1;
+        let node = loop {
+            match Kafka::default().with_tag(KAFKA_IMAGE_REF).start().await {
+                Ok(node) => break node,
+                Err(e) if attempt < START_ATTEMPTS => {
+                    eprintln!("kafka container attempt {attempt} did not start: {e}");
+                    attempt += 1;
+                }
+                Err(e) => panic!("start kafka container: {e}"),
+            }
+        };
+        let port = node
+            .get_host_port_ipv4(apache::KAFKA_PORT)
+            .await
+            .expect("kafka host port");
+        (node, format!("127.0.0.1:{port}"))
+    }
+
+    /// Create a one-partition `topic` and wait for its metadata.
+    pub(super) async fn create_topic(bootstrap: &str, topic: &'static str) {
+        let admin = KafkaAdmin::new(&KafkaConfig {
+            brokers: vec![bootstrap.to_string()],
+            group: String::new(),
+            ..Default::default()
+        })
+        .expect("kafka admin");
+        admin
+            .create_topics(&[(topic, 1, 1)])
+            .await
+            .expect("create topic");
+        tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while admin
+                .describe_topic(topic)
+                .ok()
+                .is_none_or(|t| t.partition_count == 0)
+            {
+                assert!(Instant::now() < deadline, "topic {topic} never appeared");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+        .await
+        .expect("metadata wait");
+    }
+
+    /// Write `{"seq":N}` to `topic` for each N in `seqs`, and wait for every
+    /// delivery.
+    pub(super) async fn produce(bootstrap: &str, topic: &str, seqs: Range<usize>) {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap)
+            .create()
+            .expect("raw producer");
+        for seq in seqs {
+            let payload = format!("{{\"seq\":{seq}}}");
+            producer
+                .send(
+                    FutureRecord::<(), str>::to(topic).payload(&payload),
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap_or_else(|(e, _)| panic!("deliver record {seq}: {e}"));
+        }
+    }
+
+    pub(super) fn consumer_config(bootstrap: &str, topic: &str, group: &str) -> KafkaConfig {
+        KafkaConfig {
+            brokers: vec![bootstrap.to_string()],
+            group: group.to_string(),
+            topics: vec![topic.to_string()],
+            ..Default::default()
+        }
+    }
+
+    pub(super) async fn consumer(bootstrap: &str, topic: &str, group: &str) -> KafkaTransport {
+        KafkaTransport::new(&consumer_config(bootstrap, topic, group))
+            .await
+            .expect("kafka consumer")
+    }
+
+    /// The offset `group` last committed on partition 0 of `topic`, asked of
+    /// the broker by a client that joins no group.
+    pub(super) async fn committed(bootstrap: &str, group: &str, topic: &str) -> Option<i64> {
+        let (bootstrap, group, topic) =
+            (bootstrap.to_string(), group.to_string(), topic.to_string());
+        tokio::task::spawn_blocking(move || {
+            let client: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", &bootstrap)
+                .set("group.id", &group)
+                .set("enable.auto.commit", "false")
+                .create()
+                .expect("offset client");
+            let mut partitions = TopicPartitionList::new();
+            partitions.add_partition(&topic, 0);
+            let found = client
+                .committed_offsets(partitions, Duration::from_secs(10))
+                .expect("committed offsets");
+            match found.find_partition(&topic, 0)?.offset() {
+                Offset::Offset(offset) => Some(offset),
+                _ => None,
+            }
+        })
+        .await
+        .expect("offset task")
+    }
+}
+
+/// Held source acknowledgements against a real broker in a container.
+#[cfg(all(feature = "testcontainers", feature = "worker-batch"))]
+mod held_acknowledgements {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use scalo::transport::kafka::{KafkaToken, KafkaTransport};
+    use scalo::transport::{AcknowledgementsConfig, WorkBatch};
+    use scalo::worker::{BatchEngine, BatchProcessingConfig, EngineError};
+    use tokio_util::sync::CancellationToken;
+
+    use super::broker::{committed, consumer, create_topic, produce, start_kafka};
+
+    /// Records written to each test topic.
+    const RECORDS: usize = 20;
+
+    /// Create a one-partition `topic` and write `{"seq":N}` for N in
+    /// `0..RECORDS`.
+    async fn topic_with_records(bootstrap: &str, topic: &'static str) {
+        create_topic(bootstrap, topic).await;
+        produce(bootstrap, topic, 0..RECORDS).await;
+    }
+
+    fn seq_of(payload: &[u8]) -> usize {
+        let digits = payload
+            .strip_prefix(b"{\"seq\":")
+            .and_then(|rest| rest.strip_suffix(b"}"))
+            .expect("a record written by topic_with_records");
+        std::str::from_utf8(digits)
+            .expect("ASCII digits")
+            .parse()
+            .expect("seq fits usize")
+    }
+
+    /// Run a pipeline over `transport` whose sink takes its first block and
+    /// never returns, then kill it once the sink holds the block. Returns the
+    /// records in that block.
+    async fn kill_mid_sink(transport: KafkaTransport) -> usize {
+        let (took, mut taken) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let run = tokio::spawn(async move {
+            let engine = BatchEngine::new(BatchProcessingConfig::default());
+            let result: Result<(), EngineError> = engine
+                .pipeline(&transport)
+                .run(
+                    |batch| Ok(batch),
+                    move |out: &WorkBatch<KafkaToken>| {
+                        let _ = took.send(out.records.len());
+                        std::future::pending::<Result<(), EngineError>>()
+                    },
+                )
+                .await;
+            result
+        });
+        let records = tokio::time::timeout(Duration::from_secs(60), taken.recv())
+            .await
+            .expect("the consumer read a block within 60 s")
+            .expect("the sink reported its block");
+        run.abort();
+        let _ = run.await;
+        records
+    }
+
+    #[tokio::test]
+    async fn offsets_stay_uncommitted_until_the_sink_delivers() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "held-acks";
+        let group = "held-acks-group";
+        topic_with_records(&bootstrap, topic).await;
+
+        let taken = kill_mid_sink(consumer(&bootstrap, topic, group).await).await;
+        assert!(taken > 0, "the killed consumer had records in its sink");
+        assert_eq!(
+            committed(&bootstrap, group, topic).await,
+            None,
+            "a block the sink never delivered commits nothing"
+        );
+
+        // The restarted consumer reads every record again, then commits them.
+        let restarted = consumer(&bootstrap, topic, group).await;
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(BTreeSet::new()));
+        let sink_seen = std::sync::Arc::clone(&seen);
+        let engine = BatchEngine::new(BatchProcessingConfig::default());
+        let run = engine.pipeline(&restarted).shutdown(shutdown.clone()).run(
+            |batch| Ok(batch),
+            move |out: &WorkBatch<KafkaToken>| {
+                let mut seen = sink_seen.lock();
+                seen.extend(out.records.iter().map(|r| seq_of(&r.payload)));
+                if seen.len() == RECORDS {
+                    stop.cancel();
+                }
+                std::future::ready(Ok(()))
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(120), run)
+            .await
+            .expect("the restarted consumer read every record within 120 s")
+            .expect("clean run");
+
+        assert_eq!(
+            *seen.lock(),
+            (0..RECORDS).collect::<BTreeSet<_>>(),
+            "every record is read again after the kill"
+        );
+        assert_eq!(
+            committed(&bootstrap, group, topic).await,
+            Some(i64::try_from(RECORDS).expect("fits")),
+            "and committed once delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledgements_disabled_commits_at_receipt() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "acks-off";
+        let group = "acks-off-group";
+        topic_with_records(&bootstrap, topic).await;
+
+        let transport = consumer(&bootstrap, topic, group)
+            .await
+            .with_acknowledgements(AcknowledgementsConfig::new(false));
+        let taken = kill_mid_sink(transport).await;
+
+        assert_eq!(
+            committed(&bootstrap, group, topic).await,
+            Some(i64::try_from(taken).expect("fits")),
+            "with acknowledgements off the block is committed before the sink runs, \
+             so the kill loses it"
+        );
+    }
+}
+
+/// Consumer lag against a real broker. The committed offset, the offset read
+/// to and the log end are three offsets, and the end must keep moving while
+/// the self-regulation gate holds the partition paused.
+#[cfg(all(feature = "testcontainers", feature = "governor"))]
+mod lag {
+    use std::time::{Duration, Instant};
+
+    use scalo::transport::TransportReceiver;
+    use scalo::transport::kafka::{KafkaToken, KafkaTransport, total_consumer_lag};
+
+    use super::broker::{consumer_config, create_topic, produce, start_kafka};
+
+    /// Records written before the consumer starts, all of which it reads.
+    const READ: usize = 20;
+    /// Of those, the records it commits.
+    const COMMITTED: usize = 5;
+    /// Records written while the partition is paused.
+    const WRITTEN_PAUSED: usize = 30;
+
+    /// A consumer whose statistics, and so its lag, refresh every 200 ms.
+    async fn lag_consumer(bootstrap: &str, topic: &str, group: &str) -> KafkaTransport {
+        let mut config = consumer_config(bootstrap, topic, group);
+        config
+            .librdkafka_overrides
+            .insert("statistics.interval.ms".to_string(), "200".to_string());
+        KafkaTransport::new(&config).await.expect("kafka consumer")
+    }
+
+    /// Lag behind the committed offset, and behind the read position.
+    fn lags(transport: &KafkaTransport) -> (i64, i64) {
+        (
+            total_consumer_lag(&transport.stats()),
+            transport.total_position_lag(),
+        )
+    }
+
+    /// Read until `tokens` holds `total` records.
+    async fn read_to(transport: &KafkaTransport, tokens: &mut Vec<KafkaToken>, total: usize) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while tokens.len() < total {
+            assert!(
+                Instant::now() < deadline,
+                "read {} of {total} records within 60 s",
+                tokens.len()
+            );
+            let batch = transport.recv(total - tokens.len()).await.expect("recv");
+            tokens.extend(batch.commit_tokens);
+        }
+    }
+
+    /// Poll as the run loop does, which serves the statistics, until the
+    /// lags read `want` or 30 s pass. Returns the last reading. Nothing more
+    /// may be read meanwhile.
+    async fn settle(transport: &KafkaTransport, want: (i64, i64)) -> (i64, i64) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let batch = transport.recv(100).await.expect("recv");
+            assert!(
+                batch.records.is_empty(),
+                "read {} records the test did not expect",
+                batch.records.len()
+            );
+            let now = lags(transport);
+            if now == want || Instant::now() >= deadline {
+                return now;
+            }
+        }
+    }
+
+    fn offset(count: usize) -> i64 {
+        i64::try_from(count).expect("fits an i64")
+    }
+
+    #[tokio::test]
+    async fn lag_counts_from_the_commit_and_the_read_position_and_rises_while_paused() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "lag";
+        create_topic(&bootstrap, topic).await;
+        produce(&bootstrap, topic, 0..READ).await;
+        let transport = lag_consumer(&bootstrap, topic, "lag-group").await;
+
+        let mut tokens = Vec::new();
+        read_to(&transport, &mut tokens, READ).await;
+        transport
+            .commit(&tokens[..COMMITTED])
+            .await
+            .expect("commit");
+        let (committed, read) = (offset(COMMITTED), offset(READ));
+        let want = (read - committed, 0);
+        assert_eq!(
+            settle(&transport, want).await,
+            want,
+            "end {read}, read to {read}, committed {committed}"
+        );
+
+        transport.gate_actuator().pause();
+        produce(&bootstrap, topic, READ..READ + WRITTEN_PAUSED).await;
+        let end = read + offset(WRITTEN_PAUSED);
+        let want = (end - committed, end - read);
+        assert_eq!(
+            settle(&transport, want).await,
+            want,
+            "paused: end {end}, read to {read}, committed {committed}. The end must keep \
+             moving while nothing is fetched"
+        );
+
+        transport.gate_actuator().resume();
+        read_to(&transport, &mut tokens, READ + WRITTEN_PAUSED).await;
+        let want = (end - committed, 0);
+        assert_eq!(
+            settle(&transport, want).await,
+            want,
+            "resumed and read to the end: end {end}, read to {end}, committed {committed}"
+        );
     }
 }

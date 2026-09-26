@@ -34,3 +34,10 @@ mod http_client_signed;
 
 #[cfg(feature = "auth")]
 mod auth;
+
+#[cfg(all(
+    feature = "deployment-test-support",
+    feature = "transport",
+    feature = "worker-batch"
+))]
+mod conformance;

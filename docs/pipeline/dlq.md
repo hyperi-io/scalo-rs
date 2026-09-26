@@ -89,6 +89,27 @@ concurrent callers, the other barriers return `Ok`.
 A `flush()` dropped before its ack, such as by a timeout around it, does
 not consume the error. The next `flush()` returns it.
 
+A caller that must know whether ITS entries are held, rather than whether
+anything written since the last barrier was refused, uses
+`write_confirmed(entries)`. The drain writes those entries as a batch of
+their own, runs the durable flush, and answers that caller alone: a
+refusal of anyone else's write stays for the next `flush()`, and this
+caller's refusal goes to this caller only. The durable flush covers every
+earlier write too, so a loss it finds is returned to the caller and held
+for the next `flush()` as well. A Kafka backend that purged entries it has
+not heard back about yet fails the confirmed write. The pipeline's
+`with_dlq` writes each block's dead letters this way.
+
+An error from `write_confirmed` does not say whether a retry can land the entries, and a caller holding a source acknowledgement needs to know. `refusal(&entry)` answers it before the write, per entry: `Some(DeadLetterReason::TooLarge { bytes, limit })` when no backend can ever hold the entry, `None` otherwise. Only a Kafka backend has a ceiling, its producer's `message.max.bytes` less 128 bytes of framing, measured against the entry as written, so a payload grows by a third as base64. A file or HTTP backend beside Kafka takes what Kafka refuses, so such a DLQ refuses nothing.
+
+So a caller holding a source acknowledgement:
+
+- leaves a refused entry out of the write, releases it `Dropped`, and counts it, since no retry can land it
+- holds the block and writes the rest again on any other error, since those can clear: a broker down, a timeout, a full disk
+- releases `Errored` only on `DlqError::Closed`, when the drain has exited
+
+A broker or topic ceiling below the producer's `message.max.bytes` is not seen by `refusal`: the broker refuses the entry after the write, and the confirmed write fails like any other loss. Keep the three ceilings in step ([../transport/backends.md](../transport/backends.md)).
+
 What "accepted" means depends on the backend:
 
 | Backend | Accepted means |
@@ -181,6 +202,8 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 | `send(entry).await` | Async submission that awaits queue space |
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
 | `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka; `Err(File)` if any batch written since the previous flush was refused by every backend, `Err(Kafka)` if Kafka lost entries only it held (see [Queue-admission semantics](#queue-admission-semantics)) |
+| `write_confirmed(entries).await` | Write these entries as a batch of their own and answer whether a backend holds them, to this caller alone (see [Queue-admission semantics](#queue-admission-semantics)) |
+| `refusal(&entry)` | Why no backend can ever hold this entry, or `None`: the permanent refusal a held source releases `Dropped` (needs `transport`) |
 | `shutdown().await` | Stop the drain and join it; the drain first waits for Kafka acks and counts what none confirmed in `dropped()` (see [Shutdown](#shutdown)) |
 | `is_enabled() / mode() / pending() / dropped()` | Introspection — `dropped()` totals queue overflow + disabled-DLQ sends + batches every backend refused + Kafka entries a barrier or the shutdown found lost (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
 | `DlqEntry::new(service, error_type, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_metadata(...)` | Entry builder |

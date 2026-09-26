@@ -49,11 +49,12 @@ pub struct GrpcConfig {
 
     /// Send deadline in milliseconds (0 = no deadline). Default 30s.
     ///
-    /// Bounds each `send` and `send_batch` end to end -- DNS, TCP connect, TLS
-    /// handshake and the RPC -- so a server that is down or never answers
-    /// returns `Backpressured` at the limit. A dial still unfinished at nine
-    /// tenths of it is abandoned, so the next send dials afresh. Also sent as
-    /// the `grpc-timeout` header.
+    /// Bounds each `send`, and each request of a `send_batch`, end to end --
+    /// DNS, TCP connect, TLS handshake and the RPC -- so a server that is down
+    /// or never answers returns `Backpressured` at the limit. A dial still
+    /// unfinished at nine tenths of it is abandoned, so the next send dials
+    /// afresh. Also sent as the `grpc-timeout` header, which an armed receiver
+    /// holds its answer within.
     ///
     /// A connection that has read nothing for this long is sent an HTTP/2
     /// PING, and closed if the PING goes unanswered for as long again (30s

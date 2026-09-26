@@ -132,7 +132,7 @@ auth = [
     "reqwest/form",
 ]
 http-server = ["axum", "tower", "tower-http", "tokio", "tracing"]
-spool = ["yaque", "zstd", "dep:crc32c", "chrono"]
+spool = ["yaque", "zstd", "dep:crc32c", "chrono", "tokio"]
 tiered-sink = ["transport", "yaque", "zstd", "lz4_flex", "snap", "tokio", "libc", "tracing", "dep:crc32c", "chrono"]
 
 # Outbound sink-control stack: composes timeout + load-shed + concurrency-limit
@@ -212,6 +212,10 @@ deployment-smoke = ["deployment"]
 # by scalo's own e2e tests AND by downstream consumers writing their own
 # contract-artefact e2e tests. See src/deployment/test_support.rs.
 deployment-test-support = ["deployment"]
+
+# Real-broker tests against testcontainers. Needs a Docker daemon at test time;
+# CI's Test job builds with every feature, so it runs them.
+testcontainers = []
 
 # Reflectable config schema + capability catalog (scalo-rs#6). Derives a JSON
 # Schema of the app `Config` via schemars and carries a hand-authored capability
@@ -424,8 +428,9 @@ libc = { version = ">=0.2.177, <0.3", optional = true }
 flate2 = { version = ">=1.1.9, <2", optional = true }
 tar = { version = ">=0.4.46, <0.5", optional = true }
 
-# Spool (disk-backed async queue) - yaque is async-native and maintained
-yaque = { version = ">=0.6.6, <0.7", optional = true }
+# Spool (disk-backed async queue). yaque's last release is 0.6.6 (2023-11-04,
+# crates.io API checked 2026-09-25). `recovery` clears locks a killed process left.
+yaque = { version = ">=0.6.6, <0.7", optional = true, features = ["recovery"] }
 zstd = { version = ">=0.13.3, <0.14", optional = true }
 # Per-record spool integrity (hardware-accelerated CRC32C). Apache-2.0/MIT,
 # 0.6.8 web-checked 2026-06-26. Closes the payload-integrity gap the queue's

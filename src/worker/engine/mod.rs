@@ -12,6 +12,8 @@ pub mod driver;
 pub mod intern;
 pub mod metrics;
 pub mod parse;
+#[cfg(feature = "transport")]
+pub mod pipeline;
 pub mod pre_route;
 pub mod types;
 
@@ -19,6 +21,8 @@ pub use config::{BatchProcessingConfig, ParseErrorAction, PreRouteFilterConfig};
 #[cfg(feature = "transport")]
 pub use driver::{CommitMode, ParsedBatch};
 pub use intern::FieldInterner;
+#[cfg(feature = "transport")]
+pub use pipeline::{BlockPieces, NoTicker, Pipeline};
 pub use types::{MessageMetadata, ParsedMessage, PreRouteResult};
 
 /// Errors returned by the [`BatchEngine`] `WorkBatch` drivers
@@ -183,6 +187,10 @@ pub struct BatchEngine {
     /// budget-sized sub-blocks and feeds the AIMD loop per block.
     #[cfg(feature = "governor")]
     byte_budget: Option<Arc<crate::governor::ByteBudgetController>>,
+    /// Where the pipeline loop writes dead letters, confirming each before the
+    /// source is released. `None` routes them through `filter_dlq_policy`.
+    #[cfg(all(feature = "transport", feature = "dlq"))]
+    dlq: Option<Arc<crate::dlq::Dlq>>,
 }
 
 impl BatchEngine {
@@ -217,7 +225,26 @@ impl BatchEngine {
             filter_dlq_policy: FilterDlqPolicy::default(),
             #[cfg(feature = "governor")]
             byte_budget: None,
+            #[cfg(all(feature = "transport", feature = "dlq"))]
+            dlq: None,
         }
+    }
+
+    /// Write dead letters to `dlq` in the [`pipeline`](Self::pipeline) loop.
+    ///
+    /// Each block's dead letters are a piece of it: they report `Rejected` once
+    /// [`Dlq::write_confirmed`](crate::dlq::Dlq::write_confirmed) confirms a
+    /// backend holds them, so the source is released only once the dead letters
+    /// are held. A dead letter no backend can hold
+    /// ([`Dlq::refusal`](crate::dlq::Dlq::refusal)) is dropped and counted, a
+    /// failed write is retried with the block held, and only a closed DLQ
+    /// reports `Errored`. The other run loops keep routing through
+    /// [`FilterDlqPolicy`].
+    #[cfg(all(feature = "transport", feature = "dlq"))]
+    #[must_use]
+    pub fn with_dlq(mut self, dlq: Arc<crate::dlq::Dlq>) -> Self {
+        self.dlq = Some(dlq);
+        self
     }
 
     /// Wire the self-regulation byte-budget lever (`governor` feature).
@@ -651,6 +678,8 @@ impl std::fmt::Debug for BatchEngine {
         s.field("filter_dlq_policy", &self.filter_dlq_policy);
         #[cfg(feature = "governor")]
         s.field("self_regulated", &self.byte_budget.is_some());
+        #[cfg(all(feature = "transport", feature = "dlq"))]
+        s.field("dlq", &self.dlq.is_some());
         s.finish()
     }
 }

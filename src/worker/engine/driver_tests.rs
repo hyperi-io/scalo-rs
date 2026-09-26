@@ -3272,3 +3272,1434 @@ async fn the_drain_gives_up_on_a_source_that_never_reports_closed() {
         "the drain should give up at {DRAIN_IDLE_LIMIT:?}, took {took:?}"
     );
 }
+
+// ---- Pipeline: held source acknowledgements ------------------------------
+
+use crate::transport::ack::{AckControl, AckKind, HeldAcks, SinkConfirmation};
+use crate::transport::{DeliveryStatus, PieceFinalizer};
+use crate::worker::engine::pipeline::BlockPieces;
+
+/// One release a [`HeldSource`] saw: the seqs, the status, and when.
+type Release = (Vec<u64>, DeliveryStatus, tokio::time::Instant);
+
+/// Acknowledgement controls for a test source.
+struct TestControl {
+    enabled: bool,
+    armed: std::sync::atomic::AtomicBool,
+    kind: AckKind,
+}
+
+impl AckControl for TestControl {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+    fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+    fn kind(&self) -> AckKind {
+        self.kind
+    }
+    fn held(&self) -> HeldAcks {
+        HeldAcks::default()
+    }
+}
+
+/// A source that holds its acknowledgement: it hands out scripted blocks, one
+/// per `recv`, then waits; it records every release and commit, and gives each
+/// block a hold deadline when `hold_for` is set, as a push source does.
+struct HeldSource {
+    blocks: parking_lot::Mutex<std::collections::VecDeque<Vec<u64>>>,
+    control: TestControl,
+    releases: Arc<parking_lot::Mutex<Vec<Release>>>,
+    commits: Arc<parking_lot::Mutex<Vec<u64>>>,
+    hold_for: Option<Duration>,
+    received: parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl HeldSource {
+    fn new(kind: AckKind, blocks: Vec<Vec<u64>>) -> Self {
+        Self {
+            blocks: parking_lot::Mutex::new(blocks.into()),
+            control: TestControl {
+                enabled: true,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                kind,
+            },
+            releases: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            commits: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            hold_for: None,
+            received: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn holding_for(mut self, hold: Duration) -> Self {
+        self.hold_for = Some(hold);
+        self
+    }
+
+    fn acks_disabled(mut self) -> Self {
+        self.control.enabled = false;
+        self
+    }
+
+    /// The seqs and status of every release so far.
+    fn released(&self) -> Vec<(Vec<u64>, DeliveryStatus)> {
+        self.releases
+            .lock()
+            .iter()
+            .map(|(seqs, status, _)| (seqs.clone(), *status))
+            .collect()
+    }
+}
+
+impl crate::transport::TransportBase for HeldSource {
+    async fn close(&self) -> crate::transport::TransportResult<()> {
+        self.closed.store(true, Ordering::Release);
+        Ok(())
+    }
+    fn is_healthy(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &'static str {
+        "held-test"
+    }
+}
+
+impl TransportReceiver for HeldSource {
+    type Token = crate::transport::memory::MemoryToken;
+
+    async fn recv(&self, _max: usize) -> crate::transport::TransportResult<WorkBatch<Self::Token>> {
+        let next = self.blocks.lock().pop_front();
+        let Some(seqs) = next else {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(crate::transport::TransportError::Closed);
+            }
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        };
+        let now = tokio::time::Instant::now().into_std();
+        let mut received = self.received.lock();
+        let records = seqs
+            .iter()
+            .map(|seq| {
+                received.insert(*seq, now);
+                Record {
+                    payload: Bytes::from(format!(r#"{{"seq":{seq}}}"#)),
+                    key: None,
+                    headers: vec![],
+                    metadata: RecordMeta {
+                        timestamp_ms: None,
+                        format: PayloadFormat::Json,
+                    },
+                }
+            })
+            .collect();
+        let tokens = seqs
+            .iter()
+            .map(|seq| crate::transport::memory::MemoryToken { seq: *seq })
+            .collect();
+        Ok(WorkBatch::new(records, tokens))
+    }
+
+    async fn commit(&self, tokens: &[Self::Token]) -> crate::transport::TransportResult<()> {
+        self.commits.lock().extend(tokens.iter().map(|t| t.seq));
+        Ok(())
+    }
+
+    fn ack_control(&self) -> Option<&dyn AckControl> {
+        Some(&self.control)
+    }
+
+    async fn release(
+        &self,
+        tokens: &[Self::Token],
+        outcome: DeliveryStatus,
+    ) -> crate::transport::TransportResult<()> {
+        self.releases.lock().push((
+            tokens.iter().map(|t| t.seq).collect(),
+            outcome,
+            tokio::time::Instant::now(),
+        ));
+        if outcome.should_commit() {
+            self.commit(tokens).await?;
+        }
+        Ok(())
+    }
+
+    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<std::time::Instant> {
+        let hold = self.hold_for?;
+        let received = self.received.lock();
+        tokens
+            .iter()
+            .filter_map(|t| received.get(&t.seq))
+            .min()
+            .map(|at| *at + hold)
+    }
+}
+
+/// Poll `run` for `wait` without letting it finish.
+async fn run_for<F: std::future::Future>(run: std::pin::Pin<&mut F>, wait: Duration)
+where
+    F::Output: std::fmt::Debug,
+{
+    tokio::select! {
+        out = run => panic!("the pipeline ended early: {out:?}"),
+        () = tokio::time::sleep(wait) => {}
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_ack_waits_for_every_fanned_out_piece() {
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1]]);
+    let shutdown = CancellationToken::new();
+    let late: Arc<parking_lot::Mutex<Option<PieceFinalizer>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    let engine = default_engine();
+
+    let sink_late = Arc::clone(&late);
+    let run = engine
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .run_with_pieces(
+            |batch| Ok(batch),
+            move |_out: &WorkBatch<_>, pieces: &BlockPieces<'_>| {
+                *sink_late.lock() = Some(pieces.piece());
+                std::future::ready(Ok(()))
+            },
+        );
+    tokio::pin!(run);
+
+    run_for(run.as_mut(), Duration::from_millis(100)).await;
+    assert!(
+        source.control.is_armed(),
+        "the pipeline arms a source with acknowledgements on"
+    );
+    assert!(
+        source.released().is_empty(),
+        "the sink returned, but one piece is still out: nothing is released"
+    );
+
+    late.lock()
+        .take()
+        .expect("the sink took a piece")
+        .report(DeliveryStatus::Delivered);
+    run_for(run.as_mut(), Duration::from_millis(100)).await;
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1], DeliveryStatus::Delivered)],
+        "released once, after both pieces, with the merged status"
+    );
+    assert_eq!(*source.commits.lock(), vec![0, 1]);
+
+    shutdown.cancel();
+    run.await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn one_errored_piece_withholds_the_source_ack() {
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1], vec![2]]);
+    let engine = default_engine();
+
+    let result = engine
+        .pipeline(&source)
+        .run_with_pieces(
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>, pieces: &BlockPieces<'_>| {
+                pieces.piece().report(DeliveryStatus::Errored);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(EngineError::Sink(_))),
+        "a pull source's errored block stops the loop so it is read again: {result:?}"
+    );
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1], DeliveryStatus::Errored)],
+        "released Errored, and the later block is never fetched past it"
+    );
+    assert!(source.commits.lock().is_empty(), "nothing is committed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn push_block_is_abandoned_at_its_hold_deadline() {
+    let hold = Duration::from_secs(1);
+    let source = HeldSource::new(AckKind::Push, vec![vec![0], vec![1]]).holding_for(hold);
+    let shutdown = CancellationToken::new();
+    let engine = default_engine();
+    let started = tokio::time::Instant::now();
+
+    let run = engine.pipeline(&source).shutdown(shutdown.clone()).run(
+        |batch| Ok(batch),
+        |out: &WorkBatch<crate::transport::memory::MemoryToken>| {
+            let refuse = out.commit_tokens.iter().any(|t| t.seq == 0);
+            std::future::ready(if refuse {
+                Err(EngineError::Transport(
+                    crate::transport::TransportError::Backpressure,
+                ))
+            } else {
+                Ok(())
+            })
+        },
+    );
+    tokio::pin!(run);
+    run_for(run.as_mut(), Duration::from_secs(3)).await;
+
+    let releases = source.releases.lock().clone();
+    assert_eq!(releases.len(), 2, "both blocks released: {releases:?}");
+    let (seqs, status, at) = &releases[0];
+    assert_eq!(
+        (seqs.as_slice(), *status),
+        (&[0][..], DeliveryStatus::Errored)
+    );
+    assert!(
+        at.duration_since(started) < hold,
+        "the refused block is released before its sender's deadline, at {:?}",
+        at.duration_since(started)
+    );
+    assert_eq!(
+        (releases[1].0.as_slice(), releases[1].1),
+        (&[1][..], DeliveryStatus::Delivered),
+        "the loop goes on to the next block"
+    );
+
+    shutdown.cancel();
+    run.await.expect("clean shutdown");
+}
+
+/// How a scripted pipeline run fails its first block.
+#[derive(Debug, Clone, Copy)]
+enum Failure {
+    /// `process` returns an error.
+    Process,
+    /// The sink returns a permanent error.
+    Sink,
+    /// Inbound DLQ entries under the default `Reject` policy.
+    UnroutedDeadLetter,
+    /// The sink refuses transiently until the retry window after shutdown
+    /// closes.
+    RefusedThroughShutdown,
+}
+
+/// A push source's first block, `[0, 1]`, run to `failure`: the tokens the
+/// source saw released.
+async fn released_after(failure: Failure) -> Vec<(Vec<u64>, DeliveryStatus)> {
+    let source = HeldSource::new(AckKind::Push, vec![vec![0, 1], vec![2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    let engine = default_engine();
+    let process = move |batch: WorkBatch<crate::transport::memory::MemoryToken>| match failure {
+        Failure::Process => Err(EngineError::Sink("process failed".into())),
+        Failure::UnroutedDeadLetter => {
+            Ok(
+                batch.with_dlq_entries(vec![crate::transport::filter::FilteredDlqEntry {
+                    payload: b"poison".to_vec(),
+                    key: None,
+                    reason: "filter".into(),
+                }]),
+            )
+        }
+        Failure::Sink | Failure::RefusedThroughShutdown => Ok(batch),
+    };
+    let sink = move |_out: &WorkBatch<crate::transport::memory::MemoryToken>| {
+        std::future::ready(match failure {
+            Failure::Sink => Err(EngineError::Sink("sink failed".into())),
+            Failure::RefusedThroughShutdown => {
+                stop.cancel();
+                Err(EngineError::Transport(
+                    crate::transport::TransportError::Backpressure,
+                ))
+            }
+            Failure::Process | Failure::UnroutedDeadLetter => Ok(()),
+        })
+    };
+    let _ = engine
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .run(process, sink)
+        .await;
+    source.released()
+}
+
+/// An armed push source holds every answer until release, so each path out of
+/// a block -- an error, an abandon at shutdown -- releases what it took.
+#[tokio::test(start_paused = true)]
+async fn every_token_taken_is_released_on_every_path() {
+    for failure in [
+        Failure::Process,
+        Failure::Sink,
+        Failure::UnroutedDeadLetter,
+        Failure::RefusedThroughShutdown,
+    ] {
+        assert_eq!(
+            released_after(failure).await,
+            vec![(vec![0, 1], DeliveryStatus::Errored)],
+            "{failure:?}: the block's senders are answered Errored at once"
+        );
+    }
+
+    // The shutdown drain releases every block it takes.
+    let source = HeldSource::new(AckKind::Push, vec![vec![0], vec![1, 2], vec![3]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    default_engine()
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .run(
+            |batch| Ok(batch),
+            move |_out: &WorkBatch<_>| {
+                stop.cancel();
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect("clean shutdown");
+    assert_eq!(
+        source.released(),
+        vec![
+            (vec![0], DeliveryStatus::Delivered),
+            (vec![1, 2], DeliveryStatus::Delivered),
+            (vec![3], DeliveryStatus::Delivered),
+        ],
+        "every block, drained ones included, is released once"
+    );
+}
+
+/// A push source whose sink never finishes a block, run for a while and then
+/// dropped mid-block, as a caller's `select!` or an aborted task drops it.
+#[tokio::test(start_paused = true)]
+async fn a_pipeline_dropped_mid_block_releases_the_block_errored() {
+    let source = HeldSource::new(AckKind::Push, vec![vec![0, 1]]);
+    let engine = default_engine();
+    {
+        let run = engine.pipeline(&source).run(
+            |batch| Ok(batch),
+            |_out: &WorkBatch<crate::transport::memory::MemoryToken>| std::future::pending(),
+        );
+        tokio::pin!(run);
+        run_for(run.as_mut(), Duration::from_millis(100)).await;
+        assert!(
+            source.released().is_empty(),
+            "the sink still has the block, so nothing is released yet"
+        );
+    }
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1], DeliveryStatus::Errored)],
+        "the dropped run released its block Errored, so its senders are answered"
+    );
+}
+
+/// A hand-rolled loop's `SourceAck` dropped before its release, as a panic or
+/// a dropped loop future drops it, releases its block `Errored`, and one that
+/// was released is not released again on drop.
+#[tokio::test]
+async fn a_source_ack_dropped_unreleased_releases_its_block_errored() {
+    let source = HeldSource::new(AckKind::Push, vec![vec![0, 1]]);
+    let batch = source.recv(10).await.expect("a block");
+    {
+        let ack = crate::transport::SourceAck::new(&source, batch.commit_tokens.clone());
+        let _unreported = ack.piece();
+    }
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1], DeliveryStatus::Errored)]
+    );
+
+    let ack = crate::transport::SourceAck::new(&source, batch.commit_tokens);
+    ack.piece().report(DeliveryStatus::Delivered);
+    let status = ack.release().await.expect("released");
+    assert_eq!(status, DeliveryStatus::Delivered);
+    assert_eq!(
+        source.released(),
+        vec![
+            (vec![0, 1], DeliveryStatus::Errored),
+            (vec![0, 1], DeliveryStatus::Delivered),
+        ],
+        "released once, and not again when it drops"
+    );
+}
+
+/// A push source's block `[0, 1]`, whose `process` or sink panics inside a
+/// task: the releases the source saw.
+async fn released_after_a_panic(in_process: bool) -> Vec<(Vec<u64>, DeliveryStatus)> {
+    let source = Arc::new(HeldSource::new(AckKind::Push, vec![vec![0, 1]]));
+    let run = tokio::spawn({
+        let source = Arc::clone(&source);
+        async move {
+            default_engine()
+                .pipeline(&*source)
+                .run(
+                    move |batch: WorkBatch<crate::transport::memory::MemoryToken>| {
+                        assert!(!in_process, "process panicked");
+                        Ok(batch)
+                    },
+                    move |_out: &WorkBatch<crate::transport::memory::MemoryToken>| async move {
+                        assert!(in_process, "the sink panicked");
+                        Ok(())
+                    },
+                )
+                .await
+        }
+    });
+    let joined = run.await;
+    assert!(
+        joined.as_ref().is_err_and(tokio::task::JoinError::is_panic),
+        "the pipeline task panicked: {joined:?}"
+    );
+    source.released()
+}
+
+#[tokio::test]
+async fn a_panic_in_process_or_the_sink_releases_the_block_errored() {
+    for (in_process, stage) in [(true, "process"), (false, "the sink")] {
+        assert_eq!(
+            released_after_a_panic(in_process).await,
+            vec![(vec![0, 1], DeliveryStatus::Errored)],
+            "a panic in {stage} released the block Errored"
+        );
+    }
+}
+
+/// The guarantee a pull pipeline publishes when its sink declares `declared`
+/// through `sink_confirms`, or nothing at all, with no sender.
+#[cfg(feature = "metrics")]
+async fn guarantee_published(declared: Option<SinkConfirmation>) -> Arc<GaugeCapture> {
+    let capture = Arc::new(GaugeCapture::default());
+    let recorder = metrics::set_default_local_recorder(&*capture);
+    let source = HeldSource::new(AckKind::Pull, Vec::new());
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let engine = default_engine();
+    let pipeline = engine.pipeline(&source).shutdown(shutdown);
+    let pipeline = match declared {
+        Some(confirms) => pipeline.sink_confirms(confirms),
+        None => pipeline,
+    };
+    pipeline
+        .run(
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("clean shutdown");
+    drop(recorder);
+    capture
+}
+
+/// A sink that is not a transport declares what its `Ok` proves: it has no
+/// transport screen to miss, so it is taken at its word.
+#[cfg(feature = "metrics")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_sink_that_declares_its_confirmation_is_taken_at_its_word() {
+    let remote = guarantee_published(Some(SinkConfirmation::Remote)).await;
+    assert_eq!(
+        remote.gauge(
+            "pipeline_delivery_guarantee",
+            &[("guarantee", "at_least_once"), ("reason", "confirmed")]
+        ),
+        Some(1.0)
+    );
+    let local = guarantee_published(Some(SinkConfirmation::Local)).await;
+    assert_eq!(
+        local.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "at_least_once_local"),
+                ("reason", "sink_confirms_locally")
+            ]
+        ),
+        Some(1.0)
+    );
+}
+
+/// With neither a sender nor a declared confirmation, the sink's `Ok` proves
+/// nothing and nothing screens the blocks: best effort.
+#[cfg(feature = "metrics")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_pipeline_that_declares_nothing_reports_best_effort() {
+    let undeclared = guarantee_published(None).await;
+    assert_eq!(
+        undeclared.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "best_effort"),
+                ("reason", "sink_cannot_confirm")
+            ]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        undeclared.gauge(
+            "pipeline_delivery_guarantee",
+            &[("guarantee", "at_least_once")]
+        ),
+        None
+    );
+}
+
+/// The labels of the `pipeline_delivery_guarantee` series a remote-confirming
+/// pull pipeline publishes, named `listener` or not named at all.
+#[cfg(feature = "metrics")]
+async fn guarantee_series(listener: Option<&str>) -> Vec<Vec<(String, String)>> {
+    let capture = GaugeCapture::default();
+    let _recorder = metrics::set_default_local_recorder(&capture);
+    let source = HeldSource::new(AckKind::Pull, Vec::new());
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let engine = default_engine();
+    let pipeline = engine
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .sink_confirms(SinkConfirmation::Remote);
+    let pipeline = match listener {
+        Some(name) => pipeline.listener(name),
+        None => pipeline,
+    };
+    pipeline
+        .run(
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("clean shutdown");
+    capture.gauge_series("pipeline_delivery_guarantee")
+}
+
+/// A pipeline named with `.listener` publishes its guarantee under that
+/// label and no unlabelled series beside it; one not named publishes the
+/// unlabelled series as before.
+#[cfg(feature = "metrics")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_pipeline_named_for_its_listener_labels_its_guarantee() {
+    let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+    assert_eq!(
+        guarantee_series(Some("syslog")).await,
+        vec![vec![
+            pair("guarantee", "at_least_once"),
+            pair("listener", "syslog"),
+            pair("reason", "confirmed"),
+        ]]
+    );
+    assert_eq!(
+        guarantee_series(None).await,
+        vec![vec![
+            pair("guarantee", "at_least_once"),
+            pair("reason", "confirmed"),
+        ]]
+    );
+}
+
+/// An app with a source and sink pair per listener publishes one series per
+/// listener, told apart by the `listener` label.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_guarantee_published_for_a_listener_carries_its_name() {
+    use crate::transport::ack::EffectiveGuarantee;
+
+    let capture = GaugeCapture::default();
+    let _recorder = metrics::set_default_local_recorder(&capture);
+    let source = HeldSource::new(AckKind::Pull, Vec::new());
+    EffectiveGuarantee::of(source.ack_control(), SinkConfirmation::Remote).publish_for("syslog");
+    EffectiveGuarantee::of(None, SinkConfirmation::Remote).publish_for("netflow");
+
+    assert_eq!(
+        capture.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "at_least_once"),
+                ("reason", "confirmed"),
+                ("listener", "syslog")
+            ]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        capture.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "best_effort"),
+                ("reason", "source_cannot_ack"),
+                ("listener", "netflow")
+            ]
+        ),
+        Some(1.0)
+    );
+}
+
+#[tokio::test]
+async fn acknowledgements_disabled_releases_at_receipt() {
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1]]).acks_disabled();
+    let shutdown = CancellationToken::new();
+    let commits_at_sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&commits_at_sink);
+    let commits = Arc::clone(&source.commits);
+    let stop = shutdown.clone();
+
+    default_engine()
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .run(
+            |batch| Ok(batch),
+            move |_out: &WorkBatch<_>| {
+                seen.lock().extend(commits.lock().iter().copied());
+                stop.cancel();
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect("clean shutdown");
+
+    assert!(!source.control.is_armed(), "a disabled source is not armed");
+    assert_eq!(
+        *commits_at_sink.lock(),
+        vec![0, 1],
+        "committed before the sink ran"
+    );
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1], DeliveryStatus::Delivered)],
+        "released once, at receipt"
+    );
+}
+
+/// A gauge value captured by a local recorder, keyed by name and labels.
+#[cfg(feature = "metrics")]
+#[derive(Default)]
+struct GaugeCapture {
+    gauges: std::sync::Mutex<std::collections::HashMap<metrics::Key, Arc<AtomicU64>>>,
+    counters: std::sync::Mutex<std::collections::HashMap<metrics::Key, Arc<AtomicU64>>>,
+}
+
+#[cfg(feature = "metrics")]
+impl GaugeCapture {
+    fn gauge(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        self.gauges
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .find(|(key, _)| key.name() == name && has_labels(key, labels))
+            .map(|(_, cell)| f64::from_bits(cell.load(Ordering::Acquire)))
+    }
+
+    /// The labels of every gauge series named `name`, each sorted by key.
+    fn gauge_series(&self, name: &str) -> Vec<Vec<(String, String)>> {
+        self.gauges
+            .lock()
+            .expect("capture lock")
+            .keys()
+            .filter(|key| key.name() == name)
+            .map(|key| {
+                let mut labels: Vec<(String, String)> = key
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                labels
+            })
+            .collect()
+    }
+
+    fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        self.counters
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(key, _)| key.name() == name && has_labels(key, labels))
+            .map(|(_, cell)| cell.load(Ordering::Acquire))
+            .sum()
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn has_labels(key: &metrics::Key, labels: &[(&str, &str)]) -> bool {
+    labels
+        .iter()
+        .all(|(k, v)| key.labels().any(|l| l.key() == *k && l.value() == *v))
+}
+
+#[cfg(feature = "metrics")]
+impl metrics::Recorder for GaugeCapture {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        let cell = Arc::clone(
+            self.counters
+                .lock()
+                .expect("capture lock")
+                .entry(key.clone())
+                .or_default(),
+        );
+        metrics::Counter::from_arc(cell)
+    }
+
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        let cell = Arc::clone(
+            self.gauges
+                .lock()
+                .expect("capture lock")
+                .entry(key.clone())
+                .or_default(),
+        );
+        metrics::Gauge::from_arc(cell)
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+#[cfg(all(feature = "metrics", feature = "transport-pipe"))]
+#[tokio::test(flavor = "current_thread")]
+async fn effective_guarantee_reports_best_effort_for_a_pipe_source() {
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let source = crate::transport::pipe::PipeTransport::new(
+        &crate::transport::pipe::PipeTransportConfig::default(),
+    );
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    default_engine()
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .sink_confirms(SinkConfirmation::Remote)
+        .run(
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("clean shutdown");
+
+    assert_eq!(
+        capture.gauge(
+            "pipeline_delivery_guarantee",
+            &[
+                ("guarantee", "best_effort"),
+                ("reason", "source_cannot_ack")
+            ]
+        ),
+        Some(1.0),
+        "a pipe has no acknowledgement to hold, whatever the sink confirms"
+    );
+}
+
+#[cfg(all(
+    feature = "metrics",
+    feature = "transport-kafka",
+    feature = "transport-grpc"
+))]
+#[tokio::test(flavor = "current_thread")]
+async fn effective_guarantee_reports_at_least_once_for_kafka_to_grpc() {
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    // No topics: a broker-free consumer, built without a subscribe.
+    let source = crate::transport::kafka::KafkaTransport::new(
+        &crate::transport::kafka::KafkaConfig::for_testing(
+            "localhost:9092",
+            "ack-test",
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("broker-free kafka transport");
+    // A lazily dialled client: nothing is sent, so no server is needed.
+    let sink = crate::transport::grpc::GrpcTransport::new(
+        &crate::transport::grpc::GrpcConfig::client("http://127.0.0.1:1"),
+    )
+    .await
+    .expect("grpc client");
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    // The gRPC client confirms Remote: the next hop answers only once it holds the records.
+    default_engine()
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .sender(&sink)
+        .run(
+            |batch| Ok(batch),
+            |_out: &WorkBatch<_>| std::future::ready(Ok(())),
+        )
+        .await
+        .expect("clean shutdown");
+
+    assert_eq!(
+        capture.gauge(
+            "pipeline_delivery_guarantee",
+            &[("guarantee", "at_least_once"), ("reason", "confirmed")]
+        ),
+        Some(1.0)
+    );
+}
+
+/// The producer ceiling of [`small_ceiling_kafka_sender`].
+#[cfg(feature = "transport-kafka")]
+const SMALL_CEILING: usize = 2_000_000;
+
+/// A broker-free Kafka sender whose producer refuses records over
+/// [`SMALL_CEILING`] bytes.
+#[cfg(feature = "transport-kafka")]
+async fn small_ceiling_kafka_sender() -> crate::transport::kafka::KafkaTransport {
+    let mut config =
+        crate::transport::kafka::KafkaConfig::for_testing("localhost:9092", "ack-test", Vec::new());
+    config.sizing.producer.message_max_bytes =
+        Some(i32::try_from(SMALL_CEILING).expect("fits an i32"));
+    crate::transport::kafka::KafkaTransport::new(&config)
+        .await
+        .expect("broker-free kafka transport")
+}
+
+/// A `process` that grows the record with seq 1 past [`SMALL_CEILING`].
+#[cfg(feature = "transport-kafka")]
+#[allow(clippy::unnecessary_wraps)] // the run loops' process returns a Result
+fn grow_seq_one_past_the_ceiling(
+    batch: WorkBatch<crate::transport::memory::MemoryToken>,
+) -> Result<WorkBatch<crate::transport::memory::MemoryToken>, EngineError> {
+    Ok(batch.map_records(|records| {
+        records
+            .into_iter()
+            .map(|mut record| {
+                if record.payload.as_ref() == br#"{"seq":1}"# {
+                    record.payload = Bytes::from(vec![b'x'; SMALL_CEILING + 1]);
+                }
+                record
+            })
+            .collect()
+    }))
+}
+
+#[cfg(all(feature = "metrics", feature = "transport-kafka"))]
+#[tokio::test(flavor = "current_thread")]
+async fn an_oversize_record_is_dropped_and_counted_never_delivered() {
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let sender = small_ceiling_kafka_sender().await;
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&sunk);
+    let stop = shutdown.clone();
+
+    default_engine()
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .sender(&sender)
+        .run(grow_seq_one_past_the_ceiling, move |out: &WorkBatch<_>| {
+            seen.lock()
+                .extend(out.records.iter().map(|r| r.payload.len()));
+            stop.cancel();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("clean shutdown");
+
+    // One lock: a second in the failure message would deadlock on the first.
+    let sunk = sunk.lock().clone();
+    assert_eq!(
+        sunk.len(),
+        2,
+        "the two good records reach the sink, the oversize one never does: {sunk:?}"
+    );
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Dropped)],
+        "with no DLQ the block releases Dropped, never Delivered"
+    );
+    assert_eq!(
+        capture.counter(
+            "pipeline_dead_letters_dropped_total",
+            &[("reason", "too_large")]
+        ),
+        1
+    );
+}
+
+/// A routed sender answers the screen for the route each record's key selects,
+/// so its Kafka route's ceiling reaches the pipeline. The default route has no
+/// ceiling, so a key the routed sender ignored would send the record.
+#[cfg(all(feature = "metrics", feature = "transport-kafka"))]
+#[tokio::test(flavor = "current_thread")]
+async fn an_oversize_record_through_a_routed_sender_is_screened_by_its_route() {
+    use crate::transport::factory::AnySender;
+    use crate::transport::routed::RoutedSender;
+
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let routes = std::collections::HashMap::from([(
+        "events.land".to_string(),
+        AnySender::Kafka(small_ceiling_kafka_sender().await),
+    )]);
+    let sender = RoutedSender::new(routes, Some(AnySender::Memory(mem_transport(50))));
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&sunk);
+    let stop = shutdown.clone();
+
+    default_engine()
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .sender(&sender)
+        .run(
+            |batch| {
+                let grown = grow_seq_one_past_the_ceiling(batch)?;
+                Ok(grown.map_records(|records| {
+                    records
+                        .into_iter()
+                        .map(|mut record| {
+                            record.key = Some(Arc::from("events.land"));
+                            record
+                        })
+                        .collect()
+                }))
+            },
+            move |out: &WorkBatch<_>| {
+                seen.lock()
+                    .extend(out.records.iter().map(|r| r.payload.len()));
+                stop.cancel();
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect("clean shutdown");
+
+    // One lock: a second in the failure message would deadlock on the first.
+    let sunk = sunk.lock().clone();
+    assert_eq!(
+        sunk.len(),
+        2,
+        "the oversize record never reaches the sink: {sunk:?}"
+    );
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Dropped)]
+    );
+    assert_eq!(
+        capture.counter(
+            "pipeline_dead_letters_dropped_total",
+            &[("reason", "too_large")]
+        ),
+        1
+    );
+}
+
+/// A gRPC `send_batch` outside the pipeline leaves a record over its ceiling
+/// out of a block it otherwise sends: that record is dropped, so it counts
+/// with the dropped dead letters. A block of nothing but such records is
+/// answered `FilteredDlq`, which every caller takes as handled, so those
+/// count too.
+#[cfg(all(feature = "metrics", feature = "transport-grpc"))]
+#[tokio::test(flavor = "current_thread")]
+async fn a_record_grpc_send_batch_leaves_out_counts_as_a_dropped_dead_letter() {
+    use crate::transport::grpc::{GrpcConfig, GrpcTransport};
+    use crate::transport::{SendResult, TransportSender};
+
+    const LIMIT: usize = 1024;
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let server =
+        GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0").with_max_message_size(LIMIT))
+            .await
+            .expect("server");
+    let uri = format!("http://{}", server.local_addr().expect("bound"));
+    let client = GrpcTransport::new(&GrpcConfig::client(&uri).with_max_message_size(LIMIT))
+        .await
+        .expect("client");
+    let record = |len: usize| Record {
+        payload: Bytes::from(vec![b'x'; len]),
+        key: None,
+        headers: vec![],
+        metadata: RecordMeta {
+            timestamp_ms: None,
+            format: PayloadFormat::Json,
+        },
+    };
+    let dropped = || {
+        capture.counter(
+            "pipeline_dead_letters_dropped_total",
+            &[("reason", "too_large")],
+        )
+    };
+
+    let sent = client
+        .send_batch(&[record(10), record(LIMIT), record(10)])
+        .await;
+    assert!(matches!(sent, SendResult::Ok), "{sent:?}");
+    let received = server.recv(10).await.expect("recv").records.len();
+    assert_eq!(received, 2, "the two records within the ceiling arrive");
+    assert_eq!(dropped(), 1, "the one left out is counted dropped");
+
+    let refused = client.send_batch(&[record(LIMIT), record(LIMIT)]).await;
+    assert!(refused.is_filtered_dlq(), "{refused:?}");
+    assert_eq!(
+        dropped(),
+        3,
+        "a block left out whole counts each record it drops"
+    );
+}
+
+/// An armed gRPC server whose receive queue has no room refuses a push with
+/// `ResourceExhausted` and counts it as refused, reason `full`.
+#[cfg(all(feature = "metrics", feature = "transport-grpc"))]
+#[tokio::test(flavor = "current_thread")]
+async fn a_held_push_refused_by_a_full_queue_is_counted() {
+    use crate::transport::grpc::{GrpcConfig, GrpcTransport};
+    use crate::transport::{SendResult, TransportSender};
+
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let mut config = GrpcConfig::server("127.0.0.1:0");
+    config.recv_buffer_size = 1;
+    let server = GrpcTransport::builder(&config)
+        .armed(true)
+        .start()
+        .await
+        .expect("server");
+    let uri = format!("http://{}", server.local_addr().expect("bound"));
+    let client = Arc::new(
+        GrpcTransport::new(&GrpcConfig::client(&uri))
+            .await
+            .expect("client"),
+    );
+
+    // Held, and never taken by recv, so it fills the one-slot queue.
+    let first = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            client
+                .send("main", Bytes::from_static(b"{\"first\":1}"))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.ack_control().expect("held").held().count == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first push is held");
+
+    let refused = client
+        .send("main", Bytes::from_static(b"{\"second\":1}"))
+        .await;
+    assert!(matches!(refused, SendResult::Backpressured), "{refused:?}");
+    assert_eq!(
+        capture.counter(
+            "transport_ack_refused_total",
+            &[("transport", "grpc"), ("reason", "full")]
+        ),
+        1
+    );
+    drop(server);
+    let _ = first.await;
+}
+
+/// A file DLQ writing under `dir/svc`.
+#[cfg(feature = "dlq")]
+fn file_dlq(dir: &std::path::Path, shutdown: &CancellationToken) -> Arc<crate::dlq::Dlq> {
+    let config = crate::dlq::DlqConfig {
+        file: crate::dlq::FileDlqConfig {
+            enabled: true,
+            path: dir.to_path_buf(),
+            rotation: crate::dlq::RotationPeriod::Daily,
+            max_age_days: 1,
+            compress_rotated: false,
+        },
+        mode: crate::dlq::DlqMode::FileOnly,
+        queue_capacity: 64,
+        batch_size: 16,
+        flush_interval_ms: 20,
+        ..crate::dlq::DlqConfig::default()
+    };
+    Arc::new(crate::dlq::Dlq::spawn(&config, "svc", None, shutdown.clone()).expect("spawn dlq"))
+}
+
+/// Dead letters the file DLQ under `dir` holds.
+#[cfg(feature = "dlq")]
+async fn dlq_lines(dir: &std::path::Path) -> usize {
+    tokio::fs::read_to_string(dir.join("svc/dlq.ndjson"))
+        .await
+        .map_or(0, |body| body.lines().count())
+}
+
+/// A `process` that dead-letters the record with seq 1.
+#[cfg(feature = "dlq")]
+#[allow(clippy::unnecessary_wraps)] // the run loops' process returns a Result
+fn dead_letter_seq_one(
+    batch: WorkBatch<crate::transport::memory::MemoryToken>,
+) -> Result<WorkBatch<crate::transport::memory::MemoryToken>, EngineError> {
+    let mut dead = Vec::new();
+    let batch = batch.map_records(|records| {
+        records
+            .into_iter()
+            .filter_map(|record| {
+                if record.payload.as_ref() == br#"{"seq":1}"# {
+                    dead.push(crate::transport::filter::FilteredDlqEntry {
+                        payload: record.payload.to_vec(),
+                        key: record.key.clone(),
+                        reason: "poison".into(),
+                    });
+                    None
+                } else {
+                    Some(record)
+                }
+            })
+            .collect()
+    });
+    Ok(batch.with_dlq_entries(dead))
+}
+
+/// A DLQ write that fails is retried with the block held, never released
+/// `Errored` while the loop runs: once the DLQ takes it, the block releases
+/// `Rejected`.
+#[cfg(feature = "dlq")]
+#[tokio::test]
+async fn a_refused_dlq_write_is_retried_with_the_block_held() {
+    let refusing = tempfile::tempdir().expect("tempdir");
+    let dlq_shutdown = CancellationToken::new();
+    let dlq = file_dlq(refusing.path(), &dlq_shutdown);
+    let svc = refusing.path().join("svc");
+    tokio::fs::remove_dir_all(&svc)
+        .await
+        .expect("remove dlq dir");
+    tokio::fs::write(&svc, b"not a directory")
+        .await
+        .expect("plant file");
+    let mended = svc.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::fs::remove_file(&mended)
+            .await
+            .expect("remove planted file");
+        tokio::fs::create_dir(&mended)
+            .await
+            .expect("recreate dlq dir");
+    });
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        default_engine()
+            .with_dlq(dlq)
+            .pipeline(&source)
+            .shutdown(shutdown)
+            .run(dead_letter_seq_one, move |_out: &WorkBatch<_>| {
+                stop.cancel();
+                std::future::ready(Ok(()))
+            }),
+    )
+    .await
+    .expect("the DLQ recovers inside the wait")
+    .expect("clean shutdown");
+
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Rejected)],
+        "held through the refusals, released once the DLQ holds it"
+    );
+    assert_eq!(dlq_lines(refusing.path()).await, 1);
+    dlq_shutdown.cancel();
+}
+
+/// An entry no DLQ backend can ever hold is dropped and counted, not retried:
+/// a Kafka-only DLQ whose ceiling the base64 entry is over.
+#[cfg(all(feature = "dlq-kafka", feature = "metrics"))]
+#[tokio::test(flavor = "current_thread")]
+async fn a_dead_letter_no_dlq_backend_can_hold_is_dropped_and_counted() {
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let mut kafka =
+        crate::transport::kafka::KafkaConfig::for_testing("127.0.0.1:1", "", Vec::new());
+    kafka.sizing.producer.message_max_bytes =
+        Some(i32::try_from(SMALL_CEILING).expect("fits an i32"));
+    let config = crate::dlq::DlqConfig {
+        mode: crate::dlq::DlqMode::KafkaOnly,
+        file: crate::dlq::FileDlqConfig {
+            enabled: false,
+            ..crate::dlq::FileDlqConfig::default()
+        },
+        kafka: crate::dlq::KafkaDlqConfig {
+            enabled: true,
+            ..crate::dlq::KafkaDlqConfig::default()
+        },
+        ..crate::dlq::DlqConfig::default()
+    };
+    let dlq_shutdown = CancellationToken::new();
+    let dlq = crate::dlq::Dlq::spawn(&config, "svc", Some(&kafka), dlq_shutdown.clone())
+        .expect("spawn dlq");
+    let sender = small_ceiling_kafka_sender().await;
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        default_engine()
+            .with_dlq(Arc::new(dlq))
+            .pipeline(&source)
+            .shutdown(shutdown)
+            .sender(&sender)
+            .run(grow_seq_one_past_the_ceiling, move |_out: &WorkBatch<_>| {
+                stop.cancel();
+                std::future::ready(Ok(()))
+            }),
+    )
+    .await
+    .expect("a refusal is not retried")
+    .expect("clean shutdown");
+
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Dropped)]
+    );
+    assert_eq!(
+        capture.counter(
+            "pipeline_dead_letters_dropped_total",
+            &[("reason", "too_large")]
+        ),
+        1
+    );
+    dlq_shutdown.cancel();
+}
+
+#[cfg(feature = "dlq")]
+#[tokio::test]
+async fn dlq_routed_record_releases_after_the_dlq_confirms() {
+    let dlq_shutdown = CancellationToken::new();
+
+    // A DLQ that takes it: released Rejected once the write is confirmed.
+    let holding = tempfile::tempdir().expect("tempdir");
+    let dlq = file_dlq(holding.path(), &dlq_shutdown);
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+
+    default_engine()
+        .with_dlq(dlq)
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .run(dead_letter_seq_one, move |_out: &WorkBatch<_>| {
+            stop.cancel();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("clean shutdown");
+
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Rejected)]
+    );
+    assert_eq!(*source.commits.lock(), vec![0, 1, 2]);
+    assert_eq!(
+        dlq_lines(holding.path()).await,
+        1,
+        "the dead letter is in the DLQ"
+    );
+    dlq_shutdown.cancel();
+}
+
+/// A disabled DLQ drops every dead letter: the block releases `Dropped`, and
+/// each counts in the pipeline's dropped counter as well as the DLQ's own.
+#[cfg(all(feature = "dlq", feature = "metrics"))]
+#[tokio::test(flavor = "current_thread")]
+async fn a_disabled_dlq_counts_each_dead_letter_it_drops() {
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let dlq = Arc::new(crate::dlq::Dlq::disabled());
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+
+    default_engine()
+        .with_dlq(Arc::clone(&dlq))
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .run(dead_letter_seq_one, move |_out: &WorkBatch<_>| {
+            stop.cancel();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("clean shutdown");
+
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Dropped)]
+    );
+    assert_eq!(
+        capture.counter(
+            "pipeline_dead_letters_dropped_total",
+            &[("reason", "dead_letter")]
+        ),
+        1
+    );
+    assert_eq!(dlq.dropped(), 1, "the DLQ counts it too");
+}
+
+#[cfg(all(feature = "dlq", feature = "transport-kafka"))]
+#[tokio::test]
+async fn an_oversize_record_reaches_the_dlq_never_delivered() {
+    let sender = small_ceiling_kafka_sender().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dlq_shutdown = CancellationToken::new();
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let sunk = Arc::new(parking_lot::Mutex::new(0_usize));
+    let seen = Arc::clone(&sunk);
+    let stop = shutdown.clone();
+
+    default_engine()
+        .with_dlq(file_dlq(dir.path(), &dlq_shutdown))
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .sender(&sender)
+        .run(grow_seq_one_past_the_ceiling, move |out: &WorkBatch<_>| {
+            *seen.lock() += out.records.len();
+            stop.cancel();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("clean shutdown");
+
+    assert_eq!(*sunk.lock(), 2, "only the two good records reach the sink");
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Rejected)],
+        "released once the DLQ holds the oversize record, never Delivered"
+    );
+    assert_eq!(dlq_lines(dir.path()).await, 1);
+    dlq_shutdown.cancel();
+}

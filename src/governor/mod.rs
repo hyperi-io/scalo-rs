@@ -60,6 +60,6 @@ pub use gate::{Admit, GateActuator, InboundGate, NoopActuator, ObservingActuator
 pub use rate_limit::{RateLimitConfig, RateLimiter};
 pub use runtime::SelfRegulationGovernor;
 pub use source::{
-    Hysteresis, MemoryPressureSource, Pressure, PressureSource, UnifiedPressure,
+    AckHeldSource, Hysteresis, MemoryPressureSource, Pressure, PressureSource, UnifiedPressure,
     UnifiedPressureSnapshot,
 };

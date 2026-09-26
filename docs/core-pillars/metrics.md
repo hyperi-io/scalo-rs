@@ -177,9 +177,27 @@ A source or sink that goes away is waited out rather than ending the app, and th
 |---|---|---|
 | `transport_recv_errors_total` | `transport`, `class` | receive failures; `class="transient"` were retried, `class="permanent"` were returned. Kafka emits it |
 | `transport_commit_errors_total` | `transport` | source commits that failed after the block was delivered; the `BatchEngine` driver counts them and carries on |
-| `pipeline_retries_total` | `stage` | `BatchEngine` run-loop steps retried after a transient failure, `stage` being `recv` or `sink` |
+| `pipeline_retries_total` | `stage` | `BatchEngine` run-loop steps retried after a transient failure, `stage` being `recv`, `sink`, or `dlq` for the pipeline's DLQ writes |
+| `transport_redelivered_total` | `transport`, `reason` | sends retried after an outcome the receiver may still deliver, so possible duplicates: `reason="hold_expired"` when a held response ran out of budget, `reason="deadline"` when the send's deadline passed. gRPC emits it |
 
 A rising `transport_recv_errors_total{class="transient"}` or `pipeline_retries_total` with flat throughput is an outage being ridden out. Behaviour per backend: [../transport/backends.md](../transport/backends.md).
+
+### Acknowledgements
+
+What a source holds until delivery, and the guarantee the pipeline gives ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md)):
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `pipeline_delivery_guarantee` | `guarantee`, `reason`, optional `listener` | 1 for the guarantee the pipeline gives: `at_least_once`, `at_least_once_local` or `best_effort`, and why. `listener` names the listener when an app publishes one series per listener: a pipeline built with `.listener(name)`, or `EffectiveGuarantee::publish_for` |
+| `pipeline_dead_letters_dropped_total` | `reason` | dead letters dropped with nowhere to go: the pipeline has no DLQ or a disabled one, a gRPC `send_batch` left a record over its size ceiling out of a block, or an app dropped a record a downstream peer refused for good. `reason` is `too_large`, `outbound_filter`, `dead_letter` for one an inbound filter or `process` produced, or `rejected` (`transport::DEAD_LETTER_REJECTED`) for one a downstream peer refused for good, such as a Vector-compat source answering `DataLoss`, `InvalidArgument` or `OutOfRange` |
+| `transport_ack_held` / `transport_ack_held_bytes` | `transport` | records and payload bytes whose acknowledgement is held |
+| `transport_ack_withheld` | `transport` | Kafka offsets released `Errored` and still held. Each pins its partition's commit until a restart or a revoke, so alert on it staying above 0 |
+| `transport_ack_released_total` | `transport`, `outcome` | releases, by merged status: records for Kafka, requests for gRPC and `Tickets` |
+| `transport_ack_latency_seconds` | `transport`, `outcome` | receipt to release |
+| `transport_ack_refused_total` | `transport`, `reason` | requests refused before their acknowledgement was held |
+| `transport_redelivered_total` | `transport`, `reason` | sends retried after the receiver may already have taken them |
+
+Kafka emits the `transport_ack_*` series once armed. An armed gRPC server emits them with `transport="grpc"`, one count per request, from admission to answer. Its outcomes and refusal reasons are in [../transport/backends.md](../transport/backends.md#held-responses). `Tickets` emits them for an app's own listener, under the name it was given.
 
 ---
 
@@ -191,7 +209,7 @@ A rising `transport_recv_errors_total{class="transient"}` or `pipeline_retries_t
 | `/metrics/manifest` | JSON catalogue |
 | `/livez` | `{"status":"alive"}` -- process alive |
 | `/readyz` | 200 if readiness callback + [`HealthRegistry`](health.md) both pass, else 503 |
-| `/scaling/pressure` | Float `0.0-1.0` (feature `scaling` + `set_scaling_pressure`) |
+| `/scaling/pressure` | Float `0.00-100.00` (feature `scaling` + `set_scaling_pressure`) |
 | `/memory/pressure` | JSON ratio + bytes (feature `memory` + `set_memory_guard`) |
 
 `/metrics/manifest` is matched before `/metrics` in the prefix-match handler --

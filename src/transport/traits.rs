@@ -6,8 +6,10 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
+use super::ack::{AckControl, DeadLetterReason, SinkConfirmation};
 use super::error::{TransportError, TransportResult};
 use super::filter::FilteredDlqEntry;
+use super::finalizer::DeliveryStatus;
 use super::types::{Message, SendResult};
 use super::work_batch::{Record, WorkBatch};
 use std::fmt::{Debug, Display};
@@ -242,6 +244,29 @@ pub trait TransportSender: TransportBase {
             SendResult::Ok
         }
     }
+
+    /// What this sender's `Ok` proves about delivery.
+    ///
+    /// Drives the `pipeline_delivery_guarantee` metric only: a sink that
+    /// cannot confirm still counts its `Ok` as delivered. The default is
+    /// [`SinkConfirmation::None`]; Kafka and gRPC confirm
+    /// [`Remote`](SinkConfirmation::Remote).
+    fn confirms_delivery(&self) -> SinkConfirmation {
+        SinkConfirmation::None
+    }
+
+    /// Why this sender would dead-letter `record` instead of sending it, or
+    /// `None` when it would send it or drop it by policy.
+    ///
+    /// A sender answers such a record `FilteredDlq` without writing it
+    /// anywhere, and `send_batch` counts it handled, so a caller that holds a
+    /// source acknowledgement screens the block first and routes these to its
+    /// DLQ. Kafka names a record over `message.max.bytes` and an outbound `dlq`
+    /// filter match. The default names none.
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        let _ = record;
+        None
+    }
 }
 
 /// Limits for a single byte-aware [`TransportReceiver::recv_limited`] poll.
@@ -357,6 +382,60 @@ pub trait TransportReceiver: TransportBase {
     /// - File: advances read position
     /// - Memory: advances internal sequence
     fn commit(&self, tokens: &[Self::Token]) -> impl Future<Output = TransportResult<()>> + Send;
+
+    /// The source's acknowledgement controls, or `None` for a source with no
+    /// acknowledgement to hold (pipe, memory).
+    ///
+    /// See [`super::ack`]. The default is `None`.
+    fn ack_control(&self) -> Option<&dyn AckControl> {
+        None
+    }
+
+    /// Release the source acknowledgement of `tokens` with the merged status of
+    /// every piece built from them.
+    ///
+    /// `Delivered`, `Dropped` and `Rejected` release it; `Errored` withholds it
+    /// so the records are delivered again. The default commits when
+    /// [`DeliveryStatus::should_commit`] holds and does nothing otherwise. A
+    /// push source answers its held senders here.
+    ///
+    /// # One poll from a drop (REQUIRED of implementors)
+    ///
+    /// A block abandoned by a panic or a dropped future is released `Errored`
+    /// from a `Drop`, which cannot await, so that future is polled ONCE and
+    /// then dropped. An `Errored` release must do its work before its first
+    /// `.await`: the in-tree push sources answer their senders synchronously,
+    /// and Kafka records the withheld offsets synchronously. A release that
+    /// returns `Pending` on its first poll is not driven further from a drop:
+    /// the block stays unreleased, logged at WARN, and a push sender waits out
+    /// its hold budget.
+    ///
+    /// # Errors
+    ///
+    /// The commit's error.
+    fn release(
+        &self,
+        tokens: &[Self::Token],
+        outcome: DeliveryStatus,
+    ) -> impl Future<Output = TransportResult<()>> + Send {
+        async move {
+            if outcome.should_commit() {
+                self.commit(tokens).await
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The earliest instant by which `tokens` must be released, or `None` when
+    /// nothing waits on them (a pull source).
+    ///
+    /// A push source returns its held senders' deadline, so a caller abandons a
+    /// block it cannot deliver in time and releases it `Errored`.
+    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<std::time::Instant> {
+        let _ = tokens;
+        None
+    }
 }
 
 /// Combined transport -- implements both send and receive.

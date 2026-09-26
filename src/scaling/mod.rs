@@ -16,18 +16,25 @@
 //! ## Architecture
 //!
 //! ```text
-//! App signals --> ScalingPressure --> {prefix}_scaling_pressure gauge
+//! App signals --> ScalingPressure::calculate() --> GET /scaling/pressure
 //!                  |- Gate: circuit breaker open -> 0.0
 //!                  |- Gate: memory >= threshold -> 100.0
 //!                  `- Weighted composite -> 0.0-100.0
 //! ```
+//!
+//! `MetricsManager` serves `calculate()` as plain text at `/scaling/pressure`
+//! once a pressure is attached with `set_scaling_pressure`, which
+//! `ServiceRuntime` does. Nothing copies it into the `scaling_pressure` gauge:
+//! an app that scales on the gauge sets it itself, with
+//! `ServiceMetrics::scaling_pressure(pressure.calculate())`.
 //!
 //! ## Usage
 //!
 //! 1. Define components with weights and saturation points
 //! 2. Create `ScalingPressure` with base config + components
 //! 3. Update component values from your pipeline (lock-free)
-//! 4. Call `calculate()` when rendering Prometheus metrics
+//! 4. Attach it to the `MetricsManager`, and call `calculate()` wherever a
+//!    value is wanted: the endpoint, or the gauge
 //!
 //! ```rust
 //! use scalo::scaling::{ScalingPressure, ScalingPressureConfig, ScalingComponent};
@@ -57,7 +64,8 @@
 //! CPU utilisation). Configure both triggers independently in your
 //! KEDA `ScaledObject`:
 //!
-//! - `scaling_pressure` gauge -> Prometheus scaler (app-level signals)
+//! - `scaling_pressure` gauge, set by the app -> Prometheus scaler
+//!   (app-level signals)
 //! - CPU utilisation -> CPU scaler (container-level, via metrics-server)
 //!
 //! KEDA scales to the MAX of all triggers.

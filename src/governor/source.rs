@@ -9,7 +9,7 @@
 //! Pressure seam: normalised readings, sources, and the unified latch.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::memory::MemoryGuard;
 
@@ -93,6 +93,43 @@ impl PressureSource for MemoryPressureSource {
 
     fn weight(&self) -> f64 {
         1.0
+    }
+
+    fn is_hard(&self) -> bool {
+        true
+    }
+}
+
+/// HARD pressure source over the bytes a push source holds unanswered, read
+/// as a fraction of its held-byte ceiling.
+///
+/// On the shared [`UnifiedPressure`] it arms the same latch that pauses Kafka
+/// partitions and refuses pushes, so held responses and memory brake through
+/// one gate. A gRPC receive server built with a governor attaches one itself.
+pub struct AckHeldSource {
+    held: Arc<AtomicU64>,
+    ceiling: u64,
+}
+
+impl AckHeldSource {
+    /// Read `held` bytes against `ceiling`. A zero ceiling reads full as soon
+    /// as anything is held.
+    #[must_use]
+    pub fn new(held: Arc<AtomicU64>, ceiling: u64) -> Self {
+        Self {
+            held,
+            ceiling: ceiling.max(1),
+        }
+    }
+}
+
+impl PressureSource for AckHeldSource {
+    fn name(&self) -> &'static str {
+        "ack_held"
+    }
+
+    fn sample(&self) -> Pressure {
+        Pressure::new(self.held.load(Ordering::Relaxed) as f64 / self.ceiling as f64)
     }
 
     fn is_hard(&self) -> bool {
@@ -190,7 +227,9 @@ pub struct UnifiedPressureSnapshot {
 /// latch state is an [`AtomicBool`] so [`should_hold`](Self::should_hold)
 /// is a cheap, `Sync` hot-path check.
 pub struct UnifiedPressure {
-    sources: Vec<Arc<dyn PressureSource>>,
+    /// Behind a lock so a source can join a latch already shared by the
+    /// transports it gates.
+    sources: parking_lot::RwLock<Vec<Arc<dyn PressureSource>>>,
     hyst: Hysteresis,
     paused: AtomicBool,
 }
@@ -200,7 +239,7 @@ impl UnifiedPressure {
     #[must_use]
     pub fn new(sources: Vec<Arc<dyn PressureSource>>, hyst: Hysteresis) -> Self {
         Self {
-            sources,
+            sources: parking_lot::RwLock::new(sources),
             hyst,
             paused: AtomicBool::new(false),
         }
@@ -213,7 +252,15 @@ impl UnifiedPressure {
     /// [`level`](Self::level) / [`should_hold`](Self::should_hold) are
     /// untouched.
     pub fn add_source(&mut self, source: Arc<dyn PressureSource>) {
-        self.sources.push(source);
+        self.sources.get_mut().push(source);
+    }
+
+    /// Add a source to a governor already shared behind an `Arc`.
+    ///
+    /// It counts from the next [`level`](Self::level) on, for every holder of
+    /// the governor.
+    pub fn attach_source(&self, source: Arc<dyn PressureSource>) {
+        self.sources.write().push(source);
     }
 
     /// Combined pressure level in `[0.0, 1.0]`.
@@ -232,7 +279,7 @@ impl UnifiedPressure {
     pub fn level(&self) -> f64 {
         let mut hard_max = 0.0_f64;
         let mut soft_max = 0.0_f64;
-        for src in &self.sources {
+        for src in self.sources.read().iter() {
             let raw = src.sample().get();
             if src.is_hard() {
                 hard_max = hard_max.max(raw);
@@ -276,10 +323,11 @@ impl UnifiedPressure {
     /// Per-source breakdown plus the combined level and latch state.
     #[must_use]
     pub fn snapshot(&self) -> UnifiedPressureSnapshot {
-        let mut readings = Vec::with_capacity(self.sources.len());
+        let sources = self.sources.read();
+        let mut readings = Vec::with_capacity(sources.len());
         let mut hard_max = 0.0_f64;
         let mut soft_max = 0.0_f64;
-        for src in &self.sources {
+        for src in sources.iter() {
             let raw = src.sample().get();
             let weight = src.weight();
             let is_hard = src.is_hard();
@@ -571,6 +619,65 @@ mod tests {
             .expect("cpu present");
         assert!(!cpu_reading.is_hard);
         assert!(approx(cpu_reading.effective, 0.20));
+    }
+
+    /// Held bytes at the ceiling arm the latch the inbound gate reads, and the
+    /// gate pauses once per edge, not once per evaluation.
+    #[test]
+    fn ack_held_source_trips_the_inbound_gate() {
+        use crate::governor::{Admit, GateActuator, InboundGate};
+        use std::sync::atomic::AtomicUsize;
+
+        struct Counting {
+            pauses: Arc<AtomicUsize>,
+            resumes: Arc<AtomicUsize>,
+        }
+        impl GateActuator for Counting {
+            fn pause(&self) {
+                self.pauses.fetch_add(1, Ordering::SeqCst);
+            }
+            fn resume(&self) {
+                self.resumes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let held = Arc::new(AtomicU64::new(0));
+        // Attached to a latch already shared, as a receive server does.
+        let pressure = Arc::new(UnifiedPressure::new(
+            Vec::new(),
+            Hysteresis::new(0.80, 0.65).expect("band"),
+        ));
+        let source = AckHeldSource::new(Arc::clone(&held), 1000);
+        assert!(source.is_hard(), "held bytes are never down-weighted");
+        pressure.attach_source(Arc::new(source));
+        let (pauses, resumes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let gate = InboundGate::new(
+            Arc::clone(&pressure),
+            Box::new(Counting {
+                pauses: Arc::clone(&pauses),
+                resumes: Arc::clone(&resumes),
+            }),
+        );
+
+        assert_eq!(gate.evaluate(), Admit::Yes, "nothing held");
+        held.store(1000, Ordering::Relaxed);
+        assert!(pressure.should_hold(), "held bytes at the ceiling hold");
+        assert_eq!(gate.evaluate(), Admit::Hold);
+        assert_eq!(gate.evaluate(), Admit::Hold);
+        assert_eq!(pauses.load(Ordering::SeqCst), 1, "one pause per edge");
+
+        held.store(700, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Hold, "0.70 is inside the band");
+        held.store(500, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Yes);
+        assert_eq!(gate.evaluate(), Admit::Yes);
+        assert_eq!(resumes.load(Ordering::SeqCst), 1, "one resume per edge");
+
+        held.store(1, Ordering::Relaxed);
+        assert!(
+            approx(AckHeldSource::new(held, 0).sample().get(), 1.0),
+            "a zero ceiling reads full once anything is held"
+        );
     }
 
     #[test]
