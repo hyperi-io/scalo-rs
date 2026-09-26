@@ -133,6 +133,13 @@ impl TieredSinkConfig {
     }
 
     /// Set the corrupt-cache recovery policy (see [`on_corruption`](Self::on_corruption)).
+    ///
+    /// ```
+    /// use scalo::tiered_sink::{CorruptionPolicy, TieredSinkConfig};
+    ///
+    /// let config = TieredSinkConfig::new("/var/spool/app").on_corruption(CorruptionPolicy::Quarantine);
+    /// assert!(matches!(config.on_corruption, CorruptionPolicy::Quarantine));
+    /// ```
     #[must_use]
     pub fn on_corruption(mut self, policy: CorruptionPolicy) -> Self {
         self.on_corruption = policy;
