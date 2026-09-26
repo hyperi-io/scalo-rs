@@ -73,6 +73,8 @@ mod tiered;
 pub use circuit::{CircuitBreaker, CircuitState};
 pub use codec::CompressionCodec;
 pub use config::{DiskAwareConfig, DrainStrategy, OrderingMode, TieredSinkConfig, WhenFull};
+// The config's public field and builder take it, and `spool` may be off.
+pub use crate::spool_codec::CorruptionPolicy;
 pub use error::TieredSinkError;
 pub use tiered::TieredSink;
 
