@@ -6,7 +6,7 @@
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 
-[build]
+[target.'cfg(all())']
 rustflags = ["-D", "warnings"]
 
 [alias]
