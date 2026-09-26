@@ -81,8 +81,10 @@ impl DlqBackend {
     ///   `file-rotate` exposes a sync hook.
     /// - **Kafka**: waits on the blocking pool, up to `kafka.send_timeout_ms`,
     ///   for the broker to ack every queued entry (per the producer's `acks`
-    ///   config), then purges what is left and counts the entries only Kafka
-    ///   held that the broker refused or never acked.
+    ///   config), then purges what is left. The entries only Kafka held that
+    ///   the broker refused or never acked are handed back for the drain to
+    ///   offer to the next backend in cascade mode with a backend after
+    ///   Kafka, and counted lost otherwise.
     /// - **HTTP**: no-op. `send_batch` already awaits the response.
     ///
     /// # Errors
@@ -139,6 +141,20 @@ impl DlqBackend {
             Self::Kafka(b) => b.take_durable_losses(),
             #[cfg(feature = "dlq-http")]
             Self::Http(_) => 0,
+        }
+    }
+
+    /// Entries this backend's broker never acked, grouped under the
+    /// `dlq_cascade_fallthrough_total` reason, for the drain to offer to the
+    /// backends after it. Only Kafka hands any back, and only in cascade mode.
+    #[allow(clippy::match_same_arms, reason = "only Kafka hands entries back")]
+    pub(crate) fn take_returned(&mut self) -> Vec<(&'static str, Vec<DlqEntry>)> {
+        match self {
+            Self::File(_) => Vec::new(),
+            #[cfg(feature = "dlq-kafka")]
+            Self::Kafka(b) => b.take_returned(),
+            #[cfg(feature = "dlq-http")]
+            Self::Http(_) => Vec::new(),
         }
     }
 

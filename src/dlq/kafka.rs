@@ -26,6 +26,9 @@
 //! Kafka held alone -- see `docs/pipeline/dlq.md`, "The Kafka barrier".
 //! The drain runs the same wait when it closes, because dropping the
 //! producer discards whatever it still holds.
+//!
+//! In cascade mode with a backend after Kafka, a failed delivery is not a
+//! loss: the entry is handed back for the drain to offer to that backend.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +46,25 @@ use super::error::DlqError;
 /// How long a barrier waits for the reports of the messages it purged.
 const PURGE_REPORT_WAIT: Duration = Duration::from_secs(5);
 
+/// Why the broker never acked an entry Kafka queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unacked {
+    /// The broker refused the entry.
+    DeliveryFailed,
+    /// No ack came in time, so the entry expired or was purged.
+    AckTimeout,
+}
+
+impl Unacked {
+    /// The `reason` label of `dlq_cascade_fallthrough_total`.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::DeliveryFailed => "delivery_failed",
+            Self::AckTimeout => "ack_timeout",
+        }
+    }
+}
+
 /// Kafka backend -- internal variant carried by [`super::DlqBackend::Kafka`].
 pub struct KafkaDlqInner {
     /// Shared with the blocking task a barrier waits on.
@@ -58,10 +80,12 @@ pub struct KafkaDlqInner {
     sole_custody: u64,
     /// Entries the last `send_batch` queued before it failed.
     queued_before_failure: usize,
-    /// Producer delivery failures already charged by a barrier.
-    failures_seen: u64,
-    /// Entries the last barrier found lost, until the drain takes them.
+    /// Entries lost since the drain last took them.
     durable_losses: u64,
+    /// Whether a later backend takes what the broker never acked.
+    hand_on: bool,
+    /// Entries the broker never acked, until the drain takes them to hand on.
+    returned: Vec<(Unacked, DlqEntry)>,
 }
 
 impl std::fmt::Debug for KafkaDlqInner {
@@ -86,8 +110,9 @@ impl KafkaDlqInner {
     ///
     /// Returns an error if the Kafka producer cannot be created.
     pub fn new(kafka_config: &KafkaConfig, dlq_config: &KafkaDlqConfig) -> Result<Self, DlqError> {
-        let producer = KafkaProducer::new(kafka_config, ProducerProfile::LowLatency)
-            .map_err(|e| DlqError::Kafka(format!("failed to create DLQ producer: {e}")))?;
+        let producer =
+            KafkaProducer::keeping_undelivered(kafka_config, ProducerProfile::LowLatency)
+                .map_err(|e| DlqError::Kafka(format!("failed to create DLQ producer: {e}")))?;
 
         info!(
             routing = ?dlq_config.routing,
@@ -97,7 +122,6 @@ impl KafkaDlqInner {
             "Kafka DLQ backend initialised"
         );
 
-        let failures_seen = producer.delivery_failures();
         Ok(Self {
             producer: Arc::new(producer),
             ack_wait: Duration::from_millis(dlq_config.send_timeout_ms),
@@ -108,9 +132,72 @@ impl KafkaDlqInner {
             write_errors: AtomicU64::new(0),
             sole_custody: 0,
             queued_before_failure: 0,
-            failures_seen,
             durable_losses: 0,
+            hand_on: false,
+            returned: Vec::new(),
         })
+    }
+
+    /// Hand back what the broker never acked, for the drain to offer to the
+    /// backend after this one, instead of counting it lost.
+    pub(crate) fn hand_on_unacked(&mut self) {
+        self.hand_on = true;
+    }
+
+    /// Charge the delivery failures reported since the last call to the
+    /// entries only Kafka holds: handed back when a later backend takes them,
+    /// counted lost when none does.
+    fn reap(&mut self) {
+        let undelivered = self.producer.take_undelivered();
+        let failed = undelivered.len() as u64;
+        let charged = failed.min(self.sole_custody);
+        self.sole_custody -= charged;
+        if failed > charged {
+            debug!(
+                failed,
+                charged, "Kafka lost DLQ entries another backend also holds"
+            );
+        }
+        if !self.hand_on {
+            self.durable_losses += charged;
+            return;
+        }
+        // Cascade queues nothing another backend holds, so every failure goes on: a
+        // count past custody can cost a duplicate in the next backend, never a loss.
+        if failed > charged {
+            warn!(
+                failed,
+                charged, "Kafka DLQ reported more failed deliveries than it held; handing on all"
+            );
+        }
+        for message in undelivered {
+            let cause = if message.timed_out {
+                Unacked::AckTimeout
+            } else {
+                Unacked::DeliveryFailed
+            };
+            match serde_json::from_slice::<DlqEntry>(&message.payload) {
+                Ok(entry) => self.returned.push((cause, entry)),
+                Err(e) => {
+                    warn!(error = %e, "undelivered DLQ entry does not decode; counted as dropped");
+                    self.durable_losses += 1;
+                }
+            }
+        }
+    }
+
+    /// Entries the broker never acked, grouped under the fallthrough `reason`
+    /// label of why, for the drain to offer to the next backend.
+    pub(crate) fn take_returned(&mut self) -> Vec<(&'static str, Vec<DlqEntry>)> {
+        let mut groups: Vec<(&'static str, Vec<DlqEntry>)> = Vec::new();
+        for (cause, entry) in self.returned.drain(..) {
+            let reason = cause.label();
+            match groups.iter_mut().find(|(held, _)| *held == reason) {
+                Some((_, entries)) => entries.push(entry),
+                None => groups.push((reason, vec![entry])),
+            }
+        }
+        groups
     }
 
     fn resolve_topic(&self, entry: &DlqEntry) -> String {
@@ -129,7 +216,11 @@ impl KafkaDlqInner {
     ///
     /// On `Err` the entries before the one that failed are already queued;
     /// `queued_before_failure` says how many.
+    ///
+    /// Takes the delivery failures reported since the last write first, so
+    /// the payloads they hold never outgrow what the producer had queued.
     pub async fn send_batch(&mut self, batch: &[DlqEntry]) -> Result<(), DlqError> {
+        self.reap();
         let mut queued = 0;
         let result = self.enqueue(batch, &mut queued);
         self.sole_custody += queued as u64;
@@ -169,16 +260,18 @@ impl KafkaDlqInner {
     /// Kafka holds.
     ///
     /// The wait runs on the blocking pool for up to `kafka.send_timeout_ms`.
-    /// Whatever is still unacked then is purged, which adds up to 5 s, and
-    /// counted as lost. An entry in flight to a stalled broker at the purge
-    /// can still be written, so the count can overstate the loss but never
-    /// understates it. The loss is taken by the drain through
-    /// `take_durable_losses`.
+    /// Whatever is still unacked then is purged, which adds up to 5 s. An
+    /// entry the broker refused or never acked is handed back through
+    /// `take_returned` when a later backend takes such entries, and counted
+    /// as lost otherwise. An entry in flight to a stalled broker at the purge
+    /// can still be written, so the broker can hold what is handed back or
+    /// counted lost, but nothing it did not ack goes uncounted. The loss is
+    /// taken by the drain through `take_durable_losses`.
     ///
     /// # Errors
     ///
-    /// `DlqError::Kafka` when any entry only Kafka held was refused by the
-    /// broker or purged, or the blocking task failed.
+    /// `DlqError::Kafka` when any entry lost since the previous barrier was
+    /// held by Kafka alone, or the blocking task failed.
     pub async fn flush_durable(&mut self) -> Result<(), DlqError> {
         let producer = Arc::clone(&self.producer);
         let ack_wait = self.ack_wait;
@@ -192,26 +285,17 @@ impl KafkaDlqInner {
         .await
         .map_err(|e| DlqError::Kafka(format!("DLQ durable flush task failed: {e}")))?;
 
-        let failures = self.producer.delivery_failures();
-        let failed = failures.saturating_sub(self.failures_seen);
-        self.failures_seen = failures;
-        let lost = failed.min(self.sole_custody);
-        // Unreported entries stay in custody for the next barrier to charge.
-        self.sole_custody = if drained { 0 } else { self.sole_custody - lost };
-        self.durable_losses += lost;
-
-        if failed > lost {
-            debug!(
-                failed,
-                lost, "Kafka lost DLQ entries another backend also holds"
-            );
-        }
-        if !drained {
+        self.reap();
+        // Every report is in, so what is left in custody was acked.
+        if drained {
+            self.sole_custody = 0;
+        } else {
             warn!(
                 pending = self.sole_custody,
-                "Kafka DLQ entries purged but not yet reported; the next flush or the close counts them"
+                "Kafka DLQ entries purged but not yet reported; the next flush or the close settles them"
             );
         }
+        let lost = self.durable_losses;
         if lost > 0 {
             return Err(DlqError::Kafka(format!(
                 "{lost} DLQ entries lost: the broker refused them or did not ack within {} ms",

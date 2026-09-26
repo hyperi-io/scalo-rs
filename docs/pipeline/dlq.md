@@ -36,12 +36,14 @@ types directly.
 The Kafka backend queues entries to the producer on every write and learns their fate only from the broker, so `flush()` waits for the broker's acks -- `acks=all` unless the sizing surface turns idempotence off:
 
 - The wait runs on tokio's blocking pool, so a slow or absent broker holds no runtime worker. It lasts up to `kafka.send_timeout_ms` (default 5000 ms), plus up to 5 s to purge.
-- A delivery the broker refused since the previous `flush()` fails this one with `Err(DlqError::Kafka(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
-- Entries still unacknowledged after `send_timeout_ms` are purged from the producer and counted the same way. The purge bounds the wait, but an entry already in flight to a stalled broker, not a dead one, can still be written after it. So under a stalled broker `dropped()` is an upper bound, and a caller that re-places entries reported lost can write duplicates to the DLQ topic. It never under-reports.
+- Entries still unacknowledged after `send_timeout_ms` are purged from the producer, which fails their delivery.
+- `Cascade` with a backend after Kafka: an entry whose delivery failed since the previous `flush()`, refused by the broker or purged, goes on to that backend before the barrier flushes it. It counts as accepted once that backend takes it, and is lost only if every backend after Kafka refuses it too.
+- `KafkaOnly`, `FanOut`, or `Cascade` with nothing after Kafka: such an entry fails the `flush()` with `Err(DlqError::Kafka(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
+- The purge bounds the wait, but an entry already in flight to a stalled broker, not a dead one, can still be written after it. So under a stalled broker the DLQ topic can hold an entry the file backend also took, and `dropped()` can count one the topic holds: duplicates, never a gap.
 - `Cascade`: when Kafka queues part of a batch and refuses the rest (an entry over the producer's `message.max.bytes`, say), only the rest goes on to the next backend.
 - `FanOut`: a Kafka loss counts only for entries no other backend took. When one barrier covers both kinds and Kafka lost some, the loss is charged to the entries Kafka held alone first, so the count can overstate the loss but never understate it.
 
-Delivery failures are read at the barrier and at [shutdown](#shutdown). Without a `flush()` they show in `transport_send_errors_total{transport="kafka"}` and the producer's WARN log, and in `dropped()` after shutdown.
+Delivery failures are read at every write, at the barrier and at [shutdown](#shutdown). Without a `flush()` an entry the broker never acks waits in the producer until librdkafka's `message.timeout.ms` (300000 ms unless set) fails it. It shows in `transport_send_errors_total{transport="kafka"}` and the producer's WARN log, then goes on to the next backend at the next write in `Cascade`, or counts in `dropped()` at the next `flush()` or shutdown otherwise.
 
 ---
 
@@ -49,12 +51,25 @@ Delivery failures are read at the barrier and at [shutdown](#shutdown). Without 
 
 | Mode | Behaviour |
 |------|-----------|
-| `Cascade` (default) | Try backends in order (Kafka → File → HTTP), stop on first success |
+| `Cascade` (default) | Try backends in order (Kafka -> File -> HTTP), stop on the first that takes the entry; an entry the broker never acks goes on to the next |
 | `FanOut` | Write every batch to every enabled backend, succeed if at least one takes the whole batch |
 | `FileOnly` | File backend only — no Kafka dependency |
 | `KafkaOnly` | Kafka backend only |
 
-Cascade is the production default -- Kafka primary, file fallback for entries the producer refuses to queue: a full producer queue, or an entry over its `message.max.bytes`. An unreachable broker is not one of them. The producer queues regardless, so those entries never reach the file, and the next `flush()` reports them lost (see [The Kafka barrier](#the-kafka-barrier)). FanOut is for compliance setups that need every entry mirrored to two destinations, and is the mode that keeps a copy on disk through a broker outage.
+Cascade is the production default -- Kafka primary, file fallback. An entry falls through to the file when the producer refuses to queue it (a full producer queue, or an entry over its `message.max.bytes`), and when the producer queued it but the broker refused it or never acked it. So an unreachable broker loses no dead letters while the file backend takes them: they land in the file at the next `flush()` or shutdown, which purge what is unacked, or at the next write once librdkafka has failed the delivery (`message.timeout.ms`, 300 s unless set). See [The Kafka barrier](#the-kafka-barrier). FanOut is for compliance setups that need every entry mirrored to two destinations.
+
+```mermaid
+flowchart LR
+    E[entry] --> K{Kafka queues it?}
+    K -- no --> F[next backend]
+    K -- yes --> A{broker acks it?}
+    A -- yes --> D[held by Kafka]
+    A -- "refused, expired or purged" --> F
+    F -- takes it --> H[held]
+    F -- refuses it --> L["dropped()"]
+```
+
+Each entry that falls through and lands counts once in `dlq_cascade_fallthrough_total{from, to, reason}`: `from` is the backend that gave it up, `to` the one that took it, and `reason` is `write_refused` (the backend refused the write itself), `delivery_failed` (the broker refused it) or `ack_timeout` (no ack came in time, so it expired or was purged). A rising `reason="ack_timeout"` with `to="file"` is a broker outage the file backend is covering.
 
 ---
 
@@ -76,11 +91,7 @@ previous `flush()` was accepted by a backend. That covers all three
 write triggers: a full batch (`batch_size`), the `flush_interval_ms`
 tick, and the batch the barrier itself writes.
 
-If every backend refused a batch, the next `flush()` returns
-`Err(DlqError::File(..))`. Entries only the Kafka backend held that the
-broker refused or never acked return `Err(DlqError::Kafka(..))`. The
-drain does not retry refused entries. They are counted in `dropped()`
-and in `dlq_dropped_total{reason="backends_failed"}`.
+If every backend refused a batch, the next `flush()` returns `Err(DlqError::File(..))`, and so does an entry the broker never acked that every backend after Kafka refused. Entries only the Kafka backend held that the broker refused or never acked, with no backend after Kafka to take them, return `Err(DlqError::Kafka(..))`. The drain does not retry refused entries. They are counted in `dropped()` and in `dlq_dropped_total{reason="backends_failed"}`.
 
 A refusal is reported once. The first barrier the drain processes after
 it returns the error, and the `flush()` after that starts clean. With
@@ -144,7 +155,7 @@ then exits. Triggered by either:
 Then `Dlq::shutdown().await` joins the drain task. Idempotent — safe
 to call from any clone.
 
-Before it exits the drain waits for the Kafka backend's acks the way a `flush()` does: up to `kafka.send_timeout_ms`, plus up to 5 s when it has to purge. Dropping the producer afterwards discards whatever it still holds, so the drain counts every entry only Kafka held that the broker refused or never acked in `dropped()` and `dlq_dropped_total{reason="backends_failed"}` first. `shutdown()` returns `Ok` either way; a caller that needs the loss as an `Err` calls `flush()` before it.
+Before it exits the drain waits for the Kafka backend's acks the way a `flush()` does: up to `kafka.send_timeout_ms`, plus up to 5 s when it has to purge. Dropping the producer afterwards discards whatever it still holds, so first the drain hands every entry only Kafka held that the broker refused or never acked to the backend after Kafka in `Cascade`, and counts what no backend took in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`. `shutdown()` returns `Ok` either way; a caller that needs the loss as an `Err` calls `flush()` before it.
 
 The count lands only if the drain gets to finish. Await `shutdown()`, or keep the runtime up until the drain exits: a drain dropped mid-wait counts nothing.
 

@@ -22,7 +22,9 @@
 //! ## Modes
 //!
 //! - `Cascade` / `FileOnly` / `KafkaOnly` -- try backends in order;
-//!   each entry goes to the first backend that takes it.
+//!   each entry goes to the first backend that takes it. In `Cascade`, an
+//!   entry Kafka queued that the broker refused or never acked goes on to
+//!   the backend after Kafka.
 //! - `FanOut` -- send to all backends, succeed if any succeed.
 //!
 //! ## Shutdown
@@ -338,17 +340,19 @@ impl Dlq {
     /// `Ok` means every batch the drain wrote since the previous flush was
     /// accepted by a backend. For the Kafka backend accepted means acked by
     /// the broker: the flush waits up to `kafka.send_timeout_ms` for that,
-    /// off the runtime, and entries only Kafka held that were refused or
-    /// never acked count as refused. A refused batch is reported by the
-    /// first flush after it and not again; it is also counted in
-    /// [`Dlq::dropped`]. What "accepted" means per backend is in
+    /// off the runtime. In cascade mode an entry the broker refused or never
+    /// acked goes on to the backend after Kafka and counts as accepted once
+    /// that backend takes it; otherwise it counts as refused. A refused batch
+    /// is reported by the first flush after it and not again; it is also
+    /// counted in [`Dlq::dropped`]. What "accepted" means per backend is in
     /// `docs/pipeline/dlq.md`.
     ///
     /// # Errors
     ///
     /// `File` if every backend refused a batch written since the previous
-    /// flush, whether the write was size-, tick- or barrier-triggered.
-    /// `Kafka` if the Kafka backend lost entries no other backend holds.
+    /// flush, whether the write was size-, tick- or barrier-triggered, or
+    /// refused the entries Kafka handed on. `Kafka` if the Kafka backend lost
+    /// entries no other backend holds and none after it could take.
     /// `Closed` if the drain has exited before this barrier was processed.
     pub async fn flush(&self) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
@@ -411,10 +415,10 @@ impl Dlq {
     /// caller has not separately cancelled the token passed to `spawn`.
     ///
     /// Before it exits the drain waits for the Kafka backend's acks, up to
-    /// `kafka.send_timeout_ms` plus 5 s when it has to purge, and counts
-    /// the entries only Kafka held that were never acked in
-    /// [`Dlq::dropped`]. A caller that needs that loss as an `Err` calls
-    /// [`Self::flush`] first.
+    /// `kafka.send_timeout_ms` plus 5 s when it has to purge. In cascade mode
+    /// the entries only Kafka held that were never acked go on to the backend
+    /// after Kafka; what no backend takes is counted in [`Dlq::dropped`]. A
+    /// caller that needs that loss as an `Err` calls [`Self::flush`] first.
     ///
     /// Idempotent across clones: the join happens once; later calls see
     /// an empty join slot and return Ok.
@@ -515,7 +519,43 @@ fn build_backends(
         }
     }
 
+    // A backend after Kafka takes what the broker never acks, so that is no loss.
+    #[cfg(feature = "dlq-kafka")]
+    if mode == DlqMode::Cascade
+        && backends.len() > 1
+        && let Some(DlqBackend::Kafka(kafka)) = backends.first_mut()
+    {
+        kafka.hand_on_unacked();
+    }
+
     Ok(backends)
+}
+
+/// Where entries falling through the cascade came from, for
+/// `dlq_cascade_fallthrough_total`.
+#[derive(Debug, Clone, Copy)]
+struct Fallthrough {
+    /// The backend that gave them up.
+    from: &'static str,
+    /// Why: `write_refused`, `delivery_failed` or `ack_timeout`.
+    reason: &'static str,
+}
+
+/// The `reason` for entries a backend refused to take at the write.
+const WRITE_REFUSED: &str = "write_refused";
+
+/// Count `count` entries `to` took after `fell.from` gave them up.
+fn count_fallthrough(fell: Fallthrough, to: &'static str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    ::metrics::counter!(
+        "dlq_cascade_fallthrough_total",
+        "from" => fell.from,
+        "to" => to,
+        "reason" => fell.reason
+    )
+    .increment(count as u64);
 }
 
 /// Drain task -- owns the backends and implements cascade / fan-out
@@ -546,16 +586,32 @@ impl DlqDrain {
         }
     }
 
-    /// Each entry goes to the first backend that takes it, so a backend that
-    /// queued part of the batch before failing hands on only the rest.
-    async fn write_cascade(&mut self, batch: &[DlqEntry]) -> Result<(), DrainError> {
-        let mut rest = batch;
+    /// Offer `entries` to the backends from index `start` on, each entry to
+    /// the first that takes it, so a backend that queued part of them before
+    /// failing hands on only the rest. `fell` names where the entries came
+    /// from when they are already falling through. Returns how many no
+    /// backend took, and the last refusal.
+    async fn cascade(
+        &mut self,
+        start: usize,
+        entries: &[DlqEntry],
+        mut fell: Option<Fallthrough>,
+    ) -> (usize, Option<DlqError>) {
+        let mut rest = entries;
         let mut last_err: Option<DlqError> = None;
-        for backend in &mut self.backends {
+        for backend in self.backends.iter_mut().skip(start) {
             match backend.send_batch(rest).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if let Some(fell) = fell {
+                        count_fallthrough(fell, backend.name(), rest.len());
+                    }
+                    return (0, None);
+                }
                 Err(e) => {
                     let taken = backend.queued_before_failure().min(rest.len());
+                    if let Some(fell) = fell {
+                        count_fallthrough(fell, backend.name(), taken);
+                    }
                     rest = &rest[taken..];
                     warn!(
                         backend = backend.name(),
@@ -563,16 +619,61 @@ impl DlqDrain {
                         count = rest.len(),
                         "DLQ backend failed in cascade, trying next"
                     );
+                    fell.get_or_insert(Fallthrough {
+                        from: backend.name(),
+                        reason: WRITE_REFUSED,
+                    });
                     last_err = Some(e);
                 }
             }
         }
-        // The actor discards the batch on Err -- count the loss.
-        self.note_lost(rest.len() as u64);
-        let msg = last_err.map_or_else(|| "no backends configured".to_string(), |e| e.to_string());
-        Err(DrainError::Backend(Box::new(DlqError::AllBackendsFailed(
-            msg,
-        ))))
+        (rest.len(), last_err)
+    }
+
+    /// Each entry goes to the first backend that takes it. What the broker
+    /// refused or never acked since the last write then goes on to the
+    /// backends after Kafka.
+    async fn write_cascade(&mut self, batch: &[DlqEntry]) -> Result<(), DrainError> {
+        let (lost, last_err) = self.cascade(0, batch, None).await;
+        let mut handed = Ok(());
+        for from in 0..self.backends.len() {
+            if let Err(e) = self.hand_on_returned(from).await {
+                handed = handed.and(Err(e));
+            }
+        }
+        if lost > 0 {
+            // The actor discards the batch on Err -- count the loss.
+            self.note_lost(lost as u64);
+            let msg =
+                last_err.map_or_else(|| "no backends configured".to_string(), |e| e.to_string());
+            return Err(DrainError::Backend(Box::new(DlqError::AllBackendsFailed(
+                msg,
+            ))));
+        }
+        handed.map_err(|e| DrainError::Backend(Box::new(e)))
+    }
+
+    /// Offer what the broker behind backend `from` refused or never acked to
+    /// the backends after it. What none of them takes is lost.
+    async fn hand_on_returned(&mut self, from: usize) -> Result<(), DlqError> {
+        let Some(backend) = self.backends.get_mut(from) else {
+            return Ok(());
+        };
+        let name = backend.name();
+        let mut first_err: Option<DlqError> = None;
+        for (reason, entries) in backend.take_returned() {
+            let fell = Fallthrough { from: name, reason };
+            let (lost, last_err) = self.cascade(from + 1, &entries, Some(fell)).await;
+            if lost > 0 {
+                self.note_lost(lost as u64);
+                let cause =
+                    last_err.map_or_else(|| "no backend after it".to_string(), |e| e.to_string());
+                first_err.get_or_insert(DlqError::AllBackendsFailed(format!(
+                    "{lost} entries {name} did not deliver ({reason}) found no backend to take them: {cause}"
+                )));
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// Every backend gets the whole batch; an entry is safe while any holds it.
@@ -630,15 +731,23 @@ impl SinkDrain<DlqEntry> for DlqDrain {
         }
     }
 
-    /// Run every backend's durable flush and count what they found lost.
+    /// Run every backend's durable flush and count what they found lost. What
+    /// a backend's broker never acked goes on to the backends after it before
+    /// they flush, so this barrier covers it.
     async fn flush_durable(&mut self) -> Result<(), DrainError> {
         let mut first_err: Option<DlqError> = None;
         let mut lost = 0;
-        for backend in &mut self.backends {
+        for from in 0..self.backends.len() {
+            let Some(backend) = self.backends.get_mut(from) else {
+                break;
+            };
             let result = backend.flush_durable().await;
             lost += backend.take_durable_losses();
             if let Err(e) = result {
                 warn!(backend = backend.name(), error = %e, "DLQ backend durable flush failed");
+                first_err.get_or_insert(e);
+            }
+            if let Err(e) = self.hand_on_returned(from).await {
                 first_err.get_or_insert(e);
             }
         }
@@ -1073,6 +1182,248 @@ mod tests {
             let flush = dlq.flush().await;
             assert!(matches!(flush, Err(DlqError::Kafka(_))), "got: {flush:?}");
             assert_eq!(dlq.dropped(), 1);
+            dlq.shutdown().await.expect("shutdown");
+        }
+
+        /// Kafka first and the file backend after it, the cascade default.
+        fn cascade_to(dir: &std::path::Path) -> DlqConfig {
+            DlqConfig {
+                mode: DlqMode::Cascade,
+                file: tmp_config(dir).file,
+                ..kafka_only(300)
+            }
+        }
+
+        fn spawn_cascade(dir: &std::path::Path, kafka: &crate::transport::KafkaConfig) -> Dlq {
+            Dlq::spawn(
+                &cascade_to(dir),
+                "svc",
+                Some(kafka),
+                CancellationToken::new(),
+            )
+            .expect("spawn")
+        }
+
+        /// Keeps every counter written on the thread it is the local recorder of.
+        #[derive(Default)]
+        struct Counters(std::sync::Mutex<Vec<(::metrics::Key, Arc<AtomicU64>)>>);
+
+        impl Counters {
+            /// The value of the `name` series carrying exactly `labels`.
+            fn value(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+                let held = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                held.iter()
+                    .filter(|(key, _)| {
+                        key.name() == name
+                            && key.labels().count() == labels.len()
+                            && labels.iter().all(|(k, v)| {
+                                key.labels().any(|l| l.key() == *k && l.value() == *v)
+                            })
+                    })
+                    .map(|(_, cell)| cell.load(Ordering::Relaxed))
+                    .sum()
+            }
+
+            /// Every value of the `name` series, whatever its labels.
+            fn total(&self, name: &str) -> u64 {
+                let held = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                held.iter()
+                    .filter(|(key, _)| key.name() == name)
+                    .map(|(_, cell)| cell.load(Ordering::Relaxed))
+                    .sum()
+            }
+        }
+
+        impl ::metrics::Recorder for Counters {
+            fn describe_counter(
+                &self,
+                _: ::metrics::KeyName,
+                _: Option<::metrics::Unit>,
+                _: ::metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: ::metrics::KeyName,
+                _: Option<::metrics::Unit>,
+                _: ::metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: ::metrics::KeyName,
+                _: Option<::metrics::Unit>,
+                _: ::metrics::SharedString,
+            ) {
+            }
+
+            fn register_counter(
+                &self,
+                key: &::metrics::Key,
+                _: &::metrics::Metadata<'_>,
+            ) -> ::metrics::Counter {
+                let mut held = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some((_, cell)) = held.iter().find(|(k, _)| k == key) {
+                    return ::metrics::Counter::from_arc(Arc::clone(cell));
+                }
+                let cell = Arc::new(AtomicU64::new(0));
+                held.push((key.clone(), Arc::clone(&cell)));
+                ::metrics::Counter::from_arc(cell)
+            }
+
+            fn register_gauge(
+                &self,
+                _: &::metrics::Key,
+                _: &::metrics::Metadata<'_>,
+            ) -> ::metrics::Gauge {
+                ::metrics::Gauge::noop()
+            }
+
+            fn register_histogram(
+                &self,
+                _: &::metrics::Key,
+                _: &::metrics::Metadata<'_>,
+            ) -> ::metrics::Histogram {
+                ::metrics::Histogram::noop()
+            }
+        }
+
+        const FALLTHROUGH: &str = "dlq_cascade_fallthrough_total";
+
+        fn file_reasons(dir: &std::path::Path) -> Vec<String> {
+            std::fs::read_to_string(dir.join("svc/dlq.ndjson"))
+                .map(|body| {
+                    body.lines()
+                        .map(|line| {
+                            serde_json::from_str::<DlqEntry>(line)
+                                .expect("a whole DLQ entry per line")
+                                .reason
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// Issue #213: the broker never acks, so every entry goes on to the file
+        /// backend, none is lost, and the fallthrough counter counts each one.
+        /// The drain runs on this current-thread runtime, so the local recorder
+        /// sees its counters.
+        #[tokio::test]
+        async fn cascade_lands_what_an_unreachable_broker_never_acks_in_the_file() {
+            let counters = Counters::default();
+            let _local = ::metrics::set_default_local_recorder(&counters);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dlq = spawn_cascade(dir.path(), &unreachable_broker());
+            for i in 0..5 {
+                dlq.send(test_entry(&format!("err_{i}")))
+                    .await
+                    .expect("queued");
+            }
+
+            dlq.flush()
+                .await
+                .expect("the file backend holds what the broker never acked");
+
+            let mut landed = file_reasons(dir.path());
+            landed.sort();
+            assert_eq!(landed, ["err_0", "err_1", "err_2", "err_3", "err_4"]);
+            assert_eq!(dlq.dropped(), 0, "nothing was lost");
+            let labels = [("from", "kafka"), ("to", "file"), ("reason", "ack_timeout")];
+            assert_eq!(counters.value(FALLTHROUGH, &labels), 5);
+            assert_eq!(counters.total(FALLTHROUGH), 5, "no other fallthrough");
+            assert_eq!(counters.total("dlq_dropped_total"), 0);
+
+            dlq.shutdown().await.expect("shutdown");
+            assert_eq!(dlq.dropped(), 0, "the shutdown found nothing left to lose");
+            assert_eq!(dlq_lines(dir.path()), 5, "each entry landed once");
+        }
+
+        /// A confirmed write is `Ok` once the file backend holds what the broker
+        /// never acked, and `Err` when the file refuses it too, so a caller
+        /// holding a source acknowledgement retries only a real loss.
+        #[tokio::test]
+        async fn a_confirmed_write_holds_once_the_file_takes_what_kafka_never_delivered() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dlq = spawn_cascade(dir.path(), &unreachable_broker());
+
+            dlq.write_confirmed(vec![test_entry("held")])
+                .await
+                .expect("the file backend holds it");
+            assert_eq!(file_reasons(dir.path()), ["held"]);
+            assert_eq!(dlq.dropped(), 0);
+
+            break_file_backend(dir.path());
+            let refused = dlq.write_confirmed(vec![test_entry("nowhere")]).await;
+            assert!(
+                matches!(refused, Err(DlqError::File(_))),
+                "no backend holds it: {refused:?}"
+            );
+            assert_eq!(dlq.dropped(), 1, "the entry no backend took is counted");
+            dlq.shutdown().await.expect("shutdown");
+        }
+
+        /// With no flush at all, the shutdown still hands the file backend what
+        /// the broker never acked before it drops the producer.
+        #[tokio::test]
+        async fn shutdown_lands_what_an_unreachable_broker_never_acked_in_the_file() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dlq = spawn_cascade(dir.path(), &unreachable_broker());
+            for i in 0..3 {
+                dlq.send(test_entry(&format!("err_{i}")))
+                    .await
+                    .expect("queued");
+            }
+
+            dlq.shutdown().await.expect("shutdown");
+
+            assert_eq!(dlq.dropped(), 0);
+            assert_eq!(dlq_lines(dir.path()), 3);
+        }
+
+        /// An entry the producer refuses to queue and entries the broker never
+        /// acks both fall through to the file, each counted under its reason.
+        #[tokio::test]
+        async fn the_fallthrough_counter_names_why_each_entry_fell_through() {
+            let counters = Counters::default();
+            let _local = ::metrics::set_default_local_recorder(&counters);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut kafka = unreachable_broker();
+            kafka.sizing.producer.message_max_bytes = Some(262_144);
+            let dlq = spawn_cascade(dir.path(), &kafka);
+
+            dlq.send(test_entry("queued")).await.expect("queued");
+            // Over the producer's ceiling once base64 grows it by a third.
+            dlq.send(DlqEntry::new("svc", "oversize", vec![b'x'; 300_000]))
+                .await
+                .expect("queued");
+            dlq.send(test_entry("after")).await.expect("queued");
+            dlq.flush().await.expect("the file backend holds all three");
+
+            let mut landed = file_reasons(dir.path());
+            landed.sort();
+            assert_eq!(landed, ["after", "oversize", "queued"]);
+            assert_eq!(dlq.dropped(), 0);
+            let refused = [
+                ("from", "kafka"),
+                ("to", "file"),
+                ("reason", "write_refused"),
+            ];
+            let unacked = [("from", "kafka"), ("to", "file"), ("reason", "ack_timeout")];
+            assert_eq!(
+                counters.value(FALLTHROUGH, &refused),
+                2,
+                "the oversize entry and the one after it were never queued"
+            );
+            assert_eq!(counters.value(FALLTHROUGH, &unacked), 1);
             dlq.shutdown().await.expect("shutdown");
         }
     }
