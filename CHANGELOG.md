@@ -3,6 +3,27 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.13.0](https://github.com/hyperi-io/scalo-rs/compare/v2.12.11...v2.13.0) (2026-09-26)
+
+### Features
+
+* hold source acknowledgements until delivery ([#204](https://github.com/hyperi-io/scalo-rs/issues/204)) ([c4656b0](https://github.com/hyperi-io/scalo-rs/commit/c4656b08f847982c0ce71ac61409d15a15798c7b))
+
+### Bug Fixes
+
+* **build:** apply -D warnings alongside target rustflags ([#219](https://github.com/hyperi-io/scalo-rs/issues/219)) ([92bec98](https://github.com/hyperi-io/scalo-rs/commit/92bec986d0a558bb8f83a697f67268032b51bfed))
+* **dlq:** cascade hands a failed Kafka delivery to the next backend ([#214](https://github.com/hyperi-io/scalo-rs/issues/214)) ([a30a3c8](https://github.com/hyperi-io/scalo-rs/commit/a30a3c818802ad3ae12f0876d2489518aca570f1)), closes [#213](https://github.com/hyperi-io/scalo-rs/issues/213)
+* **dlq:** label overflow drops, clear CI warnings ([#221](https://github.com/hyperi-io/scalo-rs/issues/221)) ([ba22aea](https://github.com/hyperi-io/scalo-rs/commit/ba22aeaef883c78c299c3cf68e6b887d417980eb))
+* **docs:** architecture.md states the feature edges Cargo.toml has ([#216](https://github.com/hyperi-io/scalo-rs/issues/216)) ([6ee6d33](https://github.com/hyperi-io/scalo-rs/commit/6ee6d335cb3cd372356fdffee7dff7efcf2b5615))
+* **docs:** resolve feature-gated intra-doc links ([#217](https://github.com/hyperi-io/scalo-rs/issues/217)) ([427a159](https://github.com/hyperi-io/scalo-rs/commit/427a1595517fc9068cc7c9a154951a7faf58dd60))
+* note why each flagged scanner line holds no secret ([#220](https://github.com/hyperi-io/scalo-rs/issues/220)) ([46660e4](https://github.com/hyperi-io/scalo-rs/commit/46660e4cffa70de518ed4565cb94004810366114))
+* **tiered-sink:** export the corruption policy its config takes ([#218](https://github.com/hyperi-io/scalo-rs/issues/218)) ([67b48ea](https://github.com/hyperi-io/scalo-rs/commit/67b48ea0bace0aa2cb1f4a48d1b513471108f88f))
+* zstd producer default, overrides last, one winner per librdkafka name ([#212](https://github.com/hyperi-io/scalo-rs/issues/212)) ([6b6319a](https://github.com/hyperi-io/scalo-rs/commit/6b6319a236ae73fb76a613b81ee32d9f3e07aab6))
+
+### Performance Improvements
+
+* **parse_guard:** block scan, same verdicts ([#215](https://github.com/hyperi-io/scalo-rs/issues/215)) ([6a2eb8a](https://github.com/hyperi-io/scalo-rs/commit/6a2eb8a5c9dcddb4bdb56314075973054d20a141))
+
 ## [2.12.11](https://github.com/hyperi-io/scalo-rs/compare/v2.12.10...v2.12.11) (2026-09-25)
 
 ### Bug Fixes
