@@ -625,8 +625,11 @@ impl BatchEngine {
     /// `sub_block_bytes` is the target sum of `payload.len()` per sub-block (floor
     /// one record, so a record larger than the target is still its own sub-block
     /// and the loop never stalls). Taken as an explicit parameter so the path is
-    /// testable in isolation; [`run_governed`](Self::run_governed) supplies it
-    /// from the governor's byte budget.
+    /// testable in isolation.
+    #[cfg_attr(
+        feature = "governor",
+        doc = "[`run_governed`](Self::run_governed) supplies it from the governor's byte budget."
+    )]
     ///
     /// Fan-out WITHIN a sub-block's `process` is fine (records grow); the source
     /// acks are still the batch's input tokens, committed once at the end.

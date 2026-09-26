@@ -83,9 +83,13 @@
 //! A routed send NEVER retries and NEVER routes to a DLQ: it returns the
 //! chosen backend's [`SendResult`] unchanged, so the caller applies its own
 //! policy (the fetcher holds the batch and stalls its scheduler; the receiver
-//! back-pressures its ingest). Bounded retry with backoff is
-//! [`SinkStack`](crate::sink_stack::SinkStack)'s job and composes on top --
-//! `RoutedSender` implements [`TransportSender`], so a stack wraps it.
+//! back-pressures its ingest). Bounded retry with backoff is the `sink-stack`
+//! feature's job and composes on top -- `RoutedSender` implements
+//! [`TransportSender`], so a stack wraps it.
+#![cfg_attr(
+    feature = "sink-stack",
+    doc = "See [`SinkStack`](crate::sink_stack::SinkStack)."
+)]
 //!
 //! # Metrics
 //!

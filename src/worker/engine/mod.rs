@@ -164,9 +164,12 @@ use super::config::WorkerPoolConfig;
 /// Inbound braking under memory pressure is no longer a blocking pause between
 /// chunks (the retired `check_memory_pressure` proto-actuator). It is now the
 /// self-regulation governor's job: the inbound GATE pauses the source transport
-/// and the streaming byte-budget lever bounds peak in-flight memory. See
-/// [`run_governed`](Self::run_governed). With the governor OFF, there is no
-/// active brake -- that is the deliberate opt-out.
+/// and the streaming byte-budget lever bounds peak in-flight memory. With the
+/// governor OFF, there is no active brake -- that is the deliberate opt-out.
+#[cfg_attr(
+    all(feature = "transport", feature = "governor"),
+    doc = "See [`run_governed`](Self::run_governed)."
+)]
 pub struct BatchEngine {
     config: BatchProcessingConfig,
     pool: Arc<AdaptiveWorkerPool>,

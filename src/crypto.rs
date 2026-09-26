@@ -12,8 +12,9 @@
 //! One opinionated place that defines HyperI's crypto stance, so a consuming
 //! crate SELECTS a profile and inherits the algorithm floor, the
 //! commercial-grade fallback, and the downgrade warnings - it never
-//! hand-assembles a cipher/curve/version policy. [`crate::tls`] is the first
-//! consumer; secrets-at-rest and JWT policy read the same profile later.
+//! hand-assembles a cipher/curve/version policy. The `tls` module (`tls`
+//! feature) is the first consumer; secrets-at-rest and JWT policy read the same
+//! profile later.
 //!
 //! ## Profiles - base is commercial-floor, high-security is opt-in
 //!
