@@ -508,6 +508,33 @@ impl ServiceMetrics {
             });
         }
 
+        // --- DLQ ---
+        for (name, desc, labels) in [
+            (
+                "dlq_dropped_total",
+                "Dead letters no DLQ backend holds, by reason",
+                &["reason"][..],
+            ),
+            (
+                "dlq_cascade_fallthrough_total",
+                "Dead letters a later cascade backend took after an earlier one gave them up",
+                &["from", "to", "reason"],
+            ),
+        ] {
+            metrics::describe_counter!(name, desc);
+            reg.push(MetricDescriptor {
+                name: name.into(),
+                metric_type: MetricType::Counter,
+                description: desc.into(),
+                unit: String::new(),
+                labels: labels.iter().map(|l| (*l).to_string()).collect(),
+                group: "platform".into(),
+                buckets: None,
+                use_cases: vec![],
+                dashboard_hint: None,
+            });
+        }
+
         // --- Security ---
         metrics::describe_counter!("auth_failures_total", "Authentication failures by reason");
         metrics::describe_counter!("validation_failures_total", "Validation failures by reason");

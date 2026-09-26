@@ -131,6 +131,9 @@ pub struct KafkaProducer {
     profile: ProducerProfile,
     /// Shared with the rdkafka context, which owns the delivery callback.
     delivery: Arc<DeliveryState>,
+    /// Shared with the rdkafka context, which fills it with failed deliveries.
+    #[cfg(feature = "dlq-kafka")]
+    undelivered: Option<Arc<Undelivered>>,
     /// Latches a sustained retryable enqueue failure to one warn per outage.
     enqueue_degraded: DegradedLatch,
     /// The effective `message.max.bytes`, which only the Kafka DLQ reads.
@@ -146,6 +149,9 @@ pub struct KafkaProducer {
 #[derive(Clone, Default)]
 pub struct ProducerContext {
     state: Arc<DeliveryState>,
+    /// Keeps the payload of every failed delivery, for a producer built to hand them on.
+    #[cfg(feature = "dlq-kafka")]
+    undelivered: Option<Arc<Undelivered>>,
 }
 
 impl rdkafka::ClientContext for ProducerContext {}
@@ -159,6 +165,59 @@ impl rdkafka::producer::ProducerContext for ProducerContext {
         _opaque: Self::DeliveryOpaque,
     ) {
         self.state.record(result);
+        #[cfg(feature = "dlq-kafka")]
+        if let (Some(kept), Err((err, msg))) = (&self.undelivered, result) {
+            kept.keep(err, msg);
+        }
+    }
+}
+
+/// Messages the broker never took, with their payloads, filled from
+/// librdkafka's poll thread until the owner takes them.
+#[cfg(feature = "dlq-kafka")]
+#[derive(Debug, Default)]
+pub(crate) struct Undelivered(std::sync::Mutex<Vec<UndeliveredMessage>>);
+
+/// One message the broker never took.
+#[cfg(feature = "dlq-kafka")]
+#[derive(Debug)]
+pub(crate) struct UndeliveredMessage {
+    /// The payload as it was sent.
+    pub(crate) payload: Vec<u8>,
+    /// No ack came in time: the message expired or was purged, rather than refused.
+    pub(crate) timed_out: bool,
+}
+
+#[cfg(feature = "dlq-kafka")]
+impl Undelivered {
+    fn keep(&self, err: &rdkafka::error::KafkaError, msg: &rdkafka::message::BorrowedMessage<'_>) {
+        use rdkafka::message::Message as _;
+        use rdkafka::types::RDKafkaErrorCode;
+        let timed_out = matches!(
+            err.rdkafka_error_code(),
+            Some(
+                RDKafkaErrorCode::MessageTimedOut
+                    | RDKafkaErrorCode::PurgeQueue
+                    | RDKafkaErrorCode::PurgeInflight
+            )
+        );
+        let message = UndeliveredMessage {
+            payload: msg.payload().unwrap_or_default().to_vec(),
+            timed_out,
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(message);
+    }
+
+    fn take(&self) -> Vec<UndeliveredMessage> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 }
 
@@ -174,14 +233,37 @@ impl KafkaProducer {
     ///
     /// Returns error if producer creation fails.
     pub fn new(config: &KafkaConfig, profile: ProducerProfile) -> TransportResult<Self> {
+        Self::with_context(config, profile, ProducerContext::default())
+    }
+
+    /// A producer that keeps the payload of every message the broker never
+    /// took, for [`Self::take_undelivered`] to hand back.
+    #[cfg(feature = "dlq-kafka")]
+    pub(crate) fn keeping_undelivered(
+        config: &KafkaConfig,
+        profile: ProducerProfile,
+    ) -> TransportResult<Self> {
+        let context = ProducerContext {
+            undelivered: Some(Arc::default()),
+            ..ProducerContext::default()
+        };
+        Self::with_context(config, profile, context)
+    }
+
+    fn with_context(
+        config: &KafkaConfig,
+        profile: ProducerProfile,
+        context: ProducerContext,
+    ) -> TransportResult<Self> {
         let client_config = client_config(config, profile);
         #[cfg(feature = "dlq-kafka")]
         let message_max_bytes = client_config
             .get("message.max.bytes")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(super::LIBRDKAFKA_MESSAGE_MAX_BYTES);
-        let context = ProducerContext::default();
         let delivery = Arc::clone(&context.state);
+        #[cfg(feature = "dlq-kafka")]
+        let undelivered = context.undelivered.clone();
         let producer: ThreadedProducer<ProducerContext> = client_config
             .create_with_context(context)
             .map_err(|e| TransportError::Connection(format!("Failed to create producer: {e}")))?;
@@ -190,6 +272,8 @@ impl KafkaProducer {
             producer,
             profile,
             delivery,
+            #[cfg(feature = "dlq-kafka")]
+            undelivered,
             enqueue_degraded: DegradedLatch::default(),
             #[cfg(feature = "dlq-kafka")]
             message_max_bytes,
@@ -197,6 +281,15 @@ impl KafkaProducer {
             bytes_sent: AtomicU64::new(0),
             errors: AtomicU64::new(0),
         })
+    }
+
+    /// The messages the broker refused or never acked since the last call,
+    /// with their payloads. Empty unless built by [`Self::keeping_undelivered`].
+    #[cfg(feature = "dlq-kafka")]
+    pub(crate) fn take_undelivered(&self) -> Vec<UndeliveredMessage> {
+        self.undelivered
+            .as_deref()
+            .map_or_else(Vec::new, Undelivered::take)
     }
 
     /// The largest payload `send` takes: `message.max.bytes` less the framing
