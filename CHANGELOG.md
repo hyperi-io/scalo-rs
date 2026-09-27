@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.13.1](https://github.com/hyperi-io/scalo-rs/compare/v2.13.0...v2.13.1) (2026-09-27)
+
+### Bug Fixes
+
+* **kafka:** rebuild a fatal consumer; classic is the default group protocol ([#228](https://github.com/hyperi-io/scalo-rs/issues/228)) ([cd441e1](https://github.com/hyperi-io/scalo-rs/commit/cd441e1c9aa87799f02443b0e247981456ade4ea))
+
 ## [2.13.0](https://github.com/hyperi-io/scalo-rs/compare/v2.12.11...v2.13.0) (2026-09-26)
 
 ### Features
