@@ -744,6 +744,15 @@ mod broker {
 
     /// Create a one-partition `topic` and wait for its metadata.
     pub(super) async fn create_topic(bootstrap: &str, topic: &'static str) {
+        create_topic_with_partitions(bootstrap, topic, 1).await;
+    }
+
+    /// Create `topic` with `partitions` partitions and wait for their metadata.
+    pub(super) async fn create_topic_with_partitions(
+        bootstrap: &str,
+        topic: &'static str,
+        partitions: i32,
+    ) {
         let admin = KafkaAdmin::new(&KafkaConfig {
             brokers: vec![bootstrap.to_string()],
             group: String::new(),
@@ -751,7 +760,7 @@ mod broker {
         })
         .expect("kafka admin");
         admin
-            .create_topics(&[(topic, 1, 1)])
+            .create_topics(&[(topic, partitions, 1)])
             .await
             .expect("create topic");
         tokio::task::spawn_blocking(move || {
@@ -759,7 +768,7 @@ mod broker {
             while admin
                 .describe_topic(topic)
                 .ok()
-                .is_none_or(|t| t.partition_count == 0)
+                .is_none_or(|t| t.partition_count < partitions)
             {
                 assert!(Instant::now() < deadline, "topic {topic} never appeared");
                 std::thread::sleep(Duration::from_millis(100));
@@ -1078,6 +1087,86 @@ mod lag {
             "resumed and read to the end: end {end}, read to {end}, committed {committed}"
         );
     }
+
+    /// The value of the series `name` whose labels include every one of
+    /// `labels`, as the scrape renders it.
+    #[cfg(feature = "metrics")]
+    fn scraped(rendered: &str, name: &str, labels: &[&str]) -> Option<f64> {
+        rendered
+            .lines()
+            .filter(|line| line.split([' ', '{']).next() == Some(name))
+            .filter(|line| labels.iter().all(|label| line.contains(label)))
+            .find_map(|line| line.rsplit(' ').next()?.parse().ok())
+    }
+
+    /// A group that has committed nothing publishes its lag and its assignment
+    /// from its first assignment: 0 on an empty topic, then every record
+    /// written while it reads none of them.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn a_group_that_committed_nothing_publishes_lag_and_assignment() {
+        use scalo::metrics::{MetricsConfig, MetricsManager};
+
+        let manager = MetricsManager::with_config(MetricsConfig {
+            enable_process_metrics: false,
+            enable_container_metrics: false,
+            #[cfg(feature = "otel-metrics")]
+            otel: scalo::metrics::OtelMetricsConfig {
+                enabled: false,
+                ..scalo::metrics::OtelMetricsConfig::default()
+            },
+            ..MetricsConfig::default()
+        });
+        let scrape = manager.render_handle().expect("prometheus recorder");
+        let lag = |rendered: &str| {
+            scraped(
+                rendered,
+                "rdkafka_topic_partition_consumer_lag",
+                &["topic=\"fresh\"", "partition=\"0\""],
+            )
+        };
+        // Unlabelled and process-wide: other Kafka tests in a plain `cargo test` can flake it.
+        let assigned = |rendered: &str| scraped(rendered, "consumer_partitions_assigned", &[]);
+
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "fresh";
+        let group = "fresh-group";
+        create_topic(&bootstrap, topic).await;
+        let transport = lag_consumer(&bootstrap, topic, group).await;
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let rendered = loop {
+            let batch = transport.recv(100).await.expect("recv");
+            assert!(batch.records.is_empty(), "the topic is empty");
+            let rendered = scrape.render();
+            if lag(&rendered) == Some(0.0) && assigned(&rendered) == Some(1.0) {
+                break rendered;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no lag 0 and assignment 1 within 60 s:\n{rendered}"
+            );
+        };
+        assert_eq!(lags(&transport), (0, 0), "{rendered}");
+
+        transport.gate_actuator().pause();
+        produce(&bootstrap, topic, 0..WRITTEN_PAUSED).await;
+        let written = offset(WRITTEN_PAUSED);
+        assert_eq!(
+            settle(&transport, (written, written)).await,
+            (written, written),
+            "{written} written, none read, none committed"
+        );
+        let rendered = scrape.render();
+        let written_f64 = f64::from(u32::try_from(WRITTEN_PAUSED).expect("fits a u32"));
+        assert_eq!(lag(&rendered), Some(written_f64), "{rendered}");
+        assert_eq!(assigned(&rendered), Some(1.0), "{rendered}");
+        assert_eq!(
+            super::broker::committed(&bootstrap, group, topic).await,
+            None,
+            "the group committed nothing"
+        );
+    }
 }
 
 /// The consumer-group protocol against a real broker, including a group left
@@ -1096,7 +1185,9 @@ mod group_protocol {
     use scalo::transport::kafka::{ConsumerProtocol, KafkaConfig, KafkaTransport};
     use scalo::transport::{TransportBase, TransportReceiver};
 
-    use super::broker::{consumer_config, create_topic, produce, start_kafka};
+    use super::broker::{
+        consumer_config, create_topic, create_topic_with_partitions, produce, start_kafka,
+    };
 
     /// Records written to each test topic.
     const RECORDS: usize = 20;
@@ -1305,6 +1396,98 @@ mod group_protocol {
         );
         assert_eq!(reader.group_protocol(), ConsumerProtocol::Consumer);
         assert_eq!(idle.group_protocol(), ConsumerProtocol::Consumer);
+    }
+
+    /// The partitions of `topic` a member holds, as its lag reports them.
+    fn held(member: &KafkaTransport, topic: &str) -> BTreeSet<i32> {
+        member
+            .stats()
+            .partition_lag
+            .keys()
+            .filter(|(t, _)| t == topic)
+            .map(|(_, partition)| *partition)
+            .collect()
+    }
+
+    /// Receive on every member until `done` holds of the partitions each
+    /// holds, failing after 60 s. Returns what each holds.
+    async fn receive_until(
+        members: &[&KafkaTransport],
+        topic: &str,
+        done: impl Fn(&[BTreeSet<i32>]) -> bool,
+    ) -> Vec<BTreeSet<i32>> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            for member in members {
+                member.recv(100).await.expect("recv");
+            }
+            let holding: Vec<BTreeSet<i32>> = members.iter().map(|m| held(m, topic)).collect();
+            if done(&holding) {
+                return holding;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "members held {holding:?} of {topic} after 60 s"
+            );
+        }
+    }
+
+    /// One member holds both partitions of a two-partition topic; a second
+    /// joins, and the incremental rebalance leaves each holding one. The lag
+    /// each reports follows what it holds, so a partition revoked from the
+    /// first leaves its lag, and neither reports the other's.
+    async fn a_second_member_takes_one_partition_from_the_first(
+        bootstrap: &str,
+        topic: &'static str,
+        config: &KafkaConfig,
+    ) {
+        create_topic_with_partitions(bootstrap, topic, 2).await;
+        let first = KafkaTransport::new(config).await.expect("first member");
+        receive_until(&[&first], topic, |holding| {
+            holding[0] == BTreeSet::from([0, 1])
+        })
+        .await;
+
+        let second = KafkaTransport::new(config).await.expect("second member");
+        let holding = receive_until(&[&first, &second], topic, |holding| {
+            holding[0].len() == 1 && holding[1].len() == 1 && holding[0] != holding[1]
+        })
+        .await;
+        assert_eq!(
+            holding[0]
+                .union(&holding[1])
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1]),
+            "between them the members hold both partitions"
+        );
+    }
+
+    /// Statistics every 200 ms, so the lag follows a rebalance within the test.
+    fn fast_statistics(config: KafkaConfig) -> KafkaConfig {
+        config.with_override("statistics.interval.ms", "200")
+    }
+
+    #[tokio::test]
+    async fn cooperative_sticky_members_each_report_lag_for_what_they_hold() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "split-cooperative";
+        let config = fast_statistics(
+            KafkaConfig {
+                consumer_protocol: ConsumerProtocol::Classic,
+                ..consumer_config(&bootstrap, topic, "split-cooperative-group")
+            }
+            .with_override("partition.assignment.strategy", "cooperative-sticky"),
+        );
+        a_second_member_takes_one_partition_from_the_first(&bootstrap, topic, &config).await;
+    }
+
+    #[tokio::test]
+    async fn kip_848_members_each_report_lag_for_what_they_hold() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "split-kip-848";
+        let config = fast_statistics(kip_848_config(&bootstrap, topic, "split-kip-848-group"));
+        a_second_member_takes_one_partition_from_the_first(&bootstrap, topic, &config).await;
     }
 
     /// A failure no retry clears is returned and leaves readiness alone: a
