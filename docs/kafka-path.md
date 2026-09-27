@@ -185,33 +185,40 @@ Every image that runs a scalo producer or consumer needs a librdkafka built with
 
 ---
 
-## Consumer group protocol (KIP-848) -- on by default
+## Consumer group protocol (KIP-848) -- opt-in
 
 `kafka.consumer_protocol` picks the rebalance protocol and defaults to
-`consumer`, the KIP-848 one. The group coordinator computes the assignment and
-pushes it on the heartbeat, so adding or removing a member costs no
-stop-the-world rebalance -- the difference a KEDA scale event feels.
+`classic`. A KIP-848 member is refused with a fatal error by a group that still
+holds a classic member, and librdkafka reports no join for a KIP-848 member
+that holds no partitions, so the transport cannot tell a working KIP-848
+consumer from a stuck one. Set `consumer_protocol: consumer` to opt in: the
+group coordinator then computes the assignment and pushes it on the heartbeat,
+so adding or removing a member costs no stop-the-world rebalance.
 
-It needs a Kafka 4.0+ broker, and the transport reaches `classic` two ways:
+KIP-848 needs a Kafka 4.0+ broker. An opted-in consumer reaches `classic` two
+ways:
 
 - **The provider gate.** A provider whose brokers do not implement it at all
   (`redpanda`, `redpanda-cloud`) resolves to `classic` at construction.
-- **The startup probe.** Otherwise the consumer joins with the consumer
-  protocol and construction waits, up to `kafka.consumer_protocol_probe_ms`
-  (default 5000), for librdkafka's statistics to report the group `up`. A
-  refusal arrives as a FATAL error carrying `UNSUPPORTED_VERSION`,
-  `_UNSUPPORTED_FEATURE` or `UNSUPPORTED_ASSIGNOR`; a broker that answers no
-  ConsumerGroupHeartbeat at all just never joins, which the window catches.
-  Either way the consumer is rebuilt once as `classic`, with a warning naming
-  the brokers and the reason, and the process carries on.
+- **A refusal.** The broker refuses the member with a FATAL error:
+  `GROUP_ID_NOT_FOUND` from a group whose classic cooperative-sticky member has
+  been through a rebalance, `UNKNOWN` from one whose other member has just moved
+  to classic, or `UNSUPPORTED_VERSION`, `_UNSUPPORTED_FEATURE` or
+  `UNSUPPORTED_ASSIGNOR` from a broker without KIP-848. The next `recv`
+  rebuilds the consumer as `classic`, with a warning naming the brokers and the
+  reason, and carries on.
 
-The wait ends the moment the group joins, so a KIP-848 broker pays one
-`statistics.interval.ms` (1 s on the shipped profiles), not the whole window.
-A broker that is unreachable at startup also exhausts the window and falls
-back -- classic works on 4.0 too, so the cost of that misfire is one warning.
-Set the window to `0` to take the requested protocol with no fallback, or
-`consumer_protocol: classic` to opt out. A producer-only transport joins no
-group and never probes.
+Nothing times a KIP-848 consumer out. `kafka.consumer_protocol_probe_ms` is
+still parsed and has no effect. A producer-only transport joins no group.
+
+### A fatal client is never kept
+
+librdkafka marks a client fatal when it can never be used again, and every
+poll after that fails. The next `recv` replaces it with a new client subscribed
+to the same topics: `classic` after a refusal above, the same protocol after
+any other fatal. A rebuild that follows another with no record between them
+waits a backoff first and fails `/readyz` until a record arrives.
+`transport_consumer_rebuilds_total{protocol}` counts them.
 
 Under `consumer`, librdkafka refuses the whole client if
 `partition.assignment.strategy`, `session.timeout.ms`,

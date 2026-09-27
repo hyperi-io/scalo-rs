@@ -89,6 +89,11 @@ pub(crate) const ZSTD_COMPRESSION_LEVEL: &str = "3";
 // ============================================================================
 
 /// Which consumer-group rebalance protocol the consumer joins with.
+///
+/// `classic` is the default. A KIP-848 member is refused outright by a group
+/// still holding classic members, and librdkafka reports no join for a KIP-848
+/// member that holds no partitions, so the transport cannot tell a working
+/// KIP-848 consumer from a stuck one. KIP-848 is therefore opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -96,13 +101,13 @@ pub enum ConsumerProtocol {
     /// KIP-848: the broker's group coordinator computes the assignment and
     /// pushes it on the heartbeat, so adding or removing a member costs no
     /// stop-the-world rebalance -- the difference a KEDA scale event feels.
-    /// Requires a Kafka 4.0+ broker, and the transport falls back to
-    /// [`Classic`](Self::Classic) when the broker will not speak it.
-    #[default]
+    /// Requires a Kafka 4.0+ broker. A consumer the broker refuses is rebuilt
+    /// as [`Classic`](Self::Classic).
     Consumer,
 
     /// The pre-4.0 protocol: the group leader computes the assignment and
-    /// every member stops consuming while it does.
+    /// every member stops consuming while it does. Every broker speaks it.
+    #[default]
     Classic,
 }
 
@@ -1151,31 +1156,20 @@ pub struct KafkaConfig {
     #[serde(default)]
     pub group_instance_id: Option<String>,
 
-    /// Consumer-group rebalance protocol to join with (default: `consumer`,
-    /// KIP-848).
+    /// Consumer-group rebalance protocol to join with (default: `classic`).
     ///
-    /// Not every broker speaks it, so the resolved value is
+    /// `consumer` opts in to KIP-848. The resolved value is
     /// [`effective_consumer_protocol`](Self::effective_consumer_protocol) --
-    /// a provider known not to implement KIP-848 is forced to `classic`, and
-    /// a broker that refuses it at join time drops the transport back to
-    /// `classic` once, with a warning. Set `classic` to opt out entirely.
+    /// a provider known not to implement KIP-848 is forced to `classic` -- and
+    /// a KIP-848 consumer the broker refuses is rebuilt as `classic` by the
+    /// receive that meets the refusal, with a warning.
     #[serde(default)]
     pub consumer_protocol: ConsumerProtocol,
 
-    /// How long construction waits for the broker to accept
-    /// `group.protocol=consumer` before rebuilding the consumer as `classic`,
-    /// in milliseconds.
+    /// No longer read: nothing waits on a KIP-848 join, because librdkafka
+    /// reports no join for a member that holds no partitions.
     ///
-    /// The wait ends as soon as librdkafka's statistics report the group `up`,
-    /// so on a broker that does speak KIP-848 it costs one
-    /// `statistics.interval.ms` (1 s on the shipped profiles) rather than the
-    /// whole window. A broker that is simply unreachable at startup also
-    /// exhausts the window and falls back -- classic works everywhere, so the
-    /// cost of that misfire is a warning line.
-    ///
-    /// `0` disables the probe: the requested protocol is used as-is with no
-    /// fallback. Only a subscribing consumer probes at all, since a
-    /// producer-only transport joins no group.
+    /// Kept so configs that set it still parse; it has no effect.
     #[serde(default = "default_consumer_protocol_probe_ms")]
     pub consumer_protocol_probe_ms: u64,
 
@@ -1668,10 +1662,10 @@ impl KafkaConfig {
 
     /// The consumer-group protocol this config will actually join with.
     ///
-    /// A provider whose brokers do not implement KIP-848 is forced to
-    /// [`ConsumerProtocol::Classic`] here, so it never pays the startup probe
-    /// to learn what is already known. An unrecognised provider name is left
-    /// alone -- [`apply_provider`](Self::apply_provider) is what rejects it.
+    /// A KIP-848 opt-in on a provider whose brokers do not implement it is
+    /// forced to [`ConsumerProtocol::Classic`] here, so the broker never has to
+    /// refuse it. An unrecognised provider name is left alone --
+    /// [`apply_provider`](Self::apply_provider) is what rejects it.
     #[must_use]
     pub fn effective_consumer_protocol(&self) -> ConsumerProtocol {
         use super::providers::{KafkaProvider, KnownProvider};
@@ -1852,8 +1846,8 @@ impl KafkaConfig {
     /// - `{PREFIX}_BOOTSTRAP_SERVERS` -> brokers (legacy: `{PREFIX}_BROKERS`)
     /// - `{PREFIX}_GROUP_ID` -> group
     /// - `{PREFIX}_CLIENT_RACK` -> client_rack (legacy: `{PREFIX}_AVAILABILITY_ZONE`)
-    /// - `{PREFIX}_CONSUMER_PROTOCOL` -> consumer_protocol (consumer, classic)
-    /// - `{PREFIX}_CONSUMER_PROTOCOL_PROBE_MS` -> consumer_protocol_probe_ms
+    /// - `{PREFIX}_CONSUMER_PROTOCOL` -> consumer_protocol (classic, consumer)
+    /// - `{PREFIX}_CONSUMER_PROTOCOL_PROBE_MS` -> consumer_protocol_probe_ms (no effect)
     /// - `{PREFIX}_PROVIDER` -> provider (derives security_protocol + sasl_mechanism)
     /// - `{PREFIX}_SECURITY_PROTOCOL` -> security_protocol
     /// - `{PREFIX}_SASL_MECHANISM` -> sasl_mechanism
@@ -1920,7 +1914,7 @@ impl KafkaConfig {
             config.group_instance_id = Some(val);
         }
 
-        // KIP-848 opt-out and the probe window that guards it.
+        // KIP-848 opt-in, and the probe window configs may still set.
         if let Some(val) = prefixed("CONSUMER_PROTOCOL", &[]).get()
             && let Ok(protocol) = val.parse()
         {
@@ -2185,27 +2179,25 @@ mod tests {
     // Consumer group protocol (KIP-848)
     // =========================================================================
 
-    /// KIP-848 is on by default; the whole point of the change is that nobody
-    /// has to opt in.
+    /// Classic is the default: a KIP-848 member cannot be told apart from a
+    /// stuck one, so it is opt-in.
     #[test]
-    fn consumer_protocol_defaults_to_kip_848() {
+    fn consumer_protocol_defaults_to_classic() {
         let cfg = KafkaConfig::default();
-        assert_eq!(cfg.consumer_protocol, ConsumerProtocol::Consumer);
-        assert_eq!(
-            cfg.effective_consumer_protocol(),
-            ConsumerProtocol::Consumer
-        );
+        assert_eq!(cfg.consumer_protocol, ConsumerProtocol::Classic);
+        assert_eq!(cfg.effective_consumer_protocol(), ConsumerProtocol::Classic);
         assert_eq!(ConsumerProtocol::Consumer.as_str(), "consumer");
         assert_eq!(ConsumerProtocol::Classic.as_str(), "classic");
     }
 
-    /// Redpanda implements neither KIP-848 nor KIP-932, so naming it as the
-    /// provider resolves to classic without paying the startup probe.
+    /// Redpanda implements neither KIP-848 nor KIP-932, so a KIP-848 opt-in
+    /// naming it as the provider resolves to classic.
     #[test]
     fn redpanda_resolves_to_classic() {
         for provider in ["redpanda", "redpanda-cloud"] {
             let cfg = KafkaConfig {
                 provider: Some(provider.to_string()),
+                consumer_protocol: ConsumerProtocol::Consumer,
                 ..Default::default()
             };
             assert_eq!(
@@ -2217,6 +2209,7 @@ mod tests {
         for provider in ["strimzi", "msk", "confluent-cloud", "plaintext"] {
             let cfg = KafkaConfig {
                 provider: Some(provider.to_string()),
+                consumer_protocol: ConsumerProtocol::Consumer,
                 ..Default::default()
             };
             assert_eq!(
@@ -2244,6 +2237,7 @@ mod tests {
     fn unknown_provider_does_not_downgrade_the_protocol() {
         let cfg = KafkaConfig {
             provider: Some("kinesis".to_string()),
+            consumer_protocol: ConsumerProtocol::Consumer,
             ..Default::default()
         };
         assert_eq!(
