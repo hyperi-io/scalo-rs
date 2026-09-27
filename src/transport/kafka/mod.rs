@@ -1043,9 +1043,9 @@ impl KafkaTransport {
         self.consumer().context().get_metrics()
     }
 
-    /// Records past this consumer's read position, summed over its partitions:
-    /// unread backlog, which a commit held for delivery does not inflate. See
-    /// [`StatsContext::total_position_lag`].
+    /// Records past this consumer's read position, summed over its assigned
+    /// partitions: unread backlog, which a commit held for delivery does not
+    /// inflate. See [`StatsContext::total_position_lag`].
     #[must_use]
     pub fn total_position_lag(&self) -> i64 {
         self.consumer().context().total_position_lag()
