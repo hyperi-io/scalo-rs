@@ -126,6 +126,10 @@ impl ServiceMetrics {
             "transport_commit_errors_total",
             "Source commits that failed after the block was delivered"
         );
+        metrics::describe_counter!(
+            "transport_consumer_rebuilds_total",
+            "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with"
+        );
 
         // Push transport descriptors into manifest registry. Labels are every
         // key an emitter sets: `path` on gRPC RouteBatch sends, `reason` on
@@ -205,6 +209,19 @@ impl ServiceMetrics {
                 .into(),
             unit: String::new(),
             labels: vec!["transport".into(), "class".into()],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
+        reg.push(MetricDescriptor {
+            name: "transport_consumer_rebuilds_total".into(),
+            metric_type: MetricType::Counter,
+            description:
+                "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with"
+                    .into(),
+            unit: String::new(),
+            labels: vec!["transport".into(), "protocol".into()],
             group: "platform".into(),
             buckets: None,
             use_cases: vec![],

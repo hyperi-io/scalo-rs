@@ -148,11 +148,10 @@ pub trait KafkaProvider {
     /// Whether this provider's brokers implement the KIP-848 consumer group
     /// protocol (`group.protocol=consumer`). Default: `true`.
     ///
-    /// Answer `false` for a platform that does not, and the transport picks
-    /// `classic` at construction instead of discovering the refusal through
-    /// its startup probe. It is a FACT about the platform, not a preference:
-    /// an operator who wants `classic` on a broker that could do better sets
-    /// `consumer_protocol` on the config.
+    /// Answer `false` for a platform that does not, and a KIP-848 opt-in picks
+    /// `classic` at construction instead of meeting the broker's refusal. It is
+    /// a FACT about the platform, not a preference: the protocol an operator
+    /// wants goes in `consumer_protocol` on the config.
     fn supports_consumer_group_protocol(&self) -> bool {
         true
     }
@@ -304,8 +303,8 @@ impl KafkaProvider for KnownProvider {
         match self {
             // Redpanda 26.2 answers no ConsumerGroupHeartbeat at all.
             Self::Redpanda | Self::RedpandaCloud => false,
-            // Kafka-protocol platforms, gated on the broker being 4.0+, which
-            // the startup probe settles.
+            // Kafka-protocol platforms, gated on the broker being 4.0+; an
+            // older broker's refusal rebuilds the consumer as classic.
             Self::Strimzi | Self::Msk | Self::ConfluentCloud | Self::Plaintext | Self::MskIam => {
                 true
             }
@@ -495,8 +494,8 @@ mod tests {
         assert_eq!(KnownProvider::Msk.schema_registry(), SchemaRegistry::None);
     }
 
-    /// Redpanda is the one built-in that cannot do KIP-848, so it must not be
-    /// sent to the startup probe to find that out.
+    /// Redpanda is the one built-in that cannot do KIP-848, so a KIP-848 opt-in
+    /// must not have to be refused to find that out.
     #[test]
     fn only_redpanda_lacks_the_consumer_group_protocol() {
         let without: Vec<_> = CANONICAL_TABLE

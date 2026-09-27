@@ -60,7 +60,7 @@ transport:
       sasl_password: ${KAFKA_PASSWORD}
 ```
 
-- **Cancellation safety**: `recv` polls on tokio's blocking pool, so a loop on it never holds a runtime worker. It is safe to drop at any `.await`, including its outage backoff: a poll still running when `recv` is dropped is kept, and the next `recv` returns its records.
+- **Cancellation safety**: `recv` polls on tokio's blocking pool, so a loop on it never holds a runtime worker. It is safe to drop at any `.await`, including its outage backoff and the wait after a repeated consumer rebuild: a poll still running when `recv` is dropped is kept, and the next `recv` returns its records, or an empty batch when the client it polled has been rebuilt since and the poll failed.
 - **Idle wait**: with nothing queued, `recv` waits up to 50 ms for a record, then returns an empty batch.
 - **`send_batch()`**: queues the whole block, then awaits every delivery
   report, so the block costs about one `linger.ms` window. Outbound filters
@@ -68,7 +68,8 @@ transport:
   otherwise it is the first `Backpressured`/`Fatal` in record order and part
   of the block may be on the broker -- retry it whole (at-least-once).
   Records carry their `key` as the topic and no headers.
-- **`is_healthy()`**: `false` after `close()` only; a broker outage does not flip it.
+- **`is_healthy()`**: `false` after `close()`; for a fenced static member; and from a failed consumer rebuild, or a second one with no record between, until a record arrives. A broker outage or a receive error does not flip it.
+- **Group protocol**: `classic` unless `consumer_protocol: consumer` opts in to KIP-848; `group_protocol()` reports the one in use. A consumer librdkafka flags fatal is rebuilt by the next `recv`, as `classic` when the broker refused KIP-848, except a fenced static member, which is not. See [../kafka-path.md](../kafka-path.md).
 - **`commit()`**: synchronous (`CommitMode::Sync`) on tokio's blocking pool, so a broker rejection reaches the caller. `commit_weak_async()` is the fire-and-forget form.
 - **Acknowledgements**: `acknowledgements.enabled` (default `true`) from `<key>.kafka.acknowledgements`, or `with_acknowledgements`. Once armed (`AckControl::arm`, which the `BatchEngine` pipeline builder calls), every offset `recv` hands out is held until released, and `commit` or `release` moves each partition only up to its lowest offset still held. An `Errored` release keeps its offsets held, so no later release commits past them: they are read again after a restart or rebalance. `transport_ack_withheld` counts them, so a partition pinned that way can alert. A partition a rebalance revokes is its next owner's: its held offsets go, nothing of it is held or committed until an assignment gives it back, a record read before the revoke in the same poll is not handed out, and an offset handed out before the revoke commits nothing when released, even after the partition comes back. In a hand-rolled or re-run loop, that partition's commit can stall until its next revoke when the stale copy is released `Errored`, or when the copy read again is released first. That costs time and backlog, not data, and a restart reads the partition again. Unarmed, `commit` commits the highest offset per partition, as before. See [../pipeline/acknowledgements.md](../pipeline/acknowledgements.md).
 - **Sink confirmation**: `confirms_delivery()` is `Remote`. `dead_letter_reason` names a record over `message.max.bytes` less 128 bytes of framing, and an outbound `dlq` filter match, so the pipeline dead-letters them itself instead of taking the `FilteredDlq` answer as handled.
@@ -80,7 +81,7 @@ librdkafka reconnects and rejoins by itself, so an outage ends neither the consu
 
 | Call | Broker unavailable | Returned as an error |
 |------|--------------------|----------------------|
-| `recv` | Empty batch; the next poll waits a jittered backoff, 100 ms doubling to 2 s | ACL failure, a missing topic the consumer may not create, bad config, a librdkafka fatal error, an unlisted code: `TransportError::Recv` |
+| `recv` | Empty batch; the next poll waits a jittered backoff, 100 ms doubling to 2 s | ACL failure, a missing topic the consumer may not create, bad config, an unlisted code: `TransportError::Recv`, readiness untouched. A librdkafka fatal error rebuilds the consumer and returns an empty batch; a fenced static member returns `TransportError::Recv` and fails readiness |
 | `send` / `send_batch` | `Backpressured` once the queue stays full 5 s or a record outlives `message.timeout.ms` (default 300 s) | ACL or permanent topic error: `Fatal`; oversize record: `FilteredDlq` |
 | `commit` | Retried with the same backoff for up to 60 s, never after `close()` | Once that runs out, or when a newer group generation owns the partitions: `TransportError::Commit`, which the `BatchEngine` driver logs and carries on from |
 

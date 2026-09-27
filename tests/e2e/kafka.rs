@@ -1079,3 +1079,277 @@ mod lag {
         );
     }
 }
+
+/// The consumer-group protocol against a real broker, including a group left
+/// on the classic protocol. Once its cooperative-sticky member has been through
+/// a rebalance, its subscription carries assignor data the broker will not drop,
+/// so a KIP-848 member is refused with a fatal `GroupIdNotFound`.
+#[cfg(feature = "testcontainers")]
+mod group_protocol {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use rdkafka::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use scalo::transport::kafka::{ConsumerProtocol, KafkaConfig, KafkaTransport};
+    use scalo::transport::{TransportBase, TransportReceiver};
+
+    use super::broker::{consumer_config, create_topic, produce, start_kafka};
+
+    /// Records written to each test topic.
+    const RECORDS: usize = 20;
+
+    /// A classic-protocol, cooperative-sticky member of a group, polled on its
+    /// own thread until it leaves -- the member a consumer that fell back to
+    /// classic leaves behind in a roll.
+    struct ClassicMember {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ClassicMember {
+        /// Join `group` on `topic`, polling on a thread of its own, and return
+        /// once the member holds a partition, or at once when `wait` is false.
+        async fn join(bootstrap: &str, topic: &str, group: &str, wait: bool) -> Self {
+            let consumer: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", bootstrap)
+                .set("group.id", group)
+                .set("group.protocol", "classic")
+                .set("partition.assignment.strategy", "cooperative-sticky")
+                .set("enable.auto.commit", "false")
+                .create()
+                .expect("classic member");
+            consumer
+                .subscribe(&[topic])
+                .expect("classic member subscribes");
+            let stop = Arc::new(AtomicBool::new(false));
+            let polling = Arc::clone(&stop);
+            let (joined, has_joined) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                let mut joined = Some(joined);
+                while !polling.load(Ordering::Relaxed) {
+                    let _ = consumer.poll(Duration::from_millis(100));
+                    if consumer.assignment().is_ok_and(|a| a.count() > 0)
+                        && let Some(tell) = joined.take()
+                    {
+                        let _ = tell.send(());
+                    }
+                }
+                // Leave now rather than at the session timeout: the revoke is
+                // served by the polls that follow the unsubscribe.
+                consumer.unsubscribe();
+                for _ in 0..10 {
+                    let _ = consumer.poll(Duration::from_millis(100));
+                }
+            });
+            if wait {
+                tokio::time::timeout(Duration::from_secs(60), has_joined)
+                    .await
+                    .expect("the classic member joined within 60 s")
+                    .expect("the classic member's thread reported");
+            }
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// Leave the group and wait until the member has closed.
+        async fn leave(mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                tokio::task::spawn_blocking(move || thread.join())
+                    .await
+                    .expect("join task")
+                    .expect("classic member thread");
+            }
+        }
+    }
+
+    impl Drop for ClassicMember {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn seq_of(payload: &[u8]) -> usize {
+        let digits = payload
+            .strip_prefix(b"{\"seq\":")
+            .and_then(|rest| rest.strip_suffix(b"}"))
+            .expect("a record written by produce");
+        std::str::from_utf8(digits)
+            .expect("ASCII digits")
+            .parse()
+            .expect("seq fits usize")
+    }
+
+    /// Read until every record in `0..RECORDS` has arrived, failing on any
+    /// receive error.
+    async fn read_every_record(transport: &KafkaTransport, within: Duration) {
+        let deadline = Instant::now() + within;
+        let mut seen = BTreeSet::new();
+        while seen.len() < RECORDS {
+            assert!(
+                Instant::now() < deadline,
+                "read {} of {RECORDS} records within {within:?}",
+                seen.len()
+            );
+            let batch = transport
+                .recv(100)
+                .await
+                .unwrap_or_else(|e| panic!("recv failed after {} records: {e}", seen.len()));
+            seen.extend(batch.records.iter().map(|r| seq_of(&r.payload)));
+        }
+        assert_eq!(seen, (0..RECORDS).collect::<BTreeSet<_>>());
+    }
+
+    /// How long a second classic member stays, so the first rejoins with the
+    /// partition it owns in its subscription. Past the broker's 3 s initial
+    /// rebalance delay.
+    const SECOND_MEMBER_STAY: Duration = Duration::from_secs(8);
+
+    /// How long the first member takes to settle after the second leaves.
+    const REJOIN_SETTLE: Duration = Duration::from_secs(5);
+
+    /// A topic holding `RECORDS` records and a classic group whose member
+    /// has been through a rebalance -- a roll's shape, where the member left
+    /// behind has already rejoined once.
+    async fn rebalanced_classic_group(
+        bootstrap: &str,
+        topic: &'static str,
+        group: &str,
+    ) -> ClassicMember {
+        create_topic(bootstrap, topic).await;
+        produce(bootstrap, topic, 0..RECORDS).await;
+        let member = ClassicMember::join(bootstrap, topic, group, true).await;
+        let second = ClassicMember::join(bootstrap, topic, group, false).await;
+        tokio::time::sleep(SECOND_MEMBER_STAY).await;
+        second.leave().await;
+        tokio::time::sleep(REJOIN_SETTLE).await;
+        member
+    }
+
+    /// A KIP-848 consumer for `group`, whatever the default protocol is.
+    fn kip_848_config(bootstrap: &str, topic: &str, group: &str) -> KafkaConfig {
+        KafkaConfig {
+            consumer_protocol: ConsumerProtocol::Consumer,
+            ..consumer_config(bootstrap, topic, group)
+        }
+    }
+
+    /// Receive beside the classic member until the transport has rebuilt its
+    /// consumer as classic, failing on any receive error. The refusal lands
+    /// within a second; 30 s is the failure bound, not the expectation.
+    async fn receive_until_classic(transport: &KafkaTransport) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while transport.group_protocol() != ConsumerProtocol::Classic {
+            assert!(
+                Instant::now() < deadline,
+                "the refused consumer was not rebuilt as classic within 30 s"
+            );
+            let batch = transport
+                .recv(100)
+                .await
+                .unwrap_or_else(|e| panic!("recv beside a classic member failed: {e}"));
+            assert!(
+                batch.records.is_empty(),
+                "the classic member holds the partition"
+            );
+        }
+    }
+
+    /// The zombie shape: a KIP-848 consumer meets a classic group, the broker
+    /// refuses it with a fatal error, and the receive must replace it with a
+    /// classic consumer that reads, never keep polling the dead client.
+    #[tokio::test]
+    async fn a_consumer_refused_by_a_classic_group_is_rebuilt_as_classic_and_reads() {
+        let (_node, bootstrap) = start_kafka().await;
+        let (topic, group) = ("mixed-group", "mixed-group-group");
+        let member = rebalanced_classic_group(&bootstrap, topic, group).await;
+
+        let transport = KafkaTransport::new(&kip_848_config(&bootstrap, topic, group))
+            .await
+            .expect("kafka consumer");
+        receive_until_classic(&transport).await;
+        member.leave().await;
+
+        read_every_record(&transport, Duration::from_secs(90)).await;
+        assert_eq!(transport.group_protocol(), ConsumerProtocol::Classic);
+        assert!(transport.is_healthy());
+    }
+
+    /// Nothing times an opted-in KIP-848 consumer out: the one reading and the
+    /// one left with no partition both stay on KIP-848.
+    #[tokio::test]
+    async fn opted_in_consumers_keep_kip_848_with_or_without_partitions() {
+        let (_node, bootstrap) = start_kafka().await;
+        let (topic, group) = ("fresh-group", "fresh-group-group");
+        create_topic(&bootstrap, topic).await;
+        produce(&bootstrap, topic, 0..RECORDS).await;
+
+        let config = kip_848_config(&bootstrap, topic, group);
+        let reader = KafkaTransport::new(&config).await.expect("first consumer");
+        let idle = KafkaTransport::new(&config).await.expect("second consumer");
+        // Past the 5 s window the old startup probe waited out.
+        let until = Instant::now() + Duration::from_secs(12);
+        let mut read = 0;
+        while Instant::now() < until {
+            read += reader.recv(100).await.expect("recv").records.len();
+            read += idle.recv(100).await.expect("recv").records.len();
+        }
+        assert!(
+            read >= RECORDS,
+            "read {read} of {RECORDS} records between the two"
+        );
+        assert_eq!(reader.group_protocol(), ConsumerProtocol::Consumer);
+        assert_eq!(idle.group_protocol(), ConsumerProtocol::Consumer);
+    }
+
+    /// A failure no retry clears is returned and leaves readiness alone: a
+    /// caller that reads an error plus an unhealthy transport as closed would
+    /// otherwise stop over a topic that is only briefly gone, as a removed
+    /// source's is. The same consumer reads once the topic is back.
+    #[tokio::test]
+    async fn a_permanent_receive_failure_leaves_readiness_alone() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "late-topic";
+        let config = KafkaConfig {
+            consumer_protocol: ConsumerProtocol::Classic,
+            ..consumer_config(&bootstrap, topic, "late-topic-group")
+        }
+        .with_override("topic.metadata.refresh.interval.ms", "1000");
+        let transport = KafkaTransport::new(&config).await.expect("kafka consumer");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "recv never reported the missing topic"
+            );
+            if transport.recv(100).await.is_err() {
+                break;
+            }
+        }
+        assert!(
+            transport.is_healthy(),
+            "a returned receive error leaves readiness to the caller"
+        );
+
+        create_topic(&bootstrap, topic).await;
+        produce(&bootstrap, topic, 0..RECORDS).await;
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut read = 0;
+        while read < RECORDS {
+            assert!(
+                Instant::now() < deadline,
+                "read {read} of {RECORDS} records"
+            );
+            if let Ok(batch) = transport.recv(100).await {
+                read += batch.records.len();
+            }
+        }
+        assert!(transport.is_healthy());
+    }
+}
