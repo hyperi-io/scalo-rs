@@ -1307,10 +1307,12 @@ mod group_protocol {
         assert_eq!(idle.group_protocol(), ConsumerProtocol::Consumer);
     }
 
-    /// A failure no retry clears fails readiness, and records flowing again
-    /// restore it.
+    /// A failure no retry clears is returned and leaves readiness alone: a
+    /// caller that reads an error plus an unhealthy transport as closed would
+    /// otherwise stop over a topic that is only briefly gone, as a removed
+    /// source's is. The same consumer reads once the topic is back.
     #[tokio::test]
-    async fn a_permanent_receive_failure_fails_readiness_until_records_flow() {
+    async fn a_permanent_receive_failure_leaves_readiness_alone() {
         let (_node, bootstrap) = start_kafka().await;
         let topic = "late-topic";
         let config = KafkaConfig {
@@ -1331,8 +1333,8 @@ mod group_protocol {
             }
         }
         assert!(
-            !transport.is_healthy(),
-            "a consumer that cannot read must fail readiness"
+            transport.is_healthy(),
+            "a returned receive error leaves readiness to the caller"
         );
 
         create_topic(&bootstrap, topic).await;
@@ -1348,6 +1350,6 @@ mod group_protocol {
                 read += batch.records.len();
             }
         }
-        assert!(transport.is_healthy(), "records flowing restore readiness");
+        assert!(transport.is_healthy());
     }
 }

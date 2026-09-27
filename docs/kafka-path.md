@@ -211,14 +211,25 @@ ways:
 Nothing times a KIP-848 consumer out. `kafka.consumer_protocol_probe_ms` is
 still parsed and has no effect. A producer-only transport joins no group.
 
-### A fatal client is never kept
+### A fatal client is rebuilt, unless it was fenced
 
 librdkafka marks a client fatal when it can never be used again, and every
 poll after that fails. The next `recv` replaces it with a new client subscribed
-to the same topics: `classic` after a refusal above, the same protocol after
-any other fatal. A rebuild that follows another with no record between them
-waits a backoff first and fails `/readyz` until a record arrives.
-`transport_consumer_rebuilds_total{protocol}` counts them.
+to the same topics and returns an empty batch: `classic` after a refusal above,
+the same protocol after any other fatal. A rebuild that follows another with no
+record between them fails `/readyz` until a record arrives, and the poll after
+it waits a backoff (100 ms doubling to 2 s). The first rebuild of a run logs a
+warning and the first record after it logs the recovery;
+`transport_consumer_rebuilds_total{protocol}` counts every one.
+
+A fenced static member (`FENCED_INSTANCE_ID`: another consumer holds its
+`group.instance.id`) is not rebuilt, because the new client would fence that
+consumer back. Every `recv` returns `TransportError::Recv` and `/readyz` fails:
+this instance has to stop.
+
+Any other error `recv` returns leaves `/readyz` alone. A caller that treats an
+error plus an unhealthy transport as closed would otherwise stop over a topic
+that is only briefly gone, as a removed source's is.
 
 Under `consumer`, librdkafka refuses the whole client if
 `partition.assignment.strategy`, `session.timeout.ms`,
