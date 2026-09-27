@@ -1078,6 +1078,85 @@ mod lag {
             "resumed and read to the end: end {end}, read to {end}, committed {committed}"
         );
     }
+
+    /// The value of the series `name` whose labels include every one of
+    /// `labels`, as the scrape renders it.
+    #[cfg(feature = "metrics")]
+    fn scraped(rendered: &str, name: &str, labels: &[&str]) -> Option<f64> {
+        rendered
+            .lines()
+            .filter(|line| line.split([' ', '{']).next() == Some(name))
+            .filter(|line| labels.iter().all(|label| line.contains(label)))
+            .find_map(|line| line.rsplit(' ').next()?.parse().ok())
+    }
+
+    /// A group that has committed nothing publishes its lag and its assignment
+    /// from its first assignment: 0 on an empty topic, then every record
+    /// written while it reads none of them.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn a_group_that_committed_nothing_publishes_lag_and_assignment() {
+        use scalo::metrics::{MetricsConfig, MetricsManager};
+
+        let manager = MetricsManager::with_config(MetricsConfig {
+            enable_process_metrics: false,
+            enable_container_metrics: false,
+            #[cfg(feature = "otel-metrics")]
+            otel: scalo::metrics::OtelMetricsConfig {
+                enabled: false,
+                ..scalo::metrics::OtelMetricsConfig::default()
+            },
+            ..MetricsConfig::default()
+        });
+        let scrape = manager.render_handle().expect("prometheus recorder");
+        let lag = |rendered: &str| {
+            scraped(
+                rendered,
+                "rdkafka_topic_partition_consumer_lag",
+                &["topic=\"fresh\"", "partition=\"0\""],
+            )
+        };
+        let assigned = |rendered: &str| scraped(rendered, "consumer_partitions_assigned", &[]);
+
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "fresh";
+        let group = "fresh-group";
+        create_topic(&bootstrap, topic).await;
+        let transport = lag_consumer(&bootstrap, topic, group).await;
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let rendered = loop {
+            let batch = transport.recv(100).await.expect("recv");
+            assert!(batch.records.is_empty(), "the topic is empty");
+            let rendered = scrape.render();
+            if lag(&rendered) == Some(0.0) && assigned(&rendered) == Some(1.0) {
+                break rendered;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no lag 0 and assignment 1 within 60 s:\n{rendered}"
+            );
+        };
+        assert_eq!(lags(&transport), (0, 0), "{rendered}");
+
+        transport.gate_actuator().pause();
+        produce(&bootstrap, topic, 0..WRITTEN_PAUSED).await;
+        let written = offset(WRITTEN_PAUSED);
+        assert_eq!(
+            settle(&transport, (written, written)).await,
+            (written, written),
+            "{written} written, none read, none committed"
+        );
+        let rendered = scrape.render();
+        let written_f64 = f64::from(u32::try_from(WRITTEN_PAUSED).expect("fits a u32"));
+        assert_eq!(lag(&rendered), Some(written_f64), "{rendered}");
+        assert_eq!(assigned(&rendered), Some(1.0), "{rendered}");
+        assert_eq!(
+            super::broker::committed(&bootstrap, group, topic).await,
+            None,
+            "the group committed nothing"
+        );
+    }
 }
 
 /// The consumer-group protocol against a real broker, including a group left

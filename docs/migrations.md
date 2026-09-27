@@ -822,6 +822,12 @@ The producer profile constants `PRODUCER_HIGH_THROUGHPUT`, `PRODUCER_EXACTLY_ONC
 
 **Consumer adjustment** -- a `KafkaProducer` whose `librdkafka_overrides` set a sizing key now runs that value. An override by librdkafka's other name for a property scalo sets, such as `fetch.message.max.bytes`, now always wins where it used to win at random. The Kafka DLQ backend builds on `KafkaProducer`, so its producer follows the same order. A service that builds its own producer config, to own the delivery context, builds it with the new public `transport::kafka::producer_client_config(&config, profile_defaults)`, passing its own keys as `profile_defaults`. Copying the order is not enough: moving `librdkafka_overrides` after `sizing.resolved_producer_map()` still leaves a property set under both librdkafka names to hash order.
 
+### Kafka lag and assignment are published from the first assignment (BEHAVIOUR CHANGE)
+
+`rdkafka_topic_partition_consumer_lag` and `total_consumer_lag` covered only partitions with a committed offset, since librdkafka reports `consumer_lag` only from a commit. A group that had never committed published no lag series and read as idle to a scaler on that lag, backlog or not. A partition with nothing committed now counts from the read position: the application's, else librdkafka's fetch position. The lag, `total_consumer_lag` and `total_position_lag` count only the partitions the consumer holds, as its rebalances left them, and a revoked partition's lag series drops to 0. `consumer_partitions_assigned`, which nothing set before, now follows the assignment.
+
+**Consumer adjustment** -- none in code. A service that calls `ConsumerMetrics::set_partitions_assigned` itself shares the series with the transport, so it drops the call. A second `StatsContext` consumer in the same process, in another group, now publishes the same unlabelled series, and the two write over each other. A consumer built on `StatsContext` that takes partitions with `assign()` rather than `subscribe()` serves no rebalance, so it publishes no lag.
+
 ### Smaller additions
 
 - `RoutedSender` forwards `dead_letter_reason` to the route a record's key selects, and reports the weakest `confirms_delivery` across its routes, so `.sender(&routed)` screens and reports as the routes do.

@@ -4137,4 +4137,119 @@ mod tests {
             "the commit follows what was read again, never past 3"
         );
     }
+
+    /// The value of the series `name` whose labels include every one of
+    /// `labels`, as the scrape renders it.
+    #[cfg(feature = "metrics")]
+    fn scraped(rendered: &str, name: &str, labels: &[&str]) -> Option<f64> {
+        rendered
+            .lines()
+            .filter(|line| line.split([' ', '{']).next() == Some(name))
+            .filter(|line| labels.iter().all(|label| line.contains(label)))
+            .find_map(|line| line.rsplit(' ').next()?.parse().ok())
+    }
+
+    /// The count follows each rebalance the consumer serves, and neither the
+    /// transport's producer nor a producer-only transport, which never
+    /// rebalance, writes over it.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn the_assigned_partition_count_follows_rebalances_and_nothing_else_writes_it() {
+        use rdkafka::client::ClientContext;
+        use rdkafka::producer::Producer;
+        use rdkafka::statistics::Statistics;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+
+        let transport = armed_without_a_broker().await;
+        let producer_only = KafkaTransport::new(&KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("a producer-only transport constructs broker-free");
+
+        serve(&transport, false, 0);
+        serve(&transport, false, 1);
+        serve(&transport, true, 0);
+        transport.consumer().context().emit_prometheus_metrics();
+        // Each statistics callback ends in an emit, the producers' included.
+        transport.producer.context().stats(Statistics::default());
+        producer_only
+            .producer
+            .context()
+            .stats(Statistics::default());
+        producer_only
+            .consumer()
+            .context()
+            .stats(Statistics::default());
+
+        let rendered = handle.render();
+        assert_eq!(
+            scraped(&rendered, "consumer_partitions_assigned", &[]),
+            Some(1.0),
+            "assigned 0 and 1, then revoked 0:\n{rendered}"
+        );
+    }
+
+    /// A revoked partition's lag reads 0 from the revoke on: the recorder
+    /// never drops a series, so it would otherwise show its last lag for good.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn a_revoked_partition_publishes_lag_zero() {
+        use rdkafka::client::ClientContext;
+        use rdkafka::statistics::{Partition, Statistics, Topic};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+        let partition_0 = ["topic=\"events\"", "partition=\"0\""];
+
+        let transport = armed_without_a_broker().await;
+        serve(&transport, false, 0);
+        let consumer = transport.consumer();
+        consumer.context().stats(Statistics {
+            topics: HashMap::from([(
+                "events".to_string(),
+                Topic {
+                    topic: "events".to_string(),
+                    partitions: HashMap::from([(
+                        0,
+                        Partition {
+                            partition: 0,
+                            app_offset: 12,
+                            committed_offset: 5,
+                            hi_offset: 12,
+                            consumer_lag: 7,
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let lag = |rendered: &str| {
+            scraped(
+                rendered,
+                "rdkafka_topic_partition_consumer_lag",
+                &partition_0,
+            )
+        };
+        assert_eq!(lag(&handle.render()), Some(7.0));
+
+        serve(&transport, true, 0);
+        assert_eq!(lag(&handle.render()), Some(0.0), "revoked");
+        assert_eq!(total_consumer_lag(&transport.stats()), 0);
+
+        consumer.context().emit_prometheus_metrics();
+        assert_eq!(
+            lag(&handle.render()),
+            Some(0.0),
+            "an emit before the next statistics does not bring the old lag back"
+        );
+    }
 }

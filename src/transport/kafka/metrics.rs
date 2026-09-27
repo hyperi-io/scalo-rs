@@ -35,9 +35,9 @@ use rdkafka::client::ClientContext;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::error::KafkaError;
 use rdkafka::statistics::Statistics;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 /// Kafka metrics snapshot. Mirrors the Python `KafkaMetrics` dataclass.
 #[derive(Debug, Clone, Default)]
@@ -61,7 +61,9 @@ pub struct KafkaMetrics {
     pub brokers: HashMap<String, BrokerMetrics>,
 
     // --- Per-partition metrics (consumer) ---
-    /// Per-partition statistics keyed by (topic, partition).
+    /// Records left to read on each partition this consumer is assigned,
+    /// keyed by (topic, partition): counted from the committed offset, or from
+    /// the read position on a partition with nothing committed.
     pub partition_lag: HashMap<(String, i32), i64>,
     /// Per-partition committed offsets.
     pub partition_committed: HashMap<(String, i32), i64>,
@@ -126,6 +128,8 @@ pub struct StatsContext {
     /// Ownership changes served so far, so a record can be ordered against
     /// them.
     rebalances: AtomicU64,
+    /// The partitions this consumer holds, as its rebalances left them.
+    assigned: RwLock<HashSet<(String, i32)>>,
     /// Whether the inbound gate has this consumer's assignment paused.
     #[cfg(feature = "governor")]
     paused: AtomicBool,
@@ -162,6 +166,7 @@ impl StatsContext {
             position_lag: AtomicI64::new(0),
             rebalanced: Mutex::new(Vec::new()),
             rebalances: AtomicU64::new(0),
+            assigned: RwLock::new(HashSet::new()),
             #[cfg(feature = "governor")]
             paused: AtomicBool::new(false),
             #[cfg(feature = "governor")]
@@ -228,14 +233,50 @@ impl StatsContext {
         log.push((number, change));
     }
 
-    /// Records past this consumer's read position, summed over its partitions,
-    /// as of the last statistics callback.
+    /// Add partitions a rebalance gave this consumer to its assignment.
+    fn assign(&self, given: &[(String, i32)]) {
+        self.assigned
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(given.iter().cloned());
+    }
+
+    /// Take partitions a rebalance took from this consumer out of its
+    /// assignment, and set their published lag to 0.
+    fn revoke(&self, taken: &[(String, i32)]) {
+        {
+            let mut assigned = self
+                .assigned
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            for partition in taken {
+                assigned.remove(partition);
+            }
+        }
+        {
+            let mut latest = self
+                .latest_metrics
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            for partition in taken {
+                latest.partition_lag.remove(partition);
+            }
+        }
+        // The recorder never drops a series, so a lost partition must not keep its last lag.
+        #[cfg(feature = "metrics")]
+        for (topic, partition) in taken {
+            lag_gauge(topic, *partition).set(0.0);
+        }
+    }
+
+    /// Records past this consumer's read position, summed over its assigned
+    /// partitions, as of the last statistics callback.
     ///
-    /// [`total_consumer_lag`] counts from the COMMITTED offset, so a commit held
-    /// until delivery reads as backlog there. This counts from where the
-    /// consumer has read to: unread backlog, whatever the commit policy. A
-    /// scaling signal that should not grow while acknowledgements are held
-    /// reads this one.
+    /// [`total_consumer_lag`] counts from the COMMITTED offset where there is
+    /// one, so a commit held until delivery reads as backlog there. This counts
+    /// from where the consumer has read to: unread backlog, whatever the commit
+    /// policy. A scaling signal that should not grow while acknowledgements are
+    /// held reads this one.
     #[must_use]
     pub fn total_position_lag(&self) -> i64 {
         self.position_lag.load(Ordering::Relaxed)
@@ -274,8 +315,13 @@ impl StatsContext {
     }
 
     /// Convert raw statistics to our metrics format, taking each partition's
-    /// end as the later of the statistics' and `asked_ends`.
-    fn convert_stats(stats: &Statistics, asked_ends: &HashMap<(String, i32), i64>) -> KafkaMetrics {
+    /// end as the later of the statistics' and `asked_ends`, and lag only for
+    /// the `assigned` partitions.
+    fn convert_stats(
+        stats: &Statistics,
+        asked_ends: &HashMap<(String, i32), i64>,
+        assigned: &HashSet<(String, i32)>,
+    ) -> KafkaMetrics {
         let mut metrics = KafkaMetrics {
             messages_sent: stats.txmsgs,
             messages_received: stats.rxmsgs,
@@ -315,15 +361,10 @@ impl StatsContext {
                 let key = (topic_name.clone(), *partition_id);
                 let asked_end = asked_ends.get(&key).copied();
 
-                // Consumer lag
-                let consumer_lag = match asked_end {
-                    Some(end) if partition.committed_offset >= 0 => {
-                        partition.consumer_lag.max(end - partition.committed_offset)
-                    }
-                    _ => partition.consumer_lag,
-                };
-                if consumer_lag >= 0 {
-                    metrics.partition_lag.insert(key.clone(), consumer_lag);
+                if assigned.contains(&key)
+                    && let Some(lag) = partition_lag(partition, asked_end)
+                {
+                    metrics.partition_lag.insert(key.clone(), lag);
                 }
 
                 // Committed offset
@@ -369,9 +410,14 @@ impl ClientContext for StatsContext {
             .unwrap_or_default();
         #[cfg(not(feature = "governor"))]
         let asked_ends = HashMap::new();
-        let metrics = Self::convert_stats(&statistics, &asked_ends);
-        self.position_lag
-            .store(position_lag(&statistics, &asked_ends), Ordering::Relaxed);
+        let (metrics, unread) = {
+            let assigned = self.assigned.read().unwrap_or_else(PoisonError::into_inner);
+            (
+                Self::convert_stats(&statistics, &asked_ends, &assigned),
+                position_lag(&statistics, &asked_ends, &assigned),
+            )
+        };
+        self.position_lag.store(unread, Ordering::Relaxed);
 
         if let Ok(mut lock) = self.latest_metrics.write() {
             *lock = metrics;
@@ -438,9 +484,21 @@ impl StatsContext {
     ///
     /// Emits under the `rdkafka_` prefix per the metrics standard.
     /// Per-partition metrics are bounded by `max_partitions` (default 256).
+    /// A context that has served a rebalance also sets
+    /// `consumer_partitions_assigned` to the partitions it holds.
     #[cfg(feature = "metrics")]
     pub fn emit_prometheus_metrics(&self) {
         let m = self.get_metrics();
+
+        // Only a context that has rebalanced knows the assignment; the others would write 0.
+        if self.rebalances() > 0 {
+            let held = self
+                .assigned
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len();
+            metrics::gauge!("consumer_partitions_assigned").set(held as f64);
+        }
 
         // Global counters
         metrics::gauge!("rdkafka_global_msg_cnt").set(m.queue_message_count as f64);
@@ -473,12 +531,7 @@ impl StatsContext {
             if i >= max_partitions {
                 break;
             }
-            metrics::gauge!(
-                "rdkafka_topic_partition_consumer_lag",
-                "topic" => topic.clone(),
-                "partition" => partition.to_string()
-            )
-            .set(*lag as f64);
+            lag_gauge(topic, *partition).set(*lag as f64);
         }
 
         for (i, ((topic, partition), offset)) in m.partition_committed.iter().enumerate() {
@@ -500,15 +553,26 @@ impl StatsContext {
     }
 }
 
+/// The `rdkafka_topic_partition_consumer_lag` series for one partition.
+#[cfg(feature = "metrics")]
+fn lag_gauge(topic: &str, partition: i32) -> metrics::Gauge {
+    metrics::gauge!(
+        "rdkafka_topic_partition_consumer_lag",
+        "topic" => topic.to_string(),
+        "partition" => partition.to_string()
+    )
+}
+
 /// Records each revoke and assignment, in order, before librdkafka applies
-/// it, so the transport never holds or commits for a partition it lost.
+/// it, so the transport never holds or commits for a partition it lost, and
+/// keeps the assignment the lag and `consumer_partitions_assigned` report.
 impl rdkafka::consumer::ConsumerContext for StatsContext {
     fn pre_rebalance(
         &self,
         _consumer: &rdkafka::consumer::BaseConsumer<Self>,
         rebalance: &rdkafka::consumer::Rebalance<'_>,
     ) {
-        let partitions = |list: &rdkafka::TopicPartitionList| {
+        let partitions = |list: &rdkafka::TopicPartitionList| -> Vec<(String, i32)> {
             list.elements()
                 .iter()
                 .map(|p| (p.topic().to_string(), p.partition()))
@@ -516,10 +580,14 @@ impl rdkafka::consumer::ConsumerContext for StatsContext {
         };
         match rebalance {
             rdkafka::consumer::Rebalance::Revoke(list) => {
-                self.note_rebalanced(Rebalanced::Revoked(partitions(list)));
+                let taken = partitions(list);
+                self.revoke(&taken);
+                self.note_rebalanced(Rebalanced::Revoked(taken));
             }
             rdkafka::consumer::Rebalance::Assign(list) => {
-                self.note_rebalanced(Rebalanced::Assigned(partitions(list)));
+                let given = partitions(list);
+                self.assign(&given);
+                self.note_rebalanced(Rebalanced::Assigned(given));
             }
             rdkafka::consumer::Rebalance::Error(_) => {}
         }
@@ -542,33 +610,51 @@ impl rdkafka::producer::ProducerContext for StatsContext {
 
 /// Calculate total consumer lag across all partitions.
 ///
-/// Helper function to sum lag from a `KafkaMetrics` snapshot. This is lag
-/// behind the COMMITTED offset; see [`StatsContext::total_position_lag`] for
-/// lag behind the read position.
+/// Helper function to sum lag from a `KafkaMetrics` snapshot. Each assigned
+/// partition counts from its COMMITTED offset, or from its read position when
+/// nothing is committed yet; see [`StatsContext::total_position_lag`] for lag
+/// behind the read position throughout.
 #[must_use]
 pub fn total_consumer_lag(metrics: &KafkaMetrics) -> i64 {
     metrics.partition_lag.values().sum()
 }
 
+/// One partition's records left to read, or `None` when the statistics do not
+/// yet give the partition's end or read position.
+///
+/// librdkafka reports `consumer_lag` only once the partition has a committed
+/// offset, so a partition with none counts from its read position instead.
+/// `asked_end`, the end the broker reported for a paused partition, wins when
+/// it is later.
+fn partition_lag(p: &rdkafka::statistics::Partition, asked_end: Option<i64>) -> Option<i64> {
+    let from_commit = match asked_end {
+        Some(end) if p.committed_offset >= 0 => p.consumer_lag.max(end - p.committed_offset),
+        _ => p.consumer_lag,
+    };
+    if from_commit >= 0 {
+        Some(from_commit)
+    } else {
+        partition_position_lag(p, asked_end)
+    }
+}
+
 /// One partition's records past the consumer's read position, or `None` for a
 /// partition this consumer is not reading.
 ///
-/// librdkafka measures `consumer_lag` from the committed offset to the end the
-/// consumer may read to (the last stable offset under `read_committed`, the
-/// high watermark otherwise), so that end is `consumer_lag + committed_offset`.
-/// `asked_end`, the end the broker reported for a paused partition, wins when
-/// it is later.
+/// The read position is the application's, else the committed offset, else
+/// librdkafka's fetch position, where a partition that has handed the
+/// application nothing starts reading. librdkafka measures `consumer_lag` from
+/// the committed offset to the end the consumer may read to (the last stable
+/// offset under `read_committed`, the high watermark otherwise), so that end is
+/// `consumer_lag + committed_offset`. `asked_end`, the end the broker reported
+/// for a paused partition, wins when it is later.
 fn partition_position_lag(
     p: &rdkafka::statistics::Partition,
     asked_end: Option<i64>,
 ) -> Option<i64> {
-    let position = if p.app_offset >= 0 {
-        p.app_offset
-    } else if p.committed_offset >= 0 {
-        p.committed_offset
-    } else {
-        return None;
-    };
+    let position = [p.app_offset, p.committed_offset, p.next_offset]
+        .into_iter()
+        .find(|&offset| offset >= 0)?;
     let reported = if p.consumer_lag >= 0 && p.committed_offset >= 0 {
         Some(p.consumer_lag + p.committed_offset)
     } else if p.hi_offset >= 0 {
@@ -584,20 +670,22 @@ fn partition_position_lag(
     Some((end - position).max(0))
 }
 
-/// Records past the read position, summed over every partition being read.
-fn position_lag(stats: &Statistics, asked_ends: &HashMap<(String, i32), i64>) -> i64 {
+/// Records past the read position, summed over the `assigned` partitions.
+fn position_lag(
+    stats: &Statistics,
+    asked_ends: &HashMap<(String, i32), i64>,
+    assigned: &HashSet<(String, i32)>,
+) -> i64 {
     stats
         .topics
         .iter()
         .flat_map(|(name, topic)| topic.partitions.iter().map(move |p| (name, p)))
-        .filter(|(_, (id, _))| **id >= 0)
         .filter_map(|(name, (id, p))| {
-            let asked_end = if asked_ends.is_empty() {
-                None
-            } else {
-                asked_ends.get(&(name.clone(), *id)).copied()
-            };
-            partition_position_lag(p, asked_end)
+            let key = (name.clone(), *id);
+            if !assigned.contains(&key) {
+                return None;
+            }
+            partition_position_lag(p, asked_ends.get(&key).copied())
         })
         .sum()
 }
@@ -679,17 +767,11 @@ mod tests {
         assert_send_sync::<StatsContext>();
     }
 
-    /// Statistics for one partition of `events`, committed to 5 and read to
-    /// 20, whose last fetch saw the end at 20.
-    fn stats_read_to_20() -> Statistics {
-        let partition = rdkafka::statistics::Partition {
-            partition: 0,
-            app_offset: 20,
-            committed_offset: 5,
-            hi_offset: 20,
-            consumer_lag: 15,
-            ..Default::default()
-        };
+    /// librdkafka's `RD_KAFKA_OFFSET_INVALID`: no offset known.
+    const INVALID: i64 = -1001;
+
+    /// Statistics carrying `partition` as partition 0 of `events`.
+    fn stats_with(partition: rdkafka::statistics::Partition) -> Statistics {
         let topic = rdkafka::statistics::Topic {
             topic: "events".to_string(),
             partitions: HashMap::from([(0, partition)]),
@@ -701,35 +783,126 @@ mod tests {
         }
     }
 
+    /// Statistics for one partition of `events`, committed to 5 and read to
+    /// 20, whose last fetch saw the end at 20.
+    fn stats_read_to_20() -> Statistics {
+        stats_with(rdkafka::statistics::Partition {
+            partition: 0,
+            app_offset: 20,
+            committed_offset: 5,
+            hi_offset: 20,
+            consumer_lag: 15,
+            ..Default::default()
+        })
+    }
+
+    /// Statistics for partition 0 of `events` just assigned to a group that
+    /// has committed nothing: librdkafka reports no `consumer_lag`, and the
+    /// application has read nothing, so only the fetch position and `end` are
+    /// known.
+    fn stats_uncommitted(end: i64) -> Statistics {
+        stats_with(rdkafka::statistics::Partition {
+            partition: 0,
+            app_offset: INVALID,
+            committed_offset: INVALID,
+            next_offset: 0,
+            hi_offset: end,
+            consumer_lag: -1,
+            ..Default::default()
+        })
+    }
+
+    fn events_0() -> (String, i32) {
+        ("events".to_string(), 0)
+    }
+
+    fn assigned_events_0() -> HashSet<(String, i32)> {
+        HashSet::from([events_0()])
+    }
+
     #[test]
     fn lag_counts_from_the_commit_and_the_read_position() {
         let stats = stats_read_to_20();
         let none = HashMap::new();
+        let assigned = assigned_events_0();
         assert_eq!(
-            total_consumer_lag(&StatsContext::convert_stats(&stats, &none)),
+            total_consumer_lag(&StatsContext::convert_stats(&stats, &none, &assigned)),
             15
         );
-        assert_eq!(position_lag(&stats, &none), 0);
+        assert_eq!(position_lag(&stats, &none, &assigned), 0);
     }
 
     #[test]
     fn an_end_asked_of_the_broker_moves_the_lag_the_last_fetch_left_behind() {
         let stats = stats_read_to_20();
-        let asked = HashMap::from([(("events".to_string(), 0), 50)]);
-        let metrics = StatsContext::convert_stats(&stats, &asked);
+        let assigned = assigned_events_0();
+        let asked = HashMap::from([(events_0(), 50)]);
+        let metrics = StatsContext::convert_stats(&stats, &asked, &assigned);
         assert_eq!(total_consumer_lag(&metrics), 45, "end 50 less committed 5");
+        assert_eq!(metrics.partition_high_watermark[&events_0()], 50);
         assert_eq!(
-            metrics.partition_high_watermark[&("events".to_string(), 0)],
-            50
+            position_lag(&stats, &asked, &assigned),
+            30,
+            "end 50 less read-to 20"
         );
-        assert_eq!(position_lag(&stats, &asked), 30, "end 50 less read-to 20");
 
-        let behind = HashMap::from([(("events".to_string(), 0), 10)]);
+        let behind = HashMap::from([(events_0(), 10)]);
         assert_eq!(
-            position_lag(&stats, &behind),
+            position_lag(&stats, &behind, &assigned),
             0,
             "an end older than the fetch's never lowers it"
         );
+    }
+
+    #[test]
+    fn an_assigned_partition_with_nothing_committed_reports_lag_from_where_it_reads() {
+        let none = HashMap::new();
+        let assigned = assigned_events_0();
+
+        let empty = stats_uncommitted(0);
+        let metrics = StatsContext::convert_stats(&empty, &none, &assigned);
+        assert_eq!(
+            metrics.partition_lag.get(&events_0()),
+            Some(&0),
+            "an empty partition publishes lag 0, not nothing"
+        );
+        assert_eq!(position_lag(&empty, &none, &assigned), 0);
+
+        let backlog = stats_uncommitted(5);
+        let metrics = StatsContext::convert_stats(&backlog, &none, &assigned);
+        assert_eq!(
+            metrics.partition_lag.get(&events_0()),
+            Some(&5),
+            "end 5 less fetch position 0"
+        );
+        assert_eq!(position_lag(&backlog, &none, &assigned), 5);
+
+        let asked = HashMap::from([(events_0(), 7)]);
+        assert_eq!(
+            total_consumer_lag(&StatsContext::convert_stats(&empty, &asked, &assigned)),
+            7,
+            "paused: the end asked of the broker, less fetch position 0"
+        );
+        assert_eq!(position_lag(&empty, &asked, &assigned), 7);
+    }
+
+    #[test]
+    fn a_partition_this_consumer_does_not_hold_reports_no_lag() {
+        let stats = stats_read_to_20();
+        let none = HashMap::new();
+        let metrics = StatsContext::convert_stats(&stats, &none, &HashSet::new());
+        assert!(
+            metrics.partition_lag.is_empty(),
+            "committed but not assigned: {:?}",
+            metrics.partition_lag
+        );
+        assert_eq!(
+            metrics.partition_committed.get(&events_0()),
+            Some(&5),
+            "offsets are still reported"
+        );
+        let asked = HashMap::from([(events_0(), 50)]);
+        assert_eq!(position_lag(&stats, &asked, &HashSet::new()), 0);
     }
 
     #[cfg(feature = "governor")]
