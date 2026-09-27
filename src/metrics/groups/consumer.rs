@@ -17,6 +17,12 @@ use super::super::manifest::{MetricDescriptor, MetricType};
 ///
 /// Tracks consumer lag, partition assignments, rebalances, poll latency,
 /// and offset commits.
+///
+/// A scalo `KafkaTransport` consumer fills `consumer_lag`,
+/// `consumer_partitions_assigned` and `consumer_rebalance_total` itself, from
+/// its statistics and rebalances. A service on that transport records only
+/// poll latency and offset commits. The other setters are for a consumer scalo
+/// does not own.
 #[derive(Clone)]
 pub struct ConsumerMetrics {
     pub partitions_assigned: Gauge,

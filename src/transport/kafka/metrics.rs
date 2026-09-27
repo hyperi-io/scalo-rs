@@ -69,9 +69,11 @@ pub struct KafkaMetrics {
     /// served none, as with a consumer given partitions by `assign()`, covers
     /// every partition with a committed offset, counted from it.
     pub partition_lag: HashMap<(String, i32), i64>,
-    /// Per-partition committed offsets.
+    /// Per-partition committed offsets: once the context has served a
+    /// rebalance, only for the partitions the consumer holds.
     pub partition_committed: HashMap<(String, i32), i64>,
-    /// Per-partition high watermarks.
+    /// Per-partition high watermarks: once the context has served a
+    /// rebalance, only for the partitions the consumer holds.
     pub partition_high_watermark: HashMap<(String, i32), i64>,
 
     // --- Consumer group metrics ---
@@ -235,6 +237,9 @@ impl StatsContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let number = self.rebalances.fetch_add(1, Ordering::AcqRel) + 1;
         log.push((number, change));
+        // One event per revoke or assignment, as librdkafka's own `rebalance_cnt` counts them.
+        #[cfg(feature = "metrics")]
+        metrics::counter!(CONSUMER_REBALANCES).increment(1);
     }
 
     /// Add partitions a rebalance gave this consumer to its assignment.
@@ -246,7 +251,8 @@ impl StatsContext {
     }
 
     /// Take partitions a rebalance took from this consumer out of its
-    /// assignment, and set their published lag to 0.
+    /// assignment and its snapshot, and set their published lag and committed
+    /// offset to 0.
     fn revoke(&self, taken: &[(String, i32)]) {
         {
             let mut assigned = self
@@ -264,12 +270,16 @@ impl StatsContext {
                 .unwrap_or_else(PoisonError::into_inner);
             for partition in taken {
                 latest.partition_lag.remove(partition);
+                latest.partition_committed.remove(partition);
+                latest.partition_high_watermark.remove(partition);
             }
         }
-        // The recorder never drops a series, so a lost partition must not keep its last lag.
+        // The recorder cannot drop one series, so a lost partition must not keep its last values.
         #[cfg(feature = "metrics")]
         for (topic, partition) in taken {
-            lag_gauge(topic, *partition).set(0.0);
+            for name in [PARTITION_LAG, CONSUMER_LAG, PARTITION_COMMITTED] {
+                partition_gauge(name, topic, *partition).set(0.0);
+            }
         }
     }
 
@@ -327,9 +337,13 @@ impl StatsContext {
     /// Convert raw statistics to our metrics format, taking each partition's
     /// end as the later of the statistics' and `asked_ends`.
     ///
-    /// `held` is the assignment when rebalances have given one: lag then
-    /// covers those partitions, committed or not. `None` counts every
-    /// partition with a committed offset, from that offset.
+    /// `held` is the assignment when rebalances have given one: lag, committed
+    /// offsets and high watermarks then cover only those partitions, and lag
+    /// covers them committed or not. librdkafka keeps reporting a revoked
+    /// partition's last committed offset and high watermark, so without the
+    /// assignment they would outlive the revoke. `None` counts lag for every
+    /// partition with a committed offset, from that offset, and reports every
+    /// partition's offsets.
     fn convert_stats(
         stats: &Statistics,
         asked_ends: &HashMap<(String, i32), i64>,
@@ -378,7 +392,7 @@ impl StatsContext {
                     Some(assigned) if assigned.contains(&key) => {
                         partition_lag(partition, asked_end)
                     }
-                    Some(_) => None,
+                    Some(_) => continue,
                     None => committed_lag(partition, asked_end),
                 };
                 if let Some(lag) = lag {
@@ -505,13 +519,15 @@ impl StatsContext {
     /// Emits under the `rdkafka_` prefix per the metrics standard.
     /// Per-partition metrics are bounded by `max_partitions` (default 256).
     /// A context that has served a rebalance also sets
-    /// `consumer_partitions_assigned` to the partitions it holds.
+    /// `consumer_partitions_assigned` to the partitions it holds, and
+    /// `consumer_lag{topic,partition}` to each one's lag.
     #[cfg(feature = "metrics")]
     pub fn emit_prometheus_metrics(&self) {
         let m = self.get_metrics();
 
-        // Only a context that has rebalanced knows the assignment; the others would write 0.
-        if self.rebalances() > 0 {
+        // Only a context that has rebalanced knows the assignment, so only it writes these series.
+        let rebalanced = self.rebalances() > 0;
+        if rebalanced {
             let held = self
                 .assigned
                 .read()
@@ -551,19 +567,17 @@ impl StatsContext {
             if i >= max_partitions {
                 break;
             }
-            lag_gauge(topic, *partition).set(*lag as f64);
+            partition_gauge(PARTITION_LAG, topic, *partition).set(*lag as f64);
+            if rebalanced {
+                partition_gauge(CONSUMER_LAG, topic, *partition).set(*lag as f64);
+            }
         }
 
         for (i, ((topic, partition), offset)) in m.partition_committed.iter().enumerate() {
             if i >= max_partitions {
                 break;
             }
-            metrics::gauge!(
-                "rdkafka_topic_partition_committed_offset",
-                "topic" => topic.clone(),
-                "partition" => partition.to_string()
-            )
-            .set(*offset as f64);
+            partition_gauge(PARTITION_COMMITTED, topic, *partition).set(*offset as f64);
         }
 
         // Rebalance count
@@ -573,19 +587,33 @@ impl StatsContext {
     }
 }
 
-/// The `rdkafka_topic_partition_consumer_lag` series for one partition.
+/// Per-partition lag from librdkafka's statistics.
 #[cfg(feature = "metrics")]
-fn lag_gauge(topic: &str, partition: i32) -> metrics::Gauge {
+const PARTITION_LAG: &str = "rdkafka_topic_partition_consumer_lag";
+/// Per-partition committed offset from librdkafka's statistics.
+#[cfg(feature = "metrics")]
+const PARTITION_COMMITTED: &str = "rdkafka_topic_partition_committed_offset";
+/// `ConsumerMetrics`' per-partition lag, which the transport fills for the partitions it holds.
+#[cfg(feature = "metrics")]
+const CONSUMER_LAG: &str = "consumer_lag";
+/// `ConsumerMetrics`' rebalance counter, which the transport counts.
+#[cfg(feature = "metrics")]
+const CONSUMER_REBALANCES: &str = "consumer_rebalance_total";
+
+/// The `name` series for one partition.
+#[cfg(feature = "metrics")]
+fn partition_gauge(name: &'static str, topic: &str, partition: i32) -> metrics::Gauge {
     metrics::gauge!(
-        "rdkafka_topic_partition_consumer_lag",
+        name,
         "topic" => topic.to_string(),
         "partition" => partition.to_string()
     )
 }
 
 /// Records each revoke and assignment, in order, before librdkafka applies
-/// it, so the transport never holds or commits for a partition it lost, and
-/// keeps the assignment the lag and `consumer_partitions_assigned` report.
+/// it, so the transport never holds or commits for a partition it lost,
+/// keeps the assignment the lag and `consumer_partitions_assigned` report,
+/// and counts each one in `consumer_rebalance_total`.
 impl rdkafka::consumer::ConsumerContext for StatsContext {
     fn pre_rebalance(
         &self,
@@ -925,8 +953,10 @@ mod tests {
         assert_eq!(position_lag(&empty, &asked, Some(&assigned)), 7);
     }
 
+    /// librdkafka keeps reporting a revoked partition's last committed offset
+    /// and high watermark, so none of it may reach the snapshot.
     #[test]
-    fn a_partition_this_consumer_does_not_hold_reports_no_lag() {
+    fn a_partition_this_consumer_does_not_hold_reports_no_lag_or_offsets() {
         let stats = stats_read_to_20();
         let none = HashMap::new();
         let metrics = StatsContext::convert_stats(&stats, &none, Some(&HashSet::new()));
@@ -935,10 +965,15 @@ mod tests {
             "committed but not assigned: {:?}",
             metrics.partition_lag
         );
-        assert_eq!(
-            metrics.partition_committed.get(&events_0()),
-            Some(&5),
-            "offsets are still reported"
+        assert!(
+            metrics.partition_committed.is_empty(),
+            "{:?}",
+            metrics.partition_committed
+        );
+        assert!(
+            metrics.partition_high_watermark.is_empty(),
+            "{:?}",
+            metrics.partition_high_watermark
         );
         let asked = HashMap::from([(events_0(), 50)]);
         assert_eq!(position_lag(&stats, &asked, Some(&HashSet::new())), 0);
@@ -960,10 +995,16 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(context.total_position_lag(), 40, "end 100 less read-to 60");
+        let metrics = context.get_metrics();
         assert_eq!(
-            total_consumer_lag(&context.get_metrics()),
+            total_consumer_lag(&metrics),
             90,
             "end 100 less committed 10"
+        );
+        assert_eq!(metrics.partition_committed.get(&events_0()), Some(&10));
+        assert_eq!(
+            metrics.partition_high_watermark.get(&events_0()),
+            Some(&100)
         );
     }
 

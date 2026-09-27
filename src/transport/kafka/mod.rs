@@ -4252,4 +4252,156 @@ mod tests {
             "an emit before the next statistics does not bring the old lag back"
         );
     }
+
+    /// Statistics for `events` with each `(partition, lag)` committed to and
+    /// read to 5, its end at `5 + lag`. librdkafka keeps reporting a partition
+    /// this way after it is revoked.
+    #[cfg(feature = "metrics")]
+    fn events_committed_at_5(partitions: &[(i32, i64)]) -> rdkafka::statistics::Statistics {
+        use rdkafka::statistics::{Partition, Statistics, Topic};
+        let partitions = partitions
+            .iter()
+            .map(|&(partition, lag)| {
+                let stats = Partition {
+                    partition,
+                    app_offset: 5,
+                    committed_offset: 5,
+                    hi_offset: 5 + lag,
+                    consumer_lag: lag,
+                    ..Default::default()
+                };
+                (partition, stats)
+            })
+            .collect();
+        Statistics {
+            topics: HashMap::from([(
+                "events".to_string(),
+                Topic {
+                    topic: "events".to_string(),
+                    partitions,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    /// The transport fills `ConsumerMetrics`' `consumer_lag` and
+    /// `consumer_rebalance_total` from the consumer it owns: each held
+    /// partition's lag, 0 once revoked, and one count per revoke or
+    /// assignment. A context that has served no rebalance never writes the lag.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn the_transport_fills_consumer_lag_and_the_rebalance_count() {
+        use rdkafka::client::ClientContext;
+        use rdkafka::producer::Producer;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+
+        let transport = armed_without_a_broker().await;
+        let producer_only = KafkaTransport::new(&KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("a producer-only transport constructs broker-free");
+
+        let consumer = transport.consumer();
+        let stats = events_committed_at_5(&[(0, 7), (1, 11)]);
+        serve(&transport, false, 0);
+        serve(&transport, false, 1);
+        consumer.context().stats(stats.clone());
+        serve(&transport, true, 0);
+        consumer.context().stats(stats);
+
+        // Contexts that have served no rebalance, each reporting partition 1 with lag 0.
+        let unheld = events_committed_at_5(&[(1, 0)]);
+        transport.producer.context().stats(unheld.clone());
+        producer_only.producer.context().stats(unheld.clone());
+        producer_only.consumer().context().stats(unheld);
+
+        let rendered = handle.render();
+        let consumer_lag = |partition: &str| {
+            scraped(
+                &rendered,
+                "consumer_lag",
+                &["topic=\"events\"", &format!("partition=\"{partition}\"")],
+            )
+        };
+        assert_eq!(
+            scraped(&rendered, "consumer_rebalance_total", &[]),
+            Some(3.0),
+            "assigned 0, assigned 1, revoked 0:\n{rendered}"
+        );
+        let total = total_consumer_lag(&transport.stats());
+        assert_eq!(total, 11, "only partition 1 is held");
+        assert_eq!(
+            consumer_lag("1"),
+            Some(11.0),
+            "the held partition's lag is the total:\n{rendered}"
+        );
+        assert_eq!(consumer_lag("0"), Some(0.0), "revoked:\n{rendered}");
+    }
+
+    /// A revoked partition's committed offset reads 0 from the revoke on, and
+    /// its offsets leave the snapshot, though librdkafka keeps reporting them.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn a_revoked_partition_publishes_committed_offset_zero() {
+        use rdkafka::client::ClientContext;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+        let committed = |rendered: &str| {
+            scraped(
+                rendered,
+                "rdkafka_topic_partition_committed_offset",
+                &["topic=\"events\"", "partition=\"0\""],
+            )
+        };
+
+        let transport = armed_without_a_broker().await;
+        let consumer = transport.consumer();
+        let stats = events_committed_at_5(&[(0, 7)]);
+        serve(&transport, false, 0);
+        consumer.context().stats(stats.clone());
+        assert_eq!(committed(&handle.render()), Some(5.0));
+        assert_eq!(
+            transport
+                .stats()
+                .partition_high_watermark
+                .get(&("events".to_string(), 0)),
+            Some(&12)
+        );
+
+        serve(&transport, true, 0);
+        assert_eq!(committed(&handle.render()), Some(0.0), "revoked");
+        let snapshot = transport.stats();
+        assert!(
+            snapshot.partition_committed.is_empty() && snapshot.partition_high_watermark.is_empty(),
+            "revoked, before the next statistics: {snapshot:?}"
+        );
+
+        consumer.context().stats(stats);
+        assert_eq!(
+            committed(&handle.render()),
+            Some(0.0),
+            "the next statistics do not bring the old offset back"
+        );
+        let snapshot = transport.stats();
+        assert!(
+            snapshot.partition_committed.is_empty(),
+            "{:?}",
+            snapshot.partition_committed
+        );
+        assert!(
+            snapshot.partition_high_watermark.is_empty(),
+            "{:?}",
+            snapshot.partition_high_watermark
+        );
+    }
 }
