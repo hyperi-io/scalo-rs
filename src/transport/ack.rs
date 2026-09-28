@@ -649,7 +649,7 @@ impl TicketsInner {
                 .set(self.held_bytes.load(Ordering::Relaxed) as f64);
         }
         #[cfg(not(feature = "metrics"))]
-        let _ = count;
+        let _ = (self, count);
     }
 }
 
