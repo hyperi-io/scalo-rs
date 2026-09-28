@@ -1126,6 +1126,11 @@ impl AnyReceiver {
         )),
         allow(unused_variables)
     )]
+    // Only the Kafka and gRPC arms can fail.
+    #[cfg_attr(
+        not(any(feature = "transport-kafka", feature = "transport-grpc")),
+        allow(clippy::unnecessary_wraps)
+    )]
     fn apply_acknowledgements(self, key: &str) -> TransportResult<Self> {
         match self {
             #[cfg(feature = "transport-kafka")]
