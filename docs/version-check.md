@@ -92,6 +92,8 @@ an ephemeral UUID. The UUIDv5 namespace is shared with scalo-py, so both
 chassis derive the same id on the same platform, and the derived forms are
 one-way -- nothing about the host is recoverable.
 
+The Kubernetes rung needs both `ca.crt` and `namespace` under `/var/run/secrets/kubernetes.io/serviceaccount`. A pod with its service-account token off has neither unless its chart projects them, and the id falls through to the later rungs. The chart that `generate_chart` writes projects both -- see [deployment/artefacts.md](deployment/artefacts.md#service-account-files-without-the-token).
+
 ## Failure handling
 
 Everything inside the spawned check -- DNS failure, timeout, HTTP error,

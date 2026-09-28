@@ -199,7 +199,7 @@ on. Override via `ArgocdConfig`.
 | `Chart.yaml` | Chart metadata |
 | `values.yaml` | Configurable defaults -- image, resources, probes, secrets, KEDA, HPA, `otel`, `podSecurityContext` / `securityContext` |
 | `templates/_helpers.tpl` | Standard name helpers + one `<group>SecretName` helper per secret group |
-| `templates/deployment.yaml` | `Deployment` with probes, security contexts, observability env, env from secrets, config mount |
+| `templates/deployment.yaml` | `Deployment` with probes, security contexts, observability env, env from secrets, config mount, service-account files without the token |
 | `templates/service.yaml` | `Service` exposing metrics port + any `extra_ports`; a port gated with `when` renders only while its condition holds, here and in the `Deployment` |
 | `templates/serviceaccount.yaml` | `ServiceAccount` (auto-disable token mount) |
 | `templates/configmap.yaml` | `ConfigMap` rendering `values.yaml.config` to mounted file |
@@ -230,9 +230,22 @@ out rather than forking the chart.
 and the container will not start, so a test pins both.
 
 **`readOnlyRootFilesystem` is deliberately `false`.** The spool and DLQ write
-to the container filesystem, and the only volume this chart mounts is the
-read-only config map. An app that spools nowhere can set it `true`; an app that
-spools needs a writable volume first.
+to the container filesystem, and every volume this chart mounts is read-only.
+An app that spools nowhere can set it `true`; an app that spools needs a
+writable volume first.
+
+#### Service-account files without the token
+
+The chart mounts no service-account token. `automountServiceAccountToken: false` sits on the `ServiceAccount` and on the pod, so an account the operator supplies with `serviceAccount.create: false` mounts none either.
+
+The pod still carries the two files the [version check](../version-check.md) derives its instance id from. A projected volume holds them, read-only at `/var/run/secrets/kubernetes.io/serviceaccount`:
+
+| File | Source |
+|---|---|
+| `ca.crt` | the `kube-root-ca.crt` ConfigMap Kubernetes publishes into every namespace |
+| `namespace` | the Downward API, `metadata.namespace` |
+
+These are the sources of Kubernetes' own token volume, minus the token, so the id matches the one a token-mounting pod derives. Without them every pod restart reports as a new install.
 
 #### Observability env on the Deployment
 
