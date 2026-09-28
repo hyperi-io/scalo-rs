@@ -96,6 +96,19 @@
 //! A routed record is counted once, by the transport that sends it and only
 //! once it has landed; the routed layer adds no `transport_sent_*` series.
 
+// With no backend feature on, `AnySender` is uninhabited and so zero-sized.
+#![cfg_attr(
+    not(any(
+        feature = "transport-kafka",
+        feature = "transport-grpc",
+        feature = "transport-memory",
+        feature = "transport-pipe",
+        feature = "transport-file",
+        feature = "transport-http"
+    )),
+    allow(clippy::zero_sized_map_values)
+)]
+
 use std::collections::HashMap;
 
 use super::ack::{DeadLetterReason, SinkConfirmation};

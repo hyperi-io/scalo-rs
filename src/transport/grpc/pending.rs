@@ -414,6 +414,8 @@ impl PendingRegistry {
             metrics::gauge!("transport_ack_held_bytes", "transport" => self.label)
                 .set(self.held_bytes.load(Ordering::Acquire) as f64);
         }
+        #[cfg(not(feature = "metrics"))]
+        let _ = self.label;
     }
 
     /// Count one answered or abandoned request, never while unwinding.
@@ -447,7 +449,7 @@ impl PendingRegistry {
         )
         .increment(1);
         #[cfg(not(feature = "metrics"))]
-        let _ = reason;
+        let _ = (reason, self.label);
     }
 }
 
