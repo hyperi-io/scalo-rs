@@ -1133,8 +1133,14 @@ mod lag {
                 &["topic=\"fresh\"", "partition=\"0\""],
             )
         };
-        // Unlabelled and process-wide: other Kafka tests in a plain `cargo test` can flake it.
-        let assigned = |rendered: &str| scraped(rendered, "consumer_partitions_assigned", &[]);
+        // Keyed by this test's group: other Kafka tests in one process write their own series.
+        let assigned = |rendered: &str| {
+            scraped(
+                rendered,
+                "consumer_partitions_assigned",
+                &["group_id=\"fresh-group\""],
+            )
+        };
 
         let (_node, bootstrap) = start_kafka().await;
         let topic = "fresh";
