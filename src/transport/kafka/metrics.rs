@@ -119,7 +119,8 @@ pub struct BrokerMetrics {
 /// Implements `ClientContext` to receive librdkafka statistics callbacks.
 /// rdkafka takes the context by value, so each client has its own. A context
 /// built with [`new`](Self::new) measures lag as a `read_committed` consumer
-/// does, librdkafka's default.
+/// does, librdkafka's default, and writes its `consumer_` series with no
+/// `group_id`.
 #[derive(Debug)]
 pub struct StatsContext {
     stats: RwLock<Option<Statistics>>,
@@ -154,6 +155,10 @@ pub struct StatsContext {
     /// series this context writes.
     #[cfg(feature = "metrics")]
     client: std::sync::OnceLock<Client>,
+    /// The group this context's consumer joins, which labels every
+    /// `consumer_` series it writes.
+    #[cfg(feature = "metrics")]
+    group: Group,
 }
 
 /// Where a consumer may read a partition to, as librdkafka's
@@ -230,6 +235,46 @@ impl Client {
     }
 }
 
+/// The consumer group a context's consumer joins, as its client config names
+/// it.
+///
+/// Like `client.id`, it holds across a rebuild and a restart, so each group in
+/// a process keeps its own `consumer_` series. A context built with
+/// [`StatsContext::new`] knows no group and writes them without the label.
+#[cfg(feature = "metrics")]
+#[derive(Debug, Default)]
+struct Group(Option<String>);
+
+#[cfg(feature = "metrics")]
+impl Group {
+    /// `labels`, led by `group_id` when the group is known.
+    fn labels<const N: usize>(&self, labels: [(&'static str, String); N]) -> Vec<metrics::Label> {
+        self.0
+            .iter()
+            .map(|group| metrics::Label::new("group_id", group.clone()))
+            .chain(
+                labels
+                    .into_iter()
+                    .map(|(key, value)| metrics::Label::new(key, value)),
+            )
+            .collect()
+    }
+
+    /// This group's `name` gauge, keyed further by `labels`.
+    fn gauge<const N: usize>(
+        &self,
+        name: &'static str,
+        labels: [(&'static str, String); N],
+    ) -> metrics::Gauge {
+        metrics::gauge!(name, self.labels(labels))
+    }
+
+    /// This group's `name` counter.
+    fn counter(&self, name: &'static str) -> metrics::Counter {
+        metrics::counter!(name, self.labels([]))
+    }
+}
+
 /// A change a rebalance made to what this consumer owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Rebalanced {
@@ -265,6 +310,8 @@ impl StatsContext {
             isolation: Isolation::default(),
             #[cfg(feature = "metrics")]
             client: std::sync::OnceLock::new(),
+            #[cfg(feature = "metrics")]
+            group: Group::default(),
         }
     }
 
@@ -272,6 +319,15 @@ impl StatsContext {
     #[must_use]
     pub(crate) fn reading(mut self, isolation: Isolation) -> Self {
         self.isolation = isolation;
+        self
+    }
+
+    /// This context, labelling its `consumer_` series with `group`, the
+    /// `group.id` its consumer joins.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub(crate) fn in_group(mut self, group: Option<&str>) -> Self {
+        self.group = Group(group.map(str::to_owned));
         self
     }
 
@@ -334,7 +390,7 @@ impl StatsContext {
         log.push((number, change));
         // One event per revoke or assignment, as librdkafka's own `rebalance_cnt` counts them.
         #[cfg(feature = "metrics")]
-        metrics::counter!(CONSUMER_REBALANCES).increment(1);
+        self.group.counter(CONSUMER_REBALANCES).increment(1);
     }
 
     /// Add partitions a rebalance gave this consumer to its assignment.
@@ -346,8 +402,8 @@ impl StatsContext {
     }
 
     /// Take partitions a rebalance took from this consumer out of its
-    /// assignment and its snapshot, and set their published lag and committed
-    /// offset to 0.
+    /// assignment and its snapshot, and set the lag and committed offset its
+    /// own group and client published for them to 0.
     fn revoke(&self, taken: &[(String, i32)]) {
         {
             let mut assigned = self
@@ -372,7 +428,9 @@ impl StatsContext {
         // The recorder cannot drop one series, so a lost partition must not keep its last values.
         #[cfg(feature = "metrics")]
         for (topic, partition) in taken {
-            partition_gauge(CONSUMER_LAG, topic, *partition).set(0.0);
+            self.group
+                .gauge(CONSUMER_LAG, partition_labels(topic, *partition))
+                .set(0.0);
             // Before its first statistics a client has published no series to zero.
             if let Some(client) = self.client.get() {
                 for name in [PARTITION_LAG, PARTITION_COMMITTED] {
@@ -581,13 +639,13 @@ impl ClientContext for StatsContext {
                 #[cfg(feature = "logger")]
                 tracing::error!(target: "librdkafka", facility = fac, "{}", log_message);
                 #[cfg(not(feature = "logger"))]
-                eprintln!("ERROR librdkafka: {} {}", fac, log_message);
+                eprintln!("ERROR librdkafka: {fac} {log_message}");
             }
             RDKafkaLogLevel::Warning => {
                 #[cfg(feature = "logger")]
                 tracing::warn!(target: "librdkafka", facility = fac, "{}", log_message);
                 #[cfg(not(feature = "logger"))]
-                eprintln!("WARN librdkafka: {} {}", fac, log_message);
+                eprintln!("WARN librdkafka: {fac} {log_message}");
             }
             RDKafkaLogLevel::Notice | RDKafkaLogLevel::Info => {
                 // rdkafka INFO/Notice is too verbose for application-level INFO
@@ -610,7 +668,7 @@ impl ClientContext for StatsContext {
         #[cfg(feature = "logger")]
         tracing::error!(target: "librdkafka", error = %error, "{}", reason);
         #[cfg(not(feature = "logger"))]
-        eprintln!("ERROR librdkafka: {}: {}", error, reason);
+        eprintln!("ERROR librdkafka: {error}: {reason}");
     }
 }
 
@@ -631,7 +689,10 @@ impl StatsContext {
     /// Per-partition metrics are bounded by `max_partitions` (default 256).
     /// A context that has served a rebalance also sets
     /// `consumer_partitions_assigned` to the partitions it holds, and
-    /// `consumer_lag{topic,partition}` to each one's lag.
+    /// `consumer_lag{topic,partition}` to each one's lag. Both carry
+    /// `group_id`, the group the `KafkaTransport`'s consumer joins, so each
+    /// group in a process keeps its own. A context built with
+    /// [`new`](Self::new) writes them without it.
     #[cfg(feature = "metrics")]
     pub fn emit_prometheus_metrics(&self) {
         let m = self.get_metrics();
@@ -644,7 +705,7 @@ impl StatsContext {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .len();
-            metrics::gauge!("consumer_partitions_assigned").set(held as f64);
+            self.group.gauge(CONSUMER_PARTITIONS, []).set(held as f64);
         }
 
         // Before the first statistics there is no client to label and nothing to report.
@@ -683,7 +744,9 @@ impl StatsContext {
                 .gauge(PARTITION_LAG, partition_labels(topic, *partition))
                 .set(*lag as f64);
             if rebalanced {
-                partition_gauge(CONSUMER_LAG, topic, *partition).set(*lag as f64);
+                self.group
+                    .gauge(CONSUMER_LAG, partition_labels(topic, *partition))
+                    .set(*lag as f64);
             }
         }
 
@@ -714,6 +777,9 @@ const PARTITION_COMMITTED: &str = "rdkafka_topic_partition_committed_offset";
 /// `ConsumerMetrics`' per-partition lag, which the transport fills for the partitions it holds.
 #[cfg(feature = "metrics")]
 const CONSUMER_LAG: &str = "consumer_lag";
+/// `ConsumerMetrics`' assigned partition count, which the transport sets.
+#[cfg(feature = "metrics")]
+const CONSUMER_PARTITIONS: &str = "consumer_partitions_assigned";
 /// `ConsumerMetrics`' rebalance counter, which the transport counts.
 #[cfg(feature = "metrics")]
 const CONSUMER_REBALANCES: &str = "consumer_rebalance_total";
@@ -727,16 +793,10 @@ fn partition_labels(topic: &str, partition: i32) -> [(&'static str, String); 2] 
     ]
 }
 
-/// The `name` series for one partition, whichever client writes it.
-#[cfg(feature = "metrics")]
-fn partition_gauge(name: &'static str, topic: &str, partition: i32) -> metrics::Gauge {
-    metrics::gauge!(name, &partition_labels(topic, partition))
-}
-
 /// Records each revoke and assignment, in order, before librdkafka applies
 /// it, so the transport never holds or commits for a partition it lost,
 /// keeps the assignment the lag and `consumer_partitions_assigned` report,
-/// and counts each one in `consumer_rebalance_total`.
+/// and counts each one in its group's `consumer_rebalance_total`.
 impl rdkafka::consumer::ConsumerContext for StatsContext {
     fn pre_rebalance(
         &self,
@@ -1395,17 +1455,6 @@ mod tests {
             let capture = GaugeCapture::default();
             let loader = StatsContext::new();
             let archiver = StatsContext::new();
-            let behind_by = |committed: i64| {
-                stats_with(rdkafka::statistics::Partition {
-                    partition: 0,
-                    app_offset: committed,
-                    committed_offset: committed,
-                    hi_offset: 50,
-                    ls_offset: 50,
-                    consumer_lag: 50 - committed,
-                    ..Default::default()
-                })
-            };
             metrics::with_local_recorder(&capture, || {
                 loader.stats(from_client("loader", "consumer", 1, behind_by(35)));
                 archiver.stats(from_client("archiver", "consumer", 3, behind_by(20)));
@@ -1463,6 +1512,103 @@ mod tests {
                 capture.series("rdkafka_topic_partition_committed_offset"),
                 vec![(client("loader", "consumer", &partition), 0.0)]
             );
+        }
+
+        /// The labels one group's `consumer_` series carry, sorted, with `extra` added.
+        fn group(group: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+            let mut labels: Vec<(String, String)> = [("group_id", group)]
+                .iter()
+                .chain(extra)
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            labels.sort();
+            labels
+        }
+
+        /// Statistics for partition 0 of `events`, committed and read to
+        /// `committed`, with the end at 50.
+        fn behind_by(committed: i64) -> Statistics {
+            stats_with(rdkafka::statistics::Partition {
+                partition: 0,
+                app_offset: committed,
+                committed_offset: committed,
+                hi_offset: 50,
+                ls_offset: 50,
+                consumer_lag: 50 - committed,
+                ..Default::default()
+            })
+        }
+
+        /// Two consumers in one process, in different groups, each publish
+        /// their own assignment and lag.
+        #[test]
+        fn two_groups_in_one_process_publish_separate_consumer_series() {
+            let capture = GaugeCapture::default();
+            let loader = StatsContext::new().in_group(Some("loader"));
+            let archiver = StatsContext::new().in_group(Some("archiver"));
+            holding_events_0(&loader);
+            let two = vec![events_0(), ("events".to_string(), 1)];
+            archiver.assign(&two);
+            archiver.note_rebalanced(Rebalanced::Assigned(two));
+            metrics::with_local_recorder(&capture, || {
+                loader.stats(behind_by(35));
+                archiver.stats(behind_by(20));
+            });
+            let partition = [("partition", "0"), ("topic", "events")];
+            assert_eq!(
+                capture.series("consumer_partitions_assigned"),
+                vec![(group("archiver", &[]), 2.0), (group("loader", &[]), 1.0)]
+            );
+            assert_eq!(
+                capture.series("consumer_lag"),
+                vec![
+                    (group("archiver", &partition), 30.0),
+                    (group("loader", &partition), 15.0),
+                ]
+            );
+        }
+
+        /// A revoke zeroes its own group's lag, and leaves another group's
+        /// lag on the same partition as it was.
+        #[test]
+        fn a_revoke_zeroes_only_its_own_groups_consumer_lag() {
+            let capture = GaugeCapture::default();
+            let loader = StatsContext::new().in_group(Some("loader"));
+            let archiver = StatsContext::new().in_group(Some("archiver"));
+            holding_events_0(&loader);
+            holding_events_0(&archiver);
+            metrics::with_local_recorder(&capture, || {
+                loader.stats(behind_by(35));
+                archiver.stats(behind_by(20));
+                loader.revoke(&[events_0()]);
+            });
+            let partition = [("partition", "0"), ("topic", "events")];
+            assert_eq!(
+                capture.series("consumer_lag"),
+                vec![
+                    (group("archiver", &partition), 30.0),
+                    (group("loader", &partition), 0.0),
+                ]
+            );
+        }
+
+        /// A context built with `new` knows no group, so its `consumer_`
+        /// series carry none.
+        #[test]
+        fn a_context_with_no_group_writes_the_consumer_series_without_one() {
+            let capture = GaugeCapture::default();
+            let context = StatsContext::new();
+            holding_events_0(&context);
+            metrics::with_local_recorder(&capture, || context.stats(behind_by(35)));
+            assert_eq!(
+                capture.series("consumer_partitions_assigned"),
+                vec![(Vec::new(), 1.0)]
+            );
+            let partition = vec![
+                ("partition".to_string(), "0".to_string()),
+                ("topic".to_string(), "events".to_string()),
+            ];
+            assert_eq!(capture.series("consumer_lag"), vec![(partition, 15.0)]);
         }
     }
 }
