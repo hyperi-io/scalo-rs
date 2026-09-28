@@ -615,12 +615,14 @@ fn apply_group_protocol(client_config: &mut ClientConfig, protocol: ConsumerProt
 }
 
 /// Create the consumer client, `Arc`-wrapped so the optional gate actuator
-/// (governor feature) can share it for pause/resume without `unsafe`.
+/// (governor feature) can share it for pause/resume without `unsafe`. Its
+/// context counts lag to the end `client_config`'s isolation level reads to.
 fn create_consumer(
     client_config: &ClientConfig,
 ) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
+    let context = StatsContext::new().reading(metrics::Isolation::of(client_config));
     client_config
-        .create_with_context(StatsContext::new())
+        .create_with_context(context)
         .map(Arc::new)
         .map_err(|e| TransportError::Connection(format!("Failed to create consumer: {e}")))
 }
@@ -2709,6 +2711,51 @@ mod tests {
             .map(|e| e.topic().to_string())
             .collect();
         assert_eq!(topics, vec!["syslog_load".to_string()]);
+    }
+
+    /// The consumer's context counts lag to the end its own config lets it
+    /// read to. Broker-free: the consumer is never polled, and statistics are
+    /// off so librdkafka sends none of its own.
+    #[test]
+    fn the_consumer_context_counts_lag_to_the_end_its_isolation_level_reads_to() {
+        use rdkafka::client::ClientContext;
+        use rdkafka::statistics::{Partition, Statistics, Topic};
+
+        // Read to 0 while a transaction open upstream holds the last stable offset at 6.
+        let partition = Partition {
+            partition: 0,
+            app_offset: 0,
+            committed_offset: -1001,
+            hi_offset: 10,
+            ls_offset: 6,
+            consumer_lag: -1,
+            ..Default::default()
+        };
+        let topic = Topic {
+            topic: "events".to_string(),
+            partitions: HashMap::from([(0, partition)]),
+            ..Default::default()
+        };
+        let stats = Statistics {
+            topics: HashMap::from([("events".to_string(), topic)]),
+            ..Default::default()
+        };
+        let lag_under = |config: &KafkaConfig| {
+            let built = consumer_client_config(config, ConsumerProtocol::Classic);
+            let consumer = create_consumer(&built).expect("a consumer builds broker-free");
+            consumer.context().stats(stats.clone());
+            consumer.context().total_position_lag()
+        };
+        let config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "scalo-isolation".to_string(),
+            ..Default::default()
+        }
+        .with_override("statistics.interval.ms", "0");
+
+        assert_eq!(lag_under(&config), 6, "read_committed by default: 6 less 0");
+        let uncommitted = config.with_override("isolation.level", "read_uncommitted");
+        assert_eq!(lag_under(&uncommitted), 10, "read_uncommitted: 10 less 0");
     }
 
     /// A consumer whose only broker refuses connections keeps getting empty
