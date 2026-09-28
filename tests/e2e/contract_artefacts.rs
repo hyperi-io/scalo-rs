@@ -34,7 +34,7 @@
 //!     renders. (Without a cluster, deployment manifests can't "execute".)
 //!   - ArgoCD Application: `kubeconform` -- proves the manifest is
 //!     schema-valid.
-//! - **Tier B** (env-gated by `HYPERI_E2E_CLUSTER=1`): heavy-weight checks
+//! - **Tier B** (env-gated by `E2E_CLUSTER=1`): heavy-weight checks
 //!   that bring up a local kind cluster.
 //!   - Helm: `helm install` on the kind cluster, assert the release lands.
 //!   - ArgoCD: install ArgoCD into the cluster, apply the generated
@@ -1006,7 +1006,7 @@ fn tier_b_helm_install_on_kind() {
         skip(
             "tier-b",
             "tier_b_helm_install_on_kind",
-            "HYPERI_E2E_CLUSTER env var not set (skipping cluster-based tests)",
+            "E2E_CLUSTER env var not set (skipping cluster-based tests)",
         );
         return;
     }
@@ -1086,7 +1086,7 @@ fn tier_b_argocd_application_sync_on_kind() {
         skip(
             "tier-b",
             "tier_b_argocd_application_sync_on_kind",
-            "HYPERI_E2E_CLUSTER env var not set (skipping cluster-based tests)",
+            "E2E_CLUSTER env var not set (skipping cluster-based tests)",
         );
         return;
     }
