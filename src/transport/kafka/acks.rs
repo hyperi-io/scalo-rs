@@ -415,6 +415,8 @@ impl KafkaAcks {
             ::metrics::gauge!("transport_ack_withheld", "transport" => "kafka")
                 .set(self.withheld() as f64);
         }
+        #[cfg(not(feature = "metrics"))]
+        let _ = self;
     }
 }
 

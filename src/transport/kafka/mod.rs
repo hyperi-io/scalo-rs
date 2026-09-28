@@ -616,11 +616,14 @@ fn apply_group_protocol(client_config: &mut ClientConfig, protocol: ConsumerProt
 
 /// Create the consumer client, `Arc`-wrapped so the optional gate actuator
 /// (governor feature) can share it for pause/resume without `unsafe`. Its
-/// context counts lag to the end `client_config`'s isolation level reads to.
+/// context counts lag to the end `client_config`'s isolation level reads to,
+/// and labels its `consumer_` series with the group `client_config` joins.
 fn create_consumer(
     client_config: &ClientConfig,
 ) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
     let context = StatsContext::new().reading(metrics::Isolation::of(client_config));
+    #[cfg(feature = "metrics")]
+    let context = context.in_group(client_config.get("group.id"));
     client_config
         .create_with_context(context)
         .map(Arc::new)
@@ -4391,6 +4394,121 @@ mod tests {
             "the held partition's lag is the total:\n{rendered}"
         );
         assert_eq!(consumer_lag("0"), Some(0.0), "revoked:\n{rendered}");
+    }
+
+    /// Two consumers in one process, in different groups, each keep their own
+    /// `consumer_` series, keyed by the group their config joins, and a revoke
+    /// in one leaves the other's lag alone.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn two_groups_in_one_process_keep_their_own_consumer_series() {
+        use rdkafka::client::ClientContext;
+
+        async fn in_group(group: &str) -> KafkaTransport {
+            KafkaTransport::new(&KafkaConfig::for_testing("127.0.0.1:1", group, Vec::new()))
+                .await
+                .expect("broker-free kafka transport")
+        }
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+
+        let loader = in_group("loader").await;
+        let archiver = in_group("archiver").await;
+
+        serve(&loader, false, 0);
+        serve(&archiver, false, 0);
+        serve(&archiver, false, 1);
+        loader
+            .consumer()
+            .context()
+            .stats(events_committed_at_5(&[(0, 7)]));
+        archiver
+            .consumer()
+            .context()
+            .stats(events_committed_at_5(&[(0, 11), (1, 13)]));
+        serve(&loader, true, 0);
+        // librdkafka keeps reporting a partition after its revoke.
+        loader
+            .consumer()
+            .context()
+            .stats(events_committed_at_5(&[(0, 7)]));
+
+        let rendered = handle.render();
+        let series = |name: &str, group: &str, partition: Option<&str>| {
+            let group = format!("group_id=\"{group}\"");
+            let partition = partition.map(|p| format!("partition=\"{p}\""));
+            let labels: Vec<&str> = [Some(group.as_str()), partition.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect();
+            scraped(&rendered, name, &labels)
+        };
+        assert_eq!(
+            series("consumer_partitions_assigned", "loader", None),
+            Some(0.0),
+            "assigned 0, then revoked 0:\n{rendered}"
+        );
+        assert_eq!(
+            series("consumer_partitions_assigned", "archiver", None),
+            Some(2.0),
+            "assigned 0 and 1:\n{rendered}"
+        );
+        assert_eq!(
+            series("consumer_lag", "loader", Some("0")),
+            Some(0.0),
+            "revoked:\n{rendered}"
+        );
+        assert_eq!(
+            series("consumer_lag", "archiver", Some("0")),
+            Some(11.0),
+            "the loader's revoke leaves the archiver's lag:\n{rendered}"
+        );
+        assert_eq!(
+            series("consumer_lag", "archiver", Some("1")),
+            Some(13.0),
+            "{rendered}"
+        );
+        assert_eq!(
+            series("consumer_rebalance_total", "loader", None),
+            Some(2.0),
+            "assigned 0, revoked 0:\n{rendered}"
+        );
+        assert_eq!(
+            series("consumer_rebalance_total", "archiver", None),
+            Some(2.0),
+            "assigned 0, assigned 1:\n{rendered}"
+        );
+    }
+
+    /// The group a consumer's series carry is the one librdkafka joins, so a
+    /// `group.id` set in `librdkafka_overrides` names them.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn the_consumer_series_carry_the_group_the_client_config_joins() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+
+        let config = KafkaConfig::for_testing("127.0.0.1:1", "configured", Vec::new())
+            .with_override("group.id", "overridden");
+        let transport = KafkaTransport::new(&config)
+            .await
+            .expect("broker-free kafka transport");
+        serve(&transport, false, 0);
+
+        let rendered = handle.render();
+        assert_eq!(
+            scraped(
+                &rendered,
+                "consumer_rebalance_total",
+                &["group_id=\"overridden\""]
+            ),
+            Some(1.0),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("group_id=\"configured\""), "{rendered}");
     }
 
     /// A revoked partition's committed offset reads 0 from the revoke on, and
