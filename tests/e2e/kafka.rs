@@ -1099,9 +1099,10 @@ mod lag {
             .find_map(|line| line.rsplit(' ').next()?.parse().ok())
     }
 
-    /// A group that has committed nothing publishes its lag and its assignment
-    /// from its first assignment: 0 on an empty topic, then every record
-    /// written while it reads none of them.
+    /// A group that has committed nothing publishes its lag, in both lag
+    /// series, and its assignment from its first assignment, which it counts
+    /// as a rebalance: lag 0 on an empty topic, then every record written
+    /// while it reads none of them.
     #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn a_group_that_committed_nothing_publishes_lag_and_assignment() {
@@ -1122,6 +1123,13 @@ mod lag {
             scraped(
                 rendered,
                 "rdkafka_topic_partition_consumer_lag",
+                &["topic=\"fresh\"", "partition=\"0\""],
+            )
+        };
+        let consumer_lag = |rendered: &str| {
+            scraped(
+                rendered,
+                "consumer_lag",
                 &["topic=\"fresh\"", "partition=\"0\""],
             )
         };
@@ -1148,6 +1156,11 @@ mod lag {
             );
         };
         assert_eq!(lags(&transport), (0, 0), "{rendered}");
+        assert_eq!(consumer_lag(&rendered), Some(0.0), "{rendered}");
+        assert!(
+            scraped(&rendered, "consumer_rebalance_total", &[]).is_some_and(|n| n >= 1.0),
+            "the first assignment is a rebalance:\n{rendered}"
+        );
 
         transport.gate_actuator().pause();
         produce(&bootstrap, topic, 0..WRITTEN_PAUSED).await;
@@ -1160,6 +1173,7 @@ mod lag {
         let rendered = scrape.render();
         let written_f64 = f64::from(u32::try_from(WRITTEN_PAUSED).expect("fits a u32"));
         assert_eq!(lag(&rendered), Some(written_f64), "{rendered}");
+        assert_eq!(consumer_lag(&rendered), Some(written_f64), "{rendered}");
         assert_eq!(assigned(&rendered), Some(1.0), "{rendered}");
         assert_eq!(
             super::broker::committed(&bootstrap, group, topic).await,

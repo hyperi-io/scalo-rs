@@ -35,7 +35,7 @@
 //! svc.records_received(100);
 //! app.record_processed(100);
 //! buffer.record_flush(0.042, FlushTrigger::Size);
-//! consumer.set_lag("events", 3, 1500);
+//! consumer.record_poll_duration(0.002);
 //! sink.record_duration("clickhouse", 0.015);
 //! cb.record_transition("db.events", "open");
 //! bp.record_event();

@@ -828,6 +828,14 @@ The producer profile constants `PRODUCER_HIGH_THROUGHPUT`, `PRODUCER_EXACTLY_ONC
 
 **Consumer adjustment** -- none in code. A service that calls `ConsumerMetrics::set_partitions_assigned` itself shares the series with the transport, so it drops the call. A second `StatsContext` consumer in the same process, in another group, now publishes the same unlabelled series, and the two write over each other. A consumer built on `StatsContext` that takes partitions with `assign()` rather than `subscribe()` serves no rebalance, so it keeps the commit-only rule: lag for every partition with a committed offset, position lag from the application's or committed position, and no `consumer_partitions_assigned`.
 
+### Kafka consumer series all have a writer, and a revoked partition's offsets drop (BEHAVIOUR CHANGE)
+
+`ConsumerMetrics` registered `consumer_lag{topic,partition}` and `consumer_rebalance_total` and nothing set either, so every consumer's manifest listed two series that were always empty. The Kafka transport now fills both from the consumer it owns. `consumer_lag` carries each held partition's lag, the same values as `rdkafka_topic_partition_consumer_lag` and the ones `total_consumer_lag` sums. Only a context that has served a rebalance writes it, as with `consumer_partitions_assigned`. `consumer_rebalance_total` counts each revoke and each assignment, as librdkafka's `rebalance_cnt` does, so an eager rebalance counts 2. `consumer_poll_duration_seconds` stays the service's to record.
+
+A revoked partition kept its last `rdkafka_topic_partition_committed_offset` for good, and stayed in `KafkaMetrics::partition_committed` and `partition_high_watermark`, since librdkafka keeps reporting a stopped partition's last committed offset and high watermark. The recorder cannot drop one series, so a revoke now sets that partition's committed offset and `consumer_lag` to 0 and takes it out of the snapshot. Once a context has served a rebalance, both maps cover only the partitions it holds.
+
+**Consumer adjustment** -- a service that calls `ConsumerMetrics::set_lag` or `record_rebalance` for a scalo `KafkaTransport` consumer shares the series with the transport, so it drops the call. Two consumers in one process that read the same topic in different groups write the same `consumer_lag` series. A committed offset of 0 now also marks a partition the consumer no longer holds. Code that read `partition_committed` or `partition_high_watermark` for a partition the consumer does not hold gets nothing once the context has rebalanced. A context that has served no rebalance reports every partition as before.
+
 ### Smaller additions
 
 - `RoutedSender` forwards `dead_letter_reason` to the route a record's key selects, and reports the weakest `confirms_delivery` across its routes, so `.sender(&routed)` screens and reports as the routes do.
