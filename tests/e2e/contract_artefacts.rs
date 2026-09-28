@@ -879,6 +879,80 @@ fn tier_a_chart_sets_replicas_whenever_no_scaler_renders() {
 }
 
 // ============================================================================
+// Tier A -- service-account files: the instance id survives a restart
+// ============================================================================
+
+/// The version check derives its instance id from `ca.crt` and `namespace` in
+/// the service-account directory, so the pod carries both without the token,
+/// whether the chart creates the account or the operator supplies one.
+#[test]
+fn tier_a_chart_projects_the_service_account_files_without_the_token() {
+    if !helm_available() {
+        skip(
+            "tier-a",
+            "tier_a_chart_projects_the_service_account_files_without_the_token",
+            "helm CLI not available",
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chart_dir = tmp.path().join("chart");
+    generate_chart(&test_contract(), &chart_dir, None).expect("generate_chart");
+
+    let account = render_template(&chart_dir, "templates/serviceaccount.yaml", &[]);
+    assert_eq!(
+        account["automountServiceAccountToken"].as_bool(),
+        Some(false)
+    );
+
+    let expected_sources: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        r"
+- configMap:
+    name: kube-root-ca.crt
+    items:
+      - key: ca.crt
+        path: ca.crt
+- downwardAPI:
+    items:
+      - path: namespace
+        fieldRef:
+          fieldPath: metadata.namespace
+",
+    )
+    .expect("expected sources are YAML");
+
+    for args in [&[][..], &["--set", "serviceAccount.create=false"][..]] {
+        let deployment = render_template(&chart_dir, "templates/deployment.yaml", args);
+        let pod = &deployment["spec"]["template"]["spec"];
+        assert_eq!(
+            pod["automountServiceAccountToken"].as_bool(),
+            Some(false),
+            "pod automount with {args:?}"
+        );
+
+        let mount = pod["containers"][0]["volumeMounts"]
+            .as_sequence()
+            .expect("a volumeMounts list")
+            .iter()
+            .find(|m| {
+                m["mountPath"].as_str() == Some("/var/run/secrets/kubernetes.io/serviceaccount")
+            })
+            .expect("a mount at the service-account path");
+        assert_eq!(mount["readOnly"].as_bool(), Some(true), "{args:?}");
+
+        let volume = pod["volumes"]
+            .as_sequence()
+            .expect("a volumes list")
+            .iter()
+            .find(|v| v["name"] == mount["name"])
+            .expect("the volume the mount names");
+        // Exactly these two sources, so no serviceAccountToken source rides along.
+        assert_eq!(volume["projected"]["sources"], expected_sources, "{args:?}");
+    }
+}
+
+// ============================================================================
 // Tier A -- ArgoCD Application: kubeconform
 // ============================================================================
 

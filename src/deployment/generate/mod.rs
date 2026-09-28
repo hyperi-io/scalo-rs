@@ -776,13 +776,55 @@ mod tests {
             assert!(image.contains("\nUSER 1000\n"), "{image}");
         }
         // Deliberately false: the spool and DLQ write to the container
-        // filesystem and the only volume mounted is the read-only config map.
+        // filesystem and every volume mounted is read-only.
         assert!(values.contains("readOnlyRootFilesystem: false"));
 
         let deployment =
             std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
         assert!(deployment.contains("{{- with .Values.podSecurityContext }}"));
         assert!(deployment.contains("{{- with .Values.securityContext }}"));
+    }
+
+    #[test]
+    fn test_chart_projects_the_service_account_files_without_the_token() {
+        // The version check derives its instance id from ca.crt and namespace
+        // here; with neither present every pod restart reports as a new install.
+        let contract = test_contract();
+        let dir = tempfile::tempdir().unwrap();
+        generate_chart(&contract, dir.path(), None).unwrap();
+
+        let account =
+            std::fs::read_to_string(dir.path().join("templates/serviceaccount.yaml")).unwrap();
+        assert!(account.contains("\nautomountServiceAccountToken: false\n"));
+
+        let deployment =
+            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
+        // On the pod as well, so an operator-supplied account mounts no token either.
+        assert!(deployment.contains(
+            "      serviceAccountName: {{ include \"dfe-loader.serviceAccountName\" . }}\n\
+             \x20     automountServiceAccountToken: false\n"
+        ));
+        assert!(deployment.contains(
+            "            - name: serviceaccount-files\n\
+             \x20             mountPath: /var/run/secrets/kubernetes.io/serviceaccount\n\
+             \x20             readOnly: true\n"
+        ));
+        assert!(deployment.contains(
+            "        - name: serviceaccount-files\n\
+             \x20         projected:\n\
+             \x20           sources:\n\
+             \x20             - configMap:\n\
+             \x20                 name: kube-root-ca.crt\n\
+             \x20                 items:\n\
+             \x20                   - key: ca.crt\n\
+             \x20                     path: ca.crt\n\
+             \x20             - downwardAPI:\n\
+             \x20                 items:\n\
+             \x20                   - path: namespace\n\
+             \x20                     fieldRef:\n\
+             \x20                       fieldPath: metadata.namespace\n"
+        ));
+        assert!(!deployment.contains("serviceAccountToken:"));
     }
 
     #[test]

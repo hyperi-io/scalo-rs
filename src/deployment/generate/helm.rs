@@ -223,8 +223,8 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
     // changing it -- a mismatch is worth failing on, not papering over.
     //
     // readOnlyRootFilesystem is deliberately FALSE. The spool and DLQ write to
-    // the container filesystem, and the only volume this chart mounts is the
-    // read-only config map, so turning it on would break every app that spools.
+    // the container filesystem, and every volume this chart mounts is read-only,
+    // so turning it on would break every app that spools.
     // An app that does not spool can set it true without forking the chart.
     out.push_str(
         "# -- Pod-level security context. Matches the uid the generated image\n\
@@ -238,9 +238,9 @@ fn gen_values_yaml(c: &DeploymentContract) -> String {
          \x20   type: RuntimeDefault\n\
          \n\
          # -- Container-level security context. readOnlyRootFilesystem stays\n\
-         # false because the spool and DLQ write to disk and the only volume\n\
-         # mounted here is the read-only config map; set it true only for an\n\
-         # app that spools nowhere.\n\
+         # false because the spool and DLQ write to disk and every volume\n\
+         # mounted here is read-only; set it true only for an app that spools\n\
+         # nowhere.\n\
          securityContext:\n\
          \x20 allowPrivilegeEscalation: false\n\
          \x20 privileged: false\n\
@@ -479,8 +479,6 @@ Service account name.
     out
 }
 
-/// The container `env:` entries that make a pod identifiable to observability.
-///
 /// The three container probes, all pointed at the metrics port.
 ///
 /// `startupProbe` targets the LIVENESS path. There is no startup endpoint:
@@ -514,6 +512,8 @@ fn gen_probes(c: &DeploymentContract) -> String {
     )
 }
 
+/// The container `env:` entries that make a pod identifiable to observability.
+///
 /// Per-pod / per-app differentiation rides on STANDARD OTel env vars plus
 /// platform enrichment (Prometheus scrape labels, collector k8sattributes),
 /// NEVER on metric names. The OTel SDK reads `OTEL_SERVICE_NAME` and
@@ -650,6 +650,35 @@ fn replicas_gate(c: &DeploymentContract) -> String {
     }
 }
 
+/// Where the pod carries `ca.crt` and `namespace` with no API token; the
+/// version check derives its instance id from those two files.
+const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
+/// The pod `volumes:`. The service-account files take the sources of
+/// Kubernetes' own token volume minus the token, so the derived instance id is
+/// unchanged.
+fn gen_volumes(app: &str) -> String {
+    format!(
+        "      volumes:\n\
+         \x20       - name: config\n\
+         \x20         configMap:\n\
+         \x20           name: {{{{ include \"{app}.fullname\" . }}}}-config\n\
+         \x20       - name: serviceaccount-files\n\
+         \x20         projected:\n\
+         \x20           sources:\n\
+         \x20             - configMap:\n\
+         \x20                 name: kube-root-ca.crt\n\
+         \x20                 items:\n\
+         \x20                   - key: ca.crt\n\
+         \x20                     path: ca.crt\n\
+         \x20             - downwardAPI:\n\
+         \x20                 items:\n\
+         \x20                   - path: namespace\n\
+         \x20                     fieldRef:\n\
+         \x20                       fieldPath: metadata.namespace\n",
+    )
+}
+
 fn gen_deployment_yaml(c: &DeploymentContract, gates: &[Option<String>]) -> String {
     let app = &c.app_name;
     let replicas_if = replicas_gate(c);
@@ -688,6 +717,7 @@ spec:
         {{{{- toYaml . | nindent 8 }}}}
       {{{{- end }}}}
       serviceAccountName: {{{{ include "{app}.serviceAccountName" . }}}}
+      automountServiceAccountToken: false
       {{{{- with .Values.podSecurityContext }}}}
       securityContext:
         {{{{- toYaml . | nindent 8 }}}}
@@ -777,6 +807,9 @@ spec:
         "          volumeMounts:\n\
          \x20           - name: config\n\
          \x20             mountPath: {config_dir}\n\
+         \x20             readOnly: true\n\
+         \x20           - name: serviceaccount-files\n\
+         \x20             mountPath: {SERVICE_ACCOUNT_DIR}\n\
          \x20             readOnly: true\n",
         config_dir = c.config_dir(),
     ));
@@ -789,13 +822,7 @@ spec:
          \x20         {{- end }}\n",
     );
 
-    // Volumes
-    out.push_str(&format!(
-        "      volumes:\n\
-         \x20       - name: config\n\
-         \x20         configMap:\n\
-         \x20           name: {{{{ include \"{app}.fullname\" . }}}}-config\n",
-    ));
+    out.push_str(&gen_volumes(app));
 
     // Node selector, affinity, tolerations
     out.push_str(
