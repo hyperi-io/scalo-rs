@@ -305,10 +305,11 @@ async fn a_commit_during_an_outage_reports_instead_of_hanging() {
 ///
 /// The outage stays inside the 45 s group session, so the broker never holds
 /// a rejoin, and a 100 ms reconnect backoff keeps queueing errors through it.
+/// The JVM broker takes about 15 s to restart, which counts towards that session.
 #[tokio::test]
 #[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
-    const UNPOLLED: Duration = Duration::from_secs(25);
+    const UNPOLLED: Duration = Duration::from_secs(15);
     const RESUME_WITHIN: Duration = Duration::from_secs(30);
 
     let (node, bootstrap) = start_kafka().await;
