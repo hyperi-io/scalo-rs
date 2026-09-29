@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Base configuration for scaling pressure calculation.
 ///
 /// Lives in the app's config cascade so thresholds are env-var overridable
-/// (e.g., `DFE_LOADER__SCALING__MEMORY_GATE_THRESHOLD=0.9`).
+/// (e.g., `MYAPP__SCALING__MEMORY_GATE_THRESHOLD=0.9`).
 ///
 /// Component weights and saturation points are app-specific -- defined in
 /// each app's config and passed to [`super::ScalingPressure::new`] via

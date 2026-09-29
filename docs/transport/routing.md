@@ -12,12 +12,12 @@ the bus, a gRPC endpoint on the direct transport. Sits on top of
 
 | Stage | Routed? | Why |
 |-------|---------|-----|
-| `dfe-receiver` | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
-| `dfe-fetcher` | **Yes** | Each source maps to its own destination, plus per-record routes |
-| `dfe-transform-vrl` | **Yes** | Its sink list is config-driven — one destination today, a list tomorrow |
-| `dfe-transform-vector` | **Yes** | Same, though Vector owns the transform config itself |
-| `dfe-loader` | No | One ClickHouse sink — 1:1 transport |
-| `dfe-archiver` | No | One object-storage sink — 1:1 transport |
+| `myapp-receiver` | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
+| `myapp-fetcher` | **Yes** | Each source maps to its own destination, plus per-record routes |
+| `myapp-transform-vrl` | **Yes** | Its sink list is config-driven -- one destination today, a list tomorrow |
+| `myapp-transform-vector` | **Yes** | Same, though Vector owns the transform config itself |
+| `myapp-loader` | No | One ClickHouse sink -- 1:1 transport |
+| `myapp-archiver` | No | One object-storage sink -- 1:1 transport |
 
 Push the routing decision as close to ingress as possible: a stage that
 sees one inbound stream and produces one outbound stream needs a name for
@@ -213,7 +213,7 @@ Per `send()` call, on top of the chosen backend's own cost:
 
 The routing overhead is at most 1% of any real backend's send cost.
 No allocation, no `Arc::clone`, no async indirection. The metric
-`dfe_transport_sent_total{transport="routed", route=<key>}` records
+`myapp_transport_sent_total{transport="routed", route=<key>}` records
 the route taken.
 
 ---

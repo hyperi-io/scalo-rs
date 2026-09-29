@@ -16,7 +16,7 @@
 //! auth (e.g. PLAIN on a broker that supports SCRAM). It is opt-in -- the vanilla
 //! providers work without importing it.
 //!
-//! This encodes the DFE credential contract (dfe-engine#98) when driven with DFE's
+//! This encodes a strict credential contract when driven with an operator's own
 //! allow-list, but the shape is generic: any security-conscious operator wants
 //! "strongest available, never downgraded, only these providers".
 

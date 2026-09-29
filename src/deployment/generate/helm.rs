@@ -24,7 +24,7 @@ use super::common::{is_go_identifier, safe_template_lookup, to_camel_suffix, wri
 ///
 /// Writes `Chart.yaml`, `values.yaml`, and all template files to `output_dir`.
 ///
-/// `identity`, when provided, stamps the three `io.hyperi.contract.*`
+/// `identity`, when provided, stamps the three `io.scalo.contract.*`
 /// annotations into `Chart.yaml`'s top-level `annotations:` block per the
 /// Contract Identity Annotation Scheme v1. Phase 1 rollout: optional;
 /// callers SHOULD pass `Some(&identity)`.

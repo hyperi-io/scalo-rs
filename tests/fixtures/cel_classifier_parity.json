@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared test corpus for the CEL classifier. The Python classifier in dfe_engine.cel.classify and the Rust classifier in scalo-rs src/transport/filter/classify.rs MUST agree on every entry. A copy of this file lives in dfe-engine at tests/fixtures/cel_classifier_parity.json — keep them identical.",
+  "_comment": "Shared test corpus for the CEL classifier. The Python classifier in a downstream control-plane consumer and the Rust classifier in scalo-rs src/transport/filter/classify.rs MUST agree on every entry. A copy of this file lives in that consumer's own fixtures directory -- keep them identical.",
   "_columns": "expression: input. tier: 1|2|3. op_kind: optional Tier 1 op kind. op_field: optional Tier 1 field. op_value: optional Tier 1 comparison value. fields: optional sorted list of field references for Tier 2/3.",
   "cases": [
     { "expression": "has(_table)", "tier": 1, "op_kind": "field_exists", "op_field": "_table" },

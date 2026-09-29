@@ -120,5 +120,5 @@ distribution terms if the licence change affects you.
 
 ## Getting help
 
-- scalo source and issues: <https://github.com/hyperi-io/scalo-rs>
+- scalo source and issues: see this crate's `repository` field in `Cargo.toml`
 - scalo on crates.io: <https://crates.io/crates/scalo>

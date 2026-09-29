@@ -146,7 +146,7 @@ Use `Spool` directly when:
 
 ```yaml
 spool:
-  path: /var/spool/dfe/replay
+  path: /var/spool/scalo/replay
   compress: true
   compression_level: 3
   max_items: 1000000

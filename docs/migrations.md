@@ -363,7 +363,7 @@ return the sum of outstanding `try_reserve`/`add_bytes` reservations
 unless the app registered a heap source, which no consumer did, so the
 pressure ratio sat near zero while a process held hundreds of MiB and
 neither the inbound brake nor the `dfe_scaling_pressure` hard gate ever
-engaged (dfe-transform-vrl #53).
+engaged (discovered in a downstream consumer).
 
 No consumer code change is required to get the fix. Two things to know:
 
@@ -516,15 +516,15 @@ fixed at the enum variant count.
 
 ```rust
 // Before
-dfe.auth_failure("token-expired");
-dfe.record_flush(0.012, "size");
-dfe.transport_sent("kafka", 1);
+platform_metrics.auth_failure("token-expired");
+platform_metrics.record_flush(0.012, "size");
+platform_metrics.transport_sent("kafka", 1);
 
 // After
 use scalo::metrics::{AuthFailureReason, FlushTrigger, TransportKind};
-dfe.auth_failure(AuthFailureReason::Expired);
-dfe.record_flush(0.012, FlushTrigger::Size);
-dfe.transport_sent(TransportKind::Kafka, 1);
+platform_metrics.auth_failure(AuthFailureReason::Expired);
+platform_metrics.record_flush(0.012, FlushTrigger::Size);
+platform_metrics.transport_sent(TransportKind::Kafka, 1);
 ```
 
 Variant lists:
@@ -545,7 +545,7 @@ flags every site needing the new variant.
 
 ### Wave 5 — `RoutedSender` metric label
 
-`dfe_transport_sent_total{transport="routed",route=...}` now
+`myapp_transport_sent_total{transport="routed",route=...}` now
 carries the **configured route name** (or `"default"` for the
 fallback), not the inbound message key. Cardinality is bounded by
 the routing table size. No consumer code change required — only
@@ -570,8 +570,8 @@ yourself.
 **Consumer adjustment** -- ANY path whose second segment is not `data`
 changes meaning, at any length: its first segment used to be the first
 segment of a path under `secret` and is now the mount. `myapp/tls` was
-`secret`/`myapp/tls` and is now `myapp`/`tls`; `kv/dfe-test/runzero` was
-`secret`/`kv/dfe-test/runzero` and is now `kv`/`dfe-test/runzero`.
+`secret`/`myapp/tls` and is now `myapp`/`tls`; `kv/myapp-test/token` was
+`secret`/`kv/myapp-test/token` and is now `kv`/`myapp-test/token`.
 Anything relying on the old reading now asks for a path that does not
 exist, so write the mount you mean (`secret/myapp/tls`).
 
@@ -909,4 +909,4 @@ the trait and use rdkafka directly.
 
 ## Older releases
 
-Historical migrations live in agent memory at `project_dfe_*_migration.md` (referenced from `memory.md`) until they graduate here.
+Historical migrations predating this file have not yet been transcribed here.

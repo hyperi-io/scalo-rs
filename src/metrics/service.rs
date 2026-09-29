@@ -1,12 +1,12 @@
 // Project:   scalo
 // File:      src/metrics/service.rs
-// Purpose:   Standard DFE metric definitions with transport labels
+// Purpose:   Standard pipeline metric definitions with transport labels
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Standard DFE metrics for pipeline components (receiver, loader, engine).
+//! Standard metrics for pipeline components (receiver, loader, engine).
 //!
 //! Call [`ServiceMetrics::register`] **after** creating a
 //! [`MetricsManager`](super::MetricsManager): the manager must exist so platform
@@ -28,7 +28,7 @@
 
 use super::manifest::{MetricDescriptor, MetricType};
 
-/// Standard DFE metric set: labelled counters, gauges, and histograms across
+/// Standard platform metric set: labelled counters, gauges, and histograms across
 /// transport, pipeline, records, scaling, spool, and security.
 ///
 /// Construct via [`ServiceMetrics::register`] -- describes all metrics with the
@@ -52,7 +52,7 @@ pub struct ServiceMetrics {
 pub type DfeMetrics = ServiceMetrics;
 
 impl ServiceMetrics {
-    /// Register all DFE metric descriptions with the global recorder and
+    /// Register all platform metric descriptions with the global recorder and
     /// manifest registry. Call **once** after creating a
     /// [`MetricsManager`](super::MetricsManager). Returned handle is zero-sized
     /// (recording goes through the global `metrics!` macros).
@@ -800,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_does_not_panic() {
         let mgr = super::super::MetricsManager::new_for_test("test_app");
-        let _dfe = ServiceMetrics::register(&mgr);
+        let _metrics = ServiceMetrics::register(&mgr);
     }
 
     #[tokio::test]
@@ -808,7 +808,7 @@ mod tests {
         // Bare-name contract: ServiceMetrics pushes BARE names; the registry
         // (namespace "test_app") applies the `test_app_` prefix to the manifest.
         let mgr = super::super::MetricsManager::new_for_test("test_app");
-        let _dfe = ServiceMetrics::register(&mgr);
+        let _metrics = ServiceMetrics::register(&mgr);
         let manifest = mgr.registry().manifest();
         let names: Vec<&str> = manifest.metrics.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"test_app_transport_sent_total"));
@@ -891,7 +891,7 @@ mod tests {
     async fn test_register_bare_namespace_keeps_names_bare() {
         // Empty namespace -> manifest names are bare (no prefix).
         let mgr = super::super::MetricsManager::new_for_test("");
-        let _dfe = ServiceMetrics::register(&mgr);
+        let _metrics = ServiceMetrics::register(&mgr);
         let manifest = mgr.registry().manifest();
         let names: Vec<&str> = manifest.metrics.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"transport_sent_total"));

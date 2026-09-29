@@ -39,7 +39,7 @@ use super::error::DeploymentError;
 ///
 /// Apps call this to fill [`DeploymentContract::config_schema`], typically
 /// `config_schema_json::<MyConfig>()`. Secret fields (scalo
-/// [`SensitiveString`](crate::SensitiveString)) carry the `x-dfe-secret`
+/// [`SensitiveString`](crate::SensitiveString)) carry the `x-scalo-secret`
 /// marker automatically.
 #[cfg(feature = "config-schema")]
 #[must_use]
@@ -471,7 +471,7 @@ mod tests {
             env_prefix: "DEMO".into(),
             metric_prefix: "demo".into(),
             config_mount_path: "/etc/demo/demo.yaml".into(),
-            image_registry: "ghcr.io/hyperi-io".into(),
+            image_registry: "ghcr.io/example-org".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],

@@ -15,7 +15,7 @@ use std::fmt;
 /// Populated at build time via `env!()` macros or passed by the application.
 #[derive(Debug, Clone)]
 pub struct VersionInfo {
-    /// Service name (e.g. "dfe-loader").
+    /// Service name (e.g. "myapp").
     pub name: String,
     /// Semantic version (e.g. "1.9.7").
     pub version: String,
@@ -109,8 +109,8 @@ mod tests {
 
     #[test]
     fn test_version_info_new() {
-        let v = VersionInfo::new("dfe-loader", "1.9.7");
-        assert_eq!(v.name, "dfe-loader");
+        let v = VersionInfo::new("myapp", "1.9.7");
+        assert_eq!(v.name, "myapp");
         assert_eq!(v.version, "1.9.7");
         assert!(v.commit.is_none());
         assert_eq!(v.scalo_version, crate::VERSION);
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_version_info_builder() {
-        let v = VersionInfo::new("dfe-loader", "1.9.7")
+        let v = VersionInfo::new("myapp", "1.9.7")
             .with_commit("abc1234")
             .with_build_date("2026-03-03")
             .with_rustc("1.85.0")
@@ -132,21 +132,21 @@ mod tests {
 
     #[test]
     fn test_version_info_short() {
-        let v = VersionInfo::new("dfe-loader", "1.9.7").with_commit("abc1234");
-        assert_eq!(v.short(), "dfe-loader 1.9.7 (abc1234)");
+        let v = VersionInfo::new("myapp", "1.9.7").with_commit("abc1234");
+        assert_eq!(v.short(), "myapp 1.9.7 (abc1234)");
 
-        let v2 = VersionInfo::new("dfe-loader", "1.9.7");
-        assert_eq!(v2.short(), "dfe-loader 1.9.7");
+        let v2 = VersionInfo::new("myapp", "1.9.7");
+        assert_eq!(v2.short(), "myapp 1.9.7");
     }
 
     #[test]
     fn test_version_info_display() {
-        let v = VersionInfo::new("dfe-loader", "1.9.7")
+        let v = VersionInfo::new("myapp", "1.9.7")
             .with_commit("abc1234")
             .with_target("x86_64-unknown-linux-gnu");
 
         let output = v.to_string();
-        assert!(output.contains("dfe-loader 1.9.7"));
+        assert!(output.contains("myapp 1.9.7"));
         assert!(output.contains("commit:  abc1234"));
         assert!(output.contains("target:  x86_64-unknown-linux-gnu"));
         assert!(output.contains(&format!("scalo: {}", crate::VERSION)));

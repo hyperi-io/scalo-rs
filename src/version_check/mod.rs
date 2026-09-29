@@ -61,7 +61,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `version_check.enabled: false` in any config layer always wins.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VersionCheckConfig {
-    /// Product identifier (e.g., "dfe-loader", "dfe-receiver").
+    /// Product identifier (e.g., "myapp", "myapp-receiver").
     #[serde(default)]
     pub product: String,
     /// Current version of this product (e.g., "1.8.0").
@@ -581,7 +581,7 @@ mod tests {
         // Free-form deployment strings carry operator-sensitive names, so
         // the payload struct must not have the field at all.
         let payload = CheckPayload {
-            product: "dfe-loader".into(),
+            product: "myapp".into(),
             current_version: "1.0.0".into(),
             os: Some("linux".into()),
             arch: Some("x86_64".into()),
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn test_check_payload_serialization() {
         let payload = CheckPayload {
-            product: "dfe-loader".into(),
+            product: "myapp".into(),
             current_version: "1.8.0".into(),
             os: Some("linux".into()),
             arch: Some("x86_64".into()),
@@ -607,7 +607,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["product"], "dfe-loader");
+        assert_eq!(json["product"], "myapp");
         assert_eq!(json["current_version"], "1.8.0");
         assert_eq!(json["os"], "linux");
         assert_eq!(json["arch"], "x86_64");
@@ -715,7 +715,7 @@ mod tests {
         let json = r#"{
             "latest_version": "1.9.0",
             "update_available": true,
-            "release_url": "https://github.com/hyperi-io/dfe-loader/releases/tag/v1.9.0",
+            "release_url": "https://github.com/example-org/myapp/releases/tag/v1.9.0",
             "published_at": "2026-02-15T10:00:00Z",
             "message": null
         }"#;

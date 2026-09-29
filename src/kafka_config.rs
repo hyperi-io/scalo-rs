@@ -341,13 +341,13 @@ pub const TOPIC_SUFFIX_LOAD: &str = "_load";
 /// Service role -- determines consumer group naming convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
-    /// Transform services (middleware): CG = `dfe-{service}-{source}`.
+    /// Transform services (middleware): CG = `{service}-{source}`.
     ///
     /// Transforms sit between `_land` and `_load` topics. Each source gets
     /// its own consumer group so multiple transform pipelines don't compete.
     Transform,
 
-    /// Universal consumers (loader, archiver): CG = `dfe-{service}`.
+    /// Universal consumers (loader, archiver): CG = `{service}`.
     ///
     /// Universal services consume from whatever topics are configured or
     /// auto-discovered. The source name is not part of the consumer group.
@@ -368,7 +368,7 @@ pub enum ServiceRole {
 ///
 /// Terminal consumers (loader, archiver) do not use `KafkaSource` -- they
 /// consume from whatever topics are configured or auto-discovered, and their
-/// consumer group is simply `dfe-{service}` without a source component.
+/// consumer group is simply `{service}` without a source component.
 ///
 /// # Examples
 ///
@@ -382,13 +382,13 @@ pub enum ServiceRole {
 /// // Transform: CG includes source name
 /// assert_eq!(
 ///     source.consumer_group("transform-vector", ServiceRole::Transform, None, None).unwrap(),
-///     "dfe-transform-vector-syslog"
+///     "transform-vector-syslog"
 /// );
 ///
 /// // Terminal: CG is just the service name
 /// assert_eq!(
 ///     source.consumer_group("loader", ServiceRole::Universal, None, None).unwrap(),
-///     "dfe-loader"
+///     "loader"
 /// );
 ///
 /// // Override always wins
@@ -465,8 +465,8 @@ impl KafkaSource {
     ///
     /// | Role | Pattern | Example |
     /// |------|---------|---------|
-    /// | Transform | `dfe-{service}-{source}` | `dfe-transform-vector-syslog` |
-    /// | Universal (loader, archiver) | `dfe-{service}` | `dfe-loader` |
+    /// | Transform | `{service}-{source}` | `transform-vector-syslog` |
+    /// | Universal (loader, archiver) | `{service}` | `loader` |
     ///
     /// For transforms, `pipeline` overrides the source component in the CG
     /// (e.g. `syslog-enriched` instead of `syslog`). Either the `KafkaSource`
@@ -496,14 +496,14 @@ impl KafkaSource {
                         path: String::new(),
                         message: format!(
                             "transform service '{service}' requires a source or pipeline \
-                             name for its consumer group -- a bare 'dfe-{service}' CG would \
+                             name for its consumer group -- a bare '{service}' CG would \
                              cause multiple pipelines to compete for messages"
                         ),
                     });
                 }
-                Ok(format!("dfe-{service}-{suffix}"))
+                Ok(format!("{service}-{suffix}"))
             }
-            ServiceRole::Universal => Ok(format!("dfe-{service}")),
+            ServiceRole::Universal => Ok(service.to_string()),
         }
     }
 
@@ -646,7 +646,7 @@ sasl.mechanism=SCRAM-SHA-512
     // ===================================================================
 
     #[test]
-    fn dfe_source_default_topics() {
+    fn kafka_source_default_topics() {
         let source = KafkaSource::new("syslog");
         assert_eq!(source.name(), "syslog");
         assert_eq!(source.input_topic(), "syslog_land");
@@ -654,25 +654,25 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_custom_suffixes() {
+    fn kafka_source_custom_suffixes() {
         let source = KafkaSource::with_suffixes("auth", "_raw", "_enriched");
         assert_eq!(source.input_topic(), "auth_raw");
         assert_eq!(source.output_topic(), "auth_enriched");
     }
 
     #[test]
-    fn dfe_source_cg_transform_default() {
+    fn kafka_source_cg_transform_default() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
                 .consumer_group("transform-vector", ServiceRole::Transform, None, None)
                 .unwrap(),
-            "dfe-transform-vector-syslog"
+            "transform-vector-syslog"
         );
     }
 
     #[test]
-    fn dfe_source_cg_transform_with_pipeline() {
+    fn kafka_source_cg_transform_with_pipeline() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
@@ -683,12 +683,12 @@ sasl.mechanism=SCRAM-SHA-512
                     None
                 )
                 .unwrap(),
-            "dfe-transform-vector-syslog-enriched"
+            "transform-vector-syslog-enriched"
         );
     }
 
     #[test]
-    fn dfe_source_cg_transform_empty_source_errors() {
+    fn kafka_source_cg_transform_empty_source_errors() {
         let source = KafkaSource::new("");
         assert!(
             source
@@ -698,7 +698,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_transform_empty_source_pipeline_rescues() {
+    fn kafka_source_cg_transform_empty_source_pipeline_rescues() {
         let source = KafkaSource::new("");
         assert_eq!(
             source
@@ -709,34 +709,34 @@ sasl.mechanism=SCRAM-SHA-512
                     None
                 )
                 .unwrap(),
-            "dfe-transform-vector-syslog"
+            "transform-vector-syslog"
         );
     }
 
     #[test]
-    fn dfe_source_cg_universal() {
+    fn kafka_source_cg_universal() {
         let source = KafkaSource::new("netflow");
         assert_eq!(
             source
                 .consumer_group("loader", ServiceRole::Universal, None, None)
                 .unwrap(),
-            "dfe-loader"
+            "loader"
         );
     }
 
     #[test]
-    fn dfe_source_cg_universal_ignores_pipeline() {
+    fn kafka_source_cg_universal_ignores_pipeline() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
                 .consumer_group("archiver", ServiceRole::Universal, Some("ignored"), None)
                 .unwrap(),
-            "dfe-archiver"
+            "archiver"
         );
     }
 
     #[test]
-    fn dfe_source_cg_override_wins() {
+    fn kafka_source_cg_override_wins() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
@@ -752,7 +752,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_override_wins_universal() {
+    fn kafka_source_cg_override_wins_universal() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
@@ -768,7 +768,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_from_topic_land() {
+    fn kafka_source_from_topic_land() {
         assert_eq!(
             KafkaSource::source_from_topic("syslog_land"),
             Some("syslog")
@@ -777,7 +777,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_from_topic_load() {
+    fn kafka_source_from_topic_load() {
         assert_eq!(
             KafkaSource::source_from_topic("syslog_load"),
             Some("syslog")
@@ -789,14 +789,14 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_from_topic_unknown() {
+    fn kafka_source_from_topic_unknown() {
         assert_eq!(KafkaSource::source_from_topic("unknown"), None);
         assert_eq!(KafkaSource::source_from_topic("events"), None);
         assert_eq!(KafkaSource::source_from_topic(""), None);
     }
 
     #[test]
-    fn dfe_source_from_topic_edge_cases() {
+    fn kafka_source_from_topic_edge_cases() {
         assert_eq!(KafkaSource::source_from_topic("_land"), Some(""));
         assert_eq!(KafkaSource::source_from_topic("a_load"), Some("a"));
     }

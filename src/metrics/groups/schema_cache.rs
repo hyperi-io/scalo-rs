@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/schema_cache.rs
-// Purpose:   DFE schema cache metrics group
+// Purpose:   Pipeline schema cache metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0

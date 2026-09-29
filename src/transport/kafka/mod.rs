@@ -26,7 +26,7 @@
 //!
 //! let config = KafkaConfig {
 //!     brokers: vec!["kafka:9092".to_string()],
-//!     group: "dfe-loader".to_string(),
+//!     group: "consumer-a".to_string(),
 //!     topics: vec!["events".to_string()],
 //!     ..Default::default()
 //! };
@@ -2779,28 +2779,29 @@ mod tests {
     use super::*;
 
     /// A producer-only transport's consumer still asks for its group's
-    /// coordinator, so the stand-in must sit under the prefix a DFE broker
-    /// grants (`dfe-`), and must never be empty (librdkafka >= 2.x refuses).
+    /// coordinator, so the stand-in must sit under the prefix an app's
+    /// broker grants (`app-`), and must never be empty (librdkafka >= 2.x
+    /// refuses).
     #[test]
     fn producer_only_stand_in_group_derives_from_the_client_id() {
         let producer = KafkaConfig {
             group: String::new(),
-            client_id: "dfe-fetcher".to_string(),
+            client_id: "producer-a".to_string(),
             ..Default::default()
         };
         assert_eq!(
             effective_consumer_group_id(&producer),
-            "dfe-fetcher-producer-only"
+            "producer-a-producer-only"
         );
         let built = consumer_client_config(&producer, ConsumerProtocol::Classic);
-        assert_eq!(built.get("group.id"), Some("dfe-fetcher-producer-only"));
+        assert_eq!(built.get("group.id"), Some("producer-a-producer-only"));
 
         // A real group is passed through unchanged.
         let consumer = KafkaConfig {
-            group: "dfe-loader".to_string(),
+            group: "consumer-a".to_string(),
             ..Default::default()
         };
-        assert_eq!(effective_consumer_group_id(&consumer), "dfe-loader");
+        assert_eq!(effective_consumer_group_id(&consumer), "consumer-a");
     }
 
     /// Topics on a producer-only config name where it sends, not what it reads:
@@ -2811,7 +2812,7 @@ mod tests {
         let producer = KafkaConfig {
             brokers: vec!["127.0.0.1:1".to_string()],
             group: String::new(),
-            client_id: "dfe-transform-vrl-producer-main".to_string(),
+            client_id: "producer-b-main".to_string(),
             topics: vec!["syslog_load".to_string()],
             ..Default::default()
         };
@@ -2837,7 +2838,7 @@ mod tests {
     async fn consumer_transport_subscribes_to_its_topics() {
         let consumer = KafkaConfig {
             brokers: vec!["127.0.0.1:1".to_string()],
-            group: "dfe-loader".to_string(),
+            group: "consumer-a".to_string(),
             topics: vec!["syslog_load".to_string()],
             ..Default::default()
         };

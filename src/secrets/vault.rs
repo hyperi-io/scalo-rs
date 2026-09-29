@@ -497,9 +497,9 @@ mod tests {
 
     #[test]
     fn parse_path_keeps_a_multi_segment_path_under_its_mount() {
-        let (mount, path) = OpenBaoProvider::parse_path("kv/dfe-test/runzero").unwrap();
+        let (mount, path) = OpenBaoProvider::parse_path("kv/myapp-test/token").unwrap();
         assert_eq!(mount, "kv");
-        assert_eq!(path, "dfe-test/runzero");
+        assert_eq!(path, "myapp-test/token");
     }
 
     /// Only a whole `data` segment is the KV v2 prefix, so a path segment that

@@ -29,7 +29,7 @@ fn test_config(dir: &std::path::Path) -> DirectoryConfigStoreConfig {
 }
 
 /// Write a YAML file into the given directory.
-/// Supports subdirectory table names (e.g. `loaders/dfe-loader`).
+/// Supports subdirectory table names (e.g. `loaders/myapp`).
 fn write_yaml(dir: &std::path::Path, name: &str, content: &str) {
     let path = dir.join(format!("{name}.yaml"));
     if let Some(parent) = path.parent() {
@@ -582,7 +582,7 @@ async fn test_yml_extension_supported() {
 async fn test_subdirectory_tables_loaded() {
     let tmp = tempfile::tempdir().unwrap();
     write_yaml(tmp.path(), "root-config", "name: root\n");
-    write_yaml(tmp.path(), "loaders/dfe-loader", "host: dfe\n");
+    write_yaml(tmp.path(), "loaders/myapp", "host: myapp\n");
     write_yaml(tmp.path(), "loaders/csv-loader", "host: csv\n");
     write_yaml(tmp.path(), "sinks/kafka/primary", "brokers: b1\n");
 
@@ -595,7 +595,7 @@ async fn test_subdirectory_tables_loaded() {
         tables,
         vec![
             "loaders/csv-loader",
-            "loaders/dfe-loader",
+            "loaders/myapp",
             "root-config",
             "sinks/kafka/primary",
         ]
@@ -607,30 +607,36 @@ async fn test_subdirectory_get() {
     let tmp = tempfile::tempdir().unwrap();
     write_yaml(
         tmp.path(),
-        "loaders/dfe-loader",
-        "host: dfe-host\nport: 9090\n",
+        "loaders/myapp",
+        "host: myapp-host\nport: 9090\n",
     );
 
     let store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
 
-    let value = store.get_key("loaders/dfe-loader", "host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("dfe-host".to_string()));
+    let value = store.get_key("loaders/myapp", "host").await.unwrap();
+    assert_eq!(
+        value,
+        serde_yaml_ng::Value::String("myapp-host".to_string())
+    );
 }
 
 #[tokio::test]
 async fn test_subdirectory_get_normalises_slashes() {
     let tmp = tempfile::tempdir().unwrap();
-    write_yaml(tmp.path(), "loaders/dfe-loader", "host: dfe-host\n");
+    write_yaml(tmp.path(), "loaders/myapp", "host: myapp-host\n");
 
     let store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
 
     // Leading/trailing slashes should be stripped
-    let value = store.get_key("/loaders/dfe-loader/", "host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("dfe-host".to_string()));
+    let value = store.get_key("/loaders/myapp/", "host").await.unwrap();
+    assert_eq!(
+        value,
+        serde_yaml_ng::Value::String("myapp-host".to_string())
+    );
 }
 
 #[tokio::test]
@@ -690,27 +696,27 @@ async fn test_subdirectory_set_deep_nesting() {
 #[tokio::test]
 async fn test_subdirectory_delete_key() {
     let tmp = tempfile::tempdir().unwrap();
-    write_yaml(tmp.path(), "loaders/dfe-loader", "host: dfe\nport: 9090\n");
+    write_yaml(tmp.path(), "loaders/myapp", "host: myapp\nport: 9090\n");
 
     let store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
 
     store
-        .delete_key("loaders/dfe-loader", "port", None)
+        .delete_key("loaders/myapp", "port", None)
         .await
         .unwrap();
 
     // Key should be gone
-    let result = store.get_key("loaders/dfe-loader", "port").await;
+    let result = store.get_key("loaders/myapp", "port").await;
     assert!(matches!(
         result.unwrap_err(),
         DirectoryConfigError::KeyNotFound { .. }
     ));
 
     // Other key remains
-    let host = store.get_key("loaders/dfe-loader", "host").await.unwrap();
-    assert_eq!(host, serde_yaml_ng::Value::String("dfe".to_string()));
+    let host = store.get_key("loaders/myapp", "host").await.unwrap();
+    assert_eq!(host, serde_yaml_ng::Value::String("myapp".to_string()));
 }
 
 #[tokio::test]
@@ -783,7 +789,7 @@ async fn test_invalid_table_name_rejected() {
 #[tokio::test]
 async fn test_subdirectory_background_refresh() {
     let tmp = tempfile::tempdir().unwrap();
-    write_yaml(tmp.path(), "loaders/dfe", "version: 1\n");
+    write_yaml(tmp.path(), "loaders/myapp", "version: 1\n");
 
     let mut store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
@@ -791,11 +797,11 @@ async fn test_subdirectory_background_refresh() {
     store.start().await.unwrap();
 
     // Modify file on disk
-    write_yaml(tmp.path(), "loaders/dfe", "version: 2\n");
+    write_yaml(tmp.path(), "loaders/myapp", "version: 2\n");
 
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    let value = store.get_key("loaders/dfe", "version").await.unwrap();
+    let value = store.get_key("loaders/myapp", "version").await.unwrap();
     assert_eq!(value, serde_yaml_ng::Value::Number(2.into()));
 
     store.stop().await.unwrap();
@@ -1050,10 +1056,10 @@ mod git_tests {
 
         let result = store
             .set(
-                "loaders/dfe-loader",
+                "loaders/myapp",
                 "host",
-                serde_yaml_ng::Value::String("dfe-host".to_string()),
-                Some("add dfe-loader config"),
+                serde_yaml_ng::Value::String("myapp-host".to_string()),
+                Some("add myapp config"),
             )
             .await
             .unwrap();
@@ -1063,10 +1069,10 @@ mod git_tests {
 
         // Verify commit message
         let latest = repo.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(latest.message().unwrap(), "add dfe-loader config");
+        assert_eq!(latest.message().unwrap(), "add myapp config");
 
         // Verify file exists on disk
-        assert!(tmp.path().join("loaders/dfe-loader.yaml").exists());
+        assert!(tmp.path().join("loaders/myapp.yaml").exists());
     }
 
     #[tokio::test]

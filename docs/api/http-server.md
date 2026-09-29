@@ -58,7 +58,7 @@ use axum::{Router, routing::get};
 
 let server = HttpServer::new(HttpServerConfig::default());
 let app = Router::new()
-    .route("/whoami", get(|| async { "dfe-loader" }));
+    .route("/whoami", get(|| async { "myapp" }));
 
 server.serve_with_shutdown(app, shutdown.cancelled()).await?;
 ```
@@ -121,8 +121,8 @@ http_server:
   bind_address: "0.0.0.0:9090"
   enable_config_endpoint: false   # opt-in -- exposes redacted /config
   tls:
-    cert_path: /etc/dfe/tls.crt
-    key_path:  /etc/dfe/tls.key
+    cert_path: /etc/myapp/tls.crt
+    key_path:  /etc/myapp/tls.key
   request_timeout: 30s
 ```
 

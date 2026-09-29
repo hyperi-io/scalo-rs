@@ -4,8 +4,8 @@
 <!-- Build Status and docs.rs badges omitted. The repo is private, so GitHub's
      Actions SVG 404s for anonymous crates.io viewers, and the docs.rs badge
      renders its own build state, which is worse than absent when it is red.
-     Re-add the Actions one at the public-visibility flip:
-     [![Build Status](https://github.com/hyperi-io/scalo-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/scalo-rs/actions) -->
+     Re-add the Actions one at the public-visibility flip, pointing at this
+     repo's own actions/workflows/ci.yml badge and actions page. -->
 [![Crates.io](https://img.shields.io/crates/v/scalo?logo=rust)](https://crates.io/crates/scalo)
 [![Rust Version](https://img.shields.io/badge/rust-1.95%2B-blue?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](https://www.apache.org/licenses/LICENSE-2.0)
@@ -67,7 +67,7 @@ carries the right names.
 The data plane -- the Rust hot path where every microsecond and byte counts.
 Built as the foundation for PB/hr data services.
 
-[scalo-py](https://github.com/hyperi-io/scalo-py) is the control plane half:
+scalo-py is the control plane half:
 orchestration, APIs and integration glue in Python. Same conventions, DIFFERENT
 API, separate repo. Never assume parity.
 
@@ -121,14 +121,14 @@ two routers can serve the health paths and they do NOT carry the same set.
 
 ## Related
 
-- **[scalo-py](https://github.com/hyperi-io/scalo-py)** -- sister library for
+- **scalo-py** -- sister library for
   Python control-plane services. Same opinions, same patterns, Python idiom.
 
 ## Context
 
 ### What this is
 
-HyperI's shared Rust library -- config cascade, logging, metrics, health,
+A shared Rust library -- config cascade, logging, metrics, health,
 self-regulation, transports, spool and DLQ, secrets and the deployment-contract
 generators -- published as `scalo` on crates.io under Apache-2.0.
 
@@ -167,6 +167,6 @@ result, never a local summary.
 
 ### Where this sits
 
-Generated from `dfe-infra/suite.yaml` via `dfe-stack suite`. Six DFE Rust
+Generated from the suite's own membership manifest. Six downstream Rust
 consumers declare this crate: receiver, loader, fetcher, archiver, transform-vrl
 and transform-vector.

@@ -45,7 +45,7 @@ The three trees and the table answer most picks. Want the *why* -> the tiers.
 Need jeprof / MALLOC_CONF heap profiling, or org-policy compliance?  -> jemalloc (tikv-jemallocator)
 Target Windows/MSVC, or max portability (wasm/BSD/musl/macOS)?       -> mimalloc
 Heavy CROSS-THREAD free (stage A allocs Bytes, stage B frees post-send)? -> snmalloc-rs
-Default for a long-running HyperI Linux data-plane binary            -> jemalloc
+Default for a long-running Linux data-plane binary                   -> jemalloc
 ```
 
 ### Pick a concurrent map
@@ -66,7 +66,7 @@ Need runtime CPU dispatch (AVX2 vs AVX-512 vs NEON)?  -> pulp (native width)  or
 Fixed-width portable, build-time target?             -> wide  (set RUSTFLAGS target-cpu, or build per-target)
 Just reinterpreting bytes <-> POD lanes?             -> bytemuck / zerocopy + &[T]
 Columnar batch kernels?                              -> arrow-rs compute (verify target-cpu=native for AVX-512 codegen)
-On nightly and want std?                             -> std::simd   (NOT available on HyperI stable)
+On nightly and want std?                             -> std::simd   (NOT available on stable)
 ```
 
 ### How it flows (where each structure lives on the hot path)
@@ -512,9 +512,9 @@ good the design is -- if it's not maintained, it's F.
 
 ---
 
-## Not all of these are equal under PGO/BOLT (hyperi-ci stage 2)
+## Not all of these are equal under PGO/BOLT (a release-build CI stage)
 
-On the release channel, hyperi-ci stage 2 rebuilds the binary with PGO and runs
+On the release channel, that CI stage rebuilds the binary with PGO and runs
 [BOLT](https://github.com/llvm/llvm-project/tree/main/bolt) over it --
 profile-guided branch layout, hot/cold splitting, icache packing, 15-35% on top
 of fat LTO. That changes which structures pay off, because PGO/BOLT only help
@@ -533,14 +533,14 @@ where the profile is **stable** and the hot path is **clean**:
   wins a microbenchmark this week -- snmalloc or mimalloc might. We run it
   because it's predictable: the same allocation behaviour run to run (so the PGO
   profile is representative), `jeprof` to actually SEE the hot allocations, and
-  the whole DFE build/profile story is built around it. Under PGO/BOLT an old
+  the whole build/profile story is built around it. Under PGO/BOLT an old
   allocator with a stable profile and real tooling beats a newer one that's
   faster-but-twitchy and hands you a noisy profile. Predictable > novel.
 - **Lower channels don't get this.** PGO/BOLT are release-only (and opt-in). On
   spike/alpha/beta you're on thin/fat LTO with no profile rewrite, so pick for
   raw behaviour -- the profile-stability bonus only lands at release.
 
-Cross-ref: hyperi-ci channel-tiered build (stage 2), `RUST.md` -- Release-Track
+Cross-ref: the CI channel-tiered build (release stage), `RUST.md` -- Release-Track
 Build Optimisation.
 
 ## Maintenance (check crates.io before you depend on it)
@@ -557,7 +557,7 @@ The dead ones are in F. These are still alive but worth a glance:
 
 This bit's for the coding agent, not you -- skip it.
 
-Point an agent at this doc to review memory-structure choices in HyperI Rust and
+Point an agent at this doc to review memory-structure choices in this suite's Rust and
 recommend swaps. Wire it as a Claude Code skill (`/review-rust-memory`) or run it
 ad hoc -- the doc is the rubric, the agent does the legwork.
 
@@ -597,7 +597,7 @@ jemalloc; don't "recommend" mimalloc/snmalloc unless the situational call
 stable toolchain -- no `std::simd`. If the existing choice is already right, say
 so and move on.
 
-**Field notes (from running this on scalo-rs, then named hyperi-rustlib).** A clean codebase yields a
+**Field notes (from running this on scalo-rs).** A clean codebase yields a
 SHORT report -- "conforms, no change" is a valid, valuable result; never
 manufacture remediation to justify a release. Three refinements came out of that
 pass: (1) a library never sets `#[global_allocator]` -- only flag a missing

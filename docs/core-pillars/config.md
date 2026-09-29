@@ -13,7 +13,7 @@ The cascade is **7 layers** -- one typed view assembled from CLI args, env vars,
 | # | Source | Notes |
 |---|--------|-------|
 | 1 | CLI args | `Config::merge_cli(args)` after `Config::new` |
-| 2 | Environment variables | Prefix from `ConfigOptions::env_prefix`, double-underscore for nesting (`DFE_LOADER__KAFKA__BROKERS`) |
+| 2 | Environment variables | Prefix from `ConfigOptions::env_prefix`, double-underscore for nesting (`MYAPP__KAFKA__BROKERS`) |
 | 3 | `.env` file | Loaded by `dotenvy` into env vars -- same precedence as layer 2 |
 | 4 | `settings.{env}.yaml` | `{env}` from `APP_ENV` / `ENVIRONMENT` / `ENV` (default `development`) |
 | 5 | `settings.yaml` | Team defaults, committed |
@@ -29,8 +29,8 @@ Each YAML layer is searched in this order, first match wins:
 ~/.config/<app_name>/<name>.yaml      ~/.config/<app_name>/<name>.yml
 ```
 
-`<app_name>` resolves from `ConfigOptions::app_name`, then `APP_NAME`, then the
-deprecated `HYPERI_LIB_APP_NAME`. No name -> the home-config path is skipped.
+`<app_name>` resolves from `ConfigOptions::app_name`, then `APP_NAME`. No name
+-> the home-config path is skipped.
 
 ---
 
@@ -41,7 +41,7 @@ deprecated `HYPERI_LIB_APP_NAME`. No name -> the home-config path is skipped.
 ```rust
 use scalo::config::{self, ConfigOptions};
 
-config::setup(ConfigOptions { env_prefix: "DFE_LOADER".into(), ..Default::default() })?;
+config::setup(ConfigOptions { env_prefix: "MYAPP".into(), ..Default::default() })?;
 
 let cfg = config::get();
 let brokers = cfg.get_string_list("kafka.brokers").unwrap();
@@ -106,8 +106,8 @@ See [sensitive.rs](../../src/config/sensitive.rs).
 
 ## Flat-env bridge (Kubernetes)
 
-K8s `ConfigMap` / `env:` blocks emit flat env vars (`DFE_LOADER_KAFKA_BROKERS=...`),
-but Figment's nested convention is double-underscore (`DFE_LOADER__KAFKA__BROKERS`).
+K8s `ConfigMap` / `env:` blocks emit flat env vars (`MYAPP_KAFKA_BROKERS=...`),
+but Figment's nested convention is double-underscore (`MYAPP__KAFKA__BROKERS`).
 Without bridging, K8s overrides silently fail to apply.
 
 ```rust
@@ -115,10 +115,10 @@ use scalo::config::flat_env::ApplyFlatEnv;
 
 let cfg = Figment::new()
     .merge(Yaml::file("settings.yaml"))
-    .apply_flat_env("DFE_LOADER_");
+    .apply_flat_env("MYAPP_");
 ```
 
-`apply_flat_env` reads `DFE_LOADER_KAFKA_BROKERS` and merges it as `kafka.brokers`,
+`apply_flat_env` reads `MYAPP_KAFKA_BROKERS` and merges it as `kafka.brokers`,
 so apps accept both flat (K8s) and nested (double-underscore) forms.
 `flat_env::load_config(path, prefix)` and the `ServiceApp::load_config` recipe wire
 this in. See [flat_env.rs](../../src/config/flat_env.rs).

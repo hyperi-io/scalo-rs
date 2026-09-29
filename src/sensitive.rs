@@ -197,7 +197,7 @@ impl<'de> serde::Deserialize<'de> for SensitiveString {
     }
 }
 
-/// JSON Schema: a write-only string carrying the `x-dfe-secret` marker so the
+/// JSON Schema: a write-only string carrying the `x-scalo-secret` marker so the
 /// control plane masks the field and routes it through the secrets seam
 /// (scalo-rs#6). Gated on `config-schema`. This is why apps derive `JsonSchema`
 /// via scalo's re-exported schemars -- a `SensitiveString` field automatically
@@ -213,7 +213,7 @@ impl schemars::JsonSchema for SensitiveString {
         concat!(module_path!(), "::SensitiveString").into()
     }
 
-    // Inline at every use site so the `x-dfe-secret` marker is directly on each
+    // Inline at every use site so the `x-scalo-secret` marker is directly on each
     // secret field, not hidden behind a `$ref` into `$defs` that naive UI
     // tooling might not resolve.
     fn inline_schema() -> bool {
@@ -223,7 +223,7 @@ impl schemars::JsonSchema for SensitiveString {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "x-dfe-secret": true,
+            "x-scalo-secret": true,
             "writeOnly": true
         })
     }
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn struct_round_trip_inside_expose_during_preserves_values() {
-        // Mirrors the dfe-loader bug: serialise a Config containing a
+        // Mirrors a real consumer bug: serialise a Config containing a
         // SensitiveString password, merge env overrides via figment,
         // deserialise back. Without expose_during, password becomes
         // "***REDACTED***".
@@ -488,15 +488,15 @@ mod tests {
 
     #[cfg(feature = "config-schema")]
     #[test]
-    fn json_schema_carries_dfe_secret_marker() {
+    fn json_schema_carries_scalo_secret_marker() {
         let schema = schemars::schema_for!(SensitiveString);
         let v = serde_json::to_value(&schema).unwrap();
         assert_eq!(v["type"], "string");
-        assert_eq!(v["x-dfe-secret"], true);
+        assert_eq!(v["x-scalo-secret"], true);
         assert_eq!(v["writeOnly"], true);
     }
 
-    /// A struct field of `SensitiveString` gets the `x-dfe-secret` marker
+    /// A struct field of `SensitiveString` gets the `x-scalo-secret` marker
     /// inlined (not behind a `$ref`) in the derived schema.
     #[cfg(feature = "config-schema")]
     #[test]
@@ -509,7 +509,7 @@ mod tests {
         }
         let v = serde_json::to_value(schemars::schema_for!(Cfg)).unwrap();
         let pw = &v["properties"]["password"];
-        assert_eq!(pw["x-dfe-secret"], true, "schema was: {v}");
+        assert_eq!(pw["x-scalo-secret"], true, "schema was: {v}");
         assert_eq!(pw["type"], "string");
     }
 }

@@ -381,7 +381,7 @@ mod tests {
     fn resolve_topic_per_table() {
         let routing = DlqRouting::PerTable;
         let suffix = ".dlq";
-        let common = "dfe.dlq";
+        let common = "scalo.dlq";
 
         let entry = DlqEntry::new("loader", "error", vec![]).with_destination("acme.auth");
         let topic = match routing {
@@ -401,7 +401,7 @@ mod tests {
                 .map_or_else(|| common.to_string(), |dest| format!("{dest}{suffix}")),
             DlqRouting::Common => common.to_string(),
         };
-        assert_eq!(topic, "dfe.dlq");
+        assert_eq!(topic, "scalo.dlq");
     }
 
     #[test]

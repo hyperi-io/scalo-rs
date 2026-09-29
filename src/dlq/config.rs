@@ -17,7 +17,7 @@
 //!   mode: cascade
 //!   file:
 //!     enabled: true
-//!     path: /var/spool/dfe/dlq
+//!     path: /var/spool/scalo/dlq
 //!     rotation: hourly
 //!     max_age_days: 30
 //!     compress_rotated: true
@@ -25,7 +25,7 @@
 //!     enabled: true
 //!     routing: per_table
 //!     topic_suffix: .dlq
-//!     common_topic: dfe.dlq
+//!     common_topic: scalo.dlq
 //! ```
 
 use std::path::PathBuf;
@@ -54,7 +54,7 @@ pub enum DlqMode {
     /// File backend only (no Kafka dependency).
     FileOnly,
 
-    /// Kafka backend only (current dfe-loader behaviour).
+    /// Kafka backend only (current single-consumer behaviour).
     KafkaOnly,
 }
 
@@ -139,7 +139,7 @@ impl Default for FileDlqConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            path: PathBuf::from("/var/spool/dfe/dlq"),
+            path: PathBuf::from("/var/spool/scalo/dlq"),
             rotation: RotationPeriod::default(),
             max_age_days: 30,
             compress_rotated: true,
@@ -193,7 +193,7 @@ impl Default for KafkaDlqConfig {
             enabled: true,
             routing: DlqRouting::default(),
             topic_suffix: ".dlq".to_string(),
-            common_topic: "dfe.dlq".to_string(),
+            common_topic: "scalo.dlq".to_string(),
             send_timeout_ms: 5000,
         }
     }

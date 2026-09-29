@@ -9,7 +9,7 @@
 
 //! # Crypto posture
 //!
-//! One opinionated place that defines HyperI's crypto stance, so a consuming
+//! One opinionated place that defines this suite's crypto stance, so a consuming
 //! crate SELECTS a profile and inherits the algorithm floor, the
 //! commercial-grade fallback, and the downgrade warnings - it never
 //! hand-assembles a cipher/curve/version policy. The `tls` module (`tls`

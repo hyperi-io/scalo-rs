@@ -23,14 +23,14 @@
 //!
 //! ```yaml
 //! deployment:
-//!   image_registry: ghcr.io/hyperi-io                  # default: ghcr.io/hyperi-io
+//!   image_registry: ghcr.io/example-org                # default: ghcr.io/example-org
 //!   base_image: debian:trixie-slim@sha256:<digest>     # default: DEFAULT_BASE_IMAGE
 //!   base_distro: trixie                                # default: derived from base_image
 //! ```
 //!
 //! # Defaults
 //!
-//! - [`DEFAULT_IMAGE_REGISTRY`] = `ghcr.io/hyperi-io` -- where built images go
+//! - [`DEFAULT_IMAGE_REGISTRY`] = `ghcr.io/example-org` -- where built images go
 //! - [`DEFAULT_BASE_IMAGE`] = `debian:trixie-slim@sha256:...` -- what the runtime stage builds on
 //! - [`DEFAULT_BASE_DISTRO`] = `trixie` -- which release's package names to emit
 //!
@@ -42,7 +42,7 @@
 //! guessing to do.
 //!
 //! When (eventually) a curated GHCR base image lands at
-//! `ghcr.io/hyperi-io/dfe-base:trixie`, ops can override
+//! `ghcr.io/example-org/app-base:trixie`, ops can override
 //! `deployment.base_image` in the cascade without rebuilding the apps.
 
 use super::native_deps::BaseDistro;
@@ -51,7 +51,7 @@ use super::native_deps::BaseDistro;
 ///
 /// Combined with the contract's `app_name` to produce
 /// `<DEFAULT_IMAGE_REGISTRY>/<app_name>:<version>`.
-pub const DEFAULT_IMAGE_REGISTRY: &str = "ghcr.io/hyperi-io";
+pub const DEFAULT_IMAGE_REGISTRY: &str = "ghcr.io/example-org";
 
 /// Default base image for the runtime stage.
 ///
@@ -169,7 +169,7 @@ pub fn resolve_base_distro(base_image: &str) -> Option<BaseDistro> {
 /// Read the git repo URL for ArgoCD generation from the config cascade.
 ///
 /// Reads `deployment.argocd.repo_url` from the YAML cascade. Falls back to
-/// `https://github.com/hyperi-io/{app_name}` if not set -- matches the org
+/// `https://github.com/example-org/{app_name}` if not set -- matches the org
 /// convention.
 #[must_use]
 pub fn argocd_repo_url_from_cascade(app_name: &str) -> String {
@@ -182,7 +182,7 @@ pub fn argocd_repo_url_from_cascade(app_name: &str) -> String {
             return s;
         }
     }
-    format!("https://github.com/hyperi-io/{app_name}")
+    format!("https://github.com/example-org/{app_name}")
 }
 
 #[cfg(test)]
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn defaults_are_ghcr_friendly() {
-        assert_eq!(DEFAULT_IMAGE_REGISTRY, "ghcr.io/hyperi-io");
+        assert_eq!(DEFAULT_IMAGE_REGISTRY, "ghcr.io/example-org");
     }
 
     #[test]

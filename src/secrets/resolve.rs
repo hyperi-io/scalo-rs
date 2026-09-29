@@ -21,7 +21,7 @@
 //! - any other string -- used as a literal value
 //!
 //! Folded in from the former `credential` module so data-plane services
-//! (dfe-fetcher, etc.) share one spec syntax via `scalo::secrets`.
+//! (source connectors, etc.) share one spec syntax via `scalo::secrets`.
 
 use thiserror::Error;
 

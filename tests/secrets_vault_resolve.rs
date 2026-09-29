@@ -11,7 +11,7 @@
 //! The unit tests in `src/secrets/resolve.rs` can only prove the provider gets
 //! built and the lookup leaves the process. Whether a secret actually comes back
 //! needs a server, and this is the only test that proves `vault:` specs work at
-//! all -- every consumer (dfe-fetcher credentials, transport SASL passwords)
+//! all -- every consumer (source credentials, transport SASL passwords)
 //! goes through the same `resolve()`.
 //!
 //! Skips when Docker is absent, and fails instead of skipping under CI, where a
@@ -97,14 +97,14 @@ async fn vault_spec_resolves_a_real_secret() {
     let Some((_container, address)) = start_openbao().await else {
         return;
     };
-    put_secret(&address, "dfe/creds", "api-key", "super-secret-value").await;
+    put_secret(&address, "myapp/creds", "api-key", "super-secret-value").await;
 
     let resolved = temp_env::async_with_vars(
         [
             ("VAULT_ADDR", Some(address.as_str())),
             ("VAULT_TOKEN", Some(ROOT_TOKEN)),
         ],
-        async { scalo::secrets::resolve("vault:secret/data/dfe/creds:api-key").await },
+        async { scalo::secrets::resolve("vault:secret/data/myapp/creds:api-key").await },
     )
     .await
     .unwrap_or_else(|e| panic!("resolve against {address}: {e}"));
@@ -149,7 +149,7 @@ async fn vault_spec_with_a_bad_token_fails() {
     let Some((_container, address)) = start_openbao().await else {
         return;
     };
-    put_secret(&address, "dfe/creds", "api-key", "super-secret-value").await;
+    put_secret(&address, "myapp/creds", "api-key", "super-secret-value").await;
 
     let err = temp_env::async_with_vars(
         [
@@ -157,7 +157,7 @@ async fn vault_spec_with_a_bad_token_fails() {
             ("VAULT_TOKEN", Some("not-the-root-token")),
         ],
         async {
-            scalo::secrets::resolve("vault:secret/data/dfe/creds:api-key")
+            scalo::secrets::resolve("vault:secret/data/myapp/creds:api-key")
                 .await
                 .expect_err("a bad token must not resolve the secret")
                 .to_string()

@@ -12,7 +12,7 @@
 //! counters. Composing the OTLP exporter into the `metrics` feature made that
 //! a panic -- the exporter builds a hyper connector, and hyper panics with
 //! "there is no reactor running" when there is no Tokio runtime. Ten
-//! dfe-loader tests died on it.
+//! tests in a downstream consumer died on it.
 //!
 //! Export cannot work without a runtime anyway, so it is skipped and the
 //! Prometheus recorder installs on its own.

@@ -92,7 +92,7 @@ flowchart LR
 | `transport` | Base trait architecture, factory, `AnySender`, and the `parse_guard` JSON depth pre-check (`wide`) |
 | `transport-trace` | Above + W3C traceparent propagation (pulls `opentelemetry`) |
 | `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends — each pulls only its own deps |
-| `transport-grpc-vector-compat` | Vector.dev wire-compat for `dfe-transform-vector` |
+| `transport-grpc-vector-compat` | Vector.dev wire-compat for `example-transform-vector` |
 | `transport-all` | All six backends |
 
 Pick backends explicitly. `transport-all` is a convenience for tests; in
@@ -176,7 +176,7 @@ The two rows marked release-specific bake a library version into the package nam
 so they differ per base release - the values above are for the default base.
 The full table is in [deployment/native-deps.md](deployment/native-deps.md).
 
-`hyperi-ci` auto-detects which `-sys` crates appear in `Cargo.lock` and
+a CI wrapper auto-detects which `-sys` crates appear in `Cargo.lock` and
 installs the matching packages. The Confluent APT repo is added
 automatically when `rdkafka-sys` is present and the installed version is
 below the minimum. See [deployment/native-deps.md](deployment/native-deps.md)
@@ -227,7 +227,7 @@ features = [
 ]
 ```
 
-This is the dfe-loader / dfe-receiver shape. See
+This is the myapp-loader / myapp-receiver shape. See
 [integration.md](integration.md) for the rationale.
 
 ### Plus distributed tracing

@@ -185,5 +185,5 @@ Section landing: [api/README.md](api/README.md)
 - **Crate:** [scalo](https://crates.io/crates/scalo) (crates.io)
 - **Edition:** 2024
 - **MSRV:** see `rust-version` in `Cargo.toml`
-- **Used by:** [dfe-loader](https://github.com/hyperi-io/dfe-loader), [dfe-receiver](https://github.com/hyperi-io/dfe-receiver), [dfe-fetcher](https://github.com/hyperi-io/dfe-fetcher), [dfe-archiver](https://github.com/hyperi-io/dfe-archiver), [dfe-transform-vrl](https://github.com/hyperi-io/dfe-transform-vrl), [dfe-transform-vector](https://github.com/hyperi-io/dfe-transform-vector)
-- **Sibling lib:** [scalo-py](https://github.com/hyperi-io/scalo-py) (Python control-plane equivalent)
+- **Used by:** six downstream data-plane apps -- a Kafka-to-ClickHouse loader, a gRPC receiver, a pull-mode fetcher, an object-storage archiver, and the VRL and Vector transform wrappers
+- **Sibling lib:** scalo-py (Python control-plane equivalent)

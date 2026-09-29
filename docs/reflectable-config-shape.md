@@ -1,9 +1,9 @@
 # Reflectable config shape (scalo contract, cross-language SSoT)
 
 This is the single source of truth for the schema + capability-catalog shape that
-BOTH scalo (Rust) and scalo-py (Python) emit. dfe-engine reflects on contracts
-produced by either language through ONE code path, so the two MUST emit identical
-JSON. Tracks scalo-rs#6 and scalo-py#3.
+BOTH scalo (Rust) and scalo-py (Python) emit. A Python control-plane consumer
+reflects on contracts produced by either language through ONE code path, so the
+two MUST emit identical JSON. Tracks scalo-rs#6 and scalo-py#3.
 
 ## The idea, plainly
 
@@ -69,7 +69,7 @@ FieldSpec {
   required: bool
   default: any | null      # omitted when null
   description: string
-  secret: bool             # true => also x-dfe-secret in the schema; UI masks, engine routes via secrets seam
+  secret: bool             # true => also x-scalo-secret in the schema; UI masks, engine routes via secrets seam
   enum_values: string[]    # allowed values for type=enum; omitted when empty
   example: any | null      # omitted when null
 }
@@ -91,13 +91,13 @@ Serialisation rules (identical in both languages):
 
 A secret field is flagged in TWO places:
 - catalog `FieldSpec.secret = true`
-- JSON Schema: the field's subschema carries `"x-dfe-secret": true` (plus
+- JSON Schema: the field's subschema carries `"x-scalo-secret": true` (plus
   `"writeOnly": true`).
 
 Rust: `SensitiveString` implements `JsonSchema` to emit
-`{"type": "string", "x-dfe-secret": true, "writeOnly": true}`. Python: the
-secret field type sets `json_schema_extra={"x-dfe-secret": True, "writeOnly":
-True}`. The engine keys off `x-dfe-secret` to route the value through the secrets
+`{"type": "string", "x-scalo-secret": true, "writeOnly": true}`. Python: the
+secret field type sets `json_schema_extra={"x-scalo-secret": True, "writeOnly":
+True}`. The engine keys off `x-scalo-secret` to route the value through the secrets
 seam and the UI masks the input.
 
 ## ENV mapping for nested config (decision: C)
@@ -141,7 +141,7 @@ per-connection field:
                 "properties": {
                   "id": { "type": "string" },
                   "credential_secret": { "type": ["string", "null"] },
-                  "secret_access_key": { "type": "string", "x-dfe-secret": true, "writeOnly": true }
+                  "secret_access_key": { "type": "string", "x-scalo-secret": true, "writeOnly": true }
                 }
               }
             }

@@ -64,7 +64,7 @@ fn test_config_validation_accepts_max_zero_auto_detect() {
 
 #[test]
 fn test_from_cascade_without_config_setup_returns_defaults() {
-    // Regression test for hyperi-io/dfe-loader#19:
+    // Regression test for a bug reported by a downstream consumer:
     // from_cascade() must not panic when config::setup() hasn't been called.
     // It should fall back to defaults gracefully.
     let cfg = WorkerPoolConfig::from_cascade("worker_pool")

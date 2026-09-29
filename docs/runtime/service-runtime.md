@@ -18,7 +18,7 @@ remember to register.
 | Field | Type | Feature gate | Always present? |
 |-------|------|--------------|-----------------|
 | `metrics` | `MetricsManager` | always (with `metrics`) | yes |
-| `dfe` | `Arc<ServiceMetrics>` | always (with `metrics`) | yes |
+| `platform_metrics` | `Arc<ServiceMetrics>` | always (with `metrics`) | yes |
 | `memory_guard` | `Arc<MemoryGuard>` | `memory` | yes |
 | `shutdown` | `CancellationToken` | always | yes |
 | `context` | `&'static RuntimeContext` | always | yes |
@@ -27,7 +27,7 @@ remember to register.
 | `scaling` | `Option<Arc<ScalingPressure>>` | `scaling` | optional |
 | `governor` | `Option<SelfRegulationGovernor>` | `governor` | optional (default-on) |
 
-The pillars (`metrics`, `dfe`, `shutdown`, `context`) are always
+The pillars (`metrics`, `platform_metrics`, `shutdown`, `context`) are always
 present. The optional fields are `Some(...)` when their feature is
 on and configuration succeeds -- `None` if construction fails (logged
 as a warning, not fatal).
@@ -133,7 +133,7 @@ pub trait ServiceApp: Sized {
 | Method | Required? | Purpose |
 |--------|-----------|---------|
 | `name` | yes | Service name -- log tags, OTel `service.name`, the manifest's `app`. The metric prefix is `metrics.namespace`, bare by default |
-| `env_prefix` | yes | Prefix for env-var config overrides (`DFE_LOADER_*`) |
+| `env_prefix` | yes | Prefix for env-var config overrides (`MYAPP_*`) |
 | `version_info` | yes | Version + commit + build timestamp |
 | `common_args` | yes | Returns the embedded `CommonArgs` clap struct |
 | `load_config` | yes | App-specific cascade load (typically `config::setup` + `unmarshal`) |

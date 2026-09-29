@@ -744,7 +744,7 @@ mod tests {
         // A curated org base tagged with a bare number tells us nothing -- and
         // registry.rs anticipates exactly such an image.
         assert_eq!(
-            BaseDistro::from_base_image("ghcr.io/hyperi-io/dfe-base:13"),
+            BaseDistro::from_base_image("ghcr.io/example-org/app-base:13"),
             None
         );
         assert_eq!(BaseDistro::from_base_image("postgres:13"), None);

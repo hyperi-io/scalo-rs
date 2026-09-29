@@ -424,8 +424,8 @@ mod tests {
         let exclude =
             compile_patterns(&crate::transport::KafkaConfig::default().topic_exclude).unwrap();
         assert!(passes_filters("default_land", &[], &exclude));
-        assert!(!passes_filters("dfe_loader_dlq", &[], &exclude));
-        assert!(!passes_filters("dfe_transform_dlq", &[], &exclude));
+        assert!(!passes_filters("myapp_loader_dlq", &[], &exclude));
+        assert!(!passes_filters("myapp_transform_dlq", &[], &exclude));
         assert!(!passes_filters("__consumer_offsets", &[], &exclude));
     }
 

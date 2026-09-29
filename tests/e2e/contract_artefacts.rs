@@ -7,7 +7,7 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! ============================================================================
-//! TEMPLATE -- copy this file into your DFE consumer's `tests/e2e/` and
+//! TEMPLATE -- copy this file into a downstream consumer's `tests/e2e/` and
 //! adapt the FIXTURE section. The probe/skip/cluster helpers live in
 //! `scalo::deployment::test_support` so each consumer's copy
 //! stays short and benefits from any bug fixes pushed to scalo.
@@ -57,7 +57,7 @@
 //! build context that responds to `--help`. Real consumer copies of this
 //! template should REPLACE the mock with `cargo build --release --bin
 //! <name>` and copy the produced binary into the docker build context.
-//! See dfe-receiver's adaptation for the canonical example.
+//! See a downstream receiver's adaptation for the canonical example.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
@@ -84,15 +84,15 @@ use scalo::deployment::{
 
 fn test_contract() -> DeploymentContract {
     DeploymentContract {
-        app_name: "hyperi-contract-test".into(),
-        binary_name: "hyperi-contract-test".into(),
+        app_name: "scalo-contract-test".into(),
+        binary_name: "scalo-contract-test".into(),
         description: "Throwaway test app for scalo contract e2e".into(),
         metrics_port: 9090,
         health: HealthContract::default(),
         env_prefix: "HCT".into(),
         metric_prefix: "hct".into(),
         config_mount_path: "/etc/hct/config.yaml".into(),
-        image_registry: "ghcr.io/hyperi-io".into(),
+        image_registry: "ghcr.io/example-org".into(),
         extra_ports: vec![],
         unbound_listen_paths: vec![],
         entrypoint_args: vec![],
@@ -113,7 +113,7 @@ fn test_contract() -> DeploymentContract {
 fn test_identity() -> ContractIdentity {
     ContractIdentity::new(
         "0123456789abcdef0123456789abcdef01234567",
-        "ghcr.io/hyperi-io/hyperi-contract-test:test",
+        "ghcr.io/example-org/scalo-contract-test:test",
     )
     .expect("fixture identity must validate")
 }
@@ -129,10 +129,10 @@ fn write_mock_binary(build_ctx: &Path, binary_name: &str) -> std::io::Result<()>
           # Mock binary for scalo contract-artefact e2e test.\n\
           # The real consumer's binary is replaced by this stub during testing.\n\
           if [ \"$1\" = \"--help\" ] || [ \"$1\" = \"-h\" ]; then\n\
-          \x20 echo \"hyperi-contract-test: ok\"\n\
+          \x20 echo \"scalo-contract-test: ok\"\n\
           \x20 exit 0\n\
           fi\n\
-          echo \"hyperi-contract-test: started (mock)\"\n\
+          echo \"scalo-contract-test: started (mock)\"\n\
           exit 0\n",
     )?;
     drop(f);
@@ -183,7 +183,7 @@ impl BuiltImage {
         .expect("write empty docker config");
 
         let tag = format!(
-            "hyperi-contract-test:e2e-{suffix}-{pid}",
+            "scalo-contract-test:e2e-{suffix}-{pid}",
             suffix = tag_suffix,
             pid = std::process::id(),
         );
@@ -283,7 +283,7 @@ fn tier_a_dockerfile_builds_and_image_runs() {
         "docker run failed: stdout={stdout} stderr={stderr}",
     );
     assert!(
-        stdout.contains("hyperi-contract-test: ok"),
+        stdout.contains("scalo-contract-test: ok"),
         "container ran but did not produce expected output: stdout={stdout} stderr={stderr}",
     );
     assert_runs_as_appuser(&image);
@@ -295,12 +295,12 @@ fn tier_a_dockerfile_builds_and_image_runs() {
         .expect("docker inspect invocation");
     let labels = String::from_utf8_lossy(&inspect.stdout);
     assert!(
-        labels.contains("io.hyperi.contract.version")
+        labels.contains("io.scalo.contract.version")
             && labels.contains("\"v1\"")
-            && labels.contains("io.hyperi.contract.source-commit")
+            && labels.contains("io.scalo.contract.source-commit")
             && labels.contains("0123456789abcdef0123456789abcdef01234567")
-            && labels.contains("io.hyperi.contract.image-ref"),
-        "docker inspect did not show all three io.hyperi.contract.* labels: {labels}",
+            && labels.contains("io.scalo.contract.image-ref"),
+        "docker inspect did not show all three io.scalo.contract.* labels: {labels}",
     );
 }
 
@@ -465,19 +465,21 @@ fn tier_a_chart_lint_and_template() {
     );
     let rendered = String::from_utf8_lossy(&template.stdout);
     assert!(
-        rendered.contains("hyperi-contract-test"),
+        rendered.contains("scalo-contract-test"),
         "rendered template missing app name: {rendered}",
     );
 
     let chart_yaml =
         std::fs::read_to_string(chart_dir.join("Chart.yaml")).expect("read Chart.yaml");
-    assert!(chart_yaml.contains("io.hyperi.contract.version: \"v1\""));
-    assert!(chart_yaml.contains(
-        "io.hyperi.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
-    ));
+    assert!(chart_yaml.contains("io.scalo.contract.version: \"v1\""));
     assert!(
         chart_yaml.contains(
-            "io.hyperi.contract.image-ref: \"ghcr.io/hyperi-io/hyperi-contract-test:test\""
+            "io.scalo.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
+        )
+    );
+    assert!(
+        chart_yaml.contains(
+            "io.scalo.contract.image-ref: \"ghcr.io/example-org/scalo-contract-test:test\""
         )
     );
 }
@@ -993,7 +995,7 @@ fn tier_a_argocd_application_kubeconform() {
     );
 
     let raw = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(raw.matches("io.hyperi.contract").count(), 3);
+    assert_eq!(raw.matches("io.scalo.contract").count(), 3);
 }
 
 // ============================================================================
@@ -1208,10 +1210,10 @@ fn tier_b_argocd_application_sync_on_kind() {
         .expect("kubectl get application");
     let annotations = String::from_utf8_lossy(&get.stdout);
     assert!(
-        annotations.contains("io.hyperi.contract.version")
+        annotations.contains("io.scalo.contract.version")
             && annotations.contains("v1")
-            && annotations.contains("io.hyperi.contract.source-commit")
-            && annotations.contains("io.hyperi.contract.image-ref"),
+            && annotations.contains("io.scalo.contract.source-commit")
+            && annotations.contains("io.scalo.contract.image-ref"),
         "applied Application missing identity annotations: {annotations}",
     );
 }

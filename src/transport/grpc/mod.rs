@@ -730,7 +730,7 @@ impl GrpcTransport {
             }
 
             // Native service
-            let dfe_svc = TransportServiceImpl {
+            let native_svc = TransportServiceImpl {
                 sender: tx.clone(),
                 sequence: sequence.clone(),
                 oversize: Arc::clone(&oversize),
@@ -739,7 +739,7 @@ impl GrpcTransport {
                 pressure: pressure.clone(),
             };
 
-            let dfe_server = proto::transport_server::TransportServer::new(dfe_svc)
+            let native_server = proto::transport_server::TransportServer::new(native_svc)
                 .max_decoding_message_size(config.max_message_size)
                 .max_encoding_message_size(config.max_message_size)
                 .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
@@ -779,13 +779,15 @@ impl GrpcTransport {
                     )
                 };
 
-                builder.add_service(dfe_server).add_service(vector_server)
+                builder
+                    .add_service(native_server)
+                    .add_service(vector_server)
             } else {
-                builder.add_service(dfe_server)
+                builder.add_service(native_server)
             };
 
             #[cfg(not(feature = "transport-grpc-vector-compat"))]
-            let router = builder.add_service(dfe_server);
+            let router = builder.add_service(native_server);
 
             // Bind the listener synchronously BEFORE spawning the serve task,
             // so `new()` returning is a true readiness signal -- callers connect

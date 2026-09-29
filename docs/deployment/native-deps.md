@@ -68,7 +68,7 @@ alongside it:
 
 ```yaml
 deployment:
-  base_image: ghcr.io/hyperi-io/dfe-base@sha256:...
+  base_image: ghcr.io/example-org/app-base@sha256:...
   base_distro: trixie      # trixie|bookworm|noble|jammy|focal
 ```
 
@@ -162,7 +162,7 @@ package" in a build log.
 | **Runtime host** (the container image) | `.so` runtimes: `librdkafka1`, `libzstd1`, `zlib1g`, plus the release-specific libgit2 / libssl from the table above (on trixie: `libgit2-1.9`, `libssl3t64`) |
 
 `NativeDepsContract` describes the **runtime** side only -- what ships
-in the image. hyperi-ci handles build-host packages separately by
+in the image. A CI wrapper handles build-host packages separately by
 sniffing `Cargo.lock` for `-sys` crates and installing matching `-dev`
 packages on the runner.
 

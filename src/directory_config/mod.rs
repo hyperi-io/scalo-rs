@@ -16,7 +16,7 @@
 //!
 //! - **Read API:** `get()`, `get_key()`, `get_as()`, `list_tables()`
 //! - **Write API:** `set()`, `delete_key()` with advisory file locking
-//! - **Subdirectory support:** `loaders/dfe-loader` maps to `loaders/dfe-loader.yaml`
+//! - **Subdirectory support:** `loaders/myapp` maps to `loaders/myapp.yaml`
 //! - **Background refresh:** Polling-based (safe for S3/FUSE mounts)
 //! - **Change notifications:** Subscribe via `on_change()`
 //! - **Git integration:** Optional commit-on-write (feature `directory-config-git`)
@@ -42,7 +42,7 @@
 //! let host = store.get_key("my-service", "kafka.brokers").await?;
 //!
 //! // Write (if not read-only)
-//! store.set("dfe-loader", "kafka.brokers", "broker:9092".into(), None).await?;
+//! store.set("myapp", "kafka.brokers", "broker:9092".into(), None).await?;
 //!
 //! store.stop().await?;
 //! # Ok(())

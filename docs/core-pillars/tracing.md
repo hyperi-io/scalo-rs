@@ -41,7 +41,7 @@ use scalo::otel_tracing::{OtelTracingConfig, build_tracer_layer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 let cfg = OtelTracingConfig {
-    service_name: "dfe-loader".into(),
+    service_name: "myapp".into(),
     endpoint: "http://otel-collector:4317".into(),
     ..Default::default()
 };

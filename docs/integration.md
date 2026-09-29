@@ -90,7 +90,7 @@ the `/config` admin endpoint. See
 
 YAML config files (`defaults.yaml`, `settings.yaml`,
 `settings.{env}.yaml`) populate these structs through the cascade. ENV
-vars override (`DFE_LOADER__KAFKA__BROKERS=...`, double underscore for
+vars override (`MYAPP__KAFKA__BROKERS=...`, double underscore for
 nesting).
 
 ---
@@ -116,10 +116,10 @@ pub struct LoaderCli {
 impl ServiceApp for LoaderCli {
     type Config = LoaderConfig;
 
-    fn name(&self) -> &str { "dfe-loader" }
-    fn env_prefix(&self) -> &str { "DFE_LOADER" }
+    fn name(&self) -> &str { "myapp" }
+    fn env_prefix(&self) -> &str { "MYAPP" }
     fn version_info(&self) -> VersionInfo {
-        VersionInfo::new("dfe-loader", env!("CARGO_PKG_VERSION"))
+        VersionInfo::new("myapp", env!("CARGO_PKG_VERSION"))
     }
     fn common_args(&self) -> &CommonArgs { &self.common }
     fn command(&self) -> Option<&StandardCommand> { self.command.as_ref() }
@@ -217,7 +217,7 @@ config/
 ```
 
 The cascade searches `./`, `./config/`, `/config/`,
-`~/.config/dfe-loader/` for each file in turn. See
+`~/.config/myapp/` for each file in turn. See
 [core-pillars/config.md](core-pillars/config.md#cascade-order-highest-priority-first) for the full
 priority order.
 
@@ -227,16 +227,16 @@ priority order.
 
 ```bash
 # Validate config without running
-dfe-loader config-check --config config/settings.yaml
+myapp config-check --config config/settings.yaml
 
 # Print the metric catalogue
-dfe-loader metrics-manifest > metrics-manifest.json
+myapp metrics-manifest > metrics-manifest.json
 
 # Generate deployment artefacts (Dockerfile, chart/, argocd-application.yaml)
-dfe-loader generate-artefacts --output-dir ci/
+myapp generate-artefacts --output-dir ci/
 
 # Run it
-dfe-loader run --config config/settings.yaml
+myapp run --config config/settings.yaml
 ```
 
 `config-check` walks the cascade and prints what got loaded. Use it in
@@ -250,7 +250,7 @@ ends up there.
 
 ## 7. What you didn't have to write
 
-For the dfe-loader-shaped app above, the code you actually write is:
+For the myapp-shaped app above, the code you actually write is:
 
 - a `Cargo.toml` dependency block
 - your config struct definitions
@@ -288,9 +288,9 @@ closest in shape to what you're building:
 
 | App | Best for |
 |-----|----------|
-| [dfe-loader](https://github.com/hyperi-io/dfe-loader) | Kafka in, ClickHouse out — the most complete `cli-service` integration |
-| [dfe-receiver](https://github.com/hyperi-io/dfe-receiver) | gRPC ingress + Kafka publish — push-mode entry |
-| [dfe-fetcher](https://github.com/hyperi-io/dfe-fetcher) | Pull-mode (AWS/Azure/M365/GCP) ingress |
-| [dfe-archiver](https://github.com/hyperi-io/dfe-archiver) | Long-term storage sink |
-| [dfe-transform-vrl](https://github.com/hyperi-io/dfe-transform-vrl) | Embedded VRL transform engine |
-| [dfe-transform-vector](https://github.com/hyperi-io/dfe-transform-vector) | Thin wrapper around Vector.dev |
+| myapp-loader | Kafka in, ClickHouse out -- the most complete `cli-service` integration |
+| myapp-receiver | gRPC ingress + Kafka publish -- push-mode entry |
+| myapp-fetcher | Pull-mode (AWS/Azure/M365/GCP) ingress |
+| myapp-archiver | Long-term storage sink |
+| myapp-transform-vrl | Embedded VRL transform engine |
+| myapp-transform-vector | Thin wrapper around Vector.dev |

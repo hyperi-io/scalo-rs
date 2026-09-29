@@ -44,7 +44,7 @@ impl Default for FileOutputConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            path: PathBuf::from("/var/spool/dfe/output"),
+            path: PathBuf::from("/var/spool/scalo/output"),
             filename: "events.ndjson".to_string(),
             rotation: RotationPeriod::Hourly,
             max_age_days: 7,
@@ -74,7 +74,7 @@ mod tests {
     fn test_defaults() {
         let config = FileOutputConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.path, PathBuf::from("/var/spool/dfe/output"));
+        assert_eq!(config.path, PathBuf::from("/var/spool/scalo/output"));
         assert_eq!(config.filename, "events.ndjson");
         assert_eq!(config.rotation, RotationPeriod::Hourly);
         assert_eq!(config.max_age_days, 7);

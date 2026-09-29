@@ -46,7 +46,7 @@ VersionCheck::new(config).check_on_startup();
 
 All settings live under the `version_check` cascade key. The env form
 nests with a double underscore through the app's prefix, e.g.
-`DFE_LOADER_VERSION_CHECK__ENABLED=false`.
+`MYAPP_VERSION_CHECK__ENABLED=false`.
 
 ```yaml
 version_check:
@@ -75,7 +75,7 @@ POST body, matching scalo-py field for field:
 
 ```json
 {
-  "product": "dfe-loader",
+  "product": "myapp",
   "current_version": "1.8.0",
   "os": "linux",
   "arch": "x86_64",

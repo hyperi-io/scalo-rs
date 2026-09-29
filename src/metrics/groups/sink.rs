@@ -1,12 +1,12 @@
 // Project:   scalo
 // File:      src/metrics/groups/sink.rs
-// Purpose:   DFE sink metrics group
+// Purpose:   Pipeline sink metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Sink/insert metrics for DFE apps with a downstream.
+//! Sink/insert metrics for pipeline apps with a downstream.
 
 use metrics::Gauge;
 

@@ -24,9 +24,8 @@
 //! **control plane** (orchestration, APIs, integration), sharing the same
 //! config cascade, logging, metrics and resilience conventions.
 //!
-//! Full reference docs live under [`docs/`](https://github.com/hyperi-io/scalo-rs/tree/main/docs).
-//! Start at [`docs/README.md`](https://github.com/hyperi-io/scalo-rs/blob/main/docs/README.md)
-//! for the entry-point index.
+//! Full reference docs live under `docs/` in this crate's repository.
+//! Start at `docs/README.md` for the entry-point index.
 //!
 //! ## Quick Start
 //!
@@ -435,7 +434,7 @@ pub use deployment::{
 
 /// Re-export of the `schemars` crate (JSON Schema derivation) so downstream
 /// apps derive `JsonSchema` against scalo's exact version -- one schemars in the
-/// graph, so a `SensitiveString` field's `x-dfe-secret` marker resolves against
+/// graph, so a `SensitiveString` field's `x-scalo-secret` marker resolves against
 /// the same trait. Apps enable the `config-schema` feature and either add a
 /// matching `schemars` dep or reference this re-export. See scalo-rs#6.
 #[cfg(feature = "config-schema")]

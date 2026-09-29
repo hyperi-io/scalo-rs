@@ -23,7 +23,7 @@ use super::common::{on_one_line, udp_port_suffix};
 /// runtime package installation. If `native_deps` is empty, only base utilities
 /// are installed.
 ///
-/// `identity`, when provided, stamps three `io.hyperi.contract.*` LABEL
+/// `identity`, when provided, stamps three `io.scalo.contract.*` LABEL
 /// lines on the image per the Contract Identity Annotation Scheme v1
 /// (see [`ContractIdentity`](crate::deployment::ContractIdentity)). Phase 1
 /// rollout: optional; callers SHOULD pass `Some(&identity)`. Phase 2 will
@@ -65,7 +65,7 @@ pub fn generate_dockerfile(
 
 FROM {base_image}
 
-LABEL io.hyperi.profile="{profile_label}"{identity_block}
+LABEL io.scalo.profile="{profile_label}"{identity_block}
 
 {apt_block}
 COPY {binary} /usr/local/bin/{binary}
@@ -120,7 +120,7 @@ LABEL org.opencontainers.image.title="{title}"
 LABEL org.opencontainers.image.description="{description}"
 LABEL org.opencontainers.image.vendor="{vendor}"
 LABEL org.opencontainers.image.licenses="{licenses}"
-LABEL io.hyperi.profile="{profile_label}"
+LABEL io.scalo.profile="{profile_label}"
 
 {apt_block}
 # Dynamic OCI labels (injected by CI at build time)

@@ -54,10 +54,10 @@ pub struct DeploymentContract {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
-    /// Application name (e.g., "dfe-loader") -- matched against Chart.yaml `name`.
+    /// Application name (e.g., "myapp") -- matched against Chart.yaml `name`.
     pub app_name: String,
 
-    /// Binary name (e.g., "dfe-loader"). Defaults to app_name if empty.
+    /// Binary name (e.g., "myapp"). Defaults to app_name if empty.
     #[serde(default)]
     pub binary_name: String,
 
@@ -71,17 +71,17 @@ pub struct DeploymentContract {
     /// Health probe endpoint paths.
     pub health: HealthContract,
 
-    /// Environment variable prefix (e.g., "DFE_LOADER").
+    /// Environment variable prefix (e.g., "MYAPP").
     /// Used with `__` nesting for figment config cascade.
     pub env_prefix: String,
 
     /// Prometheus metric namespace/prefix (e.g., "loader").
     pub metric_prefix: String,
 
-    /// Config file mount path (e.g., "/etc/dfe/loader.yaml").
+    /// Config file mount path (e.g., "/etc/myapp/loader.yaml").
     pub config_mount_path: String,
 
-    /// Container registry base (e.g., "ghcr.io/hyperi-io").
+    /// Container registry base (e.g., "ghcr.io/example-org").
     #[serde(default = "default_image_registry")]
     pub image_registry: String,
 
@@ -96,7 +96,7 @@ pub struct DeploymentContract {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unbound_listen_paths: Vec<String>,
 
-    /// Default ENTRYPOINT args (e.g., `["--config", "/etc/dfe/loader.yaml"]`).
+    /// Default ENTRYPOINT args (e.g., `["--config", "/etc/myapp/loader.yaml"]`).
     #[serde(default)]
     pub entrypoint_args: Vec<String>,
 
@@ -140,7 +140,7 @@ pub struct DeploymentContract {
 
     /// Reflectable JSON Schema (draft 2020-12) of the app's full `Config`,
     /// derived via schemars (scalo-rs#6). `None` when the app does not provide
-    /// one. Secret fields carry the `x-dfe-secret` marker. Carried inline so a
+    /// one. Secret fields carry the `x-scalo-secret` marker. Carried inline so a
     /// single fetch of the contract gives the schema; also written to
     /// `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,7 +195,7 @@ impl Default for OciLabels {
 }
 
 fn default_vendor() -> String {
-    "HYPERI PTY LIMITED".to_string()
+    "scalo".to_string()
 }
 
 fn default_license() -> String {
@@ -203,7 +203,7 @@ fn default_license() -> String {
 }
 
 fn default_copyright() -> String {
-    "(c) 2026 HYPERI PTY LIMITED".to_string()
+    "(c) 2026 the scalo project contributors".to_string()
 }
 
 fn default_schema_version() -> u32 {
@@ -452,7 +452,7 @@ pub struct SecretGroupContract {
 /// A single environment variable sourced from a K8s Secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretEnvContract {
-    /// Full env var name (e.g., "DFE_LOADER__KAFKA__PASSWORD").
+    /// Full env var name (e.g., "MYAPP__KAFKA__PASSWORD").
     pub env_var: String,
 
     /// Key name in values.yaml secretKeys and default values
@@ -495,7 +495,7 @@ impl DeploymentContract {
             .unwrap_or("config.yaml")
     }
 
-    /// Get the config mount directory (e.g., "/etc/dfe").
+    /// Get the config mount directory (e.g., "/etc/myapp").
     #[must_use]
     pub fn config_dir(&self) -> &str {
         self.config_mount_path
@@ -714,7 +714,7 @@ mod tests {
     fn test_config_filename() {
         let contract = DeploymentContract {
             app_name: "test".into(),
-            config_mount_path: "/etc/dfe/loader.yaml".into(),
+            config_mount_path: "/etc/myapp/loader.yaml".into(),
             metrics_port: 9090,
             health: HealthContract::default(),
             env_prefix: "T".into(),
@@ -738,7 +738,7 @@ mod tests {
             capabilities: vec![],
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
-        assert_eq!(contract.config_dir(), "/etc/dfe");
+        assert_eq!(contract.config_dir(), "/etc/myapp");
     }
 
     /// A contract with KEDA on and the given `default_config`.

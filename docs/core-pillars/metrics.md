@@ -1,6 +1,6 @@
 # Metrics
 
-`MetricsManager::new("dfe_loader")` installs a global `metrics` recorder, builds a
+`MetricsManager::new("myapp")` installs a global `metrics` recorder, builds a
 Prometheus exporter, and serves `/metrics`. Any module then calls
 `metrics::counter!` / `gauge!` / `histogram!` -- the macros are no-ops with no
 recorder, so library code compiles without the metrics feature.
@@ -35,7 +35,7 @@ don't drag a TCP listener into dependents.
 ```rust
 use scalo::metrics::MetricsManager;
 
-let mut mgr = MetricsManager::new("dfe_loader");
+let mut mgr = MetricsManager::new("myapp");
 
 // Construct metrics -- each call also registers a descriptor
 let sent = mgr.counter("transport_sent_total", "Messages sent");
@@ -45,14 +45,14 @@ let lag = mgr.histogram("send_latency_seconds", "Send latency");
 mgr.counter_with_labels("transport_sent_total", "Messages sent",
     &["transport", "topic"], "transport");
 // Apply label values at recording time:
-metrics::counter!("dfe_loader_transport_sent_total",
+metrics::counter!("myapp_transport_sent_total",
     "transport" => "kafka", "topic" => "events").increment(1);
 
 mgr.start_server("0.0.0.0:9090").await?;
 ```
 
 Names are namespace-prefixed automatically -- `counter("foo")` records as
-`dfe_loader_foo`. Use `*_with_labels` so the label keys and group land in the
+`myapp_foo`. Use `*_with_labels` so the label keys and group land in the
 manifest (i.e. nearly always; unlabeled metrics are rare in data-plane pipelines).
 
 Single-binary services use `ServiceRuntime` from `cli`, which constructs the manager, attaches its `ScalingPressure` so `/scaling/pressure` serves it, and starts the listener with `start_server`. The app sets its own readiness callback. `/memory/pressure` is served by `start_server_with_routes` only, so a service on `ServiceRuntime` does not answer it. See [../runtime/service-runtime.md](../runtime/service-runtime.md).
@@ -114,9 +114,9 @@ my-app generate-artefacts --output-dir docs/
 Add metadata after registration:
 
 ```rust
-mgr.set_use_cases("dfe_loader_send_latency_seconds",
+mgr.set_use_cases("myapp_send_latency_seconds",
     &["SLO p99 < 500ms", "Page on sustained > 1s"]);
-mgr.set_dashboard_hint("dfe_loader_send_latency_seconds", "heatmap");
+mgr.set_dashboard_hint("myapp_send_latency_seconds", "heatmap");
 mgr.set_build_info(env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT"));
 ```
 

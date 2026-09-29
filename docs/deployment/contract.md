@@ -50,7 +50,7 @@ same bytes it did under v2.
 flowchart LR
     R[Rust service<br/>uses scalo] -->|generate-artefacts| C[deployment-contract.json]
     P[Python service<br/>uses scalo-py] -->|generate-artefacts| C
-    O[bash / TS / Go service<br/>via hyperi-ci templater] -.roadmap.-> C
+    O[bash / TS / Go service<br/>via a CI templater] -.roadmap.-> C
     C --> D[Dockerfile]
     C --> H[Helm chart/]
     C --> A[argocd-application.yaml]
@@ -62,7 +62,7 @@ flowchart LR
 |------|----------|--------|
 | 1 | scalo (this crate) -- Rust services emit the contract from their config struct | **Shipped** |
 | 2 | scalo-py -- Python services emit the same contract shape | **Shipped** |
-| 3 | hyperi-ci templater -- bash/TS/Go services emit the contract via templating | **Roadmap** |
+| 3 | a CI templater -- bash/TS/Go services emit the contract via templating | **Roadmap** |
 
 Tier 3 is aspirational. The contract is JSON-serialisable and
 language-neutral by design; the Rust (`scalo`) and Python (`scalo-py`)
@@ -292,10 +292,10 @@ source.
 
 | Function | Cascade key | Default |
 |----------|-------------|---------|
-| `image_registry_from_cascade()` | `deployment.image_registry` | `ghcr.io/hyperi-io` |
+| `image_registry_from_cascade()` | `deployment.image_registry` | `ghcr.io/example-org` |
 | `base_image_from_cascade()` | `deployment.base_image` | `debian:trixie-slim@sha256:...` (`DEFAULT_BASE_IMAGE`) |
 | `resolve_base_distro(base_image)` | `deployment.base_distro` | derived from `base_image` |
-| `argocd_repo_url_from_cascade(app)` | `deployment.argocd.repo_url` | `https://github.com/hyperi-io/<app>` |
+| `argocd_repo_url_from_cascade(app)` | `deployment.argocd.repo_url` | `https://github.com/example-org/<app>` |
 
 The default base image is pinned to its multi-arch index digest, so every build
 of one scalo release gets the same bytes. Renovate moves the digest.

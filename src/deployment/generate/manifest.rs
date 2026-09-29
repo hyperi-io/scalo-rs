@@ -101,9 +101,9 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         "user": "appuser",
         "uid": 1000,
         "labels": {
-            "io.hyperi.profile": profile_str,
-            "io.hyperi.app": contract.app_name,
-            "io.hyperi.metrics_port": contract.metrics_port.to_string(),
+            "io.scalo.profile": profile_str,
+            "io.scalo.app": contract.app_name,
+            "io.scalo.metrics_port": contract.metrics_port.to_string(),
             "org.opencontainers.image.title": title,
             "org.opencontainers.image.description": contract.oci_labels.description,
             "org.opencontainers.image.vendor": contract.oci_labels.vendor,

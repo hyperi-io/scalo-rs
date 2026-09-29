@@ -46,29 +46,29 @@ mod tests {
 
     fn test_contract() -> DeploymentContract {
         DeploymentContract {
-            app_name: "dfe-loader".into(),
-            binary_name: "dfe-loader".into(),
+            app_name: "myapp".into(),
+            binary_name: "myapp".into(),
             description: "High-performance Kafka to ClickHouse data loader".into(),
             metrics_port: 9090,
             health: super::super::HealthContract::default(),
-            env_prefix: "DFE_LOADER".into(),
+            env_prefix: "MYAPP".into(),
             metric_prefix: "loader".into(),
-            config_mount_path: "/etc/dfe/loader.yaml".into(),
-            image_registry: "ghcr.io/hyperi-io".into(),
+            config_mount_path: "/etc/myapp/loader.yaml".into(),
+            image_registry: "ghcr.io/example-org".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
-            entrypoint_args: vec!["--config".into(), "/etc/dfe/loader.yaml".into()],
+            entrypoint_args: vec!["--config".into(), "/etc/myapp/loader.yaml".into()],
             secrets: vec![
                 SecretGroupContract {
                     group_name: "kafka".into(),
                     env_vars: vec![
                         SecretEnvContract {
-                            env_var: "DFE_LOADER__KAFKA__USERNAME".into(),
+                            env_var: "MYAPP__KAFKA__USERNAME".into(),
                             key_name: "username".into(),
                             secret_key: "kafka-username".into(),
                         },
                         SecretEnvContract {
-                            env_var: "DFE_LOADER__KAFKA__PASSWORD".into(),
+                            env_var: "MYAPP__KAFKA__PASSWORD".into(),
                             key_name: "password".into(),
                             secret_key: "kafka-password".into(),
                         },
@@ -77,7 +77,7 @@ mod tests {
                 SecretGroupContract {
                     group_name: "clickhouse".into(),
                     env_vars: vec![SecretEnvContract {
-                        env_var: "DFE_LOADER__CLICKHOUSE__PASSWORD".into(),
+                        env_var: "MYAPP__CLICKHOUSE__PASSWORD".into(),
                         key_name: "password".into(),
                         secret_key: "clickhouse-password".into(),
                     }],
@@ -102,11 +102,11 @@ mod tests {
         let dockerfile = generate_dockerfile(&contract, None);
 
         assert!(dockerfile.contains("FROM ubuntu:24.04"));
-        assert!(dockerfile.contains("COPY dfe-loader /usr/local/bin/dfe-loader"));
+        assert!(dockerfile.contains("COPY myapp /usr/local/bin/myapp"));
         assert!(dockerfile.contains("EXPOSE 9090"));
         assert!(dockerfile.contains("localhost:9090/livez"));
-        assert!(dockerfile.contains("ENTRYPOINT [\"dfe-loader\"]"));
-        assert!(dockerfile.contains("CMD [\"--config\", \"/etc/dfe/loader.yaml\"]"));
+        assert!(dockerfile.contains("ENTRYPOINT [\"myapp\"]"));
+        assert!(dockerfile.contains("CMD [\"--config\", \"/etc/myapp/loader.yaml\"]"));
     }
 
     #[test]
@@ -120,7 +120,7 @@ mod tests {
             "default header must carry scalo's Apache-2.0 licence"
         );
         assert!(
-            dockerfile.contains("# Copyright: (c) 2026 HYPERI PTY LIMITED"),
+            dockerfile.contains("# Copyright: (c) 2026 the scalo project contributors"),
             "default header must carry scalo's copyright"
         );
     }
@@ -146,7 +146,7 @@ mod tests {
         );
         // And scalo's defaults must NOT leak in.
         assert!(!dockerfile.contains("Apache-2.0"));
-        assert!(!dockerfile.contains("HYPERI PTY LIMITED"));
+        assert!(!dockerfile.contains("the scalo project contributors"));
     }
 
     #[test]
@@ -203,7 +203,7 @@ mod tests {
         let dockerfile = generate_dockerfile(&contract, None);
 
         assert!(dockerfile.contains("Purpose:   production container image"));
-        assert!(dockerfile.contains("io.hyperi.profile=\"production\""));
+        assert!(dockerfile.contains("io.scalo.profile=\"production\""));
         assert!(!dockerfile.contains("strace"));
         assert!(!dockerfile.contains("tcpdump"));
     }
@@ -214,7 +214,7 @@ mod tests {
         let dockerfile = generate_dockerfile(&contract, None);
 
         assert!(dockerfile.contains("Purpose:   development container image"));
-        assert!(dockerfile.contains("io.hyperi.profile=\"development\""));
+        assert!(dockerfile.contains("io.scalo.profile=\"development\""));
         assert!(dockerfile.contains("strace"));
         assert!(dockerfile.contains("tcpdump"));
         assert!(dockerfile.contains("procps"));
@@ -234,7 +234,7 @@ mod tests {
         assert!(dockerfile.contains("strace"));
         assert!(dockerfile.contains("librdkafka1"));
         assert!(dockerfile.contains("libzstd1"));
-        assert!(dockerfile.contains("io.hyperi.profile=\"development\""));
+        assert!(dockerfile.contains("io.scalo.profile=\"development\""));
     }
 
     #[test]
@@ -616,20 +616,20 @@ mod tests {
         let contract = test_contract();
         let compose = generate_compose_fragment(&contract);
 
-        assert!(compose.contains("dfe-loader:"));
-        assert!(compose.contains("ghcr.io/hyperi-io/dfe-loader"));
+        assert!(compose.contains("myapp:"));
+        assert!(compose.contains("ghcr.io/example-org/myapp"));
         assert!(compose.contains("kafka:"));
         assert!(compose.contains("clickhouse:"));
         assert!(compose.contains("condition: service_healthy"));
         assert!(compose.contains("\"9090:9090\""));
-        assert!(compose.contains("loader.yaml:/etc/dfe/loader.yaml:ro"));
+        assert!(compose.contains("loader.yaml:/etc/myapp/loader.yaml:ro"));
         assert!(compose.contains("deploy:"));
         assert!(compose.contains("resources:"));
         assert!(compose.contains("limits:"));
         // Defaulted, but overridable from the environment -- nobody should have
         // to hand-edit an AUTOGENERATED file to give a local run more headroom.
-        assert!(compose.contains("cpus: \"${DFE_LOADER_CPU_LIMIT:-2}\""));
-        assert!(compose.contains("memory: ${DFE_LOADER_MEM_LIMIT:-1G}"));
+        assert!(compose.contains("cpus: \"${MYAPP_CPU_LIMIT:-2}\""));
+        assert!(compose.contains("memory: ${MYAPP_MEM_LIMIT:-1G}"));
     }
 
     #[test]
@@ -661,7 +661,7 @@ mod tests {
         generate_chart(&contract, dir.path(), None).unwrap();
 
         let content = std::fs::read_to_string(dir.path().join("Chart.yaml")).unwrap();
-        assert!(content.contains("name: dfe-loader"));
+        assert!(content.contains("name: myapp"));
         assert!(content.contains("description: High-performance Kafka to ClickHouse data loader"));
     }
 
@@ -700,12 +700,12 @@ mod tests {
 
         let content =
             std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        assert!(content.contains("DFE_LOADER__KAFKA__USERNAME"));
-        assert!(content.contains("DFE_LOADER__KAFKA__PASSWORD"));
-        assert!(content.contains("DFE_LOADER__CLICKHOUSE__PASSWORD"));
+        assert!(content.contains("MYAPP__KAFKA__USERNAME"));
+        assert!(content.contains("MYAPP__KAFKA__PASSWORD"));
+        assert!(content.contains("MYAPP__CLICKHOUSE__PASSWORD"));
         assert!(content.contains("path: /livez"));
         assert!(content.contains("path: /readyz"));
-        assert!(content.contains("/etc/dfe"));
+        assert!(content.contains("/etc/myapp"));
         // Observability identity: OTel service.name + k8s downward-API resource
         // attrs. Per-pod differentiation comes from these, not metric names.
         assert!(content.contains("name: OTEL_SERVICE_NAME"));
@@ -801,7 +801,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
         // On the pod as well, so an operator-supplied account mounts no token either.
         assert!(deployment.contains(
-            "      serviceAccountName: {{ include \"dfe-loader.serviceAccountName\" . }}\n\
+            "      serviceAccountName: {{ include \"myapp.serviceAccountName\" . }}\n\
              \x20     automountServiceAccountToken: false\n"
         ));
         assert!(deployment.contains(
@@ -911,7 +911,7 @@ mod tests {
             }
             assert_eq!(
                 lines_after(&runtime, "# hadolint ignore=DL3022"),
-                ["COPY --from=builder /app/target/release/dfe-loader /usr/local/bin/dfe-loader"],
+                ["COPY --from=builder /app/target/release/myapp /usr/local/bin/myapp"],
                 "{runtime}"
             );
             assert!(!dockerfile.contains("DL3022"), "{dockerfile}");
@@ -1526,16 +1526,16 @@ mod tests {
     fn test_generate_argocd_application_default() {
         let contract = test_contract();
         let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
+            repo_url: "https://github.com/example-org/myapp".into(),
             ..Default::default()
         };
         let yaml = generate_argocd_application(&contract, &argo, None);
 
         assert!(yaml.contains("apiVersion: argoproj.io/v1alpha1"));
         assert!(yaml.contains("kind: Application"));
-        assert!(yaml.contains("name: dfe-loader"));
+        assert!(yaml.contains("name: myapp"));
         assert!(yaml.contains("namespace: argocd"));
-        assert!(yaml.contains("repoURL: https://github.com/hyperi-io/dfe-loader"));
+        assert!(yaml.contains("repoURL: https://github.com/example-org/myapp"));
         assert!(yaml.contains("targetRevision: main"));
         assert!(yaml.contains("path: chart"));
         assert!(yaml.contains("CreateNamespace=true"));
@@ -1546,7 +1546,7 @@ mod tests {
     fn test_generate_argocd_custom_namespace_and_path() {
         let contract = test_contract();
         let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
+            repo_url: "https://github.com/example-org/myapp".into(),
             dest_namespace: "production".into(),
             chart_path: "deploy/chart".into(),
             target_revision: "v1.0.0".into(),
@@ -1576,7 +1576,7 @@ mod tests {
     fn generate_argocd_application_emits_default_ignore_differences() {
         let contract = test_contract();
         let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
+            repo_url: "https://github.com/example-org/myapp".into(),
             ..Default::default()
         };
         let yaml = generate_argocd_application(&contract, &argo, None);
@@ -1590,7 +1590,7 @@ mod tests {
     fn generate_argocd_application_appends_extra_ignore_differences() {
         let contract = test_contract();
         let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
+            repo_url: "https://github.com/example-org/myapp".into(),
             extra_ignore_differences: vec![
                 "- group: apps\n  kind: Deployment\n  jsonPointers:\n    - /spec/template/spec/containers/0/image".into(),
             ],
@@ -1604,7 +1604,7 @@ mod tests {
     fn generate_argocd_application_sync_wave_annotation_uses_config_value() {
         let contract = test_contract();
         let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
+            repo_url: "https://github.com/example-org/myapp".into(),
             sync_wave: crate::deployment::WAVE_TOPICS,
             ..Default::default()
         };
@@ -1642,7 +1642,7 @@ mod tests {
     fn test_identity() -> crate::deployment::ContractIdentity {
         crate::deployment::ContractIdentity::new(
             "0123456789abcdef0123456789abcdef01234567",
-            "ghcr.io/hyperi-io/dfe-loader:v2.7.2",
+            "ghcr.io/example-org/myapp:v2.7.2",
         )
         .expect("test fixture must be valid")
     }
@@ -1650,22 +1650,23 @@ mod tests {
     #[test]
     fn dockerfile_omits_identity_block_when_none() {
         let dockerfile = generate_dockerfile(&test_contract(), None);
-        assert!(!dockerfile.contains("io.hyperi.contract"));
+        assert!(!dockerfile.contains("io.scalo.contract"));
     }
 
     #[test]
     fn dockerfile_emits_three_identity_labels_when_some() {
         let id = test_identity();
         let dockerfile = generate_dockerfile(&test_contract(), Some(&id));
-        assert!(dockerfile.contains("LABEL io.hyperi.contract.version=\"v1\""));
+        assert!(dockerfile.contains("LABEL io.scalo.contract.version=\"v1\""));
         assert!(dockerfile.contains(
-            "LABEL io.hyperi.contract.source-commit=\"0123456789abcdef0123456789abcdef01234567\""
+            "LABEL io.scalo.contract.source-commit=\"0123456789abcdef0123456789abcdef01234567\""
         ));
-        assert!(dockerfile.contains(
-            "LABEL io.hyperi.contract.image-ref=\"ghcr.io/hyperi-io/dfe-loader:v2.7.2\""
-        ));
-        // The existing io.hyperi.profile label is unaffected.
-        assert!(dockerfile.contains("LABEL io.hyperi.profile=\"production\""));
+        assert!(
+            dockerfile
+                .contains("LABEL io.scalo.contract.image-ref=\"ghcr.io/example-org/myapp:v2.7.2\"")
+        );
+        // The existing io.scalo.profile label is unaffected.
+        assert!(dockerfile.contains("LABEL io.scalo.profile=\"production\""));
     }
 
     #[test]
@@ -1673,7 +1674,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         generate_chart(&test_contract(), dir.path(), None).unwrap();
         let chart = std::fs::read_to_string(dir.path().join("Chart.yaml")).unwrap();
-        assert!(!chart.contains("io.hyperi.contract"));
+        assert!(!chart.contains("io.scalo.contract"));
     }
 
     #[test]
@@ -1684,12 +1685,12 @@ mod tests {
         let chart = std::fs::read_to_string(dir.path().join("Chart.yaml")).unwrap();
         // Top-level annotations block present.
         assert!(chart.contains("\nannotations:\n"));
-        assert!(chart.contains("io.hyperi.contract.version: \"v1\""));
+        assert!(chart.contains("io.scalo.contract.version: \"v1\""));
         assert!(chart.contains(
-            "io.hyperi.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
+            "io.scalo.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
         ));
         assert!(
-            chart.contains("io.hyperi.contract.image-ref: \"ghcr.io/hyperi-io/dfe-loader:v2.7.2\"")
+            chart.contains("io.scalo.contract.image-ref: \"ghcr.io/example-org/myapp:v2.7.2\"")
         );
     }
 
@@ -1697,7 +1698,7 @@ mod tests {
     fn argocd_application_omits_identity_block_when_none() {
         let argo = ArgocdConfig::default();
         let yaml = generate_argocd_application(&test_contract(), &argo, None);
-        assert!(!yaml.contains("io.hyperi.contract"));
+        assert!(!yaml.contains("io.scalo.contract"));
         // sync-wave is unaffected.
         assert!(yaml.contains("argocd.argoproj.io/sync-wave:"));
     }
@@ -1710,13 +1711,11 @@ mod tests {
         // Both the existing sync-wave AND the three identity keys must appear
         // under the same metadata.annotations block.
         assert!(yaml.contains("argocd.argoproj.io/sync-wave:"));
-        assert!(yaml.contains("io.hyperi.contract.version: \"v1\""));
+        assert!(yaml.contains("io.scalo.contract.version: \"v1\""));
         assert!(yaml.contains(
-            "io.hyperi.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
+            "io.scalo.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
         ));
-        assert!(
-            yaml.contains("io.hyperi.contract.image-ref: \"ghcr.io/hyperi-io/dfe-loader:v2.7.2\"")
-        );
+        assert!(yaml.contains("io.scalo.contract.image-ref: \"ghcr.io/example-org/myapp:v2.7.2\""));
     }
 
     #[test]
@@ -1732,8 +1731,8 @@ mod tests {
 
         // The documented grep payoff: every surface mentions the prefix
         // exactly three times (once per key).
-        assert_eq!(dockerfile.matches("io.hyperi.contract").count(), 3);
-        assert_eq!(chart.matches("io.hyperi.contract").count(), 3);
-        assert_eq!(app.matches("io.hyperi.contract").count(), 3);
+        assert_eq!(dockerfile.matches("io.scalo.contract").count(), 3);
+        assert_eq!(chart.matches("io.scalo.contract").count(), 3);
+        assert_eq!(app.matches("io.scalo.contract").count(), 3);
     }
 }

@@ -97,7 +97,7 @@ drop at any await point. Most tokio primitives are; a few are not.
 | `mpsc::Sender::send` after `reserve()` | **No** | Drop loses the permit slot |
 | Any state machine you wrote yourself | Usually no | Default to "no" until proven otherwise |
 
-The Kafka offset-commit path in `dfe-loader` was bitten by this: a
+The Kafka offset-commit path in a real consumer was bitten by this: a
 `broadcast::recv` inside `select!` dropped messages on every shutdown event,
 corrupting committed offsets. The fix is the `pin!` hoist in
 `standards/languages/RUST.md`.

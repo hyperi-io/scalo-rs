@@ -7,8 +7,9 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Test helpers for contract-artefact end-to-end tests, shared by scalo
-//! itself and every downstream consumer service (`dfe-loader`, `dfe-receiver`,
-//! `dfe-archiver`, `dfe-fetcher`, `dfe-transform-vrl`, `dfe-transform-vector`).
+//! itself and every downstream consumer service (a Kafka-to-sink loader, a
+//! gRPC receiver, an object-storage archiver, a pull-mode fetcher, and the
+//! VRL and Vector transform wrappers).
 //!
 //! # What this module provides
 //!

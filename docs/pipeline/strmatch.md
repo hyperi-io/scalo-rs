@@ -87,7 +87,7 @@ let scrubber = StrMatcher::builder()
 When a pattern compiles to the `Regex` tier, `strmatch` emits **one**
 WARN per distinct pattern per process, capped at 10 distinct WARNs
 total. Past the cap, further patterns log at DEBUG plus one INFO
-summary. The counter `hyperi_strmatch_regex_fallback_total` is
+summary. The counter `scalo_strmatch_regex_fallback_total` is
 incremented regardless of log level — operators can scrape that
 without touching log volume.
 

@@ -11,10 +11,10 @@
 //! These produce the scalo numbers for the Vector BASELINING effort (the goal:
 //! the whole picture is better, or at least not worse, than the Vector
 //! equivalent -- NOT a competitive bake-off). They run on canonical corpora
-//! (fixed small + large JSON log lines) so the per-DFE-app benches that compare
+//! (fixed small + large JSON log lines) so the per-app benches that compare
 //! against the Vector equivalent measure the SAME bytes. See
 //! `docs/vector-baselining.md` Section 7 for the full plan; the per-app
-//! Vector-equivalent comparisons live in the dfe- app repos.
+//! Vector-equivalent comparisons live in the downstream app repos.
 //!
 //! Covered here: the [`Record`] wire codec (encode/decode), the serialisation on
 //! the spill cache's cold path -- a hot-path-adjacent primitive worth a tracked

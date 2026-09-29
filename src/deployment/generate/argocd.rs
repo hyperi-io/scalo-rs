@@ -23,7 +23,7 @@ use crate::deployment::contract::DeploymentContract;
 pub struct ArgocdConfig {
     /// ArgoCD namespace (where the Application CR lives). Default: `argocd`.
     pub argocd_namespace: String,
-    /// Destination namespace for the deployed app. Default: `dfe`.
+    /// Destination namespace for the deployed app. Default: `default`.
     pub dest_namespace: String,
     /// Destination cluster (`server` field). Default: `https://kubernetes.default.svc`.
     pub dest_server: String,
@@ -57,7 +57,7 @@ impl Default for ArgocdConfig {
     fn default() -> Self {
         Self {
             argocd_namespace: "argocd".into(),
-            dest_namespace: "dfe".into(),
+            dest_namespace: "default".into(),
             dest_server: "https://kubernetes.default.svc".into(),
             repo_url: String::new(),
             target_revision: "main".into(),
@@ -86,7 +86,7 @@ impl Default for ArgocdConfig {
 /// # use scalo::deployment::DeploymentContract;
 /// # let contract: DeploymentContract = unimplemented!();
 /// let argo = ArgocdConfig {
-///     repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
+///     repo_url: "https://github.com/example-org/myapp".into(),
 ///     ..Default::default()
 /// };
 /// let yaml = generate_argocd_application(&contract, &argo, None);

@@ -1,20 +1,20 @@
 // Project:   scalo
 // File:      src/metrics/groups/mod.rs
-// Purpose:   DFE-specific metric groups
+// Purpose:   Pipeline-specific metric groups
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Composable DFE metric groups.
+//! Composable pipeline metric groups.
 //!
-//! Opt-in metric structs for DFE pipeline applications. Each group registers
+//! Opt-in metric structs for data-plane pipeline applications. Each group registers
 //! standardised metrics with BARE names (e.g. `buffer_bytes`). When the
 //! [`MetricsManager`](super::MetricsManager) has a non-empty namespace, the
 //! prefix layer on the global recorder and the manifest registry add a single
-//! `{namespace}_` prefix uniformly (e.g. `dfe_buffer_bytes`).
+//! `{namespace}_` prefix uniformly (e.g. `myapp_buffer_bytes`).
 //!
-//! Feature-gated behind `service-metrics`. Non-DFE apps are unaffected.
+//! Feature-gated behind `service-metrics`. Apps outside this pattern are unaffected.
 //!
 //! ## Usage
 //!

@@ -436,7 +436,7 @@ mod tests {
             env_prefix: "TEST_APP".into(),
             metric_prefix: "test".into(),
             config_mount_path: "/etc/test/config.yaml".into(),
-            image_registry: "ghcr.io/hyperi-io".into(),
+            image_registry: "ghcr.io/example-org".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec!["--config".into(), "/etc/test/config.yaml".into()],

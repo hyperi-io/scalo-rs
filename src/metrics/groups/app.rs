@@ -1,19 +1,19 @@
 // Project:   scalo
 // File:      src/metrics/groups/app.rs
-// Purpose:   Mandatory app-level DFE metrics
+// Purpose:   Mandatory app-level pipeline metrics
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Mandatory app-level metrics for every DFE application.
+//! Mandatory app-level metrics for every pipeline application.
 
 use metrics::{Counter, Gauge};
 
 use super::super::MetricsManager;
 use super::super::manifest::{MetricDescriptor, MetricType};
 
-/// Mandatory metrics for every DFE application.
+/// Mandatory metrics for every pipeline application.
 ///
 /// Registers `info`, `start_time_seconds`, record counters, byte counters,
 /// memory gauges, and config reload counter, under bare names or the

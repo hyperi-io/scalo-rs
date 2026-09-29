@@ -27,7 +27,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = OtelTracingConfig {
-//!     service_name: "dfe-loader".into(),
+//!     service_name: "myapp".into(),
 //!     endpoint: "http://otel-collector:4317".into(),
 //!     ..Default::default()
 //! };
@@ -504,11 +504,11 @@ mod tests {
         // A bare `starts_with` would swallow all of these.
         for target in [
             "hyperion",
-            "hyperi_thing::worker",
+            "hypervisor::worker",
             "towerbridge",
             "h2o",
             "reqwest_middleware_of_ours",
-            "dfe_receiver::ingest",
+            "myapp::ingest",
         ] {
             assert!(
                 !is_self_telemetry(target),

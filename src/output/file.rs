@@ -28,7 +28,7 @@
 //! ## File Layout
 //!
 //! ```text
-//! /var/spool/dfe/output/loader/
+//! /var/spool/scalo/output/loader/
 //! |-- events.ndjson              # Current file
 //! |-- events.ndjson.20260302T14  # Rotated (hourly)
 //! `-- events.ndjson.20260302T13.gz  # Compressed

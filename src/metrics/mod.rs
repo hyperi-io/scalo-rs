@@ -1176,7 +1176,7 @@ impl MetricsManager {
         self.registry.clone()
     }
 
-    /// Get the configured namespace (e.g. `dfe`), or empty for bare names.
+    /// Get the configured namespace (e.g. `myapp`), or empty for bare names.
     ///
     /// Metric names are bare by default. When this namespace is non-empty,
     /// the prefix layer on the global recorder prepends `{namespace}_` to

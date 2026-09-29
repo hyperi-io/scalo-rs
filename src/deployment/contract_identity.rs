@@ -13,12 +13,12 @@
 //!
 //! | Key                                | Meaning                              | Format                            |
 //! |------------------------------------|--------------------------------------|-----------------------------------|
-//! | `io.hyperi.contract.version`       | Contract schema version              | Literal string `v1`               |
-//! | `io.hyperi.contract.source-commit` | Git SHA of the consumer app's HEAD   | 40-char lowercase hex             |
-//! | `io.hyperi.contract.image-ref`     | Intended pull reference for the image | `<reg>/<repo>:<tag>` or `@<digest>` |
+//! | `io.scalo.contract.version`       | Contract schema version              | Literal string `v1`               |
+//! | `io.scalo.contract.source-commit` | Git SHA of the consumer app's HEAD   | 40-char lowercase hex             |
+//! | `io.scalo.contract.image-ref`     | Intended pull reference for the image | `<reg>/<repo>:<tag>` or `@<digest>` |
 //!
 //! Same key string on every surface. The grep payoff:
-//! `grep -r 'io.hyperi.contract' .` finds every contract-emitted artefact.
+//! `grep -r 'io.scalo.contract' .` finds every contract-emitted artefact.
 //!
 //! # Pre-push vs post-push image_ref
 //!
@@ -38,7 +38,7 @@ use std::env;
 use std::process::Command;
 
 /// Annotation key prefix shared across all three keys.
-pub const KEY_PREFIX: &str = "io.hyperi.contract";
+pub const KEY_PREFIX: &str = "io.scalo.contract";
 
 /// Schema version literal. Bumps only when the contract format itself
 /// breaks, NOT when the consumer's app version moves.
@@ -244,10 +244,10 @@ mod tests {
 
     #[test]
     fn new_accepts_valid_inputs() {
-        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/hyperi-io/dfe-loader:v2.7.2").unwrap();
+        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/example-org/myapp:v2.7.2").unwrap();
         assert_eq!(id.version(), "v1");
         assert_eq!(id.source_commit(), VALID_SHA);
-        assert_eq!(id.image_ref(), "ghcr.io/hyperi-io/dfe-loader:v2.7.2");
+        assert_eq!(id.image_ref(), "ghcr.io/example-org/myapp:v2.7.2");
     }
 
     #[test]
@@ -294,38 +294,38 @@ mod tests {
     fn new_accepts_localhost_registry() {
         // The local-registry pattern (kind+registry:2) commonly uses
         // localhost:5000/<repo>.
-        let id = ContractIdentity::new(VALID_SHA, "localhost:5000/dfe-loader:test").unwrap();
-        assert_eq!(id.image_ref(), "localhost:5000/dfe-loader:test");
+        let id = ContractIdentity::new(VALID_SHA, "localhost:5000/myapp:test").unwrap();
+        assert_eq!(id.image_ref(), "localhost:5000/myapp:test");
     }
 
     #[test]
     fn new_accepts_digest_form() {
-        let digest_ref = format!("ghcr.io/hyperi-io/dfe-loader@sha256:{VALID_SHA}");
+        let digest_ref = format!("ghcr.io/example-org/myapp@sha256:{VALID_SHA}");
         let id = ContractIdentity::new(VALID_SHA, digest_ref.clone()).unwrap();
         assert_eq!(id.image_ref(), digest_ref);
     }
 
     #[test]
     fn dockerfile_labels_canonical_order_and_quoting() {
-        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/hyperi-io/dfe-loader:v2.7.2").unwrap();
+        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/example-org/myapp:v2.7.2").unwrap();
         let out = id.as_dockerfile_labels();
         assert_eq!(
             out,
-            "LABEL io.hyperi.contract.version=\"v1\"\n\
-             LABEL io.hyperi.contract.source-commit=\"0123456789abcdef0123456789abcdef01234567\"\n\
-             LABEL io.hyperi.contract.image-ref=\"ghcr.io/hyperi-io/dfe-loader:v2.7.2\""
+            "LABEL io.scalo.contract.version=\"v1\"\n\
+             LABEL io.scalo.contract.source-commit=\"0123456789abcdef0123456789abcdef01234567\"\n\
+             LABEL io.scalo.contract.image-ref=\"ghcr.io/example-org/myapp:v2.7.2\""
         );
     }
 
     #[test]
     fn yaml_annotations_canonical_order_and_quoting() {
-        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/hyperi-io/dfe-loader:v2.7.2").unwrap();
+        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/example-org/myapp:v2.7.2").unwrap();
         let out = id.as_yaml_annotations(4);
         assert_eq!(
             out,
-            "    io.hyperi.contract.version: \"v1\"\n    \
-             io.hyperi.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\"\n    \
-             io.hyperi.contract.image-ref: \"ghcr.io/hyperi-io/dfe-loader:v2.7.2\""
+            "    io.scalo.contract.version: \"v1\"\n    \
+             io.scalo.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\"\n    \
+             io.scalo.contract.image-ref: \"ghcr.io/example-org/myapp:v2.7.2\""
         );
     }
 
@@ -333,13 +333,13 @@ mod tests {
     fn yaml_annotations_zero_indent() {
         let id = ContractIdentity::new(VALID_SHA, "ghcr.io/x/y:v1").unwrap();
         let out = id.as_yaml_annotations(0);
-        assert!(out.starts_with("io.hyperi.contract.version: \"v1\""));
+        assert!(out.starts_with("io.scalo.contract.version: \"v1\""));
     }
 
     #[test]
     fn key_prefix_is_grep_target() {
         // Sanity check the documented grep payoff:
-        //   grep -r 'io.hyperi.contract' .
+        //   grep -r 'io.scalo.contract' .
         // -- which only works if every output line literally contains
         // that string.
         let id = ContractIdentity::new(VALID_SHA, "ghcr.io/x/y:v1").unwrap();

@@ -195,7 +195,7 @@ pub fn smoke_test_build(
 }
 
 fn tempdir_for_smoke(contract: &DeploymentContract) -> std::io::Result<PathBuf> {
-    let base = std::env::temp_dir().join(format!("hyperi-smoke-{}", contract.app_name));
+    let base = std::env::temp_dir().join(format!("scalo-smoke-{}", contract.app_name));
     if base.exists() {
         std::fs::remove_dir_all(&base)?;
     }

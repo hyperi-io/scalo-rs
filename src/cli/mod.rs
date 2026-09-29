@@ -20,7 +20,7 @@
 //! use scalo::cli::{CommonArgs, ServiceApp, CliError, StandardCommand, VersionInfo, run_app};
 //!
 //! #[derive(Parser)]
-//! #[command(name = "dfe-loader", version)]
+//! #[command(name = "myapp", version)]
 //! struct App {
 //!     #[command(flatten)]
 //!     common: CommonArgs,
@@ -32,10 +32,10 @@
 //! impl ServiceApp for App {
 //!     type Config = MyConfig;
 //!
-//!     fn name(&self) -> &str { "dfe-loader" }
-//!     fn env_prefix(&self) -> &str { "DFE_LOADER" }
+//!     fn name(&self) -> &str { "myapp" }
+//!     fn env_prefix(&self) -> &str { "MYAPP" }
 //!     fn version_info(&self) -> VersionInfo {
-//!         VersionInfo::new("dfe-loader", env!("CARGO_PKG_VERSION"))
+//!         VersionInfo::new("myapp", env!("CARGO_PKG_VERSION"))
 //!     }
 //!     fn common_args(&self) -> &CommonArgs { &self.common }
 //!     fn command(&self) -> Option<&StandardCommand> { self.command.as_ref() }

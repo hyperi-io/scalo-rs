@@ -172,7 +172,7 @@ dlq:
   flush_interval_ms: 100         # partial-batch flush
   file:
     enabled: true
-    path: /var/spool/dfe/dlq
+    path: /var/spool/scalo/dlq
     rotation: hourly             # hourly | daily
     max_age_days: 30
     compress_rotated: true
@@ -180,7 +180,7 @@ dlq:
     enabled: true
     routing: per_table           # per_table | common
     topic_suffix: .dlq
-    common_topic: dfe.dlq
+    common_topic: scalo.dlq
     send_timeout_ms: 5000        # ack wait for flush() and shutdown; the purge after it adds up to 5 s
   http:                          # dlq-http feature
     enabled: false

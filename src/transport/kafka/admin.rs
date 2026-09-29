@@ -649,16 +649,16 @@ mod tests {
     use super::*;
 
     /// The offset-query consumer asks for its group's coordinator on connect,
-    /// and a DFE broker refuses any group outside the `dfe-` prefix it grants.
+    /// and an app's broker refuses any group outside the `app-` prefix it grants.
     #[test]
     fn offset_query_consumer_takes_a_group_under_the_app_prefix() {
         let config = KafkaConfig {
-            group: "dfe-loader".to_string(),
+            group: "consumer-a".to_string(),
             ..Default::default()
         };
         let base = ClientConfig::new();
         let built = offset_query_consumer_config(&base, &config);
-        assert_eq!(built.get("group.id"), Some("dfe-loader-admin"));
+        assert_eq!(built.get("group.id"), Some("consumer-a-admin"));
 
         // The admin client's own config carries no group.
         assert_eq!(base.get("group.id"), None);
@@ -669,13 +669,13 @@ mod tests {
     #[test]
     fn offset_query_group_id_wins_over_a_raw_override() {
         let config = KafkaConfig {
-            group: "dfe-archiver".to_string(),
+            group: "consumer-b".to_string(),
             ..Default::default()
         };
         let mut base = ClientConfig::new();
         base.set("group.id", "operator-override");
         let built = offset_query_consumer_config(&base, &config);
-        assert_eq!(built.get("group.id"), Some("dfe-archiver-admin"));
+        assert_eq!(built.get("group.id"), Some("consumer-b-admin"));
     }
 
     /// The admin lays `librdkafka_overrides` over its connection settings, so

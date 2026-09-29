@@ -59,7 +59,7 @@
 //! // ... program.execute(&context) per record
 //! ```
 //!
-//! See `dfe-engine/docs/EXPRESSIONS-CEL.md` for the full profile specification.
+//! See the consumer app's EXPRESSIONS-CEL.md for the full profile specification.
 
 pub mod error;
 pub mod evaluator;
