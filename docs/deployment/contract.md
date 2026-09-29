@@ -279,7 +279,7 @@ generate_dockerfile(&prod, None);    // base_image + runtime libs only
 generate_dockerfile(&dev, None);     // + strace, tcpdump, ...
 ```
 
-The profile changes what is in the image, not its tag. A release publish from hyperi-ci pushes `:v<version>`, `:latest` and `:sha-<short>`, so the pull reference is `dfe-loader:v1.15.0`, with the `v`. It pushes no `-dev` variant: an operator who wants the diagnostic tools in a debug pod builds the dev image from `generate_dockerfile(&dev, None)`.
+The profile changes what is in the image, not its tag. The release pipeline tags images `:v<version>`, `:latest` and `:sha-<short>`, so the pull reference is `myapp:v1.15.0`, with the `v`. It pushes no `-dev` variant: an operator who wants the diagnostic tools in a debug pod builds the dev image from `generate_dockerfile(&dev, None)`.
 
 ---
 

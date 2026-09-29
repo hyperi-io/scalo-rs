@@ -20,15 +20,14 @@ use super::native_deps::NativeDepsContract;
 ///
 /// # Image tags
 ///
-/// The profile sets what goes into the image, not its tag. The CI that pushes
-/// the image names it, and the release pipeline scalo's consumers build with
-/// pushes:
+/// The profile sets what goes into the image, not its tag. The release
+/// pipeline tags images:
 ///
 /// | Build | Tags | Example |
 /// |-------|------|---------|
-/// | Release channel | `:v<version>`, `:latest`, `:sha-<short>` | `dfe-loader:v1.15.0` |
-/// | Pre-GA channel | `:v<version>-<channel>`, `:sha-<short>` | `dfe-loader:v1.15.0-beta` |
-/// | Branch dev image | `:branch-<slug>`, `:branch-<slug>-sha-<short>` | `dfe-loader:branch-fix-x` |
+/// | Release channel | `:v<version>`, `:latest`, `:sha-<short>` | `myapp:v1.15.0` |
+/// | Pre-GA channel | `:v<version>-<channel>`, `:sha-<short>` | `myapp:v1.15.0-beta` |
+/// | Branch dev image | `:branch-<slug>`, `:branch-<slug>-sha-<short>` | `myapp:branch-fix-x` |
 ///
 /// Version tags carry the `v`. There is no `-dev` tag: a `Development` image
 /// is built from its own Dockerfile where it is needed.

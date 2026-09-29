@@ -1,11 +1,6 @@
 # KEDA
 
-KEDA (Kubernetes Event-driven Autoscaling) scales pods on triggers
-the standard HPA can't see -- Kafka consumer-group lag, Prometheus
-queries, cron schedules, queue depth. `KedaContract` is the
-deployment-side declaration; `ScalingPressure` is the runtime-side
-signal source. Together they make scale-out track pipeline pressure,
-not container CPU.
+KEDA (Kubernetes Event-driven Autoscaling) scales pods on triggers the standard HPA can't see -- Kafka consumer-group lag, Prometheus queries, cron schedules, queue depth. `KedaContract` is the deployment-side declaration, and the chart it generates scales on Kafka consumer-group lag and CPU. `ScalingPressure` is a runtime-side signal that chart does not read: a deployment that wants scale-out to track pipeline pressure adds a trigger for it, as the `ScalingPressure` section below describes.
 
 ---
 
@@ -210,9 +205,7 @@ is still the literal `disable` whatever the listener uses.
 
 KEDA's built-in scalers see infrastructure metrics (Kafka lag, CPU),
 not *internal* pipeline state -- buffer depth, batch formation rate,
-memory headroom, circuit-breaker status. `ScalingPressure` lets the
-app publish a composite 0.0-100.0 score that a Prometheus-trigger KEDA
-scaler reads.
+memory headroom, circuit-breaker status. `ScalingPressure` lets the app publish a composite 0.0-100.0 score for an autoscaler to read.
 
 ```rust
 use scalo::scaling::{ScalingPressure, ScalingPressureConfig, ScalingComponent};
@@ -240,17 +233,13 @@ gate when both fire:
 | Circuit-breaker open | Downstream sink unreachable | `0.0` -- scaling won't help |
 | Memory >= threshold | Pod approaching OOM | `100.0` -- scale before kill |
 
-Outside the gates, components are weighted (sum to 1.0) and each
-saturates at its configured ceiling. The app surfaces the score as a
-Prometheus gauge (the `ServiceMetrics` helper exposes it as
-`scaling_pressure`, with the `metrics.namespace` prefix when one is set)
-for KEDA's Prometheus trigger to consume.
+Outside the gates, components are weighted (sum to 1.0) and each saturates at its configured ceiling. The generated chart does not read the score. The app sets it on the `scaling_pressure` gauge through the `ServiceMetrics` helper, with the `metrics.namespace` prefix when one is set. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it; [../pipeline/scaling.md](../pipeline/scaling.md#how-keda-reads-it) shows the trigger.
 
 ---
 
 ## `/scaling/pressure` endpoint
 
-Attach `ScalingPressure` to the metrics manager via `MetricsManager::set_scaling_pressure(...)`. The metrics HTTP server then answers `/scaling/pressure` with the current value as plain text, whether `start_server` or `start_server_with_routes` started it, and 404 until a pressure is attached. `ServiceRuntime` attaches its own, so every service built on it serves the route. It works as a KEDA `metrics-api` trigger source without standing up a Prometheus query.
+Attach `ScalingPressure` to the metrics manager via `MetricsManager::set_scaling_pressure(...)`. The metrics HTTP server then answers `/scaling/pressure` with the current value as plain text, whether `start_server` or `start_server_with_routes` started it, and 404 until a pressure is attached. `ServiceRuntime` attaches its own, so every service built on it serves the route. Each pod answers with its own value; the deployment-side trigger above reads the gauge.
 
 See [../../src/metrics/mod.rs](../../src/metrics/mod.rs) for the attach
 API and [../../src/scaling/mod.rs](../../src/scaling/mod.rs) for the
@@ -265,7 +254,7 @@ CPU trigger reads container-level CPU from the K8s metrics-server --
 the right source, since the app shouldn't measure its own CPU.
 Configure both triggers independently in the `ScaledObject`:
 
-- pressure gauge -> Prometheus scaler (app-level signals)
+- pressure gauge -> `metrics-api` scaler through an adapter (app-level signals, added by the deployment)
 - CPU utilisation -> CPU scaler (container-level, via metrics-server)
 
 KEDA takes the max; either fires scale-out independently.

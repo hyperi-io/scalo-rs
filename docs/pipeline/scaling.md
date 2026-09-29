@@ -86,7 +86,7 @@ scalo publishes the value two ways, and KEDA reads neither until the deployment 
 
 The chart `generate_chart()` writes reads neither. Its ScaledObject carries a Kafka consumer-group lag trigger unless the contract turns it off, and a CPU utilisation trigger while `keda.cpu.enabled` is true. See [../deployment/keda.md](../deployment/keda.md).
 
-To scale on the composite, the deployment adds its own trigger. One way is a KEDA `metrics-api` trigger pointed at an adapter that looks the gauge up by service and answers with its value. dfe-infra's charts do this, beside the CPU trigger:
+To scale on the composite, the deployment adds its own trigger. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it, beside the CPU trigger:
 
 ```yaml
 # ScaledObject triggers, deployment-side
@@ -103,7 +103,7 @@ triggers:
       valueLocation: "value"
 ```
 
-Use `metricType: Value`. `AverageValue` treats the metric as a total to share across the replicas, which a 0-100 score is not. The adapter also decides what a failed lookup does: dfe-infra's freezes the replica count rather than scaling out.
+Use `metricType: Value`. `AverageValue` treats the metric as a total to share across the replicas, which a 0-100 score is not. The adapter also decides what a failed lookup does, and holding the replica count is safer than scaling out on a missing value.
 
 See [`../../src/metrics/mod.rs`](../../src/metrics/mod.rs) for the endpoint mount.
 
@@ -138,7 +138,7 @@ runtime.scaling.as_ref().unwrap().set_component("kafka_lag", lag as f64);
 runtime.scaling.as_ref().unwrap().set_memory(used, limit);
 ```
 
-The `runtime.dfe.scaling_pressure(value)` / `scaling_circuit_open(...)` / `scaling_memory_pressure(...)` helpers on `ServiceMetrics` write the companion gauges `scaling_pressure`, `scaling_circuit_open` and `scaling_memory_pressure`, prefixed when `metrics.namespace` is set, for the pressure trigger and dashboard overlay.
+The `scaling_pressure(value)` / `scaling_circuit_open(...)` / `scaling_memory_pressure(...)` helpers on `ServiceMetrics` write the companion gauges `scaling_pressure`, `scaling_circuit_open` and `scaling_memory_pressure`, prefixed when `metrics.namespace` is set, for the pressure trigger and dashboard overlay.
 
 ---
 
