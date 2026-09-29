@@ -250,12 +250,7 @@ for KEDA's Prometheus trigger to consume.
 
 ## `/scaling/pressure` endpoint
 
-Attach `ScalingPressure` to the metrics manager via
-`MetricsManager::set_scaling_pressure(...)`. The metrics HTTP server
-(started with `start_server_with_routes`) then mounts a
-`/scaling/pressure` route returning the current value as plain text --
-useful as a KEDA `metrics-api` trigger source without standing up a
-Prometheus query.
+Attach `ScalingPressure` to the metrics manager via `MetricsManager::set_scaling_pressure(...)`. The metrics HTTP server then answers `/scaling/pressure` with the current value as plain text, whether `start_server` or `start_server_with_routes` started it, and 404 until a pressure is attached. `ServiceRuntime` attaches its own, so every service built on it serves the route. It works as a KEDA `metrics-api` trigger source without standing up a Prometheus query.
 
 See [../../src/metrics/mod.rs](../../src/metrics/mod.rs) for the attach
 API and [../../src/scaling/mod.rs](../../src/scaling/mod.rs) for the

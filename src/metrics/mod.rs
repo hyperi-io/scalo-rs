@@ -853,8 +853,10 @@ impl MetricsManager {
 
     /// Attach a `ScalingPressure` instance.
     ///
-    /// When set and using `start_server_with_routes`, `/scaling/pressure`
-    /// returns the current pressure value; until then it returns 404.
+    /// Once set, `/scaling/pressure` on the metrics listener returns the
+    /// current pressure value as plain text, whichever of
+    /// [`start_server`](Self::start_server) or `start_server_with_routes`
+    /// started it; until then it returns 404.
     ///
     /// Takes effect immediately whether or not the server is already running,
     /// because the route reads a slot rather than a value captured at start.
@@ -898,7 +900,9 @@ impl MetricsManager {
     /// This is the OBSERVABILITY port -- the one the deployment contract
     /// advertises and Prometheus scrapes. It serves `/metrics`,
     /// `/metrics/manifest`, `/livez` and `/readyz` -- no aliases, and no
-    /// startup route (a `startupProbe` targets `/livez`).
+    /// startup route (a `startupProbe` targets `/livez`). With the `scaling`
+    /// feature it also serves `/scaling/pressure`, 404 until
+    /// `set_scaling_pressure` attaches one.
     ///
     #[cfg_attr(
         feature = "http-server",
@@ -942,6 +946,8 @@ impl MetricsManager {
         let process_metrics = self.process_metrics.clone();
         let container_metrics = self.container_metrics.clone();
         let readiness_fn = self.readiness_fn.clone();
+        #[cfg(feature = "scaling")]
+        let scaling_pressure = self.scaling_pressure.clone();
 
         let registry = self.registry();
 
@@ -955,6 +961,8 @@ impl MetricsManager {
                 process_metrics,
                 container_metrics,
                 readiness_fn,
+                #[cfg(feature = "scaling")]
+                scaling_pressure,
             )
             .await;
         });
@@ -964,13 +972,11 @@ impl MetricsManager {
 
     /// Start the metrics HTTP server with additional custom routes.
     ///
-    /// Serves the same built-in endpoints as [`start_server`](Self::start_server):
-    /// `/metrics`, `/metrics/manifest`, `/livez` and `/readyz`.
+    /// Serves the same built-in endpoints as [`start_server`](Self::start_server),
+    /// with the same answers: `/metrics`, `/metrics/manifest`, `/livez`,
+    /// `/readyz`, and `/scaling/pressure` with the `scaling` feature.
     ///
     /// Additionally:
-    /// - `/scaling/pressure` returns the current pressure value once
-    ///   [`set_scaling_pressure`](Self::set_scaling_pressure) has been called,
-    ///   and 404 until then.
     /// - `/memory/pressure` returns memory status JSON once
     ///   [`set_memory_guard`](Self::set_memory_guard) has been called, and 404
     ///   until then.
@@ -1194,6 +1200,7 @@ async fn run_server(
     process_metrics: Option<ProcessMetrics>,
     container_metrics: Option<ContainerMetrics>,
     readiness_fn: ReadinessSlot,
+    #[cfg(feature = "scaling")] scaling_pressure: ScalingPressureSlot,
 ) {
     let mut update_interval = tokio::time::interval(update_interval);
 
@@ -1215,8 +1222,18 @@ async fn run_server(
                     let handle = handle.clone();
                     let registry = registry.clone();
                     let readiness_fn = readiness_fn.clone();
+                    #[cfg(feature = "scaling")]
+                    let scaling_pressure = scaling_pressure.clone();
                     tokio::spawn(async move {
-                        handle_connection(stream, handle, registry, readiness_fn).await;
+                        handle_connection(
+                            stream,
+                            handle,
+                            registry,
+                            readiness_fn,
+                            #[cfg(feature = "scaling")]
+                            scaling_pressure,
+                        )
+                        .await;
                     });
                 }
             }
@@ -1250,6 +1267,7 @@ async fn handle_connection(
     handle: PrometheusHandle,
     registry: MetricRegistry,
     readiness_fn: ReadinessSlot,
+    #[cfg(feature = "scaling")] scaling_pressure: ScalingPressureSlot,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -1271,19 +1289,31 @@ async fn handle_connection(
         _ => return,
     }
 
+    // Same status, content type and body as the axum route, so KEDA reads one answer.
+    #[cfg(feature = "scaling")]
+    let scaling_answer = request_line.starts_with("GET /scaling/pressure").then(|| {
+        match scaling_pressure_body(&scaling_pressure) {
+            Some(body) => ("200 OK", Some("text/plain; charset=utf-8"), body),
+            None => ("404 Not Found", None, String::new()),
+        }
+    });
+    // Without the scaling feature the path falls through to the unknown-path 404.
+    #[cfg(not(feature = "scaling"))]
+    let scaling_answer: Option<(&str, Option<&str>, String)> = None;
+
     // IMPORTANT: /metrics/manifest MUST come before /metrics (prefix match ordering)
     let (status, content_type, body) = if request_line.starts_with("GET /metrics/manifest") {
         (
             "200 OK",
-            "application/json",
+            Some("application/json"),
             serde_json::to_string(&registry.manifest()).unwrap_or_default(),
         )
     } else if request_line.starts_with("GET /metrics") {
-        ("200 OK", "text/plain; charset=utf-8", handle.render())
+        ("200 OK", Some("text/plain; charset=utf-8"), handle.render())
     } else if request_line.starts_with("GET /livez") {
         (
             "200 OK",
-            "application/json",
+            Some("application/json"),
             r#"{"status":"alive"}"#.to_string(),
         )
     } else if request_line.starts_with("GET /readyz") {
@@ -1302,26 +1332,30 @@ async fn handle_connection(
         if ready {
             (
                 "200 OK",
-                "application/json",
+                Some("application/json"),
                 r#"{"status":"ready"}"#.to_string(),
             )
         } else {
             (
                 "503 Service Unavailable",
-                "application/json",
+                Some("application/json"),
                 r#"{"status":"not_ready"}"#.to_string(),
             )
         }
+    } else if let Some(answer) = scaling_answer {
+        answer
     } else {
         (
             "404 Not Found",
-            "text/plain; charset=utf-8",
+            Some("text/plain; charset=utf-8"),
             "Not Found".to_string(),
         )
     };
 
+    let content_type =
+        content_type.map_or_else(String::new, |ct| format!("Content-Type: {ct}\r\n"));
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\n{content_type}Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
 
@@ -1365,21 +1399,28 @@ fn readiness_response(rf: ReadinessSlot) -> axum::response::Response {
     }
 }
 
-/// Build the `/scaling/pressure` response, or 404 when nothing is attached.
+/// The `/scaling/pressure` body, or `None` when nothing is attached.
 ///
-/// Reads the slot per request, so a pressure attached after the listener
-/// started is served.
-#[cfg(all(feature = "metrics", feature = "http-server", feature = "scaling"))]
-fn scaling_pressure_response(slot: &ScalingPressureSlot) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
+/// Both metrics listeners answer from this, so the value KEDA reads does not
+/// depend on which one the app started. Reads the slot per request, so a
+/// pressure attached after the listener started is served.
+#[cfg(all(feature = "metrics", feature = "scaling"))]
+fn scaling_pressure_body(slot: &ScalingPressureSlot) -> Option<String> {
     let attached = slot
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
 
-    match attached {
-        Some(sp) => format!("{:.2}", sp.calculate()).into_response(),
+    attached.map(|sp| format!("{:.2}", sp.calculate()))
+}
+
+/// Build the `/scaling/pressure` response, or 404 when nothing is attached.
+#[cfg(all(feature = "metrics", feature = "http-server", feature = "scaling"))]
+fn scaling_pressure_response(slot: &ScalingPressureSlot) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    match scaling_pressure_body(slot) {
+        Some(body) => body.into_response(),
         None => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
 }

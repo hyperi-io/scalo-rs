@@ -77,7 +77,7 @@ means a `Transport` impl ships with metrics-emission baked in, and the
 | Memory guard | `MemoryGuard` constructed if `memory` feature on |
 | Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)` |
 | Worker pool | `AdaptiveWorkerPool` constructed if `worker-pool` feature on |
-| Metrics server | Started on `--metrics-addr` (default `0.0.0.0:9090`) if `metrics` feature on, serving `/metrics` `/metrics/manifest` `/livez` `/readyz` -- and nothing else |
+| Metrics server | Started on `--metrics-addr` (default `0.0.0.0:9090`) if `metrics` feature on, serving `/metrics` `/metrics/manifest` `/livez` `/readyz` `/scaling/pressure` -- and nothing else |
 | Idle gate | `app.work_state(config)` evaluated after the runtime is up if `lifecycle` feature on; a workless config parks instead of entering `run_service` ([core-pillars/lifecycle.md](core-pillars/lifecycle.md)) |
 
 What's **not** auto-wired and still requires an explicit call from the app:
