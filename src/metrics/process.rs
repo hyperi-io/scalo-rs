@@ -152,7 +152,9 @@ mod tests {
         pm.update();
         let first = {
             let system = pm.system.lock().unwrap_or_else(|e| e.into_inner());
-            system.process(pm.pid).map(sysinfo::Process::accumulated_cpu_time)
+            system
+                .process(pm.pid)
+                .map(sysinfo::Process::accumulated_cpu_time)
         };
         let mut spin = 0u64;
         for i in 0..20_000_000u64 {
@@ -162,7 +164,9 @@ mod tests {
         pm.update();
         let second = {
             let system = pm.system.lock().unwrap_or_else(|e| e.into_inner());
-            system.process(pm.pid).map(sysinfo::Process::accumulated_cpu_time)
+            system
+                .process(pm.pid)
+                .map(sysinfo::Process::accumulated_cpu_time)
         };
         assert!(second >= first, "{first:?} then {second:?}");
     }
