@@ -55,10 +55,7 @@ Names are namespace-prefixed automatically -- `counter("foo")` records as
 `dfe_loader_foo`. Use `*_with_labels` so the label keys and group land in the
 manifest (i.e. nearly always; unlabeled metrics are rare in data-plane pipelines).
 
-Single-binary services use `ServiceRuntime` from `cli`, which constructs the
-manager, wires the readiness callback, attaches optional `ScalingPressure` and
-`MemoryGuard` endpoints, and merges service routes via `start_server_with_routes`.
-See [../runtime/service-runtime.md](../runtime/service-runtime.md).
+Single-binary services use `ServiceRuntime` from `cli`, which constructs the manager, attaches its `ScalingPressure` so `/scaling/pressure` serves it, and starts the listener with `start_server`. The app sets its own readiness callback. `/memory/pressure` is served by `start_server_with_routes` only, so a service on `ServiceRuntime` does not answer it. See [../runtime/service-runtime.md](../runtime/service-runtime.md).
 
 ---
 
@@ -212,7 +209,7 @@ Kafka emits the `transport_ack_*` series once armed. An armed gRPC server emits 
 | `/livez` | `{"status":"alive"}` -- process alive |
 | `/readyz` | 200 if readiness callback + [`HealthRegistry`](health.md) both pass, else 503 |
 | `/scaling/pressure` | Float `0.00-100.00` (feature `scaling` + `set_scaling_pressure`) |
-| `/memory/pressure` | JSON ratio + bytes (feature `memory` + `set_memory_guard`) |
+| `/memory/pressure` | JSON ratio + bytes (feature `memory` + `set_memory_guard`, `start_server_with_routes` only) |
 
 `/metrics/manifest` is matched before `/metrics` in the prefix-match handler --
 don't reorder.

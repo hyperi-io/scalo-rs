@@ -15,6 +15,7 @@
 //! ## What's included (always)
 //!
 //! - [`MetricsManager`] -- started, serving `/metrics`, `/livez`, `/readyz`
+//!   and the runtime's `/scaling/pressure`
 //! - [`ServiceMetrics`] -- the platform data-plane metrics, registered under
 //!   bare names or the `metrics.namespace` prefix
 //! - [`MemoryGuard`] -- cgroup-aware, auto-detected from env prefix
@@ -422,5 +423,75 @@ mod tests {
         assert!(runtime.batch_engine.is_some(), "and an engine on it");
 
         runtime.shutdown.cancel();
+    }
+
+    /// KEDA reads `/scaling/pressure` from the metrics listener `build` starts,
+    /// so the runtime's own pressure has to answer a real request on it.
+    #[cfg(feature = "scaling")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_listener_serves_the_runtime_scaling_pressure() {
+        let addr = free_local_addr();
+        let runtime = ServiceRuntime::build(
+            "scaling-route-probe",
+            "SCALING_ROUTE_PROBE",
+            &addr,
+            "1.2.3",
+            "probe",
+            vec![crate::ScalingComponent::new("probe", 1.0, 100.0)],
+            #[cfg(feature = "version-check")]
+            crate::VersionCheckConfig::default(),
+        )
+        .await
+        .expect("the runtime builds");
+
+        runtime
+            .scaling
+            .as_ref()
+            .expect("the scaling feature builds a pressure")
+            .set_component("probe", 42.0);
+
+        let (status, body) = get(&addr, "/scaling/pressure").await;
+        assert_eq!(
+            status, 200,
+            "KEDA's signal must be reachable, got body {body:?}"
+        );
+        assert_eq!(body, "42.00");
+
+        runtime.shutdown.cancel();
+    }
+
+    /// A loopback address with a port nothing is bound to.
+    #[cfg(feature = "scaling")]
+    fn free_local_addr() -> String {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        probe.local_addr().expect("the bound address").to_string()
+    }
+
+    /// One HTTP/1.1 GET, returning the status code and the body.
+    #[cfg(feature = "scaling")]
+    async fn get(addr: &str, path: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the metrics listener");
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read the response");
+
+        let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+        let status = head
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("a status code");
+        (status, body.to_string())
     }
 }

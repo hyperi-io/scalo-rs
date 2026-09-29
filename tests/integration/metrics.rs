@@ -19,10 +19,14 @@
 //! semantically and just churn 30 call sites.
 #![allow(clippy::await_holding_lock)]
 
+#[cfg(feature = "scaling")]
+use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use scalo::metrics::{MetricsConfig, MetricsError, MetricsManager};
+#[cfg(feature = "scaling")]
+use scalo::scaling::{ScalingComponent, ScalingPressure, ScalingPressureConfig};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -56,8 +60,16 @@ async fn find_available_port() -> u16 {
     addr.port()
 }
 
-/// Send an HTTP GET request and return status line and body.
-async fn http_get(addr: &str, path: &str) -> (String, String) {
+/// What one GET came back with.
+#[derive(Debug, PartialEq, Eq)]
+struct Response {
+    status: String,
+    content_type: Option<String>,
+    body: String,
+}
+
+/// Send an HTTP GET request and return status line, content type and body.
+async fn http_get_response(addr: &str, path: &str) -> Response {
     let mut stream = TcpStream::connect(addr)
         .await
         .expect("failed to connect to server");
@@ -77,7 +89,8 @@ async fn http_get(addr: &str, path: &str) -> (String, String) {
         .await
         .expect("failed to read status line");
 
-    // Skip headers until empty line
+    // Read headers until empty line, keeping the content type
+    let mut content_type = None;
     loop {
         let mut line = String::new();
         reader
@@ -86,6 +99,11 @@ async fn http_get(addr: &str, path: &str) -> (String, String) {
             .expect("failed to read header");
         if line == "\r\n" || line.is_empty() {
             break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-type")
+        {
+            content_type = Some(value.trim().to_string());
         }
     }
 
@@ -96,7 +114,34 @@ async fn http_get(addr: &str, path: &str) -> (String, String) {
         .await
         .expect("failed to read body");
 
-    (status_line.trim().to_string(), body)
+    Response {
+        status: status_line.trim().to_string(),
+        content_type,
+        body,
+    }
+}
+
+/// Send an HTTP GET request and return status line and body.
+async fn http_get(addr: &str, path: &str) -> (String, String) {
+    let response = http_get_response(addr, path).await;
+    (response.status, response.body)
+}
+
+/// A manager of its own, so its scaling slot starts empty whatever ran before.
+#[cfg(feature = "scaling")]
+fn fresh_manager() -> MetricsManager {
+    MetricsManager::with_config(MetricsConfig::offline(""))
+}
+
+/// A pressure with one component, so the served value is known exactly.
+#[cfg(feature = "scaling")]
+fn pressure_at(value: f64) -> Arc<ScalingPressure> {
+    let pressure = ScalingPressure::new(
+        ScalingPressureConfig::default(),
+        vec![ScalingComponent::new("probe", 1.0, 100.0)],
+    );
+    pressure.set_component("probe", value);
+    Arc::new(pressure)
 }
 
 #[tokio::test]
@@ -694,4 +739,86 @@ async fn test_19_retired_probe_paths_are_gone() {
 
     // Cleanup
     let _ = manager.stop_server().await;
+}
+
+/// The listener `ServiceRuntime` starts serves KEDA's signal: 404 with an
+/// empty body until a pressure is attached, then the value as plain text.
+#[cfg(feature = "scaling")]
+#[tokio::test]
+async fn test_20_scaling_pressure_on_start_server() {
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut manager = fresh_manager();
+    let addr = format!("127.0.0.1:{}", find_available_port().await);
+    manager
+        .start_server(&addr)
+        .await
+        .expect("failed to start server");
+
+    let unattached = http_get_response(&addr, "/scaling/pressure").await;
+    assert_eq!(
+        unattached,
+        Response {
+            status: "HTTP/1.1 404 Not Found".into(),
+            content_type: None,
+            body: String::new(),
+        },
+        "nothing attached yet"
+    );
+
+    manager.set_scaling_pressure(pressure_at(42.0));
+
+    let attached = http_get_response(&addr, "/scaling/pressure").await;
+    assert_eq!(
+        attached,
+        Response {
+            status: "HTTP/1.1 200 OK".into(),
+            content_type: Some("text/plain; charset=utf-8".into()),
+            body: "42.00".into(),
+        },
+        "an attach after the listener started must reach it"
+    );
+
+    let _ = manager.stop_server().await;
+}
+
+/// Both metrics listeners give the autoscaler the same answer, attached or
+/// not, so which one an app starts cannot change what KEDA reads.
+#[cfg(all(feature = "scaling", feature = "http-server"))]
+#[tokio::test]
+async fn test_21_scaling_pressure_is_the_same_on_both_listeners() {
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut plain = fresh_manager();
+    let plain_addr = format!("127.0.0.1:{}", find_available_port().await);
+    plain
+        .start_server(&plain_addr)
+        .await
+        .expect("failed to start server");
+
+    let mut routed = fresh_manager();
+    let routed_addr = format!("127.0.0.1:{}", find_available_port().await);
+    routed
+        .start_server_with_routes(&routed_addr, axum::Router::new())
+        .await
+        .expect("failed to start server with routes");
+
+    assert_eq!(
+        http_get_response(&plain_addr, "/scaling/pressure").await,
+        http_get_response(&routed_addr, "/scaling/pressure").await,
+        "nothing attached"
+    );
+
+    let pressure = pressure_at(42.0);
+    plain.set_scaling_pressure(Arc::clone(&pressure));
+    routed.set_scaling_pressure(pressure);
+
+    assert_eq!(
+        http_get_response(&plain_addr, "/scaling/pressure").await,
+        http_get_response(&routed_addr, "/scaling/pressure").await,
+        "attached"
+    );
+
+    let _ = plain.stop_server().await;
+    let _ = routed.stop_server().await;
 }
