@@ -893,25 +893,11 @@ impl BatchEngine {
                     // regardless of rho.
                     budget.observe(block_bytes, process_time, ingest_interval);
 
-                    // Observability: surface the current budget + pressure as
-                    // gauges so throttling is visible, not mysterious, AND the
-                    // ACTUAL received block bytes so the gap between the budget
-                    // (`self_regulation_byte_budget`) and reality (`recv_block_bytes`)
-                    // is measurable -- a persistent overshoot means the recv byte
-                    // cap is not holding. The gate edges (pause/resume) are
-                    // logged by the ObservingActuator.
+                    // Received block bytes beside `self_regulation_byte_budget`,
+                    // which the controller writes: a persistent overshoot means the
+                    // recv byte cap is not holding.
                     #[cfg(feature = "metrics")]
-                    {
-                        metrics::gauge!("self_regulation_byte_budget")
-                            .set(budget.byte_budget() as f64);
-                        metrics::gauge!("self_regulation_recv_block_bytes")
-                            .set(block_bytes as f64);
-                        // `self_regulation_` domain prefix: a bare `pressure_ratio`
-                        // collides with MemoryGuard's and ScalingPressure's own
-                        // pressure gauges on the same registry.
-                        metrics::gauge!("self_regulation_pressure_ratio")
-                            .set(budget.pressure().level());
-                    }
+                    metrics::gauge!("self_regulation_recv_block_bytes").set(block_bytes as f64);
                 }
             }
         }

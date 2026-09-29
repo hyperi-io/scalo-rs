@@ -24,6 +24,7 @@
 //! `None` and the data path is byte-identical to pre-governor behaviour.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::memory::MemoryGuard;
 
@@ -117,7 +118,10 @@ impl SelfRegulationConfig {
         // change to the gate / budget APIs.
         let sources: Vec<Arc<dyn PressureSource>> =
             vec![Arc::new(MemoryPressureSource::new(memory_guard)) as Arc<dyn PressureSource>];
-        let pressure = Arc::new(UnifiedPressure::new(sources, self.hysteresis()));
+        let pressure = Arc::new(
+            UnifiedPressure::new(sources, self.hysteresis())
+                .with_max_hold(Duration::from_secs(self.max_hold_secs)),
+        );
 
         // ONE byte-budget controller (AIMD lever) over the SAME pressure, so
         // its memory HARD override consults the same latch the gate does.
@@ -130,6 +134,7 @@ impl SelfRegulationConfig {
             profile = ?self.profile,
             pause_above = self.pause_above,
             resume_below = self.resume_below,
+            max_hold_secs = self.max_hold_secs,
             start_byte_budget = budget.byte_budget(),
             "self-regulation governor enabled (default-on)"
         );
@@ -174,6 +179,23 @@ mod tests {
         // Pressure is low (empty guard) -> gate would admit, budget starts big.
         assert!(gov.pressure().level() < cfg.pause_above);
         assert!(gov.budget().byte_budget() >= 1);
+    }
+
+    /// The configured bound reaches the latch the gates share; `0` removes it.
+    #[test]
+    fn build_bounds_the_latch_with_max_hold_secs() {
+        let default = SelfRegulationConfig::default()
+            .build(guard())
+            .expect("enabled");
+        assert_eq!(default.pressure().max_hold(), Duration::from_secs(30));
+
+        let unbounded = SelfRegulationConfig {
+            max_hold_secs: 0,
+            ..Default::default()
+        }
+        .build(guard())
+        .expect("enabled");
+        assert_eq!(unbounded.pressure().max_hold(), Duration::ZERO);
     }
 
     #[test]

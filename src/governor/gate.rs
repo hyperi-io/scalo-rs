@@ -26,7 +26,7 @@
 //! [`SelfRegulationGovernor`](super::SelfRegulationGovernor) (default-on).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::source::UnifiedPressure;
 
@@ -89,10 +89,8 @@ impl GateActuator for ObservingActuator {
     fn resume(&self) {
         #[cfg(feature = "metrics")]
         ::metrics::gauge!("self_regulation_inbound_paused", "source" => self.source).set(0.0);
-        tracing::info!(
-            source = self.source,
-            "self-regulation: inbound RESUMED, pressure cleared"
-        );
+        // A hold that reached max_hold resumes too, with the pressure not cleared.
+        tracing::info!(source = self.source, "self-regulation: inbound RESUMED");
         self.inner.resume();
     }
 }
@@ -134,6 +132,8 @@ pub struct InboundGate {
     /// transition even though `should_hold()` returns `true` repeatedly
     /// while latched.
     paused_edge: AtomicBool,
+    /// The latch's expired-hold count this gate has already opened for.
+    expired_seen: AtomicU64,
 }
 
 impl InboundGate {
@@ -143,10 +143,12 @@ impl InboundGate {
     /// [`evaluate`](Self::evaluate) under pressure will fire `pause()`.
     #[must_use]
     pub fn new(pressure: Arc<UnifiedPressure>, actuator: Box<dyn GateActuator>) -> Self {
+        let expired_seen = AtomicU64::new(pressure.expired_holds());
         Self {
             pressure,
             actuator,
             paused_edge: AtomicBool::new(false),
+            expired_seen,
         }
     }
 
@@ -160,6 +162,12 @@ impl InboundGate {
     /// - true->false (falling edge): `compare_exchange(true, false)`
     ///   succeeds exactly once -> call `resume()`.
     /// - no change: `compare_exchange` fails -> no actuator call.
+    ///
+    /// A hold that reached the latch's
+    /// [`max_hold`](UnifiedPressure::with_max_hold) opens every gate on the
+    /// latch for one evaluation, whichever caller the latch itself admitted:
+    /// that evaluation returns [`Admit::Yes`] and resumes, and the next one
+    /// pauses again if the latch re-armed.
     ///
     /// Returns [`Admit::Hold`] when held, [`Admit::Yes`] otherwise. Never
     /// touches the outbound side.
@@ -176,7 +184,9 @@ impl InboundGate {
     /// concurrent evaluators; give each source its own gate.
     pub fn evaluate(&self) -> Admit {
         let hold = self.pressure.should_hold();
-        if hold {
+        let expired = self.pressure.expired_holds();
+        let fresh_expiry = self.expired_seen.swap(expired, Ordering::AcqRel) != expired;
+        if hold && !fresh_expiry {
             // Rising edge: flip false -> true exactly once.
             if self
                 .paused_edge
@@ -367,6 +377,78 @@ mod tests {
         assert!(gate.is_held());
         assert_eq!(counter.pauses(), 2, "latch re-arms, pause fires again");
         assert_eq!(counter.resumes(), 1);
+    }
+
+    const SECOND: u64 = 1_000_000_000;
+
+    /// A latch with the default 30 s bound over one HARD source at `level`,
+    /// timed on a clock the test moves.
+    fn timed_governor(level: f64) -> (Arc<MockSource>, Arc<AtomicU64>, Arc<UnifiedPressure>) {
+        let mem = Arc::new(MockSource::new(level, true));
+        let now = Arc::new(AtomicU64::new(0));
+        let pressure = UnifiedPressure::new(
+            vec![Arc::clone(&mem) as Arc<dyn PressureSource>],
+            Hysteresis::new(0.80, 0.65).expect("valid band"),
+        )
+        .with_manual_clock(Arc::clone(&now));
+        (mem, now, Arc::new(pressure))
+    }
+
+    fn counting_gate(pressure: &Arc<UnifiedPressure>) -> (InboundGate, Arc<CountingActuator>) {
+        let counter = Arc::new(CountingActuator::new());
+        let gate = InboundGate::new(
+            Arc::clone(pressure),
+            Box::new(SharedActuator(Arc::clone(&counter))),
+        );
+        (gate, counter)
+    }
+
+    /// A paused source whose level never clears resumes once at max_hold and
+    /// pauses again on the next evaluation; a level that settled in the band
+    /// stays resumed.
+    #[test]
+    fn a_hold_past_max_hold_resumes_the_source_once() {
+        let (mem, now, pressure) = timed_governor(0.85);
+        let (gate, counter) = counting_gate(&pressure);
+        assert_eq!(gate.evaluate(), Admit::Hold);
+        assert_eq!(counter.pauses(), 1);
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Yes, "one window at max_hold");
+        assert_eq!(counter.resumes(), 1);
+        assert_eq!(gate.evaluate(), Admit::Hold, "0.85 re-arms");
+        assert_eq!(gate.evaluate(), Admit::Hold);
+        assert_eq!(counter.pauses(), 2, "one pause per re-arm");
+        assert_eq!(counter.resumes(), 1);
+
+        mem.set(0.70);
+        now.store(60 * SECOND, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Yes);
+        assert_eq!(gate.evaluate(), Admit::Yes, "0.70 does not re-arm");
+        assert_eq!(counter.resumes(), 2);
+        assert_eq!(counter.pauses(), 2);
+    }
+
+    /// Two sources on one latch: the latch admits one caller when a hold
+    /// expires, and each gate still resumes once for it.
+    #[test]
+    fn every_gate_on_the_latch_opens_once_per_expired_hold() {
+        let (_mem, now, pressure) = timed_governor(0.85);
+        let (first, first_count) = counting_gate(&pressure);
+        let (second, second_count) = counting_gate(&pressure);
+        assert_eq!(first.evaluate(), Admit::Hold);
+        assert_eq!(second.evaluate(), Admit::Hold);
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        assert_eq!(first.evaluate(), Admit::Yes, "takes the latch's window");
+        assert_eq!(second.evaluate(), Admit::Yes, "re-armed latch, same expiry");
+        assert_eq!(first_count.resumes(), 1);
+        assert_eq!(second_count.resumes(), 1);
+
+        assert_eq!(first.evaluate(), Admit::Hold);
+        assert_eq!(second.evaluate(), Admit::Hold);
+        assert_eq!(first_count.pauses(), 2);
+        assert_eq!(second_count.pauses(), 2);
     }
 
     #[test]

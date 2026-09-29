@@ -148,6 +148,14 @@ impl AtomicF64 {
     }
 }
 
+/// Write the budget to `self_regulation_byte_budget`, on every change.
+fn publish_budget(bytes: u64) {
+    #[cfg(feature = "metrics")]
+    ::metrics::gauge!("self_regulation_byte_budget").set(bytes as f64);
+    #[cfg(not(feature = "metrics"))]
+    let _ = bytes;
+}
+
 /// AIMD byte-budget lever with a memory HARD override.
 ///
 /// See the [module docs](crate::governor) for the algorithm. `observe()`
@@ -174,6 +182,7 @@ impl ByteBudgetController {
     #[must_use]
     pub fn new(cfg: ByteBudgetConfig, pressure: Arc<UnifiedPressure>) -> Self {
         let cfg = cfg.sanitised();
+        publish_budget(cfg.start_bytes);
         Self {
             budget: AtomicU64::new(cfg.start_bytes),
             ema_process_s: AtomicF64::new(0.0),
@@ -220,8 +229,9 @@ impl ByteBudgetController {
             self.ema_ingest_s.store(ingest_s);
         }
 
-        // Step 3: memory HARD override takes precedence over rho entirely.
-        if self.pressure.should_hold() {
+        // Step 3: memory HARD override takes precedence over rho entirely. The
+        // budget admits nothing, so it leaves an expired hold's window to the gates.
+        if self.pressure.should_hold_without_admitting() {
             self.multiplicative_decrease();
             return;
         }
@@ -251,6 +261,7 @@ impl ByteBudgetController {
         let cur = self.budget.load(Ordering::Relaxed);
         let next = cur.saturating_add(self.cfg.ai_step).min(self.cfg.max_bytes);
         self.budget.store(next, Ordering::Relaxed);
+        publish_budget(next);
     }
 
     /// Multiplicative-decrease: budget *= md_factor, clamped to the floor
@@ -267,6 +278,7 @@ impl ByteBudgetController {
         let scaled = (cur as f64 * self.cfg.md_factor).floor() as u64;
         let next = scaled.max(self.cfg.min_bytes());
         self.budget.store(next, Ordering::Relaxed);
+        publish_budget(next);
     }
 
     /// Current byte budget. Always `>= min_bytes`, never `0`.
@@ -283,10 +295,9 @@ impl ByteBudgetController {
         self.cfg.record_cap
     }
 
-    /// The shared pressure governor this controller drives off. Lets a caller
-    /// (e.g. the governed driver) read the combined
-    /// [`level`](UnifiedPressure::level) for the `pressure_ratio` gauge without
-    /// holding a second `Arc`.
+    /// The shared pressure governor this controller drives off, so a caller
+    /// can read the combined [`level`](UnifiedPressure::level) without holding
+    /// a second `Arc`.
     #[must_use]
     pub fn pressure(&self) -> &Arc<UnifiedPressure> {
         &self.pressure
@@ -505,6 +516,56 @@ mod tests {
         ctl.observe(0, Duration::ZERO, Duration::ZERO);
         // alpha=1 so ema_process becomes 0 -> not behind -> additive-increase.
         assert!(ctl.byte_budget() >= cur, "both-zero is no-pressure slack");
+    }
+
+    /// A driver folds a block between two receives. When the hold expires
+    /// there, the budget still shrinks as held and the next receive's gate
+    /// gets the window, so the paused source resumes.
+    #[test]
+    fn the_budget_leaves_an_expired_hold_to_the_gate() {
+        use crate::governor::{Admit, InboundGate, NoopActuator};
+
+        let src = Arc::new(MockSource::new(0.85));
+        let now = Arc::new(StdAtomicU64::new(0));
+        let pressure = Arc::new(
+            UnifiedPressure::new(
+                vec![Arc::clone(&src) as Arc<dyn PressureSource>],
+                Hysteresis::new(0.80, 0.65).expect("valid band"),
+            )
+            .with_manual_clock(Arc::clone(&now)),
+        );
+        let ctl = ByteBudgetController::new(test_cfg(), Arc::clone(&pressure));
+        let gate = InboundGate::new(Arc::clone(&pressure), Box::new(NoopActuator));
+        assert_eq!(gate.evaluate(), Admit::Hold);
+
+        now.store(30_000_000_000, Ordering::Relaxed);
+        ctl.observe(0, Duration::ZERO, ms(100));
+        assert_eq!(ctl.byte_budget(), 5_000, "held: 10_000 halved");
+        assert_eq!(gate.evaluate(), Admit::Yes, "the gate gets the window");
+        assert_eq!(gate.evaluate(), Admit::Hold);
+    }
+
+    /// Every change to the budget reaches the gauge, the start value included.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn the_budget_gauge_follows_every_change() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+
+        let budget = || {
+            handle.render().lines().find_map(|line| {
+                line.strip_prefix("self_regulation_byte_budget ")?
+                    .parse::<f64>()
+                    .ok()
+            })
+        };
+
+        let src = Arc::new(MockSource::new(0.0));
+        let (ctl, _p) = controller(test_cfg(), &src);
+        assert_eq!(budget(), Some(10_000.0), "the start budget");
+        ctl.observe(500, ms(10), ms(100));
+        assert_eq!(budget(), Some(15_000.0), "one additive step");
     }
 
     /// Config sanitisation: garbage ranges fall back to safe defaults and

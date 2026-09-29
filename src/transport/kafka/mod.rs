@@ -394,6 +394,10 @@ fn effective_consumer_group_id(config: &KafkaConfig) -> String {
 /// sizing surface, then `librdkafka_overrides` -- and the protocol is applied
 /// LAST, because under `consumer` librdkafka refuses the client outright if a
 /// classic-only property was set by any of them.
+///
+/// A producer-only config (empty `group`) gets `statistics.interval.ms=0`
+/// whatever the layers set: its consumer is never polled. The producer's own
+/// statistics are unaffected.
 fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> ClientConfig {
     let mut client_config = ClientConfig::new();
 
@@ -488,9 +492,12 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
         client_config.set("client.rack", rack);
     }
 
-    // Ensure statistics callbacks fire (all profiles already set this, but
-    // guarantee it as a fallback for manual configs).
-    if client_config.get("statistics.interval.ms").is_none() {
+    if config.group.is_empty() {
+        // Nothing polls a producer-only consumer, so its statistics events would queue unread.
+        client_config.set("statistics.interval.ms", "0");
+    } else if client_config.get("statistics.interval.ms").is_none() {
+        // Ensure statistics callbacks fire (all profiles already set this, but
+        // guarantee it as a fallback for manual configs).
         client_config.set("statistics.interval.ms", "5000");
     }
 
@@ -2847,6 +2854,61 @@ mod tests {
             .map(|e| e.topic().to_string())
             .collect();
         assert_eq!(topics, vec!["syslog_load".to_string()]);
+    }
+
+    /// A producer-only transport's consumer is never polled, so every
+    /// statistics event it emitted would queue unread for the life of the
+    /// process. Its config turns them off whatever a profile or override set,
+    /// and the producer beside it keeps its own.
+    #[test]
+    fn a_producer_only_consumer_emits_no_statistics() {
+        let producer_only = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..Default::default()
+        };
+        let cases = [
+            (producer_only.clone(), "5000"),
+            (
+                producer_only.clone().with_profile(KafkaProfile::DevTest),
+                "5000",
+            ),
+            (
+                producer_only
+                    .clone()
+                    .with_override("statistics.interval.ms", "1000"),
+                "1000",
+            ),
+        ];
+        for (config, producer_interval) in &cases {
+            for protocol in [ConsumerProtocol::Classic, ConsumerProtocol::Consumer] {
+                let consumer = consumer_client_config(config, protocol);
+                assert_eq!(
+                    consumer.get("statistics.interval.ms"),
+                    Some("0"),
+                    "{:?} profile, {protocol}",
+                    config.profile
+                );
+            }
+            let classic = consumer_client_config(config, ConsumerProtocol::Classic);
+            assert_eq!(librdkafka_resolves(&classic, "statistics.interval.ms"), "0");
+            assert_eq!(
+                transport_producer_config(config).get("statistics.interval.ms"),
+                Some(*producer_interval),
+                "the producer's statistics feed its metrics"
+            );
+        }
+
+        // The control: a consumer that is polled keeps the profile's interval.
+        let consumer = KafkaConfig {
+            group: "events-reader".to_string(),
+            ..producer_only
+        };
+        assert_eq!(
+            consumer_client_config(&consumer, ConsumerProtocol::Classic)
+                .get("statistics.interval.ms"),
+            Some("1000")
+        );
     }
 
     /// The consumer's context counts lag to the end its own config lets it

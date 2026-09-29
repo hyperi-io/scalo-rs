@@ -32,7 +32,10 @@ transport's intake. Only the actuator differs:
 
 The hysteresis band (`pause_above` / `resume_below`) stops flapping: once
 paused the gate stays paused until pressure drops well below the pause
-threshold, not the instant it dips under it.
+threshold, not the instant it dips under it, or until the hold reaches
+`self_regulation.max_hold_secs` (default 30). Then every gate on the latch
+resumes for one evaluation and pauses again if pressure is still at
+`pause_above` -- see [self-regulation.md](self-regulation.md).
 
 ### The lossless caveat for the receiver
 

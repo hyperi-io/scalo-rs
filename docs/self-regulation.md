@@ -1,10 +1,10 @@
 # Self-regulation
 
-The data plane regulates itself. A scalo app sized for steady state does
-not fall over when a burst arrives, an upstream stalls, or a transform
-balloons memory -- the pipeline slows its own intake, lets the in-flight
-work drain, and speeds back up once the pressure clears. This happens
-automatically; an app wires nothing.
+The data plane regulates itself. When a burst arrives, an upstream stalls,
+or a transform balloons memory, a scalo app sized for steady state slows its
+own intake, lets the in-flight work drain, and speeds back up once the
+pressure clears. This happens automatically; an app wires nothing. The
+limits are under "What the brake guarantees" below.
 
 Self-regulation is **ON by default**. To turn it off (byte-identical to the
 pre-governor data path), set one cascade key:
@@ -39,7 +39,7 @@ exhausted. Vertical is the fast, local, free response; horizontal is the
 slow, global, capacity response. They are not alternatives. Vertical buys
 time; horizontal adds capacity when the time runs out.
 
-Memory is the hard, never-OOM authority on the vertical side. CPU is left to
+Memory is the hard authority on the vertical side. CPU is left to
 CFS: under a CPU quota the Linux scheduler throttles the process, each batch
 takes longer, and the AIMD byte-budget loop sees the longer process time and
 shrinks the budget on its own. There is no separate CPU brake -- adding one
@@ -79,17 +79,22 @@ They are NOT interchangeable; each answers a different question.
 
 | Brain | Question | Acts on | Source of truth? |
 |---|---|---|---|
-| **MemoryGuard** | "Are we about to OOM?" | The HARD pressure signal | YES -- the never-OOM authority |
+| **MemoryGuard** | "Are we about to OOM?" | The HARD pressure signal | YES -- the HARD signal |
 | **ScalingPressure** | "Do we need more pods?" | KEDA / external scaler signal | Pool sizing, not the data path |
 | **UnifiedPressure** | "Should I pull more work right now?" | The inbound gate + byte budget | Derived from the sources above |
 
-- **MemoryGuard** (`src/memory/`) is the source of truth. It tracks
-  in-flight ingress bytes (and, when a heap source is wired, the true
-  process heap -- see the `set_heap_source` entry in
-  [migrations.md](migrations.md)). Its `pressure_ratio()` is fed into the
-  governor as a **HARD** source: never weighted, never masked. A saturated
-  soft signal can never lower the combined level below what memory demands.
-  This is the never-OOM guarantee.
+- **MemoryGuard** (`src/memory/`) is the source of truth. Its
+  `pressure_ratio()` is the process's memory usage over an effective limit.
+  Usage is what the kernel charges: cgroup v2 `memory.current`, else cgroup
+  v1 `memory.usage_in_bytes`, else `/proc/self/status` `VmRSS`, each plus the
+  bytes admitted since that reading. Only where none is readable (non-Linux)
+  does the guard fall back to the bytes callers reserve and release. A heap
+  source registered with `set_heap_source` overrides all of them. The limit is
+  `min(cgroup_headroom * memory.max, memory.high)`, with `cgroup_headroom`
+  defaulting to 0.85, or `memory.limit_bytes` when set. Detail:
+  [runtime/memory.md](runtime/memory.md). The ratio feeds the governor as a
+  **HARD** source: never weighted, never masked, so a saturated soft signal
+  can never lower the combined level below what memory demands.
 - **ScalingPressure** (`src/scaling/`) drives horizontal scaling. It emits
   the external-scaler signal KEDA reads to add or remove pods. It is a
   capacity lever, not a data-path lever -- it does not pause intake, it
@@ -132,12 +137,14 @@ The HARD memory source reads the container's own cgroup, not host `used/total`
 cgroup v2 inputs, container-first:
 
 - **`memory.max`** -- the hard ceiling. Cross it and the kernel OOM-kills the
-  pod. Base pressure ratio is `memory.current / memory.max`.
+  pod. The guard's ratio is `memory.current / (0.85 * memory.max)`, so the
+  default `pause_above` of 0.80 arms at 68% of `memory.max`.
 - **`memory.high`** -- the soft throttle. The kernel reclaims hard and throttles
-  allocations here, BEFORE the OOM-kill, so the signal takes the WORST of
-  `current/max` and `current/high` -- shedding before the throttle's latency
-  cliff, not just before the kill. The `MemoryGuard` likewise caps its
-  admission limit at `memory.high` when that is below `max * headroom`.
+  allocations here, BEFORE the OOM-kill. When `memory.high` is below
+  `0.85 * memory.max` it is the guard's limit, so the brake arms before the
+  throttle's latency cliff, not just before the kill. The worker-pool scaler's
+  `detect_memory_pressure()` takes the worst of `current/max` and
+  `current/high`, without the headroom.
 - **`memory.pressure` (PSI `some avg10`)** -- the earliest signal: the fraction
   of the last 10s in which a task stalled on memory. Emitted as the
   `worker_pool_memory_psi_some` gauge for observability/alerting. NOT folded
@@ -155,6 +162,14 @@ flowchart TD
     UP --> BB["ByteBudgetController<br/>(AIMD lever -> sub-block size)"]
 ```
 
+- **The latch** (`UnifiedPressure`, `src/governor/source.rs`) arms at
+  `pause_above` and releases at `resume_below`. A hold is bounded in time:
+  memory the process already holds (allocator arenas, pages kept after a
+  free) can keep the level above `resume_below` with nothing coming in, which
+  would pause the source for good. After `max_hold_secs` (default 30) the
+  latch admits one window, then re-arms if the level is still at
+  `pause_above`. The window is one admission for a push source, and one
+  resume for every `InboundGate` on the latch; the byte budget never takes it.
 - **InboundGate** (`src/governor/gate.rs`) turns the latch into EDGE events:
   `pause()` once on the rising edge, `resume()` once on the falling edge. It
   pauses the inbound SOURCE (stops pulling new work) -- never the outbound
@@ -193,9 +208,10 @@ see it.
 |---|---|---|
 | `self_regulation_inbound_paused` | gauge (0/1) | The inbound gate is currently holding (1) or open (0). Carries a `source` label (e.g. `kafka`, `http`) so two governed receivers on one pod are told apart |
 | `self_regulation_inbound_pauses_total` | counter | Number of pause EDGES (rising transitions), not per-evaluate noise. Carries the same `source` label |
-| `self_regulation_byte_budget` | gauge | Current AIMD byte budget (the inbound block-size lever) |
+| `self_regulation_byte_budget` | gauge | Current AIMD byte budget (the inbound block-size lever), written by the controller at start and on every change |
 | `self_regulation_recv_block_bytes` | gauge | Actual bytes of the most recent received block (reality, against which the budget is the intent) |
-| `self_regulation_pressure_ratio` | gauge | Combined `UnifiedPressure.level()` in `[0, 1]` |
+| `self_regulation_pressure_ratio` | gauge | Combined `UnifiedPressure.level()` in `[0, 1]`, written by the latch on any evaluation that moves it by 0.001 or more, paused or not |
+| `self_regulation_max_hold_releases_total` | counter | Holds ended by `max_hold_secs` with the level still above `resume_below`, `signal` label = the source setting the level (`memory`, `ack_held`). A steady rate means memory the brake cannot free is holding the level up |
 | `self_regulation_kafka_gate_errors_total` | counter | Kafka pause/resume actuator failures, `op` label = `pause` or `resume`. A sustained non-zero rate means the brake is silently disabled for the Kafka source -- alert on it |
 
 Because the gate fires each edge EXACTLY ONCE (`ObservingActuator` in
@@ -205,11 +221,14 @@ per-evaluate noise. The gate also logs a brake-reason line on each edge:
 
 ```text
 WARN  self-regulation: inbound PAUSED under pressure (memory/back-pressure brake)  source=kafka
-INFO  self-regulation: inbound RESUMED, pressure cleared  source=kafka
+INFO  self-regulation: inbound RESUMED  source=kafka
 ```
 
-A pause without a matching resume in the logs means the pressure has not
-cleared -- check the memory guard and consumer lag.
+A hold that reaches `max_hold_secs` also logs a WARN, at most once a minute,
+`hold reached max_hold`, with the `pressure`, `resume_below`, `held_secs` and
+the `signal` that set the level. Pause and resume pairs about `max_hold_secs`
+apart, with that warning, mean the level is not falling to `resume_below` --
+check the memory guard and consumer lag.
 
 ---
 
@@ -225,6 +244,7 @@ self_regulation:
   profile: throughput      # throughput | balanced | low_latency -- sizes the AIMD envelope
   pause_above: 0.80        # arm the inbound hold when combined pressure reaches this
   resume_below: 0.65       # release the hold when pressure drops to this (must be < pause_above)
+  max_hold_secs: 30        # longest one hold lasts above resume_below; 0 = no bound
   target_rho: 0.7          # target utilisation for the byte-budget AIMD loop, in (0, 1)
   md_factor: 0.5           # multiplicative-decrease factor, in (0, 1)
 ```
@@ -240,6 +260,9 @@ self_regulation:
   `resume_below`, and holds its state in between. An inverted or non-finite
   band falls back to the defaults (`0.80` / `0.65`) with a warning rather
   than wedging the governor.
+- **`max_hold_secs`** -- the bound on one hold (see "How the loop works").
+  `0` restores the unbounded latch, which holds until the level falls to
+  `resume_below` however long that takes.
 - **`target_rho`** -- how busy to keep the stage. Lower means more headroom
   (safer under bursts); higher means tighter packing (more efficient,
   riskier).
@@ -261,27 +284,30 @@ pressure to react to. The governor self-corrects after that first block
 toward the limit), so this is a transient first-block spike, not a steady
 state.
 
-There is deliberately NO dedicated "small-pod" preset (YAGNI). For a
-small/memory-tight pod, do one of:
+There is deliberately NO dedicated "small-pod" preset (YAGNI), and no key
+for the start budget: the profile sets it. For a small/memory-tight pod, use
+the `balanced` (8 MiB start) or `low_latency` (1 MiB start) profile, so the
+cold-start first block is correspondingly smaller. The memory-hard override
+then shrinks the blocks after it.
 
-- Set a lower start budget directly under `self_regulation` (cap the
-  first-block size so the cold-start window cannot overshoot the pod's
-  memory limit).
-- Use the `balanced` or `low_latency` profile -- both start with a smaller
-  byte-budget envelope, so the cold-start first block is correspondingly
-  smaller.
+### What the brake guarantees
 
-Either way the memory-hard override remains the never-OOM backstop; the
-profile/start-budget choice only governs how large that first pre-feedback
-block is.
+The brake stops NEW intake once the level reaches `pause_above` and shrinks
+the blocks after it. It does not bound memory already admitted, and it cannot
+stop an allocation under way: the usage reading can be 50 ms old, and one
+block can be larger than the headroom left above the pause point. On a pod
+limited to 256-512 MiB a burst has been measured to OOM-kill the process
+within about a second with the brake on. So it is load shedding, not an OOM
+guarantee: leave headroom above the pause point for the largest block the
+pod takes.
 
 ### cgroup OOM-kill operational test (release checklist)
 
-The in-process logical never-OOM test asserts the governor's control loop
-never lets in-flight bytes exceed the configured limit. It does NOT prove
-the process survives a real OS-level cgroup OOM-killer under a hard
-container memory limit. The real test -- a memory-limited container under
-sustained load, asserting NO cgroup OOM-kill where an ungoverned pipeline
-would be killed -- is a RELEASE-CHECKLIST / CI-harness item, run out of
-process against a real cgroup. It is not covered by the in-process unit
-tests and must be exercised separately before a release.
+The in-process logical test asserts the governor's control loop never lets
+in-flight bytes exceed the configured limit. It does NOT prove the process
+survives a real OS-level cgroup OOM-killer under a hard container memory
+limit. The real test -- a memory-limited container under sustained load,
+asserting NO cgroup OOM-kill where an ungoverned pipeline would be killed --
+is a RELEASE-CHECKLIST / CI-harness item, run out of process against a real
+cgroup. It is not covered by the in-process unit tests and must be exercised
+separately before a release.

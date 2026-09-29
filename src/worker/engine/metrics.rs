@@ -93,6 +93,10 @@ pub fn describe(manager: &MetricsManager) {
             "self_regulation_kafka_gate_errors_total",
             "Kafka pause/resume actuator failures (brake degraded)",
         );
+        let _ = manager.counter(
+            "self_regulation_max_hold_releases_total",
+            "Inbound holds ended by max_hold with pressure above resume_below (per signal)",
+        );
     }
 }
 
@@ -162,6 +166,7 @@ mod tests {
             "self_regulation_inbound_paused",
             "self_regulation_inbound_pauses_total",
             "self_regulation_kafka_gate_errors_total",
+            "self_regulation_max_hold_releases_total",
         ]);
         expected.sort_unstable();
         assert_eq!(names(&described), expected);

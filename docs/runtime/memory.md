@@ -115,10 +115,9 @@ admission.
 
 ## Allocator
 
-scalo picks no allocator. Every HyperI Rust binary picks jemalloc, and here is why.
+scalo picks no allocator. The binary does, and jemalloc is the usual pick for a long-running, multi-threaded data-plane service: one set of heap stats and one profiling story.
 
-- One allocator across the fleet. One set of heap stats, one profiling story, no per-project bake-offs. That is the HyperI Rust standard (`standards/languages/rust.md`, allocator section) and DFE policy since 2026-04-17.
-- We read jemalloc's own numbers. The dfe-loader and dfe-archiver memory guards read `stats.allocated` through `tikv-jemalloc-ctl`. So jemalloc is not just the allocator. It is the meter.
+The guard does not read the allocator. In a container it reads the kernel's `memory.current`, which counts every page the process holds, arenas the allocator keeps after a free included. An allocator figure such as jemalloc's `stats.allocated` is read only when the binary registers it with `set_heap_source`, and it then replaces the kernel figure. A binary that wants the kernel figure in a container and the allocator figure elsewhere registers the source only when no cgroup usage file is readable.
 
 Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project carries it on as `tikv-jemallocator`, from the same repo: https://github.com/tikv/jemallocator. As of 2026-09-26 `tikv-jemalloc-sys` is at 0.7.1, published 2026-05-25. So `tikv-` is the maintained line, not a side fork.
 
@@ -128,7 +127,7 @@ Three crates, three jobs:
 - `tikv-jemallocator` -- the `#[global_allocator]` shim.
 - `tikv-jemalloc-ctl` -- 'ask jemalloc how much it holds'. Turn on its `stats` feature or there are no stats to read.
 
-Why not a native Rust allocator? Rust ships none of its own. Without jemalloc a binary gets the platform's C `malloc`, glibc on Linux. So the real choice is which C allocator, and the standard picks jemalloc for its heap stats and profiling, which mimalloc and snmalloc do not match.
+Why not a native Rust allocator? Rust ships none of its own. Without jemalloc a binary gets the platform's C `malloc`, glibc on Linux. So the real choice is which C allocator, and jemalloc wins on heap stats and profiling, which mimalloc and snmalloc do not match.
 
 ---
 
@@ -157,11 +156,11 @@ is no separate warn/soft/hard tier: the hot-path API is binary
 
 ## Hot-path API
 
-Lock-free atomics throughout -- every operation is one or two
-`Relaxed` loads/stores.
+Lock-free atomics throughout, plus the usage file read at most once per
+50 ms.
 
 ```rust
-let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig::from_env("DFE")));
+let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig::from_env("MYAPP")));
 
 // On data arrival -- atomic check, rolls back if it would exceed:
 if !guard.try_reserve(payload_len) {
@@ -193,7 +192,10 @@ Self-regulation (the `governor` feature) is ON by default; opt out via
 `self_regulation.enabled = false`, after which nothing is constructed
 and the data path is byte-identical to pre-governor. It consumes the
 guard's pressure to drive the inbound brake and an AIMD byte budget.
-Its metrics are namespaced `self_regulation_*`. See SELF-REGULATION.
+Memory the process already holds can keep the ratio above the brake's
+release point with nothing coming in, so one hold lasts at most
+`self_regulation.max_hold_secs` (default 30). Its metrics are namespaced
+`self_regulation_*`. See SELF-REGULATION.
 
 `ScalingPressure` consumes the guard too: memory is a hard gate. When
 the ratio exceeds ~0.9 the autoscaler signal jumps straight to maximum
@@ -213,7 +215,7 @@ hands the `Arc<MemoryGuard>` to:
 - The self-regulation governor (built from the same guard).
 
 Apps read `runtime.memory_guard` directly. Env-var overrides
-(`DFE_LOADER_MEMORY_LIMIT_BYTES`) work without bridging because
+(`MYAPP_MEMORY_LIMIT_BYTES`) work without bridging because
 `build` uses `from_env(env_prefix)`.
 
 Env vars:
