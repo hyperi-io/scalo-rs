@@ -25,7 +25,7 @@
 //! Full picture in the docs: `docs/self-regulation.md` (the three brains --
 //! memory is the HARD source of truth, CPU deliberately dropped),
 //! `docs/backpressure.md` (gate the source, never the sink), and
-//! `docs/kafka-path.md` (the three batch sizes + the rho ~ 0.7 loop).
+//! `docs/kafka-path.md` (the three batch sizes + how the byte budget moves).
 //!
 //! # Design invariants
 //!

@@ -1707,8 +1707,8 @@ fn governed_gate_and_budget_share_pressure() {
     // Low memory -> gate admits, budget unchanged on a slack observe.
     assert_eq!(gate.evaluate(), Admit::Yes, "low pressure admits");
 
-    // Slam memory high -> the SAME pressure both holds the gate AND, via the
-    // HARD override in observe(), shrinks the budget regardless of rho.
+    // Slam memory high -> the SAME pressure both holds the gate AND, through
+    // observe(), shrinks the budget.
     guard.add_bytes(950); // 95% of limit
     assert_eq!(gate.evaluate(), Admit::Hold, "high pressure holds the gate");
     budget.observe(0, Duration::from_millis(1), Duration::from_millis(100));
@@ -1820,10 +1820,9 @@ fn governed_engine_low_limit(
     let gov = crate::governor::SelfRegulationConfig::default()
         .build(Arc::clone(&guard))
         .expect("enabled by default");
-    // A SMALL recv chunk so the load arrives over many blocks: the AIMD loop
-    // (and the memory HARD override) shrink the budget block-to-block as
-    // pressure builds, rather than pulling the whole load in one cold-budget
-    // block. This is the realistic streaming shape -- a real broker/source
+    // A SMALL recv chunk so the load arrives over many blocks: the memory
+    // override shrinks the budget block-to-block as pressure builds, rather
+    // than pulling the whole load in one cold-budget block. This is the realistic streaming shape -- a real broker/source
     // delivers in poll-sized chunks, not one giant block.
     let mut engine = BatchEngine::new(BatchProcessingConfig {
         max_chunk_size: 16,
@@ -2273,6 +2272,223 @@ fn sub_block_drain_yields_incrementally() {
     assert_eq!(third.len(), 2);
     // Now exhausted.
     assert!(drain.next_sub_block().is_none(), "drain exhausted");
+}
+
+// ---- The byte budget under a backlog -----------------------------------
+
+/// Payload bytes of each backlog record: four of them fill the 1 KiB floor.
+#[cfg(feature = "governor")]
+const BACKLOG_RECORD_BYTES: usize = 256;
+
+/// The budget's record cap, so one full block.
+#[cfg(feature = "governor")]
+const BACKLOG_RECORD_CAP: usize = 64;
+
+/// Records waiting at the source: ten full blocks.
+#[cfg(feature = "governor")]
+const BACKLOG_RECORDS: usize = BACKLOG_RECORD_CAP * 10;
+
+/// The memory limit the backlog engine's pressure reads against.
+#[cfg(feature = "governor")]
+const BACKLOG_MEMORY_LIMIT: u64 = 1024 * 1024;
+
+/// A sink call's future, boxed so one helper serves every run path.
+#[cfg(feature = "governor")]
+type BacklogSinkFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EngineError>> + Send>>;
+
+/// A memory transport holding the whole backlog before the run starts.
+#[cfg(feature = "governor")]
+async fn backlog_source() -> MemoryTransport {
+    let transport = MemoryTransport::new(&MemoryConfig {
+        buffer_size: BACKLOG_RECORDS,
+        recv_timeout_ms: 50,
+        ..Default::default()
+    })
+    .expect("memory transport with valid config must construct");
+    for _ in 0..BACKLOG_RECORDS {
+        transport
+            .inject(None, vec![b'r'; BACKLOG_RECORD_BYTES])
+            .await
+            .unwrap();
+    }
+    transport
+}
+
+/// A governed engine whose byte budget starts at one full block, over a memory
+/// guard already holding `memory_used` bytes of its limit.
+#[cfg(feature = "governor")]
+fn backlog_engine(memory_used: u64) -> (BatchEngine, Arc<crate::governor::ByteBudgetController>) {
+    use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
+
+    // Pinned to the reservation counter so the pressure is `memory_used`, not the host's.
+    let guard = Arc::new(MemoryGuard::with_usage_source(
+        MemoryGuardConfig {
+            limit_bytes: BACKLOG_MEMORY_LIMIT,
+            ..Default::default()
+        },
+        UsageSource::Reservations,
+    ));
+    guard.add_bytes(memory_used);
+    let pressure = crate::governor::SelfRegulationConfig::default()
+        .build(guard)
+        .expect("enabled by default")
+        .pressure();
+    let full_block = (BACKLOG_RECORD_BYTES * BACKLOG_RECORD_CAP) as u64;
+    let budget = Arc::new(crate::governor::ByteBudgetController::new(
+        crate::governor::ByteBudgetConfig {
+            start_bytes: full_block,
+            max_bytes: full_block * 4,
+            ai_step: full_block / 4,
+            record_cap: BACKLOG_RECORD_CAP,
+            ..Default::default()
+        },
+        pressure,
+    ));
+    let mut engine = default_engine();
+    engine.set_byte_budget(Arc::clone(&budget));
+    (engine, budget)
+}
+
+/// A sink that takes `per_call` to deliver, records how many records each call
+/// carried, and stops the run once the whole backlog is delivered.
+#[cfg(feature = "governor")]
+fn backlog_sink(
+    per_call: Duration,
+    calls: &Arc<parking_lot::Mutex<Vec<usize>>>,
+    shutdown: &CancellationToken,
+) -> impl FnMut(&WorkBatch<crate::transport::memory::MemoryToken>) -> BacklogSinkFuture {
+    let calls = Arc::clone(calls);
+    let shutdown = shutdown.clone();
+    move |out| {
+        let mut calls = calls.lock();
+        calls.push(out.records.len());
+        if calls.iter().sum::<usize>() >= BACKLOG_RECORDS {
+            shutdown.cancel();
+        }
+        Box::pin(async move {
+            tokio::time::sleep(per_call).await;
+            Ok(())
+        })
+    }
+}
+
+/// Every backlog record was delivered, at an average of at least half a full
+/// block per sink call.
+#[cfg(feature = "governor")]
+fn assert_full_blocks(calls: &[usize]) {
+    let delivered: usize = calls.iter().sum();
+    assert_eq!(delivered, BACKLOG_RECORDS, "the whole backlog is delivered");
+    let average = delivered / calls.len();
+    assert!(
+        average >= BACKLOG_RECORD_CAP / 2,
+        "{average} records a sink call, from calls {calls:?}: with no memory pressure the budget \
+         must keep blocks near the {BACKLOG_RECORD_CAP}-record cap, not shrink them to the floor"
+    );
+}
+
+/// A backlog behind a slow sink, with no memory pressure, keeps full blocks
+/// through the pipeline. A busy stage is not a reason to shrink the budget:
+/// under a backlog it is busy at every block size.
+#[cfg(feature = "governor")]
+#[tokio::test]
+async fn a_pipeline_backlog_behind_a_slow_sink_keeps_full_blocks() {
+    let source = backlog_source().await;
+    let (engine, budget) = backlog_engine(0);
+    let start = budget.byte_budget();
+    let shutdown = CancellationToken::new();
+    cancel_after(shutdown.clone(), 20_000);
+    let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    engine
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .sink_confirms(SinkConfirmation::Remote)
+        .run(
+            |batch| Ok(batch),
+            backlog_sink(Duration::from_millis(20), &calls, &shutdown),
+        )
+        .await
+        .expect("clean shutdown");
+
+    assert_full_blocks(&calls.lock());
+    assert!(
+        budget.byte_budget() > start,
+        "the budget grows without memory pressure"
+    );
+}
+
+/// The same backlog through `run_governed` keeps full blocks too.
+#[cfg(feature = "governor")]
+#[tokio::test]
+async fn a_governed_backlog_behind_a_slow_sink_keeps_full_blocks() {
+    let source = backlog_source().await;
+    let (engine, budget) = backlog_engine(0);
+    let start = budget.byte_budget();
+    let shutdown = CancellationToken::new();
+    cancel_after(shutdown.clone(), 20_000);
+    let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    engine
+        .run_governed(
+            &source,
+            shutdown.clone(),
+            |batch| Ok(batch),
+            backlog_sink(Duration::from_millis(20), &calls, &shutdown),
+            CommitMode::Auto,
+            no_ticker(),
+        )
+        .await
+        .expect("clean shutdown");
+
+    assert_full_blocks(&calls.lock());
+    assert!(
+        budget.byte_budget() > start,
+        "the budget grows without memory pressure"
+    );
+}
+
+/// Memory pressure still brakes the pipeline: with the latch held, the budget
+/// halves every block down to its 1 KiB floor, and the sink calls shrink with
+/// it to four records.
+#[cfg(feature = "governor")]
+#[tokio::test]
+async fn memory_pressure_still_shrinks_pipeline_blocks_to_the_floor() {
+    let source = backlog_source().await;
+    // 95% of the limit, above pause_above (0.80), so the latch holds.
+    let (engine, budget) = backlog_engine(BACKLOG_MEMORY_LIMIT * 95 / 100);
+    let shutdown = CancellationToken::new();
+    cancel_after(shutdown.clone(), 20_000);
+    let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    engine
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .sink_confirms(SinkConfirmation::Remote)
+        .run(
+            |batch| Ok(batch),
+            backlog_sink(Duration::ZERO, &calls, &shutdown),
+        )
+        .await
+        .expect("clean shutdown");
+
+    let calls = calls.lock();
+    assert_eq!(calls.iter().sum::<usize>(), BACKLOG_RECORDS);
+    assert_eq!(
+        calls[0], BACKLOG_RECORD_CAP,
+        "the first block is sized to the start budget"
+    );
+    assert_eq!(
+        budget.byte_budget(),
+        1024,
+        "the latch drives the budget to its floor"
+    );
+    assert!(
+        calls
+            .last()
+            .is_some_and(|&n| n <= 1024 / BACKLOG_RECORD_BYTES),
+        "the last sink calls carry the floor's four records: {calls:?}"
+    );
 }
 
 // ---- DLQ + parse-error-action semantics -------------------------------

@@ -736,14 +736,15 @@ impl BatchEngine {
     ///
     /// - **Governor ON** (budget wired): streams each received block in
     ///   sub-blocks sized to the CURRENT byte budget (re-read per block), bounds
-    ///   peak in-flight memory to one sub-block, and folds each block's
-    ///   `(bytes, process_time, ingest_interval)` into the AIMD loop via
-    ///   [`observe`](crate::governor::ByteBudgetController::observe). The recv
-    ///   `max` is capped to the budget's poll-safety
+    ///   peak in-flight memory to one sub-block, and folds each block into the
+    ///   budget via
+    ///   [`observe`](crate::governor::ByteBudgetController::observe), which
+    ///   shrinks it only under memory pressure. The recv `max` is capped to the
+    ///   budget's poll-safety
     ///   [`record_cap`](crate::governor::ByteBudgetController::record_cap).
-    ///   While pressure is LOW the budget sits at its big start value, so the
-    ///   block becomes a SINGLE sub-block -- no per-record overhead, behaviour
-    ///   matches the whole-batch loop.
+    ///   Without memory pressure the budget stays at or above its big start
+    ///   value, however busy the stage, so the block becomes a SINGLE sub-block
+    ///   -- no per-record overhead, behaviour matches the whole-batch loop.
     /// - **Governor OFF** (no budget): delegates verbatim to
     ///   [`run_workbatch`](Self::run_workbatch) -- byte-identical to
     ///   pre-governor behaviour.
@@ -809,8 +810,7 @@ impl BatchEngine {
         let mut ticker = LoopTicker::new(ticker);
         let retry = RetryWindow::new(&shutdown);
 
-        // Track the previous block's arrival instant so we can feed the AIMD
-        // loop a real ingest inter-arrival interval.
+        // The previous block's arrival, for the ingest interval `observe` takes.
         let mut last_recv: Option<std::time::Instant> = None;
         let mut recv_failures = 0_u32;
 
@@ -865,14 +865,14 @@ impl BatchEngine {
                     };
                     let block_bytes = work_batch.total_payload_bytes() as u64;
                     let Some(batch) = self.ingest_workbatch(work_batch)? else {
-                        // Empty block: still fold the timing so a quiet pipeline
-                        // can grow its budget back. No bytes -> treated as slack.
+                        // An empty block still counts, so a quiet source grows the
+                        // budget back once memory pressure clears.
                         budget.observe(0, Duration::ZERO, ingest_interval);
                         continue;
                     };
 
-                    // Re-read the budget for THIS block: low pressure -> big
-                    // budget -> one sub-block (no overhead); high pressure ->
+                    // Re-read the budget for THIS block: no memory pressure -> big
+                    // budget -> one sub-block (no overhead); memory pressure ->
                     // shrunk budget -> peak in-flight bounded to one sub-block.
                     let sub_block_bytes = budget.byte_budget();
 
@@ -888,9 +888,7 @@ impl BatchEngine {
                     };
                     let process_time = process_start.elapsed();
 
-                    // Fold the OBSERVED actual block bytes into the AIMD loop. A
-                    // memory HARD override inside observe() shrinks immediately
-                    // regardless of rho.
+                    // Shrinks the budget while memory pressure holds, grows it otherwise.
                     budget.observe(block_bytes, process_time, ingest_interval);
 
                     // Received block bytes beside `self_regulation_byte_budget`,

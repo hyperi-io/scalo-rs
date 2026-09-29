@@ -3,7 +3,7 @@
 One idea: a byte-budget envelope with a time bound, so a single config takes a
 stage from "SME on a laptop" to hyperscale without re-tuning. Covered here: the
 three batch sizes, the sizing profile, the librdkafka property names the code
-uses (several differ from the Java client), the AIMD loop, wire compression,
+uses (several differ from the Java client), how the byte budget moves, wire compression,
 static membership, the raw escape hatch, the partition-limited diagnostic.
 
 Code: `src/transport/kafka/config.rs` (sizing surface),
@@ -58,7 +58,7 @@ either way. One config, no re-tuning as volume grows.
 
 On a small or memory-tight pod the generous `throughput` start budget can
 overshoot in the cold-start window (the first block before the governor's
-AIMD loop / memory-hard override reacts). Set a lower `self_regulation`
+memory-hard override reacts). Set a lower `self_regulation`
 start budget or use the `balanced` / `low_latency` profile -- see the
 small-pod guidance in [self-regulation.md](self-regulation.md).
 
@@ -134,20 +134,14 @@ The sizing surface sets this to `linger_ms` automatically. It does NOT set
 
 ---
 
-## The rho ~ 0.7 loop
+## How the byte budget moves
 
-The PROCESS byte budget is driven by an AIMD loop (full description in
-[self-regulation.md](self-regulation.md) and `src/governor/budget.rs`). In
-Kafka terms:
+The PROCESS byte budget moves one step per block and shrinks only under memory pressure (full description in [self-regulation.md](self-regulation.md) and `src/governor/budget.rs`):
 
-- `rho = EMA(process_time) / EMA(ingest_interval)` -- how much of the gap
-  between fetches the stage spends processing.
-- `rho < 0.7` (slack) -> additive-increase the budget: pull bigger blocks.
-- `rho > 0.7` (behind) -> multiplicative-decrease: pull smaller blocks.
-- memory HARD pressure -> multiplicative-decrease IMMEDIATELY, regardless of
-  rho. Memory never waits for the rho loop.
+- memory HARD pressure (the latch holds) -> multiplicative-decrease by `md_factor`: pull smaller blocks.
+- otherwise -> additive-increase up to the profile ceiling: pull bigger blocks.
 
-Target `0.7` keeps the consumer ~70% busy with 30% headroom for a fetch burst.
+How busy the consumer is does not move it. With a backlog, the gap between fetches is about as long as processing the last block, at any block size, so a budget that shrank on utilisation would fall to its floor and cap throughput at the sink's per-call cost. A consumer that cannot keep up grows lag, and lag is the autoscaler's signal.
 
 ---
 

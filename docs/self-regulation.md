@@ -39,12 +39,7 @@ exhausted. Vertical is the fast, local, free response; horizontal is the
 slow, global, capacity response. They are not alternatives. Vertical buys
 time; horizontal adds capacity when the time runs out.
 
-Memory is the hard authority on the vertical side. CPU is left to
-CFS: under a CPU quota the Linux scheduler throttles the process, each batch
-takes longer, and the AIMD byte-budget loop sees the longer process time and
-shrinks the budget on its own. There is no separate CPU brake -- adding one
-would double-count a signal CFS already handles (see "Why memory is HARD and
-CPU is deliberately dropped" below).
+Memory is the hard authority on the vertical side, and the only signal that shrinks the byte budget. CPU is left to CFS: under a CPU quota the Linux scheduler throttles the process and each batch takes longer. There is no separate CPU brake: a pod short of CPU falls behind, and the lag that builds is the autoscaler's signal (see "Why memory is HARD and CPU is deliberately dropped" below).
 
 Self-regulation is ON by default. Opt out with `self_regulation.enabled =
 false`, which builds nothing on the vertical side; horizontal scaling via
@@ -114,11 +109,7 @@ that always gets through.
 
 CPU is deliberately NOT a pressure source:
 
-- **CFS self-corrects.** Under a CPU quota the Linux scheduler throttles the
-  process for us. A CPU-bound stage simply takes longer per batch; the
-  byte-budget loop sees the longer process time and shrinks on its own. No
-  separate CPU brake is needed -- adding one would double-count the same
-  signal.
+- **CFS self-corrects.** Under a CPU quota the Linux scheduler throttles the process for us. A CPU-bound stage simply takes longer per batch. The byte budget does not react to that: a busy stage is not short of memory, and smaller blocks would only add per-call overhead.
 - **CPU saturation surfaces as lag, and lag is KEDA's job.** A pod that
   cannot keep up grows consumer lag; KEDA reads the lag and adds a replica.
   Horizontal scale is the right answer to "not enough CPU", not pausing
@@ -175,24 +166,14 @@ flowchart TD
   pauses the inbound SOURCE (stops pulling new work) -- never the outbound
   drain. See [backpressure.md](backpressure.md) for why gating the drain
   deadlocks.
-- **ByteBudgetController** (`src/governor/budget.rs`) is an AIMD
-  (additive-increase / multiplicative-decrease) lever that sizes the inbound
-  byte budget for a target utilisation `rho ~= 0.7`. Slack grows the budget
-  additively; falling behind shrinks it multiplicatively; a memory HARD
-  override shrinks IMMEDIATELY regardless of `rho`. See
-  [kafka-path.md](kafka-path.md) for the full AIMD description and the
-  PROCESS byte-budget's place among the three Kafka batch sizes.
+- **ByteBudgetController** (`src/governor/budget.rs`) is an AIMD (additive-increase / multiplicative-decrease) lever that sizes the inbound byte budget: the payload bytes one receive retains and one sub-block holds. The byte budget shrinks only under memory pressure: while the latch holds, each block shrinks it by `md_factor` toward its floor, and otherwise each block grows it by the profile's step toward the profile's ceiling. Utilisation and CPU saturation are the autoscaler's signal, not the budget's. Under a backlog a stage is about as busy at every block size, so a budget that shrank on utilisation would fall to its floor and cap throughput at the sink's per-call cost. See [kafka-path.md](kafka-path.md) for the PROCESS byte-budget's place among the three Kafka batch sizes.
 
-The controller starts BIG (`start_bytes`) and lets the decrease loop find
-the level -- a cold pipeline is never artificially throttled. While pressure
-is LOW the budget sits at its big start value, so a received block becomes a
-SINGLE sub-block with no per-record overhead: behaviour matches the
-whole-batch loop. Near-zero cost off-pressure.
+The controller starts BIG (`start_bytes`), so a cold pipeline is never artificially throttled, and grows toward its ceiling while memory is clear. Without memory pressure the budget stays at or above its start value, so a received block becomes a SINGLE sub-block with no per-record overhead: behaviour matches the whole-batch loop. Near-zero cost off-pressure.
 
 The governed driver (`BatchEngine::run_governed`) is the run path a
 self-regulating app calls. It dispatches on whether the byte budget is wired:
 budget present -> stream in sub-blocks sized to the current budget and fold
-each block's `(bytes, process_time, ingest_interval)` into the AIMD loop;
+each block into it;
 budget absent (governor off) -> delegate verbatim to `run_workbatch`,
 byte-identical to pre-governor behaviour. The streaming sub-block mechanics
 live in [backpressure.md](backpressure.md).
@@ -245,8 +226,7 @@ self_regulation:
   pause_above: 0.80        # arm the inbound hold when combined pressure reaches this
   resume_below: 0.65       # release the hold when pressure drops to this (must be < pause_above)
   max_hold_secs: 30        # longest one hold lasts above resume_below; 0 = no bound
-  target_rho: 0.7          # target utilisation for the byte-budget AIMD loop, in (0, 1)
-  md_factor: 0.5           # multiplicative-decrease factor, in (0, 1)
+  md_factor: 0.5           # byte-budget decrease per block under memory pressure, in (0, 1)
 ```
 
 - **`enabled`** -- the only knob most apps touch. `false` builds nothing.
@@ -263,11 +243,8 @@ self_regulation:
 - **`max_hold_secs`** -- the bound on one hold (see "How the loop works").
   `0` restores the unbounded latch, which holds until the level falls to
   `resume_below` however long that takes.
-- **`target_rho`** -- how busy to keep the stage. Lower means more headroom
-  (safer under bursts); higher means tighter packing (more efficient,
-  riskier).
-- **`md_factor`** -- how hard to brake when behind or under memory pressure.
-  `0.5` halves the budget per decrease step.
+- **`md_factor`** -- how hard to brake under memory pressure. `0.5` halves the budget per block while the latch holds.
+- **`target_rho`** -- has no effect: the byte budget shrinks only under memory pressure. The key is still accepted, so a config that sets it loads unchanged.
 
 Every default is set so an app that configures nothing gets a fully working,
 default-ON governor. Bad knobs are sanitised, not fatal.
@@ -278,8 +255,7 @@ The default profile is `throughput`, which starts with a large byte budget
 (start-big, back-off-on-pressure). That is the right call for a PB/day
 ingest pod with headroom, but on a small or memory-tight pod it can spike
 in the COLD-START WINDOW -- the very first block is sized to the start
-budget before the AIMD loop or the memory-hard override has seen any
-pressure to react to. The governor self-corrects after that first block
+budget before the memory-hard override has seen any pressure to react to. The governor self-corrects after that first block
 (the memory-hard override drops the budget the moment in-flight bytes climb
 toward the limit), so this is a transient first-block spike, not a steady
 state.

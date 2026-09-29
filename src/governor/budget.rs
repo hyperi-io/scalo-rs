@@ -8,32 +8,27 @@
 
 //! Byte-budget controller: the self-regulation lever.
 //!
-//! Sizes the inbound byte budget so the stage runs at a target
-//! utilisation `rho ~= 0.7` -- busy enough to be efficient, with enough
-//! headroom that a burst does not blow the buffer. The loop is AIMD
-//! (additive-increase / multiplicative-decrease), the classic congestion
-//! lever:
+//! Sizes the inbound byte budget: the payload bytes one receive retains and
+//! one sub-block holds. Memory pressure is the only thing that shrinks it.
+//! Each block folded in moves it one step:
 //!
-//! - `rho = EMA(process_time) / EMA(ingest_interval)` -- how much of the
-//!   inter-arrival gap the stage spends processing. `rho < target` means
-//!   slack (we can pull more); `rho > target` means we are falling
-//!   behind.
-//! - **slack** (`rho < target`): additive-increase the budget by
-//!   `ai_step`, capped at `max_bytes`.
-//! - **behind** (`rho > target`): multiplicative-decrease the budget by
-//!   `md_factor` (`< 1`).
-//! - **memory HARD override**: if the pressure latch says hold (or the
-//!   memory source reads high), multiplicative-decrease IMMEDIATELY,
-//!   regardless of rho. Memory never waits for the rho loop.
+//! - **memory pressure** (the pressure latch holds): multiplicative-decrease
+//!   by `md_factor` (`< 1`), toward the floor.
+//! - **otherwise**: additive-increase by `ai_step`, capped at `max_bytes`.
 //! - **floor**: the budget never drops below `min_bytes` (derived from
 //!   `floor_records`) and never reaches `0`. The [`record_cap`] poll
 //!   safety cap stays `>= 1`.
 //!
 //! [`record_cap`]: ByteBudgetController::record_cap
 //!
-//! Starts BIG (`start_bytes`) and lets the decrease loop find the right
-//! level, rather than starting small and ramping -- a cold pipeline should
-//! not be artificially throttled.
+//! How busy the stage is does not move the budget. Under a backlog a stage
+//! spends about as long processing a block as it waits between receives, at
+//! any block size, so a utilisation-driven decrease would halve the budget
+//! every block down to the floor, where the fixed cost of each sink call caps
+//! throughput. Utilisation and CPU saturation are the autoscaler's signal.
+//!
+//! Starts BIG (`start_bytes`) so a cold pipeline is not artificially
+//! throttled, and grows from there until memory pressure says otherwise.
 //!
 //! Gated behind the `governor` feature; folded per block by
 //! [`run_governed`](crate::worker::BatchEngine::run_governed) (default-on).
@@ -44,10 +39,10 @@ use std::time::Duration;
 
 use super::source::UnifiedPressure;
 
-/// EMA smoothing factor for the process-time / ingest-interval signals.
+/// Default [`ByteBudgetConfig::ema_alpha`], a field with no effect on the budget.
 const DEFAULT_EMA_ALPHA: f64 = 0.3;
 
-/// Target utilisation: keep the stage ~70% busy, 30% headroom.
+/// Default [`ByteBudgetConfig::target_rho`], a field with no effect on the budget.
 const DEFAULT_TARGET_RHO: f64 = 0.7;
 
 /// Configuration for the [`ByteBudgetController`].
@@ -68,13 +63,17 @@ pub struct ByteBudgetConfig {
     /// `floor_records`. Record sizes vary at runtime; this is only the
     /// floor estimate, not a live measurement.
     pub nominal_record_bytes: u64,
-    /// Target utilisation `rho` in `(0, 1)`. Default `0.7`.
+    /// Has no effect on the budget, which moves on memory pressure alone.
+    /// Accepted so a config that sets it still builds. Default `0.7`.
     pub target_rho: f64,
-    /// Additive-increase step (bytes added per slack observation).
+    /// Additive-increase step: bytes added per block folded in while the
+    /// pressure latch is clear.
     pub ai_step: u64,
-    /// Multiplicative-decrease factor in `(0, 1)`. Default e.g. `0.5`.
+    /// Multiplicative-decrease factor in `(0, 1)`, applied per block folded in
+    /// while the pressure latch holds. Default `0.5`.
     pub md_factor: f64,
-    /// EMA smoothing factor in `(0, 1]` for the timing signals.
+    /// Has no effect on the budget, which reads no timing signal. Accepted so
+    /// a config that sets it still builds. Default `0.3`.
     pub ema_alpha: f64,
     /// Poll-safety cap on record count, independent of the byte budget.
     /// A tiny-record flood cannot blow the count even within budget.
@@ -109,17 +108,10 @@ impl ByteBudgetConfig {
             .max(1)
     }
 
-    /// Sanitise the config so the control loop cannot misbehave: clamp
-    /// `target_rho` and `ema_alpha` into their open ranges, force
-    /// `md_factor` into `(0, 1)`, and ensure `record_cap >= 1`,
-    /// `max_bytes >= min_bytes`, and `start_bytes` inside `[min, max]`.
+    /// Sanitise the config so the budget cannot misbehave: force `md_factor`
+    /// into `(0, 1)`, and ensure `record_cap >= 1`, `max_bytes >= min_bytes`,
+    /// and `start_bytes` inside `[min, max]`.
     fn sanitised(mut self) -> Self {
-        if !self.target_rho.is_finite() || self.target_rho <= 0.0 || self.target_rho >= 1.0 {
-            self.target_rho = DEFAULT_TARGET_RHO;
-        }
-        if !self.ema_alpha.is_finite() || self.ema_alpha <= 0.0 || self.ema_alpha > 1.0 {
-            self.ema_alpha = DEFAULT_EMA_ALPHA;
-        }
         if !self.md_factor.is_finite() || self.md_factor <= 0.0 || self.md_factor >= 1.0 {
             self.md_factor = 0.5;
         }
@@ -131,23 +123,6 @@ impl ByteBudgetConfig {
     }
 }
 
-/// Stores an `f64` as an atomic bit-pattern so the controller stays
-/// `Sync` with interior mutability and no lock (the crate forbids
-/// `unsafe`, so a `Cell` would not be `Sync`).
-struct AtomicF64(AtomicU64);
-
-impl AtomicF64 {
-    fn new(value: f64) -> Self {
-        Self(AtomicU64::new(value.to_bits()))
-    }
-    fn load(&self) -> f64 {
-        f64::from_bits(self.0.load(Ordering::Relaxed))
-    }
-    fn store(&self, value: f64) {
-        self.0.store(value.to_bits(), Ordering::Relaxed);
-    }
-}
-
 /// Write the budget to `self_regulation_byte_budget`, on every change.
 fn publish_budget(bytes: u64) {
     #[cfg(feature = "metrics")]
@@ -156,20 +131,15 @@ fn publish_budget(bytes: u64) {
     let _ = bytes;
 }
 
-/// AIMD byte-budget lever with a memory HARD override.
+/// Byte-budget lever: shrinks while the memory pressure latch holds, grows
+/// otherwise.
 ///
-/// See the [module docs](crate::governor) for the algorithm. `observe()`
-/// is the control step; `byte_budget()` and `record_cap()` are the cheap reads
-/// the recv loop consults. All state is interior-mutable and `Sync`.
+/// [`observe`](Self::observe) is the control step; `byte_budget()` and
+/// `record_cap()` are the cheap reads the recv loop consults. All state is
+/// interior-mutable and `Sync`.
 pub struct ByteBudgetController {
     cfg: ByteBudgetConfig,
     pressure: Arc<UnifiedPressure>,
-    /// EMA of observed batch process time, in seconds.
-    ema_process_s: AtomicF64,
-    /// EMA of observed ingest inter-arrival interval, in seconds.
-    ema_ingest_s: AtomicF64,
-    /// Whether any timing observation has been folded in yet.
-    seeded: std::sync::atomic::AtomicBool,
     /// Current byte budget.
     budget: AtomicU64,
 }
@@ -185,71 +155,23 @@ impl ByteBudgetController {
         publish_budget(cfg.start_bytes);
         Self {
             budget: AtomicU64::new(cfg.start_bytes),
-            ema_process_s: AtomicF64::new(0.0),
-            ema_ingest_s: AtomicF64::new(0.0),
-            seeded: std::sync::atomic::AtomicBool::new(false),
             cfg,
             pressure,
         }
     }
 
-    /// Fold one observation into the control loop and update the budget.
+    /// Fold one block into the budget.
     ///
-    /// `batch_bytes` is currently informational (the loop drives off
-    /// timing, not size); `process_time` is how long the batch took to
-    /// process and `ingest_interval` is the gap since the previous
-    /// batch's arrival.
-    ///
-    /// Steps, in order:
-    /// 1. EMA-smooth `process_time` and `ingest_interval`.
-    /// 2. Compute `rho = ema_process / ema_ingest`. A zero (or
-    ///    sub-resolution) `ingest_interval` means arrivals are
-    ///    back-to-back faster than we process -- treat rho as high
-    ///    (behind), which is the safe direction (shrink).
-    /// 3. If memory says hold (the HARD override), multiplicative-decrease
-    ///    and return -- memory never waits for the rho loop.
-    /// 4. Otherwise AIMD on rho vs `target_rho`.
-    /// 5. Clamp to `[min_bytes, max_bytes]`.
+    /// While the pressure latch holds, the budget shrinks by `md_factor`
+    /// toward the floor; otherwise it grows by `ai_step` toward `max_bytes`.
+    /// The arguments describe the block (its payload bytes, how long it took
+    /// to process, and the gap since the previous receive) and do not move
+    /// the budget.
     pub fn observe(&self, batch_bytes: u64, process_time: Duration, ingest_interval: Duration) {
-        let _ = batch_bytes; // reserved for a future size-aware refinement
+        let _ = (batch_bytes, process_time, ingest_interval);
 
-        let alpha = self.cfg.ema_alpha;
-        let proc_s = process_time.as_secs_f64();
-        let ingest_s = ingest_interval.as_secs_f64();
-
-        // Step 1: EMA. Seed on the first observation so the average is not
-        // dragged from a 0.0 cold start.
-        if self.seeded.swap(true, Ordering::Relaxed) {
-            let new_proc = alpha.mul_add(proc_s, (1.0 - alpha) * self.ema_process_s.load());
-            let new_ingest = alpha.mul_add(ingest_s, (1.0 - alpha) * self.ema_ingest_s.load());
-            self.ema_process_s.store(new_proc);
-            self.ema_ingest_s.store(new_ingest);
-        } else {
-            self.ema_process_s.store(proc_s);
-            self.ema_ingest_s.store(ingest_s);
-        }
-
-        // Step 3: memory HARD override takes precedence over rho entirely. The
-        // budget admits nothing, so it leaves an expired hold's window to the gates.
+        // The budget admits nothing, so it leaves an expired hold's window to the gates.
         if self.pressure.should_hold_without_admitting() {
-            self.multiplicative_decrease();
-            return;
-        }
-
-        // Step 2: rho. Guard div-by-zero: a non-positive ingest EMA means
-        // arrivals outrun processing -> treat as "behind" (shrink).
-        let ema_ingest = self.ema_ingest_s.load();
-        let ema_process = self.ema_process_s.load();
-        let behind = if ema_ingest <= f64::EPSILON {
-            // Back-to-back arrivals with any processing cost -> behind.
-            // Pure-zero processing AND zero ingest -> nothing to do.
-            ema_process > 0.0
-        } else {
-            (ema_process / ema_ingest) > self.cfg.target_rho
-        };
-
-        // Step 4: AIMD.
-        if behind {
             self.multiplicative_decrease();
         } else {
             self.additive_increase();
@@ -378,68 +300,107 @@ mod tests {
         assert_eq!(ctl.record_cap(), 2000);
     }
 
-    /// rho < 0.7 (slack) -> budget grows additively, monotone up, capped.
-    #[test]
-    fn slack_grows_budget_additively_and_caps() {
-        let src = Arc::new(MockSource::new(0.0)); // no memory pressure
-        let (ctl, _p) = controller(test_cfg(), &src);
-
-        // process 10ms, ingest 100ms -> rho = 0.1 < 0.7 -> slack.
-        let mut last = ctl.byte_budget();
-        for _ in 0..50 {
-            ctl.observe(500, ms(10), ms(100));
-            let now = ctl.byte_budget();
-            assert!(now >= last, "budget must be monotone up under slack");
-            last = now;
-        }
-        // ai_step 5000, start 10_000, cap 100_000 -> saturates at the cap.
-        assert_eq!(ctl.byte_budget(), 100_000, "additive-increase caps at max");
+    /// Block timings from an idle stage to a fully busy one, as
+    /// `(process_time, ingest_interval)`. A backlog reads as fully busy at any
+    /// block size.
+    fn utilisations() -> [(Duration, Duration); 4] {
+        [
+            (ms(10), ms(100)),
+            (ms(90), ms(100)),
+            (ms(100), ms(100)),
+            (ms(20), ms(19)),
+        ]
     }
 
-    /// rho > 0.7 (behind) -> budget shrinks multiplicatively toward floor.
+    /// Without memory pressure the budget grows one `ai_step` a block to the
+    /// cap, however busy the stage is.
     #[test]
-    fn behind_shrinks_budget_multiplicatively() {
+    fn without_memory_pressure_the_budget_grows_to_the_cap_at_any_utilisation() {
+        for (process, ingest) in utilisations() {
+            let src = Arc::new(MockSource::new(0.0));
+            let (ctl, _p) = controller(test_cfg(), &src);
+
+            ctl.observe(500, process, ingest);
+            assert_eq!(
+                ctl.byte_budget(),
+                15_000,
+                "one ai_step up (10_000 + 5_000) at process {process:?}, ingest {ingest:?}"
+            );
+            let mut last = ctl.byte_budget();
+            for _ in 0..50 {
+                ctl.observe(500, process, ingest);
+                let now = ctl.byte_budget();
+                assert!(
+                    now >= last,
+                    "monotone up at process {process:?}, ingest {ingest:?}"
+                );
+                last = now;
+            }
+            assert_eq!(ctl.byte_budget(), 100_000, "capped at max_bytes");
+        }
+    }
+
+    /// A zero ingest interval (the first block, or back-to-back receives)
+    /// grows the budget like any other block without memory pressure.
+    #[test]
+    fn a_zero_ingest_interval_grows_the_budget_without_memory_pressure() {
         let src = Arc::new(MockSource::new(0.0));
         let (ctl, _p) = controller(test_cfg(), &src);
 
-        // process 90ms, ingest 100ms -> rho = 0.9 > 0.7 -> behind.
-        let first = ctl.byte_budget();
-        ctl.observe(500, ms(90), ms(100));
-        let after = ctl.byte_budget();
-        assert!(after < first, "behind must shrink the budget");
-        // 10_000 * 0.5 = 5_000.
-        assert_eq!(after, 5_000);
-
-        // Keep going -> shrinks toward the 1000-byte floor, never below.
-        for _ in 0..20 {
-            ctl.observe(500, ms(90), ms(100));
-        }
-        assert_eq!(ctl.byte_budget(), 1_000, "shrink clamps to min_bytes");
-        assert!(ctl.byte_budget() >= 1, "never zero");
+        ctl.observe(500, ms(5), Duration::ZERO);
+        assert_eq!(
+            ctl.byte_budget(),
+            15_000,
+            "the first block does not shrink the budget"
+        );
+        ctl.observe(0, Duration::ZERO, Duration::ZERO);
+        assert_eq!(ctl.byte_budget(), 20_000, "an empty block grows it too");
     }
 
-    /// Anti-starvation lifecycle: sustained "behind" pins the budget at the
-    /// record floor (never zero, always room for >=1 record), and once the
-    /// pressure clears the budget RECOVERS via additive-increase -- the floor
-    /// is a floor, not a trap. The recovery is deliberately the gentle linear
-    /// AIMD climb, NOT a jump-reset: a reset on repeated floor hits would
-    /// re-introduce the very oscillation AIMD exists to damp.
+    /// The memory latch halves the budget every block, whatever the timings,
+    /// down to the floor and never below it.
     #[test]
-    fn floor_never_starves_then_recovers_when_pressure_clears() {
-        let src = Arc::new(MockSource::new(0.0));
-        let (ctl, _p) = controller(test_cfg(), &src);
+    fn the_memory_latch_shrinks_the_budget_toward_the_floor() {
+        for (process, ingest) in utilisations() {
+            let src = Arc::new(MockSource::new(0.0));
+            let (ctl, _p) = controller(test_cfg(), &src);
+            ctl.observe(500, process, ingest);
+            ctl.observe(500, process, ingest);
+            assert_eq!(ctl.byte_budget(), 20_000);
 
-        // Sustained behind (rho 0.9 > 0.7) -> pinned to the 1000-byte floor.
+            src.set(0.95);
+            ctl.observe(500, process, ingest);
+            assert_eq!(
+                ctl.byte_budget(),
+                10_000,
+                "20_000 * 0.5 at process {process:?}, ingest {ingest:?}"
+            );
+            for _ in 0..20 {
+                ctl.observe(500, process, ingest);
+            }
+            assert_eq!(ctl.byte_budget(), 1_000, "clamped to min_bytes");
+            assert!(ctl.record_cap() >= 1);
+        }
+    }
+
+    /// The floor still admits a record, and once the memory latch releases the
+    /// budget climbs back one `ai_step` a block to the cap, with the stage fully
+    /// busy throughout.
+    #[test]
+    fn the_budget_recovers_from_the_floor_when_the_memory_latch_releases() {
+        let src = Arc::new(MockSource::new(0.95));
+        let (ctl, _p) = controller(test_cfg(), &src);
+        let busy = (ms(100), ms(100));
+
         for _ in 0..30 {
-            ctl.observe(500, ms(90), ms(100));
+            ctl.observe(500, busy.0, busy.1);
         }
-        assert_eq!(ctl.byte_budget(), 1_000, "sustained pressure pins to floor");
-        // The floor still admits at least one record -- no starvation/livelock.
+        assert_eq!(ctl.byte_budget(), 1_000, "the held latch pins the floor");
         assert!(ctl.byte_budget() >= test_cfg().nominal_record_bytes);
-        assert!(ctl.record_cap() >= 1);
 
-        // Pressure clears (rho 0.1 << 0.7) -> additive-increase climbs back.
-        ctl.observe(500, ms(10), ms(100));
+        // Below resume_below (0.65), so the latch releases.
+        src.set(0.10);
+        ctl.observe(500, busy.0, busy.1);
         assert_eq!(
             ctl.byte_budget(),
             6_000,
@@ -447,75 +408,12 @@ mod tests {
         );
         let mut last = ctl.byte_budget();
         for _ in 0..50 {
-            ctl.observe(500, ms(10), ms(100));
+            ctl.observe(500, busy.0, busy.1);
             let now = ctl.byte_budget();
-            assert!(now >= last, "must be monotone up while recovering");
+            assert!(now >= last, "monotone up while recovering");
             last = now;
         }
-        assert_eq!(
-            ctl.byte_budget(),
-            100_000,
-            "recovers all the way to the cap"
-        );
-    }
-
-    /// THE adversarial test: memory HARD override beats rho.
-    ///
-    /// Even with rho deep in slack (would grow), forcing memory pressure
-    /// high (`should_hold()` true) must multiplicative-decrease the budget
-    /// IMMEDIATELY, toward the floor, never to zero.
-    #[test]
-    fn memory_pressure_overrides_rho_and_shrinks_to_floor() {
-        let src = Arc::new(MockSource::new(0.0));
-        let (ctl, _p) = controller(test_cfg(), &src);
-
-        // Grow a bit first under slack so there is room to shrink.
-        ctl.observe(500, ms(10), ms(100)); // -> 15_000
-        ctl.observe(500, ms(10), ms(100)); // -> 20_000
-        assert_eq!(ctl.byte_budget(), 20_000);
-
-        // Now SLAM memory high. rho is still deep slack (10ms/100ms) but
-        // the HARD override must win and SHRINK.
-        src.set(0.95);
-        let before = ctl.byte_budget();
-        ctl.observe(500, ms(10), ms(100));
-        let after = ctl.byte_budget();
-        assert!(
-            after < before,
-            "memory override must shrink even when rho says slack"
-        );
-        assert_eq!(after, 10_000, "20_000 * 0.5 under override");
-
-        // Sustained pressure drives toward the floor, never zero.
-        for _ in 0..20 {
-            ctl.observe(500, ms(10), ms(100));
-        }
-        assert_eq!(ctl.byte_budget(), 1_000, "override clamps to floor");
-        assert!(ctl.byte_budget() >= 1);
-        assert!(ctl.record_cap() >= 1);
-    }
-
-    /// ingest_interval == 0 must not panic or divide-by-zero, and must be
-    /// treated as "behind" (shrink) -- the safe direction.
-    #[test]
-    fn zero_ingest_interval_is_safe_and_treated_as_behind() {
-        let src = Arc::new(MockSource::new(0.0));
-        let (ctl, _p) = controller(test_cfg(), &src);
-
-        let before = ctl.byte_budget();
-        // Zero ingest interval, non-zero processing -> behind -> shrink.
-        ctl.observe(500, ms(5), Duration::ZERO);
-        let after = ctl.byte_budget();
-        assert!(after <= before, "zero ingest must not grow the budget");
-        assert_eq!(after, 5_000, "treated as behind -> multiplicative-decrease");
-        assert!(ctl.byte_budget() >= 1);
-
-        // Both zero -> nothing to do (no processing cost, no arrivals):
-        // must not panic and must not collapse the budget below the floor.
-        let cur = ctl.byte_budget();
-        ctl.observe(0, Duration::ZERO, Duration::ZERO);
-        // alpha=1 so ema_process becomes 0 -> not behind -> additive-increase.
-        assert!(ctl.byte_budget() >= cur, "both-zero is no-pressure slack");
+        assert_eq!(ctl.byte_budget(), 100_000, "recovers to the cap");
     }
 
     /// A driver folds a block between two receives. When the hold expires
