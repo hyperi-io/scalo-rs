@@ -224,16 +224,11 @@ WARN  self-regulation: inbound PAUSED under pressure (memory/back-pressure brake
 INFO  self-regulation: inbound RESUMED  source=kafka
 ```
 
-A hold that reaches `max_hold_secs` also logs, at most once a minute, the
-level and how long it held:
-
-```text
-WARN  self-regulation: hold reached max_hold with pressure still above resume_below; admitting one window  pressure=0.81 resume_below=0.65 held_secs=30.0 signal=memory
-```
-
-Pause and resume pairs about `max_hold_secs` apart, with that warning, mean
-the level is not falling to `resume_below` -- check the memory guard and
-consumer lag.
+A hold that reaches `max_hold_secs` also logs a WARN, at most once a minute,
+`hold reached max_hold`, with the `pressure`, `resume_below`, `held_secs` and
+the `signal` that set the level. Pause and resume pairs about `max_hold_secs`
+apart, with that warning, mean the level is not falling to `resume_below` --
+check the memory guard and consumer lag.
 
 ---
 
