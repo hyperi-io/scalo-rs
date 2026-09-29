@@ -42,10 +42,17 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tokio_util::sync::CancellationToken;
 
-/// Kafka to test against, pinned by digest.
-// renovate: datasource=docker depName=apache/kafka-native
-const KAFKA_IMAGE_REF: &str =
-    "4.3.1@sha256:2885898ba17065023f1bd605f3a81efcfa986014f062b73b91ef5462485f9060";
+/// Kafka to test against, pinned by digest. The JVM image: `apache/kafka-native` before 4.4.0
+/// segfaults in `getpwuid` on ~2% of starts.
+// renovate: datasource=docker depName=apache/kafka
+const KAFKA_TAG: &str = "4.3.1";
+
+/// Digest of `KAFKA_TAG`, apart from it because the Renovate regex stops at a colon.
+const KAFKA_DIGEST: &str =
+    "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
+
+/// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
+const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// An ack wait long enough to outlast a paused broker, or one restarting.
 const LONG_ACK_WAIT: Duration = Duration::from_secs(30);
@@ -87,8 +94,10 @@ fn free_port() -> u16 {
 async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
     let port = free_port();
     let node = Kafka::default()
-        .with_tag(KAFKA_IMAGE_REF)
+        .with_jvm_image()
+        .with_tag(format!("{KAFKA_TAG}@{KAFKA_DIGEST}"))
         .with_mapped_port(port, apache::KAFKA_PORT)
+        .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("start kafka container");
