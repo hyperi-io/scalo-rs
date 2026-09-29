@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// Process metrics collector.
 ///
@@ -34,9 +34,9 @@ impl ProcessMetrics {
     #[must_use]
     pub fn new(_namespace: &str) -> Self {
         let pid = sysinfo::Pid::from_u32(std::process::id());
-        let system = System::new_with_specifics(
-            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-        );
+        // Empty: loading every process would hold a /proc file open for each
+        // one on the host. `update` refreshes this process alone.
+        let system = System::new();
 
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -87,9 +87,9 @@ impl ProcessMetrics {
         );
 
         if let Some(process) = system.process(self.pid) {
-            // CPU time (approximate - sysinfo gives percentage, not total time)
-            let cpu_usage = f64::from(process.cpu_usage());
-            metrics::gauge!("process_cpu_seconds_total").set(cpu_usage);
+            // sysinfo reports accumulated user + system CPU time in milliseconds.
+            let cpu_seconds = process.accumulated_cpu_time() as f64 / 1000.0;
+            metrics::gauge!("process_cpu_seconds_total").set(cpu_seconds);
 
             // Memory
             let rss = process.memory();
@@ -133,5 +133,41 @@ mod tests {
         let pm = ProcessMetrics::new("test");
         // Should not panic
         pm.update();
+    }
+
+    /// The collector tracks this process alone, never the rest of the host.
+    #[test]
+    fn only_this_process_is_loaded() {
+        let pm = ProcessMetrics::new("test");
+        pm.update();
+        let system = pm.system.lock().unwrap_or_else(|e| e.into_inner());
+        let pids: Vec<_> = system.processes().keys().copied().collect();
+        assert_eq!(pids, vec![pm.pid], "{pids:?}");
+    }
+
+    /// CPU seconds is accumulated time, so it never falls between updates.
+    #[test]
+    fn cpu_seconds_is_accumulated_time() {
+        let pm = ProcessMetrics::new("test");
+        pm.update();
+        let first = {
+            let system = pm.system.lock().unwrap_or_else(|e| e.into_inner());
+            system
+                .process(pm.pid)
+                .map(sysinfo::Process::accumulated_cpu_time)
+        };
+        let mut spin = 0u64;
+        for i in 0..20_000_000u64 {
+            spin = spin.wrapping_add(i ^ spin);
+        }
+        std::hint::black_box(spin);
+        pm.update();
+        let second = {
+            let system = pm.system.lock().unwrap_or_else(|e| e.into_inner());
+            system
+                .process(pm.pid)
+                .map(sysinfo::Process::accumulated_cpu_time)
+        };
+        assert!(second >= first, "{first:?} then {second:?}");
     }
 }
