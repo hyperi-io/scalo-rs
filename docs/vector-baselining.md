@@ -1,18 +1,19 @@
 # Vector baselining + integration
 
-Project doc. Vector is a first-class part of the DFE picture: DFE already uses
-it (2.1 and earlier), and DFE 2.2+ is deliberately swap-in/swap-out integratable
-with Vector. This doc is the standing reference for how we BASELINE scalo against
+Project doc. Vector is a first-class part of the downstream app suite's
+design: the suite already uses it in its earlier releases, and the current
+line is deliberately swap-in/swap-out integratable with Vector. This doc is
+the standing reference for how we BASELINE scalo against
 the Vector equivalent (better, or at least not worse) and how we keep clean
 INTEGRATION with Vector pipelines - cooperative, not a competitive "bake-off".
 
-It compares the scalo-rs data-plane runtime + the DFE app stack against
+It compares the scalo-rs data-plane runtime + a downstream app suite against
 vectordotdev/vector (now Datadog) across data model, concurrency,
 self-regulation, auto-scaling, transport and efficiency; then specifies the
 per-app baselining + integration benches (Section 7) so we get real, repeatable
 numbers vs the Vector equivalent instead of marketing claims.
 
-Sources: source read of /projects/scalo-rs, /projects/dfe-* and /projects/vector,
+Sources: source read of this repo, the downstream consumer apps, and vectordotdev/vector,
 plus web research. Primary-source URLs inline. Design-target (not measured) or
 vendor-reported claims are flagged; a consolidated "not verified" list is at the
 end. First written 2026-06-26.
@@ -22,8 +23,9 @@ end. First written 2026-06-26.
 ## Purpose and framing (read this first)
 
 This is a **decision aid**, not a marketing exercise - and it is NOT a
-"bake-off". We already USE Vector for a large part of DFE (2.1 and earlier),
-and DFE 2.2+ is deliberately built to be easily integratable with Vector -
+"bake-off". We already USE Vector for a large part of the downstream suite
+(its earlier releases), and its current line is deliberately built to be
+easily integratable with Vector -
 swap components in and out. So the relationship is cooperative, not
 competitive. The benches (Section 7) exist for two things:
 
@@ -43,7 +45,7 @@ point. **scalo and Vector are different deployment philosophies:**
   sinks, glue anything to anything, horizontal scaling delegated entirely
   to k8s, self-regulation limited to sink-side ARC + bounded buffers.
   Brilliant for breadth and "drop it in anywhere".
-- **scalo + the DFE stack = an optimised, opinionated data plane.**
+- **scalo + a downstream app suite = an optimised, opinionated data plane.**
   Purpose-built *bookends* (a specialised ingest receiver, specialised
   egress loader/archiver) rather than generic source/sink for everything;
   **built-in horizontal scaling** (a blended KEDA `ScalingPressure`
@@ -206,11 +208,13 @@ generic tool.
   load shedding, not an OOM guarantee. Reads the kernel's cgroup figure
   by default -- an app opts in to `set_heap_source` to gate on its own
   allocator's figure instead.
-- **ByteBudgetController** (`src/governor/budget.rs`): AIMD on
-  rho = EMA(process_time)/EMA(ingest_interval). rho<0.7 additive
-  increase, rho>0.7 multiplicative decrease (0.5), memory pressure forces
-  immediate decrease. Cold-starts big, collapses to a single sub-block
-  under low load (zero overhead).
+- **ByteBudgetController** (`src/governor/budget.rs`): AIMD on memory
+  pressure only. While the latch holds, each block shrinks the budget by
+  `md_factor` toward its floor; otherwise each block grows it by the
+  profile's step toward the ceiling. Utilisation/CPU are not inputs -
+  they are the autoscaler's signal, not the budget's (see
+  [self-regulation.md](self-regulation.md)). Cold-starts big, collapses
+  to a single sub-block under low load (zero overhead).
 - **InboundGate** (`src/governor/gate.rs`): pauses the **source** on the
   rising edge (Kafka pause-assigned partitions, HTTP 503, fetcher-pause),
   resumes on the falling edge. Never throttles the sink.
@@ -370,7 +374,7 @@ route/filter/forward workload (no mutation), scalo should beat Vector
 per-core because it skips the eager parse Vector pays at ingest - perhaps
 1.5-3x on MiB/s for pass-through and light-route, narrowing toward parity
 once every record is fully parsed and mutated (where Vector's model is
-purpose-built). For the *same VRL program*, dfe-transform-vrl and
+purpose-built). For the *same VRL program*, the VRL-transform app and
 Vector's `remap` share the VRL crate, so per-event transform cost should
 be close - the delta is runtime overhead (in-process vs Tokio task,
 batch shape), NOT the language. These are hypotheses. Measure them.
@@ -379,7 +383,7 @@ batch shape), NOT the language. These are hypotheses. Measure them.
 
 ## 7. Proposed Vector-baselining + integration benches (the deliverable)
 
-Goal: a **default baseline comparator** in each dfe- app so `cargo bench`
+Goal: a **default baseline comparator** in each downstream app so `cargo bench`
 gives real, repeatable numbers vs the equivalent Vector topology, on the
 same corpus, on the same box. Use-case-driven, not micro-trivia. Two purposes
 (from the framing note at the top): BASELINING (is the whole picture
@@ -413,7 +417,7 @@ with a Vector pipeline, so a bench also doubles as an interop check).
 
 ### 7.1 GA apps (commit full benches)
 
-**dfe-receiver** - multi-protocol ingest. Use case: accept events at the
+**the ingest app** - multi-protocol ingest. Use case: accept events at the
 edge, normalise, forward.
 - Benches: `http_json_ingest`, `grpc_ingest`, `otlp_ingest`,
   `syslog_ingest`, each -> memory/blackhole sink. Variants: 200 B vs
@@ -422,7 +426,7 @@ edge, normalise, forward.
 - Vector comparator: `http_server`/`opentelemetry`/`syslog` source ->
   `blackhole`. This is the cleanest ingest baseline.
 
-**dfe-loader** - table routing / fan-out dispatch. Use case: route by
+**the router app** - table routing / fan-out dispatch. Use case: route by
 `_table` to N topics.
 - Benches: `route_by_table_cel` (1->1 by CEL over the SIMD pre-route
   path), `fanout_transform` (N in -> M out, ack accounting),
@@ -432,7 +436,7 @@ edge, normalise, forward.
 - Vector comparator: `route` (or `exclusive_route`) transform + N sinks.
   Highlights scalo's "route on raw bytes" vs Vector's "parse then route".
 
-**dfe-fetcher** - scheduled pull / poll. Use case: poll an API/container,
+**the fetcher app** - scheduled pull / poll. Use case: poll an API/container,
 enrich, forward, persist cursor.
 - Benches: avoid live external APIs (no mocks of real deps either) - use
   the **file** and **container/log extractor** sources over a fixed
@@ -443,7 +447,7 @@ enrich, forward, persist cursor.
   blackhole. (Vector has no cursor-pull-API analogue, so cursor_overhead
   is a scalo-only line - report it, do not fake a comparator.)
 
-**dfe-archiver** - Kafka -> object storage. Use case: batch, compress,
+**the archiver app** - Kafka -> object storage. Use case: batch, compress,
 roll, ship.
 - Benches: `compress_roll_zstd|lz4|snappy|gzip`, `roll_by_size` (1 GB),
   `roll_by_time`, `multi_destination_fanout` (64 hot destinations).
@@ -453,7 +457,7 @@ roll, ship.
   with matching batch/compression settings (use a local MinIO/S3-compatible
   endpoint via testcontainers, real backend, no mock).
 
-**dfe-transform-vrl** - in-process VRL. Use case: parse/enrich/drop/remap.
+**the VRL-transform app** - in-process VRL. Use case: parse/enrich/drop/remap.
 - Benches: a VRL complexity ladder - `vrl_passthrough`, `vrl_parse_json`,
   `vrl_enrich`, `vrl_conditional_drop`, `vrl_heavy_remap` - over the same
   corpus.
@@ -464,12 +468,12 @@ roll, ship.
   The delta isolates scalo's in-process batch runtime vs Vector's Tokio
   task + EventArray. Expect near-parity; any large gap is a finding.
 
-**dfe-transform-vector** - Vector subprocess wrapper. Use case: run
+**the Vector-subprocess-transform app** - Vector subprocess wrapper. Use case: run
 Vector under scalo's lifecycle/metrics.
 - Benches: `wrapper_overhead` (scalo wrapper + Vector vs bare Vector,
   same config), `pipe_conversion_cost` (the JSON pipe in/out tax),
-  `inprocess_vs_subprocess` (same transform via dfe-transform-vrl vs via
-  dfe-transform-vector).
+  `inprocess_vs_subprocess` (same transform via the VRL-transform app vs via
+  the Vector-subprocess-transform app).
 - Metrics: added latency/event, added MiB/s loss, added memory/CPU from
   the subprocess + pipe.
 - Comparator: bare Vector is the baseline; the bench *measures the cost of
@@ -484,19 +488,19 @@ These are not GA; do not over-invest. Land a single representative
 microbench each, then extrapolate from the GA results using a measured
 overhead factor. Print extrapolations clearly as estimates.
 
-**dfe-transform-wasm** (spike) - WASM module per event (wasmtime).
+**the WASM-transform app** (spike) - WASM module per event (wasmtime).
 - Microbench: `wasm_call_overhead` (host<->guest boundary per event),
   `wasm_instantiate` (module/instance reuse cost), `wasm_passthrough` vs
   `wasm_parse_enrich`.
-- Extrapolation: throughput ~= dfe-transform-vrl throughput / wasm_factor,
+- Extrapolation: throughput ~= the VRL-transform app's throughput / wasm_factor,
   where wasm_factor is measured on passthrough then applied to the VRL
   ladder. Expect WASM slower than native VRL but faster than the Vector
   subprocess (no pipe/JSON re-encode, shared address space).
 - Comparator: Vector has **no native WASM transform**, so the honest
   baseline is Vector's `lua` transform as the "scripting" reference, plus
-  dfe-transform-vrl as the native floor. Position WASM between the two.
+  the VRL-transform app as the native floor. Position WASM between the two.
 
-**dfe-transform-elastic** (beta) - Elasticsearch shaping/bulk.
+**the Elasticsearch-transform app** (beta) - Elasticsearch shaping/bulk.
 - Microbench: `bulk_envelope_shaping` (events -> ES `_bulk` ndjson),
   `mapping_transform`. Real ES via testcontainers for an end-to-end line.
 - Extrapolation: shape-only throughput from the microbench; end-to-end
@@ -504,7 +508,7 @@ overhead factor. Print extrapolations clearly as estimates.
 - Comparator: Vector `elasticsearch` sink (same `_bulk`, same batch
   settings). Likely near-parity on shaping; the delta is batching policy.
 
-**dfe-transform-splack** (beta) - Splunk HEC shaping.
+**the Splunk-HEC-transform app** (beta) - Splunk HEC shaping.
 - Microbench: `hec_envelope_shaping`, `hec_batch_pack`.
 - Extrapolation: as for elastic - shaping cost from the microbench, scaled
   by the GA archiver/transform throughput for the full path.
@@ -517,7 +521,7 @@ overhead factor. Print extrapolations clearly as estimates.
   per-core and uncapped, with the box/version header. This becomes the
   baseline artefact we can regenerate per release and watch for regressions
   (scalo-vs-scalo over time AND scalo-vs-the-Vector-baseline).
-- Wire it into hyperi-ci as a non-gating bench job first (numbers are
+- Wire it into CI as a non-gating bench job first (numbers are
   noisy on shared runners); promote to a regression gate only once we
   have a dedicated, pinned bench box.
 
@@ -556,7 +560,7 @@ point.
 ## 9. What scalo should borrow from Vector (grounded gap analysis)
 
 Read against actual source on 2026-06-26. Each item: what scalo has
-today, what Vector has, the recommended disposition, and which dfe apps
+today, what Vector has, the recommended disposition, and which downstream apps
 benefit. Ranked by value x fit, effort noted.
 
 ### First, two myths cleared up
@@ -593,9 +597,9 @@ sender layer (http/grpc first), reusing the AIMD primitive already in
 `governor/budget.rs`. Treat the existing circuit breaker as the hard
 floor; ARC is the graded controller in front of it. Extend the same RTT
 signal to size the outbound batch (Vector batches by size/time; make ours
-shrink under rising RTT/errors). Effort: medium. Targets: dfe-fetcher
-(SaaS/cloud APIs), dfe-transform-elastic (ES `_bulk`), dfe-transform-
-splack (Splunk HEC), dfe-archiver (S3/GCS). This is the single most
+shrink under rising RTT/errors). Effort: medium. Targets: the fetcher app
+(SaaS/cloud APIs), the Elasticsearch-transform app (ES `_bulk`), the
+Splunk-HEC-transform app, the archiver app (S3/GCS). This is the single most
 material gap.
 
 **9.2 Explicit overflow policy with DLQ-on-overflow (Vector when_full).**
@@ -635,8 +639,8 @@ built to win. The genuine sub-gap is narrower:
     this for sequential VRL files; if any path re-parses per step, fix
     it. Add copy-on-write on the parsed `Value` (Vector uses
     `Arc::make_mut`) so a mutating transform doesn't deep-copy untouched
-    fields. Effort: medium. Targets: dfe-transform-vrl, -wasm, -elastic,
-    -splack.
+    fields. Effort: medium. Targets: the transform apps (VRL, WASM,
+    Elasticsearch, Splunk HEC).
 
 **9.5 Explicit rate limiter / throttle (Vector throttle transform).**
 scalo has: none on the sink. Vector has: throttle transform + per-sink
@@ -644,13 +648,13 @@ rate caps. Partly subsumed by 9.1 (ARC handles *dynamic* capacity), but a
 hard token-bucket cap is still needed for downstreams with a *contractual*
 limit ("this API allows 100 req/s"). Recommendation: a token-bucket
 limiter on the sender, configurable per route. Effort: low. Targets:
-dfe-fetcher, -splack, -elastic.
+the fetcher app, and the Splunk-HEC and Elasticsearch transform apps.
 
 ### DECLINE (conscious non-goals - document them)
 
 **9.6 First-class Metric/Trace data types (Vector's typed Metric).** scalo
 converts OTLP metrics/traces to JSON and routes them as opaque records
-(`dfe-receiver/src/server/otlp`). Vector keeps Metric first-class with
+(the ingest app's OTLP handler). Vector keeps Metric first-class with
 typed counter/gauge/histogram + arithmetic. Implementing this is a
 product-surface expansion (metrics pipeline) that cuts against scalo's
 "generic, unopinionated, bytes" positioning. Decline unless a consumer

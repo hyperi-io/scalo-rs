@@ -242,7 +242,7 @@ librdkafka will not build a consumer without a `group.id`, and a consumer asks t
 | `KafkaAdmin` offset-query consumer (also behind topic auto-discovery) | `<group>-admin`, or `<client_id>-admin` when `group` is empty | Never |
 | Idle consumer of a producer-only transport | `<client_id>-producer-only` | Never |
 
-An app granted `dfe-*` with `group: dfe-loader` gets `dfe-loader-admin`, and a producer with `client_id: dfe-fetcher` gets `dfe-fetcher-producer-only`, both inside the grant. With `group` and `client_id` both empty the anchor is the default client id, `scalo`.
+An app granted `myapp-*` with `group: myapp-consumer` gets `myapp-consumer-admin`, and a producer with `client_id: myapp-producer` gets `myapp-producer-producer-only`, both inside the grant. With `group` and `client_id` both empty the anchor is the default client id, `scalo`.
 
 An empty `group` is what marks a transport producer-only. It subscribes to nothing even when `topics` is set -- subscribing would join the stand-in group with a member that is never polled.
 

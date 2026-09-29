@@ -26,7 +26,7 @@
 //!
 //! let config = KafkaConfig {
 //!     brokers: vec!["kafka:9092".to_string()],
-//!     group: "dfe-loader".to_string(),
+//!     group: "consumer-a".to_string(),
 //!     topics: vec!["events".to_string()],
 //!     ..Default::default()
 //! };

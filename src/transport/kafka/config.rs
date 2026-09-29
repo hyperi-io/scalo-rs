@@ -1199,8 +1199,8 @@ pub struct KafkaConfig {
 
     /// Regex patterns for topic exclude filtering.
     /// Topics matching any pattern are excluded. Exclude wins over include.
-    /// Default: `["^__", "_dlq$"]` -- Kafka internal topics and the DFE
-    /// standard's dead-letter topics (a DLQ consumer sets its own include).
+    /// Default: `["^__", "_dlq$"]` -- Kafka internal topics and a downstream
+    /// dead-letter-topic convention (a DLQ consumer sets its own include).
     #[serde(default = "default_topic_exclude")]
     pub topic_exclude: Vec<String>,
 
@@ -1371,7 +1371,7 @@ pub struct KafkaConfig {
 }
 
 fn default_topic_exclude() -> Vec<String> {
-    // `_dlq$`: the DFE DLQ standard pre-creates per-app dead-letter topics;
+    // `_dlq$`: a downstream DLQ convention pre-creates per-app dead-letter topics;
     // auto-discovery must never feed dead letters back into a data path.
     vec!["^__".to_string(), "_dlq$".to_string()]
 }
@@ -1726,7 +1726,8 @@ impl KafkaConfig {
         // Universal floor (dev AND prod): PLAIN sends the password in cleartext,
         // so it MUST ride an encrypted transport (sasl_ssl). SCRAM challenges are
         // safe over a plaintext transport, so only PLAIN is gated here. Mirrors the
-        // opt-in provider presets + the Python contract (dfe-engine#98).
+        // opt-in provider presets + the Python contract (see the downstream
+        // Python consumer's own tracker).
         if self.sasl_mechanism.as_deref() == Some("PLAIN")
             && !self.security_protocol.eq_ignore_ascii_case("sasl_ssl")
         {
@@ -2000,36 +2001,36 @@ impl KafkaConfig {
 mod tests {
     use super::*;
 
-    /// A DFE broker grants consumer groups by the `dfe-` prefix, so an
+    /// A broker grants consumer groups by a fixed per-app prefix, so an
     /// internal client's group id has to start with whatever the app is
     /// already granted, never with a literal of scalo's own.
     #[test]
     fn internal_group_ids_share_the_app_prefix() {
         let consumer = KafkaConfig {
-            group: "dfe-loader".to_string(),
-            client_id: "dfe-loader".to_string(),
+            group: "consumer-a".to_string(),
+            client_id: "consumer-a".to_string(),
             ..Default::default()
         };
-        assert_eq!(consumer.internal_group_id("admin"), "dfe-loader-admin");
+        assert_eq!(consumer.internal_group_id("admin"), "consumer-a-admin");
 
         // A producer-only config has no group, so the client id anchors it.
         let producer = KafkaConfig {
             group: String::new(),
-            client_id: "dfe-fetcher".to_string(),
+            client_id: "consumer-b".to_string(),
             ..Default::default()
         };
         assert_eq!(
             producer.internal_group_id("producer-only"),
-            "dfe-fetcher-producer-only"
+            "consumer-b-producer-only"
         );
 
         // The group wins over the client id when both are set.
         let both = KafkaConfig {
-            group: "dfe-archiver".to_string(),
-            client_id: "archiver-pod-7".to_string(),
+            group: "consumer-c".to_string(),
+            client_id: "consumer-c-pod-7".to_string(),
             ..Default::default()
         };
-        assert_eq!(both.internal_group_id("admin"), "dfe-archiver-admin");
+        assert_eq!(both.internal_group_id("admin"), "consumer-c-admin");
     }
 
     /// With both identifying fields cleared the id is still non-empty --
