@@ -33,6 +33,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::source::DEFAULT_MAX_HOLD_SECS;
 use super::{ByteBudgetConfig, Hysteresis};
 
 /// Sizing profile for the self-regulation byte budget.
@@ -90,6 +91,10 @@ fn default_md_factor() -> f64 {
     0.5
 }
 
+const fn default_max_hold_secs() -> u64 {
+    DEFAULT_MAX_HOLD_SECS
+}
+
 /// Cascade-overridable settings for the self-regulation governor.
 ///
 /// Loaded under the `self_regulation` key. All fields have sensible defaults
@@ -118,6 +123,12 @@ pub struct SelfRegulationConfig {
 
     /// Multiplicative-decrease factor for the byte budget, in `(0, 1)`.
     pub md_factor: f64,
+
+    /// Longest the inbound hold lasts, in seconds, while pressure stays above
+    /// `resume_below`. At the bound one window of work is admitted and the
+    /// hold re-arms if pressure is still at `pause_above`. Default `30`;
+    /// `0` holds until pressure falls to `resume_below`, however long.
+    pub max_hold_secs: u64,
 }
 
 impl Default for SelfRegulationConfig {
@@ -129,6 +140,7 @@ impl Default for SelfRegulationConfig {
             resume_below: default_resume_below(),
             target_rho: default_target_rho(),
             md_factor: default_md_factor(),
+            max_hold_secs: default_max_hold_secs(),
         }
     }
 }
@@ -195,6 +207,20 @@ mod tests {
         let cfg = SelfRegulationConfig::default();
         assert!(cfg.enabled, "governor is ON by default (opt-out)");
         assert_eq!(cfg.profile, SelfRegulationProfile::Throughput);
+        assert_eq!(cfg.max_hold_secs, 30, "a hold is bounded by default");
+    }
+
+    /// `max_hold_secs` reads from the section like its siblings, and `0` is
+    /// accepted as the unbounded hold.
+    #[cfg(feature = "config")]
+    #[test]
+    fn max_hold_secs_parses_and_zero_is_accepted() {
+        let cfg: SelfRegulationConfig = serde_yaml_ng::from_str("max_hold_secs: 5\n").unwrap();
+        assert_eq!(cfg.max_hold_secs, 5);
+        let cfg: SelfRegulationConfig = serde_yaml_ng::from_str("max_hold_secs: 0\n").unwrap();
+        assert_eq!(cfg.max_hold_secs, 0);
+        let cfg: SelfRegulationConfig = serde_yaml_ng::from_str("enabled: true\n").unwrap();
+        assert_eq!(cfg.max_hold_secs, 30, "absent -> default");
     }
 
     #[test]

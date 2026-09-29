@@ -9,9 +9,45 @@
 //! Pressure seam: normalised readings, sources, and the unified latch.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::memory::MemoryGuard;
+
+/// Default bound, in seconds, on a hold whose level stays above `resume_below`.
+pub(crate) const DEFAULT_MAX_HOLD_SECS: u64 = 30;
+
+/// Least time between two warnings that a hold reached its bound.
+#[cfg(feature = "logger")]
+const EXPIRED_HOLD_WARN_INTERVAL_MS: u64 = 60_000;
+
+/// Change in the level that republishes `self_regulation_pressure_ratio`.
+#[cfg(feature = "metrics")]
+const LEVEL_PUBLISH_STEP: f64 = 0.001;
+
+/// Nanoseconds in `d`, saturating at `u64::MAX`.
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The monotonic time a hold is measured on.
+enum HoldClock {
+    /// Nanoseconds since the latch was built.
+    Monotonic(Instant),
+    /// Nanoseconds a test sets.
+    #[cfg(test)]
+    Manual(Arc<AtomicU64>),
+}
+
+impl HoldClock {
+    fn now_nanos(&self) -> u64 {
+        match self {
+            Self::Monotonic(epoch) => nanos(epoch.elapsed()),
+            #[cfg(test)]
+            Self::Manual(now) => now.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// A normalised pressure reading, clamped to `[0.0, 1.0]` on construction.
 ///
@@ -224,25 +260,91 @@ pub struct UnifiedPressureSnapshot {
 /// Combines pressure sources into one level under a hysteretic latch.
 ///
 /// See the [module docs](crate::governor) for the design invariants. The
-/// latch state is an [`AtomicBool`] so [`should_hold`](Self::should_hold)
-/// is a cheap, `Sync` hot-path check.
+/// latch state is one atomic word so [`should_hold`](Self::should_hold) is a
+/// cheap, `Sync` hot-path check.
 pub struct UnifiedPressure {
     /// Behind a lock so a source can join a latch already shared by the
     /// transports it gates.
     sources: parking_lot::RwLock<Vec<Arc<dyn PressureSource>>>,
     hyst: Hysteresis,
-    paused: AtomicBool,
+    /// `0` while released; while held, the clock reading the hold armed at,
+    /// plus one, so one compare-exchange ends exactly the hold that was read.
+    hold: AtomicU64,
+    /// Longest a hold lasts with the level above `resume_below`, in clock
+    /// nanoseconds. `0` is no bound.
+    max_hold_nanos: u64,
+    /// Holds that reached `max_hold_nanos` and were ended by it.
+    expired_holds: AtomicU64,
+    clock: HoldClock,
+    /// When the last expired-hold warning went out, in Unix epoch ms.
+    #[cfg(feature = "logger")]
+    last_expiry_warn_ms: AtomicU64,
+    /// The level last written to `self_regulation_pressure_ratio`, as bits.
+    #[cfg(feature = "metrics")]
+    published_level: AtomicU64,
 }
 
 impl UnifiedPressure {
-    /// Build a governor over the given sources and hysteresis band.
+    /// Build a governor over the given sources and hysteresis band, with a
+    /// hold bounded at 30 s (see [`with_max_hold`](Self::with_max_hold)).
     #[must_use]
     pub fn new(sources: Vec<Arc<dyn PressureSource>>, hyst: Hysteresis) -> Self {
         Self {
             sources: parking_lot::RwLock::new(sources),
             hyst,
-            paused: AtomicBool::new(false),
+            hold: AtomicU64::new(0),
+            max_hold_nanos: nanos(Duration::from_secs(DEFAULT_MAX_HOLD_SECS)),
+            expired_holds: AtomicU64::new(0),
+            clock: HoldClock::Monotonic(Instant::now()),
+            #[cfg(feature = "logger")]
+            last_expiry_warn_ms: AtomicU64::new(0),
+            #[cfg(feature = "metrics")]
+            published_level: AtomicU64::new(f64::NAN.to_bits()),
         }
+    }
+
+    /// Bound how long the latch holds while the level stays above
+    /// `resume_below`. `Duration::ZERO` removes the bound.
+    ///
+    /// Memory the process already holds -- allocator arenas, pages retained
+    /// after a free -- can keep the level above `resume_below` with no intake
+    /// at all, and an unbounded latch then holds intake paused for good. Once
+    /// a hold has lasted `max_hold`, the next caller of
+    /// [`should_hold`](Self::should_hold) is admitted, a warning names the
+    /// level and the time held, and `self_regulation_max_hold_releases_total`
+    /// counts it. The evaluation after that re-arms if the level is still at
+    /// `pause_above`, so the latch still brakes a level that keeps rising.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use scalo::governor::{Hysteresis, UnifiedPressure};
+    ///
+    /// // Admit one window per minute of a hold the level never clears.
+    /// let band = Hysteresis::new(0.80, 0.65)?;
+    /// let latch = UnifiedPressure::new(Vec::new(), band).with_max_hold(Duration::from_secs(60));
+    /// assert!(!latch.should_hold());
+    /// # Ok::<(), String>(())
+    /// ```
+    #[must_use]
+    pub fn with_max_hold(mut self, max_hold: Duration) -> Self {
+        self.max_hold_nanos = nanos(max_hold);
+        self
+    }
+
+    /// The same latch, timed on a clock the test sets in nanoseconds.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_manual_clock(mut self, now: Arc<AtomicU64>) -> Self {
+        self.clock = HoldClock::Manual(now);
+        self
+    }
+
+    /// The bound in force, `Duration::ZERO` when there is none.
+    #[cfg(test)]
+    pub(crate) fn max_hold(&self) -> Duration {
+        Duration::from_nanos(self.max_hold_nanos)
     }
 
     /// Add a source after construction.
@@ -296,27 +398,124 @@ impl UnifiedPressure {
         hard_max.max(soft_max)
     }
 
-    /// Hysteretic hold latch over [`level`](Self::level).
+    /// Hysteretic hold latch over [`level`](Self::level), bounded in time.
+    /// Call it where work is admitted.
     ///
     /// - Held and `level <= resume_below` -> release, return `false`.
     /// - Not held and `level >= pause_above` -> arm, return `true`.
+    /// - Held for [`max_hold`](Self::with_max_hold) with the level still above
+    ///   `resume_below` -> release for this one caller, return `false`. The
+    ///   next evaluation re-arms if the level is still at `pause_above`.
     /// - Otherwise -> return the current latch state (the band holds it).
+    ///
+    /// Beyond [`level`](Self::level) it loads the latch word and, with
+    /// `metrics`, the last published level; a held latch with a bound also
+    /// reads the monotonic clock.
     #[must_use]
     pub fn should_hold(&self) -> bool {
+        self.evaluate(true)
+    }
+
+    /// The latch for a caller that admits no work, such as a sizing lever.
+    ///
+    /// Arms and releases on the level as [`should_hold`](Self::should_hold)
+    /// does, but never takes the admission a hold past `max_hold` lets
+    /// through, so that admission reaches a caller that admits work.
+    #[must_use]
+    pub(crate) fn should_hold_without_admitting(&self) -> bool {
+        self.evaluate(false)
+    }
+
+    /// Holds that `max_hold` has ended since the latch was built.
+    pub(crate) fn expired_holds(&self) -> u64 {
+        self.expired_holds.load(Ordering::Acquire)
+    }
+
+    fn evaluate(&self, admitting: bool) -> bool {
         let level = self.level();
-        let paused = self.paused.load(Ordering::Acquire);
-        if paused {
-            if level <= self.hyst.resume_below {
-                self.paused.store(false, Ordering::Release);
-                return false;
-            }
-            true
-        } else {
+        #[cfg(feature = "metrics")]
+        self.publish_level(level);
+        let hold = self.hold.load(Ordering::Acquire);
+        if hold == 0 {
             if level >= self.hyst.pause_above {
-                self.paused.store(true, Ordering::Release);
+                let armed = self.clock.now_nanos().saturating_add(1);
+                self.hold.store(armed, Ordering::Release);
                 return true;
             }
-            false
+            return false;
+        }
+        if level <= self.hyst.resume_below {
+            self.hold.store(0, Ordering::Release);
+            return false;
+        }
+        !(admitting && self.end_expired_hold(hold, level))
+    }
+
+    /// End the hold read as `hold` once it has lasted `max_hold`, for exactly
+    /// one caller.
+    fn end_expired_hold(&self, hold: u64, level: f64) -> bool {
+        if self.max_hold_nanos == 0 {
+            return false;
+        }
+        let held_for = self.clock.now_nanos().saturating_sub(hold - 1);
+        if held_for < self.max_hold_nanos {
+            return false;
+        }
+        // Fails when a racing caller ended this hold, or released and re-armed it.
+        if self
+            .hold
+            .compare_exchange(hold, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.expired_holds.fetch_add(1, Ordering::AcqRel);
+        self.note_expired_hold(level, Duration::from_nanos(held_for));
+        true
+    }
+
+    #[cold]
+    fn note_expired_hold(&self, level: f64, held_for: Duration) {
+        let signal = self.dominant_source();
+        #[cfg(feature = "metrics")]
+        ::metrics::counter!("self_regulation_max_hold_releases_total", "signal" => signal)
+            .increment(1);
+        #[cfg(feature = "logger")]
+        let due =
+            crate::logger::log_debounced(&self.last_expiry_warn_ms, EXPIRED_HOLD_WARN_INTERVAL_MS);
+        // Without the logger helpers the warning is already bounded to one per max_hold.
+        #[cfg(not(feature = "logger"))]
+        let due = true;
+        if due {
+            tracing::warn!(
+                pressure = level,
+                resume_below = self.hyst.resume_below,
+                held_secs = held_for.as_secs_f64(),
+                signal,
+                "self-regulation: hold reached max_hold with pressure still above resume_below; \
+                 admitting one window"
+            );
+        }
+    }
+
+    /// The source whose reading sets the level, to label an expired hold.
+    fn dominant_source(&self) -> &'static str {
+        self.snapshot()
+            .sources
+            .into_iter()
+            .max_by(|a, b| a.effective.total_cmp(&b.effective))
+            .map_or("none", |reading| reading.name)
+    }
+
+    /// Write the level to `self_regulation_pressure_ratio` when it has moved by
+    /// `LEVEL_PUBLISH_STEP`, keeping the recorder off most evaluations.
+    #[cfg(feature = "metrics")]
+    fn publish_level(&self, level: f64) {
+        let last = f64::from_bits(self.published_level.load(Ordering::Relaxed));
+        if last.is_nan() || (level - last).abs() >= LEVEL_PUBLISH_STEP {
+            self.published_level
+                .store(level.to_bits(), Ordering::Relaxed);
+            ::metrics::gauge!("self_regulation_pressure_ratio").set(level);
         }
     }
 
@@ -350,7 +549,7 @@ impl UnifiedPressure {
             hard_max,
             soft_max,
             level: hard_max.max(soft_max),
-            paused: self.paused.load(Ordering::Acquire),
+            paused: self.hold.load(Ordering::Acquire) != 0,
         }
     }
 }
@@ -429,8 +628,7 @@ mod tests {
     /// Out-of-`[0,1]` bands must be rejected: `Pressure` clamps every sample to
     /// `[0,1]`, so a band outside that range is unreachable in one direction --
     /// `resume_below < 0.0` can never release (permanent stuck-pause) and
-    /// `pause_above > 1.0` can never arm (brake silently disabled). Both are
-    /// the failure modes the never-OOM/no-flap contract forbids.
+    /// `pause_above > 1.0` can never arm (brake silently disabled).
     #[test]
     fn hysteresis_rejects_out_of_range_band() {
         // resume_below below the clamp floor -> latch could never release.
@@ -704,6 +902,175 @@ mod tests {
             approx(src.sample().get(), 0.70),
             "sample should mirror guard.pressure_ratio(), got {}",
             src.sample().get()
+        );
+    }
+
+    const SECOND: u64 = 1_000_000_000;
+
+    /// A latch with the default bound over one HARD `memory` source at
+    /// `level`, timed on a clock the test moves.
+    fn timed_latch(level: f64) -> (UnifiedPressure, Arc<MockSource>, Arc<AtomicU64>) {
+        let mem = Arc::new(MockSource::new("memory", level, 1.0, true));
+        let now = Arc::new(AtomicU64::new(0));
+        let latch = UnifiedPressure::new(
+            vec![Arc::clone(&mem) as Arc<dyn PressureSource>],
+            Hysteresis::new(0.80, 0.65).expect("band"),
+        )
+        .with_manual_clock(Arc::clone(&now));
+        (latch, mem, now)
+    }
+
+    /// The wedge: a burst arms the latch, the level settles in the band on
+    /// memory the paused intake cannot free, and the hold ends at 30 s. The
+    /// band then keeps the latch released.
+    #[test]
+    fn a_hold_the_level_never_clears_releases_at_max_hold() {
+        let (latch, mem, now) = timed_latch(0.85);
+        assert_eq!(
+            latch.max_hold(),
+            Duration::from_secs(30),
+            "the default bound"
+        );
+        assert!(latch.should_hold(), "arms at 0.85");
+
+        mem.set(0.70);
+        now.store(30 * SECOND - 1, Ordering::Relaxed);
+        assert!(latch.should_hold(), "in the band, 1 ns short of max_hold");
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        assert!(!latch.should_hold(), "30 s held at 0.70 admits");
+        assert_eq!(latch.expired_holds(), 1);
+        assert!(
+            !latch.should_hold(),
+            "0.70 is under pause_above, so the band keeps the latch released"
+        );
+        assert_eq!(latch.expired_holds(), 1, "one expiry per hold");
+    }
+
+    /// A level still at `pause_above` is admitted once per max_hold and held
+    /// again on the evaluation after.
+    #[test]
+    fn a_level_still_high_rearms_on_the_next_evaluation() {
+        let (latch, _mem, now) = timed_latch(0.85);
+        assert!(latch.should_hold());
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        assert!(!latch.should_hold(), "one admission at max_hold");
+        assert!(
+            latch.should_hold(),
+            "re-armed: 0.85 is still at pause_above"
+        );
+
+        now.store(60 * SECOND - 1, Ordering::Relaxed);
+        assert!(latch.should_hold(), "the new hold started at 30 s");
+        now.store(60 * SECOND, Ordering::Relaxed);
+        assert!(!latch.should_hold(), "and ends 30 s later");
+        assert_eq!(latch.expired_holds(), 2);
+    }
+
+    /// Falling to `resume_below` releases at once, as it always did, and is
+    /// not counted as an expired hold.
+    #[test]
+    fn a_level_at_resume_below_releases_as_before() {
+        let (latch, mem, now) = timed_latch(0.85);
+        assert!(latch.should_hold());
+
+        now.store(SECOND, Ordering::Relaxed);
+        mem.set(0.65);
+        assert!(!latch.should_hold(), "resume_below releases at 1 s");
+        assert_eq!(latch.expired_holds(), 0);
+
+        now.store(40 * SECOND, Ordering::Relaxed);
+        mem.set(0.70);
+        assert!(!latch.should_hold(), "released, and 0.70 does not re-arm");
+    }
+
+    /// `Duration::ZERO` is the unbounded latch.
+    #[test]
+    fn a_zero_max_hold_never_releases_by_time() {
+        let (latch, mem, now) = timed_latch(0.85);
+        let latch = latch.with_max_hold(Duration::ZERO);
+        assert!(latch.should_hold());
+
+        mem.set(0.70);
+        now.store(10 * 24 * 3600 * SECOND, Ordering::Relaxed);
+        assert!(latch.should_hold(), "ten days in the band, still held");
+        assert_eq!(latch.expired_holds(), 0);
+    }
+
+    /// A caller that admits nothing sees an expired hold as held, and leaves
+    /// the admission to the caller that admits work.
+    #[test]
+    fn a_non_admitting_evaluation_leaves_the_window_to_an_admitting_one() {
+        let (latch, _mem, now) = timed_latch(0.85);
+        assert!(latch.should_hold());
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        assert!(latch.should_hold_without_admitting());
+        assert!(latch.should_hold_without_admitting());
+        assert_eq!(latch.expired_holds(), 0);
+        assert!(
+            !latch.should_hold(),
+            "the admitting caller still gets the window"
+        );
+    }
+
+    /// Callers racing into one expired hold: exactly one is admitted.
+    #[test]
+    fn exactly_one_racing_caller_takes_an_expired_hold() {
+        const CALLERS: usize = 8;
+        for round in 0..100 {
+            let (latch, _mem, now) = timed_latch(0.85);
+            assert!(latch.should_hold());
+            now.store(30 * SECOND, Ordering::Relaxed);
+
+            let start = std::sync::Barrier::new(CALLERS);
+            let admitted = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..CALLERS {
+                    s.spawn(|| {
+                        start.wait();
+                        if !latch.should_hold() {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            assert_eq!(admitted.load(Ordering::Relaxed), 1, "round {round}");
+            assert_eq!(latch.expired_holds(), 1, "round {round}");
+        }
+    }
+
+    /// The latch writes its level while it holds, and counts an expired hold
+    /// under the source that set the level.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn the_latch_publishes_its_level_and_counts_expired_holds() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+        let series = |prefix: &str| {
+            handle
+                .render()
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix)?.parse::<f64>().ok())
+        };
+
+        let (latch, mem, now) = timed_latch(0.85);
+        assert!(latch.should_hold());
+        mem.set(0.70);
+        assert!(latch.should_hold());
+        assert_eq!(
+            series("self_regulation_pressure_ratio "),
+            Some(0.70),
+            "the level while held"
+        );
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        assert!(!latch.should_hold());
+        assert_eq!(
+            series("self_regulation_max_hold_releases_total{signal=\"memory\"} "),
+            Some(1.0)
         );
     }
 }
