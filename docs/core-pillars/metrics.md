@@ -177,6 +177,7 @@ A source or sink that goes away is waited out rather than ending the app, and th
 |---|---|---|
 | `transport_recv_errors_total` | `transport`, `class` | receive failures; `class="transient"` were retried, `class="permanent"` were returned. Kafka emits it |
 | `transport_consumer_rebuilds_total` | `transport`, `protocol` | consumers replaced after librdkafka flagged them fatal, by the group protocol the new client joins with. Kafka emits it |
+| `transport_revoke_discarded_total` | `transport`, `stage` | records a revoke kept from a write, since the partition's next owner reads them again: `stage="receive"` for those `recv` left out, read before a revoke of their partition in the same poll, `stage="buffer"` for those a caller discarded from its own buffer and counted with `KafkaTransport::discarded_after_revoke`. Kafka emits it |
 | `transport_commit_errors_total` | `transport` | source commits that failed after the block was delivered; the `BatchEngine` driver counts them and carries on |
 | `pipeline_retries_total` | `stage` | `BatchEngine` run-loop steps retried after a transient failure, `stage` being `recv`, `sink`, or `dlq` for the pipeline's DLQ writes |
 | `transport_redelivered_total` | `transport`, `reason` | sends retried after an outcome the receiver may still deliver, so possible duplicates: `reason="hold_expired"` when a held response ran out of budget, `reason="deadline"` when the send's deadline passed. gRPC emits it |

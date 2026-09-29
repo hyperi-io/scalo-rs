@@ -130,6 +130,10 @@ impl ServiceMetrics {
             "transport_consumer_rebuilds_total",
             "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with"
         );
+        metrics::describe_counter!(
+            "transport_revoke_discarded_total",
+            "Records a revoke kept from a write, as the partition's next owner reads them again, by stage"
+        );
 
         // Push transport descriptors into manifest registry. Labels are every
         // key an emitter sets: `path` on gRPC RouteBatch sends, `reason` on
@@ -222,6 +226,20 @@ impl ServiceMetrics {
                     .into(),
             unit: String::new(),
             labels: vec!["transport".into(), "protocol".into()],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
+        reg.push(MetricDescriptor {
+            name: "transport_revoke_discarded_total".into(),
+            metric_type: MetricType::Counter,
+            description: "Records a revoke kept from a write, as the partition's next owner reads \
+                          them again, by stage: receive (left out by recv) or buffer (discarded \
+                          by the caller)"
+                .into(),
+            unit: String::new(),
+            labels: vec!["transport".into(), "stage".into()],
             group: "platform".into(),
             buckets: None,
             use_cases: vec![],

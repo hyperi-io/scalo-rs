@@ -54,6 +54,7 @@ mod admin;
 mod classify;
 mod config;
 pub mod contract;
+mod lease;
 mod metrics;
 mod producer;
 pub mod providers;
@@ -69,6 +70,7 @@ pub use config::{
     PRODUCER_EXACTLY_ONCE, PRODUCER_HIGH_THROUGHPUT, PRODUCER_LOW_LATENCY, PRODUCTION_PROFILE,
     ProducerKnobs, SelfRegulationProfile, SuppressionRule, merge_with_overrides,
 };
+pub use lease::PartitionLease;
 pub use metrics::{
     BrokerMetrics, KafkaMetrics, StatsContext, healthy_broker_count, total_consumer_lag,
 };
@@ -80,6 +82,7 @@ pub use token::KafkaToken;
 pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
 
 use config::{librdkafka_alias, raw_layer};
+use metrics::Rebalanced;
 
 use super::ack::{
     AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
@@ -300,6 +303,9 @@ pub struct KafkaTransport {
 struct ConsumerSlot {
     client: Arc<BaseConsumer<StatsContext>>,
     protocol: ConsumerProtocol,
+    /// Clients this transport built before this one, which keeps a lease from
+    /// an earlier client from matching one of this client's.
+    epoch: u64,
 }
 
 /// The transport's consumer slot, shared with the gate actuator.
@@ -665,6 +671,28 @@ fn count_consumer_rebuild(protocol: ConsumerProtocol) {
     let _ = protocol;
 }
 
+/// The `stage` of a record `recv` left out: read before a revoke of its
+/// partition in the same poll.
+const REVOKE_STAGE_RECEIVE: &str = "receive";
+
+/// The `stage` of a record a caller discarded from its own buffer.
+const REVOKE_STAGE_BUFFER: &str = "buffer";
+
+/// Count `records` a revoke kept from a write, by where they were discarded.
+fn count_revoke_discarded(stage: &'static str, records: u64) {
+    #[cfg(feature = "metrics")]
+    if records > 0 {
+        ::metrics::counter!(
+            "transport_revoke_discarded_total",
+            "transport" => "kafka",
+            "stage" => stage
+        )
+        .increment(records);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (stage, records);
+}
+
 impl KafkaTransport {
     /// Create a new high-throughput Kafka transport.
     ///
@@ -819,6 +847,7 @@ impl KafkaTransport {
             consumer: Arc::new(parking_lot::RwLock::new(ConsumerSlot {
                 client: consumer,
                 protocol,
+                epoch: 0,
             })),
             config: Box::new(owned.clone()),
             rebuilds: std::sync::atomic::AtomicU32::new(0),
@@ -935,6 +964,90 @@ impl KafkaTransport {
         self.consumer.read().protocol
     }
 
+    /// The lease this consumer holds `topic`/`partition` under, or `None`
+    /// while it does not hold it.
+    ///
+    /// A lease runs from the assignment that gives this consumer a partition
+    /// to the revoke, or the consumer rebuild, that ends it. A record read
+    /// under a lease is this consumer's to write and commit while the lease
+    /// lasts. After that, the partition's next owner reads the record again
+    /// from the committed offset: another member, or this one under a new
+    /// lease, as when an eager rebalance hands a partition straight back.
+    ///
+    /// Take a record's lease when `recv` returns it, before the next `recv`.
+    /// A rebalance runs only inside a receive's poll, and `recv` never hands
+    /// out a record read before its partition's last revoke, so every record
+    /// of a partition in a batch was read under the lease the partition has
+    /// when the batch arrives. One call per partition per batch is enough:
+    /// each takes a read lock and copies the topic name.
+    ///
+    /// `None` for a record just received means this consumer no longer holds
+    /// its partition, as after a consumer rebuild since the poll that read
+    /// it: discard the record.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(transport: scalo::transport::KafkaTransport) -> scalo::transport::TransportResult<()> {
+    /// use scalo::transport::TransportReceiver;
+    ///
+    /// let batch = transport.recv(1_000).await?;
+    /// for (record, token) in batch.records.iter().zip(&batch.commit_tokens) {
+    ///     // Buffer the record with the lease its partition has now.
+    ///     let lease = transport.lease(&token.topic, token.partition);
+    /// #   let _ = (record, lease);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn lease(&self, topic: &str, partition: i32) -> Option<PartitionLease> {
+        let slot = self.consumer.read();
+        slot.client
+            .context()
+            .assignment(topic, partition)
+            .map(|assignment| PartitionLease::new(slot.epoch, assignment))
+    }
+
+    /// Whether `lease` is still this consumer's claim on `topic`/`partition`.
+    ///
+    /// Ask right before writing a buffered record. `false` means a revoke or
+    /// a consumer rebuild ended the lease, and the partition's next owner
+    /// reads the record again from the committed offset, so writing the
+    /// buffered copy as well duplicates it. Discard it and count it with
+    /// [`discarded_after_revoke`](Self::discarded_after_revoke). Unarmed,
+    /// leave its token out of [`commit`](TransportReceiver::commit): its
+    /// offset can move the commit past a record nobody wrote. Armed, release
+    /// its token as for any record the caller drops: an offset handed out
+    /// before its partition's revoke commits nothing, and the release keeps
+    /// the copy read again from stalling the partition's commit.
+    ///
+    /// The answer is live. It covers a revoke served by a poll whose `recv`
+    /// has not returned yet, such as one a `select!` arm dropped.
+    ///
+    /// A partition nothing has committed to yet is read again from where
+    /// `auto.offset.reset` points: the log start under `earliest`, the
+    /// default. Under `latest` its next owner starts at the log end, so a
+    /// record of such a partition that is discarded is read by nobody.
+    #[must_use]
+    pub fn holds(&self, topic: &str, partition: i32, lease: PartitionLease) -> bool {
+        self.lease(topic, partition) == Some(lease)
+    }
+
+    /// Count `records` the caller discarded because the lease they were read
+    /// under ended, in `transport_revoke_discarded_total{transport="kafka",stage="buffer"}`.
+    ///
+    /// The same series counts under `stage="receive"` the records `recv`
+    /// leaves out itself: those read before a revoke of their partition in
+    /// the same poll.
+    #[allow(
+        clippy::unused_self,
+        reason = "a method, so a caller finds it beside `holds`"
+    )]
+    pub fn discarded_after_revoke(&self, records: u64) {
+        count_revoke_discarded(REVOKE_STAGE_BUFFER, records);
+    }
+
     /// Replace the consumer client with a new one joined under `protocol`,
     /// subscribed to the same topics.
     ///
@@ -955,10 +1068,18 @@ impl KafkaTransport {
         }
         let client = create_consumer(&consumer_client_config(&self.config, protocol))?;
         subscribe_consumer(&client, &self.subscribed_topics.read())?;
-        let old = std::mem::replace(
-            &mut *self.consumer.write(),
-            ConsumerSlot { client, protocol },
-        );
+        let old = {
+            let mut slot = self.consumer.write();
+            let epoch = slot.epoch.saturating_add(1);
+            std::mem::replace(
+                &mut *slot,
+                ConsumerSlot {
+                    client,
+                    protocol,
+                    epoch,
+                },
+            )
+        };
         self.deferred_recv_error.lock().take();
         count_consumer_rebuild(protocol);
         match tokio::runtime::Handle::try_current() {
@@ -1779,12 +1900,12 @@ impl KafkaTransport {
         // that never pends starves every other task on the runtime.
         #[cfg(feature = "metrics")]
         let poll_start = std::time::Instant::now();
-        let polled = self
+        let (polled, rebalanced) = self
             .poll_off_runtime(&consumer, max_msgs, max_bytes)
             .await?;
         // Rebalances run inside the poll, so what one changed is known before
-        // anything this poll read is held.
-        let revoked_at = self.acks.rebalanced(consumer.context().take_rebalanced());
+        // anything this poll read is held or handed out.
+        let revoked_at = self.acks.rebalanced(rebalanced);
         let (arena, mut spans) = match polled {
             Polled::Empty => {
                 #[cfg(feature = "metrics")]
@@ -1821,9 +1942,8 @@ impl KafkaTransport {
                 (arena, spans)
             }
         };
-        if self.acks.is_armed() {
-            drop_read_before_revoke(&mut spans, &revoked_at);
-        }
+        let dropped = drop_read_before_revoke(&mut spans, &revoked_at);
+        count_revoke_discarded(REVOKE_STAGE_RECEIVE, dropped as u64);
 
         // Freeze the arena to ONE refcounted Bytes, then rebuild messages as
         // zero-copy slices into it. All borrowed Kafka buffers are long gone --
@@ -1883,12 +2003,15 @@ impl KafkaTransport {
     /// would skip them for good. A job picked up that way keeps the limits of
     /// the call that started it. One that polled a client replaced since is
     /// settled by [`settle_stale_poll`], never against the new client.
+    ///
+    /// Returns the job's result with the ownership changes `consumer` served
+    /// since the last call took them.
     async fn poll_off_runtime(
         &self,
         consumer: &Arc<BaseConsumer<StatsContext>>,
         max_msgs: usize,
         max_bytes: Option<u64>,
-    ) -> TransportResult<Polled> {
+    ) -> TransportResult<(Polled, Vec<(u64, Rebalanced)>)> {
         let mut in_flight = self.in_flight.lock().await;
         let running = in_flight.get_or_insert_with(|| {
             let job = PollJob {
@@ -1911,11 +2034,15 @@ impl KafkaTransport {
         *in_flight = None;
         let polled =
             polled.map_err(|e| TransportError::Recv(format!("kafka poll task failed: {e}")))?;
-        Ok(if stale {
+        // Taken under the lock, so a revoke a waiting receive's poll serves is
+        // left for that receive to check its own records against.
+        let rebalanced = consumer.context().take_rebalanced();
+        let polled = if stale {
             settle_stale_poll(polled)
         } else {
             polled
-        })
+        };
+        Ok((polled, rebalanced))
     }
 
     /// Settle a poll job that ended on an error before any record: an empty
@@ -2082,16 +2209,21 @@ fn build_batch_from_spans(arena: bytes::Bytes, spans: Vec<Span>) -> Vec<Message<
 }
 
 /// Leave out every record read before a revoke of its partition in the same
-/// poll job.
+/// poll job, and return how many.
 ///
 /// Its partition's next owner reads it again from the committed offset, which
-/// is below it, so leaving it out loses nothing. Handed out, its release would
-/// be a release for a partition this member no longer holds, which, once the
-/// partition came back in the same job, would commit past an offset the
-/// member released `Errored` before the revoke.
-fn drop_read_before_revoke(spans: &mut Vec<Span>, revoked_at: &HashMap<(Arc<str>, i32), u64>) {
+/// is below it, so leaving it out loses nothing. Handed out, a caller would
+/// write a copy the next owner writes too, and take it under the lease the
+/// partition has once the job ends, which is not the one it was read under.
+/// Armed, its release would be a release for a partition this member no
+/// longer holds, which, once the partition came back in the same job, would
+/// commit past an offset the member released `Errored` before the revoke.
+fn drop_read_before_revoke(
+    spans: &mut Vec<Span>,
+    revoked_at: &HashMap<(Arc<str>, i32), u64>,
+) -> usize {
     if revoked_at.is_empty() {
-        return;
+        return 0;
     }
     let before = spans.len();
     spans.retain(|span| {
@@ -2106,6 +2238,7 @@ fn drop_read_before_revoke(spans: &mut Vec<Span>, revoked_at: &HashMap<(Arc<str>
             "kafka: records read before their partition was revoked are left for its next owner"
         );
     }
+    dropped
 }
 
 /// Get or insert topic Arc into cache.
@@ -4186,6 +4319,136 @@ mod tests {
             vec![3],
             "the commit follows what was read again, never past 3"
         );
+    }
+
+    /// A broker-free transport nothing arms, as a hand-rolled loop leaves it.
+    async fn unarmed_without_a_broker() -> KafkaTransport {
+        KafkaTransport::new(&KafkaConfig::for_testing(
+            "127.0.0.1:1",
+            "lease-test",
+            Vec::new(),
+        ))
+        .await
+        .expect("broker-free kafka transport")
+    }
+
+    /// A lease runs from the assignment to the revoke. Given back, the same
+    /// partition is under a new lease, so a record read under the old one is
+    /// never taken for one read again.
+    #[tokio::test]
+    async fn a_lease_lasts_from_an_assignment_to_the_revoke_that_ends_it() {
+        let transport = unarmed_without_a_broker().await;
+        assert_eq!(transport.lease("events", 0), None, "nothing assigned yet");
+
+        serve(&transport, false, 0);
+        let first = transport.lease("events", 0).expect("assigned");
+        assert!(transport.holds("events", 0, first));
+        assert!(!transport.holds("events", 1, first), "another partition");
+        assert!(!transport.holds("other", 0, first), "another topic");
+
+        serve(&transport, false, 1);
+        assert!(
+            transport.holds("events", 0, first),
+            "an incremental assignment of another partition leaves this lease"
+        );
+
+        serve(&transport, true, 0);
+        assert!(!transport.holds("events", 0, first), "revoked");
+        assert_eq!(transport.lease("events", 0), None);
+        assert!(transport.lease("events", 1).is_some(), "partition 1 kept");
+
+        serve(&transport, false, 0);
+        let second = transport.lease("events", 0).expect("given back");
+        assert_ne!(first, second, "given back is a new lease");
+        assert!(!transport.holds("events", 0, first));
+        assert!(transport.holds("events", 0, second));
+    }
+
+    /// A rebuilt consumer rejoins and reads every partition again from the
+    /// committed offset, so what the old client read is under no lease the
+    /// new one holds, even where the two number their assignments alike.
+    #[tokio::test]
+    async fn a_rebuilt_consumer_holds_its_partitions_under_new_leases() {
+        let transport = unarmed_without_a_broker().await;
+        serve(&transport, false, 0);
+        let before = transport.lease("events", 0).expect("assigned");
+
+        transport
+            .rebuild_consumer(ConsumerProtocol::Classic, "test rebuild")
+            .expect("broker-free rebuild");
+        assert_eq!(
+            transport.lease("events", 0),
+            None,
+            "the new client holds nothing yet"
+        );
+        assert!(!transport.holds("events", 0, before));
+
+        // The new client's first assignment takes the old one's number.
+        serve(&transport, false, 0);
+        let after = transport
+            .lease("events", 0)
+            .expect("assigned to the new client");
+        assert_ne!(before, after);
+        assert!(!transport.holds("events", 0, before));
+        assert!(transport.holds("events", 0, after));
+    }
+
+    /// Unarmed as armed, a record read before a revoke of its partition in the
+    /// same poll is left out and counted, and one read after it is kept.
+    #[tokio::test]
+    async fn an_unarmed_receive_leaves_out_what_was_read_before_a_revoke() {
+        let transport = unarmed_without_a_broker().await;
+        serve(&transport, false, 0);
+        serve(&transport, false, 1);
+
+        let mut job: Vec<Span> = tokens(0, 10..15)
+            .into_iter()
+            .map(|t| polled(&transport, t))
+            .collect();
+        job.push(polled(&transport, tokens(1, 0..1).remove(0)));
+        serve(&transport, true, 0);
+        serve(&transport, false, 0);
+        job.extend(tokens(0, 0..3).into_iter().map(|t| polled(&transport, t)));
+
+        let revoked_at = transport
+            .acks
+            .rebalanced(transport.consumer().context().take_rebalanced());
+        assert_eq!(drop_read_before_revoke(&mut job, &revoked_at), 5);
+        let kept: Vec<(i32, i64)> = job
+            .iter()
+            .map(|s| (s.token.partition, s.token.offset))
+            .collect();
+        assert_eq!(kept, vec![(1, 0), (0, 0), (0, 1), (0, 2)]);
+    }
+
+    /// Both places a revoke keeps a record from a write count in one series,
+    /// told apart by `stage`, and a count of none writes nothing.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn records_discarded_on_a_revoke_are_counted_by_stage() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+
+        let transport = unarmed_without_a_broker().await;
+        transport.discarded_after_revoke(0);
+        assert!(
+            !handle.render().contains("transport_revoke_discarded_total"),
+            "nothing discarded, nothing written"
+        );
+
+        transport.discarded_after_revoke(7);
+        count_revoke_discarded(REVOKE_STAGE_RECEIVE, 2);
+        let rendered = handle.render();
+        let discarded = |stage: &str| {
+            scraped(
+                &rendered,
+                "transport_revoke_discarded_total",
+                &["transport=\"kafka\"", &format!("stage=\"{stage}\"")],
+            )
+        };
+        assert_eq!(discarded("buffer"), Some(7.0), "{rendered}");
+        assert_eq!(discarded("receive"), Some(2.0), "{rendered}");
     }
 
     /// The value of the series `name` whose labels include every one of

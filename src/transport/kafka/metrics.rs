@@ -37,7 +37,7 @@ use rdkafka::client::ClientContext;
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::error::KafkaError;
 use rdkafka::statistics::Statistics;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError, RwLock};
 
@@ -139,8 +139,9 @@ pub struct StatsContext {
     /// Ownership changes served so far, so a record can be ordered against
     /// them.
     rebalances: AtomicU64,
-    /// The partitions this consumer holds, as its rebalances left them.
-    assigned: RwLock<HashSet<(String, i32)>>,
+    /// The partitions this consumer holds, as its rebalances left them, each
+    /// with the number of the assignment that gave it.
+    assigned: RwLock<HashMap<(String, i32), u64>>,
     /// Whether the inbound gate has this consumer's assignment paused.
     #[cfg(feature = "governor")]
     paused: AtomicBool,
@@ -302,7 +303,7 @@ impl StatsContext {
             position_lag: AtomicI64::new(0),
             rebalanced: Mutex::new(Vec::new()),
             rebalances: AtomicU64::new(0),
-            assigned: RwLock::new(HashSet::new()),
+            assigned: RwLock::new(HashMap::new()),
             #[cfg(feature = "governor")]
             paused: AtomicBool::new(false),
             #[cfg(feature = "governor")]
@@ -380,8 +381,8 @@ impl StatsContext {
     }
 
     /// Record one ownership change, numbered under the lock so the log and
-    /// the count agree.
-    fn note_rebalanced(&self, change: Rebalanced) {
+    /// the count agree, and return its number.
+    fn note_rebalanced(&self, change: Rebalanced) -> u64 {
         let mut log = self
             .rebalanced
             .lock()
@@ -391,14 +392,26 @@ impl StatsContext {
         // One event per revoke or assignment, as librdkafka's own `rebalance_cnt` counts them.
         #[cfg(feature = "metrics")]
         self.group.counter(CONSUMER_REBALANCES).increment(1);
+        number
     }
 
-    /// Add partitions a rebalance gave this consumer to its assignment.
-    fn assign(&self, given: &[(String, i32)]) {
+    /// Add partitions the assignment numbered `number` gave this consumer.
+    fn assign(&self, given: &[(String, i32)], number: u64) {
         self.assigned
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .extend(given.iter().cloned());
+            .extend(given.iter().map(|partition| (partition.clone(), number)));
+    }
+
+    /// The number of the assignment this consumer holds `topic`/`partition`
+    /// under, or `None` while it does not hold it. Only a rebalance changes
+    /// the answer, and librdkafka runs one only inside a poll.
+    pub(crate) fn assignment(&self, topic: &str, partition: i32) -> Option<u64> {
+        self.assigned
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(topic.to_owned(), partition))
+            .copied()
     }
 
     /// Take partitions a rebalance took from this consumer out of its
@@ -507,7 +520,7 @@ impl StatsContext {
     fn convert_stats(
         stats: &Statistics,
         asked_ends: &HashMap<(String, i32), i64>,
-        held: Option<&HashSet<(String, i32)>>,
+        held: Option<&HashMap<(String, i32), u64>>,
         isolation: Isolation,
     ) -> KafkaMetrics {
         let mut metrics = KafkaMetrics {
@@ -550,7 +563,7 @@ impl StatsContext {
                 let asked_end = asked_ends.get(&key).copied();
 
                 let lag = match held {
-                    Some(assigned) if assigned.contains(&key) => {
+                    Some(assigned) if assigned.contains_key(&key) => {
                         partition_lag(partition, asked_end, isolation)
                     }
                     Some(_) => continue,
@@ -795,8 +808,9 @@ fn partition_labels(topic: &str, partition: i32) -> [(&'static str, String); 2] 
 
 /// Records each revoke and assignment, in order, before librdkafka applies
 /// it, so the transport never holds or commits for a partition it lost,
-/// keeps the assignment the lag and `consumer_partitions_assigned` report,
-/// and counts each one in its group's `consumer_rebalance_total`.
+/// keeps the assignment the lag, `consumer_partitions_assigned` and each
+/// partition's lease report, and counts each one in its group's
+/// `consumer_rebalance_total`.
 impl rdkafka::consumer::ConsumerContext for StatsContext {
     fn pre_rebalance(
         &self,
@@ -817,8 +831,8 @@ impl rdkafka::consumer::ConsumerContext for StatsContext {
             }
             rdkafka::consumer::Rebalance::Assign(list) => {
                 let given = partitions(list);
-                self.assign(&given);
-                self.note_rebalanced(Rebalanced::Assigned(given));
+                let number = self.note_rebalanced(Rebalanced::Assigned(given.clone()));
+                self.assign(&given, number);
             }
             rdkafka::consumer::Rebalance::Error(_) => {}
         }
@@ -919,7 +933,7 @@ fn partition_position_lag(
 fn position_lag(
     stats: &Statistics,
     asked_ends: &HashMap<(String, i32), i64>,
-    held: Option<&HashSet<(String, i32)>>,
+    held: Option<&HashMap<(String, i32), u64>>,
     isolation: Isolation,
 ) -> i64 {
     stats
@@ -930,7 +944,7 @@ fn position_lag(
         .filter_map(|(name, (id, p))| {
             let key = (name.clone(), *id);
             let is_held = match held {
-                Some(assigned) if !assigned.contains(&key) => return None,
+                Some(assigned) if !assigned.contains_key(&key) => return None,
                 Some(_) => true,
                 None => false,
             };
@@ -1071,8 +1085,8 @@ mod tests {
         ("events".to_string(), 0)
     }
 
-    fn assigned_events_0() -> HashSet<(String, i32)> {
-        HashSet::from([events_0()])
+    fn assigned_events_0() -> HashMap<(String, i32), u64> {
+        HashMap::from([(events_0(), 1)])
     }
 
     #[test]
@@ -1157,7 +1171,7 @@ mod tests {
     fn a_partition_this_consumer_does_not_hold_reports_no_lag_or_offsets() {
         let stats = stats_read_to_20();
         let none = HashMap::new();
-        let metrics = StatsContext::convert_stats(&stats, &none, Some(&HashSet::new()), COMMITTED);
+        let metrics = StatsContext::convert_stats(&stats, &none, Some(&HashMap::new()), COMMITTED);
         assert!(
             metrics.partition_lag.is_empty(),
             "committed but not assigned: {:?}",
@@ -1175,7 +1189,7 @@ mod tests {
         );
         let asked = HashMap::from([(events_0(), 50)]);
         assert_eq!(
-            position_lag(&stats, &asked, Some(&HashSet::new()), COMMITTED),
+            position_lag(&stats, &asked, Some(&HashMap::new()), COMMITTED),
             0
         );
     }
@@ -1256,10 +1270,50 @@ mod tests {
         })
     }
 
+    /// Serve an assignment of `given` to `context`, as `pre_rebalance` does.
+    fn assign_to(context: &StatsContext, given: &[(String, i32)]) -> u64 {
+        let number = context.note_rebalanced(Rebalanced::Assigned(given.to_vec()));
+        context.assign(given, number);
+        number
+    }
+
+    /// Serve a revoke of `taken` from `context`, as `pre_rebalance` does.
+    fn revoke_from(context: &StatsContext, taken: &[(String, i32)]) -> u64 {
+        context.revoke(taken);
+        context.note_rebalanced(Rebalanced::Revoked(taken.to_vec()))
+    }
+
     /// A context holding partition 0 of `events`, as a rebalance left it.
     fn holding_events_0(context: &StatsContext) {
-        context.assign(&[events_0()]);
-        context.note_rebalanced(Rebalanced::Assigned(vec![events_0()]));
+        assign_to(context, &[events_0()]);
+    }
+
+    /// A partition's assignment number is the rebalance that gave it: a
+    /// revoke ends it, and the same partition given back gets a new one,
+    /// while an assignment of another partition leaves it alone.
+    #[test]
+    fn each_assignment_of_a_partition_has_its_own_number() {
+        let context = StatsContext::new();
+        let events_1 = ("events".to_string(), 1);
+        assert_eq!(context.assignment("events", 0), None, "nothing held yet");
+
+        let first = assign_to(&context, &[events_0()]);
+        assert_eq!(context.assignment("events", 0), Some(first));
+        assign_to(&context, std::slice::from_ref(&events_1));
+        assert_eq!(
+            context.assignment("events", 0),
+            Some(first),
+            "an incremental assignment of another partition leaves this one's"
+        );
+
+        revoke_from(&context, &[events_0()]);
+        assert_eq!(context.assignment("events", 0), None, "revoked");
+        assert!(context.assignment("events", 1).is_some(), "not revoked");
+
+        let second = assign_to(&context, &[events_0()]);
+        assert!(second > first, "given back is a new assignment");
+        assert_eq!(context.assignment("events", 0), Some(second));
+        assert_eq!(context.assignment("other", 0), None, "another topic");
     }
 
     #[test]
@@ -1547,9 +1601,7 @@ mod tests {
             let loader = StatsContext::new().in_group(Some("loader"));
             let archiver = StatsContext::new().in_group(Some("archiver"));
             holding_events_0(&loader);
-            let two = vec![events_0(), ("events".to_string(), 1)];
-            archiver.assign(&two);
-            archiver.note_rebalanced(Rebalanced::Assigned(two));
+            assign_to(&archiver, &[events_0(), ("events".to_string(), 1)]);
             metrics::with_local_recorder(&capture, || {
                 loader.stats(behind_by(35));
                 archiver.stats(behind_by(20));

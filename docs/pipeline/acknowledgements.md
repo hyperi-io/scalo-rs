@@ -98,6 +98,8 @@ ack.release().await?; // seals, awaits the pieces, releases the source
 
 A `SourceAck` dropped before its `release` completes -- a panic, or the loop's future dropped mid-block -- releases its block `Errored`, as the pipeline does.
 
+A loop that holds Kafka records across receives before writing them keeps each record's partition lease beside it, taken with `KafkaTransport::lease` when `recv` returns the record. Right before the write it asks `holds`, and discards a record whose lease a revoke has ended: the partition's next owner reads it again from the committed offset, so writing it too duplicates it. The discarded record's share of its block reports `Dropped`. Armed, the transport commits nothing for an offset handed out before its partition's revoke, and the release keeps the copy read again from stalling the partition's commit. See [../transport/backends.md](../transport/backends.md#kafka).
+
 An app's own listener uses `scalo::transport::ack::Tickets`:
 
 - `admit(bytes, deadline)` before queuing a request, refused past the held-byte ceiling unless nothing is held
