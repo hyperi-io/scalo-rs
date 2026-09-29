@@ -431,6 +431,11 @@ impl UnifiedPressure {
         self.expired_holds.load(Ordering::Acquire)
     }
 
+    /// The clock holds are measured on, in nanoseconds.
+    pub(crate) fn now_nanos(&self) -> u64 {
+        self.clock.now_nanos()
+    }
+
     fn evaluate(&self, admitting: bool) -> bool {
         let level = self.level();
         #[cfg(feature = "metrics")]

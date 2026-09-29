@@ -1856,3 +1856,50 @@ mod revoked_mid_buffer {
         );
     }
 }
+
+/// The per-partition fetch every sizing profile sets against a real broker.
+#[cfg(feature = "testcontainers")]
+mod partition_fetch {
+    use std::time::{Duration, Instant};
+
+    use rdkafka::ClientConfig;
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    use scalo::transport::TransportReceiver;
+    use scalo::transport::kafka::{MESSAGE_MAX_BYTES, PARTITION_FETCH_BYTES};
+
+    use super::broker::{consumer, create_topic, start_kafka};
+
+    /// A record four times the 1 MiB partition fetch reaches the consumer
+    /// whole: librdkafka grows the fetch until the record fits.
+    #[tokio::test]
+    async fn a_record_larger_than_the_partition_fetch_arrives_whole() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "fetch-larger-record";
+        create_topic(&bootstrap, topic).await;
+        let large = vec![b'x'; 4 * usize::try_from(PARTITION_FETCH_BYTES).expect("fits")];
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap)
+            .set("message.max.bytes", MESSAGE_MAX_BYTES.to_string())
+            .create()
+            .expect("raw producer");
+        for payload in [large.as_slice(), b"after".as_slice()] {
+            producer
+                .send(
+                    FutureRecord::<(), [u8]>::to(topic).payload(payload),
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap_or_else(|(e, _)| panic!("deliver a {} byte record: {e}", payload.len()));
+        }
+
+        let transport = consumer(&bootstrap, topic, "fetch-larger-record-group").await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut sizes = Vec::new();
+        while sizes.len() < 2 {
+            assert!(Instant::now() < deadline, "read {sizes:?} within 60 s");
+            let batch = transport.recv(10).await.expect("recv");
+            sizes.extend(batch.records.iter().map(|r| r.payload.len()));
+        }
+        assert_eq!(sizes, [large.len(), b"after".len()]);
+    }
+}

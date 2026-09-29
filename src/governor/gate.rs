@@ -27,8 +27,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use super::source::UnifiedPressure;
+
+/// Longest a gate stays open for an expired hold when no receive returns a record.
+const RELEASE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Drives the inbound source on pause/resume edges.
 ///
@@ -134,6 +138,9 @@ pub struct InboundGate {
     paused_edge: AtomicBool,
     /// The latch's expired-hold count this gate has already opened for.
     expired_seen: AtomicU64,
+    /// `0` while no release window is open; while one is, the latch clock
+    /// reading it opened at, plus one.
+    release_window: AtomicU64,
 }
 
 impl InboundGate {
@@ -149,6 +156,7 @@ impl InboundGate {
             actuator,
             paused_edge: AtomicBool::new(false),
             expired_seen,
+            release_window: AtomicU64::new(0),
         }
     }
 
@@ -164,10 +172,14 @@ impl InboundGate {
     /// - no change: `compare_exchange` fails -> no actuator call.
     ///
     /// A hold that reached the latch's
-    /// [`max_hold`](UnifiedPressure::with_max_hold) opens every gate on the
-    /// latch for one evaluation, whichever caller the latch itself admitted:
-    /// that evaluation returns [`Admit::Yes`] and resumes, and the next one
-    /// pauses again if the latch re-armed.
+    /// [`max_hold`](UnifiedPressure::with_max_hold) opens a release window on
+    /// every gate on the latch, whichever caller the latch itself admitted.
+    /// The window resumes the source once and returns [`Admit::Yes`] until
+    /// [`note_received`](Self::note_received) reports a receive that returned
+    /// a record, or 2 s pass. A resumed source has to fetch before it returns
+    /// anything, so the first receive after the resume is often empty. Once
+    /// the window closes, the next evaluation pauses again if the latch
+    /// re-armed.
     ///
     /// Returns [`Admit::Hold`] when held, [`Admit::Yes`] otherwise. Never
     /// touches the outbound side.
@@ -185,8 +197,14 @@ impl InboundGate {
     pub fn evaluate(&self) -> Admit {
         let hold = self.pressure.should_hold();
         let expired = self.pressure.expired_holds();
-        let fresh_expiry = self.expired_seen.swap(expired, Ordering::AcqRel) != expired;
-        if hold && !fresh_expiry {
+        if self.expired_seen.swap(expired, Ordering::AcqRel) != expired {
+            let opened = self.pressure.now_nanos().saturating_add(1);
+            self.release_window.store(opened, Ordering::Release);
+        } else if !hold {
+            // The level released the latch, so a later hold must not inherit the window.
+            self.release_window.store(0, Ordering::Release);
+        }
+        if hold && !self.release_window_open() {
             // Rising edge: flip false -> true exactly once.
             if self
                 .paused_edge
@@ -207,6 +225,33 @@ impl InboundGate {
             }
             Admit::Yes
         }
+    }
+
+    /// Report how many records the receive after the last
+    /// [`evaluate`](Self::evaluate) returned.
+    ///
+    /// A receive that returned a record closes the release window an expired
+    /// hold opened, so the next evaluation pauses again if the latch still
+    /// holds. Call it from the task that calls `evaluate()`, once per receive;
+    /// a caller that never reports keeps each window open for 2 s.
+    pub fn note_received(&self, records: usize) {
+        if records > 0 {
+            self.release_window.store(0, Ordering::Release);
+        }
+    }
+
+    /// Whether a release window is open, closing one that has run its 2 s.
+    fn release_window_open(&self) -> bool {
+        let opened = self.release_window.load(Ordering::Acquire);
+        if opened == 0 {
+            return false;
+        }
+        let open_for = self.pressure.now_nanos().saturating_sub(opened - 1);
+        if Duration::from_nanos(open_for) < RELEASE_WINDOW {
+            return true;
+        }
+        self.release_window.store(0, Ordering::Release);
+        false
     }
 
     /// Whether the gate last drove the actuator to the held state.
@@ -404,8 +449,8 @@ mod tests {
     }
 
     /// A paused source whose level never clears resumes once at max_hold and
-    /// pauses again on the next evaluation; a level that settled in the band
-    /// stays resumed.
+    /// pauses again once a receive returns records; a level that settled in
+    /// the band stays resumed.
     #[test]
     fn a_hold_past_max_hold_resumes_the_source_once() {
         let (mem, now, pressure) = timed_governor(0.85);
@@ -416,6 +461,7 @@ mod tests {
         now.store(30 * SECOND, Ordering::Relaxed);
         assert_eq!(gate.evaluate(), Admit::Yes, "one window at max_hold");
         assert_eq!(counter.resumes(), 1);
+        gate.note_received(10);
         assert_eq!(gate.evaluate(), Admit::Hold, "0.85 re-arms");
         assert_eq!(gate.evaluate(), Admit::Hold);
         assert_eq!(counter.pauses(), 2, "one pause per re-arm");
@@ -442,13 +488,132 @@ mod tests {
         now.store(30 * SECOND, Ordering::Relaxed);
         assert_eq!(first.evaluate(), Admit::Yes, "takes the latch's window");
         assert_eq!(second.evaluate(), Admit::Yes, "re-armed latch, same expiry");
+        assert_eq!(
+            first.evaluate(),
+            Admit::Yes,
+            "open until a receive returns records"
+        );
         assert_eq!(first_count.resumes(), 1);
         assert_eq!(second_count.resumes(), 1);
 
+        first.note_received(1);
+        second.note_received(1);
         assert_eq!(first.evaluate(), Admit::Hold);
         assert_eq!(second.evaluate(), Admit::Hold);
         assert_eq!(first_count.pauses(), 2);
         assert_eq!(second_count.pauses(), 2);
+        assert_eq!(first_count.resumes(), 1, "one resume per expired hold");
+        assert_eq!(second_count.resumes(), 1, "one resume per expired hold");
+    }
+
+    /// A pull source behind the gate whose first poll after a resume returns
+    /// nothing, as a consumer that has to fetch again does.
+    struct RefetchingSource {
+        paused: AtomicBool,
+        refetching: AtomicBool,
+        batch: usize,
+    }
+
+    impl RefetchingSource {
+        fn poll(&self) -> usize {
+            if self.paused.load(Ordering::Relaxed) || self.refetching.swap(false, Ordering::Relaxed)
+            {
+                return 0;
+            }
+            self.batch
+        }
+    }
+
+    struct SourceActuator(Arc<RefetchingSource>);
+
+    impl GateActuator for SourceActuator {
+        fn pause(&self) {
+            self.0.paused.store(true, Ordering::Relaxed);
+        }
+        fn resume(&self) {
+            self.0.paused.store(false, Ordering::Relaxed);
+            self.0.refetching.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A gate over a source that refetches after a resume, and one receive in
+    /// the order a transport's recv runs it: evaluate, poll, report.
+    fn refetching_gate(pressure: &Arc<UnifiedPressure>) -> impl Fn() -> usize {
+        let source = Arc::new(RefetchingSource {
+            paused: AtomicBool::new(false),
+            refetching: AtomicBool::new(false),
+            batch: 500,
+        });
+        let gate = InboundGate::new(
+            Arc::clone(pressure),
+            Box::new(SourceActuator(Arc::clone(&source))),
+        );
+        move || {
+            let _ = gate.evaluate();
+            let records = source.poll();
+            gate.note_received(records);
+            records
+        }
+    }
+
+    /// An expired hold admits the batch after the resume even though the first
+    /// poll after it returns nothing. With a window of one evaluation the
+    /// second receive paused the source again and the hold admitted nothing.
+    #[test]
+    fn an_expired_hold_admits_a_batch_through_an_empty_first_poll() {
+        let (_mem, now, pressure) = timed_governor(0.85);
+        let recv = refetching_gate(&pressure);
+        assert_eq!(recv(), 0, "paused");
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        let admitted: usize = (0..5).map(|_| recv()).sum();
+        assert_eq!(
+            admitted, 500,
+            "one batch through the window, then paused again"
+        );
+
+        now.store(59 * SECOND, Ordering::Relaxed);
+        assert_eq!(recv(), 0, "held until the next max_hold");
+        now.store(60 * SECOND, Ordering::Relaxed);
+        let admitted: usize = (0..5).map(|_| recv()).sum();
+        assert_eq!(admitted, 500, "one batch per expired hold");
+    }
+
+    /// A window no receive fills closes after 2 s, and the source pauses again.
+    #[test]
+    fn a_release_window_closes_after_2_s_without_records() {
+        let (_mem, now, pressure) = timed_governor(0.85);
+        let (gate, counter) = counting_gate(&pressure);
+        assert_eq!(gate.evaluate(), Admit::Hold);
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Yes);
+        gate.note_received(0);
+        now.store(31 * SECOND, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Yes, "1 s into the window");
+        now.store(32 * SECOND, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Hold, "2 s bound");
+        assert_eq!(counter.pauses(), 2);
+        assert_eq!(counter.resumes(), 1);
+    }
+
+    /// A window ends when the level releases the latch: a hold that arms after
+    /// it pauses at once.
+    #[test]
+    fn a_hold_armed_after_the_level_released_gets_no_window() {
+        let (mem, now, pressure) = timed_governor(0.85);
+        let (gate, counter) = counting_gate(&pressure);
+        assert_eq!(gate.evaluate(), Admit::Hold);
+
+        now.store(30 * SECOND, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Yes);
+        mem.set(0.50);
+        assert_eq!(gate.evaluate(), Admit::Yes, "released by the level");
+        mem.set(0.90);
+        now.store(31 * SECOND, Ordering::Relaxed);
+        assert_eq!(gate.evaluate(), Admit::Hold, "a new hold, no window");
+        assert_eq!(counter.pauses(), 2);
+        assert_eq!(counter.resumes(), 1);
     }
 
     #[test]

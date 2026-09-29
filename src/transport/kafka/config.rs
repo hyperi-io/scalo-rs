@@ -66,6 +66,16 @@ use std::str::FromStr;
 /// never the largest record the pipeline accepts.
 pub const MESSAGE_MAX_BYTES: i32 = 16_777_216;
 
+/// The per-partition fetch size every sizing profile sets (1 MiB).
+///
+/// librdkafka's `max.partition.fetch.bytes` is the INITIAL size of a
+/// partition's fetch: a record larger than it grows the fetch until the whole
+/// record arrives, so a record up to [`MESSAGE_MAX_BYTES`] still comes through.
+/// What the value bounds is memory: each fetch reply carries up to this many
+/// compressed bytes per partition, and librdkafka decompresses all of it into
+/// its own buffers before the application reads a record.
+pub const PARTITION_FETCH_BYTES: i32 = 1_048_576;
+
 // ============================================================================
 // Producer codec
 // ============================================================================
@@ -184,7 +194,7 @@ pub const CLASSIC_ONLY_CONSUMER_KEYS: &[&str] = &[
 pub enum SelfRegulationProfile {
     /// Maximum throughput: generous byte budgets, tolerates batching delay.
     ///
-    /// Consumer: 1 MiB fetch.min.bytes, 50 ms wait, 16 MiB per-partition,
+    /// Consumer: 1 MiB fetch.min.bytes, 50 ms wait, 1 MiB per-partition,
     /// 50 MiB total, 2000 poll-safety cap.
     /// Producer: 128 KiB batch, 20 ms linger, zstd level 3, 64 MiB buffer,
     /// 5 in-flight, 16 MiB record ceiling.
@@ -193,7 +203,7 @@ pub enum SelfRegulationProfile {
 
     /// Balanced: moderate batching, 5 ms linger, smaller per-partition budget.
     ///
-    /// Consumer: 256 KiB fetch.min.bytes, 25 ms wait, 16 MiB per-partition,
+    /// Consumer: 256 KiB fetch.min.bytes, 25 ms wait, 1 MiB per-partition,
     /// 50 MiB total, 1000 poll-safety cap.
     /// Producer: 64 KiB batch, 5 ms linger, zstd level 3, 32 MiB buffer,
     /// 5 in-flight, 16 MiB record ceiling.
@@ -201,7 +211,7 @@ pub enum SelfRegulationProfile {
 
     /// Low latency: minimal batching delay, smaller buffers.
     ///
-    /// Consumer: 1 byte fetch.min.bytes, 5 ms wait, 16 MiB per-partition,
+    /// Consumer: 1 byte fetch.min.bytes, 5 ms wait, 1 MiB per-partition,
     /// 16 MiB total, 500 poll-safety cap.
     /// Producer: 16 KiB batch, 0 ms linger, zstd level 3, 16 MiB buffer,
     /// 5 in-flight, 16 MiB record ceiling.
@@ -218,9 +228,8 @@ impl SelfRegulationProfile {
                 fetch_min_bytes: Some(1_048_576),
                 // 50 ms -- gives broker time to fill the 1 MiB budget.
                 fetch_max_wait_ms: Some(50),
-                // The record ceiling: a partition must be able to yield one
-                // maximum-size record in a single fetch.
-                max_partition_fetch_bytes: Some(MESSAGE_MAX_BYTES),
+                // Bounds what one fetch decompresses per partition; a larger record grows the fetch.
+                max_partition_fetch_bytes: Some(PARTITION_FETCH_BYTES),
                 // 50 MiB -- caps total network fetch per round-trip, and stays
                 // under the 55 MiB the broker holds read-only on MSK Express.
                 fetch_max_bytes: Some(52_428_800),
@@ -230,17 +239,15 @@ impl SelfRegulationProfile {
             Self::Balanced => ConsumerKnobs {
                 fetch_min_bytes: Some(262_144), // 256 KiB
                 fetch_max_wait_ms: Some(25),
-                max_partition_fetch_bytes: Some(MESSAGE_MAX_BYTES),
+                max_partition_fetch_bytes: Some(PARTITION_FETCH_BYTES),
                 fetch_max_bytes: Some(52_428_800), // 50 MiB
                 max_poll_records: Some(1000),
             },
             Self::LowLatency => ConsumerKnobs {
                 fetch_min_bytes: Some(1),   // no batching threshold
                 fetch_max_wait_ms: Some(5), // return fast
-                max_partition_fetch_bytes: Some(MESSAGE_MAX_BYTES),
-                // The smallest total budget that can still carry one
-                // maximum-size record: equal to the per-partition ceiling.
-                fetch_max_bytes: Some(MESSAGE_MAX_BYTES),
+                max_partition_fetch_bytes: Some(PARTITION_FETCH_BYTES),
+                fetch_max_bytes: Some(16_777_216), // 16 MiB
                 max_poll_records: Some(500),
             },
         }
@@ -313,22 +320,23 @@ pub struct ConsumerKnobs {
     #[serde(default)]
     pub fetch_max_wait_ms: Option<u32>,
 
-    /// Maximum bytes returned per partition per Fetch request.
+    /// Bytes requested per partition per Fetch request.
     ///
     /// librdkafka: `max.partition.fetch.bytes` (alias `fetch.message.max.bytes`,
-    /// default 1 MiB). Must be >= the topic's `max.message.bytes`, so every
-    /// profile sets it to [`MESSAGE_MAX_BYTES`]. librdkafka does grow it on
-    /// sight of a larger record, but the explicit value keeps the consumer's
-    /// memory envelope predictable instead of discovered.
+    /// default 1 MiB). It bounds memory, not record size: librdkafka grows the
+    /// fetch for a record larger than it until the whole record arrives, and
+    /// decompresses everything a fetch returns before the application reads it.
+    /// Every profile sets [`PARTITION_FETCH_BYTES`].
     #[serde(default)]
     pub max_partition_fetch_bytes: Option<i32>,
 
     /// Maximum total bytes returned by the broker for a single Fetch request
     /// across all partitions.
     ///
-    /// librdkafka: `fetch.max.bytes` (default 50 MiB). Keep it at or under
-    /// 50 MiB: MSK Express holds the broker's own 55 MiB fetch ceiling
-    /// read-only, so asking for more is a number that can never be honoured.
+    /// librdkafka: `fetch.max.bytes` (default 50 MiB). A first batch larger
+    /// than it is still returned whole. Keep it at or under 50 MiB: MSK
+    /// Express holds the broker's own 55 MiB fetch ceiling read-only, so
+    /// asking for more is a number that can never be honoured.
     #[serde(default)]
     pub fetch_max_bytes: Option<i32>,
 
@@ -2301,9 +2309,8 @@ mod tests {
         assert_eq!(map["fetch.min.bytes"], "1048576", "1 MiB fetch.min.bytes");
         assert_eq!(map["fetch.wait.max.ms"], "50");
         assert_eq!(
-            map["max.partition.fetch.bytes"],
-            MESSAGE_MAX_BYTES.to_string(),
-            "a partition must yield one maximum-size record in a single fetch"
+            map["max.partition.fetch.bytes"], "1048576",
+            "1 MiB per partition"
         );
         assert_eq!(
             map["fetch.max.bytes"], "52428800",
@@ -2324,16 +2331,10 @@ mod tests {
         assert_eq!(map["fetch.min.bytes"], "1", "no batching threshold");
         assert_eq!(map["fetch.wait.max.ms"], "5", "return fast");
         assert_eq!(
-            map["max.partition.fetch.bytes"],
-            MESSAGE_MAX_BYTES.to_string(),
-            "low latency still has to be able to fetch a maximum-size record"
+            map["max.partition.fetch.bytes"], "1048576",
+            "1 MiB per partition"
         );
-        assert_eq!(
-            map["fetch.max.bytes"],
-            MESSAGE_MAX_BYTES.to_string(),
-            "the smallest total budget that can still carry one maximum-size \
-             record is the per-partition ceiling itself"
-        );
+        assert_eq!(map["fetch.max.bytes"], "16777216", "16 MiB total");
         assert_eq!(s.effective_poll_cap(), 500);
     }
 
@@ -2352,28 +2353,23 @@ mod tests {
         assert_eq!(s.effective_poll_cap(), 1000);
     }
 
-    /// The per-partition fetch budget is part of the record-size chain, so it
-    /// does not vary by profile: any profile that fetched less than the record
-    /// ceiling would stall on a maximum-size record.
+    /// A partition's fetch is decompressed whole before the application reads
+    /// it, so its size is a memory bound on every profile. A record larger
+    /// than it still arrives: librdkafka grows the fetch until it does.
     #[test]
-    fn every_profile_fetches_a_whole_maximum_size_record() {
+    fn every_profile_bounds_the_partition_fetch_at_1_mib() {
         for profile in [
             SelfRegulationProfile::Throughput,
             SelfRegulationProfile::Balanced,
             SelfRegulationProfile::LowLatency,
         ] {
             let map = sizing_for_profile(profile).resolved_consumer_map();
-            assert_eq!(
-                map["max.partition.fetch.bytes"],
-                MESSAGE_MAX_BYTES.to_string(),
-                "profile {profile:?} must fetch a whole maximum-size record"
+            let partition: i32 = map["max.partition.fetch.bytes"].parse().unwrap();
+            assert!(
+                partition <= 1_048_576,
+                "profile {profile:?} max.partition.fetch.bytes={partition} is over 1 MiB"
             );
             let total: i32 = map["fetch.max.bytes"].parse().unwrap();
-            assert!(
-                total >= MESSAGE_MAX_BYTES,
-                "profile {profile:?} fetch.max.bytes={total} is below the \
-                 record ceiling, so one maximum-size record never fits"
-            );
             assert!(
                 total <= 52_428_800,
                 "profile {profile:?} fetch.max.bytes={total} exceeds 50 MiB, \

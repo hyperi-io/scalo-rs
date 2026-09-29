@@ -376,6 +376,17 @@ fn note_unarmed<R: TransportReceiver>(receiver: &R) {
     }
 }
 
+/// Write a received block's bytes to `self_regulation_recv_block_bytes`, beside
+/// the `self_regulation_byte_budget` the controller writes: a persistent
+/// overshoot means the recv byte cap is not holding.
+#[cfg(all(feature = "transport", feature = "governor"))]
+pub(super) fn note_recv_block_bytes(bytes: u64) {
+    #[cfg(feature = "metrics")]
+    metrics::gauge!("self_regulation_recv_block_bytes").set(bytes as f64);
+    #[cfg(not(feature = "metrics"))]
+    let _ = bytes;
+}
+
 /// Report the first success after a run of transient failures.
 #[cfg(feature = "transport")]
 pub(super) fn note_recovered(stage: &'static str, failures: u32) {
@@ -890,12 +901,7 @@ impl BatchEngine {
 
                     // Shrinks the budget while memory pressure holds, grows it otherwise.
                     budget.observe(block_bytes, process_time, ingest_interval);
-
-                    // Received block bytes beside `self_regulation_byte_budget`,
-                    // which the controller writes: a persistent overshoot means the
-                    // recv byte cap is not holding.
-                    #[cfg(feature = "metrics")]
-                    metrics::gauge!("self_regulation_recv_block_bytes").set(block_bytes as f64);
+                    note_recv_block_bytes(block_bytes);
                 }
             }
         }

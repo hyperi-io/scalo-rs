@@ -4296,6 +4296,53 @@ impl metrics::Recorder for GaugeCapture {
     }
 }
 
+/// A governed pipeline writes each received block's bytes beside the byte
+/// budget, as the governed driver does: the gauge holds one block's bytes
+/// while the next is in the sink, and the last block's once the run ends.
+#[cfg(all(feature = "metrics", feature = "governor"))]
+#[tokio::test(flavor = "current_thread")]
+async fn a_governed_pipeline_writes_each_received_block_bytes() {
+    let payload_bytes = |seqs: &[u64]| -> f64 {
+        seqs.iter()
+            .map(|s| format!(r#"{{"seq":{s}}}"#).len() as f64)
+            .sum()
+    };
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let (engine, _gov) = governed_engine();
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2], vec![10]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    let seen = Arc::clone(&capture);
+    let during_second = Arc::new(parking_lot::Mutex::new(None));
+    let noted = Arc::clone(&during_second);
+    let mut blocks = 0;
+
+    engine
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .sink_confirms(SinkConfirmation::Remote)
+        .run(
+            |batch| Ok(batch),
+            move |_out: &WorkBatch<_>| {
+                blocks += 1;
+                if blocks == 2 {
+                    *noted.lock() = seen.gauge("self_regulation_recv_block_bytes", &[]);
+                    stop.cancel();
+                }
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect("clean shutdown");
+
+    assert_eq!(*during_second.lock(), Some(payload_bytes(&[0, 1, 2])));
+    assert_eq!(
+        capture.gauge("self_regulation_recv_block_bytes", &[]),
+        Some(payload_bytes(&[10]))
+    );
+}
+
 #[cfg(all(feature = "metrics", feature = "transport-pipe"))]
 #[tokio::test(flavor = "current_thread")]
 async fn effective_guarantee_reports_best_effort_for_a_pipe_source() {

@@ -49,7 +49,8 @@
 //!   (default 30 s, `self_regulation.max_hold_secs`) the latch admits one
 //!   window and re-arms if the level is still at `pause_above`, so a source
 //!   is never paused for good. Each [`InboundGate`] on the latch resumes once
-//!   per expired hold; the byte budget never takes that window.
+//!   per expired hold and stays open until a receive returns records or 2 s
+//!   pass; the byte budget never takes that window.
 //!
 //! New source kinds (e.g. a future CPU source) plug in via
 //! [`UnifiedPressure::add_source`] with zero change to the gate API.
