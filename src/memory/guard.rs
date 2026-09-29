@@ -217,14 +217,14 @@ impl MemoryGuardConfig {
     /// # Example
     ///
     /// ```bash
-    /// DFE_MEMORY_LIMIT_BYTES=4294967296      # 4 GiB explicit
-    /// DFE_MEMORY_PRESSURE_THRESHOLD=0.75     # backpressure at 75%
-    /// DFE_MEMORY_CGROUP_HEADROOM=0.90        # use 90% of cgroup
+    /// MYAPP_MEMORY_LIMIT_BYTES=4294967296      # 4 GiB explicit
+    /// MYAPP_MEMORY_PRESSURE_THRESHOLD=0.75     # backpressure at 75%
+    /// MYAPP_MEMORY_CGROUP_HEADROOM=0.90        # use 90% of cgroup
     /// ```
     ///
     /// ```rust,no_run
     /// use scalo::memory::MemoryGuardConfig;
-    /// let config = MemoryGuardConfig::from_env("DFE");
+    /// let config = MemoryGuardConfig::from_env("MYAPP");
     /// ```
     #[must_use]
     #[cfg(feature = "config")]

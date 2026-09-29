@@ -202,9 +202,10 @@ generic tool.
 
 - **MemoryGuard** (`src/memory/guard.rs`): hard source of truth from
   cgroup v2 `memory.current`/`memory.max`/`memory.high`; effective limit
-  = max * headroom (0.85), capped at memory.high; pressure ratio is the
-  never-OOM backstop. App registers its allocator via `set_heap_source`
-  so scalo stays allocator-agnostic.
+  = max * headroom (0.85), capped at memory.high; pressure ratio drives
+  load shedding, not an OOM guarantee. Reads the kernel's cgroup figure
+  by default -- an app opts in to `set_heap_source` to gate on its own
+  allocator's figure instead.
 - **ByteBudgetController** (`src/governor/budget.rs`): AIMD on
   rho = EMA(process_time)/EMA(ingest_interval). rho<0.7 additive
   increase, rho>0.7 multiplicative decrease (0.5), memory pressure forces
