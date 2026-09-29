@@ -18,12 +18,19 @@ use super::native_deps::NativeDepsContract;
 /// Both profiles use the same linking strategy (dynamic). The difference is
 /// optimisation level, debug tooling, and image metadata.
 ///
-/// # Image tagging convention
+/// # Image tags
 ///
-/// | Profile | Tag | Example |
-/// |---------|-----|---------|
-/// | `Production` | `:<version>`, `:latest` | `dfe-loader:1.15.0` |
-/// | `Development` | `:<version>-dev`, `:latest-dev` | `dfe-loader:1.15.0-dev` |
+/// The profile sets what goes into the image, not its tag. The release
+/// pipeline tags images:
+///
+/// | Build | Tags | Example |
+/// |-------|------|---------|
+/// | Release channel | `:v<version>`, `:latest`, `:sha-<short>` | `myapp:v1.15.0` |
+/// | Pre-GA channel | `:v<version>-<channel>`, `:sha-<short>` | `myapp:v1.15.0-beta` |
+/// | Branch dev image | `:branch-<slug>`, `:branch-<slug>-sha-<short>` | `myapp:branch-fix-x` |
+///
+/// Version tags carry the `v`. There is no `-dev` tag: a `Development` image
+/// is built from its own Dockerfile where it is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageProfile {

@@ -1,10 +1,6 @@
 # Scaling
 
-`ScalingPressure` produces a single `f64` in the range `0.0..=100.0`
-that KEDA consumes via its Prometheus external scaler. The value is a
-weighted composite over N app-specific `ScalingComponent`s, with two
-hard gates that override the composite when the right thing to do is
-unambiguous.
+`ScalingPressure` produces a single `f64` in the range `0.0..=100.0` for an autoscaler such as KEDA to read. The value is a weighted composite over N app-specific `ScalingComponent`s, with two hard gates that override the composite when the right thing to do is unambiguous.
 
 Lock-free updates from any thread (component values stored as
 `f64::to_bits()` in `AtomicU64`, all writes `Relaxed`). Pressure is a
@@ -73,7 +69,7 @@ has a native CPU trigger that reads container-level CPU from the
 Kubernetes metrics-server. The right wiring is two independent KEDA
 triggers in the `ScaledObject`:
 
-- **`scaling_pressure` gauge** → Prometheus scaler → app-level signals
+- **`scaling_pressure` gauge** -> the deployment's own pressure trigger ([below](#how-keda-reads-it)) -> app-level signals
 - **CPU utilisation** → CPU scaler → container-level, via metrics-server
 
 KEDA scales to the MAX of all triggers. Mixing CPU into the composite
@@ -83,33 +79,33 @@ would double-count and obscure which signal is driving the scale.
 
 ## How KEDA reads it
 
-The `/scaling/pressure` endpoint is mounted on the metrics HTTP
-server when `MetricsManager::set_scaling_pressure` has been called
-(which `ServiceRuntime` does automatically). Body is a plain text
-float — `format!("{:.2}", pressure.calculate())`.
+scalo publishes the value two ways, and KEDA reads neither until the deployment adds a trigger for it:
 
-The `dfe_scaling_pressure` gauge carries the same number only once the
-app sets it: nothing copies `calculate()` into the gauge. An app whose
-KEDA Prometheus scaler reads the gauge calls
-`ServiceMetrics::scaling_pressure(pressure.calculate())` on a tick. Until
-it does, the gauge carries nothing from `ScalingPressure`.
+- **`/scaling/pressure`** on the metrics listener answers `format!("{:.2}", pressure.calculate())` as plain text once `MetricsManager::set_scaling_pressure` has attached a pressure, which `ServiceRuntime` does, and 404 until then.
+- **The `scaling_pressure` gauge**, `{namespace}_scaling_pressure` when `metrics.namespace` sets a prefix, carries the number only once the app sets it. Nothing copies `calculate()` into it: an app that scales on the gauge calls `ServiceMetrics::scaling_pressure(pressure.calculate())` on a tick.
+
+The chart `generate_chart()` writes reads neither. Its ScaledObject carries a Kafka consumer-group lag trigger unless the contract turns it off, and a CPU utilisation trigger while `keda.cpu.enabled` is true. See [../deployment/keda.md](../deployment/keda.md).
+
+To scale on the composite, the deployment adds its own trigger. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it, beside the CPU trigger:
 
 ```yaml
-# KEDA ScaledObject excerpt
+# ScaledObject triggers, deployment-side
 triggers:
-  - type: prometheus
-    metadata:
-      serverAddress: http://prometheus:9090
-      query: dfe_scaling_pressure{app="dfe-loader"}
-      threshold: "50"
   - type: cpu
+    metricType: Utilization
     metadata:
-      type: Utilization
-      value: "80"
+      value: "70"
+  - type: metrics-api
+    metricType: Value
+    metadata:
+      targetValue: "70"
+      url: "http://<adapter>/keda/pressure?service=<app>"
+      valueLocation: "value"
 ```
 
-See [`../../src/metrics/mod.rs`](../../src/metrics/mod.rs) for the
-endpoint mount.
+Use `metricType: Value`. `AverageValue` treats the metric as a total to share across the replicas, which a 0-100 score is not. The adapter also decides what a failed lookup does, and holding the replica count is safer than scaling out on a missing value.
+
+See [`../../src/metrics/mod.rs`](../../src/metrics/mod.rs) for the endpoint mount.
 
 ---
 
@@ -142,11 +138,7 @@ runtime.scaling.as_ref().unwrap().set_component("kafka_lag", lag as f64);
 runtime.scaling.as_ref().unwrap().set_memory(used, limit);
 ```
 
-The `dfe.scaling_pressure(value)` / `dfe.scaling_circuit_open(...)` /
-`dfe.scaling_memory_pressure(...)` helpers on `ServiceMetrics` write the
-companion gauges (`dfe_scaling_pressure`,
-`dfe_scaling_circuit_open`, `dfe_scaling_memory_pressure`) for
-dashboard overlay.
+The `scaling_pressure(value)` / `scaling_circuit_open(...)` / `scaling_memory_pressure(...)` helpers on `ServiceMetrics` write the companion gauges `scaling_pressure`, `scaling_circuit_open` and `scaling_memory_pressure`, prefixed when `metrics.namespace` is set, for the pressure trigger and dashboard overlay.
 
 ---
 

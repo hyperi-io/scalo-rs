@@ -71,8 +71,9 @@ impl From<PayloadFormat> for crate::PayloadFormat {
 /// Metadata attached to a parsed message.
 ///
 /// Carries transport provenance -- timestamp and detected format. Commit
-/// tokens are NOT carried here: they live on [`crate::transport::WorkBatch`]'s
-/// `commit_tokens` and are decoupled from individual records.
+/// tokens are NOT carried here: they live on `transport::WorkBatch`'s
+/// `commit_tokens` (`transport` feature) and are decoupled from individual
+/// records.
 #[derive(Debug, Clone)]
 pub struct MessageMetadata {
     /// Message timestamp from the transport layer (milliseconds since epoch).
@@ -84,7 +85,8 @@ pub struct MessageMetadata {
 /// A JSON-parsed message.
 ///
 /// Holds the parsed JSON value alongside extracted fields for fast routing
-/// lookups. Built by the engine's parse step from a [`crate::transport::Record`].
+/// lookups. Built by the engine's parse step from a `transport::Record`
+/// (`transport` feature).
 #[derive(Debug, Clone)]
 pub struct ParsedMessage {
     /// Full parsed JSON value.

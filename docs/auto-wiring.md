@@ -15,10 +15,10 @@ This doc is the model — what's wired, how, and what the consequences are.
 | Config | `OnceLock<Config>` | `config::setup(opts)` | `config::get`, `T::from_cascade()`, `Config::unmarshal_key_registered` |
 | Logger | Global `tracing` subscriber | `logger::setup_default()` | `tracing::info!`, `warn!`, `error!`, `debug!`, `trace!` macros |
 | Metrics | Global `metrics` recorder | `MetricsManager::new("app")` | `metrics::counter!`, `gauge!`, `histogram!` macros |
-| OTel | Global meter + tracer provider | `otel::setup()` (or via `otel-tracing` subscriber layer) | Propagated through `tracing::span!` and `#[instrument]` |
-| Health | `HealthRegistry` | `HealthRegistry::register("module", ...)` | `/readyz` aggregates; `HealthState::current()` |
-| Shutdown | `CancellationToken` (from `tokio-util`) | `ServiceRuntime::new` (or `shutdown::install_handlers()`) | `token.cancelled().await` in any task |
-| Runtime context | `OnceLock<RuntimeContext>` | `RuntimeContext::detect()` (called by `ServiceRuntime`) | `RuntimeContext::current()` |
+| OTel | Global meter + tracer provider | `MetricsManager` sets the meter provider (`otel-metrics`); `logger::setup` adds the span layer (`otel-tracing`) | Propagated through `tracing::span!` and `#[instrument]` |
+| Health | `OnceLock<HealthRegistry>`, created on first use | `HealthRegistry::register("module", ...)` | `/readyz` aggregates; `HealthRegistry::is_ready()`, `is_healthy()` |
+| Shutdown | `CancellationToken` (from `tokio-util`) | `shutdown::install_signal_handler()`, which `ServiceRuntime::build` calls | `token.cancelled().await` in any task; `shutdown::token()` |
+| Runtime context | `OnceLock<RuntimeContext>` | `RuntimeContext::detect()`, run once on first read | `env::runtime_context()` |
 
 These are the only globals. Everything else passes handles or
 borrows.
@@ -31,20 +31,20 @@ borrows.
 sequenceDiagram
     participant Main as main
     participant Run as run_app
-    participant SR as ServiceRuntime new
+    participant SR as ServiceRuntime build
     participant Pillars as Pillar singletons
     participant App as run_service
     participant Module as Pipeline module
 
     Main->>Run: app
-    Run->>Pillars: logger::setup_default()
     Run->>App: load_config(path)
     App->>Pillars: config::setup() / Config::from_cascade
+    Run->>Pillars: logger::setup(opts)
     Run->>SR: build runtime
-    SR->>Pillars: MetricsManager::new(app.name())
-    SR->>Pillars: RuntimeContext::detect()
-    SR->>Pillars: HealthRegistry::install()
-    SR->>Pillars: CancellationToken::new() + signal handlers
+    SR->>Pillars: env::runtime_context()
+    SR->>Pillars: MetricsManager::with_config(settings)
+    SR->>Pillars: shutdown::install_signal_handler()
+    SR->>Pillars: start_server(metrics addr)
     SR-->>Run: ServiceRuntime
     Run->>App: work_state(config)
     Run->>App: run_service(config, runtime) [when Active]
@@ -64,16 +64,16 @@ means a `Transport` impl ships with metrics-emission baked in, and the
 
 ## What's auto-wired versus explicit
 
-`ServiceRuntime::new` is the one-stop wire-up. It pulls in:
+`ServiceRuntime::build`, which `run_app` calls, is the one-stop wire-up. It pulls in:
 
 | Singleton | Action |
 |-----------|--------|
-| Logger | Already installed by `run_app` before `ServiceRuntime::new` runs |
-| Config | Already loaded by `app.load_config` before `ServiceRuntime::new` runs |
-| Metrics | `MetricsManager::new(app.name())` installed and running |
-| Health | `HealthRegistry` initialised; modules `register` themselves later |
+| Logger | Already installed by `run_app` before `ServiceRuntime::build` runs |
+| Config | Already loaded by `app.load_config` before `ServiceRuntime::build` runs |
+| Metrics | `MetricsManager::with_config(...)` built from the `metrics` config section, bare names unless `metrics.namespace` sets a prefix, with the scalo runtime metric set described |
+| Health | Not touched: `HealthRegistry` is created on first use, and modules `register` themselves |
 | Shutdown | `CancellationToken` created, SIGTERM/SIGINT handlers attached, K8s pre-stop delay configured |
-| Runtime context | `RuntimeContext::detect()` runs once, results cached |
+| Runtime context | `env::runtime_context()` detects once, results cached |
 | Memory guard | `MemoryGuard` constructed if `memory` feature on |
 | Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)` |
 | Worker pool | `AdaptiveWorkerPool` constructed if `worker-pool` feature on |
@@ -104,7 +104,7 @@ are tools you compose into your `run_service`.
 | `config::setup(opts)` | 7-layer cascade, env-var nesting, `.env`, sensitive masking, hot-reload, `/config` admin endpoint, section registry |
 | `logger::setup_default()` | Structured tracing, JSON/text autodetect, RFC 3339 timestamps, masking, flood control |
 | `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint, process metrics, cardinality cap, `/metrics/manifest` |
-| `ServiceRuntime::new(...)` | All of the above + memory guard + scaling pressure + worker pool + shutdown token + K8s pre-stop + runtime context + HTTP server |
+| `run_app(app)` | All of the above + memory guard + scaling pressure + worker pool + shutdown token + K8s pre-stop + runtime context + metrics server |
 | Any `Transport` impl | 3-tier filter engine, DLQ routing, per-direction/action metrics, traceparent propagation |
 | `TieredSink::new(...)` | Transport + spool + circuit breaker + retry + DLQ + backpressure signal |
 | `BatchEngine::process_mid_tier()` | SIMD JSON parse, pre-route filter, field interning, parallel transform on the worker pool, commit-token plumbing |

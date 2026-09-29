@@ -15,8 +15,8 @@
 //! regenerated rather than replayed.
 //!
 //! The hook is async because acquiring the credential can be I/O -- a token
-//! exchange, a metadata-server call, a secret read. The placements in
-//! [`crate::auth`] are the implementations that come with scalo; a signing
+//! exchange, a metadata-server call, a secret read. The placements in the
+//! `auth` module (`auth` feature) are the implementations that come with scalo; a signing
 //! scheme with its own crypto dependencies (SigV4, a request HMAC) belongs in
 //! the consumer as one more implementation of this trait.
 
@@ -29,7 +29,7 @@ use reqwest::header::HeaderValue;
 /// Not retried by default: a credential that could not be rendered will not
 /// render on the next attempt. A signer whose credential endpoint could not be
 /// reached says so with [`Self::retryable`], and the retry loop then re-signs.
-/// A placement over a [`crate::auth`] source hands its acquisition failure
+/// A placement over an `auth` source (`auth` feature) hands its acquisition failure
 /// through whole, so a consumer can read the status of a refusal.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

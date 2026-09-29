@@ -248,7 +248,7 @@ impl MemoryGuardConfig {
 
     /// Create config from environment variables without requiring `config` feature.
     ///
-    /// Same as [`from_env`](Self::from_env) but uses `std::env` directly.
+    /// Same as `from_env` (`config` feature) but uses `std::env` directly.
     #[must_use]
     pub fn from_env_raw(prefix: &str) -> Self {
         let mut config = Self::default();

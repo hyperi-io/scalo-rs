@@ -196,6 +196,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             // default rather than what the cascade actually yields.
             let config_path = args.config.as_deref();
             let loaded = app.load_config(config_path);
+            #[cfg(feature = "logger")]
             init_logger(args)?;
 
             match loaded {
@@ -278,6 +279,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             // span exporter, whose settings live in the cascade. The cascade
             // has no subscriber while it loads, so its own log lines are lost.
             let loaded = app.load_config(config_path);
+            #[cfg(feature = "logger")]
             init_logger_for_service(args, app.name(), &version_info.version)?;
             let config = loaded?;
 
@@ -395,22 +397,6 @@ fn init_logger_for_service(
         service_version: Some(service_version.to_string()),
         ..opts
     })?;
-    Ok(())
-}
-
-/// Initialise the logger from CLI arguments (no-op without logger feature).
-#[cfg(not(feature = "logger"))]
-fn init_logger(_args: &CommonArgs) -> Result<(), CliError> {
-    Ok(())
-}
-
-/// Initialise the logger with service name and version (no-op without logger feature).
-#[cfg(not(feature = "logger"))]
-fn init_logger_for_service(
-    _args: &CommonArgs,
-    _service_name: &str,
-    _service_version: &str,
-) -> Result<(), CliError> {
     Ok(())
 }
 
@@ -773,10 +759,12 @@ mod tests {
     }
 
     /// A service that names the commit it was built from.
+    #[cfg(feature = "service-metrics")]
     struct CommittedApp {
         common: CommonArgs,
     }
 
+    #[cfg(feature = "service-metrics")]
     impl ServiceApp for CommittedApp {
         type Config = ();
 

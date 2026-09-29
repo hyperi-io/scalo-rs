@@ -50,7 +50,8 @@
 //! whatever host the downstream names. Build a client whose calls are signed
 //! with a header or a query parameter through
 //! [`HttpClient::with_redirect_policy`] and a policy that refuses the hop, as
-//! the token exchanges in [`crate::auth`] do for themselves.
+//! the token exchanges in the `auth` module (`auth` feature) do for
+//! themselves.
 //!
 //! # Config Cascade
 //!
