@@ -146,20 +146,20 @@ use super::config::WorkerPoolConfig;
 
 /// Core batch processing engine for the data-plane pipeline.
 ///
-/// Provides two in-process processing modes (the run-loop drivers live in the
-/// `driver` module, gated on the `transport` feature):
+/// With the `transport` feature it provides two in-process processing modes
+/// (the run-loop drivers live in the `driver` module, gated the same way):
 ///
-/// - [`process_mid_tier`](Self::process_mid_tier) -- parse JSON via SIMD, extract
+/// - `process_mid_tier` -- parse JSON via SIMD, extract
 ///   known fields, apply pre-route filters, then parallel transform via rayon.
 ///   The standard path for most consumer services (loader, archiver, transforms).
 ///
-/// - [`process_raw`](Self::process_raw) -- skip parsing, apply pre-route on raw
+/// - `process_raw` -- skip parsing, apply pre-route on raw
 ///   bytes, then parallel transform via rayon. For apps that handle raw bytes
 ///   (receiver, binary protocols).
 ///
-/// Both take the canonical [`Record`](crate::transport::Record) slice (the same
-/// currency the [`WorkBatch`](crate::transport::WorkBatch) carries), chunk large
-/// batches, and track stats atomically.
+/// Both take the canonical `transport::Record` slice (the same currency a
+/// `transport::WorkBatch` carries), chunk large batches, and track stats
+/// atomically.
 ///
 /// Inbound braking under memory pressure is no longer a blocking pause between
 /// chunks (the retired `check_memory_pressure` proto-actuator). It is now the

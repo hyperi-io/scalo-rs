@@ -26,14 +26,14 @@
 //!
 //! The emptiness predicate belongs to the app (it is the only thing that knows
 //! what "no work" means); the behaviour belongs to scalo. An app names its
-//! predicate by implementing [`ServiceApp::work_state`](crate::cli::ServiceApp::work_state).
+//! predicate by implementing `ServiceApp::work_state` (`cli-service` feature).
 //!
 //! ## What idle looks like from outside
 //!
-//! - `/livez` and `/readyz`: serving, and READY. A `work_config` component is
-//!   registered [`Degraded`](crate::health::HealthStatus::Degraded) -- ready,
-//!   not healthy -- so a deploy's readiness gate passes while an operator (and
-//!   `/healthz`) can still see the app has nothing to do.
+//! - `/livez` and `/readyz`: serving, and READY. With the `health` feature a
+//!   `work_config` component is registered `Degraded` -- ready, not healthy --
+//!   so a deploy's readiness gate passes while an operator (and `/healthz`)
+//!   can still see the app has nothing to do.
 //! - `pipeline_idle` gauge: 1 while idle, 0 once work arrives.
 //! - No transport is constructed, so no broker connection, no consumer group,
 //!   no listener socket.
@@ -57,7 +57,7 @@ pub const WORK_COMPONENT: &str = "work_config";
 
 /// Whether an app's configuration currently gives it work to do.
 ///
-/// Returned by [`ServiceApp::work_state`](crate::cli::ServiceApp::work_state).
+/// Returned by `ServiceApp::work_state` (`cli-service` feature).
 /// The default for every app is [`Active`](WorkState::Active): an app that has
 /// not named an emptiness predicate behaves exactly as it did before.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,8 +127,8 @@ pub enum GateWake {
 
 /// The idle gate: health component, `pipeline_idle` gauge, and the park.
 ///
-/// One per process, held by
-/// [`run_app`](crate::cli::run_app) across the work-state loop. The health
+/// One per process, held by `run_app` (`cli-service` feature) across the
+/// work-state loop. The health
 /// component is registered on the FIRST idle only: an app that never idles adds
 /// nothing to `/healthz`.
 pub struct IdleGate {

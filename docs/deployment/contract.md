@@ -269,9 +269,7 @@ Neither `bound_from` nor `unbound_listen_paths` changes a byte of any generated 
 
 ## Dev profile derivation
 
-`ImageProfile::Development` is a one-line variant: same binary, same
-linking, plus diagnostic tools (`bash`, `strace`, `tcpdump`, `procps`,
-`dnsutils`, `net-tools`, `less`, `jq`) and a `-dev` image tag suffix.
+`ImageProfile::Development` is a one-line variant: same binary, same linking, plus diagnostic tools (`bash`, `strace`, `tcpdump`, `procps`, `dnsutils`, `net-tools`, `less`, `jq`).
 
 ```rust
 let prod = build_contract();
@@ -281,9 +279,7 @@ generate_dockerfile(&prod, None);    // base_image + runtime libs only
 generate_dockerfile(&dev, None);     // + strace, tcpdump, ...
 ```
 
-CI produces both: `:1.15.0` (prod) and `:1.15.0-dev` (dev). Operators
-pull the dev image into a debug pod for forensic work without
-rebuilding.
+The profile changes what is in the image, not its tag. A release publish from hyperi-ci pushes `:v<version>`, `:latest` and `:sha-<short>`, so the pull reference is `dfe-loader:v1.15.0`, with the `v`. It pushes no `-dev` variant: an operator who wants the diagnostic tools in a debug pod builds the dev image from `generate_dockerfile(&dev, None)`.
 
 ---
 

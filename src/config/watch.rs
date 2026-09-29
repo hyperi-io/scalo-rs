@@ -12,9 +12,9 @@
 //! a config-file mtime change, a periodic tick, and SIGHUP -- and hands back
 //! which one fired. Two callers share it:
 //!
-//! - [`ConfigReloader`](super::reloader::ConfigReloader), which reloads and
+//! - `ConfigReloader` (`config-reload` feature), which reloads and
 //!   validates on each trigger and updates its `SharedConfig<T>`.
-//! - [`IdleGate`](crate::lifecycle::IdleGate), which parks a service that has
+//! - `IdleGate` (`lifecycle` feature), which parks a service that has
 //!   no work to do until a change might give it some.
 //!
 //! ```rust,no_run

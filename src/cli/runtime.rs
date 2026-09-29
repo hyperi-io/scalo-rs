@@ -99,7 +99,7 @@ pub struct ServiceRuntime {
     /// Thread [`pressure`](crate::SelfRegulationGovernor::pressure) into your
     /// receive transports' inbound gate / `with_pressure` hooks. The
     /// [`budget`](crate::SelfRegulationGovernor::budget) is already wired into
-    /// the [`batch_engine`](Self::batch_engine) governed run path.
+    /// the `batch_engine` governed run path (`worker-batch` feature).
     #[cfg(feature = "governor")]
     pub governor: Option<crate::SelfRegulationGovernor>,
 }

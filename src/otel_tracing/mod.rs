@@ -13,8 +13,8 @@
 //! OTLP to a collector or backend (Tempo, Jaeger, Honeycomb, etc.).
 //!
 //! Closes the loop on the framework's W3C traceparent propagation:
-//! [`crate::transport::propagation`] reads the current OTel context
-//! (set externally) and propagates it across transport boundaries.
+//! `transport::propagation` (`transport` feature) reads the current OTel
+//! context (set externally) and propagates it across transport boundaries.
 //! Without this module wired up, internal `tracing::span!`s never become
 //! OTel spans, leaving distributed traces with broken segments.
 //!
@@ -60,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer as _;
 
-/// OTLP transport protocol (mirrors [`crate::metrics::OtelProtocol`]).
+/// OTLP transport protocol (mirrors `metrics::OtelProtocol`, `otel-metrics` feature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OtelTracingProtocol {
     /// gRPC with tonic (default; OTLP-native, lowest overhead).
@@ -221,7 +221,7 @@ fn build_span_exporter(
 /// Build an OTel tracer + tracing-subscriber layer ready for composition.
 ///
 /// Sets the resulting [`SdkTracerProvider`] as the **global** tracer
-/// provider (so [`crate::transport::propagation`] picks it up). The
+/// provider (so `transport::propagation` picks it up). The
 /// returned layer should be added to a `tracing_subscriber::Registry`.
 ///
 /// The provider is also returned so callers can `.shutdown()` it on
