@@ -159,8 +159,7 @@ flowchart TD
   free) can keep the level above `resume_below` with nothing coming in, which
   would pause the source for good. After `max_hold_secs` (default 30) the
   latch admits one window, then re-arms if the level is still at
-  `pause_above`. The window is one admission for a push source, and one
-  resume for every `InboundGate` on the latch; the byte budget never takes it.
+  `pause_above`. The window is one admission for a push source. For every `InboundGate` on the latch it is one resume that stays open until a receive returns records, or 2 s pass: a resumed Kafka consumer has to fetch before it returns anything, so the first receive after the resume is often empty. The byte budget never takes the window.
 - **InboundGate** (`src/governor/gate.rs`) turns the latch into EDGE events:
   `pause()` once on the rising edge, `resume()` once on the falling edge. It
   pauses the inbound SOURCE (stops pulling new work) -- never the outbound

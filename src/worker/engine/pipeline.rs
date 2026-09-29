@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "governor")]
+use super::driver::note_recv_block_bytes;
 use super::driver::{
     CommitMode, DRAIN_IDLE_LIMIT, Delivery, LoopTicker, RecvCap, RetryWindow, SHUTDOWN_RETRY_LIMIT,
     SubBlockDrain, close_source, note_recovered, note_transient, recv_capped, settle_recv,
@@ -332,7 +334,8 @@ where
                     #[cfg(feature = "governor")]
                     let started = std::time::Instant::now();
 
-                    if !is_empty_block(&batch) {
+                    let driven = !is_empty_block(&batch);
+                    if driven {
                         let Delivery::Sunk = run
                             .drive(batch, sub_block_bytes, &process, &mut sink)
                             .await?
@@ -344,6 +347,9 @@ where
                     #[cfg(feature = "governor")]
                     if let Some(budget) = &budget {
                         budget.observe(block_bytes, started.elapsed(), ingest_interval);
+                        if driven {
+                            note_recv_block_bytes(block_bytes);
+                        }
                     }
                 }
             }

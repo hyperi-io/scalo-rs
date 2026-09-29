@@ -66,9 +66,10 @@ pub use admin::{KafkaAdmin, TopicInfo};
 pub use config::{
     CLASSIC_ONLY_CONSUMER_KEYS, ConsumerKnobs, ConsumerProtocol, DEVTEST_PROFILE,
     HIGH_THROUGHPUT_CONSUMER_DEFAULTS, KafkaConfig, KafkaProfile, KafkaSizingConfig,
-    LOW_LATENCY_CONSUMER_DEFAULTS, MESSAGE_MAX_BYTES, PRODUCER_DEFAULTS, PRODUCER_DEVTEST,
-    PRODUCER_EXACTLY_ONCE, PRODUCER_HIGH_THROUGHPUT, PRODUCER_LOW_LATENCY, PRODUCTION_PROFILE,
-    ProducerKnobs, SelfRegulationProfile, SuppressionRule, merge_with_overrides,
+    LOW_LATENCY_CONSUMER_DEFAULTS, MESSAGE_MAX_BYTES, PARTITION_FETCH_BYTES, PRODUCER_DEFAULTS,
+    PRODUCER_DEVTEST, PRODUCER_EXACTLY_ONCE, PRODUCER_HIGH_THROUGHPUT, PRODUCER_LOW_LATENCY,
+    PRODUCTION_PROFILE, ProducerKnobs, SelfRegulationProfile, SuppressionRule,
+    merge_with_overrides,
 };
 pub use lease::PartitionLease;
 pub use metrics::{
@@ -266,7 +267,8 @@ pub struct KafkaTransport {
     /// Optional inbound gate (`governor` feature). `None` by default ->
     /// `recv()` makes no gate calls and behaviour is byte-identical to today.
     /// When `Some`, each `recv()` calls [`InboundGate::evaluate`], which drives
-    /// the [`KafkaGateActuator`] on pause/resume edges. The poll is ALWAYS
+    /// the [`KafkaGateActuator`] on pause/resume edges, and reports the records
+    /// its poll returned with [`InboundGate::note_received`]. The poll is ALWAYS
     /// issued regardless of hold state -- paused partitions just return nothing,
     /// keeping the consumer-group heartbeat alive (no rebalance). It is purely
     /// additive and opt-in until a later release turns it on by default.
@@ -1928,6 +1930,10 @@ impl KafkaTransport {
                 spans,
                 stopped_by,
             } => {
+                #[cfg(feature = "governor")]
+                if let Some(ref gate) = self.inbound_gate {
+                    gate.note_received(spans.len());
+                }
                 self.recv_state.record_success();
                 self.rebuilds.store(0, Ordering::Relaxed);
                 if self.rebuild_latch.clear() {
@@ -3487,13 +3493,13 @@ mod tests {
     // Consumer config: one property under two librdkafka names
     // =========================================================================
 
-    /// The default fetch ceiling reaches librdkafka as the record ceiling.
+    /// The default partition fetch reaches librdkafka as the 1 MiB memory bound.
     #[test]
-    fn consumer_fetches_a_whole_maximum_size_record_by_default() {
+    fn consumer_fetches_1_mib_per_partition_by_default() {
         let built = consumer_client_config(&KafkaConfig::default(), ConsumerProtocol::Classic);
         assert_eq!(
             librdkafka_resolves(&built, "fetch.message.max.bytes"),
-            MESSAGE_MAX_BYTES.to_string()
+            PARTITION_FETCH_BYTES.to_string()
         );
     }
 

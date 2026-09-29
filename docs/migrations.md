@@ -859,12 +859,25 @@ A caller that buffers records before writing them wrote the records of a revoked
 
 **Consumer adjustment** -- none to keep today's behaviour. A caller that holds records across `recv` calls stores each record's lease beside its offset when `recv` returns it, discards the records `holds` rejects right before each write, and counts them with `discarded_after_revoke`. Unarmed, it leaves their offsets out of `commit`. Armed, it releases their tokens as for any record it drops.
 
+### Kafka consumers fetch 1 MiB per partition (BEHAVIOUR CHANGE)
+
+Every sizing profile sets `max.partition.fetch.bytes` to 1 MiB, the new public `transport::kafka::PARTITION_FETCH_BYTES`, where it set 16 MiB. librdkafka grows a fetch for a larger record until the whole record arrives, so a record up to `MESSAGE_MAX_BYTES` still comes through. What changes is memory: a fetch reply carries at most 1 MiB of compressed data per partition, and librdkafka decompresses all of it before the application reads a record. See [kafka-path.md](kafka-path.md#profile--getsend-tuning-table).
+
+**Consumer adjustment** -- none. A stage that wants the larger fetch back sets `kafka.sizing.consumer.max_partition_fetch_bytes`.
+
+### An expired hold keeps the gate open until records arrive (BEHAVIOUR CHANGE)
+
+A hold that reached `self_regulation.max_hold_secs` resumed each `InboundGate` on the latch for one evaluation. A resumed Kafka consumer has to fetch before it returns anything, so the next receive paused it again and the window admitted nothing. The gate now stays open until `InboundGate::note_received` reports a receive that returned records, or 2 s pass, and still resumes once per expired hold. `KafkaTransport` reports every receive.
+
+**Consumer adjustment** -- code that drives its own `InboundGate` calls `note_received(records)` after each receive. Without it each window stays open for 2 s.
+
 ### Smaller additions
 
 - `RoutedSender` forwards `dead_letter_reason` to the route a record's key selects, and reports the weakest `confirms_delivery` across its routes, so `.sender(&routed)` screens and reports as the routes do.
 - `VectorCompatClient::connect_lazy_within(endpoint, send_timeout_ms)` sets the dial, health-check and PING limit that `connect_lazy` fixes at 30 s.
 - `VectorCompatClient::send_events_status` fails with the gRPC status, and `VectorCompatClient::is_permanent_rejection` names the refusals no resend clears (`DataLoss`, `InvalidArgument`, `OutOfRange`), so a transform stops resending events a Vector sink rejected. `send_events` is unchanged. One it drops counts in `pipeline_dead_letters_dropped_total` under `transport::DEAD_LETTER_REJECTED` (`reason="rejected"`).
 - `Pipeline::listener(name)` publishes the pipeline's `pipeline_delivery_guarantee` with a `listener` label, for an app that runs several pipelines.
+- `BatchEngine::pipeline` writes `self_regulation_recv_block_bytes` for each block it drives under the governor, as `run_governed` does. Nothing wrote it on the pipeline path.
 - `EffectiveGuarantee::publish_for(listener)` publishes `pipeline_delivery_guarantee` with a `listener` label, for an app with one source and sink pair per listener.
 - `BackgroundSink` counts a push its full queue refuses in `<prefix>_dropped_total{reason="overflow"}`, where the series had no label. For the DLQ that is `dlq_dropped_total`, whose other drops already carry `reason`, so the metric no longer mixes a labelled and an unlabelled series. A query that sums the metric is unchanged. One that matched the unlabelled series by exact labels now needs `reason="overflow"`.
 

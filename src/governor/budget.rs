@@ -440,6 +440,7 @@ mod tests {
         ctl.observe(0, Duration::ZERO, ms(100));
         assert_eq!(ctl.byte_budget(), 5_000, "held: 10_000 halved");
         assert_eq!(gate.evaluate(), Admit::Yes, "the gate gets the window");
+        gate.note_received(1);
         assert_eq!(gate.evaluate(), Admit::Hold);
     }
 

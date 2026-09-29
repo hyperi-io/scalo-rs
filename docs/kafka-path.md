@@ -90,17 +90,15 @@ The profile defaults, with the ACTUAL librdkafka property each maps to:
 
 | Profile | GET `fetch.min.bytes` | GET `fetch.wait.max.ms` | GET `max.partition.fetch.bytes` | GET `fetch.max.bytes` | poll cap | SEND `batch.size` | SEND `linger.ms` | SEND codec | SEND `queue.buffering.max.kbytes` | SEND `message.max.bytes` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `throughput` (default) | 1 MiB | 50 ms | 16 MiB | 50 MiB | 2000 | 128 KiB | 20 ms | zstd, level 3 | 64 MiB | 16 MiB |
-| `balanced` | 256 KiB | 25 ms | 16 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | zstd, level 3 | 32 MiB | 16 MiB |
-| `low_latency` | 1 byte | 5 ms | 16 MiB | 16 MiB | 500 | 16 KiB | 0 ms | zstd, level 3 | 16 MiB | 16 MiB |
+| `throughput` (default) | 1 MiB | 50 ms | 1 MiB | 50 MiB | 2000 | 128 KiB | 20 ms | zstd, level 3 | 64 MiB | 16 MiB |
+| `balanced` | 256 KiB | 25 ms | 1 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | zstd, level 3 | 32 MiB | 16 MiB |
+| `low_latency` | 1 byte | 5 ms | 1 MiB | 16 MiB | 500 | 16 KiB | 0 ms | zstd, level 3 | 16 MiB | 16 MiB |
 
-Two columns do not vary by profile, because they are the record-size chain
-rather than a tuning dial: `message.max.bytes` (the producer's own ceiling,
-which librdkafka defaults to 1,000,000 bytes and enforces LOCALLY, so raising
-the broker alone changes nothing) and `max.partition.fetch.bytes` (a profile
-that fetched less would stall on a maximum-size record). `fetch.max.bytes` stays
-at or under 50 MiB: MSK Express holds the broker's 55 MiB fetch ceiling
-read-only, so a larger ask can never be honoured.
+Two columns do not vary by profile. `message.max.bytes` is the record-size chain rather than a tuning dial: the producer's own ceiling, which librdkafka defaults to 1,000,000 bytes and enforces LOCALLY, so raising the broker alone changes nothing.
+
+`max.partition.fetch.bytes` bounds memory, not record size. librdkafka treats it as the INITIAL bytes per partition: a larger record grows the fetch until the whole record arrives, so a 16 MiB record still comes through a 1 MiB fetch. The value sets how much compressed data one fetch reply carries per partition, and librdkafka decompresses all of it before the application reads a record. That memory is outside the PROCESS byte budget, so on a compressed backlog this is the knob that bounds it.
+
+`fetch.max.bytes` stays at or under 50 MiB: MSK Express holds the broker's 55 MiB fetch ceiling read-only, so a larger ask can never be honoured. A first batch larger than it is still returned whole.
 
 The topic layer of that chain is set where scalo creates the topic:
 `KafkaAdmin::create_topics` gives every topic it creates
