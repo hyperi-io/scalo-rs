@@ -852,6 +852,14 @@ A held partition with nothing committed measured its lag to the high watermark, 
 
 **Consumer adjustment** -- none in code. A query on these series now sees one per group: aggregate over `group_id`, or group by it. No `consumer_partitions_assigned` or `consumer_rebalance_total` series exists before the consumer's first rebalance. Two transports in one process in the same group write one `consumer_partitions_assigned`, so the last write wins.
 
+### Kafka partition leases, and a revoke reaches the caller (additive, BEHAVIOUR CHANGE)
+
+A caller that buffers records before writing them wrote the records of a revoked partition anyway, and the partition's next owner read and wrote them again from the committed offset, so every rebalance under a live buffer duplicated what it moved. `KafkaTransport::lease(topic, partition)` now returns the `PartitionLease` the consumer holds a partition under, and `holds(topic, partition, lease)` says whether it still stands. A revoke or a consumer rebuild ends a lease, and a partition given back is under a new one, so a copy read before an eager revoke never passes for the copy read again. `discarded_after_revoke(n)` counts what the caller discards in the new `transport_revoke_discarded_total{transport="kafka",stage="buffer"}`. `PartitionLease` and the three methods are new public API.
+
+`recv` leaves out a record read before a revoke of its partition in the same poll whether or not acknowledgements are armed, where it did so only armed. Handed out, a caller wrote a copy the next owner writes too. Each one counts in `transport_revoke_discarded_total{stage="receive"}`. The next owner reads it from the committed offset, or, where nothing is committed yet, from where `auto.offset.reset` points, so a consumer on `latest` loses such a record from a partition its group has never committed to. See [transport/backends.md](transport/backends.md#kafka).
+
+**Consumer adjustment** -- none to keep today's behaviour. A caller that holds records across `recv` calls stores each record's lease beside its offset when `recv` returns it, discards the records `holds` rejects right before each write, and counts them with `discarded_after_revoke`. Unarmed, it leaves their offsets out of `commit`. Armed, it releases their tokens as for any record it drops.
+
 ### Smaller additions
 
 - `RoutedSender` forwards `dead_letter_reason` to the route a record's key selects, and reports the weakest `confirms_delivery` across its routes, so `.sender(&routed)` screens and reports as the routes do.

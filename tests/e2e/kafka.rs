@@ -1569,3 +1569,290 @@ mod group_protocol {
         assert!(transport.is_healthy());
     }
 }
+
+/// A member that holds records in a buffer before it writes them, as a loader
+/// does, loses partitions to a second member mid-buffer. The second member
+/// reads those partitions again from the committed offset and writes them, so
+/// a first member that writes its whole buffer writes them twice. The lease
+/// each record arrived under says which ones are still the first member's.
+#[cfg(feature = "testcontainers")]
+mod revoked_mid_buffer {
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    use rdkafka::ClientConfig;
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    use scalo::transport::TransportReceiver;
+    use scalo::transport::kafka::{
+        ConsumerProtocol, KafkaConfig, KafkaToken, KafkaTransport, PartitionLease,
+    };
+
+    use super::broker::{consumer_config, create_topic_with_partitions, start_kafka};
+
+    const PARTITIONS: i32 = 4;
+
+    /// Records written to each partition.
+    const PER_PARTITION: usize = 10;
+
+    /// Every record written: record `seq` sits on partition `seq / PER_PARTITION`.
+    fn every_seq() -> BTreeSet<usize> {
+        (0..PER_PARTITION * usize::try_from(PARTITIONS).expect("fits")).collect()
+    }
+
+    fn seq_of(payload: &[u8]) -> usize {
+        let digits = payload
+            .strip_prefix(b"{\"seq\":")
+            .and_then(|rest| rest.strip_suffix(b"}"))
+            .expect("a record written by fill");
+        std::str::from_utf8(digits)
+            .expect("ASCII digits")
+            .parse()
+            .expect("seq fits usize")
+    }
+
+    /// Write `PER_PARTITION` records to each partition of `topic`, and wait
+    /// for every delivery.
+    async fn fill(bootstrap: &str, topic: &str) {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap)
+            .create()
+            .expect("raw producer");
+        for seq in every_seq() {
+            let partition = i32::try_from(seq / PER_PARTITION).expect("fits");
+            let payload = format!("{{\"seq\":{seq}}}");
+            producer
+                .send(
+                    FutureRecord::<(), str>::to(topic)
+                        .partition(partition)
+                        .payload(&payload),
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap_or_else(|(e, _)| panic!("deliver record {seq}: {e}"));
+        }
+    }
+
+    /// One record a member holds before it writes it.
+    struct Held {
+        seq: usize,
+        token: KafkaToken,
+        /// The lease its partition had when the record arrived.
+        lease: Option<PartitionLease>,
+    }
+
+    /// Receive once and hold what arrives, each record with its lease. No
+    /// inbound filter is set, so each record's token sits at its own index.
+    async fn receive_into(member: &KafkaTransport, held: &mut Vec<Held>) {
+        let batch = member.recv(100).await.expect("recv");
+        for (record, token) in batch.records.iter().zip(batch.commit_tokens) {
+            let lease = member.lease(&token.topic, token.partition);
+            held.push(Held {
+                seq: seq_of(&record.payload),
+                token,
+                lease,
+            });
+        }
+    }
+
+    /// Receive once and write what arrives at once, then commit it.
+    async fn receive_and_write(member: &KafkaTransport, written: &mut Vec<usize>) {
+        let batch = member.recv(100).await.expect("recv");
+        written.extend(batch.records.iter().map(|r| seq_of(&r.payload)));
+        member
+            .commit(&batch.commit_tokens)
+            .await
+            .expect("commit what was written");
+    }
+
+    fn still_held(member: &KafkaTransport, record: &Held) -> bool {
+        record
+            .lease
+            .is_some_and(|lease| member.holds(&record.token.topic, record.token.partition, lease))
+    }
+
+    /// Whether the rebalance has settled and every record is either written by
+    /// `second` or held by `first` under the lease its partition has now.
+    fn settled(
+        topic: &str,
+        first: &KafkaTransport,
+        second: &KafkaTransport,
+        held: &[Held],
+        written: &[usize],
+    ) -> bool {
+        let mut second_holds_one = false;
+        for partition in 0..PARTITIONS {
+            let by_first = first.lease(topic, partition).is_some();
+            let by_second = second.lease(topic, partition).is_some();
+            if by_first == by_second {
+                return false;
+            }
+            second_holds_one |= by_second;
+        }
+        let covered: BTreeSet<usize> = written
+            .iter()
+            .copied()
+            .chain(
+                held.iter()
+                    .filter(|record| still_held(first, record))
+                    .map(|record| record.seq),
+            )
+            .collect();
+        second_holds_one && covered == every_seq()
+    }
+
+    /// What the first member's flush left.
+    struct Flushed {
+        /// Records it discarded because their lease had ended.
+        discarded: Vec<Held>,
+        /// Partitions it holds at the flush.
+        kept: BTreeSet<i32>,
+    }
+
+    /// Fill `topic`, have the first member buffer every record, start a second
+    /// member, and receive on both until the rebalance settles. Then the first
+    /// member flushes: it writes what it still holds the lease for and
+    /// discards the rest. Every record must be written exactly once.
+    async fn lose_partitions_mid_buffer(
+        bootstrap: &str,
+        topic: &'static str,
+        config: &KafkaConfig,
+    ) -> Flushed {
+        create_topic_with_partitions(bootstrap, topic, PARTITIONS).await;
+        fill(bootstrap, topic).await;
+
+        let first = KafkaTransport::new(config).await.expect("first member");
+        let mut held = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while held.len() < every_seq().len() {
+            assert!(
+                Instant::now() < deadline,
+                "the first member buffered {} of {} records within 60 s",
+                held.len(),
+                every_seq().len()
+            );
+            receive_into(&first, &mut held).await;
+        }
+
+        let second = KafkaTransport::new(config).await.expect("second member");
+        let mut written_by_second = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !settled(topic, &first, &second, &held, &written_by_second) {
+            assert!(
+                Instant::now() < deadline,
+                "no settled rebalance within 90 s: the second member wrote {written_by_second:?}"
+            );
+            receive_into(&first, &mut held).await;
+            receive_and_write(&second, &mut written_by_second).await;
+        }
+
+        let kept: BTreeSet<i32> = (0..PARTITIONS)
+            .filter(|&partition| first.lease(topic, partition).is_some())
+            .collect();
+        let (write, discarded): (Vec<Held>, Vec<Held>) = held
+            .into_iter()
+            .partition(|record| still_held(&first, record));
+        first.discarded_after_revoke(u64::try_from(discarded.len()).expect("fits"));
+        let tokens: Vec<KafkaToken> = write.iter().map(|record| record.token.clone()).collect();
+        first
+            .commit(&tokens)
+            .await
+            .expect("commit what the first member wrote");
+
+        let mut every_write: Vec<usize> = written_by_second
+            .iter()
+            .copied()
+            .chain(write.iter().map(|record| record.seq))
+            .collect();
+        every_write.sort_unstable();
+        eprintln!(
+            "{topic}: the first member keeps partitions {kept:?}, writes {} and discards {}; \
+             the second member wrote {}",
+            write.len(),
+            discarded.len(),
+            written_by_second.len()
+        );
+        assert_eq!(
+            every_write,
+            every_seq().into_iter().collect::<Vec<_>>(),
+            "every record written once: no duplicate, nothing lost"
+        );
+        assert!(
+            !discarded.is_empty(),
+            "the first member lost nothing it had buffered, so this proves nothing"
+        );
+        Flushed { discarded, kept }
+    }
+
+    /// Cooperative-sticky: only the partitions that move are revoked, so the
+    /// first member keeps the lease on what it keeps, and discards only the
+    /// records of what it lost.
+    #[tokio::test]
+    async fn a_cooperative_member_discards_only_what_it_lost() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "revoke-cooperative";
+        let config = KafkaConfig {
+            consumer_protocol: ConsumerProtocol::Classic,
+            ..consumer_config(&bootstrap, topic, "revoke-cooperative-group")
+        }
+        .with_override("partition.assignment.strategy", "cooperative-sticky");
+        let flushed = lose_partitions_mid_buffer(&bootstrap, topic, &config).await;
+        assert!(
+            flushed
+                .discarded
+                .iter()
+                .all(|record| !flushed.kept.contains(&record.token.partition)),
+            "discarded a record of a partition it kept, holding {:?}",
+            flushed.kept
+        );
+    }
+
+    /// An eager assignor revokes every partition and hands some straight back,
+    /// and the first member reads those again under a new lease. Its buffer
+    /// holds two copies of each: asking whether it holds the partition would
+    /// write both, and the lease writes one.
+    #[tokio::test]
+    async fn an_eager_member_writes_one_copy_of_a_partition_given_straight_back() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "revoke-eager";
+        let config = KafkaConfig {
+            consumer_protocol: ConsumerProtocol::Classic,
+            ..consumer_config(&bootstrap, topic, "revoke-eager-group")
+        }
+        .with_override("partition.assignment.strategy", "range");
+        let flushed = lose_partitions_mid_buffer(&bootstrap, topic, &config).await;
+        assert!(
+            flushed.discarded.len() >= every_seq().len(),
+            "an eager revoke ends the lease of every record buffered before it, discarded {}",
+            flushed.discarded.len()
+        );
+        assert!(
+            flushed
+                .discarded
+                .iter()
+                .any(|record| flushed.kept.contains(&record.token.partition)),
+            "no partition was given straight back, holding {:?}",
+            flushed.kept
+        );
+    }
+
+    /// KIP-848: the broker computes the assignment and moves partitions
+    /// incrementally, as cooperative-sticky does.
+    #[tokio::test]
+    async fn a_kip_848_member_discards_only_what_it_lost() {
+        let (_node, bootstrap) = start_kafka().await;
+        let topic = "revoke-kip-848";
+        let config = KafkaConfig {
+            consumer_protocol: ConsumerProtocol::Consumer,
+            ..consumer_config(&bootstrap, topic, "revoke-kip-848-group")
+        };
+        let flushed = lose_partitions_mid_buffer(&bootstrap, topic, &config).await;
+        assert!(
+            flushed
+                .discarded
+                .iter()
+                .all(|record| !flushed.kept.contains(&record.token.partition)),
+            "discarded a record of a partition it kept, holding {:?}",
+            flushed.kept
+        );
+    }
+}
