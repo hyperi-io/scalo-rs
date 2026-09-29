@@ -3,6 +3,16 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.13.3](https://github.com/hyperi-io/scalo-rs/compare/v2.13.2...v2.13.3) (2026-09-29)
+
+### Bug Fixes
+
+* bound the fetch and admit on a hold release ([#251](https://github.com/hyperi-io/scalo-rs/issues/251)) ([35595f8](https://github.com/hyperi-io/scalo-rs/commit/35595f8e6d3b0284b1dc8b7805c08d27cb298b2e))
+* bound the memory hold and stop an idle leak ([#247](https://github.com/hyperi-io/scalo-rs/issues/247)) ([551e8c3](https://github.com/hyperi-io/scalo-rs/commit/551e8c3c82b3d2301be2004c1372258c2240c8e5))
+* neutral names in kafka/vector docs and tests ([#252](https://github.com/hyperi-io/scalo-rs/issues/252)) ([f47d353](https://github.com/hyperi-io/scalo-rs/commit/f47d353b3a38b7f8c802f73cdefc49ecaed88a58))
+* neutral names in scalo's docs and tests ([#249](https://github.com/hyperi-io/scalo-rs/issues/249)) ([7728660](https://github.com/hyperi-io/scalo-rs/commit/772866060f893c25ae55051a497500ca9c02705d))
+* shrink the byte budget only under memory ([#250](https://github.com/hyperi-io/scalo-rs/issues/250)) ([2222054](https://github.com/hyperi-io/scalo-rs/commit/2222054f562766866c4b2dcf9501880c23d5fc7a))
+
 ## [2.13.2](https://github.com/hyperi-io/scalo-rs/compare/v2.13.1...v2.13.2) (2026-09-29)
 
 ### Bug Fixes
