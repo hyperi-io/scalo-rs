@@ -101,7 +101,7 @@ sub-components (filter engine lives inside every transport).
 
 - [self-regulation.md](self-regulation.md) -- ON by default; the three brains (MemoryGuard / ScalingPressure / UnifiedPressure), observe + tune
 - [backpressure.md](backpressure.md) -- gate the source never the sink; the per-stage brake/commit-token table; streaming sub-blocks
-- [kafka-path.md](kafka-path.md) -- the three batch sizes, sizing profiles + librdkafka names, rho~0.7 loop, partition-limited diagnostic
+- [kafka-path.md](kafka-path.md) -- the three batch sizes, sizing profiles + librdkafka names, how the byte budget moves, partition-limited diagnostic
 
 ### Core pillars (always-on, auto-wired)
 

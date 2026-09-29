@@ -55,9 +55,9 @@ pub enum SelfRegulationProfile {
 }
 
 impl SelfRegulationProfile {
-    /// The byte-budget envelope for this profile. The hysteresis band and
-    /// target utilisation are profile-independent (set in
-    /// [`SelfRegulationConfig`]); this only sizes the AIMD lever.
+    /// The byte-budget envelope for this profile. The hysteresis band is
+    /// profile-independent (set in [`SelfRegulationConfig`]); this only sizes
+    /// the AIMD lever.
     #[must_use]
     fn byte_budget_envelope(self) -> (u64, u64, u64, usize) {
         // (start_bytes, max_bytes, ai_step, record_cap)
@@ -118,10 +118,12 @@ pub struct SelfRegulationConfig {
     /// falls back to the defaults).
     pub resume_below: f64,
 
-    /// Target utilisation `rho` for the byte-budget AIMD loop, in `(0, 1)`.
+    /// Has no effect: the byte budget shrinks only under memory pressure.
+    /// Accepted so a config that sets `self_regulation.target_rho` still loads.
     pub target_rho: f64,
 
-    /// Multiplicative-decrease factor for the byte budget, in `(0, 1)`.
+    /// Multiplicative-decrease factor for the byte budget, applied per block
+    /// while memory pressure holds, in `(0, 1)`.
     pub md_factor: f64,
 
     /// Longest the inbound hold lasts, in seconds, while pressure stays above
@@ -182,7 +184,8 @@ impl SelfRegulationConfig {
     }
 
     /// Build the [`ByteBudgetConfig`] from the profile envelope + overridable
-    /// `target_rho` / `md_factor`. The controller sanitises ranges itself.
+    /// `md_factor`, carrying `target_rho` through unused. The controller
+    /// sanitises ranges itself.
     #[must_use]
     pub fn byte_budget_config(&self) -> ByteBudgetConfig {
         let (start_bytes, max_bytes, ai_step, record_cap) = self.profile.byte_budget_envelope();

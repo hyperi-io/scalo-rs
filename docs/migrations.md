@@ -148,9 +148,8 @@ self_regulation:
 ```
 
 Full tuning surface (profile / pause_above / resume_below / max_hold_secs /
-target_rho / md_factor) in [self-regulation.md](self-regulation.md).
-Off-pressure cost is near zero: the budget sits at its big start value so a
-block is one sub-block with no per-record overhead.
+md_factor) in [self-regulation.md](self-regulation.md). `target_rho` is still accepted and has no effect: the byte budget shrinks only under memory pressure, and utilisation and CPU saturation are the autoscaler's signal.
+Off-pressure cost is near zero: without memory pressure the budget stays at or above its big start value, so a block is one sub-block with no per-record overhead.
 
 ### Originator brake / token wiring (BEHAVIOUR CHANGE)
 
