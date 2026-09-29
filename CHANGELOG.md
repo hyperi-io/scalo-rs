@@ -3,6 +3,21 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.13.2](https://github.com/hyperi-io/scalo-rs/compare/v2.13.1...v2.13.2) (2026-09-29)
+
+### Bug Fixes
+
+* **chart:** instance id survives a pod restart ([#236](https://github.com/hyperi-io/scalo-rs/issues/236)) ([7933ecc](https://github.com/hyperi-io/scalo-rs/commit/7933eccb3e1691a05fc1c93ff47896282f355a2a))
+* **kafka:** label rdkafka_ by client, lag to LSO ([#237](https://github.com/hyperi-io/scalo-rs/issues/237)) ([3859405](https://github.com/hyperi-io/scalo-rs/commit/3859405358afd1e18d0734652fb42f63bf4e9635))
+* **kafka:** publish consumer lag and assignment from the first assignment ([#231](https://github.com/hyperi-io/scalo-rs/issues/231)) ([0ce5780](https://github.com/hyperi-io/scalo-rs/commit/0ce5780d0c267e23f5263995cd4f2bb6db325641))
+* **kafka:** tell the caller when a revoke ends its claim on a partition ([#244](https://github.com/hyperi-io/scalo-rs/issues/244)) ([cb1f151](https://github.com/hyperi-io/scalo-rs/commit/cb1f151afbc8b50256a436b4f5e2255c22bf7058))
+* **metrics:** fill the consumer series scalo registers, and drop a revoked partition's offsets ([#234](https://github.com/hyperi-io/scalo-rs/issues/234)) ([787c6eb](https://github.com/hyperi-io/scalo-rs/commit/787c6eb61344a265c561a093b487a0fbe2aa3399)), closes [#232](https://github.com/hyperi-io/scalo-rs/issues/232)
+* **metrics:** label consumer series by group ([#239](https://github.com/hyperi-io/scalo-rs/issues/239)) ([f302165](https://github.com/hyperi-io/scalo-rs/commit/f302165cdea88222220d0d2f256123b88f0c238d)), closes [#238](https://github.com/hyperi-io/scalo-rs/issues/238)
+* reduced-feature lint and doc drift ([#246](https://github.com/hyperi-io/scalo-rs/issues/246)) ([95ce828](https://github.com/hyperi-io/scalo-rs/commit/95ce828ee2315b56ecd6b7e82455bc13db1ce59a)), closes [#144](https://github.com/hyperi-io/scalo-rs/issues/144) [#225](https://github.com/hyperi-io/scalo-rs/issues/225) [hyperi-io/dfe-fetcher#206](https://github.com/hyperi-io/dfe-fetcher/issues/206)
+* serve /scaling/pressure on start_server ([#245](https://github.com/hyperi-io/scalo-rs/issues/245)) ([b761c95](https://github.com/hyperi-io/scalo-rs/commit/b761c959c89b58e3b4526ce2396d639c5efc9e73)), closes [#168](https://github.com/hyperi-io/scalo-rs/issues/168)
+* **test:** run the Kafka test brokers on the JVM image ([#243](https://github.com/hyperi-io/scalo-rs/issues/243)) ([0024d77](https://github.com/hyperi-io/scalo-rs/commit/0024d778e97b25a5b3a27af38cc7db8f8d58053e))
+* **transport:** clippy clean with no backend on ([#241](https://github.com/hyperi-io/scalo-rs/issues/241)) ([1f73b6e](https://github.com/hyperi-io/scalo-rs/commit/1f73b6ef589479b7bbcb73a905495b81feb6a0c7)), closes [#240](https://github.com/hyperi-io/scalo-rs/issues/240)
+
 ## [2.13.1](https://github.com/hyperi-io/scalo-rs/compare/v2.13.0...v2.13.1) (2026-09-27)
 
 ### Bug Fixes
