@@ -714,10 +714,17 @@ mod broker {
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
-    /// Kafka to test against, pinned by digest.
-    // renovate: datasource=docker depName=apache/kafka-native
-    const KAFKA_IMAGE_REF: &str =
-        "4.3.1@sha256:2885898ba17065023f1bd605f3a81efcfa986014f062b73b91ef5462485f9060";
+    /// Kafka to test against, pinned by digest. The JVM image: `apache/kafka-native` before
+    /// 4.4.0 segfaults in `getpwuid` on ~2% of starts.
+    // renovate: datasource=docker depName=apache/kafka
+    const KAFKA_TAG: &str = "4.3.1";
+
+    /// Digest of `KAFKA_TAG`, apart from it because the Renovate regex stops at a colon.
+    const KAFKA_DIGEST: &str =
+        "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
+
+    /// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
+    const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 
     /// Container starts to try: on a busy CI runner a broker started alongside
     /// others can exit before it logs that it is ready.
@@ -726,7 +733,13 @@ mod broker {
     pub(super) async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
         let mut attempt = 1;
         let node = loop {
-            match Kafka::default().with_tag(KAFKA_IMAGE_REF).start().await {
+            match Kafka::default()
+                .with_jvm_image()
+                .with_tag(format!("{KAFKA_TAG}@{KAFKA_DIGEST}"))
+                .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
+                .start()
+                .await
+            {
                 Ok(node) => break node,
                 Err(e) if attempt < START_ATTEMPTS => {
                     eprintln!("kafka container attempt {attempt} did not start: {e}");
