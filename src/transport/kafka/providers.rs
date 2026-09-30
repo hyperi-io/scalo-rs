@@ -317,9 +317,13 @@ impl KafkaProvider for KnownProvider {
 /// - PLAIN credentials MUST ride SASL_SSL (never PLAIN over a plaintext transport).
 /// - SASL_SSL requires a mechanism.
 ///
+/// Both values are trimmed and matched in any letter case: librdkafka skips
+/// leading whitespace in each, so ` PLAIN` runs as `PLAIN`.
+///
 /// # Errors
 /// Returns `Err` with a description when either invariant is violated.
 pub fn validate(security_protocol: &str, sasl_mechanism: &str) -> Result<(), String> {
+    let (security_protocol, sasl_mechanism) = (security_protocol.trim(), sasl_mechanism.trim());
     if sasl_mechanism.eq_ignore_ascii_case("PLAIN")
         && !security_protocol.eq_ignore_ascii_case("SASL_SSL")
     {
@@ -386,6 +390,29 @@ mod tests {
     fn validate_requires_mechanism_for_sasl_ssl() {
         assert!(validate("SASL_SSL", "").is_err());
         assert!(validate("SASL_SSL", "SCRAM-SHA-512").is_ok());
+    }
+
+    /// librdkafka skips leading whitespace in both values, so ` PLAIN` runs
+    /// as PLAIN and ` SASL_SSL` as SASL_SSL.
+    #[test]
+    fn validate_reads_padded_values_as_librdkafka_does() {
+        for (protocol, mechanism) in [
+            ("sasl_plaintext", " PLAIN"),
+            ("sasl_plaintext", "PLAIN\n"),
+            ("PLAINTEXT", "\tplain "),
+            (" sasl_plaintext ", "PLAIN"),
+        ] {
+            assert!(
+                validate(protocol, mechanism).is_err(),
+                "{mechanism:?} over {protocol:?} must be refused"
+            );
+        }
+        assert!(validate(" SASL_SSL", "PLAIN ").is_ok());
+        assert!(validate("sasl_ssl\n", " SCRAM-SHA-512").is_ok());
+        assert!(
+            validate(" SASL_SSL ", "  ").is_err(),
+            "a blank mechanism is no mechanism"
+        );
     }
 
     #[test]

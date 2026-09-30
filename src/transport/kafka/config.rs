@@ -842,6 +842,12 @@ const CERTIFICATE_VERIFICATION_KEYS: &[&str] = &["enable.ssl.certificate.verific
 /// librdkafka's broker hostname check, off when set to `none`.
 const HOSTNAME_VERIFICATION_KEYS: &[&str] = &["ssl.endpoint.identification.algorithm"];
 
+/// The OIDC token endpoint librdkafka posts the OAUTHBEARER client secret to.
+const TOKEN_ENDPOINT_KEYS: &[&str] = &["sasl.oauthbearer.token.endpoint.url"];
+
+/// The OpenSSL cipher list librdkafka hands to `SSL_CTX_set_cipher_list`.
+const CIPHER_SUITES_KEYS: &[&str] = &["ssl.cipher.suites"];
+
 /// Where a value a client may run a security setting with was set.
 #[derive(Debug, Clone, Copy)]
 enum SettingOrigin<'a> {
@@ -849,6 +855,15 @@ enum SettingOrigin<'a> {
     Field(&'static str),
     /// `key` in the raw librdkafka map at config path `map`.
     Raw { map: &'static str, key: &'a str },
+}
+
+impl std::fmt::Display for SettingOrigin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Field(name) => f.write_str(name),
+            Self::Raw { map, key } => write!(f, "{map} key '{key}'"),
+        }
+    }
 }
 
 /// One value a client may run a security setting with, and where it was set.
@@ -878,14 +893,43 @@ impl<'a> SecuritySetting<'a> {
     fn is_false(&self) -> bool {
         self.is("false") || self.is("f") || self.value == "0"
     }
+
+    /// Whether the value is a URL whose scheme, the text before the first
+    /// `:`, is anything but `https` in any case. A URL with no scheme counts,
+    /// since the HTTP client reads it as `http`; an empty value is unset.
+    fn is_not_https_url(&self) -> bool {
+        !self.value.is_empty()
+            && !self
+                .value
+                .split_once(':')
+                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+    }
+
+    /// Whether the value, an OpenSSL cipher list, names a suite with no
+    /// encryption.
+    ///
+    /// The list splits on `:`, `,`, `;` and whitespace. A token names one when
+    /// a `+`, `-` or `_` separated part of it is `NULL` or `eNULL`, in any
+    /// case: `eNULL`, `NULL-SHA`, `ECDHE-RSA-NULL-SHA`, `RSA+eNULL`.
+    /// `COMPLEMENTOFALL`, the one alias whose suites are the eNULL ones, counts
+    /// too; other aliases are not expanded. A token led by `!` or `-` removes
+    /// suites, so it never counts.
+    fn names_null_cipher(&self) -> bool {
+        self.value
+            .split(|c: char| matches!(c, ':' | ',' | ';') || c.is_whitespace())
+            .filter(|token| !token.starts_with(['!', '-']))
+            .flat_map(|token| token.trim_start_matches('+').split(['+', '-', '_']))
+            .any(|part| {
+                ["NULL", "eNULL", "COMPLEMENTOFALL"]
+                    .iter()
+                    .any(|null| part.eq_ignore_ascii_case(null))
+            })
+    }
 }
 
 impl std::fmt::Display for SecuritySetting<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.origin {
-            SettingOrigin::Field(name) => write!(f, "{name}='{}'", self.value),
-            SettingOrigin::Raw { map, key } => write!(f, "{map} key '{key}'='{}'", self.value),
-        }
+        write!(f, "{}='{}'", self.origin, self.value)
     }
 }
 
@@ -1819,11 +1863,12 @@ impl KafkaConfig {
     /// Each rule is judged on every value a client can run with: the typed
     /// field, and each value `librdkafka_overrides`, `sizing.producer_librdkafka`,
     /// `sizing.consumer_librdkafka` or `extra_config` gives `security.protocol`,
-    /// `sasl.mechanism` (or `sasl.mechanisms`), `enable.ssl.certificate.verification`
-    /// or `ssl.endpoint.identification.algorithm`. The consumer sets the typed
-    /// security fields after those maps and the producer and admin clients set
-    /// them before, so one config can run both values and the weaker one
-    /// decides. Keys and values match in any letter case.
+    /// `sasl.mechanism` (or `sasl.mechanisms`), `enable.ssl.certificate.verification`,
+    /// `ssl.endpoint.identification.algorithm`, `sasl.oauthbearer.token.endpoint.url`
+    /// or `ssl.cipher.suites`. The consumer sets the typed security fields
+    /// after those maps and the producer and admin clients set them before, so
+    /// one config can run both values and the weaker one decides. Keys and
+    /// values match in any letter case, and values are trimmed.
     ///
     /// NOTE: `ssl_skip_verify` is slated for removal at GA -- supply the broker
     /// CA via `ssl_ca_location` (private-CA trust) instead.
@@ -1834,9 +1879,12 @@ impl KafkaConfig {
     /// but the transport is not `sasl_ssl` -- a PLAIN password must never cross
     /// a plaintext transport. Additionally, when `is_production`, returns `Err`
     /// if `ssl_skip_verify` is set, a raw map turns certificate or hostname
-    /// verification off, or an unencrypted transport (`plaintext`/`sasl_plaintext`) is
-    /// configured without the explicit `allow_insecure_transport` opt-in. A
-    /// refusal a raw map caused names the map and the key.
+    /// verification off, an unencrypted transport (`plaintext`/`sasl_plaintext`) is
+    /// configured without the explicit `allow_insecure_transport` opt-in, a raw
+    /// map gives `sasl.oauthbearer.token.endpoint.url` a URL that is not
+    /// `https` (one with no scheme included), or a raw map's `ssl.cipher.suites`
+    /// names a `NULL`, `eNULL` or `COMPLEMENTOFALL` suite that no `!` or `-`
+    /// excludes. A refusal a raw map caused names the map and the key.
     pub fn validate(&self, is_production: bool) -> Result<(), String> {
         let raw_maps = self.raw_librdkafka_maps();
         let protocols: Vec<SecuritySetting<'_>> = std::iter::once(SecuritySetting::field(
@@ -1905,6 +1953,26 @@ impl KafkaConfig {
                  permitted in production -- use 'ssl'/'sasl_ssl', or set \
                  allow_insecure_transport=true to deliberately opt in (e.g. mesh-encrypted \
                  in-cluster traffic)"
+            ));
+        }
+        // The value is left out of the refusal: a URL can carry credentials.
+        if let Some(endpoint) =
+            raw_settings(&raw_maps, TOKEN_ENDPOINT_KEYS).find(SecuritySetting::is_not_https_url)
+        {
+            return Err(format!(
+                "kafka: {} is not an https:// token endpoint, so it would send the \
+                 OAUTHBEARER client secret unencrypted, which is not permitted in \
+                 production -- use an https:// token endpoint",
+                endpoint.origin
+            ));
+        }
+        if let Some(suites) =
+            raw_settings(&raw_maps, CIPHER_SUITES_KEYS).find(SecuritySetting::names_null_cipher)
+        {
+            return Err(format!(
+                "kafka: {suites} offers a NULL cipher suite, which sends data unencrypted \
+                 and is not permitted in production -- remove it, or exclude it with \
+                 '!eNULL'"
             ));
         }
         Ok(())
@@ -2530,6 +2598,131 @@ mod tests {
             why.contains("security_protocol='plaintext'"),
             "the refusal does not name the typed field: {why}"
         );
+    }
+
+    /// A TLS client authenticating with OAUTHBEARER, which passes every other
+    /// production rule.
+    fn oauthbearer_over_tls() -> KafkaConfig {
+        KafkaConfig {
+            security_protocol: "sasl_ssl".to_string(),
+            sasl_mechanism: Some("OAUTHBEARER".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// librdkafka posts the client secret to this endpoint, so over plain
+    /// HTTP anyone on the path reads it.
+    #[test]
+    fn validate_refuses_a_non_https_token_endpoint_in_production() {
+        const KEY: &str = "sasl.oauthbearer.token.endpoint.url";
+        for (key, url) in [
+            (KEY, "http://idp.example.com/oauth2/token"),
+            (KEY, "HTTP://idp.example.com/oauth2/token"),
+            (KEY, " http://idp.example.com/oauth2/token\n"),
+            (KEY, "http://client:hunter2@idp.example.com/oauth2/token"),
+            (KEY, "idp.example.com/oauth2/token"),
+            (KEY, "ftp://idp.example.com/oauth2/token"),
+            (
+                "SASL.OAuthBearer.Token.Endpoint.URL",
+                "http://idp.example.com/oauth2/token",
+            ),
+        ] {
+            let config = oauthbearer_over_tls().with_override(key, url);
+            assert!(config.validate(false).is_ok(), "dev allows {url:?}");
+            let why = refusal(&config, true);
+            assert!(
+                why.contains(&format!("librdkafka_overrides key '{key}'")),
+                "the refusal of {url:?} does not name the override: {why}"
+            );
+            assert!(
+                !why.contains("idp.example.com") && !why.contains("hunter2"),
+                "the refusal repeats the URL: {why}"
+            );
+        }
+
+        let mut consumer = oauthbearer_over_tls();
+        consumer.sizing.consumer_librdkafka.insert(
+            KEY.to_string(),
+            "http://idp.example.com/oauth2/token".to_string(),
+        );
+        let why = refusal(&consumer, true);
+        assert!(
+            why.contains(&format!("sizing.consumer_librdkafka key '{KEY}'")),
+            "the refusal does not name the map: {why}"
+        );
+
+        for url in [
+            "https://idp.example.com/oauth2/token",
+            "HTTPS://idp.example.com/oauth2/token",
+            "",
+        ] {
+            let secure = oauthbearer_over_tls().with_override(KEY, url);
+            assert!(
+                secure.validate(true).is_ok(),
+                "{url} keeps the secret on TLS"
+            );
+        }
+    }
+
+    /// A NULL suite authenticates the broker and encrypts nothing.
+    #[test]
+    fn validate_refuses_a_null_cipher_suite_in_production() {
+        const KEY: &str = "ssl.cipher.suites";
+        let verified = || KafkaConfig {
+            security_protocol: "ssl".to_string(),
+            ..Default::default()
+        };
+        for suites in [
+            "eNULL",
+            "NULL",
+            " enull ",
+            "NULL-SHA",
+            "ECDHE-RSA-NULL-SHA",
+            "TLS_RSA_WITH_NULL_SHA256",
+            "ECDHE-ECDSA-AES256-GCM-SHA384:eNULL",
+            "HIGH,NULL-SHA256",
+            "HIGH NULL",
+            "HIGH;ENULL",
+            "RSA+eNULL",
+            "+eNULL",
+            "COMPLEMENTOFALL",
+            "HIGH:complementofall",
+        ] {
+            let config = verified().with_override(KEY, suites);
+            assert!(config.validate(false).is_ok(), "dev allows {suites:?}");
+            let why = refusal(&config, true);
+            assert!(
+                why.contains(&format!("librdkafka_overrides key '{KEY}'")),
+                "the refusal of {suites:?} does not name the override: {why}"
+            );
+        }
+
+        let mut producer = verified();
+        producer
+            .sizing
+            .producer_librdkafka
+            .insert("SSL.Cipher.Suites".to_string(), "eNULL".to_string());
+        let why = refusal(&producer, true);
+        assert!(
+            why.contains("sizing.producer_librdkafka key 'SSL.Cipher.Suites'='eNULL'"),
+            "the refusal does not name the map and key: {why}"
+        );
+
+        for suites in [
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384",
+            "HIGH:!aNULL:!eNULL",
+            "ALL:!NULL",
+            "DEFAULT:-eNULL",
+            "HIGH,!RSA+eNULL",
+            "HIGH:!COMPLEMENTOFALL",
+            "",
+        ] {
+            let config = verified().with_override(KEY, suites);
+            assert!(
+                config.validate(true).is_ok(),
+                "{suites:?} offers no NULL suite"
+            );
+        }
     }
 
     #[test]
