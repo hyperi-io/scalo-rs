@@ -6,8 +6,6 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-#![allow(unsafe_code)]
-
 //! Environment detection parity tests.
 //!
 //! These tests verify that environment detection behaves identically
@@ -43,32 +41,25 @@ fn test_is_container_parity() {
 /// Test get_app_env() priority: APP_ENV > ENVIRONMENT > ENV > "development".
 #[test]
 fn test_get_app_env_priority() {
-    // SAFETY: single-threaded test, no concurrent env access
-    unsafe {
-        // Clear all
-        std::env::remove_var("APP_ENV");
-        std::env::remove_var("ENVIRONMENT");
-        std::env::remove_var("ENV");
-
-        // Default should be "development"
-        assert_eq!(get_app_env(), "development");
-
-        // ENV should override default
-        std::env::set_var("ENV", "staging");
-        assert_eq!(get_app_env(), "staging");
-
-        // ENVIRONMENT should override ENV
-        std::env::set_var("ENVIRONMENT", "production");
-        assert_eq!(get_app_env(), "production");
-
-        // APP_ENV should override all
-        std::env::set_var("APP_ENV", "testing");
-        assert_eq!(get_app_env(), "testing");
-
-        // Cleanup
-        std::env::remove_var("APP_ENV");
-        std::env::remove_var("ENVIRONMENT");
-        std::env::remove_var("ENV");
+    // [APP_ENV, ENVIRONMENT, ENV], and the name each set resolves to.
+    let cases = [
+        ([None, None, None], "development"),
+        ([None, None, Some("staging")], "staging"),
+        ([None, Some("production"), Some("staging")], "production"),
+        (
+            [Some("testing"), Some("production"), Some("staging")],
+            "testing",
+        ),
+    ];
+    for ([app_env, environment, env], expected) in cases {
+        temp_env::with_vars(
+            [
+                ("APP_ENV", app_env),
+                ("ENVIRONMENT", environment),
+                ("ENV", env),
+            ],
+            || assert_eq!(get_app_env(), expected),
+        );
     }
 }
 
