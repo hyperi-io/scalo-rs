@@ -257,6 +257,7 @@ impl From<&str> for SensitiveString {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn serialize_always_redacted() {
         let s = SensitiveString::new("my_actual_secret");
@@ -265,6 +266,7 @@ mod tests {
         assert!(!json.contains("my_actual_secret"));
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn deserialize_reads_actual_value() {
         let json = "\"my_actual_secret\"";
@@ -309,6 +311,7 @@ mod tests {
         assert_eq!(s.expose(), "world");
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn struct_with_sensitive_field_serialises_safely() {
         #[derive(serde::Serialize, serde::Deserialize)]
@@ -329,6 +332,7 @@ mod tests {
         assert!(!json.contains("user:pass"));
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn struct_with_sensitive_field_deserialises_correctly() {
         #[derive(serde::Serialize, serde::Deserialize)]
@@ -347,6 +351,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn no_leak_through_any_serialisation_path() {
         let secret = "super_secret_value_12345";
@@ -368,6 +373,7 @@ mod tests {
     /// `Value`, then deserialise back. Without `expose_during` the
     /// inner string is destroyed (replaced by `***REDACTED***`); inside
     /// the helper, the value survives.
+    #[cfg(feature = "serde_json")]
     #[test]
     fn round_trip_inside_expose_during_preserves_value() {
         let s = SensitiveString::new("hunter2");
@@ -376,6 +382,7 @@ mod tests {
         assert_eq!(round_tripped.expose(), "hunter2");
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn round_trip_outside_expose_during_redacts() {
         let s = SensitiveString::new("hunter2");
@@ -389,6 +396,7 @@ mod tests {
         assert_eq!(round_tripped.expose(), REDACTED);
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn expose_during_restores_after_body() {
         let s = SensitiveString::new("secret");
@@ -403,6 +411,7 @@ mod tests {
         assert!(!serde_json::to_string(&s).unwrap().contains("secret"));
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn expose_during_restores_after_panic() {
         let s = SensitiveString::new("secret");
@@ -419,6 +428,7 @@ mod tests {
         assert!(!serde_json::to_string(&s).unwrap().contains("secret"));
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn expose_during_nests_correctly() {
         let s = SensitiveString::new("secret");
@@ -434,6 +444,7 @@ mod tests {
         assert!(serde_json::to_string(&s).unwrap().contains(REDACTED));
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn struct_round_trip_inside_expose_during_preserves_values() {
         // Mirrors the dfe-loader bug: serialise a Config containing a
@@ -459,6 +470,7 @@ mod tests {
 
     /// Cross-thread isolation: thread A's `expose_during` does NOT
     /// affect thread B's serialisation.
+    #[cfg(feature = "serde_json")]
     #[test]
     fn expose_flag_is_thread_local() {
         use std::sync::{Arc, Mutex};

@@ -188,7 +188,7 @@ environment.
 
 `std::env::set_var` is `unsafe` in edition 2024 and forbidden in
 this crate -- see the `temp-env` pattern in
-[tests/common](../../tests/common/).
+[tests/integration/env_parity.rs](../../tests/integration/env_parity.rs).
 
 ---
 
