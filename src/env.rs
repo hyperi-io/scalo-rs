@@ -318,16 +318,23 @@ pub fn is_helm() -> bool {
 /// App environment used when none of `APP_ENV`, `ENVIRONMENT` or `ENV` is set.
 const DEFAULT_APP_ENV: &str = "development";
 
+/// The variables that name the app environment, highest precedence first.
+const APP_ENV_VARS: [&str; 3] = ["APP_ENV", "ENVIRONMENT", "ENV"];
+
 /// Guards the one-shot default-posture warning in [`get_app_env`].
 static DEFAULT_POSTURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Get the current application environment name (dev, staging, prod).
 ///
-/// Checks in order: `APP_ENV`, `ENVIRONMENT`, `ENV`, defaults to "development".
+/// Returns the first of `APP_ENV`, `ENVIRONMENT` and `ENV` that holds a
+/// value, trimmed of surrounding whitespace, else "development". A variable
+/// that is empty or only whitespace counts as unset, so resolution moves on
+/// to the next one.
 ///
 /// Falling back to the default turns off every [`is_production`] check, so
 /// the first fallback a log subscriber would record emits one warning per
-/// process. Setting any of the three variables, to any value, silences it.
+/// process. Setting any of the three variables to a non-blank value silences
+/// it.
 #[must_use]
 pub fn get_app_env() -> String {
     app_env_or_default(&DEFAULT_POSTURE_WARNED)
@@ -335,10 +342,11 @@ pub fn get_app_env() -> String {
 
 /// Resolve the app environment, claiming `warned` to log the default once.
 fn app_env_or_default(warned: &AtomicBool) -> String {
-    if let Ok(app_env) = std::env::var("APP_ENV")
-        .or_else(|_| std::env::var("ENVIRONMENT"))
-        .or_else(|_| std::env::var("ENV"))
-    {
+    if let Some(app_env) = APP_ENV_VARS.iter().find_map(|name| {
+        let value = std::env::var(name).ok()?;
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }) {
         return app_env;
     }
     // Claimed only once a subscriber would record it: config can load before the logger.
@@ -361,10 +369,11 @@ fn app_env_or_default(warned: &AtomicBool) -> String {
 /// Whether the current app environment is production-like.
 ///
 /// True when [`get_app_env`] resolves (case-insensitively) to `production`
-/// or `prod`. Used by config `validate(is_production)` methods to reject
-/// insecure-by-design settings (e.g. TLS `skip_verify`, plaintext disk
-/// caches) outside of dev/test. With none of the three variables set this
-/// is `false`, and [`get_app_env`] logs that once.
+/// or `prod`, so ` production` and `production\n` count too. Used by config
+/// `validate(is_production)` methods to reject insecure-by-design settings
+/// (e.g. TLS `skip_verify`, plaintext disk caches) outside of dev/test. With
+/// none of the three variables set to a non-blank value this is `false`, and
+/// [`get_app_env`] logs that once.
 #[must_use]
 pub fn is_production() -> bool {
     matches!(
@@ -436,6 +445,11 @@ mod tests {
     #[cfg(feature = "logger")]
     const NAMES_THE_VARIABLES: &str = "none of APP_ENV, ENVIRONMENT or ENV is set";
 
+    /// `UNSET` with `var` set to `value`.
+    fn only(var: &str, value: &'static str) -> [(&'static str, Option<&'static str>); 3] {
+        UNSET.map(|(name, _)| (name, (name == var).then_some(value)))
+    }
+
     #[test]
     fn is_production_accepts_only_production_and_prod() {
         for (value, expected) in [
@@ -443,13 +457,66 @@ mod tests {
             ("prod", true),
             ("PRODUCTION", true),
             ("Prod", true),
+            (" production", true),
+            ("production\n", true),
+            ("\tprod ", true),
             ("staging", false),
             ("development", false),
             ("production-eu", false),
+            ("pro duction", false),
             ("", false),
+            ("  ", false),
         ] {
-            temp_env::with_var("APP_ENV", Some(value), || {
+            temp_env::with_vars(only("APP_ENV", value), || {
                 assert_eq!(is_production(), expected, "APP_ENV={value:?}");
+            });
+        }
+    }
+
+    /// A padded value resolves as the name inside it, so the config cascade
+    /// picks `settings.staging.yaml` for ` staging `.
+    #[test]
+    fn get_app_env_trims_the_value() {
+        for (value, expected) in [
+            (" production", "production"),
+            ("production\n", "production"),
+            (" staging ", "staging"),
+            ("\ttest\r\n", "test"),
+        ] {
+            temp_env::with_vars(only("APP_ENV", value), || {
+                assert_eq!(get_app_env(), expected, "APP_ENV={value:?}");
+            });
+        }
+    }
+
+    /// An empty or blank variable is skipped, so it cannot mask a production
+    /// posture set further down the order.
+    #[test]
+    fn a_blank_variable_counts_as_unset() {
+        for blank in ["", " ", "\n", " \t "] {
+            let masked = [
+                ("APP_ENV", Some(blank)),
+                ("ENVIRONMENT", Some("production")),
+                ("ENV", None),
+            ];
+            temp_env::with_vars(masked, || {
+                assert_eq!(get_app_env(), "production", "APP_ENV={blank:?}");
+                assert!(is_production(), "APP_ENV={blank:?} over ENVIRONMENT");
+            });
+
+            let deepest = [
+                ("APP_ENV", Some(blank)),
+                ("ENVIRONMENT", Some(blank)),
+                ("ENV", Some("prod")),
+            ];
+            temp_env::with_vars(deepest, || {
+                assert_eq!(get_app_env(), "prod", "blank APP_ENV and ENVIRONMENT");
+            });
+
+            let all_blank = UNSET.map(|(name, _)| (name, Some(blank)));
+            temp_env::with_vars(all_blank, || {
+                assert_eq!(get_app_env(), "development", "all three {blank:?}");
+                assert!(!is_production());
             });
         }
     }
@@ -457,8 +524,9 @@ mod tests {
     #[test]
     fn is_production_reads_each_variable_in_turn() {
         for var in ["APP_ENV", "ENVIRONMENT", "ENV"] {
-            let vars = UNSET.map(|(name, _)| (name, (name == var).then_some("prod")));
-            temp_env::with_vars(vars, || assert!(is_production(), "{var}=prod"));
+            temp_env::with_vars(only(var, "prod"), || {
+                assert!(is_production(), "{var}=prod");
+            });
         }
         temp_env::with_vars(UNSET, || {
             assert!(!is_production(), "unset resolves to development");
@@ -531,8 +599,7 @@ mod tests {
             for value in ["staging", "production"] {
                 let warned = AtomicBool::new(false);
                 let (subscriber, buf) = capture();
-                let vars = UNSET.map(|(name, _)| (name, (name == var).then_some(value)));
-                temp_env::with_vars(vars, || {
+                temp_env::with_vars(only(var, value), || {
                     tracing::subscriber::with_default(subscriber, || {
                         assert_eq!(app_env_or_default(&warned), value);
                     });
@@ -543,6 +610,28 @@ mod tests {
                     "{var}={value} must leave the warning unclaimed"
                 );
             }
+        }
+    }
+
+    /// A blank variable is unset, so it cannot hide the development default.
+    #[cfg(feature = "logger")]
+    #[test]
+    fn blank_variables_still_warn() {
+        for blank in ["", "  ", "\n"] {
+            let warned = AtomicBool::new(false);
+            let (subscriber, buf) = capture();
+            temp_env::with_vars(UNSET.map(|(name, _)| (name, Some(blank))), || {
+                tracing::subscriber::with_default(subscriber, || {
+                    assert_eq!(app_env_or_default(&warned), "development");
+                });
+            });
+            let out = captured(&buf);
+            assert_eq!(
+                out.matches(NAMES_THE_VARIABLES).count(),
+                1,
+                "all three {blank:?}: {out}"
+            );
+            assert!(warned.load(std::sync::atomic::Ordering::Relaxed));
         }
     }
 

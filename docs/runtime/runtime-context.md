@@ -89,11 +89,13 @@ duplicated cgroup file reads.
 
 ## App env and production posture
 
-`get_app_env()` resolves the deployment environment name and is intentionally separate from `RuntimeContext`. It returns the first of these that is set, else `development`:
+`get_app_env()` resolves the deployment environment name and is intentionally separate from `RuntimeContext`. It returns the first of these that holds a value, trimmed of surrounding whitespace, else `development`:
 
 1. `APP_ENV`
 2. `ENVIRONMENT`
 3. `ENV`
+
+A variable that is empty or only whitespace counts as unset, so `APP_ENV=""` beside `ENVIRONMENT=production` resolves to `production`. A padded value resolves to the name inside it: `" production"` and `"production\n"` are `production`.
 
 The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md](../core-pillars/config.md). It is also the `deployment.environment.name` attribute on OTel metrics (`otel-metrics`).
 
@@ -101,17 +103,17 @@ The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md
 
 | Constructor | Refused in production |
 |---|---|
-| `KafkaTransport::new`, `KafkaProducer::new`, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend (`Dlq::spawn`), via `KafkaConfig::validate` | `ssl_skip_verify`, `enable.ssl.certificate.verification: "false"` or `ssl.endpoint.identification.algorithm: none`, and a `plaintext` or `sasl_plaintext` transport without `allow_insecure_transport`, whether a typed field sets it or `librdkafka_overrides` or another raw librdkafka map does |
+| `KafkaTransport::new`, `KafkaProducer::new`, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend (`Dlq::spawn`), via `KafkaConfig::validate` | `ssl_skip_verify`, `enable.ssl.certificate.verification: "false"` or `ssl.endpoint.identification.algorithm: none`, and a `plaintext` or `sasl_plaintext` transport without `allow_insecure_transport`, whether a typed field sets it or `librdkafka_overrides` or another raw librdkafka map does. From a raw map, also an `http://` `sasl.oauthbearer.token.endpoint.url`, and an `ssl.cipher.suites` that names a `NULL` or `eNULL` suite without a leading `!` or `-` |
 | `OpenBaoProvider::new`, via `OpenBaoConfig::validate` | `skip_verify` |
 | `SecretCache::new` (and so `SecretsManager::new`), via `CacheConfig::validate` | a disk cache with no `encryption_key` and `allow_plaintext_disk_cache` set |
 
-Set `APP_ENV=production` on every production deployment. Left unset, the posture is development and every refusal above is off. scalo logs one warning per process the first time it falls back to the default with a subscriber that records `WARN`, so a default resolved before the logger starts does not use it up:
+Set `APP_ENV=production` on every production deployment. Left unset or blank, the posture is development and every refusal above is off. scalo logs one warning per process the first time it falls back to the default with a subscriber that records `WARN`, so a default resolved before the logger starts does not use it up:
 
 ```text
 WARN scalo::env: none of APP_ENV, ENVIRONMENT or ENV is set, so the app environment defaults to development and production-only safety checks are disabled -- set APP_ENV=production on a production deployment app_env="development"
 ```
 
-Setting any of the three variables, to any value, silences it. The warning is compiled in with the `tracing` dependency, which the default features and every feature that reaches the refusals above enable.
+Setting any of the three variables to a non-blank value silences it, and an empty or whitespace-only value does not. The warning is compiled in with the `tracing` dependency, which the default features and every feature that reaches the refusals above enable.
 
 `is_helm()` is the other helper in `env.rs` -- returns true if
 `HELM_RELEASE_NAME` is set or `/etc/podinfo/labels` contains
