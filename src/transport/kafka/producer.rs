@@ -231,7 +231,10 @@ impl KafkaProducer {
     ///
     /// # Errors
     ///
-    /// Returns error if producer creation fails.
+    /// `TransportError::Config` when the provider preset or
+    /// [`KafkaConfig::validate`] refuses the config, as
+    /// [`KafkaTransport::new`](super::KafkaTransport::new) does;
+    /// `TransportError::Connection` when librdkafka cannot build the producer.
     pub fn new(config: &KafkaConfig, profile: ProducerProfile) -> TransportResult<Self> {
         Self::with_context(config, profile, ProducerContext::default())
     }
@@ -255,7 +258,7 @@ impl KafkaProducer {
         profile: ProducerProfile,
         context: ProducerContext,
     ) -> TransportResult<Self> {
-        let client_config = client_config(config, profile);
+        let client_config = client_config(&super::checked_config(config)?, profile);
         #[cfg(feature = "dlq-kafka")]
         let message_max_bytes = client_config
             .get("message.max.bytes")
@@ -527,7 +530,22 @@ impl std::fmt::Debug for KafkaProducer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::client_gate;
     use super::*;
+
+    #[test]
+    fn a_producer_refuses_the_configs_the_transport_refuses() {
+        client_gate::assert_refuses_as_the_transport_does(|config| {
+            client_gate::config_refusal(KafkaProducer::new(config, ProducerProfile::HighThroughput))
+        });
+    }
+
+    #[test]
+    fn a_producer_builds_on_a_verified_config_under_production() {
+        client_gate::assert_builds_under_production(|config| {
+            client_gate::config_refusal(KafkaProducer::new(config, ProducerProfile::HighThroughput))
+        });
+    }
 
     #[test]
     fn test_producer_profile_display() {

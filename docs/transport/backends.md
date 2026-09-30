@@ -60,6 +60,7 @@ transport:
       sasl_password: ${KAFKA_PASSWORD}
 ```
 
+- **Security floor**: every constructor that builds a client from a `KafkaConfig` applies `provider`, then runs `KafkaConfig::validate`: `KafkaTransport::new`, `KafkaProducer::new` and its profile shorthands, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend. In any environment it refuses an unknown `provider`, and `sasl_mechanism: PLAIN` unless `security_protocol` is `sasl_ssl`. Where `APP_ENV` (else `ENVIRONMENT`, else `ENV`) is `production` or `prod`, it also refuses `ssl_skip_verify: true`, and `plaintext` or `sasl_plaintext` without `allow_insecure_transport: true`. The refusal is `TransportError::Config`, or `DlqError::Kafka` from `Dlq::spawn`. `producer_client_config` does neither step, so an app building its own client from it calls `apply_provider` and `validate` first.
 - **Cancellation safety**: `recv` polls on tokio's blocking pool, so a loop on it never holds a runtime worker. It is safe to drop at any `.await`, including its outage backoff and the wait after a repeated consumer rebuild: a poll still running when `recv` is dropped is kept, and the next `recv` returns its records, or an empty batch when the client it polled has been rebuilt since and the poll failed.
 - **Idle wait**: with nothing queued, `recv` waits up to 50 ms for a record, then returns an empty batch.
 - **`send_batch()`**: queues the whole block, then awaits every delivery

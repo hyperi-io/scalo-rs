@@ -320,7 +320,9 @@ impl KafkaProvider for KnownProvider {
 /// # Errors
 /// Returns `Err` with a description when either invariant is violated.
 pub fn validate(security_protocol: &str, sasl_mechanism: &str) -> Result<(), String> {
-    if sasl_mechanism == "PLAIN" && !security_protocol.eq_ignore_ascii_case("SASL_SSL") {
+    if sasl_mechanism.eq_ignore_ascii_case("PLAIN")
+        && !security_protocol.eq_ignore_ascii_case("SASL_SSL")
+    {
         return Err("PLAIN credentials require security_protocol=SASL_SSL \
              (never send PLAIN over a plaintext transport)"
             .to_string());
@@ -335,7 +337,7 @@ pub fn validate(security_protocol: &str, sasl_mechanism: &str) -> Result<(), Str
 mod tests {
     use super::*;
 
-    // The cross-language contract (dfe-engine#98). scalo-py + dfe-engine MUST produce
+    // The cross-language contract. scalo-py and its Python consumers MUST produce
     // this exact table: (provider_key, security_protocol, sasl_mechanism).
     const CANONICAL_TABLE: &[(&str, &str, &str)] = &[
         ("strimzi", "SASL_SSL", "SCRAM-SHA-512"),
@@ -375,7 +377,9 @@ mod tests {
     fn validate_refuses_plain_over_plaintext() {
         assert!(validate("PLAINTEXT", "PLAIN").is_err());
         assert!(validate("sasl_plaintext", "PLAIN").is_err());
+        assert!(validate("sasl_plaintext", "plain").is_err());
         assert!(validate("SASL_SSL", "PLAIN").is_ok());
+        assert!(validate("sasl_ssl", "plain").is_ok());
     }
 
     #[test]

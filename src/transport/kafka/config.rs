@@ -1709,7 +1709,10 @@ impl KafkaConfig {
     /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
     /// and is set by the `devtest`/`for_testing` profiles by design. It is
     /// permitted only in dev/test; under a production profile this returns an
-    /// error. Call at startup with [`crate::env::is_production`].
+    /// error. Every constructor that builds an rdkafka client from a config
+    /// runs this with [`crate::env::is_production`], after
+    /// [`apply_provider`](Self::apply_provider). Call it directly to check a
+    /// config without building a client.
     ///
     /// NOTE: `ssl_skip_verify` is slated for removal at GA -- supply the broker
     /// CA via `ssl_ca_location` (private-CA trust) instead.
@@ -1728,7 +1731,10 @@ impl KafkaConfig {
         // safe over a plaintext transport, so only PLAIN is gated here. Mirrors the
         // opt-in provider presets + the Python contract (see the downstream
         // Python consumer's own tracker).
-        if self.sasl_mechanism.as_deref() == Some("PLAIN")
+        if self
+            .sasl_mechanism
+            .as_deref()
+            .is_some_and(|mechanism| mechanism.eq_ignore_ascii_case("PLAIN"))
             && !self.security_protocol.eq_ignore_ascii_case("sasl_ssl")
         {
             return Err(format!(
@@ -2112,6 +2118,19 @@ mod tests {
             "dev must still reject PLAIN over plaintext"
         );
         assert!(plain_plaintext.validate(true).is_err());
+
+        // The floor matches the mechanism in any case.
+        for mechanism in ["plain", "Plain"] {
+            let lowercase = KafkaConfig {
+                security_protocol: "sasl_plaintext".to_string(),
+                sasl_mechanism: Some(mechanism.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                lowercase.validate(false).is_err(),
+                "sasl_mechanism={mechanism} over plaintext must be refused"
+            );
+        }
 
         // PLAIN over sasl_ssl is fine (the Confluent Cloud shape).
         let plain_tls = KafkaConfig {

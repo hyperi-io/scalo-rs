@@ -511,6 +511,11 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
 /// security, `profile_defaults`, the sizing surface, then `librdkafka_overrides`,
 /// each key replacing its other librdkafka name set earlier.
 ///
+/// It neither applies `provider` nor runs [`KafkaConfig::validate`]: a caller
+/// building its own client from it runs
+/// [`KafkaConfig::apply_provider`] and `validate` first, as scalo's own
+/// constructors do.
+///
 /// # Examples
 ///
 /// ```
@@ -577,6 +582,131 @@ pub(super) fn apply_layer(client_config: &mut ClientConfig, layer: &[(&str, &str
             client_config.remove(alias);
         }
         client_config.set(key, value);
+    }
+}
+
+/// The config a client is built from: the provider preset applied, then
+/// [`KafkaConfig::validate`] run for the environment
+/// [`crate::env::is_production`] reports.
+///
+/// Every constructor that turns a [`KafkaConfig`] into an rdkafka client
+/// builds from this, so each refuses the same configs.
+///
+/// # Errors
+///
+/// `TransportError::Config` when `provider` names no known provider or
+/// `validate` refuses the config.
+fn checked_config(config: &KafkaConfig) -> TransportResult<KafkaConfig> {
+    let mut checked = config.clone();
+    checked.apply_provider().map_err(TransportError::Config)?;
+    checked
+        .validate(crate::env::is_production())
+        .map_err(TransportError::Config)?;
+    Ok(checked)
+}
+
+/// Checks every client constructor runs against [`checked_config`]'s refusals.
+#[cfg(test)]
+pub(crate) mod client_gate {
+    use super::{KafkaConfig, TransportError, TransportResult};
+
+    /// Producer-only, at a loopback port that refuses at once, so building a
+    /// client does no network I/O the test waits on.
+    fn unreachable() -> KafkaConfig {
+        KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..KafkaConfig::default()
+        }
+    }
+
+    /// Assert `build` refuses each config the Kafka transport refuses, with a
+    /// refusal that says why. `build` returns the refusal's text, or `None`
+    /// when it built a client.
+    pub(crate) fn assert_refuses_as_the_transport_does(
+        build: impl Fn(&KafkaConfig) -> Option<String>,
+    ) {
+        let in_production = [
+            (
+                KafkaConfig {
+                    security_protocol: "ssl".to_string(),
+                    ssl_skip_verify: true,
+                    ..unreachable()
+                },
+                "ssl_skip_verify",
+            ),
+            (unreachable(), "security_protocol='plaintext'"),
+            // Only the provider preset makes this plaintext: `ssl` as written passes.
+            (
+                KafkaConfig {
+                    security_protocol: "ssl".to_string(),
+                    provider: Some("plaintext".to_string()),
+                    ..unreachable()
+                },
+                "security_protocol='plaintext'",
+            ),
+        ];
+        let in_any_environment = [
+            (
+                KafkaConfig {
+                    security_protocol: "sasl_plaintext".to_string(),
+                    sasl_mechanism: Some("PLAIN".to_string()),
+                    ..unreachable()
+                },
+                "SASL PLAIN requires security_protocol=sasl_ssl",
+            ),
+            (
+                KafkaConfig {
+                    provider: Some("no-such-provider".to_string()),
+                    ..unreachable()
+                },
+                "unknown kafka provider",
+            ),
+        ];
+        for (app_env, cases) in [
+            ("production", &in_production[..]),
+            ("development", &in_any_environment[..]),
+        ] {
+            temp_env::with_var("APP_ENV", Some(app_env), || {
+                for (config, names) in cases {
+                    let refusal = build(config).unwrap_or_else(|| {
+                        panic!("built a client despite {names} under APP_ENV={app_env}")
+                    });
+                    assert!(
+                        refusal.contains(names),
+                        "the refusal under APP_ENV={app_env} does not name {names}: {refusal}"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Assert `build` builds a client from a TLS-verifying config under a
+    /// production posture. `build` is as for
+    /// [`assert_refuses_as_the_transport_does`].
+    pub(crate) fn assert_builds_under_production(build: impl Fn(&KafkaConfig) -> Option<String>) {
+        let verified = KafkaConfig {
+            security_protocol: "ssl".to_string(),
+            ..unreachable()
+        };
+        temp_env::with_var("APP_ENV", Some("production"), || {
+            if let Some(refusal) = build(&verified) {
+                panic!("refused a TLS-verifying config under production: {refusal}");
+            }
+        });
+    }
+
+    /// The refusal a transport-side constructor returned, `None` when it built.
+    ///
+    /// # Panics
+    ///
+    /// When it failed with anything but `TransportError::Config`.
+    pub(crate) fn config_refusal<T>(built: TransportResult<T>) -> Option<String> {
+        match built {
+            Ok(_) => None,
+            Err(TransportError::Config(why)) => Some(why),
+            Err(other) => panic!("failed as {other}, not as a config refusal"),
+        }
     }
 }
 
@@ -717,21 +847,15 @@ impl KafkaTransport {
     ///
     /// # Errors
     ///
-    /// Returns error if Kafka client creation fails.
+    /// `TransportError::Config` when the provider preset or
+    /// [`KafkaConfig::validate`] refuses the config, before any client is
+    /// built; otherwise an error if Kafka client creation fails.
     // Large but linear constructor (config -> client -> subscribe -> assemble),
     // over the 150-line soft cap with the config building already factored out.
     #[allow(clippy::too_many_lines)]
     pub async fn new(config: &KafkaConfig) -> TransportResult<Self> {
-        // Resolve the provider preset FIRST: if `config.provider` is set, derive
-        // security_protocol + sasl_mechanism from it (never hand-set). Then enforce
-        // the production guardrail (reject ssl_skip_verify / insecure transport) at
-        // construction, not only when an app remembers to call validate().
-        let mut owned = config.clone();
-        owned.apply_provider().map_err(TransportError::Config)?;
+        let owned = checked_config(config)?;
         let config = &owned;
-        config
-            .validate(crate::env::is_production())
-            .map_err(TransportError::Config)?;
 
         // StatsContext receives librdkafka statistics callbacks and auto-emits
         // rdkafka_* Prometheus metrics when a recorder is installed.
@@ -2783,6 +2907,25 @@ impl std::fmt::Debug for KafkaTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal `KafkaTransport::new` returned, `None` when it built.
+    fn transport_refusal(config: &KafkaConfig) -> Option<String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+            .block_on(async { client_gate::config_refusal(KafkaTransport::new(config).await) })
+    }
+
+    #[test]
+    fn the_transport_refuses_what_every_client_constructor_refuses() {
+        client_gate::assert_refuses_as_the_transport_does(transport_refusal);
+    }
+
+    #[test]
+    fn the_transport_builds_on_a_verified_config_under_production() {
+        client_gate::assert_builds_under_production(transport_refusal);
+    }
 
     /// A producer-only transport's consumer still asks for its group's
     /// coordinator, so the stand-in must sit under the app's own client-id

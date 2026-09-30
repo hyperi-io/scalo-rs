@@ -108,7 +108,9 @@ impl KafkaDlqInner {
     ///
     /// # Errors
     ///
-    /// Returns an error if the Kafka producer cannot be created.
+    /// `DlqError::Kafka` when the Kafka producer cannot be created, including
+    /// when the provider preset or [`KafkaConfig::validate`] refuses
+    /// `kafka_config`, as they do for the Kafka transport.
     pub fn new(kafka_config: &KafkaConfig, dlq_config: &KafkaDlqConfig) -> Result<Self, DlqError> {
         let producer =
             KafkaProducer::keeping_undelivered(kafka_config, ProducerProfile::LowLatency)
@@ -376,6 +378,26 @@ pub(super) fn unreachable_broker() -> KafkaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::kafka::client_gate;
+
+    /// The refusal `KafkaDlqInner::new` returned, `None` when it built.
+    fn backend_refusal(kafka_config: &KafkaConfig) -> Option<String> {
+        match KafkaDlqInner::new(kafka_config, &KafkaDlqConfig::default()) {
+            Ok(_) => None,
+            Err(DlqError::Kafka(why)) => Some(why),
+            Err(other) => panic!("failed as {other}, not as a Kafka backend error"),
+        }
+    }
+
+    #[test]
+    fn the_kafka_backend_refuses_the_configs_the_transport_refuses() {
+        client_gate::assert_refuses_as_the_transport_does(backend_refusal);
+    }
+
+    #[test]
+    fn the_kafka_backend_builds_on_a_verified_config_under_production() {
+        client_gate::assert_builds_under_production(backend_refusal);
+    }
 
     #[test]
     fn resolve_topic_per_table() {
