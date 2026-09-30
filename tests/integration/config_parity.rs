@@ -6,8 +6,6 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-#![allow(unsafe_code)]
-
 //! Configuration cascade parity tests.
 //!
 //! These tests verify that the 7-layer cascade behaves identically
@@ -26,32 +24,6 @@
 use scalo::config::{Config, ConfigOptions};
 use std::fs;
 use tempfile::TempDir;
-
-/// Guard to cleanup environment variables on drop.
-struct EnvGuard {
-    vars: Vec<String>,
-}
-
-impl EnvGuard {
-    fn new(vars: &[(&str, &str)]) -> Self {
-        for (k, v) in vars {
-            // SAFETY: single-threaded test setup
-            unsafe { std::env::set_var(k, v) };
-        }
-        Self {
-            vars: vars.iter().map(|(k, _)| k.to_string()).collect(),
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for var in &self.vars {
-            // SAFETY: single-threaded test teardown
-            unsafe { std::env::remove_var(var) };
-        }
-    }
-}
 
 /// Create a test config directory with the full cascade.
 fn setup_config_dir() -> (TempDir, std::path::PathBuf) {
@@ -219,23 +191,24 @@ fn test_settings_yaml_overrides_defaults() {
 #[test]
 fn test_env_specific_settings_development() {
     let (_dir, path) = setup_config_dir();
-    let _env = EnvGuard::new(&[("APP_ENV", "development")]);
 
-    let config = Config::new(ConfigOptions {
-        config_paths: vec![path],
-        app_env: Some("development".to_string()),
-        ..Default::default()
-    })
-    .expect("config should load");
+    temp_env::with_var("APP_ENV", Some("development"), || {
+        let config = Config::new(ConfigOptions {
+            config_paths: vec![path],
+            app_env: Some("development".to_string()),
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    // settings.development.yaml overrides settings.yaml
-    assert_eq!(
-        config.get_string("database.host"),
-        Some("dev-host".to_string())
-    );
-    assert_eq!(config.get_bool("debug"), Some(true));
-    assert_eq!(config.get_bool("cache.enabled"), Some(true));
-    assert_eq!(config.get_int("cache.ttl"), Some(60));
+        // settings.development.yaml overrides settings.yaml
+        assert_eq!(
+            config.get_string("database.host"),
+            Some("dev-host".to_string())
+        );
+        assert_eq!(config.get_bool("debug"), Some(true));
+        assert_eq!(config.get_bool("cache.enabled"), Some(true));
+        assert_eq!(config.get_int("cache.ttl"), Some(60));
+    });
 }
 
 #[test]
@@ -274,23 +247,23 @@ fn test_dotenv_file_loaded() {
     let original_dir = std::env::current_dir().expect("failed to get cwd");
     std::env::set_current_dir(&path).expect("failed to change dir");
 
-    let config = Config::new(ConfigOptions {
-        env_prefix: "DOTENV_TEST".to_string(),
-        config_paths: vec![path.clone()],
-        load_dotenv: true,
-        ..Default::default()
-    })
-    .expect("config should load");
+    // Unset going in and restored coming out, since dotenvy sets this itself
+    // as a side effect of loading the file below.
+    temp_env::with_var("DOTENV_TEST_VAR", None::<&str>, || {
+        let config = Config::new(ConfigOptions {
+            env_prefix: "DOTENV_TEST".to_string(),
+            config_paths: vec![path.clone()],
+            load_dotenv: true,
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    // Restore original directory
-    std::env::set_current_dir(original_dir).expect("failed to restore dir");
+        // Restore original directory
+        std::env::set_current_dir(&original_dir).expect("failed to restore dir");
 
-    // .env should have been loaded into environment
-    assert_eq!(config.get_string("var"), Some("from_dotenv".to_string()));
-
-    // Cleanup
-    // SAFETY: single-threaded test
-    unsafe { std::env::remove_var("DOTENV_TEST_VAR") };
+        // .env should have been loaded into environment
+        assert_eq!(config.get_string("var"), Some("from_dotenv".to_string()));
+    });
 }
 
 // ============================================================================
@@ -300,67 +273,68 @@ fn test_dotenv_file_loaded() {
 #[test]
 fn test_env_overrides_file() {
     let (_dir, path) = setup_config_dir();
-    let _env = EnvGuard::new(&[("PARITY_DATABASE__HOST", "env-host")]);
 
-    let config = Config::new(ConfigOptions {
-        env_prefix: "PARITY".to_string(),
-        config_paths: vec![path],
-        ..Default::default()
-    })
-    .expect("config should load");
+    temp_env::with_var("PARITY_DATABASE__HOST", Some("env-host"), || {
+        let config = Config::new(ConfigOptions {
+            env_prefix: "PARITY".to_string(),
+            config_paths: vec![path],
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    // ENV var overrides settings.development.yaml
-    assert_eq!(
-        config.get_string("database.host"),
-        Some("env-host".to_string())
-    );
+        // ENV var overrides settings.development.yaml
+        assert_eq!(
+            config.get_string("database.host"),
+            Some("env-host".to_string())
+        );
+    });
 }
 
 #[test]
 fn test_env_var_flat_key() {
-    let _env = EnvGuard::new(&[("FLAT_LOG_LEVEL", "warn")]);
+    temp_env::with_var("FLAT_LOG_LEVEL", Some("warn"), || {
+        let config = Config::new(ConfigOptions {
+            env_prefix: "FLAT".to_string(),
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    let config = Config::new(ConfigOptions {
-        env_prefix: "FLAT".to_string(),
-        ..Default::default()
-    })
-    .expect("config should load");
-
-    // Flat env var (no nesting)
-    assert_eq!(config.get_string("log_level"), Some("warn".to_string()));
+        // Flat env var (no nesting)
+        assert_eq!(config.get_string("log_level"), Some("warn".to_string()));
+    });
 }
 
 #[test]
 fn test_env_var_nested_key() {
-    let _env = EnvGuard::new(&[("NESTED_DATABASE__HOST", "nested-host")]);
+    temp_env::with_var("NESTED_DATABASE__HOST", Some("nested-host"), || {
+        let config = Config::new(ConfigOptions {
+            env_prefix: "NESTED".to_string(),
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    let config = Config::new(ConfigOptions {
-        env_prefix: "NESTED".to_string(),
-        ..Default::default()
-    })
-    .expect("config should load");
-
-    // Nested env var using double underscore
-    assert_eq!(
-        config.get_string("database.host"),
-        Some("nested-host".to_string())
-    );
+        // Nested env var using double underscore
+        assert_eq!(
+            config.get_string("database.host"),
+            Some("nested-host".to_string())
+        );
+    });
 }
 
 #[test]
 fn test_env_var_deeply_nested() {
     // Figment's split("__") replaces __ with . for nested keys
     // With prefix "DEEP2_", env var "DEEP2_A__B" becomes "a.b"
-    let _env = EnvGuard::new(&[("DEEP2_CACHE__DISK__ENABLED", "true")]);
+    temp_env::with_var("DEEP2_CACHE__DISK__ENABLED", Some("true"), || {
+        let config = Config::new(ConfigOptions {
+            env_prefix: "DEEP2".to_string(),
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    let config = Config::new(ConfigOptions {
-        env_prefix: "DEEP2".to_string(),
-        ..Default::default()
-    })
-    .expect("config should load");
-
-    // Three levels: cache.disk.enabled
-    assert_eq!(config.get_bool("cache.disk.enabled"), Some(true));
+        // Three levels: cache.disk.enabled
+        assert_eq!(config.get_bool("cache.disk.enabled"), Some(true));
+    });
 }
 
 // ============================================================================
@@ -370,39 +344,40 @@ fn test_env_var_deeply_nested() {
 #[test]
 fn test_cli_args_highest_priority() {
     let (_dir, path) = setup_config_dir();
-    let _env = EnvGuard::new(&[("CLI_DATABASE__HOST", "env-host")]);
 
-    // Create config with file and env
-    let config = Config::new(ConfigOptions {
-        env_prefix: "CLI".to_string(),
-        config_paths: vec![path],
-        ..Default::default()
-    })
-    .expect("config should load");
+    temp_env::with_var("CLI_DATABASE__HOST", Some("env-host"), || {
+        // Create config with file and env
+        let config = Config::new(ConfigOptions {
+            env_prefix: "CLI".to_string(),
+            config_paths: vec![path.clone()],
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    // Simulate CLI args by merging
-    #[derive(serde::Serialize)]
-    struct CliArgs {
-        database: Database,
-    }
-    #[derive(serde::Serialize)]
-    struct Database {
-        host: String,
-    }
+        // Simulate CLI args by merging
+        #[derive(serde::Serialize)]
+        struct CliArgs {
+            database: Database,
+        }
+        #[derive(serde::Serialize)]
+        struct Database {
+            host: String,
+        }
 
-    let cli = CliArgs {
-        database: Database {
-            host: "cli-host".to_string(),
-        },
-    };
+        let cli = CliArgs {
+            database: Database {
+                host: "cli-host".to_string(),
+            },
+        };
 
-    let config = config.merge_cli(cli);
+        let config = config.merge_cli(cli);
 
-    // CLI should override everything
-    assert_eq!(
-        config.get_string("database.host"),
-        Some("cli-host".to_string())
-    );
+        // CLI should override everything
+        assert_eq!(
+            config.get_string("database.host"),
+            Some("cli-host".to_string())
+        );
+    });
 }
 
 // ============================================================================
@@ -412,34 +387,35 @@ fn test_cli_args_highest_priority() {
 #[test]
 fn test_full_cascade_priority() {
     let (_dir, path) = setup_config_dir();
-    let _env = EnvGuard::new(&[("CASCADE_DATABASE__HOST", "env-host")]);
 
-    // Start with all layers
-    let config = Config::new(ConfigOptions {
-        env_prefix: "CASCADE".to_string(),
-        config_paths: vec![path],
-        app_env: Some("development".to_string()),
-        ..Default::default()
-    })
-    .expect("config should load");
+    temp_env::with_var("CASCADE_DATABASE__HOST", Some("env-host"), || {
+        // Start with all layers
+        let config = Config::new(ConfigOptions {
+            env_prefix: "CASCADE".to_string(),
+            config_paths: vec![path.clone()],
+            app_env: Some("development".to_string()),
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    // ENV overrides file configs
-    assert_eq!(
-        config.get_string("database.host"),
-        Some("env-host".to_string())
-    );
+        // ENV overrides file configs
+        assert_eq!(
+            config.get_string("database.host"),
+            Some("env-host".to_string())
+        );
 
-    // settings.development.yaml values not overridden by ENV
-    assert_eq!(config.get_bool("debug"), Some(true));
+        // settings.development.yaml values not overridden by ENV
+        assert_eq!(config.get_bool("debug"), Some(true));
 
-    // settings.yaml values
-    assert_eq!(config.get_string("app_name"), Some("test_app".to_string()));
+        // settings.yaml values
+        assert_eq!(config.get_string("app_name"), Some("test_app".to_string()));
 
-    // defaults.yaml values not overridden
-    assert_eq!(config.get_int("database.port"), Some(5432));
+        // defaults.yaml values not overridden
+        assert_eq!(config.get_int("database.port"), Some(5432));
 
-    // hardcoded defaults
-    assert_eq!(config.get_string("log_format"), Some("auto".to_string()));
+        // hardcoded defaults
+        assert_eq!(config.get_string("log_format"), Some("auto".to_string()));
+    });
 }
 
 // ============================================================================
@@ -448,28 +424,28 @@ fn test_full_cascade_priority() {
 
 #[test]
 fn test_get_bool_from_string() {
-    let _env = EnvGuard::new(&[("BOOL_ENABLED", "true")]);
+    temp_env::with_var("BOOL_ENABLED", Some("true"), || {
+        let config = Config::new(ConfigOptions {
+            env_prefix: "BOOL".to_string(),
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    let config = Config::new(ConfigOptions {
-        env_prefix: "BOOL".to_string(),
-        ..Default::default()
-    })
-    .expect("config should load");
-
-    assert_eq!(config.get_bool("enabled"), Some(true));
+        assert_eq!(config.get_bool("enabled"), Some(true));
+    });
 }
 
 #[test]
 fn test_get_int_from_string() {
-    let _env = EnvGuard::new(&[("INT_PORT", "8080")]);
+    temp_env::with_var("INT_PORT", Some("8080"), || {
+        let config = Config::new(ConfigOptions {
+            env_prefix: "INT".to_string(),
+            ..Default::default()
+        })
+        .expect("config should load");
 
-    let config = Config::new(ConfigOptions {
-        env_prefix: "INT".to_string(),
-        ..Default::default()
-    })
-    .expect("config should load");
-
-    assert_eq!(config.get_int("port"), Some(8080));
+        assert_eq!(config.get_int("port"), Some(8080));
+    });
 }
 
 #[test]
@@ -586,15 +562,16 @@ fn test_app_name_from_env_does_not_panic() {
     // When APP_NAME is set but the directory doesn't exist,
     // config should load without error (directory is silently skipped)
     let empty_dir = TempDir::new().expect("failed to create temp dir");
-    let _env = EnvGuard::new(&[("APP_NAME", "nonexistent_app_12345")]);
 
-    let config = Config::new(ConfigOptions {
-        load_dotenv: false,
-        config_paths: vec![empty_dir.path().to_path_buf()],
-        ..Default::default()
-    })
-    .expect("config should load even with non-existent app dir");
+    temp_env::with_var("APP_NAME", Some("nonexistent_app_12345"), || {
+        let config = Config::new(ConfigOptions {
+            load_dotenv: false,
+            config_paths: vec![empty_dir.path().to_path_buf()],
+            ..Default::default()
+        })
+        .expect("config should load even with non-existent app dir");
 
-    // Hardcoded defaults still work (empty dir has no config files)
-    assert_eq!(config.get_string("log_level"), Some("info".to_string()));
+        // Hardcoded defaults still work (empty dir has no config files)
+        assert_eq!(config.get_string("log_level"), Some("info".to_string()));
+    });
 }

@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-#![allow(unsafe_code, dead_code)]
+#![allow(dead_code)]
 
 //! Shared test fixtures and utilities.
 
@@ -54,34 +54,4 @@ database:
     .expect("failed to write settings.development.yaml");
 
     (dir, path)
-}
-
-/// Set environment variables for testing, returning a guard that clears them on drop.
-pub struct EnvGuard {
-    vars: Vec<String>,
-}
-
-impl EnvGuard {
-    /// Create a new environment guard with the given variables.
-    pub fn new(vars: &[(&str, &str)]) -> Self {
-        let var_names: Vec<String> = vars
-            .iter()
-            .map(|(k, v)| {
-                // SAFETY: single-threaded test setup, ENV_LOCK held by caller
-                unsafe { std::env::set_var(k, v) };
-                k.to_string()
-            })
-            .collect();
-
-        Self { vars: var_names }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for var in &self.vars {
-            // SAFETY: single-threaded test teardown, ENV_LOCK held by caller
-            unsafe { std::env::remove_var(var) };
-        }
-    }
 }

@@ -26,8 +26,6 @@ use scalo::transport::kafka::{
 };
 use std::sync::Arc;
 
-use crate::common::EnvGuard;
-
 // --- Unit Tests (no Kafka required) ---
 
 // --- Profile Tests ---
@@ -399,32 +397,35 @@ fn test_kafka_config_chained_builders() {
 
 #[test]
 fn test_kafka_config_from_env() {
-    let _guard = EnvGuard::new(&[
-        ("TESTAPP_BOOTSTRAP_SERVERS", "kafka1:9092,kafka2:9092"),
-        ("TESTAPP_GROUP_ID", "test-consumer"),
-        ("TESTAPP_CLIENT_ID", "test-client"),
-        ("TESTAPP_SECURITY_PROTOCOL", "sasl_ssl"),
-        ("TESTAPP_SASL_MECHANISM", "SCRAM-SHA-256"),
-        ("TESTAPP_SASL_USERNAME", "testuser"),
-        ("TESTAPP_SASL_PASSWORD", "testpass"),
-        ("TESTAPP_SSL_SKIP_VERIFY", "true"),
-        ("TESTAPP_TOPICS", "topic1,topic2,topic3"),
-    ]);
+    temp_env::with_vars(
+        [
+            ("TESTAPP_BOOTSTRAP_SERVERS", Some("kafka1:9092,kafka2:9092")),
+            ("TESTAPP_GROUP_ID", Some("test-consumer")),
+            ("TESTAPP_CLIENT_ID", Some("test-client")),
+            ("TESTAPP_SECURITY_PROTOCOL", Some("sasl_ssl")),
+            ("TESTAPP_SASL_MECHANISM", Some("SCRAM-SHA-256")),
+            ("TESTAPP_SASL_USERNAME", Some("testuser")),
+            ("TESTAPP_SASL_PASSWORD", Some("testpass")),
+            ("TESTAPP_SSL_SKIP_VERIFY", Some("true")),
+            ("TESTAPP_TOPICS", Some("topic1,topic2,topic3")),
+        ],
+        || {
+            let config = KafkaConfig::from_env("TESTAPP");
 
-    let config = KafkaConfig::from_env("TESTAPP");
-
-    assert_eq!(config.brokers, vec!["kafka1:9092", "kafka2:9092"]);
-    assert_eq!(config.group, "test-consumer");
-    assert_eq!(config.client_id, "test-client");
-    assert_eq!(config.security_protocol, "sasl_ssl");
-    assert_eq!(config.sasl_mechanism, Some("SCRAM-SHA-256".to_string()));
-    assert_eq!(config.sasl_username, Some("testuser".to_string()));
-    assert_eq!(
-        config.sasl_password.as_ref().map(|p| p.expose()),
-        Some("testpass")
+            assert_eq!(config.brokers, vec!["kafka1:9092", "kafka2:9092"]);
+            assert_eq!(config.group, "test-consumer");
+            assert_eq!(config.client_id, "test-client");
+            assert_eq!(config.security_protocol, "sasl_ssl");
+            assert_eq!(config.sasl_mechanism, Some("SCRAM-SHA-256".to_string()));
+            assert_eq!(config.sasl_username, Some("testuser".to_string()));
+            assert_eq!(
+                config.sasl_password.as_ref().map(|p| p.expose()),
+                Some("testpass")
+            );
+            assert!(config.ssl_skip_verify);
+            assert_eq!(config.topics, vec!["topic1", "topic2", "topic3"]);
+        },
     );
-    assert!(config.ssl_skip_verify);
-    assert_eq!(config.topics, vec!["topic1", "topic2", "topic3"]);
 }
 
 #[test]
@@ -440,16 +441,19 @@ fn test_kafka_librdkafka_overrides_win() {
 
 #[test]
 fn test_kafka_config_from_env_with_profile() {
-    let _guard = EnvGuard::new(&[
-        ("TESTAPP2_PROFILE", "devtest"),
-        ("TESTAPP2_BOOTSTRAP_SERVERS", "kafka:9092"),
-    ]);
+    temp_env::with_vars(
+        [
+            ("TESTAPP2_PROFILE", Some("devtest")),
+            ("TESTAPP2_BOOTSTRAP_SERVERS", Some("kafka:9092")),
+        ],
+        || {
+            let config = KafkaConfig::from_env("TESTAPP2");
 
-    let config = KafkaConfig::from_env("TESTAPP2");
-
-    assert_eq!(config.profile, KafkaProfile::DevTest);
-    assert!(config.ssl_skip_verify); // Auto-enabled for devtest
-    assert_eq!(config.brokers, vec!["kafka:9092"]);
+            assert_eq!(config.profile, KafkaProfile::DevTest);
+            assert!(config.ssl_skip_verify); // Auto-enabled for devtest
+            assert_eq!(config.brokers, vec!["kafka:9092"]);
+        },
+    );
 }
 
 // --- Token Tests ---
