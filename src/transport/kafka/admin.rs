@@ -154,8 +154,12 @@ impl KafkaAdmin {
     ///
     /// # Errors
     ///
-    /// Returns error if admin client creation fails.
+    /// `TransportError::Config` when the provider preset or
+    /// [`KafkaConfig::validate`] refuses the config, as
+    /// [`KafkaTransport::new`](super::KafkaTransport::new) does;
+    /// `TransportError::Connection` when librdkafka cannot build a client.
     pub fn new(config: &KafkaConfig) -> TransportResult<Self> {
+        let config = &super::checked_config(config)?;
         let client_config = admin_client_config(config);
 
         let admin: AdminClient<DefaultClientContext> = client_config.create().map_err(|e| {
@@ -646,7 +650,22 @@ impl std::fmt::Debug for KafkaAdmin {
 
 #[cfg(test)]
 mod tests {
+    use super::super::client_gate;
     use super::*;
+
+    #[test]
+    fn the_admin_refuses_the_configs_the_transport_refuses() {
+        client_gate::assert_refuses_as_the_transport_does(|config| {
+            client_gate::config_refusal(KafkaAdmin::new(config))
+        });
+    }
+
+    #[test]
+    fn the_admin_builds_on_a_verified_config_under_production() {
+        client_gate::assert_builds_under_production(|config| {
+            client_gate::config_refusal(KafkaAdmin::new(config))
+        });
+    }
 
     /// The offset-query consumer asks for its group's coordinator on connect,
     /// and a DFE broker refuses any group outside the `dfe-` prefix it grants.

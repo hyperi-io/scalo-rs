@@ -1709,7 +1709,10 @@ impl KafkaConfig {
     /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
     /// and is set by the `devtest`/`for_testing` profiles by design. It is
     /// permitted only in dev/test; under a production profile this returns an
-    /// error. Call at startup with [`crate::env::is_production`].
+    /// error. Every constructor that builds an rdkafka client from a config
+    /// runs this with [`crate::env::is_production`], after
+    /// [`apply_provider`](Self::apply_provider). Call it directly to check a
+    /// config without building a client.
     ///
     /// NOTE: `ssl_skip_verify` is slated for removal at GA -- supply the broker
     /// CA via `ssl_ca_location` (private-CA trust) instead.

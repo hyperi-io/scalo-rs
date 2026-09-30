@@ -54,7 +54,8 @@ impl TopicResolver {
     ///
     /// # Errors
     ///
-    /// Returns error if admin client creation fails or any regex pattern is invalid.
+    /// Returns error if [`KafkaAdmin::new`] refuses the config or cannot build
+    /// its client, or any regex pattern is invalid.
     pub fn new(config: &KafkaConfig) -> TransportResult<Self> {
         let admin = KafkaAdmin::new(config)?;
         let include_patterns = compile_patterns(&config.topic_include)?;
@@ -319,7 +320,22 @@ impl TopicResolver {
 
 #[cfg(test)]
 mod tests {
+    use super::super::client_gate;
     use super::*;
+
+    #[test]
+    fn the_resolver_refuses_the_configs_the_transport_refuses() {
+        client_gate::assert_refuses_as_the_transport_does(|config| {
+            client_gate::config_refusal(TopicResolver::new(config))
+        });
+    }
+
+    #[test]
+    fn the_resolver_builds_on_a_verified_config_under_production() {
+        client_gate::assert_builds_under_production(|config| {
+            client_gate::config_refusal(TopicResolver::new(config))
+        });
+    }
 
     #[test]
     fn default_suppression_load_over_land() {
