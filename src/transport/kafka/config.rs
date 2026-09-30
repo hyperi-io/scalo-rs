@@ -1731,7 +1731,10 @@ impl KafkaConfig {
         // safe over a plaintext transport, so only PLAIN is gated here. Mirrors the
         // opt-in provider presets + the Python contract (see the downstream
         // Python consumer's own tracker).
-        if self.sasl_mechanism.as_deref() == Some("PLAIN")
+        if self
+            .sasl_mechanism
+            .as_deref()
+            .is_some_and(|mechanism| mechanism.eq_ignore_ascii_case("PLAIN"))
             && !self.security_protocol.eq_ignore_ascii_case("sasl_ssl")
         {
             return Err(format!(
@@ -2115,6 +2118,19 @@ mod tests {
             "dev must still reject PLAIN over plaintext"
         );
         assert!(plain_plaintext.validate(true).is_err());
+
+        // The floor matches the mechanism in any case.
+        for mechanism in ["plain", "Plain"] {
+            let lowercase = KafkaConfig {
+                security_protocol: "sasl_plaintext".to_string(),
+                sasl_mechanism: Some(mechanism.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                lowercase.validate(false).is_err(),
+                "sasl_mechanism={mechanism} over plaintext must be refused"
+            );
+        }
 
         // PLAIN over sasl_ssl is fine (the Confluent Cloud shape).
         let plain_tls = KafkaConfig {

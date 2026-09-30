@@ -881,6 +881,16 @@ A hold that reached `self_regulation.max_hold_secs` resumed each `InboundGate` o
 - `EffectiveGuarantee::publish_for(listener)` publishes `pipeline_delivery_guarantee` with a `listener` label, for an app with one source and sink pair per listener.
 - `BackgroundSink` counts a push its full queue refuses in `<prefix>_dropped_total{reason="overflow"}`, where the series had no label. For the DLQ that is `dlq_dropped_total`, whose other drops already carry `reason`, so the metric no longer mixes a labelled and an unlabelled series. A query that sums the metric is unchanged. One that matched the unlabelled series by exact labels now needs `reason="overflow"`.
 
+### Kafka config is checked on every client constructor (BEHAVIOUR CHANGE)
+
+`KafkaProducer` (every profile constructor), `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ now apply the `provider` preset and run `KafkaConfig::validate(is_production())` before building a client, as `KafkaTransport::new` already did. The PLAIN floor also matches the mechanism case-insensitively, so `plain` over a plaintext transport is refused like `PLAIN`.
+
+**Consumer adjustment** -- a config these paths used to accept unchecked can now fail construction with `TransportError::Config` (`DlqError::Kafka` for the DLQ):
+- in any environment, SASL `PLAIN` (any case) without `security_protocol=sasl_ssl`, or an unknown `provider`;
+- in production, `ssl_skip_verify`, or `plaintext` / `sasl_plaintext` without `allow_insecure_transport: true`.
+
+A `provider` preset that these paths silently ignored now takes effect. `producer_client_config` still applies neither step: a caller that builds a producer from it runs `apply_provider` and `validate` itself.
+
 ---
 
 ## Known open issues (not fixed on this branch)
