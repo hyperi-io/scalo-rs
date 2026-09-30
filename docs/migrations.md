@@ -885,9 +885,12 @@ A hold that reached `self_regulation.max_hold_secs` resumed each `InboundGate` o
 
 `KafkaProducer` (every profile constructor), `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ now apply the `provider` preset and run `KafkaConfig::validate(is_production())` before building a client, as `KafkaTransport::new` already did. The PLAIN floor also matches the mechanism case-insensitively, so `plain` over a plaintext transport is refused like `PLAIN`.
 
+`validate` also judges the raw librdkafka maps the client builders apply: `librdkafka_overrides`, `sizing.producer_librdkafka`, `sizing.consumer_librdkafka` and `extra_config`. Each value they give `security.protocol`, `sasl.mechanism` or `sasl.mechanisms` is held to the rules above, and a false `enable.ssl.certificate.verification` is refused in production like `ssl_skip_verify`. Keys and values match in any case, a value is read past surrounding whitespace, and the refusal names the map and the key. The consumer runs the typed `security_protocol` over an override and the producer runs the override, so both are judged: an override to `ssl` does not lift a typed `plaintext`.
+
 **Consumer adjustment** -- a config these paths used to accept unchecked can now fail construction with `TransportError::Config` (`DlqError::Kafka` for the DLQ):
 - in any environment, SASL `PLAIN` (any case) without `security_protocol=sasl_ssl`, or an unknown `provider`;
-- in production, `ssl_skip_verify`, or `plaintext` / `sasl_plaintext` without `allow_insecure_transport: true`.
+- in production, `ssl_skip_verify`, or `plaintext` / `sasl_plaintext` without `allow_insecure_transport: true`;
+- a config that got past either check through a raw map, such as `librdkafka_overrides: { security.protocol: sasl_plaintext }` beside a typed `sasl_ssl` and `PLAIN`, or `{ enable.ssl.certificate.verification: "false" }` in production, on every constructor including `KafkaTransport::new`. Set the typed field instead, or `allow_insecure_transport: true` for an audited plaintext transport.
 
 A `provider` preset that these paths silently ignored now takes effect. `producer_client_config` still applies neither step: a caller that builds a producer from it runs `apply_provider` and `validate` itself.
 

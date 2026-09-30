@@ -645,6 +645,23 @@ pub(crate) mod client_gate {
                 },
                 "security_protocol='plaintext'",
             ),
+            // Only an override turns verification off: the typed fields pass.
+            (
+                KafkaConfig {
+                    security_protocol: "ssl".to_string(),
+                    ..unreachable()
+                }
+                .with_override("enable.ssl.certificate.verification", "false"),
+                "librdkafka_overrides key 'enable.ssl.certificate.verification'",
+            ),
+            (
+                KafkaConfig {
+                    security_protocol: "ssl".to_string(),
+                    ..unreachable()
+                }
+                .with_override("security.protocol", "plaintext"),
+                "librdkafka_overrides key 'security.protocol'='plaintext'",
+            ),
         ];
         let in_any_environment = [
             (
@@ -654,6 +671,16 @@ pub(crate) mod client_gate {
                     ..unreachable()
                 },
                 "SASL PLAIN requires security_protocol=sasl_ssl",
+            ),
+            // Only an override takes a PLAIN password off TLS.
+            (
+                KafkaConfig {
+                    security_protocol: "sasl_ssl".to_string(),
+                    sasl_mechanism: Some("PLAIN".to_string()),
+                    ..unreachable()
+                }
+                .with_override("security.protocol", "sasl_plaintext"),
+                "librdkafka_overrides key 'security.protocol'='sasl_plaintext'",
             ),
             (
                 KafkaConfig {
@@ -682,16 +709,22 @@ pub(crate) mod client_gate {
     }
 
     /// Assert `build` builds a client from a TLS-verifying config under a
-    /// production posture. `build` is as for
-    /// [`assert_refuses_as_the_transport_does`].
+    /// production posture, with and without overrides that keep it verifying.
+    /// `build` is as for [`assert_refuses_as_the_transport_does`].
     pub(crate) fn assert_builds_under_production(build: impl Fn(&KafkaConfig) -> Option<String>) {
         let verified = KafkaConfig {
             security_protocol: "ssl".to_string(),
             ..unreachable()
         };
+        let overridden = verified
+            .clone()
+            .with_override("security.protocol", "SSL")
+            .with_override("enable.ssl.certificate.verification", "true");
         temp_env::with_var("APP_ENV", Some("production"), || {
-            if let Some(refusal) = build(&verified) {
-                panic!("refused a TLS-verifying config under production: {refusal}");
+            for config in [&verified, &overridden] {
+                if let Some(refusal) = build(config) {
+                    panic!("refused a TLS-verifying config under production: {refusal}");
+                }
             }
         });
     }

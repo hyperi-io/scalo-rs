@@ -827,6 +827,82 @@ fn settle_compression_level(map: &mut BTreeMap<String, String>, layers: &[RawLay
 }
 
 // ============================================================================
+// Security settings judged by `KafkaConfig::validate`
+// ============================================================================
+
+/// librdkafka's name for the transport protocol.
+const SECURITY_PROTOCOL_KEYS: &[&str] = &["security.protocol"];
+
+/// librdkafka's two names for the SASL mechanism.
+const SASL_MECHANISM_KEYS: &[&str] = &["sasl.mechanism", "sasl.mechanisms"];
+
+/// The key every client builder sets to `false` for `ssl_skip_verify`.
+const CERTIFICATE_VERIFICATION_KEYS: &[&str] = &["enable.ssl.certificate.verification"];
+
+/// Where a value a client may run a security setting with was set.
+#[derive(Debug, Clone, Copy)]
+enum SettingOrigin<'a> {
+    /// The typed field of this name.
+    Field(&'static str),
+    /// `key` in the raw librdkafka map at config path `map`.
+    Raw { map: &'static str, key: &'a str },
+}
+
+/// One value a client may run a security setting with, and where it was set.
+///
+/// The value is trimmed, since librdkafka skips leading whitespace in an enum
+/// value such as `security.protocol`.
+#[derive(Debug, Clone, Copy)]
+struct SecuritySetting<'a> {
+    value: &'a str,
+    origin: SettingOrigin<'a>,
+}
+
+impl<'a> SecuritySetting<'a> {
+    fn field(name: &'static str, value: &'a str) -> Self {
+        Self {
+            value: value.trim(),
+            origin: SettingOrigin::Field(name),
+        }
+    }
+
+    fn is(&self, expected: &str) -> bool {
+        self.value.eq_ignore_ascii_case(expected)
+    }
+
+    /// Whether librdkafka reads the value as boolean false: `false` or `f` in
+    /// any case, or `0`.
+    fn is_false(&self) -> bool {
+        self.is("false") || self.is("f") || self.value == "0"
+    }
+}
+
+impl std::fmt::Display for SecuritySetting<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.origin {
+            SettingOrigin::Field(name) => write!(f, "{name}='{}'", self.value),
+            SettingOrigin::Raw { map, key } => write!(f, "{map} key '{key}'='{}'", self.value),
+        }
+    }
+}
+
+/// The values `maps` give any of `keys`, a key matching in any letter case.
+fn raw_settings<'a>(
+    maps: &'a [(&'static str, RawLayer<'a>)],
+    keys: &'static [&'static str],
+) -> impl Iterator<Item = SecuritySetting<'a>> {
+    maps.iter().flat_map(move |&(map, ref layer)| {
+        layer
+            .iter()
+            .filter(|(key, _)| keys.iter().any(|k| key.eq_ignore_ascii_case(k)))
+            .map(move |&(key, value)| SecuritySetting {
+                value: value.trim(),
+                origin: SettingOrigin::Raw { map, key },
+            })
+    })
+}
+
+// ============================================================================
 // Topic Resolution Types
 // ============================================================================
 
@@ -1344,8 +1420,10 @@ pub struct KafkaConfig {
     ///
     /// These settings override the profile defaults, the explicit config
     /// fields and the whole sizing surface: every producer and consumer path
-    /// applies them after all three. Use this to customize any librdkafka
-    /// setting not exposed as an explicit field.
+    /// applies them after all three, except that the consumer sets its
+    /// security, TLS, `client_id` and `client_rack` fields after them. Use this
+    /// to customize any librdkafka setting not exposed as an explicit field.
+    /// [`validate`](Self::validate) judges the security keys set here.
     ///
     /// Example:
     /// ```yaml
@@ -1704,6 +1782,27 @@ impl KafkaConfig {
         format!("{anchor}-{role}")
     }
 
+    /// Every raw librdkafka map a client builder lays over the typed fields,
+    /// by its config path.
+    #[allow(deprecated)]
+    fn raw_librdkafka_maps(&self) -> [(&'static str, RawLayer<'_>); 4] {
+        [
+            ("extra_config", raw_layer(&self.extra_config)),
+            (
+                "sizing.consumer_librdkafka",
+                raw_layer(&self.sizing.consumer_librdkafka),
+            ),
+            (
+                "sizing.producer_librdkafka",
+                raw_layer(&self.sizing.producer_librdkafka),
+            ),
+            (
+                "librdkafka_overrides",
+                raw_layer(&self.librdkafka_overrides),
+            ),
+        ]
+    }
+
     /// Validate the Kafka config against the deployment profile.
     ///
     /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
@@ -1714,33 +1813,53 @@ impl KafkaConfig {
     /// [`apply_provider`](Self::apply_provider). Call it directly to check a
     /// config without building a client.
     ///
+    /// Each rule is judged on every value a client can run with: the typed
+    /// field, and each value `librdkafka_overrides`, `sizing.producer_librdkafka`,
+    /// `sizing.consumer_librdkafka` or `extra_config` gives `security.protocol`,
+    /// `sasl.mechanism` (or `sasl.mechanisms`) or
+    /// `enable.ssl.certificate.verification`. The consumer sets the typed
+    /// security fields after those maps and the producer and admin clients set
+    /// them before, so one config can run both values and the weaker one
+    /// decides. Keys and values match in any letter case.
+    ///
     /// NOTE: `ssl_skip_verify` is slated for removal at GA -- supply the broker
     /// CA via `ssl_ca_location` (private-CA trust) instead.
     ///
     /// # Errors
     ///
-    /// Returns `Err` (in ANY environment) when `sasl_mechanism` is `PLAIN` but the
-    /// transport is not `sasl_ssl` -- a PLAIN password must never cross a plaintext
-    /// transport. Additionally, when `is_production`, returns `Err` if
-    /// `ssl_skip_verify` is set, or an unencrypted transport
-    /// (`plaintext`/`sasl_plaintext`) is configured without the explicit
-    /// `allow_insecure_transport` opt-in.
+    /// Returns `Err` (in ANY environment) when the SASL mechanism is `PLAIN`
+    /// but the transport is not `sasl_ssl` -- a PLAIN password must never cross
+    /// a plaintext transport. Additionally, when `is_production`, returns `Err`
+    /// if `ssl_skip_verify` is set or a raw map turns certificate verification
+    /// off, or an unencrypted transport (`plaintext`/`sasl_plaintext`) is
+    /// configured without the explicit `allow_insecure_transport` opt-in. A
+    /// refusal a raw map caused names the map and the key.
     pub fn validate(&self, is_production: bool) -> Result<(), String> {
+        let raw_maps = self.raw_librdkafka_maps();
+        let protocols: Vec<SecuritySetting<'_>> = std::iter::once(SecuritySetting::field(
+            "security_protocol",
+            &self.security_protocol,
+        ))
+        .chain(raw_settings(&raw_maps, SECURITY_PROTOCOL_KEYS))
+        .collect();
+
         // Universal floor (dev AND prod): PLAIN sends the password in cleartext,
         // so it MUST ride an encrypted transport (sasl_ssl). SCRAM challenges are
         // safe over a plaintext transport, so only PLAIN is gated here. Mirrors the
         // opt-in provider presets + the Python contract (see the downstream
         // Python consumer's own tracker).
-        if self
+        if let Some(plain) = self
             .sasl_mechanism
             .as_deref()
-            .is_some_and(|mechanism| mechanism.eq_ignore_ascii_case("PLAIN"))
-            && !self.security_protocol.eq_ignore_ascii_case("sasl_ssl")
+            .map(|mechanism| SecuritySetting::field("sasl_mechanism", mechanism))
+            .into_iter()
+            .chain(raw_settings(&raw_maps, SASL_MECHANISM_KEYS))
+            .find(|mechanism| mechanism.is("PLAIN"))
+            && let Some(protocol) = protocols.iter().find(|protocol| !protocol.is("sasl_ssl"))
         {
             return Err(format!(
-                "kafka: SASL PLAIN requires security_protocol=sasl_ssl (got '{}') -- \
-                 never send a PLAIN password over a plaintext transport",
-                self.security_protocol
+                "kafka: SASL PLAIN requires security_protocol=sasl_ssl (got {protocol}, with \
+                 {plain}) -- never send a PLAIN password over a plaintext transport"
             ));
         }
         if !is_production {
@@ -1753,16 +1872,27 @@ impl KafkaConfig {
                     .to_string(),
             );
         }
+        if let Some(unverified) =
+            raw_settings(&raw_maps, CERTIFICATE_VERIFICATION_KEYS).find(SecuritySetting::is_false)
+        {
+            return Err(format!(
+                "kafka: {unverified} disables TLS certificate verification, which is not \
+                 permitted in production -- configure ssl_ca_location for private-CA trust \
+                 instead"
+            ));
+        }
         // An unencrypted transport ships data (and SASL/PLAIN credentials) in
         // the clear. Reject in prod unless deliberately opted into.
-        let proto = self.security_protocol.to_ascii_lowercase();
-        if !self.allow_insecure_transport && (proto == "plaintext" || proto == "sasl_plaintext") {
+        if !self.allow_insecure_transport
+            && let Some(unencrypted) = protocols
+                .iter()
+                .find(|protocol| protocol.is("plaintext") || protocol.is("sasl_plaintext"))
+        {
             return Err(format!(
-                "kafka: security_protocol='{}' sends data/credentials unencrypted and is not \
+                "kafka: {unencrypted} sends data/credentials unencrypted and is not \
                  permitted in production -- use 'ssl'/'sasl_ssl', or set \
                  allow_insecure_transport=true to deliberately opt in (e.g. mesh-encrypted \
-                 in-cluster traffic)",
-                self.security_protocol
+                 in-cluster traffic)"
             ));
         }
         Ok(())
@@ -2151,6 +2281,216 @@ mod tests {
         assert!(
             scram_plaintext.validate(false).is_ok(),
             "SCRAM over plaintext is ok in dev"
+        );
+    }
+
+    /// The refusal `validate` gives `config`, failing the test when it passes.
+    fn refusal(config: &KafkaConfig, is_production: bool) -> String {
+        config
+            .validate(is_production)
+            .expect_err("validate passed a config a client would run insecurely")
+    }
+
+    #[test]
+    fn validate_refuses_an_override_that_sends_plain_over_plaintext() {
+        // The typed fields pass; the producer and admin clients apply the
+        // override after them and would run PLAIN over sasl_plaintext.
+        let protocol_override = KafkaConfig {
+            security_protocol: "sasl_ssl".to_string(),
+            sasl_mechanism: Some("PLAIN".to_string()),
+            ..Default::default()
+        }
+        .with_override("security.protocol", "sasl_plaintext");
+        for is_production in [false, true] {
+            let why = refusal(&protocol_override, is_production);
+            assert!(
+                why.contains("librdkafka_overrides key 'security.protocol'='sasl_plaintext'"),
+                "the refusal does not name the override: {why}"
+            );
+        }
+
+        // An override that makes the mechanism PLAIN, under either librdkafka name.
+        for key in ["sasl.mechanism", "sasl.mechanisms"] {
+            let mechanism_override = KafkaConfig {
+                security_protocol: "sasl_plaintext".to_string(),
+                sasl_mechanism: Some("SCRAM-SHA-512".to_string()),
+                ..Default::default()
+            }
+            .with_override(key, "PLAIN");
+            let why = refusal(&mechanism_override, false);
+            assert!(
+                why.contains(&format!("librdkafka_overrides key '{key}'='PLAIN'")),
+                "the refusal does not name {key}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_refuses_an_override_that_turns_verification_off_in_production() {
+        for off in ["false", "FALSE", "f", "0"] {
+            let config = KafkaConfig {
+                security_protocol: "ssl".to_string(),
+                ..Default::default()
+            }
+            .with_override("enable.ssl.certificate.verification", off);
+            assert!(config.validate(false).is_ok(), "dev allows {off}");
+            let why = refusal(&config, true);
+            assert!(
+                why.contains("librdkafka_overrides key 'enable.ssl.certificate.verification'"),
+                "the refusal of {off} does not name the override: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_refuses_an_override_to_an_unencrypted_transport_in_production() {
+        for protocol in ["plaintext", "SASL_PLAINTEXT"] {
+            let config = KafkaConfig {
+                security_protocol: "ssl".to_string(),
+                ..Default::default()
+            }
+            .with_override("security.protocol", protocol);
+            assert!(config.validate(false).is_ok(), "dev allows {protocol}");
+            let why = refusal(&config, true);
+            assert!(
+                why.contains(&format!(
+                    "librdkafka_overrides key 'security.protocol'='{protocol}'"
+                )),
+                "the refusal does not name the override: {why}"
+            );
+
+            let opted_in = KafkaConfig {
+                allow_insecure_transport: true,
+                ..config
+            };
+            assert!(
+                opted_in.validate(true).is_ok(),
+                "allow_insecure_transport opts into {protocol} set by an override"
+            );
+        }
+    }
+
+    /// The consumer sets the typed protocol after the overrides, so an
+    /// override to TLS leaves the consumer on the typed plaintext.
+    #[test]
+    fn validate_judges_the_typed_protocol_an_override_does_not_reach() {
+        let config = KafkaConfig::default().with_override("security.protocol", "ssl");
+        let why = refusal(&config, true);
+        assert!(
+            why.contains("security_protocol='plaintext'"),
+            "the refusal does not name the typed field: {why}"
+        );
+    }
+
+    #[test]
+    fn validate_matches_override_keys_and_values_in_any_case() {
+        let plain_over_tls = KafkaConfig {
+            security_protocol: "sasl_ssl".to_string(),
+            sasl_mechanism: Some("PLAIN".to_string()),
+            ..Default::default()
+        };
+        let scram_over_plaintext = KafkaConfig {
+            security_protocol: "sasl_plaintext".to_string(),
+            sasl_mechanism: Some("SCRAM-SHA-512".to_string()),
+            ..Default::default()
+        };
+        let verified = KafkaConfig {
+            security_protocol: "ssl".to_string(),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                plain_over_tls.with_override("Security.Protocol", " SASL_PLAINTEXT "),
+                false,
+                "librdkafka_overrides key 'Security.Protocol'='SASL_PLAINTEXT'",
+            ),
+            (
+                scram_over_plaintext.with_override("SASL.MECHANISMS", "plain"),
+                false,
+                "librdkafka_overrides key 'SASL.MECHANISMS'='plain'",
+            ),
+            (
+                verified.with_override("Enable.SSL.Certificate.Verification", "False"),
+                true,
+                "librdkafka_overrides key 'Enable.SSL.Certificate.Verification'='False'",
+            ),
+        ];
+        for (config, is_production, names) in cases {
+            let why = refusal(&config, is_production);
+            assert!(
+                why.contains(names),
+                "the refusal does not name {names}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_judges_every_raw_librdkafka_map() {
+        let secure = || KafkaConfig {
+            security_protocol: "ssl".to_string(),
+            ..Default::default()
+        };
+        let mut producer = secure();
+        producer
+            .sizing
+            .producer_librdkafka
+            .insert("security.protocol".to_string(), "plaintext".to_string());
+        let mut consumer = secure();
+        consumer.sizing.consumer_librdkafka.insert(
+            "enable.ssl.certificate.verification".to_string(),
+            "false".to_string(),
+        );
+        #[allow(deprecated)]
+        let legacy = {
+            let mut legacy = secure();
+            legacy.extra_config.insert(
+                "enable.ssl.certificate.verification".to_string(),
+                "false".to_string(),
+            );
+            legacy
+        };
+        for (config, map) in [
+            (producer, "sizing.producer_librdkafka"),
+            (consumer, "sizing.consumer_librdkafka"),
+            (legacy, "extra_config"),
+        ] {
+            assert!(config.validate(false).is_ok(), "dev allows {map}");
+            let why = refusal(&config, true);
+            assert!(
+                why.contains(&format!("{map} key")),
+                "the refusal does not name {map}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_passes_overrides_that_keep_the_client_secure() {
+        let config = KafkaConfig {
+            security_protocol: "sasl_ssl".to_string(),
+            sasl_mechanism: Some("PLAIN".to_string()),
+            ..Default::default()
+        }
+        .with_override("security.protocol", "SASL_SSL")
+        .with_override("sasl.mechanism", "SCRAM-SHA-512")
+        .with_override("enable.ssl.certificate.verification", "true")
+        .with_override("statistics.interval.ms", "0");
+        assert!(config.validate(false).is_ok());
+        assert!(config.validate(true).is_ok());
+    }
+
+    /// librdkafka skips leading whitespace in an enum value, so ` plaintext`
+    /// runs as plaintext.
+    #[test]
+    fn validate_reads_a_padded_typed_protocol_as_librdkafka_does() {
+        let config = KafkaConfig {
+            security_protocol: " plaintext".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate(false).is_ok());
+        let why = refusal(&config, true);
+        assert!(
+            why.contains("security_protocol='plaintext'"),
+            "the refusal does not name the typed field: {why}"
         );
     }
 
