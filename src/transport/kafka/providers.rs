@@ -32,8 +32,8 @@
 //!
 //! This module is pure, generic FACT: what each provider's platform requires. It holds
 //! NO deployment POLICY. An app that wants an opinionated contract -- "SCRAM mandatory
-//! on brokers we own, never weakened; only this blessed set is allowed" (the DFE
-//! credential contract, dfe-engine#98) -- layers that ON TOP, opt-in, in the consumer.
+//! on brokers we own, never weakened; only this blessed set is allowed" (an
+//! opinionated credential contract) -- layers that ON TOP, opt-in, in the consumer.
 //! The vanilla core works irrespective of any such opinion.
 //!
 //! One credential shape holds across the built-in managed providers: SASL over TLS
@@ -46,8 +46,8 @@
 //! The one hard floor: PLAIN must ride SASL_SSL. Enforced by [`validate`] and by
 //! [`KafkaConfig::validate`](super::KafkaConfig::validate).
 //!
-//! The built-in table is the canonical record for dfe-engine#98 and is MIRRORED in
-//! scalo-py + dfe-engine (Python) -- keep the three tables identical.
+//! The built-in table is the canonical record for this credential contract and is MIRRORED in
+//! scalo-py and its Python consumers -- keep the tables identical.
 
 use super::KafkaConfig;
 
@@ -187,7 +187,7 @@ pub enum KnownProvider {
 }
 
 impl KnownProvider {
-    /// Parse a provider name. The string keys match scalo-py + dfe-engine.
+    /// Parse a provider name. The string keys match scalo-py and its Python consumers.
     ///
     /// # Errors
     /// Returns `Err` with the list of known providers for an unknown name.

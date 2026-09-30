@@ -17,10 +17,10 @@
 //! piping through standard Unix tools:
 //!
 //! ```bash
-//! dfe-loader top --once | grep kafka          # filter by name
-//! dfe-loader top --once | awk -F'\t' '$3>100' # value > 100
-//! dfe-loader top --once | cut -f1,3           # name and value only
-//! dfe-loader top --once | tail -n+2 | sort -t$'\t' -k3 -rn  # sort by value
+//! myapp top --once | grep kafka          # filter by name
+//! myapp top --once | awk -F'\t' '$3>100' # value > 100
+//! myapp top --once | cut -f1,3           # name and value only
+//! myapp top --once | tail -n+2 | sort -t$'\t' -k3 -rn  # sort by value
 //! ```
 
 use std::collections::HashMap;

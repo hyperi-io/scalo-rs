@@ -7,7 +7,7 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! ============================================================================
-//! TEMPLATE -- copy this file into your DFE consumer's `tests/e2e/` and
+//! TEMPLATE -- copy this file into your consumer's `tests/e2e/` and
 //! adapt the FIXTURE section. The probe/skip/cluster helpers live in
 //! `scalo::deployment::test_support` so each consumer's copy
 //! stays short and benefits from any bug fixes pushed to scalo.
@@ -57,7 +57,7 @@
 //! build context that responds to `--help`. Real consumer copies of this
 //! template should REPLACE the mock with `cargo build --release --bin
 //! <name>` and copy the produced binary into the docker build context.
-//! See dfe-receiver's adaptation for the canonical example.
+//! See a receiver's adaptation for the canonical example.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]

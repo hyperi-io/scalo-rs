@@ -6,15 +6,15 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Composable DFE metric groups.
+//! Composable metric groups.
 //!
-//! Opt-in metric structs for DFE pipeline applications. Each group registers
+//! Opt-in metric structs for data-plane pipeline applications. Each group registers
 //! standardised metrics with BARE names (e.g. `buffer_bytes`). When the
 //! [`MetricsManager`](super::MetricsManager) has a non-empty namespace, the
 //! prefix layer on the global recorder and the manifest registry add a single
 //! `{namespace}_` prefix uniformly (e.g. `dfe_buffer_bytes`).
 //!
-//! Feature-gated behind `service-metrics`. Non-DFE apps are unaffected.
+//! Feature-gated behind `service-metrics`. Apps outside this pipeline shape are unaffected.
 //!
 //! ## Usage
 //!

@@ -18,7 +18,7 @@
 //!
 //! let config = FileOutputConfig {
 //!     enabled: true,
-//!     path: "/tmp/dfe/output".into(),
+//!     path: "/tmp/myapp/output".into(),
 //!     ..Default::default()
 //! };
 //!

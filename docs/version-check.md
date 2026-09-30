@@ -75,7 +75,7 @@ POST body, matching scalo-py field for field:
 
 ```json
 {
-  "product": "dfe-loader",
+  "product": "my-app",
   "current_version": "1.8.0",
   "os": "linux",
   "arch": "x86_64",

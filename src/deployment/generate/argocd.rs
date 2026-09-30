@@ -86,7 +86,7 @@ impl Default for ArgocdConfig {
 /// # use scalo::deployment::DeploymentContract;
 /// # let contract: DeploymentContract = unimplemented!();
 /// let argo = ArgocdConfig {
-///     repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
+///     repo_url: "https://github.com/example-org/example-app".into(),
 ///     ..Default::default()
 /// };
 /// let yaml = generate_argocd_application(&contract, &argo, None);

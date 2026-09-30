@@ -61,7 +61,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `version_check.enabled: false` in any config layer always wins.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VersionCheckConfig {
-    /// Product identifier (e.g., "dfe-loader", "dfe-receiver").
+    /// Product identifier (e.g., "loader", "receiver").
     #[serde(default)]
     pub product: String,
     /// Current version of this product (e.g., "1.8.0").

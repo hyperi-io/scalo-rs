@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Kafka consumer metrics for DFE apps.
+//! Kafka consumer metrics for pipeline apps.
 
 use std::sync::Arc;
 

@@ -36,18 +36,18 @@
 //! };
 //!
 //! let contract = DeploymentContract {
-//!     app_name: "dfe-loader".into(),
-//!     binary_name: "dfe-loader".into(),
+//!     app_name: "my-app".into(),
+//!     binary_name: "my-app".into(),
 //!     description: "High-performance data loader".into(),
 //!     metrics_port: 9090,
 //!     health: HealthContract::default(),
 //!     env_prefix: "DFE_LOADER".into(),
 //!     metric_prefix: "loader".into(),
-//!     config_mount_path: "/etc/dfe/loader.yaml".into(),
-//!     image_registry: "ghcr.io/hyperi-io".into(),
+//!     config_mount_path: "/etc/my-app/config.yaml".into(),
+//!     image_registry: "ghcr.io/example-org".into(),
 //!     extra_ports: vec![],
 //!     unbound_listen_paths: vec![],
-//!     entrypoint_args: vec!["--config".into(), "/etc/dfe/loader.yaml".into()],
+//!     entrypoint_args: vec!["--config".into(), "/etc/my-app/config.yaml".into()],
 //!     secrets: vec![],
 //!     default_config: None,
 //!     depends_on: vec!["kafka".into(), "clickhouse".into()],

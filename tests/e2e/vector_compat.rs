@@ -342,10 +342,10 @@ sinks:
     let _ = server.close().await;
 }
 
-/// Test: Both native DFE client and Vector CLI can send to the same server.
+/// Test: Both a native client and Vector CLI can send to the same server.
 ///
 /// Verifies that the vector_compat server accepts events on both the
-/// DFE native proto and the Vector proto simultaneously.
+/// native proto and the Vector proto simultaneously.
 #[tokio::test]
 async fn test_vector_and_native_coexist() {
     let Some(vector_bin) = vector_binary_path() else {
@@ -364,7 +364,7 @@ async fn test_vector_and_native_coexist() {
         .await
         .expect("failed to create vector-compat server");
 
-    // Send native DFE messages
+    // Send native protocol messages
     let client_config = GrpcConfig::client(&format!("http://127.0.0.1:{port}"));
     let client = GrpcTransport::new(&client_config)
         .await

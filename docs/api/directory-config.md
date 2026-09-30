@@ -35,7 +35,7 @@ use scalo::directory_config::{
 };
 
 let mut store = DirectoryConfigStore::new(DirectoryConfigStoreConfig {
-    directory: "/etc/dfe/rules".into(),
+    directory: "/etc/myapp/rules".into(),
     write_mode: WriteMode::ReadWrite,
     git: None,
     ..Default::default()
@@ -88,7 +88,7 @@ changes to a backing git repo via `libgit2`:
 ```rust
 let config = DirectoryConfigStoreConfig {
     git: Some(GitBackend {
-        remote: "git@github.com:org/dfe-rules.git".into(),
+        remote: "git@github.com:org/myapp-rules.git".into(),
         branch: "main".into(),
         auto_pull_interval: Duration::from_secs(60),
         commit_message_template: "ops: {table} update".into(),
@@ -129,11 +129,11 @@ hot-reload of derived data structures.
 
 ```yaml
 directory_config:
-  directory: /etc/dfe/rules
+  directory: /etc/myapp/rules
   write_mode: read_only         # read_only | read_write
   refresh_interval: 5s
   git:
-    remote: "git@github.com:org/dfe-rules.git"
+    remote: "git@github.com:org/myapp-rules.git"
     branch: main
     auto_pull_interval: 60s
 ```

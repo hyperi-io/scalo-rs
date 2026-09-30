@@ -362,7 +362,7 @@ return the sum of outstanding `try_reserve`/`add_bytes` reservations
 unless the app registered a heap source, which no consumer did, so the
 pressure ratio sat near zero while a process held hundreds of MiB and
 neither the inbound brake nor the `dfe_scaling_pressure` hard gate ever
-engaged (dfe-transform-vrl #53).
+engaged.
 
 No consumer code change is required to get the fix. Two things to know:
 

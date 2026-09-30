@@ -66,7 +66,7 @@
 //!   min_retry_interval_ms: 100
 //!   max_retry_interval_ms: 30000
 //!   retry_non_idempotent: false
-//!   user_agent: "dfe-fetcher/1.0"
+//!   user_agent: "my-app/1.0"
 //! ```
 
 pub mod config;

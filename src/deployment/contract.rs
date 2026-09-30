@@ -54,10 +54,10 @@ pub struct DeploymentContract {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
-    /// Application name (e.g., "dfe-loader") -- matched against Chart.yaml `name`.
+    /// Application name (e.g., "my-app") -- matched against Chart.yaml `name`.
     pub app_name: String,
 
-    /// Binary name (e.g., "dfe-loader"). Defaults to app_name if empty.
+    /// Binary name (e.g., "my-app"). Defaults to app_name if empty.
     #[serde(default)]
     pub binary_name: String,
 
@@ -78,7 +78,7 @@ pub struct DeploymentContract {
     /// Prometheus metric namespace/prefix (e.g., "loader").
     pub metric_prefix: String,
 
-    /// Config file mount path (e.g., "/etc/dfe/loader.yaml").
+    /// Config file mount path (e.g., "/etc/my-app/config.yaml").
     pub config_mount_path: String,
 
     /// Container registry base (e.g., "ghcr.io/hyperi-io").
@@ -96,7 +96,7 @@ pub struct DeploymentContract {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unbound_listen_paths: Vec<String>,
 
-    /// Default ENTRYPOINT args (e.g., `["--config", "/etc/dfe/loader.yaml"]`).
+    /// Default ENTRYPOINT args (e.g., `["--config", "/etc/my-app/config.yaml"]`).
     #[serde(default)]
     pub entrypoint_args: Vec<String>,
 
@@ -495,7 +495,7 @@ impl DeploymentContract {
             .unwrap_or("config.yaml")
     }
 
-    /// Get the config mount directory (e.g., "/etc/dfe").
+    /// Get the config mount directory (e.g., "/etc/my-app").
     #[must_use]
     pub fn config_dir(&self) -> &str {
         self.config_mount_path

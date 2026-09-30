@@ -15,7 +15,7 @@ use std::fmt;
 /// Populated at build time via `env!()` macros or passed by the application.
 #[derive(Debug, Clone)]
 pub struct VersionInfo {
-    /// Service name (e.g. "dfe-loader").
+    /// Service name (e.g. "my-service").
     pub name: String,
     /// Semantic version (e.g. "1.9.7").
     pub version: String,

@@ -13,7 +13,7 @@
 //!
 //! Includes:
 //! - Expected failures (invalid CEL, tier rejections, DLQ without config)
-//! - Sample data from real DFE pipelines
+//! - Sample data from real data-plane pipelines
 //! - Adversarial inputs (binary garbage, truncated JSON, Unicode, 1MB payloads)
 
 #![cfg(feature = "transport-memory")]
@@ -366,7 +366,7 @@ fn expected_fail_whitespace_only_expression() {
 }
 
 // ============================================================================
-// Section 3: Sample Data Tests (real DFE pipeline payloads)
+// Section 3: Sample Data Tests (real pipeline payloads)
 // ============================================================================
 
 #[test]
@@ -1295,17 +1295,14 @@ fn tier3_patterns_rejected_by_default() {
 //
 // Loads tests/fixtures/cel_classifier_parity.json and verifies the Rust
 // classifier produces the same tier, op, and field results as the fixture
-// expects. The dfe-engine Python test in
-// `/projects/dfe-engine/tests/unit/test_cel/test_parity.py` runs the SAME
-// fixture through the Python classifier in `dfe_engine.cel.classify`.
+// expects. A companion Python test runs the SAME fixture through a Python
+// classifier that mirrors this crate's rules.
 //
 // If both tests pass on their respective sides, the UI validator and the
 // runtime engine agree on classification — no drift.
 //
-// To add a new test case, edit the fixture in BOTH:
-//   * /projects/scalo/tests/fixtures/cel_classifier_parity.json
-//   * /projects/dfe-engine/tests/fixtures/cel_classifier_parity.json
-// They must remain byte-identical.
+// To add a new test case, edit the fixture in BOTH this crate's copy and
+// the consumer's copy. They must remain byte-identical.
 
 #[test]
 fn classifier_matches_python_fixture() {
