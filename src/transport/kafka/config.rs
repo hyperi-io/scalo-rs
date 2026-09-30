@@ -895,11 +895,14 @@ impl<'a> SecuritySetting<'a> {
     }
 
     /// Whether the value is a URL whose scheme, the text before the first
-    /// `:`, is `http` in any case.
-    fn is_http_url(&self) -> bool {
-        self.value
-            .split_once(':')
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http"))
+    /// `:`, is anything but `https` in any case. A URL with no scheme counts,
+    /// since the HTTP client reads it as `http`; an empty value is unset.
+    fn is_not_https_url(&self) -> bool {
+        !self.value.is_empty()
+            && !self
+                .value
+                .split_once(':')
+                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
     }
 
     /// Whether the value, an OpenSSL cipher list, names a suite with no
@@ -907,15 +910,20 @@ impl<'a> SecuritySetting<'a> {
     ///
     /// The list splits on `:`, `,`, `;` and whitespace. A token names one when
     /// a `+`, `-` or `_` separated part of it is `NULL` or `eNULL`, in any
-    /// case: `eNULL`, `NULL-SHA`, `ECDHE-RSA-NULL-SHA`, `RSA+eNULL`. A token
-    /// led by `!` or `-` removes suites, so it never counts. Aliases that
-    /// reach a NULL suite indirectly, such as `COMPLEMENTOFALL`, are not read.
+    /// case: `eNULL`, `NULL-SHA`, `ECDHE-RSA-NULL-SHA`, `RSA+eNULL`.
+    /// `COMPLEMENTOFALL`, the one alias whose suites are the eNULL ones, counts
+    /// too; other aliases are not expanded. A token led by `!` or `-` removes
+    /// suites, so it never counts.
     fn names_null_cipher(&self) -> bool {
         self.value
             .split(|c: char| matches!(c, ':' | ',' | ';') || c.is_whitespace())
             .filter(|token| !token.starts_with(['!', '-']))
             .flat_map(|token| token.trim_start_matches('+').split(['+', '-', '_']))
-            .any(|part| part.eq_ignore_ascii_case("NULL") || part.eq_ignore_ascii_case("eNULL"))
+            .any(|part| {
+                ["NULL", "eNULL", "COMPLEMENTOFALL"]
+                    .iter()
+                    .any(|null| part.eq_ignore_ascii_case(null))
+            })
     }
 }
 
@@ -1873,9 +1881,10 @@ impl KafkaConfig {
     /// if `ssl_skip_verify` is set, a raw map turns certificate or hostname
     /// verification off, an unencrypted transport (`plaintext`/`sasl_plaintext`) is
     /// configured without the explicit `allow_insecure_transport` opt-in, a raw
-    /// map gives `sasl.oauthbearer.token.endpoint.url` an `http` URL, or a raw
-    /// map's `ssl.cipher.suites` names a `NULL` or `eNULL` suite that no `!` or
-    /// `-` excludes. A refusal a raw map caused names the map and the key.
+    /// map gives `sasl.oauthbearer.token.endpoint.url` a URL that is not
+    /// `https` (one with no scheme included), or a raw map's `ssl.cipher.suites`
+    /// names a `NULL`, `eNULL` or `COMPLEMENTOFALL` suite that no `!` or `-`
+    /// excludes. A refusal a raw map caused names the map and the key.
     pub fn validate(&self, is_production: bool) -> Result<(), String> {
         let raw_maps = self.raw_librdkafka_maps();
         let protocols: Vec<SecuritySetting<'_>> = std::iter::once(SecuritySetting::field(
@@ -1948,12 +1957,12 @@ impl KafkaConfig {
         }
         // The value is left out of the refusal: a URL can carry credentials.
         if let Some(endpoint) =
-            raw_settings(&raw_maps, TOKEN_ENDPOINT_KEYS).find(SecuritySetting::is_http_url)
+            raw_settings(&raw_maps, TOKEN_ENDPOINT_KEYS).find(SecuritySetting::is_not_https_url)
         {
             return Err(format!(
-                "kafka: {} is an http:// token endpoint, which would send the OAUTHBEARER \
-                 client secret unencrypted and is not permitted in production -- use an \
-                 https:// token endpoint",
+                "kafka: {} is not an https:// token endpoint, so it would send the \
+                 OAUTHBEARER client secret unencrypted, which is not permitted in \
+                 production -- use an https:// token endpoint",
                 endpoint.origin
             ));
         }
@@ -2604,13 +2613,15 @@ mod tests {
     /// librdkafka posts the client secret to this endpoint, so over plain
     /// HTTP anyone on the path reads it.
     #[test]
-    fn validate_refuses_an_http_token_endpoint_in_production() {
+    fn validate_refuses_a_non_https_token_endpoint_in_production() {
         const KEY: &str = "sasl.oauthbearer.token.endpoint.url";
         for (key, url) in [
             (KEY, "http://idp.example.com/oauth2/token"),
             (KEY, "HTTP://idp.example.com/oauth2/token"),
             (KEY, " http://idp.example.com/oauth2/token\n"),
             (KEY, "http://client:hunter2@idp.example.com/oauth2/token"),
+            (KEY, "idp.example.com/oauth2/token"),
+            (KEY, "ftp://idp.example.com/oauth2/token"),
             (
                 "SASL.OAuthBearer.Token.Endpoint.URL",
                 "http://idp.example.com/oauth2/token",
@@ -2643,6 +2654,7 @@ mod tests {
         for url in [
             "https://idp.example.com/oauth2/token",
             "HTTPS://idp.example.com/oauth2/token",
+            "",
         ] {
             let secure = oauthbearer_over_tls().with_override(KEY, url);
             assert!(
@@ -2673,6 +2685,8 @@ mod tests {
             "HIGH;ENULL",
             "RSA+eNULL",
             "+eNULL",
+            "COMPLEMENTOFALL",
+            "HIGH:complementofall",
         ] {
             let config = verified().with_override(KEY, suites);
             assert!(config.validate(false).is_ok(), "dev allows {suites:?}");
@@ -2700,6 +2714,7 @@ mod tests {
             "ALL:!NULL",
             "DEFAULT:-eNULL",
             "HIGH,!RSA+eNULL",
+            "HIGH:!COMPLEMENTOFALL",
             "",
         ] {
             let config = verified().with_override(KEY, suites);
