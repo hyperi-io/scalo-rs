@@ -87,25 +87,31 @@ duplicated cgroup file reads.
 
 ---
 
-## App env (separate from RuntimeContext)
+## App env and production posture
 
-`get_app_env()` resolves the deployment environment name (dev,
-staging, prod) and is intentionally separate from `RuntimeContext`:
+`get_app_env()` resolves the deployment environment name and is intentionally separate from `RuntimeContext`. It returns the first of these that is set, else `development`:
 
-```rust
-pub fn get_app_env() -> String {
-    std::env::var("APP_ENV")
-        .or_else(|_| std::env::var("ENVIRONMENT"))
-        .or_else(|_| std::env::var("ENV"))
-        .unwrap_or_else(|_| "development".to_string())
-}
+1. `APP_ENV`
+2. `ENVIRONMENT`
+3. `ENV`
+
+The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md](../core-pillars/config.md). It is also the `deployment.environment.name` attribute on OTel metrics (`otel-metrics`).
+
+`is_production()` is true when that name is `production` or `prod`, in any letter case. Every other value, `staging` and `production-eu` included, is not production. It gates these refusals, each of which fails the constructor in production and passes in any other environment:
+
+| Constructor | Refused in production |
+|---|---|
+| `KafkaTransport::new`, via `KafkaConfig::validate` | `ssl_skip_verify`, and a `plaintext` or `sasl_plaintext` transport without `allow_insecure_transport` |
+| `OpenBaoProvider::new`, via `OpenBaoConfig::validate` | `skip_verify` |
+| `SecretCache::new` (and so `SecretsManager::new`), via `CacheConfig::validate` | a disk cache with no `encryption_key` and `allow_plaintext_disk_cache` set |
+
+Set `APP_ENV=production` on every production deployment. Left unset, the posture is development and every refusal above is off. scalo logs one warning per process the first time it falls back to the default with a subscriber that records `WARN`, so a default resolved before the logger starts does not use it up:
+
+```text
+WARN scalo::env: none of APP_ENV, ENVIRONMENT or ENV is set, so the app environment defaults to development and production-only safety checks are disabled -- set APP_ENV=production on a production deployment app_env="development"
 ```
 
-Precedence: `APP_ENV` -> `ENVIRONMENT` -> `ENV` -> `"development"`.
-The config cascade uses this to resolve `settings.{env}.yaml` -- see
-[config.md](../core-pillars/config.md). `is_production()` is the
-related predicate: true when `get_app_env()` resolves to `production`
-or `prod` (case-insensitive), used by config `validate` methods.
+Setting any of the three variables, to any value, silences it. The warning is compiled in with the `tracing` dependency, which the default features and every feature that reaches the refusals above enable.
 
 `is_helm()` is the other helper in `env.rs` -- returns true if
 `HELM_RELEASE_NAME` is set or `/etc/podinfo/labels` contains
@@ -161,7 +167,7 @@ let cfg_path = paths.config_dir.join("settings.yaml");
 | `RuntimeContext::is_kubernetes()` / `is_container()` / `is_bare_metal()` | Delegate to the embedded `Environment` |
 | `runtime_context() -> &'static RuntimeContext` | The pillar reader -- cached singleton |
 | `get_app_env()` | Deployment environment name for cascade resolution |
-| `is_production()` | True when app env resolves to `production` / `prod` |
+| `is_production()` | True when app env resolves to `production` / `prod`; gates the production refusals |
 | `is_helm()` | Helm-deployment predicate |
 | `RuntimePaths` | Resolved config / data / cache / run paths |
 | `RuntimePaths::discover()` | Auto-detect environment and build paths |

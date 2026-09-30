@@ -13,6 +13,7 @@
 //! to configure paths, logging format, and other runtime behaviour.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 /// Runtime environment types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -314,15 +315,47 @@ pub fn is_helm() -> bool {
     false
 }
 
+/// App environment used when none of `APP_ENV`, `ENVIRONMENT` or `ENV` is set.
+const DEFAULT_APP_ENV: &str = "development";
+
+/// Guards the one-shot default-posture warning in [`get_app_env`].
+static DEFAULT_POSTURE_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Get the current application environment name (dev, staging, prod).
 ///
 /// Checks in order: `APP_ENV`, `ENVIRONMENT`, `ENV`, defaults to "development".
+///
+/// Falling back to the default turns off every [`is_production`] check, so
+/// the first fallback a log subscriber would record emits one warning per
+/// process. Setting any of the three variables, to any value, silences it.
 #[must_use]
 pub fn get_app_env() -> String {
-    std::env::var("APP_ENV")
+    app_env_or_default(&DEFAULT_POSTURE_WARNED)
+}
+
+/// Resolve the app environment, claiming `warned` to log the default once.
+fn app_env_or_default(warned: &AtomicBool) -> String {
+    if let Ok(app_env) = std::env::var("APP_ENV")
         .or_else(|_| std::env::var("ENVIRONMENT"))
         .or_else(|_| std::env::var("ENV"))
-        .unwrap_or_else(|_| "development".to_string())
+    {
+        return app_env;
+    }
+    // Claimed only once a subscriber would record it: config can load before the logger.
+    #[cfg(feature = "tracing")]
+    if tracing::enabled!(tracing::Level::WARN)
+        && !warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            app_env = DEFAULT_APP_ENV,
+            "none of APP_ENV, ENVIRONMENT or ENV is set, so the app environment defaults to \
+             development and production-only safety checks are disabled -- set \
+             APP_ENV=production on a production deployment"
+        );
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = warned;
+    DEFAULT_APP_ENV.to_string()
 }
 
 /// Whether the current app environment is production-like.
@@ -330,7 +363,8 @@ pub fn get_app_env() -> String {
 /// True when [`get_app_env`] resolves (case-insensitively) to `production`
 /// or `prod`. Used by config `validate(is_production)` methods to reject
 /// insecure-by-design settings (e.g. TLS `skip_verify`, plaintext disk
-/// caches) outside of dev/test.
+/// caches) outside of dev/test. With none of the three variables set this
+/// is `false`, and [`get_app_env`] logs that once.
 #[must_use]
 pub fn is_production() -> bool {
     matches!(
@@ -392,6 +426,154 @@ mod tests {
         temp_env::with_var("APP_ENV", Some("production"), || {
             assert_eq!(get_app_env(), "production");
         });
+    }
+
+    /// All three posture variables cleared, so resolution reaches the default.
+    const UNSET: [(&str, Option<&str>); 3] =
+        [("APP_ENV", None), ("ENVIRONMENT", None), ("ENV", None)];
+
+    /// Substring of the default-posture warning that names all three variables.
+    #[cfg(feature = "logger")]
+    const NAMES_THE_VARIABLES: &str = "none of APP_ENV, ENVIRONMENT or ENV is set";
+
+    #[test]
+    fn is_production_accepts_only_production_and_prod() {
+        for (value, expected) in [
+            ("production", true),
+            ("prod", true),
+            ("PRODUCTION", true),
+            ("Prod", true),
+            ("staging", false),
+            ("development", false),
+            ("production-eu", false),
+            ("", false),
+        ] {
+            temp_env::with_var("APP_ENV", Some(value), || {
+                assert_eq!(is_production(), expected, "APP_ENV={value:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn is_production_reads_each_variable_in_turn() {
+        for var in ["APP_ENV", "ENVIRONMENT", "ENV"] {
+            let vars = UNSET.map(|(name, _)| (name, (name == var).then_some("prod")));
+            temp_env::with_vars(vars, || assert!(is_production(), "{var}=prod"));
+        }
+        temp_env::with_vars(UNSET, || {
+            assert!(!is_production(), "unset resolves to development");
+        });
+    }
+
+    /// Subscriber recording WARN and above as text, and the buffer it writes to.
+    #[cfg(feature = "logger")]
+    fn capture() -> (
+        impl tracing::Subscriber + Send + Sync + 'static,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&buf);
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || Sink(Arc::clone(&writer))),
+            );
+        (subscriber, buf)
+    }
+
+    #[cfg(feature = "logger")]
+    fn captured(buf: &std::sync::Mutex<Vec<u8>>) -> String {
+        String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
+    }
+
+    #[cfg(feature = "logger")]
+    #[test]
+    fn default_posture_warns_once_naming_the_variables() {
+        let warned = AtomicBool::new(false);
+        let (subscriber, buf) = capture();
+        temp_env::with_vars(UNSET, || {
+            tracing::subscriber::with_default(subscriber, || {
+                for _ in 0..3 {
+                    assert_eq!(app_env_or_default(&warned), "development");
+                }
+            });
+        });
+
+        let out = captured(&buf);
+        assert_eq!(out.matches(NAMES_THE_VARIABLES).count(), 1, "{out}");
+        assert!(out.contains("WARN"), "{out}");
+        assert!(
+            out.contains("production-only safety checks are disabled"),
+            "{out}"
+        );
+    }
+
+    #[cfg(feature = "logger")]
+    #[test]
+    fn any_set_variable_silences_the_warning() {
+        for var in ["APP_ENV", "ENVIRONMENT", "ENV"] {
+            for value in ["staging", "production"] {
+                let warned = AtomicBool::new(false);
+                let (subscriber, buf) = capture();
+                let vars = UNSET.map(|(name, _)| (name, (name == var).then_some(value)));
+                temp_env::with_vars(vars, || {
+                    tracing::subscriber::with_default(subscriber, || {
+                        assert_eq!(app_env_or_default(&warned), value);
+                    });
+                });
+                assert!(captured(&buf).is_empty(), "{var}={value} must not warn");
+                assert!(
+                    !warned.load(std::sync::atomic::Ordering::Relaxed),
+                    "{var}={value} must leave the warning unclaimed"
+                );
+            }
+        }
+    }
+
+    /// A default resolved before the logger is up must not use up the warning.
+    #[cfg(feature = "logger")]
+    #[test]
+    fn default_posture_waits_for_a_subscriber() {
+        let warned = AtomicBool::new(false);
+        let (subscriber, buf) = capture();
+        temp_env::with_vars(UNSET, || {
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                assert_eq!(app_env_or_default(&warned), "development");
+            });
+            assert!(!warned.load(std::sync::atomic::Ordering::Relaxed));
+
+            tracing::subscriber::with_default(subscriber, || {
+                assert_eq!(app_env_or_default(&warned), "development");
+            });
+        });
+        assert_eq!(captured(&buf).matches(NAMES_THE_VARIABLES).count(), 1);
+    }
+
+    /// The public resolver goes through the process-wide one-shot, not a local flag.
+    #[cfg(feature = "logger")]
+    #[test]
+    fn get_app_env_arms_the_process_warning() {
+        let (subscriber, _buf) = capture();
+        temp_env::with_vars(UNSET, || {
+            tracing::subscriber::with_default(subscriber, || assert!(!is_production()));
+        });
+        assert!(DEFAULT_POSTURE_WARNED.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
