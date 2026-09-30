@@ -9,7 +9,7 @@ HyperI projects use [Conventional Commits](https://www.conventionalcommits.org/)
 and [semantic-release](https://semantic-release.gitbook.io/) for automated
 versioning and changelog generation. All commits must follow this format:
 
-```
+```text
 <type>(<scope>): <subject>
 
 [optional body]
@@ -20,7 +20,7 @@ versioning and changelog generation. All commits must follow this format:
 ### Types
 
 | Type | Description | Version Bump |
-|------|-------------|--------------|
+| ------ | ------------- | -------------- |
 | `feat` | A new feature | Minor (0.X.0) |
 | `fix` | A bug fix | Patch (0.0.X) |
 | `docs` | Documentation only | None |
@@ -38,7 +38,7 @@ versioning and changelog generation. All commits must follow this format:
 For breaking changes that require a major version bump, add `!` after the type
 or include `BREAKING CHANGE:` in the footer:
 
-```
+```text
 feat!: remove deprecated API endpoints
 
 BREAKING CHANGE: The /v1/users endpoint has been removed. Use /v2/users instead.
@@ -46,7 +46,7 @@ BREAKING CHANGE: The /v1/users endpoint has been removed. Use /v2/users instead.
 
 ### Examples
 
-```
+```text
 feat(auth): add OAuth2 support for Google login
 
 fix(api): handle null response from upstream service
