@@ -101,7 +101,7 @@ The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md
 
 | Constructor | Refused in production |
 |---|---|
-| `KafkaTransport::new`, `KafkaProducer::new`, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend (`Dlq::spawn`), via `KafkaConfig::validate` | `ssl_skip_verify` or `enable.ssl.certificate.verification: "false"`, and a `plaintext` or `sasl_plaintext` transport without `allow_insecure_transport`, whether a typed field sets it or `librdkafka_overrides` or another raw librdkafka map does |
+| `KafkaTransport::new`, `KafkaProducer::new`, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend (`Dlq::spawn`), via `KafkaConfig::validate` | `ssl_skip_verify`, `enable.ssl.certificate.verification: "false"` or `ssl.endpoint.identification.algorithm: none`, and a `plaintext` or `sasl_plaintext` transport without `allow_insecure_transport`, whether a typed field sets it or `librdkafka_overrides` or another raw librdkafka map does |
 | `OpenBaoProvider::new`, via `OpenBaoConfig::validate` | `skip_verify` |
 | `SecretCache::new` (and so `SecretsManager::new`), via `CacheConfig::validate` | a disk cache with no `encryption_key` and `allow_plaintext_disk_cache` set |
 

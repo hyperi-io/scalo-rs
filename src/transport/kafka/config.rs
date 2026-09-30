@@ -839,6 +839,9 @@ const SASL_MECHANISM_KEYS: &[&str] = &["sasl.mechanism", "sasl.mechanisms"];
 /// The key every client builder sets to `false` for `ssl_skip_verify`.
 const CERTIFICATE_VERIFICATION_KEYS: &[&str] = &["enable.ssl.certificate.verification"];
 
+/// librdkafka's broker hostname check, off when set to `none`.
+const HOSTNAME_VERIFICATION_KEYS: &[&str] = &["ssl.endpoint.identification.algorithm"];
+
 /// Where a value a client may run a security setting with was set.
 #[derive(Debug, Clone, Copy)]
 enum SettingOrigin<'a> {
@@ -1816,8 +1819,8 @@ impl KafkaConfig {
     /// Each rule is judged on every value a client can run with: the typed
     /// field, and each value `librdkafka_overrides`, `sizing.producer_librdkafka`,
     /// `sizing.consumer_librdkafka` or `extra_config` gives `security.protocol`,
-    /// `sasl.mechanism` (or `sasl.mechanisms`) or
-    /// `enable.ssl.certificate.verification`. The consumer sets the typed
+    /// `sasl.mechanism` (or `sasl.mechanisms`), `enable.ssl.certificate.verification`
+    /// or `ssl.endpoint.identification.algorithm`. The consumer sets the typed
     /// security fields after those maps and the producer and admin clients set
     /// them before, so one config can run both values and the weaker one
     /// decides. Keys and values match in any letter case.
@@ -1830,8 +1833,8 @@ impl KafkaConfig {
     /// Returns `Err` (in ANY environment) when the SASL mechanism is `PLAIN`
     /// but the transport is not `sasl_ssl` -- a PLAIN password must never cross
     /// a plaintext transport. Additionally, when `is_production`, returns `Err`
-    /// if `ssl_skip_verify` is set or a raw map turns certificate verification
-    /// off, or an unencrypted transport (`plaintext`/`sasl_plaintext`) is
+    /// if `ssl_skip_verify` is set, a raw map turns certificate or hostname
+    /// verification off, or an unencrypted transport (`plaintext`/`sasl_plaintext`) is
     /// configured without the explicit `allow_insecure_transport` opt-in. A
     /// refusal a raw map caused names the map and the key.
     pub fn validate(&self, is_production: bool) -> Result<(), String> {
@@ -1879,6 +1882,15 @@ impl KafkaConfig {
                 "kafka: {unverified} disables TLS certificate verification, which is not \
                  permitted in production -- configure ssl_ca_location for private-CA trust \
                  instead"
+            ));
+        }
+        if let Some(unchecked) =
+            raw_settings(&raw_maps, HOSTNAME_VERIFICATION_KEYS).find(|setting| setting.is("none"))
+        {
+            return Err(format!(
+                "kafka: {unchecked} disables broker hostname verification, which is not \
+                 permitted in production -- issue the broker a certificate for the name \
+                 clients use instead"
             ));
         }
         // An unencrypted transport ships data (and SASL/PLAIN credentials) in
@@ -2340,6 +2352,32 @@ mod tests {
                 "the refusal of {off} does not name the override: {why}"
             );
         }
+    }
+
+    #[test]
+    fn validate_refuses_an_override_that_turns_hostname_checks_off_in_production() {
+        for off in ["none", "NONE", " none"] {
+            let config = KafkaConfig {
+                security_protocol: "ssl".to_string(),
+                ..Default::default()
+            }
+            .with_override("ssl.endpoint.identification.algorithm", off);
+            assert!(config.validate(false).is_ok(), "dev allows {off:?}");
+            let why = refusal(&config, true);
+            assert!(
+                why.contains("librdkafka_overrides key 'ssl.endpoint.identification.algorithm'"),
+                "the refusal of {off:?} does not name the override: {why}"
+            );
+        }
+        let checked = KafkaConfig {
+            security_protocol: "ssl".to_string(),
+            ..Default::default()
+        }
+        .with_override("ssl.endpoint.identification.algorithm", "https");
+        assert!(
+            checked.validate(true).is_ok(),
+            "https keeps the hostname check"
+        );
     }
 
     #[test]
