@@ -9,7 +9,7 @@
 //! Startup smoke test.
 //!
 //! Boots the library on default configuration and asserts the state each step
-//! leaves behind. Six DFE apps take this library, so a default boot that
+//! leaves behind. Multiple downstream apps take this library, so a default boot that
 //! panics, or quietly produces nothing, has to fail here rather than in a
 //! consumer.
 //!

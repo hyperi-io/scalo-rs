@@ -27,7 +27,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = OtelTracingConfig {
-//!     service_name: "dfe-loader".into(),
+//!     service_name: "my-service".into(),
 //!     endpoint: "http://otel-collector:4317".into(),
 //!     ..Default::default()
 //! };

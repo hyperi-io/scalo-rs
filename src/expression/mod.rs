@@ -58,8 +58,6 @@
 //! let program = compile("score > threshold").unwrap();
 //! // ... program.execute(&context) per record
 //! ```
-//!
-//! See `dfe-engine/docs/EXPRESSIONS-CEL.md` for the full profile specification.
 
 pub mod error;
 pub mod evaluator;

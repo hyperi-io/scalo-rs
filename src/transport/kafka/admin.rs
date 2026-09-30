@@ -668,7 +668,7 @@ mod tests {
     }
 
     /// The offset-query consumer asks for its group's coordinator on connect,
-    /// and a DFE broker refuses any group outside the `dfe-` prefix it grants.
+    /// and a broker refuses any group outside the `dfe-` prefix it grants.
     #[test]
     fn offset_query_consumer_takes_a_group_under_the_app_prefix() {
         let config = KafkaConfig {

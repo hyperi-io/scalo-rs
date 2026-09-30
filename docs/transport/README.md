@@ -177,7 +177,7 @@ With no inbound filter configured, `dlq_entries` is empty. Full design and tier 
 
 `RoutedSender` wraps N `AnySender`s in a `HashMap<String, AnySender>`
 plus an optional default. `send(destination, payload)` picks the
-backend by destination. Only `dfe-receiver` and `dfe-fetcher` use
+backend by destination. Only the receiver and fetcher stages use
 this — mid-tier and
 sink stages do 1:1. See [routing.md](routing.md).
 

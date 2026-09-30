@@ -16,7 +16,7 @@ use super::super::manifest::{MetricDescriptor, MetricType};
 /// Default histogram buckets for buffer flush duration.
 const BUFFER_FLUSH_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
 
-/// Buffer metrics for DFE apps with batching.
+/// Buffer metrics for apps with batching.
 ///
 /// Tracks buffer depth, flush operations, and flush trigger reasons.
 #[derive(Clone)]

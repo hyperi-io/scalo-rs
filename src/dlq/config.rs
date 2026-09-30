@@ -54,7 +54,7 @@ pub enum DlqMode {
     /// File backend only (no Kafka dependency).
     FileOnly,
 
-    /// Kafka backend only (current dfe-loader behaviour).
+    /// Kafka backend only (matches a typical consumer's current behaviour).
     KafkaOnly,
 }
 

@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Sink/insert metrics for DFE apps with a downstream.
+//! Sink/insert metrics for apps with a downstream.
 
 use metrics::Gauge;
 

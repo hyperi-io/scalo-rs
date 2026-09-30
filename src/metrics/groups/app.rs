@@ -6,14 +6,14 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Mandatory app-level metrics for every DFE application.
+//! Mandatory app-level metrics for every application.
 
 use metrics::{Counter, Gauge};
 
 use super::super::MetricsManager;
 use super::super::manifest::{MetricDescriptor, MetricType};
 
-/// Mandatory metrics for every DFE application.
+/// Mandatory metrics for every application.
 ///
 /// Registers `info`, `start_time_seconds`, record counters, byte counters,
 /// memory gauges, and config reload counter, under bare names or the

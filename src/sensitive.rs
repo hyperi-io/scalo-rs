@@ -447,7 +447,7 @@ mod tests {
     #[cfg(feature = "serde_json")]
     #[test]
     fn struct_round_trip_inside_expose_during_preserves_values() {
-        // Mirrors the dfe-loader bug: serialise a Config containing a
+        // Mirrors a loader bug: serialise a Config containing a
         // SensitiveString password, merge env overrides via figment,
         // deserialise back. Without expose_during, password becomes
         // "***REDACTED***".

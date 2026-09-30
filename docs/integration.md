@@ -116,10 +116,10 @@ pub struct LoaderCli {
 impl ServiceApp for LoaderCli {
     type Config = LoaderConfig;
 
-    fn name(&self) -> &str { "dfe-loader" }
+    fn name(&self) -> &str { "my-loader" }
     fn env_prefix(&self) -> &str { "DFE_LOADER" }
     fn version_info(&self) -> VersionInfo {
-        VersionInfo::new("dfe-loader", env!("CARGO_PKG_VERSION"))
+        VersionInfo::new("my-loader", env!("CARGO_PKG_VERSION"))
     }
     fn common_args(&self) -> &CommonArgs { &self.common }
     fn command(&self) -> Option<&StandardCommand> { self.command.as_ref() }
@@ -217,7 +217,7 @@ config/
 ```
 
 The cascade searches `./`, `./config/`, `/config/`,
-`~/.config/dfe-loader/` for each file in turn. See
+`~/.config/my-loader/` for each file in turn. See
 [core-pillars/config.md](core-pillars/config.md#cascade-order-highest-priority-first) for the full
 priority order.
 
@@ -227,16 +227,16 @@ priority order.
 
 ```bash
 # Validate config without running
-dfe-loader config-check --config config/settings.yaml
+my-loader config-check --config config/settings.yaml
 
 # Print the metric catalogue
-dfe-loader metrics-manifest > metrics-manifest.json
+my-loader metrics-manifest > metrics-manifest.json
 
 # Generate deployment artefacts (Dockerfile, chart/, argocd-application.yaml)
-dfe-loader generate-artefacts --output-dir ci/
+my-loader generate-artefacts --output-dir ci/
 
 # Run it
-dfe-loader run --config config/settings.yaml
+my-loader run --config config/settings.yaml
 ```
 
 `config-check` walks the cascade and prints what got loaded. Use it in
@@ -250,7 +250,7 @@ ends up there.
 
 ## 7. What you didn't have to write
 
-For the dfe-loader-shaped app above, the code you actually write is:
+For the loader-shaped app above, the code you actually write is:
 
 - a `Cargo.toml` dependency block
 - your config struct definitions
@@ -283,14 +283,14 @@ See [auto-wiring.md](auto-wiring.md) for the full
 
 ## Reference apps
 
-The six core consumer services are the canonical examples. Read whichever is
-closest in shape to what you're building:
+Each shape below matches a common consumer pattern. Read whichever is
+closest to what you're building:
 
-| App | Best for |
+| Shape | Best for |
 |-----|----------|
-| [dfe-loader](https://github.com/hyperi-io/dfe-loader) | Kafka in, ClickHouse out — the most complete `cli-service` integration |
-| [dfe-receiver](https://github.com/hyperi-io/dfe-receiver) | gRPC ingress + Kafka publish — push-mode entry |
-| [dfe-fetcher](https://github.com/hyperi-io/dfe-fetcher) | Pull-mode (AWS/Azure/M365/GCP) ingress |
-| [dfe-archiver](https://github.com/hyperi-io/dfe-archiver) | Long-term storage sink |
-| [dfe-transform-vrl](https://github.com/hyperi-io/dfe-transform-vrl) | Embedded VRL transform engine |
-| [dfe-transform-vector](https://github.com/hyperi-io/dfe-transform-vector) | Thin wrapper around Vector.dev |
+| Loader | Kafka in, ClickHouse out — the most complete `cli-service` integration |
+| Receiver | gRPC ingress + Kafka publish — push-mode entry |
+| Fetcher | Pull-mode (cloud-provider) ingress |
+| Archiver | Long-term storage sink |
+| VRL transform | Embedded VRL transform engine |
+| Vector-compat transform | Thin wrapper around Vector.dev |

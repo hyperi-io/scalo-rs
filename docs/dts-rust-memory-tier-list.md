@@ -533,7 +533,7 @@ where the profile is **stable** and the hot path is **clean**:
   wins a microbenchmark this week -- snmalloc or mimalloc might. We run it
   because it's predictable: the same allocation behaviour run to run (so the PGO
   profile is representative), `jeprof` to actually SEE the hot allocations, and
-  the whole DFE build/profile story is built around it. Under PGO/BOLT an old
+  the whole build/profile story is built around it. Under PGO/BOLT an old
   allocator with a stable profile and real tooling beats a newer one that's
   faster-but-twitchy and hands you a noisy profile. Predictable > novel.
 - **Lower channels don't get this.** PGO/BOLT are release-only (and opt-in). On

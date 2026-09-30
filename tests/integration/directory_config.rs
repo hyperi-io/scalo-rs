@@ -29,7 +29,7 @@ fn test_config(dir: &std::path::Path) -> DirectoryConfigStoreConfig {
 }
 
 /// Write a YAML file into the given directory.
-/// Supports subdirectory table names (e.g. `loaders/dfe-loader`).
+/// Supports subdirectory table names (e.g. `loaders/my-service`).
 fn write_yaml(dir: &std::path::Path, name: &str, content: &str) {
     let path = dir.join(format!("{name}.yaml"));
     if let Some(parent) = path.parent() {

@@ -50,7 +50,7 @@ saturation point, scales linearly below that, and is capped at its
 weight (no over-contribution). Weights should sum to ~1.0 — the cap
 on the total keeps the output well-formed even if they don't.
 
-Example composition for dfe-loader:
+Example composition for a loader:
 
 | Component | Weight | Saturation | Source |
 |-----------|--------|------------|--------|

@@ -52,11 +52,11 @@ transport:
     kafka:
       profile: production
       brokers: ["kafka-0:9092", "kafka-1:9092"]
-      group: dfe-loader
+      group: my-app
       topics: ["events.land"]
       security_protocol: sasl_ssl
       sasl_mechanism: SCRAM-SHA-512
-      sasl_username: dfe
+      sasl_username: myapp
       sasl_password: ${KAFKA_PASSWORD}
 ```
 
@@ -108,7 +108,7 @@ transport:
   output:
     type: grpc
     grpc:
-      endpoint: "http://dfe-loader:6000"
+      endpoint: "http://my-app:6000"
       max_message_size: 16777216
       compression: false
 ```
@@ -148,7 +148,7 @@ A server armed by a caller that releases every token it takes answers a push onl
 ### `transport-grpc-vector-compat`
 
 Wire-compat shim for `vector.Vector/PushEvents`. Only used by
-`dfe-transform-vector` so legacy Vector sinks can target a native gRPC
+a Vector-compat transform consumer so legacy Vector sinks can target a native gRPC
 endpoint without recompile. Enable with `vector_compat: true` in the
 gRPC config — the server then accepts both native and Vector RPCs on
 the same listener. Not a separate backend, not for any other app.
@@ -216,7 +216,7 @@ transport:
   output:
     type: file
     file:
-      path: "/var/log/dfe/events.ndjson"
+      path: "/var/log/myapp/events.ndjson"
       append: true
 ```
 

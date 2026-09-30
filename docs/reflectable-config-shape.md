@@ -1,7 +1,7 @@
 # Reflectable config shape (scalo contract, cross-language SSoT)
 
 This is the single source of truth for the schema + capability-catalog shape that
-BOTH scalo (Rust) and scalo-py (Python) emit. dfe-engine reflects on contracts
+BOTH scalo (Rust) and scalo-py (Python) emit. Consumers reflect on contracts
 produced by either language through ONE code path, so the two MUST emit identical
 JSON. Tracks scalo-rs#6 and scalo-py#3.
 

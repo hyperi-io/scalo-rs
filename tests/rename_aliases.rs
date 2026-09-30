@@ -7,8 +7,8 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Compile-time + runtime checks that the deprecated brand aliases
-//! (`DfeMetrics`, `DfeSource`, `DfeApp`) still name the renamed types, so the
-//! DFE consumers compile unchanged through the scalo transition.
+//! (`DfeMetrics`, `DfeSource`, `DfeApp`) still name the renamed types, so
+//! consumers compile unchanged through the scalo transition.
 
 #![allow(deprecated)]
 

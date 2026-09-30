@@ -68,7 +68,7 @@ alongside it:
 
 ```yaml
 deployment:
-  base_image: ghcr.io/hyperi-io/dfe-base@sha256:...
+  base_image: ghcr.io/org/base@sha256:...
   base_distro: trixie      # trixie|bookworm|noble|jammy|focal
 ```
 

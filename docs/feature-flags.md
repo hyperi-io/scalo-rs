@@ -92,7 +92,7 @@ flowchart LR
 | `transport` | Base trait architecture, factory, `AnySender`, and the `parse_guard` JSON depth pre-check (`wide`) |
 | `transport-trace` | Above + W3C traceparent propagation (pulls `opentelemetry`) |
 | `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends — each pulls only its own deps |
-| `transport-grpc-vector-compat` | Vector.dev wire-compat for `dfe-transform-vector` |
+| `transport-grpc-vector-compat` | Vector.dev wire-compat for a transform consumer |
 | `transport-all` | All six backends |
 
 Pick backends explicitly. `transport-all` is a convenience for tests; in
@@ -227,7 +227,7 @@ features = [
 ]
 ```
 
-This is the dfe-loader / dfe-receiver shape. See
+This is the loader / receiver shape. See
 [integration.md](integration.md) for the rationale.
 
 ### Plus distributed tracing

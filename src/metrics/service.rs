@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Standard DFE metrics for pipeline components (receiver, loader, engine).
+//! Standard metrics for pipeline components (receiver, loader, engine).
 //!
 //! Call [`ServiceMetrics::register`] **after** creating a
 //! [`MetricsManager`](super::MetricsManager): the manager must exist so platform
@@ -28,7 +28,7 @@
 
 use super::manifest::{MetricDescriptor, MetricType};
 
-/// Standard DFE metric set: labelled counters, gauges, and histograms across
+/// Standard metric set: labelled counters, gauges, and histograms across
 /// transport, pipeline, records, scaling, spool, and security.
 ///
 /// Construct via [`ServiceMetrics::register`] -- describes all metrics with the
@@ -52,7 +52,7 @@ pub struct ServiceMetrics {
 pub type DfeMetrics = ServiceMetrics;
 
 impl ServiceMetrics {
-    /// Register all DFE metric descriptions with the global recorder and
+    /// Register all metric descriptions with the global recorder and
     /// manifest registry. Call **once** after creating a
     /// [`MetricsManager`](super::MetricsManager). Returned handle is zero-sized
     /// (recording goes through the global `metrics!` macros).

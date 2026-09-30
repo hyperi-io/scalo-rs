@@ -16,8 +16,8 @@
 //! auth (e.g. PLAIN on a broker that supports SCRAM). It is opt-in -- the vanilla
 //! providers work without importing it.
 //!
-//! This encodes the DFE credential contract (dfe-engine#98) when driven with DFE's
-//! allow-list, but the shape is generic: any security-conscious operator wants
+//! This encodes an opinionated credential contract when driven with the
+//! consumer's allow-list, but the shape is generic: any security-conscious operator wants
 //! "strongest available, never downgraded, only these providers".
 
 use super::providers::{KafkaProvider, KnownProvider, validate};

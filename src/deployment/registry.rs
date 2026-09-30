@@ -42,7 +42,7 @@
 //! guessing to do.
 //!
 //! When (eventually) a curated GHCR base image lands at
-//! `ghcr.io/hyperi-io/dfe-base:trixie`, ops can override
+//! `ghcr.io/org/base:trixie`, ops can override
 //! `deployment.base_image` in the cascade without rebuilding the apps.
 
 use super::native_deps::BaseDistro;

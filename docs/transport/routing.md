@@ -12,12 +12,12 @@ the bus, a gRPC endpoint on the direct transport. Sits on top of
 
 | Stage | Routed? | Why |
 |-------|---------|-----|
-| `dfe-receiver` | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
-| `dfe-fetcher` | **Yes** | Each source maps to its own destination, plus per-record routes |
-| `dfe-transform-vrl` | **Yes** | Its sink list is config-driven — one destination today, a list tomorrow |
-| `dfe-transform-vector` | **Yes** | Same, though Vector owns the transform config itself |
-| `dfe-loader` | No | One ClickHouse sink — 1:1 transport |
-| `dfe-archiver` | No | One object-storage sink — 1:1 transport |
+| receiver | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
+| fetcher | **Yes** | Each source maps to its own destination, plus per-record routes |
+| VRL transform | **Yes** | Its sink list is config-driven — one destination today, a list tomorrow |
+| Vector-compat transform | **Yes** | Same, though Vector owns the transform config itself |
+| loader | No | One ClickHouse sink — 1:1 transport |
+| archiver | No | One object-storage sink — 1:1 transport |
 
 Push the routing decision as close to ingress as possible: a stage that
 sees one inbound stream and produces one outbound stream needs a name for

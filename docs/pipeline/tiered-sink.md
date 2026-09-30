@@ -142,7 +142,7 @@ what to do — typical pattern is to route to the DLQ.
 
 ```yaml
 tiered_sink:
-  spool_path: /var/spool/dfe-loader/clickhouse
+  spool_path: /var/spool/myapp/clickhouse
   send_timeout_ms: 1000
   compression: { type: zstd, level: 1 }
   drain_strategy:

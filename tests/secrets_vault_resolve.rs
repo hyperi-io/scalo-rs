@@ -11,7 +11,7 @@
 //! The unit tests in `src/secrets/resolve.rs` can only prove the provider gets
 //! built and the lookup leaves the process. Whether a secret actually comes back
 //! needs a server, and this is the only test that proves `vault:` specs work at
-//! all -- every consumer (dfe-fetcher credentials, transport SASL passwords)
+//! all -- every consumer (fetcher credentials, transport SASL passwords)
 //! goes through the same `resolve()`.
 //!
 //! Skips when Docker is absent, and fails instead of skipping under CI, where a
