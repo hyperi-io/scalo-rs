@@ -16,7 +16,7 @@ of deploys.
 ## Backends
 
 | Backend | Feature | Backed by | Use when |
-|---------|---------|-----------|----------|
+| --------- | --------- | ----------- | ---------- |
 | File | `secrets` (default) | Plain files on disk | Local dev, K8s `Secret` volume mounts |
 | OpenBao / Vault | `secrets-vault` | [`vaultrs`](https://crates.io/crates/vaultrs) | Centralised secret store, rotation enabled |
 | AWS Secrets Manager | `secrets-aws` | [`aws-sdk-secretsmanager`](https://crates.io/crates/aws-sdk-secretsmanager) | AWS-native deployments |
@@ -53,7 +53,7 @@ plaintext value, so config knobs and data-plane services share one
 syntax instead of each hand-rolling its own env/vault lookup:
 
 | Spec | Resolves to |
-|------|-------------|
+| ------ | ------------- |
 | `vault:<mount>/<path>:<key>` | OpenBao lookup via `SecretsManager`: the first segment is the KV mount, the KV v2 `data` segment is optional (needs `secrets-vault`) |
 | `vault:<name>:<key>` | the same lookup on the default `secret` mount, for a path with no mount segment |
 | `bao:<mount>/<path>:<key>`, `openbao:<mount>/<path>:<key>` | the same lookup, spelled as the OpenBao tooling spells it |
@@ -151,7 +151,7 @@ backend.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `SecretsManager::new(config)` | Build a manager with configured backends |
 | `SecretsConfig::from_cascade()` | Build config from the global cascade (pass to `SecretsManager::new`) |
 | `.get(name) -> SecretValue` | Fetch a secret by name through routed backend |

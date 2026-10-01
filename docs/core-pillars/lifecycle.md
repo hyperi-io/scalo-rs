@@ -14,7 +14,7 @@ the first config that gives the service work.
 ## The split every app makes
 
 | Config is | Behaviour |
-|---|---|
+| --- | --- |
 | structurally invalid -- bad address, unparseable, contradictory | refuse loudly, exit non-zero |
 | valid but EMPTY of work -- no sources, no topics, no destination | idle: start, stay Ready, wait |
 
@@ -56,7 +56,7 @@ flowchart LR
 ## What idle looks like from outside
 
 | Surface | While idle |
-|---|---|
+| --- | --- |
 | `/livez` | 200 |
 | `/readyz` | 200 -- the `work_config` component is `Degraded`, which is ready, not healthy |
 | `/healthz` | `work_config: degraded`, so an operator can see there is nothing to do |
@@ -85,7 +85,7 @@ immediate.
 ## API surface
 
 | Item | Purpose |
-|---|---|
+| --- | --- |
 | `ServiceApp::work_state(&config) -> WorkState` | The app's emptiness predicate; defaults to `Active` |
 | `WorkState::{Active, Idle(reason)}` | Whether the config names work |
 | `WorkState::idle_if(empty, reason)` | The shape almost every predicate takes |

@@ -208,7 +208,7 @@ runtime, and calls your `run_service`.
 
 In your app repo:
 
-```
+```text
 config/
 |-- defaults.yaml          # Safe fallback baseline (always loaded last)
 |-- settings.yaml          # Team defaults (committed)
@@ -262,7 +262,7 @@ For the loader-shaped app above, the code you actually write is:
 What you skipped:
 
 | Skipped | Source |
-|---------|--------|
+| --------- | -------- |
 | `tracing-subscriber` setup, JSON/text autodetect | `logger::setup_default` |
 | `figment` cascade, env-var nesting, `.env` loading, sensitive masking | `config::load_typed` |
 | Prometheus exporter, `/metrics` endpoint, process metrics | `MetricsManager::new` |
@@ -287,7 +287,7 @@ Each shape below matches a common consumer pattern. Read whichever is
 closest to what you're building:
 
 | Shape | Best for |
-|-----|----------|
+| ----- | ---------- |
 | Loader | Kafka in, ClickHouse out — the most complete `cli-service` integration |
 | Receiver | gRPC ingress + Kafka publish — push-mode entry |
 | Fetcher | Pull-mode (cloud-provider) ingress |

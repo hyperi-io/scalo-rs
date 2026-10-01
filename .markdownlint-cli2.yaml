@@ -19,3 +19,8 @@ ignores:
 # line and the editor soft-wraps it.
 config:
   MD013: false
+  # "aligned" (the default) pads every cell to the widest one in its column,
+  # which is impractical once a table has a 200+ char cell -- compact keeps
+  # a single space around each cell instead.
+  MD060:
+    style: "compact"

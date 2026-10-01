@@ -95,7 +95,7 @@ Which is the part you would otherwise build:
 [docs/README.md](docs/README.md) is the index. The ones you want first:
 
 | Topic | Doc |
-|---|---|
+| --- | --- |
 | Config cascade and hot reload | [core-pillars/config.md](docs/core-pillars/config.md) |
 | Logging and masking | [core-pillars/logging.md](docs/core-pillars/logging.md) |
 | Metrics | [core-pillars/metrics.md](docs/core-pillars/metrics.md) |
@@ -138,7 +138,7 @@ repo. Never assume parity.
 ### Where things live
 
 | Path | What it holds |
-|------|---------------|
+| ------ | --------------- |
 | `src/<module>/` | One directory per module, gated by the feature of the same name |
 | `docs/core-pillars/` | config, logging, metrics, health, tracing, shutdown, lifecycle |
 | `docs/pipeline/` | spool, DLQ, tiered sink, worker pool, batch engine, scaling |
@@ -160,7 +160,7 @@ result, never a local summary.
 ### What tends to bite
 
 | Don't | Do | Why |
-|-------|----|-----|
+| ------- | ---- | ----- |
 | Declare rustflags under `[build]` | Put them under `[target.<triple>]` | The ARC pod sets `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which counts as a target entry, and cargo reads `build.rustflags` ONLY when no target entry exists. A committed, correct-looking config.toml ships without its flags and nothing fails |
 | Negate a file inside an excluded directory in `.gitignore` | Exclude with `.cargo/*` so the negation can apply | `.cargo/` excludes the directory, so `!.cargo/config.toml` is inert and the file never commits |
 | Read an instruction count as proof a target-cpu applied | Compare VEX to legacy-SSE encodings within one binary | Crates with runtime dispatch compile AVX2 paths whatever `target-cpu` says, so a raw BMI2 or ymm count measures what the binary LINKS, not what the compiler was told |

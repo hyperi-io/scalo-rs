@@ -25,7 +25,7 @@ The same gate and the same `Admit::{Yes, Hold}` decision drive every
 transport's intake. Only the actuator differs:
 
 | Stage | Brake mechanism | Commit / ack token | Lossless? |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Loader / transform (Kafka in) | Pause ASSIGNED partitions (member stays in group, no rebalance) | Kafka offset, committed after send | Yes -- offsets not advanced, re-delivered |
 | Receiver (HTTP / gRPC in) | Return 503 / `UNAVAILABLE` to the caller | The response. A source that holds its acknowledgement answers on `release`, under the `BatchEngine` pipeline builder. Otherwise it answers once the record is queued for `recv`, and `commit` is a no-op | Only if the upstream RETRIES the rejected request, and, where the answer comes at enqueue, only up to the enqueue |
 | Fetcher (poll a source) | Pause-fetch (stop the poll loop) | Fetch cursor | Yes -- cursor not advanced, re-fetched |

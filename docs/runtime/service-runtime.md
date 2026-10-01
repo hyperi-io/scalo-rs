@@ -16,7 +16,7 @@ remember to register.
 ## What's in the runtime
 
 | Field | Type | Feature gate | Always present? |
-|-------|------|--------------|-----------------|
+| ------- | ------ | -------------- | ----------------- |
 | `metrics` | `MetricsManager` | always (with `metrics`) | yes |
 | `dfe` | `Arc<ServiceMetrics>` | always (with `metrics`) | yes |
 | `memory_guard` | `Arc<MemoryGuard>` | `memory` | yes |
@@ -131,7 +131,7 @@ pub trait ServiceApp: Sized {
 ```
 
 | Method | Required? | Purpose |
-|--------|-----------|---------|
+| -------- | ----------- | --------- |
 | `name` | yes | Service name -- log tags, OTel `service.name`, the manifest's `app`. The metric prefix is `metrics.namespace`, bare by default |
 | `env_prefix` | yes | Prefix for env-var config overrides (`DFE_LOADER_*`) |
 | `version_info` | yes | Version + commit + build timestamp |
@@ -158,7 +158,7 @@ service loop. Every service gets the same six subcommands without
 writing any extra code:
 
 | Subcommand | Behaviour |
-|------------|-----------|
+| ------------ | ----------- |
 | `run` | Default -- full lifecycle, ends in `run_service` |
 | `version` | Print `version_info()` and exit |
 | `config-check` | Load logger + config, print summary, exit non-zero on failure |
@@ -215,7 +215,7 @@ remain in app code because they're genuinely domain-specific:
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `ServiceApp` trait | Service contract -- implement to get the standard lifecycle |
 | `run_app::<A>(app)` | Drives the lifecycle; matches subcommand, builds runtime, calls `run_service` |
 | `ServiceRuntime` | Pre-wired infrastructure bundle -- built by `run_app`, passed to `run_service` |

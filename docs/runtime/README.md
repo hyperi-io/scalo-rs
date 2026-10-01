@@ -7,7 +7,7 @@ the environment, and wires the memory guard, scaling pressure and worker pool
 together so an app does not have to know they exist.
 
 | Doc | Covers |
-|---|---|
+| --- | --- |
 | [service-runtime.md](service-runtime.md) | `ServiceRuntime`, the `ServiceApp` trait, `run_app` |
 | [runtime-context.md](runtime-context.md) | K8s / Docker / bare-metal detection, pod metadata |
 | [memory.md](memory.md) | `MemoryGuard`, cgroup-aware limits and backpressure |

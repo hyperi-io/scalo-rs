@@ -76,13 +76,7 @@ generic tool.
   events in VRL's `Value` model. So scalo's design bet is "don't pay for
   what you don't read"; Vector's is "parse once, rich model, broad
   ecosystem".
-- Self-regulation doctrine differs. scalo gates the **inbound source**
-  (Kafka pause / HTTP 503 / fetcher-pause) under a cgroup-v2 memory guard
-  + AIMD byte-budget, and emits a separate KEDA scale signal. Vector's
-  in-process adaptivity is **ARC on the outbound sink** (AIMD on RTT,
-  TCP-congestion-control style) and it pushes backpressure upstream via
-  bounded buffers. Vector does NOT horizontally self-scale - that is
-  delegated entirely to k8s HPA/KEDA + a fronting load balancer.
+- Self-regulation doctrine differs. scalo gates the **inbound source** (Kafka pause / HTTP 503 / fetcher-pause) under a cgroup-v2 memory guard + AIMD byte-budget, and emits a separate KEDA scale signal. Vector's in-process adaptivity is **ARC on the outbound sink** (AIMD on RTT, TCP-congestion-control style) and it pushes backpressure upstream via bounded buffers. Vector does NOT horizontally self-scale - that is delegated entirely to k8s HPA/KEDA + a fronting load balancer.
 - Neither side has trustworthy apples-to-apples throughput numbers today.
   scalo has design targets but no committed benches; Vector's headline
   table is ~2019-vintage and self-published. Hence Section 7 (baselining).
@@ -131,8 +125,8 @@ generic tool.
   landed Jan 2022, rolled out v0.20.0 (+10-20%) to v0.22.0 (up to +50%
   on common topologies), with a `component_received_events_count`
   histogram added to observe internal batch size distinct from sink
-  batching. https://vector.dev/releases/0.20.0/ ,
-  https://vector.dev/releases/0.22.0/
+  batching. <https://vector.dev/releases/0.20.0/> ,
+  <https://vector.dev/releases/0.22.0/>
 - `LogEvent` content is VRL's `Value` (already parsed/typed),
   reportedly `Arc<Inner>` with copy-on-write and cached byte/JSON sizes.
   Not columnar, no Arrow.
@@ -153,7 +147,7 @@ generic tool.
   have deferred - relevant only if a consumer needs analytical
   scan/aggregate, where vectorized columnar is "one or two orders of
   magnitude" faster than tuple-at-a-time (MonetDB/X100, CIDR 2005,
-  https://www.cidrdb.org/cidr2005/papers/P19.pdf). For route/transform/
+  <https://www.cidrdb.org/cidr2005/papers/P19.pdf>). For route/transform/
   ship workloads, row batching is the right call for both.
 
 ---
@@ -187,9 +181,9 @@ generic tool.
   zero-overhead concurrency; stateful ("task") transforms run as their
   own streaming tasks.
 - "Automatically scales to take advantage of all vCPUs"
-  (https://vector.dev/docs/setup/going-to-prod/sizing/) - vertical only.
+  (<https://vector.dev/docs/setup/going-to-prod/sizing/>) - vertical only.
 
-### So what
+### So what - split runtimes vs one runtime
 
 - scalo splits CPU (rayon) from I/O (Tokio) deliberately; Vector runs
   everything on Tokio. scalo's split is better for parse/route/compress
@@ -227,8 +221,8 @@ This matches the canonical doctrine: gate inbound, never the drain.
 Throttling the drain deadlocks the bounded buffer (the drain is the only
 party that frees space). External load is push-based so an admission gate
 is unavoidable. Reactive Streams / Flink / Kafka pause-resume all agree.
-https://github.com/reactive-streams/reactive-streams-jvm ,
-https://flink.apache.org/2021/07/07/how-to-identify-the-source-of-backpressure/
+<https://github.com/reactive-streams/reactive-streams-jvm> ,
+<https://flink.apache.org/2021/07/07/how-to-identify-the-source-of-backpressure/>
 
 ### Vector - ARC on the sink, backpressure via bounded buffers
 
@@ -239,7 +233,7 @@ https://flink.apache.org/2021/07/07/how-to-identify-the-source-of-backpressure/
   decrease (0.9) on rising RTT / 429 / 503 / backpressure. Defaults:
   initial 1, ewma_alpha 0.4, decrease_ratio 0.9, rtt_deviation_scale 2.5,
   max 200. **Default for HTTP-based sinks.**
-  https://vector.dev/docs/architecture/arc/ ,
+  <https://vector.dev/docs/architecture/arc/> ,
   RFC 1858 (2020-04-06). One observed case: static limits were
   "limiting performance by over 80%".
 - **Buffers** (`lib/vector-buffers`): memory (default, 500-event sink
@@ -292,18 +286,18 @@ https://flink.apache.org/2021/07/07/how-to-identify-the-source-of-backpressure/
   Aggregator->StatefulSet, Stateless-Aggregator->Deployment. Scale on
   avg CPU ~80-85% with a 5-min window, or KEDA. Partitioning is done in
   front by a load balancer, not by Vector.
-  https://vector.dev/docs/setup/going-to-prod/sizing/
+  <https://vector.dev/docs/setup/going-to-prod/sizing/>
 
-### So what
+### So what - KEDA lag signal vs CPU-based HPA
 
 - For Kafka-lag-driven stateful scaling, scalo's blended KEDA signal is
   more direct than Vector's CPU-based HPA (CPU is a lagging indicator;
   queue depth/lag scales before latency rises -
-  https://www.datadoghq.com/blog/autoscaling-custom-metrics/). Both hit
+  <https://www.datadoghq.com/blog/autoscaling-custom-metrics/>). Both hit
   the same hard ceiling for Kafka consumers: **one consumer per
   partition** - partition count caps replicas (KEDA enforces this by
   default), and rebalancing cost is real (cooperative rebalancing,
-  KIP-429, mitigates it). https://keda.sh/docs/2.19/scalers/apache-kafka/
+  KIP-429, mitigates it). <https://keda.sh/docs/2.19/scalers/apache-kafka/>
 
 ---
 
@@ -330,13 +324,13 @@ https://flink.apache.org/2021/07/07/how-to-identify-the-source-of-backpressure/
   system allocator (citing the stale gnzlbg crate), then **re-added** it
   via the maintained tikv binding - exactly the "jemalloc revived" arc in
   our memory. Lesson logged.
-  https://vector.dev/highlights/2021-06-02-drop-jemalloc/
+  <https://vector.dev/highlights/2021-06-02-drop-jemalloc/>
 - **Scripting/transform perf lesson**. Vector built a VRL bytecode VM
   (v0.21, opt-in), measured +10-15%, then **removed it in v0.23** because
   the optimised tree-walking AST interpreter reached parity. If we ever
   consider a CEL/VRL VM in scalo, this is the cautionary precedent: a
   well-tuned tree-walker matched a bespoke VM for this workload class.
-  https://vector.dev/highlights/2022-07-07-0-23-0-upgrade-guide/
+  <https://vector.dev/highlights/2022-07-07-0-23-0-upgrade-guide/>
 
 ---
 
@@ -348,14 +342,14 @@ committed benches.
 
 - Vector self-published (MiB/s): TCP->Blackhole 86, File->TCP 76.7,
   TCP->HTTP 26.7; regex parsing 13.2 (Fluent Bit beats it at 20.5).
-  https://github.com/vectordotdev/vector
+  <https://github.com/vectordotdev/vector>
 - Vector sizing guidance (best current first-party): ~10-25 MiB/s per
   vCPU (10 unstructured, ~25 structured), ~2 GiB RAM/vCPU, "almost
-  always CPU constrained". https://vector.dev/docs/setup/going-to-prod/sizing/
+  always CPU constrained". <https://vector.dev/docs/setup/going-to-prod/sizing/>
 - Independent (VictoriaMetrics, Mar 2026, competitor - flag bias; 1 core
   / 1 GiB cap): Vector ~25,000 logs/s (3rd), Fluent Bit 31.3k. Vector
   flagged for a silent-loss default and an FD leak under load.
-  https://victoriametrics.com/blog/log-collectors-benchmark-2026/
+  <https://victoriametrics.com/blog/log-collectors-benchmark-2026/>
 - Kafka per broker (the usual downstream): ~150-360 MB/s on commodity
   NVMe; small clusters ~600 MB/s-1 GB/s aggregate; **3x sync replication
   roughly halves it**. LinkedIn 2014, Confluent.
@@ -419,6 +413,7 @@ with a Vector pipeline, so a bench also doubles as an interop check).
 
 **the ingest app** - multi-protocol ingest. Use case: accept events at the
 edge, normalise, forward.
+
 - Benches: `http_json_ingest`, `grpc_ingest`, `otlp_ingest`,
   `syslog_ingest`, each -> memory/blackhole sink. Variants: 200 B vs
   4 KiB, structured vs unstructured, with-filter vs no-filter.
@@ -428,6 +423,7 @@ edge, normalise, forward.
 
 **the router app** - table routing / fan-out dispatch. Use case: route by
 `_table` to N topics.
+
 - Benches: `route_by_table_cel` (1->1 by CEL over the SIMD pre-route
   path), `fanout_transform` (N in -> M out, ack accounting),
   `route_cardinality_sweep` (4 / 64 / 1024 destinations).
@@ -438,6 +434,7 @@ edge, normalise, forward.
 
 **the fetcher app** - scheduled pull / poll. Use case: poll an API/container,
 enrich, forward, persist cursor.
+
 - Benches: avoid live external APIs (no mocks of real deps either) - use
   the **file** and **container/log extractor** sources over a fixed
   corpus. `poll_cycle_throughput`, `enrichment_cost` (timestamp/tag CEL),
@@ -449,6 +446,7 @@ enrich, forward, persist cursor.
 
 **the archiver app** - Kafka -> object storage. Use case: batch, compress,
 roll, ship.
+
 - Benches: `compress_roll_zstd|lz4|snappy|gzip`, `roll_by_size` (1 GB),
   `roll_by_time`, `multi_destination_fanout` (64 hot destinations).
 - Metrics: MiB/s in, compressed MiB/s out, compression ratio, CPU/MiB,
@@ -458,6 +456,7 @@ roll, ship.
   endpoint via testcontainers, real backend, no mock).
 
 **the VRL-transform app** - in-process VRL. Use case: parse/enrich/drop/remap.
+
 - Benches: a VRL complexity ladder - `vrl_passthrough`, `vrl_parse_json`,
   `vrl_enrich`, `vrl_conditional_drop`, `vrl_heavy_remap` - over the same
   corpus.
@@ -470,6 +469,7 @@ roll, ship.
 
 **the Vector-subprocess-transform app** - Vector subprocess wrapper. Use case: run
 Vector under scalo's lifecycle/metrics.
+
 - Benches: `wrapper_overhead` (scalo wrapper + Vector vs bare Vector,
   same config), `pipe_conversion_cost` (the JSON pipe in/out tax),
   `inprocess_vs_subprocess` (same transform via the VRL-transform app vs via
@@ -489,6 +489,7 @@ microbench each, then extrapolate from the GA results using a measured
 overhead factor. Print extrapolations clearly as estimates.
 
 **the WASM-transform app** (spike) - WASM module per event (wasmtime).
+
 - Microbench: `wasm_call_overhead` (host<->guest boundary per event),
   `wasm_instantiate` (module/instance reuse cost), `wasm_passthrough` vs
   `wasm_parse_enrich`.
@@ -501,6 +502,7 @@ overhead factor. Print extrapolations clearly as estimates.
   the VRL-transform app as the native floor. Position WASM between the two.
 
 **the Elasticsearch-transform app** (beta) - Elasticsearch shaping/bulk.
+
 - Microbench: `bulk_envelope_shaping` (events -> ES `_bulk` ndjson),
   `mapping_transform`. Real ES via testcontainers for an end-to-end line.
 - Extrapolation: shape-only throughput from the microbench; end-to-end
@@ -509,6 +511,7 @@ overhead factor. Print extrapolations clearly as estimates.
   settings). Likely near-parity on shaping; the delta is batching policy.
 
 **the Splunk-HEC-transform app** (beta) - Splunk HEC shaping.
+
 - Microbench: `hec_envelope_shaping`, `hec_batch_pack`.
 - Extrapolation: as for elastic - shaping cost from the microbench, scaled
   by the GA archiver/transform throughput for the full path.
@@ -530,12 +533,14 @@ overhead factor. Print extrapolations clearly as estimates.
 ## 8. Honest caveats / not verified
 
 From scalo side:
+
 - scalo has **no committed benches today**; "PB/day", "PB/s" are design
   targets, not measurements. Section 7 exists precisely to fix this.
 - The 1.5-3x pass-through estimate in Section 6 is a reasoned hypothesis
   from architecture, not a measurement.
 
 From Vector / web research side:
+
 - No dedicated EventArray RFC; the perf rationale is code + release notes
   together. ARC "default flipped in v0.17" is synthesis (current default
   IS adaptive, confirmed). Exact EC2 instance for Vector's own benches
@@ -630,10 +635,11 @@ NOT a core change.** The user's flagged contrast is right: bytes-first is
 the correct default for route/filter/forward (the 80%). Do NOT adopt
 Vector's always-parsed core - it would tax the pass-through case scalo is
 built to win. The genuine sub-gap is narrower:
-  - Across apps, the Kafka boundary is bytes, so a 3-app transform chain
+
+- Across apps, the Kafka boundary is bytes, so a 3-app transform chain
     re-parses 3x. That re-parse is the *price of durability/replay* and
     is a deliberate feature, not a bug - leave it.
-  - Within a single app, a multi-step transform stage should parse ONCE
+- Within a single app, a multi-step transform stage should parse ONCE
     and mutate a shared typed view, writing bytes back ONCE. Verify
     `ParsedBatch`/`run_workbatch_parsed` (`worker/engine`) already does
     this for sequential VRL files; if any path re-parses per step, fix

@@ -28,7 +28,7 @@ The `Environment` enum is the four-way classifier -- anything that
 isn't K8s, Docker, or a generic container is bare metal.
 
 | Variant | Detected by |
-|---------|-------------|
+| --------- | ------------- |
 | `Kubernetes` | `/var/run/secrets/kubernetes.io/serviceaccount/token` exists, or `KUBERNETES_SERVICE_HOST` env var present |
 | `Docker` | `/.dockerenv` exists |
 | `Container` | `/proc/1/cgroup` or `/proc/1/mountinfo` mention `/docker/`, `/kubepods/`, `/lxc/`, `/containerd/` |
@@ -42,7 +42,7 @@ also a container, but you want to know it's K8s.
 ## Field detection
 
 | Field | Source |
-|-------|--------|
+| ------- | -------- |
 | `environment` | `Environment::detect()` |
 | `pod_name` | `POD_NAME` env, falling back to `HOSTNAME` in container environments |
 | `namespace` | `POD_NAMESPACE` env, falling back to `/var/run/secrets/kubernetes.io/serviceaccount/namespace` |
@@ -102,7 +102,7 @@ The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md
 `is_production()` is true when that name is `production` or `prod`, in any letter case. Every other value, `staging` and `production-eu` included, is not production. It gates these refusals, each of which fails the constructor in production and passes in any other environment:
 
 | Constructor | Refused in production |
-|---|---|
+| --- | --- |
 | `KafkaTransport::new`, `KafkaProducer::new`, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend (`Dlq::spawn`), via `KafkaConfig::validate` | `ssl_skip_verify`, `enable.ssl.certificate.verification: "false"` or `ssl.endpoint.identification.algorithm: none`, and a `plaintext` or `sasl_plaintext` transport without `allow_insecure_transport`, whether a typed field sets it or `librdkafka_overrides` or another raw librdkafka map does. From a raw map, also a `sasl.oauthbearer.token.endpoint.url` that is not `https://`, and an `ssl.cipher.suites` that names a `NULL`, `eNULL` or `COMPLEMENTOFALL` suite without a leading `!` or `-` |
 | `OpenBaoProvider::new`, via `OpenBaoConfig::validate` | `skip_verify` |
 | `SecretCache::new` (and so `SecretsManager::new`), via `CacheConfig::validate` | a disk cache with no `encryption_key` and `allow_plaintext_disk_cache` set |
@@ -131,7 +131,7 @@ data, temp, logs, cache, and runtime files for the current
 environment.
 
 | Path | Container (K8s / Docker / Container) | Bare metal (XDG) |
-|------|--------------------------------------|------------------|
+| ------ | -------------------------------------- | ------------------ |
 | `config_dir` | `/app/config` | `$XDG_CONFIG_HOME/<app>` |
 | `secrets_dir` | `/app/secrets` | `~/.<app>/secrets` |
 | `data_dir` | `/app/data` | `$XDG_DATA_HOME/<app>` |
@@ -160,7 +160,7 @@ let cfg_path = paths.config_dir.join("settings.yaml");
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `Environment` | Four-way enum: `Kubernetes`, `Docker`, `Container`, `BareMetal` |
 | `Environment::detect()` | One-shot detection, returns the variant |
 | `Environment::is_container()` / `is_kubernetes()` / `is_docker()` / `is_bare_metal()` | Convenience predicates |

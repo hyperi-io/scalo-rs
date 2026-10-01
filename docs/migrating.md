@@ -50,7 +50,7 @@ prefix *you* declare via `ConfigOptions::env_prefix` (e.g. set `DFE` to read
 Removed with no in-lib replacement:
 
 | Removed | Use instead |
-|---------|-------------|
+| --------- | ------------- |
 | `HYPERI_LIB_APP_NAME` | bare `APP_NAME` (or `<YOUR_PREFIX>_APP_NAME`) |
 | `HYPERI_E2E_CLUSTER` | bare `E2E_CLUSTER` |
 | `HYPERI_TELEMETRY` | removed -- gate version checks via `version_check.enabled` |
@@ -61,7 +61,7 @@ all keys follow it.
 ## 4. Dropped features
 
 | Removed | Replacement |
-|---------|-------------|
+| --------- | ------------- |
 | `database` | none in-lib -- bring your own client |
 | `config-postgres` (Postgres config source) | none -- config cascade is now **7-layer** (was 8); use YAML/env/CLI layers |
 | `cache` | use `spool` / `tiered-sink` for durable buffering |

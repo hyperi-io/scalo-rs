@@ -54,7 +54,7 @@ flowchart TB
 ```
 
 | Sink result | Disposition | Circuit effect |
-|-------------|-------------|----------------|
+| ------------- | ------------- | ---------------- |
 | `Ok(())` | Done | Records success — closes circuit if Open/HalfOpen |
 | `Err(Full)` | Spool to disk | No failure counted (backpressure ≠ unhealthy) |
 | `Err(Unavailable)` | Spool to disk | Failure counted, may open circuit |
@@ -95,7 +95,7 @@ See [`../../src/tiered_sink/circuit.rs`](../../src/tiered_sink/circuit.rs).
 ## Ordering modes
 
 | Mode | Hot path policy | Trade-off |
-|------|-----------------|-----------|
+| ------ | ----------------- | ----------- |
 | `Interleaved` (default) | Always try hot path when circuit allows | Max throughput; new messages may arrive before older spooled ones |
 | `StrictFifo` | Hot path only when spool is empty | Strict order; new traffic queues behind drain |
 
@@ -111,7 +111,7 @@ The background drain (`drainer::drain_loop`) pulls from the spool and
 re-tries the primary sink at a rate controlled by `DrainStrategy`:
 
 | Strategy | Behaviour |
-|----------|-----------|
+| ---------- | ----------- |
 | `Adaptive { initial_rate, max_rate }` (default) | Start slow (100 msg/s), accelerate based on success rate, cap at `max_rate` (10 000 msg/s) |
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible — risks overwhelming a recovering sink |
@@ -168,7 +168,7 @@ common cases without writing the full struct.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `TieredSink::new(sink, config)` | Construct, open spool, spawn drain task |
 | `send(data) -> Result<()>` | Send with hot-path → spool → DLQ-by-caller fallback |
 | `spool_len() / spool_is_empty() / spool_bytes()` | Spool depth introspection |

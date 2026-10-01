@@ -48,7 +48,7 @@ false`, which builds nothing on the vertical side; horizontal scaling via
 ### Vertical vs horizontal
 
 | | Vertical (self-regulation) | Horizontal (KEDA) |
-|---|---|---|
+| --- | --- | --- |
 | Question | "Should this pod pull more work right now?" | "Do we need more pods?" |
 | Mechanism | MemoryGuard + UnifiedPressure inbound gate + AIMD byte budget | ScalingPressure -> external-scaler signal -> KEDA |
 | Lives in | This library, in-pod | This library's signal; KEDA acts on it |
@@ -73,7 +73,7 @@ Self-regulation is three distinct controllers with three distinct jobs.
 They are NOT interchangeable; each answers a different question.
 
 | Brain | Question | Acts on | Source of truth? |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **MemoryGuard** | "Are we about to OOM?" | The HARD pressure signal | YES -- the HARD signal |
 | **ScalingPressure** | "Do we need more pods?" | KEDA / external scaler signal | Pool sizing, not the data path |
 | **UnifiedPressure** | "Should I pull more work right now?" | The inbound gate + byte budget | Derived from the sources above |
@@ -185,7 +185,7 @@ Self-regulation is visible, not mysterious. When throttling happens you can
 see it.
 
 | Signal | Kind | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `self_regulation_inbound_paused` | gauge (0/1) | The inbound gate is currently holding (1) or open (0). Carries a `source` label (e.g. `kafka`, `http`) so two governed receivers on one pod are told apart |
 | `self_regulation_inbound_pauses_total` | counter | Number of pause EDGES (rising transitions), not per-evaluate noise. Carries the same `source` label |
 | `self_regulation_byte_budget` | gauge | Current AIMD byte budget (the inbound block-size lever), written by the controller at start and on every change |

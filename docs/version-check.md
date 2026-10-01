@@ -58,7 +58,7 @@ version_check:
 ```
 
 | Setting | Library default | Purpose |
-|---------|-----------------|---------|
+| --------- | ----------------- | --------- |
 | `enabled` | `true` | The kill switch. An explicit `false` wins over any app default. |
 | `api_url` | empty | Endpoint. No baked-in default -- the binary supplies its own; without one the check is inert. |
 | `timeout` | `5` | HTTP timeout in seconds. |

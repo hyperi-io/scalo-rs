@@ -77,7 +77,7 @@ The four legacy `BatchEngine` run loops (`run` / `run_raw` / `run_async` /
 (`src/worker/engine/driver.rs`):
 
 | New method | Use |
-|---|---|
+| --- | --- |
 | `run_governed` | The default for a self-regulating app. Streams in byte-budget sub-blocks when the governor is on; delegates to `run_workbatch` when off (byte-identical). |
 | `run_workbatch` | On-demand parse (default). The driver does not pre-parse; a transform calls `codec::parse` when it needs a field. Pass-through apps pay zero parse. |
 | `run_workbatch_parsed` | Opt-in hot path. The driver pre-parses the whole block (SIMD JSON / native MsgPack) on the pool and hands the closure a `ParsedBatch` (records + aligned `ParsedPayload`s + shared `FieldInterner`). Parse failures route to DLQ, no silent drop. |
@@ -315,8 +315,7 @@ let url = format!("postgres://{}:{}@{}/{}", c.user, c.password, c.host, c.db);
 let url = format!("postgres://{}:{}@{}/{}", c.user, c.password.expose(), c.host, c.db);
 ```
 
-In-crate URL builders already do this. The change exists so `Debug`
-+ `serde` round-trips redact by default.
+In-crate URL builders already do this. The change exists so `Debug` + `serde` round-trips redact by default.
 
 ### `Cache::set` signature
 
@@ -506,7 +505,7 @@ now take typed enums. The labels are bounded; cardinality is
 fixed at the enum variant count.
 
 | Method | Old | New |
-|---|---|---|
+| --- | --- | --- |
 | `transport_sent` | `(transport: &str, count)` | `(transport: TransportKind, count)` |
 | `transport_send_errors` | `(transport: &str, count)` | `(transport: TransportKind, count)` |
 | `auth_failure` | `(reason: &str)` | `(reason: AuthFailureReason)` |
@@ -527,6 +526,7 @@ dfe.transport_sent(TransportKind::Kafka, 1);
 ```
 
 Variant lists:
+
 - `TransportKind`: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http`, `Redis`, `Routed`
 - `FlushTrigger`: `Size`, `Records`, `Age`, `Eviction`, `Shutdown`, `Manual`
 - `AuthFailureReason`: RFC 6749 codes + JWT failure modes
@@ -560,7 +560,7 @@ path, and a non-default mount could only be named by writing `data`
 yourself.
 
 | Spec | Old | New |
-|---|---|---|
+| --- | --- | --- |
 | `vault:secret/data/myapp/tls:k` | mount `secret`, path `myapp/tls` | unchanged |
 | `vault:kv/data/myapp/tls:k` | mount `kv`, path `myapp/tls` | unchanged |
 | `vault:kv/myapp/tls:k` | mount `secret`, path `kv/myapp/tls` | mount `kv`, path `myapp/tls` |
@@ -888,6 +888,7 @@ A hold that reached `self_regulation.max_hold_secs` resumed each `InboundGate` o
 `validate` also judges the raw librdkafka maps the client builders apply: `librdkafka_overrides`, `sizing.producer_librdkafka`, `sizing.consumer_librdkafka` and `extra_config`. Each value they give `security.protocol`, `sasl.mechanism` or `sasl.mechanisms` is held to the rules above, and a false `enable.ssl.certificate.verification` or an `ssl.endpoint.identification.algorithm` of `none` is refused in production like `ssl_skip_verify`. In production they may not give `sasl.oauthbearer.token.endpoint.url` anything but an `https://` URL, since `http://` or no scheme would send the OAUTHBEARER client secret in cleartext, or give `ssl.cipher.suites` a `NULL`, `eNULL` or `COMPLEMENTOFALL` suite that no leading `!` or `-` excludes, such as `eNULL`, `NULL-SHA` or `ECDHE-RSA-NULL-SHA`. Keys and values match in any case, a value is read past surrounding whitespace, and the refusal names the map and the key. The consumer runs the typed `security_protocol` over an override and the producer runs the override, so both are judged: an override to `ssl` does not lift a typed `plaintext`.
 
 **Consumer adjustment** -- a config these paths used to accept unchecked can now fail construction with `TransportError::Config` (`DlqError::Kafka` for the DLQ):
+
 - in any environment, SASL `PLAIN` (any case) without `security_protocol=sasl_ssl`, or an unknown `provider`;
 - in production, `ssl_skip_verify`, or `plaintext` / `sasl_plaintext` without `allow_insecure_transport: true`;
 - a config that got past either check through a raw map, such as `librdkafka_overrides: { security.protocol: sasl_plaintext }` beside a typed `sasl_ssl` and `PLAIN`, or `{ enable.ssl.certificate.verification: "false" }` in production, on every constructor including `KafkaTransport::new`. Set the typed field instead, or `allow_insecure_transport: true` for an audited plaintext transport;

@@ -32,7 +32,7 @@ async fn every_acknowledged_record_arrives() {
 Each fault is keyed on the middle marker, so it lands at the same point however fast the pipeline runs. A case whose fault never landed panics, because it proved nothing.
 
 | `Fault` | What happens at the middle marker |
-|---|---|
+| --- | --- |
 | `GracefulStop` | shutdown fires while that send is in flight; the send then completes |
 | `KillMidBatch` | the pipeline task is aborted while that send is in flight |
 | `DownstreamRefusing` | the sink refuses that send and every send for 300 ms after it |

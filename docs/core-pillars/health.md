@@ -15,7 +15,7 @@ exists only to detect a deadlocked process.
 ## The two probes
 
 | Endpoint | Semantics | Fails when | K8s action |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `/livez` | Liveness -- process alive | Never (always 200) | Kill + restart pod |
 | `/readyz` | Readiness -- deps OK + app says ready | Registry has an `Unhealthy` component OR the readiness callback returns false | Remove from Service endpoints (no traffic), don't restart |
 
@@ -98,7 +98,7 @@ pub enum HealthStatus { Healthy, Degraded, Unhealthy }
 ```
 
 | Status | `is_healthy()` | `is_ready()` | Use for |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `Healthy` | Yes | Yes | Fully operational |
 | `Degraded` | No | Yes | Impaired but serving -- circuit half-open, fallback active, elevated latency |
 | `Unhealthy` | No | No | Not operational -- stop traffic |
@@ -184,7 +184,7 @@ does not serve `/metrics`.
 ## API surface
 
 | Item | Purpose |
-|---|---|
+| --- | --- |
 | `HealthRegistry::register(name, fn)` | Add a component health-check callback |
 | `HealthRegistry::is_healthy() -> bool` | All components `Healthy` |
 | `HealthRegistry::is_ready() -> bool` | No components `Unhealthy` |

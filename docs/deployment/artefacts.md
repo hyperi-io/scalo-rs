@@ -173,7 +173,7 @@ guard makes the line a no-op there rather than a build failure.
 The generated Dockerfile and fragment lint clean under hadolint, which gates the build. Three findings are suppressed at the instruction they concern, each with its reason on the line above:
 
 | Rule | Instruction | Why it is suppressed |
-|---|---|---|
+| --- | --- | --- |
 | DL3008 | the `apt-get install` RUN | Debian's archive drops superseded package versions, so a pinned version breaks the build within weeks. The digest-pinned base fixes the release. |
 | DL3025 | `HEALTHCHECK` | Shell form lets `\|\| exit 1` map any curl failure onto 1, the only unhealthy status Docker defines. Exec form cannot. |
 | DL3022 | `COPY --from=builder` (fragment only) | CI prepends the builder stage, so the fragment cannot define it. |
@@ -195,7 +195,7 @@ on. Override via `ArgocdConfig`.
 `generate_chart()` writes a complete chart (apps call it directly):
 
 | File | Purpose |
-|------|---------|
+| ------ | --------- |
 | `Chart.yaml` | Chart metadata |
 | `values.yaml` | Configurable defaults -- image, resources, probes, secrets, KEDA, HPA, `otel`, `podSecurityContext` / `securityContext` |
 | `templates/_helpers.tpl` | Standard name helpers + one `<group>SecretName` helper per secret group |
@@ -216,7 +216,7 @@ by default. Both blocks come from values, so an app with a genuine need opts
 out rather than forking the chart.
 
 | Values key | Default | What it settles |
-|---|---|---|
+| --- | --- | --- |
 | `podSecurityContext.runAsNonRoot` | `true` | refuse to start as root |
 | `podSecurityContext.runAsUser` / `runAsGroup` / `fsGroup` | `1000` | the uid the image already switches to |
 | `podSecurityContext.seccompProfile.type` | `RuntimeDefault` | the runtime's syscall filter |
@@ -241,7 +241,7 @@ The chart mounts no service-account token. `automountServiceAccountToken: false`
 The pod still carries the two files the [version check](../version-check.md) derives its instance id from. A projected volume holds them, read-only at `/var/run/secrets/kubernetes.io/serviceaccount`:
 
 | File | Source |
-|---|---|
+| --- | --- |
 | `ca.crt` | the `kube-root-ca.crt` ConfigMap Kubernetes publishes into every namespace |
 | `namespace` | the Downward API, `metadata.namespace` |
 
@@ -256,7 +256,7 @@ carries OTLP (traces, for a collector).
 `templates/deployment.yaml` always emits these, secrets or no secrets:
 
 | Env var | Value |
-|---|---|
+| --- | --- |
 | `OTEL_SERVICE_NAME` | the contract's `app_name` |
 | `POD_NAME` / `POD_NAMESPACE` / `POD_UID` / `NODE_NAME` | k8s Downward API field refs |
 | `OTEL_RESOURCE_ATTRIBUTES` | `k8s.pod.name` / `k8s.namespace.name` / `k8s.pod.uid` / `k8s.node.name`, built from those four |

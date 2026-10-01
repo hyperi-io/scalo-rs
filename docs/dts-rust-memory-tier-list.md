@@ -1,11 +1,11 @@
 # Rust Memory Structures -- Tier List
 
 Key points for context --
+
 - **Derek's experience with at-scale data processing and ingest.**
 - **Perspective:** zero-copy-wherever-feasible - always-multi-threaded - SIMD - batch processing.
 - **Hard constraints:** extreme CPU/memory cost-sensitivity ($$$ consumption).
 - **Lock-waits are a defect to be avoided**, not a tradeoff to accept.
-
 
 The workload: **heavily-optimised at-scale data processing**
 Zero-copy, multi-threaded, SIMD, PB/hr ingest, where a **1% regression is many
@@ -41,7 +41,7 @@ The three trees and the table answer most picks. Want the *why* -> the tiers.
 
 ### Pick an allocator (all three are S; choose by the job)
 
-```
+```text
 Need jeprof / MALLOC_CONF heap profiling, or org-policy compliance?  -> jemalloc (tikv-jemallocator)
 Target Windows/MSVC, or max portability (wasm/BSD/musl/macOS)?       -> mimalloc
 Heavy CROSS-THREAD free (stage A allocs Bytes, stage B frees post-send)? -> snmalloc-rs
@@ -50,7 +50,7 @@ Default for a long-running HyperI Linux data-plane binary            -> jemalloc
 
 ### Pick a concurrent map
 
-```
+```text
 Read-heavy, lock-free reads, tail-latency-sensitive?         -> papaya  (or scc::HashIndex)
 Write-heavy, concurrent inserts, non-blocking resize?        -> scc2::HashMap
 Whole table swapped between batches, read-mostly?            -> ArcSwap<HashMap>  (ArcSwap<rpds map> for cheap snapshots)
@@ -61,7 +61,7 @@ Genuine in-place mutation, snapshot too costly?              -> shard a parking_
 
 ### Pick a SIMD path (stable toolchain)
 
-```
+```text
 Need runtime CPU dispatch (AVX2 vs AVX-512 vs NEON)?  -> pulp (native width)  or  #[multiversion]
 Fixed-width portable, build-time target?             -> wide  (set RUSTFLAGS target-cpu, or build per-target)
 Just reinterpreting bytes <-> POD lanes?             -> bytemuck / zerocopy + &[T]
@@ -108,7 +108,7 @@ flowchart TD
 ### Quick-reference table
 
 | Tier | Item | Tag | Note |
-|------|------|-----|------|
+| ------ | ------ | ----- | ------ |
 | **S** | global allocator (jemalloc/mimalloc/snmalloc) | alloc | one line; jemalloc = org default |
 | **S** | `bytes::Bytes`/`BytesMut` | own | align 1 (not SIMD-aligned) |
 | **S** | `Arc<[T]>` / `triomphe::Arc` | own | triomphe = no weak count |
@@ -493,7 +493,7 @@ flowchart TD
 
 ## F -- don't
 
-**Won't compile here**
+### Won't compile here
 
 - **`Rc` / `Rc<RefCell<T>>`** -- `[own]` -- not `Send`/`Sync`. "Always
   multi-threaded" deletes these outright. Legal and a hair faster than `Arc`

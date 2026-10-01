@@ -21,7 +21,7 @@ propagation, and the metrics bridge is a different module from the tracing bridg
 ## Feature breakdown
 
 | Feature | Provides | Pair with |
-|---|---|---|
+| --- | --- | --- |
 | `otel` | OTel SDK + OTLP exporter crates for other modules | umbrella; rarely useful alone |
 | `otel-metrics` | `metrics`-crate bridge to OTel meters | [metrics.md](metrics.md) |
 | `otel-tracing` | `tracing-opentelemetry` layer bridging spans to OTel spans | this doc |
@@ -59,7 +59,7 @@ provider.shutdown()?;
 Env-var overrides resolve at build time, so one config covers dev and prod:
 
 | Var | Overrides |
-|---|---|
+| --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `endpoint` |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `protocol` (`grpc` / `http/protobuf`) |
 | `OTEL_SERVICE_NAME` | `service_name` |
@@ -110,7 +110,7 @@ Enforced by `clippy::await_holding_lock` and the audit script in
 With `transport-trace`, `transport::propagation::current_traceparent()` returns the
 current OTel context as a W3C `traceparent` header:
 
-```
+```text
 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 ```
 
@@ -141,7 +141,7 @@ side monitoring for export loss.
 ## API surface
 
 | Item | Purpose |
-|---|---|
+| --- | --- |
 | `OtelTracingConfig` | `endpoint`, `protocol`, `service_name`, `batch_scheduled_delay_ms`, `batch_max_queue_size` |
 | `OtelTracingProtocol::{Grpc, Http}` | OTLP transport choice |
 | `build_tracer_layer(&cfg)` | Returns `(layer, provider)`; installs the provider as global |

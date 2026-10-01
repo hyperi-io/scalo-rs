@@ -23,7 +23,7 @@ flowchart TD
 ```
 
 | Gate | Trigger | Output | Why |
-|------|---------|--------|-----|
+| ------ | --------- | -------- | ----- |
 | **Circuit breaker** | `set_circuit_open(true)` | `0.0` | Downstream sink is unavailable. Adding replicas can't help — they'd also fail. Don't scale. |
 | **Memory pressure** | `memory_used / memory_limit ≥ memory_gate_threshold` (default 0.8) | `100.0` | OOM is imminent. Bypass the composite and call for max scale immediately. |
 
@@ -53,7 +53,7 @@ on the total keeps the output well-formed even if they don't.
 Example composition for a loader:
 
 | Component | Weight | Saturation | Source |
-|-----------|--------|------------|--------|
+| ----------- | -------- | ------------ | -------- |
 | `kafka_lag` | 0.35 | 100 000 | Consumer lag from the Kafka client |
 | `buffer_depth` | 0.25 | 10 000 | In-memory batch buffer depth |
 | `insert_latency` | 0.15 | 5.0 s | ClickHouse insert latency p99 |
@@ -162,7 +162,7 @@ falls back to defaults if absent.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `ScalingPressure::new(config, components)` | Build calculator with the given components and config |
 | `set_component(name, value)` | Update a component (lock-free, unknown names are no-ops) |
 | `set_circuit_open(bool)` | Toggle the circuit-breaker gate |

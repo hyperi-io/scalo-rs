@@ -16,7 +16,7 @@ buffer, a checkpoint store, or a custom drainer.
 ## What it gives you
 
 | Property | Notes |
-|----------|-------|
+| ---------- | ------- |
 | FIFO order | Strict — yaque is a single-producer / single-consumer log |
 | Persistent | Survives restarts; segment files in the queue directory |
 | Crash-safe | Receiver position persisted in `recv-metadata`; commit-then-advance semantics |
@@ -30,7 +30,7 @@ buffer, a checkpoint store, or a custom drainer.
 
 Inside the configured `path`:
 
-```
+```text
 spool.queue/
 |-- 0.q                # segment file — [4-byte Hamming header][payload] ...
 |-- 1.q
@@ -71,7 +71,7 @@ yaque keeps `send.lock`, `recv.lock` and `version/lock` in the queue directory, 
 `Spool::open` and `TieredSink::new` (shared code in `src/spool_codec.rs`) handle each leftover lock before opening:
 
 | Lock file | Action |
-|-----------|--------|
+| ----------- | -------- |
 | Owner pid not running, or equal to this process's pid with another token (a restarted container reusing its pid) | Removed, counted in `spool_stale_locks_cleared_total{lock,reason="dead_owner"}`, one warn with the path |
 | Empty or unparseable (killed between create and write) | Re-read after 500 ms if younger than that, then removed as `reason="unparseable"` |
 | Owner pid running, or this process's own open queue | Open refused with `Open` / `SpoolOpen` naming the lock. Never quarantined |
@@ -107,7 +107,7 @@ override.
 ## Bounded size
 
 | Limit | Behaviour on exceeded |
-|-------|----------------------|
+| ------- | ---------------------- |
 | `max_items: Some(n)` | `push` returns `Err(MaxItemsReached { max })` |
 | `max_size_bytes: Some(b)` | `push` returns `Err(MaxSizeReached { max_bytes })` |
 
@@ -189,7 +189,7 @@ arrives). `pop_front` is the try-style alternative that returns
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `Spool::open(config)` | Open or create the queue; recovers item count from disk |
 | `Spool::create(path)` | Convenience for `open(SpoolConfig::new(path))` |
 | `Spool::create_compressed(path)` | Convenience for `open(SpoolConfig::with_compression(path))` |

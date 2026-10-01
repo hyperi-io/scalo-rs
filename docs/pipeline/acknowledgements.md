@@ -20,7 +20,7 @@ A **piece** is one downstream delivery covering part of a block: each sink call 
 Once every piece has reported, the loop calls `TransportReceiver::release` once with the merged status:
 
 | Merged status | Source |
-|---------------|--------|
+| --------------- | -------- |
 | `Delivered`, `Dropped`, `Rejected` (dead-lettered, and the DLQ confirmed it) | Released: Kafka commits, a held push is answered OK |
 | `Errored` | Withheld. Kafka does not commit, so the block is read again after a restart, and the loop stops. A push source answers `UNAVAILABLE`, its sender retries, and the loop goes on |
 
@@ -65,7 +65,7 @@ Without a DLQ, entries from filters and `process` go through the `FilterDlqPolic
 At start the loop sets `pipeline_delivery_guarantee{guarantee, reason}` to 1:
 
 | `guarantee` | `reason` | When |
-|-------------|----------|------|
+| ------------- | ---------- | ------ |
 | `at_least_once` | `confirmed` | The source holds its ack and the sink confirms remotely (`SinkConfirmation::Remote`: Kafka, gRPC) |
 | `at_least_once_local` | `sink_confirms_locally` | The sink confirms a durable local write |
 | `best_effort` | `sink_cannot_confirm` | The sink's `Ok` proves nothing more, including a pipeline with neither `.sender(&sender)` nor `.sink_confirms(..)`. `.sink_confirms(..)` declares a custom sink that does |

@@ -38,11 +38,11 @@ paths-ignored, so committing regenerated artefacts is CI-free; the drift test
 still runs on any code change.
 
 | File | Content |
-|------|---------|
+| ------ | --------- |
 | `config-schema.json` | JSON Schema (draft 2020-12) of `Config`, JSON encoding |
 | `config-schema.yaml` | Same schema, YAML encoding (human-friendly, parity with the app's own YAML config) |
-| `capability-catalog.json`  | The capability catalog, JSON encoding |
-| `capability-catalog.yaml`  | Same catalog, YAML encoding |
+| `capability-catalog.json` | The capability catalog, JSON encoding |
+| `capability-catalog.yaml` | Same catalog, YAML encoding |
 
 `config-schema.*` comes from `config_schema` on the contract;
 `capability-catalog.*` from `capabilities` on the contract.
@@ -53,7 +53,7 @@ One combined catalog: a flat list of `Capability`, each discriminated by `kind`
 (not separate sources/services/transports documents). A source's services nest
 under it via `children`.
 
-```
+```text
 Capability {
   kind: string             # "source" | "service" | "transport" | "sink" | "dlq" | ...
   name: string             # "aws", "cloudtrail", "kafka", ...
@@ -79,6 +79,7 @@ FieldType (lower_snake_case string):
 ```
 
 Serialisation rules (identical in both languages):
+
 - `type` is the JSON key for a `FieldSpec`'s field type (Rust `#[serde(rename =
   "type")]`; Python field alias `type`).
 - Empty `fields`, `children`, `enum_values` are OMITTED (not `[]`).
@@ -90,6 +91,7 @@ Serialisation rules (identical in both languages):
 ## Secret marker
 
 A secret field is flagged in TWO places:
+
 - catalog `FieldSpec.secret = true`
 - JSON Schema: the field's subschema carries `"x-dfe-secret": true` (plus
   `"writeOnly": true`).
@@ -202,7 +204,7 @@ they are authored here by reading that code.
 
 `DeploymentContract` grows two optional, defaulted, back-compat fields:
 
-```
+```text
 config_schema: object | null      # the JSON Schema; null/absent = not provided
 capabilities:  Capability[]       # the catalog; [] = not provided
 ```

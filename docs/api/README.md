@@ -7,7 +7,7 @@ If you are looking for config, logging, metrics, tracing, health or shutdown,
 those are auto-wired and live in [../core-pillars/README.md](../core-pillars/README.md).
 
 | Doc | Covers |
-|---|---|
+| --- | --- |
 | [secrets.md](secrets.md) | OpenBao / Vault, AWS Secrets Manager, file backend |
 | [http-server.md](http-server.md) | the optional axum listener, and what it does NOT serve |
 | [http-client.md](http-client.md) | `reqwest` plus retry, backoff and the signing hook |

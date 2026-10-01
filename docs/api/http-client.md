@@ -143,7 +143,7 @@ such a client; a client that only downloads keeps the default.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `HttpClient::new(config)` | Build from explicit config |
 | `HttpClient::with_redirect_policy(config, policy)` | Build from explicit config with a `reqwest::redirect::Policy` of the caller's choosing |
 | `HttpClient::from_cascade()` | Build from the `http_client` config section |
@@ -162,7 +162,7 @@ such a client; a client that only downloads keeps the default.
 ## When to use which
 
 | Need | Use |
-|------|-----|
+| ------ | ----- |
 | Outbound HTTP from a service | `HttpClient` -- always |
 | A credential on the request | `.get_signed` / `.send_signed` with a placement from [auth.md](auth.md) |
 | A signature over the body or query | A `RequestSigner`; the hook runs after the request is built |

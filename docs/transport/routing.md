@@ -11,7 +11,7 @@ the bus, a gRPC endpoint on the direct transport. Sits on top of
 ## When to use it
 
 | Stage | Routed? | Why |
-|-------|---------|-----|
+| ------- | --------- | ----- |
 | receiver | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
 | fetcher | **Yes** | Each source maps to its own destination, plus per-record routes |
 | VRL transform | **Yes** | Its sink list is config-driven — one destination today, a list tomorrow |
@@ -189,9 +189,7 @@ backends. So `RoutedSender::send`:
 2. `AnySender::send(destination, payload).await` on the chosen sender.
 3. Backend's own `send` runs — Kafka, gRPC, etc.
 
-Two layers of dispatch, both monomorphised by the compiler. The
-route lookup is a `HashMap<String, AnySender>::get` — single hash
-+ equality compare, no allocation when the key is `&str`.
+Two layers of dispatch, both monomorphised by the compiler. The route lookup is a `HashMap<String, AnySender>::get` — single hash + equality compare, no allocation when the key is `&str`.
 
 `RoutedSender` itself implements `TransportSender` — anywhere an
 app expects `impl TransportSender`, a routed sender drops in. It
@@ -206,7 +204,7 @@ sender is unhealthy.
 Per `send()` call, on top of the chosen backend's own cost:
 
 | Step | Cost |
-|------|------|
+| ------ | ------ |
 | `HashMap::get(&str)` lookup | ~20-40 ns (SipHash + compare) |
 | Match on `AnySender` variant | <5 ns (jump table) |
 | Backend `send` | µs to ms — dominates |
@@ -223,7 +221,7 @@ the route taken.
 Behaviour when `destination` is not in `routes`:
 
 | Config | Result |
-|--------|--------|
+| -------- | -------- |
 | `default` is set | Falls through to the default sender |
 | `default` is unset | `SendResult::Fatal(TransportError::Config(...))` |
 
@@ -244,7 +242,7 @@ That holds for `send` and `send_to`. The block and fan-out forms (`send_batch`, 
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `RoutedSender::new(routes, default)` | Construct from pre-built `AnySender`s |
 | `RoutedSender::from_route_configs(routes, default).await` | Construct from per-route `TransportConfig`s |
 | `RoutedSender::send(destination, payload).await` | Dispatch by destination, fall to default if missing |

@@ -53,7 +53,7 @@ if let Some(city) = paths.city {
 ## Providers
 
 | Provider (`provider:`) | Auth | City | ASN | Format |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `db_ip_lite` (default) | none | yes | yes | gzip |
 | `max_mind_geo_lite2` | account id + licence key | yes | yes | tar.gz |
 | `ip_locate` | none | no | yes | raw |
@@ -97,7 +97,7 @@ call unconditionally and let config decide.
 ## API surface
 
 | Item | Purpose |
-|---|---|
+| --- | --- |
 | `ensure_databases(&GeoIpConfig) -> Result<DatabasePaths, GeoIpDownloadError>` | Resolve and, if needed, download |
 | `DatabasePaths { city, asn }` | `Option<PathBuf>` each |
 | `GeoIpConfig` / `GeoIpConfig::from_cascade()` | Provisioning config |
@@ -130,7 +130,7 @@ same-directory rename, so a reader never sees a half-written database.
 An app that carried its own `geoip_download` maps across like this:
 
 | App-side | scalo |
-|---|---|
+| --- | --- |
 | `GeoIpConfig.enabled` | same field, now honoured by `ensure_databases`, and defaults to `true` |
 | `GeoIpConfig.cache_capacity` | **stays in the app** -- a lookup-cache size, not a provisioning input |
 | `city_db_path` / `asn_db_path`: `Option<String>` | `Option<PathBuf>` (same YAML) |

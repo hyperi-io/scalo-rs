@@ -74,7 +74,7 @@ wraps a transport sender. Solid arrows show layer dependencies.
 ### L1 - Core pillars (always-on, auto-wired)
 
 | Module | Feature | Purpose |
-|--------|---------|---------|
+| -------- | --------- | --------- |
 | `config` | `config` (default) | 7-layer cascade (CLI -> env -> .env -> YAML -> defaults), hot-reload, section registry, `/config` admin endpoint |
 | `logger` | `logger` (default) | `tracing-subscriber` with JSON/text autodetect, RFC 3339 timestamps, sensitive-field masking, flood-control helpers |
 | `metrics` | `metrics-core`, `metrics-process`, `metrics` | Lock-free counters/gauges/histograms, Prometheus exporter, `/metrics` + `/metrics/manifest` |
@@ -89,7 +89,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 ### L2 - Runtime and self-regulation
 
 | Module | Feature | Purpose |
-|--------|---------|---------|
+| -------- | --------- | --------- |
 | `env` | always | Detect environment (Kubernetes, Docker, container, bare metal) |
 | `runtime` | `runtime` | XDG/container-aware paths, `RuntimeContext` singleton (pod, namespace, node, memory limit, CPU quota) |
 | `memory` | `memory` | `MemoryGuard` - cgroup-aware OOM prevention with auto-detected limits |
@@ -102,7 +102,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 ### L3 - Transport and I/O
 
 | Module | Feature | Purpose |
-|--------|---------|---------|
+| -------- | --------- | --------- |
 | `transport` | `transport`, `transport-{kafka,grpc,memory,file,pipe,http}` | Trait architecture (`TransportBase`, `TransportSender`, `TransportReceiver`, `Transport`), `AnySender` enum dispatch, factory |
 | `transport::filter` | `transport` | 3-tier engine (SIMD field ops / compiled CEL / complex CEL) embedded in every backend |
 | `http_server` | `http-server` | axum-based server, probe wiring, `/config` / `/metrics` / `/metrics/manifest` mount points |
@@ -114,7 +114,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 ### L4 - Pipeline
 
 | Module | Feature | Purpose |
-|--------|---------|---------|
+| -------- | --------- | --------- |
 | `spool` | `spool` | Disk-backed async FIFO queue (`yaque` + `zstd`), per-record CRC32C integrity |
 | `tiered_sink` | `tiered-sink` | Transport + spool + circuit breaker + retry + DLQ fallback |
 | `sink_stack` | `sink-stack` | Outbound control stack - composes timeout, load-shed, concurrency-limit, retry/backoff and rate-limit around a transport sender (tower `ServiceBuilder`); preserves at-least-once |
@@ -125,7 +125,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 ### L5 - App scaffolding
 
 | Module | Feature | Purpose |
-|--------|---------|---------|
+| -------- | --------- | --------- |
 | `cli` | `cli` | `clap` types: `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
 | `cli::service` | `cli-service` | `ServiceApp` trait, `run_app`, `ServiceRuntime` - full data-plane app scaffolding |
 | `top` | `top` | TUI metrics dashboard (`ratatui`) |

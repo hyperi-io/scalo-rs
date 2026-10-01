@@ -19,7 +19,7 @@ THREE distinct batch sizes on the Kafka path; conflating them is the usual
 tuning mistake. Each governs a different hop.
 
 | # | Batch | Governs | Sized by |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | **GET** (consumer fetch) | How many bytes the broker hands the consumer per Fetch | `fetch.min.bytes` + `fetch.wait.max.ms` + `fetch.max.bytes` + `max.partition.fetch.bytes` |
 | 2 | **PROCESS** (WorkBatch) | How much in-flight data the stage holds while processing | The AIMD byte budget (`src/governor/budget.rs`) -- the self-regulation lever |
 | 3 | **SEND** (producer) | How many bytes the producer accumulates per MessageSet | `batch.size` + `linger.ms` |
@@ -89,7 +89,7 @@ kafka:
 The profile defaults, with the ACTUAL librdkafka property each maps to:
 
 | Profile | GET `fetch.min.bytes` | GET `fetch.wait.max.ms` | GET `max.partition.fetch.bytes` | GET `fetch.max.bytes` | poll cap | SEND `batch.size` | SEND `linger.ms` | SEND codec | SEND `queue.buffering.max.kbytes` | SEND `message.max.bytes` |
-|---|---|---|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `throughput` (default) | 1 MiB | 50 ms | 1 MiB | 50 MiB | 2000 | 128 KiB | 20 ms | zstd, level 3 | 64 MiB | 16 MiB |
 | `balanced` | 256 KiB | 25 ms | 1 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | zstd, level 3 | 32 MiB | 16 MiB |
 | `low_latency` | 1 byte | 5 ms | 1 MiB | 16 MiB | 500 | 16 KiB | 0 ms | zstd, level 3 | 16 MiB | 16 MiB |
@@ -115,7 +115,7 @@ the code uses the librdkafka ones. Getting these wrong silently no-ops
 (librdkafka ignores unknown keys).
 
 | Intent | librdkafka (used here) | NOT (Java client) |
-|---|---|---|
+| --- | --- | --- |
 | Max broker wait to fill a fetch | `fetch.wait.max.ms` | `fetch.max.wait.ms` |
 | Uniform sticky for null-key messages (KIP-794) | `sticky.partitioning.linger.ms` | `partitioner.ignore.keys` |
 | Total producer queue byte budget | `queue.buffering.max.kbytes` (in KiB) | `buffer.memory` (in bytes) |
@@ -238,7 +238,7 @@ applies its own default, `uniform`.
 librdkafka will not build a consumer without a `group.id`, and a consumer asks the broker for its group's coordinator as soon as it connects, whether or not it ever subscribes. A broker that grants groups by prefix refuses that lookup for any group outside the prefix, and logs it as `GroupAuthorizationFailed`. So the two consumers scalo builds for its own use take a group id derived from the app's config, never a fixed literal:
 
 | Client | Group id | Joins or commits |
-|---|---|---|
+| --- | --- | --- |
 | `KafkaAdmin` offset-query consumer (also behind topic auto-discovery) | `<group>-admin`, or `<client_id>-admin` when `group` is empty | Never |
 | Idle consumer of a producer-only transport | `<client_id>-producer-only` | Never |
 

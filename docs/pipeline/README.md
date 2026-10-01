@@ -23,7 +23,7 @@ Solid arrows are the happy path; dotted are the fallbacks that only carry data
 when the happy path is failing.
 
 | Doc | Covers |
-|---|---|
+| --- | --- |
 | [batch-engine.md](batch-engine.md) | SIMD parse, pre-route filter, field interning |
 | [worker-pool.md](worker-pool.md) | `AdaptiveWorkerPool`, pressure-based scaling |
 | [tiered-sink.md](tiered-sink.md) | resilient delivery, disk spillover, circuit breaker |

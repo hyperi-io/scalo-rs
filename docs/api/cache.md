@@ -41,7 +41,7 @@ above. For raw `Vec<u8>` access, use `moka` directly.
 ## What it isn't
 
 | Use case | Use instead |
-|----------|-------------|
+| ---------- | ------------- |
 | HTTP response cache | A real cache (CDN, proxy) -- those handle revalidation, vary headers, etc. |
 | Distributed cache across pods | An external shared cache -- scalo ships none |
 | Session store | Postgres |
@@ -68,7 +68,7 @@ set just wastes memory.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `Cache::new(config)` | Build from explicit config |
 | `Cache::from_cascade()` | Build from the `cache` config section |
 | `.get::<T>(source, key) -> Option<T>` | Fetch and deserialise |

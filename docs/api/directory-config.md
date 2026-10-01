@@ -15,7 +15,7 @@ written via tooling or git push).
 ## When to use which
 
 | Need | Use |
-|------|-----|
+| ------ | ----- |
 | App config (Kafka brokers, ports, log level) | [Config cascade](../core-pillars/config.md) |
 | Per-environment overrides of app config | Cascade -- `settings.{env}.yaml` |
 | One YAML per logical object, ops adds/removes them | This module |
@@ -143,7 +143,7 @@ directory_config:
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `DirectoryConfigStore::new(config)` | Build a store (async -- opens the directory) |
 | `.start()` | Open watches and start refresh loop |
 | `.stop()` | Shut down watches |

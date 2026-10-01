@@ -28,7 +28,7 @@ pub struct KedaContract {
 `KedaContract::default()` shape:
 
 | Field | Default |
-|-------|---------|
+| ------- | --------- |
 | `enabled` | `true` |
 | `min_replicas` | `1` |
 | `max_replicas` | `10` |
@@ -59,7 +59,7 @@ Where those live in `values.yaml` depends on the app's config shape, so
 the contract says. Each path is dotted and `.Values`-relative:
 
 | Field | Default | Accepts |
-|-------|---------|---------|
+| ------- | --------- | --------- |
 | `enabled` | `true` | `false` drops the Kafka trigger, leaving CPU |
 | `brokers_path` | `config.kafka.brokers` | a list or a comma-separated string |
 | `group_path` | `config.kafka.group_id` | a string |
@@ -229,7 +229,7 @@ checked in order -- circuit breaker first, so it wins over the memory
 gate when both fire:
 
 | Gate | Trigger | Result |
-|------|---------|--------|
+| ------ | --------- | -------- |
 | Circuit-breaker open | Downstream sink unreachable | `0.0` -- scaling won't help |
 | Memory >= threshold | Pod approaching OOM | `100.0` -- scale before kill |
 
@@ -264,7 +264,7 @@ KEDA takes the max; either fires scale-out independently.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `KedaConfig` | Cascade-loaded runtime config (`enabled`, thresholds) |
 | `KedaContract` | Deployment-time subset; `enabled: false` generates what `keda: None` does |
 | `KedaContract::from_config(&cfg)` | Build contract from config, `enabled` included |

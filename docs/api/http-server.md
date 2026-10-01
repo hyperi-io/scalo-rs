@@ -8,7 +8,7 @@ Read this first, because the distinction has bitten people. There are TWO
 servers and they are not interchangeable:
 
 | | Metrics server | `HttpServer` |
-|---|---|---|
+| --- | --- | --- |
 | Started by | `ServiceRuntime` automatically (`metrics` feature) | the app, explicitly |
 | Default bind | `--metrics-addr`, `0.0.0.0:9090` | `0.0.0.0:8080` |
 | Implementation | hand-rolled over tokio, no axum | axum |
@@ -30,7 +30,7 @@ SIGTERM drains in-flight requests before exit.
 What `build_router` actually mounts:
 
 | Path | Wired by | What it returns |
-|------|----------|-----------------|
+| ------ | ---------- | ----------------- |
 | `/livez` | on by default (`enable_health_endpoints`) | 200 if process is alive (no dep checks -- never restart on dep down) |
 | `/readyz` | same | 200 if `ready_flag` is true AND all registered checks pass; 503 otherwise |
 | `/health/detailed` | `health` + `serde_json` | per-check JSON breakdown |
@@ -131,7 +131,7 @@ http_server:
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `HttpServer::new(config)` | Build from explicit config |
 | `HttpServer::bind(addr)` | Build with just a bind address |
 | `.serve(app)` | Run until the future is dropped (merges probes/metrics/config routes) |
