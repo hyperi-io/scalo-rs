@@ -1,10 +1,6 @@
 # Logging
 
-`logger::setup_default()` installs a `tracing-subscriber` once at startup; every
-module then uses `tracing::info!` / `error!` / `#[instrument]` with no handle
-passing. Format is decided at install time by sniffing the terminal: TTY without
-`NO_COLOR` gets coloured human-readable text, everything else (containers, CI,
-pipes) gets line-delimited JSON with RFC 3339 UTC timestamps.
+`logger::setup_default()` installs a `tracing-subscriber` once at startup. Every module then uses `tracing::info!` / `error!` / `#[instrument]` with no handle passing. Output is line-delimited JSON or human-readable text, both with RFC 3339 UTC timestamps. With no format set, an OTEL endpoint gives JSON, a CI runner gives text, a terminal gives text, and anything else (containers, pipes) gets JSON. Text is coloured only on a terminal unless `LOG_COLOR`, `NO_COLOR` or `logger.color` says otherwise. See [Format and colour](#format-and-colour).
 
 The subscriber wraps stderr in a `MaskingWriter` that redacts sensitive field
 values at the write boundary -- both `password=secret123` and
@@ -38,15 +34,45 @@ setup(LoggerOptions {
 | Var | Effect |
 |---|---|
 | `LOG_LEVEL` / `RUST_LOG` | Level filter; falls back to `EnvFilter` for per-module filters (`hyper=warn,my_app=debug`) |
-| `LOG_FORMAT` | `json` / `text` / `auto` (default) |
-| `NO_COLOR` | Disable ANSI colour even on a TTY |
+| `LOG_FORMAT` | `json` / `text` / `auto` (default). Unset, blank, `auto` or unrecognised defers to `logger.format`, then to the derived default |
+| `LOG_COLOR` | Text-mode colour: `true` / `1` / `yes` (any case) is on, any other value off. Outranks `NO_COLOR` and `logger.color` |
+| `NO_COLOR` | Disable ANSI colour, even on a TTY, when `LOG_COLOR` is unset |
 | `LOG_THROTTLE_ENABLED` | Global `tracing-throttle` token bucket (default off) |
 | `LOG_THROTTLE_BURST` | Burst capacity (default 50) |
 | `LOG_THROTTLE_RATE` | Recovery tokens/sec (default 1.0) |
 | `SERVICE_NAME` / `SERVICE_VERSION` | Injected into JSON lines |
 
-`LogFormat::Auto` resolves to `Text` on a TTY with `NO_COLOR` unset, `Json`
-otherwise.
+When config is loaded, `setup_default()` reads `logger.format` and `setup()` reads `logger.color` from the cascade.
+
+---
+
+## Format and colour
+
+These rules match scalo-py's logger.
+
+The format is the first selector that names `json` or `text` (`pretty` and `human` are aliases of `text`):
+
+1. `--log-format` on a [`CommonArgs`](../../src/cli/args.rs) CLI
+2. `LOG_FORMAT`
+3. `logger.format` in config
+
+`auto` and blank defer to the next selector. An unrecognised value fails `CommonArgs::to_logger_options` with an invalid-argument error, and defers in `setup_default()`. With nothing concrete set, the format is derived, first match wins:
+
+1. `OTEL_EXPORTER_OTLP_ENDPOINT` set and not blank: JSON
+2. A CI runner (`CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `CIRCLECI` or `TRAVIS` equal to `true`, or `JENKINS_URL` present): text
+3. stderr is a terminal: text
+4. Anything else: JSON
+
+`LogFormat::Auto` resolves by the same derivation. `setup(opts)` takes `opts.format` as given and reads neither `LOG_FORMAT` nor `logger.format`: an explicit `Json` or `Text` is used as is, and `Auto` goes straight to the derivation.
+
+Colour applies to text output only; JSON is never coloured. First match wins:
+
+1. `LOG_COLOR`: `true`, `1` or `yes` in any case is on, any other value (empty included) is off
+2. `NO_COLOR` present, with any value: off
+3. `logger.color` in config: a bool, a number (non-zero is on), or the strings `LOG_COLOR` accepts
+4. Whether stderr is a terminal
+
+So text piped to a file or another process carries no ANSI escapes unless one of the first three turns colour on.
 
 ---
 
@@ -120,6 +146,7 @@ collapse into one.
 | `logger::setup(opts)` | Explicit install |
 | `LoggerOptions` | `level`, `format`, `add_source`, `enable_masking`, `sensitive_fields`, `span_events`, `throttle`, `service_name`, `service_version` |
 | `LogFormat::{Json, Text, Auto}` | Format; `Auto` resolves on `setup` |
+| `LoggerSettings` | `level`, `format`, `color` under the `logger` config key; `LoggerSettings::from_cascade()` |
 | `ThrottleConfig` | `enabled`, `burst`, `rate`, `max_signatures`, `excluded_fields` |
 | `logger::default_sensitive_fields() -> Vec<String>` | Baseline mask list -- extend, don't replace |
 | `logger::mask_sensitive_string(input, patterns) -> String` | Ad-hoc redaction outside the logger |
