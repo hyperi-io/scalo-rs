@@ -1985,6 +1985,39 @@ mod tests {
         );
     }
 
+    /// The record left out counts as too large and as a dropped dead letter.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn send_batch_counts_the_record_it_leaves_out() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+
+        let config = GrpcConfig::client("http://127.0.0.1:1").with_max_message_size(64);
+        let transport = GrpcTransport::new(&config).await.unwrap();
+        let rec = Record {
+            payload: bytes::Bytes::from(vec![b'x'; 256]),
+            key: None,
+            headers: Vec::new(),
+            metadata: crate::transport::work_batch::RecordMeta {
+                timestamp_ms: None,
+                format: PayloadFormat::Json,
+            },
+        };
+        assert!(transport.send_batch(&[rec]).await.is_filtered_dlq());
+
+        let rendered = handle.render();
+        for series in [
+            r#"transport_message_too_large_total{transport="grpc"} 1"#,
+            r#"pipeline_dead_letters_dropped_total{reason="too_large"} 1"#,
+        ] {
+            assert!(
+                rendered.lines().any(|line| line == series),
+                "{series} missing:\n{rendered}"
+            );
+        }
+    }
+
     #[test]
     fn grpc_config_with_compression() {
         let config = GrpcConfig::server("0.0.0.0:6000").with_compression();

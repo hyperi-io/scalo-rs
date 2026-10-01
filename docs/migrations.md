@@ -793,6 +793,12 @@ A `KafkaTransport` armed through `AckControl::arm` commits each partition only u
 
 **Consumer adjustment** -- none to keep today's behaviour. To hold acknowledgements, move from `run_governed` to `pipeline(..)`, call `.sender(&sender)` for a transport sink, and give the loop a DLQ with `with_dlq`. A hand-rolled loop arms the source before its first `recv` and releases each block through `SourceAck`.
 
+### An `acknowledgements` section under an HTTP or file source warns (behaviour)
+
+`AnyReceiver::from_config` and its armed and governed siblings ignored `<key>.http.acknowledgements` and `<key>.file.acknowledgements` without a word. Each now logs one WARN per process, naming the section and what the source does instead: HTTP answers 200 once a request is queued, and a file source saves the highest read position released, so neither holds its acknowledgement yet. Memory and pipe still warn that they have nothing to hold, now once each, where the two shared one warning.
+
+**Consumer adjustment** -- none in code. The key does nothing under these sources: remove it. An HTTP endpoint that must answer only once its records are delivered is an app's own listener over `Tickets`. See [pipeline/acknowledgements.md](pipeline/acknowledgements.md#which-sources-hold-it).
+
 ### gRPC `send_batch` splits a block over `max_message_size` (BEHAVIOUR CHANGE)
 
 2.12 returned `Fatal` for a block over `max_message_size` and sent none of it. `send_batch` now sends it as several requests, each within the limit. A record over the limit on its own no longer fails the block: it is left out, the rest is sent and the result is `Ok`, and the record is dropped, counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`. A block of nothing but such records returns `FilteredDlq`, and its records count there too.

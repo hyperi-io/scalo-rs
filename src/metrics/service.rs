@@ -127,6 +127,10 @@ impl ServiceMetrics {
             "Source commits that failed after the block was delivered"
         );
         metrics::describe_counter!(
+            "transport_message_too_large_total",
+            "Records over a sender's size ceiling, refused before sending or by the receiver"
+        );
+        metrics::describe_counter!(
             "transport_consumer_rebuilds_total",
             "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with"
         );
@@ -190,6 +194,12 @@ impl ServiceMetrics {
             (
                 "transport_commit_errors_total",
                 "Source commits that failed after the block was delivered",
+                MetricType::Counter,
+                &["transport"],
+            ),
+            (
+                "transport_message_too_large_total",
+                "Records over a sender's size ceiling, refused before sending or by the receiver",
                 MetricType::Counter,
                 &["transport"],
             ),
@@ -849,6 +859,10 @@ mod tests {
                 vec!["transport", "class"],
             ),
             ("test_app_transport_commit_errors_total", vec!["transport"]),
+            (
+                "test_app_transport_message_too_large_total",
+                vec!["transport"],
+            ),
             ("test_app_pipeline_retries_total", vec!["stage"]),
             (
                 "test_app_pipeline_delivery_guarantee",

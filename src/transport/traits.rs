@@ -383,8 +383,9 @@ pub trait TransportReceiver: TransportBase {
     /// - Memory: advances internal sequence
     fn commit(&self, tokens: &[Self::Token]) -> impl Future<Output = TransportResult<()>> + Send;
 
-    /// The source's acknowledgement controls, or `None` for a source with no
-    /// acknowledgement to hold (pipe, memory).
+    /// The source's acknowledgement controls, or `None` for a source that does
+    /// not hold its acknowledgement: pipe and memory have none, and HTTP and
+    /// file do not hold theirs yet.
     ///
     /// See [`super::ack`]. The default is `None`.
     fn ack_control(&self) -> Option<&dyn AckControl> {
