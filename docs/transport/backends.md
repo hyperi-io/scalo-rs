@@ -4,14 +4,16 @@ Six concrete backends behind the
 [transport traits](README.md). Each is gated behind its own
 feature flag — apps pull only what they ship.
 
-| Backend | Feature flag | Native dep | Use case |
-| --------- | -------------- | ------------ | ---------- |
-| Kafka | `transport-kafka` | `librdkafka1` (runtime), `librdkafka-dev` (build) | Production default, persistence, replay |
-| gRPC | `transport-grpc` | None (pure Rust — `tonic`) | Inter-service mesh, low latency |
-| Memory | `transport-memory` | None | Unit tests, same-process pipelines |
-| File | `transport-file` | None | Debugging, audit trails, replay |
-| Pipe | `transport-pipe` | None | Unix pipeline composition |
-| HTTP | `transport-http` | None | Webhook delivery, REST ingest |
+| Backend | Feature flag | Native dep | Use case | Holds its source acknowledgement |
+| --------- | -------------- | ------------ | ---------- | ---------- |
+| Kafka | `transport-kafka` | `librdkafka1` (runtime), `librdkafka-dev` (build) | Production default, persistence, replay | Yes |
+| gRPC | `transport-grpc` | None (pure Rust — `tonic`) | Inter-service mesh, low latency | Yes |
+| Memory | `transport-memory` | None | Unit tests, same-process pipelines | No, none to hold |
+| File | `transport-file` | None | Debugging, audit trails, replay | Not yet |
+| Pipe | `transport-pipe` | None | Unix pipeline composition | No, none to hold |
+| HTTP | `transport-http` | None | Webhook delivery, REST ingest | Not yet |
+
+A source that holds its acknowledgement releases it only once its records are delivered. See [../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#which-sources-hold-it).
 
 The Vector-compat shim lives behind `transport-grpc-vector-compat` —
 it isn't a separate backend, it's a wire-protocol overlay on the
@@ -199,6 +201,7 @@ transport:
 - **`close()`**: refuses every `send` from then on, and keeps what `send` already accepted: `recv` returns it, then `TransportError::Closed`.
 - **`is_healthy()`**: `!closed` — atomic flag flipped by `close()`.
 - **`commit()`**: advances an internal `AtomicU64` sequence.
+- **Acknowledgements**: none to hold. `<key>.memory.acknowledgements` has no effect, and the factory warns once.
 
 Source: [../../src/transport/memory/](../../src/transport/memory/).
 
@@ -226,6 +229,7 @@ transport:
   byte of a line read across dropped calls.
 - **Line bytes**: passed through as read; a line need not be UTF-8.
 - **`is_healthy()`**: `!closed` atomic flag.
+- **Acknowledgements**: not held yet. `commit` and `release` save the highest offset they are given, so a restart reads again from the last position released, but a block released `Errored` is skipped once a later block is delivered. `<key>.file.acknowledgements` has no effect, and the factory warns once.
 
 Source: [../../src/transport/file.rs](../../src/transport/file.rs).
 
@@ -252,6 +256,7 @@ transport:
   returns them.
 - **Line bytes**: passed through as read; a line need not be UTF-8.
 - **`is_healthy()`**: `!closed`.
+- **Acknowledgements**: none to hold. `<key>.pipe.acknowledgements` has no effect, and the factory warns once.
 
 Source: [../../src/transport/pipe.rs](../../src/transport/pipe.rs).
 
@@ -280,7 +285,7 @@ transport:
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
 - **Send failures**: a refused, reset or timed-out connection, and HTTP 408, 429, 502, 503 or 504, are `Backpressured`, so a down endpoint is waited out. Any other non-2xx status, and a request that cannot be built, is `Fatal`.
-- **Acknowledgement**: the server answers 200 once the record is queued for `recv`, not once the consumer reads it. A full queue (`recv_buffer_size`), a held inbound gate, and a closed receiver answer 503 with `Retry-After: 1`.
+- **Acknowledgement**: the server answers 200 once the record is queued for `recv`, not once the consumer reads it, so a crash loses what it answered but had not delivered. A full queue (`recv_buffer_size`), a held inbound gate, and a closed receiver answer 503 with `Retry-After: 1`. It does not hold its answer yet: `<key>.http.acknowledgements` has no effect, and the factory warns once. An endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#a-hand-rolled-loop)).
 - **`close()`**: answers new POSTs with 503, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Open connections finish their in-flight requests on their own, the listener is free when `close()` returns, and a client that never finishes its request does not hold it open. Dropping the transport stops the server too.
 - **Shutdown order**: `close()`, then `recv` until `Closed`, then flush. The `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). Flushing first loses the records still queued.
 - **Counters**: receipts count in `transport_received_*`, never in `transport_sent_total`.

@@ -38,11 +38,25 @@ kafka:
     enabled: true   # the default
 ```
 
-The key sits beside the transport's own section: `AnyReceiver::from_config(key)` reads `<key>.kafka.acknowledgements` or `<key>.grpc.acknowledgements`, and a transport built from an explicit config takes it with `KafkaTransport::with_acknowledgements` or `GrpcTransport::builder(..).acknowledgements(..)`. Pipe and memory have no acknowledgement to hold, and the factory warns once when the key sits under either.
+The key sits beside the transport's own section: `AnyReceiver::from_config(key)` reads `<key>.kafka.acknowledgements` or `<key>.grpc.acknowledgements`, and a transport built from an explicit config takes it with `KafkaTransport::with_acknowledgements` or `GrpcTransport::builder(..).acknowledgements(..)`. Only those two sources hold their acknowledgement ([below](#which-sources-hold-it)). Under a memory, pipe, file or HTTP source the key has no effect, and the factory logs one WARN per backend saying so.
 
 - **On:** the loop arms the source (`AckControl::arm`) before the first `recv`. Kafka then commits each partition only up to its lowest offset not yet released, whatever order releases arrive in, and an `Errored` offset holds the commit below it. A push source answers its sender only on release, once armed. Before that it answers at enqueue, so a push that arrives between the server starting and the loop's `arm` is acknowledged with nothing to deliver it. Build a push source armed instead: `GrpcTransport::builder(..).armed(true)`, or `AnyReceiver::from_config_armed(key)` and `from_config_with_governor_armed(key, governor)`. The loop's own `arm` then changes nothing.
 - **Off:** the source is released at receipt, before the block is processed. A crash or a failed delivery loses what was released.
 - **A source with no acknowledgement:** released after the pieces, as the other run loops commit.
+
+---
+
+## Which sources hold it
+
+| Source | Holds its acknowledgement | `acknowledgements` under it |
+| --- | --- | --- |
+| Kafka | Yes: the offset commit | Applied |
+| gRPC | Yes: the answer to a push | Applied |
+| HTTP | Not yet. The server answers 200 once a request is queued, so a crash loses what it answered but had not delivered | No effect, one WARN |
+| File, as a source | Not yet. It saves the highest read position released: a restart reads again what was not released, but a block released `Errored` is skipped once a later block is delivered | No effect, one WARN |
+| Pipe, memory | No: there is no acknowledgement to hold | No effect, one WARN |
+
+HTTP and file sources are to hold it through `AcknowledgingReceiver`, as Kafka and gRPC do. Until then a pipeline over either reports `best_effort` / `source_cannot_ack`. An HTTP endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([below](#a-hand-rolled-loop)).
 
 ---
 
@@ -70,7 +84,7 @@ At start the loop sets `pipeline_delivery_guarantee{guarantee, reason}` to 1:
 | `at_least_once_local` | `sink_confirms_locally` | The sink confirms a durable local write |
 | `best_effort` | `sink_cannot_confirm` | The sink's `Ok` proves nothing more, including a pipeline with neither `.sender(&sender)` nor `.sink_confirms(..)`. `.sink_confirms(..)` declares a custom sink that does |
 | `best_effort` | `acks_disabled` | `acknowledgements.enabled: false` |
-| `best_effort` | `source_cannot_ack` | Pipe or memory source |
+| `best_effort` | `source_cannot_ack` | Pipe, memory, file or HTTP source |
 | `best_effort` | `unarmed` | A push source with acknowledgements on, run by a loop that does not arm it, so it answers at enqueue |
 
 A write to a sink that cannot confirm still counts as delivered: the metric reports the weaker guarantee rather than refusing to run. The other run loops set only the `unarmed` row.
@@ -100,7 +114,7 @@ A `SourceAck` dropped before its `release` completes -- a panic, or the loop's f
 
 A loop that holds Kafka records across receives before writing them keeps each record's partition lease beside it, taken with `KafkaTransport::lease` when `recv` returns the record. Right before the write it asks `holds`, and discards a record whose lease a revoke has ended: the partition's next owner reads it again from the committed offset, so writing it too duplicates it. The discarded record's share of its block reports `Dropped`. Armed, the transport commits nothing for an offset handed out before its partition's revoke, and the release keeps the copy read again from stalling the partition's commit. See [../transport/backends.md](../transport/backends.md#kafka).
 
-An app's own listener uses `scalo::transport::ack::Tickets`:
+An app's own listener, such as an HTTP endpoint that must answer only once its records are delivered, uses `scalo::transport::ack::Tickets`:
 
 - `admit(bytes, deadline)` before queuing a request, refused past the held-byte ceiling unless nothing is held
 - `ticket.piece()` for each destination send

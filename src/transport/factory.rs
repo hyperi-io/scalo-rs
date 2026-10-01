@@ -983,20 +983,48 @@ async fn armed_grpc(
     .await
 }
 
-/// Warn, once per process, that an `acknowledgements` section sits under a
-/// backend with no acknowledgement to hold.
+/// Why a section under a memory or pipe source has no effect.
 #[cfg(all(
     feature = "config",
     any(feature = "transport-memory", feature = "transport-pipe")
 ))]
-fn warn_acknowledgements_ignored(key: &str, backend: &str) {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
-            section = %format!("{key}.{backend}.acknowledgements"),
-            "acknowledgements has no effect here: this source has no acknowledgement \
-             to hold, so the pipeline reports best effort"
-        );
+const NO_ACKNOWLEDGEMENT_TO_HOLD: &str = "acknowledgements has no effect here: this source has no \
+     acknowledgement to hold, so the pipeline reports best effort";
+
+/// Why a section under an HTTP source has no effect.
+#[cfg(all(feature = "config", feature = "transport-http"))]
+const HTTP_ACKNOWLEDGEMENT_NOT_HELD: &str = "acknowledgements is not supported on an HTTP \
+     source yet: it answers 200 once a request is queued, so a crash loses records answered \
+     but not yet delivered, and the pipeline reports best effort";
+
+/// Why a section under a file source has no effect.
+#[cfg(all(feature = "config", feature = "transport-file"))]
+const FILE_ACKNOWLEDGEMENT_NOT_HELD: &str = "acknowledgements is not supported on a file \
+     source yet: it saves the highest read position released, so a block released Errored is \
+     skipped once a later block is delivered, and the pipeline reports best effort";
+
+/// Warn, once per process and `backend`, when `<key>.<backend>.acknowledgements`
+/// is set on a source that does not hold its acknowledgement.
+#[cfg(all(
+    feature = "config",
+    any(
+        feature = "transport-memory",
+        feature = "transport-pipe",
+        feature = "transport-file",
+        feature = "transport-http"
+    )
+))]
+fn warn_acknowledgements_ignored(
+    key: &str,
+    backend: &str,
+    warned: &std::sync::atomic::AtomicBool,
+    why: &str,
+) {
+    let section = format!("{key}.{backend}.acknowledgements");
+    if crate::config::try_get().is_some_and(|c| c.contains(&section))
+        && !warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(section = %section, "{why}");
     }
 }
 
@@ -1116,13 +1144,17 @@ impl AnyReceiver {
     }
 
     /// Apply the `<key>.<type>.acknowledgements` section to a Kafka or gRPC
-    /// source, and warn once when one sits under a pipe or memory source.
+    /// source, and warn once per backend when one sits under a memory, pipe,
+    /// file or HTTP source, which does not hold its acknowledgement.
     #[cfg(feature = "config")]
     #[cfg_attr(
         not(any(
             feature = "transport-kafka",
+            feature = "transport-grpc",
             feature = "transport-memory",
-            feature = "transport-pipe"
+            feature = "transport-pipe",
+            feature = "transport-file",
+            feature = "transport-http"
         )),
         allow(unused_variables)
     )]
@@ -1145,24 +1177,32 @@ impl AnyReceiver {
             }),
             #[cfg(feature = "transport-memory")]
             Self::Memory(t) => {
-                if crate::config::try_get()
-                    .is_some_and(|c| c.contains(&format!("{key}.memory.acknowledgements")))
-                {
-                    warn_acknowledgements_ignored(key, "memory");
-                }
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                warn_acknowledgements_ignored(key, "memory", &WARNED, NO_ACKNOWLEDGEMENT_TO_HOLD);
                 Ok(Self::Memory(t))
             }
             #[cfg(feature = "transport-pipe")]
             Self::Pipe(t) => {
-                if crate::config::try_get()
-                    .is_some_and(|c| c.contains(&format!("{key}.pipe.acknowledgements")))
-                {
-                    warn_acknowledgements_ignored(key, "pipe");
-                }
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                warn_acknowledgements_ignored(key, "pipe", &WARNED, NO_ACKNOWLEDGEMENT_TO_HOLD);
                 Ok(Self::Pipe(t))
             }
-            #[allow(unreachable_patterns)]
-            other => Ok(other),
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                warn_acknowledgements_ignored(key, "file", &WARNED, FILE_ACKNOWLEDGEMENT_NOT_HELD);
+                Ok(Self::File(t))
+            }
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                warn_acknowledgements_ignored(key, "http", &WARNED, HTTP_ACKNOWLEDGEMENT_NOT_HELD);
+                Ok(Self::Http(t))
+            }
         }
     }
 
