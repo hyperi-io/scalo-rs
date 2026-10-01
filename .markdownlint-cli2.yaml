@@ -11,3 +11,11 @@ ignores:
   - "**/CHANGELOG.md"
   - "ai/**"
   - "ci/**"
+
+# Owning this file opts scalo-rs out of hyperi-ci's own default rule set
+# (src/hyperi_ci/config/markdownlint.yaml), which only applies when a repo
+# has no markdownlint config of its own - so MD013 must be disabled here too.
+# Markdown has no line-width limit in the house style: a paragraph is one
+# line and the editor soft-wraps it.
+config:
+  MD013: false
