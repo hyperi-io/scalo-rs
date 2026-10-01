@@ -17,7 +17,7 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 ## Three backends
 
 | Backend | Feature | Storage |
-|---------|---------|---------|
+| --------- | --------- | --------- |
 | File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, with rotation (`Hourly` default) and gzip on rotation |
 | Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic — per-table (`acme.auth` → `acme.auth.dlq`) or single common topic |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
@@ -50,7 +50,7 @@ Delivery failures are read at every write, at the barrier and at [shutdown](#shu
 ## Modes
 
 | Mode | Behaviour |
-|------|-----------|
+| ------ | ----------- |
 | `Cascade` (default) | Try backends in order (Kafka -> File -> HTTP), stop on the first that takes the entry; an entry the broker never acks goes on to the next |
 | `FanOut` | Write every batch to every enabled backend, succeed if at least one takes the whole batch |
 | `FileOnly` | File backend only — no Kafka dependency |
@@ -124,7 +124,7 @@ A broker or topic ceiling below the producer's `message.max.bytes` is not seen b
 What "accepted" means depends on the backend:
 
 | Backend | Accepted means |
-|---------|----------------|
+| --------- | ---------------- |
 | File | Written to the kernel page cache. No `fsync`, so power loss before write-back can still lose it |
 | Kafka | Acknowledged by the broker, under the producer's `acks` setting. The barrier waits up to `kafka.send_timeout_ms` -- see [The Kafka barrier](#the-kafka-barrier) |
 | HTTP | The endpoint returned a 2xx status. The barrier adds no wait: the write already waited for the response |
@@ -206,7 +206,7 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `Dlq::disabled()` | No-op handle — `send` succeeds, nothing written; each routed entry is counted in `dropped()`, emitted as `dlq_dropped_total{reason="disabled"}`, and logged at ERROR (rate-limited) |
 | `Dlq::spawn(config, service_name, kafka_config, shutdown)` | Build backends, spawn drain, return cloneable handle |
 | `try_send(entry) -> Result<(), DlqError>` | Sync-shape queue submission; `QueueFull` on overflow |

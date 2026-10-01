@@ -23,7 +23,7 @@ drain. Gating the drain deadlocks (you stop the thing that frees
 memory). See the backpressure doctrine in SELF-REGULATION.
 
 | Consumer | Behaviour on `under_pressure()` |
-|----------|--------------------------------|
+| ---------- | -------------------------------- |
 | HTTP server | 503 Service Unavailable |
 | Kafka receiver | Pause partition assignment |
 | `TieredSink` | Spill in-memory buffer to disk |
@@ -40,7 +40,7 @@ The guard publishes the ratio; it owns none of these policies.
 default) auto-detects via `detect_memory_limit`:
 
 | Priority | Source | File |
-|----------|--------|------|
+| ---------- | -------- | ------ |
 | 1 | cgroup v2 | `/sys/fs/cgroup/memory.max` |
 | 2 | cgroup v1 | `/sys/fs/cgroup/memory/memory.limit_in_bytes` |
 | 3 | system memory | `sysinfo::System::total_memory()` |
@@ -62,7 +62,7 @@ Both halves of the pressure ratio come from the kernel. `UsageSource`
 is resolved once per guard, in this order:
 
 | Priority | Source | File | Name in the init log |
-|----------|--------|------|----------------------|
+| ---------- | -------- | ------ | ---------------------- |
 | 1 | cgroup v2 | `/sys/fs/cgroup/memory.current` | `cgroup-v2` |
 | 2 | cgroup v1 | `/sys/fs/cgroup/memory/memory.usage_in_bytes` | `cgroup-v1` |
 | 3 | procfs | `/proc/self/status` `VmRSS` | `proc-status` |
@@ -119,7 +119,7 @@ scalo picks no allocator. The binary does, and jemalloc is the usual pick for a 
 
 The guard does not read the allocator. In a container it reads the kernel's `memory.current`, which counts every page the process holds, arenas the allocator keeps after a free included. An allocator figure such as jemalloc's `stats.allocated` is read only when the binary registers it with `set_heap_source`, and it then replaces the kernel figure. A binary that wants the kernel figure in a container and the allocator figure elsewhere registers the source only when no cgroup usage file is readable.
 
-Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project carries it on as `tikv-jemallocator`, from the same repo: https://github.com/tikv/jemallocator. As of 2026-09-26 `tikv-jemalloc-sys` is at 0.7.1, published 2026-05-25. So `tikv-` is the maintained line, not a side fork.
+Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project carries it on as `tikv-jemallocator`, from the same repo: <https://github.com/tikv/jemallocator>. As of 2026-09-26 `tikv-jemalloc-sys` is at 0.7.1, published 2026-05-25. So `tikv-` is the maintained line, not a side fork.
 
 Three crates, three jobs:
 
@@ -177,7 +177,7 @@ if guard.under_pressure() {
 ```
 
 | Operation | Cost |
-|-----------|------|
+| ----------- | ------ |
 | `try_reserve(n)` | one cached usage read + compare + `fetch_add` on the ledger (rollback on the reservation counter only on rung 4) |
 | `add_bytes(n)` | two `fetch_add` + threshold update |
 | `release(n)` | two saturating `fetch_update` -- over-release floors at zero |
@@ -229,7 +229,7 @@ Env vars:
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `memory::set_heap_source(fn() -> usize) -> bool` | Override the detected source with an allocator reader (set-once; returns false if already set) |
 | `MemoryGuard::new(config)` | Construct; detects the usage source, and the limit if `limit_bytes == 0` |
 | `MemoryGuard::with_usage_source(config, source)` | Construct reading usage from a pinned `UsageSource` |
@@ -256,7 +256,7 @@ Env vars:
 ## Two-layer model
 
 | Layer | Default | Behaviour |
-|-------|---------|-----------|
+| ------- | --------- | ----------- |
 | 1 -- cap allocator | opt-in | Hard cap; last-resort crash via `handle_alloc_error` instead of OOM-kill |
 | 2 -- `MemoryGuard` | on | Cgroup-aware tracking + backpressure signal |
 

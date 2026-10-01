@@ -32,7 +32,7 @@ setup(LoggerOptions {
 `setup_default()` reads:
 
 | Var | Effect |
-|---|---|
+| --- | --- |
 | `LOG_LEVEL` / `RUST_LOG` | Level filter; falls back to `EnvFilter` for per-module filters (`hyper=warn,my_app=debug`) |
 | `LOG_FORMAT` | `json` / `text` / `auto` (default). Unset, blank, `auto` or unrecognised defers to `logger.format`, then to the derived default |
 | `LOG_COLOR` | Text-mode colour: `true` / `1` / `yes` (any case) is on, any other value off. Outranks `NO_COLOR` and `logger.color` |
@@ -141,7 +141,7 @@ collapse into one.
 ## API surface
 
 | Item | Purpose |
-|---|---|
+| --- | --- |
 | `logger::setup_default()` | Env-driven install -- `ServiceApp` calls this |
 | `logger::setup(opts)` | Explicit install |
 | `LoggerOptions` | `level`, `format`, `add_source`, `enable_masking`, `sensitive_fields`, `span_events`, `throttle`, `service_name`, `service_version` |

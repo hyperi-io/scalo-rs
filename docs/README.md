@@ -18,7 +18,7 @@ for how features cascade into one another.
 ## What you get for free
 
 | Wire this at startup | And these come along | No need to |
-|----------------------|----------------------|------------|
+| ---------------------- | ---------------------- | ------------ |
 | `config::setup(opts)` | 7-layer cascade, env-var nesting, `.env`, sensitive masking, hot-reload, `/config` admin endpoint, section registry | Wire figment, write a settings loader, build a reload watcher |
 | `logger::setup_default()` | Structured tracing, JSON or text picked from the OTEL endpoint, CI and the terminal, colour only on a terminal, RFC 3339 timestamps, sensitive-field masking, flooding helpers | Install a tracing subscriber, format JSON, pick a logger crate |
 | `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint, process metrics, cardinality cap, `/metrics/manifest` catalogue | Stand up an exporter, wire a process collector, hand-roll a manifest |

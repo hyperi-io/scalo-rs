@@ -15,7 +15,7 @@ and an app-supplied sink.
 ## Two modes
 
 | API | Parses? | Transform receives | Use case |
-|-----|---------|--------------------|----------|
+| ----- | --------- | -------------------- | ---------- |
 | `process_mid_tier` | Yes (SIMD JSON) | `&mut ParsedMessage` | Loader, archiver, VRL — needs field access |
 | `process_raw` | No | `&Record` | Receiver forwarding, binary protocols, opaque payloads |
 
@@ -54,7 +54,7 @@ configured `known_fields` (`_table`, `_timestamp`, `_source`, `host`,
 `source_type`, `event_type` by default). Hot-path costs:
 
 | Path | Cost |
-|------|------|
+| ------ | ------ |
 | Already interned (`Arc::clone`) | ~20 ns |
 | First occurrence (`Arc::from` + insert) | ~100 ns |
 
@@ -74,7 +74,7 @@ Four async methods drive the engine from a `TransportReceiver`, one
 sink, then the commit. They need the `transport` feature.
 
 | Method | `process` receives | The sink gets | Use |
-|--------|--------------------|---------------|-----|
+| -------- | -------------------- | --------------- | ----- |
 | `run_governed` | `WorkBatch` | Byte-budget sub-blocks with the governor on, the whole block with it off | The default for a self-regulating app |
 | `run_workbatch` | `WorkBatch` | The whole block | On-demand parse: a transform calls `codec::parse` when it needs a field |
 | `run_workbatch_parsed` | `ParsedBatch` (records, parsed payloads, `FieldInterner`) | The whole block | The driver pre-parses the block on the pool |
@@ -195,7 +195,7 @@ pause inside the engine. See [self-regulation.md](../self-regulation.md).
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `BatchEngine::new(cfg)` | Standalone engine — builds its own worker pool |
 | `BatchEngine::with_pool(pool, cfg)` | Reuse an existing pool (preferred when `ServiceRuntime` is available) |
 | `BatchEngine::from_cascade(key)` | Load config from the cascade |

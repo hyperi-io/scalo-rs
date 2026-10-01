@@ -13,7 +13,7 @@ at startup, then handed to every component that needs parallelism
 ## Two APIs
 
 | API | Backend | Use for | Avoid for |
-|-----|---------|---------|-----------|
+| ----- | --------- | --------- | ----------- |
 | `process_batch(items, f)` | rayon `par_iter` | JSON parse, transforms, compression, CEL eval, routing | Anything that needs `.await` |
 | `fan_out_async(items, f)` | tokio `spawn` with concurrency cap | Enrichment lookups, external APIs, storage writes | Pure-CPU loops (steals from the runtime) |
 
@@ -58,7 +58,7 @@ A background controller (`ScalingController`, started by
 `Semaphore::set_permits`.
 
 | Signal | Direction | Step |
-|--------|-----------|------|
+| -------- | ----------- | ------ |
 | `cpu < grow_below` (default 0.60) | up | +2 permits |
 | `grow_below ≤ cpu ≤ shrink_above` (default 0.85) | steady | unchanged |
 | `shrink_above < cpu ≤ emergency_above` (default 0.95) | down | −1 permit |
@@ -144,7 +144,7 @@ just use `runtime.worker_pool`.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `AdaptiveWorkerPool::new(cfg)` | Build pool with explicit config |
 | `AdaptiveWorkerPool::from_cascade(key)` | Build pool from `worker_pool` cascade key |
 | `process_batch(items, f)` | Rayon `par_iter` with permit throttling, results in input order |

@@ -41,7 +41,7 @@ classDiagram
 ```
 
 | Trait | Purpose | Object-safe? |
-|-------|---------|--------------|
+| ------- | --------- | -------------- |
 | `TransportBase` | Lifecycle + introspection -- `close()`, `is_healthy()`, `name()`, `healthcheck()` | No -- `close()` and `healthcheck()` return `impl Future` |
 | `TransportSender` | Add `send(destination, payload)` — async fn in trait | Not via `dyn` — see below |
 | `TransportReceiver` | Add `recv` + `commit`, associated `type Token: CommitToken` | No -- `impl Future` returns, and `Token` differs per backend |
@@ -112,7 +112,7 @@ provenance.
 **Commit semantics**: the caller drives commit. Receive a batch, process it, and once every record in it has been delivered or dead-lettered, call `commit(&tokens)` with all of the batch's tokens. Commit no subset while any record of the batch is still undelivered: Kafka commits the highest offset each partition's tokens carry, so a subset commits past an earlier record of that partition the sink has not taken. Token routing back through the same transport is the contract — commits don't cross transports. Each backend's commit does what's needed:
 
 | Backend | `commit()` effect |
-|---------|-------------------|
+| --------- | ------------------- |
 | Kafka | Commits consumer offsets |
 | gRPC | No-op — no persistence |
 | File | Persists read position to `.pos` sidecar |
@@ -186,7 +186,7 @@ sink stages do 1:1. See [routing.md](routing.md).
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `TransportBase` | `close`, `is_healthy`, `name`, `healthcheck` -- every backend |
 | `TransportSender::send(destination, payload)` | Async send, returns `SendResult` |
 | `TransportReceiver::recv(max)` | Async batch receive, returns `WorkBatch<Token>` (`records` + `commit_tokens` + `dlq_entries`) |

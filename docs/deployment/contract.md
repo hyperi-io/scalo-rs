@@ -29,7 +29,7 @@ Current version is **3** (the field defaults to 3). Bump it when the
 struct shape changes in a way that breaks downstream consumers.
 
 | Version | Notes |
-|---------|-------|
+| --------- | ------- |
 | 1 | Initial shape -- no `image_profile`, no `oci_labels` |
 | 2 | `ImageProfile`, `OciLabels`, `SecretGroupContract` |
 | 3 | Current - adds `config_schema` + `capabilities` |
@@ -59,7 +59,7 @@ flowchart LR
 ```
 
 | Tier | Producer | Status |
-|------|----------|--------|
+| ------ | ---------- | -------- |
 | 1 | scalo (this crate) -- Rust services emit the contract from their config struct | **Shipped** |
 | 2 | scalo-py -- Python services emit the same contract shape | **Shipped** |
 | 3 | hyperi-ci templater -- bash/TS/Go services emit the contract via templating | **Roadmap** |
@@ -130,10 +130,10 @@ let contract = DeploymentContract {
 ### Fields
 
 | Field | Type | Default | Notes |
-|-------|------|---------|-------|
+| ------- | ------ | --------- | ------- |
 | `schema_version` | `u32` | `3` | CI rejects an unsupported version |
 | `app_name` | `String` | required | Matches `Chart.yaml` `name`; image repo segment |
-| `binary_name` | `String` | `""` -> falls back to `app_name` via `.binary()` |
+| `binary_name` | `String` | `""` | Falls back to `app_name` via `.binary()` |
 | `description` | `String` | `""` | Chart description |
 | `metrics_port` | `u16` | required | Metrics + health listen port |
 | `health` | `HealthContract` | default | Probe paths -- see below |
@@ -158,7 +158,7 @@ let contract = DeploymentContract {
 `HealthContract` fields:
 
 | Field | Default | Consumed by |
-|-------|---------|-------------|
+| ------- | --------- | ------------- |
 | `liveness_path` | `/livez` | Dockerfile `HEALTHCHECK`, Helm `livenessProbe` AND `startupProbe` |
 | `readiness_path` | `/readyz` | Helm `readinessProbe` |
 | `metrics_path` | `/metrics` | Prometheus scrape annotation in `values.yaml` |
@@ -186,7 +186,7 @@ Secret per backend -- Kafka credentials, ClickHouse password, Vault
 token).
 
 | Field | Purpose |
-|-------|---------|
+| ------- | --------- |
 | `group_name` | Section name in `values.yaml`, helper template suffix (`kafkaSecretName`) |
 | `env_vars[].env_var` | The full env var name injected into the pod (`EVENT_LOADER__KAFKA__PASSWORD`) |
 | `env_vars[].key_name` | Field name in `values.yaml.<group>.secretKeys.<key_name>` |
@@ -215,7 +215,7 @@ extra_ports: vec![
 A service with two transports binds its push listener on one of them only. Without a gate the port lands in every artefact anyway, so the Service publishes a port that refuses connections.
 
 | Condition | Builder | Holds when the value |
-|---|---|---|
+| --- | --- | --- |
 | `Enabled { path }` | `.when_enabled(path)` | counts as true -- anything but false, null, zero or empty |
 | `Equals { path, value }` | `.when_equals(path, value)` | as a string, equals `value` |
 | `OneOf { path, values }` | `.when_one_of(path, values)` | as a string, is one of `values` (for a setting with an alias) |
@@ -225,7 +225,7 @@ A service with two transports binds its push listener on one of them only. Witho
 Gate `equals` and `one_of` on a string or boolean setting. Both compare the chart's `toString` of the value, and Helm reads a large number in `values.yaml` as a float, so `1000000` in the config prints as `1e+06` and never matches. A numeric gate compares unreliably.
 
 | Artefact | A gated port |
-|---|---|
+| --- | --- |
 | chart `Deployment` + `Service` | wrapped in `{{- if <condition> }}`, so it renders only when the listener is on |
 | Dockerfile + runtime stage | left out of `EXPOSE`, listed in a comment right under it with its condition |
 | `container-manifest.json` | left out of `expose_ports`, listed under `conditional_ports` (key present only when a port is gated) |
@@ -291,7 +291,7 @@ registry and base image from `settings.yaml` rather than baking them into
 source.
 
 | Function | Cascade key | Default |
-|----------|-------------|---------|
+| ---------- | ------------- | --------- |
 | `image_registry_from_cascade()` | `deployment.image_registry` | `ghcr.io/hyperi-io` |
 | `base_image_from_cascade()` | `deployment.base_image` | `debian:trixie-slim@sha256:...` (`DEFAULT_BASE_IMAGE`) |
 | `resolve_base_distro(base_image)` | `deployment.base_distro` | derived from `base_image` |
@@ -312,7 +312,7 @@ reference carries no codename.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `DeploymentContract` | Top-level contract struct |
 | `DeploymentContract::with_dev_profile()` | Clone with `ImageProfile::Development` |
 | `DeploymentContract::to_json()` / `to_yaml()` | Serialise for CI consumption |

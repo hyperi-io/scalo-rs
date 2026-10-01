@@ -22,7 +22,7 @@ on `token.cancelled()` in every loop.
 ## Pre-stop delay
 
 | Detection | Default | Override |
-|---|---|---|
+| --- | --- | --- |
 | K8s (via [`env::runtime_context().is_kubernetes()`](../../src/env.rs)) | 5 seconds | `PRESTOP_DELAY_SECS` |
 | Docker / bare metal | 0 (immediate cancel) | `PRESTOP_DELAY_SECS` |
 
@@ -87,7 +87,7 @@ A future polled by `select!` and dropped when another arm wins must be safe to
 drop at any await point. Most tokio primitives are; a few are not.
 
 | Future | Cancel-safe? | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `mpsc::Receiver::recv` | Yes | Drop abandons the wait |
 | `oneshot::Receiver` | Yes | |
 | `time::sleep` | Yes | |
@@ -118,7 +118,7 @@ scalo::shutdown::is_shutdown();    // check state without awaiting
 ## API surface
 
 | Item | Purpose |
-|---|---|
+| --- | --- |
 | `shutdown::install_signal_handler() -> CancellationToken` | Install SIGTERM/SIGINT handler; spawn the wait task; return the global token |
 | `shutdown::token() -> CancellationToken` | Clone the global token (created lazily if no handler installed) |
 | `shutdown::trigger()` | Cancel the global token |
@@ -127,7 +127,7 @@ scalo::shutdown::is_shutdown();    // check state without awaiting
 | `CancellationToken::child_token()` | Scoped cancellation not affecting the parent |
 
 | Var | Effect |
-|---|---|
+| --- | --- |
 | `PRESTOP_DELAY_SECS` | Override pre-stop delay (default 5 in K8s, 0 elsewhere) |
 
 ---

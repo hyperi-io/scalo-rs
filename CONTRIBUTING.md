@@ -103,13 +103,13 @@ By making a contribution to this project, you certify that:
 You must sign off each commit to indicate your acceptance of the DCO. Combine
 the signoff with your conventional commit message:
 
-```
+```bash
 git commit --signoff -m "feat(auth): add two-factor authentication"
 ```
 
 This produces:
 
-```
+```text
 feat(auth): add two-factor authentication
 
 Signed-off-by: Your Name <your.email@example.com>
@@ -117,7 +117,7 @@ Signed-off-by: Your Name <your.email@example.com>
 
 Make sure your Git configuration has your correct name and email:
 
-```
+```bash
 git config --global user.name "Your Name"
 git config --global user.email "your.email@example.com"
 ```
@@ -152,7 +152,7 @@ HyperI projects gate every push through CI (lint, format, tests, secret scan,
 dependency audit, build). Run the SAME checks locally first so your change lands
 green instead of bouncing:
 
-```
+```bash
 hyperi-ci check
 ```
 

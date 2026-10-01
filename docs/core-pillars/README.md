@@ -9,7 +9,7 @@ metrics registry. Making them global removes the plumbing that every service
 would otherwise write, identically, and get subtly wrong.
 
 | Doc | Covers |
-|---|---|
+| --- | --- |
 | [config.md](config.md) | 7-layer cascade, hot-reload, section registry, `/config` endpoint |
 | [logging.md](logging.md) | tracing setup, JSON/text autodetect, field masking, flood control |
 | [metrics.md](metrics.md) | Prometheus exporter, manifest catalogue, cardinality cap |

@@ -11,7 +11,7 @@ This doc is the model — what's wired, how, and what the consequences are.
 ## The singletons
 
 | Pillar | Singleton mechanism | Initialiser | Reader |
-|--------|---------------------|-------------|--------|
+| -------- | --------------------- | ------------- | -------- |
 | Config | `OnceLock<Config>` | `config::setup(opts)` | `config::get`, `T::from_cascade()`, `Config::unmarshal_key_registered` |
 | Logger | Global `tracing` subscriber | `logger::setup_default()` | `tracing::info!`, `warn!`, `error!`, `debug!`, `trace!` macros |
 | Metrics | Global `metrics` recorder | `MetricsManager::new("app")` | `metrics::counter!`, `gauge!`, `histogram!` macros |
@@ -67,7 +67,7 @@ means a `Transport` impl ships with metrics-emission baked in, and the
 `ServiceRuntime::build`, which `run_app` calls, is the one-stop wire-up. It pulls in:
 
 | Singleton | Action |
-|-----------|--------|
+| ----------- | -------- |
 | Logger | Already installed by `run_app` before `ServiceRuntime::build` runs |
 | Config | Already loaded by `app.load_config` before `ServiceRuntime::build` runs |
 | Metrics | `MetricsManager::with_config(...)` built from the `metrics` config section, bare names unless `metrics.namespace` sets a prefix, with the scalo runtime metric set described |
@@ -100,7 +100,7 @@ are tools you compose into your `run_service`.
 ## The "you get this for free" matrix
 
 | You did this | You got this — no extra wiring |
-|--------------|-------------------------------|
+| -------------- | ------------------------------- |
 | `config::setup(opts)` | 7-layer cascade, env-var nesting, `.env`, sensitive masking, hot-reload, `/config` admin endpoint, section registry |
 | `logger::setup_default()` | Structured tracing, JSON/text autodetect, RFC 3339 timestamps, masking, flood control |
 | `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint, process metrics, cardinality cap, `/metrics/manifest` |
@@ -166,6 +166,4 @@ that has one), the auto-wiring contract is:
 5. **If the module is long-lived**, take a `CancellationToken` argument
    (or grab it off the runtime) and select on it in your main loop.
 
-Follow that contract and your module ships with full observability the
-moment the consumer wires `MetricsManager::new` + `logger::setup_default`
-+ `config::setup`. No extra plumbing.
+Follow that contract and your module ships with full observability the moment the consumer wires `MetricsManager::new` + `logger::setup_default` + `config::setup`. No extra plumbing.

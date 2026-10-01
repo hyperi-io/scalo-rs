@@ -10,7 +10,7 @@ dependencies pin a single version each. Duplicates fall into three buckets.
 ## 1. Actionable (transitive, upgrade path exists)
 
 | Duplicate | Pulled by | Action |
-|-----------|-----------|--------|
+| ----------- | ----------- | -------- |
 | `reqwest 0.12` (alongside our `0.13`) | `opentelemetry-otlp 0.31` -> `opentelemetry-http 0.31` | Bump OTLP to 0.32 when it lands on reqwest 0.13 (we pin `>=0.31, <0.32`). Until then unavoidable -- OTLP owns the old reqwest. |
 | `sysinfo 0.28` (alongside our `0.39`) | `yaque 0.6.6` (spool/disk-queue) | yaque pins old sysinfo. Track yaque updates, or revisit the spool backend. Low impact (compiled once, not on the hot path). |
 

@@ -40,9 +40,9 @@ flowchart LR
 ```
 
 | Tier | Cost per message | Operations | Config gate |
-|------|------------------|------------|-------------|
+| ------ | ------------------ | ------------ | ------------- |
 | **1** | ~50-100 ns | `has(field)`, `!has(field)`, `field == "literal"`, `field != "literal"`, `field.startsWith(...)`, `field.endsWith(...)`, `field.contains(...)` -- `field` may be a dotted path such as `a.b` | Always on |
-| **2** | ~500 ns - 1 us | Compound CEL (`&&`, `||`), numeric comparison, multi-field access, `size()` | `transport.filter_tiers.allow_cel_filters_in` / `_out` |
+| **2** | ~500 ns - 1 us | Compound CEL (`&&`, `\|\|`), numeric comparison, multi-field access, `size()` | `transport.filter_tiers.allow_cel_filters_in` / `_out` |
 | **3** | ~5-50 us | `matches()` (regex), `exists()`, `filter()`, `map()`, `all()`, `exists_one()`, `timestamp()`, `duration()` | `transport.filter_tiers.allow_complex_filters_in` / `_out` (implies tier-2) |
 
 Tier 1 uses `sonic-rs::get_from_slice` for field extraction plus
@@ -251,7 +251,7 @@ its own config section's `filters_in` / `filters_out` plus the
 `TransportFilterTierConfig::from_cascade()`:
 
 | Transport | Source |
-|-----------|--------|
+| ----------- | -------- |
 | Kafka | [src/transport/kafka/mod.rs](../../src/transport/kafka/mod.rs) |
 | gRPC | [src/transport/grpc/mod.rs](../../src/transport/grpc/mod.rs) |
 | Memory | [src/transport/memory/mod.rs](../../src/transport/memory/mod.rs) |
@@ -287,7 +287,7 @@ converts it to JSON upstream.
 Open gaps in the engine, by status:
 
 | # | Item | Status | Notes |
-|---|------|--------|-------|
+| --- | ------ | -------- | ------- |
 | 7 | Constant-time string comparison for sensitive fields | Pending | Low risk; door open for timing attacks on high-entropy field values |
 | 8 | Log masking for filter expression content | Pending | Expression text logged as-is at startup; expression authors should treat expressions as non-secret |
 | 9 | Pre-quoted bytes fast path for `field == "value"` | Partial | `FieldExists` / `FieldNotExists` already use pre-compiled `memmem::Finder`; `FieldEquals` still uses SIMD extract + string compare |

@@ -80,7 +80,7 @@ DEPLOYMENT__BASE_DISTRO=trixie <app> generate-artefacts --output-dir ci-artefact
 What the release decides:
 
 | Release | Confluent suite | libgit2 | libssl |
-|---------|-----------------|---------|--------|
+| --------- | ----------------- | --------- | -------- |
 | `trixie` (default) | `bookworm` | `libgit2-1.9` | `libssl3t64` |
 | `bookworm` | `bookworm` | `libgit2-1.5` | `libssl3` |
 | `noble` | `noble` | `libgit2-1.7` | `libssl3t64` |
@@ -97,7 +97,7 @@ to `libssl3t64` on trixie and noble.
 ## Feature -> package map
 
 | Feature(s) | APT repo | Runtime packages |
-|------------|----------|-------------------|
+| ------------ | ---------- | ------------------- |
 | `transport-kafka`, `dlq-kafka` (or any `dlq-kafka-*`) | Confluent (`packages.confluent.io/clients/deb`) | `librdkafka1`, libssl, `zlib1g` |
 | `spool`, `tiered-sink` | -- | `libzstd1` |
 | `http`, `secrets*`, `transport*`, `otel*` | -- | libssl, `zlib1g` |
@@ -157,7 +157,7 @@ package" in a build log.
 ## Build host vs runtime host
 
 | Where | Needs |
-|-------|-------|
+| ------- | ------- |
 | **Build host** (CI runner doing `cargo build`) | `-dev` packages: `librdkafka-dev`, `libgit2-dev`, `libzstd-dev`, `libssl-dev`, `zlib1g-dev` |
 | **Runtime host** (the container image) | `.so` runtimes: `librdkafka1`, `libzstd1`, `zlib1g`, plus the release-specific libgit2 / libssl from the table above (on trixie: `libgit2-1.9`, `libssl3t64`) |
 
@@ -200,7 +200,7 @@ If you OVERRIDE `deployment.base_image`, keep its glibc >= the build
 host's (debian trixie):
 
 | Runtime image | Safe on a debian-trixie builder? |
-|---|---|
+| --- | --- |
 | `debian:trixie-slim@sha256:...` (default) | yes -- same release |
 | a newer Debian release | yes -- newer glibc |
 | an OLDER Debian, or Ubuntu | no -- older glibc; build on that base too |
@@ -285,7 +285,7 @@ drift-detection pattern.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `NativeDepsContract` | The contract -- `apt_repos`, `apt_packages`, `distro`, `unresolved_base_image` |
 | `NativeDepsContract::for_features(&[..], BaseDistro)` | Build for a stated release, nothing inferred |
 | `NativeDepsContract::for_scalo_features(&[..], base)` | Build from feature names, resolving the release |

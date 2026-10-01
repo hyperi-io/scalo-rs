@@ -15,7 +15,7 @@ reaching for `tokio::spawn` + a custom channel.
 ## Decision matrix
 
 | Workload shape | Use |
-|----------------|-----|
+| ---------------- | ----- |
 | Stateless function | Just call the function. No primitive needed. |
 | Per-request short-lived work | `tokio::spawn` + `JoinSet` |
 | Pure CPU batch | `rayon::par_iter` |
@@ -197,7 +197,7 @@ join.join().await?;
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `BackgroundSink::spawn(drain, config, shutdown)` | Spawn the actor task; returns `(BackgroundSink, BackgroundSinkHandle)` |
 | `.try_push(msg)` | Hot-path push, returns immediately |
 | `.push_blocking(msg)` | Await capacity |

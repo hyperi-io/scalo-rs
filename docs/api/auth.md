@@ -80,7 +80,7 @@ resolution and per-deployment substitution happen in the consumer before
 the exchange is built.
 
 | Exchange | Protocol |
-|---|---|
+| --- | --- |
 | `Static` | No I/O. A key the consumer already resolved, held for the life of the process |
 | `ClientCredentials` | OAuth2 client credentials (RFC 6749 s4.4) -- a form POST of `grant_type`, `client_id`, `client_secret`, optional `scope` |
 | `TokenPost` | A form POST of exactly the fields handed to it -- the generic shape |
@@ -189,7 +189,7 @@ link-local address.
 ## Placements
 
 | Placement | Puts the credential |
-|---|---|
+| --- | --- |
 | `HeaderPlacement::bearer(source)` | `Authorization: Bearer <secret>` |
 | `HeaderPlacement::new(name, prefix, source)` | `<name>: <prefix><secret>`, prefix empty for the providers wanting a bare key |
 | `QueryPlacement::new(name, source)` | `?<name>=<secret>`, appended to the built URL and encoded, so the URL a caller holds never carries it |
@@ -270,7 +270,7 @@ never left. Any other refusal is final: it will be the same refusal next
 attempt.
 
 | `AuthError` | Meaning | Transient |
-|---|---|---|
+| --- | --- | --- |
 | `Unreachable` | The endpoint could not be reached, or the transport failed | yes |
 | `TimedOut` | The acquisition did not finish inside the exchange's own deadline | yes |
 | `Shared` | The acquisition this caller waited on failed; carries whether that failure was transient | as the failure it reports |

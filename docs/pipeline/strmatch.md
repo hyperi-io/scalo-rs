@@ -15,10 +15,10 @@ classifiers, and field filters across the data plane.
 ## Four tiers
 
 | Tier | Engine | Typical budget¹ | What classifies here |
-|------|--------|-----------------|----------------------|
+| ------ | -------- | ----------------- | ---------------------- |
 | `Byte` | `memchr` / `memchr2` / `memchr3` / single-byte `starts_with` / `ends_with` / `==` | ≤ 30 ns | `/x/`, `/[xy]/`, `/[xyz]/`, `/^/`, `/$/` on single byte |
 | `Literal` | `memmem::Finder` / multi-byte `starts_with` / `ends_with` / `==` | ≤ 200 ns | `/AKIA/`, `/^https:/`, `/error$/`, `/^GET /` |
-| `LiteralSet` | `aho-corasick` over ≥ 2 literals (one linear scan) | ≤ 500 ns | `/AKIA|ghp_|sk_live_/`, anchored alternation, extractor-derived literal sets |
+| `LiteralSet` | `aho-corasick` over ≥ 2 literals (one linear scan) | ≤ 500 ns | `/AKIA\|ghp_\|sk_live_/`, anchored alternation, extractor-derived literal sets |
 | `Regex` | `regex_automata::meta::Regex` (full engine, with its own prefilter pipeline) | engine-bounded | Word boundaries, multi-line anchors, unbounded quantifiers, large unicode classes, everything else |
 
 ¹Budgets are typical for a modern x86 server on a ~200-byte haystack.
@@ -75,7 +75,7 @@ let scrubber = StrMatcher::builder()
 `OnBelowMin` choices:
 
 | Policy | Effect |
-|--------|--------|
+| -------- | -------- |
 | `Allow` (default) | Build succeeds; anti-spam protocol still emits up to 10 WARNs per process |
 | `Warn` | Build succeeds; always WARN (bypasses anti-spam cap) |
 | `Reject` | Build fails with `BuildError::TierTooLow { pattern, wanted, got, reason, hint }` |
@@ -133,7 +133,7 @@ detection.
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `StrMatcher::new(pattern)` | Compile with defaults |
 | `StrMatcher::builder() -> StrMatcherBuilder` | Custom build with `min_tier` / `on_below_min` / case-folding |
 | `StrMatcher::is_match(hay) -> bool` | Hot path — single match arm, 1–2 instructions for Byte / Literal |

@@ -75,7 +75,7 @@ an explicit key via `from_cascade_key`. Defaults preserve behaviour: no
 concurrency cap, ARC off, queue-don't-shed.
 
 | Key | Default | Meaning |
-|-----|---------|---------|
+| ----- | --------- | --------- |
 | `max_concurrency` | `0` | Static in-flight cap; `0` = uncapped. Ignored when `adaptive` is set |
 | `adaptive` | unset | Enables ARC (AIMD limiter), replacing the static gate |
 | `attempt_timeout_ms` | `30000` | Per-attempt timeout |

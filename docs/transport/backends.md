@@ -5,7 +5,7 @@ Six concrete backends behind the
 feature flag — apps pull only what they ship.
 
 | Backend | Feature flag | Native dep | Use case |
-|---------|--------------|------------|----------|
+| --------- | -------------- | ------------ | ---------- |
 | Kafka | `transport-kafka` | `librdkafka1` (runtime), `librdkafka-dev` (build) | Production default, persistence, replay |
 | gRPC | `transport-grpc` | None (pure Rust — `tonic`) | Inter-service mesh, low latency |
 | Memory | `transport-memory` | None | Unit tests, same-process pipelines |
@@ -25,7 +25,7 @@ The picture below applies to the Kafka and gRPC backends — the other
 four don't make a transit-network choice.
 
 | Model | Persistence | Replay | Latency | Failure mode | Use when |
-|-------|-------------|--------|---------|--------------|----------|
+| ------- | ------------- | -------- | --------- | -------------- | ---------- |
 | **Kafka-mediated** | Yes (broker disk) | Yes | ~ms | Producer keeps writing if consumer down | Default for staged pipelines, audit-trail required, consumer-failure tolerance matters |
 | **Direct gRPC** | No | No | ~µs | Sender fails fast if receiver down | Tight data-plane mesh, latency-sensitive, broker overhead unacceptable |
 
@@ -84,7 +84,7 @@ transport:
 librdkafka reconnects and rejoins by itself, so an outage ends neither the consumer nor the producer.
 
 | Call | Broker unavailable | Returned as an error |
-|------|--------------------|----------------------|
+| ------ | -------------------- | ---------------------- |
 | `recv` | Empty batch; the next poll waits a jittered backoff, 100 ms doubling to 2 s | ACL failure, a missing topic the consumer may not create, bad config, an unlisted code: `TransportError::Recv`, readiness untouched. A librdkafka fatal error rebuilds the consumer and returns an empty batch; a fenced static member returns `TransportError::Recv` and fails readiness |
 | `send` / `send_batch` | `Backpressured` once the queue stays full 5 s or a record outlives `message.timeout.ms` (default 300 s) | ACL or permanent topic error: `Fatal`; oversize record: `FilteredDlq` |
 | `commit` | Retried with the same backoff for up to 60 s, never after `close()` | Once that runs out, or when a newer group generation owns the partitions: `TransportError::Commit`, which the `BatchEngine` driver logs and carries on from |
@@ -164,7 +164,7 @@ Armed, a `PushEvents` is held like a native push, over the same registry, ceilin
 `send_events` fails with `TransportError::Send`, which does not say whether a resend can succeed. `send_events_status` fails with the gRPC status instead, and `VectorCompatClient::is_permanent_rejection(&status)` names the refusals no resend clears:
 
 | Code | Permanent | Why |
-|---|---|---|
+| --- | --- | --- |
 | `DataLoss` | yes | Vector's `vector` source answers it when a sink it feeds rejected the events |
 | `InvalidArgument` | yes | the source cannot use the request |
 | `OutOfRange` | yes | the request is over the source's message-size limit |

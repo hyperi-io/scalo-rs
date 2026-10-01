@@ -48,7 +48,7 @@ flowchart LR
 ```
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `metrics-core` | `metrics` crate + macros (`counter!`, `gauge!`, `histogram!`). Emit-only — no exporter |
 | `metrics-process` | Above + `sysinfo` for cgroup-aware process gauges (RSS, CPU, FDs) |
 | `metrics` | Above + Prometheus exporter, `/metrics` HTTP endpoint, manifest dump |
@@ -65,7 +65,7 @@ flowchart LR
 ```
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio) with pressure-based scaling |
 | `worker-batch` | Above + `BatchEngine` (SIMD JSON via `sonic-rs`, field interning via `dashmap`) and the `parse_guard` JSON depth pre-check (`wide`) |
 | `worker` | Alias for `worker-batch` — back-compat |
@@ -79,7 +79,7 @@ flowchart LR
 ```
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `cli` | `clap`-based `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
 | `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + shutdown + governor + sink-stack + lifecycle`). The worker pool is opt-in: add `worker-pool`, or `worker-batch` for the pool plus `BatchEngine` |
 | `lifecycle` | Idle-until-configured gate (`WorkState`, `IdleGate`, `pipeline_idle`) — folded into `cli-service` |
@@ -88,7 +88,7 @@ flowchart LR
 ### Transport
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `transport` | Base trait architecture, factory, `AnySender`, and the `parse_guard` JSON depth pre-check (`wide`) |
 | `transport-trace` | Above + W3C traceparent propagation (pulls `opentelemetry`) |
 | `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends — each pulls only its own deps |
@@ -101,7 +101,7 @@ production apps list only what you actually use.
 ### DLQ
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `dlq` | File backend (always available) |
 | `dlq-kafka` | Above + Kafka backend (pulls `transport-kafka`) |
 | `dlq-http` | Above + HTTP backend (pulls `reqwest`) |
@@ -109,7 +109,7 @@ production apps list only what you actually use.
 ### Secrets
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `secrets` | `SecretsManager` trait + file backend |
 | `secrets-vault` | Above + OpenBao/Vault backend (`vaultrs`) |
 | `secrets-aws` | Above + AWS Secrets Manager backend (`aws-sdk-secretsmanager`) |
@@ -118,7 +118,7 @@ production apps list only what you actually use.
 ### OpenTelemetry
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `otel` | Umbrella — SDK, OTLP exporter |
 | `otel-metrics` | Above + bridge `metrics` crate → OTLP |
 | `otel-tracing` | Above + bridge `tracing` crate → OTLP (closes the W3C distributed-tracing chain when paired with `transport-trace`) |
@@ -130,7 +130,7 @@ For full distributed tracing through Kafka/gRPC, enable
 ### Directory config
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `directory-config` | YAML directory store with file locking |
 | `directory-config-git` | Above + `git2` for commit/push of config changes |
 
@@ -139,7 +139,7 @@ For full distributed tracing through Kafka/gRPC, enable
 ## Standalone features
 
 | Feature | Adds |
-|---------|------|
+| --------- | ------ |
 | `geoip-download` | MMDB database provisioning -- pulls `http` (the shared `HttpClient`), plus `flate2` and `tar` for the provider archive formats. Files onto disk only, no lookup engine. See [api/geoip-download.md](api/geoip-download.md) |
 | `auth` | Credential acquisition and placement -- pulls `http` (an exchange is an `HttpClient` call, a placement its signing hook), `arc-swap` for the held credential, and reqwest's `form` and `query` encoders. No signing scheme and no crypto dependency. See [api/auth.md](api/auth.md) |
 
@@ -164,7 +164,7 @@ libraries. The build host needs `-dev` packages; the deployment host
 needs runtime libs.
 
 | Feature | `-sys` crate | Build package | Runtime package |
-|---------|--------------|---------------|-----------------|
+| --------- | -------------- | --------------- | ----------------- |
 | `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (≥ 2.12.1, Confluent APT repo) | `librdkafka1` |
 | `directory-config-git` | `libgit2-sys` | `libgit2-dev` | `libgit2-1.9` (release-specific) |
 | `spool` / `tiered-sink` | `zstd-sys` | `libzstd-dev` | `libzstd1` |
@@ -276,10 +276,7 @@ A handful of dependencies aren't visible from the feature name alone:
   pool, so it needs a tokio runtime.
 - `dlq` requires `concurrency` (for the `BackgroundSink` actor that
   drains queued entries).
-- `cli-service` reaches across the stack -- `metrics + memory + scaling
-  + shutdown + governor + sink-stack + lifecycle`. It does not pull
-  `worker-pool`, so rayon is compiled only by a service that asks for
-  `worker-pool` or `worker-batch`.
+- `cli-service` reaches across the stack -- `metrics + memory + scaling + shutdown + governor + sink-stack + lifecycle`. It does not pull `worker-pool`, so rayon is compiled only by a service that asks for `worker-pool` or `worker-batch`.
 - `top` pulls `cli-service` (and through that, the full L2 runtime).
 - `expression` pulls the `cel` crate; needed only if any transport
   filter uses Tier 2 or Tier 3 CEL (see

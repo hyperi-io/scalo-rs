@@ -11,7 +11,7 @@ The cascade is **7 layers** -- one typed view assembled from CLI args, env vars,
 ## Cascade order (highest priority first)
 
 | # | Source | Notes |
-|---|--------|-------|
+| --- | -------- | ------- |
 | 1 | CLI args | `Config::merge_cli(args)` after `Config::new` |
 | 2 | Environment variables | Prefix from `ConfigOptions::env_prefix`, double-underscore for nesting (`DFE_LOADER__KAFKA__BROKERS`) |
 | 3 | `.env` file | Loaded by `dotenvy` into env vars -- same precedence as layer 2 |
@@ -22,7 +22,7 @@ The cascade is **7 layers** -- one typed view assembled from CLI args, env vars,
 
 Each YAML layer is searched in this order, first match wins:
 
-```
+```text
 ./<name>.yaml             ./<name>.yml
 ./config/<name>.yaml      ./config/<name>.yml
 /config/<name>.yaml       /config/<name>.yml
@@ -167,7 +167,7 @@ inside the cluster. See [http_server/config.rs](../../src/http_server/config.rs)
 ## API surface
 
 | Item | Purpose |
-|------|---------|
+| ------ | --------- |
 | `config::setup(opts)` | One-shot init -- builds the cascade into the global `OnceLock` |
 | `config::get() -> &Config` | Reader, panics if not initialised |
 | `config::try_get() -> Option<&Config>` | Reader, `None` if not initialised |

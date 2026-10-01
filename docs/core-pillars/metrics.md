@@ -20,7 +20,7 @@ features are on; container metrics read cgroup v1 and v2 transparently.
 ## Feature tiers
 
 | Feature | Adds | Use |
-|---|---|---|
+| --- | --- | --- |
 | `metrics-core` | Macros + `MetricRegistry` | Library crates that record but don't host the exporter |
 | `metrics-process` | `metrics-core` + sysinfo process probe | Single binaries wanting RSS/CPU without an HTTP server |
 | `metrics` | `metrics-process` + Prometheus exporter + `/metrics` server | Services |
@@ -133,7 +133,7 @@ A name with no labels is one series, whichever handle writes it, so two call sit
 for one event double the count:
 
 | Series | Counted by | Not also by |
-|---|---|---|
+| --- | --- | --- |
 | `records_received_total` | `ServiceMetrics::records_received`, once per record | `AppMetrics::record_received`, or an `increment` on `AppMetrics::records_received`. That field is the same series, for an app that sets the total with `absolute` |
 | `transport_*` for a scalo transport | the transport itself, under its own `transport` label | the matching `ServiceMetrics::transport_*` method |
 | `transport_*` for a sink or source scalo does not provide | the `ServiceMetrics::transport_*` methods | -- |
@@ -150,7 +150,7 @@ A counter emitted both with and without labels is two series under one name, and
 The transport layer counts both events AND bytes, in both directions. All carry the `transport` label (backend kind: `kafka` / `grpc` / `http` / `file` / `pipe`). A record sent through a `RoutedSender` counts once, under the transport that sent it, and only once it has landed. Bytes are RAW wire bytes (summed `payload.len()` per `WorkBatch`), incremented once per batch send/recv -- not per event.
 
 | Metric | Direction | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `transport_sent_total` | egress | events written to the wire |
 | `transport_sent_bytes_total` | egress | raw bytes written to the wire |
 | `transport_received_events_total` | ingress | events read off the wire |
@@ -171,7 +171,7 @@ sum by (transport) (rate(transport_sent_bytes_total[1m]))
 A source or sink that goes away is waited out rather than ending the app, and these count what that cost:
 
 | Metric | Labels | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `transport_recv_errors_total` | `transport`, `class` | receive failures; `class="transient"` were retried, `class="permanent"` were returned. Kafka emits it |
 | `transport_consumer_rebuilds_total` | `transport`, `protocol` | consumers replaced after librdkafka flagged them fatal, by the group protocol the new client joins with. Kafka emits it |
 | `transport_revoke_discarded_total` | `transport`, `stage` | records a revoke kept from a write, since the partition's next owner reads them again: `stage="receive"` for those `recv` left out, read before a revoke of their partition in the same poll, `stage="buffer"` for those a caller discarded from its own buffer and counted with `KafkaTransport::discarded_after_revoke`. Kafka emits it |
@@ -186,7 +186,7 @@ A rising `transport_recv_errors_total{class="transient"}` or `pipeline_retries_t
 What a source holds until delivery, and the guarantee the pipeline gives ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md)):
 
 | Metric | Labels | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `pipeline_delivery_guarantee` | `guarantee`, `reason`, optional `listener` | 1 for the guarantee the pipeline gives: `at_least_once`, `at_least_once_local` or `best_effort`, and why. `listener` names the listener when an app publishes one series per listener: a pipeline built with `.listener(name)`, or `EffectiveGuarantee::publish_for` |
 | `pipeline_dead_letters_dropped_total` | `reason` | dead letters dropped with nowhere to go: the pipeline has no DLQ or a disabled one, a gRPC `send_batch` left a record over its size ceiling out of a block, or an app dropped a record a downstream peer refused for good. `reason` is `too_large`, `outbound_filter`, `dead_letter` for one an inbound filter or `process` produced, or `rejected` (`transport::DEAD_LETTER_REJECTED`) for one a downstream peer refused for good, such as a Vector-compat source answering `DataLoss`, `InvalidArgument` or `OutOfRange` |
 | `transport_ack_held` / `transport_ack_held_bytes` | `transport` | records and payload bytes whose acknowledgement is held |
@@ -203,7 +203,7 @@ Kafka emits the `transport_ack_*` series once armed. An armed gRPC server emits 
 ## Endpoints
 
 | Path | Body |
-|---|---|
+| --- | --- |
 | `/metrics` | Prometheus text |
 | `/metrics/manifest` | JSON catalogue |
 | `/livez` | `{"status":"alive"}` -- process alive |
@@ -231,7 +231,7 @@ batching config.
 ## API surface
 
 | Item | Purpose |
-|---|---|
+| --- | --- |
 | `MetricsManager::new(namespace)` | Construct + install recorder |
 | `MetricsManager::with_config(MetricsConfig)` | Custom namespace, intervals, OTel config |
 | `MetricsManager::new_for_test(namespace)` *(test only)* | No global install -- safe for parallel tests |
