@@ -382,6 +382,55 @@ pub fn is_production() -> bool {
     )
 }
 
+// =============================================================================
+// Console context for the default log format and colour
+// =============================================================================
+
+/// What the default log format and colour are decided from.
+///
+/// [`ConsoleContext::detect`] reads it from the process; tests build one directly.
+#[cfg(any(feature = "logger", feature = "cli"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ConsoleContext {
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is set and not blank.
+    pub(crate) otel_endpoint: bool,
+    /// A CI runner is detected, by the variables [`is_ci`] reads.
+    pub(crate) ci: bool,
+    /// stderr, where the logger writes, is a terminal.
+    pub(crate) tty: bool,
+}
+
+#[cfg(any(feature = "logger", feature = "cli"))]
+impl ConsoleContext {
+    /// Read the context from the environment and stderr.
+    pub(crate) fn detect() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            otel_endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .is_ok_and(|v| !v.trim().is_empty()),
+            ci: is_ci(),
+            tty: std::io::stderr().is_terminal(),
+        }
+    }
+
+    /// `true` when an unset or `auto` log format resolves to JSON rather than text.
+    ///
+    /// An OTEL endpoint gives JSON, then a CI run gives text, then a terminal
+    /// gives text and anything else JSON, the order scalo-py applies.
+    pub(crate) fn wants_json(self) -> bool {
+        self.otel_endpoint || !(self.ci || self.tty)
+    }
+}
+
+/// `true` under a CI runner, by the variables scalo-py checks.
+#[cfg(any(feature = "logger", feature = "cli"))]
+fn is_ci() -> bool {
+    ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI", "TRAVIS"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|v| v == "true"))
+        || std::env::var_os("JENKINS_URL").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +839,71 @@ mod tests {
                 // but we can verify the RuntimeContext is bare metal
                 assert!(!ctx.is_kubernetes());
             }
+        });
+    }
+
+    // --- ConsoleContext tests ---
+
+    /// The CI variables `is_ci` reads, all cleared.
+    #[cfg(any(feature = "logger", feature = "cli"))]
+    const NO_CI: [(&str, Option<&str>); 6] = [
+        ("CI", None),
+        ("GITHUB_ACTIONS", None),
+        ("GITLAB_CI", None),
+        ("CIRCLECI", None),
+        ("TRAVIS", None),
+        ("JENKINS_URL", None),
+    ];
+
+    #[cfg(any(feature = "logger", feature = "cli"))]
+    #[test]
+    fn unset_format_is_json_with_otel_then_text_in_ci_or_on_a_tty() {
+        for (otel_endpoint, ci, tty, json) in [
+            (true, false, false, true),
+            (true, true, true, true),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (false, false, false, true),
+        ] {
+            let ctx = ConsoleContext {
+                otel_endpoint,
+                ci,
+                tty,
+            };
+            assert_eq!(ctx.wants_json(), json, "{ctx:?}");
+        }
+    }
+
+    #[cfg(any(feature = "logger", feature = "cli"))]
+    #[test]
+    fn is_ci_reads_each_runner_variable() {
+        temp_env::with_vars(NO_CI, || assert!(!is_ci(), "nothing set"));
+        for name in ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI", "TRAVIS"] {
+            let set = NO_CI.map(|(n, _)| (n, (n == name).then_some("true")));
+            temp_env::with_vars(set, || assert!(is_ci(), "{name}=true"));
+            let other = NO_CI.map(|(n, _)| (n, (n == name).then_some("1")));
+            temp_env::with_vars(other, || assert!(!is_ci(), "{name}=1 is not true"));
+        }
+        let jenkins = NO_CI.map(|(n, _)| (n, (n == "JENKINS_URL").then_some("")));
+        temp_env::with_vars(jenkins, || assert!(is_ci(), "JENKINS_URL present"));
+    }
+
+    #[cfg(any(feature = "logger", feature = "cli"))]
+    #[test]
+    fn detect_reads_the_otel_endpoint_and_ignores_a_blank_one() {
+        temp_env::with_var(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            Some("http://otel:4317"),
+            || {
+                assert!(ConsoleContext::detect().otel_endpoint);
+            },
+        );
+        temp_env::with_var("OTEL_EXPORTER_OTLP_ENDPOINT", Some("  "), || {
+            assert!(!ConsoleContext::detect().otel_endpoint);
+        });
+        temp_env::with_var("OTEL_EXPORTER_OTLP_ENDPOINT", None::<&str>, || {
+            assert!(!ConsoleContext::detect().otel_endpoint);
         });
     }
 }

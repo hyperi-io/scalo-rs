@@ -43,9 +43,9 @@ pub struct CommonArgs {
 
     /// Log output format (json, text, auto).
     ///
-    /// Unset falls through to `logger.format`, then derives from otel
-    /// presence: `json` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (the
-    /// deployment ships telemetry), `text` otherwise.
+    /// Unset or `auto` falls through to `LOG_FORMAT`, then `logger.format`,
+    /// then derives: `json` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, else
+    /// `text` under a CI runner or when stderr is a terminal, else `json`.
     #[arg(long = "log-format", env = "LOG_FORMAT")]
     pub log_format: Option<String>,
 
@@ -74,9 +74,9 @@ impl CommonArgs {
 
     /// Hard-coded log format, used on the same terms.
     ///
-    /// Retained for API compatibility; the unset fall-through now derives
-    /// from otel presence instead of returning this. Explicit `auto` keeps
-    /// the container/terminal detection.
+    /// An unset format resolves exactly as `auto` does, so
+    /// [`effective_log_format`](Self::effective_log_format) returns the
+    /// concrete `json` or `text` it derives rather than this value.
     pub const DEFAULT_LOG_FORMAT: &'static str = "auto";
 
     /// Hard-coded metrics bind address, used when neither the CLI, the
@@ -108,28 +108,42 @@ impl CommonArgs {
 
     /// Resolve the effective log format.
     ///
-    /// `--log-format` or `LOG_FORMAT`, then `logger.format` from config, then
-    /// derived from otel presence: a deployment that ships telemetry logs
-    /// `json`, one that does not logs `text` line-by-line. The signal is the
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` env var -- the one knob the deploy
-    /// layers set exactly where telemetry is shipped.
+    /// The first selector that is neither blank nor `auto` wins: `--log-format`,
+    /// then `LOG_FORMAT`, then `logger.format` from config. A value that is not
+    /// a known format is returned as given, so
+    /// [`to_logger_options`](Self::to_logger_options) rejects it. With none
+    /// set, `json` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, else `text`
+    /// under a CI runner or when stderr is a terminal, else `json`.
     #[must_use]
     pub fn effective_log_format(&self) -> String {
-        if let Some(format) = &self.log_format {
-            return format.clone();
-        }
-        #[cfg(feature = "logger")]
-        if let Some(format) = crate::logger::LoggerSettings::from_cascade().format {
-            return format;
-        }
-        Self::derive_log_format(
-            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok_and(|v| !v.trim().is_empty()),
-        )
-        .to_string()
+        self.effective_log_format_in(crate::env::ConsoleContext::detect())
     }
 
-    /// The otel-derived format default: `json` iff the deployment ships
-    /// telemetry to otel, `text` otherwise.
+    /// [`effective_log_format`](Self::effective_log_format) with the console
+    /// context supplied rather than detected.
+    fn effective_log_format_in(&self, ctx: crate::env::ConsoleContext) -> String {
+        let from_env = std::env::var("LOG_FORMAT").ok();
+        if let Some(format) = [self.log_format.as_deref(), from_env.as_deref()]
+            .into_iter()
+            .find_map(concrete_format)
+        {
+            return format;
+        }
+        #[cfg(feature = "logger")]
+        if let Some(format) = concrete_format(
+            crate::logger::LoggerSettings::from_cascade()
+                .format
+                .as_deref(),
+        ) {
+            return format;
+        }
+        if ctx.wants_json() { "json" } else { "text" }.to_string()
+    }
+
+    /// The `json` / `text` choice from OTEL presence alone.
+    ///
+    /// [`effective_log_format`](Self::effective_log_format) applies this rule
+    /// first, then the CI and terminal checks this function does not make.
     #[must_use]
     pub fn derive_log_format(otel_endpoint_set: bool) -> &'static str {
         if otel_endpoint_set { "json" } else { "text" }
@@ -192,9 +206,16 @@ impl CommonArgs {
     }
 }
 
+/// The selector trimmed, or `None` when it is unset, blank or `auto` so the next one decides.
+fn concrete_format(selector: Option<&str>) -> Option<String> {
+    let selector = selector?.trim();
+    (!selector.is_empty() && !selector.eq_ignore_ascii_case("auto")).then(|| selector.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::ConsoleContext;
 
     /// Args with nothing supplied on the command line.
     fn bare_args() -> CommonArgs {
@@ -275,13 +296,95 @@ mod tests {
 
     #[test]
     fn unset_format_resolves_to_a_derived_value_not_auto() {
-        // Whatever the env holds, the unset fall-through must yield a concrete
-        // format -- `auto` is only ever an explicit opt-in now.
-        let resolved = bare_args().effective_log_format();
-        assert!(
-            resolved == "json" || resolved == "text",
-            "expected a derived concrete format, got {resolved}"
-        );
+        temp_env::with_var("LOG_FORMAT", None::<&str>, || {
+            let resolved = bare_args().effective_log_format();
+            assert!(
+                resolved == "json" || resolved == "text",
+                "expected a derived concrete format, got {resolved}"
+            );
+        });
+    }
+
+    /// Nothing set: no OTEL endpoint, no CI runner, stderr not a terminal.
+    const PIPED: ConsoleContext = ConsoleContext {
+        otel_endpoint: false,
+        ci: false,
+        tty: false,
+    };
+
+    fn with_format(format: Option<&str>) -> CommonArgs {
+        CommonArgs {
+            log_format: format.map(str::to_string),
+            ..bare_args()
+        }
+    }
+
+    #[test]
+    fn an_explicit_format_outranks_log_format() {
+        temp_env::with_var("LOG_FORMAT", Some("text"), || {
+            assert_eq!(
+                with_format(Some("json")).effective_log_format_in(PIPED),
+                "json"
+            );
+            assert_eq!(
+                with_format(Some("pretty")).effective_log_format_in(PIPED),
+                "pretty"
+            );
+        });
+    }
+
+    #[test]
+    fn an_explicit_auto_defers_to_log_format() {
+        for env in ["json", "text"] {
+            temp_env::with_var("LOG_FORMAT", Some(env), || {
+                assert_eq!(
+                    with_format(Some("auto")).effective_log_format_in(PIPED),
+                    env
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn blank_and_auto_defer_to_the_derived_format() {
+        for selector in ["auto", "AUTO", "", "  "] {
+            temp_env::with_var("LOG_FORMAT", Some(selector), || {
+                assert_eq!(
+                    with_format(Some(selector)).effective_log_format_in(PIPED),
+                    "json",
+                    "{selector:?} on the flag and in LOG_FORMAT"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn unset_format_derives_from_otel_then_ci_then_the_terminal() {
+        temp_env::with_var("LOG_FORMAT", None::<&str>, || {
+            let unset = bare_args();
+            assert_eq!(unset.effective_log_format_in(PIPED), "json", "piped");
+            let tty = ConsoleContext { tty: true, ..PIPED };
+            assert_eq!(unset.effective_log_format_in(tty), "text", "terminal");
+            let ci = ConsoleContext { ci: true, ..PIPED };
+            assert_eq!(unset.effective_log_format_in(ci), "text", "CI, piped");
+            let otel = ConsoleContext {
+                otel_endpoint: true,
+                ci: true,
+                tty: true,
+            };
+            assert_eq!(unset.effective_log_format_in(otel), "json", "OTEL on a TTY");
+        });
+    }
+
+    #[cfg(feature = "logger")]
+    #[test]
+    fn an_unknown_format_still_fails() {
+        temp_env::with_var("LOG_FORMAT", None::<&str>, || {
+            assert!(with_format(Some("yaml")).to_logger_options().is_err());
+        });
+        temp_env::with_var("LOG_FORMAT", Some("yaml"), || {
+            assert!(with_format(Some("auto")).to_logger_options().is_err());
+        });
     }
 
     #[test]

@@ -10,7 +10,8 @@
 //!
 //! Only reachable because config now loads before the logger. The precedence
 //! is the cascade's: `--verbose`/`--quiet`, then `--log-level` / `LOG_LEVEL`,
-//! then `logger.level`, then the hard-coded default.
+//! then `logger.level`, then the hard-coded default. `logger.format` and
+//! `logger.color` load from the same section.
 //!
 //! The global config installs once per process, so this file owns it.
 
@@ -34,7 +35,7 @@ fn settings_yaml_supplies_the_level_and_the_cli_still_outranks_it() {
     let dir = tempfile::tempdir().expect("config tempdir");
     std::fs::write(
         dir.path().join("settings.yaml"),
-        "logger:\n  level: warn\n  format: json\n",
+        "logger:\n  level: warn\n  format: json\n  color: yes\n",
     )
     .expect("write settings.yaml");
 
@@ -60,6 +61,11 @@ fn settings_yaml_supplies_the_level_and_the_cli_still_outranks_it() {
                 bare_args().effective_log_format(),
                 "json",
                 "logger.format from settings.yaml must beat the hard-coded default"
+            );
+            assert_eq!(
+                scalo::logger::LoggerSettings::from_cascade().color,
+                Some(true),
+                "a string logger.color is read as scalo-py reads it"
             );
 
             let explicit = CommonArgs {

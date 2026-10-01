@@ -9,14 +9,15 @@
 //! Structured logging with JSON output and sensitive data masking.
 //!
 //! Provides production-ready logging matching scalo-py.
-//! Automatically detects terminal vs container environment for format selection.
+//! With no format set, picks JSON or text from the OTEL endpoint, a CI runner
+//! and whether stderr is a terminal.
 //!
 //! ## Features
 //!
 //! - RFC 3339 timestamps with timezone
-//! - JSON output for containers, coloured text for terminals
+//! - JSON or human-readable text, coloured only on a terminal unless configured
 //! - Sensitive data masking (passwords, tokens, API keys)
-//! - Environment variable overrides (LOG_LEVEL, LOG_FORMAT, NO_COLOR)
+//! - Environment variable overrides (LOG_LEVEL, LOG_FORMAT, LOG_COLOR, NO_COLOR)
 //!
 //! ## Example
 //!
@@ -36,7 +37,6 @@ pub mod helpers;
 mod masking;
 pub mod security;
 
-use std::io;
 use std::sync::OnceLock;
 
 use thiserror::Error;
@@ -49,6 +49,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use tracing_throttle::{Policy, TracingRateLimitLayer};
+
+use crate::env::ConsoleContext;
 
 pub use helpers::{log_debounced, log_sampled, log_state_change};
 pub use masking::{MaskingLayer, MaskingWriter, default_sensitive_fields, mask_sensitive_string};
@@ -84,24 +86,31 @@ pub enum LogFormat {
     Json,
     /// Human-readable coloured text.
     Text,
-    /// Auto-detect based on environment (JSON in containers, Text on TTY).
+    /// Resolve from the environment: JSON when an OTEL endpoint is set, text in
+    /// CI or on a terminal, JSON otherwise.
     #[default]
     Auto,
 }
 
 impl LogFormat {
-    /// Resolve Auto to a concrete format.
+    /// Resolve `Auto` to `Json` or `Text`; other formats are returned unchanged.
+    ///
+    /// `Auto` gives `Json` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, else
+    /// `Text` under a CI runner or when stderr is a terminal, else `Json`.
     #[must_use]
     pub fn resolve(self) -> Self {
         match self {
-            Self::Auto => {
-                if is_terminal() && !is_no_color() {
-                    Self::Text
-                } else {
-                    Self::Json
-                }
-            }
+            Self::Auto => Self::derived(ConsoleContext::detect()),
             other => other,
+        }
+    }
+
+    /// The concrete format `Auto` resolves to in `ctx`.
+    fn derived(ctx: ConsoleContext) -> Self {
+        if ctx.wants_json() {
+            Self::Json
+        } else {
+            Self::Text
         }
     }
 }
@@ -197,7 +206,7 @@ impl Default for LoggerOptions {
 
 /// Cascade-loadable logger settings, under the `logger` config key.
 ///
-/// Both fields are optional so an absent key is distinguishable from a set
+/// Every field is optional so an absent key is distinguishable from a set
 /// one: a CLI flag or environment variable outranks config, and can only do
 /// so if "not given" is representable.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -209,6 +218,31 @@ pub struct LoggerSettings {
     /// Output format (json, text, auto).
     #[serde(default)]
     pub format: Option<String>,
+
+    /// Colour in text mode: a bool, a number (non-zero is on), or a string
+    /// (`true`, `1` or `yes` is on). `LOG_COLOR` and `NO_COLOR` outrank it.
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    pub color: Option<bool>,
+}
+
+/// Read a bool, number or string as on or off, the way scalo-py reads `logging.color`.
+fn deserialize_flag<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Flag {
+        Bool(bool),
+        Int(i64),
+        Text(String),
+    }
+    let flag: Option<Flag> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(flag.map(|flag| match flag {
+        Flag::Bool(on) => on,
+        Flag::Int(n) => n != 0,
+        Flag::Text(text) => is_truthy(&text),
+    }))
 }
 
 impl LoggerSettings {
@@ -329,7 +363,12 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
         }
         LogFormat::Text => {
             let writer = masking::make_masking_writer(sensitive, false, None, None);
-            let ansi = !is_no_color();
+            let ansi = colour_enabled(
+                std::env::var("LOG_COLOR").ok().as_deref(),
+                is_no_color(),
+                LoggerSettings::from_cascade().color,
+                ConsoleContext::detect().tty,
+            );
             let formatter = format::ColouredFormatter::new(ansi)
                 .with_file(opts.add_source)
                 .with_line_number(opts.add_source);
@@ -370,8 +409,13 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
 ///
 /// Respects environment variables:
 /// - `LOG_LEVEL` or `RUST_LOG`: Log level
-/// - `LOG_FORMAT`: Output format (json, text, auto)
-/// - `NO_COLOR`: Disable coloured output
+/// - `LOG_FORMAT`: Output format (json, text, auto). Unset, blank, `auto` or
+///   unrecognised defers to `logger.format` in config, then to
+///   [`LogFormat::Auto`]
+/// - `LOG_COLOR`: Colour in text mode (`true`, `1` or `yes` is on, anything
+///   else off); unset defers to `NO_COLOR`, then `logger.color`, then the
+///   terminal check
+/// - `NO_COLOR`: Disable coloured output when `LOG_COLOR` is unset
 /// - `LOG_THROTTLE_ENABLED`: Enable log deduplication (default: false)
 /// - `LOG_THROTTLE_BURST`: Token bucket burst capacity (default: 50)
 /// - `LOG_THROTTLE_RATE`: Token recovery rate per second (default: 1.0)
@@ -386,10 +430,10 @@ pub fn setup_default() -> Result<(), LoggerError> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(Level::INFO);
 
-    let format = std::env::var("LOG_FORMAT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(LogFormat::Auto);
+    let format = first_concrete_format([
+        std::env::var("LOG_FORMAT").ok(),
+        LoggerSettings::from_cascade().format,
+    ]);
 
     let throttle_enabled = std::env::var("LOG_THROTTLE_ENABLED")
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
@@ -448,10 +492,40 @@ fn build_throttle_filter(config: &ThrottleConfig) -> Option<TracingRateLimitLaye
     }
 }
 
-/// Check if stderr is a terminal.
-fn is_terminal() -> bool {
-    use std::io::IsTerminal;
-    io::stderr().is_terminal()
+/// The first selector naming `json` or `text`, else `Auto`; blank, `auto` and unrecognised ones defer.
+fn first_concrete_format<const N: usize>(selectors: [Option<String>; N]) -> LogFormat {
+    selectors
+        .into_iter()
+        .flatten()
+        .filter_map(|selector| selector.trim().parse::<LogFormat>().ok())
+        .find(|format| *format != LogFormat::Auto)
+        .unwrap_or(LogFormat::Auto)
+}
+
+/// Whether text output carries ANSI colour.
+///
+/// `LOG_COLOR` decides when set, then a set `NO_COLOR` turns colour off, then
+/// `logger.color`, then whether stderr is a terminal.
+fn colour_enabled(
+    log_color: Option<&str>,
+    no_color: bool,
+    configured: Option<bool>,
+    tty: bool,
+) -> bool {
+    if let Some(value) = log_color {
+        return is_truthy(value);
+    }
+    if no_color {
+        return false;
+    }
+    configured.unwrap_or(tty)
+}
+
+/// `true` for `true`, `1` or `yes` in any case, the values scalo-py reads as on.
+fn is_truthy(value: &str) -> bool {
+    ["true", "1", "yes"]
+        .iter()
+        .any(|on| value.eq_ignore_ascii_case(on))
 }
 
 /// Check if NO_COLOR environment variable is set.
@@ -485,6 +559,126 @@ mod tests {
         // Auto resolves based on environment
         let resolved = LogFormat::Auto.resolve();
         assert!(matches!(resolved, LogFormat::Json | LogFormat::Text));
+    }
+
+    #[test]
+    fn auto_is_json_off_a_terminal_and_text_on_one() {
+        let piped = ConsoleContext::default();
+        let tty = ConsoleContext { tty: true, ..piped };
+        assert_eq!(LogFormat::derived(piped), LogFormat::Json);
+        assert_eq!(LogFormat::derived(tty), LogFormat::Text);
+    }
+
+    #[test]
+    fn auto_is_json_with_an_otel_endpoint_even_on_a_terminal() {
+        let ctx = ConsoleContext {
+            otel_endpoint: true,
+            ci: true,
+            tty: true,
+        };
+        assert_eq!(LogFormat::derived(ctx), LogFormat::Json);
+    }
+
+    #[test]
+    fn auto_is_text_in_ci_even_when_piped() {
+        let ctx = ConsoleContext {
+            ci: true,
+            ..ConsoleContext::default()
+        };
+        assert_eq!(LogFormat::derived(ctx), LogFormat::Text);
+    }
+
+    #[test]
+    fn the_first_concrete_selector_wins() {
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            first_concrete_format([some("json"), some("text")]),
+            LogFormat::Json,
+            "LOG_FORMAT outranks logger.format"
+        );
+        assert_eq!(
+            first_concrete_format([some(" Pretty "), None]),
+            LogFormat::Text,
+            "aliases and padding are read as scalo-py reads them"
+        );
+        for deferring in ["auto", "AUTO", "", "  ", "yaml"] {
+            assert_eq!(
+                first_concrete_format([some(deferring), some("text")]),
+                LogFormat::Text,
+                "LOG_FORMAT={deferring:?} defers to logger.format"
+            );
+        }
+        assert_eq!(
+            first_concrete_format([None, some("auto")]),
+            LogFormat::Auto,
+            "nothing concrete leaves Auto for setup to resolve"
+        );
+        assert_eq!(first_concrete_format([None, None]), LogFormat::Auto);
+    }
+
+    #[test]
+    fn log_color_outranks_everything() {
+        for (log_color, on) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("yes", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                colour_enabled(Some(log_color), true, Some(!on), !on),
+                on,
+                "LOG_COLOR={log_color:?} beats NO_COLOR, config and the terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn no_color_outranks_config_and_the_terminal() {
+        assert!(!colour_enabled(None, true, Some(true), true));
+    }
+
+    #[test]
+    fn config_outranks_the_terminal() {
+        assert!(colour_enabled(None, false, Some(true), false));
+        assert!(!colour_enabled(None, false, Some(false), true));
+    }
+
+    #[test]
+    fn colour_follows_the_terminal_when_nothing_is_set() {
+        assert!(colour_enabled(None, false, None, true), "terminal");
+        assert!(!colour_enabled(None, false, None, false), "piped");
+    }
+
+    #[test]
+    fn logger_color_reads_bools_numbers_and_strings() {
+        for (json, expected) in [
+            (r#"{"color": true}"#, Some(true)),
+            (r#"{"color": false}"#, Some(false)),
+            (r#"{"color": 1}"#, Some(true)),
+            (r#"{"color": 0}"#, Some(false)),
+            (r#"{"color": "yes"}"#, Some(true)),
+            (r#"{"color": "TRUE"}"#, Some(true)),
+            (r#"{"color": "off"}"#, Some(false)),
+            (r#"{"color": null}"#, None),
+            ("{}", None),
+        ] {
+            let settings: LoggerSettings = serde_json::from_str(json).expect(json);
+            assert_eq!(settings.color, expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_string_color_leaves_level_and_format_intact() {
+        let settings: LoggerSettings =
+            serde_json::from_str(r#"{"level": "warn", "format": "json", "color": "no"}"#)
+                .expect("settings");
+        assert_eq!(settings.level.as_deref(), Some("warn"));
+        assert_eq!(settings.format.as_deref(), Some("json"));
+        assert_eq!(settings.color, Some(false));
     }
 
     #[test]
