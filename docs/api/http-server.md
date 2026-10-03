@@ -119,12 +119,15 @@ For test wiring or programmatic shutdown, `serve_with_handle` returns a
 ```yaml
 http_server:
   bind_address: "0.0.0.0:9090"
+  request_timeout_ms: 30000
+  max_connections: 10000          # in-flight cap; excess requests queue
+  max_body_bytes: 16777216        # 413 past this; 0 turns the cap off
+  enable_health_endpoints: true
   enable_config_endpoint: false   # opt-in -- exposes redacted /config
-  tls:
-    cert_path: /etc/myapp/tls.crt
-    key_path:  /etc/myapp/tls.key
-  request_timeout: 30s
+  shutdown_timeout_ms: 30000
 ```
+
+`max_body_bytes` applies to every route, so a handler that takes the body through a custom extractor or streams it is capped too. A declared `Content-Length` over the limit is answered 413 before the handler runs. `tls_cert_path` and `tls_key_path` exist only so `validate()` can refuse them.
 
 ---
 

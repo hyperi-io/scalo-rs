@@ -647,8 +647,13 @@ fn generate_artefacts<A: ServiceApp>(
 
 /// Emit just the reflectable config artefacts (`config-schema.*`,
 /// `capability-catalog.*`) for the `config-schema` subcommand.
+///
+/// Loads the app's config first, best-effort, as `generate-artefacts` does, so
+/// a contract that reads the cascade sees the service's config, and a config
+/// that does not load is warned about without stopping the artefacts.
 #[cfg(feature = "deployment")]
 fn emit_config_schema<A: ServiceApp>(app: &A, dir: &str) -> Result<(), CliError> {
+    load_config_for_artefacts(app);
     let Some(contract) = app.deployment_contract() else {
         output::print_warn(&format!(
             "ServiceApp::deployment_contract() returned None for `{}` -- no config artefacts",

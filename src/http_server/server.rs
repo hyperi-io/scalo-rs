@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::watch;
 use tower::limit::ConcurrencyLimitLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
@@ -281,6 +282,12 @@ impl HttpServer {
             router = router.route("/config", get(config_dump));
         }
 
+        // Every route, extractor or not, gets the cap, so a custom extractor or
+        // a streamed body cannot buffer past it.
+        if self.config.max_body_bytes > 0 {
+            router = router.layer(RequestBodyLimitLayer::new(self.config.max_body_bytes));
+        }
+
         router
             .layer(TraceLayer::new_for_http())
             .layer(TimeoutLayer::with_status_code(
@@ -419,6 +426,55 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    /// A route that records whether it ran, behind a server with this body cap.
+    fn capped_ingest(max_body_bytes: usize) -> (Router, Arc<AtomicBool>) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&ran);
+        let handler = move |body: axum::body::Bytes| {
+            seen.store(true, Ordering::SeqCst);
+            async move { body.len().to_string() }
+        };
+        let server = HttpServer::new(HttpServerConfig {
+            max_body_bytes,
+            ..HttpServerConfig::default()
+        });
+        let app = server.build_router(Router::new().route("/ingest", axum::routing::post(handler)));
+        (app, ran)
+    }
+
+    fn post_ingest(len: usize) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/ingest")
+            .header("content-length", len)
+            .body(Body::from(vec![b'x'; len]))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_refused_before_the_handler_runs() {
+        let (app, ran) = capped_ingest(16);
+
+        let over = app.clone().oneshot(post_ingest(32)).await.unwrap();
+        assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the handler ran for a refused body"
+        );
+
+        let under = app.oneshot(post_ingest(16)).await.unwrap();
+        assert_eq!(under.status(), StatusCode::OK);
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_zero_limit_turns_the_cap_off() {
+        let (app, ran) = capped_ingest(0);
+        let response = app.oneshot(post_ingest(64 * 1024)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(ran.load(Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn test_health_live() {

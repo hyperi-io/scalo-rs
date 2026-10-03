@@ -196,7 +196,7 @@ ArgoCD `Application` CR pointing at the Helm chart in the app's git repo. `gener
 | `Chart.yaml` | Chart metadata |
 | `values.yaml` | Configurable defaults -- image, resources, probes, secrets, KEDA, HPA, `otel`, `podSecurityContext` / `securityContext` |
 | `templates/_helpers.tpl` | Standard name helpers + one `<group>SecretName` helper per secret group |
-| `templates/deployment.yaml` | `Deployment` with probes, security contexts, observability env, env from secrets, config mount, service-account files without the token |
+| `templates/deployment.yaml` | `Deployment` with probes, security contexts, observability env, env from secrets, config mount, service-account files without the token. The pod template carries `checksum/config` and, with any secret group, `checksum/secret`, so a changed ConfigMap or chart-managed Secret rolls the pods. A group on `existingSecret` renders nothing into `secret.yaml`, so rotating that Secret is the operator's roll |
 | `templates/service.yaml` | `Service` exposing metrics port + any `extra_ports`; a port gated with `when` renders only while its condition holds, here and in the `Deployment` |
 | `templates/serviceaccount.yaml` | `ServiceAccount` (auto-disable token mount) |
 | `templates/configmap.yaml` | `ConfigMap` rendering `values.yaml.config` to mounted file |

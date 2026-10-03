@@ -143,6 +143,9 @@ pub(crate) struct UsageReader {
     /// figure is up to [`CACHE_INTERVAL`] stale, so a burst inside one window
     /// would otherwise be admitted against a reading that predates it.
     admitted_since_sample: AtomicU64,
+    /// File reads taken, so a test can count them.
+    #[cfg(test)]
+    samples: std::sync::atomic::AtomicUsize,
 }
 
 impl UsageReader {
@@ -154,6 +157,8 @@ impl UsageReader {
             cached_at_nanos: AtomicU64::new(0),
             primed: AtomicBool::new(false),
             admitted_since_sample: AtomicU64::new(0),
+            #[cfg(test)]
+            samples: std::sync::atomic::AtomicUsize::new(0),
         };
         reader.sample();
         reader
@@ -164,23 +169,39 @@ impl UsageReader {
     }
 
     /// Current usage, re-read at most once per [`CACHE_INTERVAL`].
+    ///
+    /// When the cached reading goes stale, the one thread whose compare-exchange
+    /// moves the timestamp on reads the file and clears the ledger. Every other
+    /// thread serves the cached reading for the rest of that window, so a burst
+    /// crossing the boundary costs one file read and one ledger clear, not one
+    /// each.
     pub(crate) fn read(&self) -> Option<u64> {
-        if !self.primed.load(Ordering::Relaxed) {
+        if !self.primed.load(Ordering::Acquire) {
             return self.sample();
         }
-        let age = self
-            .elapsed_nanos()
-            .saturating_sub(self.cached_at_nanos.load(Ordering::Relaxed));
-        if Duration::from_nanos(age) < CACHE_INTERVAL {
+        let cached_at = self.cached_at_nanos.load(Ordering::Relaxed);
+        let now = self.elapsed_nanos();
+        if Duration::from_nanos(now.saturating_sub(cached_at)) < CACHE_INTERVAL {
             return Some(self.cached_bytes.load(Ordering::Relaxed));
         }
-        self.sample()
+        let elected = self
+            .cached_at_nanos
+            .compare_exchange(cached_at, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok();
+        if elected {
+            return self.sample();
+        }
+        Some(self.cached_bytes.load(Ordering::Relaxed))
     }
 
     /// Kernel sample plus what has been admitted against it since.
     ///
-    /// The sample is taken first, so the ledger read afterwards is always one
-    /// the clear inside [`Self::sample`] has already reset.
+    /// A reader that sees the reader primed also sees the reading that primed
+    /// it (`Release` on the flag, `Acquire` on its loads). The sample and the
+    /// ledger are still two atomics, not one pair: a reader landing between a
+    /// sampler's ledger clear and its new reading takes the previous reading
+    /// against an empty ledger, an under-count that lasts until the reading
+    /// lands. Electing one sampler per window keeps that to one gap a window.
     pub(crate) fn estimate(&self) -> Option<u64> {
         let sampled = self.read()?;
         Some(sampled.saturating_add(self.admitted_since_sample.load(Ordering::Relaxed)))
@@ -190,6 +211,19 @@ impl UsageReader {
     pub(crate) fn admit(&self, bytes: u64) {
         self.admitted_since_sample
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Charge an admission and return the ledger total that charge produced,
+    /// saturating, so a caller judging the limit judges its own charge in.
+    pub(crate) fn admit_and_get(&self, bytes: u64) -> u64 {
+        let previous = self
+            .admitted_since_sample
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(bytes))
+            })
+            // Always succeeds (closure always returns Some).
+            .unwrap_or_else(|v| v);
+        previous.saturating_add(bytes)
     }
 
     /// Discharge released bytes from the ledger, saturating at zero.
@@ -202,6 +236,8 @@ impl UsageReader {
     }
 
     fn sample(&self) -> Option<u64> {
+        #[cfg(test)]
+        self.samples.fetch_add(1, Ordering::Relaxed);
         // Cleared before the file read, not after: an admission landing between
         // the two is then double-counted rather than dropped, and over-counting
         // brakes early where an under-count is the overshoot that OOM-kills.
@@ -211,13 +247,14 @@ impl UsageReader {
                 self.cached_bytes.store(bytes, Ordering::Relaxed);
                 self.cached_at_nanos
                     .store(self.elapsed_nanos(), Ordering::Relaxed);
-                self.primed.store(true, Ordering::Relaxed);
+                // Release: a reader that sees the flag set sees the reading above.
+                self.primed.store(true, Ordering::Release);
                 Some(bytes)
             }
             // A read that fails after the source worked keeps serving the last
             // good figure, rather than disarming the guard onto a counter that
             // cannot see the process's real usage.
-            None if self.primed.load(Ordering::Relaxed) => {
+            None if self.primed.load(Ordering::Acquire) => {
                 Some(self.cached_bytes.load(Ordering::Relaxed))
             }
             None => None,
@@ -360,6 +397,60 @@ mod tests {
             Some(1000),
             "an unreadable file must not disarm the guard"
         );
+    }
+
+    /// A burst of readers crossing the interval boundary together elects one
+    /// sampler: one file read and one ledger clear for the window, not one each.
+    #[test]
+    fn a_burst_across_the_boundary_reads_the_file_once() {
+        let dir = fixture(&[("memory.current", "1000\n")]);
+        let reader = UsageReader::new(UsageSource::CgroupV2(dir.path().to_path_buf()));
+        assert_eq!(
+            reader.samples.load(Ordering::Relaxed),
+            1,
+            "the priming read"
+        );
+
+        std::fs::write(dir.path().join("memory.current"), "2000\n").expect("rewrite");
+        std::thread::sleep(CACHE_INTERVAL + Duration::from_millis(10));
+
+        let threads = 16;
+        let barrier = std::sync::Barrier::new(threads);
+        let started = Instant::now();
+        let readings: Vec<Option<u64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        reader.read()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        // A burst a loaded host stretches past one window may open a second.
+        let windows = 1 + started.elapsed().as_nanos() / CACHE_INTERVAL.as_nanos();
+
+        let burst_reads = reader.samples.load(Ordering::Relaxed) - 1;
+        assert!(
+            burst_reads >= 1 && burst_reads as u128 <= windows,
+            "{burst_reads} file reads across {windows} window(s), from {threads} readers: \
+             {readings:?}"
+        );
+        assert!(
+            readings.iter().all(|r| matches!(r, Some(1000 | 2000))),
+            "every reader served a real reading: {readings:?}"
+        );
+        assert_eq!(reader.read(), Some(2000), "the elected read landed");
+    }
+
+    #[test]
+    fn admit_and_get_returns_the_total_its_charge_made() {
+        let reader = UsageReader::new(UsageSource::Reservations);
+        assert_eq!(reader.admit_and_get(10), 10);
+        assert_eq!(reader.admit_and_get(5), 15);
+        reader.forget(15);
+        assert_eq!(reader.admit_and_get(u64::MAX), u64::MAX, "saturates");
     }
 
     #[test]

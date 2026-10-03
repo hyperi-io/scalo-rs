@@ -163,6 +163,8 @@ the same suite CI runs -- and reports what to fix. Run it before every push and 
 pull request; it is the single best way to give your change the best chance of
 surviving CI.
 
+To run the tests by hand, use `cargo nextest run --all-features`, not plain `cargo test`. The suite shares process-global state (the config cascade, the metrics recorder, the health registry), so it needs nextest's one process per test, and under `cargo test` tests fail for that reason alone.
+
 ## CI/CD Workflow
 
 When your pull request is merged to `main`:

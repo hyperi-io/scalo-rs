@@ -35,6 +35,14 @@ pub struct HttpServerConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
+    /// Largest request body any route accepts, in bytes. Default 16 MiB, the
+    /// same as the HTTP transport's `max_body_bytes`. A larger declared
+    /// `Content-Length` is answered 413 before the handler runs, and a chunked
+    /// body is cut off at the limit. `0` turns the limit off, for a server whose
+    /// routes stream bodies of their own size.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+
     /// Mount /livez + /readyz. Default true.
     #[serde(default = "default_true")]
     pub enable_health_endpoints: bool,
@@ -88,6 +96,10 @@ fn default_max_connections() -> usize {
     10_000
 }
 
+fn default_max_body_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
 fn default_shutdown_timeout_ms() -> u64 {
     30_000
 }
@@ -103,6 +115,7 @@ impl Default for HttpServerConfig {
             request_timeout_ms: default_request_timeout_ms(),
             keep_alive_timeout_ms: default_keep_alive_timeout_ms(),
             max_connections: default_max_connections(),
+            max_body_bytes: default_max_body_bytes(),
             enable_health_endpoints: true,
             enable_metrics_endpoint: false,
             enable_config_endpoint: false,
@@ -188,6 +201,7 @@ mod tests {
         assert_eq!(config.request_timeout_ms, 30_000);
         assert_eq!(config.keep_alive_timeout_ms, 75_000);
         assert_eq!(config.max_connections, 10_000);
+        assert_eq!(config.max_body_bytes, 16 * 1024 * 1024);
         assert!(config.enable_health_endpoints);
         assert!(!config.enable_metrics_endpoint);
         assert!(config.enable_http2);

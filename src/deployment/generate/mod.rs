@@ -753,6 +753,34 @@ mod tests {
         assert!(content.contains("name: OTEL_SERVICE_NAME"));
     }
 
+    /// secretKeyRef env is read once at start, so the pod template carries a
+    /// checksum of the chart-managed Secret; a group on existingSecret renders
+    /// nothing into secret.yaml, so the operator's own Secret cannot move it.
+    #[test]
+    fn a_chart_managed_secret_is_checksummed_into_the_pod_template() {
+        let contract = test_contract();
+        let dir = tempfile::tempdir().unwrap();
+        generate_chart(&contract, dir.path(), None).unwrap();
+        let deployment =
+            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
+        assert!(
+            deployment.contains(
+                "        checksum/secret: {{ include (print $.Template.BasePath \"/secret.yaml\") . | sha256sum }}\n"
+            ),
+            "{deployment}"
+        );
+        let secret = std::fs::read_to_string(dir.path().join("templates/secret.yaml")).unwrap();
+        assert!(secret.contains("{{- if not .Values.kafka.existingSecret }}"));
+
+        let mut no_secrets = test_contract();
+        no_secrets.secrets.clear();
+        let dir = tempfile::tempdir().unwrap();
+        generate_chart(&no_secrets, dir.path(), None).unwrap();
+        let deployment =
+            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
+        assert!(!deployment.contains("checksum/secret"), "{deployment}");
+    }
+
     #[test]
     fn test_otlp_export_is_wired_and_opt_in() {
         // The scrape annotations get metrics to Prometheus; this is the other

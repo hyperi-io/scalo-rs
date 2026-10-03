@@ -1,13 +1,13 @@
 // Project:   scalo
 // File:      tests/artefact_commands.rs
-// Purpose:   metrics-manifest and generate-artefacts, read off a real process
+// Purpose:   The artefact subcommands, read off a real process
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! `metrics-manifest` and `generate-artefacts` run the way a service binary
-//! runs them: in a process of their own, so what they print is read off real
+//! `metrics-manifest`, `generate-artefacts` and `config-schema` run the way a
+//! service binary runs them: in a process of their own, so what they print is read off real
 //! stdout and stderr, and the config cascade installs fresh for each command.
 //!
 //! The test binary re-runs itself as that process. A test finding
@@ -307,6 +307,42 @@ fn a_config_that_does_not_load_is_warned_about_and_artefacts_still_written() {
     let contract: serde_json::Value =
         serde_json::from_str(&read(out.path(), "deployment-contract.json")).expect("JSON");
     assert_eq!(contract["base_image"], DEFAULT_BASE_IMAGE);
+}
+
+/// `config-schema` loads the config as `generate-artefacts` does: a config that
+/// does not load is named on stderr once, and the command still succeeds.
+#[test]
+fn config_schema_loads_the_config_and_survives_a_broken_one() {
+    const TEST: &str = "config_schema_loads_the_config_and_survives_a_broken_one";
+    if ran_as_probe() {
+        return;
+    }
+    let broken = settings_dir("deployment: [unclosed\n");
+    let out = tempfile::tempdir().expect("artefact tempdir");
+
+    let streams = probe(
+        TEST,
+        broken.path(),
+        &["config-schema", "--dir", path_str(out.path())],
+    );
+    assert_eq!(
+        streams.stderr.matches("config did not load").count(),
+        1,
+        "the config is loaded once, and its failure named:\n{}",
+        streams.stderr
+    );
+
+    let good = settings_dir("metrics:\n  namespace: probe\n");
+    let streams = probe(
+        TEST,
+        good.path(),
+        &["config-schema", "--dir", path_str(out.path())],
+    );
+    assert!(
+        !streams.stderr.contains("config did not load"),
+        "a config that loads draws no warning:\n{}",
+        streams.stderr
+    );
 }
 
 /// With no repo named for it, the ArgoCD Application is not written and the

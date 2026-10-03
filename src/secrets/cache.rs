@@ -224,12 +224,11 @@ impl SecretCache {
     ///
     /// Detects encryption envelopes by their `"v":` JSON marker and
     /// decrypts via [`crypto::open`] when an encryption key is
-    /// configured. Legacy plaintext entries (no envelope) are still
-    /// accepted but loaded with a warning -- operators upgrading from
-    /// pre-encryption deployments see one notice per file. A future
-    /// release will hard-reject legacy entries to force a clean
-    /// migration; for now we read-through so existing caches keep
-    /// working.
+    /// configured. A plaintext entry is read only under the same
+    /// `allow_plaintext_disk_cache` opt-in that lets one be written, and
+    /// never once an `encryption_key` is set: either way it is skipped
+    /// with a warning and the secret is fetched from its source, which
+    /// rewrites the slot in the configured form.
     fn load_from_disk(&self, key: &str) -> Option<SecretValue> {
         let cache_dir = self.cache_dir.as_ref()?;
         let cache_file = cache_dir.join(Self::key_to_filename(key));
@@ -263,14 +262,20 @@ impl SecretCache {
                 }
             }
         } else {
-            // Legacy plaintext path. Warn once per load to nudge
-            // operators toward re-running with an `encryption_key`
-            // configured, which will rewrite entries on next refresh.
             if self.config.encryption_key.is_some() {
                 tracing::warn!(
                     file = %cache_file.display(),
-                    "cache file is plaintext but encryption_key is set -- will be re-encrypted on next refresh",
+                    "cache file is plaintext but encryption_key is set -- skipping; the next fetch \
+                     rewrites it encrypted",
                 );
+                return None;
+            }
+            if !self.config.allow_plaintext_disk_cache {
+                tracing::warn!(
+                    file = %cache_file.display(),
+                    "cache file is plaintext and allow_plaintext_disk_cache is off -- skipping",
+                );
+                return None;
             }
             raw
         };
@@ -663,6 +668,53 @@ mod tests {
             fresh.get("k").unwrap().as_bytes(),
             b"plaintext-secret",
             "plaintext entry is readable from disk without a key"
+        );
+    }
+
+    /// A plaintext entry written under the opt-in, in the directory `cfg`
+    /// names, then read back by a cache built from `reader`.
+    fn plaintext_left_for(reader: &CacheConfig) -> Option<SecretValue> {
+        let writer = CacheConfig {
+            allow_plaintext_disk_cache: true,
+            encryption_key: None,
+            ..reader.clone()
+        };
+        SecretCache::new(&writer)
+            .unwrap()
+            .set("k", &SecretValue::new(b"plaintext-secret".to_vec()))
+            .unwrap();
+        SecretCache::new(reader).unwrap().get("k")
+    }
+
+    #[test]
+    fn a_plaintext_file_is_refused_without_the_opt_in() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let reader = CacheConfig {
+            enabled: true,
+            directory: Some(temp_dir.path().to_path_buf()),
+            encryption_key: None,
+            allow_plaintext_disk_cache: false,
+            ..Default::default()
+        };
+        assert!(
+            plaintext_left_for(&reader).is_none(),
+            "a default-config app read a plaintext entry another app wrote"
+        );
+    }
+
+    #[test]
+    fn a_plaintext_file_is_refused_outright_once_a_key_is_set() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let reader = CacheConfig {
+            enabled: true,
+            directory: Some(temp_dir.path().to_path_buf()),
+            encryption_key: Some(crate::SensitiveString::new("k".repeat(32))),
+            allow_plaintext_disk_cache: true,
+            ..Default::default()
+        };
+        assert!(
+            plaintext_left_for(&reader).is_none(),
+            "an app with an encryption_key served a plaintext file"
         );
     }
 }
