@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/app.rs
-// Purpose:   Mandatory app-level DFE metrics
+// Purpose:   Mandatory app-level metrics
 // Language:  Rust
 //
 // License:   Apache-2.0

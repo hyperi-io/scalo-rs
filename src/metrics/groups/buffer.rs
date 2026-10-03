@@ -1,12 +1,12 @@
 // Project:   scalo
 // File:      src/metrics/groups/buffer.rs
-// Purpose:   DFE buffer metrics group
+// Purpose:   Buffer metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Buffer metrics for apps with batching (receiver, loader, archiver).
+//! Buffer metrics for apps that batch before a sink.
 
 use metrics::{Counter, Gauge, Histogram};
 

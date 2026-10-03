@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/consumer.rs
-// Purpose:   DFE consumer metrics group
+// Purpose:   Kafka consumer metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0

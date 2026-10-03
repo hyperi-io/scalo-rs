@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/enrichment.rs
-// Purpose:   DFE enrichment metrics group
+// Purpose:   Enrichment cache metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0

@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/sink.rs
-// Purpose:   DFE sink metrics group
+// Purpose:   Sink metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0
