@@ -7,10 +7,7 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Doc comments ship in rustdoc and in every config schema derived from
-//! them, so they stay ASCII. tests/ and benches/ carry no schema, but
-//! authored prose there is held to the same bar; string-literal test
-//! data (e.g. Unicode fixture values) is untouched because the check
-//! only looks at lines starting `///` or `//!`.
+//! them, so they stay ASCII. tests/ and benches/ are held to the same bar.
 
 use std::path::{Path, PathBuf};
 
@@ -30,12 +27,16 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Find every doc-comment line under `dir` (relative to `root`) that is
-/// not pure ASCII, as `path:line` strings.
+/// Every non-ASCII doc-comment line under `dir`, as `path:line` relative to `root`.
 fn find_offenders(root: &Path, dir: &Path) -> Vec<String> {
     let mut files = Vec::new();
     rust_sources(dir, &mut files);
     files.sort();
+    assert!(
+        !files.is_empty(),
+        "no .rs files found under {}",
+        dir.display()
+    );
 
     let mut offenders = Vec::new();
     for file in &files {
@@ -55,12 +56,7 @@ fn find_offenders(root: &Path, dir: &Path) -> Vec<String> {
 #[test]
 fn doc_comments_under_src_are_ascii() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src = root.join("src");
-    let mut files = Vec::new();
-    rust_sources(&src, &mut files);
-    assert!(!files.is_empty(), "no .rs files found under src/");
-
-    let offenders = find_offenders(root, &src);
+    let offenders = find_offenders(root, &root.join("src"));
     assert!(
         offenders.is_empty(),
         "non-ASCII in doc comments (use ->, --, ..., <=, >=, us):\n{}",
