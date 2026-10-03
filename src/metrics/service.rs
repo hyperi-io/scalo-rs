@@ -47,10 +47,6 @@ pub struct ServiceMetrics {
     _private: (),
 }
 
-/// Deprecated brand alias for [`ServiceMetrics`]. Removed before GA.
-#[deprecated(since = "2.9.0", note = "renamed to ServiceMetrics; removed before GA")]
-pub type DfeMetrics = ServiceMetrics;
-
 impl ServiceMetrics {
     /// Register all metric descriptions with the global recorder and
     /// manifest registry. Call **once** after creating a

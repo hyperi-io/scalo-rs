@@ -29,16 +29,13 @@ hyperi-rustlib `2.8.x`.
 ## 2. Renamed public types (`Dfe*` -> `Service*`)
 
 Every `Dfe`-prefixed public type now has a brand-neutral `Service`-prefixed
-name. The old names remain as `#[deprecated]` aliases for one release, so
-existing code compiles with warnings:
+name. The old names shipped as `#[deprecated]` aliases for one release and are
+now gone:
 
 ```diff
 - let metrics = DfeMetrics::register(&manager)?;
 + let metrics = ServiceMetrics::register(&manager)?;
 ```
-
-Fix the warnings at your own pace; the aliases will be removed in a later scalo
-release.
 
 ## 3. Environment variables are now bare by default
 

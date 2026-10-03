@@ -129,8 +129,6 @@ type MemoryGuardSlot = Arc<RwLock<Option<Arc<crate::memory::MemoryGuard>>>>;
 use metrics_exporter_prometheus::PrometheusHandle;
 
 pub use container::ContainerMetrics;
-#[allow(deprecated)]
-pub use service::DfeMetrics;
 pub use service::ServiceMetrics;
 #[cfg(feature = "service-metrics")]
 pub mod groups;

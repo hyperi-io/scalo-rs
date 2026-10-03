@@ -75,9 +75,6 @@ pub use version::VersionInfo;
 
 #[cfg(feature = "cli-service")]
 pub use app::{ServiceApp, run_app};
-// Deprecated brand alias for the app trait -- removed before GA.
-#[cfg(feature = "cli-service")]
-pub use app::ServiceApp as DfeApp;
 #[cfg(feature = "cli-service")]
 pub use runtime::ServiceRuntime;
 
