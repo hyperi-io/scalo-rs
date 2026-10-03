@@ -183,7 +183,7 @@ async fn test_commit_is_noop() {
         .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let batch = server.recv(10).await.expect("recv should succeed");
-    assert!(!batch.records.is_empty());
+    assert_ne!(batch.records, [] as [scalo::Record; 0]);
 
     // Commit tokens — should succeed (no-op)
     let result = server.commit(&batch.commit_tokens).await;

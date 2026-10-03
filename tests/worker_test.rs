@@ -187,7 +187,10 @@ fn test_process_batch_empty_input() {
     let pool = AdaptiveWorkerPool::new(WorkerPoolConfig::default());
     let items: Vec<i32> = vec![];
     let results: Vec<Result<i32, String>> = pool.process_batch(&items, |&x| Ok(x));
-    assert!(results.is_empty());
+    assert_eq!(
+        results,
+        [] as [std::result::Result<i32, std::string::String>; 0]
+    );
 }
 
 // --- fan_out_async tests ---
@@ -266,7 +269,10 @@ async fn test_fan_out_async_empty_input() {
     let items: Vec<i32> = vec![];
     let results: Vec<Option<Result<i32, String>>> =
         pool.fan_out_async(&items, |&x| async move { Ok(x) }).await;
-    assert!(results.is_empty());
+    assert_eq!(
+        results,
+        [] as [std::option::Option<std::result::Result<i32, std::string::String>>; 0]
+    );
 }
 
 // --- Scaling decision tests ---

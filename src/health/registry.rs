@@ -232,7 +232,10 @@ mod tests {
 
         assert!(HealthRegistry::is_healthy());
         assert!(HealthRegistry::is_ready());
-        assert!(HealthRegistry::components().is_empty());
+        assert_eq!(
+            HealthRegistry::components(),
+            [] as [(std::string::String, crate::health::registry::HealthStatus); 0]
+        );
     }
 
     #[test]
@@ -347,7 +350,10 @@ mod tests {
 
         let json = HealthRegistry::to_json();
         assert_eq!(json["status"], "healthy");
-        assert!(json["components"].as_array().unwrap().is_empty());
+        assert_eq!(
+            json["components"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]

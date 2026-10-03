@@ -2552,7 +2552,10 @@ mod tests {
 
         let result = client.send_batch(&[record]).await;
         assert!(result.is_filtered_dlq(), "got {result:?}");
-        assert!(server.recv(10).await.unwrap().records.is_empty());
+        assert_eq!(
+            server.recv(10).await.unwrap().records,
+            [] as [crate::transport::work_batch::Record; 0]
+        );
 
         client.close().await.unwrap();
         server.close().await.unwrap();

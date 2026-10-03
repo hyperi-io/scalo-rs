@@ -1627,7 +1627,7 @@ mod tests {
     #[test]
     fn test_metrics_config_default() {
         let config = MetricsConfig::default();
-        assert!(config.namespace.is_empty());
+        assert_eq!(config.namespace, "");
         assert!(config.enable_process_metrics);
         assert!(config.enable_container_metrics);
         assert_eq!(config.update_interval, Duration::from_secs(15));
@@ -1643,7 +1643,7 @@ mod tests {
             "default metrics namespace must be bare, not derived from app_name"
         );
         // from_cascade with no cascade initialised must also fall back to bare.
-        assert!(MetricsSettings::from_cascade().namespace.is_empty());
+        assert_eq!(MetricsSettings::from_cascade().namespace, "");
     }
 
     #[test]
@@ -1654,7 +1654,7 @@ mod tests {
         assert_eq!(settings.namespace, "myapp");
         // Empty object -> bare (serde default).
         let bare: MetricsSettings = serde_json::from_str("{}").expect("valid empty");
-        assert!(bare.namespace.is_empty());
+        assert_eq!(bare.namespace, "");
     }
 
     #[test]

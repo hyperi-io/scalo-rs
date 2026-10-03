@@ -792,7 +792,10 @@ mod tests {
         let complete = keda_contract(Some(serde_json::json!({
             "kafka": { "brokers": ["kafka:9092"], "group_id": "g", "topics": ["t"] }
         })));
-        assert!(complete.unresolved_values_paths().is_empty());
+        assert_eq!(
+            complete.unresolved_values_paths(),
+            [] as [std::string::String; 0]
+        );
     }
 
     /// A contract written before `when`, `bound_from` and
@@ -810,7 +813,10 @@ mod tests {
         }"#;
         let contract: DeploymentContract = serde_json::from_str(json).unwrap();
         assert_eq!(contract.extra_ports, vec![PortContract::tcp("http", 8080)]);
-        assert!(contract.unbound_listen_paths.is_empty());
+        assert_eq!(
+            contract.unbound_listen_paths,
+            [] as [std::string::String; 0]
+        );
 
         let out = contract.to_json();
         for key in ["\"when\"", "\"bound_from\"", "\"unbound_listen_paths\""] {
@@ -1015,7 +1021,10 @@ mod tests {
         pointed.keda = pointed.keda.map(|k| {
             k.with_kafka_trigger(crate::deployment::KafkaLagTrigger::under("config.source"))
         });
-        assert!(pointed.unresolved_values_paths().is_empty());
+        assert_eq!(
+            pointed.unresolved_values_paths(),
+            [] as [std::string::String; 0]
+        );
 
         // No config at all resolves nothing.
         assert_eq!(keda_contract(None).unresolved_values_paths().len(), 3);
@@ -1025,12 +1034,18 @@ mod tests {
         no_trigger.keda = no_trigger
             .keda
             .map(|k| k.with_kafka_trigger(crate::deployment::KafkaLagTrigger::disabled()));
-        assert!(no_trigger.unresolved_values_paths().is_empty());
+        assert_eq!(
+            no_trigger.unresolved_values_paths(),
+            [] as [std::string::String; 0]
+        );
 
         let mut keda_off = keda_contract(None);
         if let Some(keda) = keda_off.keda.as_mut() {
             keda.enabled = false;
         }
-        assert!(keda_off.unresolved_values_paths().is_empty());
+        assert_eq!(
+            keda_off.unresolved_values_paths(),
+            [] as [std::string::String; 0]
+        );
     }
 }

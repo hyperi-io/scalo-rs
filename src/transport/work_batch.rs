@@ -811,7 +811,10 @@ mod tests {
         let decoded = Record::decode(&original.encode()).unwrap();
         assert_eq!(decoded.payload, original.payload);
         assert!(decoded.key.is_none());
-        assert!(decoded.headers.is_empty());
+        assert_eq!(
+            decoded.headers,
+            [] as [(std::string::String, std::vec::Vec<u8>); 0]
+        );
         assert_eq!(decoded.metadata, original.metadata);
     }
 
@@ -882,7 +885,10 @@ mod tests {
         assert!(b.is_empty());
         assert_eq!(b.len(), 0);
         assert_eq!(b.record_count(), 0);
-        assert!(b.commit_tokens.is_empty());
+        assert_eq!(
+            b.commit_tokens,
+            [] as [crate::transport::work_batch::tests::TestToken; 0]
+        );
         assert!(b.dlq_entries.is_empty());
         assert_eq!(b.total_payload_bytes(), 0);
     }
@@ -892,7 +898,10 @@ mod tests {
         let b = WorkBatch::<TestToken>::from_records(vec![record(b"{}"), record(b"[]")]);
         assert_eq!(b.len(), 2);
         assert!(!b.is_empty());
-        assert!(b.commit_tokens.is_empty());
+        assert_eq!(
+            b.commit_tokens,
+            [] as [crate::transport::work_batch::tests::TestToken; 0]
+        );
     }
 
     #[test]
@@ -1174,11 +1183,17 @@ mod tests {
         let blob = Bytes::from_static(b"{\"a\":1}");
         let b = WorkBatch::<TestToken>::single(blob.clone());
         assert_eq!(b.record_count(), 1);
-        assert!(b.commit_tokens.is_empty());
+        assert_eq!(
+            b.commit_tokens,
+            [] as [crate::transport::work_batch::tests::TestToken; 0]
+        );
         assert!(b.dlq_entries.is_empty());
         assert_eq!(b.records[0].payload, blob);
         assert_eq!(b.records[0].key, None);
-        assert!(b.records[0].headers.is_empty());
+        assert_eq!(
+            b.records[0].headers,
+            [] as [(std::string::String, std::vec::Vec<u8>); 0]
+        );
         // whole blob is the same allocation (zero-copy)
         assert_eq!(b.records[0].payload.as_ptr(), blob.as_ptr());
     }
@@ -1210,7 +1225,10 @@ mod tests {
             assert_eq!(r.metadata.format, PayloadFormat::Json);
             assert_within(&r.payload, &blob);
         }
-        assert!(b.commit_tokens.is_empty());
+        assert_eq!(
+            b.commit_tokens,
+            [] as [crate::transport::work_batch::tests::TestToken; 0]
+        );
     }
 
     #[test]
@@ -1262,7 +1280,10 @@ mod tests {
     fn json_array_empty_yields_no_records() {
         let b = WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[]")).unwrap();
         assert_eq!(b.record_count(), 0);
-        assert!(b.commit_tokens.is_empty());
+        assert_eq!(
+            b.commit_tokens,
+            [] as [crate::transport::work_batch::tests::TestToken; 0]
+        );
         assert!(b.dlq_entries.is_empty());
     }
 
@@ -1452,6 +1473,6 @@ mod tests {
     fn framing_error_is_displayable() {
         let err = WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"nope")).unwrap_err();
         // thiserror Display should produce a non-empty, informative message.
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 }

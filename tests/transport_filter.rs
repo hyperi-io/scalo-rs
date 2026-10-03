@@ -837,7 +837,10 @@ fn empty_filters_config_deserializes() {
         filters_in: Vec<FilterRule>,
     }
     let config: TestConfig = serde_yaml_ng::from_str(yaml).unwrap();
-    assert!(config.filters_in.is_empty());
+    assert_eq!(
+        config.filters_in,
+        [] as [scalo::transport::filter::FilterRule; 0]
+    );
 }
 
 // ============================================================================

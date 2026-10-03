@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(msgs.len(), 1);
 
         let more = reader.recv(10).await.unwrap().records;
-        assert!(more.is_empty());
+        assert_eq!(more, [] as [crate::transport::work_batch::Record; 0]);
     }
 
     /// `recv` dropped after a single poll, as a losing `select!` arm is,

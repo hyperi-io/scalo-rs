@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn test_split_empty() {
         let lines = split_lines(b"");
-        assert!(lines.is_empty());
+        assert_eq!(lines, [] as [&[u8]; 0]);
     }
 
     #[test]

@@ -569,11 +569,11 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = VersionCheckConfig::default();
-        assert!(config.api_url.is_empty());
+        assert_eq!(config.api_url, "");
         assert_eq!(config.timeout, Duration::from_secs(5));
         // Opt-out: on by default, inert until an api_url is configured.
         assert!(config.enabled);
-        assert!(config.product.is_empty());
+        assert_eq!(config.product, "");
     }
 
     #[test]

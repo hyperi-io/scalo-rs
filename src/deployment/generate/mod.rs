@@ -1607,7 +1607,7 @@ mod tests {
     #[test]
     fn argocd_config_default_has_no_extra_ignore_differences() {
         let cfg = ArgocdConfig::default();
-        assert!(cfg.extra_ignore_differences.is_empty());
+        assert_eq!(cfg.extra_ignore_differences, [] as [std::string::String; 0]);
     }
 
     #[test]

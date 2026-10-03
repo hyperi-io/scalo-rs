@@ -370,7 +370,7 @@ async fn a_missing_topic_still_ends_the_consumer() {
             "recv never reported the missing topic"
         );
         match consumer.recv(100).await {
-            Ok(batch) => assert!(batch.records.is_empty()),
+            Ok(batch) => assert_eq!(batch.records, [] as [scalo::Record; 0]),
             Err(e) => break e,
         }
     };

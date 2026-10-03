@@ -550,7 +550,7 @@ mod tests {
         let batch =
             engine.partition_batch(messages, |m| m.payload.as_slice(), |_m| None, |m| m.token);
         assert_eq!(batch.messages.len(), 1);
-        assert!(batch.filtered_tokens.is_empty());
+        assert_eq!(batch.filtered_tokens, [] as [u64; 0]);
         assert_eq!(batch.drop_count, 0);
     }
 
