@@ -10,9 +10,9 @@
 //!
 //! Targets (per `StrMatcher::is_match` call on a ~200-byte haystack):
 //!
-//! - **Byte** (memchr / single-byte starts/ends/eq): ≤ 30 ns
-//! - **Literal** (memmem / multi-byte starts/ends/eq): ≤ 200 ns
-//! - **LiteralSet** (AhoCorasick over many literals): ≤ 500 ns
+//! - **Byte** (memchr / single-byte starts/ends/eq): <= 30 ns
+//! - **Literal** (memmem / multi-byte starts/ends/eq): <= 200 ns
+//! - **LiteralSet** (AhoCorasick over many literals): <= 500 ns
 //! - **Regex** (regex-automata fallback): bounded by the engine itself
 //!
 //! Run with `cargo bench --bench strmatch --features strmatch`.
@@ -110,7 +110,7 @@ fn bench_set_construction(c: &mut Criterion) {
     let patterns: Vec<String> = (0..100).map(|i| format!("token_{i:04}")).collect();
     let set = StrMatcherSet::new(&patterns).unwrap();
     let [byte_n, lit_n, lit_set_n, regex_n] = set.tier_counts();
-    // Each pattern is multi-byte "token_XXXX" → Literal tier
+    // Each pattern is multi-byte "token_XXXX" -> Literal tier
     assert_eq!(
         (byte_n, lit_n, lit_set_n, regex_n),
         (0, 100, 0, 0),

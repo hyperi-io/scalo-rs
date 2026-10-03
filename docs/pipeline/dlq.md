@@ -1,12 +1,12 @@
 # DLQ
 
 The DLQ (dead-letter queue) is the last-resort sink for messages the
-primary pipeline couldn't deliver — parse errors, validation
+primary pipeline couldn't deliver -- parse errors, validation
 failures, persistent transport failure, `TieredSink::SpoolFull`,
 poison records. Every data-plane service shares one DLQ orchestrator built
 from cascade config.
 
-The orchestrator is `Dlq` — a clone-cheap handle wrapping a
+The orchestrator is `Dlq` -- a clone-cheap handle wrapping a
 `BackgroundSink<DlqEntry>`. Calling `send` queues the entry on an
 in-memory mpsc and returns. A drain task pulled out of the runtime
 loop coalesces queued entries into batches and writes to one or more
@@ -28,7 +28,7 @@ External rotation of the DLQ file (logrotate, say) is unsupported: the backend r
 
 Backends are concrete variants of a `DlqBackend` enum (static
 dispatch, no `Box<dyn>`, no `async-trait` macro). Adding a new backend
-means extending the enum in scalo — consumers never construct backend
+means extending the enum in scalo -- consumers never construct backend
 types directly.
 
 ### The Kafka barrier
@@ -53,7 +53,7 @@ Delivery failures are read at every write, at the barrier and at [shutdown](#shu
 | ------ | ----------- |
 | `Cascade` (default) | Try backends in order (Kafka -> File -> HTTP), stop on the first that takes the entry; an entry the broker never acks goes on to the next |
 | `FanOut` | Write every batch to every enabled backend, succeed if at least one takes the whole batch |
-| `FileOnly` | File backend only — no Kafka dependency |
+| `FileOnly` | File backend only -- no Kafka dependency |
 | `KafkaOnly` | Kafka backend only |
 
 Cascade is the production default -- Kafka primary, file fallback. An entry falls through to the file when the producer refuses to queue it (a full producer queue, or an entry over its `message.max.bytes`), and when the producer queued it but the broker refused it or never acked it. So an unreachable broker loses no dead letters while the file backend takes them: they land in the file at the next `flush()` or shutdown, which purge what is unacked, or at the next write once librdkafka has failed the delivery (`message.timeout.ms`, 300 s unless set). See [The Kafka barrier](#the-kafka-barrier). FanOut is for compliance setups that need every entry mirrored to two destinations.
@@ -139,7 +139,7 @@ by design and the drain will eventually write.
 
 `try_send` returns `Err(DlqError::QueueFull)` immediately when the
 in-memory queue is full (`Overflow::Drop`). The drop counter is
-incremented for visibility — the caller decides whether to log,
+incremented for visibility -- the caller decides whether to log,
 escalate, or proceed.
 
 ---
@@ -152,7 +152,7 @@ then exits. Triggered by either:
 - `CancellationToken::cancel()` passed to `spawn`, or
 - All `Dlq` handles dropped (channel closes naturally).
 
-Then `Dlq::shutdown().await` joins the drain task. Idempotent — safe
+Then `Dlq::shutdown().await` joins the drain task. Idempotent -- safe
 to call from any clone.
 
 Before it exits the drain waits for the Kafka backend's acks the way a `flush()` does: up to `kafka.send_timeout_ms`, plus up to 5 s when it has to purge. Dropping the producer afterwards discards whatever it still holds, so first the drain hands every entry only Kafka held that the broker refused or never acked to the backend after Kafka in `Cascade`, and counts what no backend took in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`. `shutdown()` returns `Ok` either way; a caller that needs the loss as an `Err` calls `flush()` before it.
@@ -192,12 +192,12 @@ dlq:
 ## Upgrading from the older DLQ API
 
 Earlier releases exposed `Dlq::file_only` / `Dlq::with_kafka` constructors
-and a `DlqBackend` trait object. Both are gone — every backend mix now goes
+and a `DlqBackend` trait object. Both are gone -- every backend mix now goes
 through `Dlq::spawn` with `DlqMode` selecting routing, and `DlqBackend` is an
 enum (static dispatch). The orchestrator gained `try_send` (non-blocking,
 `QueueFull` on overflow), `flush` (write barrier), and `shutdown`
 (drain + join). `send` semantics changed from "wait for durable write" to
-queue-admission — see [Queue-admission semantics](#queue-admission-semantics).
+queue-admission -- see [Queue-admission semantics](#queue-admission-semantics).
 
 The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 
@@ -207,7 +207,7 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 
 | Item | Purpose |
 | ------ | --------- |
-| `Dlq::disabled()` | No-op handle — `send` succeeds, nothing written; each routed entry is counted in `dropped()`, emitted as `dlq_dropped_total{reason="disabled"}`, and logged at ERROR (rate-limited) |
+| `Dlq::disabled()` | No-op handle -- `send` succeeds, nothing written; each routed entry is counted in `dropped()`, emitted as `dlq_dropped_total{reason="disabled"}`, and logged at ERROR (rate-limited) |
 | `Dlq::spawn(config, service_name, kafka_config, shutdown)` | Build backends, spawn drain, return cloneable handle |
 | `try_send(entry) -> Result<(), DlqError>` | Sync-shape queue submission; `QueueFull` on overflow |
 | `send(entry).await` | Async submission that awaits queue space |
@@ -216,14 +216,14 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 | `write_confirmed(entries).await` | Write these entries as a batch of their own and answer whether a backend holds them, to this caller alone (see [Queue-admission semantics](#queue-admission-semantics)) |
 | `refusal(&entry)` | Why no backend can ever hold this entry, or `None`: the permanent refusal a held source releases `Dropped` (needs `transport`) |
 | `shutdown().await` | Stop the drain and join it; the drain first waits for Kafka acks and counts what none confirmed in `dropped()` (see [Shutdown](#shutdown)) |
-| `is_enabled() / mode() / pending() / dropped()` | Introspection — `dropped()` totals queue overflow (`dlq_dropped_total{reason="overflow"}`) + disabled-DLQ sends + batches every backend refused + Kafka entries a barrier or the shutdown found lost (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
+| `is_enabled() / mode() / pending() / dropped()` | Introspection -- `dropped()` totals queue overflow (`dlq_dropped_total{reason="overflow"}`) + disabled-DLQ sends + batches every backend refused + Kafka entries a barrier or the shutdown found lost (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
 | `DlqEntry::new(service, error_type, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_metadata(...)` | Entry builder |
 | `DlqSource::kafka(topic, partition, offset) / ::http(url) / ...` | Provenance for the entry |
-| `DlqBackend` (enum) | `File / Kafka / Http` — feature-gated variants |
+| `DlqBackend` (enum) | `File / Kafka / Http` -- feature-gated variants |
 | `DlqMode` | `Cascade / FanOut / FileOnly / KafkaOnly` |
 | `DlqError` | `Io / Serialization / File / Kafka / BackendError / AllBackendsFailed / NotConfigured / QueueFull / Closed` |
 
-`Dlq` is `Clone` — clones share the same drain. The single-owner
+`Dlq` is `Clone` -- clones share the same drain. The single-owner
 shutdown handle lives inside `Arc<AsyncMutex<Option<...>>>` so any
 clone can call `shutdown()`.
 
@@ -232,10 +232,10 @@ clone can call `shutdown()`.
 ## Source
 
 - [`../../src/dlq/mod.rs`](../../src/dlq/mod.rs)
-- [`../../src/dlq/orchestrator.rs`](../../src/dlq/orchestrator.rs) — `Dlq`, `DlqDrain`, cascade/fan-out dispatch
-- [`../../src/dlq/backend.rs`](../../src/dlq/backend.rs) — `DlqBackend` enum
+- [`../../src/dlq/orchestrator.rs`](../../src/dlq/orchestrator.rs) -- `Dlq`, `DlqDrain`, cascade/fan-out dispatch
+- [`../../src/dlq/backend.rs`](../../src/dlq/backend.rs) -- `DlqBackend` enum
 - [`../../src/dlq/config.rs`](../../src/dlq/config.rs)
-- [`../../src/dlq/entry.rs`](../../src/dlq/entry.rs) — `DlqEntry`, `DlqSource`
+- [`../../src/dlq/entry.rs`](../../src/dlq/entry.rs) -- `DlqEntry`, `DlqSource`
 - [`../../src/dlq/file.rs`](../../src/dlq/file.rs)
 - [`../../src/dlq/kafka.rs`](../../src/dlq/kafka.rs)
 - [`../../src/dlq/http.rs`](../../src/dlq/http.rs)
@@ -244,10 +244,10 @@ clone can call `shutdown()`.
 
 ## Related
 
-- [tiered-sink.md](tiered-sink.md) — common upstream caller (routes `SpoolFull` / `Fatal` to DLQ)
-- [batch-engine.md](batch-engine.md) — parse errors and pre-route DLQ outcomes flow here
-- [../transport/README.md](../transport/README.md) — Kafka backend reuses `KafkaConfig`
-- [../transport/filter-engine.md](../transport/filter-engine.md) — wire-level filter drains DLQ entries here
-- [../feature-flags.md](../feature-flags.md) — `dlq`, `dlq-kafka`, `dlq-http`
+- [tiered-sink.md](tiered-sink.md) -- common upstream caller (routes `SpoolFull` / `Fatal` to DLQ)
+- [batch-engine.md](batch-engine.md) -- parse errors and pre-route DLQ outcomes flow here
+- [../transport/README.md](../transport/README.md) -- Kafka backend reuses `KafkaConfig`
+- [../transport/filter-engine.md](../transport/filter-engine.md) -- wire-level filter drains DLQ entries here
+- [../feature-flags.md](../feature-flags.md) -- `dlq`, `dlq-kafka`, `dlq-http`
 - [../auto-wiring.md](../auto-wiring.md)
 - [../architecture.md](../architecture.md)

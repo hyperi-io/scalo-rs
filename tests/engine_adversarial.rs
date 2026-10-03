@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      tests/engine_adversarial.rs
-// Purpose:   Adversarial tests for BatchEngine — edge cases, boundaries, stress
+// Purpose:   Adversarial tests for BatchEngine -- edge cases, boundaries, stress
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -224,14 +224,14 @@ fn empty_payload_bytes() {
 
 #[test]
 fn null_in_payload() {
-    // Payload with embedded NUL bytes — not valid JSON
+    // Payload with embedded NUL bytes -- not valid JSON
     let payload = b"{\"id\":1,\x00\"extra\":2}";
     let engine = default_engine();
     let msgs = vec![make_raw(payload)];
     // sonic_rs should reject NUL bytes in the middle of JSON
     let results: Vec<Result<(), String>> = engine.process_mid_tier(&msgs, |_| Ok(()));
     assert_eq!(results.len(), 1);
-    // May parse OK or fail depending on sonic_rs behaviour — just verify no panic
+    // May parse OK or fail depending on sonic_rs behaviour -- just verify no panic
     let _ = results[0].as_ref();
 }
 
@@ -252,7 +252,7 @@ fn pre_route_all_filtered() {
         .collect();
 
     let results: Vec<Result<(), String>> = engine.process_mid_tier(&msgs, |_| Ok(()));
-    // All filtered — no results
+    // All filtered -- no results
     assert_eq!(
         results,
         [] as [std::result::Result<(), std::string::String>; 0]
@@ -275,7 +275,7 @@ fn pre_route_none_filtered() {
     };
     let engine = BatchEngine::new(config);
 
-    // All messages have _table — none filtered
+    // All messages have _table -- none filtered
     let msgs = make_json_messages(50);
     let results: Vec<Result<(), String>> = engine.process_mid_tier(&msgs, |_| Ok(()));
     assert_eq!(results.len(), 50);
@@ -336,7 +336,7 @@ fn transform_returns_error() {
     assert_eq!(results.len(), 10);
     let err_count = results.iter().filter(|r| r.is_err()).count();
     let ok_count = results.iter().filter(|r| r.is_ok()).count();
-    // ids 0,2,4,6,8 → 5 errors; 1,3,5,7,9 → 5 ok
+    // ids 0,2,4,6,8 -> 5 errors; 1,3,5,7,9 -> 5 ok
     assert_eq!(err_count, 5);
     assert_eq!(ok_count, 5);
 }
@@ -392,7 +392,7 @@ fn process_raw_large_batch() {
 
 #[test]
 fn parse_error_action_skip() {
-    // With Skip action, invalid messages are silently dropped — not included in results.
+    // With Skip action, invalid messages are silently dropped -- not included in results.
     let config = BatchProcessingConfig {
         parse_error_action: scalo::worker::engine::ParseErrorAction::Skip,
         ..Default::default()
@@ -403,10 +403,10 @@ fn parse_error_action_skip() {
     // Insert 2 invalid messages at positions 1 and 3
     msgs.insert(1, make_raw(b"not json {{{"));
     msgs.push(make_raw(b"also not json <<<"));
-    // msgs is now: valid, invalid, valid, valid, invalid → 5 total, 3 valid
+    // msgs is now: valid, invalid, valid, valid, invalid -> 5 total, 3 valid
 
     let results: Vec<Result<(), String>> = engine.process_mid_tier(&msgs, |_| Ok(()));
-    // Skip drops the 2 invalid ones entirely — only 3 Ok entries
+    // Skip drops the 2 invalid ones entirely -- only 3 Ok entries
     assert_eq!(
         results.len(),
         3,
@@ -433,7 +433,7 @@ fn parse_error_action_fail_batch() {
     let mut msgs = make_json_messages(4);
     // Inject one invalid message at position 2
     msgs.insert(2, make_raw(b"totally not json!!!"));
-    // msgs: valid, valid, invalid, valid, valid → 5 total
+    // msgs: valid, valid, invalid, valid, valid -> 5 total
 
     let results: Vec<Result<(), String>> = engine.process_mid_tier(&msgs, |_| Ok(()));
     // FailBatch: all results in the batch (up to and including the error) are Err
@@ -457,7 +457,7 @@ fn msgpack_auto_detection() {
     let msgpack_bytes = rmp_serde::to_vec(&json_value).expect("msgpack encode failed");
 
     let engine = default_engine();
-    // Use Auto format — engine should sniff the MsgPack header bytes, then
+    // Use Auto format -- engine should sniff the MsgPack header bytes, then
     // decode natively via rmpv (no rmp_serde -> serde_json bridge on the
     // engine parse path).
     let msg = Record {
@@ -485,7 +485,7 @@ fn msgpack_auto_detection() {
 #[test]
 fn pre_route_field_error_on_invalid_json() {
     // Routing + DropFieldMissing filter applied to messages with completely invalid JSON.
-    // Invalid JSON cannot be parsed for field extraction — should be treated as
+    // Invalid JSON cannot be parsed for field extraction -- should be treated as
     // field-missing (dropped) or parse error (DLQ) depending on engine phase ordering.
     let config = BatchProcessingConfig {
         routing_field: Some("_table".to_string()),
@@ -505,7 +505,7 @@ fn pre_route_field_error_on_invalid_json() {
     let results: Vec<Result<(), String>> = engine.process_mid_tier(&msgs, |_| Ok(()));
 
     // The two valid messages should succeed.
-    // The invalid JSON message is either filtered (field extraction fails → treated as
+    // The invalid JSON message is either filtered (field extraction fails -> treated as
     // missing) or produces an Err (DLQ from parse phase after pre-route passes).
     // Either way, no panic and exactly 2 Ok results.
     let ok_count = results.iter().filter(|r| r.is_ok()).count();

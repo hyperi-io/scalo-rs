@@ -2,12 +2,12 @@
 
 Six concrete backends behind the
 [transport traits](README.md). Each is gated behind its own
-feature flag — apps pull only what they ship.
+feature flag -- apps pull only what they ship.
 
 | Backend | Feature flag | Native dep | Use case | Holds its source acknowledgement |
 | --------- | -------------- | ------------ | ---------- | ---------- |
 | Kafka | `transport-kafka` | `librdkafka1` (runtime), `librdkafka-dev` (build) | Production default, persistence, replay | Yes |
-| gRPC | `transport-grpc` | None (pure Rust — `tonic`) | Inter-service mesh, low latency | Yes |
+| gRPC | `transport-grpc` | None (pure Rust -- `tonic`) | Inter-service mesh, low latency | Yes |
 | Memory | `transport-memory` | None | Unit tests, same-process pipelines | No, none to hold |
 | File | `transport-file` | None | Debugging, audit trails, replay | Not yet |
 | Pipe | `transport-pipe` | None | Unix pipeline composition | No, none to hold |
@@ -15,7 +15,7 @@ feature flag — apps pull only what they ship.
 
 A source that holds its acknowledgement releases it only once its records are delivered. See [../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#which-sources-hold-it).
 
-The Vector-compat shim lives behind `transport-grpc-vector-compat` —
+The Vector-compat shim lives behind `transport-grpc-vector-compat` --
 it isn't a separate backend, it's a wire-protocol overlay on the
 gRPC server.
 
@@ -23,24 +23,24 @@ gRPC server.
 
 ## Two deployment models (Kafka vs gRPC)
 
-The picture below applies to the Kafka and gRPC backends — the other
+The picture below applies to the Kafka and gRPC backends -- the other
 four don't make a transit-network choice.
 
 | Model | Persistence | Replay | Latency | Failure mode | Use when |
 | ------- | ------------- | -------- | --------- | -------------- | ---------- |
 | **Kafka-mediated** | Yes (broker disk) | Yes | ~ms | Producer keeps writing if consumer down | Default for staged pipelines, audit-trail required, consumer-failure tolerance matters |
-| **Direct gRPC** | No | No | ~µs | Sender fails fast if receiver down | Tight data-plane mesh, latency-sensitive, broker overhead unacceptable |
+| **Direct gRPC** | No | No | ~us | Sender fails fast if receiver down | Tight data-plane mesh, latency-sensitive, broker overhead unacceptable |
 
 Apps pick per-stage. A typical data-plane deployment runs
-`receiver → Kafka → loader` (durability at ingress) and
-`loader → gRPC → archiver` (latency on the sink) — same binary set,
+`receiver -> Kafka -> loader` (durability at ingress) and
+`loader -> gRPC -> archiver` (latency on the sink) -- same binary set,
 config-only difference.
 
 ---
 
 ## Kafka
 
-`rdkafka` with dynamic linking against system librdkafka — see
+`rdkafka` with dynamic linking against system librdkafka -- see
 [../feature-flags.md](../feature-flags.md) for the package matrix.
 Profile-based config (`production`, `devtest`) with
 `librdkafka_overrides` for fine control. Supports auto-discovery
@@ -116,7 +116,7 @@ transport:
 ```
 
 - **Cancellation safety**: `recv` reads from an internal mpsc, safe
-  to drop. `send` is a single unary RPC — drop cancels cleanly.
+  to drop. `send` is a single unary RPC -- drop cancels cleanly.
 - **Send deadline**: `send_timeout_ms` (default 30 s, `0` for none) bounds each `send`, and each request of a `send_batch`, end to end, DNS, connect and TLS handshake included, and a send past it is `Backpressured`. A dial whose DNS lookup, TCP connect or TLS handshake has not finished by nine tenths of the limit is abandoned, so the send that started it reports the failure and the next send dials afresh.
 - **Send failures**: `Unavailable`, `ResourceExhausted`, `DeadlineExceeded` (`send_timeout_ms`), `Cancelled` (a server cutting the RPC at its deadline), and a connection that fails before the server answers are `Backpressured`, so an absent, restarting or overrun receiver is waited out. Any other status the server returns is `Fatal`. A send answered `Unavailable` with the `scalo-hold-expired` trailer, or ended by `DeadlineExceeded` or `Cancelled`, may still be delivered by the receiver, so the retry can duplicate it: it counts in `transport_redelivered_total{reason="hold_expired"|"deadline"}`.
 - **Dead connections**: the client sends an HTTP/2 PING once a connection has read nothing for `send_timeout_ms` (30 s when it is `0`), and closes the connection when the PING goes unanswered for as long again. A receiver that stays connected but stops answering is dropped that way, and the next send dials afresh.
@@ -152,7 +152,7 @@ A server armed by a caller that releases every token it takes answers a push onl
 Wire-compat shim for `vector.Vector/PushEvents`. Only used by
 a Vector-compat transform consumer so legacy Vector sinks can target a native gRPC
 endpoint without recompile. Enable with `vector_compat: true` in the
-gRPC config — the server then accepts both native and Vector RPCs on
+gRPC config -- the server then accepts both native and Vector RPCs on
 the same listener. Not a separate backend, not for any other app.
 
 A `PushEvents` request is queued whole or not at all: every event is converted first, then room for all of them is reserved in the receive queue, waiting while it is full. A receiver closed under the request refuses it with `Unavailable` (`receiver closed`), which Vector retries, and none of its events were queued. A request with more events than `recv_buffer_size` cannot be reserved at once, so it is queued one event at a time; if the receiver closes part-way, the events already queued arrive again when Vector retries the request.
@@ -182,9 +182,9 @@ Source: [../../src/transport/vector_compat/](../../src/transport/vector_compat/)
 
 ## Memory
 
-`tokio::sync::mpsc` bounded channel. Same-process only — sender and
+`tokio::sync::mpsc` bounded channel. Same-process only -- sender and
 receiver are tied to the same `MemoryTransport` instance. **Not a
-deployable backend** — for tests and in-process pipelines (e.g.
+deployable backend** -- for tests and in-process pipelines (e.g.
 unit tests against the `BatchEngine`).
 
 ```yaml
@@ -197,9 +197,9 @@ transport:
 ```
 
 - **Cancellation safety**: `recv` is a `select!` on `recv_timeout`
-  and channel `recv` — safe to drop.
+  and channel `recv` -- safe to drop.
 - **`close()`**: refuses every `send` from then on, and keeps what `send` already accepted: `recv` returns it, then `TransportError::Closed`.
-- **`is_healthy()`**: `!closed` — atomic flag flipped by `close()`.
+- **`is_healthy()`**: `!closed` -- atomic flag flipped by `close()`.
 - **`commit()`**: advances an internal `AtomicU64` sequence.
 - **Acknowledgements**: none to hold. `<key>.memory.acknowledgements` has no effect, and the factory warns once.
 
@@ -240,7 +240,7 @@ Source: [../../src/transport/file.rs](../../src/transport/file.rs).
 ## Pipe
 
 Reads from stdin, writes to stdout. Newline-delimited, one line per
-message. The `destination` arg to `send()` is ignored — there's only one
+message. The `destination` arg to `send()` is ignored -- there's only one
 stdout. `PipeToken` is a monotonic sequence number; `commit()` is a
 no-op because stdin is forward-only.
 
@@ -283,7 +283,7 @@ transport:
       recv_buffer_size: 10000
 ```
 
-- **Cancellation safety**: send is `reqwest`'s async path — drop
+- **Cancellation safety**: send is `reqwest`'s async path -- drop
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
 - **Send failures**: a refused, reset or timed-out connection, and HTTP 408, 429, 502, 503 or 504, are `Backpressured`, so a down endpoint is waited out. Any other non-2xx status, and a request that cannot be built, is `Fatal`.
@@ -301,7 +301,7 @@ Source: [../../src/transport/http.rs](../../src/transport/http.rs).
 
 Every backend reads `filters_in` and `filters_out` from its own
 config section and instantiates a [`TransportFilterEngine`](filter-engine.md)
-at construction. No backend-specific filter code — the engine is the
+at construction. No backend-specific filter code -- the engine is the
 same across all six. Tier-1 filters cost ~50-100 ns when present
 and zero when absent.
 
@@ -309,9 +309,9 @@ and zero when absent.
 
 ## Related
 
-- [README.md](README.md) — traits, factory, enum dispatch
-- [filter-engine.md](filter-engine.md) — embedded filtering
-- [routing.md](routing.md) — per-key dispatch over multiple backends
-- [../feature-flags.md](../feature-flags.md) — feature-to-dep table
-- [../integration.md](../integration.md) — ServiceApp recipe
-- [../pipeline/dlq.md](../pipeline/dlq.md) — DLQ sink backends
+- [README.md](README.md) -- traits, factory, enum dispatch
+- [filter-engine.md](filter-engine.md) -- embedded filtering
+- [routing.md](routing.md) -- per-key dispatch over multiple backends
+- [../feature-flags.md](../feature-flags.md) -- feature-to-dep table
+- [../integration.md](../integration.md) -- ServiceApp recipe
+- [../pipeline/dlq.md](../pipeline/dlq.md) -- DLQ sink backends

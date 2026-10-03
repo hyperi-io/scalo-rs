@@ -17,7 +17,7 @@ use scalo::expression::{
     check_profile_with_config, compile, evaluate, evaluate_condition, validate,
 };
 
-// ── validate() ────────────────────────────────────────────────
+// -- validate() ------------------------------------------------
 
 #[test]
 fn validate_valid_comparison() {
@@ -187,7 +187,7 @@ fn validate_disallowed_duration() {
     assert!(errors[0].contains("duration()"));
 }
 
-// ── evaluate() ────────────────────────────────────────────────
+// -- evaluate() ------------------------------------------------
 
 #[test]
 fn evaluate_arithmetic() {
@@ -372,7 +372,7 @@ fn evaluate_disallowed_function_errors() {
     assert!(result.is_err());
 }
 
-// ── evaluate_condition() ──────────────────────────────────────
+// -- evaluate_condition() --------------------------------------
 
 #[test]
 fn condition_match() {
@@ -466,7 +466,7 @@ fn condition_numeric_comparison() {
 fn condition_ternary_truthy() {
     let mut data = HashMap::new();
     data.insert("is_admin".into(), json!(true));
-    // Ternary returns 95 (non-zero int) → truthy
+    // Ternary returns 95 (non-zero int) -> truthy
     assert!(evaluate_condition("is_admin ? 95 : 0", &data));
 }
 
@@ -474,11 +474,11 @@ fn condition_ternary_truthy() {
 fn condition_ternary_falsy() {
     let mut data = HashMap::new();
     data.insert("is_admin".into(), json!(true));
-    // Ternary returns 0 → falsy
+    // Ternary returns 0 -> falsy
     assert!(!evaluate_condition("is_admin ? 0 : 50", &data));
 }
 
-// ── compile() ─────────────────────────────────────────────────
+// -- compile() -------------------------------------------------
 
 #[test]
 fn compile_and_execute() {
@@ -521,7 +521,7 @@ fn compile_empty_raises() {
     assert!(compile("").is_err());
 }
 
-// ── Profile ───────────────────────────────────────────────────
+// -- Profile ---------------------------------------------------
 
 #[test]
 fn allowed_functions_contains_core() {
@@ -569,7 +569,7 @@ fn no_overlap_between_allowed_and_disallowed() {
     }
 }
 
-// ── String literal false-positive prevention ─────────────────
+// -- String literal false-positive prevention -----------------
 
 #[test]
 fn validate_function_name_inside_string_not_flagged() {
@@ -602,7 +602,7 @@ fn validate_real_call_after_string_caught() {
     assert!(errors[0].contains("map()"));
 }
 
-// ── ProfileConfig integration ────────────────────────────────
+// -- ProfileConfig integration --------------------------------
 
 #[test]
 fn profile_config_default_blocks_all_restricted() {
@@ -625,7 +625,7 @@ fn profile_config_selective_unlock() {
     assert!(blocked.contains(&"timestamp"));
 }
 
-// ── ExpressionError ───────────────────────────────────────────
+// -- ExpressionError -------------------------------------------
 
 #[test]
 fn error_validation_display() {

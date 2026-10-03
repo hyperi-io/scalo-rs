@@ -1,10 +1,10 @@
 # Overview
 
 The transport layer is the boundary between an app and any
-message-shaped backend — Kafka, gRPC, Memory, File, Pipe,
+message-shaped backend -- Kafka, gRPC, Memory, File, Pipe,
 HTTP. Apps depend on the traits; the concrete backend is selected
 at runtime from config. Embedded filter engine, embedded metrics,
-embedded propagation — see [filter-engine.md](filter-engine.md) and
+embedded propagation -- see [filter-engine.md](filter-engine.md) and
 [backends.md](backends.md).
 
 ---
@@ -43,13 +43,13 @@ classDiagram
 | Trait | Purpose | Object-safe? |
 | ------- | --------- | -------------- |
 | `TransportBase` | Lifecycle + introspection -- `close()`, `is_healthy()`, `name()`, `healthcheck()` | No -- `close()` and `healthcheck()` return `impl Future` |
-| `TransportSender` | Add `send(destination, payload)` — async fn in trait | Not via `dyn` — see below |
+| `TransportSender` | Add `send(destination, payload)` -- async fn in trait | Not via `dyn` -- see below |
 | `TransportReceiver` | Add `recv` + `commit`, associated `type Token: CommitToken` | No -- `impl Future` returns, and `Token` differs per backend |
-| `Transport` | Marker — blanket impl for `T: Sender + Receiver` | N/A |
+| `Transport` | Marker -- blanket impl for `T: Sender + Receiver` | N/A |
 
 `TransportSender::send` returns `impl Future<Output = SendResult> + Send`
-— native async fn in trait. Receivers have the same shape on `recv`
-and `commit`. Native async-fn-in-trait is not object-safe — the
+-- native async fn in trait. Receivers have the same shape on `recv`
+and `commit`. Native async-fn-in-trait is not object-safe -- the
 opaque return type means `Box<dyn TransportSender>` won't compile.
 
 The fix is **enum dispatch**, not `dyn`.
@@ -71,7 +71,7 @@ and delegating. Static dispatch, no vtable, no `Box`.
 
 `from_config(key).await` reads the `TransportConfig` at the given
 cascade key, picks the backend from `transport_type`, and constructs
-it. The call is **async** — backends like Kafka and gRPC do socket
+it. The call is **async** -- backends like Kafka and gRPC do socket
 work during construction. Forgetting the `.await` is a compile error.
 
 `from_transport_config(&cfg).await` is the non-cascade variant for
@@ -104,17 +104,17 @@ pub trait CommitToken: Clone + Send + Sync + Debug + Display + 'static {
 
 Every backend defines its own token (`KafkaToken`, `GrpcToken`,
 `FileToken`, etc.). The token carries whatever the backend needs to
-ack the message — Kafka offsets, file byte positions, in-memory
+ack the message -- Kafka offsets, file byte positions, in-memory
 sequence numbers. The `Display` impl prints a human-readable form
 (e.g. `kafka:events.land:0:12345`, `file:8192`) for logs and DLQ
 provenance.
 
-**Commit semantics**: the caller drives commit. Receive a batch, process it, and once every record in it has been delivered or dead-lettered, call `commit(&tokens)` with all of the batch's tokens. Commit no subset while any record of the batch is still undelivered: Kafka commits the highest offset each partition's tokens carry, so a subset commits past an earlier record of that partition the sink has not taken. Token routing back through the same transport is the contract — commits don't cross transports. Each backend's commit does what's needed:
+**Commit semantics**: the caller drives commit. Receive a batch, process it, and once every record in it has been delivered or dead-lettered, call `commit(&tokens)` with all of the batch's tokens. Commit no subset while any record of the batch is still undelivered: Kafka commits the highest offset each partition's tokens carry, so a subset commits past an earlier record of that partition the sink has not taken. Token routing back through the same transport is the contract -- commits don't cross transports. Each backend's commit does what's needed:
 
 | Backend | `commit()` effect |
 | --------- | ------------------- |
 | Kafka | Commits consumer offsets |
-| gRPC | No-op — no persistence |
+| gRPC | No-op -- no persistence |
 | File | Persists read position to `.pos` sidecar |
 | Memory | Advances internal sequence |
 | HTTP | No-op -- the server answered when the record was queued |
@@ -143,9 +143,9 @@ pub struct Record {
 }
 ```
 
-Generic over `Token` — pinned to the receiving transport. Payload is
+Generic over `Token` -- pinned to the receiving transport. Payload is
 raw bytes, parsed by the app. Format auto-detected from the first
-byte (`{`/`[` → JSON; `0x80..0x9f`/`0xdc..0xdf` → MsgPack). See
+byte (`{`/`[` -> JSON; `0x80..0x9f`/`0xdc..0xdf` -> MsgPack). See
 [../pipeline/dlq.md](../pipeline/dlq.md) for how messages flow
 into the DLQ when downstream processing fails.
 
@@ -155,12 +155,12 @@ A backend collects `Message<Token>` values (`key`, `payload: Bytes`, `token`, `t
 
 ---
 
-## Filter engine — embedded, not bolted on
+## Filter engine -- embedded, not bolted on
 
 Every backend wires the filter engine on construction. Inbound
 filters drop or DLQ-stage messages inside `recv()` before the caller
 ever sees them; outbound filters do the same on `send()`. Filters
-that match `action: dlq` don't route to a DLQ directly — they come back
+that match `action: dlq` don't route to a DLQ directly -- they come back
 **inline** in `recv()`'s `WorkBatch.dlq_entries`, which the caller routes:
 
 ```rust
@@ -175,12 +175,12 @@ With no inbound filter configured, `dlq_entries` is empty. Full design and tier 
 
 ---
 
-## Routing — per-destination dispatch (originators only)
+## Routing -- per-destination dispatch (originators only)
 
 `RoutedSender` wraps N `AnySender`s in a `HashMap<String, AnySender>`
 plus an optional default. `send(destination, payload)` picks the
 backend by destination. Only the receiver and fetcher stages use
-this — mid-tier and
+this -- mid-tier and
 sink stages do 1:1. See [routing.md](routing.md).
 
 ---
@@ -199,7 +199,7 @@ sink stages do 1:1. See [routing.md](routing.md).
 | `ack::{AcknowledgementsConfig, SourceAck, Tickets}` | The `acknowledgements` key, the hand-rolled release, listener admission |
 | `CommitToken` | `Clone + Send + Sync + Debug + Display`, `as_str()` |
 | `Transport` | Blanket impl for any `T: Sender + Receiver` |
-| `AnySender::from_config(key).await` | Cascade factory — **async** |
+| `AnySender::from_config(key).await` | Cascade factory -- **async** |
 | `AnySender::from_transport_config(&cfg).await` | Direct factory for tests |
 | `AnyReceiver::from_config(key).await` | Receive-side cascade factory -- **async**; `from_transport_config` too |
 | `AnyToken` | Type-erased commit token from `AnyReceiver`, `#[non_exhaustive]` |
@@ -210,7 +210,7 @@ sink stages do 1:1. See [routing.md](routing.md).
 | `TransportConfig` | Top-level config struct read by the factory |
 | `TransportType` | Enum: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http` |
 
-Source: [../../src/transport/](../../src/transport/) — particularly
+Source: [../../src/transport/](../../src/transport/) -- particularly
 [mod.rs](../../src/transport/mod.rs),
 [traits.rs](../../src/transport/traits.rs),
 [factory.rs](../../src/transport/factory.rs),
@@ -220,10 +220,10 @@ Source: [../../src/transport/](../../src/transport/) — particularly
 
 ## Related
 
-- [backends.md](backends.md) — six concrete backends, config and deps
-- [filter-engine.md](filter-engine.md) — tiered CEL filtering
-- [routing.md](routing.md) — `RoutedSender` for originators
-- [../auto-wiring.md](../auto-wiring.md) — factory in the pillar model
-- [../integration.md](../integration.md) — ServiceApp wiring recipe
-- [../feature-flags.md](../feature-flags.md) — per-backend features
-- [../pipeline/dlq.md](../pipeline/dlq.md) — DLQ sinks
+- [backends.md](backends.md) -- six concrete backends, config and deps
+- [filter-engine.md](filter-engine.md) -- tiered CEL filtering
+- [routing.md](routing.md) -- `RoutedSender` for originators
+- [../auto-wiring.md](../auto-wiring.md) -- factory in the pillar model
+- [../integration.md](../integration.md) -- ServiceApp wiring recipe
+- [../feature-flags.md](../feature-flags.md) -- per-backend features
+- [../pipeline/dlq.md](../pipeline/dlq.md) -- DLQ sinks

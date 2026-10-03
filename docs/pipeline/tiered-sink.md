@@ -1,7 +1,7 @@
 # Tiered Sink
 
 `TieredSink<S>` wraps any `Sink` backend (Kafka, gRPC, S3, HTTP) with
-the resilience primitives every production data-plane pipeline needs —
+the resilience primitives every production data-plane pipeline needs --
 timeout, circuit breaker, disk spillover, background drain. Apps call
 `sink.send(msg).await?` and the sink picks the right failure response.
 
@@ -18,8 +18,8 @@ flowchart TB
     subgraph TS["TieredSink wraps sink S"]
         Hot["Hot path<br/>circuit Closed? try_send with timeout + retry/backoff"]
         Cold["Cold path<br/>compress (LZ4/Snappy/Zstd), append to yaque spool"]
-        Fatal["Fatal<br/>Sink::Fatal — propagate error"]
-        Drain["Background drain, always running<br/>circuit recovers → spool → sink"]
+        Fatal["Fatal<br/>Sink::Fatal -- propagate error"]
+        Drain["Background drain, always running<br/>circuit recovers -> spool -> sink"]
         Hot -->|&quot;Full / Unavailable / timeout&quot;| Cold
         Cold -->|&quot;SpoolFull / DiskUnavailable&quot;| Fatal
     end
@@ -29,7 +29,7 @@ flowchart TB
 ```
 
 A `disk_capacity_poller` watches the spool filesystem when
-`disk_aware` is configured — if usage crosses the threshold the
+`disk_aware` is configured -- if usage crosses the threshold the
 `disk_available` flag flips and new spool writes return
 `DiskUnavailable` instead of silently filling the disk.
 
@@ -55,8 +55,8 @@ flowchart TB
 
 | Sink result | Disposition | Circuit effect |
 | ------------- | ------------- | ---------------- |
-| `Ok(())` | Done | Records success — closes circuit if Open/HalfOpen |
-| `Err(Full)` | Spool to disk | No failure counted (backpressure ≠ unhealthy) |
+| `Ok(())` | Done | Records success -- closes circuit if Open/HalfOpen |
+| `Err(Full)` | Spool to disk | No failure counted (backpressure != unhealthy) |
 | `Err(Unavailable)` | Spool to disk | Failure counted, may open circuit |
 | `Err(Fatal(e))` | Return `Err` to caller | No spool, no circuit change |
 | Timeout | Spool to disk | Failure counted, may open circuit |
@@ -74,15 +74,15 @@ Three states, evaluated per `send`:
 ```mermaid
 stateDiagram-v2
     [*] --> Closed
-    Closed --> Open : consecutive_failures ≥ threshold
+    Closed --> Open : consecutive_failures >= threshold
     Open --> HalfOpen : reset_timeout elapsed
     HalfOpen --> Closed : record_success
     HalfOpen --> Open : record_failure
 ```
 
-- **Closed** — hot path active, failures counted.
-- **Open** — hot path skipped, every message goes straight to spool.
-- **Half-open** — one probe allowed; success → Closed, failure → Open.
+- **Closed** -- hot path active, failures counted.
+- **Open** -- hot path skipped, every message goes straight to spool.
+- **Half-open** -- one probe allowed; success -> Closed, failure -> Open.
 
 Hooks into the global `HealthRegistry` (when `health` feature is on)
 so `/readyz` reports the sink as Degraded (HalfOpen) or Unhealthy
@@ -114,7 +114,7 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | ---------- | ----------- |
 | `Adaptive { initial_rate, max_rate }` (default) | Start slow (100 msg/s), accelerate based on success rate, cap at `max_rate` (10 000 msg/s) |
 | `RateLimited { msgs_per_sec }` | Fixed rate |
-| `Greedy` | Drain as fast as possible — risks overwhelming a recovering sink |
+| `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
 The drain task is `tokio::spawn`'d at construction and stops on
 `shutdown.notify_one()`.
@@ -123,16 +123,16 @@ The drain task is `tokio::spawn`'d at construction and stops on
 
 ## Spool sizing and disk awareness
 
-- `max_spool_items` — reject new spool writes once the count is hit.
-- `max_spool_bytes` — same, in bytes (post-compression).
-- `disk_aware: { max_usage_percent, poll_interval_secs }` — background
+- `max_spool_items` -- reject new spool writes once the count is hit.
+- `max_spool_bytes` -- same, in bytes (post-compression).
+- `disk_aware: { max_usage_percent, poll_interval_secs }` -- background
   `statvfs` poller; once filesystem use crosses the threshold,
   `disk_available` flips false and spool writes return
   `DiskUnavailable`.
 
 Hitting any limit causes `send` to return
 `TieredSinkError::SpoolFull` or `DiskUnavailable`. The caller decides
-what to do — typical pattern is to route to the DLQ.
+what to do -- typical pattern is to route to the DLQ.
 
 `TieredSink::new` clears spool locks a killed process left behind and refuses a `spool_path` another live sink holds, so each sink needs its own path. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. See [spool.md](spool.md#locks-after-a-hard-kill).
 
@@ -170,7 +170,7 @@ common cases without writing the full struct.
 | Item | Purpose |
 | ------ | --------- |
 | `TieredSink::new(sink, config)` | Construct, open spool, spawn drain task |
-| `send(data) -> Result<()>` | Send with hot-path → spool → DLQ-by-caller fallback |
+| `send(data) -> Result<()>` | Send with hot-path -> spool -> DLQ-by-caller fallback |
 | `spool_len() / spool_is_empty() / spool_bytes()` | Spool depth introspection |
 | `circuit_state()` | Current `CircuitState` |
 | `reset_circuit()` | Manual reset (admin / test) |
@@ -179,10 +179,10 @@ common cases without writing the full struct.
 | `inner() -> &S` | Borrow the wrapped backend |
 | `shutdown()` | Stop the drain task and drainer-side join |
 | `Sink` trait | `type Error: StdError + Send + Sync; async fn try_send(&self, data: &[u8]) -> Result<(), SinkError<Self::Error>>` |
-| `SinkError<E>` | `Full / Unavailable / Fatal(E)` — drives spillover behaviour |
+| `SinkError<E>` | `Full / Unavailable / Fatal(E)` -- drives spillover behaviour |
 | `CircuitBreaker` / `CircuitState` | Exposed for tests and custom integrations |
 
-Drop fires `shutdown.notify_one()` — the drain exits cleanly even if
+Drop fires `shutdown.notify_one()` -- the drain exits cleanly even if
 the consumer forgets to call `shutdown().await`.
 
 ---
@@ -194,17 +194,17 @@ the consumer forgets to call `shutdown().await`.
 - [`../../src/tiered_sink/circuit.rs`](../../src/tiered_sink/circuit.rs)
 - [`../../src/tiered_sink/error.rs`](../../src/tiered_sink/error.rs)
 - [`../../src/tiered_sink/drainer.rs`](../../src/tiered_sink/drainer.rs)
-- [`../../src/tiered_sink/codec.rs`](../../src/tiered_sink/codec.rs) — compression
+- [`../../src/tiered_sink/codec.rs`](../../src/tiered_sink/codec.rs) -- compression
 - [`../../src/tiered_sink/config.rs`](../../src/tiered_sink/config.rs)
 
 ---
 
 ## Related
 
-- [spool.md](spool.md) — the yaque-backed disk queue under the hood
-- [dlq.md](dlq.md) — where to send `SpoolFull` / `Fatal` errors
-- [batch-engine.md](batch-engine.md) — the run loops this is a common sink for
+- [spool.md](spool.md) -- the yaque-backed disk queue under the hood
+- [dlq.md](dlq.md) -- where to send `SpoolFull` / `Fatal` errors
+- [batch-engine.md](batch-engine.md) -- the run loops this is a common sink for
 - [../transport/README.md](../transport/README.md)
-- [../feature-flags.md](../feature-flags.md) — `tiered-sink`
+- [../feature-flags.md](../feature-flags.md) -- `tiered-sink`
 - [../auto-wiring.md](../auto-wiring.md)
 - [../architecture.md](../architecture.md)

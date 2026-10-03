@@ -4,7 +4,7 @@
 
 Lock-free updates from any thread (component values stored as
 `f64::to_bits()` in `AtomicU64`, all writes `Relaxed`). Pressure is a
-hint, not a synchronisation primitive — KEDA polls it on its own
+hint, not a synchronisation primitive -- KEDA polls it on its own
 cadence.
 
 ---
@@ -19,21 +19,21 @@ flowchart TD
     G1 -->|yes| Z1["0.0 - sink down, scaling will not help"]
     G1 -->|no| G2{"memory_ratio >= memory_gate_threshold?"}
     G2 -->|yes| Z2["100.0 - scale NOW, before OOM"]
-    G2 -->|no| W[Weighted composite<br/>Σ score_i, capped at 100.0]
+    G2 -->|no| W[Weighted composite<br/>sum score_i, capped at 100.0]
 ```
 
 | Gate | Trigger | Output | Why |
 | ------ | --------- | -------- | ----- |
-| **Circuit breaker** | `set_circuit_open(true)` | `0.0` | Downstream sink is unavailable. Adding replicas can't help — they'd also fail. Don't scale. |
-| **Memory pressure** | `memory_used / memory_limit ≥ memory_gate_threshold` (default 0.8) | `100.0` | OOM is imminent. Bypass the composite and call for max scale immediately. |
+| **Circuit breaker** | `set_circuit_open(true)` | `0.0` | Downstream sink is unavailable. Adding replicas can't help -- they'd also fail. Don't scale. |
+| **Memory pressure** | `memory_used / memory_limit >= memory_gate_threshold` (default 0.8) | `100.0` | OOM is imminent. Bypass the composite and call for max scale immediately. |
 
-Without hard gates, a weighted composite smears over both cases —
+Without hard gates, a weighted composite smears over both cases --
 during a sink outage it would still call for scaling (wasteful and
 potentially harmful); during a memory event it would scale gradually
 based on whatever other signals are weighted high. The gates make the
 right thing happen unambiguously.
 
-Order: enabled → circuit → memory → composite. Circuit takes
+Order: enabled -> circuit -> memory -> composite. Circuit takes
 precedence over memory by design.
 
 ---
@@ -42,12 +42,12 @@ precedence over memory by design.
 
 ```text
 score_i = min(value_i / saturation_i, 1.0) * weight_i * 100.0
-pressure = min(Σ score_i, 100.0)
+pressure = min(sum score_i, 100.0)
 ```
 
 Each component contributes `weight_i * 100` when it reaches its
 saturation point, scales linearly below that, and is capped at its
-weight (no over-contribution). Weights should sum to ~1.0 — the cap
+weight (no over-contribution). Weights should sum to ~1.0 -- the cap
 on the total keeps the output well-formed even if they don't.
 
 Example composition for a loader:
@@ -70,7 +70,7 @@ Kubernetes metrics-server. The right wiring is two independent KEDA
 triggers in the `ScaledObject`:
 
 - **`scaling_pressure` gauge** -> the deployment's own pressure trigger ([below](#how-keda-reads-it)) -> app-level signals
-- **CPU utilisation** → CPU scaler → container-level, via metrics-server
+- **CPU utilisation** -> CPU scaler -> container-level, via metrics-server
 
 KEDA scales to the MAX of all triggers. Mixing CPU into the composite
 would double-count and obscure which signal is driving the scale.
@@ -150,7 +150,7 @@ scaling:
   memory_gate_threshold: 0.80
 ```
 
-Base config only — per-component weights and saturations live in the
+Base config only -- per-component weights and saturations live in the
 app's config struct (since they're app-specific). The default
 threshold of 0.80 fires the memory gate when used/limit crosses 80%.
 
@@ -168,11 +168,11 @@ falls back to defaults if absent.
 | `set_circuit_open(bool)` | Toggle the circuit-breaker gate |
 | `set_memory(used_bytes, limit_bytes)` | Update the memory gate inputs |
 | `calculate() -> f64` | Apply gates + composite, return `0.0..=100.0` |
-| `snapshot() -> PressureSnapshot` | Diagnostic — `{value, gate_active, components, memory_ratio, circuit_open}` |
+| `snapshot() -> PressureSnapshot` | Diagnostic -- `{value, gate_active, components, memory_ratio, circuit_open}` |
 | `is_enabled() -> bool` | Reflects `config.enabled` |
 | `ScalingComponent::new(name, weight, saturation)` | Component constructor |
 | `ScalingPressureConfig::from_cascade()` | Load base config from `scaling` cascade key |
-| `GateType::CircuitBreaker / MemoryPressure` | Diagnostic — which gate (if any) is currently active |
+| `GateType::CircuitBreaker / MemoryPressure` | Diagnostic -- which gate (if any) is currently active |
 | `RateWindow` | Helper for converting per-event rates into windowed pressure inputs |
 | `ServiceApp::scaling_components(&self, &config) -> Vec<ScalingComponent>` | App registration hook (default empty) |
 
@@ -181,7 +181,7 @@ falls back to defaults if absent.
 ## Source
 
 - [`../../src/scaling/mod.rs`](../../src/scaling/mod.rs)
-- [`../../src/scaling/pressure.rs`](../../src/scaling/pressure.rs) — calculator, gates, atomic component storage
+- [`../../src/scaling/pressure.rs`](../../src/scaling/pressure.rs) -- calculator, gates, atomic component storage
 - [`../../src/scaling/config.rs`](../../src/scaling/config.rs)
 - [`../../src/scaling/rate_window.rs`](../../src/scaling/rate_window.rs)
 
@@ -189,10 +189,10 @@ falls back to defaults if absent.
 
 ## Related
 
-- [worker-pool.md](worker-pool.md) — pool saturation feeds into the composite as `worker_pool_saturation`
-- [tiered-sink.md](tiered-sink.md) — the circuit-breaker source that drives the gate
-- [../runtime/memory.md](../runtime/memory.md) — the memory pressure source
-- [../runtime/service-runtime.md](../runtime/service-runtime.md) — auto-wiring entry point
-- [../feature-flags.md](../feature-flags.md) — `scaling`
+- [worker-pool.md](worker-pool.md) -- pool saturation feeds into the composite as `worker_pool_saturation`
+- [tiered-sink.md](tiered-sink.md) -- the circuit-breaker source that drives the gate
+- [../runtime/memory.md](../runtime/memory.md) -- the memory pressure source
+- [../runtime/service-runtime.md](../runtime/service-runtime.md) -- auto-wiring entry point
+- [../feature-flags.md](../feature-flags.md) -- `scaling`
 - [../auto-wiring.md](../auto-wiring.md)
 - [../architecture.md](../architecture.md)

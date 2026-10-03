@@ -1,8 +1,8 @@
 # Filter Engine
 
 The transport filter engine drops or DLQs messages on the way in or
-the way out of every transport — Kafka, gRPC, Memory, File, Pipe,
-HTTP — before they reach app code. It's embedded in every
+the way out of every transport -- Kafka, gRPC, Memory, File, Pipe,
+HTTP -- before they reach app code. It's embedded in every
 backend, zero-cost when no rules are configured, and tiered so the
 common case (field-presence or equality on a top-level field) runs at
 ~50-100 ns per message without invoking the CEL engine at all.
@@ -22,7 +22,7 @@ Operators want to:
 - **Pay nothing** for the engine when no filters are configured.
 
 The three-tier design makes that last point work: the fast tier runs
-without CEL, and tier classification happens at config-load — startup
+without CEL, and tier classification happens at config-load -- startup
 fails fast if a rule lands in a tier the operator hasn't allowed.
 
 ---
@@ -54,7 +54,7 @@ Tier 2 compiles the CEL expression once at startup, then evaluates
 against fields extracted via SIMD.
 
 Tier 3 enables CEL's regex / iteration / time profile (which adds
-expensive operations and DoS surface — hence the separate gate).
+expensive operations and DoS surface -- hence the separate gate).
 
 Tier 2 and Tier 3 need the `expression` Cargo feature. Without it, a rule that classifies above Tier 1 fails at startup.
 
@@ -66,7 +66,7 @@ Tier 2 and Tier 3 need the `expression` Cargo feature. Without it, a rule that c
 matching**, not AST analysis. `LazyLock` regex patterns for each
 tier-1 operation are tried in order of expected frequency
 (`has`, `!has`, `==`, `!=`, `startsWith`, `endsWith`, `contains`). If
-none match, scan for restricted function names — match means tier 3.
+none match, scan for restricted function names -- match means tier 3.
 Otherwise tier 2.
 
 This is conservative on purpose: only expressions that obviously fit a
@@ -81,7 +81,7 @@ See [src/transport/filter/classify.rs](../../src/transport/filter/classify.rs).
 ## Semantics
 
 - **First-match wins.** Filters are evaluated in declared order; the
-  first match returns its action and stops the loop. No match → message
+  first match returns its action and stops the loop. No match -> message
   passes.
 - **`drop` action** silently discards. Every match, `drop` or `dlq`, counts
   in the `transport_filtered_total` counter, labelled `direction` and `action`.
@@ -132,10 +132,10 @@ transport:
           action: drop
 ```
 
-### `transport.filter_tiers.*` — the tier gates
+### `transport.filter_tiers.*` -- the tier gates
 
 Top-level gate controlling which tiers any transport is allowed to
-compile. Defaults to all Tier 2/3 gates closed — first-time deployments
+compile. Defaults to all Tier 2/3 gates closed -- first-time deployments
 get Tier 1 only.
 
 ```yaml
@@ -184,7 +184,7 @@ The tier-gate config (`transport.filter_tiers.*`) is read **at
 transport construction time** via
 `TransportFilterTierConfig::from_cascade()`. A `ConfigReloader` update
 to those keys does **not** propagate to an already-running transport
-— the old gates remain in effect until the transport is reconstructed.
+-- the old gates remain in effect until the transport is reconstructed.
 
 This is intentional: a misconfigured reload that flips a gate would
 otherwise tear down a working transport mid-stream. Operators wanting
@@ -192,7 +192,7 @@ the new gate config to take effect should restart the service (or, in
 K8s, roll the pod). Rule lists load the same way, so a rule change
 needs a restart too.
 
-A first-time deployment should start with all gates off — only Tier 1
+A first-time deployment should start with all gates off -- only Tier 1
 filters work. Flip a gate on once Tier 2 or Tier 3 is genuinely needed
 and the operator has reviewed the cost (Tier 3 is unbounded CPU; see
 [Known limitations](#known-limitations)).
@@ -261,7 +261,7 @@ its own config section's `filters_in` / `filters_out` plus the
 
 `PipeTransport::new` returns the transport rather than a `Result`, so a rule that fails to compile cannot fail its constructor. The pipe starts unhealthy instead: `send` returns `SendResult::Fatal` and `recv` returns `TransportError::Config`, both carrying the compile error, until it is rebuilt with valid rules. `AnySender` and `AnyReceiver` fail construction on the same rule, as for every other backend.
 
-The engine is a no-op when both filter vectors are empty — there's no
+The engine is a no-op when both filter vectors are empty -- there's no
 per-message overhead beyond the inlined `has_*_filters` check.
 
 ---
@@ -275,7 +275,7 @@ warning, and every bypass counts in
 `transport_filter_msgpack_bypass_total{direction}` (with the `metrics`
 feature).
 
-This is a deliberate choice — running JSON-shaped filters against
+This is a deliberate choice -- running JSON-shaped filters against
 binary payloads would either falsely match or always reject. The engine
 has no MsgPack evaluator, so a pipeline that needs to filter MsgPack
 converts it to JSON upstream.
@@ -314,8 +314,8 @@ Tier-1 latency confirmed at ~50-100 ns/message on the bench machine.
 
 ## Related
 
-- [transport/README.md](README.md) — trait architecture, factory, `AnySender`
-- [transport/backends.md](backends.md) — per-backend wiring
-- [pipeline/dlq.md](../pipeline/dlq.md) — DLQ sink backends
-- [core-pillars/config.md](../core-pillars/config.md) — cascade
-- [feature-flags.md](../feature-flags.md) — `transport`, `expression`
+- [transport/README.md](README.md) -- trait architecture, factory, `AnySender`
+- [transport/backends.md](backends.md) -- per-backend wiring
+- [pipeline/dlq.md](../pipeline/dlq.md) -- DLQ sink backends
+- [core-pillars/config.md](../core-pillars/config.md) -- cascade
+- [feature-flags.md](../feature-flags.md) -- `transport`, `expression`

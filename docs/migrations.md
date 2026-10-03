@@ -213,7 +213,7 @@ data. (Metrics are not delivery.)
 filters AND use the generic run loops. Apps with no inbound DLQ filters are
 unaffected (the policy never triggers).
 
-**Consumer adjustment** — pick a policy explicitly:
+**Consumer adjustment** -- pick a policy explicitly:
 
 ```rust
 use scalo::worker::engine::FilterDlqPolicy;
@@ -247,7 +247,7 @@ Owned-bytes send removes the per-send `payload.to_vec()` copy on
 the HTTP path (reqwest `Body::from(Bytes)` is zero-copy) and lets a caller that
 already holds `Bytes` (the `BatchEngine`) flow it through without re-copying.
 
-**Consumer adjustment** — at each `send` call, pass owned `Bytes`:
+**Consumer adjustment** -- at each `send` call, pass owned `Bytes`:
 
 ```rust
 // Old:
@@ -261,7 +261,7 @@ sender.send("topic", bytes::Bytes::copy_from_slice(slice)).await;   // &[u8]    
 ```
 
 A caller holding `&[u8]` now copies once at the call site (`copy_from_slice`)
-instead of inside the transport — net-neutral. Callers holding `Vec<u8>` or
+instead of inside the transport -- net-neutral. Callers holding `Vec<u8>` or
 `Bytes` (the hot path) are now zero-copy. `bytes` is a `transport`-feature dep.
 
 ### `transport::FromCascade` trait (additive, non-breaking)
@@ -269,7 +269,7 @@ instead of inside the transport — net-neutral. Callers holding `Vec<u8>` or
 New `transport::FromCascade` trait with a default `from_cascade_key(key)`
 consolidates the byte-identical `from_cascade()` bodies the 5 transport configs
 (grpc/http/file/pipe/redis) each repeated. Each config's inherent
-`from_cascade()` is unchanged in signature — it just delegates — so this is
+`from_cascade()` is unchanged in signature -- it just delegates -- so this is
 **not** a consumer migration; it only removes internal duplication.
 
 ### `AdaptiveWorkerPool::fan_out_async` return type
@@ -380,7 +380,7 @@ New: `MemoryGuard::reserved_bytes()`, `MemoryGuard::usage_source()`,
 enum. The guard logs which source it resolved at init, and warns when it
 resolved to `Reservations` (no kernel accounting readable -- non-Linux).
 
-### `memory::set_heap_source` — allocator override (additive, opt-in)
+### `memory::set_heap_source` -- allocator override (additive, opt-in)
 
 Crate hook `scalo::memory::set_heap_source(fn() -> usize)` overrides the
 detected `UsageSource` with an allocator statistic. It is now rarely
@@ -415,7 +415,7 @@ New trait method; existing impls compile unchanged. A drain with a durability st
 ### `Dlq` struct (internal layout)
 
 Gained a `cancel: CancellationToken` field. Consumers construct via
-`Dlq::spawn` or `Dlq::disabled` and don't touch the struct fields —
+`Dlq::spawn` or `Dlq::disabled` and don't touch the struct fields --
 no visible change.
 
 ### `TransportFilterTierConfig.budget`
@@ -454,7 +454,7 @@ intent.
 old opt-out env var is removed (gate via `version_check.enabled`).
 `CheckPayload` no longer includes `instance_id` or `deployment`.
 
-### Wave 1 — Tier-3 single-knob
+### Wave 1 -- Tier-3 single-knob
 
 `transport.filter_tiers.allow_complex_filters_in/out: true` now
 implies `expression.allow_regex / allow_iteration / allow_time =
@@ -462,46 +462,46 @@ true` for the transport's compile path. Previously operators had
 to flip both knobs and they could disagree (filter passes the
 transport gate, fails the expression profile). One source of truth.
 
-### Wave 1 — `WorkerPoolConfig::validate`
+### Wave 1 -- `WorkerPoolConfig::validate`
 
 `async_concurrency == 0` now rejected at config-load. Previously
 passed validation and panicked at `step_by(0)` inside
 `fan_out_async`.
 
-### Wave 2 — `BackgroundSink::flush()` surfaces drain errors
+### Wave 2 -- `BackgroundSink::flush()` surfaces drain errors
 
 `flush()` now returns `Err(SinkError::Drain(_))` when the underlying
 drain's `write_batch` or `flush_durable` failed. Previously acked
-`Ok(())` regardless — callers thought messages were durable when
+`Ok(())` regardless -- callers thought messages were durable when
 they were lost. Caller adjustment: handle `Err(SinkError::Drain)`
 on `flush().await`.
 
-### Wave 2 — Kafka DLQ `flush_durable` Err on outstanding
+### Wave 2 -- Kafka DLQ `flush_durable` Err on outstanding
 
 The Kafka backend's durable flush returns `DlqError::Kafka` when its wait for acks expires with messages still in flight, where it used to log at debug and return `Ok(())`. Nothing called it until the DLQ drain began to, so `Dlq::flush()` never saw that error -- see [Kafka DLQ `flush()` waits for broker acks](#kafka-dlq-flush-waits-for-broker-acks-behaviour-change).
 
-### Wave 3 — `CacheConfig.dir_mode` / `.file_mode`
+### Wave 3 -- `CacheConfig.dir_mode` / `.file_mode`
 
 Two new optional fields default to `Some(0o700)` and `Some(0o600)`.
-`None` disables chmod entirely — required on S3-FUSE / root-
+`None` disables chmod entirely -- required on S3-FUSE / root-
 squashed NFS / similar mounts that reject chmod. Operators on
 those mounts must own upstream perms.
 
-### Wave 3 — `dangerous-diagnostics` feature
+### Wave 3 -- `dangerous-diagnostics` feature
 
 `config::registry::dump_effective_unredacted()` is now gated by
 the `dangerous-diagnostics` cargo feature. Not included in `full`.
 Compile with `--features dangerous-diagnostics` only for one-off
 operator-driven debugging.
 
-### Wave 3 — strict CEL `has(<single>)`
+### Wave 3 -- strict CEL `has(<single>)`
 
 Tier-1 `has(<single-field>)` now only matches at JSON depth 1
 (immediate child of the root). Previously matched at any depth.
 Operators relying on the nested-match behaviour must switch to a
 dotted path (`has(some.path.field)`) or to a Tier-2 CEL filter.
 
-### Wave 5 — bounded metric labels (F7)
+### Wave 5 -- bounded metric labels (F7)
 
 `ServiceMetrics` methods that took free-form `&str` for metric labels
 now take typed enums. The labels are bounded; cardinality is
@@ -545,12 +545,12 @@ No `Other` catch-all. New failure modes require a scalo release
 that adds a variant; consumers then bump and recompile. The compiler
 flags every site needing the new variant.
 
-### Wave 5 — `RoutedSender` metric label
+### Wave 5 -- `RoutedSender` metric label
 
 `dfe_transport_sent_total{transport="routed",route=...}` now
 carries the **configured route name** (or `"default"` for the
 fallback), not the inbound message key. Cardinality is bounded by
-the routing table size. No consumer code change required — only
+the routing table size. No consumer code change required -- only
 the metric label values change. Dashboards keyed on per-message
 keys need rewiring.
 
@@ -949,7 +949,7 @@ The names scalo writes into artefacts, and the defaults it falls back on, named 
 Tracked upstream; each needs its own focused commit. Workarounds
 applied at the consumer level until then.
 
-### #35 — Kafka topic auto-discovery race
+### #35 -- Kafka topic auto-discovery race
 
 `KafkaAdmin::list_topics` returns empty when the admin consumer
 hasn't finished its bootstrap handshake.
@@ -962,13 +962,13 @@ covers both the race and the legitimate case of an app deployed
 before its first source exists. Set `topic_refresh_secs: 0` and a
 transport that discovered nothing consumes nothing until restart.
 
-### #36 — `KafkaTransport` always allocates both roles
+### #36 -- `KafkaTransport` always allocates both roles
 
 `KafkaTransport::new` builds BOTH a `BaseConsumer` and a `FutureProducer` (the producer from its own `ClientConfig`). A producer-only config (empty `group`) constructs: the idle consumer takes the derived stand-in group `<client_id>-producer-only` and subscribes to nothing. It still connects and looks up that group's coordinator, so the broker has to grant the app's group prefix.
 
 **Workaround:** none needed. Do not set `group.id` in `librdkafka_overrides` on a producer config -- the override replaces the derived stand-in with a group the broker may not grant.
 
-### #37 — `TransportSender::send(key, payload)` overloads `key` as topic
+### #37 -- `TransportSender::send(key, payload)` overloads `key` as topic
 
 The Kafka impl passes `key` to `FutureRecord::to(key)`, so the
 "key" arg is the destination topic, not a partition key. Callers

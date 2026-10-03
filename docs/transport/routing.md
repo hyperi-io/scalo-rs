@@ -1,7 +1,7 @@
 # Routing -- the named sink set
 
 `RoutedSender` dispatches a send to one of N backend senders held under
-NAMES — `loader`, `archiver`, `transform-orders` — so a routing decision
+NAMES -- `loader`, `archiver`, `transform-orders` -- so a routing decision
 picks a name and the config decides what that name is: a Kafka topic on
 the bus, a gRPC endpoint on the direct transport. Sits on top of
 [`AnySender`](README.md); no new backend, no new trait.
@@ -14,10 +14,10 @@ the bus, a gRPC endpoint on the direct transport. Sits on top of
 | ------- | --------- | ----- |
 | receiver | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
 | fetcher | **Yes** | Each source maps to its own destination, plus per-record routes |
-| VRL transform | **Yes** | Its sink list is config-driven — one destination today, a list tomorrow |
+| VRL transform | **Yes** | Its sink list is config-driven -- one destination today, a list tomorrow |
 | Vector-compat transform | **Yes** | Same, though Vector owns the transform config itself |
-| loader | No | One ClickHouse sink — 1:1 transport |
-| archiver | No | One object-storage sink — 1:1 transport |
+| loader | No | One ClickHouse sink -- 1:1 transport |
+| archiver | No | One object-storage sink -- 1:1 transport |
 
 Push the routing decision as close to ingress as possible: a stage that
 sees one inbound stream and produces one outbound stream needs a name for
@@ -68,7 +68,7 @@ transport:
           endpoint: "http://archiver:6000"
 ```
 
-Each route value is a full `TransportConfig` — any backend
+Each route value is a full `TransportConfig` -- any backend
 [backends.md](backends.md) supports is fair game. The `default` is
 optional; without it, an unknown key returns `SendResult::Fatal`.
 
@@ -89,9 +89,9 @@ routes.insert("audit.land".into(), grpc_cfg.clone());
 
 let sender = RoutedSender::from_route_configs(routes, Some(default_cfg)).await?;
 
-sender.send("events.land", payload).await;   // → Kafka topic
-sender.send("audit.land", payload).await;    // → gRPC archiver
-sender.send("anything-else", payload).await; // → default
+sender.send("events.land", payload).await;   // -> Kafka topic
+sender.send("audit.land", payload).await;    // -> gRPC archiver
+sender.send("anything-else", payload).await; // -> default
 ```
 
 Construct directly from pre-built senders when the config indirection
@@ -109,8 +109,8 @@ let sender = RoutedSender::new(routes, Some(default_sender));
 
 `send` uses ONE string for both the route lookup and the backend's wire
 destination, which fits a table keyed by topic. When the destination NAME
-is not the wire key — a destination called `loader` whose Kafka topic is
-`orders_land`, computed per record — pass the two separately:
+is not the wire key -- a destination called `loader` whose Kafka topic is
+`orders_land`, computed per record -- pass the two separately:
 
 ```rust
 sender.send_to("loader", "orders_land", payload).await;
@@ -127,7 +127,7 @@ on the direct transport.
 
 A rule's destination may be a LIST. `send_fanout` delivers one payload to
 every named destination and is acknowledged only when every one has
-accepted — this is how a matched record reaches the loader AND the
+accepted -- this is how a matched record reaches the loader AND the
 archiver without a broker in the path:
 
 ```rust
@@ -136,7 +136,7 @@ sender.send_fanout(&["loader", "archiver"], "orders_land", payload).await;
 
 The first `Backpressured`/`Fatal` short-circuits and is returned, so the
 caller retries the whole fan-out and re-delivers to whichever destinations
-already accepted: at-least-once, duplicates never loss — the same contract
+already accepted: at-least-once, duplicates never loss -- the same contract
 as `send_batch`'s per-record fallback. An empty list is `Ok`.
 
 ---
@@ -145,14 +145,14 @@ as `send_batch`'s per-record fallback. An empty list is `Ok`.
 
 `send_batch` groups a block by the route each record's `key` resolves to
 and hands each group to its sender in ONE call, so a routed block keeps
-whatever native batch the backend has — gRPC's single `RouteBatch` and its
-all-or-nothing acceptance — instead of degrading to one `send` per record.
+whatever native batch the backend has -- gRPC's single `RouteBatch` and its
+all-or-nothing acceptance -- instead of degrading to one `send` per record.
 Order is preserved within a group, and every record is counted on its own
 route's metrics exactly as `send` counts it. Two things follow from
 grouping that the per-record default cannot give you: an unroutable record
 fails the whole block with nothing sent (the routing is deterministic, so a
 retry would re-deliver the same prefix and fail again forever), and a
-`Backpressured`/`Fatal` short-circuits at group granularity — the failing
+`Backpressured`/`Fatal` short-circuits at group granularity -- the failing
 destination's result is the block's result, groups after it stay unsent for
 the caller's retry. An empty block is `Ok`. `send_batch_fanout` is the
 batch form of `send_fanout`: the whole block to every named destination,
@@ -169,7 +169,7 @@ sender.send_batch_fanout(&["loader", "archiver"], &workbatch.records).await;
 
 A routed send NEVER retries and NEVER routes to a DLQ. It returns the
 chosen backend's `SendResult` unchanged so the caller applies its own
-policy — the fetcher holds the batch and stalls its scheduler, the
+policy -- the fetcher holds the batch and stalls its scheduler, the
 receiver back-pressures its ingest. A DLQ that only exists on the bus is
 not a fallback a brokerless deployment can take.
 
@@ -181,19 +181,19 @@ so a stack wraps the whole set.
 
 ## Composition with `AnySender`
 
-`RoutedSender` **owns** N `AnySender`s — one per route plus the
+`RoutedSender` **owns** N `AnySender`s -- one per route plus the
 default. Each `AnySender` is itself enum-dispatched over the seven
 backends. So `RoutedSender::send`:
 
 1. `HashMap::get(destination)` to find the route (or fall back to default).
 2. `AnySender::send(destination, payload).await` on the chosen sender.
-3. Backend's own `send` runs — Kafka, gRPC, etc.
+3. Backend's own `send` runs -- Kafka, gRPC, etc.
 
-Two layers of dispatch, both monomorphised by the compiler. The route lookup is a `HashMap<String, AnySender>::get` — single hash + equality compare, no allocation when the key is `&str`.
+Two layers of dispatch, both monomorphised by the compiler. The route lookup is a `HashMap<String, AnySender>::get` -- single hash + equality compare, no allocation when the key is `&str`.
 
-`RoutedSender` itself implements `TransportSender` — anywhere an
+`RoutedSender` itself implements `TransportSender` -- anywhere an
 app expects `impl TransportSender`, a routed sender drops in. It
-implements `TransportBase` too — `close()` cascades to every route
+implements `TransportBase` too -- `close()` cascades to every route
 and the default, `is_healthy()` reports `false` if any constituent
 sender is unhealthy.
 
@@ -207,7 +207,7 @@ Per `send()` call, on top of the chosen backend's own cost:
 | ------ | ------ |
 | `HashMap::get(&str)` lookup | ~20-40 ns (SipHash + compare) |
 | Match on `AnySender` variant | <5 ns (jump table) |
-| Backend `send` | µs to ms — dominates |
+| Backend `send` | us to ms -- dominates |
 
 The routing overhead is at most 1% of any real backend's send cost.
 No allocation, no `Arc::clone`, no async indirection. The metric
@@ -225,13 +225,13 @@ Behaviour when `destination` is not in `routes`:
 | `default` is set | Falls through to the default sender |
 | `default` is unset | `SendResult::Fatal(TransportError::Config(...))` |
 
-Mark a default unless the calling code is OK with the fatal — for
-ingress paths this is usually wanted (unknown tenant → catch-all
+Mark a default unless the calling code is OK with the fatal -- for
+ingress paths this is usually wanted (unknown tenant -> catch-all
 "unknown.tenant" topic for ops to triage). For audit paths the fatal
 is the right default (no silent drop).
 
 For "route exists but send fails", `RoutedSender` returns the
-chosen backend's `SendResult` unchanged — backpressure, fatal, and
+chosen backend's `SendResult` unchanged -- backpressure, fatal, and
 filter-DLQ propagate up. Caller distinguishes by matching on the
 result.
 
@@ -257,7 +257,7 @@ That holds for `send` and `send_to`. The block and fan-out forms (`send_batch`, 
 | `RoutedSender::has_default() -> bool` | Check if a default sender is wired |
 | `RoutedSender::destination_health() -> Vec<(&str, bool)>` | Per-destination health, `"default"` included |
 | `RoutedSender::is_destination_healthy(name) -> bool` | Health of the sender that resolves `name` |
-| `RoutedSender::any_healthy() -> bool` | At least one sender healthy — the readiness form |
+| `RoutedSender::any_healthy() -> bool` | At least one sender healthy -- the readiness form |
 | `RoutedSender::close().await` | Cascade close to every route + default |
 | `RoutedSender::is_healthy() -> bool` | True only if every constituent sender is healthy |
 | `RoutedSender::name() -> &'static str` | Returns `"routed"` |
@@ -268,9 +268,9 @@ Source: [../../src/transport/routed.rs](../../src/transport/routed.rs).
 
 ## Related
 
-- [README.md](README.md) — traits, `AnySender`, enum dispatch
-- [backends.md](backends.md) — concrete backends each route can pick
-- [filter-engine.md](filter-engine.md) — filters run per-backend, after routing
-- [../architecture.md](../architecture.md) — data-plane stage model
-- [../integration.md](../integration.md) — wiring for receiver/fetcher
-- [../feature-flags.md](../feature-flags.md) — feature flags per backend
+- [README.md](README.md) -- traits, `AnySender`, enum dispatch
+- [backends.md](backends.md) -- concrete backends each route can pick
+- [filter-engine.md](filter-engine.md) -- filters run per-backend, after routing
+- [../architecture.md](../architecture.md) -- data-plane stage model
+- [../integration.md](../integration.md) -- wiring for receiver/fetcher
+- [../feature-flags.md](../feature-flags.md) -- feature flags per backend

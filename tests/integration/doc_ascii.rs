@@ -1,13 +1,16 @@
 // Project:   scalo
 // File:      tests/integration/doc_ascii.rs
-// Purpose:   Keep every doc comment under src/ ASCII
+// Purpose:   Keep every doc comment under src/, tests/, benches/ ASCII
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Doc comments ship in rustdoc and in every config schema derived from
-//! them, so they stay ASCII.
+//! them, so they stay ASCII. tests/ and benches/ carry no schema, but
+//! authored prose there is held to the same bar; string-literal test
+//! data (e.g. Unicode fixture values) is untouched because the check
+//! only looks at lines starting `///` or `//!`.
 
 use std::path::{Path, PathBuf};
 
@@ -27,13 +30,12 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn doc_comments_under_src_are_ascii() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+/// Find every doc-comment line under `dir` (relative to `root`) that is
+/// not pure ASCII, as `path:line` strings.
+fn find_offenders(root: &Path, dir: &Path) -> Vec<String> {
     let mut files = Vec::new();
-    rust_sources(&root.join("src"), &mut files);
+    rust_sources(dir, &mut files);
     files.sort();
-    assert!(!files.is_empty(), "no .rs files found under src/");
 
     let mut offenders = Vec::new();
     for file in &files {
@@ -46,6 +48,32 @@ fn doc_comments_under_src_are_ascii() {
                 offenders.push(format!("{}:{}", shown.display(), idx + 1));
             }
         }
+    }
+    offenders
+}
+
+#[test]
+fn doc_comments_under_src_are_ascii() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("src");
+    let mut files = Vec::new();
+    rust_sources(&src, &mut files);
+    assert!(!files.is_empty(), "no .rs files found under src/");
+
+    let offenders = find_offenders(root, &src);
+    assert!(
+        offenders.is_empty(),
+        "non-ASCII in doc comments (use ->, --, ..., <=, >=, us):\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn doc_comments_under_tests_and_benches_are_ascii() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    for dir in ["tests", "benches"] {
+        offenders.extend(find_offenders(root, &root.join(dir)));
     }
 
     assert!(

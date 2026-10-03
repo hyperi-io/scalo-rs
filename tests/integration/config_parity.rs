@@ -13,13 +13,13 @@
 //!
 //! ## Cascade Priority (high to low)
 //!
-//! 1. CLI args/switches          → --host=X (runtime override)
-//! 2. ENV variables              → MYAPP_DATABASE_HOST (deployment)
-//! 3. .env file                  → Local secrets (gitignored)
-//! 4. settings.{env}.yaml        → Environment-specific (production/staging)
-//! 5. settings.yaml              → Project base defaults
-//! 6. defaults.yaml              → Safe fallback defaults
-//! 7. Hard-coded                 → Last resort in code
+//! 1. CLI args/switches          -> --host=X (runtime override)
+//! 2. ENV variables              -> MYAPP_DATABASE_HOST (deployment)
+//! 3. .env file                  -> Local secrets (gitignored)
+//! 4. settings.{env}.yaml        -> Environment-specific (production/staging)
+//! 5. settings.yaml              -> Project base defaults
+//! 6. defaults.yaml              -> Safe fallback defaults
+//! 7. Hard-coded                 -> Last resort in code
 
 use scalo::config::{Config, ConfigOptions};
 use std::fs;

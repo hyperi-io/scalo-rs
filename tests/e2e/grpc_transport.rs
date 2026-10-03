@@ -185,7 +185,7 @@ async fn test_commit_is_noop() {
     let batch = server.recv(10).await.expect("recv should succeed");
     assert_ne!(batch.records, [] as [scalo::Record; 0]);
 
-    // Commit tokens — should succeed (no-op)
+    // Commit tokens -- should succeed (no-op)
     let result = server.commit(&batch.commit_tokens).await;
     assert!(result.is_ok(), "commit should succeed (no-op): {result:?}");
 
@@ -1063,7 +1063,7 @@ async fn test_recv_timeout_returns_empty() {
         .await
         .expect("failed to create server");
 
-    // Recv with no messages sent — should return empty after timeout
+    // Recv with no messages sent -- should return empty after timeout
     let records = server.recv(10).await.expect("recv should succeed").records;
     assert!(
         records.is_empty(),

@@ -8,7 +8,7 @@
 
 //! Grep-based lint: scan every `.rs` file under `src/` for `async fn`
 //! bodies containing synchronous blocking calls. Each match is a
-//! latent runtime stall — the call pins a tokio worker thread for the
+//! latent runtime stall -- the call pins a tokio worker thread for the
 //! duration of the I/O, starving every other task on that worker.
 //!
 //! The lint is intentionally simple and conservative:
@@ -29,22 +29,22 @@ use std::path::{Path, PathBuf};
 /// Forbidden patterns. Match is byte-substring (not regex) so the test
 /// stays fast and doesn't drag in a regex dep.
 ///
-/// `parking_lot::*::lock()` held across `.await` is NOT detected here —
+/// `parking_lot::*::lock()` held across `.await` is NOT detected here --
 /// `clippy::await_holding_lock` catches it more reliably and is
 /// enabled crate-wide via `#![warn(clippy::pedantic)]`.
 const FORBIDDEN: &[(&str, &str)] = &[
-    ("std::fs::", "blocking filesystem call — use tokio::fs"),
+    ("std::fs::", "blocking filesystem call -- use tokio::fs"),
     (
         "std::io::Write::write",
-        "blocking write — use AsyncWriteExt or BackgroundSink",
+        "blocking write -- use AsyncWriteExt or BackgroundSink",
     ),
     (
         "std::thread::sleep",
-        "blocking sleep — use tokio::time::sleep",
+        "blocking sleep -- use tokio::time::sleep",
     ),
     (
         "reqwest::blocking",
-        "blocking HTTP client — use reqwest::Client",
+        "blocking HTTP client -- use reqwest::Client",
     ),
 ];
 
@@ -53,7 +53,7 @@ const FORBIDDEN: &[(&str, &str)] = &[
 const ALLOW_MARKER: &str = "allow-sync-in-async";
 
 // Load-bearing at zero. Any new violation fails CI. If you need to add
-// one, justify it inline with `// allow-sync-in-async: <reason>` — the
+// one, justify it inline with `// allow-sync-in-async: <reason>` -- the
 // marker is reviewable and grep-able.
 
 fn collect_rs_files(root: &Path, acc: &mut Vec<PathBuf>) {
@@ -72,7 +72,7 @@ fn collect_rs_files(root: &Path, acc: &mut Vec<PathBuf>) {
 
 /// Walk the file's tokens just enough to know which lines lie inside an
 /// `async fn` body **outside** a `#[cfg(test)] mod` block. Tests are
-/// exempt — they run under per-test runtimes and don't risk starving
+/// exempt -- they run under per-test runtimes and don't risk starving
 /// production tasks.
 fn scan_file(path: &Path) -> Vec<String> {
     let Ok(source) = fs::read_to_string(path) else {
@@ -184,7 +184,7 @@ fn no_sync_in_async() {
 
     assert!(
         violations.is_empty(),
-        "found {} sync-in-async violation(s) — see eprintln output above. \
+        "found {} sync-in-async violation(s) -- see eprintln output above. \
          Migrate to BackgroundSink / PeriodicWorker / tokio::fs, or add \
          an `// allow-sync-in-async: <reason>` marker if genuinely safe.",
         violations.len(),
