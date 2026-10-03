@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/service.rs
-// Purpose:   Standard DFE metric definitions with transport labels
+// Purpose:   Standard metric definitions with transport labels
 // Language:  Rust
 //
 // License:   Apache-2.0

@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/backpressure.rs
-// Purpose:   DFE backpressure metrics group
+// Purpose:   Backpressure metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0

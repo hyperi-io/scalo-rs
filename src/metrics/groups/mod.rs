@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/mod.rs
-// Purpose:   DFE-specific metric groups
+// Purpose:   Composable metric groups
 // Language:  Rust
 //
 // License:   Apache-2.0

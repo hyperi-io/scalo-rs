@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/buffer.rs
-// Purpose:   DFE buffer metrics group
+// Purpose:   Buffer metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0

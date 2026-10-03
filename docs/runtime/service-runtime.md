@@ -18,7 +18,7 @@ remember to register.
 | Field | Type | Feature gate | Always present? |
 | ------- | ------ | -------------- | ----------------- |
 | `metrics` | `MetricsManager` | always (with `metrics`) | yes |
-| `dfe` | `Arc<ServiceMetrics>` | always (with `metrics`) | yes |
+| `service_metrics` | `Arc<ServiceMetrics>` | always (with `metrics`) | yes |
 | `memory_guard` | `Arc<MemoryGuard>` | `memory` | yes |
 | `shutdown` | `CancellationToken` | always | yes |
 | `context` | `&'static RuntimeContext` | always | yes |
@@ -27,7 +27,7 @@ remember to register.
 | `scaling` | `Option<Arc<ScalingPressure>>` | `scaling` | optional |
 | `governor` | `Option<SelfRegulationGovernor>` | `governor` | optional (default-on) |
 
-The pillars (`metrics`, `dfe`, `shutdown`, `context`) are always
+The pillars (`metrics`, `service_metrics`, `shutdown`, `context`) are always
 present. The optional fields are `Some(...)` when their feature is
 on and configuration succeeds -- `None` if construction fails (logged
 as a warning, not fatal).

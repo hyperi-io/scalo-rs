@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/metrics/groups/circuit_breaker.rs
-// Purpose:   DFE circuit breaker metrics group
+// Purpose:   Circuit breaker metrics group
 // Language:  Rust
 //
 // License:   Apache-2.0
