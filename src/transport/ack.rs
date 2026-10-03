@@ -718,7 +718,7 @@ impl Tickets {
             let max = inner.max_held_bytes;
             inner
                 .held_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                     (held == 0 || held.saturating_add(bytes) <= max)
                         .then(|| held.saturating_add(bytes))
                 })

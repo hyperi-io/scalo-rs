@@ -457,7 +457,7 @@ impl MemoryGuard {
         self.usage.forget(bytes);
         let prev = self
             .reserved_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(bytes))
             })
             // Always succeeds (closure always returns Some).

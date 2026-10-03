@@ -194,7 +194,7 @@ impl UsageReader {
 
     /// Discharge released bytes from the ledger, saturating at zero.
     pub(crate) fn forget(&self, bytes: u64) {
-        let _ = self.admitted_since_sample.fetch_update(
+        let _ = self.admitted_since_sample.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_sub(bytes)),
