@@ -61,7 +61,7 @@ pub struct ServiceRuntime {
     /// Platform data-plane metrics (transport, pipeline, records, scaling,
     /// spool), under bare names or the `metrics.namespace` prefix. Already
     /// registered.
-    pub dfe: Arc<crate::metrics::ServiceMetrics>,
+    pub service_metrics: Arc<crate::metrics::ServiceMetrics>,
 
     /// Cgroup-aware memory guard. Tracks memory usage for backpressure.
     /// Auto-detected from env prefix + cgroup limits.
@@ -136,7 +136,7 @@ impl ServiceRuntime {
         let metrics_config = crate::metrics::MetricsSettings::from_cascade().into_config(app_name);
         let mut metrics = MetricsManager::with_config(metrics_config);
         metrics.registry().set_app_name(app_name);
-        let dfe = Arc::new(register_runtime_metrics(&metrics, version, commit));
+        let service_metrics = Arc::new(register_runtime_metrics(&metrics, version, commit));
 
         // --- Memory guard ---
         #[cfg(feature = "memory")]
@@ -254,7 +254,7 @@ impl ServiceRuntime {
 
         Ok(Self {
             metrics,
-            dfe,
+            service_metrics,
             #[cfg(feature = "memory")]
             memory_guard,
             shutdown,

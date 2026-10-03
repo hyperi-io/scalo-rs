@@ -33,7 +33,7 @@
 //! fall-back), `strmatch` emits **one** WARN per distinct pattern per
 //! process, capped at 10 distinct WARNs total. After the cap, further
 //! fall-through patterns log at DEBUG. A counter
-//! `hyperi_strmatch_regex_fallback_total` increments on every
+//! `strmatch_regex_fallback_total` increments on every
 //! fall-through regardless of log level -- operators can scrape that
 //! rather than rely on logs.
 //!
@@ -776,7 +776,7 @@ mod warn {
                 "{}+ distinct patterns have fallen through to the regex engine; \
                  further fall-throughs log at DEBUG. Inspect StrMatcher::tier() / \
                  StrMatcherSet::tier_counts() at runtime, or scrape the \
-                 hyperi_strmatch_regex_fallback_total metric.",
+                 strmatch_regex_fallback_total metric.",
                 WARN_CAP,
             );
         }
@@ -798,7 +798,7 @@ mod warn {
 #[inline]
 fn metrics_inc_fallback() {
     #[cfg(feature = "metrics")]
-    metrics::counter!("hyperi_strmatch_regex_fallback_total").increment(1);
+    metrics::counter!("strmatch_regex_fallback_total").increment(1);
 }
 
 // Re-export the warn-state reset for integration tests inside the

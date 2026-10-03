@@ -266,9 +266,6 @@ pub use kafka_config::{
     KafkaConfigError, KafkaConfigResult, KafkaSource, ServiceRole, TOPIC_SUFFIX_LAND,
     TOPIC_SUFFIX_LOAD, config_from_file, config_from_properties_str,
 };
-// Deprecated brand alias -- removed before GA (scalo-rs migration).
-#[allow(deprecated)]
-pub use kafka_config::DfeSource;
 pub use sensitive::{SensitiveString, expose_during};
 
 #[cfg(feature = "runtime")]
@@ -304,10 +301,6 @@ pub use logger::{
 #[cfg(any(feature = "metrics", feature = "otel-metrics"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "metrics", feature = "otel-metrics"))))]
 pub use metrics::{MetricsConfig, MetricsError, MetricsManager, ServiceMetrics};
-// Deprecated brand alias -- removed before GA (scalo-rs migration).
-#[cfg(any(feature = "metrics", feature = "otel-metrics"))]
-#[allow(deprecated)]
-pub use metrics::DfeMetrics;
 
 #[cfg(feature = "otel-metrics")]
 #[cfg_attr(docsrs, doc(cfg(feature = "otel-metrics")))]
@@ -395,9 +388,6 @@ pub use cli::{CliError, CommonArgs, StandardCommand, VersionInfo};
 #[cfg(feature = "cli-service")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cli-service")))]
 pub use cli::{ServiceApp, ServiceRuntime};
-// Deprecated brand alias for the app trait -- removed before GA.
-#[cfg(feature = "cli-service")]
-pub use cli::ServiceApp as DfeApp;
 
 #[cfg(feature = "io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "io")))]

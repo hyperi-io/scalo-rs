@@ -251,7 +251,7 @@ fn render_header(frame: &mut Frame, app: &DashboardApp, area: ratatui::layout::R
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
-            " dfe top",
+            " top",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

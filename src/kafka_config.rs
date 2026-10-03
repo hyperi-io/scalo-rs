@@ -425,10 +425,6 @@ pub struct KafkaSource {
     group_prefix: String,
 }
 
-/// Deprecated brand alias for [`KafkaSource`]. Removed before GA.
-#[deprecated(since = "2.9.0", note = "renamed to KafkaSource; removed before GA")]
-pub type DfeSource = KafkaSource;
-
 impl KafkaSource {
     /// Create a new source with default suffixes (`_land`, `_load`).
     #[must_use]
