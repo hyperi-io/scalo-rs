@@ -212,7 +212,9 @@ Source: [../../src/transport/memory/](../../src/transport/memory/).
 NDJSON file I/O. Each `send()` appends one newline-delimited line.
 Read side tracks a byte offset and persists it to a `.pos` sidecar
 file so reads survive restarts. `FileToken` carries the byte offset;
-`commit()` writes the highest committed offset to disk.
+`commit()` writes the highest committed offset to a temporary file, syncs it
+and renames it over the sidecar. Only a line ending in `\n` becomes a record,
+so a reader racing an appender holds a half-written line until it is finished.
 
 ```yaml
 transport:

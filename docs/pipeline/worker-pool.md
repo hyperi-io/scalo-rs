@@ -83,7 +83,8 @@ max of the two so either source can trigger the cap.
   pressure into scaling decisions.
 - `set_scaling_pressure(Arc<ScalingPressure>)` — feed pool saturation
   back into the KEDA signal as the `worker_pool_saturation`
-  component.
+  component. The pool feeds it only when the app registers a
+  `worker_pool_saturation` component; otherwise the composite never sees it.
 
 Both are no-ops when the corresponding feature is off.
 `ServiceRuntime` wires both automatically.

@@ -415,11 +415,25 @@ fn announce_once(config: &VersionCheckConfig) {
         tracing::info!(
             endpoint = %config.api_url,
             send_instance_id = config.send_instance_id,
-            "version check: sending {{product, current_version, os, arch, instance_id}} \
-             to endpoint (off via version_check.enabled: false; id off via \
-             version_check.send_instance_id: false)"
+            "{}",
+            announcement(config)
         );
     });
+}
+
+/// What the announcement says: that the check is on and what it sends first,
+/// then how to turn it off, so the line cannot be read as "telemetry off".
+fn announcement(config: &VersionCheckConfig) -> String {
+    let fields = if config.send_instance_id {
+        "product, current_version, os, arch, instance_id"
+    } else {
+        "product, current_version, os, arch"
+    };
+    format!(
+        "version check ON: sending {{{fields}}} to {endpoint}. Disable with \
+         version_check.enabled: false; drop the id with version_check.send_instance_id: false",
+        endpoint = config.api_url
+    )
 }
 
 /// Perform the HTTP version check.
@@ -699,6 +713,36 @@ mod tests {
     #[test]
     fn test_send_instance_id_defaults_on() {
         assert!(VersionCheckConfig::default().send_instance_id);
+    }
+
+    #[test]
+    fn the_announcement_says_on_before_how_to_turn_it_off() {
+        let config = VersionCheckConfig {
+            api_url: "https://releases.example.com/api/v1/check".into(),
+            ..Default::default()
+        };
+        let line = announcement(&config);
+        assert!(
+            line.starts_with(
+                "version check ON: sending {product, current_version, os, arch, instance_id} \
+                 to https://releases.example.com/api/v1/check."
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains("Disable with version_check.enabled: false"),
+            "{line}"
+        );
+        assert!(!line.contains("(off via"), "{line}");
+
+        let without_id = announcement(&VersionCheckConfig {
+            send_instance_id: false,
+            ..config
+        });
+        assert!(
+            without_id.contains("{product, current_version, os, arch}"),
+            "{without_id}"
+        );
     }
 
     #[test]

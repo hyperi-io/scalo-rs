@@ -18,7 +18,12 @@
 //! ## Receive
 //!
 //! Reads NDJSON lines from the file, tracking byte offset for commit.
-//! Position is persisted to a `.pos` sidecar file so reads survive restarts.
+//! Position is persisted to a `.pos` sidecar file so reads survive restarts,
+//! written by temporary file and rename so a crash cannot truncate it.
+//!
+//! Only a line that ends in `\n` becomes a record. A trailing line without
+//! one is held until the writer finishes it, so a file whose last line has no
+//! newline never yields that line.
 //!
 //! ## Example
 //!
@@ -192,11 +197,30 @@ impl FileTransport {
     }
 
     /// Save read position to the sidecar file.
+    ///
+    /// Written to a temporary sibling, synced and renamed over the sidecar, so
+    /// a crash mid-commit leaves the previous position rather than an empty
+    /// file that reads back as offset 0.
     async fn save_position(data_path: &Path, offset: u64) -> TransportResult<()> {
         let pos_path = Self::pos_path(data_path);
-        tokio::fs::write(&pos_path, offset.to_string())
+        let mut tmp_path = pos_path.as_os_str().to_owned();
+        tmp_path.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_path);
+        let commit_err = |e: std::io::Error| {
+            TransportError::Commit(format!("failed to write position file: {e}"))
+        };
+
+        let mut tmp = tokio::fs::File::create(&tmp_path)
             .await
-            .map_err(|e| TransportError::Commit(format!("failed to write position file: {e}")))
+            .map_err(commit_err)?;
+        tmp.write_all(offset.to_string().as_bytes())
+            .await
+            .map_err(commit_err)?;
+        tmp.sync_all().await.map_err(commit_err)?;
+        drop(tmp);
+        tokio::fs::rename(&tmp_path, &pos_path)
+            .await
+            .map_err(commit_err)
     }
 
     /// Lazily open the write file handle.
@@ -371,8 +395,9 @@ impl TransportReceiver for FileTransport {
                 .await
                 .map_err(|e| TransportError::Recv(format!("read failed: {e}")))?;
 
-            if line.is_empty() {
-                // EOF
+            // EOF, or a line the writer has not finished: keep the partial
+            // bytes in `line` for the next call and leave `offset` before them.
+            if line.last() != Some(&b'\n') {
                 break;
             }
 
@@ -669,6 +694,59 @@ mod tests {
         );
         assert_eq!(got.len(), lines.len(), "lines received");
         assert_eq!(last_offset, body.len() as u64, "last token offset");
+    }
+
+    /// A reader racing an appender sees a half-written line as nothing until
+    /// its newline lands, then as one record.
+    #[tokio::test]
+    async fn a_line_without_its_newline_waits_for_the_rest() {
+        use std::io::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("append.ndjson");
+        std::fs::write(&path, b"first\n{\"half\":").unwrap();
+        let reader = make_transport(&dir, "append.ndjson").await;
+
+        let batch = reader.recv(10).await.unwrap();
+        let payloads: Vec<&[u8]> = batch.records.iter().map(|r| r.payload.as_ref()).collect();
+        assert_eq!(payloads, [b"first".as_slice()]);
+        assert_eq!(
+            batch.commit_tokens[0].offset, 6,
+            "the offset stops before the half line"
+        );
+        assert_eq!(reader.recv(10).await.unwrap().records.len(), 0);
+
+        let mut appender = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        appender.write_all(b"true}\n").unwrap();
+
+        let batch = reader.recv(10).await.unwrap();
+        let payloads: Vec<&[u8]> = batch.records.iter().map(|r| r.payload.as_ref()).collect();
+        assert_eq!(payloads, [b"{\"half\":true}".as_slice()]);
+        assert_eq!(batch.commit_tokens[0].offset, 20);
+    }
+
+    /// The position is renamed into place, so a commit leaves the sidecar
+    /// holding a whole offset and no temporary file behind it.
+    #[tokio::test]
+    async fn commit_replaces_the_position_file_whole() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pos.ndjson");
+        std::fs::write(&path, b"a\nbb\n").unwrap();
+        let reader = make_transport(&dir, "pos.ndjson").await;
+
+        let batch = reader.recv(10).await.unwrap();
+        reader.commit(&batch.commit_tokens[..1]).await.unwrap();
+        reader.commit(&batch.commit_tokens).await.unwrap();
+
+        let pos = dir.path().join("pos.ndjson.pos");
+        assert_eq!(std::fs::read_to_string(&pos).unwrap(), "5");
+        assert!(
+            !dir.path().join("pos.ndjson.pos.tmp").exists(),
+            "the temporary file is renamed over the sidecar"
+        );
     }
 
     #[tokio::test]

@@ -117,6 +117,9 @@ pub struct ScalingPressure {
     circuit_open: AtomicBool,
     memory_used: AtomicU64,
     memory_limit: AtomicU64,
+    /// Names [`set_component`](Self::set_component) has already warned about;
+    /// locked only on a miss, never on the registered path.
+    warned_unregistered: parking_lot::Mutex<Vec<String>>,
 }
 
 impl ScalingPressure {
@@ -142,12 +145,14 @@ impl ScalingPressure {
             circuit_open: AtomicBool::new(false),
             memory_used: AtomicU64::new(0),
             memory_limit: AtomicU64::new(0),
+            warned_unregistered: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
     /// Set a component's current value (lock-free).
     ///
-    /// If `name` doesn't match any registered component, this is a no-op.
+    /// A `name` that matches no registered component stores nothing and logs
+    /// one warning per name, so a feed nobody registered does not look wired.
     pub fn set_component(&self, name: &str, value: f64) {
         for entry in &self.components {
             if entry.name == name {
@@ -155,6 +160,30 @@ impl ScalingPressure {
                 return;
             }
         }
+        self.warn_unregistered(name);
+    }
+
+    /// Whether `name` is a registered component.
+    #[cfg(any(feature = "worker-pool", test))]
+    pub(crate) fn has_component(&self, name: &str) -> bool {
+        self.components.iter().any(|entry| entry.name == name)
+    }
+
+    /// Warn the first time `name` misses; returns whether this call warned.
+    fn warn_unregistered(&self, name: &str) -> bool {
+        let mut warned = self.warned_unregistered.lock();
+        if warned.iter().any(|seen| seen == name) {
+            return false;
+        }
+        warned.push(name.to_string());
+        let registered: Vec<&str> = self.components.iter().map(|e| e.name.as_str()).collect();
+        tracing::warn!(
+            component = name,
+            ?registered,
+            "scaling pressure: set_component names no registered component, so the value is \
+             dropped and the composite does not see it"
+        );
+        true
     }
 
     /// Signal whether the circuit breaker is open.
@@ -308,6 +337,21 @@ mod tests {
             value.abs() < f64::EPSILON,
             "Zero load should produce 0.0, got {value}"
         );
+    }
+
+    #[test]
+    fn an_unregistered_name_warns_once_per_name_and_moves_nothing() {
+        let p = test_pressure();
+        p.set_component("kafka_lagg", 100_000.0);
+        assert!(
+            p.calculate().abs() < f64::EPSILON,
+            "a misspelt name must not reach the composite"
+        );
+        assert!(!p.warn_unregistered("kafka_lagg"), "already warned once");
+        assert!(p.warn_unregistered("worker_pool_saturation"));
+        assert!(!p.warn_unregistered("worker_pool_saturation"));
+        assert!(p.has_component("kafka_lag"));
+        assert!(!p.has_component("worker_pool_saturation"));
     }
 
     #[test]

@@ -389,15 +389,18 @@ allocator retains after a free, whereas the cgroup default is the number
 the OOM killer acts on. Register one only where the allocator figure is
 the one you mean to gate on.
 
+`tikv_jemalloc_ctl::stats` needs that crate's `stats` feature, which is off by default: `tikv-jemalloc-ctl = { version = "...", features = ["stats"] }`.
+
 ```rust
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
-    scalo::memory::set_heap_source(|| {
+    let registered = scalo::memory::set_heap_source(|| {
         tikv_jemalloc_ctl::epoch::advance().ok();
         tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
     });
+    assert!(registered, "a heap source was already registered");
     // ... ServiceRuntime / MemoryGuard built afterwards pick it up ...
 }
 ```

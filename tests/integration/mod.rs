@@ -8,6 +8,7 @@
 
 // Always-compiled integration tests (core modules only)
 mod doc_ascii;
+mod docs_rs_features;
 mod env;
 mod env_parity;
 

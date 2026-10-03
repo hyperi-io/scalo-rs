@@ -164,7 +164,7 @@ falls back to defaults if absent.
 | Item | Purpose |
 | ------ | --------- |
 | `ScalingPressure::new(config, components)` | Build calculator with the given components and config |
-| `set_component(name, value)` | Update a component (lock-free, unknown names are no-ops) |
+| `set_component(name, value)` | Update a component (lock-free). An unknown name stores nothing and logs one warning per name |
 | `set_circuit_open(bool)` | Toggle the circuit-breaker gate |
 | `set_memory(used_bytes, limit_bytes)` | Update the memory gate inputs |
 | `calculate() -> f64` | Apply gates + composite, return `0.0..=100.0` |

@@ -32,8 +32,10 @@
 //!
 //! - `/livez` and `/readyz`: serving, and READY. With the `health` feature a
 //!   `work_config` component is registered `Degraded` -- ready, not healthy --
-//!   so a deploy's readiness gate passes while an operator (and `/healthz`)
-//!   can still see the app has nothing to do.
+//!   so a deploy's readiness gate passes and `HealthRegistry::to_json()` still
+//!   shows the app has nothing to do. No route serves that JSON: the metrics
+//!   server answers `/livez` and `/readyz` only, with no per-component body.
+//! - A WARN log line naming the reason, once per transition into idle.
 //! - `pipeline_idle` gauge: 1 while idle, 0 once work arrives.
 //! - No transport is constructed, so no broker connection, no consumer group,
 //!   no listener socket.
@@ -65,7 +67,7 @@ pub enum WorkState {
     /// The config names work -- run the service.
     Active,
     /// The config is valid but empty of work. The string is the operator-facing
-    /// reason, logged and reported on `/healthz`.
+    /// reason, logged when the gate enters idle.
     Idle(Cow<'static, str>),
 }
 
@@ -105,7 +107,7 @@ impl WorkState {
 
 /// Idle is [`Degraded`](crate::health::HealthStatus::Degraded) -- READY but not
 /// healthy -- so a deploy's readiness gate passes an app with nothing to do
-/// while `/healthz` still shows why it is not working.
+/// while the health registry still records that it is not working.
 #[cfg(feature = "health")]
 #[must_use]
 fn work_health(idle: bool) -> crate::health::HealthStatus {
@@ -130,7 +132,7 @@ pub enum GateWake {
 /// One per process, held by `run_app` (`cli-service` feature) across the
 /// work-state loop. The health
 /// component is registered on the FIRST idle only: an app that never idles adds
-/// nothing to `/healthz`.
+/// nothing to the health registry.
 pub struct IdleGate {
     idle: Arc<AtomicBool>,
     registered: bool,

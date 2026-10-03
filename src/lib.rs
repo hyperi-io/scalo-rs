@@ -73,10 +73,7 @@
 // sync mutex opt out file-locally with `#![allow(...)]` and a comment
 // explaining the safety reasoning.
 #![deny(clippy::await_holding_lock)]
-#![warn(rustdoc::broken_intra_doc_links)]
-#![warn(rustdoc::private_intra_doc_links)]
-#![warn(rustdoc::invalid_codeblock_attributes)]
-#![warn(rustdoc::bare_urls)]
+// No in-source rustdoc lint levels: one would override a command-line `-D rustdoc::...`.
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::doc_markdown)] // Allow brand names without backticks
 #![allow(clippy::cast_precision_loss)] // Metrics values are fine with f64 precision

@@ -98,8 +98,7 @@ otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing
 otel-metrics = ["otel", "metrics-process", "metrics-util", "metrics-exporter-opentelemetry", "opentelemetry_sdk/rt-tokio", "tokio"]
 otel-tracing = ["otel", "opentelemetry_sdk/rt-tokio", "tokio", "tracing-subscriber"]
 
-# Standard pipeline metric groups (opt-in). The dfe_* metric prefix
-# de-brand is tracked separately.
+# Standard pipeline metric groups (opt-in).
 service-metrics = ["metrics"]
 
 # Directory config store (YAML directory-backed)
@@ -642,5 +641,3 @@ required-features = ["config", "logger"]
 [[example]]
 name = "full_demo"
 required-features = ["config", "logger", "metrics", "runtime"]
-
-# Release marker: trigger v2.8.0 publish via hyperi-ci version-first pipeline.

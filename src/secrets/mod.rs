@@ -27,7 +27,7 @@
 //!
 //! ## Credential specs
 //!
-//! [`resolve`] / [`resolve_optional`] turn a short credential spec string
+//! [`resolve`](fn@resolve) / [`resolve_optional`] turn a short credential spec string
 //! into a plaintext value, so data-plane services share one syntax:
 //!
 //! - `vault:mount/path:key` -- fetch from OpenBao (needs the `secrets-vault`

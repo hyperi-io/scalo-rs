@@ -9,24 +9,27 @@
 //! Pre-built service infrastructure for data-plane pipeline applications.
 //!
 //! [`ServiceRuntime`] is created by [`super::run_app`] before calling
-//! [`ServiceApp::run_service`]. Apps receive it fully wired -- eliminates
-//! ~50 lines of identical boilerplate per consumer service.
+//! [`ServiceApp::run_service`](super::ServiceApp::run_service). Apps receive it
+//! fully wired -- eliminates ~50 lines of identical boilerplate per consumer
+//! service.
 //!
 //! ## What's included (always)
 //!
 //! - [`MetricsManager`] -- started, serving `/metrics`, `/livez`, `/readyz`
 //!   and the runtime's `/scaling/pressure`
-//! - [`ServiceMetrics`] -- the platform data-plane metrics, registered under
-//!   bare names or the `metrics.namespace` prefix
+//! - [`ServiceMetrics`](crate::metrics::ServiceMetrics) -- the platform
+//!   data-plane metrics, registered under bare names or the `metrics.namespace`
+//!   prefix
 //! - [`MemoryGuard`] -- cgroup-aware, auto-detected from env prefix
 //! - [`CancellationToken`] -- signal handler installed with K8s pre-stop delay
 //! - [`RuntimeContext`] -- K8s/Docker/BareMetal metadata
 //!
 //! ## What's included (when features enabled)
 //!
-//! - [`AdaptiveWorkerPool`] -- rayon + tokio hybrid (`worker-pool` feature,
+//! - `AdaptiveWorkerPool` -- rayon + tokio hybrid (`worker-pool` feature,
 //!   which `worker-batch` includes)
-//! - [`ScalingPressure`] -- KEDA signals (`scaling` feature)
+//! - [`ScalingPressure`](crate::scaling::ScalingPressure) -- KEDA signals
+//!   (`scaling` feature)
 //!
 //! ## What stays app-specific
 //!
