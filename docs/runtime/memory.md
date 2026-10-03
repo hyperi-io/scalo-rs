@@ -180,7 +180,7 @@ if guard.under_pressure() {
 | ----------- | ------ |
 | `try_reserve(n)` | one cached usage read + compare + `fetch_add` on the ledger (rollback on the reservation counter only on rung 4) |
 | `add_bytes(n)` | two `fetch_add` + threshold update |
-| `release(n)` | two saturating `fetch_update` -- over-release floors at zero |
+| `release(n)` | two saturating `try_update` -- over-release floors at zero |
 | `under_pressure()` | one cached usage read + compare; one file read per 50 ms |
 | `pressure_ratio()` | the same read + one float division; >1.0 means misconfigured limit |
 

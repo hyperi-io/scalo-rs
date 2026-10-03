@@ -230,7 +230,7 @@ impl Permit {
     fn debt_take(&self) -> Option<()> {
         self.limiter
             .debt
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |d| {
                 if d > 0 { Some(d - 1) } else { None }
             })
             .ok()

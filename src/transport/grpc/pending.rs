@@ -207,7 +207,7 @@ impl PendingRegistry {
     pub(crate) fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
         let ceiling = self.max_held_bytes;
         self.held_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 (held == 0 || held.saturating_add(bytes) <= ceiling)
                     .then(|| held.saturating_add(bytes))
             })
@@ -395,7 +395,7 @@ impl PendingRegistry {
     fn return_bytes(&self, bytes: u64) {
         let _ = self
             .held_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(bytes))
             });
         #[cfg(feature = "memory")]

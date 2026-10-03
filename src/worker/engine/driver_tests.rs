@@ -617,7 +617,7 @@ impl TransportReceiver for OrderedReceiver {
                 return Err(crate::transport::TransportError::Closed);
             }
             if recv_backpressure
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok()
             {
                 return Err(crate::transport::TransportError::Backpressure);
@@ -659,7 +659,7 @@ impl TransportReceiver for OrderedReceiver {
         // the u64::MAX "nothing committed" sentinel replaced by the first commit.
         let _ = self
             .committed_hwm
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(if current == u64::MAX {
                     max_seq
                 } else {

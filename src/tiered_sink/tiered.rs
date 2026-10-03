@@ -310,7 +310,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         }
     }
 
-    /// Reserve capacity (`fetch_update`) before enqueue; roll back
+    /// Reserve capacity (`try_update`) before enqueue; roll back
     /// on failure. Atomic reservation prevents two concurrent
     /// callers from both passing the cap check and overshooting.
     async fn spool_message(&self, record: &Record) -> Result<()> {
@@ -334,7 +334,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             let max_items_u64 = max_items as u64;
             if self
                 .spool_count
-                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |cur| {
+                .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |cur| {
                     if cur < max_items_u64 {
                         Some(cur + 1)
                     } else {
@@ -358,7 +358,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
         // Reserve byte budget; roll back item slot on failure.
         if let Some(max_bytes) = self.config.max_spool_bytes {
-            if let Err(current_bytes) = self.spool_bytes.fetch_update(
+            if let Err(current_bytes) = self.spool_bytes.try_update(
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
                 |cur| {
