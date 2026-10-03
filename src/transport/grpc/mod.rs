@@ -1454,6 +1454,13 @@ impl TransportReceiver for GrpcTransport {
     /// handed over first. After [`close`](TransportBase::close) this keeps
     /// returning the records still queued, then [`TransportError::Closed`] once
     /// none are left.
+    ///
+    /// Cancel-safe: dropping the future (a losing `select!` arm on shutdown)
+    /// loses no record. The only waits are the receiver lock, taken before any
+    /// record is, and the wait for a first record, which runs only while none
+    /// has been taken and is itself a cancel-safe channel receive. Once a record
+    /// is taken the call returns without awaiting again, so a dropped call
+    /// leaves every record still queued for the next one.
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
         let Some(receiver) = &self.receiver else {
             if self.closed.load(Ordering::Relaxed) {

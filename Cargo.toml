@@ -380,7 +380,7 @@ webpki-roots = { version = ">=1.0.7, <2", optional = true }
 # HTTP server (axum)
 axum = { version = ">=0.8.8, <0.9", optional = true }
 tower = { version = ">=0.5.3, <0.6", features = ["limit", "timeout", "load-shed", "retry", "util"], optional = true }
-tower-http = { version = ">=0.6.8, <0.7", features = ["timeout", "trace"], optional = true }
+tower-http = { version = ">=0.6.8, <0.7", features = ["timeout", "trace", "limit"], optional = true }
 
 # Async (for transport)
 chrono = { version = ">=0.4.43, <0.5", optional = true }

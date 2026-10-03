@@ -475,3 +475,20 @@ pub fn init(env_prefix: &str) -> Result<(), Box<dyn std::error::Error + Send + S
     })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod runner {
+    /// The suite shares process-global state, so plain `cargo test` fails
+    /// tests for that reason alone; this one says so by name.
+    #[test]
+    fn the_suite_runs_one_test_per_process_under_cargo_nextest() {
+        assert_eq!(
+            std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+            Ok("process-per-test"),
+            "scalo's tests share process-global state (the config cascade, the metrics \
+             recorder, the health registry, the heap-source hook, the environment), so they \
+             run one test per process: use `cargo nextest run`, as CI does. Under plain \
+             `cargo test` other tests fail for that reason rather than their own."
+        );
+    }
+}

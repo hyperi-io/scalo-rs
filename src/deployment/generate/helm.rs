@@ -687,6 +687,13 @@ fn gen_deployment_yaml(c: &DeploymentContract, gates: &[Option<String>]) -> Stri
     let app = &c.app_name;
     let replicas_if = replicas_gate(c);
     let mut out = String::with_capacity(4096);
+    // secretKeyRef env is read once at start: a rotated chart-managed Secret must roll the pods.
+    let secret_checksum = if c.secrets.is_empty() {
+        String::new()
+    } else {
+        "\n        checksum/secret: {{ include (print $.Template.BasePath \"/secret.yaml\") . | sha256sum }}"
+            .to_string()
+    };
 
     // Header
     out.push_str(&format!(
@@ -706,7 +713,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: {{{{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}}}
+        checksum/config: {{{{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}}}{secret_checksum}
         {{{{- with .Values.podAnnotations }}}}
         {{{{- toYaml . | nindent 8 }}}}
         {{{{- end }}}}

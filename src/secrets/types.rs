@@ -93,7 +93,8 @@ pub struct CacheConfig {
     /// Explicitly permit writing UNENCRYPTED secrets to the disk cache when
     /// no `encryption_key` is configured. Default `false`: without a key the
     /// disk tier is silently skipped (memory-only) rather than persisting
-    /// plaintext secrets. Enabling this is rejected by
+    /// plaintext secrets, and a plaintext file found in the cache directory
+    /// is not read either. Enabling this is rejected by
     /// [`validate`](CacheConfig::validate) under a production profile.
     #[serde(default)]
     pub allow_plaintext_disk_cache: bool,

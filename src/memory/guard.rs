@@ -413,7 +413,9 @@ impl MemoryGuard {
     /// counter -- the kernel charges the bytes once they are allocated and
     /// uncharges them on drop, so no `release` is needed to keep the check
     /// honest. An admission is charged to the usage reader's ledger so the
-    /// callers behind it in the same cache window see it. Only where no usage
+    /// callers behind it in the same cache window see it, and the charge is
+    /// taken before the check and rolled back on refusal, so callers racing on
+    /// one reading admit only what fits between them. Only where no usage
     /// source is readable does it fall back to the classic atomic
     /// check-and-add on the per-batch counter (rolled back if it would exceed
     /// the limit).
@@ -423,13 +425,19 @@ impl MemoryGuard {
             // A registered heap source is read live, so it needs no ledger.
             return heap.saturating_add(bytes) <= self.limit_bytes;
         }
-        if let Some(estimate) = self.usage.estimate() {
-            // Saturating, so an absurd `bytes` is refused rather than wrapping
-            // past the limit and being admitted.
-            if estimate.saturating_add(bytes) > self.limit_bytes {
+        if let Some(sampled) = self.usage.read() {
+            // More than the whole limit never fits, and is refused before it can
+            // saturate the ledger and erase other callers' charges on rollback.
+            if bytes > self.limit_bytes {
                 return false;
             }
-            self.usage.admit(bytes);
+            // Charge first, then judge the total the charge produced, so threads
+            // sharing one estimate cannot each admit against the same headroom.
+            let admitted = self.usage.admit_and_get(bytes);
+            if sampled.saturating_add(admitted) > self.limit_bytes {
+                self.usage.forget(bytes);
+                return false;
+            }
             return true;
         }
         let current = self.reserved_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
@@ -795,6 +803,49 @@ mod tests {
         );
     }
 
+    /// Two callers released together against headroom for one: exactly one is
+    /// admitted, every round, because each judges the total its own charge made.
+    #[test]
+    fn two_racing_reserves_against_room_for_one_admit_one() {
+        let six_mib = 6 * 1024 * 1024;
+        for round in 0..200 {
+            let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+            let guard = ledger_guard(&dir);
+            let barrier = std::sync::Barrier::new(2);
+            let admitted = std::thread::scope(|scope| {
+                let racers: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            guard.try_reserve(six_mib)
+                        })
+                    })
+                    .collect();
+                racers
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .filter(|&ok| ok)
+                    .count()
+            });
+            assert_eq!(admitted, 1, "round {round}: 12 MiB admitted into 10 MiB");
+            assert_eq!(
+                guard.current_bytes(),
+                six_mib,
+                "round {round}: the refused charge was rolled back"
+            );
+        }
+    }
+
+    /// More than the whole limit is refused without touching the ledger.
+    #[test]
+    fn a_reserve_larger_than_the_limit_leaves_the_ledger_alone() {
+        let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+        let guard = ledger_guard(&dir);
+        assert!(guard.try_reserve(1024));
+        assert!(!guard.try_reserve(u64::MAX));
+        assert_eq!(guard.current_bytes(), 1024);
+    }
+
     #[test]
     fn release_discharges_the_ledger() {
         let dir = cgroup_fixture(&[("memory.current", "0\n")]);
@@ -880,10 +931,7 @@ mod tests {
         assert_eq!(guard.usage_source(), "reservations");
     }
 
-    // Process-global heap source for the switch test. nextest isolates each
-    // test in its own process, so registering it here is contained to this
-    // test and does not leak into the per-batch-counter tests above. (This is
-    // the single test in this module that touches the global hook.)
+    // The heap hook is a OnceLock with no reset: its test runs only under nextest.
     static TEST_HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     fn test_heap_source() -> usize {
         TEST_HEAP.load(Ordering::Relaxed)
@@ -891,6 +939,13 @@ mod tests {
 
     #[test]
     fn heap_source_overrides_read_path_and_admission() {
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+            eprintln!(
+                "skipped: registers a process-global heap source, so it runs only under \
+                 cargo nextest's process-per-test mode"
+            );
+            return;
+        }
         assert!(set_heap_source(test_heap_source), "first set wins");
         assert!(
             !set_heap_source(test_heap_source),
