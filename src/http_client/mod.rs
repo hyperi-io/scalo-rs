@@ -216,6 +216,16 @@ fn method_label(method: &Method) -> &'static str {
     }
 }
 
+/// The `status` label of `http_client_requests_total` for a finished call:
+/// `success` for a 2xx answer, `error` for any other answer or no answer.
+#[cfg(any(feature = "metrics", test))]
+fn outcome_label(result: &Result<Response, HttpError>) -> &'static str {
+    match result {
+        Ok(resp) if resp.status().is_success() => "success",
+        _ => "error",
+    }
+}
+
 /// Whether replaying the method is safe, matching what the typed methods
 /// hardcode.
 fn is_idempotent(method: &Method) -> bool {
@@ -226,6 +236,10 @@ fn is_idempotent(method: &Method) -> bool {
 }
 
 /// Production HTTP client with retry/backoff.
+///
+/// `Debug` prints the reqwest client and the timeouts and retry counts, none
+/// of which is secret, so a type holding one can derive its own `Debug`.
+#[derive(Debug)]
 pub struct HttpClient {
     inner: Client,
     config: HttpClientConfig,
@@ -369,11 +383,18 @@ impl HttpClient {
     }
 
     /// Record request outcome metrics (no-op without the `metrics` feature).
+    ///
+    /// A response counts as a success only when its status is 2xx, so a 5xx
+    /// handed back once the retries are spent is recorded as the error it is.
     #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
-    fn record(method: &'static str, ok: bool, start: std::time::Instant) {
+    fn record(
+        method: &'static str,
+        result: &Result<Response, HttpError>,
+        start: std::time::Instant,
+    ) {
         #[cfg(feature = "metrics")]
         {
-            let status = if ok { "success" } else { "error" };
+            let status = outcome_label(result);
             metrics::counter!("http_client_requests_total", "method" => method, "status" => status)
                 .increment(1);
             metrics::histogram!("http_client_duration_seconds", "method" => method)
@@ -390,7 +411,7 @@ impl HttpClient {
     pub async fn get(&self, url: &str) -> Result<Response, HttpError> {
         let start = std::time::Instant::now();
         let result = self.execute("GET", true, || self.inner.get(url)).await;
-        Self::record("GET", result.is_ok(), start);
+        Self::record("GET", &result, start);
         result
     }
 
@@ -416,7 +437,7 @@ impl HttpClient {
         let result = self
             .execute("GET", true, || customise(self.inner.get(url)))
             .await;
-        Self::record("GET", result.is_ok(), start);
+        Self::record("GET", &result, start);
         result
     }
 
@@ -447,7 +468,7 @@ impl HttpClient {
                     .body(body_bytes.clone())
             })
             .await;
-        Self::record("POST", result.is_ok(), start);
+        Self::record("POST", &result, start);
         result
     }
 
@@ -471,7 +492,7 @@ impl HttpClient {
                     .body(body_bytes.clone())
             })
             .await;
-        Self::record("PUT", result.is_ok(), start);
+        Self::record("PUT", &result, start);
         result
     }
 
@@ -485,7 +506,7 @@ impl HttpClient {
         let result = self
             .execute("DELETE", true, || self.inner.delete(url))
             .await;
-        Self::record("DELETE", result.is_ok(), start);
+        Self::record("DELETE", &result, start);
         result
     }
 
@@ -511,7 +532,7 @@ impl HttpClient {
                 self.inner.get(url).build().map_err(HttpError::from)
             })
             .await;
-        Self::record("GET", result.is_ok(), start);
+        Self::record("GET", &result, start);
         result
     }
 
@@ -550,7 +571,7 @@ impl HttpClient {
                 customise(builder).build().map_err(HttpError::from)
             })
             .await;
-        Self::record(label, result.is_ok(), start);
+        Self::record(label, &result, start);
         result
     }
 
@@ -683,5 +704,164 @@ mod tests {
         assert_eq!(client.config().max_retries, 3);
         // The backoff honours config bounds.
         let _ = client.backoff();
+    }
+
+    #[test]
+    fn a_type_holding_the_client_can_derive_debug() {
+        #[derive(Debug)]
+        struct Holder {
+            client: std::sync::Arc<HttpClient>,
+        }
+        let holder = Holder {
+            client: std::sync::Arc::new(HttpClient::new(HttpClientConfig::default()).unwrap()),
+        };
+        let rendered = format!("{holder:?}");
+        assert!(rendered.contains("timeout_secs: 30"), "{rendered}");
+        assert_eq!(holder.client.config().timeout_secs, 30);
+    }
+
+    /// Counters by key, for reading what one call emitted.
+    #[cfg(feature = "metrics")]
+    #[derive(Default)]
+    struct Counters(
+        std::sync::Mutex<Vec<(metrics::Key, std::sync::Arc<std::sync::atomic::AtomicU64>)>>,
+    );
+
+    #[cfg(feature = "metrics")]
+    impl Counters {
+        fn value(&self, name: &str, status: &str) -> u64 {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| {
+                    key.name() == name
+                        && key
+                            .labels()
+                            .any(|l| l.key() == "status" && l.value() == status)
+                })
+                .map(|(_, cell)| cell.load(std::sync::atomic::Ordering::Relaxed))
+                .sum()
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    impl metrics::Recorder for Counters {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let mut held = self.0.lock().unwrap();
+            let cell = if let Some((_, cell)) = held.iter().find(|(k, _)| k == key) {
+                std::sync::Arc::clone(cell)
+            } else {
+                let cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                held.push((key.clone(), std::sync::Arc::clone(&cell)));
+                cell
+            };
+            metrics::Counter::from_arc(cell)
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// A listener answering `GET /down` with 503 and anything else with 200,
+    /// and the count of requests it has answered.
+    #[cfg(feature = "metrics")]
+    fn status_server() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = std::sync::Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let status = if request[..read].starts_with(b"GET /down ") {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                };
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        (addr, hits)
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_5xx_left_after_the_retries_counts_as_an_error() {
+        let (addr, hits) = status_server();
+        let client = HttpClient::new(HttpClientConfig {
+            max_retries: 2,
+            min_retry_interval_ms: 1,
+            max_retry_interval_ms: 5,
+            ..HttpClientConfig::default()
+        })
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let capture = Counters::default();
+
+        let down = metrics::with_local_recorder(&capture, || {
+            runtime.block_on(client.get(&format!("http://{addr}/down")))
+        });
+        assert_eq!(down.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the first attempt and both retries"
+        );
+        assert_eq!(capture.value("http_client_requests_total", "error"), 1);
+        assert_eq!(capture.value("http_client_requests_total", "success"), 0);
+
+        let up = metrics::with_local_recorder(&capture, || {
+            runtime.block_on(client.get(&format!("http://{addr}/up")))
+        });
+        assert_eq!(up.unwrap().status(), StatusCode::OK);
+        assert_eq!(capture.value("http_client_requests_total", "success"), 1);
+        assert_eq!(capture.value("http_client_requests_total", "error"), 1);
     }
 }

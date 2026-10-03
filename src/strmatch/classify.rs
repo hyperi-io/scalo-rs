@@ -579,7 +579,7 @@ fn shape_reason(shape: &ShapeOp) -> &'static str {
 }
 
 /// Map a `ShapeOp` to the public [`MatcherTier`]. Single-byte
-/// dispatch (memchr, hay.first/last, hay == [b]) lands in
+/// dispatch (memchr, hay.first/last, `hay == [b]`) lands in
 /// [`MatcherTier::Byte`]; multi-byte literals (memmem, multi-byte
 /// starts_with/ends_with/eq) land in [`MatcherTier::Literal`].
 fn tier_for_shape(shape: &ShapeOp) -> MatcherTier {

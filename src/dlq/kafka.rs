@@ -8,9 +8,8 @@
 
 //! Kafka backend variant for the DLQ enum.
 //!
-//! Routes failed messages to Kafka topics using scalo's
-//! [`KafkaProducer`](crate::transport::kafka::KafkaProducer). The
-//! producer uses the `LowLatency` profile -- DLQ volume is low and we
+//! Routes failed messages to Kafka topics using scalo's [`KafkaProducer`].
+//! The producer uses the `LowLatency` profile -- DLQ volume is low and we
 //! want failures visible quickly.
 //!
 //! ## Topic Routing

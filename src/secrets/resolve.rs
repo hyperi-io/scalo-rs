@@ -139,6 +139,12 @@ fn parse_aws_spec(rest: &str) -> Result<(&str, Option<&str>), CredentialError> {
             "invalid aws spec, expected 'aws:secret_id' or 'aws:secret_id:key'".to_string(),
         ));
     }
+    if key == Some("") {
+        return Err(CredentialError::BadSpec(format!(
+            "invalid aws spec '{rest}', the key after the last ':' is empty -- drop the \
+             trailing ':' for the whole secret, or name the JSON key"
+        )));
+    }
     Ok((secret_id, key))
 }
 
@@ -604,6 +610,23 @@ mod tests {
             err.contains("secrets.sources"),
             "the refusal must name the way around it: {err}"
         );
+    }
+
+    /// A trailing ':' with nothing after it is a typo, not a request for the
+    /// whole secret, so refuse it by name rather than look up an empty JSON key.
+    #[tokio::test]
+    async fn aws_spec_with_an_empty_key_is_refused() {
+        let err = resolve("aws:name:").await.unwrap_err();
+        assert!(
+            matches!(err, CredentialError::BadSpec(_)),
+            "expected BadSpec, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("'name:'"),
+            "the refusal must name the spec: {err}"
+        );
+        assert_eq!(parse_aws_spec("name").unwrap(), ("name", None));
+        assert_eq!(parse_aws_spec("name:key").unwrap(), ("name", Some("key")));
     }
 
     /// A `vault:` spec with no key cannot be served, so refuse it before the

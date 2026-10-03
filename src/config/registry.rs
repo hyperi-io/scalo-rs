@@ -164,8 +164,9 @@ pub fn dump_defaults() -> JsonValue {
 /// Any JSON field whose name (lowercased) contains one of these
 /// substrings will have its value replaced with `"***REDACTED***"`.
 ///
-/// Safety net only -- the primary protection is [`SensitiveString`]
-/// on the field type (compile-time safe). This heuristic catches fields
+/// Safety net only -- the primary protection is
+/// [`SensitiveString`](crate::SensitiveString) on the field type (compile-time
+/// safe). This heuristic catches fields
 /// that developers forgot to mark as sensitive.
 const SENSITIVE_PATTERNS: &[&str] = &[
     "password",

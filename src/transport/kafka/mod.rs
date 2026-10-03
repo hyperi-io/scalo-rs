@@ -266,9 +266,9 @@ pub struct KafkaTransport {
     filter_engine: super::filter::TransportFilterEngine,
     /// Optional inbound gate (`governor` feature). `None` by default ->
     /// `recv()` makes no gate calls and behaviour is byte-identical to today.
-    /// When `Some`, each `recv()` calls [`InboundGate::evaluate`], which drives
+    /// When `Some`, each `recv()` calls `InboundGate::evaluate`, which drives
     /// the [`KafkaGateActuator`] on pause/resume edges, and reports the records
-    /// its poll returned with [`InboundGate::note_received`]. The poll is ALWAYS
+    /// its poll returned with `InboundGate::note_received`. The poll is ALWAYS
     /// issued regardless of hold state -- paused partitions just return nothing,
     /// keeping the consumer-group heartbeat alive (no rebalance). It is purely
     /// additive and opt-in until a later release turns it on by default.
@@ -2885,8 +2885,8 @@ pub fn partition_limited(members: usize, partitions: usize, lag: u64) -> bool {
 ///
 /// The kafka `SuppressionRule` in this crate is a topic-suffix suppressor
 /// (auto-discovery), NOT a rate-limiter -- so the once-per-window dedup is a
-/// small purpose-built latch here. [`should_warn`](Self::should_warn) returns
-/// `true` at most once per `cooldown`, so a persistently partition-limited
+/// small purpose-built latch here. [`should_warn_at`](Self::should_warn_at)
+/// returns `true` at most once per `cooldown`, so a persistently partition-limited
 /// consumer logs once per window rather than every recv.
 #[cfg(feature = "governor")]
 struct PartitionLimitedDiagnostic {

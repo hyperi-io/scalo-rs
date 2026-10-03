@@ -515,7 +515,7 @@ struct ReceiverState {
     sequence: Arc<AtomicU64>,
     /// Optional pressure governor (`governor` feature). `None` by default
     /// -> the handler never consults it and behaviour is byte-identical. When
-    /// `Some`, the handler rejects with 503 while [`UnifiedPressure::should_hold`]
+    /// `Some`, the handler rejects with 503 while `UnifiedPressure::should_hold`
     /// holds -- pressure-driven shedding ON TOP of the existing channel-full
     /// 503, never replacing it.
     #[cfg(feature = "governor")]

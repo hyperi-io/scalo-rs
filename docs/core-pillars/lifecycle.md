@@ -59,7 +59,7 @@ flowchart LR
 | --- | --- |
 | `/livez` | 200 |
 | `/readyz` | 200 -- the `work_config` component is `Degraded`, which is ready, not healthy |
-| `/healthz` | `work_config: degraded`, so an operator can see there is nothing to do |
+| Log | one WARN naming the reason each time the app goes idle |
 | `pipeline_idle` | 1 while idle, 0 once work arrives |
 | Connections | none -- no broker, no consumer group, no listener socket |
 

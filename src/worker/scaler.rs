@@ -248,9 +248,11 @@ impl ScalingController {
         metrics::gauge!("worker_pool_saturation")
             .set(decision.target as f64 / cfg.max_threads.max(1) as f64);
 
-        // Feed back into ScalingPressure if attached
+        // Feed ScalingPressure only when the app registered the component.
         #[cfg(feature = "scaling")]
-        if let Some(sp) = self.pool.scaling_pressure.lock().as_ref() {
+        if let Some(sp) = self.pool.scaling_pressure.lock().as_ref()
+            && sp.has_component("worker_pool_saturation")
+        {
             let saturation = decision.target as f64 / cfg.max_threads.max(1) as f64;
             sp.set_component("worker_pool_saturation", saturation);
         }

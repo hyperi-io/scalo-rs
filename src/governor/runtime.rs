@@ -15,9 +15,10 @@
 //! engine driver so the pressure can be threaded into:
 //!
 //! - the inbound gate of each receive transport (Kafka pause-partitions,
-//!   HTTP/gRPC 503), via [`pressure`](Self::pressure);
+//!   HTTP/gRPC 503), via
+//!   [`pressure`](SelfRegulationGovernor::pressure);
 //! - the byte-budget lever feeding the streaming driver's sub-block size +
-//!   recv `max`, via [`budget`](Self::budget).
+//!   recv `max`, via [`budget`](SelfRegulationGovernor::budget).
 //!
 //! When `enabled = false` the runtime builds NOTHING -- it never calls
 //! [`SelfRegulationConfig::build`] -- so all the downstream `Option`s stay

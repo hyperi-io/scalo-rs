@@ -52,7 +52,9 @@ transfer, say).
   so the caller can read the status and body rather than getting a
   transport error.
 - **Request metrics** per method: `http_client_requests_total`,
-  `http_client_duration_seconds`, `http_client_retries_total`.
+  `http_client_duration_seconds`, `http_client_retries_total`. A request
+  counts as `status="success"` only when the final answer is a 2xx, so a 5xx
+  returned once the retries are spent counts as `status="error"`.
 - **No request URL on an error.** reqwest keeps a copy of the URL and
   renders it, and a credential placed in the query is inside that URL,
   so the loop drops it from every error it returns.

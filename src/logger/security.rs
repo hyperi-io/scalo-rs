@@ -150,6 +150,9 @@ impl<'a> SecurityEvent<'a> {
     /// - `Success` -> `info!`
     /// - `Failure` / `Denied` -> `warn!`
     /// - `Error` -> `error!`
+    ///
+    /// Every outcome writes the same fields, `reason` and `detail` included,
+    /// with `-` for any the event did not set.
     pub fn emit(&self) {
         let source_ip_str = self.source_ip.map(|ip| ip.to_string());
         let source_ip_ref = source_ip_str.as_deref().unwrap_or("-");
@@ -164,6 +167,8 @@ impl<'a> SecurityEvent<'a> {
                     actor = self.actor.unwrap_or("-"),
                     source_ip = source_ip_ref,
                     resource = self.resource.unwrap_or("-"),
+                    reason = self.reason.unwrap_or("-"),
+                    detail = self.detail.unwrap_or("-"),
                     "security event"
                 );
             }
@@ -177,6 +182,7 @@ impl<'a> SecurityEvent<'a> {
                     source_ip = source_ip_ref,
                     resource = self.resource.unwrap_or("-"),
                     reason = self.reason.unwrap_or("-"),
+                    detail = self.detail.unwrap_or("-"),
                     "security event"
                 );
             }
@@ -384,5 +390,77 @@ mod tests {
     fn test_no_source_ip() {
         auth_success("api_key", "svc-internal", None);
         auth_failure("bearer_validate", "malformed", None);
+    }
+
+    /// The text every event emitted inside `body` writes, at INFO and above.
+    fn captured(body: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&buf);
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || Sink(Arc::clone(&writer))),
+            );
+        tracing::subscriber::with_default(subscriber, body);
+        String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
+    }
+
+    #[test]
+    fn every_outcome_logs_its_reason_and_detail() {
+        for outcome in [
+            SecurityOutcome::Success,
+            SecurityOutcome::Failure,
+            SecurityOutcome::Denied,
+            SecurityOutcome::Error,
+        ] {
+            let out = captured(|| {
+                SecurityEvent::new("data.dlq_routed", "route", outcome)
+                    .reason("oversize")
+                    .detail("topic=t partition=3 offset=42")
+                    .emit();
+            });
+            assert!(
+                out.contains("detail=\"topic=t partition=3 offset=42\""),
+                "{outcome}: {out}"
+            );
+            assert!(out.contains("reason=\"oversize\""), "{outcome}: {out}");
+        }
+    }
+
+    #[test]
+    fn the_convenience_functions_keep_their_detail() {
+        let out = captured(|| {
+            config_changed("reload", "system", "auth config updated");
+            token_rotated("bearer_refresh", "3 tokens loaded");
+            record_dlq("route", "oversize", Some("topic=t offset=42"));
+            data_quality_alert("validate", "rejection rate 12%");
+        });
+        for detail in [
+            "auth config updated",
+            "3 tokens loaded",
+            "topic=t offset=42",
+            "rejection rate 12%",
+        ] {
+            assert!(
+                out.contains(&format!("detail=\"{detail}\"")),
+                "{detail}: {out}"
+            );
+        }
     }
 }

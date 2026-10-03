@@ -58,7 +58,7 @@ syntax instead of each hand-rolling its own env/vault lookup:
 | `vault:<name>:<key>` | the same lookup on the default `secret` mount, for a path with no mount segment |
 | `bao:<mount>/<path>:<key>`, `openbao:<mount>/<path>:<key>` | the same lookup, spelled as the OpenBao tooling spells it |
 | `file:path` | the contents of a local file, read fresh every time so a rotated mount is seen; a zero-byte file is refused |
-| `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`). An ARN is refused -- it carries colons of its own, so use the secret name or an `aws` source in `secrets.sources` |
+| `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`). An ARN is refused -- it carries colons of its own, so use the secret name or an `aws` source in `secrets.sources`. So is an empty key (`aws:name:`) |
 | `env:VAR` | the environment variable `VAR` (hard error if unset) |
 | anything else | the literal string |
 

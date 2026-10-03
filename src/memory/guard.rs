@@ -49,16 +49,21 @@ static HEAP_SOURCE: OnceLock<fn() -> usize> = OnceLock::new();
 /// one such as `tikv-jemalloc-ctl` (`stats.allocated`); the `cap` crate also
 /// works but is effectively unmaintained (last release 2023).
 ///
+/// `tikv_jemalloc_ctl::stats` sits behind that crate's `stats` feature, which
+/// is off by default, so the application's `Cargo.toml` needs
+/// `tikv-jemalloc-ctl = { version = "...", features = ["stats"] }`.
+///
 /// ```ignore
 /// // In the application binary, using jemalloc:
 /// #[global_allocator]
 /// static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 ///
 /// fn main() {
-///     scalo::memory::set_heap_source(|| {
+///     let registered = scalo::memory::set_heap_source(|| {
 ///         tikv_jemalloc_ctl::epoch::advance().ok();
 ///         tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0)
 ///     });
+///     assert!(registered, "a heap source was already registered");
 ///     // ... build ServiceRuntime / MemoryGuard ...
 /// }
 /// ```
