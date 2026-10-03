@@ -908,6 +908,37 @@ A `provider` preset that these paths silently ignored now takes effect. `produce
 
 **Consumer adjustment** -- a deployment that set one of these to a padded production value was running in development posture and now runs in production posture; check its Kafka, secrets and cache config against the production refusals above before it rolls.
 
+### Contract names and defaults carry no organisation or product name
+
+The names scalo writes into artefacts, and the defaults it falls back on, named one organisation and one product. They are now scalo's own or the app's, and an app that relied on the old value sets it explicitly. Once it does, every name and default below is what it was, except that the secret schema also carries `x-scalo-secret`.
+
+| Old | New | To keep the old value |
+| --- | --- | --- |
+| Secret schema marker `x-dfe-secret` | `x-scalo-secret`, with `x-dfe-secret` still emitted beside it | Nothing: both are emitted. Move every reader to `x-scalo-secret`, tests that assert the marker included. scalo-py emits both in the same order and reads either -- see [reflectable-config-shape.md](reflectable-config-shape.md#secret-marker) |
+| Label and annotation keys `io.hyperi.profile`, `io.hyperi.app`, `io.hyperi.metrics_port`, `io.hyperi.contract.*` | `io.scalo.*`, under the new `OciLabels::label_namespace` | `oci_labels.label_namespace: "io.hyperi".into()` |
+| `pub const KEY_PREFIX` (`io.hyperi.contract`) | `pub const KEY_SEGMENT` (`contract`), under the label namespace | -- |
+| `ContractIdentity::as_dockerfile_labels()`, `as_yaml_annotations(indent)` | take the namespace: `as_dockerfile_labels(ns)`, `as_yaml_annotations(ns, indent)` | pass `"io.hyperi"` |
+| Vendor label default `HYPERI PTY LIMITED` | empty, and an empty vendor writes no label | `oci_labels.vendor: "HYPERI PTY LIMITED".into()` |
+| Copyright default `(c) 2026 HYPERI PTY LIMITED`, written to the generated Dockerfile's `# Copyright:` header line | empty, and an empty copyright writes no `# Copyright:` line | `oci_labels.copyright: "(c) 2026 HYPERI PTY LIMITED".into()`, which writes the header exactly as before |
+| Licence default `Apache-2.0` (scalo's own), written to the `# License:` header line and the `org.opencontainers.image.licenses` label | empty, and an empty licence writes neither | `oci_labels.licenses: "Apache-2.0".into()`, or the app's own licence. With neither licence nor copyright set, the header drops both lines and the `#` after them |
+| `DEFAULT_IMAGE_REGISTRY` (`ghcr.io/hyperi-io`) | removed. `image_registry` is required and `validate()` refuses an empty one | `image_registry: "ghcr.io/hyperi-io".into()`, or `deployment.image_registry` in the cascade |
+| `image_registry_from_cascade() -> String` | `-> Option<String>`, `None` when unset | `image_registry_from_cascade().unwrap_or_else(\|\| "ghcr.io/hyperi-io".into())` |
+| `argocd_repo_url_from_cascade(app) -> String`, falling back to `https://github.com/hyperi-io/<app>` | `argocd_repo_url_from_cascade() -> Option<String>`. `generate-artefacts` writes no `argocd-application.yaml` without it, and warns | `deployment.argocd.repo_url: https://github.com/hyperi-io/<app>`, in a config file the cascade reads when `generate-artefacts` loads it |
+| `ArgocdConfig::default().dest_namespace` `dfe` | empty, which deploys into a namespace named after `app_name`. New cascade key `deployment.argocd.dest_namespace` | `dest_namespace: "dfe".into()`, or `deployment.argocd.dest_namespace: dfe` for `generate-artefacts` |
+| `KafkaSource::consumer_group` groups `dfe-{service}-{source}` and `dfe-{service}` | `{service}-{source}` and `{service}`, led by `KafkaSource::with_group_prefix` | `KafkaSource::new(name).with_group_prefix("dfe-")` |
+| `FileDlqConfig::default().path` `/var/spool/dfe/dlq` | `/var/spool/scalo/dlq` | `dlq.file.path: /var/spool/dfe/dlq` |
+| `FileOutputConfig::default().path` `/var/spool/dfe/output` | `/var/spool/scalo/output` | `path: /var/spool/dfe/output` |
+| `FileWriterConfig::default().path` `/var/spool/dfe` | `/var/spool/scalo` (`io::DEFAULT_SPOOL_ROOT`) | `path: /var/spool/dfe` |
+| `KafkaDlqConfig.common_topic: String`, default `dfe.dlq` | `Option<String>`, default `None`, which resolves to `<service>.dlq` for the service `Dlq::spawn` is given, or `dlq`. A value that is set, the empty string included, is used as it is | `common_topic: Some("dfe.dlq".into())`, or `dlq.kafka.common_topic: dfe.dlq`. Code assigning a `String` wraps it in `Some` |
+
+**Consumer adjustment** -- set each value the app relied on, in code or config, before the bump. The ones that break something when missed:
+
+- A consumer group that changes resets the group's committed offsets, and a broker that grants groups by prefix refuses the new one. Every `KafkaSource` that derives a group takes `.with_group_prefix(...)` with the prefix it had.
+- A contract with no registry fails `validate()`, so `generate_chart`, `generate_container_manifest`, `check_chart_drift` and `generate-artefacts` refuse it.
+- `#[serde(default)]` on scalo's `DlqConfig` means a partial `dlq:` block in a config file reverts the fields it leaves out to scalo's defaults, not to the app's. A deployment that mounts its spool volume at the old path sets `dlq.file.path` wherever it writes a `dlq:` block.
+- A field-level `#[serde(default)]` on an app's own `dlq: DlqConfig` field fills a config file with no `dlq:` key from `DlqConfig::default()`, not from the app's container `Default`. DLQ values the app sets in its own `Default` then reach only code that builds that default, never a loaded file. Give the field `#[serde(default = "...")]` naming a function that returns the app's values.
+- Committed artefacts that `generate_dockerfile`, `generate_runtime_stage`, `generate_container_manifest`, `generate_chart` or `config_schema_json` produced change on regeneration -- the secret marker gains `x-scalo-secret`, and the label and header lines follow the settings above -- so regenerate them in the same change as the bump. `assert_no_config_artifact_drift` and `check_chart_drift` fail until they are. A committed `argocd-application.yaml` stops regenerating unless `deployment.argocd.repo_url` is set.
+
 ---
 
 ## Known open issues (not fixed on this branch)

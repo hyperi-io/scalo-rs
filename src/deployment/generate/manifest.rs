@@ -69,6 +69,41 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         &contract.oci_labels.title
     };
 
+    let namespace = &contract.oci_labels.label_namespace;
+    let mut labels = serde_json::Map::new();
+    labels.insert(format!("{namespace}.profile"), profile_str.into());
+    labels.insert(
+        format!("{namespace}.app"),
+        contract.app_name.as_str().into(),
+    );
+    labels.insert(
+        format!("{namespace}.metrics_port"),
+        contract.metrics_port.to_string().into(),
+    );
+    labels.insert(
+        "org.opencontainers.image.title".into(),
+        title.as_str().into(),
+    );
+    labels.insert(
+        "org.opencontainers.image.description".into(),
+        contract.oci_labels.description.as_str().into(),
+    );
+    // An unset vendor or licence writes no label rather than an empty one.
+    for (key, value) in [
+        (
+            "org.opencontainers.image.vendor",
+            &contract.oci_labels.vendor,
+        ),
+        (
+            "org.opencontainers.image.licenses",
+            &contract.oci_labels.licenses,
+        ),
+    ] {
+        if !value.is_empty() {
+            labels.insert(key.into(), value.as_str().into());
+        }
+    }
+
     let mut manifest = serde_json::json!({
         "schema_version": "1",
         "app_name": contract.app_name,
@@ -100,15 +135,7 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         "cmd": contract.entrypoint_args,
         "user": "appuser",
         "uid": 1000,
-        "labels": {
-            "io.hyperi.profile": profile_str,
-            "io.hyperi.app": contract.app_name,
-            "io.hyperi.metrics_port": contract.metrics_port.to_string(),
-            "org.opencontainers.image.title": title,
-            "org.opencontainers.image.description": contract.oci_labels.description,
-            "org.opencontainers.image.vendor": contract.oci_labels.vendor,
-            "org.opencontainers.image.licenses": contract.oci_labels.licenses,
-        },
+        "labels": labels,
     });
     // Only present when a port is gated, so an ungated contract's manifest is unchanged.
     if !conditional_ports.is_empty()

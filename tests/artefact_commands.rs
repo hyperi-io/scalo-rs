@@ -301,11 +301,69 @@ fn a_config_that_does_not_load_is_warned_about_and_artefacts_still_written() {
         "deployment-contract.json",
         "container-manifest.json",
         "Dockerfile.runtime",
-        "argocd-application.yaml",
     ] {
         assert!(out.path().join(name).is_file(), "{name} not written");
     }
     let contract: serde_json::Value =
         serde_json::from_str(&read(out.path(), "deployment-contract.json")).expect("JSON");
     assert_eq!(contract["base_image"], DEFAULT_BASE_IMAGE);
+}
+
+/// With no repo named for it, the ArgoCD Application is not written and the
+/// reason is on stderr; every other artefact still is.
+#[test]
+fn no_argocd_application_without_a_repo() {
+    const TEST: &str = "no_argocd_application_without_a_repo";
+    if ran_as_probe() {
+        return;
+    }
+    let config = settings_dir("metrics:\n  namespace: probe\n");
+    let out = tempfile::tempdir().expect("artefact tempdir");
+
+    let streams = probe(
+        TEST,
+        config.path(),
+        &["generate-artefacts", "--output-dir", path_str(out.path())],
+    );
+
+    assert!(
+        !out.path().join("argocd-application.yaml").exists(),
+        "an Application was written with no repo to sync"
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("deployment.argocd.repo_url is not set"),
+        "no warning on stderr:\n{}",
+        streams.stderr
+    );
+    assert!(out.path().join("Dockerfile.runtime").is_file());
+}
+
+/// The repo and destination namespace the cascade names are the ones the
+/// Application carries.
+#[test]
+fn the_argocd_application_follows_the_config_cascade() {
+    const TEST: &str = "the_argocd_application_follows_the_config_cascade";
+    if ran_as_probe() {
+        return;
+    }
+    let config = settings_dir(
+        "deployment:\n  argocd:\n    repo_url: https://git.example.com/team/artefact-probe\n    \
+         dest_namespace: probes\n",
+    );
+    let out = tempfile::tempdir().expect("artefact tempdir");
+
+    probe(
+        TEST,
+        config.path(),
+        &["generate-artefacts", "--output-dir", path_str(out.path())],
+    );
+
+    let app = read(out.path(), "argocd-application.yaml");
+    assert!(
+        app.contains("repoURL: https://git.example.com/team/artefact-probe\n"),
+        "{app}"
+    );
+    assert!(app.contains("    namespace: probes\n"), "{app}");
 }

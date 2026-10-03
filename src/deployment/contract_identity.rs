@@ -11,14 +11,17 @@
 //! Stamps every deployment artefact (OCI image, Helm chart, ArgoCD Application)
 //! with three uniform, greppable identity annotations:
 //!
-//! | Key                                | Meaning                              | Format                            |
-//! |------------------------------------|--------------------------------------|-----------------------------------|
-//! | `io.hyperi.contract.version`       | Contract schema version              | Literal string `v1`               |
-//! | `io.hyperi.contract.source-commit` | Git SHA of the consumer app's HEAD   | 40-char lowercase hex             |
-//! | `io.hyperi.contract.image-ref`     | Intended pull reference for the image | `<reg>/<repo>:<tag>` or `@<digest>` |
+//! | Key                               | Meaning                              | Format                            |
+//! |-----------------------------------|--------------------------------------|-----------------------------------|
+//! | `io.scalo.contract.version`       | Contract schema version              | Literal string `v1`               |
+//! | `io.scalo.contract.source-commit` | Git SHA of the consumer app's HEAD   | 40-char lowercase hex             |
+//! | `io.scalo.contract.image-ref`     | Intended pull reference for the image | `<reg>/<repo>:<tag>` or `@<digest>` |
 //!
-//! Same key string on every surface. The grep payoff:
-//! `grep -r 'io.hyperi.contract' .` finds every contract-emitted artefact.
+//! `io.scalo` is the contract's
+//! [`OciLabels::label_namespace`](super::OciLabels::label_namespace), which an
+//! app may set to its own reverse-DNS name. Same key string on every surface.
+//! The grep payoff: `grep -r 'io.scalo.contract' .` finds every
+//! contract-emitted artefact under the default namespace.
 //!
 //! # Pre-push vs post-push image_ref
 //!
@@ -37,8 +40,9 @@
 use std::env;
 use std::process::Command;
 
-/// Annotation key prefix shared across all three keys.
-pub const KEY_PREFIX: &str = "io.hyperi.contract";
+/// Segment under the label namespace that holds all three keys, so the keys
+/// are `<namespace>.contract.version` and so on.
+pub const KEY_SEGMENT: &str = "contract";
 
 /// Schema version literal. Bumps only when the contract format itself
 /// breaks, NOT when the consumer's app version moves.
@@ -153,31 +157,32 @@ impl ContractIdentity {
         &self.image_ref
     }
 
-    /// Render as three Dockerfile `LABEL` lines, in canonical order
+    /// Render as three Dockerfile `LABEL` lines under `namespace` (the
+    /// contract's `oci_labels.label_namespace`), in canonical order
     /// (version, source-commit, image-ref). No trailing newline; the
     /// caller is responsible for any separator.
     #[must_use]
-    pub fn as_dockerfile_labels(&self) -> String {
+    pub fn as_dockerfile_labels(&self, namespace: &str) -> String {
         format!(
-            "LABEL {KEY_PREFIX}.version=\"{VERSION}\"\n\
-             LABEL {KEY_PREFIX}.source-commit=\"{c}\"\n\
-             LABEL {KEY_PREFIX}.image-ref=\"{r}\"",
+            "LABEL {namespace}.{KEY_SEGMENT}.version=\"{VERSION}\"\n\
+             LABEL {namespace}.{KEY_SEGMENT}.source-commit=\"{c}\"\n\
+             LABEL {namespace}.{KEY_SEGMENT}.image-ref=\"{r}\"",
             c = self.source_commit,
             r = self.image_ref,
         )
     }
 
-    /// Render as three YAML annotation lines, indented by `indent`
-    /// spaces. Suitable for inclusion under `metadata.annotations:`
+    /// Render as three YAML annotation lines under `namespace`, indented by
+    /// `indent` spaces. Suitable for inclusion under `metadata.annotations:`
     /// (ArgoCD Application) or top-level `annotations:` (Helm
     /// `Chart.yaml`). No trailing newline.
     #[must_use]
-    pub fn as_yaml_annotations(&self, indent: usize) -> String {
+    pub fn as_yaml_annotations(&self, namespace: &str, indent: usize) -> String {
         let pad = " ".repeat(indent);
         format!(
-            "{pad}{KEY_PREFIX}.version: \"{VERSION}\"\n\
-             {pad}{KEY_PREFIX}.source-commit: \"{c}\"\n\
-             {pad}{KEY_PREFIX}.image-ref: \"{r}\"",
+            "{pad}{namespace}.{KEY_SEGMENT}.version: \"{VERSION}\"\n\
+             {pad}{namespace}.{KEY_SEGMENT}.source-commit: \"{c}\"\n\
+             {pad}{namespace}.{KEY_SEGMENT}.image-ref: \"{r}\"",
             c = self.source_commit,
             r = self.image_ref,
         )
@@ -242,12 +247,14 @@ mod tests {
 
     const VALID_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    const IMAGE_REF: &str = "registry.example.com/event-loader:v2.7.2";
+
     #[test]
     fn new_accepts_valid_inputs() {
-        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/hyperi-io/dfe-loader:v2.7.2").unwrap();
+        let id = ContractIdentity::new(VALID_SHA, IMAGE_REF).unwrap();
         assert_eq!(id.version(), "v1");
         assert_eq!(id.source_commit(), VALID_SHA);
-        assert_eq!(id.image_ref(), "ghcr.io/hyperi-io/dfe-loader:v2.7.2");
+        assert_eq!(id.image_ref(), IMAGE_REF);
     }
 
     #[test]
@@ -307,45 +314,63 @@ mod tests {
 
     #[test]
     fn dockerfile_labels_canonical_order_and_quoting() {
-        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/hyperi-io/dfe-loader:v2.7.2").unwrap();
-        let out = id.as_dockerfile_labels();
+        let id = ContractIdentity::new(VALID_SHA, IMAGE_REF).unwrap();
+        let out = id.as_dockerfile_labels("io.scalo");
         assert_eq!(
             out,
-            "LABEL io.hyperi.contract.version=\"v1\"\n\
-             LABEL io.hyperi.contract.source-commit=\"0123456789abcdef0123456789abcdef01234567\"\n\
-             LABEL io.hyperi.contract.image-ref=\"ghcr.io/hyperi-io/dfe-loader:v2.7.2\""
+            "LABEL io.scalo.contract.version=\"v1\"\n\
+             LABEL io.scalo.contract.source-commit=\"0123456789abcdef0123456789abcdef01234567\"\n\
+             LABEL io.scalo.contract.image-ref=\"registry.example.com/event-loader:v2.7.2\""
         );
     }
 
     #[test]
     fn yaml_annotations_canonical_order_and_quoting() {
-        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/hyperi-io/dfe-loader:v2.7.2").unwrap();
-        let out = id.as_yaml_annotations(4);
+        let id = ContractIdentity::new(VALID_SHA, IMAGE_REF).unwrap();
+        let out = id.as_yaml_annotations("io.scalo", 4);
         assert_eq!(
             out,
-            "    io.hyperi.contract.version: \"v1\"\n    \
-             io.hyperi.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\"\n    \
-             io.hyperi.contract.image-ref: \"ghcr.io/hyperi-io/dfe-loader:v2.7.2\""
+            "    io.scalo.contract.version: \"v1\"\n    \
+             io.scalo.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\"\n    \
+             io.scalo.contract.image-ref: \"registry.example.com/event-loader:v2.7.2\""
         );
     }
 
     #[test]
     fn yaml_annotations_zero_indent() {
         let id = ContractIdentity::new(VALID_SHA, "ghcr.io/x/y:v1").unwrap();
-        let out = id.as_yaml_annotations(0);
-        assert!(out.starts_with("io.hyperi.contract.version: \"v1\""));
+        let out = id.as_yaml_annotations("io.scalo", 0);
+        assert!(out.starts_with("io.scalo.contract.version: \"v1\""));
+    }
+
+    /// The keys follow the namespace they are rendered under, so an app that
+    /// sets its own keeps the keys it already ships.
+    #[test]
+    fn keys_follow_the_namespace() {
+        let id = ContractIdentity::new(VALID_SHA, "ghcr.io/x/y:v1").unwrap();
+        let dockerfile = id.as_dockerfile_labels("com.example");
+        let yaml = id.as_yaml_annotations("com.example", 2);
+        for out in [&dockerfile, &yaml] {
+            assert_eq!(out.matches("com.example.contract.").count(), 3, "{out}");
+            assert!(!out.contains("io.scalo"), "{out}");
+        }
     }
 
     #[test]
     fn key_prefix_is_grep_target() {
         // Sanity check the documented grep payoff:
-        //   grep -r 'io.hyperi.contract' .
+        //   grep -r 'io.scalo.contract' .
         // -- which only works if every output line literally contains
         // that string.
+        let prefix = format!(
+            "{}.{KEY_SEGMENT}",
+            crate::deployment::DEFAULT_LABEL_NAMESPACE
+        );
         let id = ContractIdentity::new(VALID_SHA, "ghcr.io/x/y:v1").unwrap();
-        let dockerfile = id.as_dockerfile_labels();
-        let yaml = id.as_yaml_annotations(2);
-        assert_eq!(dockerfile.matches(KEY_PREFIX).count(), 3);
-        assert_eq!(yaml.matches(KEY_PREFIX).count(), 3);
+        let dockerfile = id.as_dockerfile_labels(crate::deployment::DEFAULT_LABEL_NAMESPACE);
+        let yaml = id.as_yaml_annotations(crate::deployment::DEFAULT_LABEL_NAMESPACE, 2);
+        assert_eq!(prefix, "io.scalo.contract");
+        assert_eq!(dockerfile.matches(&prefix).count(), 3);
+        assert_eq!(yaml.matches(&prefix).count(), 3);
     }
 }

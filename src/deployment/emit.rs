@@ -39,7 +39,7 @@ use super::error::DeploymentError;
 ///
 /// Apps call this to fill [`DeploymentContract::config_schema`], typically
 /// `config_schema_json::<MyConfig>()`. Secret fields (scalo
-/// [`SensitiveString`](crate::SensitiveString)) carry the `x-dfe-secret`
+/// [`SensitiveString`](crate::SensitiveString)) carry the `x-scalo-secret`
 /// marker automatically.
 #[cfg(feature = "config-schema")]
 #[must_use]

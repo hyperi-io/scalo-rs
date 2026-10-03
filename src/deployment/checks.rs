@@ -26,6 +26,9 @@ impl DeploymentContract {
     /// `generate-artefacts` subcommand run it before writing anything, and
     /// [`validate_helm_values`](super::validate_helm_values) reports it.
     ///
+    /// `image_registry` must be set: there is no default, and an image named
+    /// without one resolves to Docker Hub's library namespace.
+    ///
     /// Each extra port needs a name Kubernetes takes -- 1 to 15 lowercase
     /// letters, digits and single inner hyphens, with at least one letter --
     /// and a protocol of TCP, UDP or SCTP in any case. No `when` path or value
@@ -39,6 +42,15 @@ impl DeploymentContract {
     ///
     /// [`DeploymentError::InvalidContract`] naming the first field at fault.
     pub fn validate(&self) -> Result<(), DeploymentError> {
+        if self.image_registry.trim().is_empty() {
+            return Err(invalid(
+                "image_registry".to_string(),
+                "no registry is set, so the chart, compose file and container manifest would \
+                 name an image nothing pushed. Set `image_registry` in the contract, or \
+                 `deployment.image_registry` in the config cascade"
+                    .to_string(),
+            ));
+        }
         for (index, port) in self.extra_ports.iter().enumerate() {
             check_port(index, port)?;
         }

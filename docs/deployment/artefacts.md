@@ -18,7 +18,7 @@ ci/
 |-- deployment-contract.json     # when ServiceApp::deployment_contract() is Some
 |-- container-manifest.json      # minimal CI-consumable subset
 |-- Dockerfile.runtime           # runtime-stage fragment for CI composition
-`-- argocd-application.yaml      # ArgoCD Application CR
+`-- argocd-application.yaml      # ArgoCD Application CR, when deployment.argocd.repo_url is set
 ```
 
 The Helm `chart/` tree is NOT written by `generate-artefacts`. Apps
@@ -106,9 +106,7 @@ FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee
 # Static OCI labels (from contract)
 LABEL org.opencontainers.image.title="my-app"
 LABEL org.opencontainers.image.description=""
-LABEL org.opencontainers.image.vendor="HYPERI PTY LIMITED"
-LABEL org.opencontainers.image.licenses="Apache-2.0"
-LABEL io.hyperi.profile="production"
+LABEL io.scalo.profile="production"
 
 # Runtime shared libraries for dynamically-linked Rust crates.
 # Apt versions are unpinned because Debian drops superseded ones, so the digest-pinned base is what fixes the release.
@@ -162,6 +160,8 @@ CMD ["--config", "/etc/my-app/config.yaml"]
 
 `FROM` is the contract's `base_image`. The default, `DEFAULT_BASE_IMAGE`, is `debian:trixie-slim` pinned to its multi-arch index digest, and Renovate moves the digest. Override it with `deployment.base_image`.
 
+The sample contract names no vendor or licence, so the fragment carries no `org.opencontainers.image.vendor` or `org.opencontainers.image.licenses` label. Set `oci_labels.vendor` and `oci_labels.licenses` and the two lines appear after `description`, vendor first. `io.scalo.profile` is under the contract's `oci_labels.label_namespace` -- see [contract.md](contract.md#labels).
+
 The `userdel -r ubuntu` before `useradd --uid 1000 appuser` is guarded by
 `id ubuntu` because it is only needed on an Ubuntu 24.04 base, which ships
 a `ubuntu` user already squatting UID 1000 - `useradd --uid 1000` fails
@@ -185,10 +185,7 @@ arrive via `--build-arg` from CI at build time.
 
 ### `argocd-application.yaml`
 
-ArgoCD `Application` CR pointing at the Helm chart in the app's git
-repo. Defaults: namespace `argocd`, destination namespace `dfe`,
-chart path `chart`, target revision `main`, self-healing on, prune
-on. Override via `ArgocdConfig`.
+ArgoCD `Application` CR pointing at the Helm chart in the app's git repo. `generate-artefacts` writes it only when `deployment.argocd.repo_url` names that repo, and warns on stderr when it does not. Defaults: namespace `argocd`, destination namespace the app's own name (set `deployment.argocd.dest_namespace` to share one), chart path `chart`, target revision `main`, self-healing on, prune on. Override via `ArgocdConfig`.
 
 ### `chart/` -- Helm chart
 
@@ -290,6 +287,8 @@ Every generated file starts with:
 # Source contract: my-app::deployment::contract()
 # Regenerate with: `my-app emit-dockerfile > Dockerfile`
 ```
+
+A generated Dockerfile puts `# License:` and `# Copyright:` lines above that block, each only when `oci_labels.licenses` or `oci_labels.copyright` is set.
 
 - **Do not edit** -- edits get clobbered on the next CI regeneration.
 - **To change behaviour, change the contract.** The contract is the

@@ -81,8 +81,11 @@ pub struct DeploymentContract {
     /// Config file mount path (e.g., "/etc/my-app/config.yaml").
     pub config_mount_path: String,
 
-    /// Container registry base (e.g., "ghcr.io/hyperi-io").
-    #[serde(default = "default_image_registry")]
+    /// Container registry base the image is pushed to and pulled from (e.g.,
+    /// "registry.example.com/team"). Required: there is no default, and
+    /// [`validate`](Self::validate) refuses an empty value. Read it from the
+    /// cascade with [`image_registry_from_cascade`](super::image_registry_from_cascade).
+    #[serde(default)]
     pub image_registry: String,
 
     /// Additional ports beyond metrics (e.g., HTTP data port for receiver).
@@ -140,7 +143,7 @@ pub struct DeploymentContract {
 
     /// Reflectable JSON Schema (draft 2020-12) of the app's full `Config`,
     /// derived via schemars (scalo-rs#6). `None` when the app does not provide
-    /// one. Secret fields carry the `x-dfe-secret` marker. Carried inline so a
+    /// one. Secret fields carry the `x-scalo-secret` marker. Carried inline so a
     /// single fetch of the contract gives the schema; also written to
     /// `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,6 +157,9 @@ pub struct DeploymentContract {
     pub capabilities: Vec<super::Capability>,
 }
 
+/// Reverse-DNS namespace of the labels and annotations scalo writes itself.
+pub const DEFAULT_LABEL_NAMESPACE: &str = "io.scalo";
+
 /// OCI image labels for the container.
 ///
 /// Static labels are set from the contract. Dynamic labels (source, revision,
@@ -166,19 +172,25 @@ pub struct OciLabels {
     /// Image description.
     #[serde(default)]
     pub description: String,
-    /// Image vendor.
-    #[serde(default = "default_vendor")]
+    /// Image vendor, the `org.opencontainers.image.vendor` label. Empty by
+    /// default, and an empty vendor writes no label.
+    #[serde(default)]
     pub vendor: String,
-    /// License identifier (SPDX). Drives BOTH the OCI
+    /// Reverse-DNS namespace of the keys scalo stamps itself:
+    /// `<namespace>.profile`, `<namespace>.app` and `<namespace>.metrics_port`
+    /// on the image, and the three `<namespace>.contract.*` identity keys on
+    /// every artefact. Defaults to [`DEFAULT_LABEL_NAMESPACE`].
+    #[serde(default = "default_label_namespace")]
+    pub label_namespace: String,
+    /// The app's licence (SPDX). Drives BOTH the OCI
     /// `org.opencontainers.image.licenses` label AND the generated Dockerfile's
-    /// `# License` header comment, so a non-Apache consumer (e.g. a BUSL-1.1
-    /// app) gets a correct header. Defaults to scalo's own (Apache-2.0).
-    #[serde(default = "default_license")]
+    /// `# License` header comment. Empty by default, and an empty licence
+    /// writes neither.
+    #[serde(default)]
     pub licenses: String,
-    /// Copyright holder line for the generated Dockerfile's `# Copyright`
-    /// header comment. Consumer-supplied so a non-scalo consumer does not get
-    /// scalo's copyright stamped into their repo. Defaults to scalo's own.
-    #[serde(default = "default_copyright")]
+    /// The app's copyright line for the generated Dockerfile's `# Copyright`
+    /// header comment. Empty by default, and an empty copyright writes no line.
+    #[serde(default)]
     pub copyright: String,
 }
 
@@ -187,23 +199,16 @@ impl Default for OciLabels {
         Self {
             title: String::new(),
             description: String::new(),
-            vendor: default_vendor(),
-            licenses: default_license(),
-            copyright: default_copyright(),
+            vendor: String::new(),
+            label_namespace: default_label_namespace(),
+            licenses: String::new(),
+            copyright: String::new(),
         }
     }
 }
 
-fn default_vendor() -> String {
-    "HYPERI PTY LIMITED".to_string()
-}
-
-fn default_license() -> String {
-    "Apache-2.0".to_string()
-}
-
-fn default_copyright() -> String {
-    "(c) 2026 HYPERI PTY LIMITED".to_string()
+fn default_label_namespace() -> String {
+    DEFAULT_LABEL_NAMESPACE.to_string()
 }
 
 fn default_schema_version() -> u32 {
@@ -467,10 +472,6 @@ fn default_base_image() -> String {
     super::DEFAULT_BASE_IMAGE.to_string()
 }
 
-fn default_image_registry() -> String {
-    super::DEFAULT_IMAGE_REGISTRY.to_string()
-}
-
 fn default_protocol() -> String {
     "TCP".to_string()
 }
@@ -627,7 +628,7 @@ mod tests {
             keda: None,
             binary_name: String::new(),
             description: String::new(),
-            image_registry: default_image_registry(),
+            image_registry: "registry.example.com".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],
@@ -659,7 +660,7 @@ mod tests {
             keda: None,
             binary_name: String::new(),
             description: String::new(),
-            image_registry: default_image_registry(),
+            image_registry: "registry.example.com".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],
@@ -692,7 +693,7 @@ mod tests {
             config_mount_path: "/etc/app/config.yaml".into(),
             keda: None,
             description: String::new(),
-            image_registry: default_image_registry(),
+            image_registry: "registry.example.com".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],
@@ -722,7 +723,7 @@ mod tests {
             keda: None,
             binary_name: String::new(),
             description: String::new(),
-            image_registry: default_image_registry(),
+            image_registry: "registry.example.com".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],
@@ -753,7 +754,7 @@ mod tests {
             keda: Some(KedaContract::default()),
             binary_name: String::new(),
             description: String::new(),
-            image_registry: default_image_registry(),
+            image_registry: "registry.example.com".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],
@@ -814,6 +815,53 @@ mod tests {
         let out = contract.to_json();
         for key in ["\"when\"", "\"bound_from\"", "\"unbound_listen_paths\""] {
             assert!(!out.contains(key), "{key} serialised when unset:\n{out}");
+        }
+    }
+
+    /// The labels name no vendor, licence or copyright of their own, so an app
+    /// gets none it did not set.
+    #[test]
+    fn test_oci_labels_default_to_no_vendor_licence_or_copyright() {
+        let labels = OciLabels::default();
+        assert_eq!(labels.vendor, "");
+        assert_eq!(labels.licenses, "");
+        assert_eq!(labels.copyright, "");
+        assert_eq!(labels.label_namespace, "io.scalo");
+        assert_eq!(labels.label_namespace, DEFAULT_LABEL_NAMESPACE);
+    }
+
+    /// Labels written before `label_namespace` existed load under the default
+    /// namespace and keep the vendor, licence and copyright they name.
+    #[test]
+    fn test_oci_labels_without_a_namespace_load_under_the_default() {
+        let labels: OciLabels = serde_json::from_str(
+            r#"{ "vendor": "Example Ltd", "licenses": "MIT", "copyright": "(c) 2026 Example Ltd" }"#,
+        )
+        .unwrap();
+        assert_eq!(labels.vendor, "Example Ltd");
+        assert_eq!(labels.licenses, "MIT");
+        assert_eq!(labels.copyright, "(c) 2026 Example Ltd");
+        assert_eq!(labels.label_namespace, DEFAULT_LABEL_NAMESPACE);
+    }
+
+    /// A contract that names no registry still loads, and `validate` refuses it.
+    #[test]
+    fn test_contract_without_a_registry_loads_with_an_empty_one() {
+        let json = r#"{
+            "app_name": "old", "metrics_port": 9090,
+            "health": { "liveness_path": "/livez", "readiness_path": "/readyz",
+                        "metrics_path": "/metrics" },
+            "env_prefix": "OLD", "metric_prefix": "old",
+            "config_mount_path": "/etc/old/config.yaml", "keda": null
+        }"#;
+        let contract: DeploymentContract = serde_json::from_str(json).unwrap();
+        assert_eq!(contract.image_registry, "");
+        match contract.validate() {
+            Err(crate::deployment::DeploymentError::InvalidContract { field, reason }) => {
+                assert_eq!(field, "image_registry");
+                assert!(reason.contains("deployment.image_registry"), "{reason}");
+            }
+            other => panic!("an empty registry passed validate: {other:?}"),
         }
     }
 

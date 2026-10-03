@@ -295,12 +295,12 @@ fn tier_a_dockerfile_builds_and_image_runs() {
         .expect("docker inspect invocation");
     let labels = String::from_utf8_lossy(&inspect.stdout);
     assert!(
-        labels.contains("io.hyperi.contract.version")
+        labels.contains("io.scalo.contract.version")
             && labels.contains("\"v1\"")
-            && labels.contains("io.hyperi.contract.source-commit")
+            && labels.contains("io.scalo.contract.source-commit")
             && labels.contains("0123456789abcdef0123456789abcdef01234567")
-            && labels.contains("io.hyperi.contract.image-ref"),
-        "docker inspect did not show all three io.hyperi.contract.* labels: {labels}",
+            && labels.contains("io.scalo.contract.image-ref"),
+        "docker inspect did not show all three io.scalo.contract.* labels: {labels}",
     );
 }
 
@@ -471,15 +471,16 @@ fn tier_a_chart_lint_and_template() {
 
     let chart_yaml =
         std::fs::read_to_string(chart_dir.join("Chart.yaml")).expect("read Chart.yaml");
-    assert!(chart_yaml.contains("io.hyperi.contract.version: \"v1\""));
-    assert!(chart_yaml.contains(
-        "io.hyperi.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
-    ));
+    assert!(chart_yaml.contains("io.scalo.contract.version: \"v1\""));
     assert!(
         chart_yaml.contains(
-            "io.hyperi.contract.image-ref: \"ghcr.io/hyperi-io/hyperi-contract-test:test\""
+            "io.scalo.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
         )
     );
+    assert!(chart_yaml.contains(&format!(
+        "io.scalo.contract.image-ref: \"{}\"",
+        test_identity().image_ref()
+    )));
 }
 
 // ============================================================================
@@ -993,7 +994,7 @@ fn tier_a_argocd_application_kubeconform() {
     );
 
     let raw = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(raw.matches("io.hyperi.contract").count(), 3);
+    assert_eq!(raw.matches("io.scalo.contract").count(), 3);
 }
 
 // ============================================================================
@@ -1208,10 +1209,10 @@ fn tier_b_argocd_application_sync_on_kind() {
         .expect("kubectl get application");
     let annotations = String::from_utf8_lossy(&get.stdout);
     assert!(
-        annotations.contains("io.hyperi.contract.version")
+        annotations.contains("io.scalo.contract.version")
             && annotations.contains("v1")
-            && annotations.contains("io.hyperi.contract.source-commit")
-            && annotations.contains("io.hyperi.contract.image-ref"),
+            && annotations.contains("io.scalo.contract.source-commit")
+            && annotations.contains("io.scalo.contract.image-ref"),
         "applied Application missing identity annotations: {annotations}",
     );
 }

@@ -159,7 +159,7 @@ fn dlq_config(mode: DlqMode, topic: &str, file_dir: Option<&Path>) -> DlqConfig 
         kafka: KafkaDlqConfig {
             enabled: true,
             routing: DlqRouting::Common,
-            common_topic: topic.to_string(),
+            common_topic: Some(topic.to_string()),
             ..KafkaDlqConfig::default()
         },
         ..DlqConfig::default()

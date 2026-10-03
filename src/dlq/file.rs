@@ -16,7 +16,7 @@
 //! ## File Layout
 //!
 //! ```text
-//! /var/spool/data-plane/dlq/loader/
+//! /var/spool/scalo/dlq/loader/
 //! |-- dlq.ndjson              # Current file
 //! |-- dlq.ndjson.20260302T14  # Rotated (hourly)
 //! `-- dlq.ndjson.20260302T13.gz  # Compressed

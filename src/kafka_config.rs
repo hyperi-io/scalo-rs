@@ -339,15 +339,18 @@ pub const TOPIC_SUFFIX_LAND: &str = "_land";
 pub const TOPIC_SUFFIX_LOAD: &str = "_load";
 
 /// Service role -- determines consumer group naming convention.
+///
+/// Every pattern below is preceded by the source's group prefix
+/// ([`KafkaSource::with_group_prefix`]), which is empty by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
-    /// Transform services (middleware): CG = `dfe-{service}-{source}`.
+    /// Transform services (middleware): CG = `{prefix}{service}-{source}`.
     ///
     /// Transforms sit between `_land` and `_load` topics. Each source gets
     /// its own consumer group so multiple transform pipelines don't compete.
     Transform,
 
-    /// Universal consumers (loader, archiver): CG = `dfe-{service}`.
+    /// Universal consumers (loader, archiver): CG = `{prefix}{service}`.
     ///
     /// Universal services consume from whatever topics are configured or
     /// auto-discovered. The source name is not part of the consumer group.
@@ -368,7 +371,12 @@ pub enum ServiceRole {
 ///
 /// Terminal consumers (loader, archiver) do not use `KafkaSource` -- they
 /// consume from whatever topics are configured or auto-discovered, and their
-/// consumer group is simply `dfe-{service}` without a source component.
+/// consumer group is simply `{prefix}{service}` without a source component.
+///
+/// Consumer groups carry no prefix unless one is set with
+/// [`with_group_prefix`](Self::with_group_prefix). A deployment whose broker
+/// grants groups by prefix sets that prefix here, so every derived group falls
+/// under it.
 ///
 /// # Examples
 ///
@@ -381,31 +389,40 @@ pub enum ServiceRole {
 ///
 /// // Transform: CG includes source name
 /// assert_eq!(
-///     source.consumer_group("transform-vector", ServiceRole::Transform, None, None).unwrap(),
-///     "dfe-transform-vector-syslog"
+///     source.consumer_group("transform-vector", ServiceRole::Transform, None, None)?,
+///     "transform-vector-syslog"
 /// );
 ///
 /// // Terminal: CG is just the service name
 /// assert_eq!(
-///     source.consumer_group("loader", ServiceRole::Universal, None, None).unwrap(),
-///     "dfe-loader"
+///     source.consumer_group("loader", ServiceRole::Universal, None, None)?,
+///     "loader"
+/// );
+///
+/// // A group prefix leads every derived group
+/// let prefixed = KafkaSource::new("syslog").with_group_prefix("acme-");
+/// assert_eq!(
+///     prefixed.consumer_group("transform-vector", ServiceRole::Transform, None, None)?,
+///     "acme-transform-vector-syslog"
 /// );
 ///
 /// // Override always wins
 /// assert_eq!(
-///     source.consumer_group("transform-vector", ServiceRole::Transform, None, Some("custom")).unwrap(),
+///     source.consumer_group("transform-vector", ServiceRole::Transform, None, Some("custom"))?,
 ///     "custom"
 /// );
 ///
 /// // Transform without source is an error
 /// let empty = KafkaSource::new("");
 /// assert!(empty.consumer_group("transform-vector", ServiceRole::Transform, None, None).is_err());
+/// # Ok::<(), scalo::kafka_config::KafkaConfigError>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KafkaSource {
     name: String,
     land_suffix: String,
     load_suffix: String,
+    group_prefix: String,
 }
 
 /// Deprecated brand alias for [`KafkaSource`]. Removed before GA.
@@ -416,11 +433,7 @@ impl KafkaSource {
     /// Create a new source with default suffixes (`_land`, `_load`).
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            land_suffix: TOPIC_SUFFIX_LAND.to_string(),
-            load_suffix: TOPIC_SUFFIX_LOAD.to_string(),
-        }
+        Self::with_suffixes(name, TOPIC_SUFFIX_LAND, TOPIC_SUFFIX_LOAD)
     }
 
     /// Create a source with custom suffixes.
@@ -434,13 +447,30 @@ impl KafkaSource {
             name: name.into(),
             land_suffix: land_suffix.into(),
             load_suffix: load_suffix.into(),
+            group_prefix: String::new(),
         }
+    }
+
+    /// Lead every derived consumer group with `prefix`, written as given --
+    /// include any separator, e.g. `"acme-"`. An override passed to
+    /// [`consumer_group`](Self::consumer_group) is taken as is, without it.
+    #[must_use]
+    pub fn with_group_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.group_prefix = prefix.into();
+        self
     }
 
     /// Source name (e.g. `"syslog"`, `"netflow"`).
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The prefix leading every derived consumer group, empty unless set with
+    /// [`with_group_prefix`](Self::with_group_prefix).
+    #[must_use]
+    pub fn group_prefix(&self) -> &str {
+        &self.group_prefix
     }
 
     /// Landing zone topic: `{source}_land`.
@@ -461,12 +491,12 @@ impl KafkaSource {
     /// explicitly configures a consumer group in YAML/env.
     ///
     /// When `cg_override` is `None`, the default pattern depends on the
-    /// service role:
+    /// service role, led by the [group prefix](Self::with_group_prefix):
     ///
-    /// | Role | Pattern | Example |
-    /// |------|---------|---------|
-    /// | Transform | `dfe-{service}-{source}` | `dfe-transform-vector-syslog` |
-    /// | Universal (loader, archiver) | `dfe-{service}` | `dfe-loader` |
+    /// | Role | Pattern | Example, no prefix | Example, prefix `acme-` |
+    /// |------|---------|--------------------|-------------------------|
+    /// | Transform | `{prefix}{service}-{source}` | `transform-vector-syslog` | `acme-transform-vector-syslog` |
+    /// | Universal (loader, archiver) | `{prefix}{service}` | `loader` | `acme-loader` |
     ///
     /// For transforms, `pipeline` overrides the source component in the CG
     /// (e.g. `syslog-enriched` instead of `syslog`). Either the `KafkaSource`
@@ -488,6 +518,7 @@ impl KafkaSource {
             return Ok(cg.to_string());
         }
 
+        let prefix = &self.group_prefix;
         match role {
             ServiceRole::Transform => {
                 let suffix = pipeline.unwrap_or(&self.name);
@@ -496,14 +527,14 @@ impl KafkaSource {
                         path: String::new(),
                         message: format!(
                             "transform service '{service}' requires a source or pipeline \
-                             name for its consumer group -- a bare 'dfe-{service}' CG would \
+                             name for its consumer group -- a bare '{prefix}{service}' CG would \
                              cause multiple pipelines to compete for messages"
                         ),
                     });
                 }
-                Ok(format!("dfe-{service}-{suffix}"))
+                Ok(format!("{prefix}{service}-{suffix}"))
             }
-            ServiceRole::Universal => Ok(format!("dfe-{service}")),
+            ServiceRole::Universal => Ok(format!("{prefix}{service}")),
         }
     }
 
@@ -667,7 +698,7 @@ sasl.mechanism=SCRAM-SHA-512
             source
                 .consumer_group("transform-vector", ServiceRole::Transform, None, None)
                 .unwrap(),
-            "dfe-transform-vector-syslog"
+            "transform-vector-syslog"
         );
     }
 
@@ -683,7 +714,7 @@ sasl.mechanism=SCRAM-SHA-512
                     None
                 )
                 .unwrap(),
-            "dfe-transform-vector-syslog-enriched"
+            "transform-vector-syslog-enriched"
         );
     }
 
@@ -709,7 +740,7 @@ sasl.mechanism=SCRAM-SHA-512
                     None
                 )
                 .unwrap(),
-            "dfe-transform-vector-syslog"
+            "transform-vector-syslog"
         );
     }
 
@@ -720,7 +751,7 @@ sasl.mechanism=SCRAM-SHA-512
             source
                 .consumer_group("loader", ServiceRole::Universal, None, None)
                 .unwrap(),
-            "dfe-loader"
+            "loader"
         );
     }
 
@@ -731,7 +762,7 @@ sasl.mechanism=SCRAM-SHA-512
             source
                 .consumer_group("archiver", ServiceRole::Universal, Some("ignored"), None)
                 .unwrap(),
-            "dfe-archiver"
+            "archiver"
         );
     }
 
@@ -765,6 +796,75 @@ sasl.mechanism=SCRAM-SHA-512
                 .unwrap(),
             "custom-loader-cg"
         );
+    }
+
+    #[test]
+    fn kafka_source_has_no_group_prefix_by_default() {
+        assert_eq!(KafkaSource::new("syslog").group_prefix(), "");
+        assert_eq!(
+            KafkaSource::with_suffixes("auth", "_raw", "_enriched").group_prefix(),
+            ""
+        );
+    }
+
+    /// The prefix leads every derived group, for both roles and with a
+    /// pipeline, exactly as written -- no separator is added.
+    #[test]
+    fn kafka_source_group_prefix_leads_every_derived_group() {
+        let source = KafkaSource::new("syslog").with_group_prefix("acme-");
+        assert_eq!(source.group_prefix(), "acme-");
+        let cg = |service, role, pipeline| {
+            source
+                .consumer_group(service, role, pipeline, None)
+                .unwrap()
+        };
+        assert_eq!(
+            cg("transform-vector", ServiceRole::Transform, None),
+            "acme-transform-vector-syslog"
+        );
+        assert_eq!(
+            cg(
+                "transform-vector",
+                ServiceRole::Transform,
+                Some("syslog-enriched")
+            ),
+            "acme-transform-vector-syslog-enriched"
+        );
+        assert_eq!(cg("loader", ServiceRole::Universal, None), "acme-loader");
+        assert_eq!(
+            cg("archiver", ServiceRole::Universal, Some("ignored")),
+            "acme-archiver"
+        );
+        let unseparated = KafkaSource::new("syslog").with_group_prefix("acme");
+        assert_eq!(
+            unseparated
+                .consumer_group("loader", ServiceRole::Universal, None, None)
+                .unwrap(),
+            "acmeloader"
+        );
+    }
+
+    /// An override is the whole group id, with no prefix added to it.
+    #[test]
+    fn kafka_source_group_prefix_skips_an_override() {
+        let source = KafkaSource::new("syslog").with_group_prefix("acme-");
+        assert_eq!(
+            source
+                .consumer_group("loader", ServiceRole::Universal, None, Some("custom-cg"))
+                .unwrap(),
+            "custom-cg"
+        );
+    }
+
+    /// A transform with no source still refuses, and the refusal names the
+    /// group it would have made, prefix included.
+    #[test]
+    fn kafka_source_group_prefix_shows_in_the_refusal() {
+        let err = KafkaSource::new("")
+            .with_group_prefix("acme-")
+            .consumer_group("transform-vector", ServiceRole::Transform, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("'acme-transform-vector'"), "{err}");
     }
 
     #[test]

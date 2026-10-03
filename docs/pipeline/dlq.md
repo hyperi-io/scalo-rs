@@ -19,7 +19,7 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 | Backend | Feature | Storage |
 | --------- | --------- | --------- |
 | File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, with rotation (`Hourly` default) and gzip on rotation |
-| Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic — per-table (`acme.auth` → `acme.auth.dlq`) or single common topic |
+| Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic -- per-table (`acme.auth` -> `acme.auth.dlq`) or single common topic (`<service>.dlq` unless `common_topic` names one) |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
 
 After a refused write the file backend reopens its file on a later write, waiting 250 ms and doubling up to 30 s while writes keep failing. So a deleted file or a restored directory recovers without a restart. It never recreates a missing directory, because that could put the DLQ on the filesystem under an unmounted volume. While its file is missing it refuses writes before they reach `file-rotate`, whose rotation would otherwise panic -- an abort in a `panic = "abort"` service.
@@ -172,7 +172,7 @@ dlq:
   flush_interval_ms: 100         # partial-batch flush
   file:
     enabled: true
-    path: /var/spool/dfe/dlq
+    path: /var/spool/scalo/dlq   # the service name is appended as a subdirectory
     rotation: hourly             # hourly | daily
     max_age_days: 30
     compress_rotated: true
@@ -180,7 +180,7 @@ dlq:
     enabled: true
     routing: per_table           # per_table | common
     topic_suffix: .dlq
-    common_topic: dfe.dlq
+    common_topic: errors.dlq     # unset: <service>.dlq, the service Dlq::spawn is given
     send_timeout_ms: 5000        # ack wait for flush() and shutdown; the purge after it adds up to 5 s
   http:                          # dlq-http feature
     enabled: false

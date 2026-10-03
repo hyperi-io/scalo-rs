@@ -195,7 +195,7 @@ pub fn smoke_test_build(
 }
 
 fn tempdir_for_smoke(contract: &DeploymentContract) -> std::io::Result<PathBuf> {
-    let base = std::env::temp_dir().join(format!("hyperi-smoke-{}", contract.app_name));
+    let base = std::env::temp_dir().join(format!("scalo-smoke-{}", contract.app_name));
     if base.exists() {
         std::fs::remove_dir_all(&base)?;
     }
@@ -250,7 +250,7 @@ mod tests {
             env_prefix: "SMOKE".into(),
             metric_prefix: "smoke".into(),
             config_mount_path: "/etc/smoke/config.yaml".into(),
-            image_registry: super::super::DEFAULT_IMAGE_REGISTRY.to_string(),
+            image_registry: "registry.example.com".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],
