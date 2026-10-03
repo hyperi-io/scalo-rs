@@ -2865,7 +2865,7 @@ mod tests {
     #[test]
     fn kafka_config_topic_resolution_defaults() {
         let config = KafkaConfig::default();
-        assert!(config.topic_include.is_empty());
+        assert_eq!(config.topic_include, [] as [std::string::String; 0]);
         assert_eq!(
             config.topic_exclude,
             vec!["^__".to_string(), "_dlq$".to_string()]

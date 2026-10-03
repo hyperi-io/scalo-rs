@@ -1133,7 +1133,7 @@ mod tests {
 
         // recv should timeout with no messages
         let records = receiver.recv(10).await.unwrap().records;
-        assert!(records.is_empty());
+        assert_eq!(records, [] as [crate::transport::work_batch::Record; 0]);
 
         receiver.close().await.unwrap();
     }

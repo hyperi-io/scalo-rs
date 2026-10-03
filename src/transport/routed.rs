@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn route_keys_and_has_route() {
         let sender = RoutedSender::new(HashMap::new(), None);
-        assert!(sender.route_keys().is_empty());
+        assert_eq!(sender.route_keys(), [] as [&str; 0]);
         assert!(!sender.has_route("anything"));
         assert!(!sender.has_default());
     }

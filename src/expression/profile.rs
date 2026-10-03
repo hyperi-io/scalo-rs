@@ -250,17 +250,26 @@ mod tests {
 
     #[test]
     fn allowed_function_passes() {
-        assert!(check_profile(r#"msg.contains("error")"#).is_empty());
+        assert_eq!(
+            check_profile(r#"msg.contains("error")"#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn starts_with_passes() {
-        assert!(check_profile(r#"path.startsWith("/api/")"#).is_empty());
+        assert_eq!(
+            check_profile(r#"path.startsWith("/api/")"#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn ends_with_passes() {
-        assert!(check_profile(r#"file.endsWith(".log")"#).is_empty());
+        assert_eq!(
+            check_profile(r#"file.endsWith(".log")"#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -361,19 +370,28 @@ mod tests {
 
     #[test]
     fn keywords_skipped() {
-        assert!(check_profile("has(user.name)").is_empty());
-        assert!(check_profile("int(x) > 10").is_empty());
-        assert!(check_profile("bool(y)").is_empty());
+        assert_eq!(
+            check_profile("has(user.name)"),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(check_profile("int(x) > 10"), [] as [std::string::String; 0]);
+        assert_eq!(check_profile("bool(y)"), [] as [std::string::String; 0]);
     }
 
     #[test]
     fn plain_comparison_passes() {
-        assert!(check_profile(r#"severity == "critical""#).is_empty());
+        assert_eq!(
+            check_profile(r#"severity == "critical""#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn compound_expression_passes() {
-        assert!(check_profile(r#"severity == "critical" && amount > 10000"#).is_empty());
+        assert_eq!(
+            check_profile(r#"severity == "critical" && amount > 10000"#),
+            [] as [std::string::String; 0]
+        );
     }
 
     // -- String literal false-positive prevention ----------------
@@ -381,34 +399,52 @@ mod tests {
     #[test]
     fn function_name_inside_string_not_flagged() {
         // "filter" appears inside a string literal, not as a function call
-        assert!(check_profile(r#"msg.contains("filter")"#).is_empty());
+        assert_eq!(
+            check_profile(r#"msg.contains("filter")"#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn function_name_inside_string_with_parens_not_flagged() {
         // "map(" appears inside a string -- should not be flagged
-        assert!(check_profile(r#"msg.contains("map(x)")"#).is_empty());
+        assert_eq!(
+            check_profile(r#"msg.contains("map(x)")"#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn matches_inside_string_not_flagged() {
-        assert!(check_profile(r#"msg.contains("matches")"#).is_empty());
+        assert_eq!(
+            check_profile(r#"msg.contains("matches")"#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn timestamp_inside_string_not_flagged() {
-        assert!(check_profile(r#"label == "timestamp""#).is_empty());
+        assert_eq!(
+            check_profile(r#"label == "timestamp""#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn escaped_quote_inside_string_handled() {
         // String with escaped quote: "filter\"(" -- scanner must not exit early
-        assert!(check_profile(r#"msg.contains("filter\"(")"#).is_empty());
+        assert_eq!(
+            check_profile(r#"msg.contains("filter\"(")"#),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn single_quoted_string_handled() {
-        assert!(check_profile("msg.contains('filter')").is_empty());
+        assert_eq!(
+            check_profile("msg.contains('filter')"),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -427,7 +463,10 @@ mod tests {
             allow_regex: true,
             ..Default::default()
         };
-        assert!(check_profile_with_config(r#"name.matches("^web-[0-9]+$")"#, &config).is_empty());
+        assert_eq!(
+            check_profile_with_config(r#"name.matches("^web-[0-9]+$")"#, &config),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -447,9 +486,18 @@ mod tests {
             allow_iteration: true,
             ..Default::default()
         };
-        assert!(check_profile_with_config("[1,2].map(x, x * 2)", &config).is_empty());
-        assert!(check_profile_with_config("[1,2].filter(x, x > 1)", &config).is_empty());
-        assert!(check_profile_with_config("[1,2].exists(x, x > 1)", &config).is_empty());
+        assert_eq!(
+            check_profile_with_config("[1,2].map(x, x * 2)", &config),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            check_profile_with_config("[1,2].filter(x, x > 1)", &config),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            check_profile_with_config("[1,2].exists(x, x > 1)", &config),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -458,10 +506,14 @@ mod tests {
             allow_time: true,
             ..Default::default()
         };
-        assert!(
-            check_profile_with_config(r#"timestamp("2024-01-01T00:00:00Z")"#, &config).is_empty()
+        assert_eq!(
+            check_profile_with_config(r#"timestamp("2024-01-01T00:00:00Z")"#, &config),
+            [] as [std::string::String; 0]
         );
-        assert!(check_profile_with_config(r#"duration("1h")"#, &config).is_empty());
+        assert_eq!(
+            check_profile_with_config(r#"duration("1h")"#, &config),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -471,9 +523,10 @@ mod tests {
             allow_iteration: true,
             allow_time: true,
         };
-        assert!(config.blocked_functions().is_empty());
-        assert!(
-            check_profile_with_config(r#"name.matches("x") && [1].map(x, x)"#, &config).is_empty()
+        assert_eq!(config.blocked_functions(), [] as [&str; 0]);
+        assert_eq!(
+            check_profile_with_config(r#"name.matches("x") && [1].map(x, x)"#, &config),
+            [] as [std::string::String; 0]
         );
     }
 
@@ -482,7 +535,7 @@ mod tests {
     #[test]
     fn identifier_not_followed_by_paren_is_fine() {
         // "filter" as a variable name, not a function call
-        assert!(check_profile("filter > 10").is_empty());
+        assert_eq!(check_profile("filter > 10"), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -494,12 +547,12 @@ mod tests {
 
     #[test]
     fn empty_expression() {
-        assert!(check_profile("").is_empty());
+        assert_eq!(check_profile(""), [] as [std::string::String; 0]);
     }
 
     #[test]
     fn whitespace_only() {
-        assert!(check_profile("   ").is_empty());
+        assert_eq!(check_profile("   "), [] as [std::string::String; 0]);
     }
 
     #[test]

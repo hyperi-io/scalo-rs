@@ -46,7 +46,7 @@ async fn test_new_with_empty_directory() {
     let store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
-    assert!(store.list_tables().await.is_empty());
+    assert_eq!(store.list_tables().await, [] as [std::string::String; 0]);
     assert_eq!(store.write_mode(), WriteMode::DirectWrite);
 }
 
@@ -445,7 +445,7 @@ async fn test_background_refresh_detects_new_table() {
     let mut store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
-    assert!(store.list_tables().await.is_empty());
+    assert_eq!(store.list_tables().await, [] as [std::string::String; 0]);
 
     store.start().await.unwrap();
 
@@ -477,7 +477,7 @@ async fn test_background_refresh_detects_removed_table() {
 
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    assert!(store.list_tables().await.is_empty());
+    assert_eq!(store.list_tables().await, [] as [std::string::String; 0]);
 
     store.stop().await.unwrap();
 }
@@ -808,7 +808,7 @@ async fn test_subdirectory_background_refresh_new_subdir() {
     let mut store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
-    assert!(store.list_tables().await.is_empty());
+    assert_eq!(store.list_tables().await, [] as [std::string::String; 0]);
 
     store.start().await.unwrap();
 
@@ -896,7 +896,7 @@ mod git_tests {
             .await
             .unwrap();
         let branches = store.list_branches().unwrap();
-        assert!(!branches.is_empty());
+        assert_ne!(branches, [] as [std::string::String; 0]);
     }
 
     #[tokio::test]
@@ -1091,7 +1091,7 @@ mod git_tests {
         // WriteResult should have git metadata
         assert!(result.commit.is_some());
         let hash = result.commit.unwrap();
-        assert!(!hash.is_empty());
+        assert_ne!(hash, "");
         assert!(hash.len() <= 7);
     }
 }

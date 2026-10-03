@@ -194,7 +194,7 @@ mod tests {
 
         assert_eq!(msg.field("_table").and_then(|v| v.as_str()), Some("events"));
         assert!(msg.value().is_some());
-        assert!(!msg.raw_payload().is_empty());
+        assert_ne!(msg.raw_payload(), [] as [u8; 0]);
     }
 
     #[test]

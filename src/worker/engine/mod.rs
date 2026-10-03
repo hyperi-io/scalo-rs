@@ -904,7 +904,10 @@ mod engine_tests {
     fn process_mid_tier_empty_batch() {
         let engine = default_engine();
         let results: Vec<Result<(), String>> = engine.process_mid_tier(&[], |_| Ok(()));
-        assert!(results.is_empty());
+        assert_eq!(
+            results,
+            [] as [std::result::Result<(), std::string::String>; 0]
+        );
     }
 
     #[test]

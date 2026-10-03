@@ -49,7 +49,10 @@ fn default_engine() -> BatchEngine {
 fn empty_batch() {
     let engine = default_engine();
     let results: Vec<Result<(), String>> = engine.process_mid_tier(&[], |_| Ok(()));
-    assert!(results.is_empty());
+    assert_eq!(
+        results,
+        [] as [std::result::Result<(), std::string::String>; 0]
+    );
 }
 
 #[test]
@@ -250,7 +253,10 @@ fn pre_route_all_filtered() {
 
     let results: Vec<Result<(), String>> = engine.process_mid_tier(&msgs, |_| Ok(()));
     // All filtered — no results
-    assert!(results.is_empty());
+    assert_eq!(
+        results,
+        [] as [std::result::Result<(), std::string::String>; 0]
+    );
 
     let snap = engine.stats().snapshot();
     assert_eq!(snap.filtered, 20);

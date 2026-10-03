@@ -396,7 +396,7 @@ mod tests {
 
         // Subsequent call returns empty (channel closed)
         let batch = drainer.next_batch().await;
-        assert!(batch.is_empty());
+        assert_eq!(batch, [] as [i32; 0]);
     }
 
     #[tokio::test]
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(b3.len(), 1); // remaining partial batch
 
         let b4 = drainer.next_batch().await;
-        assert!(b4.is_empty()); // channel closed
+        assert_eq!(b4, [] as [i32; 0]); // channel closed
     }
 
     #[tokio::test]
@@ -470,7 +470,7 @@ mod tests {
         let (_acc, mut drainer) = BatchAccumulator::<i32>::new(config);
 
         let remaining = drainer.drain_remaining();
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, [] as [i32; 0]);
     }
 
     /// Push-ingest helper: drained Records + supplied tokens become a WorkBatch.

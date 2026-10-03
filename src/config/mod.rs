@@ -576,10 +576,10 @@ mod tests {
     #[test]
     fn test_config_options_default() {
         let opts = ConfigOptions::default();
-        assert!(opts.env_prefix.is_empty());
+        assert_eq!(opts.env_prefix, "");
         assert!(opts.app_env.is_none());
         assert!(opts.app_name.is_none());
-        assert!(opts.config_paths.is_empty());
+        assert_eq!(opts.config_paths, [] as [std::path::PathBuf; 0]);
         assert!(opts.load_dotenv);
         assert!(!opts.load_home_dotenv);
     }

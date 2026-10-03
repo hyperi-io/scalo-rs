@@ -3161,7 +3161,10 @@ mod tests {
                 .recv(100)
                 .await
                 .expect("an unreachable broker must not end the consumer");
-            assert!(batch.records.is_empty());
+            assert_eq!(
+                batch.records,
+                [] as [crate::transport::work_batch::Record; 0]
+            );
             calls += 1;
         }
         assert!(
@@ -3216,7 +3219,7 @@ mod tests {
                             () = stop_loop.cancelled() => break,
                             batch = transport.recv(100) => {
                                 let batch = batch.expect("an idle consumer's recv is Ok");
-                                assert!(batch.records.is_empty());
+                                assert_eq!(batch.records, [] as [crate::transport::work_batch::Record; 0]);
                             }
                         }
                     }
@@ -3277,7 +3280,10 @@ mod tests {
             .recv(100)
             .await
             .expect("a transient backlog must not fail recv");
-        assert!(batch.records.is_empty());
+        assert_eq!(
+            batch.records,
+            [] as [crate::transport::work_batch::Record; 0]
+        );
         assert_eq!(
             transport.recv_state.failures(),
             1,
@@ -3479,7 +3485,10 @@ mod tests {
         let batch = transport
             .replace_fatal_consumer(RDKafkaErrorCode::Fatal, "fatal")
             .expect("first rebuild");
-        assert!(batch.records.is_empty());
+        assert_eq!(
+            batch.records,
+            [] as [crate::transport::work_batch::Record; 0]
+        );
         assert!(
             transport.is_healthy(),
             "one rebuild is recovery, not failure"
@@ -3533,7 +3542,10 @@ mod tests {
             .recv(10)
             .await
             .expect("the next receive proceeds on the rebuilt client");
-        assert!(batch.records.is_empty());
+        assert_eq!(
+            batch.records,
+            [] as [crate::transport::work_batch::Record; 0]
+        );
         assert!(Arc::ptr_eq(&rebuilt, &transport.consumer()));
         assert_eq!(transport.rebuilds.load(Ordering::Relaxed), 2);
         assert!(transport.rebuild_not_before.lock().is_none());
@@ -3575,7 +3587,10 @@ mod tests {
             .recv(10)
             .await
             .expect("the replaced client's failure is not this receive's");
-        assert!(batch.records.is_empty());
+        assert_eq!(
+            batch.records,
+            [] as [crate::transport::work_batch::Record; 0]
+        );
 
         let topic: Arc<str> = Arc::from("events");
         leave_in_flight(
@@ -4486,7 +4501,10 @@ mod tests {
         // Whatever the broker-free poll returns, the revoke it carried is applied.
         let _ = transport.recv(10).await;
         assert_eq!(transport.acks.held().count, 0);
-        assert!(transport.consumer().context().take_rebalanced().is_empty());
+        assert_eq!(
+            transport.consumer().context().take_rebalanced(),
+            [] as [(u64, crate::transport::kafka::metrics::Rebalanced); 0]
+        );
     }
 
     /// Records of a partition read in the same poll job as its revoke, after

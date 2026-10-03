@@ -588,7 +588,7 @@ mod tests {
     fn malformed_json_errors() {
         let err = parse(&Bytes::from_static(b"{not valid json"), PayloadFormat::Json).unwrap_err();
         assert!(matches!(err, CodecError::Json(_)), "got {err:?}");
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 
     #[test]
@@ -603,7 +603,7 @@ mod tests {
         // 0x81 declares a fixmap with one entry but supplies no key/value.
         let err = parse(&Bytes::from_static(&[0x81]), PayloadFormat::MsgPack).unwrap_err();
         assert!(matches!(err, CodecError::MsgPack(_)), "got {err:?}");
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 
     #[test]

@@ -617,7 +617,7 @@ mod tests {
         );
         let served_after = register(&acks, 0, 15..20);
         assert_eq!(acks.held().count, 5, "a lost partition holds nothing");
-        assert!(targets(&acks, &served_after).is_empty());
+        assert_eq!(targets(&acks, &served_after), [] as [i64; 0]);
         assert_eq!(targets(&acks, &other), vec![5], "partition 1 commits");
 
         acks.rebalanced(vec![change(2, false, 0)]);
@@ -640,7 +640,7 @@ mod tests {
         acks.rebalanced(vec![change(1, true, 0), change(2, false, 0)]);
         let read_again = register(&acks, 0, 5..20);
 
-        assert!(targets(&acks, &in_flight).is_empty());
+        assert_eq!(targets(&acks, &in_flight), [] as [i64; 0]);
         assert_eq!(
             targets(&acks, &read_again[..5]),
             vec![10],
@@ -813,7 +813,7 @@ mod tests {
 
         assert_eq!(targets(&acks, &block[..3]), vec![3]);
         let later = register(&acks, 0, 10..20);
-        assert!(targets(&acks, &block[5..]).is_empty());
+        assert_eq!(targets(&acks, &block[5..]), [] as [i64; 0]);
         assert!(
             targets(&acks, &later).is_empty(),
             "the commit is pinned at the withheld offset"

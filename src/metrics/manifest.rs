@@ -580,7 +580,7 @@ mod tests {
             r#"{"schema_version":1,"app":"a","version":"","commit":"","registered_at":"","metrics":[]}"#,
         )
         .unwrap();
-        assert!(parsed.namespace.is_empty());
+        assert_eq!(parsed.namespace, "");
     }
 
     #[test]

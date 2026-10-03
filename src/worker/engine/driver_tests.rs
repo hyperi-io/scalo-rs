@@ -1141,7 +1141,7 @@ fn split_floor_one_oversized_record() {
 #[test]
 fn split_empty_yields_no_sub_blocks() {
     let sub = BatchEngine::split_into_sub_blocks(Vec::new(), 100);
-    assert!(sub.is_empty());
+    assert_eq!(sub, [] as [std::vec::Vec<crate::Record>; 0]);
 }
 
 #[test]

@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(opts.format, LogFormat::Auto);
         assert!(opts.add_source);
         assert!(opts.enable_masking);
-        assert!(!opts.sensitive_fields.is_empty());
+        assert_ne!(opts.sensitive_fields, [] as [std::string::String; 0]);
     }
 
     #[test]

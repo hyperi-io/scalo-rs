@@ -422,11 +422,11 @@ mod tests {
     fn config_default_round_trip() {
         let cfg = OtelTracingConfig::default();
         assert_eq!(cfg.protocol, OtelTracingProtocol::Grpc);
-        assert!(!cfg.endpoint.is_empty());
+        assert_ne!(cfg.endpoint, "");
         assert!(cfg.enabled, "span export is on by default");
         // Empty on purpose: the caller supplies the app's name. A crate-name
         // default would report every service in the fleet as "scalo".
-        assert!(cfg.service_name.is_empty());
+        assert_eq!(cfg.service_name, "");
     }
 
     #[tokio::test]

@@ -534,7 +534,7 @@ mod tests {
         contract.capabilities = vec![];
         let dir = tempfile::tempdir().unwrap();
         let written = emit_config_artifacts(&contract, dir.path()).unwrap();
-        assert!(written.is_empty());
+        assert_eq!(written, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]

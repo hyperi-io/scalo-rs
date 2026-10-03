@@ -361,7 +361,7 @@ mod antispam {
                 assert_eq!(wanted, MatcherTier::LiteralSet);
                 assert_eq!(got, MatcherTier::Regex);
                 assert_eq!(reason, "word-boundary");
-                assert!(!hint.is_empty());
+                assert_ne!(hint, "");
             }
             other => panic!("expected TierTooLow, got {other:?}"),
         }

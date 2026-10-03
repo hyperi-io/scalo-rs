@@ -263,7 +263,7 @@ mod tests {
         let encoded = records_to_proto(Vec::new()).encode_to_vec();
         let decoded = proto::Batch::decode(Bytes::from(encoded)).expect("prost decode");
         let back = proto_batch_to_records(decoded);
-        assert!(back.is_empty());
+        assert_eq!(back, [] as [crate::transport::work_batch::Record; 0]);
     }
 
     /// A large-ish batch (1000 small records) round-trips intact.

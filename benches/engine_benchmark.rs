@@ -43,7 +43,10 @@ fn bench_engine(c: &mut Criterion) {
                 let _ = msg.field("_table");
                 Ok(())
             });
-            assert!(!results.is_empty());
+            assert_ne!(
+                results,
+                [] as [std::result::Result<(), std::string::String>; 0]
+            );
         });
     });
 
@@ -57,7 +60,10 @@ fn bench_engine(c: &mut Criterion) {
                     Ok(())
                 })
                 .collect();
-            assert!(!results.is_empty());
+            assert_ne!(
+                results,
+                [] as [std::result::Result<(), std::string::String>; 0]
+            );
         });
     });
 
@@ -71,7 +77,10 @@ fn bench_engine(c: &mut Criterion) {
         b.iter(|| {
             let results: Vec<Result<(), String>> =
                 engine.process_mid_tier(&messages_10k, |_| Ok(()));
-            assert!(!results.is_empty());
+            assert_ne!(
+                results,
+                [] as [std::result::Result<(), std::string::String>; 0]
+            );
         });
     });
 
@@ -89,7 +98,10 @@ fn bench_engine(c: &mut Criterion) {
                         let _ = msg.field("host");
                         Ok(())
                     });
-                    assert!(!results.is_empty());
+                    assert_ne!(
+                        results,
+                        [] as [std::result::Result<(), std::string::String>; 0]
+                    );
                 });
             },
         );
@@ -101,7 +113,10 @@ fn bench_engine(c: &mut Criterion) {
         b.iter(|| {
             let results: Vec<Result<usize, String>> =
                 engine.process_raw(&messages_10k, |msg| Ok(msg.payload.len()));
-            assert!(!results.is_empty());
+            assert_ne!(
+                results,
+                [] as [std::result::Result<usize, std::string::String>; 0]
+            );
         });
     });
 

@@ -21,37 +21,52 @@ use scalo::expression::{
 
 #[test]
 fn validate_valid_comparison() {
-    assert!(validate(r#"severity == "critical""#).is_empty());
+    assert_eq!(
+        validate(r#"severity == "critical""#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_valid_numeric() {
-    assert!(validate("amount > 10000").is_empty());
+    assert_eq!(validate("amount > 10000"), [] as [std::string::String; 0]);
 }
 
 #[test]
 fn validate_valid_logical() {
-    assert!(validate("a > 1 && b < 10").is_empty());
+    assert_eq!(validate("a > 1 && b < 10"), [] as [std::string::String; 0]);
 }
 
 #[test]
 fn validate_valid_membership() {
-    assert!(validate(r#"status in ["active", "pending"]"#).is_empty());
+    assert_eq!(
+        validate(r#"status in ["active", "pending"]"#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_valid_string_function() {
-    assert!(validate(r#"msg.contains("error")"#).is_empty());
+    assert_eq!(
+        validate(r#"msg.contains("error")"#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_valid_starts_with() {
-    assert!(validate(r#"path.startsWith("/api/")"#).is_empty());
+    assert_eq!(
+        validate(r#"path.startsWith("/api/")"#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_valid_ends_with() {
-    assert!(validate(r#"file.endsWith(".log")"#).is_empty());
+    assert_eq!(
+        validate(r#"file.endsWith(".log")"#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -67,47 +82,59 @@ fn validate_matches_allowed_with_config() {
         allow_regex: true,
         ..Default::default()
     };
-    assert!(check_profile_with_config(r#"name.matches("^web-[0-9]+$")"#, &config).is_empty());
+    assert_eq!(
+        check_profile_with_config(r#"name.matches("^web-[0-9]+$")"#, &config),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_valid_has() {
-    assert!(validate("has(user.name)").is_empty());
+    assert_eq!(validate("has(user.name)"), [] as [std::string::String; 0]);
 }
 
 #[test]
 fn validate_valid_size() {
-    assert!(validate("size(tags) > 0").is_empty());
+    assert_eq!(validate("size(tags) > 0"), [] as [std::string::String; 0]);
 }
 
 #[test]
 fn validate_valid_ternary() {
-    assert!(validate("is_admin ? 95 : 50").is_empty());
+    assert_eq!(
+        validate("is_admin ? 95 : 50"),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_valid_type_cast() {
-    assert!(validate("int(x) > 10").is_empty());
+    assert_eq!(validate("int(x) > 10"), [] as [std::string::String; 0]);
 }
 
 #[test]
 fn validate_valid_arithmetic() {
-    assert!(validate("price * quantity > threshold").is_empty());
+    assert_eq!(
+        validate("price * quantity > threshold"),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_valid_boolean_literal() {
-    assert!(validate("enabled == true").is_empty());
+    assert_eq!(validate("enabled == true"), [] as [std::string::String; 0]);
 }
 
 #[test]
 fn validate_valid_null_check() {
-    assert!(validate("x == null").is_empty());
+    assert_eq!(validate("x == null"), [] as [std::string::String; 0]);
 }
 
 #[test]
 fn validate_valid_compound() {
-    assert!(validate(r#"severity == "critical" && amount > 10000 && !is_test"#).is_empty());
+    assert_eq!(
+        validate(r#"severity == "critical" && amount > 10000 && !is_test"#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -546,23 +573,32 @@ fn no_overlap_between_allowed_and_disallowed() {
 
 #[test]
 fn validate_function_name_inside_string_not_flagged() {
-    assert!(validate(r#"msg.contains("filter")"#).is_empty());
+    assert_eq!(
+        validate(r#"msg.contains("filter")"#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_timestamp_inside_string_not_flagged() {
-    assert!(validate(r#"label == "timestamp""#).is_empty());
+    assert_eq!(
+        validate(r#"label == "timestamp""#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_matches_inside_string_not_flagged() {
-    assert!(validate(r#"msg.contains("matches")"#).is_empty());
+    assert_eq!(
+        validate(r#"msg.contains("matches")"#),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
 fn validate_real_call_after_string_caught() {
     let errors = validate(r#""ok" + items.map(x, x)"#);
-    assert!(!errors.is_empty());
+    assert_ne!(errors, [] as [std::string::String; 0]);
     assert!(errors[0].contains("map()"));
 }
 

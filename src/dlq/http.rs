@@ -116,7 +116,7 @@ mod tests {
     fn config_defaults() {
         let config = HttpDlqConfig::default();
         assert!(!config.enabled);
-        assert!(config.endpoint.is_empty());
+        assert_eq!(config.endpoint, "");
         assert_eq!(config.timeout_secs, 30);
     }
 
