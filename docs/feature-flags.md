@@ -12,7 +12,7 @@ This doc covers:
 - Native-deps that come with certain features (apt packages on Linux)
 - Recommended bundles for common app shapes
 
-For the *what* — what a feature actually does — see the subsystem doc
+For the *what* -- what a feature actually does -- see the subsystem doc
 linked in each row. This page is about which features to enable and what
 that costs.
 
@@ -49,7 +49,7 @@ flowchart LR
 
 | Feature | Adds |
 | --------- | ------ |
-| `metrics-core` | `metrics` crate + macros (`counter!`, `gauge!`, `histogram!`). Emit-only — no exporter |
+| `metrics-core` | `metrics` crate + macros (`counter!`, `gauge!`, `histogram!`). Emit-only -- no exporter |
 | `metrics-process` | Above + `sysinfo` for cgroup-aware process gauges (RSS, CPU, FDs) |
 | `metrics` | Above + Prometheus exporter, `/metrics` HTTP endpoint, manifest dump |
 
@@ -68,7 +68,7 @@ flowchart LR
 | --------- | ------ |
 | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio) with pressure-based scaling |
 | `worker-batch` | Above + `BatchEngine` (SIMD JSON via `sonic-rs`, field interning via `dashmap`) and the `parse_guard` JSON depth pre-check (`wide`) |
-| `worker` | Alias for `worker-batch` — back-compat |
+| `worker` | Alias for `worker-batch` -- back-compat |
 
 ### CLI
 
@@ -82,7 +82,7 @@ flowchart LR
 | --------- | ------ |
 | `cli` | `clap`-based `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
 | `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + shutdown + governor + sink-stack + lifecycle`). The worker pool is opt-in: add `worker-pool`, or `worker-batch` for the pool plus `BatchEngine` |
-| `lifecycle` | Idle-until-configured gate (`WorkState`, `IdleGate`, `pipeline_idle`) — folded into `cli-service` |
+| `lifecycle` | Idle-until-configured gate (`WorkState`, `IdleGate`, `pipeline_idle`) -- folded into `cli-service` |
 | `top` | Above + `ratatui` TUI metrics dashboard |
 
 ### Transport
@@ -91,7 +91,7 @@ flowchart LR
 | --------- | ------ |
 | `transport` | Base trait architecture, factory, `AnySender`, and the `parse_guard` JSON depth pre-check (`wide`) |
 | `transport-trace` | Above + W3C traceparent propagation (pulls `opentelemetry`) |
-| `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends — each pulls only its own deps |
+| `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends -- each pulls only its own deps |
 | `transport-grpc-vector-compat` | Vector.dev wire-compat for a transform consumer |
 | `transport-all` | All six backends |
 
@@ -119,9 +119,9 @@ production apps list only what you actually use.
 
 | Feature | Adds |
 | --------- | ------ |
-| `otel` | Umbrella — SDK, OTLP exporter |
-| `otel-metrics` | Above + bridge `metrics` crate → OTLP |
-| `otel-tracing` | Above + bridge `tracing` crate → OTLP (closes the W3C distributed-tracing chain when paired with `transport-trace`) |
+| `otel` | Umbrella -- SDK, OTLP exporter |
+| `otel-metrics` | Above + bridge `metrics` crate -> OTLP |
+| `otel-tracing` | Above + bridge `tracing` crate -> OTLP (closes the W3C distributed-tracing chain when paired with `transport-trace`) |
 
 For full distributed tracing through Kafka/gRPC, enable
 `otel-tracing` + `transport-trace`. The latter alone propagates
@@ -165,12 +165,12 @@ needs runtime libs.
 
 | Feature | `-sys` crate | Build package | Runtime package |
 | --------- | -------------- | --------------- | ----------------- |
-| `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (≥ 2.12.1, Confluent APT repo) | `librdkafka1` |
+| `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (>= 2.12.1, Confluent APT repo) | `librdkafka1` |
 | `directory-config-git` | `libgit2-sys` | `libgit2-dev` | `libgit2-1.9` (release-specific) |
 | `spool` / `tiered-sink` | `zstd-sys` | `libzstd-dev` | `libzstd1` |
 | (transitive via several) | `openssl-sys` | `libssl-dev` | `libssl3t64` (release-specific) |
 | (transitive via several) | `libz-sys` | `zlib1g-dev` | `zlib1g` |
-| `secrets-aws` | `aws-lc-sys` | — (compiled from source, ~20-30s, sccache-cached) | — (statically linked) |
+| `secrets-aws` | `aws-lc-sys` | -- (compiled from source, ~20-30s, sccache-cached) | -- (statically linked) |
 
 The two rows marked release-specific bake a library version into the package name,
 so they differ per base release - the values above are for the default base.
@@ -248,12 +248,12 @@ features = ["otel-tracing", "transport-trace"]
 A few features are deliberately excluded from `full` because they're
 diagnostic, smoke-test, or specialty:
 
-- `deployment-smoke` — runs `docker build` + `docker run` as part of
+- `deployment-smoke` -- runs `docker build` + `docker run` as part of
   tests. Requires a Docker daemon.
 - `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, and with `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)).
-- `config-postgres` — PostgreSQL-backed config source. Built-for, not
-  built-with — the YAML cascade already handles centralised config.
-- `worker-msgpack` — MsgPack batch serialisation for the worker pool.
+- `config-postgres` -- PostgreSQL-backed config source. Built-for, not
+  built-with -- the YAML cascade already handles centralised config.
+- `worker-msgpack` -- MsgPack batch serialisation for the worker pool.
   Specialty use.
 - `testcontainers` -- builds scalo's own real-broker tests, which start Kafka
   in a container and need a Docker daemon. Adds no code to the library.
@@ -297,7 +297,7 @@ cargo tree --features "cli-service,transport-kafka,deployment"
 # Which transitive crates does each feature add?
 cargo hack --each-feature --no-dev-deps check --lib
 
-# Build with only defaults — should compile clean
+# Build with only defaults -- should compile clean
 cargo check --no-default-features --features "config,logger"
 ```
 

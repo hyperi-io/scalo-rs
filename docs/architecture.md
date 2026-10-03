@@ -193,4 +193,4 @@ auto-wired vs explicit.
 - **MSRV:** see `rust-version` in `Cargo.toml`
 - **Sibling lib:** `scalo-py` (Python control-plane equivalent)
 - **Downstream:** the six core consumer services consume `scalo` in
-  lockstep (see [README.md § Project facts](README.md#project-facts))
+  lockstep (see [README.md Section Project facts](README.md#project-facts))

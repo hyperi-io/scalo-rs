@@ -4,7 +4,7 @@ The rule across the crate: **modules talk to each other through global
 singletons, not handle passing**. Wire the singleton once at startup,
 every module that needs it picks it up via a macro or a global getter.
 
-This doc is the model — what's wired, how, and what the consequences are.
+This doc is the model -- what's wired, how, and what the consequences are.
 
 ---
 
@@ -56,7 +56,7 @@ sequenceDiagram
 ```
 
 The app never passes a `Logger` or `MetricsManager` into a module. The
-module reaches into the singleton via a macro. This is intentional — it
+module reaches into the singleton via a macro. This is intentional -- it
 means a `Transport` impl ships with metrics-emission baked in, and the
 *same* `Transport` impl works in any app that's wired `MetricsManager`.
 
@@ -82,15 +82,15 @@ means a `Transport` impl ships with metrics-emission baked in, and the
 
 What's **not** auto-wired and still requires an explicit call from the app:
 
-- `HttpServer` — despite the name, `ServiceRuntime` does NOT start it. It is an
+- `HttpServer` -- despite the name, `ServiceRuntime` does NOT start it. It is an
   optional extra listener for apps that want one (default `0.0.0.0:8080`), and
   it does not serve `/metrics`. The observability port is the
   metrics server above. See [api/http-server.md](api/http-server.md).
 
-- `TieredSink::new(...)` — you choose which transport, which spool, which DLQ
-- `BatchEngine::process_*` — you choose the parsing strategy and the transform closure
-- `Transport::from_config(...)` — you name the config section (`transport.output`, `transport.input`)
-- Anything in `directory-config`, `secrets`, `cache`, `database` — these are tools you reach for when needed
+- `TieredSink::new(...)` -- you choose which transport, which spool, which DLQ
+- `BatchEngine::process_*` -- you choose the parsing strategy and the transform closure
+- `Transport::from_config(...)` -- you name the config section (`transport.output`, `transport.input`)
+- Anything in `directory-config`, `secrets`, `cache`, `database` -- these are tools you reach for when needed
 
 Rule of thumb: the **pillars** auto-wire. The **L4 pipeline** modules
 are tools you compose into your `run_service`.
@@ -99,7 +99,7 @@ are tools you compose into your `run_service`.
 
 ## The "you get this for free" matrix
 
-| You did this | You got this — no extra wiring |
+| You did this | You got this -- no extra wiring |
 | -------------- | ------------------------------- |
 | `config::setup(opts)` | 7-layer cascade, env-var nesting, `.env`, sensitive masking, hot-reload, `/config` admin endpoint, section registry |
 | `logger::setup_default()` | Structured tracing, JSON/text autodetect, RFC 3339 timestamps, masking, flood control |
@@ -118,7 +118,7 @@ row.
 
 ## Why singletons
 
-The alternative is constructor injection — pass a `Logger` to every
+The alternative is constructor injection -- pass a `Logger` to every
 module that logs, a `MetricsManager` to every module that emits
 counters, a `Config` to every module that reads config. That model
 works in small services. It rots in a 50-module crate that ships into
@@ -144,7 +144,7 @@ parallel race on installing the global. The two mitigations:
 - **Process-per-test runners**: `cargo nextest` runs each test in its
   own process. The global is fresh per test.
 
-See [core-pillars/metrics.md § Testing](core-pillars/metrics.md#testing)
+See [core-pillars/metrics.md Section Testing](core-pillars/metrics.md#testing)
 for the test pattern.
 
 ---
@@ -154,7 +154,7 @@ for the test pattern.
 When you add a new module to `scalo` (or to a downstream app
 that has one), the auto-wiring contract is:
 
-1. **If the module has configurable behaviour**, load via the cascade —
+1. **If the module has configurable behaviour**, load via the cascade --
    `T::from_cascade()` or `Config::unmarshal_key_registered::<T>(...)`.
    Don't read env vars directly.
 2. **If the module does I/O or processing**, add `#[cfg(feature = "metrics-core")]`

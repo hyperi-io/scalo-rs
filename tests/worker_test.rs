@@ -360,7 +360,7 @@ async fn test_graceful_shutdown_drains_work() {
     cancel.cancel();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Pool still usable after scaler stops — just no more scaling adjustments
+    // Pool still usable after scaler stops -- just no more scaling adjustments
     let more: Vec<Result<i32, String>> = pool.process_batch(&[42], |&x| Ok(x));
     assert_eq!(more.len(), 1);
     assert_eq!(*more[0].as_ref().unwrap(), 42);
@@ -504,7 +504,7 @@ fn test_process_batch_large_batch_stress() {
 fn test_config_validation_grow_equals_shrink_rejected() {
     let cfg = WorkerPoolConfig {
         grow_below: 0.80,
-        shrink_above: 0.80, // equal — no dead band
+        shrink_above: 0.80, // equal -- no dead band
         ..Default::default()
     };
     assert!(cfg.validate().is_err());
@@ -534,7 +534,7 @@ fn test_config_min_threads_zero_rejected_by_validate() {
 
 #[test]
 fn test_scaling_decision_boundary_exactly_at_grow_below() {
-    // CPU exactly at grow_below threshold — should be in steady band (not grow)
+    // CPU exactly at grow_below threshold -- should be in steady band (not grow)
     let input = ScalingInput {
         cpu_util: 0.60, // exactly at grow_below
         memory_pressure: 0.20,
@@ -548,7 +548,7 @@ fn test_scaling_decision_boundary_exactly_at_grow_below() {
     };
     let decision = ScalingDecision::evaluate(&input);
     // At exactly grow_below: cpu_util < grow_below is FALSE (0.60 < 0.60 = false)
-    // So it falls to cpu_util <= shrink_above (0.60 <= 0.85 = true) → steady
+    // So it falls to cpu_util <= shrink_above (0.60 <= 0.85 = true) -> steady
     assert_eq!(decision.direction, "steady");
 }
 
@@ -566,7 +566,7 @@ fn test_scaling_decision_boundary_exactly_at_shrink_above() {
         memory_pressure_cap: 0.80,
     };
     let decision = ScalingDecision::evaluate(&input);
-    // cpu_util <= shrink_above (0.85 <= 0.85 = true) → steady
+    // cpu_util <= shrink_above (0.85 <= 0.85 = true) -> steady
     assert_eq!(decision.direction, "steady");
 }
 
@@ -584,7 +584,7 @@ fn test_scaling_decision_boundary_exactly_at_emergency() {
         memory_pressure_cap: 0.80,
     };
     let decision = ScalingDecision::evaluate(&input);
-    // cpu_util <= emergency_above (0.95 <= 0.95 = true) → down (not emergency)
+    // cpu_util <= emergency_above (0.95 <= 0.95 = true) -> down (not emergency)
     assert_eq!(decision.direction, "down");
 }
 
@@ -602,8 +602,8 @@ fn test_scaling_decision_memory_exactly_at_cap() {
         memory_pressure_cap: 0.80,
     };
     let decision = ScalingDecision::evaluate(&input);
-    // memory_pressure > memory_pressure_cap (0.80 > 0.80 = false) → NOT memory_cap
-    // Falls through to cpu check: 0.40 < 0.60 → grow
+    // memory_pressure > memory_pressure_cap (0.80 > 0.80 = false) -> NOT memory_cap
+    // Falls through to cpu check: 0.40 < 0.60 -> grow
     assert_eq!(decision.direction, "up");
 }
 
@@ -615,7 +615,7 @@ async fn test_fan_out_async_with_all_failures() {
         .fan_out_async(&items, |&item| async move { Err(format!("fail: {item}")) })
         .await;
     assert_eq!(results.len(), 10);
-    // Every slot is `Some(Err(...))` — no task panicked, every one returned Err.
+    // Every slot is `Some(Err(...))` -- no task panicked, every one returned Err.
     assert!(results.iter().all(|r| matches!(r, Some(Err(_)))));
 }
 

@@ -12,7 +12,7 @@
 //! Validates the design assumptions:
 //!
 //! - `BackgroundSink::try_push` is ~100 ns happy path (the consumer hot
-//!   path target — slower than this means we've regressed the headline
+//!   path target -- slower than this means we've regressed the headline
 //!   guarantee).
 //! - `ActorHandle::try_send` is in the same ballpark (~100 ns).
 //! - Both stay below 500 ns p99 under contention from many concurrent
@@ -37,7 +37,7 @@ use scalo::concurrency::{
     SinkDrain,
 };
 
-/// Drain that counts incoming messages atomically. Trivial — keeps the
+/// Drain that counts incoming messages atomically. Trivial -- keeps the
 /// bench focused on the producer hot path, not the drain.
 struct CountingDrain {
     count: Arc<AtomicU64>,

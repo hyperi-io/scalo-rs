@@ -1,8 +1,8 @@
 # Worker Pool
 
 `AdaptiveWorkerPool` is the shared compute primitive for every data-plane
-service. Hybrid backend — rayon for CPU-bound work, tokio JoinSet for
-async I/O — and a permit semaphore that the scaler resizes at runtime.
+service. Hybrid backend -- rayon for CPU-bound work, tokio JoinSet for
+async I/O -- and a permit semaphore that the scaler resizes at runtime.
 
 The common pattern: one pool per process, built from the cascade
 at startup, then handed to every component that needs parallelism
@@ -34,12 +34,12 @@ at `max_threads` (default = `available_parallelism`, cgroup-aware) and
 a counting semaphore controls how many threads pick up work. Threads
 that fail to acquire a permit `std::thread::yield_now`.
 
-The scaler updates `permits` — never the underlying pool size.
+The scaler updates `permits` -- never the underlying pool size.
 
 ```mermaid
 flowchart TB
     Pool["rayon::ThreadPool<br/>fixed at max_threads"]
-    Sem["Semaphore<br/>permits — scaler controls"]
+    Sem["Semaphore<br/>permits -- scaler controls"]
     Batch["process_batch<br/>each item acquires a permit, releases on drop"]
     Pool --> Sem --> Batch
 ```
@@ -60,18 +60,18 @@ A background controller (`ScalingController`, started by
 | Signal | Direction | Step |
 | -------- | ----------- | ------ |
 | `cpu < grow_below` (default 0.60) | up | +2 permits |
-| `grow_below ≤ cpu ≤ shrink_above` (default 0.85) | steady | unchanged |
-| `shrink_above < cpu ≤ emergency_above` (default 0.95) | down | −1 permit |
-| `cpu > emergency_above` | emergency down | −2 permits |
+| `grow_below <= cpu <= shrink_above` (default 0.85) | steady | unchanged |
+| `shrink_above < cpu <= emergency_above` (default 0.95) | down | -1 permit |
+| `cpu > emergency_above` | emergency down | -2 permits |
 | `memory_pressure > memory_pressure_cap` (default 0.80) | hard cap | clamp to `min_threads` |
 
-Memory pressure overrides everything — when memory is hot we shrink
+Memory pressure overrides everything -- when memory is hot we shrink
 to the floor and stay there, regardless of CPU. The clamp is to
 `[min_threads, max_threads]`. Each scaling decision emits a counter
 (`worker_pool_scale_events_total{direction}`) and gauges for active
 threads, target threads, CPU, memory, and saturation.
 
-Memory pressure has two sources — sysinfo process RSS and an optional
+Memory pressure has two sources -- sysinfo process RSS and an optional
 `MemoryGuard` attached via `set_memory_guard`. The controller uses the
 max of the two so either source can trigger the cap.
 
@@ -79,9 +79,9 @@ max of the two so either source can trigger the cap.
 
 ## Optional integrations
 
-- `set_memory_guard(Arc<MemoryGuard>)` — feed cgroup/process memory
+- `set_memory_guard(Arc<MemoryGuard>)` -- feed cgroup/process memory
   pressure into scaling decisions.
-- `set_scaling_pressure(Arc<ScalingPressure>)` — feed pool saturation
+- `set_scaling_pressure(Arc<ScalingPressure>)` -- feed pool saturation
   back into the KEDA signal as the `worker_pool_saturation`
   component. The pool feeds it only when the app registers a
   `worker_pool_saturation` component; otherwise the composite never sees it.
@@ -99,10 +99,10 @@ Cascade key `worker_pool`:
 worker_pool:
   min_threads: 2            # floor for scaling
   max_threads: 0            # 0 = auto-detect (cgroup-aware), else capped at available_parallelism
-  grow_below: 0.60          # CPU below → +2 permits
-  shrink_above: 0.85        # CPU above → −1 permit
-  emergency_above: 0.95     # CPU above → −2 permits
-  memory_pressure_cap: 0.80 # memory above → clamp to min_threads
+  grow_below: 0.60          # CPU below -> +2 permits
+  shrink_above: 0.85        # CPU above -> -1 permit
+  emergency_above: 0.95     # CPU above -> -2 permits
+  memory_pressure_cap: 0.80 # memory above -> clamp to min_threads
   scale_interval_secs: 5
   async_concurrency: 32     # fan_out_async chunk size
   health_saturation_timeout_secs: 30
@@ -110,11 +110,11 @@ worker_pool:
 
 `validate()` rejects out-of-order thresholds at startup
 (`grow_below >= shrink_above`, `shrink_above >= emergency_above`,
-`min_threads > max_threads`) — fail-fast on config typos. One exception: when
+`min_threads > max_threads`) -- fail-fast on config typos. One exception: when
 `min_threads` is the DERIVED default (not user-set) and the CPU-derived
 ceiling lands below it (a 1-CPU cgroup resolves `max_threads = 1` under the
 default `min_threads = 2`), the min clamps down to the ceiling with an INFO
-log instead of failing — a user-explicit contradictory pair still errors.
+log instead of failing -- a user-explicit contradictory pair still errors.
 
 ---
 
@@ -137,7 +137,7 @@ let enriched = pool.fan_out_async(&items, |item| async move {
 ```
 
 `ServiceRuntime` does the construction and `start_scaling_loop`
-plumbing automatically when the `worker-pool` feature is on — apps
+plumbing automatically when the `worker-pool` feature is on -- apps
 just use `runtime.worker_pool`.
 
 ---
@@ -150,7 +150,7 @@ just use `runtime.worker_pool`.
 | `AdaptiveWorkerPool::from_cascade(key)` | Build pool from `worker_pool` cascade key |
 | `process_batch(items, f)` | Rayon `par_iter` with permit throttling, results in input order |
 | `fan_out_async(items, f)` | Tokio fan-out with `async_concurrency` cap, results in input order |
-| `install(f)` | Raw rayon pool access — no permit throttling |
+| `install(f)` | Raw rayon pool access -- no permit throttling |
 | `register_metrics(mgr)` | Register operational gauges with `MetricsManager` |
 | `start_scaling_loop(cancel)` | Spawn the pressure-based scaling controller |
 | `set_memory_guard(guard)` | Attach memory pressure source for the scaler |
@@ -162,19 +162,19 @@ just use `runtime.worker_pool`.
 
 ## Source
 
-- [`../../src/worker/pool.rs`](../../src/worker/pool.rs) — `AdaptiveWorkerPool`, `Semaphore`
-- [`../../src/worker/scaler.rs`](../../src/worker/scaler.rs) — `ScalingController`, watermark algorithm
-- [`../../src/worker/config.rs`](../../src/worker/config.rs) — `WorkerPoolConfig`, validation
+- [`../../src/worker/pool.rs`](../../src/worker/pool.rs) -- `AdaptiveWorkerPool`, `Semaphore`
+- [`../../src/worker/scaler.rs`](../../src/worker/scaler.rs) -- `ScalingController`, watermark algorithm
+- [`../../src/worker/config.rs`](../../src/worker/config.rs) -- `WorkerPoolConfig`, validation
 - [`../../src/worker/metrics.rs`](../../src/worker/metrics.rs)
 
 ---
 
 ## Related
 
-- [batch-engine.md](batch-engine.md) — primary consumer of the pool
-- [scaling.md](scaling.md) — `ScalingPressure` integration
-- [../runtime/memory.md](../runtime/memory.md) — `MemoryGuard` integration
+- [batch-engine.md](batch-engine.md) -- primary consumer of the pool
+- [scaling.md](scaling.md) -- `ScalingPressure` integration
+- [../runtime/memory.md](../runtime/memory.md) -- `MemoryGuard` integration
 - [../runtime/service-runtime.md](../runtime/service-runtime.md)
 - [../auto-wiring.md](../auto-wiring.md)
-- [../feature-flags.md](../feature-flags.md) — `worker-pool`
+- [../feature-flags.md](../feature-flags.md) -- `worker-pool`
 - [../architecture.md](../architecture.md)

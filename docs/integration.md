@@ -15,7 +15,7 @@ Two questions:
 
 - **Is this a service** (long-running, pipelines data) or a **tool**
   (one-shot CLI)?
-- **What transports** does it touch — Kafka, gRPC, file, none?
+- **What transports** does it touch -- Kafka, gRPC, file, none?
 
 For a typical data-plane service that talks to Kafka, ingests gRPC, scales under
 KEDA, and ships container artefacts, the `Cargo.toml` reads:
@@ -43,7 +43,7 @@ features = [
 ]
 ```
 
-`cli-service` is doing most of the work — see
+`cli-service` is doing most of the work -- see
 [feature-flags.md](feature-flags.md#cli) for what it pulls in
 transitively.
 
@@ -55,7 +55,7 @@ features = ["cli", "config", "logger"]
 ```
 
 For light apps that just need config + logs, the defaults (`config`,
-`logger`) are enough — list nothing else.
+`logger`) are enough -- list nothing else.
 
 ---
 
@@ -172,7 +172,7 @@ impl ServiceApp for LoaderCli {
 
 Notes on the trait surface:
 
-- `load_config` is yours to define — typically one call into
+- `load_config` is yours to define -- typically one call into
   `config::load_typed` or `Config::from_cascade::<T>`.
 - `run_service` is where the actual work lives. Everything else is
   scaffolding.
@@ -257,7 +257,7 @@ For the loader-shaped app above, the code you actually write is:
 - the `ServiceApp` impl
 - a near-trivial `main.rs`
 - the `deployment_contract()` builder
-- your actual pipeline business logic in `run_service` — the bulk of it
+- your actual pipeline business logic in `run_service` -- the bulk of it
 
 What you skipped:
 
@@ -288,8 +288,8 @@ closest to what you're building:
 
 | Shape | Best for |
 | ----- | ---------- |
-| Loader | Kafka in, ClickHouse out — the most complete `cli-service` integration |
-| Receiver | gRPC ingress + Kafka publish — push-mode entry |
+| Loader | Kafka in, ClickHouse out -- the most complete `cli-service` integration |
+| Receiver | gRPC ingress + Kafka publish -- push-mode entry |
 | Fetcher | Pull-mode (cloud-provider) ingress |
 | Archiver | Long-term storage sink |
 | VRL transform | Embedded VRL transform engine |

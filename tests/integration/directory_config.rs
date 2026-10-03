@@ -927,7 +927,7 @@ mod git_tests {
             .await
             .unwrap();
 
-        // Count commits after — should have one more
+        // Count commits after -- should have one more
         let head_after = repo.head().unwrap().peel_to_commit().unwrap();
         let count_after = {
             let mut revwalk = repo.revwalk().unwrap();
@@ -1024,7 +1024,7 @@ mod git_tests {
     #[tokio::test]
     async fn test_git_list_branches_on_non_git_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        // No git init — DirectWrite mode
+        // No git init -- DirectWrite mode
         let config = DirectoryConfigStoreConfig {
             directory: tmp.path().to_path_buf(),
             refresh_interval: Duration::from_millis(100),

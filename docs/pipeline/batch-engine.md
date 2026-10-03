@@ -7,7 +7,7 @@ across a rayon pool. Auto-wired by `ServiceRuntime` when the
 `worker-batch` feature is on.
 
 `BatchEngine` is the standard ingest-loop primitive for loader,
-archiver, and transform apps — it sits between a `TransportReceiver`
+archiver, and transform apps -- it sits between a `TransportReceiver`
 and an app-supplied sink.
 
 ---
@@ -16,7 +16,7 @@ and an app-supplied sink.
 
 | API | Parses? | Transform receives | Use case |
 | ----- | --------- | -------------------- | ---------- |
-| `process_mid_tier` | Yes (SIMD JSON) | `&mut ParsedMessage` | Loader, archiver, VRL — needs field access |
+| `process_mid_tier` | Yes (SIMD JSON) | `&mut ParsedMessage` | Loader, archiver, VRL -- needs field access |
 | `process_raw` | No | `&Record` | Receiver forwarding, binary protocols, opaque payloads |
 
 Both take a `&[Record]` slice, chunk it at `max_chunk_size` (default
@@ -31,7 +31,7 @@ flowchart LR
     R[Record slice] --> C{routing_field set?}
     C -->|yes| F[Pre-route filter<br/>SIMD field extract<br/>~100 ns/msg]
     C -->|no| P
-    F --> P[Parse<br/>sonic_rs::from_slice<br/>~1-5 µs/msg]
+    F --> P[Parse<br/>sonic_rs::from_slice<br/>~1-5 us/msg]
     P --> I[Intern known fields<br/>extract into HashMap]
     I --> T[Parallel transform<br/>rayon par_iter_mut]
     T --> O[Vec&lt;Result&lt;O, E&gt;&gt;]
@@ -41,7 +41,7 @@ Filter-rejected messages are removed from the output. DLQ-routed and
 parse-error messages become `Err` entries; the action is configured
 via `parse_error_action: dlq | skip | fail_batch`.
 
-`process_raw` skips the parse and intern phases — pre-route runs on
+`process_raw` skips the parse and intern phases -- pre-route runs on
 raw bytes only.
 
 ---
@@ -59,7 +59,7 @@ configured `known_fields` (`_table`, `_timestamp`, `_source`, `host`,
 | First occurrence (`Arc::from` + insert) | ~100 ns |
 
 Once a field is interned, every subsequent batch reuses the same
-`Arc<str>` — the slow path runs at most once per unique field per
+`Arc<str>` -- the slow path runs at most once per unique field per
 process. `ParsedMessage::field()` checks the extracted map first
 (interned fast path) before walking the full JSON tree.
 
@@ -196,11 +196,11 @@ pause inside the engine. See [self-regulation.md](../self-regulation.md).
 
 | Item | Purpose |
 | ------ | --------- |
-| `BatchEngine::new(cfg)` | Standalone engine — builds its own worker pool |
+| `BatchEngine::new(cfg)` | Standalone engine -- builds its own worker pool |
 | `BatchEngine::with_pool(pool, cfg)` | Reuse an existing pool (preferred when `ServiceRuntime` is available) |
 | `BatchEngine::from_cascade(key)` | Load config from the cascade |
-| `process_mid_tier(messages, transform)` | Sync — parse JSON, extract known fields, run transform on `&mut ParsedMessage` via rayon |
-| `process_raw(messages, transform)` | Sync — no parse; run transform on `&Record` via rayon |
+| `process_mid_tier(messages, transform)` | Sync -- parse JSON, extract known fields, run transform on `&mut ParsedMessage` via rayon |
+| `process_raw(messages, transform)` | Sync -- no parse; run transform on `&Record` via rayon |
 | `run_governed(receiver, shutdown, process, sink, commit, ticker)` | Async loop; sub-blocks sized by the governor's byte budget, whole blocks with it off |
 | `run_workbatch(receiver, shutdown, process, sink, commit, ticker)` | Async loop, whole blocks, on-demand parse |
 | `run_workbatch_parsed(receiver, shutdown, process_parsed, sink, commit, ticker)` | Async loop, whole blocks, pre-parsed `ParsedBatch` |
@@ -208,13 +208,13 @@ pause inside the engine. See [self-regulation.md](../self-regulation.md).
 | `pipeline(&receiver)` ... `.run(process, sink)` / `.run_with_pieces(process, sink)` | Governed loop that holds each block's source acknowledgement until every piece is delivered ([acknowledgements.md](acknowledgements.md)) |
 | `with_dlq(Arc<Dlq>)` | Dead letters of the `pipeline` loop, confirmed by the DLQ before the source is released |
 | `set_byte_budget(budget)` | Wire the governor's byte budget -- `ServiceRuntime` does this when self-regulation is on |
-| `auto_wire(metrics, memory_guard)` | Called by `ServiceRuntime` — apps never call directly |
+| `auto_wire(metrics, memory_guard)` | Called by `ServiceRuntime` -- apps never call directly |
 | `stats() -> &Arc<PipelineStats>` | Atomic counters (received, processed, errors, filtered, dlq, bytes) |
 | `pool() -> &Arc<AdaptiveWorkerPool>` | Underlying rayon pool |
 | `config() -> &BatchProcessingConfig` | Active config |
 
 The transform closure is `Fn(...) -> Result<O, E>` with
-`E: Send + From<String>` — DLQ and parse-error reasons are surfaced as
+`E: Send + From<String>` -- DLQ and parse-error reasons are surfaced as
 `E::from(reason)` so the app's error type controls how they flow
 downstream.
 
@@ -233,12 +233,12 @@ downstream.
 
 ## Related
 
-- [worker-pool.md](worker-pool.md) — the rayon-backed pool that runs the transform phase
-- [tiered-sink.md](tiered-sink.md) — common sink target for the run loops
-- [../runtime/service-runtime.md](../runtime/service-runtime.md) — auto-wiring entry point
-- [../runtime/memory.md](../runtime/memory.md) — memory guard wired in via `auto_wire`
-- [../transport/README.md](../transport/README.md) — `TransportReceiver` consumed by the async run loops
-- [../transport/filter-engine.md](../transport/filter-engine.md) — wire-level filter (runs at the transport, not inside the engine)
-- [../feature-flags.md](../feature-flags.md) — `worker-batch` (pulls `worker-pool`)
+- [worker-pool.md](worker-pool.md) -- the rayon-backed pool that runs the transform phase
+- [tiered-sink.md](tiered-sink.md) -- common sink target for the run loops
+- [../runtime/service-runtime.md](../runtime/service-runtime.md) -- auto-wiring entry point
+- [../runtime/memory.md](../runtime/memory.md) -- memory guard wired in via `auto_wire`
+- [../transport/README.md](../transport/README.md) -- `TransportReceiver` consumed by the async run loops
+- [../transport/filter-engine.md](../transport/filter-engine.md) -- wire-level filter (runs at the transport, not inside the engine)
+- [../feature-flags.md](../feature-flags.md) -- `worker-batch` (pulls `worker-pool`)
 - [../auto-wiring.md](../auto-wiring.md)
 - [../architecture.md](../architecture.md)

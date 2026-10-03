@@ -145,7 +145,7 @@ async fn run_vector_async(
         }
         Err(elapsed) => {
             panic!(
-                "Vector did not exit within {timeout_secs}s ({elapsed}) — likely stuck retrying failed deliveries"
+                "Vector did not exit within {timeout_secs}s ({elapsed}) -- likely stuck retrying failed deliveries"
             );
         }
     }
@@ -181,14 +181,14 @@ fn assert_no_vector_errors(stderr: &str) {
 }
 
 // =============================================================================
-// Vector gRPC Sink → GrpcTransport (vector_compat) Tests
+// Vector gRPC Sink -> GrpcTransport (vector_compat) Tests
 // =============================================================================
 
 /// Test: Vector binary sends events via its native `vector` sink to our
 /// GrpcTransport server with vector_compat enabled.
 ///
-/// This verifies end-to-end compatibility: Vector → PushEvents RPC →
-/// VectorCompatService → message channel → recv().
+/// This verifies end-to-end compatibility: Vector -> PushEvents RPC ->
+/// VectorCompatService -> message channel -> recv().
 #[tokio::test]
 async fn test_vector_grpc_sink_to_transport() {
     let Some(vector_bin) = vector_binary_path() else {
@@ -571,7 +571,7 @@ async fn test_vector_compat_client_to_vector_source() {
     let data_dir_str = data_dir.to_str().unwrap();
     let output_path_str = output_path.to_str().unwrap();
 
-    // Vector config: vector source (server) → file sink
+    // Vector config: vector source (server) -> file sink
     let vector_config = format!(
         r#"
 data_dir: "{data_dir_str}"

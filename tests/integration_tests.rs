@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Integration tests — consolidated into a single binary for compile-time efficiency.
+//! Integration tests -- consolidated into a single binary for compile-time efficiency.
 //!
 //! Each submodule is feature-gated to match its library dependency.
 //! Run with: `cargo nextest run --test integration`

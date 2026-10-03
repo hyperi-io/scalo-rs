@@ -110,7 +110,7 @@ async fn run_workbatch_shuts_down_immediately_when_empty() {
     let engine = make_engine();
     let transport = make_transport();
 
-    // No messages — cancel immediately.
+    // No messages -- cancel immediately.
     let shutdown = CancellationToken::new();
     shutdown.cancel();
 

@@ -13,7 +13,7 @@
 //!
 //! `clippy::await_holding_lock` is deliberately allowed here: the suite uses a
 //! `std::sync::Mutex` to externally serialise tests that touch the global
-//! recorder. The lock is held across `.await` points by design — there is no
+//! recorder. The lock is held across `.await` points by design -- there is no
 //! second task that can contend (tests are serialised, the lock has no cross-
 //! task purpose). Switching to `tokio::sync::Mutex` would change nothing
 //! semantically and just churn 30 call sites.
@@ -573,7 +573,7 @@ async fn test_15_shutdown_stops_accepting() {
     // Verify TCP connect is refused after shutdown
     let connect = timeout(Duration::from_millis(500), TcpStream::connect(&addr)).await;
     let refused = match connect {
-        Ok(Ok(_)) => false,          // Connected — not shut down
+        Ok(Ok(_)) => false,          // Connected -- not shut down
         Ok(Err(_)) | Err(_) => true, // Connection refused or timed out
     };
     assert!(refused, "server should refuse connections after shutdown");

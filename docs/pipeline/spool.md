@@ -8,7 +8,7 @@ pipeline that needs durable store-and-forward.
 
 For most workloads you want `TieredSink` (transport + spool + circuit
 breaker + drain). Reach for `Spool` directly only when you're building
-something `TieredSink` doesn't cover — e.g. an out-of-band replay
+something `TieredSink` doesn't cover -- e.g. an out-of-band replay
 buffer, a checkpoint store, or a custom drainer.
 
 ---
@@ -17,11 +17,11 @@ buffer, a checkpoint store, or a custom drainer.
 
 | Property | Notes |
 | ---------- | ------- |
-| FIFO order | Strict — yaque is a single-producer / single-consumer log |
+| FIFO order | Strict -- yaque is a single-producer / single-consumer log |
 | Persistent | Survives restarts; segment files in the queue directory |
 | Crash-safe | Receiver position persisted in `recv-metadata`; commit-then-advance semantics |
-| Async-native | Built on yaque's async receiver — `recv()` awaits when empty |
-| Optional compression | zstd at construction-time level (1–22, clamped) |
+| Async-native | Built on yaque's async receiver -- `recv()` awaits when empty |
+| Optional compression | zstd at construction-time level (1-22, clamped) |
 | Bounded | `max_items` (count) and `max_size_bytes` (directory size) |
 
 ---
@@ -32,7 +32,7 @@ Inside the configured `path`:
 
 ```text
 spool.queue/
-|-- 0.q                # segment file — [4-byte Hamming header][payload] ...
+|-- 0.q                # segment file -- [4-byte Hamming header][payload] ...
 |-- 1.q
 |-- ...
 |-- recv-metadata      # 16 bytes: (segment u64 BE, position u64 BE)
@@ -42,18 +42,18 @@ spool.queue/
 Segments roll over as they fill. The receiver position is two
 big-endian u64s pointing into the segment file at the next byte to
 read. On `recv` / `pop_front` the guard returned by yaque is
-explicitly `commit()`'d — the position advances; on drop without
+explicitly `commit()`'d -- the position advances; on drop without
 commit, the read rolls back and the item stays in the queue (this is
 how `peek` works).
 
 `Spool::open` rescans the directory on construction to recover the
-item count after a restart — yaque doesn't expose a length API.
+item count after a restart -- yaque doesn't expose a length API.
 
 ---
 
 ## Durability and recovery
 
-- yaque writes durable per-message — a successful `push().await`
+- yaque writes durable per-message -- a successful `push().await`
   means the bytes are in the segment file. (Whether the OS has
   fsync'd to disk depends on yaque's internal policy; for absolute
   durability the caller should `fsync` the directory out-of-band or
@@ -61,7 +61,7 @@ item count after a restart — yaque doesn't expose a length API.
 - On restart, the receiver position is read from `recv-metadata` and
   scanning starts from there. Items consumed before the crash stay
   consumed; items not yet committed reappear.
-- `clear()` walks the queue and commits every item — empties without
+- `clear()` walks the queue and commits every item -- empties without
   touching the filesystem directly.
 
 ### Locks after a hard kill
@@ -96,10 +96,10 @@ Permission, full-disk, read-only and quota errors are returned under either poli
 When `compress = true`, every payload is zstd-compressed before
 `sender.send` and decompressed inside `recv` / `pop_front` /
 `pop_front_async`. Compression level is config-controlled (default 3
-— fast). Use higher levels (10+) for archival queues; default for
+-- fast). Use higher levels (10+) for archival queues; default for
 hot-path spool.
 
-The choice is a one-shot at construction — there's no per-message
+The choice is a one-shot at construction -- there's no per-message
 override.
 
 ---
@@ -112,12 +112,12 @@ override.
 | `max_size_bytes: Some(b)` | `push` returns `Err(MaxSizeReached { max_bytes })` |
 
 Both checks happen pre-write. The size check uses `file_size()` which
-sums every regular file in the queue directory — exact for fresh
+sums every regular file in the queue directory -- exact for fresh
 opens, slightly stale between segment rolls. Callers should treat
 these as soft bounds; downstream pressure (DLQ, drop, throttle) is
 the right response when they fire.
 
-There's no built-in "drop oldest" mode — yaque is append-only and
+There's no built-in "drop oldest" mode -- yaque is append-only and
 removing oldest would require rewriting segment files. If you need
 ring-buffer semantics, build it on top by combining `pop_front` (oldest)
 with `push` (newest) under your own lock.
@@ -134,7 +134,7 @@ Use `TieredSink` if the answer to all of these is yes:
 
 Use `Spool` directly when:
 
-- You're not retrying against an upstream sink — the spool **is** the
+- You're not retrying against an upstream sink -- the spool **is** the
   destination (replay buffer, audit log, deferred-work queue).
 - You need to peek or clear the queue, which `TieredSink` doesn't
   expose.
@@ -153,7 +153,7 @@ spool:
   max_size_bytes: 10737418240   # 10 GiB
 ```
 
-Builder methods on `SpoolConfig` cover the common shapes —
+Builder methods on `SpoolConfig` cover the common shapes --
 `SpoolConfig::new(path)`, `SpoolConfig::with_compression(path)`,
 `.compress(bool)`, `.compression_level(i)`, `.max_items(n)`,
 `.max_size_bytes(b)`.
@@ -179,7 +179,7 @@ while let Some(data) = spool.pop_front().await? {
 }
 ```
 
-`recv()` is the async-await variant — it blocks when the queue is
+`recv()` is the async-await variant -- it blocks when the queue is
 empty (useful for a consumer task that should idle until work
 arrives). `pop_front` is the try-style alternative that returns
 `Ok(None)` instead of blocking.
@@ -209,7 +209,7 @@ arrives). `pop_front` is the try-style alternative that returns
 ## Source
 
 - [`../../src/spool/mod.rs`](../../src/spool/mod.rs)
-- [`../../src/spool/queue.rs`](../../src/spool/queue.rs) — `Spool`, yaque wrapper, item count recovery
+- [`../../src/spool/queue.rs`](../../src/spool/queue.rs) -- `Spool`, yaque wrapper, item count recovery
 - [`../../src/spool/config.rs`](../../src/spool/config.rs)
 - [`../../src/spool/error.rs`](../../src/spool/error.rs)
 
@@ -217,7 +217,7 @@ arrives). `pop_front` is the try-style alternative that returns
 
 ## Related
 
-- [tiered-sink.md](tiered-sink.md) — the primary consumer; handles the retry / circuit / drain semantics on top
-- [dlq.md](dlq.md) — where to send messages when spool is full
-- [../feature-flags.md](../feature-flags.md) — `spool` (pulls `zstd`)
+- [tiered-sink.md](tiered-sink.md) -- the primary consumer; handles the retry / circuit / drain semantics on top
+- [dlq.md](dlq.md) -- where to send messages when spool is full
+- [../feature-flags.md](../feature-flags.md) -- `spool` (pulls `zstd`)
 - [../architecture.md](../architecture.md)

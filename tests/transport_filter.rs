@@ -133,7 +133,7 @@ async fn outbound_filter_blocks_send() {
         action: FilterAction::Drop,
     }]);
 
-    // Send a debug message — should be silently dropped
+    // Send a debug message -- should be silently dropped
     let result = transport
         .send(
             "topic",
@@ -145,7 +145,7 @@ async fn outbound_filter_blocks_send() {
         "Filtered send should return Ok (silent drop)"
     );
 
-    // Send a normal message — should go through
+    // Send a normal message -- should go through
     let result = transport
         .send("topic", bytes::Bytes::from_static(br#"{"msg":"normal"}"#))
         .await;
@@ -226,19 +226,19 @@ async fn first_match_wins_integration() {
     transport
         .inject(None, br#"{"status":"a"}"#.to_vec())
         .await
-        .unwrap(); // matches filter 0 → drop
+        .unwrap(); // matches filter 0 -> drop
     transport
         .inject(None, br#"{"status":"b"}"#.to_vec())
         .await
-        .unwrap(); // matches filter 1 → dlq
+        .unwrap(); // matches filter 1 -> dlq
     transport
         .inject(None, br#"{"status":"c"}"#.to_vec())
         .await
-        .unwrap(); // matches filter 2 → drop
+        .unwrap(); // matches filter 2 -> drop
     transport
         .inject(None, br#"{"no_status":true}"#.to_vec())
         .await
-        .unwrap(); // matches nothing → pass
+        .unwrap(); // matches nothing -> pass
 
     let messages = transport.recv(10).await.unwrap().records;
     assert_eq!(messages.len(), 1, "Only the no-status message should pass");
@@ -411,7 +411,7 @@ fn sample_data_nested_cloud_event() {
 
 #[test]
 fn sample_data_dfe_loader_routing() {
-    // Loader uses _table field for routing — filter out internal tables
+    // Loader uses _table field for routing -- filter out internal tables
     let engine = TransportFilterEngine::new(
         &[FilterRule {
             expression: r#"_table.startsWith("_internal")"#.into(),
@@ -511,7 +511,7 @@ fn adversarial_truncated_json() {
 
     // Truncated JSON with `"_table":` pattern: the memmem fast-path detects
     // the field exists pattern, so it matches the filter (Drop action).
-    // This is safe filtering behaviour — broken JSON containing the field
+    // This is safe filtering behaviour -- broken JSON containing the field
     // pattern is treated as if the field exists.
     assert_eq!(
         engine.apply_inbound(br#"{"_table":"ev"#),
@@ -662,7 +662,7 @@ fn adversarial_missing_field_no_error() {
     .unwrap();
 
     let payload = br#"{"other":"data"}"#;
-    // Field missing → no match (not error)
+    // Field missing -> no match (not error)
     assert_eq!(engine.apply_inbound(payload), FilterDisposition::Pass);
 }
 
@@ -714,7 +714,7 @@ fn adversarial_msgpack_bypasses_filters() {
     )
     .unwrap();
 
-    // MsgPack fixmap with _table key — should bypass filter (not crash)
+    // MsgPack fixmap with _table key -- should bypass filter (not crash)
     let msgpack = &[
         0x81, 0xa6, 0x5f, 0x74, 0x61, 0x62, 0x6c, 0x65, 0xa6, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x73,
     ];
@@ -1024,7 +1024,7 @@ fn tier2_missing_field_safe() {
     )
     .unwrap();
 
-    // Missing severity field — should NOT match (evaluate_condition returns false on missing)
+    // Missing severity field -- should NOT match (evaluate_condition returns false on missing)
     let no_severity = br#"{"source":"external"}"#;
     assert_eq!(engine.apply_inbound(no_severity), FilterDisposition::Pass);
 }
@@ -1148,11 +1148,11 @@ fn has_single_field_only_matches_top_level() {
     )
     .unwrap();
 
-    // Top-level — match.
+    // Top-level -- match.
     let real_match = br#"{"_table":"events"}"#;
     assert_eq!(engine.apply_inbound(real_match), FilterDisposition::Drop);
 
-    // Nested — must NOT match (strict CEL).
+    // Nested -- must NOT match (strict CEL).
     let nested_payload = br#"{"data":{"_table":"events"}}"#;
     assert_eq!(
         engine.apply_inbound(nested_payload),
@@ -1160,7 +1160,7 @@ fn has_single_field_only_matches_top_level() {
         "nested _table must not satisfy top-level has(_table)",
     );
 
-    // Field name appears only inside an escaped string value — no match.
+    // Field name appears only inside an escaped string value -- no match.
     let escaped_in_value = br#"{"description":"event with \"_table\": substring"}"#;
     assert_eq!(
         engine.apply_inbound(escaped_in_value),
@@ -1219,7 +1219,7 @@ async fn engine_send_sync_concurrent_evaluation() {
         total_passes += p;
     }
 
-    // 32 threads × 1000 messages = 32000 total
+    // 32 threads x 1000 messages = 32000 total
     assert_eq!(total_drops + total_passes, 32_000);
     // ~33% are poison
     assert!(total_drops > 10_000 && total_drops < 12_000);
@@ -1240,7 +1240,7 @@ fn filter_action_is_send_sync() {
 
 #[tokio::test]
 async fn smoke_memory_transport_filters_field_present() {
-    // Construct MemoryTransport with filter config — verifies field exists
+    // Construct MemoryTransport with filter config -- verifies field exists
     let transport = MemoryTransport::new(&MemoryConfig {
         buffer_size: 100,
         recv_timeout_ms: 50,
@@ -1302,7 +1302,7 @@ fn tier3_patterns_rejected_by_default() {
 // classifier that mirrors this crate's rules.
 //
 // If both tests pass on their respective sides, the UI validator and the
-// runtime engine agree on classification — no drift.
+// runtime engine agree on classification -- no drift.
 //
 // To add a new test case, edit the fixture in BOTH this crate's copy and
 // the consumer's copy. They must remain byte-identical.
