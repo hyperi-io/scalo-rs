@@ -175,7 +175,7 @@ pub struct FieldSpec {
     pub description: String,
 
     /// Whether the field holds a secret. When `true` the app schema also marks
-    /// the field `x-dfe-secret` so the UI masks it and the engine routes it
+    /// the field `x-scalo-secret` so the UI masks it and the engine routes it
     /// through the secrets seam. Omitted when `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub secret: bool,

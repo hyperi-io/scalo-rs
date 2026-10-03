@@ -41,7 +41,7 @@
 //!     description: "High-performance data loader".into(),
 //!     metrics_port: 9090,
 //!     health: HealthContract::default(),
-//!     env_prefix: "DFE_LOADER".into(),
+//!     env_prefix: "MY_APP".into(),
 //!     metric_prefix: "loader".into(),
 //!     config_mount_path: "/etc/my-app/config.yaml".into(),
 //!     image_registry: "ghcr.io/example-org".into(),
@@ -101,10 +101,10 @@ pub mod waves;
 pub use app_project::{AppProjectContract, AppProjectDestination, generate_argocd_app_project};
 pub use capability::{Capability, FieldSpec, FieldType};
 pub use contract::{
-    DeploymentContract, HealthContract, ImageProfile, OciLabels, PortCondition, PortContract,
-    SecretEnvContract, SecretGroupContract,
+    DEFAULT_LABEL_NAMESPACE, DeploymentContract, HealthContract, ImageProfile, OciLabels,
+    PortCondition, PortContract, SecretEnvContract, SecretGroupContract,
 };
-pub use contract_identity::{ContractIdentity, IdentityError, KEY_PREFIX, VERSION};
+pub use contract_identity::{ContractIdentity, IdentityError, KEY_SEGMENT, VERSION};
 #[cfg(feature = "config-schema")]
 pub use emit::config_schema_json;
 pub use emit::{
@@ -119,9 +119,9 @@ pub use generate::{
 pub use keda::{KafkaLagTrigger, KedaConfig, KedaContract};
 pub use native_deps::{AptRepoContract, BaseDistro, NativeDepsContract};
 pub use registry::{
-    DEFAULT_BASE_DISTRO, DEFAULT_BASE_IMAGE, DEFAULT_IMAGE_REGISTRY, argocd_repo_url_from_cascade,
-    base_distro_from_cascade, base_image_from_cascade, image_registry_from_cascade,
-    resolve_base_distro,
+    DEFAULT_BASE_DISTRO, DEFAULT_BASE_IMAGE, argocd_dest_namespace_from_cascade,
+    argocd_repo_url_from_cascade, base_distro_from_cascade, base_image_from_cascade,
+    image_registry_from_cascade, resolve_base_distro,
 };
 pub use validate::{validate_dockerfile, validate_helm_values};
 pub use waves::{WAVE_APPS, WAVE_CRDS, WAVE_OPERATORS, WAVE_POST, WAVE_TOPICS};

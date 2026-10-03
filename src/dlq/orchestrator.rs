@@ -496,6 +496,7 @@ fn build_backends(
             backends.push(DlqBackend::Kafka(super::kafka::KafkaDlqInner::new(
                 kc,
                 &config.kafka,
+                service_name,
             )?));
         }
     }
@@ -1227,7 +1228,7 @@ mod tests {
                 kafka: KafkaDlqConfig {
                     enabled: true,
                     routing: DlqRouting::Common,
-                    common_topic: "dlq.unreachable".to_string(),
+                    common_topic: Some("dlq.unreachable".to_string()),
                     send_timeout_ms,
                     ..KafkaDlqConfig::default()
                 },

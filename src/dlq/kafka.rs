@@ -104,22 +104,28 @@ impl std::fmt::Debug for KafkaDlqInner {
 }
 
 impl KafkaDlqInner {
-    /// Build the Kafka backend.
+    /// Build the Kafka backend for the DLQ of `service_name`, which names the
+    /// common topic when the config leaves it unset.
     ///
     /// # Errors
     ///
     /// `DlqError::Kafka` when the Kafka producer cannot be created, including
     /// when the provider preset or [`KafkaConfig::validate`] refuses
     /// `kafka_config`, as they do for the Kafka transport.
-    pub fn new(kafka_config: &KafkaConfig, dlq_config: &KafkaDlqConfig) -> Result<Self, DlqError> {
+    pub fn new(
+        kafka_config: &KafkaConfig,
+        dlq_config: &KafkaDlqConfig,
+        service_name: &str,
+    ) -> Result<Self, DlqError> {
         let producer =
             KafkaProducer::keeping_undelivered(kafka_config, ProducerProfile::LowLatency)
                 .map_err(|e| DlqError::Kafka(format!("failed to create DLQ producer: {e}")))?;
+        let common_topic = dlq_config.resolved_common_topic(service_name);
 
         info!(
             routing = ?dlq_config.routing,
             suffix = %dlq_config.topic_suffix,
-            common_topic = %dlq_config.common_topic,
+            common_topic = %common_topic,
             send_timeout_ms = dlq_config.send_timeout_ms,
             "Kafka DLQ backend initialised"
         );
@@ -129,7 +135,7 @@ impl KafkaDlqInner {
             ack_wait: Duration::from_millis(dlq_config.send_timeout_ms),
             routing: dlq_config.routing,
             topic_suffix: dlq_config.topic_suffix.clone(),
-            common_topic: dlq_config.common_topic.clone(),
+            common_topic,
             entries_written: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
             sole_custody: 0,
@@ -382,7 +388,7 @@ mod tests {
 
     /// The refusal `KafkaDlqInner::new` returned, `None` when it built.
     fn backend_refusal(kafka_config: &KafkaConfig) -> Option<String> {
-        match KafkaDlqInner::new(kafka_config, &KafkaDlqConfig::default()) {
+        match KafkaDlqInner::new(kafka_config, &KafkaDlqConfig::default(), "loader") {
             Ok(_) => None,
             Err(DlqError::Kafka(why)) => Some(why),
             Err(other) => panic!("failed as {other}, not as a Kafka backend error"),
@@ -403,7 +409,7 @@ mod tests {
     fn resolve_topic_per_table() {
         let routing = DlqRouting::PerTable;
         let suffix = ".dlq";
-        let common = "dfe.dlq";
+        let common = "loader.dlq";
 
         let entry = DlqEntry::new("loader", "error", vec![]).with_destination("acme.auth");
         let topic = match routing {
@@ -423,7 +429,7 @@ mod tests {
                 .map_or_else(|| common.to_string(), |dest| format!("{dest}{suffix}")),
             DlqRouting::Common => common.to_string(),
         };
-        assert_eq!(topic, "dfe.dlq");
+        assert_eq!(topic, "loader.dlq");
     }
 
     #[test]
@@ -448,7 +454,8 @@ mod tests {
             send_timeout_ms: 400,
             ..KafkaDlqConfig::default()
         };
-        let mut backend = KafkaDlqInner::new(&unreachable_broker(), &dlq_config).expect("backend");
+        let mut backend =
+            KafkaDlqInner::new(&unreachable_broker(), &dlq_config, "svc").expect("backend");
         backend
             .send_batch(&[DlqEntry::new("svc", "err", b"x".to_vec())])
             .await
@@ -467,5 +474,24 @@ mod tests {
             "the configured 400 ms did not bound the wait: {took:?}"
         );
         assert_eq!(backend.take_durable_losses(), 1);
+    }
+
+    /// An entry with no destination goes to the service's own topic when no
+    /// common topic is configured, and to the configured one when it is.
+    #[tokio::test]
+    async fn the_common_topic_is_the_services_own_unless_configured() {
+        let entry = DlqEntry::new("loader", "err", b"x".to_vec());
+        let backend =
+            KafkaDlqInner::new(&unreachable_broker(), &KafkaDlqConfig::default(), "loader")
+                .expect("backend");
+        assert_eq!(backend.resolve_topic(&entry), "loader.dlq");
+
+        let configured = KafkaDlqConfig {
+            common_topic: Some("acme_loader_dlq".into()),
+            ..KafkaDlqConfig::default()
+        };
+        let backend =
+            KafkaDlqInner::new(&unreachable_broker(), &configured, "loader").expect("backend");
+        assert_eq!(backend.resolve_topic(&entry), "acme_loader_dlq");
     }
 }

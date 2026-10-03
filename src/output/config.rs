@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::io::{FileWriterConfig, RotationPeriod};
+use crate::io::{DEFAULT_SPOOL_ROOT, FileWriterConfig, RotationPeriod};
 
 /// File output sink configuration.
 ///
@@ -24,7 +24,8 @@ pub struct FileOutputConfig {
     /// Enable the file output sink.
     pub enabled: bool,
 
-    /// Base directory for output files.
+    /// Base directory for output files. The service name is appended as a
+    /// subdirectory. Default `/var/spool/scalo/output`.
     pub path: PathBuf,
 
     /// Output filename (e.g. "events.ndjson").
@@ -44,7 +45,7 @@ impl Default for FileOutputConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            path: PathBuf::from("/var/spool/dfe/output"),
+            path: PathBuf::from(DEFAULT_SPOOL_ROOT).join("output"),
             filename: "events.ndjson".to_string(),
             rotation: RotationPeriod::Hourly,
             max_age_days: 7,
@@ -74,7 +75,7 @@ mod tests {
     fn test_defaults() {
         let config = FileOutputConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.path, PathBuf::from("/var/spool/dfe/output"));
+        assert_eq!(config.path, PathBuf::from("/var/spool/scalo/output"));
         assert_eq!(config.filename, "events.ndjson");
         assert_eq!(config.rotation, RotationPeriod::Hourly);
         assert_eq!(config.max_age_days, 7);

@@ -23,14 +23,19 @@
 //!
 //! ```yaml
 //! deployment:
-//!   image_registry: ghcr.io/hyperi-io                  # default: ghcr.io/hyperi-io
+//!   image_registry: registry.example.com/team          # no default -- required
 //!   base_image: debian:trixie-slim@sha256:<digest>     # default: DEFAULT_BASE_IMAGE
 //!   base_distro: trixie                                # default: derived from base_image
+//!   argocd:
+//!     repo_url: https://git.example.com/team/my-app    # no default -- no Application without it
+//!     dest_namespace: my-namespace                     # default: the app name
 //! ```
 //!
 //! # Defaults
 //!
-//! - [`DEFAULT_IMAGE_REGISTRY`] = `ghcr.io/hyperi-io` -- where built images go
+//! - `image_registry` has none: an organisation's registry is not something a
+//!   library can guess, and [`DeploymentContract::validate`](super::DeploymentContract::validate)
+//!   refuses a contract that names none
 //! - [`DEFAULT_BASE_IMAGE`] = `debian:trixie-slim@sha256:...` -- what the runtime stage builds on
 //! - [`DEFAULT_BASE_DISTRO`] = `trixie` -- which release's package names to emit
 //!
@@ -46,12 +51,6 @@
 //! `deployment.base_image` in the cascade without rebuilding the apps.
 
 use super::native_deps::BaseDistro;
-
-/// Default publish-target registry for the org.
-///
-/// Combined with the contract's `app_name` to produce
-/// `<DEFAULT_IMAGE_REGISTRY>/<app_name>:<version>`.
-pub const DEFAULT_IMAGE_REGISTRY: &str = "ghcr.io/hyperi-io";
 
 /// Default base image for the runtime stage.
 ///
@@ -74,9 +73,9 @@ pub const DEFAULT_BASE_DISTRO: BaseDistro = BaseDistro::Trixie;
 
 /// Read the publish-target image registry from the config cascade.
 ///
-/// Reads `deployment.image_registry` from the YAML cascade. Falls back to
-/// [`DEFAULT_IMAGE_REGISTRY`] when not set, when config isn't loaded, or
-/// when the `config` feature is disabled.
+/// Reads `deployment.image_registry` from the YAML cascade. `None` when it is
+/// not set or empty, when config isn't loaded, or when the `config` feature is
+/// disabled -- there is no default registry, so the caller names its own.
 ///
 /// # Example
 ///
@@ -84,20 +83,27 @@ pub const DEFAULT_BASE_DISTRO: BaseDistro = BaseDistro::Trixie;
 /// use scalo::deployment::{DeploymentContract, image_registry_from_cascade};
 /// # fn dummy() -> DeploymentContract { unimplemented!() }
 /// let mut contract = dummy();
-/// contract.image_registry = image_registry_from_cascade();
+/// contract.image_registry =
+///     image_registry_from_cascade().unwrap_or_else(|| "registry.example.com/team".into());
 /// ```
 #[must_use]
-pub fn image_registry_from_cascade() -> String {
+pub fn image_registry_from_cascade() -> Option<String> {
+    cascade_string("deployment.image_registry")
+}
+
+/// The non-empty string the cascade holds at `key`, if config is loaded.
+fn cascade_string(key: &str) -> Option<String> {
     #[cfg(feature = "config")]
     {
-        if let Some(cfg) = crate::config::try_get()
-            && let Some(s) = cfg.get_string("deployment.image_registry")
-            && !s.is_empty()
-        {
-            return s;
-        }
+        crate::config::try_get()
+            .and_then(|cfg| cfg.get_string(key))
+            .filter(|s| !s.is_empty())
     }
-    DEFAULT_IMAGE_REGISTRY.to_string()
+    #[cfg(not(feature = "config"))]
+    {
+        let _ = key;
+        None
+    }
 }
 
 /// Read the runtime base image from the config cascade.
@@ -106,16 +112,7 @@ pub fn image_registry_from_cascade() -> String {
 /// [`DEFAULT_BASE_IMAGE`] when not set.
 #[must_use]
 pub fn base_image_from_cascade() -> String {
-    #[cfg(feature = "config")]
-    {
-        if let Some(cfg) = crate::config::try_get()
-            && let Some(s) = cfg.get_string("deployment.base_image")
-            && !s.is_empty()
-        {
-            return s;
-        }
-    }
-    DEFAULT_BASE_IMAGE.to_string()
+    cascade_string("deployment.base_image").unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_string())
 }
 
 /// Read the explicit distro release from the config cascade.
@@ -168,31 +165,27 @@ pub fn resolve_base_distro(base_image: &str) -> Option<BaseDistro> {
 
 /// Read the git repo URL for ArgoCD generation from the config cascade.
 ///
-/// Reads `deployment.argocd.repo_url` from the YAML cascade. Falls back to
-/// `https://github.com/hyperi-io/{app_name}` if not set -- matches the org
-/// convention.
+/// Reads `deployment.argocd.repo_url` from the YAML cascade. `None` when it is
+/// not set: where an app's chart lives is not something a library can guess,
+/// so `generate-artefacts` writes no ArgoCD `Application` without it.
 #[must_use]
-pub fn argocd_repo_url_from_cascade(app_name: &str) -> String {
-    #[cfg(feature = "config")]
-    {
-        if let Some(cfg) = crate::config::try_get()
-            && let Some(s) = cfg.get_string("deployment.argocd.repo_url")
-            && !s.is_empty()
-        {
-            return s;
-        }
-    }
-    format!("https://github.com/hyperi-io/{app_name}")
+pub fn argocd_repo_url_from_cascade() -> Option<String> {
+    cascade_string("deployment.argocd.repo_url")
+}
+
+/// Read the ArgoCD destination namespace from the config cascade.
+///
+/// Reads `deployment.argocd.dest_namespace` from the YAML cascade. `None` when
+/// it is not set, which leaves [`ArgocdConfig::dest_namespace`](super::ArgocdConfig::dest_namespace)
+/// empty and deploys the app into a namespace named after it.
+#[must_use]
+pub fn argocd_dest_namespace_from_cascade() -> Option<String> {
+    cascade_string("deployment.argocd.dest_namespace")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn defaults_are_ghcr_friendly() {
-        assert_eq!(DEFAULT_IMAGE_REGISTRY, "ghcr.io/hyperi-io");
-    }
 
     #[test]
     fn default_base_image_is_pinned_by_digest() {
@@ -211,8 +204,11 @@ mod tests {
 
     #[test]
     fn cascade_falls_back_to_defaults_when_no_config() {
-        // No config setup -> returns defaults.
-        assert_eq!(image_registry_from_cascade(), DEFAULT_IMAGE_REGISTRY);
+        // No config setup -> the base image has a default, and the registry and
+        // the ArgoCD source and namespace have none.
+        assert_eq!(image_registry_from_cascade(), None);
+        assert_eq!(argocd_repo_url_from_cascade(), None);
+        assert_eq!(argocd_dest_namespace_from_cascade(), None);
         assert_eq!(base_image_from_cascade(), DEFAULT_BASE_IMAGE);
     }
 

@@ -86,7 +86,8 @@ let contract = DeploymentContract {
     env_prefix: "EVENT_LOADER".into(),
     metric_prefix: "loader".into(),
     config_mount_path: "/etc/event-loader/config.yaml".into(),
-    image_registry: image_registry_from_cascade(),   // org registry
+    image_registry: image_registry_from_cascade()    // org registry -- required
+        .unwrap_or_else(|| "registry.example.com/team".into()),
     base_image: base_image_from_cascade(),           // org base image
     extra_ports: vec![],
     unbound_listen_paths: vec![],
@@ -140,7 +141,7 @@ let contract = DeploymentContract {
 | `env_prefix` | `String` | required | Config env prefix; `__` is the nesting separator |
 | `metric_prefix` | `String` | required | Prometheus namespace |
 | `config_mount_path` | `String` | required | E.g. `/etc/event-loader/config.yaml` |
-| `image_registry` | `String` | cascade | Container registry base |
+| `image_registry` | `String` | required | Container registry base, and `validate()` refuses an empty one |
 | `extra_ports` | `Vec<PortContract>` | `[]` | HTTP / gRPC / data ports beyond metrics -- see [Ports](#ports) |
 | `unbound_listen_paths` | `Vec<String>` | `[]` | `default_config` listen paths no port serves -- see [Ports](#ports) |
 | `entrypoint_args` | `Vec<String>` | `[]` | Default `CMD` args |
@@ -151,7 +152,7 @@ let contract = DeploymentContract {
 | `base_image` | `String` | cascade | Runtime base for the Dockerfile |
 | `native_deps` | `NativeDepsContract` | default | See [native-deps.md](native-deps.md) |
 | `image_profile` | `ImageProfile` | `Production` | See below |
-| `oci_labels` | `OciLabels` | default | Static OCI labels |
+| `oci_labels` | `OciLabels` | default | Static OCI labels and the namespace of scalo's own keys -- see [Labels](#labels) |
 | `config_schema` | `Option<Value>` | `None` | JSON Schema of the app's `Config` (v3) |
 | `capabilities` | `Vec<Capability>` | `[]` | Runtime-surface catalogue (v3) |
 
@@ -283,6 +284,23 @@ The profile changes what is in the image, not its tag. The release pipeline tags
 
 ---
 
+## Labels
+
+scalo stamps a few keys of its own beside the standard `org.opencontainers.image.*` labels. They share one reverse-DNS namespace, `oci_labels.label_namespace`, which defaults to `io.scalo` (`DEFAULT_LABEL_NAMESPACE`):
+
+| Key | Where | Value |
+| --- | --- | --- |
+| `<namespace>.profile` | Dockerfile, runtime stage, container manifest | `production` or `development` |
+| `<namespace>.app` | container manifest | `app_name` |
+| `<namespace>.metrics_port` | container manifest | `metrics_port` |
+| `<namespace>.contract.version` / `.source-commit` / `.image-ref` | Dockerfile, `Chart.yaml`, ArgoCD `Application`, when a `ContractIdentity` is passed | see `ContractIdentity` |
+
+An app that already ships its own namespace keeps it by setting `label_namespace`, and every key above moves with it.
+
+`oci_labels.vendor`, `oci_labels.licenses` and `oci_labels.copyright` are empty by default, and an empty one writes nothing: no vendor or licence label, no `# License` or `# Copyright` header line. Set them to name the app's vendor, licence and copyright holder.
+
+---
+
 ## Cascade-driven defaults
 
 These read from the config cascade so ops can change them org-wide
@@ -292,10 +310,13 @@ source.
 
 | Function | Cascade key | Default |
 | ---------- | ------------- | --------- |
-| `image_registry_from_cascade()` | `deployment.image_registry` | `ghcr.io/hyperi-io` |
+| `image_registry_from_cascade()` | `deployment.image_registry` | none -- returns `None`, and the contract must name a registry |
 | `base_image_from_cascade()` | `deployment.base_image` | `debian:trixie-slim@sha256:...` (`DEFAULT_BASE_IMAGE`) |
 | `resolve_base_distro(base_image)` | `deployment.base_distro` | derived from `base_image` |
-| `argocd_repo_url_from_cascade(app)` | `deployment.argocd.repo_url` | `https://github.com/hyperi-io/<app>` |
+| `argocd_repo_url_from_cascade()` | `deployment.argocd.repo_url` | none -- `generate-artefacts` writes no ArgoCD `Application` without it |
+| `argocd_dest_namespace_from_cascade()` | `deployment.argocd.dest_namespace` | none -- the `Application` deploys into a namespace named after `app_name` |
+
+There is no default registry or ArgoCD source: where an organisation pushes its images and keeps its charts is not something a library can guess, and a guess sends images and syncs to someone else's.
 
 The default base image is pinned to its multi-arch index digest, so every build
 of one scalo release gets the same bytes. Renovate moves the digest.
@@ -325,19 +346,16 @@ reference carries no codename.
 | `DeploymentContract::undeclared_listeners()` / `assert_listeners_declared()` | Listener coverage -- see [Ports](#ports) |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |
 | `SecretEnvContract` | Single env var sourced from a Secret key |
-| `OciLabels` | Static OCI labels (`title`, `description`, `vendor`, `licenses`, `copyright`) |
+| `OciLabels` | Static OCI labels (`title`, `description`, `vendor`, `licenses`, `copyright`) and `label_namespace` |
 | `NativeDepsContract` | Runtime APT packages -- see [native-deps.md](native-deps.md) |
 | `KedaContract` | Autoscaling thresholds -- see [keda.md](keda.md) |
 | `ArgocdConfig` | ArgoCD `Application` repo / path / namespace |
-| `DEFAULT_IMAGE_REGISTRY` / `DEFAULT_BASE_IMAGE` | Defaults used when cascade is silent |
-| `image_registry_from_cascade()` / `base_image_from_cascade()` / `argocd_repo_url_from_cascade()` | Cascade readers |
+| `DEFAULT_BASE_IMAGE` / `DEFAULT_LABEL_NAMESPACE` | Defaults used when the cascade or the contract is silent |
+| `image_registry_from_cascade()` / `base_image_from_cascade()` / `argocd_repo_url_from_cascade()` / `argocd_dest_namespace_from_cascade()` | Cascade readers |
 | `Capability` / `FieldSpec` | Capability-catalog entry and its config fields |
 | `config_schema_json::<T>()` | Derive the JSON Schema for the app's `Config` |
 
-`oci_labels.licenses` and `oci_labels.copyright` do double duty: they set the
-OCI labels AND the generated Dockerfile's `# License` / `# Copyright` header,
-so a non-Apache consumer does not get scalo's licence stamped into its repo.
-Both default to scalo's own values.
+`oci_labels.licenses` and `oci_labels.copyright` name the app's own licence and copyright holder. `licenses` sets the `org.opencontainers.image.licenses` label and the generated Dockerfile's `# License` header line, and `copyright` sets its `# Copyright` line. Both are empty by default, and an empty one writes no label and no line, so an app's artefacts carry only the terms the app states.
 
 ---
 

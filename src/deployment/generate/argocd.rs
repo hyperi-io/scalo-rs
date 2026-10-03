@@ -23,7 +23,9 @@ use crate::deployment::contract::DeploymentContract;
 pub struct ArgocdConfig {
     /// ArgoCD namespace (where the Application CR lives). Default: `argocd`.
     pub argocd_namespace: String,
-    /// Destination namespace for the deployed app. Default: `dfe`.
+    /// Destination namespace for the deployed app. Default: empty, which
+    /// deploys into a namespace named after the contract's `app_name`, so an
+    /// app lands in its own namespace unless it is told to share one.
     pub dest_namespace: String,
     /// Destination cluster (`server` field). Default: `https://kubernetes.default.svc`.
     pub dest_server: String,
@@ -57,7 +59,7 @@ impl Default for ArgocdConfig {
     fn default() -> Self {
         Self {
             argocd_namespace: "argocd".into(),
-            dest_namespace: "dfe".into(),
+            dest_namespace: String::new(),
             dest_server: "https://kubernetes.default.svc".into(),
             repo_url: String::new(),
             target_revision: "main".into(),
@@ -101,8 +103,17 @@ pub fn generate_argocd_application(
     // alongside the existing sync-wave entry. Indented to match the
     // 4-space `metadata.annotations:` block below.
     let identity_block = identity
-        .map(|id| format!("\n{ann}", ann = id.as_yaml_annotations(4)))
+        .map(|id| {
+            let ann = id.as_yaml_annotations(&contract.oci_labels.label_namespace, 4);
+            format!("\n{ann}")
+        })
         .unwrap_or_default();
+
+    let dest_namespace = if argo.dest_namespace.is_empty() {
+        &contract.app_name
+    } else {
+        &argo.dest_namespace
+    };
 
     // Build the extras block: each entry is a raw YAML fragment starting with
     // `- group: ...`. Indent every line by 4 spaces to nest under
@@ -192,7 +203,7 @@ spec:
         target_revision = argo.target_revision,
         chart_path = argo.chart_path,
         dest_server = argo.dest_server,
-        dest_namespace = argo.dest_namespace,
+        dest_namespace = dest_namespace,
         extras_block = extras_block,
         identity_block = identity_block,
     )

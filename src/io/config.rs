@@ -14,6 +14,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Root of the default spool paths: the file writer's, the file output sink's
+/// (`output/`) and the file DLQ's (`dlq/`). The output sink and the DLQ append
+/// the service name, so apps sharing one volume keep separate directories.
+pub const DEFAULT_SPOOL_ROOT: &str = "/var/spool/scalo";
+
 /// File rotation period.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
@@ -48,7 +53,7 @@ pub struct FileWriterConfig {
 impl Default for FileWriterConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from("/var/spool/dfe"),
+            path: PathBuf::from(DEFAULT_SPOOL_ROOT),
             rotation: RotationPeriod::default(),
             max_age_days: 30,
             compress_rotated: true,
@@ -63,7 +68,7 @@ mod tests {
     #[test]
     fn test_defaults() {
         let config = FileWriterConfig::default();
-        assert_eq!(config.path, PathBuf::from("/var/spool/dfe"));
+        assert_eq!(config.path, PathBuf::from("/var/spool/scalo"));
         assert_eq!(config.rotation, RotationPeriod::Hourly);
         assert_eq!(config.max_age_days, 30);
         assert!(config.compress_rotated);

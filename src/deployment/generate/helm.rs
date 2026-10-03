@@ -24,8 +24,9 @@ use super::common::{is_go_identifier, safe_template_lookup, to_camel_suffix, wri
 ///
 /// Writes `Chart.yaml`, `values.yaml`, and all template files to `output_dir`.
 ///
-/// `identity`, when provided, stamps the three `io.hyperi.contract.*`
-/// annotations into `Chart.yaml`'s top-level `annotations:` block per the
+/// `identity`, when provided, stamps the three `<namespace>.contract.*`
+/// annotations, under the contract's `oci_labels.label_namespace` (`io.scalo`
+/// by default), into `Chart.yaml`'s top-level `annotations:` block per the
 /// Contract Identity Annotation Scheme v1. Phase 1 rollout: optional;
 /// callers SHOULD pass `Some(&identity)`.
 ///
@@ -114,7 +115,10 @@ fn gen_chart_yaml(
 ) -> String {
     // Contract Identity Annotation Scheme v1 -- top-level annotations block.
     let identity_block = identity
-        .map(|id| format!("\nannotations:\n{ann}\n", ann = id.as_yaml_annotations(2)))
+        .map(|id| {
+            let ann = id.as_yaml_annotations(&c.oci_labels.label_namespace, 2);
+            format!("\nannotations:\n{ann}\n")
+        })
         .unwrap_or_default();
 
     format!(
