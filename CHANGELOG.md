@@ -246,7 +246,7 @@ All notable changes to scalo are recorded here, following
 [Semantic Versioning](https://semver.org/). History prior to the
 open-source release is intentionally not included.
 
-## 2.9.2 (unreleased)
+## 2.9.2 (2026-06-27)
 
 - Kafka images source librdkafka1 from the Confluent clients repo on ALL
   bases (debian trixie via the bookworm suite, since Confluent has no trixie
