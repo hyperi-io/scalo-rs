@@ -11,7 +11,7 @@
 | ----------- | ----------- | -------- |
 | `reqwest 0.12` (alongside our `0.13`) | `opentelemetry-otlp 0.31` -> `opentelemetry-http 0.31` | Clears with the OpenTelemetry stack bump, held at 0.31 until metrics-exporter-opentelemetry publishes (scalo-rs#281). |
 | `tower-http 0.6` (alongside our `0.7`) | `reqwest 0.12` and `reqwest 0.13` | Clears when reqwest moves to tower-http 0.7. |
-| `base64 0.22` (alongside our `0.23`) | `tonic 0.14`, `cel 0.14`, `metrics-exporter-prometheus 0.18`, `reqwest 0.12` | Clears as those crates move to base64 0.23. |
+| `base64 0.22` (alongside our `0.23`) | `tonic 0.14`, `cel 0.13`, `metrics-exporter-prometheus 0.18`, `reqwest 0.12` | Clears as those crates move to base64 0.23. |
 | `sha2 0.11`, `hmac 0.13` (alongside our `sha2 0.10`, `hkdf 0.12`) | `aws-sigv4 1.6` | Ours: move `aes-gcm`, `hkdf`, `sha2` and `rand_core` (the `secrets` disk-cache crypto) to the RustCrypto 0.11 line together. |
 | `sysinfo 0.28` (alongside our `0.39`) | `yaque 0.6.6` (spool/disk-queue) | yaque pins old sysinfo. Track yaque updates, or revisit the spool backend. Low impact (compiled once, not on the hot path). |
 

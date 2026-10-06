@@ -307,7 +307,7 @@ git2 = { version = ">=0.21.0, <0.22", optional = true }
 
 # CEL expression evaluation
 # Renamed from cel-interpreter — same project, same maintainers, near-identical API.
-cel = { version = ">=0.14.5, <0.15", features = ["json"], optional = true }
+cel = { version = ">=0.13, <0.14", features = ["json"], optional = true }
 
 # CLI framework
 clap = { version = ">=4.5, <5", features = ["derive", "env"], optional = true }
