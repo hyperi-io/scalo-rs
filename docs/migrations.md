@@ -1,11 +1,8 @@
 # Migrations
 
-API surface changes that require consumer adjustment. Indexed by the
-scalo version where the change first ships. The local `rebuild-consumers`
-skill reads this when `cargo check` flags breakage on a downstream bump.
-
-Pre-GA discipline: no `BREAKING CHANGE:` footer, no major bump. All
-six core consumer services migrate in lockstep.
+API and behaviour changes that need a consumer adjustment, indexed by the
+scalo release where each first ships. Read the sections between your current
+release and the target before bumping.
 
 ---
 
@@ -667,13 +664,12 @@ inbound brake even when the governor is on. Adopt the `*_with_governor` /
 `governed_receiver` path so the default-on governor is not a silent no-op on the
 receive side.
 
-### KEPT but deferred
+### `Message` and `RecvBatch` stay as build helpers (no surface change)
 
-- `Message` / `RecvBatch` remain as internal build-helpers (with
-  `From<Message>` / `From<RecvBatch>` conversions into `WorkBatch`). Fully
-  retiring them needs a filter-layer rework -- deferred.
-- `ParsedMessage -> ParsedPayload` rename deferred (the engine still uses
-  `ParsedMessage` for the in-process callers).
+- `Message` and `RecvBatch` remain as internal build helpers, with
+  `From<Message>` and `From<RecvBatch>` conversions into `WorkBatch`.
+- The engine keeps `ParsedMessage` for its in-process callers; the codec's
+  type is `ParsedPayload`.
 
 ### `BatchEngine` filter-DLQ policy (BEHAVIOUR CHANGE)
 
@@ -975,12 +971,11 @@ keys need rewiring.
 
 ---
 
-## Known open issues
+## Known limitations
 
-Tracked upstream; each needs its own focused commit. Workarounds
-applied at the consumer level until then.
+Behaviour a consumer should know about, with the workaround where one is needed.
 
-### #35 -- Kafka topic auto-discovery race
+### Kafka topic auto-discovery can start empty
 
 `KafkaAdmin::list_topics` returns empty when the admin consumer
 hasn't finished its bootstrap handshake.
@@ -993,24 +988,22 @@ covers both the race and the legitimate case of an app deployed
 before its first source exists. Set `topic_refresh_secs: 0` and a
 transport that discovered nothing consumes nothing until restart.
 
-### #36 -- `KafkaTransport` always allocates both roles
+### `KafkaTransport` always allocates both roles
 
 `KafkaTransport::new` builds BOTH a `BaseConsumer` and a `FutureProducer` (the producer from its own `ClientConfig`). A producer-only config (empty `group`) constructs: the idle consumer takes the derived stand-in group `<client_id>-producer-only` and subscribes to nothing. It still connects and looks up that group's coordinator, so the broker has to grant the app's group prefix.
 
 **Workaround:** none needed. Do not set `group.id` in `librdkafka_overrides` on a producer config -- the override replaces the derived stand-in with a group the broker may not grant.
 
-### #37 -- `TransportSender::send(key, payload)` overloads `key` as topic
+### `TransportSender::send` takes a destination, not a partition key
 
-The Kafka impl passes `key` to `FutureRecord::to(key)`, so the
-"key" arg is the destination topic, not a partition key. Callers
-can't route to a configured topic AND set a partition key in one
-call.
+`send(destination, payload)` routes to the destination topic and sets no
+partition key, so one trait call cannot do both.
 
-**Workaround:** none. Sites needing partition keys must bypass
-the trait and use rdkafka directly.
+**Workaround:** a caller that needs a partition key uses
+`KafkaProducer::send(topic, key, payload)` directly.
 
 ---
 
 ## Older releases
 
-Historical migrations live in agent memory at `project_dfe_*_migration.md` (referenced from `memory.md`) until they graduate here.
+Changes before 2.9.1 are recorded in [CHANGELOG.md](../CHANGELOG.md).
