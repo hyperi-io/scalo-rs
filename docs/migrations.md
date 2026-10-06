@@ -942,6 +942,17 @@ The names scalo writes into artefacts, and the defaults it falls back on, named 
 - A field-level `#[serde(default)]` on an app's own `dlq: DlqConfig` field fills a config file with no `dlq:` key from `DlqConfig::default()`, not from the app's container `Default`. DLQ values the app sets in its own `Default` then reach only code that builds that default, never a loaded file. Give the field `#[serde(default = "...")]` naming a function that returns the app's values.
 - Committed artefacts that `generate_dockerfile`, `generate_runtime_stage`, `generate_container_manifest`, `generate_chart` or `config_schema_json` produced change on regeneration -- the secret marker gains `x-scalo-secret`, and the label and header lines follow the settings above -- so regenerate them in the same change as the bump. `assert_no_config_artifact_drift` and `check_chart_drift` fail until they are. A committed `argocd-application.yaml` stops regenerating unless `deployment.argocd.repo_url` is set.
 
+### CEL moves to cel 0.14 (BEHAVIOUR CHANGE)
+
+The `expression` module and the Tier 2/3 transport filters evaluate on cel 0.14, which matches what the Python `common-expression-language` 0.10 package evaluates. Two things change for expressions written against cel 0.13:
+
+- `contains` is a string function only. `tags.contains("pii")` on a list or map is an evaluation error: `evaluate` returns `ExpressionError::Evaluation` and `evaluate_condition` returns `false`. List membership is `"pii" in tags`, and `"region" in meta` tests a map key. A transport filter of exactly the form `field.contains("literal")` runs on the Tier 1 native path, not through cel, and still searches a non-string field's JSON text.
+- `min` and `max` have no default overload. The profile already refused both, so nothing that passed `validate` changes.
+
+The `cel::Program`, `cel::Value` and `cel::Context` types the expression API returns are cel 0.14 types.
+
+**Consumer adjustment** -- an app that declares `cel` itself moves it to `>=0.14.5, <0.15` in the same change as the bump; otherwise it builds a second cel whose types do not match the ones the expression API returns. Check stored routing rules and computed fields for `.contains(` on a list or map field, and rewrite them with `in`.
+
 ---
 
 ## Known open issues (not fixed on this branch)

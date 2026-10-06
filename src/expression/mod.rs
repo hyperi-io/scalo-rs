@@ -22,8 +22,8 @@
 //! |----------|---------|
 //! | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` |
 //! | Logical | `&&`, `\|\|`, `!` |
-//! | Membership | `in` |
-//! | String | `contains()`, `startsWith()`, `endsWith()` |
+//! | Membership | `in` (list elements, map keys) |
+//! | String | `contains()`, `startsWith()`, `endsWith()` (strings only) |
 //! | Existence | `has()` |
 //! | Size | `size()` |
 //! | Ternary | `? :` |
