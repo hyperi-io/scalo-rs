@@ -38,7 +38,7 @@ use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, Image
 /// buried in a crate default is invisible to Renovate, which only reads
 /// Cargo.toml.
 // renovate: datasource=docker depName=otel/opentelemetry-collector
-const COLLECTOR_TAG: &str = "0.159.0";
+const COLLECTOR_TAG: &str = "0.162.0";
 
 const OTLP_GRPC_PORT: u16 = 4317;
 

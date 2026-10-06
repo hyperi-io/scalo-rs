@@ -32,7 +32,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 // renovate: datasource=docker depName=otel/opentelemetry-collector
-const COLLECTOR_TAG: &str = "0.159.0";
+const COLLECTOR_TAG: &str = "0.162.0";
 
 const OTLP_GRPC_PORT: u16 = 4317;
 
