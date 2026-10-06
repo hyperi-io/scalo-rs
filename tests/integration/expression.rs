@@ -310,6 +310,54 @@ fn evaluate_size_list() {
     assert_eq!(result, true.into());
 }
 
+// cel 0.14 keeps `contains` for strings only; membership in a list or map is `in`.
+
+#[test]
+fn evaluate_contains_on_a_list_is_an_error() {
+    let mut data = HashMap::new();
+    data.insert("tags".into(), json!(["pii", "audit"]));
+    let result = evaluate(r#"tags.contains("pii")"#, &data);
+    assert!(
+        matches!(result, Err(ExpressionError::Evaluation(_))),
+        "{result:?}"
+    );
+    assert!(!evaluate_condition(r#"tags.contains("pii")"#, &data));
+}
+
+#[test]
+fn evaluate_contains_on_a_map_is_an_error() {
+    let mut data = HashMap::new();
+    data.insert("meta".into(), json!({"region": "au"}));
+    let result = evaluate(r#"meta.contains("region")"#, &data);
+    assert!(
+        matches!(result, Err(ExpressionError::Evaluation(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn evaluate_in_is_list_membership() {
+    let mut data = HashMap::new();
+    data.insert("tags".into(), json!(["pii", "audit"]));
+    let result = evaluate(r#""pii" in tags"#, &data).unwrap();
+    assert_eq!(result, true.into());
+}
+
+#[test]
+fn evaluate_in_is_map_key_membership() {
+    let mut data = HashMap::new();
+    data.insert("meta".into(), json!({"region": "au"}));
+    let result = evaluate(r#""region" in meta"#, &data).unwrap();
+    assert_eq!(result, true.into());
+}
+
+// `min` and `max` are outside the profile, and cel 0.14 has no default overload for either.
+#[test]
+fn validate_min_and_max_rejected() {
+    assert_ne!(validate("min(a, b) > 0"), [] as [std::string::String; 0]);
+    assert_ne!(validate("max(a, b) > 0"), [] as [std::string::String; 0]);
+}
+
 #[test]
 fn evaluate_ternary_true() {
     let mut data = HashMap::new();

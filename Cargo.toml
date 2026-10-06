@@ -258,7 +258,7 @@ transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "trans
 # Secrets management
 secrets = ["tokio", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:rand_core"]
 secrets-vault = ["secrets", "vaultrs"]
-secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager", "aws-smithy-types"]
+secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager"]
 secrets-all = ["secrets-vault", "secrets-aws"]
 
 # Unified TLS trust + client-config construction (src/tls.rs). Private-CA
@@ -282,7 +282,7 @@ serde = { version = ">=1.0.228, <2", features = ["derive"] }
 thiserror = ">=2.0.18, <3"
 
 # Environment detection
-dirs = { version = ">=6.0.0, <7", optional = true }
+dirs = { version = ">=6.0.0, <8", optional = true }
 
 # Opt-in version-check instance id
 uuid = { version = ">=1.16.0, <2", features = ["v4", "v5"], optional = true }
@@ -307,7 +307,7 @@ git2 = { version = ">=0.21.0, <0.22", optional = true }
 
 # CEL expression evaluation
 # Renamed from cel-interpreter — same project, same maintainers, near-identical API.
-cel = { version = ">=0.13, <0.14", features = ["json"], optional = true }
+cel = { version = ">=0.14.5, <0.15", features = ["json"], optional = true }
 
 # CLI framework
 clap = { version = ">=4.5, <5", features = ["derive", "env"], optional = true }
@@ -319,16 +319,16 @@ owo-colors = { version = ">=4.2.3, <5", optional = true }
 tracing-throttle = { version = ">=0.4.2, <0.5", default-features = false, optional = true }
 
 # OpenTelemetry (modern observability - OTLP native)
-# Held at 0.31. tracing-opentelemetry 0.33 (2026-05) unblocked its half of
-# this, but metrics-exporter-opentelemetry 0.2.1 (still the latest) requires
-# opentelemetry ^0.31, and the otel crates do not interoperate across a minor,
-# so `otel-metrics` cannot compile against a 0.32 SDK. Bump the whole stack
-# together once that exporter moves.
+# Held at 0.31: metrics-exporter-opentelemetry 0.2.1, its newest crates.io
+# release as of 2026-10-06, requires opentelemetry ^0.31, and the otel crates do
+# not interoperate across a minor, so `otel-metrics` cannot build against a newer
+# SDK. The exporter's main branch already targets 0.33 but is unreleased. Bump the
+# whole stack together once that release ships (scalo-rs#281).
 #
-# This pin holds opentelemetry_sdk below the 0.32.1 that fixes the unbounded
-# allocation in W3C Baggage propagation. Not reachable here: scalo registers no
-# text-map propagator and never touches Baggage - trace context is carried by
-# hand in src/transport/propagation.rs. Re-check on the next bump.
+# The hold keeps opentelemetry_sdk below 0.32.1, which fixes GHSA-w9wp-h8wv-79jx
+# (CVE-2026-48504, unbounded allocation in W3C Baggage propagation). Not reachable
+# here: scalo registers no text-map propagator and never touches Baggage - trace
+# context is carried by hand in src/transport/propagation.rs.
 opentelemetry = { version = ">=0.31.0, <0.32", optional = true }
 opentelemetry_sdk = { version = ">=0.31.0, <0.32", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = ">=0.31.0, <0.32", features = ["grpc-tonic", "http-proto", "metrics", "logs"], optional = true }
@@ -380,7 +380,7 @@ webpki-roots = { version = ">=1.0.7, <2", optional = true }
 # HTTP server (axum)
 axum = { version = ">=0.8.8, <0.9", optional = true }
 tower = { version = ">=0.5.3, <0.6", features = ["limit", "timeout", "load-shed", "retry", "util"], optional = true }
-tower-http = { version = ">=0.6.8, <0.7", features = ["timeout", "trace", "limit"], optional = true }
+tower-http = { version = ">=0.6.8, <0.8", features = ["timeout", "trace", "limit"], optional = true }
 
 # Async (for transport)
 chrono = { version = ">=0.4.43, <0.5", optional = true }
@@ -431,7 +431,7 @@ tar = { version = ">=0.4.46, <0.5", optional = true }
 # Spool (disk-backed async queue). yaque's last release is 0.6.6 (2023-11-04,
 # crates.io API checked 2026-09-25). `recovery` clears locks a killed process left.
 yaque = { version = ">=0.6.6, <0.7", optional = true, features = ["recovery"] }
-zstd = { version = ">=0.13.3, <0.14", optional = true }
+zstd = { version = ">=0.13.3, <0.15", optional = true }
 # Per-record spool integrity (hardware-accelerated CRC32C). Apache-2.0/MIT,
 # 0.6.8 web-checked 2026-06-26. Closes the payload-integrity gap the queue's
 # length-only header leaves open.
@@ -441,7 +441,7 @@ crc32c = { version = ">=0.6.8, <0.7", optional = true }
 # Floor is 0.12.1: RUSTSEC-2026-0041 leaks uninitialised memory out of the block
 # decompressor up to 0.11.5 and in 0.12.0, and 0.12.1 is the lowest release that
 # no vulnerable range covers.
-lz4_flex = { version = ">=0.12.1, <0.14", optional = true }
+lz4_flex = { version = ">=0.12.1, <0.15", optional = true }
 snap = { version = ">=1.1.1, <2", optional = true }
 
 # SIMD JSON (BatchEngine — 2-4x faster than serde_json)
@@ -469,7 +469,7 @@ gcra = { package = "governor", version = ">=0.10.4, <0.11", optional = true }
 
 # Data parallelism (CPU-bound work distribution for worker pool)
 rayon = { version = ">=1.10, <2", optional = true }
-base64 = { version = ">=0.22.1, <0.23", optional = true }
+base64 = { version = ">=0.22.1, <0.24", optional = true }
 
 # AEAD for at-rest encryption of the secrets disk cache. Gated by
 # the `secrets` feature; consumers without it pay nothing. AES-256-
@@ -504,13 +504,9 @@ vaultrs = { version = ">=0.8, <0.9", optional = true }
 # `default-https-client` uses the modern aws-smithy-http-client/rustls-aws-lc
 # path with rustls 0.23 + rustls-webpki 0.103 — that's what we want.
 aws-config = { version = ">=1.8, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
-aws-sdk-secretsmanager = { version = ">=1.102, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
-# Not used by scalo code -- declared only to hold the resolver below 1.7.0, which
-# reshaped Document::Object inside a minor and stops aws-smithy-json 0.63 from
-# compiling (E0308 in codec/deserializer.rs). aws-config 1.12.0 still depends on
-# that 0.63, so a fresh resolve without this ceiling does not build. Lift it once
-# an aws-config release depends on aws-smithy-json >= 0.64.
-aws-smithy-types = { version = ">=1.6.3, <1.7", optional = true }
+# Floor is 1.117, the first release to require aws-smithy-json 0.63.1: 0.63.0 does
+# not compile against the aws-smithy-types 1.7 Document::Object reshape (E0308).
+aws-sdk-secretsmanager = { version = ">=1.117, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = ">=0.14.5, <0.15", optional = true }
@@ -519,7 +515,7 @@ prost-build = { version = ">=0.14, <0.15", optional = true }
 [dev-dependencies]
 tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
 tempfile = ">=3.24.0, <4"
-criterion = { version = ">=0.5, <0.9", features = ["html_reports"] }
+criterion = { version = ">=0.8.2, <0.9", features = ["html_reports"] }
 pretty_assertions = ">=1.4.1, <2"
 # `async_closure` for `async_with_vars`: env mutation is process-global and
 # `std::env::set_var` is unsafe, which `#![deny(unsafe_code)]` refuses, so an

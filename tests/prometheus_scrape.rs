@@ -34,7 +34,7 @@ use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, Image
 ///
 /// Pinned in our own source so dependency review can see it.
 // renovate: datasource=docker depName=prom/prometheus
-const PROMETHEUS_TAG: &str = "v3.14.0";
+const PROMETHEUS_TAG: &str = "v3.15.0";
 
 const PROMETHEUS_PORT: u16 = 9090;
 

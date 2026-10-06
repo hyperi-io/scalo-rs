@@ -11,7 +11,7 @@
 # --cpus` to observe the KERNEL outcome (CPU burned + cgroup throttling) with a
 # parked-pool vs busy-spin control.
 
-FROM rust:1-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS builder
+FROM rust:1-trixie@sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49 AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --example cpu_loadgen --features worker
