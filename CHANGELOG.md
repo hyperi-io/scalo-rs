@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.1](https://github.com/hyperi-io/scalo-rs/compare/v2.14.0...v2.14.1) (2026-10-06)
+
+### Bug Fixes
+
+* **deps:** update dependencies for GA ([#282](https://github.com/hyperi-io/scalo-rs/issues/282)) ([48a716e](https://github.com/hyperi-io/scalo-rs/commit/48a716e861d43e95ed6f6004c90b04661418d5b6)), closes [#281](https://github.com/hyperi-io/scalo-rs/issues/281)
+
 ## [2.14.0](https://github.com/hyperi-io/scalo-rs/compare/v2.13.3...v2.14.0) (2026-10-05)
 
 ### Features
