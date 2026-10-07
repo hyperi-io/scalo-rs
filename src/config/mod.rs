@@ -24,9 +24,10 @@
 //!
 //! ## How .env Files Work in the Cascade
 //!
-//! `dotenvy::dotenv()` loads `.env` into the process environment, so `.env`
-//! values are read at layer 2 alongside real env vars. Real env vars win:
-//! `dotenvy` does NOT overwrite existing variables.
+//! `.env` in the working directory (parent directories are not searched) is
+//! loaded into the process environment, so `.env` values are read at layer 2
+//! alongside real env vars. Real env vars win: `dotenvy` does NOT overwrite
+//! existing variables.
 //!
 //! ## Environment Variable Naming
 //!
@@ -64,7 +65,7 @@ pub mod shared;
 #[cfg(any(feature = "config-reload", feature = "lifecycle"))]
 pub mod watch;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -188,7 +189,7 @@ impl Config {
         // Load .env files (home = global defaults, project = overrides).
         // Real env vars always win -- dotenvy doesn't overwrite.
         if opts.load_dotenv {
-            Self::load_dotenv_cascade(opts.load_home_dotenv);
+            Self::load_dotenv_cascade(Path::new("."), opts.load_home_dotenv);
         }
 
         // Build the cascade (lowest to highest priority)
@@ -236,22 +237,26 @@ impl Config {
         })
     }
 
-    /// Load `.env` files: `~/.env` (global defaults) then project `.env`
+    /// Load `.env` files: `~/.env` (global defaults) then `project_dir/.env`
     /// (overrides). `dotenvy` doesn't overwrite, so load in reverse --
     /// project first wins, home only fills gaps. Real env vars beat both.
-    fn load_dotenv_cascade(load_home: bool) {
+    ///
+    /// Only `project_dir` itself is read. `dotenvy::dotenv()` would search
+    /// every parent up to `/` and load the first `.env` it found.
+    fn load_dotenv_cascade(project_dir: &Path, load_home: bool) {
         use tracing::debug;
 
         // Project .env first -- these values take precedence.
-        match dotenvy::dotenv() {
-            Ok(path) => {
-                debug!(path = %path.display(), "Loaded project .env file");
+        let project_env = project_dir.join(".env");
+        match dotenvy::from_path(&project_env) {
+            Ok(()) => {
+                debug!(path = %project_env.display(), "Loaded project .env file");
             }
             Err(dotenvy::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 // No project .env, that's fine
             }
             Err(e) => {
-                debug!(error = %e, "Failed to load project .env file");
+                debug!(path = %project_env.display(), error = %e, "Failed to load project .env file");
             }
         }
 
@@ -706,6 +711,43 @@ mod tests {
             Some("from-the-named-file".to_string()),
             "a file passed as --config did not reach the cascade"
         );
+    }
+
+    /// A `.env` above the project directory is never read.
+    ///
+    /// `dotenvy::dotenv()` searched every parent up to `/`, so an app started
+    /// anywhere under `$HOME` exported every secret in `~/.env`.
+    #[test]
+    fn dotenv_above_the_project_dir_is_not_loaded() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(root.path().join(".env"), "SCALO_DOTENV_PARENT=loaded\n").unwrap();
+
+        temp_env::with_var_unset("SCALO_DOTENV_PARENT", || {
+            Config::load_dotenv_cascade(&project, false);
+            assert_eq!(
+                std::env::var("SCALO_DOTENV_PARENT").ok(),
+                None,
+                "a .env in a parent directory was loaded"
+            );
+        });
+    }
+
+    /// The project directory's own `.env` still loads.
+    #[test]
+    fn dotenv_in_the_project_dir_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SCALO_DOTENV_PROJECT=loaded\n").unwrap();
+
+        temp_env::with_var_unset("SCALO_DOTENV_PROJECT", || {
+            Config::load_dotenv_cascade(dir.path(), false);
+            assert_eq!(
+                std::env::var("SCALO_DOTENV_PROJECT").ok().as_deref(),
+                Some("loaded"),
+                "the project .env did not load"
+            );
+        });
     }
 
     /// A directory entry keeps searching for {base_name}.yaml inside it.
