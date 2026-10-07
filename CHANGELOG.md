@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.2](https://github.com/hyperi-io/scalo-rs/compare/v2.14.1...v2.14.2) (2026-10-07)
+
+### Bug Fixes
+
+* read only the working directory's .env, never a parent's ([#289](https://github.com/hyperi-io/scalo-rs/issues/289)) ([e11019c](https://github.com/hyperi-io/scalo-rs/commit/e11019cd0797f308e88a0a043c10a59ea686f994)), closes [scalo-py#80](https://github.com/hyperi-io/scalo-py/issues/80)
+
 ## [2.14.1](https://github.com/hyperi-io/scalo-rs/compare/v2.14.0...v2.14.1) (2026-10-06)
 
 ### Bug Fixes
