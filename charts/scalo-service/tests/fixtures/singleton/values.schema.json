@@ -254,6 +254,7 @@
         "enabled": { "type": "boolean" },
         "type": { "type": "string" },
         "loadBalancerIP": { "type": "string" },
+        "udpLoadBalancerIP": { "type": "string" },
         "loadBalancerClass": { "type": "string" },
         "loadBalancerSourceRanges": { "type": "array", "items": { "type": "string" } },
         "externalTrafficPolicy": { "enum": ["Cluster", "Local"] },

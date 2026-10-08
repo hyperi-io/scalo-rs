@@ -1,0 +1,3 @@
+publicService:
+  enabled: true
+  udpLoadBalancerIP: 10
