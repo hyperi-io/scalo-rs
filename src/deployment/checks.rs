@@ -19,6 +19,9 @@ const KUBERNETES_PROTOCOLS: [&str; 3] = ["TCP", "UDP", "SCTP"];
 /// The longest port name Kubernetes takes (an RFC 6335 `IANA_SVC_NAME`).
 const MAX_PORT_NAME_LEN: usize = 15;
 
+/// The longest Kubernetes Service name (an RFC 1035 label).
+const MAX_APP_NAME_LEN: usize = 63;
+
 /// The longest writable path name, so `writable-<name>` stays a 63-character volume name.
 const MAX_WRITABLE_NAME_LEN: usize = 50;
 
@@ -30,6 +33,10 @@ impl DeploymentContract {
     /// [`check_chart_drift`](super::check_chart_drift) and the
     /// `generate-artefacts` subcommand run it before writing anything, and
     /// [`validate_helm_values`](super::validate_helm_values) reports it.
+    ///
+    /// `app_name` is a Kubernetes Service name -- 1 to 63 lowercase letters,
+    /// digits and inner hyphens, starting with a letter -- because every object
+    /// the chart renders is named after it.
     ///
     /// `image_registry` must be set: there is no default, and an image named
     /// without one resolves to Docker Hub's library namespace.
@@ -55,6 +62,17 @@ impl DeploymentContract {
     ///
     /// [`DeploymentError::InvalidContract`] naming the first field at fault.
     pub fn validate(&self) -> Result<(), DeploymentError> {
+        if let Some(fault) = app_name_fault(&self.app_name) {
+            return Err(invalid(
+                "app_name".to_string(),
+                format!(
+                    "{:?} {fault}, and every object the chart renders is named after it, so it \
+                     must be a Kubernetes Service name: 1 to {MAX_APP_NAME_LEN} lowercase \
+                     letters, digits and inner hyphens, starting with a letter",
+                    self.app_name
+                ),
+            ));
+        }
         if self.image_registry.trim().is_empty() {
             return Err(invalid(
                 "image_registry".to_string(),
@@ -251,6 +269,26 @@ fn writable_name_fault(name: &str) -> Option<&'static str> {
     }
     if name.starts_with('-') || name.ends_with('-') {
         return Some("starts or ends with '-'");
+    }
+    None
+}
+
+/// Why `name` is not a Kubernetes Service name, or `None` when it is one.
+fn app_name_fault(name: &str) -> Option<&'static str> {
+    if name.is_empty() || name.len() > MAX_APP_NAME_LEN {
+        return Some("is not 1 to 63 characters long");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Some("holds a character other than a lowercase letter, a digit or '-'");
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Some("does not start with a lowercase letter");
+    }
+    if name.ends_with('-') {
+        return Some("ends with '-'");
     }
     None
 }
@@ -454,6 +492,36 @@ mod tests {
         let mut c = contract();
         c.extra_ports = vec![PortContract::tcp("grpc", 6000).app_protocol("h2c\nx")];
         assert_eq!(refused_field(&c), "extra_ports[grpc].app_protocol");
+    }
+
+    #[test]
+    fn an_app_name_is_checked_as_a_service_name() {
+        for good in ["app", "my-app", "a", "dfe-receiver", "app2", "a--b", &"a".repeat(63)] {
+            assert_eq!(app_name_fault(good), None, "{good:?}");
+        }
+        for bad in [
+            "",
+            &"a".repeat(64),
+            "My-app",
+            "my_app",
+            "my.app",
+            "1app",
+            "-app",
+            "app-",
+            "app\n",
+            "my app",
+        ] {
+            assert!(app_name_fault(bad).is_some(), "{bad:?} passed");
+        }
+    }
+
+    #[test]
+    fn a_contract_whose_app_name_is_not_a_service_name_is_refused() {
+        let mut c = contract();
+        c.app_name = "Event_Stage".into();
+        assert_eq!(refused_field(&c), "app_name");
+        c.app_name = "event-stage".into();
+        c.validate().unwrap();
     }
 
     #[test]

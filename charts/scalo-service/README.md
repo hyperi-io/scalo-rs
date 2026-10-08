@@ -54,10 +54,12 @@ A release pipeline runs these steps after it builds the image. Nothing here depe
 
    `scalo::deployment::dials` is this walk, and the test suite checks the fixtures against it.
 6. **Inline each dial.** Replace every local `$ref` inside a dial with its target, keys on the node beside the `$ref` winning. Keep every constraint (`minimum`, `maximum`, `enum`, `pattern`, `default`) and the `x-scalo-dial` marker.
-7. **Write `values.schema.json`.** Start from `skeleton/values.schema.json`. Add `properties.config` as `{"type": "object"}`, and for each dial path `a.b.c` nest `properties.a` and `properties.b` as `{"type": "object"}` objects under it and set `properties.c` to the inlined dial. Copy the contract schema's `$schema` when the fragment has none. A fragment that already declares `properties.config` is an error.
+7. **Write `values.schema.json`.** Start from `skeleton/values.schema.json`. Add `properties.config` as `{"type": "object"}`, and for each dial path `a.b.c` nest `properties.a` and `properties.b` as `{"type": "object"}` objects under it and set `properties.c` to the inlined dial. When the fragment has no top-level `$schema`, set it to the `$schema` of the contract's `config_schema`. A fragment that already declares `properties.config` is an error.
 8. **Write `values.yaml`.** `config: {}`, `image.digest` set to the digest built for the tag, and one comment line per dial, `# config.<path>: <default>  # <tier>`, so an operator sees what can be tuned without it being set.
 
-Write every JSON and YAML file with sorted keys and no timestamp, and the same inputs give the same bytes.
+Write every JSON and YAML file with sorted keys and no timestamp, so one assembler given the same inputs writes the same bytes. Two assemblers may differ in comments and layout, never in what the chart renders.
+
+Before rendering a thin chart, fetch the library into its `charts/` with `helm dependency build`.
 
 Config keys that are not dials still reach the app, through `config` or `configOverrides`, but the schema does not validate them. A stored overlay therefore never pins a key a later app release drops.
 
@@ -66,7 +68,7 @@ Config keys that are not dials still reach the app, through `config` or `configO
 | Object | Name | When |
 | --- | --- | --- |
 | Deployment | `<fullname>` | always |
-| Service | `<fullname>` | always: metrics plus every open port |
+| Service | `<fullname>` | always: the metrics port, named `metrics`, plus every open port |
 | Service | `<fullname>-public`, `<fullname>-public-udp` | `publicService.enabled`, for ports the contract marks `public` |
 | ConfigMap | `<fullname>-config` | the contract names a `config_mount_path` |
 | ConfigMap | `<fullname>-<set>` | per `fileSets` entry |
@@ -87,7 +89,7 @@ A persistent writable path is a claim beside a Deployment that recreates its pod
 
 | Field | Renders | When absent |
 | --- | --- | --- |
-| `app_name` | image repository `<registry>/<app_name>` | required |
+| `app_name` | the chart name, so every object's name; image repository `<registry>/<app_name>` | required; a Kubernetes Service name: 1 to 63 lowercase letters, digits and inner hyphens, starting with a letter |
 | `image_registry` | image registry | `image.registry` or `global.registry` must be set |
 | `metrics_port`, `health.*` | metrics port, the three probes, scrape annotations | required |
 | `health.startup_budget_seconds` | startup probe `failureThreshold`, at a 5 s period | 150 |
@@ -95,7 +97,7 @@ A persistent writable path is a claim beside a Deployment that recreates its pod
 | `extra_ports[].when`, `writable_paths[].when` | the port or path only while the condition holds | always |
 | `config_mount_path` | the config ConfigMap and its mount | no config file |
 | `entrypoint_args` | container `args` | none |
-| `env_prefix` | `<env_prefix>_VERSION_CHECK__*` | bare `VERSION_CHECK__*` |
+| `env_prefix` | `<env_prefix>_VERSION_CHECK__*` | required; an empty prefix gives bare `VERSION_CHECK__*` |
 | `secrets[]` | one `secretKeyRef` per variable, `optional` where the group is | none |
 | `keda` | ScaledObject bounds and triggers | KEDA off |
 | `writable_paths[]` | emptyDir or claim per path; `/tmp` is always added | `/tmp` only |
@@ -112,7 +114,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `fullnameOverride` | chart name | Name of every object |
+| `fullnameOverride` | chart name | Name of every object; a Kubernetes Service name, as `app_name` |
 | `partOf` | none | `app.kubernetes.io/part-of` |
 | `commonLabels`, `commonAnnotations` | `{}` | On every object; the standard labels win a collision |
 | `podLabels`, `podAnnotations` | `{}` | On the pod template; the selector label always wins |
@@ -151,7 +153,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `publicService.enabled`, `type`, `loadBalancerIP`, `loadBalancerClass`, `loadBalancerSourceRanges`, `externalTrafficPolicy`, `annotations` | off, `LoadBalancer` | Load balancers for public ports |
 | `networkPolicy.enabled`, `from`, `publicFrom` | off, the namespace, any source | Ingress policy |
 | `serviceAccount.create`, `name`, `mountToken`, `annotations` | true, fullname, false | Service account; the token stays unmounted unless asked |
-| `extraEnv` | `{}` | Env by name; a name the chart derives is dropped |
+| `extraEnv` | `{}` | Env by name: a scalar through `tpl`, an object as its `valueFrom`; a name the chart derives is dropped |
 | `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts`, `initContainers`, `sidecars` | `[]` | Passed through `tpl` |
 | `extraPorts[{name, port, protocol, appProtocol, public}]` | `[]` | Ports beside the contract's, on the container and Services |
 | `extraObjects` | `[]` | Extra documents, maps or strings, through `tpl` |

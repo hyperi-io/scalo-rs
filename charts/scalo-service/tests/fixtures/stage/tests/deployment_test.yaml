@@ -210,6 +210,32 @@ tests:
             name: OTEL_SERVICE_NAME
             value: overridden
 
+  - it: renders an extraEnv string through tpl and takes a valueFrom
+    release:
+      namespace: apps
+    set:
+      extraEnv:
+        API_URL: "http://api.{{ .Release.Namespace }}.svc:8080"
+        DB_PASSWORD:
+          valueFrom:
+            secretKeyRef:
+              name: "{{ .Release.Namespace }}-db"
+              key: password
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: API_URL
+            value: http://api.apps.svc:8080
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: apps-db
+                key: password
+
   - it: reads each secret variable from the group's Secret, optional where the contract says
     asserts:
       - contains:

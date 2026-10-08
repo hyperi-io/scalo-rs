@@ -45,13 +45,13 @@ scalo-service.podLabelSet -- the pod template's labels as JSON: the label set an
 {{- end -}}
 
 {{/*
-scalo-service.metadata -- an object's name, labels and annotations, with `commonAnnotations`
-under the object's own. Takes (dict "ctx" . "name" NAME "annotations" MAP).
+scalo-service.metadata -- an object's name, release namespace, labels and annotations, with
+`commonAnnotations` under the object's own. Takes (dict "ctx" . "name" NAME "annotations" MAP).
 */}}
 {{- define "scalo-service.metadata" -}}
 {{- $annotations := deepCopy (.ctx.Values.commonAnnotations | default dict) -}}
 {{- $annotations = mergeOverwrite $annotations (deepCopy (.annotations | default dict)) -}}
-{{- $metadata := dict "name" .name "labels" (include "scalo-service.labelSet" .ctx | fromJson) -}}
+{{- $metadata := dict "name" .name "namespace" .ctx.Release.Namespace "labels" (include "scalo-service.labelSet" .ctx | fromJson) -}}
 {{- with $annotations }}{{ $_ := set $metadata "annotations" . }}{{ end -}}
 {{- toYaml $metadata -}}
 {{- end -}}

@@ -63,6 +63,13 @@ pub struct DeploymentContract {
     pub schema_version: u32,
 
     /// Application name (e.g., "my-app") -- matched against Chart.yaml `name`.
+    /// Every object the chart renders is named after it, so it is a Kubernetes
+    /// Service name: 1 to 63 lowercase letters, digits and inner hyphens,
+    /// starting with a letter.
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(regex(pattern = r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$"))
+    )]
     pub app_name: String,
 
     /// Binary name (e.g., "my-app"). Defaults to app_name if empty.
