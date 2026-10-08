@@ -203,9 +203,6 @@ impl<'de> serde::Deserialize<'de> for SensitiveString {
 /// via scalo's re-exported schemars -- a `SensitiveString` field automatically
 /// gets the secret marker in the emitted `config-schema.*` with no per-field
 /// annotation.
-///
-/// `x-dfe-secret` is the marker's earlier name, emitted beside it until every
-/// reader keys on `x-scalo-secret`.
 #[cfg(feature = "config-schema")]
 impl schemars::JsonSchema for SensitiveString {
     fn schema_name() -> std::borrow::Cow<'static, str> {
@@ -227,7 +224,6 @@ impl schemars::JsonSchema for SensitiveString {
         schemars::json_schema!({
             "type": "string",
             "x-scalo-secret": true,
-            "x-dfe-secret": true,
             "writeOnly": true
         })
     }
@@ -504,13 +500,20 @@ mod tests {
 
     #[cfg(feature = "config-schema")]
     #[test]
-    fn json_schema_carries_the_secret_marker_under_both_names() {
+    fn json_schema_carries_the_secret_marker() {
         let schema = schemars::schema_for!(SensitiveString);
         let v = serde_json::to_value(&schema).unwrap();
         assert_eq!(v["type"], "string");
         assert_eq!(v["x-scalo-secret"], true);
-        assert_eq!(v["x-dfe-secret"], true);
         assert_eq!(v["writeOnly"], true);
+        let keys: Vec<&str> = v
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|k| k.starts_with("x-"))
+            .collect();
+        assert_eq!(keys, ["x-scalo-secret"], "schema was: {v}");
     }
 
     /// A struct field of `SensitiveString` gets the secret marker inlined (not
@@ -527,7 +530,6 @@ mod tests {
         let v = serde_json::to_value(schemars::schema_for!(Cfg)).unwrap();
         let pw = &v["properties"]["password"];
         assert_eq!(pw["x-scalo-secret"], true, "schema was: {v}");
-        assert_eq!(pw["x-dfe-secret"], true, "schema was: {v}");
         assert_eq!(pw["type"], "string");
     }
 }
