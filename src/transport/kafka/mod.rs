@@ -3242,23 +3242,45 @@ mod tests {
 
     /// Errors librdkafka queued while nothing polled are cleared by ONE
     /// receive, so whatever is queued behind them -- a rebalance, a record --
-    /// is reached without a backoff per stale error. Broker-free: one broker
-    /// refuses and the other holds the connection past its 1 s setup timeout,
-    /// which queues three errors, and the 60 s reconnect backoff keeps a fresh
-    /// error out of the check.
+    /// is reached without a backoff per stale error.
+    ///
+    /// Broker-free, and no error can be queued after the backlog: the
+    /// consumer's only broker is a local peer that resets its first two
+    /// connections and holds the third open without a byte. Each reset queues
+    /// all-brokers-down, plus a transport error where librdkafka reports the
+    /// reset as a receive failure, so the backlog holds at least two errors.
+    /// The broker thread queues them before it opens the third connection, so
+    /// its arrival proves the backlog complete, and with the setup and request
+    /// timeouts past the end of the test, nothing fails after it.
     #[tokio::test]
     async fn queued_errors_clear_in_one_receive() {
-        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent broker");
-        let silent_address = silent.local_addr().expect("silent broker address");
-        std::thread::spawn(move || {
-            // Held open without a byte, so the connection setup times out.
-            let mut held = Vec::new();
-            for stream in silent.incoming() {
+        use tokio::io::AsyncReadExt as _;
+
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a peer broker");
+        let peer_address = peer.local_addr().expect("peer broker address");
+        let (backlog_tx, backlog_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut reset, _) = peer.accept().await.expect("a connection to reset");
+                // Reset only once the request is in, so the client is reading when it lands.
+                let mut request_size = [0_u8; 4];
+                reset
+                    .read_exact(&mut request_size)
+                    .await
+                    .expect("the client's first request");
+                reset.set_zero_linger().expect("reset on close");
+            }
+            let (held, _) = peer.accept().await.expect("a connection to hold");
+            let _ = backlog_tx.send(());
+            let mut held = vec![held];
+            while let Ok((stream, _)) = peer.accept().await {
                 held.push(stream);
             }
         });
-        let config = KafkaConfig {
-            brokers: vec!["127.0.0.1:1".to_string(), silent_address.to_string()],
+        let mut config = KafkaConfig {
+            brokers: vec![peer_address.to_string()],
             group: "scalo-error-backlog".to_string(),
             topics: vec!["events".to_string()],
             ..Default::default()
@@ -3266,15 +3288,22 @@ mod tests {
         .with_overrides(&[
             // Off, so the first poll's 50 ms is not spent on queued stats events.
             ("statistics.interval.ms", "0"),
-            ("socket.connection.setup.timeout.ms", "1000"),
-            ("reconnect.backoff.ms", "60000"),
-            ("reconnect.backoff.max.ms", "60000"),
+            ("socket.connection.setup.timeout.ms", "60000"),
+            ("api.version.request.timeout.ms", "60000"),
         ]);
+        // The transport's producer dials elsewhere, so every connection the peer sees is the consumer's.
+        config
+            .sizing
+            .producer_librdkafka
+            .insert("bootstrap.servers".to_string(), "127.0.0.1:1".to_string());
         let transport = KafkaTransport::new(&config)
             .await
             .expect("a consumer transport constructs broker-free");
-        // Both connection failures have queued about 2 s in, while nothing polls.
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        // A liveness bound only: the consumer reconnects within a second or two.
+        tokio::time::timeout(Duration::from_secs(30), backlog_rx)
+            .await
+            .expect("the consumer reconnects to the peer")
+            .expect("the peer task reports the held connection");
 
         let batch = transport
             .recv(100)
