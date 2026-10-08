@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.4](https://github.com/hyperi-io/scalo-rs/compare/v2.14.3...v2.14.4) (2026-10-08)
+
+### Bug Fixes
+
+* pin loadBalancerIP on the TCP Service only ([#306](https://github.com/hyperi-io/scalo-rs/issues/306)) ([7d04426](https://github.com/hyperi-io/scalo-rs/commit/7d04426bb97a9de26e928bfaf9cd29778635c884))
+
 ## [2.14.3](https://github.com/hyperi-io/scalo-rs/compare/v2.14.2...v2.14.3) (2026-10-08)
 
 ### Bug Fixes
