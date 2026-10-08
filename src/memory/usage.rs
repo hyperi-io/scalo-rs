@@ -141,10 +141,17 @@ pub(crate) struct UsageReader {
     cached_at_nanos: AtomicU64,
     /// False until the first successful read, so a cold reader never serves 0.
     primed: AtomicBool,
-    /// Net bytes admitted since the cached sample, floored at zero: the kernel
-    /// figure is up to [`CACHE_INTERVAL`] stale, so a burst inside one window
-    /// would otherwise be admitted against a reading that predates it.
-    admitted_since_sample: AtomicU64,
+    /// Running total of bytes charged, wrapping. The ledger -- bytes admitted
+    /// since the cached sample and not yet released -- is read off this and
+    /// the two totals below, because the kernel figure is up to
+    /// [`CACHE_INTERVAL`] stale and a burst inside one window would otherwise
+    /// be admitted against a reading that predates it.
+    charged: AtomicU64,
+    /// Running total of bytes released, wrapping, never ahead of `charged`.
+    released: AtomicU64,
+    /// `charged` when the cached sample was taken. A sample moves this mark
+    /// rather than zeroing a balance, so no release can reach back across it.
+    charged_at_sample: AtomicU64,
     /// File reads taken, so a test can count them.
     #[cfg(test)]
     samples: std::sync::atomic::AtomicUsize,
@@ -165,7 +172,9 @@ impl UsageReader {
             cached_bytes: AtomicU64::new(0),
             cached_at_nanos: AtomicU64::new(0),
             primed: AtomicBool::new(false),
-            admitted_since_sample: AtomicU64::new(0),
+            charged: AtomicU64::new(0),
+            released: AtomicU64::new(0),
+            charged_at_sample: AtomicU64::new(0),
             #[cfg(test)]
             samples: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -207,50 +216,71 @@ impl UsageReader {
     ///
     /// A reader that sees the reader primed also sees the reading that primed
     /// it (`Release` on the flag, `Acquire` on its loads). The sample and the
-    /// ledger are still two atomics, not one pair: a reader landing between a
-    /// sampler's ledger clear and its new reading takes the previous reading
+    /// ledger are still separate atomics, not one record: a reader landing
+    /// between a sampler's mark and its new reading takes the previous reading
     /// against an empty ledger, an under-count that lasts until the reading
     /// lands. Electing one sampler per window keeps that to one gap a window.
     pub(crate) fn estimate(&self) -> Option<u64> {
         let sampled = self.read()?;
-        Some(sampled.saturating_add(self.admitted_since_sample.load(Ordering::Relaxed)))
+        Some(sampled.saturating_add(self.ledger()))
     }
 
     /// Charge an admission to the ledger, until the next sample sees it.
     pub(crate) fn admit(&self, bytes: u64) {
-        self.admitted_since_sample
-            .fetch_add(bytes, Ordering::Relaxed);
+        self.charged.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Charge an admission and return the ledger total that charge produced,
-    /// saturating, so a caller judging the limit judges its own charge in.
-    pub(crate) fn admit_and_get(&self, bytes: u64) -> u64 {
-        let previous = self
-            .admitted_since_sample
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_add(bytes))
+    /// Charge an admission only if `sampled` plus the ledger, this charge
+    /// included, stays within `limit`. The judgement and the charge are one
+    /// compare-exchange, so threads sharing one reading cannot each admit
+    /// against the same headroom, and a refusal leaves nothing to roll back.
+    pub(crate) fn try_admit(&self, sampled: u64, bytes: u64, limit: u64) -> bool {
+        // Loaded before `charged`, so neither total can be ahead of it.
+        let charged_at_sample = self.charged_at_sample.load(Ordering::Acquire);
+        let released = self.released.load(Ordering::Acquire);
+        self.charged
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
+                let ledger = since_sample(charged, charged_at_sample, released);
+                let fits = sampled.saturating_add(ledger).saturating_add(bytes) <= limit;
+                fits.then(|| charged.wrapping_add(bytes))
             })
-            // Always succeeds (closure always returns Some).
-            .unwrap_or_else(|v| v);
-        previous.saturating_add(bytes)
+            .is_ok()
     }
 
-    /// Discharge released bytes from the ledger, saturating at zero.
+    /// Discharge released bytes, oldest charge first, never more than is
+    /// outstanding.
+    ///
+    /// A release names no charge, so it is taken from what was outstanding at
+    /// the last sample before any charge made since. A lease taken before a
+    /// re-sample and released after it then leaves the ledger alone, because
+    /// the fresh reading already counts it.
     pub(crate) fn forget(&self, bytes: u64) {
-        let _ = self.admitted_since_sample.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(bytes)),
-        );
+        let _ = self
+            .released
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |released| {
+                // Loaded after `released`, so it is never behind it.
+                let outstanding = self.charged.load(Ordering::Relaxed).wrapping_sub(released);
+                Some(released.wrapping_add(bytes.min(outstanding)))
+            });
+    }
+
+    /// Bytes charged since the cached sample and not yet released.
+    fn ledger(&self) -> u64 {
+        // Loaded before `charged`, so neither total can be ahead of it.
+        let charged_at_sample = self.charged_at_sample.load(Ordering::Acquire);
+        let released = self.released.load(Ordering::Acquire);
+        let charged = self.charged.load(Ordering::Relaxed);
+        since_sample(charged, charged_at_sample, released)
     }
 
     fn sample(&self) -> Option<u64> {
         #[cfg(test)]
         self.samples.fetch_add(1, Ordering::Relaxed);
-        // Cleared before the file read, not after: an admission landing between
+        // Marked before the file read, not after: an admission landing between
         // the two is then double-counted rather than dropped, and over-counting
         // brakes early where an under-count is the overshoot that OOM-kills.
-        self.admitted_since_sample.store(0, Ordering::Relaxed);
+        let charged = self.charged.load(Ordering::Relaxed);
+        self.charged_at_sample.store(charged, Ordering::Release);
         match self.source.read() {
             Some(bytes) => {
                 self.cached_bytes.store(bytes, Ordering::Relaxed);
@@ -273,6 +303,24 @@ impl UsageReader {
     fn elapsed_nanos(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
+
+    /// Take a fresh sample now, as the reader elected at a window boundary does.
+    #[cfg(test)]
+    pub(super) fn resample(&self) -> Option<u64> {
+        self.sample()
+    }
+}
+
+/// Bytes charged after the sample mark and not yet released:
+/// `charged - max(charged_at_sample, released)`.
+///
+/// Releases are spent on the charges outstanding at the mark first, so they
+/// shrink the ledger only once they pass it. Both totals trail `charged`, so
+/// each wrapping difference is exact while under 2^64 bytes are outstanding.
+fn since_sample(charged: u64, charged_at_sample: u64, released: u64) -> u64 {
+    charged
+        .wrapping_sub(charged_at_sample)
+        .min(charged.wrapping_sub(released))
 }
 
 #[cfg(test)]
@@ -454,12 +502,61 @@ mod tests {
     }
 
     #[test]
-    fn admit_and_get_returns_the_total_its_charge_made() {
+    fn try_admit_charges_only_what_fits() {
         let reader = UsageReader::new(UsageSource::Reservations);
-        assert_eq!(reader.admit_and_get(10), 10);
-        assert_eq!(reader.admit_and_get(5), 15);
-        reader.forget(15);
-        assert_eq!(reader.admit_and_get(u64::MAX), u64::MAX, "saturates");
+        assert!(reader.try_admit(0, 6, 10));
+        assert!(!reader.try_admit(0, 5, 10), "6 + 5 is over 10");
+        assert!(
+            reader.try_admit(0, 4, 10),
+            "the refusal charged nothing, so 6 + 4 fits exactly"
+        );
+        assert!(
+            !reader.try_admit(0, u64::MAX, 10),
+            "10 + u64::MAX saturates rather than wrapping back under the limit"
+        );
+        assert!(
+            !reader.try_admit(1, 0, 10),
+            "a reading of 1 over a full ledger"
+        );
+        assert_eq!(reader.ledger(), 10);
+    }
+
+    #[test]
+    fn forget_never_releases_more_than_is_outstanding() {
+        let reader = UsageReader::new(UsageSource::Reservations);
+        reader.admit(4);
+        reader.forget(10);
+        assert_eq!(reader.ledger(), 0);
+        reader.admit(3);
+        assert_eq!(
+            reader.ledger(),
+            3,
+            "the excess release left no credit against a later charge"
+        );
+    }
+
+    /// The totals are running counters, so they wrap. The ledger reads their
+    /// differences and must not notice.
+    #[test]
+    fn the_ledger_survives_its_totals_wrapping() {
+        let reader = UsageReader::new(UsageSource::Reservations);
+        let near_wrap = u64::MAX - 5;
+        reader.charged.store(near_wrap, Ordering::Relaxed);
+        reader.released.store(near_wrap, Ordering::Relaxed);
+        reader.charged_at_sample.store(near_wrap, Ordering::Relaxed);
+
+        reader.admit(10);
+        assert_eq!(reader.ledger(), 10, "charged wrapped past zero");
+        reader.forget(8);
+        assert_eq!(reader.ledger(), 2, "released wrapped past zero");
+        assert!(reader.try_admit(0, 8, 10));
+        assert!(!reader.try_admit(0, 1, 10));
+        reader.forget(u64::MAX);
+        assert_eq!(
+            reader.ledger(),
+            0,
+            "released stops at charged, past the wrap"
+        );
     }
 
     #[test]

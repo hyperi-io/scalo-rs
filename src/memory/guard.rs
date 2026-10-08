@@ -418,12 +418,12 @@ impl MemoryGuard {
     /// counter -- the kernel charges the bytes once they are allocated and
     /// uncharges them on drop, so no `release` is needed to keep the check
     /// honest. An admission is charged to the usage reader's ledger so the
-    /// callers behind it in the same cache window see it, and the charge is
-    /// taken before the check and rolled back on refusal, so callers racing on
-    /// one reading admit only what fits between them. Only where no usage
-    /// source is readable does it fall back to the classic atomic
-    /// check-and-add on the per-batch counter (rolled back if it would exceed
-    /// the limit).
+    /// callers behind it in the same cache window see it, and the check and
+    /// the charge are one compare-exchange, so callers racing on one reading
+    /// admit only what fits between them and a refusal charges nothing. Only
+    /// where no usage source is readable does it fall back to the classic
+    /// atomic check-and-add on the per-batch counter (rolled back if it would
+    /// exceed the limit).
     #[inline]
     pub fn try_reserve(&self, bytes: u64) -> bool {
         if let Some(heap) = heap_bytes() {
@@ -431,19 +431,7 @@ impl MemoryGuard {
             return heap.saturating_add(bytes) <= self.limit_bytes;
         }
         if let Some(sampled) = self.usage.read() {
-            // More than the whole limit never fits, and is refused before it can
-            // saturate the ledger and erase other callers' charges on rollback.
-            if bytes > self.limit_bytes {
-                return false;
-            }
-            // Charge first, then judge the total the charge produced, so threads
-            // sharing one estimate cannot each admit against the same headroom.
-            let admitted = self.usage.admit_and_get(bytes);
-            if sampled.saturating_add(admitted) > self.limit_bytes {
-                self.usage.forget(bytes);
-                return false;
-            }
-            return true;
+            return self.usage.try_admit(sampled, bytes, self.limit_bytes);
         }
         let current = self.reserved_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if current > self.limit_bytes {
@@ -469,7 +457,13 @@ impl MemoryGuard {
 
     /// Release bytes after data is flushed/sent/dropped.
     ///
-    /// Uses saturating subtraction to prevent underflow wrapping.
+    /// The reservation counter saturates at zero rather than wrapping. The
+    /// usage ledger is discharged oldest charge first: a lease taken before a
+    /// usage re-sample and released after it spends bytes the fresh reading
+    /// already counts, never a charge another caller made since. While a lease
+    /// older than the reading is still outstanding, a newer one's release is
+    /// spent on it, so the ledger over-counts by at most what was outstanding
+    /// at the sample, until that lease ends or the next sample.
     #[inline]
     pub fn release(&self, bytes: u64) {
         self.usage.forget(bytes);
@@ -818,8 +812,8 @@ mod tests {
     }
 
     /// Two callers released together into one cache window, against headroom
-    /// for one: exactly one is admitted, every round, because each judges the
-    /// total its own charge made.
+    /// for one: exactly one is admitted, every round, because each judges and
+    /// charges in one compare-exchange.
     #[test]
     fn two_racing_reserves_against_room_for_one_admit_one() {
         let six_mib = 6 * 1024 * 1024;
@@ -846,7 +840,7 @@ mod tests {
             assert_eq!(
                 guard.current_bytes(),
                 six_mib,
-                "round {round}: the refused charge was rolled back"
+                "round {round}: the refusal charged nothing"
             );
         }
     }
@@ -886,6 +880,179 @@ mod tests {
             guard.try_reserve(six_mib),
             "the new reading accounts for those bytes, so the ledger restarts"
         );
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Rewrite the fixture's `memory.current`, as the kernel moves its charge.
+    fn set_current(dir: &tempfile::TempDir, bytes: u64) {
+        std::fs::write(dir.path().join("memory.current"), format!("{bytes}\n")).expect("write");
+    }
+
+    /// A lease taken before a re-sample and released after it: the fresh
+    /// reading already counts its bytes, so its release must not erase a charge
+    /// another caller made since.
+    #[test]
+    fn a_lease_released_across_a_resample_keeps_later_charges() {
+        let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+        let guard = ledger_guard(&dir, ONE_WINDOW);
+
+        guard.add_bytes(4 * MIB);
+        set_current(&dir, 4 * MIB);
+        guard.usage.resample();
+        assert!(
+            guard.try_reserve(4 * MIB),
+            "4 MiB read plus 4 MiB admitted fits 10 MiB"
+        );
+
+        guard.release(4 * MIB);
+        assert!(
+            !guard.try_reserve(4 * MIB),
+            "a third 4 MiB is 12 MiB of a 10 MiB limit"
+        );
+        assert_eq!(
+            guard.current_bytes(),
+            8 * MIB,
+            "the reading holds the old lease until the next sample, and the new charge stays"
+        );
+    }
+
+    /// A lease charged and released inside one window comes straight off the
+    /// ledger and leaves other callers' charges alone, before a re-sample and
+    /// after one taken with nothing outstanding.
+    #[test]
+    fn a_lease_released_in_its_own_window_discharges_its_charge() {
+        let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+        let guard = ledger_guard(&dir, ONE_WINDOW);
+
+        assert!(guard.try_reserve(2 * MIB));
+        guard.add_bytes(6 * MIB);
+        guard.release(6 * MIB);
+        assert_eq!(
+            guard.current_bytes(),
+            2 * MIB,
+            "the lease is gone, the other charge stays"
+        );
+
+        guard.release(2 * MIB);
+        guard.usage.resample();
+        assert!(guard.try_reserve(3 * MIB));
+        guard.add_bytes(6 * MIB);
+        guard.release(6 * MIB);
+        assert_eq!(
+            guard.current_bytes(),
+            3 * MIB,
+            "same again in the window after the re-sample"
+        );
+    }
+
+    /// A release names no lease, so while a lease older than the reading is
+    /// outstanding a newer lease's release is spent on it: the ledger
+    /// over-counts, never under, and is exact again once the older lease ends.
+    #[test]
+    fn a_newer_release_is_spent_on_an_older_lease_first() {
+        let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+        let guard = ledger_guard(&dir, ONE_WINDOW);
+
+        guard.add_bytes(3 * MIB);
+        set_current(&dir, 3 * MIB);
+        guard.usage.resample();
+
+        guard.add_bytes(2 * MIB);
+        guard.release(2 * MIB);
+        assert_eq!(
+            guard.current_bytes(),
+            5 * MIB,
+            "spent on the older lease: over by the newer 2 MiB, never under"
+        );
+
+        guard.release(3 * MIB);
+        assert_eq!(
+            guard.current_bytes(),
+            3 * MIB,
+            "both leases ended: only the reading is left"
+        );
+    }
+
+    /// Releasing a lease twice is a caller bug. Neither number goes below zero,
+    /// and the extra release leaves no credit to admit against, in one window
+    /// or across a re-sample.
+    #[test]
+    fn a_double_release_leaves_no_credit_behind() {
+        let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+        let guard = ledger_guard(&dir, ONE_WINDOW);
+
+        guard.add_bytes(2 * MIB);
+        guard.release(2 * MIB);
+        guard.release(2 * MIB);
+        assert_eq!(guard.reserved_bytes(), 0);
+        assert_eq!(guard.current_bytes(), 0, "the ledger stops at zero");
+
+        guard.add_bytes(2 * MIB);
+        set_current(&dir, 2 * MIB);
+        guard.usage.resample();
+        guard.release(2 * MIB);
+        guard.release(2 * MIB);
+        assert!(
+            guard.try_reserve(8 * MIB),
+            "2 MiB read plus 8 MiB is the 10 MiB limit"
+        );
+        assert!(
+            !guard.try_reserve(1),
+            "the extra release left no credit to let one more byte in"
+        );
+        assert_eq!(guard.current_bytes(), 10 * MIB);
+    }
+
+    /// Threads take leases, a re-sample counts them, then the same threads
+    /// release those leases while racing for the headroom left. The limit
+    /// holds every round, and the ledger ends at exactly what was admitted.
+    #[test]
+    fn concurrent_releases_across_a_resample_hold_the_limit() {
+        const THREADS: usize = 8;
+        const LEASE: u64 = 512 * 1024;
+        const LEASES: u64 = THREADS as u64 * LEASE;
+        const SLOT: u64 = 256 * 1024;
+        // 10 MiB limit less the 4 MiB of leases the reading counts.
+        const SLOTS_THAT_FIT: u64 = (10 * MIB - LEASES) / SLOT;
+
+        for round in 0..100 {
+            let dir = cgroup_fixture(&[("memory.current", "0\n")]);
+            let guard = ledger_guard(&dir, ONE_WINDOW);
+            for _ in 0..THREADS {
+                guard.add_bytes(LEASE);
+            }
+            set_current(&dir, LEASES);
+            guard.usage.resample();
+
+            let barrier = std::sync::Barrier::new(THREADS);
+            let admitted: u64 = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            let mut slots = u64::from(guard.try_reserve(SLOT));
+                            guard.release(LEASE);
+                            for _ in 0..4 {
+                                slots += u64::from(guard.try_reserve(SLOT));
+                            }
+                            slots
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|h| h.join().unwrap()).sum()
+            });
+
+            assert_eq!(
+                admitted, SLOTS_THAT_FIT,
+                "round {round}: {admitted} slots of 256 KiB admitted into 6 MiB of headroom"
+            );
+            assert_eq!(
+                guard.current_bytes(),
+                LEASES + admitted * SLOT,
+                "round {round}: the reading plus exactly what was admitted"
+            );
+        }
     }
 
     #[test]
