@@ -1,0 +1,2 @@
+fixture=stage
+error=files/contract.json has no metrics_port

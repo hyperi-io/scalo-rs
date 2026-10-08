@@ -1,0 +1,2 @@
+fixture=singleton
+error=marks this app a singleton

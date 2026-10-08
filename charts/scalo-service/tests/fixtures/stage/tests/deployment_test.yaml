@@ -1,0 +1,474 @@
+suite: deployment
+templates:
+  - deployment.yaml
+release:
+  name: release
+  namespace: apps
+tests:
+  - it: names the Deployment after the chart and pins the image by digest
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: metadata.name
+          value: event-stage
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.com/team/event-stage:v1.4.2@sha256:0b3a9c1d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: ["--config", "/etc/event-stage/config.yaml"]
+
+  - it: keeps the selector to the name label whatever labels values add
+    set:
+      commonLabels:
+        app.kubernetes.io/name: hijacked
+        team: data
+      podLabels:
+        app.kubernetes.io/name: hijacked
+        app.kubernetes.io/instance: other
+        tier: stage
+    asserts:
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: event-stage
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: event-stage
+      - equal:
+          path: metadata.labels["app.kubernetes.io/name"]
+          value: event-stage
+      - equal:
+          path: spec.template.metadata.labels.tier
+          value: stage
+      - equal:
+          path: metadata.labels.team
+          value: data
+
+  - it: renames every name and the selector with fullnameOverride, never the release name
+    set:
+      fullnameOverride: event-stage-eu
+    asserts:
+      - equal:
+          path: metadata.name
+          value: event-stage-eu
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: event-stage-eu
+      - equal:
+          path: spec.template.spec.volumes[0].configMap.name
+          value: event-stage-eu-config
+
+  - it: leaves replicas to KEDA while the contract turns it on
+    asserts:
+      - notExists:
+          path: spec.replicas
+
+  - it: sets replicas from replicaCount once KEDA is off
+    set:
+      keda.enabled: false
+      replicaCount: 3
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  - it: replaces pods surge-first
+    asserts:
+      - equal:
+          path: spec.strategy
+          value:
+            type: RollingUpdate
+            rollingUpdate:
+              maxUnavailable: 0
+              maxSurge: 1
+
+  - it: checksums the rendered config file
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+
+  - it: rolls the pods when the rendered config changes
+    set:
+      config.buffer.flush_rows: 5000
+    asserts:
+      - notEqual:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+
+  - it: scrapes the contract's metrics port and path
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/port"]
+          value: "9090"
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/path"]
+          value: /metrics
+
+  - it: turns scrape annotations off with telemetry.prometheus.scrape false
+    set:
+      telemetry.prometheus.scrape: false
+    asserts:
+      - notExists:
+          path: spec.template.metadata.annotations["prometheus.io/scrape"]
+
+  - it: gives the startup probe the contract's startup budget on the liveness path
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe
+          value:
+            httpGet:
+              path: /livez
+              port: metrics
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+
+  - it: merges a partial probe override over the derived probe
+    set:
+      livenessProbe.periodSeconds: 30
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.periodSeconds
+          value: 30
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /livez
+
+  - it: runs non-root on a read-only root filesystem with every capability dropped
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext
+          value:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+      - equal:
+          path: spec.template.spec.containers[0].securityContext
+          value:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+  - it: lets containerSecurityContext turn the read-only root filesystem off
+    set:
+      containerSecurityContext.readOnlyRootFilesystem: false
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: false
+
+  - it: takes the termination grace from the contract, then values, honouring 0
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 45
+
+  - it: overrides the termination grace from values
+    set:
+      terminationGracePeriodSeconds: 0
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 0
+
+  - it: renders extraEnv first and drops a name the chart derives
+    set:
+      extraEnv:
+        AAA_FIRST: "1"
+        OTEL_SERVICE_NAME: overridden
+        RETRIES: 5
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[0]
+          value:
+            name: AAA_FIRST
+            value: "1"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RETRIES
+            value: "5"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_SERVICE_NAME
+            value: event-stage
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_SERVICE_NAME
+            value: overridden
+
+  - it: reads each secret variable from the group's Secret, optional where the contract says
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: EVENT_STAGE__KAFKA__PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: event-stage-kafka
+                key: kafka-password
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: EVENT_STAGE__AUTH__TOKENS
+            valueFrom:
+              secretKeyRef:
+                name: event-stage-auth
+                key: bearer-tokens
+                optional: true
+
+  - it: points a secret group at an existing Secret, renames a key, and drops a disabled group
+    set:
+      secrets.kafka.existingSecret: broker-credentials
+      secrets.kafka.keys.password: sasl-password
+      secrets.auth.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: EVENT_STAGE__KAFKA__PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: broker-credentials
+                key: sasl-password
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: EVENT_STAGE__AUTH__TOKENS
+            valueFrom:
+              secretKeyRef:
+                name: event-stage-auth
+                key: bearer-tokens
+                optional: true
+
+  - it: writes version-check overrides under the contract's env prefix only when set
+    set:
+      versionCheck.enabled: false
+      versionCheck.apiUrl: https://mirror.example.com/releases
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: EVENT_STAGE_VERSION_CHECK__ENABLED
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: EVENT_STAGE_VERSION_CHECK__API_URL
+            value: https://mirror.example.com/releases
+
+  - it: exports OTLP only when otel.endpoint is set
+    set:
+      otel.endpoint: http://collector.observability:4317
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: http://collector.observability:4317
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_EXPORTER_OTLP_PROTOCOL
+            value: grpc
+
+  - it: opens a gated port only while its condition holds, falling back to default_config
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports
+          value:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: syslog
+              containerPort: 5514
+              protocol: UDP
+
+  - it: opens the gRPC port when values turn it on and closes syslog when its protocol moves
+    set:
+      config.grpc.enabled: true
+      config.syslog.protocol: tcp
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: grpc
+            containerPort: 6000
+            protocol: TCP
+      - notContains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: syslog
+            containerPort: 5514
+            protocol: UDP
+
+  - it: mounts the config directory, the spool with its size cap, and /tmp
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts
+          value:
+            - name: config
+              mountPath: /etc/event-stage
+              readOnly: true
+            - name: writable-spool
+              mountPath: /var/lib/event-stage/spool
+            - name: writable-tmp
+              mountPath: /tmp
+            - name: serviceaccount-files
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: writable-spool
+            emptyDir:
+              sizeLimit: 2Gi
+
+  - it: drops the spool when its condition no longer holds
+    set:
+      config.spool.enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: writable-spool
+            mountPath: /var/lib/event-stage/spool
+
+  - it: mounts the config as one file with configMount.subPath
+    set:
+      configMount.subPath: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[0]
+          value:
+            name: config
+            mountPath: /etc/event-stage/config.yaml
+            subPath: config.yaml
+            readOnly: true
+
+  - it: takes resources from the contract, overridden by values, with an empty string dropping one
+    set:
+      resources.requests.memory: 512Mi
+      resources.limits.cpu: ""
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+
+  - it: moves the image with global.registry and image.repository
+    set:
+      global.registry: mirror.example.com/apps
+      image.digest: ""
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: mirror.example.com/apps/event-stage:v1.4.2
+
+  - it: lets image.repository replace the whole repository
+    set:
+      image.repository: other.example.com/stage
+      image.tag: v2.0.0
+      image.digest: ""
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: other.example.com/stage:v2.0.0
+
+  - it: mounts no service-account token, but keeps the files the token path holds
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: serviceaccount-files
+            projected:
+              sources:
+                - configMap:
+                    name: kube-root-ca.crt
+                    items:
+                      - key: ca.crt
+                        path: ca.crt
+                - downwardAPI:
+                    items:
+                      - path: namespace
+                        fieldRef:
+                          fieldPath: metadata.namespace
+
+  - it: drops the service-account files when the token is mounted
+    set:
+      serviceAccount.mountToken: true
+    asserts:
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: serviceaccount-files
+            mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+            readOnly: true
+
+  - it: passes init containers, sidecars and extra volumes through tpl
+    set:
+      initContainers:
+        - name: wait
+          image: busybox:1.37
+          args: ["{{ .Release.Namespace }}"]
+      sidecars:
+        - name: proxy
+          image: envoyproxy/envoy:v1.36.0
+      extraVolumes:
+        - name: certs
+          secret:
+            secretName: "{{ .Release.Name }}-certs"
+      extraVolumeMounts:
+        - name: certs
+          mountPath: /etc/certs
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].args[0]
+          value: apps
+      - equal:
+          path: spec.template.spec.containers[1].name
+          value: proxy
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: certs
+            secret:
+              secretName: release-certs
+
+  - it: adds reload annotations to the Deployment when reload.enabled
+    set:
+      reload.enabled: true
+      reload.secrets: ["broker-credentials"]
+    asserts:
+      - equal:
+          path: metadata.annotations["reloader.stakater.com/auto"]
+          value: "true"
+      - equal:
+          path: metadata.annotations["secret.reloader.stakater.com/reload"]
+          value: broker-credentials

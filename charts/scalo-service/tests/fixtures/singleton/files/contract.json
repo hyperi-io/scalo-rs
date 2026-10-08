@@ -1,0 +1,36 @@
+{
+  "schema_version": 4,
+  "app_name": "cursor-keeper",
+  "description": "A singleton that keeps its cursors on a persistent volume",
+  "metrics_port": 9100,
+  "health": {
+    "liveness_path": "/livez",
+    "readiness_path": "/readyz",
+    "metrics_path": "/metrics",
+    "startup_budget_seconds": 300
+  },
+  "env_prefix": "",
+  "metric_prefix": "keeper",
+  "image_registry": "registry.example.com/team",
+  "extra_ports": [
+    { "name": "api", "port": 8443, "protocol": "TCP", "public": true, "app_protocol": "https" },
+    { "name": "tunnel", "port": 1194, "protocol": "UDP", "public": true }
+  ],
+  "keda": null,
+  "writable_paths": [
+    { "name": "state", "path": "/var/lib/cursor-keeper", "persistent": true, "size": "5Gi" },
+    { "name": "cache", "path": "/var/cache/cursor-keeper", "size_limit": "512Mi", "size": "1Gi" }
+  ],
+  "termination_grace_seconds": 90,
+  "resources": {
+    "requests": { "memory": "64Mi" }
+  },
+  "security": {
+    "run_as_user": 10001,
+    "run_as_group": 10001,
+    "fs_group": 10001,
+    "read_only_root_filesystem": true,
+    "capabilities_add": ["NET_ADMIN"]
+  },
+  "singleton": true
+}

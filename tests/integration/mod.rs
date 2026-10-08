@@ -19,6 +19,9 @@ mod env_parity;
 mod config_parity;
 
 #[cfg(feature = "config-schema")]
+mod chart_fixtures;
+
+#[cfg(feature = "config-schema")]
 mod contract_parity;
 
 #[cfg(feature = "logger")]

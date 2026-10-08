@@ -1,0 +1,12 @@
+# No autoscaler: a fixed replica count, no spool, and the config mounted as one file.
+keda:
+  enabled: false
+replicaCount: 3
+configMount:
+  subPath: true
+config:
+  spool:
+    enabled: false
+resources:
+  limits:
+    cpu: ""

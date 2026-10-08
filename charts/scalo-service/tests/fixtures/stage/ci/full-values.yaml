@@ -1,0 +1,102 @@
+# Every extension point at once, so kubeconform sees each object the library can render.
+fullnameOverride: event-stage-eu
+partOf: pipeline
+commonLabels:
+  team: data
+commonAnnotations:
+  owner: data-team
+podLabels:
+  tier: stage
+podAnnotations:
+  sidecar.example.com/inject: "false"
+imagePullSecrets:
+  - registry-credentials
+  - name: mirror-credentials
+config:
+  grpc:
+    enabled: true
+  buffer:
+    flush_rows: 5000
+configOverrides:
+  loader:
+    endpoint: loader:6000
+extraEnv:
+  RUST_LOG: info
+extraEnvFrom:
+  - secretRef:
+      name: cloud-credentials
+      optional: true
+otel:
+  endpoint: http://collector.observability:4317
+versionCheck:
+  enabled: false
+reload:
+  enabled: true
+  secrets: ["broker-credentials"]
+secrets:
+  kafka:
+    existingSecret: broker-credentials
+keda:
+  maxReplicaCount: 20
+  extraTriggers:
+    - type: metrics-api
+      metricType: Value
+      metadata:
+        url: "http://pressure.{{ .Release.Namespace }}.svc:8080/pressure"
+        targetValue: "70"
+        valueLocation: value
+  triggerAuthentication:
+    secretTargetRef:
+      - parameter: password
+        name: broker-credentials
+        key: password
+pdb:
+  minAvailable: 1
+replicaCount: 2
+publicService:
+  enabled: true
+  loadBalancerSourceRanges: ["203.0.113.0/24"]
+networkPolicy:
+  enabled: true
+fileSets:
+  transforms:
+    mountPath: /etc/event-stage-transforms
+    files:
+      - name: main.vrl
+        content: ".message = upcase(string!(.message))\n"
+nodeSelector:
+  kubernetes.io/arch: arm64
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: pipeline
+    effect: NoSchedule
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: event-stage-eu
+initContainers:
+  - name: wait
+    image: busybox:1.37
+    command: ["sh", "-c", "echo {{ .Release.Namespace }}"]
+sidecars:
+  - name: proxy
+    image: envoyproxy/envoy:v1.36.0
+extraVolumes:
+  - name: certs
+    secret:
+      secretName: event-stage-certs
+extraVolumeMounts:
+  - name: certs
+    mountPath: /etc/certs
+    readOnly: true
+extraObjects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: "{{ .Release.Name }}-extra"
+    data:
+      namespace: "{{ .Release.Namespace }}"

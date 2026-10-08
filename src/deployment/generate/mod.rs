@@ -73,6 +73,7 @@ mod tests {
                             secret_key: "kafka-password".into(),
                         },
                     ],
+                    optional: false,
                 },
                 SecretGroupContract {
                     group_name: "clickhouse".into(),
@@ -81,6 +82,7 @@ mod tests {
                         key_name: "password".into(),
                         secret_key: "clickhouse-password".into(),
                     }],
+                    optional: false,
                 },
             ],
             default_config: None,
@@ -93,6 +95,11 @@ mod tests {
             oci_labels: OciLabels::default(),
             config_schema: None,
             capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: crate::deployment::ResourcesContract::default(),
+            security: crate::deployment::SecurityContract::default(),
+            singleton: false,
         }
     }
 
@@ -1530,6 +1537,7 @@ mod tests {
                 key_name: "bearer-tokens".into(),
                 secret_key: "bearer-tokens".into(),
             }],
+            optional: false,
         });
 
         let dir = tempfile::tempdir().unwrap();

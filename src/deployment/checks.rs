@@ -8,7 +8,9 @@
 
 //! The one check a contract passes before an artefact is generated from it.
 
-use super::contract::{DeploymentContract, PortCondition, PortContract};
+use std::collections::BTreeSet;
+
+use super::contract::{DeploymentContract, PortCondition, PortContract, WritablePath};
 use super::error::DeploymentError;
 
 /// The protocols Kubernetes takes on a container or Service port.
@@ -16,6 +18,9 @@ const KUBERNETES_PROTOCOLS: [&str; 3] = ["TCP", "UDP", "SCTP"];
 
 /// The longest port name Kubernetes takes (an RFC 6335 `IANA_SVC_NAME`).
 const MAX_PORT_NAME_LEN: usize = 15;
+
+/// The longest writable path name, so `writable-<name>` stays a 63-character volume name.
+const MAX_WRITABLE_NAME_LEN: usize = 50;
 
 impl DeploymentContract {
     /// Check that every artefact generated from this contract comes out valid.
@@ -36,7 +41,15 @@ impl DeploymentContract {
     /// print them onto one line and a newline there starts an instruction or a
     /// key of its own. KEDA left on needs a trigger to scale on, and a
     /// ScaledObject whose only trigger is CPU needs `min_replicas` of at least
-    /// one, because KEDA's CPU scaler cannot wake a workload from zero.
+    /// one, because KEDA's CPU scaler cannot wake a workload from zero. A
+    /// `singleton` runs one pod, so it cannot leave KEDA on.
+    ///
+    /// Each writable path needs a unique name of 1 to 50 lowercase letters,
+    /// digits and inner hyphens, a unique absolute path, and a claim size when
+    /// it is persistent. Each added
+    /// capability is an upper-case Linux capability name such as `NET_ADMIN`.
+    /// Every `x-scalo-dial` marker in `config_schema` is `big` or `small`, and
+    /// every `$ref` the dial search follows resolves.
     ///
     /// # Errors
     ///
@@ -54,7 +67,60 @@ impl DeploymentContract {
         for (index, port) in self.extra_ports.iter().enumerate() {
             check_port(index, port)?;
         }
+        self.check_writable_paths()?;
+        self.check_security()?;
+        if let Some(schema) = &self.config_schema {
+            super::dials(schema)
+                .map_err(|e| invalid("config_schema".to_string(), e.to_string()))?;
+        }
+        if self.singleton && self.enabled_keda().is_some() {
+            return Err(invalid(
+                "keda".to_string(),
+                "a singleton runs exactly one pod, so KEDA must be off; set `keda: None`"
+                    .to_string(),
+            ));
+        }
         self.check_keda()
+    }
+
+    /// The `writable_paths` half of [`validate`](Self::validate).
+    fn check_writable_paths(&self) -> Result<(), DeploymentError> {
+        let mut names = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        for (index, writable) in self.writable_paths.iter().enumerate() {
+            check_writable_path(index, writable)?;
+            let field = |part: &str| format!("writable_paths[{}].{part}", writable.name);
+            if !names.insert(writable.name.as_str()) {
+                return Err(invalid(field("name"), "is declared twice".to_string()));
+            }
+            if !paths.insert(writable.path.trim_end_matches('/')) {
+                return Err(invalid(
+                    field("path"),
+                    format!("{:?} is mounted by another writable path", writable.path),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `security` half of [`validate`](Self::validate).
+    fn check_security(&self) -> Result<(), DeploymentError> {
+        for (index, capability) in self.security.capabilities_add.iter().enumerate() {
+            let named = !capability.is_empty()
+                && capability
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+            if !named {
+                return Err(invalid(
+                    format!("security.capabilities_add[{index}]"),
+                    format!(
+                        "{capability:?} is not a Linux capability name; write it upper case \
+                         without the CAP_ prefix, e.g. NET_ADMIN"
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The KEDA half of [`validate`](Self::validate).
@@ -123,7 +189,70 @@ fn check_port(index: usize, port: &PortContract) -> Result<(), DeploymentError> 
             holds_a_control_character(path),
         ));
     }
+    if has_control(&port.app_protocol) {
+        return Err(invalid(
+            field("app_protocol"),
+            holds_a_control_character(&port.app_protocol),
+        ));
+    }
     Ok(())
+}
+
+/// Check one writable path, naming it by index until its name is known to be printable.
+fn check_writable_path(index: usize, writable: &WritablePath) -> Result<(), DeploymentError> {
+    if let Some(fault) = writable_name_fault(&writable.name) {
+        return Err(invalid(
+            format!("writable_paths[{index}].name"),
+            format!(
+                "{:?} {fault}, and a writable path name is 1 to {MAX_WRITABLE_NAME_LEN} \
+                 lowercase letters, digits and inner hyphens",
+                writable.name
+            ),
+        ));
+    }
+    let field = |part: &str| format!("writable_paths[{}].{part}", writable.name);
+    if !writable.path.starts_with('/') || has_control(&writable.path) {
+        return Err(invalid(
+            field("path"),
+            format!("{:?} is not an absolute path on one line", writable.path),
+        ));
+    }
+    if writable.persistent && writable.size.trim().is_empty() {
+        return Err(invalid(
+            field("size"),
+            "a persistent path needs a size for its claim, e.g. \"1Gi\"".to_string(),
+        ));
+    }
+    for text in [&writable.size, &writable.size_limit] {
+        if has_control(text) {
+            return Err(invalid(field("size"), holds_a_control_character(text)));
+        }
+    }
+    if let Some(text) = writable
+        .when
+        .as_ref()
+        .and_then(|when| condition_texts(when).find(|text| has_control(text)))
+    {
+        return Err(invalid(field("when"), holds_a_control_character(text)));
+    }
+    Ok(())
+}
+
+/// Why `name` is not a writable path name, or `None` when it is one.
+fn writable_name_fault(name: &str) -> Option<&'static str> {
+    if name.is_empty() || name.len() > MAX_WRITABLE_NAME_LEN {
+        return Some("is not 1 to 50 characters long");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Some("holds a character other than a lowercase letter, a digit or '-'");
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Some("starts or ends with '-'");
+    }
+    None
 }
 
 /// Why `name` is not a port name Kubernetes takes, or `None` when it is one.
@@ -174,6 +303,158 @@ fn invalid(field: String, reason: String) -> DeploymentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deployment::{
+        HealthContract, ImageProfile, KedaContract, NativeDepsContract, OciLabels,
+        ResourcesContract, SecurityContract,
+    };
+
+    fn contract() -> DeploymentContract {
+        DeploymentContract {
+            schema_version: crate::deployment::CONTRACT_SCHEMA_VERSION,
+            app_name: "app".into(),
+            binary_name: String::new(),
+            description: String::new(),
+            metrics_port: 9090,
+            health: HealthContract::default(),
+            env_prefix: "APP".into(),
+            metric_prefix: "app".into(),
+            config_mount_path: String::new(),
+            image_registry: "registry.example.com".into(),
+            extra_ports: vec![],
+            unbound_listen_paths: vec![],
+            entrypoint_args: vec![],
+            secrets: vec![],
+            default_config: None,
+            depends_on: vec![],
+            keda: None,
+            base_image: "debian:trixie-slim".into(),
+            native_deps: NativeDepsContract::default(),
+            image_profile: ImageProfile::default(),
+            oci_labels: OciLabels::default(),
+            config_schema: None,
+            capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: ResourcesContract::default(),
+            security: SecurityContract::default(),
+            singleton: false,
+        }
+    }
+
+    fn refused_field(contract: &DeploymentContract) -> String {
+        match contract.validate() {
+            Err(DeploymentError::InvalidContract { field, .. }) => field,
+            other => panic!("the contract passed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writable_paths_with_good_names_and_paths_pass() {
+        let mut c = contract();
+        c.writable_paths = vec![
+            WritablePath::new("spool", "/var/lib/app/spool").size_limit("2Gi"),
+            WritablePath::new("state-2", "/var/lib/app/state").persistent("5Gi"),
+        ];
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn a_bad_writable_path_is_refused_with_its_field() {
+        let cases = [
+            (
+                WritablePath::new("Spool", "/spool"),
+                "writable_paths[0].name",
+            ),
+            (
+                WritablePath::new("-spool", "/spool"),
+                "writable_paths[0].name",
+            ),
+            (WritablePath::new("", "/spool"), "writable_paths[0].name"),
+            (
+                WritablePath::new("a".repeat(51), "/spool"),
+                "writable_paths[0].name",
+            ),
+            (
+                WritablePath::new("spool", "spool"),
+                "writable_paths[spool].path",
+            ),
+            (
+                WritablePath::new("spool", "/sp\nool"),
+                "writable_paths[spool].path",
+            ),
+            (
+                WritablePath::new("spool", "/spool").persistent(""),
+                "writable_paths[spool].size",
+            ),
+            (
+                WritablePath::new("spool", "/spool").when(PortCondition::Enabled {
+                    path: "config.a\nb".into(),
+                }),
+                "writable_paths[spool].when",
+            ),
+        ];
+        for (writable, field) in cases {
+            let mut c = contract();
+            c.writable_paths = vec![writable.clone()];
+            assert_eq!(refused_field(&c), field, "{writable:?}");
+        }
+    }
+
+    #[test]
+    fn a_writable_name_or_path_declared_twice_is_refused() {
+        let mut c = contract();
+        c.writable_paths = vec![
+            WritablePath::new("spool", "/a"),
+            WritablePath::new("spool", "/b"),
+        ];
+        assert_eq!(refused_field(&c), "writable_paths[spool].name");
+        c.writable_paths = vec![
+            WritablePath::new("one", "/data/"),
+            WritablePath::new("two", "/data"),
+        ];
+        assert_eq!(refused_field(&c), "writable_paths[two].path");
+    }
+
+    #[test]
+    fn a_singleton_cannot_leave_keda_on() {
+        let mut c = contract();
+        c.singleton = true;
+        c.keda = Some(KedaContract::default());
+        assert_eq!(refused_field(&c), "keda");
+        c.keda = None;
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn an_added_capability_must_be_a_capability_name() {
+        let mut c = contract();
+        c.security.capabilities_add = vec!["NET_ADMIN".into()];
+        c.validate().unwrap();
+        for bad in ["net_admin", "CAP NET", ""] {
+            c.security.capabilities_add = vec![bad.into()];
+            assert_eq!(refused_field(&c), "security.capabilities_add[0]", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_dial_marker_outside_the_tiers_is_refused() {
+        let mut c = contract();
+        c.config_schema = Some(serde_json::json!({
+            "properties": { "rows": { "type": "integer", "x-scalo-dial": "big" } }
+        }));
+        c.validate().unwrap();
+        c.config_schema = Some(serde_json::json!({
+            "properties": { "rows": { "type": "integer", "x-scalo-dial": "huge" } }
+        }));
+        assert_eq!(refused_field(&c), "config_schema");
+    }
+
+    #[test]
+    fn a_control_character_in_an_app_protocol_is_refused() {
+        let mut c = contract();
+        c.extra_ports = vec![PortContract::tcp("grpc", 6000).app_protocol("h2c\nx")];
+        assert_eq!(refused_field(&c), "extra_ports[grpc].app_protocol");
+    }
 
     #[test]
     fn a_port_name_is_checked_as_kubernetes_checks_it() {

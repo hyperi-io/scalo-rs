@@ -495,6 +495,11 @@ mod tests {
                     .field(FieldSpec::string("id").required())
                     .field(FieldSpec::secret("secret_access_key")),
             ],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: crate::deployment::ResourcesContract::default(),
+            security: crate::deployment::SecurityContract::default(),
+            singleton: false,
         }
     }
 
@@ -835,6 +840,7 @@ mod tests {
     #[cfg(feature = "config-schema")]
     #[test]
     fn generated_config_schemas_are_ascii() {
+        assert_schema_is_ascii::<DeploymentContract>();
         #[cfg(feature = "dlq")]
         assert_schema_is_ascii::<crate::dlq::DlqConfig>();
         #[cfg(feature = "dlq-kafka")]

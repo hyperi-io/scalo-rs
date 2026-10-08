@@ -1,0 +1,8 @@
+{
+  "schema_version": 4,
+  "app_name": "minimal",
+  "metrics_port": 9090,
+  "health": { "liveness_path": "/livez", "readiness_path": "/readyz", "metrics_path": "/metrics" },
+  "env_prefix": "MINIMAL",
+  "metric_prefix": "minimal"
+}

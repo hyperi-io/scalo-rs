@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 /// See the module docs and `docs/reflectable-config-shape.md` for the shape
 /// contract shared with scalo-py.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct Capability {
     /// Discriminator: `"source"`, `"service"`, `"transport"`, `"sink"`, ...
     pub kind: String,
@@ -155,6 +156,7 @@ impl Capability {
 
 /// A single config field within a [`Capability`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct FieldSpec {
     /// Field name.
     pub name: String,
@@ -315,6 +317,7 @@ impl FieldSpec {
 
 /// The type of a [`FieldSpec`]. Serialised lower-snake-case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FieldType {
     /// A UTF-8 string.

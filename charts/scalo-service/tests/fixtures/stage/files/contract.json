@@ -1,0 +1,162 @@
+{
+  "schema_version": 4,
+  "app_name": "event-stage",
+  "binary_name": "event-stage",
+  "description": "A pipeline stage that consumes events, buffers them and passes them on",
+  "metrics_port": 9090,
+  "health": {
+    "liveness_path": "/livez",
+    "readiness_path": "/readyz",
+    "metrics_path": "/metrics",
+    "startup_budget_seconds": 120
+  },
+  "env_prefix": "EVENT_STAGE",
+  "metric_prefix": "stage",
+  "config_mount_path": "/etc/event-stage/config.yaml",
+  "image_registry": "registry.example.com/team",
+  "extra_ports": [
+    {
+      "name": "http",
+      "port": 8080,
+      "protocol": "TCP",
+      "bound_from": "http.bind_address",
+      "public": true
+    },
+    {
+      "name": "grpc",
+      "port": 6000,
+      "protocol": "TCP",
+      "when": { "kind": "enabled", "path": "config.grpc.enabled" },
+      "bound_from": "grpc.bind_address",
+      "app_protocol": "kubernetes.io/h2c"
+    },
+    {
+      "name": "syslog",
+      "port": 5514,
+      "protocol": "UDP",
+      "when": { "kind": "one_of", "path": "config.syslog.protocol", "values": ["udp", "both"] },
+      "public": true
+    }
+  ],
+  "entrypoint_args": ["--config", "/etc/event-stage/config.yaml"],
+  "secrets": [
+    {
+      "group_name": "kafka",
+      "env_vars": [
+        { "env_var": "EVENT_STAGE__KAFKA__USERNAME", "key_name": "username", "secret_key": "kafka-username" },
+        { "env_var": "EVENT_STAGE__KAFKA__PASSWORD", "key_name": "password", "secret_key": "kafka-password" }
+      ]
+    },
+    {
+      "group_name": "auth",
+      "env_vars": [
+        { "env_var": "EVENT_STAGE__AUTH__TOKENS", "key_name": "tokens", "secret_key": "bearer-tokens" }
+      ],
+      "optional": true
+    }
+  ],
+  "default_config": {
+    "http": { "bind_address": "0.0.0.0:8080" },
+    "grpc": { "enabled": false, "bind_address": "0.0.0.0:6000" },
+    "syslog": { "protocol": "udp" },
+    "spool": { "enabled": true },
+    "kafka": { "brokers": ["kafka:9092"], "group_id": "event-stage", "topics": ["events", "events-retry"] },
+    "buffer": { "flush_rows": 20000 }
+  },
+  "depends_on": ["kafka"],
+  "keda": {
+    "enabled": true,
+    "min_replicas": 1,
+    "max_replicas": 10,
+    "polling_interval": 15,
+    "cooldown_period": 300,
+    "kafka_lag_threshold": 1000,
+    "activation_lag_threshold": 0,
+    "cpu_enabled": true,
+    "cpu_threshold": 80,
+    "kafka_trigger": {
+      "enabled": true,
+      "brokers_path": "config.kafka.brokers",
+      "group_path": "config.kafka.group_id",
+      "topics_path": "config.kafka.topics"
+    }
+  },
+  "base_image": "debian:trixie-slim",
+  "native_deps": { "apt_repos": [], "apt_packages": [] },
+  "image_profile": "production",
+  "oci_labels": {
+    "title": "event-stage",
+    "description": "",
+    "vendor": "",
+    "label_namespace": "io.scalo",
+    "licenses": "",
+    "copyright": ""
+  },
+  "config_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Config",
+    "type": "object",
+    "properties": {
+      "buffer": { "$ref": "#/$defs/Buffer" },
+      "kafka": { "$ref": "#/$defs/Kafka" },
+      "log_level": {
+        "description": "Log level.",
+        "type": "string",
+        "enum": ["error", "warn", "info", "debug"],
+        "default": "info",
+        "x-scalo-dial": "small"
+      }
+    },
+    "$defs": {
+      "Buffer": {
+        "type": "object",
+        "properties": {
+          "flush_rows": {
+            "description": "Rows held before a flush.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000000,
+            "default": 20000,
+            "x-scalo-dial": "big"
+          }
+        }
+      },
+      "Kafka": {
+        "type": "object",
+        "properties": {
+          "brokers": { "type": "array", "items": { "type": "string" } },
+          "password": { "type": "string", "x-scalo-secret": true, "writeOnly": true },
+          "batch_size": {
+            "description": "Records fetched per poll.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100000,
+            "default": 500,
+            "x-scalo-dial": "big"
+          }
+        }
+      }
+    }
+  },
+  "writable_paths": [
+    {
+      "name": "spool",
+      "path": "/var/lib/event-stage/spool",
+      "size_limit": "2Gi",
+      "size": "1Gi",
+      "when": { "kind": "enabled", "path": "config.spool.enabled" }
+    }
+  ],
+  "termination_grace_seconds": 45,
+  "resources": {
+    "requests": { "cpu": "250m", "memory": "256Mi" },
+    "limits": { "cpu": "2", "memory": "1Gi" }
+  },
+  "security": {
+    "run_as_user": 1000,
+    "run_as_group": 1000,
+    "fs_group": 1000,
+    "read_only_root_filesystem": true
+  },
+  "singleton": false
+}

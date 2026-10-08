@@ -1,0 +1,20 @@
+suite: a singleton refuses every autoscaler
+templates:
+  - scaledobject.yaml
+  - hpa.yaml
+tests:
+  - it: refuses KEDA
+    template: scaledobject.yaml
+    set:
+      keda.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "marks this app a singleton"
+
+  - it: refuses the fallback autoscaler
+    template: hpa.yaml
+    set:
+      autoscaling.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "marks this app a singleton"

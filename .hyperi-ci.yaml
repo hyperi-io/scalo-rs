@@ -17,6 +17,15 @@ language: rust
 license: Apache-2.0
 quality:
   enabled: true
+  # The thin-chart skeleton renders only once an assembler adds files/contract.json.
+  exclude_paths:
+    - charts/scalo-service/skeleton
+  # Jobs of .github/workflows/scalo-service.yml, repeated so a local check predicts them.
+  local_gates:
+    - name: scalo-service chart tests
+      command: ["charts/scalo-service/tests/run.sh"]
+    - name: contract schema breaking-change check
+      command: ["scripts/schema-breaking-check.sh"]
   ignore:
     # Not reachable: the flaw is in W3C Baggage propagation, and scalo registers no text-map propagator.
     - tool: osv-scanner

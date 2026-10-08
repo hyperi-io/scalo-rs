@@ -1,0 +1,22 @@
+# Public load balancers, a storage class, and a mounted service-account token.
+publicService:
+  enabled: true
+  externalTrafficPolicy: Local
+  annotations:
+    service.example.com/lb-type: external
+writablePaths:
+  state:
+    persistence:
+      storageClass: fast
+      size: 10Gi
+      annotations:
+        backup.example.com/enabled: "true"
+serviceAccount:
+  mountToken: true
+  annotations:
+    iam.example.com/role: cursor-keeper
+networkPolicy:
+  enabled: true
+  publicFrom:
+    - ipBlock:
+        cidr: 0.0.0.0/0

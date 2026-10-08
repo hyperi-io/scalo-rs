@@ -23,24 +23,45 @@ boundary.
 
 ## Schema versioning
 
-`DeploymentContract::schema_version` is checked by CI, giving a
-fail-fast hook before generation runs against a stale contract.
-Current version is **3** (the field defaults to 3). Bump it when the
-struct shape changes in a way that breaks downstream consumers.
+`DeploymentContract::schema_version` is the handshake between whatever writes a
+contract and whatever reads it. Current version is **4**,
+`CONTRACT_SCHEMA_VERSION`, and the field defaults to it. A reader refuses a
+version it does not support: the [scalo-service](../../charts/scalo-service/README.md)
+library chart renders version 4 only.
 
 | Version | Notes |
 | --------- | ------- |
 | 1 | Initial shape -- no `image_profile`, no `oci_labels` |
 | 2 | `ImageProfile`, `OciLabels`, `SecretGroupContract` |
-| 3 | Current - adds `config_schema` + `capabilities` |
+| 3 | Adds `config_schema` + `capabilities` |
+| 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, the `x-scalo-dial` keyword in `config_schema`; `config_mount_path` may be empty |
 
-v3 is back-compatible in both directions. Reading FORWARD, a v2 consumer
-tolerates a v3 contract because `DeploymentContract` does not set
-`deny_unknown_fields`, so serde ignores the fields it does not know -- that
-holds whether or not the new fields carry content. Reading BACKWARD, a v3
-consumer accepts a v2 contract because both fields carry `#[serde(default)]`.
-They are also `skip_serializing_if`, so an app that provides neither emits the
-same bytes it did under v2.
+An app that writes `schema_version: 3` in its struct literal still emits 3, and
+a version-4 reader refuses it; write `CONTRACT_SCHEMA_VERSION` instead. Serde
+reads a v3 contract into the v4 types with every new field at its default, and
+a v3 reader ignores the v4 fields, because `DeploymentContract` does not set
+`deny_unknown_fields`.
+
+### The JSON Schema
+
+`contract_json_schema()` (feature `config-schema`) derives the contract's JSON
+Schema, draft 2020-12, from these types with schemars, `schema_version` pinned
+and required. It is committed as
+`charts/scalo-service/schema/deployment-contract.v4.schema.json`, where a chart
+assembler in any language validates a contract against it. A test fails when the
+committed file and the derivation differ; regenerate with:
+
+```bash
+env SCALO_WRITE_CONTRACT_SCHEMA=1 cargo nextest run --all-features -E 'test(committed_contract_schema)'
+```
+
+A released version file only widens. `scripts/schema-breaking-check.sh` compares
+it with the last release tag in CI and fails on a removed or renamed field, a
+narrowed type or enum, a tightened bound or new pattern, a newly required field,
+closed properties, a lost `anyOf` branch, or a removed dial. A change that
+breaks goes into a `v5` file, beside a `CONTRACT_SCHEMA_VERSION` bump. The
+comparison is `breaking_changes(old, new)`, which an app can run on its own
+`config_schema` to keep its dials compatible.
 
 ---
 
@@ -77,7 +98,7 @@ producers both exist today. Cross-language consumers read
 use scalo::deployment::*;
 
 let contract = DeploymentContract {
-    schema_version: 3,
+    schema_version: CONTRACT_SCHEMA_VERSION,
     app_name: "event-loader".into(),
     binary_name: "event-loader".into(),
     description: "Kafka -> ClickHouse data loader".into(),
@@ -93,9 +114,9 @@ let contract = DeploymentContract {
     unbound_listen_paths: vec![],
     entrypoint_args: vec!["--config".into(), "/etc/event-loader/config.yaml".into()],
     secrets: vec![
-        SecretGroupContract {
-            group_name: "kafka".into(),
-            env_vars: vec![
+        SecretGroupContract::new(
+            "kafka",
+            vec![
                 SecretEnvContract {
                     env_var: "EVENT_LOADER__KAFKA__USERNAME".into(),
                     key_name: "username".into(),
@@ -107,7 +128,7 @@ let contract = DeploymentContract {
                     secret_key: "kafka-password".into(),
                 },
             ],
-        },
+        ),
     ],
     default_config: None,
     depends_on: vec!["kafka".into(), "clickhouse".into()],
@@ -125,6 +146,14 @@ let contract = DeploymentContract {
             .description("Kafka source and sink")
             .maturity("stable"),
     ],
+    // v4 fields
+    writable_paths: vec![
+        WritablePath::new("spool", "/var/lib/event-loader/spool").size_limit("2Gi"),
+    ],
+    termination_grace_seconds: 45,
+    resources: ResourcesContract::default(),
+    security: SecurityContract::default(),
+    singleton: false,
 };
 ```
 
@@ -132,7 +161,7 @@ let contract = DeploymentContract {
 
 | Field | Type | Default | Notes |
 | ------- | ------ | --------- | ------- |
-| `schema_version` | `u32` | `3` | CI rejects an unsupported version |
+| `schema_version` | `u32` | `4` | A reader refuses an unsupported version |
 | `app_name` | `String` | required | Matches `Chart.yaml` `name`; image repo segment |
 | `binary_name` | `String` | `""` | Falls back to `app_name` via `.binary()` |
 | `description` | `String` | `""` | Chart description |
@@ -140,7 +169,7 @@ let contract = DeploymentContract {
 | `health` | `HealthContract` | default | Probe paths -- see below |
 | `env_prefix` | `String` | required | Config env prefix; `__` is the nesting separator |
 | `metric_prefix` | `String` | required | Prometheus namespace |
-| `config_mount_path` | `String` | required | E.g. `/etc/event-loader/config.yaml` |
+| `config_mount_path` | `String` | `""` | E.g. `/etc/event-loader/config.yaml`; empty means the app reads no config file (v4) |
 | `image_registry` | `String` | required | Container registry base, and `validate()` refuses an empty one |
 | `extra_ports` | `Vec<PortContract>` | `[]` | HTTP / gRPC / data ports beyond metrics -- see [Ports](#ports) |
 | `unbound_listen_paths` | `Vec<String>` | `[]` | `default_config` listen paths no port serves -- see [Ports](#ports) |
@@ -153,8 +182,13 @@ let contract = DeploymentContract {
 | `native_deps` | `NativeDepsContract` | default | See [native-deps.md](native-deps.md) |
 | `image_profile` | `ImageProfile` | `Production` | See below |
 | `oci_labels` | `OciLabels` | default | Static OCI labels and the namespace of scalo's own keys -- see [Labels](#labels) |
-| `config_schema` | `Option<Value>` | `None` | JSON Schema of the app's `Config` (v3) |
+| `config_schema` | `Option<Value>` | `None` | JSON Schema of the app's `Config` (v3); dials carry `x-scalo-dial` (v4) -- see [Dials](#dials) |
 | `capabilities` | `Vec<Capability>` | `[]` | Runtime-surface catalogue (v3) |
+| `writable_paths` | `Vec<WritablePath>` | `[]` | Directories the app writes, so the root filesystem stays read-only (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
+| `termination_grace_seconds` | `u32` | `45` | Seconds between SIGTERM and SIGKILL (v4) |
+| `resources` | `ResourcesContract` | empty | The app's own requests and limits; empty leaves the chart default (v4) |
+| `security` | `SecurityContract` | uid/gid/fsGroup 1000, read-only root | Identity and capabilities the image runs with (v4) |
+| `singleton` | `bool` | `false` | Exactly one pod: no autoscaling, Recreate rollout (v4) |
 
 `HealthContract` fields:
 
@@ -163,6 +197,7 @@ let contract = DeploymentContract {
 | `liveness_path` | `/livez` | Dockerfile `HEALTHCHECK`, Helm `livenessProbe` AND `startupProbe` |
 | `readiness_path` | `/readyz` | Helm `readinessProbe` |
 | `metrics_path` | `/metrics` | Prometheus scrape annotation in `values.yaml` |
+| `startup_budget_seconds` | `150` | How long the scalo-service startup probe waits for the liveness path before a restart; at least 1 (v4) |
 
 Those three paths are the whole probe surface. There are no aliases -- a
 retired path returns 404, deliberately, because an alias that keeps answering
@@ -192,6 +227,69 @@ token).
 | `env_vars[].env_var` | The full env var name injected into the pod (`EVENT_LOADER__KAFKA__PASSWORD`) |
 | `env_vars[].key_name` | Field name in `values.yaml.<group>.secretKeys.<key_name>` |
 | `env_vars[].secret_key` | Default K8s Secret data key (`kafka-password`) |
+| `optional` | The app starts without the group, so a missing Secret or key leaves the variable unset (v4); build with `SecretGroupContract::new(..).optional()` |
+
+---
+
+## Writable paths, resources and security
+
+These v4 fields describe what the container needs from the pod. The
+[scalo-service](../../charts/scalo-service/README.md) library chart renders
+them; the older `generate_chart` does not read them.
+
+```rust
+writable_paths: vec![
+    WritablePath::new("spool", "/var/lib/event-loader/spool")
+        .size_limit("2Gi")
+        .when(PortCondition::Enabled { path: "config.spool.enabled".into() }),
+    WritablePath::new("state", "/var/lib/event-loader/state").persistent("5Gi"),
+],
+security: SecurityContract {
+    capabilities_add: vec!["NET_BIND_SERVICE".into()],
+    ..SecurityContract::default()
+},
+singleton: true,
+```
+
+| Type | Field | Default | Notes |
+| --- | --- | --- | --- |
+| `WritablePath` | `name` | required | 1 to 50 lowercase letters, digits and inner hyphens; a persistent path's claim is `<chart name>-<name>` |
+| | `path` | required | Absolute mount path |
+| | `size_limit` | `""` | Cap on an ephemeral path, a Kubernetes quantity; empty is no cap |
+| | `persistent` | `false` | A claim that outlives the pod instead of an `emptyDir` |
+| | `size` | `"1Gi"` | The claim's requested size |
+| | `when` | `None` | A `PortCondition`, read as for ports; `None` is always |
+| `ResourcesContract` | `requests`, `limits` | empty | Each a `ResourceList` of `cpu` and `memory` quantities; empty is unset |
+| `SecurityContract` | `run_as_user`, `run_as_group`, `fs_group` | `1000` | Numeric; uid 0 lets the process run as root |
+| | `read_only_root_filesystem` | `true` | Writes go to `writable_paths` |
+| | `capabilities_add` | `[]` | Upper-case Linux capability names, added after every other one is dropped |
+
+A chart always adds a scratch `/tmp` beside the declared paths.
+
+---
+
+## Dials
+
+A dial is a config setting an operator is expected to tune per deployment. Mark
+it in the app's `Config` with the `x-scalo-dial` JSON Schema keyword
+(`DIAL_KEYWORD`), set to `big` (most deployments tune it) or `small` (a few do).
+Constraints stay plain JSON Schema:
+
+```rust
+#[derive(schemars::JsonSchema)]
+struct Buffer {
+    /// Rows held before a flush.
+    #[schemars(extend("x-scalo-dial" = "big"), range(min = 1, max = 10_000_000))]
+    flush_rows: u64,
+}
+```
+
+`dials(config_schema)` returns every marked node by dotted path, with local
+`$ref`s inlined. A chart assembler copies exactly those nodes into the chart's
+`values.schema.json` under `config`, so an operator gets a typed, bounded value
+for each dial and every other config key passes through unvalidated. Narrowing a
+dial's constraint or removing a dial is a breaking change: a value an operator
+already stored fails every later render.
 
 ---
 
@@ -201,15 +299,21 @@ A port can say when its listener exists, and which listen address it serves.
 
 ```rust
 extra_ports: vec![
-    PortContract::tcp("http", 8080).bound_from("http.listen"),
+    PortContract::tcp("http", 8080).bound_from("http.listen").public(),
     PortContract::tcp("push", 6000)
         .when_one_of("config.source.transport", ["direct", "grpc"])
-        .bound_from("source.grpc.listen"),
+        .bound_from("source.grpc.listen")
+        .app_protocol("kubernetes.io/h2c"),
     PortContract::udp("netflow", 2055)
         .when_enabled("config.flow.enabled")
         .bound_from("flow.bind_address"),
 ],
 ```
+
+`public()` (v4) marks a port clients outside the cluster connect to; the
+scalo-service chart puts such ports on a load balancer when the deployment asks
+for one. `app_protocol` (v4) is written to the Service port's `appProtocol`, so a
+proxy in front of a plain-text gRPC port speaks HTTP/2 to it.
 
 ### `when` -- ports that only sometimes listen
 
@@ -241,7 +345,9 @@ A port without `when` is always on: in every `EXPOSE`, `expose_ports` and publis
 
 - a name Kubernetes takes -- 1 to 15 lowercase letters, digits and single inner hyphens, with at least one letter (`syslog-udp`, not `Syslog_UDP`)
 - a protocol of TCP, UDP or SCTP, in any case
-- no control character in a `when` path or value, or in `bound_from`
+- no control character in a `when` path or value, in `bound_from`, or in `app_protocol`
+
+Beyond the ports, `validate()` requires each writable path to have a unique name of 1 to 50 lowercase letters, digits and inner hyphens, a unique absolute path, and a size when it is persistent; each `security.capabilities_add` entry to be an upper-case capability name such as `NET_ADMIN`; a `singleton` to leave KEDA off; and every `x-scalo-dial` in `config_schema` to be `big` or `small`, with every `$ref` the dial search follows resolving.
 
 `generate_dockerfile`, `generate_runtime_stage` and `generate_compose_fragment` return text rather than a `Result`, so they cannot refuse. They print a gated port's name and condition onto one comment line with any control character escaped, so a newline in a contract value cannot start a Dockerfile instruction or a YAML key. Run `validate()` in a test to catch the contract itself.
 
@@ -354,6 +460,11 @@ reference carries no codename.
 | `image_registry_from_cascade()` / `base_image_from_cascade()` / `argocd_repo_url_from_cascade()` / `argocd_dest_namespace_from_cascade()` | Cascade readers |
 | `Capability` / `FieldSpec` | Capability-catalog entry and its config fields |
 | `config_schema_json::<T>()` | Derive the JSON Schema for the app's `Config` |
+| `CONTRACT_SCHEMA_VERSION` | The contract schema version this crate writes and reads (4) |
+| `WritablePath` / `ResourcesContract` / `ResourceList` / `SecurityContract` | v4 pod needs -- see [Writable paths](#writable-paths-resources-and-security) |
+| `contract_json_schema()` / `contract_schema_file_name(version)` | The contract's JSON Schema and its committed file name (feature `config-schema`) |
+| `DIAL_KEYWORD` / `DIAL_TIERS` / `dials(config_schema)` | The dial marker, its two values, and every marked node by path -- see [Dials](#dials) |
+| `breaking_changes(old, new)` / `SchemaBreak` / `SchemaBreakKind` | Every change between two JSON Schemas that refuses what the old one accepted |
 
 `oci_labels.licenses` and `oci_labels.copyright` name the app's own licence and copyright holder. `licenses` sets the `org.opencontainers.image.licenses` label and the generated Dockerfile's `# License` header line, and `copyright` sets its `# Copyright` line. Both are empty by default, and an empty one writes no label and no line, so an app's artefacts carry only the terms the app states.
 
@@ -374,6 +485,7 @@ hook that exposes the contract to the CLI.
 ## Related
 
 - [artefacts.md](artefacts.md) -- what `generate-artefacts` writes
+- [../../charts/scalo-service/README.md](../../charts/scalo-service/README.md) -- the library chart that renders a contract, and the thin-chart format
 - [native-deps.md](native-deps.md) -- auto-detected APT packages
 - [keda.md](keda.md) -- autoscaling contract
 - [../auto-wiring.md](../auto-wiring.md) -- singleton pattern

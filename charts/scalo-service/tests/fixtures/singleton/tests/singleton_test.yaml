@@ -1,0 +1,196 @@
+suite: singleton with a persistent path and no config file
+templates:
+  - deployment.yaml
+  - pvc.yaml
+  - configmap.yaml
+  - scaledobject.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - service-public.yaml
+tests:
+  - it: pins one replica and recreates the pod rather than run two
+    template: deployment.yaml
+    set:
+      replicaCount: 3
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+      - equal:
+          path: spec.strategy
+          value:
+            type: Recreate
+
+  - it: binds the persistent path to its claim and caps the ephemeral one
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes
+          value:
+            - name: writable-state
+              persistentVolumeClaim:
+                claimName: cursor-keeper-state
+            - name: writable-cache
+              emptyDir:
+                sizeLimit: 512Mi
+            - name: writable-tmp
+              emptyDir: {}
+            - name: serviceaccount-files
+              projected:
+                sources:
+                  - configMap:
+                      name: kube-root-ca.crt
+                      items:
+                        - key: ca.crt
+                          path: ca.crt
+                  - downwardAPI:
+                      items:
+                        - path: namespace
+                          fieldRef:
+                            fieldPath: metadata.namespace
+
+  - it: runs as the contract's uid with its one added capability
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 10001
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 10001
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities
+          value:
+            drop: ["ALL"]
+            add: ["NET_ADMIN"]
+
+  - it: mounts no config and passes no args when the contract names no config file
+    template: deployment.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].args
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: config
+            configMap:
+              name: cursor-keeper-config
+      - notExists:
+          path: spec.template.metadata.annotations["checksum/config"]
+
+  - it: writes version-check names bare when the contract's env prefix is empty
+    template: deployment.yaml
+    set:
+      versionCheck.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: VERSION_CHECK__ENABLED
+            value: "false"
+
+  - it: takes the contract's grace and startup budget
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 90
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 60
+
+  - it: fills the contract's partial resources from the library default
+    template: deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+  - it: lets podSecurityContext enabled false drop the pod security context
+    template: deployment.yaml
+    set:
+      podSecurityContext.enabled: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.securityContext
+
+  - it: claims the persistent path under a name an upgrade keeps
+    template: pvc.yaml
+    set:
+      writablePaths.state.persistence.storageClass: fast
+    asserts:
+      - equal:
+          path: metadata.name
+          value: cursor-keeper-state
+      - equal:
+          path: spec
+          value:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: fast
+            resources:
+              requests:
+                storage: 5Gi
+
+  - it: uses an existing claim instead of creating one
+    set:
+      writablePaths.state.persistence.existingClaim: legacy-state
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: pvc.yaml
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: writable-state
+            persistentVolumeClaim:
+              claimName: legacy-state
+        template: deployment.yaml
+
+  - it: renders no ConfigMap, ScaledObject, HPA or budget
+    set:
+      replicaCount: 3
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: configmap.yaml
+      - hasDocuments:
+          count: 0
+        template: scaledobject.yaml
+      - hasDocuments:
+          count: 0
+        template: hpa.yaml
+      - hasDocuments:
+          count: 0
+        template: pdb.yaml
+
+  - it: puts the public TCP and UDP ports on their own load balancers
+    template: service-public.yaml
+    set:
+      publicService.enabled: true
+      publicService.externalTrafficPolicy: Local
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: spec.ports
+          value:
+            - name: api
+              port: 8443
+              targetPort: api
+              protocol: TCP
+              appProtocol: https
+        documentIndex: 0
+      - equal:
+          path: spec.externalTrafficPolicy
+          value: Local
+        documentIndex: 1
+      - equal:
+          path: spec.ports[0].name
+          value: tunnel
+        documentIndex: 1

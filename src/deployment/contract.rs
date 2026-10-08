@@ -32,6 +32,7 @@ use super::native_deps::NativeDepsContract;
 /// Version tags carry the `v`. There is no `-dev` tag: a `Development` image
 /// is built from its own Dockerfile where it is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ImageProfile {
     /// Minimal production image -- stripped binary, no debug tools.
@@ -42,6 +43,12 @@ pub enum ImageProfile {
     Development,
 }
 
+/// The contract schema version this crate writes and reads.
+///
+/// The JSON Schema for it ships as
+/// `charts/scalo-service/schema/deployment-contract.v4.schema.json`.
+pub const CONTRACT_SCHEMA_VERSION: u32 = 4;
+
 /// Deployment-facing contract points derived from the app config cascade.
 ///
 /// Apps build this from their `Config::default()`. Validation functions
@@ -49,8 +56,9 @@ pub enum ImageProfile {
 /// functions create deployment artifacts (Dockerfile, Helm chart, Compose
 /// fragment) from scratch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct DeploymentContract {
-    /// Contract schema version. CI checks this and fails if unsupported.
+    /// Contract schema version. A reader refuses a version it does not support.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
@@ -71,14 +79,16 @@ pub struct DeploymentContract {
     /// Health probe endpoint paths.
     pub health: HealthContract,
 
-    /// Environment variable prefix (e.g., "DFE_LOADER").
+    /// Environment variable prefix (e.g., "MY_APP").
     /// Used with `__` nesting for figment config cascade.
     pub env_prefix: String,
 
     /// Prometheus metric namespace/prefix (e.g., "loader").
     pub metric_prefix: String,
 
-    /// Config file mount path (e.g., "/etc/my-app/config.yaml").
+    /// Config file mount path (e.g., "/etc/my-app/config.yaml"). Empty means
+    /// the app reads no config file, so no ConfigMap is mounted.
+    #[serde(default)]
     pub config_mount_path: String,
 
     /// Container registry base the image is pushed to and pulled from (e.g.,
@@ -143,10 +153,15 @@ pub struct DeploymentContract {
 
     /// Reflectable JSON Schema (draft 2020-12) of the app's full `Config`,
     /// derived via schemars (scalo-rs#6). `None` when the app does not provide
-    /// one. Secret fields carry the `x-scalo-secret` marker. Carried inline so a
-    /// single fetch of the contract gives the schema; also written to
-    /// `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).
+    /// one. Secret fields carry the `x-scalo-secret` marker, and operator dials
+    /// carry `x-scalo-dial` (`big` or `small`, see [`DIAL_KEYWORD`](super::DIAL_KEYWORD)).
+    /// Carried inline so a single fetch of the contract gives the schema; also
+    /// written to `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(with = "Option<super::contract_schema::ConfigSchemaNode>")
+    )]
     pub config_schema: Option<serde_json::Value>,
 
     /// Capability catalog -- the runtime-data surface schemars cannot derive
@@ -155,6 +170,201 @@ pub struct DeploymentContract {
     /// See [`Capability`](super::Capability).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<super::Capability>,
+
+    /// Directories the app writes at run time, so the root filesystem can stay
+    /// read-only. A chart always adds a scratch `/tmp` beside these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable_paths: Vec<WritablePath>,
+
+    /// Seconds between SIGTERM and SIGKILL. The default leaves time for a
+    /// pre-stop pause, a gRPC drain and a final commit after the endpoints
+    /// drop the pod.
+    #[serde(default = "default_termination_grace_seconds")]
+    pub termination_grace_seconds: u32,
+
+    /// The app's own CPU and memory requests and limits. Empty values leave
+    /// the chart's defaults in place; deployment values override both.
+    #[serde(default, skip_serializing_if = "ResourcesContract::is_empty")]
+    pub resources: ResourcesContract,
+
+    /// The user, group and Linux capabilities the image runs with.
+    #[serde(default)]
+    pub security: SecurityContract,
+
+    /// Exactly one pod may run: replicas stay at one, nothing autoscales it, and
+    /// a new pod starts only after the old one has stopped.
+    #[serde(default)]
+    pub singleton: bool,
+}
+
+/// Default grace: 5 s pre-stop pause, up to 20 s gRPC drain, then the final commit.
+const DEFAULT_TERMINATION_GRACE_SECONDS: u32 = 45;
+
+fn default_termination_grace_seconds() -> u32 {
+    DEFAULT_TERMINATION_GRACE_SECONDS
+}
+
+/// A directory the app writes at run time.
+///
+/// A chart mounts each one as a volume, so the container's root filesystem can
+/// stay read-only. An ephemeral path is an `emptyDir`; a persistent one is a
+/// claim that outlives the pod. Build one with [`new`](Self::new).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+pub struct WritablePath {
+    /// Volume name: 1 to 50 lowercase letters, digits and inner hyphens
+    /// (e.g. "spool"). A persistent path's claim is named `<chart name>-<name>`.
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(regex(pattern = r"^[a-z0-9]([-a-z0-9]{0,48}[a-z0-9])?$"))
+    )]
+    pub name: String,
+    /// Absolute mount path (e.g. "/var/lib/my-app/spool").
+    #[cfg_attr(feature = "config-schema", schemars(regex(pattern = r"^/")))]
+    pub path: String,
+    /// Size cap for an ephemeral path, as a Kubernetes quantity (e.g. "2Gi").
+    /// Empty means no cap.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub size_limit: String,
+    /// Keep the contents across pod restarts with a persistent volume claim.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub persistent: bool,
+    /// Requested size of a persistent path's claim, as a Kubernetes quantity.
+    #[serde(default = "default_volume_size")]
+    pub size: String,
+    /// The values condition under which the app writes here; `None` means always.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<PortCondition>,
+}
+
+fn default_volume_size() -> String {
+    "1Gi".to_string()
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl WritablePath {
+    /// An ephemeral path with no size cap.
+    #[must_use]
+    pub fn new(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: path.into(),
+            size_limit: String::new(),
+            persistent: false,
+            size: default_volume_size(),
+            when: None,
+        }
+    }
+
+    /// Cap an ephemeral path at `limit`, a Kubernetes quantity such as "2Gi".
+    #[must_use]
+    pub fn size_limit(mut self, limit: impl Into<String>) -> Self {
+        self.size_limit = limit.into();
+        self
+    }
+
+    /// Keep the contents across restarts in a claim of `size`.
+    #[must_use]
+    pub fn persistent(mut self, size: impl Into<String>) -> Self {
+        self.persistent = true;
+        self.size = size.into();
+        self
+    }
+
+    /// Mount only while `condition` holds.
+    #[must_use]
+    pub fn when(mut self, condition: PortCondition) -> Self {
+        self.when = Some(condition);
+        self
+    }
+}
+
+/// CPU and memory requests and limits, as Kubernetes quantities.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+pub struct ResourcesContract {
+    /// What the scheduler reserves for the container.
+    #[serde(default, skip_serializing_if = "ResourceList::is_empty")]
+    pub requests: ResourceList,
+    /// The most the container may use.
+    #[serde(default, skip_serializing_if = "ResourceList::is_empty")]
+    pub limits: ResourceList,
+}
+
+impl ResourcesContract {
+    /// True when no request or limit is set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty() && self.limits.is_empty()
+    }
+}
+
+/// One CPU and memory pair. An empty value is unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+pub struct ResourceList {
+    /// CPU, e.g. "250m" or "2".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cpu: String,
+    /// Memory, e.g. "256Mi".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub memory: String,
+}
+
+impl ResourceList {
+    /// True when neither CPU nor memory is set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cpu.is_empty() && self.memory.is_empty()
+    }
+}
+
+/// The identity and privileges the container runs with.
+///
+/// The defaults match the image the Dockerfile generator writes: uid and gid
+/// 1000, a read-only root filesystem and no added capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+pub struct SecurityContract {
+    /// Numeric user the process runs as; 0 lets it run as root.
+    #[serde(default = "default_id")]
+    pub run_as_user: u32,
+    /// Numeric primary group.
+    #[serde(default = "default_id")]
+    pub run_as_group: u32,
+    /// Group that owns mounted volumes.
+    #[serde(default = "default_id")]
+    pub fs_group: u32,
+    /// Mount the root filesystem read-only; writes go to `writable_paths`.
+    #[serde(default = "default_true")]
+    pub read_only_root_filesystem: bool,
+    /// Linux capabilities added after every other one is dropped (e.g. "NET_ADMIN").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities_add: Vec<String>,
+}
+
+fn default_id() -> u32 {
+    1000
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SecurityContract {
+    fn default() -> Self {
+        Self {
+            run_as_user: default_id(),
+            run_as_group: default_id(),
+            fs_group: default_id(),
+            read_only_root_filesystem: true,
+            capabilities_add: Vec::new(),
+        }
+    }
 }
 
 /// Reverse-DNS namespace of the labels and annotations scalo writes itself.
@@ -165,6 +375,7 @@ pub const DEFAULT_LABEL_NAMESPACE: &str = "io.scalo";
 /// Static labels are set from the contract. Dynamic labels (source, revision,
 /// version, created) are injected by CI at build time via `--build-arg`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct OciLabels {
     /// Image title (defaults to app_name).
     #[serde(default)]
@@ -212,9 +423,7 @@ fn default_label_namespace() -> String {
 }
 
 fn default_schema_version() -> u32 {
-    // v3: added `config_schema` + `capabilities` (scalo-rs#6). Back-compat --
-    // old consumers ignore the new optional fields.
-    3
+    CONTRACT_SCHEMA_VERSION
 }
 
 /// Health probe endpoint paths.
@@ -224,6 +433,7 @@ fn default_schema_version() -> u32 {
 /// gives both a generous boot budget and a tight liveness period without the
 /// two drifting apart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct HealthContract {
     /// Liveness probe path (e.g., "/livez").
     pub liveness_path: String,
@@ -233,6 +443,17 @@ pub struct HealthContract {
 
     /// Prometheus metrics path (e.g., "/metrics").
     pub metrics_path: String,
+
+    /// Longest the app may take from start to a passing liveness probe, in
+    /// seconds. The chart's startup probe allows this long before it restarts
+    /// the pod.
+    #[serde(default = "default_startup_budget_seconds")]
+    #[cfg_attr(feature = "config-schema", schemars(range(min = 1)))]
+    pub startup_budget_seconds: u32,
+}
+
+fn default_startup_budget_seconds() -> u32 {
+    150
 }
 
 /// Additional container port beyond the metrics port.
@@ -241,6 +462,7 @@ pub struct HealthContract {
 /// listener exists with [`when`](Self::when()) and which listen address it
 /// serves with [`bound_from`](Self::bound_from()).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct PortContract {
     /// Port name (e.g., "http").
     pub name: String,
@@ -260,6 +482,15 @@ pub struct PortContract {
     /// generated artefact changes with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_from: Option<String>,
+    /// Clients outside the cluster connect here. A chart can put such ports on
+    /// a load balancer; whether it does is a deployment choice.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub public: bool,
+    /// The application protocol a proxy speaks to this port, written to the
+    /// Service port's `appProtocol` (e.g. "kubernetes.io/h2c" for gRPC without
+    /// TLS). Empty writes none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_protocol: String,
 }
 
 impl PortContract {
@@ -272,7 +503,23 @@ impl PortContract {
             protocol: "TCP".to_string(),
             when: None,
             bound_from: None,
+            public: false,
+            app_protocol: String::new(),
         }
+    }
+
+    /// Mark the port as one clients outside the cluster connect to.
+    #[must_use]
+    pub fn public(mut self) -> Self {
+        self.public = true;
+        self
+    }
+
+    /// Name the application protocol a proxy speaks to this port.
+    #[must_use]
+    pub fn app_protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.app_protocol = protocol.into();
+        self
     }
 
     /// A UDP port that always listens.
@@ -340,6 +587,7 @@ impl PortContract {
 /// large number in `values.yaml` as a float and prints `1e+06` where the config
 /// says `1000000`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PortCondition {
@@ -445,6 +693,7 @@ pub(crate) fn value_at<'a>(
 
 /// A group of secrets from the same K8s Secret (e.g., "kafka", "clickhouse").
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct SecretGroupContract {
     /// Group name (e.g., "kafka", "clickhouse").
     /// Used in values.yaml section name and helper template names.
@@ -452,12 +701,37 @@ pub struct SecretGroupContract {
 
     /// Environment variables injected from this secret group.
     pub env_vars: Vec<SecretEnvContract>,
+
+    /// The app starts without this group, so a missing Secret or key leaves
+    /// the variable unset instead of stopping the pod.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
+}
+
+impl SecretGroupContract {
+    /// A required group of `env_vars` read from one Secret.
+    #[must_use]
+    pub fn new(group_name: impl Into<String>, env_vars: Vec<SecretEnvContract>) -> Self {
+        Self {
+            group_name: group_name.into(),
+            env_vars,
+            optional: false,
+        }
+    }
+
+    /// Let the app start when the Secret or a key in it is missing.
+    #[must_use]
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
+        self
+    }
 }
 
 /// A single environment variable sourced from a K8s Secret.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct SecretEnvContract {
-    /// Full env var name (e.g., "DFE_LOADER__KAFKA__PASSWORD").
+    /// Full env var name (e.g., "MY_APP__KAFKA__PASSWORD").
     pub env_var: String,
 
     /// Key name in values.yaml secretKeys and default values
@@ -600,6 +874,7 @@ impl Default for HealthContract {
             liveness_path: "/livez".to_string(),
             readiness_path: "/readyz".to_string(),
             metrics_path: "/metrics".to_string(),
+            startup_budget_seconds: default_startup_budget_seconds(),
         }
     }
 }
@@ -642,6 +917,11 @@ mod tests {
             oci_labels: OciLabels::default(),
             config_schema: None,
             capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: ResourcesContract::default(),
+            security: SecurityContract::default(),
+            singleton: false,
         };
         let json = contract.to_json();
         assert!(json.contains("test-app"));
@@ -674,6 +954,11 @@ mod tests {
             oci_labels: OciLabels::default(),
             config_schema: None,
             capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: ResourcesContract::default(),
+            security: SecurityContract::default(),
+            singleton: false,
         };
         let json = contract.to_json();
         let parsed: DeploymentContract = serde_json::from_str(&json).unwrap();
@@ -707,6 +992,11 @@ mod tests {
             oci_labels: OciLabels::default(),
             config_schema: None,
             capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: ResourcesContract::default(),
+            security: SecurityContract::default(),
+            singleton: false,
         };
         assert_eq!(contract.binary(), "my-app");
     }
@@ -737,6 +1027,11 @@ mod tests {
             oci_labels: OciLabels::default(),
             config_schema: None,
             capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: ResourcesContract::default(),
+            security: SecurityContract::default(),
+            singleton: false,
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
         assert_eq!(contract.config_dir(), "/etc/dfe");
@@ -768,6 +1063,11 @@ mod tests {
             oci_labels: OciLabels::default(),
             config_schema: None,
             capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: ResourcesContract::default(),
+            security: SecurityContract::default(),
+            singleton: false,
         }
     }
 

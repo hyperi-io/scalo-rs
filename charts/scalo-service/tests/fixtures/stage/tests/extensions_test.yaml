@@ -1,0 +1,84 @@
+suite: network policy, file sets and extra objects
+templates:
+  - networkpolicy.yaml
+  - filesets.yaml
+  - extra-objects.yaml
+  - deployment.yaml
+release:
+  name: release
+  namespace: apps
+tests:
+  - it: renders no NetworkPolicy by default
+    template: networkpolicy.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: admits private ports from the namespace and public ports from anywhere
+    template: networkpolicy.yaml
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - equal:
+          path: spec.podSelector.matchLabels
+          value:
+            app.kubernetes.io/name: event-stage
+      - equal:
+          path: spec.ingress
+          value:
+            - from:
+                - podSelector: {}
+              ports:
+                - port: metrics
+                  protocol: TCP
+            - ports:
+                - port: http
+                  protocol: TCP
+                - port: syslog
+                  protocol: UDP
+
+  - it: renders each file set as a ConfigMap and mounts it read-only
+    set:
+      fileSets:
+        transforms:
+          mountPath: /etc/event-stage-transforms
+          files:
+            - name: main.vrl
+              content: "  .indented = true\n.flat = true\n"
+    asserts:
+      - equal:
+          path: metadata.name
+          value: event-stage-transforms
+        template: filesets.yaml
+      - equal:
+          path: data["main.vrl"]
+          value: "  .indented = true\n.flat = true\n"
+        template: filesets.yaml
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: fileset-transforms
+            mountPath: /etc/event-stage-transforms
+            readOnly: true
+        template: deployment.yaml
+      - exists:
+          path: spec.template.metadata.annotations["checksum/files"]
+        template: deployment.yaml
+
+  - it: renders extraObjects through tpl
+    template: extra-objects.yaml
+    set:
+      extraObjects:
+        - apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ .Release.Name }}-extra"
+          data:
+            namespace: "{{ .Release.Namespace }}"
+    asserts:
+      - equal:
+          path: metadata.name
+          value: release-extra
+      - equal:
+          path: data.namespace
+          value: apps
