@@ -151,7 +151,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `writablePaths.<name>.persistence.enabled`, `.size`, `.storageClass`, `.accessModes`, `.existingClaim`, `.annotations` | contract, `[ReadWriteOnce]` | The path's claim |
 | `secrets.<group>.enabled`, `.existingSecret`, `.keys.<key_name>`, `.optional` | on, `<fullname>-<group>`, contract `secret_key`, contract | Per contract secret group; `existingSecret` through `tpl` |
 | `service.type`, `service.annotations` | `ClusterIP` | In-cluster Service |
-| `publicService.enabled`, `type`, `loadBalancerIP`, `loadBalancerClass`, `loadBalancerSourceRanges`, `externalTrafficPolicy`, `annotations` | off, `LoadBalancer` | Load balancers for public ports |
+| `publicService.enabled`, `type`, `loadBalancerIP`, `udpLoadBalancerIP`, `loadBalancerClass`, `loadBalancerSourceRanges`, `externalTrafficPolicy`, `annotations` | off, `LoadBalancer` | Load balancers for public ports. `loadBalancerIP` pins the TCP/SCTP Service only and `udpLoadBalancerIP` pins the UDP Service, since many clouds refuse two Services on one address |
 | `networkPolicy.enabled`, `from`, `publicFrom` | off, the namespace, any source | Ingress policy |
 | `serviceAccount.create`, `name`, `mountToken`, `annotations` | true, fullname, false | Service account; the token stays unmounted unless asked |
 | `extraEnv` | `{}` | Env by name: a scalar through `tpl`, an object as its `valueFrom`; a name the chart derives is dropped |

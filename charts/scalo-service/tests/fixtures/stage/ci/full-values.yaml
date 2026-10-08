@@ -55,6 +55,8 @@ pdb:
 replicaCount: 2
 publicService:
   enabled: true
+  loadBalancerIP: 203.0.113.10
+  udpLoadBalancerIP: 203.0.113.11
   loadBalancerSourceRanges: ["203.0.113.0/24"]
 networkPolicy:
   enabled: true

@@ -35,7 +35,8 @@ spec:
 scalo-service.publicService -- with publicService.enabled, a load balancer for the ports
 the contract marks public: <fullname>-public for TCP and SCTP, <fullname>-public-udp for
 UDP, since many load balancers take one protocol each. Exposure is a deployment choice,
-so it is off by default.
+so it is off by default. loadBalancerIP pins the TCP/SCTP Service only, because many
+clouds refuse two Services on one address, and udpLoadBalancerIP pins the UDP Service.
 */}}
 {{- define "scalo-service.publicService" -}}
 {{- $public := .Values.publicService | default dict -}}
@@ -53,9 +54,10 @@ so it is off by default.
 {{- range $suffix := list "public" "public-udp" }}
 {{- with get $groups $suffix }}
 {{- $spec := dict "type" ($public.type | default "LoadBalancer") "selector" (include "scalo-service.selectorLabelSet" $ | fromJson) -}}
-{{- range $key := list "loadBalancerClass" "loadBalancerIP" "loadBalancerSourceRanges" "externalTrafficPolicy" -}}
+{{- range $key := list "loadBalancerClass" "loadBalancerSourceRanges" "externalTrafficPolicy" -}}
 {{- with get $public $key }}{{ $_ := set $spec $key . }}{{ end -}}
 {{- end -}}
+{{- with ternary $public.udpLoadBalancerIP $public.loadBalancerIP (eq $suffix "public-udp") }}{{ $_ := set $spec "loadBalancerIP" . }}{{ end -}}
 {{- $_ := set $spec "ports" (include "scalo-service.servicePorts" (dict "ports" .) | fromJson).items }}
 ---
 apiVersion: v1

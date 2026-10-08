@@ -91,3 +91,100 @@ tests:
           path: spec.ports[0].protocol
           value: UDP
         documentIndex: 1
+
+  - it: pins loadBalancerIP on the TCP load balancer only
+    template: service-public.yaml
+    set:
+      publicService.enabled: true
+      publicService.loadBalancerIP: 203.0.113.10
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: metadata.name
+          value: event-stage-public
+        documentIndex: 0
+      - equal:
+          path: spec.loadBalancerIP
+          value: 203.0.113.10
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: event-stage-public-udp
+        documentIndex: 1
+      - notExists:
+          path: spec.loadBalancerIP
+        documentIndex: 1
+
+  - it: pins udpLoadBalancerIP on the UDP load balancer only
+    template: service-public.yaml
+    set:
+      publicService.enabled: true
+      publicService.udpLoadBalancerIP: 203.0.113.11
+    asserts:
+      - hasDocuments:
+          count: 2
+      - notExists:
+          path: spec.loadBalancerIP
+        documentIndex: 0
+      - equal:
+          path: spec.loadBalancerIP
+          value: 203.0.113.11
+        documentIndex: 1
+
+  - it: gives each load balancer its own address when both are set
+    template: service-public.yaml
+    set:
+      publicService.enabled: true
+      publicService.loadBalancerIP: 203.0.113.10
+      publicService.udpLoadBalancerIP: 203.0.113.11
+    asserts:
+      - equal:
+          path: spec.loadBalancerIP
+          value: 203.0.113.10
+        documentIndex: 0
+      - equal:
+          path: spec.loadBalancerIP
+          value: 203.0.113.11
+        documentIndex: 1
+
+  - it: pins no address unless one is set
+    template: service-public.yaml
+    set:
+      publicService.enabled: true
+    asserts:
+      - notExists:
+          path: spec.loadBalancerIP
+        documentIndex: 0
+      - notExists:
+          path: spec.loadBalancerIP
+        documentIndex: 1
+
+  - it: shares the class, source ranges and traffic policy across both load balancers
+    template: service-public.yaml
+    set:
+      publicService.enabled: true
+      publicService.loadBalancerClass: example.com/lb
+      publicService.loadBalancerSourceRanges: ["203.0.113.0/24"]
+      publicService.externalTrafficPolicy: Local
+    asserts:
+      - equal:
+          path: spec.loadBalancerClass
+          value: example.com/lb
+        documentIndex: 0
+      - equal:
+          path: spec.loadBalancerClass
+          value: example.com/lb
+        documentIndex: 1
+      - equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["203.0.113.0/24"]
+        documentIndex: 1
+      - equal:
+          path: spec.externalTrafficPolicy
+          value: Local
+        documentIndex: 0
+      - equal:
+          path: spec.externalTrafficPolicy
+          value: Local
+        documentIndex: 1

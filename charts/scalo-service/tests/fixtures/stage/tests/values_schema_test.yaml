@@ -48,6 +48,13 @@ tests:
       - failedTemplate:
           errorPattern: "digest"
 
+  - it: refuses a udpLoadBalancerIP that is not a string
+    set:
+      publicService.udpLoadBalancerIP: 10
+    asserts:
+      - failedTemplate:
+          errorPattern: "udpLoadBalancerIP"
+
   - it: lets a config key that is not a dial through unvalidated
     set:
       config.routing.default: events
