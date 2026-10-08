@@ -9,6 +9,24 @@ tests:
       - failedTemplate:
           errorPattern: "replicaCount"
 
+  - it: refuses a fullnameOverride that starts with a digit, which no Service may be named
+    set:
+      fullnameOverride: 1stage
+    asserts:
+      - failedTemplate:
+          errorPattern: "fullnameOverride"
+
+  - it: refuses an extraEnv object without a valueFrom
+    set:
+      extraEnv:
+        DB_PASSWORD:
+          secretKeyRef:
+            name: db
+            key: password
+    asserts:
+      - failedTemplate:
+          errorPattern: "extraEnv"
+
   - it: refuses a dial below its minimum
     set:
       config.buffer.flush_rows: 0

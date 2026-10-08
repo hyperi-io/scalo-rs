@@ -19,6 +19,12 @@ const KUBERNETES_PROTOCOLS: [&str; 3] = ["TCP", "UDP", "SCTP"];
 /// The longest port name Kubernetes takes (an RFC 6335 `IANA_SVC_NAME`).
 const MAX_PORT_NAME_LEN: usize = 15;
 
+/// The longest Kubernetes Service name (an RFC 1035 label).
+const MAX_APP_NAME_LEN: usize = 63;
+
+/// Why a port of 0 is refused.
+const PORT_ZERO: &str = "is 0, and Kubernetes takes a port of 1 to 65535";
+
 /// The longest writable path name, so `writable-<name>` stays a 63-character volume name.
 const MAX_WRITABLE_NAME_LEN: usize = 50;
 
@@ -31,8 +37,13 @@ impl DeploymentContract {
     /// `generate-artefacts` subcommand run it before writing anything, and
     /// [`validate_helm_values`](super::validate_helm_values) reports it.
     ///
+    /// `app_name` is a Kubernetes Service name -- 1 to 63 lowercase letters,
+    /// digits and inner hyphens, starting with a letter -- because every object
+    /// the chart renders is named after it.
+    ///
     /// `image_registry` must be set: there is no default, and an image named
-    /// without one resolves to Docker Hub's library namespace.
+    /// without one resolves to Docker Hub's library namespace. `metrics_port`
+    /// and every extra port are 1 to 65535.
     ///
     /// Each extra port needs a name Kubernetes takes -- 1 to 15 lowercase
     /// letters, digits and single inner hyphens, with at least one letter --
@@ -55,6 +66,17 @@ impl DeploymentContract {
     ///
     /// [`DeploymentError::InvalidContract`] naming the first field at fault.
     pub fn validate(&self) -> Result<(), DeploymentError> {
+        if let Some(fault) = app_name_fault(&self.app_name) {
+            return Err(invalid(
+                "app_name".to_string(),
+                format!(
+                    "{:?} {fault}, and every object the chart renders is named after it, so it \
+                     must be a Kubernetes Service name: 1 to {MAX_APP_NAME_LEN} lowercase \
+                     letters, digits and inner hyphens, starting with a letter",
+                    self.app_name
+                ),
+            ));
+        }
         if self.image_registry.trim().is_empty() {
             return Err(invalid(
                 "image_registry".to_string(),
@@ -63,6 +85,9 @@ impl DeploymentContract {
                  `deployment.image_registry` in the config cascade"
                     .to_string(),
             ));
+        }
+        if self.metrics_port == 0 {
+            return Err(invalid("metrics_port".to_string(), PORT_ZERO.to_string()));
         }
         for (index, port) in self.extra_ports.iter().enumerate() {
             check_port(index, port)?;
@@ -164,6 +189,9 @@ fn check_port(index: usize, port: &PortContract) -> Result<(), DeploymentError> 
         ));
     }
     let field = |part: &str| format!("extra_ports[{}].{part}", port.name);
+    if port.port == 0 {
+        return Err(invalid(field("port"), PORT_ZERO.to_string()));
+    }
     if !KUBERNETES_PROTOCOLS
         .iter()
         .any(|known| port.protocol.eq_ignore_ascii_case(known))
@@ -223,9 +251,12 @@ fn check_writable_path(index: usize, writable: &WritablePath) -> Result<(), Depl
             "a persistent path needs a size for its claim, e.g. \"1Gi\"".to_string(),
         ));
     }
-    for text in [&writable.size, &writable.size_limit] {
+    for (part, text) in [
+        ("size", &writable.size),
+        ("size_limit", &writable.size_limit),
+    ] {
         if has_control(text) {
-            return Err(invalid(field("size"), holds_a_control_character(text)));
+            return Err(invalid(field(part), holds_a_control_character(text)));
         }
     }
     if let Some(text) = writable
@@ -251,6 +282,26 @@ fn writable_name_fault(name: &str) -> Option<&'static str> {
     }
     if name.starts_with('-') || name.ends_with('-') {
         return Some("starts or ends with '-'");
+    }
+    None
+}
+
+/// Why `name` is not a Kubernetes Service name, or `None` when it is one.
+fn app_name_fault(name: &str) -> Option<&'static str> {
+    if name.is_empty() || name.len() > MAX_APP_NAME_LEN {
+        return Some("is not 1 to 63 characters long");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Some("holds a character other than a lowercase letter, a digit or '-'");
+    }
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Some("does not start with a lowercase letter");
+    }
+    if name.ends_with('-') {
+        return Some("ends with '-'");
     }
     None
 }
@@ -454,6 +505,61 @@ mod tests {
         let mut c = contract();
         c.extra_ports = vec![PortContract::tcp("grpc", 6000).app_protocol("h2c\nx")];
         assert_eq!(refused_field(&c), "extra_ports[grpc].app_protocol");
+    }
+
+    #[test]
+    fn an_app_name_is_checked_as_a_service_name() {
+        for good in [
+            "app",
+            "my-app",
+            "a",
+            "dfe-receiver",
+            "app2",
+            "a--b",
+            &"a".repeat(63),
+        ] {
+            assert_eq!(app_name_fault(good), None, "{good:?}");
+        }
+        for bad in [
+            "",
+            &"a".repeat(64),
+            "My-app",
+            "my_app",
+            "my.app",
+            "1app",
+            "-app",
+            "app-",
+            "app\n",
+            "my app",
+        ] {
+            assert!(app_name_fault(bad).is_some(), "{bad:?} passed");
+        }
+    }
+
+    #[test]
+    fn a_port_of_zero_is_refused() {
+        let mut c = contract();
+        c.metrics_port = 0;
+        assert_eq!(refused_field(&c), "metrics_port");
+        c.metrics_port = 9090;
+        c.extra_ports = vec![PortContract::tcp("http", 0)];
+        assert_eq!(refused_field(&c), "extra_ports[http].port");
+    }
+
+    #[test]
+    fn a_control_character_in_a_size_limit_names_size_limit() {
+        let mut c = contract();
+        c.writable_paths = vec![WritablePath::new("spool", "/spool").size_limit("2G\ni")];
+        assert_eq!(refused_field(&c), "writable_paths[spool].size_limit");
+    }
+
+    #[test]
+    fn a_contract_whose_app_name_is_not_a_service_name_is_refused() {
+        let mut c = contract();
+        c.app_name = "Event_Stage".into();
+        assert_eq!(refused_field(&c), "app_name");
+        c.app_name = "event-stage".into();
+        c.validate().unwrap();
     }
 
     #[test]

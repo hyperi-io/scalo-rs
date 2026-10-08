@@ -13,8 +13,9 @@
       "const": 4
     },
     "app_name": {
-      "description": "Application name (e.g., \"my-app\") -- matched against Chart.yaml `name`.",
-      "type": "string"
+      "description": "Application name (e.g., \"my-app\") -- matched against Chart.yaml `name`.\nEvery object the chart renders is named after it, so it is a Kubernetes\nService name: 1 to 63 lowercase letters, digits and inner hyphens,\nstarting with a letter.",
+      "type": "string",
+      "pattern": "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$"
     },
     "binary_name": {
       "description": "Binary name (e.g., \"my-app\"). Defaults to app_name if empty.",
@@ -27,10 +28,10 @@
       "default": ""
     },
     "metrics_port": {
-      "description": "Metrics/health listen port (e.g., 9090).",
+      "description": "Metrics/health listen port (e.g., 9090), 1 to 65535.",
       "type": "integer",
       "format": "uint16",
-      "minimum": 0,
+      "minimum": 1,
       "maximum": 65535
     },
     "health": {
@@ -239,10 +240,10 @@
           "type": "string"
         },
         "port": {
-          "description": "Port number (e.g., 8080).",
+          "description": "Port number (e.g., 8080), 1 to 65535.",
           "type": "integer",
           "format": "uint16",
-          "minimum": 0,
+          "minimum": 1,
           "maximum": 65535
         },
         "protocol": {

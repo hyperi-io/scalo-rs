@@ -3,6 +3,15 @@ templates:
   - service.yaml
   - service-public.yaml
 tests:
+  - it: names the release namespace on the object
+    template: service.yaml
+    release:
+      namespace: apps
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: apps
+
   - it: serves the metrics port and every open port, selecting by name only
     template: service.yaml
     asserts:

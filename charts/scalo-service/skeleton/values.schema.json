@@ -37,7 +37,7 @@
     "fullnameOverride": {
       "description": "Name of every object, instead of the chart name.",
       "type": "string",
-      "pattern": "^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)?$"
+      "pattern": "^([a-z]([-a-z0-9]{0,61}[a-z0-9])?)?$"
     },
     "partOf": {
       "description": "The app.kubernetes.io/part-of label.",
@@ -278,9 +278,19 @@
       }
     },
     "extraEnv": {
-      "description": "Environment variables by name, for settings no dial models.",
+      "description": "Environment variables by name, for settings no dial models. A scalar is rendered through tpl; an object is a valueFrom.",
       "type": "object",
-      "additionalProperties": { "type": ["string", "number", "boolean"] }
+      "additionalProperties": {
+        "oneOf": [
+          { "type": ["string", "number", "boolean"] },
+          {
+            "type": "object",
+            "properties": { "valueFrom": { "type": "object" } },
+            "required": ["valueFrom"],
+            "additionalProperties": false
+          }
+        ]
+      }
     },
     "extraEnvFrom": { "$ref": "#/$defs/objectList" },
     "extraVolumes": { "$ref": "#/$defs/objectList" },
