@@ -44,9 +44,9 @@ A release pipeline runs these steps after it builds the image. Nothing here depe
 
 1. **Validate the contract.** Pick `schema/deployment-contract.v<N>.schema.json` for the contract's `schema_version`. No such file means this library release cannot render that contract. The contract must validate against it without error.
 2. **Copy the skeleton.** Copy `skeleton/` to a directory named after the contract's `app_name`.
-3. **Write `files/contract.json`.** The contract, as JSON.
-4. **Fill in `Chart.yaml`.** Set `name` to `app_name`, `version` to the service's release version, and `appVersion` to the image tag. Set `description` to the contract's when it has one. Replace `dependencies` with one entry: `name: scalo-service`, the library `version`, and the `repository` it is pulled from.
-5. **Find the dials.** Walk the contract's `config_schema` from its root, carrying a dotted path:
+3. **Write `files/contract.json`.** The contract, byte for byte as the service emitted or committed it.
+4. **Fill in `Chart.yaml`.** Set `name` to `app_name`, `version` to the service's release version, and `appVersion` to the image tag exactly as pushed, `v` included. Set `description` to the contract's when it has one. Replace `dependencies` with one entry: `name: scalo-service`, the library `version`, and the `repository` it is pulled from.
+5. **Find the dials.** A contract with no `config_schema`, or a null one, has none. Otherwise walk it from its root, carrying a dotted path:
    - a node carrying `x-scalo-dial` is a dial at the current path, recorded once, and nothing beneath it is walked; its value must be `big` or `small`
    - a `$ref` is followed to its target at the same path, at most once per reference along one branch
    - each `properties` entry is walked at `<path>.<name>`, in name order
@@ -54,10 +54,10 @@ A release pipeline runs these steps after it builds the image. Nothing here depe
 
    `scalo::deployment::dials` is this walk, and the test suite checks the fixtures against it.
 6. **Inline each dial.** Replace every local `$ref` inside a dial with its target, keys on the node beside the `$ref` winning. Keep every constraint (`minimum`, `maximum`, `enum`, `pattern`, `default`) and the `x-scalo-dial` marker.
-7. **Write `values.schema.json`.** Start from `skeleton/values.schema.json`. Add `properties.config` as `{"type": "object"}`, and for each dial path `a.b.c` nest `properties.a` and `properties.b` as `{"type": "object"}` objects under it and set `properties.c` to the inlined dial. When the fragment has no top-level `$schema`, set it to the `$schema` of the contract's `config_schema`. A fragment that already declares `properties.config` is an error.
+7. **Write `values.schema.json`.** Start from `skeleton/values.schema.json`, the fragment. Add `properties.config` as `{"type": "object"}`, and for each dial path `a.b.c` nest `properties.a` and `properties.b` as `{"type": "object"}` objects under it and set `properties.c` to the inlined dial. When the fragment has no top-level `$schema`, set it to the `$schema` of the contract's `config_schema`. A fragment that already declares `properties.config` is an error.
 8. **Write `values.yaml`.** `config: {}`, `image.digest` set to the digest built for the tag, and one comment line per dial, `# config.<path>: <default>  # <tier>`, so an operator sees what can be tuned without it being set.
 
-Write every JSON and YAML file with sorted keys and no timestamp, so one assembler given the same inputs writes the same bytes. Two assemblers may differ in comments and layout, never in what the chart renders.
+Write the files these steps derive (`Chart.yaml`, `values.schema.json`, `values.yaml`) with sorted keys and no timestamp, so one assembler given the same inputs writes the same bytes. Two assemblers may differ in comments and layout, never in what the chart renders.
 
 Before rendering a thin chart, fetch the library into its `charts/` with `helm dependency build`.
 
@@ -116,7 +116,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | --- | --- | --- |
 | `fullnameOverride` | chart name | Name of every object; a Kubernetes Service name, as `app_name` |
 | `partOf` | none | `app.kubernetes.io/part-of` |
-| `commonLabels`, `commonAnnotations` | `{}` | On every object; the standard labels win a collision |
+| `commonLabels`, `commonAnnotations` | `{}` | On every object; label values through `tpl`; the standard labels win a collision |
 | `podLabels`, `podAnnotations` | `{}` | On the pod template; the selector label always wins |
 | `global.registry`, `image.registry` | contract `image_registry` | Image registry |
 | `image.repository` | `<registry>/<app_name>` | Replaces the whole repository |
@@ -148,7 +148,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `fileSets.<set>.mountPath`, `fileSets.<set>.files[{name, content}]` | none | Files mounted read-only from a ConfigMap |
 | `writablePaths.<name>.enabled`, `.sizeLimit` | on, contract | Per contract path |
 | `writablePaths.<name>.persistence.enabled`, `.size`, `.storageClass`, `.accessModes`, `.existingClaim`, `.annotations` | contract, `[ReadWriteOnce]` | The path's claim |
-| `secrets.<group>.enabled`, `.existingSecret`, `.keys.<key_name>`, `.optional` | on, `<fullname>-<group>`, contract `secret_key`, contract | Per contract secret group |
+| `secrets.<group>.enabled`, `.existingSecret`, `.keys.<key_name>`, `.optional` | on, `<fullname>-<group>`, contract `secret_key`, contract | Per contract secret group; `existingSecret` through `tpl` |
 | `service.type`, `service.annotations` | `ClusterIP` | In-cluster Service |
 | `publicService.enabled`, `type`, `loadBalancerIP`, `loadBalancerClass`, `loadBalancerSourceRanges`, `externalTrafficPolicy`, `annotations` | off, `LoadBalancer` | Load balancers for public ports |
 | `networkPolicy.enabled`, `from`, `publicFrom` | off, the namespace, any source | Ingress policy |

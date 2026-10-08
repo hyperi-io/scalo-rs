@@ -210,6 +210,28 @@ tests:
             name: OTEL_SERVICE_NAME
             value: overridden
 
+  - it: renders commonLabels values and a secret group's existingSecret through tpl
+    release:
+      namespace: apps
+    set:
+      commonLabels:
+        example.com/namespace: "{{ .Release.Namespace }}"
+      secrets:
+        kafka:
+          existingSecret: "{{ .Release.Namespace }}-kafka"
+    asserts:
+      - equal:
+          path: metadata.labels["example.com/namespace"]
+          value: apps
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: EVENT_STAGE__KAFKA__USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: apps-kafka
+                key: kafka-username
+
   - it: renders an extraEnv string through tpl and takes a valueFrom
     release:
       namespace: apps

@@ -1,7 +1,7 @@
 {{/*
 scalo-service.secretEnv -- one secretKeyRef per variable of each contract secret group,
-as {"items": [...]}. secrets.<group>.existingSecret names the Secret (default
-<fullname>-<group>), secrets.<group>.keys.<key_name> renames a key,
+as {"items": [...]}. secrets.<group>.existingSecret names the Secret, through `tpl`
+(default <fullname>-<group>), secrets.<group>.keys.<key_name> renames a key,
 secrets.<group>.optional overrides the contract, and secrets.<group>.enabled: false
 leaves the group out.
 */}}
@@ -17,7 +17,8 @@ leaves the group out.
 {{- if $enabled -}}
 {{- $optional := $group.optional | default false -}}
 {{- if hasKey $override "optional" }}{{ $optional = $override.optional }}{{ end -}}
-{{- $secret := $override.existingSecret | default (printf "%s-%s" $fullname $group.group_name) -}}
+{{- $secret := printf "%s-%s" $fullname $group.group_name -}}
+{{- with $override.existingSecret }}{{ $secret = tpl (toString .) $ }}{{ end -}}
 {{- $keys := $override.keys | default dict -}}
 {{- range $var := $group.env_vars -}}
 {{- $ref := dict "name" $secret "key" (get $keys $var.key_name | default $var.secret_key) -}}

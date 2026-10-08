@@ -14,13 +14,14 @@ scalo-service.selectorLabels -- the selector label set as YAML.
 {{- end -}}
 
 {{/*
-scalo-service.labelSet -- the standard labels over `commonLabels`, as JSON; the standard
-keys win a collision so commonLabels cannot rename the workload.
+scalo-service.labelSet -- the standard labels over `commonLabels` (values through `tpl`), as
+JSON; the standard keys win a collision so commonLabels cannot rename the workload.
 */}}
 {{- define "scalo-service.labelSet" -}}
+{{- $ctx := . -}}
 {{- $labels := dict -}}
 {{- range $key, $value := .Values.commonLabels | default dict -}}
-{{- $_ := set $labels $key (toString $value) -}}
+{{- $_ := set $labels $key (tpl (toString $value) $ctx) -}}
 {{- end -}}
 {{- $_ := set $labels "app.kubernetes.io/name" (include "scalo-service.fullname" .) -}}
 {{- $_ = set $labels "app.kubernetes.io/instance" .Release.Name -}}
