@@ -6,6 +6,14 @@ release and the target before bumping.
 
 ---
 
+## Unreleased
+
+### The secret schema marker is `x-scalo-secret` alone (BEHAVIOUR CHANGE)
+
+`SensitiveString`'s JSON Schema no longer carries `x-dfe-secret`. A secret field now reads `{"type": "string", "x-scalo-secret": true, "writeOnly": true}`. scalo-py emits the same keys and opts a field in on `x-scalo-secret` only.
+
+**Consumer adjustment** -- a reader that keyed on `x-dfe-secret` keys on `x-scalo-secret`, in the same change as the bump. A committed `config-schema.*` loses the old marker on regeneration, so `assert_no_config_artifact_drift` fails until it is regenerated.
+
 ## 2.14.1
 
 ### CEL moves to cel 0.14 (BEHAVIOUR CHANGE)

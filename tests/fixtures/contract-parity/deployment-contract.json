@@ -1,0 +1,283 @@
+{
+  "schema_version": 3,
+  "app_name": "parity-app",
+  "binary_name": "parity-app-bin",
+  "description": "Sample app covering every contract field",
+  "metrics_port": 9090,
+  "health": {
+    "liveness_path": "/healthz",
+    "readiness_path": "/ready",
+    "metrics_path": "/metrics"
+  },
+  "env_prefix": "PARITY_APP",
+  "metric_prefix": "parity",
+  "config_mount_path": "/etc/parity-app/config.yaml",
+  "image_registry": "registry.example.com/team",
+  "extra_ports": [
+    {
+      "name": "http",
+      "port": 8080,
+      "protocol": "TCP",
+      "bound_from": "http.bind_address"
+    },
+    {
+      "name": "grpc",
+      "port": 6000,
+      "protocol": "TCP",
+      "when": {
+        "kind": "enabled",
+        "path": "config.grpc.enabled"
+      },
+      "bound_from": "grpc.bind_address"
+    },
+    {
+      "name": "push",
+      "port": 6001,
+      "protocol": "TCP",
+      "when": {
+        "kind": "equals",
+        "path": "config.source.transport",
+        "value": "direct"
+      }
+    },
+    {
+      "name": "syslog",
+      "port": 5514,
+      "protocol": "UDP",
+      "when": {
+        "kind": "one_of",
+        "path": "config.syslog.protocol",
+        "values": [
+          "udp",
+          "both"
+        ]
+      },
+      "bound_from": "syslog.bind_address"
+    }
+  ],
+  "unbound_listen_paths": [
+    "client.bind_address"
+  ],
+  "entrypoint_args": [
+    "--config",
+    "/etc/parity-app/config.yaml"
+  ],
+  "secrets": [
+    {
+      "group_name": "source",
+      "env_vars": [
+        {
+          "env_var": "PARITY_APP__SOURCE__PASSWORD",
+          "key_name": "password",
+          "secret_key": "source-password"
+        }
+      ]
+    }
+  ],
+  "default_config": {
+    "http": {
+      "bind_address": "0.0.0.0:8080"
+    },
+    "grpc": {
+      "enabled": false,
+      "bind_address": "0.0.0.0:6000"
+    },
+    "source": {
+      "transport": "kafka",
+      "brokers": [
+        "broker:9092"
+      ],
+      "group_id": "parity-app",
+      "topics": [
+        "events"
+      ]
+    },
+    "syslog": {
+      "protocol": "udp",
+      "bind_address": "0.0.0.0:5514"
+    },
+    "client": {
+      "bind_address": "0.0.0.0:0"
+    }
+  },
+  "depends_on": [
+    "kafka"
+  ],
+  "keda": {
+    "enabled": true,
+    "min_replicas": 2,
+    "max_replicas": 8,
+    "polling_interval": 15,
+    "cooldown_period": 120,
+    "kafka_lag_threshold": 1000,
+    "activation_lag_threshold": 0,
+    "cpu_enabled": true,
+    "cpu_threshold": 80,
+    "kafka_trigger": {
+      "enabled": true,
+      "brokers_path": "config.source.brokers",
+      "group_path": "config.source.group_id",
+      "topics_path": "config.source.topics"
+    }
+  },
+  "base_image": "debian:trixie-slim",
+  "native_deps": {
+    "apt_repos": [
+      {
+        "key_url": "https://packages.confluent.io/clients/deb/archive.key",
+        "keyring": "/usr/share/keyrings/confluent-clients.gpg",
+        "url": "https://packages.confluent.io/clients/deb",
+        "codename": "bookworm",
+        "key_fingerprint": "CBBB821E8FAF364F79835C438B1DA6120C2BF624",
+        "packages": [
+          "librdkafka1"
+        ]
+      }
+    ],
+    "apt_packages": [
+      "libssl3t64",
+      "zlib1g",
+      "libzstd1",
+      "libgit2-1.9"
+    ],
+    "distro": "trixie",
+    "unresolved_base_image": "registry.example.com/base@sha256:0123",
+    "contradicted_base_image": "debian:bookworm-slim"
+  },
+  "image_profile": "development",
+  "oci_labels": {
+    "title": "parity-app",
+    "description": "Sample app covering every contract field",
+    "vendor": "Example Ltd",
+    "label_namespace": "com.example",
+    "licenses": "Apache-2.0",
+    "copyright": "(c) 2026 Example Ltd"
+  },
+  "config_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "ParityConfig",
+    "description": "Sample app configuration.",
+    "type": "object",
+    "properties": {
+      "http": {
+        "description": "HTTP intake.",
+        "$ref": "#/$defs/HttpSection"
+      },
+      "source": {
+        "description": "Upstream the app consumes from.",
+        "$ref": "#/$defs/SourceSection"
+      }
+    },
+    "required": [
+      "http",
+      "source"
+    ],
+    "$defs": {
+      "HttpSection": {
+        "type": "object",
+        "properties": {
+          "bind_address": {
+            "description": "Listen address.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bind_address"
+        ]
+      },
+      "SourceSection": {
+        "type": "object",
+        "properties": {
+          "transport": {
+            "description": "`kafka` or `direct`.",
+            "type": "string"
+          },
+          "brokers": {
+            "description": "Broker list.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "group_id": {
+            "description": "Consumer group.",
+            "type": "string"
+          },
+          "topics": {
+            "description": "Topics to consume.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "password": {
+            "description": "Broker password.",
+            "type": "string",
+            "x-scalo-secret": true,
+            "writeOnly": true
+          }
+        },
+        "required": [
+          "transport",
+          "brokers",
+          "group_id",
+          "topics",
+          "password"
+        ]
+      }
+    }
+  },
+  "capabilities": [
+    {
+      "kind": "source",
+      "name": "kafka",
+      "description": "Consume from a Kafka topic.",
+      "maturity": "stable",
+      "fields": [
+        {
+          "name": "brokers",
+          "type": "string",
+          "required": true,
+          "description": "Broker list.",
+          "example": [
+            "broker:9092"
+          ]
+        },
+        {
+          "name": "password",
+          "type": "secret",
+          "required": false,
+          "description": "Broker password.",
+          "secret": true
+        },
+        {
+          "name": "transport",
+          "type": "enum",
+          "required": false,
+          "default": "kafka",
+          "description": "",
+          "enum_values": [
+            "kafka",
+            "direct"
+          ]
+        }
+      ],
+      "children": [
+        {
+          "kind": "service",
+          "name": "events",
+          "description": "",
+          "fields": [
+            {
+              "name": "partitions",
+              "type": "int",
+              "required": false,
+              "default": 3,
+              "description": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

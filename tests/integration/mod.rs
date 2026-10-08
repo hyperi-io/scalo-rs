@@ -18,6 +18,9 @@ mod env_parity;
 #[cfg(feature = "config")]
 mod config_parity;
 
+#[cfg(feature = "config-schema")]
+mod contract_parity;
+
 #[cfg(feature = "logger")]
 mod logger_output;
 

@@ -95,7 +95,7 @@ A secret field is flagged in TWO places:
 - catalog `FieldSpec.secret = true`
 - JSON Schema: the field's subschema carries `"x-scalo-secret": true` (plus `"writeOnly": true`).
 
-Rust: `SensitiveString` implements `JsonSchema` to emit `{"type": "string", "x-scalo-secret": true, "x-dfe-secret": true, "writeOnly": true}`. `x-dfe-secret` is the marker's earlier name, emitted beside it until every reader keys on `x-scalo-secret`, so a reader looks for `x-scalo-secret`. Python must emit the same keys, in the same order, through the secret field type's `json_schema_extra`. The control plane keys off the marker to route the value through the secrets seam and the UI masks the input.
+Rust: `SensitiveString` implements `JsonSchema` to emit `{"type": "string", "x-scalo-secret": true, "writeOnly": true}`. Python must emit the same keys, in the same order, through the secret field type's `json_schema_extra`. The control plane keys off the marker to route the value through the secrets seam and the UI masks the input.
 
 ## ENV mapping for nested config (decision: C)
 
@@ -138,7 +138,7 @@ per-connection field:
                 "properties": {
                   "id": { "type": "string" },
                   "credential_secret": { "type": ["string", "null"] },
-                  "secret_access_key": { "type": "string", "x-scalo-secret": true, "x-dfe-secret": true, "writeOnly": true }
+                  "secret_access_key": { "type": "string", "x-scalo-secret": true, "writeOnly": true }
                 }
               }
             }
