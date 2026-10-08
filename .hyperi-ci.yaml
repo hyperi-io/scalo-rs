@@ -50,3 +50,8 @@ build:
     targets: []
 release:
   enabled: true
+  # Named by exact directory: a glob skips library charts.
+  helm:
+    enabled: true
+    charts:
+      - charts/scalo-service
