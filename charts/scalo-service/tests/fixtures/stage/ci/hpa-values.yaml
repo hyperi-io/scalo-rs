@@ -1,0 +1,7 @@
+# KEDA off and the fallback HorizontalPodAutoscaler on, with a budget from its floor.
+keda:
+  enabled: false
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6

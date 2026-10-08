@@ -1,0 +1,20 @@
+# Project:   scalo
+# File:      charts/scalo-service/Chart.yaml
+# Purpose:   Library chart that renders a service from its deployment contract
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+apiVersion: v2
+name: scalo-service
+description: Library chart that renders a Kubernetes service from the deployment contract its parent chart carries in files/contract.json.
+type: library
+# The release stamps the scalo-rs version here when it packages the chart.
+version: 0.0.0
+keywords:
+  - library
+  - deployment-contract
+home: https://github.com/hyperi-io/scalo-rs/tree/main/charts/scalo-service
+sources:
+  - https://github.com/hyperi-io/scalo-rs
+annotations:
+  licenses: Apache-2.0

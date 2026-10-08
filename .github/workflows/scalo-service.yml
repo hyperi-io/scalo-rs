@@ -1,0 +1,66 @@
+# Project:   scalo
+# File:      .github/workflows/scalo-service.yml
+# Purpose:   Test the scalo-service library chart and gate breaking contract schema changes
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+
+name: scalo-service
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "charts/**"
+      - "src/deployment/**"
+      - "examples/schema_breaking.rs"
+      - "scripts/schema-breaking-check.sh"
+      - "Cargo.toml"
+      - ".github/workflows/scalo-service.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - "src/deployment/**"
+      - "examples/schema_breaking.rs"
+      - "scripts/schema-breaking-check.sh"
+      - "Cargo.toml"
+      - ".github/workflows/scalo-service.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    name: chart (helm-unittest, kubeconform, expected-fail)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fixture charts through the library
+        env:
+          SCALO_CHART_TOOLS: ${{ runner.temp }}/chart-tools
+        run: charts/scalo-service/tests/run.sh
+
+  contract-schema:
+    name: contract schema breaking-change check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # The last release tag is the baseline, so the full history comes down.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Compare with the last release
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: scripts/schema-breaking-check.sh

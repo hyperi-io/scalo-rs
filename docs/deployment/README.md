@@ -10,8 +10,9 @@ so a reviewer sees the diff when the contract changes.
 
 | Doc | Covers |
 | --- | --- |
-| [contract.md](contract.md) | `DeploymentContract` fields, schema versioning, cascade keys |
+| [contract.md](contract.md) | `DeploymentContract` fields, schema versioning and its JSON Schema, dials, cascade keys |
 | [artefacts.md](artefacts.md) | what each generator emits, file by file |
+| [../../charts/scalo-service/README.md](../../charts/scalo-service/README.md) | the library chart that renders a contract, and how to assemble a thin chart |
 | [native-deps.md](native-deps.md) | feature to APT package map, base release resolution |
 | [keda.md](keda.md) | `KedaContract`, scaler triggers, fallback HPA |
 | [conformance.md](conformance.md) | test harness: every acknowledged record arrives, under injected faults |

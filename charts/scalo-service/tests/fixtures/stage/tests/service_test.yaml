@@ -1,0 +1,84 @@
+suite: service
+templates:
+  - service.yaml
+  - service-public.yaml
+tests:
+  - it: serves the metrics port and every open port, selecting by name only
+    template: service.yaml
+    asserts:
+      - equal:
+          path: spec.selector
+          value:
+            app.kubernetes.io/name: event-stage
+      - equal:
+          path: spec.ports
+          value:
+            - name: metrics
+              port: 9090
+              targetPort: metrics
+              protocol: TCP
+            - name: http
+              port: 8080
+              targetPort: http
+              protocol: TCP
+            - name: syslog
+              port: 5514
+              targetPort: syslog
+              protocol: UDP
+
+  - it: carries the contract's appProtocol on the gRPC port
+    template: service.yaml
+    set:
+      config.grpc.enabled: true
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: grpc
+            port: 6000
+            targetPort: grpc
+            protocol: TCP
+            appProtocol: kubernetes.io/h2c
+
+  - it: exposes nothing publicly by default
+    template: service-public.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: splits public ports into a TCP and a UDP load balancer
+    template: service-public.yaml
+    set:
+      publicService.enabled: true
+      publicService.loadBalancerSourceRanges: ["203.0.113.0/24"]
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: metadata.name
+          value: event-stage-public
+        documentIndex: 0
+      - equal:
+          path: spec.ports
+          value:
+            - name: http
+              port: 8080
+              targetPort: http
+              protocol: TCP
+        documentIndex: 0
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+        documentIndex: 0
+      - equal:
+          path: spec.loadBalancerSourceRanges
+          value: ["203.0.113.0/24"]
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: event-stage-public-udp
+        documentIndex: 1
+      - equal:
+          path: spec.ports[0].protocol
+          value: UDP
+        documentIndex: 1

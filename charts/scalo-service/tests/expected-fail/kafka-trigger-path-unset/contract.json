@@ -1,0 +1,21 @@
+{
+  "schema_version": 4,
+  "app_name": "minimal",
+  "metrics_port": 9090,
+  "health": { "liveness_path": "/livez", "readiness_path": "/readyz", "metrics_path": "/metrics" },
+  "env_prefix": "MINIMAL",
+  "metric_prefix": "minimal",
+  "image_registry": "registry.example.com/team",
+  "default_config": { "kafka": { "brokers": ["kafka:9092"], "topics": ["events"] } },
+  "keda": {
+    "enabled": true,
+    "min_replicas": 1,
+    "max_replicas": 4,
+    "polling_interval": 15,
+    "cooldown_period": 300,
+    "kafka_lag_threshold": 1000,
+    "activation_lag_threshold": 0,
+    "cpu_enabled": true,
+    "cpu_threshold": 80
+  }
+}

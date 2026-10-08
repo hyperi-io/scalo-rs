@@ -1,0 +1,3 @@
+fixture=stage
+remove-contract=true
+error=the chart has no files/contract.json

@@ -1,0 +1,10 @@
+apiVersion: v2
+appVersion: v0.9.0
+dependencies:
+- name: scalo-service
+  repository: file://../../..
+  version: 0.0.0
+description: A singleton that keeps its cursors on a persistent volume
+name: cursor-keeper
+type: application
+version: 0.9.0

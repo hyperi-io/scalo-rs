@@ -1,0 +1,946 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeploymentContract",
+  "description": "Deployment-facing contract points derived from the app config cascade.\n\nApps build this from their `Config::default()`. Validation functions\ncompare Helm charts and Dockerfiles against these values. Generation\nfunctions create deployment artifacts (Dockerfile, Helm chart, Compose\nfragment) from scratch.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "description": "Contract schema version. A reader refuses a version it does not support.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0,
+      "default": 4,
+      "const": 4
+    },
+    "app_name": {
+      "description": "Application name (e.g., \"my-app\") -- matched against Chart.yaml `name`.",
+      "type": "string"
+    },
+    "binary_name": {
+      "description": "Binary name (e.g., \"my-app\"). Defaults to app_name if empty.",
+      "type": "string",
+      "default": ""
+    },
+    "description": {
+      "description": "One-line description for Chart.yaml.",
+      "type": "string",
+      "default": ""
+    },
+    "metrics_port": {
+      "description": "Metrics/health listen port (e.g., 9090).",
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "health": {
+      "description": "Health probe endpoint paths.",
+      "$ref": "#/$defs/HealthContract"
+    },
+    "env_prefix": {
+      "description": "Environment variable prefix (e.g., \"MY_APP\").\nUsed with `__` nesting for figment config cascade.",
+      "type": "string"
+    },
+    "metric_prefix": {
+      "description": "Prometheus metric namespace/prefix (e.g., \"loader\").",
+      "type": "string"
+    },
+    "config_mount_path": {
+      "description": "Config file mount path (e.g., \"/etc/my-app/config.yaml\"). Empty means\nthe app reads no config file, so no ConfigMap is mounted.",
+      "type": "string",
+      "default": ""
+    },
+    "image_registry": {
+      "description": "Container registry base the image is pushed to and pulled from (e.g.,\n\"registry.example.com/team\"). Required: there is no default, and\n[`validate`](Self::validate) refuses an empty value. Read it from the\ncascade with [`image_registry_from_cascade`](super::image_registry_from_cascade).",
+      "type": "string",
+      "default": ""
+    },
+    "extra_ports": {
+      "description": "Additional ports beyond metrics (e.g., HTTP data port for receiver).",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PortContract"
+      },
+      "default": []
+    },
+    "unbound_listen_paths": {
+      "description": "`default_config` listen paths that need no port, e.g. the bind address\nof a client that only sends. Waives them from\n[`undeclared_listeners`](Self::undeclared_listeners); no generated\nartefact changes with it.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "entrypoint_args": {
+      "description": "Default ENTRYPOINT args (e.g., `[\"--config\", \"/etc/my-app/config.yaml\"]`).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "secrets": {
+      "description": "Secret groups injected from K8s Secrets.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SecretGroupContract"
+      },
+      "default": []
+    },
+    "default_config": {
+      "description": "App-specific config YAML for values.yaml (serialised as serde_json::Value).",
+      "default": null
+    },
+    "depends_on": {
+      "description": "Docker Compose service dependencies (e.g., `[\"kafka\", \"clickhouse\"]`).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "keda": {
+      "description": "KEDA autoscaling contract (None if KEDA not used).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KedaContract"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "base_image": {
+      "description": "Base container image for the runtime stage.",
+      "type": "string",
+      "default": "debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a"
+    },
+    "native_deps": {
+      "description": "Runtime native dependencies for the container image.\n\nUse [`NativeDepsContract::for_scalo_features`] to auto-populate from\nscalo feature flags. The Dockerfile generator emits the correct\nAPT repo setup and package installation commands.",
+      "$ref": "#/$defs/NativeDepsContract",
+      "default": {
+        "apt_repos": [],
+        "apt_packages": []
+      }
+    },
+    "image_profile": {
+      "description": "Image profile -- production (minimal) or development (debug tools).\n\nDefaults to [`ImageProfile::Production`]. Use [`with_dev_profile`](Self::with_dev_profile)\nto derive a development variant from an existing contract.",
+      "$ref": "#/$defs/ImageProfile",
+      "default": "production"
+    },
+    "oci_labels": {
+      "description": "OCI image labels (static -- dynamic labels injected by CI at build time).",
+      "$ref": "#/$defs/OciLabels",
+      "default": {
+        "title": "",
+        "description": "",
+        "vendor": "",
+        "label_namespace": "io.scalo",
+        "licenses": "",
+        "copyright": ""
+      }
+    },
+    "config_schema": {
+      "description": "Reflectable JSON Schema (draft 2020-12) of the app's full `Config`,\nderived via schemars (scalo-rs#6). `None` when the app does not provide\none. Secret fields carry the `x-scalo-secret` marker, and operator dials\ncarry `x-scalo-dial` (`big` or `small`, see [`DIAL_KEYWORD`](super::DIAL_KEYWORD)).\nCarried inline so a single fetch of the contract gives the schema; also\nwritten to `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConfigSchemaNode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "capabilities": {
+      "description": "Capability catalog -- the runtime-data surface schemars cannot derive\n(service names + their knobs). Hand-authored per app. Empty when the app\ndoes not provide one. Also written to `capability-catalog.{json,yaml}`.\nSee [`Capability`](super::Capability).",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Capability"
+      }
+    },
+    "writable_paths": {
+      "description": "Directories the app writes at run time, so the root filesystem can stay\nread-only. A chart always adds a scratch `/tmp` beside these.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WritablePath"
+      }
+    },
+    "termination_grace_seconds": {
+      "description": "Seconds between SIGTERM and SIGKILL. The default leaves time for a\npre-stop pause, a gRPC drain and a final commit after the endpoints\ndrop the pod.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0,
+      "default": 45
+    },
+    "resources": {
+      "description": "The app's own CPU and memory requests and limits. Empty values leave\nthe chart's defaults in place; deployment values override both.",
+      "$ref": "#/$defs/ResourcesContract"
+    },
+    "security": {
+      "description": "The user, group and Linux capabilities the image runs with.",
+      "$ref": "#/$defs/SecurityContract",
+      "default": {
+        "run_as_user": 1000,
+        "run_as_group": 1000,
+        "fs_group": 1000,
+        "read_only_root_filesystem": true
+      }
+    },
+    "singleton": {
+      "description": "Exactly one pod may run: replicas stay at one, nothing autoscales it, and\na new pod starts only after the old one has stopped.",
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "app_name",
+    "metrics_port",
+    "health",
+    "env_prefix",
+    "metric_prefix"
+  ],
+  "$defs": {
+    "HealthContract": {
+      "description": "Health probe endpoint paths.\n\nThere is no startup path. A `startupProbe` targets `liveness_path`:\nKubernetes suspends liveness until the startup probe passes, so one path\ngives both a generous boot budget and a tight liveness period without the\ntwo drifting apart.",
+      "type": "object",
+      "properties": {
+        "liveness_path": {
+          "description": "Liveness probe path (e.g., \"/livez\").",
+          "type": "string"
+        },
+        "readiness_path": {
+          "description": "Readiness probe path (e.g., \"/readyz\").",
+          "type": "string"
+        },
+        "metrics_path": {
+          "description": "Prometheus metrics path (e.g., \"/metrics\").",
+          "type": "string"
+        },
+        "startup_budget_seconds": {
+          "description": "Longest the app may take from start to a passing liveness probe, in\nseconds. The chart's startup probe allows this long before it restarts\nthe pod.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 150
+        }
+      },
+      "required": [
+        "liveness_path",
+        "readiness_path",
+        "metrics_path"
+      ]
+    },
+    "PortContract": {
+      "description": "Additional container port beyond the metrics port.\n\nBuild one with [`tcp`](Self::tcp) or [`udp`](Self::udp), then say when its\nlistener exists with [`when`](Self::when()) and which listen address it\nserves with [`bound_from`](Self::bound_from()).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Port name (e.g., \"http\").",
+          "type": "string"
+        },
+        "port": {
+          "description": "Port number (e.g., 8080).",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "protocol": {
+          "description": "Protocol (default: \"TCP\").",
+          "type": "string",
+          "default": "TCP"
+        },
+        "when": {
+          "description": "The values condition under which the listener behind this port exists.\n`None` means it always listens. A gated port renders in the chart only\nwhile the condition holds, and stays out of the Dockerfile `EXPOSE`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bound_from": {
+          "description": "Dotted `default_config` path of the listen address this port serves,\ne.g. `grpc.listen`. Read only by\n[`undeclared_listeners`](DeploymentContract::undeclared_listeners); no\ngenerated artefact changes with it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "public": {
+          "description": "Clients outside the cluster connect here. A chart can put such ports on\na load balancer; whether it does is a deployment choice.",
+          "type": "boolean"
+        },
+        "app_protocol": {
+          "description": "The application protocol a proxy speaks to this port, written to the\nService port's `appProtocol` (e.g. \"kubernetes.io/h2c\" for gRPC without\nTLS). Empty writes none.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "port"
+      ]
+    },
+    "PortCondition": {
+      "description": "When a port's listener exists, as a test on a chart values path.\n\n`path` is dotted and `.Values`-relative, and each segment must be a Go\nidentifier, e.g. `config.source.transport`. The chart reads app config under\n`config`, so only a path under `config.` can be checked against\n`default_config`. A missing or null value never satisfies a condition.\n\n`Equals` and `OneOf` compare the chart's `toString` of the value, so gate on\na string or boolean setting. A numeric one compares unreliably: Helm reads a\nlarge number in `values.yaml` as a float and prints `1e+06` where the config\nsays `1000000`.",
+      "oneOf": [
+        {
+          "description": "The value counts as true: anything but false, null, zero or empty.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "Values path of the switch.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "enabled"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ]
+        },
+        {
+          "description": "The value, as a string, equals `value`.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "Values path of the setting.",
+              "type": "string"
+            },
+            "value": {
+              "description": "The value that turns the listener on.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "equals"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "value"
+          ]
+        },
+        {
+          "description": "The value, as a string, is one of `values`.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "Values path of the setting.",
+              "type": "string"
+            },
+            "values": {
+              "description": "The values that turn the listener on.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "one_of"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "values"
+          ]
+        }
+      ]
+    },
+    "SecretGroupContract": {
+      "description": "A group of secrets from the same K8s Secret (e.g., \"kafka\", \"clickhouse\").",
+      "type": "object",
+      "properties": {
+        "group_name": {
+          "description": "Group name (e.g., \"kafka\", \"clickhouse\").\nUsed in values.yaml section name and helper template names.",
+          "type": "string"
+        },
+        "env_vars": {
+          "description": "Environment variables injected from this secret group.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SecretEnvContract"
+          }
+        },
+        "optional": {
+          "description": "The app starts without this group, so a missing Secret or key leaves\nthe variable unset instead of stopping the pod.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "group_name",
+        "env_vars"
+      ]
+    },
+    "SecretEnvContract": {
+      "description": "A single environment variable sourced from a K8s Secret.",
+      "type": "object",
+      "properties": {
+        "env_var": {
+          "description": "Full env var name (e.g., \"MY_APP__KAFKA__PASSWORD\").",
+          "type": "string"
+        },
+        "key_name": {
+          "description": "Key name in values.yaml secretKeys and default values\n(e.g., \"password\", \"username\").",
+          "type": "string"
+        },
+        "secret_key": {
+          "description": "Default K8s secret key name (e.g., \"kafka-password\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "env_var",
+        "key_name",
+        "secret_key"
+      ]
+    },
+    "KedaContract": {
+      "description": "KEDA contract points validated against Helm `values.yaml`.\n\nBuilt from [`KedaConfig`] defaults. Use [`KedaContract::from_config`]\nto convert.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether the chart turns KEDA on. `false` generates exactly what\n`keda: None` does, so there is one meaning for off.",
+          "type": "boolean",
+          "default": true
+        },
+        "min_replicas": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_replicas": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "polling_interval": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cooldown_period": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "kafka_lag_threshold": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "activation_lag_threshold": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cpu_enabled": {
+          "type": "boolean"
+        },
+        "cpu_threshold": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "kafka_trigger": {
+          "description": "Where the Kafka lag trigger finds its connection details in the chart's\nvalues, or that there is no Kafka lag trigger at all.",
+          "$ref": "#/$defs/KafkaLagTrigger",
+          "default": {
+            "enabled": true,
+            "brokers_path": "config.kafka.brokers",
+            "group_path": "config.kafka.group_id",
+            "topics_path": "config.kafka.topics"
+          }
+        }
+      },
+      "required": [
+        "min_replicas",
+        "max_replicas",
+        "polling_interval",
+        "cooldown_period",
+        "kafka_lag_threshold",
+        "activation_lag_threshold",
+        "cpu_enabled",
+        "cpu_threshold"
+      ]
+    },
+    "KafkaLagTrigger": {
+      "description": "Where the generated Kafka lag trigger reads the broker list, consumer group\nand topics in the chart's values.\n\nThis describes the chart's layout, not an operator setting, which is why it\nlives on the contract and not on [`KedaConfig`]. Each path is a dotted,\n`.Values`-relative chain of Go identifiers. The default suits an app whose\nconfig has a top-level `kafka` section; an app that keeps them elsewhere\nnames that section with [`under`](Self::under), then sets any path that\nsits elsewhere on the value it returns.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Emit the Kafka lag trigger. Off leaves CPU as the only scaler.",
+          "type": "boolean",
+          "default": true
+        },
+        "brokers_path": {
+          "description": "Values path of the broker list, as a list or a comma-separated string.",
+          "type": "string",
+          "default": "config.kafka.brokers"
+        },
+        "group_path": {
+          "description": "Values path of the consumer group id.",
+          "type": "string",
+          "default": "config.kafka.group_id"
+        },
+        "topics_path": {
+          "description": "Values path of the topics, as a list or a comma-separated string. KEDA\nwatches the first.",
+          "type": "string",
+          "default": "config.kafka.topics"
+        }
+      }
+    },
+    "NativeDepsContract": {
+      "description": "Runtime native dependencies for a container image.\n\nPopulated via [`NativeDepsContract::for_features`] (explicit distro) or\n[`NativeDepsContract::for_scalo_features`] (distro resolved from the\ncascade or the base image) -- pass the list of scalo features your app\nenables, get back the runtime packages and any custom APT repos needed.",
+      "type": "object",
+      "properties": {
+        "apt_repos": {
+          "description": "Custom APT repositories to add before installing packages.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AptRepoContract"
+          },
+          "default": []
+        },
+        "apt_packages": {
+          "description": "APT packages to install from default repos.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "distro": {
+          "description": "The distro release the package names above were resolved for.\n\n`None` on a contract deserialised from an older emitter. Package names\nare release-specific (soname-versioned packages do not alias), so this\nrecords WHICH release the names are valid for rather than leaving it\nimplicit in the base-image string.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BaseDistro"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unresolved_base_image": {
+          "description": "Set when the distro could not be derived from the base image and\n[`DEFAULT_BASE_DISTRO`](crate::deployment::DEFAULT_BASE_DISTRO) was\nassumed instead.\n\nDigest-pinned images (`debian@sha256:...`) carry no codename, so this is\nthe expected state whenever the pinning rule is followed without also\nsetting `deployment.base_distro`. The Dockerfile generator stamps a\nwarning into its output while this is set, so the assumption cannot ship\nsilently.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contradicted_base_image": {
+          "description": "Set when an explicit `deployment.base_distro` CONTRADICTED a base image\nthat names its own release.\n\nThe explicit value still wins -- config beats a string -- but the result\nis a Dockerfile whose `FROM` and whose package names are for different\nreleases, which is almost always a mistake rather than an intention. It\nis the one disagreement the generator cannot resolve for you, so it says\nso in the artefact rather than quietly picking a side.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "AptRepoContract": {
+      "description": "A custom APT repository (e.g., Confluent for librdkafka).",
+      "type": "object",
+      "properties": {
+        "key_url": {
+          "description": "GPG key URL for the repo.",
+          "type": "string"
+        },
+        "keyring": {
+          "description": "Local keyring file path (e.g., `/usr/share/keyrings/confluent-clients.gpg`).",
+          "type": "string"
+        },
+        "url": {
+          "description": "Repository base URL (e.g., `https://packages.confluent.io/clients/deb`).",
+          "type": "string"
+        },
+        "codename": {
+          "description": "Distribution codename (e.g., `noble`, `bookworm`).\nIf empty, derived from the base image at generation time.",
+          "type": "string",
+          "default": ""
+        },
+        "key_fingerprint": {
+          "description": "Expected OpenPGP fingerprint of `key_url`, uppercase hex, no spaces.\n\nWhen set, the generated build asserts the downloaded key matches before\ntrusting the repo. Without it the key is trust-on-first-use, re-fetched\non every build: a compromised mirror or a CA-level intercept serves its\nown key, `signed-by` then validates the attacker's repo, and we install\ntheir `librdkafka1` into a binary the data plane dynamically links.\n\nPinning locks in the key as observed. It does NOT establish that the key\nwas legitimate in the first place -- it converts an every-build TOFU into\na one-time one, which is the part worth having.",
+          "type": "string",
+          "default": ""
+        },
+        "packages": {
+          "description": "APT packages to install from this specific repo.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "key_url",
+        "keyring",
+        "url",
+        "packages"
+      ]
+    },
+    "BaseDistro": {
+      "description": "A distro release we can generate runtime package names for.\n\nRuntime package names are release-specific: soname-versioned packages bake\nthe library version into the package name (`libgit2-1.9` vs `libgit2-1.7`)\nand do not alias, so installing the wrong one fails the build outright.\n\nThis is an explicit contract value, NOT something inferred from the base\nimage on every use. [`from_base_image`](Self::from_base_image) is a\nbest-effort convenience for the recognisable cases only: a digest-pinned\nreference (`debian@sha256:...`) carries no codename at all, and a rolling\nalias (`debian:stable-slim`) means a different release every couple of\nyears. Both return `None` so the caller falls back to a stated default\ninstead of silently borrowing another distro's package names.",
+      "oneOf": [
+        {
+          "description": "Debian 13 \"trixie\" -- the org default.",
+          "type": "string",
+          "const": "trixie"
+        },
+        {
+          "description": "Debian 12 \"bookworm\".",
+          "type": "string",
+          "const": "bookworm"
+        },
+        {
+          "description": "Ubuntu 24.04 \"noble\".",
+          "type": "string",
+          "const": "noble"
+        },
+        {
+          "description": "Ubuntu 22.04 \"jammy\".",
+          "type": "string",
+          "const": "jammy"
+        },
+        {
+          "description": "Ubuntu 20.04 \"focal\".",
+          "type": "string",
+          "const": "focal"
+        }
+      ]
+    },
+    "ImageProfile": {
+      "description": "Container image profile -- controls what goes into the generated Dockerfile.\n\nBoth profiles use the same linking strategy (dynamic). The difference is\noptimisation level, debug tooling, and image metadata.\n\n# Image tags\n\nThe profile sets what goes into the image, not its tag. The release\npipeline tags images:\n\n| Build | Tags | Example |\n|-------|------|---------|\n| Release channel | `:v<version>`, `:latest`, `:sha-<short>` | `myapp:v1.15.0` |\n| Pre-GA channel | `:v<version>-<channel>`, `:sha-<short>` | `myapp:v1.15.0-beta` |\n| Branch dev image | `:branch-<slug>`, `:branch-<slug>-sha-<short>` | `myapp:branch-fix-x` |\n\nVersion tags carry the `v`. There is no `-dev` tag: a `Development` image\nis built from its own Dockerfile where it is needed.",
+      "oneOf": [
+        {
+          "description": "Minimal production image -- stripped binary, no debug tools.",
+          "type": "string",
+          "const": "production"
+        },
+        {
+          "description": "Development image -- includes diagnostic tools (bash, strace, tcpdump,\nprocps, dnsutils, net-tools). Same binary, same linking.",
+          "type": "string",
+          "const": "development"
+        }
+      ]
+    },
+    "OciLabels": {
+      "description": "OCI image labels for the container.\n\nStatic labels are set from the contract. Dynamic labels (source, revision,\nversion, created) are injected by CI at build time via `--build-arg`.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "description": "Image title (defaults to app_name).",
+          "type": "string",
+          "default": ""
+        },
+        "description": {
+          "description": "Image description.",
+          "type": "string",
+          "default": ""
+        },
+        "vendor": {
+          "description": "Image vendor, the `org.opencontainers.image.vendor` label. Empty by\ndefault, and an empty vendor writes no label.",
+          "type": "string",
+          "default": ""
+        },
+        "label_namespace": {
+          "description": "Reverse-DNS namespace of the keys scalo stamps itself:\n`<namespace>.profile`, `<namespace>.app` and `<namespace>.metrics_port`\non the image, and the three `<namespace>.contract.*` identity keys on\nevery artefact. Defaults to [`DEFAULT_LABEL_NAMESPACE`].",
+          "type": "string",
+          "default": "io.scalo"
+        },
+        "licenses": {
+          "description": "The app's licence (SPDX). Drives BOTH the OCI\n`org.opencontainers.image.licenses` label AND the generated Dockerfile's\n`# License` header comment. Empty by default, and an empty licence\nwrites neither.",
+          "type": "string",
+          "default": ""
+        },
+        "copyright": {
+          "description": "The app's copyright line for the generated Dockerfile's `# Copyright`\nheader comment. Empty by default, and an empty copyright writes no line.",
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "ConfigSchemaNode": {
+      "description": "A node of the app's config JSON Schema. Wherever `x-scalo-dial` appears it is `big` or `small`, and `x-scalo-secret` is a boolean.",
+      "properties": {
+        "x-scalo-dial": {
+          "type": "string",
+          "enum": [
+            "big",
+            "small"
+          ]
+        },
+        "x-scalo-secret": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/ConfigSchemaNode"
+      },
+      "items": {
+        "$ref": "#/$defs/ConfigSchemaNode"
+      }
+    },
+    "Capability": {
+      "description": "One node in the capability catalog.\n\nSee the module docs and `docs/reflectable-config-shape.md` for the shape\ncontract shared with scalo-py.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Discriminator: `\"source\"`, `\"service\"`, `\"transport\"`, `\"sink\"`, ...",
+          "type": "string"
+        },
+        "name": {
+          "description": "Capability name (e.g. `\"aws\"`, `\"cloudtrail\"`, `\"kafka\"`).",
+          "type": "string"
+        },
+        "description": {
+          "description": "Human-readable description.",
+          "type": "string",
+          "default": ""
+        },
+        "maturity": {
+          "description": "Maturity: `\"alpha\"`, `\"beta\"`, `\"stable\"`. Omitted when unspecified.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fields": {
+          "description": "Config fields for this capability (connection/service knobs). Omitted\nwhen empty.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FieldSpec"
+          }
+        },
+        "children": {
+          "description": "Nested capabilities (e.g. a source's services). Omitted when empty.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Capability"
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ]
+    },
+    "FieldSpec": {
+      "description": "A single config field within a [`Capability`].",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Field name.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Field type. Serialised under the JSON key `type`.",
+          "$ref": "#/$defs/FieldType"
+        },
+        "required": {
+          "description": "Whether the field is required.",
+          "type": "boolean"
+        },
+        "default": {
+          "description": "Default value, if any. Omitted when absent."
+        },
+        "description": {
+          "description": "Human-readable description.",
+          "type": "string",
+          "default": ""
+        },
+        "secret": {
+          "description": "Whether the field holds a secret. When `true` the app schema also marks\nthe field `x-scalo-secret` so the UI masks it and the engine routes it\nthrough the secrets seam. Omitted when `false`.",
+          "type": "boolean"
+        },
+        "enum_values": {
+          "description": "Allowed values for `type = enum`. Omitted when empty.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "example": {
+          "description": "Example value. Omitted when absent."
+        }
+      },
+      "required": [
+        "name",
+        "type",
+        "required"
+      ]
+    },
+    "FieldType": {
+      "description": "The type of a [`FieldSpec`]. Serialised lower-snake-case.",
+      "oneOf": [
+        {
+          "description": "A UTF-8 string.",
+          "type": "string",
+          "const": "string"
+        },
+        {
+          "description": "A signed integer.",
+          "type": "string",
+          "const": "int"
+        },
+        {
+          "description": "A floating-point number.",
+          "type": "string",
+          "const": "float"
+        },
+        {
+          "description": "A boolean.",
+          "type": "string",
+          "const": "bool"
+        },
+        {
+          "description": "A secret string (masked; routed via the secrets seam).",
+          "type": "string",
+          "const": "secret"
+        },
+        {
+          "description": "A closed set of string values (see [`FieldSpec::enum_values`]).",
+          "type": "string",
+          "const": "enum"
+        },
+        {
+          "description": "A duration (seconds unless the description says otherwise).",
+          "type": "string",
+          "const": "duration"
+        },
+        {
+          "description": "A list/array of values.",
+          "type": "string",
+          "const": "list"
+        },
+        {
+          "description": "A string-keyed map of values.",
+          "type": "string",
+          "const": "map"
+        },
+        {
+          "description": "A nested object.",
+          "type": "string",
+          "const": "object"
+        }
+      ]
+    },
+    "WritablePath": {
+      "description": "A directory the app writes at run time.\n\nA chart mounts each one as a volume, so the container's root filesystem can\nstay read-only. An ephemeral path is an `emptyDir`; a persistent one is a\nclaim that outlives the pod. Build one with [`new`](Self::new).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Volume name: 1 to 50 lowercase letters, digits and inner hyphens\n(e.g. \"spool\"). A persistent path's claim is named `<chart name>-<name>`.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,48}[a-z0-9])?$"
+        },
+        "path": {
+          "description": "Absolute mount path (e.g. \"/var/lib/my-app/spool\").",
+          "type": "string",
+          "pattern": "^/"
+        },
+        "size_limit": {
+          "description": "Size cap for an ephemeral path, as a Kubernetes quantity (e.g. \"2Gi\").\nEmpty means no cap.",
+          "type": "string"
+        },
+        "persistent": {
+          "description": "Keep the contents across pod restarts with a persistent volume claim.",
+          "type": "boolean"
+        },
+        "size": {
+          "description": "Requested size of a persistent path's claim, as a Kubernetes quantity.",
+          "type": "string",
+          "default": "1Gi"
+        },
+        "when": {
+          "description": "The values condition under which the app writes here; `None` means always.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortCondition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "path"
+      ]
+    },
+    "ResourcesContract": {
+      "description": "CPU and memory requests and limits, as Kubernetes quantities.",
+      "type": "object",
+      "properties": {
+        "requests": {
+          "description": "What the scheduler reserves for the container.",
+          "$ref": "#/$defs/ResourceList"
+        },
+        "limits": {
+          "description": "The most the container may use.",
+          "$ref": "#/$defs/ResourceList"
+        }
+      }
+    },
+    "ResourceList": {
+      "description": "One CPU and memory pair. An empty value is unset.",
+      "type": "object",
+      "properties": {
+        "cpu": {
+          "description": "CPU, e.g. \"250m\" or \"2\".",
+          "type": "string"
+        },
+        "memory": {
+          "description": "Memory, e.g. \"256Mi\".",
+          "type": "string"
+        }
+      }
+    },
+    "SecurityContract": {
+      "description": "The identity and privileges the container runs with.\n\nThe defaults match the image the Dockerfile generator writes: uid and gid\n1000, a read-only root filesystem and no added capability.",
+      "type": "object",
+      "properties": {
+        "run_as_user": {
+          "description": "Numeric user the process runs as; 0 lets it run as root.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 1000
+        },
+        "run_as_group": {
+          "description": "Numeric primary group.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 1000
+        },
+        "fs_group": {
+          "description": "Group that owns mounted volumes.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 1000
+        },
+        "read_only_root_filesystem": {
+          "description": "Mount the root filesystem read-only; writes go to `writable_paths`.",
+          "type": "boolean",
+          "default": true
+        },
+        "capabilities_add": {
+          "description": "Linux capabilities added after every other one is dropped (e.g. \"NET_ADMIN\").",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

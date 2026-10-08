@@ -14,6 +14,12 @@ release and the target before bumping.
 
 **Consumer adjustment** -- a reader that keyed on `x-dfe-secret` keys on `x-scalo-secret`, in the same change as the bump. A committed `config-schema.*` loses the old marker on regeneration, so `assert_no_config_artifact_drift` fails until it is regenerated.
 
+### Deployment contract schema 4 (API CHANGE)
+
+`DeploymentContract` gains `writable_paths`, `termination_grace_seconds`, `resources`, `security` and `singleton`; `HealthContract` gains `startup_budget_seconds`; `PortContract` gains `public` and `app_protocol`; `SecretGroupContract` gains `optional`. `CONTRACT_SCHEMA_VERSION` is 4 and `schema_version` defaults to it. `config_mount_path` may be omitted or empty, meaning no config file. See [deployment/contract.md](deployment/contract.md#schema-versioning).
+
+**Consumer adjustment** -- a struct literal of any of those four types names the new fields: `writable_paths: vec![]`, `termination_grace_seconds: 45`, `resources: ResourcesContract::default()`, `security: SecurityContract::default()`, `singleton: false`, `startup_budget_seconds: 150`, `optional: false`, or builds through `HealthContract::default()`, `PortContract::tcp`/`udp` and `SecretGroupContract::new`. An app that writes `schema_version: 3` writes `CONTRACT_SCHEMA_VERSION` instead, because the scalo-service chart renders version 4 only. `validate()` now also refuses a malformed writable path, a capability that is not an upper-case name, a singleton with KEDA on, and an `x-scalo-dial` other than `big` or `small`. A committed `deployment-contract.json` changes on regeneration.
+
 ## 2.14.1
 
 ### CEL moves to cel 0.14 (BEHAVIOUR CHANGE)

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 /// cascade or the base image) -- pass the list of scalo features your app
 /// enables, get back the runtime packages and any custom APT repos needed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 // Adding a field must not break downstream literal construction -- consumers
 // build this through the constructors below, never by struct literal.
 #[non_exhaustive]
@@ -68,6 +69,7 @@ pub struct NativeDepsContract {
 
 /// A custom APT repository (e.g., Confluent for librdkafka).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct AptRepoContract {
     /// GPG key URL for the repo.
     pub key_url: String,
@@ -131,6 +133,7 @@ fn confluent_repo(codename: &str) -> AptRepoContract {
 /// years. Both return `None` so the caller falls back to a stated default
 /// instead of silently borrowing another distro's package names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 // Adding a release is not a breaking change -- a future Debian 14 must not
 // break every downstream exhaustive match.

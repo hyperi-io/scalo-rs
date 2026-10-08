@@ -63,6 +63,7 @@ impl Default for KedaConfig {
 /// Built from [`KedaConfig`] defaults. Use [`KedaContract::from_config`]
 /// to convert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct KedaContract {
     /// Whether the chart turns KEDA on. `false` generates exactly what
     /// `keda: None` does, so there is one meaning for off.
@@ -125,6 +126,7 @@ impl KedaContract {
 /// names that section with [`under`](Self::under), then sets any path that
 /// sits elsewhere on the value it returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 #[non_exhaustive]
 pub struct KafkaLagTrigger {

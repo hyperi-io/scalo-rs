@@ -17,7 +17,7 @@ repository = "https://github.com/hyperi-io/scalo-rs"
 publish = true
 keywords = ["data-plane", "backpressure", "observability", "kafka", "autoscaling"]
 categories = ["asynchronous", "config", "network-programming", "concurrency", "development-tools"]
-exclude = [".claude/", ".github/", "ci/", "ai/", "docs/", "examples/", "benches/", "scripts/"]
+exclude = [".claude/", ".github/", "ci/", "ai/", "docs/", "examples/", "benches/", "scripts/", "charts/"]
 
 [package.metadata.docs.rs]
 # `all-features = true` triggers transport-kafka (needs librdkafka-dev),
@@ -219,7 +219,8 @@ testcontainers = []
 
 # Reflectable config schema + capability catalog (scalo-rs#6). Derives a JSON
 # Schema of the app `Config` via schemars and carries a hand-authored capability
-# catalog the control plane reflects on to build per-endpoint CRUD forms.
+# catalog the control plane reflects on to build per-endpoint CRUD forms. Also
+# derives the deployment contract's own JSON Schema (`contract_json_schema`).
 # Pure-Rust, opt-in. Implies `deployment` (the contract carries + emits both).
 config-schema = ["dep:schemars", "serde_json", "deployment"]
 
@@ -548,6 +549,10 @@ reqwest = { version = ">=0.13.3, <0.14", default-features = false, features = ["
 # Same declaration as the optional `http-server` dependency for the reason the
 # reqwest note above gives.
 axum = ">=0.8.8, <0.9"
+# Validates the emitted contract against the committed contract JSON Schema, the
+# check a chart assembler outside Rust runs. Local refs only, so no HTTP resolver.
+# MIT; 0.58.6 (2026-10-06) read from the crates.io API.
+jsonschema = { version = ">=0.58.6, <0.59", default-features = false }
 
 [lints.rust]
 unsafe_code = "deny"
@@ -637,3 +642,9 @@ required-features = ["config", "logger"]
 [[example]]
 name = "full_demo"
 required-features = ["config", "logger", "metrics", "runtime"]
+
+# Breaking-change gate over two JSON Schema files, driven by
+# scripts/schema-breaking-check.sh against the last release tag.
+[[example]]
+name = "schema_breaking"
+required-features = ["deployment"]

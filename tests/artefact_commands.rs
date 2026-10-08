@@ -123,6 +123,11 @@ impl ServiceApp for ProbeApp {
             oci_labels: OciLabels::default(),
             config_schema: None,
             capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: scalo::deployment::ResourcesContract::default(),
+            security: scalo::deployment::SecurityContract::default(),
+            singleton: false,
         })
     }
 }

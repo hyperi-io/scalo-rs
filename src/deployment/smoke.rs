@@ -264,6 +264,11 @@ mod tests {
             oci_labels: super::super::OciLabels::default(),
             config_schema: None,
             capabilities: vec![],
+            writable_paths: vec![],
+            termination_grace_seconds: 45,
+            resources: super::super::ResourcesContract::default(),
+            security: super::super::SecurityContract::default(),
+            singleton: false,
         }
     }
 }

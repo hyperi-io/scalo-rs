@@ -1,0 +1,2 @@
+fixture=stage
+error=the Kafka lag trigger reads config.kafka.group_id

@@ -1,0 +1,129 @@
+suite: scaledobject
+templates:
+  - scaledobject.yaml
+  - triggerauthentication.yaml
+release:
+  namespace: apps
+tests:
+  - it: scales on CPU and the contract's Kafka lag trigger
+    template: scaledobject.yaml
+    asserts:
+      - equal:
+          path: metadata.name
+          value: event-stage-scaler
+      - equal:
+          path: spec.scaleTargetRef.name
+          value: event-stage
+      - equal:
+          path: spec.minReplicaCount
+          value: 1
+      - equal:
+          path: spec.pollingInterval
+          value: 15
+      - equal:
+          path: spec.triggers
+          value:
+            - type: cpu
+              metricType: Utilization
+              metadata:
+                value: "80"
+            - type: kafka
+              metadata:
+                bootstrapServers: kafka:9092
+                consumerGroup: event-stage
+                topic: events
+                lagThreshold: "1000"
+                activationLagThreshold: "0"
+
+  - it: reads the trigger's brokers from values over default_config and takes values bounds
+    template: scaledobject.yaml
+    set:
+      config.kafka.brokers: ["b1:9092", "b2:9092"]
+      keda.maxReplicaCount: 20
+      keda.kafka.lagThreshold: 5000
+      keda.cpu.targetUtilization: 70
+    asserts:
+      - equal:
+          path: spec.maxReplicaCount
+          value: 20
+      - equal:
+          path: spec.triggers[1].metadata.bootstrapServers
+          value: b1:9092,b2:9092
+      - equal:
+          path: spec.triggers[1].metadata.lagThreshold
+          value: "5000"
+      - equal:
+          path: spec.triggers[0].metadata.value
+          value: "70"
+
+  - it: replaces the triggers with keda.triggers and appends keda.extraTriggers through tpl
+    template: scaledobject.yaml
+    set:
+      keda.triggers:
+        - type: cpu
+          metricType: Utilization
+          metadata:
+            value: "60"
+      keda.extraTriggers:
+        - type: metrics-api
+          metricType: Value
+          metadata:
+            url: "http://pressure.{{ .Release.Namespace }}.svc:8080/pressure"
+            targetValue: "70"
+            valueLocation: value
+    asserts:
+      - lengthEqual:
+          path: spec.triggers
+          count: 2
+      - equal:
+          path: spec.triggers[0].metadata.value
+          value: "60"
+      - equal:
+          path: spec.triggers[1].metadata.url
+          value: http://pressure.apps.svc:8080/pressure
+
+  - it: renders no ScaledObject once KEDA is off
+    template: scaledobject.yaml
+    set:
+      keda.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: points the Kafka trigger at a TriggerAuthentication when one is configured
+    set:
+      keda.triggerAuthentication.secretTargetRef:
+        - parameter: password
+          name: broker-credentials
+          key: password
+    asserts:
+      - equal:
+          path: spec.triggers[1].authenticationRef.name
+          value: event-stage-trigger-auth
+        template: scaledobject.yaml
+      - equal:
+          path: metadata.name
+          value: event-stage-trigger-auth
+        template: triggerauthentication.yaml
+      - equal:
+          path: spec.secretTargetRef[0].name
+          value: broker-credentials
+        template: triggerauthentication.yaml
+
+  - it: refuses KEDA with no trigger to scale on
+    template: scaledobject.yaml
+    set:
+      keda.cpu.enabled: false
+      keda.kafka.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "KEDA is on with no trigger"
+
+  - it: refuses a CPU-only ScaledObject that may scale to zero
+    template: scaledobject.yaml
+    set:
+      keda.kafka.enabled: false
+      keda.minReplicaCount: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "cannot wake a workload from zero"

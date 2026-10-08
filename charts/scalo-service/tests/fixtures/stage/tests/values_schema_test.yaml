@@ -1,0 +1,39 @@
+suite: values schema
+templates:
+  - deployment.yaml
+tests:
+  - it: refuses a value of the wrong type
+    set:
+      replicaCount: two
+    asserts:
+      - failedTemplate:
+          errorPattern: "replicaCount"
+
+  - it: refuses a dial below its minimum
+    set:
+      config.buffer.flush_rows: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "flush_rows"
+
+  - it: refuses a dial outside its enum
+    set:
+      config.log_level: trace
+    asserts:
+      - failedTemplate:
+          errorPattern: "log_level"
+
+  - it: refuses an image digest that is not a sha256
+    set:
+      image.digest: sha256:abc
+    asserts:
+      - failedTemplate:
+          errorPattern: "digest"
+
+  - it: lets a config key that is not a dial through unvalidated
+    set:
+      config.routing.default: events
+      deploy.service: event-stage
+    asserts:
+      - isKind:
+          of: Deployment

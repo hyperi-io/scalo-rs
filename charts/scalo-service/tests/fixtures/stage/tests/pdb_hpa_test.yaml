@@ -1,0 +1,66 @@
+suite: disruption budget and fallback autoscaler
+templates:
+  - pdb.yaml
+  - hpa.yaml
+tests:
+  - it: renders no budget while the workload can run one pod
+    template: pdb.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: keeps one pod up once the KEDA floor is two
+    template: pdb.yaml
+    set:
+      keda.minReplicaCount: 2
+    asserts:
+      - equal:
+          path: spec
+          value:
+            minAvailable: 1
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: event-stage
+
+  - it: lets one pod go when replicaCount is two but KEDA can scale to one
+    template: pdb.yaml
+    set:
+      replicaCount: 2
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+
+  - it: honours pdb.enabled false
+    template: pdb.yaml
+    set:
+      keda.minReplicaCount: 3
+      pdb.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: falls back to a CPU HPA when KEDA is off and autoscaling is on
+    template: hpa.yaml
+    set:
+      keda.enabled: false
+      autoscaling.enabled: true
+      autoscaling.minReplicas: 2
+      autoscaling.maxReplicas: 6
+    asserts:
+      - isKind:
+          of: HorizontalPodAutoscaler
+      - equal:
+          path: spec.minReplicas
+          value: 2
+      - equal:
+          path: spec.metrics[0].resource.target.averageUtilization
+          value: 80
+
+  - it: renders no HPA while KEDA scales the workload
+    template: hpa.yaml
+    set:
+      autoscaling.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0

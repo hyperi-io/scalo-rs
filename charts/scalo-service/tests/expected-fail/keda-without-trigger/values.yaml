@@ -1,0 +1,5 @@
+keda:
+  cpu:
+    enabled: false
+  kafka:
+    enabled: false

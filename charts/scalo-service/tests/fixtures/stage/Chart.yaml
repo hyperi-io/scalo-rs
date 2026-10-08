@@ -1,0 +1,10 @@
+apiVersion: v2
+appVersion: v1.4.2
+dependencies:
+- name: scalo-service
+  repository: file://../../..
+  version: 0.0.0
+description: A pipeline stage that consumes events, buffers them and passes them on
+name: event-stage
+type: application
+version: 1.4.2

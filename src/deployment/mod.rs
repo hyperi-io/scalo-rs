@@ -30,8 +30,9 @@
 //!
 //! ```rust,no_run
 //! use scalo::deployment::{
-//!     DEFAULT_BASE_DISTRO, DeploymentContract, HealthContract, ImageProfile, KedaContract,
-//!     NativeDepsContract, base_image_from_cascade, generate_dockerfile, generate_chart,
+//!     CONTRACT_SCHEMA_VERSION, DEFAULT_BASE_DISTRO, DeploymentContract, HealthContract,
+//!     ImageProfile, KedaContract, NativeDepsContract, ResourcesContract, SecurityContract,
+//!     WritablePath, base_image_from_cascade, generate_dockerfile, generate_chart,
 //!     generate_compose_fragment,
 //! };
 //!
@@ -59,9 +60,14 @@
 //!     ),
 //!     image_profile: ImageProfile::Production,
 //!     oci_labels: Default::default(),
-//!     schema_version: 3,
+//!     schema_version: CONTRACT_SCHEMA_VERSION,
 //!     config_schema: None,
 //!     capabilities: vec![],
+//!     writable_paths: vec![WritablePath::new("spool", "/var/lib/my-app/spool").size_limit("2Gi")],
+//!     termination_grace_seconds: 45,
+//!     resources: ResourcesContract::default(),
+//!     security: SecurityContract::default(),
+//!     singleton: false,
 //! };
 //!
 //! // Generate production Dockerfile (without identity annotations -- Phase 1
@@ -84,6 +90,9 @@ mod capability;
 mod checks;
 mod contract;
 pub mod contract_identity;
+#[cfg(feature = "config-schema")]
+mod contract_schema;
+mod dials;
 mod emit;
 mod error;
 pub mod generate;
@@ -91,6 +100,7 @@ mod keda;
 mod listeners;
 mod native_deps;
 mod registry;
+mod schema_compat;
 #[cfg(feature = "deployment-smoke")]
 pub mod smoke;
 #[cfg(feature = "deployment-test-support")]
@@ -101,10 +111,14 @@ pub mod waves;
 pub use app_project::{AppProjectContract, AppProjectDestination, generate_argocd_app_project};
 pub use capability::{Capability, FieldSpec, FieldType};
 pub use contract::{
-    DEFAULT_LABEL_NAMESPACE, DeploymentContract, HealthContract, ImageProfile, OciLabels,
-    PortCondition, PortContract, SecretEnvContract, SecretGroupContract,
+    CONTRACT_SCHEMA_VERSION, DEFAULT_LABEL_NAMESPACE, DeploymentContract, HealthContract,
+    ImageProfile, OciLabels, PortCondition, PortContract, ResourceList, ResourcesContract,
+    SecretEnvContract, SecretGroupContract, SecurityContract, WritablePath,
 };
 pub use contract_identity::{ContractIdentity, IdentityError, KEY_SEGMENT, VERSION};
+#[cfg(feature = "config-schema")]
+pub use contract_schema::{contract_json_schema, contract_schema_file_name};
+pub use dials::{DIAL_KEYWORD, DIAL_TIERS, DialError, dials};
 #[cfg(feature = "config-schema")]
 pub use emit::config_schema_json;
 pub use emit::{
@@ -123,6 +137,7 @@ pub use registry::{
     argocd_repo_url_from_cascade, base_distro_from_cascade, base_image_from_cascade,
     image_registry_from_cascade, resolve_base_distro,
 };
+pub use schema_compat::{SchemaBreak, SchemaBreakKind, breaking_changes};
 pub use validate::{validate_dockerfile, validate_helm_values};
 pub use waves::{WAVE_APPS, WAVE_CRDS, WAVE_OPERATORS, WAVE_POST, WAVE_TOPICS};
 
