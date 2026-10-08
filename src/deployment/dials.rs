@@ -47,6 +47,17 @@ pub enum DialError {
         /// The marker's value, as JSON.
         value: String,
     },
+    /// A name on a dial's path is not a Helm value key a chart can write.
+    #[error(
+        "config.{path:?}: the dial path holds {name:?}, and a dial name is one or more letters, \
+         digits, '_' or '-', because it becomes a key in the chart's values"
+    )]
+    BadName {
+        /// Dotted path of the marked node.
+        path: String,
+        /// The first name on the path that is not a value key.
+        name: String,
+    },
     /// A `$ref` is not local, points at nothing, or refers to itself.
     #[error("config_schema $ref {reference:?} {reason}")]
     BadRef {
@@ -96,6 +107,12 @@ fn walk(
                 value: tier.to_string(),
             });
         }
+        if let Some(name) = path.iter().find(|name| !is_value_key(name)) {
+            return Err(DialError::BadName {
+                path: path.join("."),
+                name: name.clone(),
+            });
+        }
         let inlined = inline(root, node, &BTreeSet::new())?;
         found.entry(path.join(".")).or_insert(inlined);
         return Ok(());
@@ -122,6 +139,14 @@ fn walk(
         }
     }
     Ok(())
+}
+
+/// Whether `name` can be a Helm value key: a `.` would split it, and a newline or space would break the values file line it is written on.
+fn is_value_key(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// The node a local `$ref` names in `root`.
@@ -221,6 +246,26 @@ mod tests {
         let found =
             dials(&json!({ "type": "object", "properties": { "a": { "type": "string" } } }));
         assert_eq!(found.unwrap(), BTreeMap::new());
+    }
+
+    #[test]
+    fn a_dial_whose_path_holds_a_name_that_is_not_a_value_key_is_refused() {
+        for bad in ["batch.size", "flush rows", "rows\n", "", "r\u{f6}ws"] {
+            let schema = json!({
+                "properties": { "buffer": { "properties": {
+                    bad: { "type": "integer", "x-scalo-dial": "big" }
+                } } }
+            });
+            match dials(&schema) {
+                Err(DialError::BadName { name, .. }) => assert_eq!(name, bad),
+                other => panic!("{bad:?} passed: {other:?}"),
+            }
+        }
+        let fine = json!({ "properties": { "flush_rows": { "x-scalo-dial": "big" },
+                                           "max-age": { "x-scalo-dial": "small" },
+                                           "odd name": { "type": "string" } } });
+        let paths: Vec<String> = dials(&fine).unwrap().into_keys().collect();
+        assert_eq!(paths, ["flush_rows", "max-age"]);
     }
 
     #[test]

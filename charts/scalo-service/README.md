@@ -48,7 +48,7 @@ A release pipeline runs these steps after it builds the image. Nothing here depe
 3. **Write `files/contract.json`.** The contract, byte for byte as the service emitted or committed it.
 4. **Fill in `Chart.yaml`.** Set `name` to `app_name`, `version` to the service's release version, and `appVersion` to the image tag exactly as pushed, `v` included. Set `description` to the contract's when it has one. Replace `dependencies` with one entry: `name: scalo-service`, the library `version`, and the `repository` it is pulled from.
 5. **Find the dials.** A contract with no `config_schema`, or a null one, has none. Otherwise walk it from its root, carrying a dotted path:
-   - a node carrying `x-scalo-dial` is a dial at the current path, recorded once, and nothing beneath it is walked; its value must be `big` or `small`
+   - a node carrying `x-scalo-dial` is a dial at the current path, recorded once, and nothing beneath it is walked; its value must be `big` or `small`, and every name on its path must be one or more ASCII letters, digits, `_` or `-`, because each becomes a key in `values.yaml`
    - a `$ref` is followed to its target at the same path, at most once per reference along one branch
    - each `properties` entry is walked at `<path>.<name>`, in name order
    - each `allOf`, `anyOf` and `oneOf` branch is walked at the same path
