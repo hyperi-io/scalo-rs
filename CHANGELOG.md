@@ -3,6 +3,21 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.3](https://github.com/hyperi-io/scalo-rs/compare/v2.14.2...v2.14.3) (2026-10-08)
+
+### Bug Fixes
+
+* contract schema v4 and scalo-service chart ([#298](https://github.com/hyperi-io/scalo-rs/issues/298)) ([108b1aa](https://github.com/hyperi-io/scalo-rs/commit/108b1aa3b583c7d80f7036cd7f4893e3003e4351))
+* detect containers from container evidence only ([#292](https://github.com/hyperi-io/scalo-rs/issues/292)) ([0293574](https://github.com/hyperi-io/scalo-rs/commit/029357469030eaed2c85de4b3bb1a514a7b89b3f)), closes [hyperi-io/scalo-py#85](https://github.com/hyperi-io/scalo-py/issues/85)
+* drop x-dfe-secret and pin the contract shape ([#293](https://github.com/hyperi-io/scalo-rs/issues/293)) ([ba80a56](https://github.com/hyperi-io/scalo-rs/commit/ba80a563951fb10f53f95ef63188bbcfe3e293d9))
+* make the queued-error drain test independent of timing ([#291](https://github.com/hyperi-io/scalo-rs/issues/291)) ([02fd08b](https://github.com/hyperi-io/scalo-rs/commit/02fd08bc7fbf3226b7660a1cc1a6fafcc60e89e5)), closes [#290](https://github.com/hyperi-io/scalo-rs/issues/290)
+* name rules, namespace, templated values and lint skips in scalo-service ([#304](https://github.com/hyperi-io/scalo-rs/issues/304)) ([9294e32](https://github.com/hyperi-io/scalo-rs/commit/9294e3290ecfbfcd190e53a4345fcef9526271fb))
+* publish the scalo-service library chart on release ([#302](https://github.com/hyperi-io/scalo-rs/issues/302)) ([8239137](https://github.com/hyperi-io/scalo-rs/commit/8239137f0d73d1c8ded1bdf72302ce510be6ca23))
+* refuse a dial whose path holds a name that is not a Helm value key ([#305](https://github.com/hyperi-io/scalo-rs/issues/305)) ([4382552](https://github.com/hyperi-io/scalo-rs/commit/4382552aa7af945eafd69ce58aea42d35ecefe13))
+* stop stale guard releases erasing new charges ([#299](https://github.com/hyperi-io/scalo-rs/issues/299)) ([541db4c](https://github.com/hyperi-io/scalo-rs/commit/541db4c5e0dd8fc5f766e051a7bc4d0ee489769f)), closes [#297](https://github.com/hyperi-io/scalo-rs/issues/297)
+* take the timing out of two flaky tests ([#296](https://github.com/hyperi-io/scalo-rs/issues/296)) ([fff0149](https://github.com/hyperi-io/scalo-rs/commit/fff014905d70b1c338687c0bd05b8cc60972995e))
+* wait on the drain in tiered_sink tests instead of a fixed sleep ([#303](https://github.com/hyperi-io/scalo-rs/issues/303)) ([71f6916](https://github.com/hyperi-io/scalo-rs/commit/71f6916f9dee465a8ecb1b3041d4f95351c7306f))
+
 ## [2.14.2](https://github.com/hyperi-io/scalo-rs/compare/v2.14.1...v2.14.2) (2026-10-07)
 
 ### Bug Fixes
