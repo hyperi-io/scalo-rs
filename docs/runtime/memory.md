@@ -80,11 +80,11 @@ The file read is cached for 50 ms. The guard is sampled per payload on
 the receive path, and the kernel charges memory in per-CPU batches, so
 a reading is approximate below that interval anyway.
 
-Bytes admitted since that reading are added to it, so a burst inside one
-window is charged against the limit instead of against a reading that
-predates it. The ledger is cleared whenever a fresh sample is taken --
-before the file is read, so an admission racing the sample is
-double-counted rather than dropped.
+### Admission ledger
+
+Bytes admitted since that reading and not yet released are added to it, so a burst inside one window is charged against the limit instead of against a reading that predates it. A fresh sample restarts the ledger, marked before the file is read, so an admission racing the sample is double-counted rather than dropped.
+
+A release names no lease, so it discharges the oldest charges first. A lease taken before a sample and released after it spends bytes the fresh reading already counts, never a charge made since. While an older lease is outstanding, a newer one's release is spent on it: the ledger over-counts by at most what was outstanding at the sample, until that lease ends or the next sample. A release never discharges more than is outstanding, so a double release leaves no credit behind.
 
 `current_bytes()` is that estimate -- what the kernel charges, plus what
 has been admitted against the current reading. `reserved_bytes()` is the
@@ -162,7 +162,7 @@ Lock-free atomics throughout, plus the usage file read at most once per
 ```rust
 let guard = Arc::new(MemoryGuard::new(MemoryGuardConfig::from_env("MYAPP")));
 
-// On data arrival -- atomic check, rolls back if it would exceed:
+// On data arrival -- one atomic check-and-charge, refused if it would exceed:
 if !guard.try_reserve(payload_len) {
     return Err(BackpressureError::MemoryFull);   // 503 / pause / spill
 }
@@ -178,9 +178,9 @@ if guard.under_pressure() {
 
 | Operation | Cost |
 | ----------- | ------ |
-| `try_reserve(n)` | one cached usage read + compare + `fetch_add` on the ledger (rollback on the reservation counter only on rung 4) |
+| `try_reserve(n)` | one cached usage read + a compare-exchange that judges and charges the ledger in one step (rollback on the reservation counter only on rung 4) |
 | `add_bytes(n)` | two `fetch_add` + threshold update |
-| `release(n)` | two saturating `try_update` -- over-release floors at zero |
+| `release(n)` | two `try_update` -- the reservation counter floors at zero, the ledger discharges oldest-first and never past what is outstanding |
 | `under_pressure()` | one cached usage read + compare; one file read per 50 ms |
 | `pressure_ratio()` | the same read + one float division; >1.0 means misconfigured limit |
 
@@ -235,7 +235,7 @@ Env vars:
 | `MemoryGuard::with_usage_source(config, source)` | Construct reading usage from a pinned `UsageSource` |
 | `MemoryGuard::try_reserve(n) -> bool` | Projected-admission check against current usage |
 | `MemoryGuard::add_bytes(n)` | Unchecked lease tracking -- data already accepted |
-| `MemoryGuard::release(n)` | Saturating subtract on the reservation counter and the ledger |
+| `MemoryGuard::release(n)` | Saturating subtract on the reservation counter, oldest-first discharge of the ledger, so a release across a re-sample never erases a later charge |
 | `MemoryGuard::under_pressure() -> bool` | Hot-path probe |
 | `MemoryGuard::pressure() -> MemoryPressure` | Three-level enum for logs/labels |
 | `MemoryGuard::pressure_ratio() -> f64` | Usage as fraction of effective limit |
