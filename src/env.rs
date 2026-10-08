@@ -22,35 +22,71 @@ pub enum Environment {
     Kubernetes,
     /// Running in Docker (but not K8s)
     Docker,
-    /// Running in a generic container (detected via cgroups)
+    /// Running in a generic container (detected via cgroups, the root mount or a container variable)
     Container,
     /// Running on bare metal / local development
     BareMetal,
 }
 
+/// cgroup path segments only a containerised process sits under; host daemons such as `docker.service` do not match.
+const CONTAINER_CGROUP_MARKERS: [&str; 4] = ["/docker/", "/kubepods", "/lxc/", "/containerd/"];
+
+/// Runtime names found in the mount options of a container's own root filesystem.
+const CONTAINER_ROOTFS_MARKERS: [&str; 3] = ["docker", "containerd", "kubelet"];
+
+/// Variables a container runtime or orchestrator sets inside the container.
+const CONTAINER_ENV_VARS: [&str; 3] = [
+    "container",
+    "DOCKER_CONTAINER",
+    "ECS_CONTAINER_METADATA_URI",
+];
+
 impl Environment {
     /// Detect the current runtime environment.
     ///
-    /// Detection priority (highest confidence first):
-    /// 1. Kubernetes service account token exists
-    /// 2. Kubernetes environment variables present
-    /// 3. Docker: `/.dockerenv` file exists
-    /// 4. Container: cgroups contain container markers
-    /// 5. Default: `BareMetal`
+    /// Only container evidence counts, highest confidence first. A host
+    /// directory such as `/cache` or `/data`, a container daemon's own cgroup
+    /// (`docker.service`), and the container mounts a docker host lists in its
+    /// mountinfo do not make the host a container.
+    ///
+    /// 1. `Kubernetes`: the `/var/run/secrets/kubernetes.io/serviceaccount`
+    ///    directory exists, or `KUBERNETES_SERVICE_HOST` is set
+    /// 2. `Docker`: `/.dockerenv` exists
+    /// 3. `Container`: `/proc/1/cgroup` or `/proc/self/cgroup` names a container
+    ///    cgroup (`/docker/`, `/kubepods`, `/lxc/`, `/containerd/` or a
+    ///    `docker-<64 hex>.scope`), the mount at `/` in `/proc/self/mountinfo`
+    ///    is an overlay whose options name `docker`, `containerd` or `kubelet`,
+    ///    or `container`, `DOCKER_CONTAINER` or `ECS_CONTAINER_METADATA_URI` is set
+    /// 4. `BareMetal`: none of the above
+    ///
+    /// A variable set to an empty value counts as unset.
     #[must_use]
     pub fn detect() -> Self {
-        // Check for Kubernetes first (highest priority)
-        if Self::is_kubernetes_by_token() || Self::is_kubernetes_by_env() {
+        Self::detect_at(Path::new("/"))
+    }
+
+    /// Detect from the files under `root` and the process environment.
+    fn detect_at(root: &Path) -> Self {
+        if root
+            .join("var/run/secrets/kubernetes.io/serviceaccount")
+            .exists()
+            || env_is_set("KUBERNETES_SERVICE_HOST")
+        {
             return Self::Kubernetes;
         }
 
-        // Check for Docker
-        if Self::is_docker_by_file() {
+        if root.join(".dockerenv").exists() {
             return Self::Docker;
         }
 
-        // Check for generic container via cgroups
-        if Self::is_container_by_cgroups() {
+        let in_container_cgroup = ["proc/1/cgroup", "proc/self/cgroup"].iter().any(|file| {
+            std::fs::read_to_string(root.join(file)).is_ok_and(|body| cgroup_names_container(&body))
+        });
+        if in_container_cgroup
+            || std::fs::read_to_string(root.join("proc/self/mountinfo"))
+                .is_ok_and(|body| rootfs_is_container_overlay(&body))
+            || CONTAINER_ENV_VARS.iter().any(|name| env_is_set(name))
+        {
             return Self::Container;
         }
 
@@ -80,43 +116,50 @@ impl Environment {
     pub const fn is_bare_metal(&self) -> bool {
         matches!(self, Self::BareMetal)
     }
+}
 
-    // Detection helpers
+/// Whether `name` is set to a non-empty value.
+fn env_is_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
 
-    fn is_kubernetes_by_token() -> bool {
-        Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token").exists()
-    }
+/// Whether a `/proc/<pid>/cgroup` body places the process inside a container.
+fn cgroup_names_container(body: &str) -> bool {
+    CONTAINER_CGROUP_MARKERS
+        .iter()
+        .any(|marker| body.contains(marker))
+        || has_docker_scope(body)
+}
 
-    fn is_kubernetes_by_env() -> bool {
-        std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
-    }
+/// Whether `body` holds a `/docker-<64 lowercase hex>.scope` segment, the systemd cgroup driver's name for a container.
+fn has_docker_scope(body: &str) -> bool {
+    const PREFIX: &str = "/docker-";
+    const ID_LEN: usize = 64;
+    body.match_indices(PREFIX).any(|(at, _)| {
+        let rest = body.as_bytes().get(at + PREFIX.len()..).unwrap_or_default();
+        rest.get(..ID_LEN)
+            .is_some_and(|id| id.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            && rest
+                .get(ID_LEN..)
+                .is_some_and(|tail| tail.starts_with(b".scope"))
+    })
+}
 
-    fn is_docker_by_file() -> bool {
-        Path::new("/.dockerenv").exists()
-    }
-
-    fn is_container_by_cgroups() -> bool {
-        // Check cgroup v1
-        if let Ok(content) = std::fs::read_to_string("/proc/1/cgroup")
-            && (content.contains("/docker/")
-                || content.contains("/kubepods/")
-                || content.contains("/lxc/")
-                || content.contains("/containerd/"))
-        {
-            return true;
+/// Whether the mount at `/` in a mountinfo body is an overlay a container runtime built; only the root mount counts, as a host that runs containers lists their overlays too.
+fn rootfs_is_container_overlay(mountinfo: &str) -> bool {
+    mountinfo.lines().any(|line| {
+        if line.split(' ').nth(4) != Some("/") {
+            return false;
         }
-
-        // Check cgroup v2 (unified hierarchy)
-        if let Ok(content) = std::fs::read_to_string("/proc/1/mountinfo")
-            && (content.contains("/docker/")
-                || content.contains("/kubepods/")
-                || content.contains("/containerd/"))
-        {
-            return true;
-        }
-
-        false
-    }
+        let Some((_, filesystem)) = line.split_once(" - ") else {
+            return false;
+        };
+        let fs_type = filesystem.split(' ').next().unwrap_or_default();
+        fs_type.contains("overlay")
+            && CONTAINER_ROOTFS_MARKERS
+                .iter()
+                .any(|marker| filesystem.contains(marker))
+    })
 }
 
 impl std::fmt::Display for Environment {
@@ -712,6 +755,238 @@ mod tests {
             tracing::subscriber::with_default(subscriber, || assert!(!is_production()));
         });
         assert!(DEFAULT_POSTURE_WARNED.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // --- Container detection from a fake filesystem root ---
+
+    /// The variables that decide detection on their own, all cleared so the runner's environment (a CI pod) cannot.
+    const NO_CONTAINER_VARS: [(&str, Option<&str>); 4] = [
+        ("KUBERNETES_SERVICE_HOST", None),
+        ("container", None),
+        ("DOCKER_CONTAINER", None),
+        ("ECS_CONTAINER_METADATA_URI", None),
+    ];
+
+    const DOCKER_ID: &str = "0ddaeccc84c6fcf3cadf246caa3f5a6578f505691c1923b1517a23b4a3107959";
+
+    const HOST_PID1_CGROUP: &str = "0::/init.scope\n";
+    const HOST_SELF_CGROUP: &str =
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n";
+
+    /// A bare-metal docker host: ext4 root, with its containers' overlays and netns mounts on other paths.
+    fn docker_host_mountinfo() -> String {
+        format!(
+            "27 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro\n\
+             176 27 8:17 / /cache rw,relatime shared:94 - ext4 /dev/sdb1 rw\n\
+             423 176 0:65 / /cache/docker/rootfs/overlayfs/{DOCKER_ID} rw,relatime shared:220 - overlay overlay \
+             rw,lowerdir=/cache/docker/containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots/12/fs,\
+             upperdir=/cache/docker/containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots/13/fs\n\
+             431 27 0:66 / /var/lib/docker/overlay2/1/merged rw,relatime - overlay overlay \
+             rw,lowerdir=/var/lib/docker/overlay2/l/ABC,upperdir=/var/lib/docker/overlay2/1/diff\n\
+             439 34 0:5 net:[4026533674] /run/docker/netns/026949dfeea6 rw shared:225 - nsfs nsfs rw\n"
+        )
+    }
+
+    /// Inside a docker container: the root mount is the overlay docker assembled.
+    const DOCKER_CONTAINER_MOUNTINFO: &str = "612 540 0:61 / / rw,relatime master:220 - overlay overlay \
+        rw,lowerdir=/var/lib/docker/overlay2/l/ABC:/var/lib/docker/overlay2/l/DEF,\
+        upperdir=/var/lib/docker/overlay2/123/diff,workdir=/var/lib/docker/overlay2/123/work\n\
+        613 612 0:64 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n";
+
+    /// Inside a Kubernetes pod on containerd: the root mount is a containerd snapshot overlay.
+    const CONTAINERD_CONTAINER_MOUNTINFO: &str = "1462 1360 0:310 / / rw,relatime - overlay overlay \
+        rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/88/fs,\
+        upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/90/fs\n";
+
+    /// An image-based desktop distro: the root is a composefs overlay that no container runtime built.
+    const COMPOSEFS_MOUNTINFO: &str = "28 1 0:31 / / ro,relatime shared:1 - overlay composefs \
+        ro,lowerdir+=/run/ostree/.private/cfsroot-lower,datadir+=/sysroot/ostree/repo/objects\n";
+
+    /// A host root on LVM whose volume group is named for docker, which is not an overlay.
+    const DOCKER_NAMED_EXT4_ROOT_MOUNTINFO: &str = "27 1 253:0 / / rw,relatime shared:1 - ext4 /dev/mapper/docker--vg-root rw,errors=remount-ro\n";
+
+    /// Write the `/proc` files detection reads under a fresh fake root.
+    fn fake_root(mountinfo: &str, pid1_cgroup: &str, self_cgroup: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("fake root");
+        for dir in ["proc/1", "proc/self"] {
+            std::fs::create_dir_all(root.path().join(dir)).expect("fake /proc dir");
+        }
+        for (file, body) in [
+            ("proc/1/cgroup", pid1_cgroup),
+            ("proc/self/cgroup", self_cgroup),
+            ("proc/self/mountinfo", mountinfo),
+        ] {
+            std::fs::write(root.path().join(file), body).expect("fake /proc file");
+        }
+        root
+    }
+
+    fn docker_host_root() -> tempfile::TempDir {
+        fake_root(&docker_host_mountinfo(), HOST_PID1_CGROUP, HOST_SELF_CGROUP)
+    }
+
+    /// Detection under `root` with every container variable cleared.
+    fn detect_in(root: &Path) -> Environment {
+        temp_env::with_vars(NO_CONTAINER_VARS, || Environment::detect_at(root))
+    }
+
+    #[test]
+    fn a_docker_host_with_host_dirs_and_container_mounts_is_bare_metal() {
+        let root = docker_host_root();
+        for host_dir in ["cache", "data", "app/config", "config"] {
+            std::fs::create_dir_all(root.path().join(host_dir)).expect("host dir");
+        }
+        assert_eq!(detect_in(root.path()), Environment::BareMetal);
+    }
+
+    #[test]
+    fn a_root_that_is_not_a_container_overlay_is_bare_metal() {
+        for mountinfo in [COMPOSEFS_MOUNTINFO, DOCKER_NAMED_EXT4_ROOT_MOUNTINFO] {
+            let root = fake_root(mountinfo, HOST_PID1_CGROUP, HOST_SELF_CGROUP);
+            assert_eq!(
+                detect_in(root.path()),
+                Environment::BareMetal,
+                "{mountinfo}"
+            );
+        }
+    }
+
+    /// A root line with no ` - ` separator names no filesystem, so it is not evidence.
+    #[test]
+    fn a_malformed_root_mount_line_is_bare_metal() {
+        let root = fake_root(
+            "612 540 0:61 / / rw,relatime overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/ABC\n",
+            HOST_PID1_CGROUP,
+            HOST_SELF_CGROUP,
+        );
+        assert_eq!(detect_in(root.path()), Environment::BareMetal);
+    }
+
+    /// A container daemon's own cgroup, and names that only look like a container scope, are host evidence.
+    #[test]
+    fn host_service_cgroups_are_bare_metal() {
+        let short_scope = format!("0::/system.slice/docker-{}.scope\n", &DOCKER_ID[..12]);
+        let upper_scope = format!(
+            "0::/system.slice/docker-{}.scope\n",
+            DOCKER_ID.to_ascii_uppercase()
+        );
+        for cgroup in [
+            "0::/system.slice/containerd.service\n",
+            "0::/system.slice/docker.service\n",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-docker\\x2ddesktop-1234.scope\n",
+            "0::/system.slice/docker-backup.service\n",
+            "12:memory:/system.slice/lxcfs.service\n",
+            short_scope.as_str(),
+            upper_scope.as_str(),
+        ] {
+            let in_pid1 = fake_root(&docker_host_mountinfo(), cgroup, HOST_SELF_CGROUP);
+            assert_eq!(
+                detect_in(in_pid1.path()),
+                Environment::BareMetal,
+                "pid 1 {cgroup}"
+            );
+            let in_self = fake_root(&docker_host_mountinfo(), HOST_PID1_CGROUP, cgroup);
+            assert_eq!(
+                detect_in(in_self.path()),
+                Environment::BareMetal,
+                "self {cgroup}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_proc_files_are_bare_metal() {
+        let root = tempfile::tempdir().expect("empty root");
+        assert_eq!(detect_in(root.path()), Environment::BareMetal);
+    }
+
+    /// A container variable set to an empty value counts as unset.
+    #[test]
+    fn empty_container_variables_are_bare_metal() {
+        let root = docker_host_root();
+        for name in [
+            "KUBERNETES_SERVICE_HOST",
+            "container",
+            "DOCKER_CONTAINER",
+            "ECS_CONTAINER_METADATA_URI",
+        ] {
+            let vars = NO_CONTAINER_VARS.map(|(var, _)| (var, (var == name).then_some("")));
+            let detected = temp_env::with_vars(vars, || Environment::detect_at(root.path()));
+            assert_eq!(detected, Environment::BareMetal, "{name}=\"\"");
+        }
+    }
+
+    #[test]
+    fn an_overlay_root_a_runtime_built_is_a_container() {
+        for mountinfo in [DOCKER_CONTAINER_MOUNTINFO, CONTAINERD_CONTAINER_MOUNTINFO] {
+            let root = fake_root(mountinfo, "0::/\n", "0::/\n");
+            assert_eq!(
+                detect_in(root.path()),
+                Environment::Container,
+                "{mountinfo}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_cgroups_are_containers() {
+        let v1_docker = format!("12:memory:/docker/{DOCKER_ID}\n");
+        let systemd_docker = format!("0::/system.slice/docker-{DOCKER_ID}.scope\n");
+        for cgroup in [
+            v1_docker.as_str(),
+            systemd_docker.as_str(),
+            "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-1.scope\n",
+            "11:devices:/kubepods/besteffort/pod1/abc\n",
+            "11:devices:/lxc/web01\n",
+            "0::/containerd/default/web01\n",
+        ] {
+            let in_pid1 = fake_root(&docker_host_mountinfo(), cgroup, HOST_SELF_CGROUP);
+            assert_eq!(
+                detect_in(in_pid1.path()),
+                Environment::Container,
+                "pid 1 {cgroup}"
+            );
+            let in_self = fake_root(&docker_host_mountinfo(), HOST_PID1_CGROUP, cgroup);
+            assert_eq!(
+                detect_in(in_self.path()),
+                Environment::Container,
+                "self {cgroup}"
+            );
+        }
+    }
+
+    #[test]
+    fn dockerenv_is_docker() {
+        let root = docker_host_root();
+        std::fs::write(root.path().join(".dockerenv"), "").expect("dockerenv");
+        assert_eq!(detect_in(root.path()), Environment::Docker);
+    }
+
+    /// The service-account directory counts on its own, whether or not a token is mounted in it.
+    #[test]
+    fn the_service_account_directory_is_kubernetes() {
+        let root = docker_host_root();
+        std::fs::create_dir_all(
+            root.path()
+                .join("var/run/secrets/kubernetes.io/serviceaccount"),
+        )
+        .expect("service account dir");
+        assert_eq!(detect_in(root.path()), Environment::Kubernetes);
+    }
+
+    #[test]
+    fn container_variables_are_detected() {
+        let root = docker_host_root();
+        for (name, expected) in [
+            ("KUBERNETES_SERVICE_HOST", Environment::Kubernetes),
+            ("container", Environment::Container),
+            ("DOCKER_CONTAINER", Environment::Container),
+            ("ECS_CONTAINER_METADATA_URI", Environment::Container),
+        ] {
+            let vars = NO_CONTAINER_VARS.map(|(var, _)| (var, (var == name).then_some("set")));
+            let detected = temp_env::with_vars(vars, || Environment::detect_at(root.path()));
+            assert_eq!(detected, expected, "{name}=set");
+        }
     }
 
     #[test]

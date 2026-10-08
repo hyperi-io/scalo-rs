@@ -29,13 +29,15 @@ isn't K8s, Docker, or a generic container is bare metal.
 
 | Variant | Detected by |
 | --------- | ------------- |
-| `Kubernetes` | `/var/run/secrets/kubernetes.io/serviceaccount/token` exists, or `KUBERNETES_SERVICE_HOST` env var present |
+| `Kubernetes` | the `/var/run/secrets/kubernetes.io/serviceaccount` directory exists, or the `KUBERNETES_SERVICE_HOST` env var is set |
 | `Docker` | `/.dockerenv` exists |
-| `Container` | `/proc/1/cgroup` or `/proc/1/mountinfo` mention `/docker/`, `/kubepods/`, `/lxc/`, `/containerd/` |
+| `Container` | a container cgroup in `/proc/1/cgroup` or `/proc/self/cgroup` (`/docker/`, `/kubepods` (which includes `kubepods.slice`), `/lxc/`, `/containerd/` or `docker-<64 hex>.scope`), an overlay mount at `/` in `/proc/self/mountinfo` whose options name `docker`, `containerd` or `kubelet`, or a non-empty `container`, `DOCKER_CONTAINER` or `ECS_CONTAINER_METADATA_URI` env var |
 | `BareMetal` | none of the above |
 
 Detection priority runs highest-confidence first -- a K8s pod is
 also a container, but you want to know it's K8s.
+
+Only evidence from inside the container counts. A docker host is `BareMetal`: its mountinfo lists the containers' overlay and netns mounts on non-root paths, and its own daemon cgroup (`docker.service`) names no container. Host directories such as `/cache` or `/data` count for nothing either. An env var set to an empty value counts as unset.
 
 ---
 
@@ -141,8 +143,9 @@ environment.
 | `run_dir` | `/app/run` | `$XDG_RUNTIME_DIR/<app>` |
 
 The container base path defaults to `/app` and is overridable via
-the `CONTAINER_BASE_PATH` env var. App name on bare metal comes
-from `APP_NAME`, defaulting to `hs-app`.
+the `CONTAINER_BASE_PATH` env var.
+
+On bare metal the directories are named for the app. The name resolves from the `app_name` argument of `RuntimePaths::discover_for_app`, then the `APP_NAME` env var, then the program name (the file stem of `argv[0]`, underscores turned into hyphens), then `app`. `discover()` and `discover_for(env)` pass no name. A blank value counts as unset, and an `argv[0]` that is empty or starts with `-` names no program. Container paths take no name.
 
 ```rust
 use scalo::runtime::RuntimePaths;
@@ -173,6 +176,7 @@ let cfg_path = paths.config_dir.join("settings.yaml");
 | `is_helm()` | Helm-deployment predicate |
 | `RuntimePaths` | Resolved config / data / cache / run paths |
 | `RuntimePaths::discover()` | Auto-detect environment and build paths |
+| `RuntimePaths::discover_for_app(env, app_name)` | Build paths for `env`, naming the bare-metal directories `app_name` |
 | `RuntimePaths::ensure_dirs()` | `mkdir -p` everything |
 
 ---
