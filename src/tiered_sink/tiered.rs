@@ -689,6 +689,20 @@ mod tests {
         }
     }
 
+    /// Poll until the drainer has emptied the spool and released its byte count; a fixed sleep flakes on a loaded runner.
+    async fn wait_for_drain(tiered: &TieredSink<TestSink>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(tiered.spool_is_empty().await && tiered.spool_bytes() == 0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drainer left {} records, {} bytes in the spool",
+                tiered.spool_len().await,
+                tiered.spool_bytes()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// A real `TransportSender` test double: records what it receives and can be
     /// toggled unavailable to drive the spill/circuit/drain paths.
     struct TestSink {
@@ -844,9 +858,8 @@ mod tests {
         tiered.send(&rec(b"recover me")).await.unwrap();
         assert_eq!(tiered.spool_len().await, 1);
 
-        // Make sink available and wait for drain
         tiered.inner().set_available(true);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        wait_for_drain(&tiered).await;
 
         // Should have drained -- and the EXACT payload must survive the
         // encode -> spool -> drain -> decode round-trip (full Record fidelity).
@@ -892,8 +905,7 @@ mod tests {
         assert_eq!(tiered.spool_len().await, 1);
 
         tiered.inner().set_available(true);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(tiered.spool_is_empty().await);
+        wait_for_drain(&tiered).await;
 
         let got = tiered.inner().received.lock().await;
         assert_eq!(got.len(), 1);
@@ -946,12 +958,7 @@ mod tests {
 
         // Recover and let the drainer work through the backlog.
         tiered.inner().set_available(true);
-        for _ in 0..40 {
-            if tiered.spool_is_empty().await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        wait_for_drain(&tiered).await;
 
         assert!(tiered.spool_is_empty().await, "drainer cleared the backlog");
         assert_eq!(
@@ -985,12 +992,7 @@ mod tests {
         assert!(tiered.spool_len().await > 0, "records spilled");
 
         tiered.inner().set_available(true);
-        for _ in 0..40 {
-            if tiered.spool_is_empty().await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        wait_for_drain(&tiered).await;
         assert!(tiered.spool_is_empty().await);
         assert_eq!(
             tiered.inner().received_payloads().await,
@@ -1035,12 +1037,7 @@ mod tests {
         config.compression = CompressionCodec::None;
         config.drain_interval_ms = 5;
         let tiered = TieredSink::new(sink, config).await.unwrap();
-        for _ in 0..40 {
-            if tiered.spool_is_empty().await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        wait_for_drain(&tiered).await;
         assert!(
             tiered.spool_is_empty().await,
             "corrupt record was drained (dropped)"
@@ -1211,9 +1208,8 @@ mod tests {
         let bytes_after_spool = tiered.spool_bytes();
         assert!(bytes_after_spool > 0);
 
-        // Make sink available and wait for drain
         tiered.inner().set_available(true);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        wait_for_drain(&tiered).await;
 
         // Bytes should be decremented
         assert_eq!(tiered.spool_bytes(), 0);
@@ -1362,12 +1358,7 @@ mod tests {
             expect,
             "spooled records recovered"
         );
-        for _ in 0..200 {
-            if tiered.spool_is_empty().await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_for_drain(&tiered).await;
         let got = tiered.inner().received_payloads().await;
         tiered.shutdown().await;
         got
@@ -1572,12 +1563,7 @@ mod tests {
         // The first owner still has every record and still drains them.
         assert_eq!(first.spool_len().await, 4);
         first.inner().set_available(true);
-        for _ in 0..200 {
-            if first.spool_is_empty().await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_for_drain(&first).await;
         assert_eq!(first.inner().received_payloads().await, payloads(4));
         first.shutdown().await;
     }
@@ -1693,12 +1679,7 @@ mod tests {
         tiered.inner().set_available(false);
         tiered.send(&rec(b"after")).await.unwrap();
         tiered.inner().set_available(true);
-        for _ in 0..200 {
-            if tiered.spool_is_empty().await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_for_drain(&tiered).await;
         assert_eq!(
             tiered.inner().received_payloads().await,
             vec![b"after".to_vec()]
