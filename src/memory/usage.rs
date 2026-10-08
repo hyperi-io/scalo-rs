@@ -134,6 +134,8 @@ fn read_vm_rss(proc_self: &Path) -> Option<u64> {
 /// the per-payload path.
 pub(crate) struct UsageReader {
     source: UsageSource,
+    /// How long one reading is reused: [`CACHE_INTERVAL`] outside tests.
+    interval: Duration,
     started: Instant,
     cached_bytes: AtomicU64,
     cached_at_nanos: AtomicU64,
@@ -150,8 +152,15 @@ pub(crate) struct UsageReader {
 
 impl UsageReader {
     pub(crate) fn new(source: UsageSource) -> Self {
+        Self::with_interval(source, CACHE_INTERVAL)
+    }
+
+    /// A reader that reuses each reading for `interval`, so a test decides
+    /// when the next sample is taken rather than the host's scheduler.
+    pub(crate) fn with_interval(source: UsageSource, interval: Duration) -> Self {
         let reader = Self {
             source,
+            interval,
             started: Instant::now(),
             cached_bytes: AtomicU64::new(0),
             cached_at_nanos: AtomicU64::new(0),
@@ -168,7 +177,7 @@ impl UsageReader {
         &self.source
     }
 
-    /// Current usage, re-read at most once per [`CACHE_INTERVAL`].
+    /// Current usage, re-read at most once per interval.
     ///
     /// When the cached reading goes stale, the one thread whose compare-exchange
     /// moves the timestamp on reads the file and clears the ledger. Every other
@@ -181,7 +190,7 @@ impl UsageReader {
         }
         let cached_at = self.cached_at_nanos.load(Ordering::Relaxed);
         let now = self.elapsed_nanos();
-        if Duration::from_nanos(now.saturating_sub(cached_at)) < CACHE_INTERVAL {
+        if Duration::from_nanos(now.saturating_sub(cached_at)) < self.interval {
             return Some(self.cached_bytes.load(Ordering::Relaxed));
         }
         let elected = self

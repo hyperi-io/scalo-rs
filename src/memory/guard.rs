@@ -346,8 +346,14 @@ impl MemoryGuard {
     /// detected one. For a test fixture directory, or a host where detection
     /// picks the wrong cgroup.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn with_usage_source(config: MemoryGuardConfig, source: UsageSource) -> Self {
+        Self::with_usage_reader(config, UsageReader::new(source))
+    }
+
+    /// Create a memory guard around a usage reader already built, so a test
+    /// can choose how long the reader reuses each reading.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn with_usage_reader(config: MemoryGuardConfig, usage: UsageReader) -> Self {
         // Defensive: a non-finite / out-of-range threshold or headroom would
         // produce a zero/NaN limit and a divide-by-zero pressure ratio. Clamp
         // to the safe default and log loudly. Callers wanting hard rejection
@@ -376,7 +382,6 @@ impl MemoryGuard {
         // divides by it.
         let limit_bytes = raw_limit.max(1);
 
-        let usage = UsageReader::new(source);
         let usage_source = if HEAP_SOURCE.get().is_some() {
             "explicit"
         } else {
@@ -568,6 +573,8 @@ impl MemoryGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// A guard pinned to the reservation counter: the byte-lease ladder these
@@ -776,15 +783,22 @@ mod tests {
         );
     }
 
+    /// A reading that never goes stale, so every call in a test shares one window.
+    const ONE_WINDOW: Duration = Duration::MAX;
+
+    /// A reading that is stale at once, so every call takes a fresh sample.
+    const EVERY_CALL: Duration = Duration::ZERO;
+
     /// Ten MiB limit against a cgroup file that stays at zero, so admission can
-    /// only be refused by the ledger of bytes taken since that reading.
-    fn ledger_guard(dir: &tempfile::TempDir) -> MemoryGuard {
-        MemoryGuard::with_usage_source(
+    /// only be refused by the ledger of bytes taken since that reading, which
+    /// is re-sampled after `interval`.
+    fn ledger_guard(dir: &tempfile::TempDir, interval: Duration) -> MemoryGuard {
+        MemoryGuard::with_usage_reader(
             MemoryGuardConfig {
                 limit_bytes: 10 * 1024 * 1024,
                 ..Default::default()
             },
-            UsageSource::CgroupV2(dir.path().to_path_buf()),
+            UsageReader::with_interval(UsageSource::CgroupV2(dir.path().to_path_buf()), interval),
         )
     }
 
@@ -793,7 +807,7 @@ mod tests {
         // The overshoot this guards: the kernel figure is up to CACHE_INTERVAL
         // stale, so admitting against it alone lets a burst through unbounded.
         let dir = cgroup_fixture(&[("memory.current", "0\n")]);
-        let guard = ledger_guard(&dir);
+        let guard = ledger_guard(&dir, ONE_WINDOW);
         let six_mib = 6 * 1024 * 1024;
 
         assert!(guard.try_reserve(six_mib), "6 MiB of a 10 MiB limit fits");
@@ -803,14 +817,15 @@ mod tests {
         );
     }
 
-    /// Two callers released together against headroom for one: exactly one is
-    /// admitted, every round, because each judges the total its own charge made.
+    /// Two callers released together into one cache window, against headroom
+    /// for one: exactly one is admitted, every round, because each judges the
+    /// total its own charge made.
     #[test]
     fn two_racing_reserves_against_room_for_one_admit_one() {
         let six_mib = 6 * 1024 * 1024;
         for round in 0..200 {
             let dir = cgroup_fixture(&[("memory.current", "0\n")]);
-            let guard = ledger_guard(&dir);
+            let guard = ledger_guard(&dir, ONE_WINDOW);
             let barrier = std::sync::Barrier::new(2);
             let admitted = std::thread::scope(|scope| {
                 let racers: Vec<_> = (0..2)
@@ -840,7 +855,7 @@ mod tests {
     #[test]
     fn a_reserve_larger_than_the_limit_leaves_the_ledger_alone() {
         let dir = cgroup_fixture(&[("memory.current", "0\n")]);
-        let guard = ledger_guard(&dir);
+        let guard = ledger_guard(&dir, ONE_WINDOW);
         assert!(guard.try_reserve(1024));
         assert!(!guard.try_reserve(u64::MAX));
         assert_eq!(guard.current_bytes(), 1024);
@@ -849,7 +864,7 @@ mod tests {
     #[test]
     fn release_discharges_the_ledger() {
         let dir = cgroup_fixture(&[("memory.current", "0\n")]);
-        let guard = ledger_guard(&dir);
+        let guard = ledger_guard(&dir, ONE_WINDOW);
         let six_mib = 6 * 1024 * 1024;
 
         assert!(guard.try_reserve(six_mib));
@@ -863,11 +878,10 @@ mod tests {
     #[test]
     fn a_fresh_sample_clears_the_ledger() {
         let dir = cgroup_fixture(&[("memory.current", "0\n")]);
-        let guard = ledger_guard(&dir);
+        let guard = ledger_guard(&dir, EVERY_CALL);
         let six_mib = 6 * 1024 * 1024;
 
         assert!(guard.try_reserve(six_mib));
-        std::thread::sleep(std::time::Duration::from_millis(60)); // past the read cache
         assert!(
             guard.try_reserve(six_mib),
             "the new reading accounts for those bytes, so the ledger restarts"
@@ -877,7 +891,7 @@ mod tests {
     #[test]
     fn the_ledger_adds_to_what_the_kernel_already_charges() {
         let dir = cgroup_fixture(&[("memory.current", "4194304\n")]); // 4 MiB
-        let guard = ledger_guard(&dir);
+        let guard = ledger_guard(&dir, ONE_WINDOW);
 
         assert_eq!(guard.current_bytes(), 4 * 1024 * 1024);
         assert!(guard.try_reserve(2 * 1024 * 1024));
