@@ -28,10 +28,10 @@
       "default": ""
     },
     "metrics_port": {
-      "description": "Metrics/health listen port (e.g., 9090).",
+      "description": "Metrics/health listen port (e.g., 9090), 1 to 65535.",
       "type": "integer",
       "format": "uint16",
-      "minimum": 0,
+      "minimum": 1,
       "maximum": 65535
     },
     "health": {
@@ -240,10 +240,10 @@
           "type": "string"
         },
         "port": {
-          "description": "Port number (e.g., 8080).",
+          "description": "Port number (e.g., 8080), 1 to 65535.",
           "type": "integer",
           "format": "uint16",
-          "minimum": 0,
+          "minimum": 1,
           "maximum": 65535
         },
         "protocol": {

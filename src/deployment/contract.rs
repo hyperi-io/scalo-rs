@@ -80,7 +80,8 @@ pub struct DeploymentContract {
     #[serde(default)]
     pub description: String,
 
-    /// Metrics/health listen port (e.g., 9090).
+    /// Metrics/health listen port (e.g., 9090), 1 to 65535.
+    #[cfg_attr(feature = "config-schema", schemars(range(min = 1)))]
     pub metrics_port: u16,
 
     /// Health probe endpoint paths.
@@ -473,7 +474,8 @@ fn default_startup_budget_seconds() -> u32 {
 pub struct PortContract {
     /// Port name (e.g., "http").
     pub name: String,
-    /// Port number (e.g., 8080).
+    /// Port number (e.g., 8080), 1 to 65535.
+    #[cfg_attr(feature = "config-schema", schemars(range(min = 1)))]
     pub port: u16,
     /// Protocol (default: "TCP").
     #[serde(default = "default_protocol")]
