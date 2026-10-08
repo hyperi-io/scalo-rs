@@ -970,14 +970,14 @@ async fn a_send_to_a_server_that_never_answers_ends_at_send_timeout() {
 /// `send_timeout_ms`, so each send dials afresh rather than queueing behind
 /// the stalled one.
 ///
-/// The dial gives up a tenth of the limit before its send does; a 1 s limit
-/// keeps that 100 ms margin clear of scheduler stalls on a busy host.
-#[tokio::test]
+/// The clock is paused, so the dial's limit, nine tenths of the send's, always
+/// fires first: a stalled test thread cannot reach both limits at once.
+#[tokio::test(start_paused = true)]
 async fn each_send_after_a_stalled_tls_handshake_dials_afresh() {
     let (addr, accepts) = silent_listener().await;
     let client = tls_client(addr, 1_000).await;
 
-    for _ in 0..3 {
+    for dialled in 1..=3 {
         let sent = tokio::time::timeout(
             Duration::from_secs(5),
             client.send("main", bytes::Bytes::from_static(b"{}")),
@@ -987,13 +987,12 @@ async fn each_send_after_a_stalled_tls_handshake_dials_afresh() {
             matches!(sent, Ok(SendResult::Backpressured)),
             "send must end at send_timeout_ms as backpressure, got {sent:?}"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            dialled,
+            "send {dialled} to a server that never answers should dial it once"
+        );
     }
-    assert_eq!(
-        accepts.load(std::sync::atomic::Ordering::SeqCst),
-        3,
-        "three sends to a server that never answers should each dial it once"
-    );
 }
 
 /// Accepted gRPC records count as received, never as sent: in one process the
