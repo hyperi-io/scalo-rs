@@ -1,0 +1,13 @@
+# Project:   scalo
+# File:      charts/scalo-service/lint-skip.yaml
+# Purpose:   Scanner findings an assembled thin chart accepts by design
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+#
+# Keyed by scanner, then check id, with the reason. An assembler applies these
+# to the thin chart it builds and to nothing else in the repo.
+
+checkov:
+  CKV_K8S_40: "The uid comes from the contract's security block and must match the image's USER, so the library cannot choose a high one."
+  CKV2_K8S_6: "A NetworkPolicy needs the service's peers, which a generic library cannot know; networkPolicy.enabled turns one on."

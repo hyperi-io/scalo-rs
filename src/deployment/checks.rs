@@ -496,7 +496,15 @@ mod tests {
 
     #[test]
     fn an_app_name_is_checked_as_a_service_name() {
-        for good in ["app", "my-app", "a", "dfe-receiver", "app2", "a--b", &"a".repeat(63)] {
+        for good in [
+            "app",
+            "my-app",
+            "a",
+            "dfe-receiver",
+            "app2",
+            "a--b",
+            &"a".repeat(63),
+        ] {
             assert_eq!(app_name_fault(good), None, "{good:?}");
         }
         for bad in [

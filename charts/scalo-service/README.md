@@ -23,6 +23,7 @@ The contract is the JSON `scalo::deployment::DeploymentContract` serialises, at 
 | `skeleton/Chart.yaml` | The thin chart's `Chart.yaml`, before an assembler fills it in |
 | `skeleton/templates/*.yaml` | One `include` per object |
 | `skeleton/values.schema.json` | The schema of the standard values; it never declares `config` |
+| `lint-skip.yaml` | Scanner findings a thin chart accepts by design, keyed by scanner and check id, each with its reason; an assembler applies them to the thin chart only |
 | `tests/` | Fixture thin charts, helm-unittest suites and expected-fail cases; not packaged |
 
 ## The thin chart
