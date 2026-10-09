@@ -386,7 +386,7 @@ pub fn get_app_env() -> String {
 /// Resolve the app environment, claiming `warned` to log the default once.
 fn app_env_or_default(warned: &AtomicBool) -> String {
     if let Some(app_env) = APP_ENV_VARS.iter().find_map(|name| {
-        let value = std::env::var(name).ok()?;
+        let value = posture_var(name)?;
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }) {
@@ -423,6 +423,68 @@ pub fn is_production() -> bool {
         get_app_env().to_ascii_lowercase().as_str(),
         "production" | "prod"
     )
+}
+
+/// The posture variable `name` from the process environment.
+#[cfg(not(test))]
+fn posture_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// The posture variable `name`, from the calling test's [`test_posture`] scope when one names it.
+#[cfg(test)]
+fn posture_var(name: &str) -> Option<String> {
+    test_posture::read(name)
+}
+
+/// Posture variables scoped to one test thread.
+///
+/// The process environment is shared by every test in the process, so a
+/// production posture set there makes Kafka clients that tests build on other
+/// threads refuse as if in production. A test that needs a production posture
+/// sets it here instead.
+#[cfg(test)]
+pub(crate) mod test_posture {
+    use std::cell::RefCell;
+
+    /// A posture variable set (`Some`) or unset (`None`).
+    pub(crate) type Var = (&'static str, Option<&'static str>);
+
+    thread_local! {
+        /// Every scope open on this thread, innermost last.
+        static SCOPES: RefCell<Vec<Var>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// `name` as the innermost scope on this thread sets it, else from the process environment.
+    pub(super) fn read(name: &str) -> Option<String> {
+        SCOPES.with_borrow(|scopes| {
+            scopes
+                .iter()
+                .rev()
+                .find(|(var, _)| *var == name)
+                .map_or_else(
+                    || std::env::var(name).ok(),
+                    |(_, value)| value.map(str::to_string),
+                )
+        })
+    }
+
+    /// Run `f` with each of `vars` set or unset for posture reads on this thread alone.
+    pub(crate) fn with_vars<R>(vars: impl AsRef<[Var]>, f: impl FnOnce() -> R) -> R {
+        let vars = vars.as_ref();
+        SCOPES.with_borrow_mut(|scopes| scopes.extend_from_slice(vars));
+        let _close = Close(vars.len());
+        f()
+    }
+
+    /// Closes a scope on drop, so a panic in its closure closes it too.
+    struct Close(usize);
+
+    impl Drop for Close {
+        fn drop(&mut self) {
+            SCOPES.with_borrow_mut(|scopes| scopes.truncate(scopes.len().saturating_sub(self.0)));
+        }
+    }
 }
 
 // =============================================================================
@@ -522,10 +584,11 @@ mod tests {
         );
     }
 
+    /// Reads the process environment, with a value no production check acts on.
     #[test]
     fn test_get_app_env_from_app_env() {
-        temp_env::with_var("APP_ENV", Some("production"), || {
-            assert_eq!(get_app_env(), "production");
+        temp_env::with_var("APP_ENV", Some("staging"), || {
+            assert_eq!(get_app_env(), "staging");
         });
     }
 
@@ -559,7 +622,7 @@ mod tests {
             ("", false),
             ("  ", false),
         ] {
-            temp_env::with_vars(only("APP_ENV", value), || {
+            test_posture::with_vars(only("APP_ENV", value), || {
                 assert_eq!(is_production(), expected, "APP_ENV={value:?}");
             });
         }
@@ -575,7 +638,7 @@ mod tests {
             (" staging ", "staging"),
             ("\ttest\r\n", "test"),
         ] {
-            temp_env::with_vars(only("APP_ENV", value), || {
+            test_posture::with_vars(only("APP_ENV", value), || {
                 assert_eq!(get_app_env(), expected, "APP_ENV={value:?}");
             });
         }
@@ -591,7 +654,7 @@ mod tests {
                 ("ENVIRONMENT", Some("production")),
                 ("ENV", None),
             ];
-            temp_env::with_vars(masked, || {
+            test_posture::with_vars(masked, || {
                 assert_eq!(get_app_env(), "production", "APP_ENV={blank:?}");
                 assert!(is_production(), "APP_ENV={blank:?} over ENVIRONMENT");
             });
@@ -601,12 +664,12 @@ mod tests {
                 ("ENVIRONMENT", Some(blank)),
                 ("ENV", Some("prod")),
             ];
-            temp_env::with_vars(deepest, || {
+            test_posture::with_vars(deepest, || {
                 assert_eq!(get_app_env(), "prod", "blank APP_ENV and ENVIRONMENT");
             });
 
             let all_blank = UNSET.map(|(name, _)| (name, Some(blank)));
-            temp_env::with_vars(all_blank, || {
+            test_posture::with_vars(all_blank, || {
                 assert_eq!(get_app_env(), "development", "all three {blank:?}");
                 assert!(!is_production());
             });
@@ -616,12 +679,41 @@ mod tests {
     #[test]
     fn is_production_reads_each_variable_in_turn() {
         for var in ["APP_ENV", "ENVIRONMENT", "ENV"] {
-            temp_env::with_vars(only(var, "prod"), || {
+            test_posture::with_vars(only(var, "prod"), || {
                 assert!(is_production(), "{var}=prod");
             });
         }
-        temp_env::with_vars(UNSET, || {
+        test_posture::with_vars(UNSET, || {
             assert!(!is_production(), "unset resolves to development");
+        });
+    }
+
+    /// The scope sets this thread's posture, and another thread reads the process environment.
+    #[test]
+    fn a_scoped_posture_reaches_no_other_thread() {
+        temp_env::with_vars(UNSET, || {
+            test_posture::with_vars(only("APP_ENV", "production"), || {
+                assert!(is_production(), "the scope sets this thread's posture");
+                let elsewhere = std::thread::spawn(is_production)
+                    .join()
+                    .expect("reader thread");
+                assert!(
+                    !elsewhere,
+                    "another thread read the scoped production posture"
+                );
+            });
+            assert!(!is_production(), "the scope outlived its closure");
+        });
+    }
+
+    #[test]
+    fn a_scoped_posture_closes_when_its_closure_panics() {
+        let unwound = std::panic::catch_unwind(|| {
+            test_posture::with_vars(only("APP_ENV", "production"), || panic!("inside the scope"));
+        });
+        assert!(unwound.is_err());
+        temp_env::with_vars(UNSET, || {
+            assert!(!is_production(), "the panic left the scope open");
         });
     }
 
@@ -691,7 +783,7 @@ mod tests {
             for value in ["staging", "production"] {
                 let warned = AtomicBool::new(false);
                 let (subscriber, buf) = capture();
-                temp_env::with_vars(only(var, value), || {
+                test_posture::with_vars(only(var, value), || {
                     tracing::subscriber::with_default(subscriber, || {
                         assert_eq!(app_env_or_default(&warned), value);
                     });

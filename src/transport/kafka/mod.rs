@@ -606,6 +606,9 @@ fn checked_config(config: &KafkaConfig) -> TransportResult<KafkaConfig> {
 }
 
 /// Checks every client constructor runs against [`checked_config`]'s refusals.
+///
+/// Each `build` must construct on the calling thread, the only thread the
+/// production posture is set for (see [`crate::env::test_posture`]).
 #[cfg(test)]
 pub(crate) mod client_gate {
     use super::{KafkaConfig, TransportError, TransportResult};
@@ -694,7 +697,7 @@ pub(crate) mod client_gate {
             ("production", &in_production[..]),
             ("development", &in_any_environment[..]),
         ] {
-            temp_env::with_var("APP_ENV", Some(app_env), || {
+            crate::env::test_posture::with_vars([("APP_ENV", Some(app_env))], || {
                 for (config, names) in cases {
                     let refusal = build(config).unwrap_or_else(|| {
                         panic!("built a client despite {names} under APP_ENV={app_env}")
@@ -720,7 +723,7 @@ pub(crate) mod client_gate {
             .clone()
             .with_override("security.protocol", "SSL")
             .with_override("enable.ssl.certificate.verification", "true");
-        temp_env::with_var("APP_ENV", Some("production"), || {
+        crate::env::test_posture::with_vars([("APP_ENV", Some("production"))], || {
             for config in [&verified, &overridden] {
                 if let Some(refusal) = build(config) {
                     panic!("refused a TLS-verifying config under production: {refusal}");

@@ -202,7 +202,7 @@ mod tests {
     fn resolve_sets_deployment_environment_and_keeps_resource_attributes() {
         temp_env::with_vars(
             [
-                ("APP_ENV", Some("production")),
+                ("APP_ENV", Some("staging")),
                 ("ENVIRONMENT", None::<&str>),
                 ("ENV", None::<&str>),
                 ("OTEL_SERVICE_NAME", None::<&str>),
@@ -214,7 +214,7 @@ mod tests {
                     .insert("team".to_string(), "data-plane".to_string());
                 let resolved = resolve_config(&cfg);
                 assert_eq!(
-                    resolved.deployment_environment, "production",
+                    resolved.deployment_environment, "staging",
                     "deployment environment must come from APP_ENV"
                 );
                 assert_eq!(
