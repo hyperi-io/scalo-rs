@@ -20,17 +20,19 @@ The cascade is **7 layers** -- one typed view assembled from CLI args, env vars,
 | 6 | `defaults.yaml` | Fallback baseline |
 | 7 | Hard-coded defaults | `log_level=info`, `log_format=auto` |
 
-Each YAML layer is searched in this order, first match wins:
+Each YAML layer reads every location below that holds the file and merges them in this order, so a later location overrides an earlier one. Within one location `.yaml` beats `.yml`.
 
 ```text
-./<name>.yaml             ./<name>.yml
-./config/<name>.yaml      ./config/<name>.yml
-/config/<name>.yaml       /config/<name>.yml
+./<name>.yaml                         ./<name>.yml
+./config/<name>.yaml                  ./config/<name>.yml
+/config/<name>.yaml                   /config/<name>.yml
 ~/.config/<app_name>/<name>.yaml      ~/.config/<app_name>/<name>.yml
+<config_paths dir>/<name>.yaml        <config_paths dir>/<name>.yml
 ```
 
-`<app_name>` resolves from `ConfigOptions::app_name`, then `APP_NAME`, then the
-deprecated `HYPERI_LIB_APP_NAME`. No name -> the home-config path is skipped.
+A `ConfigOptions::config_paths` entry that is a directory is searched like the locations above. An entry that is a file, which is what `--config` passes, joins the `settings` layer only and merges after every other `settings.yaml`, so it outranks those and `defaults.yaml`. `settings.{env}.yaml` and env vars still outrank it.
+
+`<app_name>` resolves from `ConfigOptions::app_name`, then `APP_NAME`, with no other fallback. No name -> the home-config path is skipped.
 
 ---
 
