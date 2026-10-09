@@ -21,6 +21,8 @@
 
 #![cfg(feature = "dlq-kafka")]
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -245,17 +247,15 @@ async fn read_reasons_async(bootstrap: &str, topic: &str) -> Vec<String> {
         .expect("verify task")
 }
 
+/// The `reason` of every entry the file backend wrote, oldest first.
 fn file_reasons(dir: &Path) -> Vec<String> {
-    std::fs::read_to_string(dir.join("svc/dlq.ndjson"))
-        .map(|body| {
-            body.lines()
-                .map(|line| {
-                    let entry: serde_json::Value = serde_json::from_str(line).expect("DLQ JSON");
-                    entry["reason"].as_str().unwrap_or_default().to_string()
-                })
-                .collect()
+    common::dlq_file_lines(dir, "svc")
+        .iter()
+        .map(|line| {
+            let entry: serde_json::Value = serde_json::from_str(line).expect("DLQ JSON");
+            entry["reason"].as_str().unwrap_or_default().to_string()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Replace the file backend's directory with a regular file so every write fails.

@@ -4709,12 +4709,13 @@ fn file_dlq(dir: &std::path::Path, shutdown: &CancellationToken) -> Arc<crate::d
     Arc::new(crate::dlq::Dlq::spawn(&config, "svc", None, shutdown.clone()).expect("spawn dlq"))
 }
 
-/// Dead letters the file DLQ under `dir` holds.
+/// Dead letters the file DLQ under `dir` holds, in every file its rotation keeps.
 #[cfg(feature = "dlq")]
 async fn dlq_lines(dir: &std::path::Path) -> usize {
-    tokio::fs::read_to_string(dir.join("svc/dlq.ndjson"))
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::dlq::test_files::written_lines(&dir, "svc").len())
         .await
-        .map_or(0, |body| body.lines().count())
+        .expect("read the DLQ files")
 }
 
 /// A `process` that dead-letters the record with seq 1.

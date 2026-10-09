@@ -84,3 +84,44 @@ pub use http::HttpDlqConfig;
 
 /// Result type for DLQ operations.
 pub type Result<T> = std::result::Result<T, DlqError>;
+
+/// Reads what the file backend wrote, for tests in any module.
+#[cfg(test)]
+pub(crate) mod test_files {
+    use std::path::{Path, PathBuf};
+
+    /// The file backend's current file name; a rotation appends a timestamp to it.
+    const CURRENT: &str = "dlq.ndjson";
+
+    /// Every line the file backend wrote under `path` for `service`, oldest
+    /// first: the files a rotation moved aside, then the current file. A daily
+    /// rotation can fall between two writes, so the current file alone can miss
+    /// entries. Empty when the service directory cannot be listed.
+    pub(crate) fn written_lines(path: &Path, service: &str) -> Vec<String> {
+        let Ok(listing) = std::fs::read_dir(path.join(service)) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = listing
+            .map(|entry| entry.expect("list the DLQ directory").path())
+            .filter(|file| {
+                file.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix(CURRENT))
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+            })
+            .collect();
+        files.sort_by_key(|file| {
+            (
+                file.file_name().is_some_and(|name| name == CURRENT),
+                file.clone(),
+            )
+        });
+        files
+            .iter()
+            .flat_map(|file| {
+                let body = std::fs::read_to_string(file).expect("read a DLQ file");
+                body.lines().map(str::to_owned).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+}

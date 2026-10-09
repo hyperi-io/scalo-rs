@@ -837,37 +837,13 @@ mod tests {
         }
     }
 
-    /// Every line the file backend wrote, from the current file and every file
-    /// a rotation moved aside, since a daily rotation can fall between two writes.
-    fn dlq_file_lines(dir: &std::path::Path) -> Vec<String> {
-        let Ok(listing) = std::fs::read_dir(dir.join("svc")) else {
-            return Vec::new();
-        };
-        let mut files: Vec<std::path::PathBuf> = listing
-            .map(|entry| entry.expect("list the DLQ directory").path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name == "dlq.ndjson" || name.starts_with("dlq.ndjson."))
-            })
-            .collect();
-        files.sort();
-        files
-            .iter()
-            .flat_map(|path| {
-                let body = std::fs::read_to_string(path).expect("read a DLQ file");
-                body.lines().map(str::to_owned).collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
     fn dlq_lines(dir: &std::path::Path) -> usize {
-        dlq_file_lines(dir).len()
+        crate::dlq::test_files::written_lines(dir, "svc").len()
     }
 
-    /// The `reason` of every entry the file backend wrote.
+    /// The `reason` of every entry the file backend wrote, oldest first.
     fn file_reasons(dir: &std::path::Path) -> Vec<String> {
-        dlq_file_lines(dir)
+        crate::dlq::test_files::written_lines(dir, "svc")
             .iter()
             .map(|line| {
                 serde_json::from_str::<DlqEntry>(line)
@@ -878,7 +854,7 @@ mod tests {
     }
 
     /// A write that rotates the file moves what it held aside; the readers
-    /// above still return every entry, in whichever file it landed.
+    /// above still return every entry, oldest first, in whichever file it landed.
     #[tokio::test]
     async fn the_file_readers_see_entries_a_rotation_moved_aside() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -905,9 +881,7 @@ mod tests {
 
         let files = std::fs::read_dir(&svc).expect("list dir").count();
         assert_eq!(files, 2, "the write rotated the earlier entry aside");
-        let mut reasons = file_reasons(dir.path());
-        reasons.sort();
-        assert_eq!(reasons, ["earlier", "later"]);
+        assert_eq!(file_reasons(dir.path()), ["earlier", "later"]);
         assert_eq!(dlq_lines(dir.path()), 2);
         shutdown.cancel();
     }
