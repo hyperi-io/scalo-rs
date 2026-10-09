@@ -837,8 +837,79 @@ mod tests {
         }
     }
 
+    /// Every line the file backend wrote, from the current file and every file
+    /// a rotation moved aside, since a daily rotation can fall between two writes.
+    fn dlq_file_lines(dir: &std::path::Path) -> Vec<String> {
+        let Ok(listing) = std::fs::read_dir(dir.join("svc")) else {
+            return Vec::new();
+        };
+        let mut files: Vec<std::path::PathBuf> = listing
+            .map(|entry| entry.expect("list the DLQ directory").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == "dlq.ndjson" || name.starts_with("dlq.ndjson."))
+            })
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|path| {
+                let body = std::fs::read_to_string(path).expect("read a DLQ file");
+                body.lines().map(str::to_owned).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn dlq_lines(dir: &std::path::Path) -> usize {
-        std::fs::read_to_string(dir.join("svc/dlq.ndjson")).map_or(0, |body| body.lines().count())
+        dlq_file_lines(dir).len()
+    }
+
+    /// The `reason` of every entry the file backend wrote.
+    fn file_reasons(dir: &std::path::Path) -> Vec<String> {
+        dlq_file_lines(dir)
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<DlqEntry>(line)
+                    .expect("a whole DLQ entry per line")
+                    .reason
+            })
+            .collect()
+    }
+
+    /// A write that rotates the file moves what it held aside; the readers
+    /// above still return every entry, in whichever file it landed.
+    #[tokio::test]
+    async fn the_file_readers_see_entries_a_rotation_moved_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc = dir.path().join("svc");
+        std::fs::create_dir(&svc).expect("create dir");
+        let mut earlier = serde_json::to_vec(&test_entry("earlier")).expect("serialise");
+        earlier.push(b'\n');
+        std::fs::write(svc.join("dlq.ndjson"), earlier).expect("write the earlier entry");
+        // Last written two days ago, so the next write crosses the daily boundary.
+        std::fs::File::options()
+            .write(true)
+            .open(svc.join("dlq.ndjson"))
+            .and_then(|file| {
+                file.set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400),
+                )
+            })
+            .expect("age the file");
+        let shutdown = CancellationToken::new();
+        let dlq = spawn_dlq(&tmp_config(dir.path()), &shutdown);
+
+        dlq.send(test_entry("later")).await.expect("queued");
+        dlq.flush().await.expect("flush");
+
+        let files = std::fs::read_dir(&svc).expect("list dir").count();
+        assert_eq!(files, 2, "the write rotated the earlier entry aside");
+        let mut reasons = file_reasons(dir.path());
+        reasons.sort();
+        assert_eq!(reasons, ["earlier", "later"]);
+        assert_eq!(dlq_lines(dir.path()), 2);
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -1026,10 +1097,7 @@ mod tests {
         }
         dlq.flush().await.expect("flush");
 
-        let path = dir.path().join("svc/dlq.ndjson");
-        let body = std::fs::read_to_string(&path).expect("read");
-        let lines: Vec<&str> = body.trim().lines().collect();
-        assert_eq!(lines.len(), 5);
+        assert_eq!(dlq_lines(dir.path()), 5);
 
         shutdown.cancel();
         dlq.shutdown().await.expect("clean shutdown");
@@ -1333,20 +1401,6 @@ mod tests {
 
         const FALLTHROUGH: &str = "dlq_cascade_fallthrough_total";
 
-        fn file_reasons(dir: &std::path::Path) -> Vec<String> {
-            std::fs::read_to_string(dir.join("svc/dlq.ndjson"))
-                .map(|body| {
-                    body.lines()
-                        .map(|line| {
-                            serde_json::from_str::<DlqEntry>(line)
-                                .expect("a whole DLQ entry per line")
-                                .reason
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        }
-
         /// Issue #213: the broker never acks, so every entry goes on to the file
         /// backend, none is lost, and the fallthrough counter counts each one.
         /// The drain runs on this current-thread runtime, so the local recorder
@@ -1473,9 +1527,7 @@ mod tests {
         dlq2.send(test_entry("b")).await.expect("send b");
         dlq.flush().await.expect("flush");
 
-        let path = dir.path().join("svc/dlq.ndjson");
-        let body = std::fs::read_to_string(&path).expect("read");
-        assert_eq!(body.trim().lines().count(), 2);
+        assert_eq!(dlq_lines(dir.path()), 2);
 
         shutdown.cancel();
         dlq.shutdown().await.expect("shutdown");
