@@ -1528,44 +1528,54 @@ mod tests {
     #[cfg(feature = "http-server")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_acked_record_is_delivered_when_close_races_the_senders() {
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+
+        /// Acks left unread before `close()`, as behind a consumer that stopped calling recv.
+        const BACKLOG: usize = 20;
 
         let receiver = HttpTransport::new(&receiver_config(100))
             .await
             .expect("receiver");
         let sender = Arc::new(sender_to(&receiver).await);
         let stop = Arc::new(AtomicBool::new(false));
+        let acked = Arc::new(AtomicUsize::new(0));
 
         let mut senders = tokio::task::JoinSet::new();
         for task in 0..4_u32 {
             let sender = Arc::clone(&sender);
             let stop = Arc::clone(&stop);
+            let acked = Arc::clone(&acked);
             senders.spawn(async move {
-                let mut acked = 0_usize;
                 let mut seq = task * 1_000_000;
                 while !stop.load(Ordering::Relaxed) {
                     let payload = bytes::Bytes::from(format!("{{\"seq\":{seq}}}"));
                     if sender.send("", payload).await.is_ok() {
-                        acked += 1;
+                        acked.fetch_add(1, Ordering::Relaxed);
                     }
                     seq += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
-                acked
             });
         }
 
-        // Acks pile up unread, as behind a consumer that stopped calling recv.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Close on a backlog, not a timer: a loaded host can take longer than any sleep to ack.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while acked.load(Ordering::Relaxed) < BACKLOG {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the senders got {} of {BACKLOG} acks in 10 s",
+                acked.load(Ordering::Relaxed)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         receiver.close().await.expect("close");
         let delivered = drain_until_closed(&receiver).await.expect("drain");
         stop.store(true, Ordering::Relaxed);
 
-        let mut acked = 0;
-        while let Some(count) = senders.join_next().await {
-            acked += count.expect("sender task");
+        while let Some(joined) = senders.join_next().await {
+            joined.expect("sender task");
         }
-        assert!(acked > 0, "the senders never got an ack");
+        let acked = acked.load(Ordering::Relaxed);
         assert_eq!(
             delivered, acked,
             "{acked} records acked to the senders, {delivered} returned by recv"
