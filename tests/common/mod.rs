@@ -10,8 +10,44 @@
 
 //! Shared test fixtures and utilities.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// The file DLQ's current file name; a rotation appends a timestamp to it.
+const DLQ_FILE: &str = "dlq.ndjson";
+
+/// Every line a file DLQ wrote under `path` for `service`, oldest first: the
+/// files a rotation moved aside, then the current file. A daily rotation can
+/// fall between two writes, so the current file alone can miss entries. The
+/// unit tests' copy is `scalo::dlq::test_files::written_lines`, which an
+/// integration test cannot reach.
+pub fn dlq_file_lines(path: &Path, service: &str) -> Vec<String> {
+    let Ok(listing) = std::fs::read_dir(path.join(service)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = listing
+        .map(|entry| entry.expect("list the DLQ directory").path())
+        .filter(|file| {
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(DLQ_FILE))
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        })
+        .collect();
+    files.sort_by_key(|file| {
+        (
+            file.file_name().is_some_and(|name| name == DLQ_FILE),
+            file.clone(),
+        )
+    });
+    files
+        .iter()
+        .flat_map(|file| {
+            let body = std::fs::read_to_string(file).expect("read a DLQ file");
+            body.lines().map(str::to_owned).collect::<Vec<_>>()
+        })
+        .collect()
+}
 
 /// Create a temporary directory with config files for testing.
 #[allow(dead_code)]
