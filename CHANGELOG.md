@@ -3,6 +3,15 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.5](https://github.com/hyperi-io/scalo-rs/compare/v2.14.4...v2.14.5) (2026-10-10)
+
+### Bug Fixes
+
+* describe how the config cascade really finds its YAML files ([#315](https://github.com/hyperi-io/scalo-rs/issues/315)) ([e5fcb27](https://github.com/hyperi-io/scalo-rs/commit/e5fcb273d6aa7de15b60bda1dccca92fe9728deb))
+* let a contract opt out of its ServiceAccount ([#317](https://github.com/hyperi-io/scalo-rs/issues/317)) ([ae6b3d3](https://github.com/hyperi-io/scalo-rs/commit/ae6b3d3bd2ba936504cf03b479cb42fd3f9e5fe7))
+* read every rotated DLQ file in the orchestrator tests ([#311](https://github.com/hyperi-io/scalo-rs/issues/311)) ([011535b](https://github.com/hyperi-io/scalo-rs/commit/011535bde037004121edcb7409ba3500d925ffaf)), closes [#310](https://github.com/hyperi-io/scalo-rs/issues/310) [#310](https://github.com/hyperi-io/scalo-rs/issues/310)
+* wait on an ack backlog in the HTTP close test ([#308](https://github.com/hyperi-io/scalo-rs/issues/308)) ([7f74d76](https://github.com/hyperi-io/scalo-rs/commit/7f74d766f05ccbeb63ec6461e3b8f2fcce2f5c38)), closes [#307](https://github.com/hyperi-io/scalo-rs/issues/307) [#307](https://github.com/hyperi-io/scalo-rs/issues/307)
+
 ## [2.14.4](https://github.com/hyperi-io/scalo-rs/compare/v2.14.3...v2.14.4) (2026-10-08)
 
 ### Bug Fixes
