@@ -953,6 +953,7 @@ mod tests {
                 resources: crate::deployment::ResourcesContract::default(),
                 security: crate::deployment::SecurityContract::default(),
                 singleton: false,
+                service_account: crate::deployment::ServiceAccount::Own,
             },
         }
     }

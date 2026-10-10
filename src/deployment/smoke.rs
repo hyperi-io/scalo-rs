@@ -269,6 +269,7 @@ mod tests {
             resources: super::super::ResourcesContract::default(),
             security: super::super::SecurityContract::default(),
             singleton: false,
+            service_account: super::super::ServiceAccount::Own,
         }
     }
 }

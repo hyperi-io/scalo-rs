@@ -128,6 +128,7 @@ impl ServiceApp for ProbeApp {
             resources: scalo::deployment::ResourcesContract::default(),
             security: scalo::deployment::SecurityContract::default(),
             singleton: false,
+            service_account: scalo::deployment::ServiceAccount::Own,
         })
     }
 }

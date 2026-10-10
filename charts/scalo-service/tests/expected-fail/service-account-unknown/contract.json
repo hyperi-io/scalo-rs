@@ -1,0 +1,10 @@
+{
+  "schema_version": 4,
+  "app_name": "static-site",
+  "metrics_port": 9090,
+  "health": { "liveness_path": "/livez", "readiness_path": "/readyz", "metrics_path": "/metrics" },
+  "env_prefix": "STATIC_SITE",
+  "metric_prefix": "site",
+  "image_registry": "registry.example.com/team",
+  "service_account": "external"
+}

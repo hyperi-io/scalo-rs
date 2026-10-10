@@ -190,6 +190,11 @@
       "description": "Exactly one pod may run: replicas stay at one, nothing autoscales it, and\na new pod starts only after the old one has stopped.",
       "type": "boolean",
       "default": false
+    },
+    "service_account": {
+      "description": "Whether the chart gives the pod a ServiceAccount of its own. Left out of\nthe serialised contract while it is [`ServiceAccount::Own`].",
+      "$ref": "#/$defs/ServiceAccount",
+      "default": "own"
     }
   },
   "required": [
@@ -942,6 +947,21 @@
           }
         }
       }
+    },
+    "ServiceAccount": {
+      "description": "Whether the chart gives the pod a ServiceAccount of its own.\n\nSerialised lower case: `own` or `none`.",
+      "oneOf": [
+        {
+          "description": "The chart creates a ServiceAccount named after the app and runs the pod\nas it.",
+          "type": "string",
+          "const": "own"
+        },
+        {
+          "description": "The chart creates no ServiceAccount and names none, so the pod runs as\nits namespace's `default` account. For an app that calls no Kubernetes\nAPI.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
     }
   }
 }

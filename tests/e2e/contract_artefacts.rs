@@ -109,6 +109,7 @@ fn test_contract() -> DeploymentContract {
         resources: scalo::deployment::ResourcesContract::default(),
         security: scalo::deployment::SecurityContract::default(),
         singleton: false,
+        service_account: scalo::deployment::ServiceAccount::Own,
         keda: None,
         default_config: None,
         depends_on: vec![],

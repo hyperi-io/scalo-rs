@@ -1,0 +1,10 @@
+apiVersion: v2
+appVersion: v1.0.0
+dependencies:
+- name: scalo-service
+  repository: file://../../..
+  version: 0.0.0
+description: A web server that calls no Kubernetes API
+name: static-site
+type: application
+version: 1.0.0

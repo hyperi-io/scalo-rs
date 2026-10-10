@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### The contract says whether the pod gets a ServiceAccount (API CHANGE)
+
+`DeploymentContract` gains `service_account` (`ServiceAccount::Own` or `ServiceAccount::None`, `"own"` or `"none"` in the JSON), default `Own` and left out of the JSON while it is. On `none` the scalo-service chart creates no ServiceAccount and leaves `serviceAccountName` off the pod. The chart also stops naming an account it did not create: `serviceAccount.create: false` without `serviceAccount.name` now renders no `serviceAccountName`, where it named `<fullname>`, an account that did not exist. See [deployment/contract.md](deployment/contract.md#writable-paths-resources-and-security).
+
+**Consumer adjustment** -- a `DeploymentContract` struct literal names the new field: `service_account: ServiceAccount::Own` keeps today's chart. A committed `deployment-contract.json` does not change. A deployment that set `serviceAccount.create: false` with no name now runs its pod as the namespace's `default` account instead of being refused admission.
+
 ### The secret schema marker is `x-scalo-secret` alone (BEHAVIOUR CHANGE)
 
 `SensitiveString`'s JSON Schema no longer carries `x-dfe-secret`. A secret field now reads `{"type": "string", "x-scalo-secret": true, "writeOnly": true}`. scalo-py emits the same keys and opts a field in on `x-scalo-secret` only.

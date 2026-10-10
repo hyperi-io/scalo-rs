@@ -28,7 +28,7 @@ use scalo::deployment::{
     BaseDistro, CONTRACT_SCHEMA_VERSION, Capability, DeploymentContract, FieldSpec, HealthContract,
     ImageProfile, KafkaLagTrigger, KedaConfig, KedaContract, NativeDepsContract, OciLabels,
     PortCondition, PortContract, ResourceList, ResourcesContract, SecretEnvContract,
-    SecretGroupContract, SecurityContract, WritablePath, config_schema_json,
+    SecretGroupContract, SecurityContract, ServiceAccount, WritablePath, config_schema_json,
     contract_schema_file_name,
 };
 use scalo::schemars;
@@ -206,6 +206,7 @@ fn parity_contract() -> DeploymentContract {
             capabilities_add: vec!["NET_BIND_SERVICE".into()],
         },
         singleton: false,
+        service_account: ServiceAccount::None,
     }
 }
 
@@ -264,6 +265,7 @@ fn contract_parity_fixture_carries_every_optional_key() {
         "/resources/limits/memory",
         "/security/capabilities_add",
         "/singleton",
+        "/service_account",
         "/config_schema/$defs/SourceSection/properties/batch_size/x-scalo-dial",
     ] {
         assert!(
@@ -320,7 +322,7 @@ fn contract_parity_fixture_passes_the_committed_schema() {
 fn contracts_the_committed_schema_refuses() {
     let validator = committed_schema_validator();
     let base: serde_json::Value = serde_json::from_str(&emitted()).expect("contract JSON");
-    let broken: [(&str, fn(&mut serde_json::Value)); 7] = [
+    let broken: [(&str, fn(&mut serde_json::Value)); 8] = [
         ("app_name missing", |c| {
             c.as_object_mut().unwrap().remove("app_name");
         }),
@@ -342,6 +344,9 @@ fn contracts_the_committed_schema_refuses() {
         }),
         ("startup budget zero", |c| {
             c["health"]["startup_budget_seconds"] = 0.into();
+        }),
+        ("service account unknown", |c| {
+            c["service_account"] = "external".into();
         }),
     ];
     for (case, mutate) in broken {

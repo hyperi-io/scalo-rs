@@ -36,7 +36,7 @@ change rolls the pods.
 {{- $containers := list $container -}}
 {{- with .Values.sidecars }}{{ $containers = concat $containers (tpl (toYaml .) $ | fromYamlArray) }}{{ end -}}
 {{- $pod := include "scalo-service.scheduling" . | fromJson -}}
-{{- $_ = set $pod "serviceAccountName" (include "scalo-service.serviceAccountName" .) -}}
+{{- with include "scalo-service.podServiceAccountName" . }}{{ $_ = set $pod "serviceAccountName" . }}{{ end -}}
 {{- $_ = set $pod "automountServiceAccountToken" (not (empty (include "scalo-service.tokenMounted" .))) -}}
 {{- $_ = set $pod "enableServiceLinks" false -}}
 {{- $_ = set $pod "terminationGracePeriodSeconds" (int (include "scalo-service.terminationGrace" .)) -}}

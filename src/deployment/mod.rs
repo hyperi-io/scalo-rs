@@ -32,8 +32,8 @@
 //! use scalo::deployment::{
 //!     CONTRACT_SCHEMA_VERSION, DEFAULT_BASE_DISTRO, DeploymentContract, HealthContract,
 //!     ImageProfile, KedaContract, NativeDepsContract, ResourcesContract, SecurityContract,
-//!     WritablePath, base_image_from_cascade, generate_dockerfile, generate_chart,
-//!     generate_compose_fragment,
+//!     ServiceAccount, WritablePath, base_image_from_cascade, generate_dockerfile,
+//!     generate_chart, generate_compose_fragment,
 //! };
 //!
 //! let contract = DeploymentContract {
@@ -68,6 +68,7 @@
 //!     resources: ResourcesContract::default(),
 //!     security: SecurityContract::default(),
 //!     singleton: false,
+//!     service_account: ServiceAccount::Own,
 //! };
 //!
 //! // Generate production Dockerfile (without identity annotations -- Phase 1
@@ -113,7 +114,7 @@ pub use capability::{Capability, FieldSpec, FieldType};
 pub use contract::{
     CONTRACT_SCHEMA_VERSION, DEFAULT_LABEL_NAMESPACE, DeploymentContract, HealthContract,
     ImageProfile, OciLabels, PortCondition, PortContract, ResourceList, ResourcesContract,
-    SecretEnvContract, SecretGroupContract, SecurityContract, WritablePath,
+    SecretEnvContract, SecretGroupContract, SecurityContract, ServiceAccount, WritablePath,
 };
 pub use contract_identity::{ContractIdentity, IdentityError, KEY_SEGMENT, VERSION};
 #[cfg(feature = "config-schema")]

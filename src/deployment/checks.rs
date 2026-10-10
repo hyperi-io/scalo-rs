@@ -356,7 +356,7 @@ mod tests {
     use super::*;
     use crate::deployment::{
         HealthContract, ImageProfile, KedaContract, NativeDepsContract, OciLabels,
-        ResourcesContract, SecurityContract,
+        ResourcesContract, SecurityContract, ServiceAccount,
     };
 
     fn contract() -> DeploymentContract {
@@ -389,6 +389,7 @@ mod tests {
             resources: ResourcesContract::default(),
             security: SecurityContract::default(),
             singleton: false,
+            service_account: ServiceAccount::Own,
         }
     }
 

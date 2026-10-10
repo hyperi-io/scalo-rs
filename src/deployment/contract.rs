@@ -203,6 +203,39 @@ pub struct DeploymentContract {
     /// a new pod starts only after the old one has stopped.
     #[serde(default)]
     pub singleton: bool,
+
+    /// Whether the chart gives the pod a ServiceAccount of its own. Left out of
+    /// the serialised contract while it is [`ServiceAccount::Own`].
+    #[serde(default, skip_serializing_if = "ServiceAccount::is_own")]
+    // schemars drops the default of a field serde skips at its default, and a reader outside Rust needs it.
+    #[cfg_attr(feature = "config-schema", schemars(extend("default" = "own")))]
+    pub service_account: ServiceAccount,
+}
+
+/// Whether the chart gives the pod a ServiceAccount of its own.
+///
+/// Serialised lower case: `own` or `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ServiceAccount {
+    /// The chart creates a ServiceAccount named after the app and runs the pod
+    /// as it.
+    #[default]
+    Own,
+    /// The chart creates no ServiceAccount and names none, so the pod runs as
+    /// its namespace's `default` account. For an app that calls no Kubernetes
+    /// API.
+    None,
+}
+
+impl ServiceAccount {
+    /// True for [`ServiceAccount::Own`], the value the serialised contract omits.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_own(&self) -> bool {
+        *self == Self::Own
+    }
 }
 
 /// Default grace: 5 s pre-stop pause, up to 20 s gRPC drain, then the final commit.
@@ -931,6 +964,7 @@ mod tests {
             resources: ResourcesContract::default(),
             security: SecurityContract::default(),
             singleton: false,
+            service_account: ServiceAccount::Own,
         };
         let json = contract.to_json();
         assert!(json.contains("test-app"));
@@ -968,6 +1002,7 @@ mod tests {
             resources: ResourcesContract::default(),
             security: SecurityContract::default(),
             singleton: false,
+            service_account: ServiceAccount::Own,
         };
         let json = contract.to_json();
         let parsed: DeploymentContract = serde_json::from_str(&json).unwrap();
@@ -1006,6 +1041,7 @@ mod tests {
             resources: ResourcesContract::default(),
             security: SecurityContract::default(),
             singleton: false,
+            service_account: ServiceAccount::Own,
         };
         assert_eq!(contract.binary(), "my-app");
     }
@@ -1041,6 +1077,7 @@ mod tests {
             resources: ResourcesContract::default(),
             security: SecurityContract::default(),
             singleton: false,
+            service_account: ServiceAccount::Own,
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
         assert_eq!(contract.config_dir(), "/etc/dfe");
@@ -1077,6 +1114,7 @@ mod tests {
             resources: ResourcesContract::default(),
             security: SecurityContract::default(),
             singleton: false,
+            service_account: ServiceAccount::Own,
         }
     }
 
@@ -1130,6 +1168,43 @@ mod tests {
         let out = contract.to_json();
         for key in ["\"when\"", "\"bound_from\"", "\"unbound_listen_paths\""] {
             assert!(!out.contains(key), "{key} serialised when unset:\n{out}");
+        }
+    }
+
+    /// A contract without `service_account` loads as `own` and writes no key, so
+    /// every contract written before the field existed emits the same bytes;
+    /// `none` round-trips, and a value outside the two is refused.
+    #[test]
+    fn test_service_account_defaults_to_own_and_is_written_only_as_none() {
+        let json = r#"{
+            "app_name": "app", "metrics_port": 9090,
+            "health": { "liveness_path": "/livez", "readiness_path": "/readyz",
+                        "metrics_path": "/metrics" },
+            "env_prefix": "APP", "metric_prefix": "app", "keda": null
+        }"#;
+        let mut contract: DeploymentContract = serde_json::from_str(json).unwrap();
+        assert_eq!(contract.service_account, ServiceAccount::Own);
+        assert_eq!(ServiceAccount::default(), ServiceAccount::Own);
+        assert!(!contract.to_json().contains("service_account"));
+
+        contract.service_account = ServiceAccount::None;
+        let value: serde_json::Value = serde_json::from_str(&contract.to_json()).unwrap();
+        assert_eq!(value["service_account"], "none");
+        let back: DeploymentContract = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(back.service_account, ServiceAccount::None);
+
+        let mut own = value.clone();
+        own["service_account"] = "own".into();
+        let own: DeploymentContract = serde_json::from_value(own).unwrap();
+        assert_eq!(own.service_account, ServiceAccount::Own);
+
+        for bad in ["None", "external", ""] {
+            let mut broken = value.clone();
+            broken["service_account"] = bad.into();
+            assert!(
+                serde_json::from_value::<DeploymentContract>(broken).is_err(),
+                "service_account {bad:?} loaded"
+            );
         }
     }
 
