@@ -143,6 +143,7 @@ mod tests {
             "/properties/resources",
             "/properties/security",
             "/properties/singleton",
+            "/properties/service_account",
             "/properties/config_mount_path",
             "/$defs/HealthContract/properties/startup_budget_seconds",
             "/$defs/PortContract/properties/public",
@@ -159,6 +160,13 @@ mod tests {
         assert_eq!(
             schema["$defs"]["HealthContract"]["properties"]["startup_budget_seconds"]["minimum"],
             1
+        );
+        assert_eq!(schema["properties"]["service_account"]["default"], "own");
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&"service_account".into())
         );
     }
 

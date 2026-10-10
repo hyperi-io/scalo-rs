@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scalo-service values",
+  "description": "The values every chart built on scalo-service takes. An assembler adds `config`, from the contract's x-scalo-dial leaves; this file never declares it.",
+  "type": "object",
+  "$defs": {
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "quantity": {
+      "type": ["string", "number"]
+    },
+    "resourceList": {
+      "type": "object",
+      "properties": {
+        "cpu": { "$ref": "#/$defs/quantity" },
+        "memory": { "$ref": "#/$defs/quantity" }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "properties": {
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "successThreshold": { "type": "integer", "minimum": 1 },
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "objectList": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  },
+  "properties": {
+    "fullnameOverride": {
+      "description": "Name of every object, instead of the chart name.",
+      "type": "string",
+      "pattern": "^([a-z]([-a-z0-9]{0,61}[a-z0-9])?)?$"
+    },
+    "partOf": {
+      "description": "The app.kubernetes.io/part-of label.",
+      "type": "string"
+    },
+    "commonLabels": { "$ref": "#/$defs/stringMap" },
+    "commonAnnotations": { "$ref": "#/$defs/stringMap" },
+    "podLabels": { "$ref": "#/$defs/stringMap" },
+    "podAnnotations": { "$ref": "#/$defs/stringMap" },
+    "global": {
+      "type": "object",
+      "properties": {
+        "registry": { "type": "string" }
+      }
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "registry": { "type": "string" },
+        "repository": { "type": "string" },
+        "tag": { "type": "string" },
+        "digest": {
+          "description": "Pins the image bytes; the assembler writes the digest it built.",
+          "type": "string",
+          "pattern": "^(sha256:[0-9a-f]{64})?$"
+        },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          { "type": "string" },
+          { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] }
+        ]
+      }
+    },
+    "replicaCount": {
+      "description": "Pods to run while nothing autoscales the workload.",
+      "type": "integer",
+      "minimum": 0,
+      "x-scalo-dial": "big"
+    },
+    "resources": {
+      "description": "Requests and limits over the contract's; an empty string drops an entry.",
+      "type": "object",
+      "properties": {
+        "requests": { "$ref": "#/$defs/resourceList" },
+        "limits": { "$ref": "#/$defs/resourceList" }
+      },
+      "x-scalo-dial": "big"
+    },
+    "terminationGracePeriodSeconds": {
+      "description": "Seconds between SIGTERM and SIGKILL, over the contract's.",
+      "type": "integer",
+      "minimum": 0,
+      "x-scalo-dial": "big"
+    },
+    "strategy": {
+      "description": "The Deployment strategy, replacing the derived one.",
+      "type": "object"
+    },
+    "keda": {
+      "description": "KEDA scaling over the contract's keda block.",
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicaCount": { "type": "integer", "minimum": 0 },
+        "maxReplicaCount": { "type": "integer", "minimum": 1 },
+        "idleReplicaCount": { "type": "integer", "minimum": 0 },
+        "pollingInterval": { "type": "integer", "minimum": 1 },
+        "cooldownPeriod": { "type": "integer", "minimum": 0 },
+        "cpu": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "targetUtilization": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "kafka": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "lagThreshold": { "type": "integer", "minimum": 1 },
+            "activationLagThreshold": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "triggers": { "$ref": "#/$defs/objectList" },
+        "extraTriggers": { "$ref": "#/$defs/objectList" },
+        "triggerAuthentication": {
+          "type": "object",
+          "properties": {
+            "secretTargetRef": { "$ref": "#/$defs/objectList" }
+          }
+        }
+      },
+      "x-scalo-dial": "big"
+    },
+    "autoscaling": {
+      "description": "The CPU HorizontalPodAutoscaler used while KEDA is off.",
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1 }
+      },
+      "x-scalo-dial": "big"
+    },
+    "pdb": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] },
+        "maxUnavailable": { "type": ["integer", "string"] }
+      },
+      "x-scalo-dial": "big"
+    },
+    "podSecurityContext": { "type": "object" },
+    "containerSecurityContext": { "type": "object" },
+    "nodeSelector": { "$ref": "#/$defs/stringMap", "x-scalo-dial": "small" },
+    "tolerations": { "$ref": "#/$defs/objectList", "x-scalo-dial": "small" },
+    "affinity": { "type": "object", "x-scalo-dial": "small" },
+    "topologySpreadConstraints": { "$ref": "#/$defs/objectList", "x-scalo-dial": "small" },
+    "priorityClassName": { "type": "string", "x-scalo-dial": "small" },
+    "workingDir": { "type": "string" },
+    "args": {
+      "description": "Container args, replacing the contract's entrypoint_args.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "startupProbe": { "$ref": "#/$defs/probe", "x-scalo-dial": "small" },
+    "livenessProbe": { "$ref": "#/$defs/probe", "x-scalo-dial": "small" },
+    "readinessProbe": { "$ref": "#/$defs/probe", "x-scalo-dial": "small" },
+    "configOverrides": {
+      "description": "Merged over `config` into the config file, unvalidated.",
+      "type": "object"
+    },
+    "configMount": {
+      "type": "object",
+      "properties": {
+        "subPath": { "type": "boolean" }
+      }
+    },
+    "fileSets": {
+      "description": "ConfigMaps of files mounted read-only, by set name.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "mountPath": { "type": "string", "pattern": "^/" },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "content": { "type": "string" }
+              },
+              "required": ["name"]
+            }
+          }
+        },
+        "required": ["mountPath"]
+      }
+    },
+    "writablePaths": {
+      "description": "Per-name overrides of the contract's writable paths.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "sizeLimit": { "type": "string" },
+          "persistence": {
+            "type": "object",
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "size": { "type": "string" },
+              "storageClass": { "type": "string" },
+              "existingClaim": { "type": "string" },
+              "accessModes": { "type": "array", "items": { "type": "string" } },
+              "annotations": { "$ref": "#/$defs/stringMap" }
+            }
+          }
+        }
+      }
+    },
+    "secrets": {
+      "description": "Per-group wiring of the contract's secret groups.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "existingSecret": { "type": "string" },
+          "optional": { "type": "boolean" },
+          "keys": { "$ref": "#/$defs/stringMap" }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "annotations": { "$ref": "#/$defs/stringMap" }
+      }
+    },
+    "publicService": {
+      "description": "A load balancer for the contract's public ports.",
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "type": { "type": "string" },
+        "loadBalancerIP": { "type": "string" },
+        "udpLoadBalancerIP": { "type": "string" },
+        "loadBalancerClass": { "type": "string" },
+        "loadBalancerSourceRanges": { "type": "array", "items": { "type": "string" } },
+        "externalTrafficPolicy": { "enum": ["Cluster", "Local"] },
+        "annotations": { "$ref": "#/$defs/stringMap" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "from": { "$ref": "#/$defs/objectList" },
+        "publicFrom": { "$ref": "#/$defs/objectList" }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "mountToken": { "type": "boolean" },
+        "annotations": { "$ref": "#/$defs/stringMap" }
+      }
+    },
+    "extraEnv": {
+      "description": "Environment variables by name, for settings no dial models. A scalar is rendered through tpl; an object is a valueFrom.",
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          { "type": ["string", "number", "boolean"] },
+          {
+            "type": "object",
+            "properties": { "valueFrom": { "type": "object" } },
+            "required": ["valueFrom"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "extraEnvFrom": { "$ref": "#/$defs/objectList" },
+    "extraVolumes": { "$ref": "#/$defs/objectList" },
+    "extraVolumeMounts": { "$ref": "#/$defs/objectList" },
+    "initContainers": { "$ref": "#/$defs/objectList" },
+    "sidecars": { "$ref": "#/$defs/objectList" },
+    "extraPorts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "protocol": { "enum": ["TCP", "UDP", "SCTP", "tcp", "udp", "sctp"] },
+          "appProtocol": { "type": "string" },
+          "public": { "type": "boolean" }
+        },
+        "required": ["name", "port"]
+      }
+    },
+    "extraObjects": {
+      "type": "array",
+      "items": { "type": ["object", "string"] }
+    },
+    "otel": {
+      "type": "object",
+      "properties": {
+        "endpoint": { "type": "string" },
+        "protocol": { "type": "string" },
+        "serviceName": { "type": "string" }
+      },
+      "x-scalo-dial": "small"
+    },
+    "telemetry": {
+      "type": "object",
+      "properties": {
+        "prometheus": {
+          "type": "object",
+          "properties": {
+            "scrape": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "versionCheck": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "sendInstanceId": { "type": "boolean" },
+        "apiUrl": { "type": "string" },
+        "instanceId": { "type": "string" }
+      },
+      "x-scalo-dial": "small"
+    },
+    "reload": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "secrets": { "type": "array", "items": { "type": "string" } },
+        "configmaps": { "type": "array", "items": { "type": "string" } }
+      },
+      "x-scalo-dial": "small"
+    },
+    "config": {
+      "type": "object"
+    }
+  }
+}

@@ -73,7 +73,7 @@ Config keys that are not dials still reach the app, through `config` or `configO
 | Service | `<fullname>-public`, `<fullname>-public-udp` | `publicService.enabled`, for ports the contract marks `public` |
 | ConfigMap | `<fullname>-config` | the contract names a `config_mount_path` |
 | ConfigMap | `<fullname>-<set>` | per `fileSets` entry |
-| ServiceAccount | `serviceAccount.name`, else `<fullname>` | unless `serviceAccount.create: false` |
+| ServiceAccount | `serviceAccount.name`, else `<fullname>` | `serviceAccount.create` when set, else unless the contract's `service_account` is `none` |
 | PersistentVolumeClaim | `<fullname>-<path name>` | per persistent writable path without `existingClaim` |
 | PodDisruptionBudget | `<fullname>` | `replicaCount` or the autoscaler floor is two or more, never for a singleton |
 | ScaledObject | `<fullname>-scaler` | KEDA on |
@@ -106,6 +106,7 @@ A persistent writable path is a claim beside a Deployment that recreates its pod
 | `resources` | requests and limits over the library default | 100m / 128Mi requested, 500m / 512Mi limit |
 | `security` | uid, gid, fsGroup, read-only root filesystem, added capabilities | 1000, 1000, 1000, read-only, none |
 | `singleton` | one replica, Recreate, no autoscaler, no budget | false |
+| `service_account` | `own`: a ServiceAccount the pod runs as; `none`: no ServiceAccount, and the pod names none, so it runs as the namespace's `default` account | `own` |
 
 A condition reads its `path` from values. A path under `config.` reads the config the app ends up running: the contract's `default_config`, then `config`, then `configOverrides`. So a port the app opens by default is open without anyone setting it. A missing or null value never satisfies a condition.
 
@@ -153,7 +154,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `service.type`, `service.annotations` | `ClusterIP` | In-cluster Service |
 | `publicService.enabled`, `type`, `loadBalancerIP`, `udpLoadBalancerIP`, `loadBalancerClass`, `loadBalancerSourceRanges`, `externalTrafficPolicy`, `annotations` | off, `LoadBalancer` | Load balancers for public ports. `loadBalancerIP` pins the TCP/SCTP Service only and `udpLoadBalancerIP` pins the UDP Service, since many clouds refuse two Services on one address |
 | `networkPolicy.enabled`, `from`, `publicFrom` | off, the namespace, any source | Ingress policy |
-| `serviceAccount.create`, `name`, `mountToken`, `annotations` | true, fullname, false | Service account; the token stays unmounted unless asked |
+| `serviceAccount.create`, `name`, `mountToken`, `annotations` | contract `service_account`, fullname, false | Service account; the token stays unmounted unless asked. With none created, the pod runs as `name` when set, else names none |
 | `extraEnv` | `{}` | Env by name: a scalar through `tpl`, an object as its `valueFrom`; a name the chart derives is dropped |
 | `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts`, `initContainers`, `sidecars` | `[]` | Passed through `tpl` |
 | `extraPorts[{name, port, protocol, appProtocol, public}]` | `[]` | Ports beside the contract's, on the container and Services |

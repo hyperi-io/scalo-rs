@@ -1,0 +1,2 @@
+fixture=no-service-account
+error=files/contract.json has service_account external, and this library reads own and none

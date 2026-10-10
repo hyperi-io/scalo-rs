@@ -122,12 +122,16 @@ fn the_skeleton_values_schema_compiles_and_leaves_config_to_the_dials() {
     jsonschema::validator_for(&skeleton).expect("the skeleton fragment compiles");
 }
 
-/// The two expected-fail contracts that drop a required field or name another
-/// version fail the schema as well as the chart.
+/// The expected-fail contracts that drop a required field, name another version
+/// or name an unknown service account fail the schema as well as the chart.
 #[test]
 fn expected_fail_contracts_the_schema_also_refuses() {
     let validator = validator();
-    for case in ["missing-metrics-port", "unsupported-schema-version"] {
+    for case in [
+        "missing-metrics-port",
+        "unsupported-schema-version",
+        "service-account-unknown",
+    ] {
         let contract = read_json(
             &chart_dir()
                 .join("tests/expected-fail")

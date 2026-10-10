@@ -195,7 +195,7 @@ ArgoCD `Application` CR pointing at the Helm chart in the app's git repo. `gener
 `generate_chart()` writes a complete chart (apps call it directly). It predates
 contract schema 4 and renders none of the v4 fields (`writable_paths`,
 `termination_grace_seconds`, `resources`, `security`, `singleton`,
-`startup_budget_seconds`, `public`, `app_protocol`, `optional`); the
+`service_account`, `startup_budget_seconds`, `public`, `app_protocol`, `optional`); the
 [scalo-service](../../charts/scalo-service/README.md) library chart renders them
 from the contract itself.
 

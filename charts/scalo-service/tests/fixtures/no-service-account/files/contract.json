@@ -1,0 +1,19 @@
+{
+  "schema_version": 4,
+  "app_name": "static-site",
+  "description": "A web server that calls no Kubernetes API",
+  "metrics_port": 9090,
+  "health": {
+    "liveness_path": "/livez",
+    "readiness_path": "/readyz",
+    "metrics_path": "/metrics"
+  },
+  "env_prefix": "STATIC_SITE",
+  "metric_prefix": "site",
+  "image_registry": "registry.example.com/team",
+  "extra_ports": [
+    { "name": "http", "port": 8080, "protocol": "TCP" }
+  ],
+  "keda": null,
+  "service_account": "none"
+}

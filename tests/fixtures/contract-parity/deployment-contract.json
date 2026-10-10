@@ -331,5 +331,6 @@
       "NET_BIND_SERVICE"
     ]
   },
-  "singleton": false
+  "singleton": false,
+  "service_account": "none"
 }

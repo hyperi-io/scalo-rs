@@ -34,7 +34,7 @@ library chart renders version 4 only.
 | 1 | Initial shape -- no `image_profile`, no `oci_labels` |
 | 2 | `ImageProfile`, `OciLabels`, `SecretGroupContract` |
 | 3 | Adds `config_schema` + `capabilities` |
-| 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, the `x-scalo-dial` keyword in `config_schema`; `config_mount_path` may be empty |
+| 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `service_account`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, the `x-scalo-dial` keyword in `config_schema`; `config_mount_path` may be empty |
 
 An app that writes `schema_version: 3` in its struct literal still emits 3, and
 a version-4 reader refuses it; write `CONTRACT_SCHEMA_VERSION` instead. Serde
@@ -154,6 +154,7 @@ let contract = DeploymentContract {
     resources: ResourcesContract::default(),
     security: SecurityContract::default(),
     singleton: false,
+    service_account: ServiceAccount::Own,
 };
 ```
 
@@ -189,6 +190,7 @@ let contract = DeploymentContract {
 | `resources` | `ResourcesContract` | empty | The app's own requests and limits; empty leaves the chart default (v4) |
 | `security` | `SecurityContract` | uid/gid/fsGroup 1000, read-only root | Identity and capabilities the image runs with (v4) |
 | `singleton` | `bool` | `false` | Exactly one pod: no autoscaling, Recreate rollout (v4) |
+| `service_account` | `ServiceAccount` | `Own` | `none` for an app that calls no Kubernetes API: the chart creates no ServiceAccount and the pod names none. Omitted from the JSON while `own` (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
 
 `HealthContract` fields:
 
@@ -265,6 +267,8 @@ singleton: true,
 | | `capabilities_add` | `[]` | Upper-case Linux capability names, added after every other one is dropped |
 
 A chart always adds a scratch `/tmp` beside the declared paths.
+
+`service_account: ServiceAccount::None` (`"none"` in the JSON) is for an app with no Kubernetes client and no use for a token. The scalo-service chart then creates no ServiceAccount and leaves `serviceAccountName` off the pod, so it runs as the namespace's `default` account with the token still unmounted. Values can still set `serviceAccount.create` either way, or `serviceAccount.name` to run as an account the operator supplies.
 
 ---
 
@@ -461,7 +465,7 @@ reference carries no codename.
 | `Capability` / `FieldSpec` | Capability-catalog entry and its config fields |
 | `config_schema_json::<T>()` | Derive the JSON Schema for the app's `Config` |
 | `CONTRACT_SCHEMA_VERSION` | The contract schema version this crate writes and reads (4) |
-| `WritablePath` / `ResourcesContract` / `ResourceList` / `SecurityContract` | v4 pod needs -- see [Writable paths](#writable-paths-resources-and-security) |
+| `WritablePath` / `ResourcesContract` / `ResourceList` / `SecurityContract` / `ServiceAccount` | v4 pod needs -- see [Writable paths](#writable-paths-resources-and-security) |
 | `contract_json_schema()` / `contract_schema_file_name(version)` | The contract's JSON Schema and its committed file name (feature `config-schema`) |
 | `DIAL_KEYWORD` / `DIAL_TIERS` / `dials(config_schema)` | The dial marker, its two values, and every marked node by path -- see [Dials](#dials) |
 | `breaking_changes(old, new)` / `SchemaBreak` / `SchemaBreakKind` | Every change between two JSON Schemas that refuses what the old one accepted |
