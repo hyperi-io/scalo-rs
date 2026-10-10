@@ -100,6 +100,8 @@ For values with no recognisable field name (e.g. a token in a URL), use
 `SensitiveString` from [config](config.md) -- it serialises as `***REDACTED***`
 regardless of caller.
 
+Masking reads field names, never values. An email address, literal or percent-encoded (`sentinel.user%40example.com` in a URL), or an opaque provider user id such as Okta's `00u1sentinel2abc3`, is written as-is unless the field carrying it is on the list, and `email` is not on the default list. scalo-py's logger redacts email addresses by value; scalo-rs has no value scrubber yet (see [Planned](../README.md#planned-not-in-current-release)).
+
 ---
 
 ## Flood-control helpers
