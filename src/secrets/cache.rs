@@ -168,6 +168,20 @@ impl SecretCache {
         None
     }
 
+    /// The version of the newest value held for `key`, however old it is.
+    ///
+    /// Memory first, then disk. TTL and grace period are ignored, and no hit
+    /// or miss is counted. `None` when nothing is held, the held value carries
+    /// no version, or caching is disabled (a disabled cache holds nothing).
+    pub(crate) fn last_version(&self, key: &str) -> Option<String> {
+        match self.memory.get(key) {
+            Some(value) => value.metadata.version.clone(),
+            None => self
+                .load_from_disk(key)
+                .and_then(|value| value.metadata.version),
+        }
+    }
+
     /// Store a secret in cache.
     ///
     /// # Errors
@@ -494,6 +508,70 @@ mod tests {
         let stale = cache.get_stale("stale-key");
         assert!(stale.is_some());
         assert_eq!(stale.unwrap().as_bytes(), b"stale-secret");
+    }
+
+    fn versioned(data: &[u8], version: &str) -> SecretValue {
+        SecretValue::with_metadata(
+            data.to_vec(),
+            crate::secrets::types::SecretMetadata {
+                version: Some(version.to_string()),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn last_version_ignores_expiry() {
+        let config = CacheConfig {
+            ttl_secs: 1,
+            stale_grace_secs: 1,
+            ..test_config()
+        };
+        let mut cache = SecretCache::new(&config).unwrap();
+        let mut old = versioned(b"v", "7");
+        old.fetched_at = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        cache.set("k", &old).unwrap();
+
+        assert!(cache.get("k").is_none(), "the entry is already expired");
+        assert!(cache.get_stale("k").is_none(), "and past its grace period");
+        assert_eq!(cache.last_version("k").as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn last_version_reads_the_disk_tier() {
+        let config = test_config();
+        SecretCache::new(&config)
+            .unwrap()
+            .set("k", &versioned(b"v", "3"))
+            .unwrap();
+
+        let fresh = SecretCache::new(&config).unwrap();
+        assert_eq!(fresh.last_version("k").as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn last_version_reads_memory_before_disk() {
+        let config = test_config();
+        let mut cache = SecretCache::new(&config).unwrap();
+        cache.set("k", &versioned(b"v", "1")).unwrap();
+        // A second cache over the same directory overwrites the disk entry only.
+        SecretCache::new(&config)
+            .unwrap()
+            .set("k", &versioned(b"v", "2"))
+            .unwrap();
+
+        assert_eq!(cache.last_version("k").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_disabled_cache_has_no_last_version() {
+        let config = CacheConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let mut cache = SecretCache::new(&config).unwrap();
+        cache.set("k", &versioned(b"v", "1")).unwrap();
+        assert!(cache.last_version("k").is_none());
     }
 
     #[test]

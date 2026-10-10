@@ -13,6 +13,9 @@
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[cfg(feature = "secrets-vault")]
+pub mod openbao;
+
 /// The file DLQ's current file name; a rotation appends a timestamp to it.
 const DLQ_FILE: &str = "dlq.ndjson";
 

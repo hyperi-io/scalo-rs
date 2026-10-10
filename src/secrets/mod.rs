@@ -22,8 +22,9 @@
 //! - Multi-provider support with unified API
 //! - Local disk cache with TTL for resilience
 //! - Stale cache fallback when providers are unavailable
-//! - Background refresh for proactive secret renewal
-//! - Rotation callbacks for application notification
+//! - On-demand refresh of every configured source (`refresh_all`), with no
+//!   background refresh loop
+//! - Rotation events for application notification
 //!
 //! ## Credential specs
 //!
@@ -202,7 +203,8 @@ impl SecretsManager {
         Ok(value)
     }
 
-    /// Get a secret from a specific source.
+    /// Get a secret from a specific source: a fresh cache entry, else the
+    /// provider, else a stale entry within the grace period.
     async fn get_from_source(
         &self,
         cache_key: &str,
@@ -219,7 +221,26 @@ impl SecretsManager {
         #[cfg(feature = "metrics")]
         metrics::counter!("secrets_cache_misses_total").increment(1);
 
-        // Fetch from provider
+        match self.fetch(cache_key, source).await {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                // Try stale cache on provider failure
+                if let Some(stale) = self.cache.read().get_stale(cache_key) {
+                    warn!(
+                        key = %cache_key,
+                        error = %e,
+                        "Provider failed, using stale cached secret"
+                    );
+                    return Ok(stale);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Fetch `source` from its provider, skipping the cache, and cache the
+    /// value on success.
+    async fn fetch(&self, cache_key: &str, source: &SecretSource) -> SecretsResult<SecretValue> {
         let result = match source {
             SecretSource::File { path } => self.file_provider.get(path).await,
 
@@ -259,27 +280,11 @@ impl SecretsManager {
         #[cfg(feature = "metrics")]
         metrics::counter!("secrets_fetch_total").increment(1);
 
-        match result {
-            Ok(value) => {
-                // Update cache
-                if let Err(e) = self.cache.write().set(cache_key, &value) {
-                    warn!(key = %cache_key, error = %e, "Failed to cache secret");
-                }
-                Ok(value)
-            }
-            Err(e) => {
-                // Try stale cache on provider failure
-                if let Some(stale) = self.cache.read().get_stale(cache_key) {
-                    warn!(
-                        key = %cache_key,
-                        error = %e,
-                        "Provider failed, using stale cached secret"
-                    );
-                    return Ok(stale);
-                }
-                Err(e)
-            }
+        let value = result?;
+        if let Err(e) = self.cache.write().set(cache_key, &value) {
+            warn!(key = %cache_key, error = %e, "Failed to cache secret");
         }
+        Ok(value)
     }
 
     /// Subscribe to rotation events.
@@ -290,38 +295,47 @@ impl SecretsManager {
         self.rotation_tx.subscribe()
     }
 
-    /// Refresh all configured secrets from their providers.
+    /// Re-fetch every configured source from its provider, fresh cache
+    /// entries included.
     ///
-    /// This is useful for proactive refresh before TTL expiry.
+    /// Each value fetched replaces the cached one, so the next
+    /// [`get`](Self::get) returns it. A [`RotationEvent`] is sent when the
+    /// version fetched differs from the version the cache last held for that
+    /// source, expired or not. With caching disabled the cache holds no
+    /// previous version, so no event is sent, and a source whose provider
+    /// reports no version (a file) never produces one.
     ///
     /// # Errors
     ///
-    /// Returns an error if any secret refresh fails (but continues with others).
+    /// Returns [`SecretsError::RefreshFailed`] naming every source that
+    /// failed, after refreshing the rest. A failed source is not answered
+    /// from the stale cache, and its cached value is left as it was.
     pub async fn refresh_all(&self) -> SecretsResult<()> {
         let mut errors = Vec::new();
 
         for (name, source) in &self.config.sources {
-            // Get old version for rotation detection
-            let old_version = self
-                .cache
-                .read()
-                .get(name)
-                .and_then(|v| v.metadata.version.clone());
+            let old_version = self.cache.read().last_version(name);
 
-            match self.get_from_source(name, source).await {
+            match self.fetch(name, source).await {
                 Ok(new_value) => {
-                    // Check for rotation
-                    if let Some(ref new_version) = new_value.metadata.version
-                        && old_version.as_ref() != Some(new_version)
+                    if let (Some(old_version), Some(new_version)) =
+                        (old_version, new_value.metadata.version)
+                        && old_version != new_version
                     {
+                        info!(
+                            name = %name,
+                            old_version = %old_version,
+                            new_version = %new_version,
+                            "Secret rotated"
+                        );
                         let event = RotationEvent {
                             name: name.clone(),
-                            old_version,
-                            new_version: new_version.clone(),
+                            old_version: Some(old_version),
+                            new_version,
                             rotated_at: std::time::SystemTime::now(),
                         };
+                        // No subscriber is not an error.
                         let _ = self.rotation_tx.send(event);
-                        info!(name = %name, new_version = %new_version, "Secret rotated");
                     }
                 }
                 Err(e) => {
