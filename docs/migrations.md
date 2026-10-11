@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### A `get()` that reaches the backend reports rotations (BEHAVIOUR CHANGE)
+
+`SecretsManager::get` now sends a `RotationEvent` when a fetch from the backend, on a cache miss or an expired entry, returns a version that differs from the one the cache last held -- the check `refresh_all()` already made. Before, a rotation picked up by `get()` was cached silently, and `refresh_all()` then saw nothing new, so a subscriber never heard of it. A fresh cache hit still reports nothing. See [api/secrets.md](api/secrets.md#rotation-events).
+
+**Consumer adjustment** -- none for a subscriber that rebuilds its client on a `RotationEvent`: it now rebuilds on the first read of the new version rather than not at all.
+
 ### The contract says whether the pod gets a ServiceAccount (API CHANGE)
 
 `DeploymentContract` gains `service_account` (`ServiceAccount::Own` or `ServiceAccount::None`, `"own"` or `"none"` in the JSON), default `Own` and left out of the JSON while it is. On `none` the scalo-service chart creates no ServiceAccount and leaves `serviceAccountName` off the pod. The chart also stops naming an account it did not create: `serviceAccount.create: false` without `serviceAccount.name` now renders no `serviceAccountName`, where it named `<fullname>`, an account that did not exist. See [deployment/contract.md](deployment/contract.md#writable-paths-resources-and-security).

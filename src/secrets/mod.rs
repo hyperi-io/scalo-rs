@@ -152,6 +152,8 @@ impl SecretsManager {
     /// Get a secret by name (from configured sources).
     ///
     /// Looks up the named source in configuration and fetches from the appropriate provider.
+    /// A read that reaches the provider sends a [`RotationEvent`] when the version changed
+    /// since the cache last held the secret, as [`refresh_all`](Self::refresh_all) does.
     ///
     /// # Errors
     ///
@@ -238,9 +240,11 @@ impl SecretsManager {
         }
     }
 
-    /// Fetch `source` from its provider, skipping the cache, and cache the
-    /// value on success.
+    /// Fetch `source` from its provider, skipping the cache, cache the value
+    /// on success, and send a [`RotationEvent`] when its version differs from
+    /// the one the cache last held for `cache_key`, expired or not.
     async fn fetch(&self, cache_key: &str, source: &SecretSource) -> SecretsResult<SecretValue> {
+        let old_version = self.cache.read().last_version(cache_key);
         let result = match source {
             SecretSource::File { path } => self.file_provider.get(path).await,
 
@@ -284,6 +288,24 @@ impl SecretsManager {
         if let Err(e) = self.cache.write().set(cache_key, &value) {
             warn!(key = %cache_key, error = %e, "Failed to cache secret");
         }
+        if let (Some(old_version), Some(new_version)) = (old_version, &value.metadata.version)
+            && &old_version != new_version
+        {
+            info!(
+                name = %cache_key,
+                old_version = %old_version,
+                new_version = %new_version,
+                "Secret rotated"
+            );
+            let event = RotationEvent {
+                name: cache_key.to_string(),
+                old_version: Some(old_version),
+                new_version: new_version.clone(),
+                rotated_at: std::time::SystemTime::now(),
+            };
+            // No subscriber is not an error.
+            let _ = self.rotation_tx.send(event);
+        }
         Ok(value)
     }
 
@@ -301,7 +323,8 @@ impl SecretsManager {
     /// Each value fetched replaces the cached one, so the next
     /// [`get`](Self::get) returns it. A [`RotationEvent`] is sent when the
     /// version fetched differs from the version the cache last held for that
-    /// source, expired or not. With caching disabled the cache holds no
+    /// source, expired or not -- the same check a [`get`](Self::get) that
+    /// reaches the provider makes. With caching disabled the cache holds no
     /// previous version, so no event is sent, and a source whose provider
     /// reports no version (a file) never produces one.
     ///
@@ -314,34 +337,9 @@ impl SecretsManager {
         let mut errors = Vec::new();
 
         for (name, source) in &self.config.sources {
-            let old_version = self.cache.read().last_version(name);
-
-            match self.fetch(name, source).await {
-                Ok(new_value) => {
-                    if let (Some(old_version), Some(new_version)) =
-                        (old_version, new_value.metadata.version)
-                        && old_version != new_version
-                    {
-                        info!(
-                            name = %name,
-                            old_version = %old_version,
-                            new_version = %new_version,
-                            "Secret rotated"
-                        );
-                        let event = RotationEvent {
-                            name: name.clone(),
-                            old_version: Some(old_version),
-                            new_version,
-                            rotated_at: std::time::SystemTime::now(),
-                        };
-                        // No subscriber is not an error.
-                        let _ = self.rotation_tx.send(event);
-                    }
-                }
-                Err(e) => {
-                    warn!(name = %name, error = %e, "Failed to refresh secret");
-                    errors.push(format!("{name}: {e}"));
-                }
+            if let Err(e) = self.fetch(name, source).await {
+                warn!(name = %name, error = %e, "Failed to refresh secret");
+                errors.push(format!("{name}: {e}"));
             }
         }
 
@@ -354,7 +352,39 @@ impl SecretsManager {
 
     /// Check health of all configured providers.
     ///
-    /// Returns a map of provider names to their health status.
+    /// Returns a map of provider names to their health status. A
+    /// `HealthRegistry` check is synchronous, so poll this from a task and let
+    /// the check read the last answer:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "health")]
+    /// # async fn wire(mgr: std::sync::Arc<scalo::secrets::SecretsManager>) {
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicBool, Ordering};
+    /// use std::time::Duration;
+    ///
+    /// use scalo::{HealthRegistry, HealthStatus};
+    ///
+    /// let backends_up = Arc::new(AtomicBool::new(true));
+    /// let poller = (Arc::clone(&mgr), Arc::clone(&backends_up));
+    /// tokio::spawn(async move {
+    ///     let (mgr, backends_up) = poller;
+    ///     let mut tick = tokio::time::interval(Duration::from_secs(30));
+    ///     loop {
+    ///         tick.tick().await;
+    ///         let up = mgr.health_check().await.values().all(|&ok| ok);
+    ///         backends_up.store(up, Ordering::Relaxed);
+    ///     }
+    /// });
+    /// HealthRegistry::register("secrets", move || {
+    ///     if backends_up.load(Ordering::Relaxed) {
+    ///         HealthStatus::Healthy
+    ///     } else {
+    ///         HealthStatus::Unhealthy
+    ///     }
+    /// });
+    /// # }
+    /// ```
     pub async fn health_check(&self) -> HashMap<String, bool> {
         let mut health = HashMap::new();
 
