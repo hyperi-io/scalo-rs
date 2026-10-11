@@ -88,6 +88,9 @@ Step by step inside `run_app` for the default `run` subcommand:
      byte budget into its governed run path.
    - Install signal handler -- returns `CancellationToken`.
    - Start the worker pool scaling loop.
+   - With `service-metrics`, start a task that writes the value
+     `/scaling/pressure` serves into the `scaling_pressure` gauge once a
+     second until the token is cancelled.
    - Start the metrics server on `args.metrics_addr`.
    - Fire-and-forget version check if `version-check` is on: enabled by
      default, inert until `version_check_defaults()` or config supplies an

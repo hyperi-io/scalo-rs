@@ -31,8 +31,8 @@ impl OtelProtocol {
     #[must_use]
     pub fn default_endpoint(self) -> &'static str {
         match self {
-            Self::Grpc => "http://localhost:4317",
-            Self::Http => "http://localhost:4318",
+            Self::Grpc => crate::otel_backoff::DEFAULT_GRPC_ENDPOINT,
+            Self::Http => crate::otel_backoff::DEFAULT_HTTP_ENDPOINT,
         }
     }
 }
@@ -47,7 +47,8 @@ pub struct OtelMetricsConfig {
     /// nothing. Both routes leave the Prometheus scrape endpoint untouched.
     pub enabled: bool,
 
-    /// OTLP endpoint (default: protocol-dependent).
+    /// OTLP endpoint. Left at the gRPC default, it resolves to the HTTP default
+    /// when the protocol is HTTP.
     ///
     /// Override via `OTEL_EXPORTER_OTLP_ENDPOINT` env var. An empty endpoint
     /// disables export -- it is the "off" value for an operator who cannot

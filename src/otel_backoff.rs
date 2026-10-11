@@ -23,8 +23,9 @@
 //! carries the full value. For spans it drops the batch, which is the same
 //! outcome as the bounded queue overflowing, only cheaper.
 //!
-//! The OTLP/HTTP signal path lives here too, so metrics and tracing build the
-//! export URL one way. Mirrors `scalo-py` `otel_backoff.py`.
+//! The OTLP/HTTP signal path and the default endpoint per protocol live here
+//! too, so metrics and tracing build the export URL one way. Mirrors `scalo-py`
+//! `otel_backoff.py`.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -33,6 +34,25 @@ use crate::backoff::Backoff;
 
 /// Ceiling on the wait between attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(900);
+
+/// Default OTLP gRPC endpoint, the one every config struct starts from.
+pub(crate) const DEFAULT_GRPC_ENDPOINT: &str = "http://localhost:4317";
+
+/// Default OTLP/HTTP endpoint.
+pub(crate) const DEFAULT_HTTP_ENDPOINT: &str = "http://localhost:4318";
+
+/// The configured endpoint for a protocol, with the gRPC default moved to the
+/// HTTP port when the protocol is HTTP.
+///
+/// The config structs default `endpoint` to the gRPC address, so that value is
+/// the only sign none was configured. Any other endpoint is used as given.
+pub(crate) fn endpoint_for_protocol(configured: &str, protocol_is_http: bool) -> &str {
+    if protocol_is_http && configured.trim() == DEFAULT_GRPC_ENDPOINT {
+        DEFAULT_HTTP_ENDPOINT
+    } else {
+        configured
+    }
+}
 
 /// Append an OTLP signal path to a base endpoint, for the HTTP protocol.
 ///

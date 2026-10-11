@@ -82,7 +82,9 @@ would double-count and obscure which signal is driving the scale.
 scalo publishes the value two ways, and KEDA reads neither until the deployment adds a trigger for it:
 
 - **`/scaling/pressure`** on the metrics listener answers `format!("{:.2}", pressure.calculate())` as plain text once `MetricsManager::set_scaling_pressure` has attached a pressure, which `ServiceRuntime` does, and 404 until then.
-- **The `scaling_pressure` gauge**, `{namespace}_scaling_pressure` when `metrics.namespace` sets a prefix, carries the number only once the app sets it. Nothing copies `calculate()` into it: an app that scales on the gauge calls `ServiceMetrics::scaling_pressure(pressure.calculate())` on a tick.
+- **The `scaling_pressure` gauge**, `{namespace}_scaling_pressure` when `metrics.namespace` sets a prefix. With `service-metrics` on, `ServiceRuntime` writes the value `/scaling/pressure` serves into it once a second, from build until the shutdown token is cancelled, so the scrape and the OTLP push both carry it with no traffic and no app code. It reads the pressure attached to the metrics listener, so an app that attaches its own with `set_scaling_pressure` gets that value in the gauge. A service built without `ServiceRuntime`, or without `service-metrics`, calls `ServiceMetrics::scaling_pressure(pressure.calculate())` on its own tick.
+
+An app that still writes the gauge from `runtime.scaling` writes the same number the runtime does, because both read one pressure. Two writers of one gauge on two different pressures would flap between them, which is why the runtime reads what the listener serves.
 
 The [scalo-service](../../charts/scalo-service/README.md) chart reads neither. Its ScaledObject carries a Kafka consumer-group lag trigger unless the contract or `keda.kafka.enabled` turns it off, and a CPU utilisation trigger unless `cpu_enabled` or `keda.cpu.enabled` does. See [../deployment/keda.md](../deployment/keda.md).
 
@@ -129,16 +131,17 @@ impl ServiceApp for LoaderApp {
 ```
 
 `ServiceRuntime` constructs the `ScalingPressure`, registers the
-`/scaling/pressure` endpoint via `MetricsManager`, and wires
+`/scaling/pressure` endpoint via `MetricsManager`, wires
 `worker_pool.set_scaling_pressure` so pool saturation also feeds into
-the signal. Apps then update component values from their pipeline:
+the signal, and with `service-metrics` keeps the `scaling_pressure`
+gauge current. Apps then update component values from their pipeline:
 
 ```rust
 runtime.scaling.as_ref().unwrap().set_component("kafka_lag", lag as f64);
 runtime.scaling.as_ref().unwrap().set_memory(used, limit);
 ```
 
-The `scaling_pressure(value)` / `scaling_circuit_open(...)` / `scaling_memory_pressure(...)` helpers on `ServiceMetrics` write the companion gauges `scaling_pressure`, `scaling_circuit_open` and `scaling_memory_pressure`, prefixed when `metrics.namespace` is set, for the pressure trigger and dashboard overlay.
+The `scaling_pressure(value)` / `scaling_circuit_open(...)` / `scaling_memory_pressure(...)` helpers on `ServiceMetrics` write the companion gauges `scaling_pressure`, `scaling_circuit_open` and `scaling_memory_pressure`, prefixed when `metrics.namespace` is set, for the pressure trigger and dashboard overlay. Under `ServiceRuntime` with `service-metrics` the runtime writes `scaling_pressure`; the circuit and memory gauges stay with the app, which knows how it measures each.
 
 ---
 

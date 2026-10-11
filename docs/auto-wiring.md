@@ -75,7 +75,7 @@ means a `Transport` impl ships with metrics-emission baked in, and the
 | Shutdown | `CancellationToken` created, SIGTERM/SIGINT handlers attached, K8s pre-stop delay configured |
 | Runtime context | `env::runtime_context()` detects once, results cached |
 | Memory guard | `MemoryGuard` constructed if `memory` feature on |
-| Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)` |
+| Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)`; with `service-metrics` on, the served value is written to the `scaling_pressure` gauge once a second |
 | Worker pool | `AdaptiveWorkerPool` constructed if `worker-pool` feature on |
 | Metrics server | Started on `--metrics-addr` (default `0.0.0.0:9090`) if `metrics` feature on, serving `/metrics` `/metrics/manifest` `/livez` `/readyz` `/scaling/pressure` -- and nothing else |
 | Idle gate | `app.work_state(config)` evaluated after the runtime is up if `lifecycle` feature on; a workless config parks instead of entering `run_service` ([core-pillars/lifecycle.md](core-pillars/lifecycle.md)) |

@@ -149,6 +149,9 @@ pub mod metrics;
 #[cfg(any(feature = "otel-metrics", feature = "otel-tracing"))]
 mod otel_backoff;
 
+#[cfg(any(feature = "otel-metrics", feature = "otel-tracing"))]
+mod otel_resource;
+
 #[cfg(feature = "otel-tracing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "otel-tracing")))]
 pub mod otel_tracing;

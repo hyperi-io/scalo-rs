@@ -39,8 +39,6 @@ struct ResolvedOtelConfig {
 
 /// Resolve OTel config with env var overrides.
 fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
-    let endpoint = super::otel_types::resolved_endpoint(&config.endpoint);
-
     let protocol = std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
         .ok()
         .and_then(|p| match p.as_str() {
@@ -49,6 +47,13 @@ fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
             _ => None,
         })
         .unwrap_or(config.protocol);
+
+    // Resolved after the protocol, as the default endpoint depends on it.
+    let endpoint =
+        super::otel_types::resolved_endpoint(crate::otel_backoff::endpoint_for_protocol(
+            &config.endpoint,
+            protocol == OtelProtocol::Http,
+        ));
 
     let export_interval = std::env::var("OTEL_METRIC_EXPORT_INTERVAL")
         .ok()
@@ -123,6 +128,30 @@ fn build_otlp_exporter(
     }
 }
 
+/// The OTLP resource every exported metric carries: `service.name`,
+/// `deployment.environment.name`, the replica's identity, and the consumer's
+/// attributes, which win over all three.
+///
+/// `deployment.environment.name` is the stable semconv key; the bare
+/// `deployment.environment` is deprecated.
+fn resource(resolved: &ResolvedOtelConfig) -> opentelemetry_sdk::Resource {
+    let mut builder = opentelemetry_sdk::Resource::builder();
+    if !resolved.service_name.is_empty() {
+        builder = builder.with_service_name(resolved.service_name.clone());
+    }
+    if !resolved.deployment_environment.is_empty() {
+        builder = builder.with_attribute(opentelemetry::KeyValue::new(
+            "deployment.environment.name",
+            resolved.deployment_environment.clone(),
+        ));
+    }
+    builder = builder.with_attributes(crate::otel_resource::instance_attributes());
+    for (k, v) in &resolved.resource_attributes {
+        builder = builder.with_attribute(opentelemetry::KeyValue::new(k.clone(), v.clone()));
+    }
+    builder.build()
+}
+
 /// Build the OTel recorder (without installing it globally).
 ///
 /// Uses `metrics-exporter-opentelemetry` to create a `metrics::Recorder`
@@ -151,24 +180,7 @@ pub(crate) fn build_otel_recorder(
         .with_interval(resolved.export_interval)
         .build();
 
-    // Build resource: service.name + deployment.environment.name + any
-    // consumer-configured attributes. `deployment.environment.name` is the
-    // STABLE OTel semconv key (the bare `deployment.environment` is deprecated).
-    let mut resource_builder = opentelemetry_sdk::Resource::builder();
-    if !resolved.service_name.is_empty() {
-        resource_builder = resource_builder.with_service_name(resolved.service_name);
-    }
-    if !resolved.deployment_environment.is_empty() {
-        resource_builder = resource_builder.with_attribute(opentelemetry::KeyValue::new(
-            "deployment.environment.name",
-            resolved.deployment_environment,
-        ));
-    }
-    // Consumer attributes applied LAST so they win over the auto-set ones.
-    for (k, v) in resolved.resource_attributes {
-        resource_builder = resource_builder.with_attribute(opentelemetry::KeyValue::new(k, v));
-    }
-    let resource = resource_builder.build();
+    let resource = resource(&resolved);
 
     // Use with_meter_provider to attach our OTLP reader to the internal provider
     let reader_for_closure = reader;
@@ -226,6 +238,119 @@ mod tests {
                     Some("data-plane"),
                     "configured resource attributes must survive resolution"
                 );
+            },
+        );
+    }
+
+    fn attribute(resource: &opentelemetry_sdk::Resource, key: &'static str) -> Option<String> {
+        resource
+            .get(&opentelemetry::Key::from_static_str(key))
+            .map(|value| value.to_string())
+    }
+
+    /// Every replica pushing one series makes the pushed copy useless for rates.
+    #[test]
+    fn the_metrics_resource_names_the_replica() {
+        temp_env::with_vars(
+            [
+                ("OTEL_RESOURCE_ATTRIBUTES", None::<&str>),
+                ("POD_NAME", Some("loader-7d9f-abcde")),
+                ("HOSTNAME", Some("node-host")),
+            ],
+            || {
+                let resource = resource(&resolve_config(&OtelMetricsConfig::default()));
+                assert_eq!(
+                    attribute(&resource, "service.instance.id").as_deref(),
+                    Some("loader-7d9f-abcde")
+                );
+                assert_eq!(
+                    attribute(&resource, "k8s.pod.name").as_deref(),
+                    Some("loader-7d9f-abcde")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn configured_resource_attributes_win_over_the_replica_identity() {
+        temp_env::with_vars(
+            [
+                ("OTEL_RESOURCE_ATTRIBUTES", None::<&str>),
+                ("POD_NAME", Some("loader-7d9f-abcde")),
+            ],
+            || {
+                let mut cfg = OtelMetricsConfig::default();
+                cfg.resource_attributes
+                    .insert("service.instance.id".to_string(), "from-config".to_string());
+                let resource = resource(&resolve_config(&cfg));
+                assert_eq!(
+                    attribute(&resource, "service.instance.id").as_deref(),
+                    Some("from-config")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn the_default_endpoint_follows_the_protocol() {
+        temp_env::with_vars(
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", None::<&str>),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", None::<&str>),
+            ],
+            || {
+                assert_eq!(
+                    resolve_config(&OtelMetricsConfig::default()).endpoint,
+                    "http://localhost:4317"
+                );
+                let http = OtelMetricsConfig {
+                    protocol: OtelProtocol::Http,
+                    ..OtelMetricsConfig::default()
+                };
+                assert_eq!(resolve_config(&http).endpoint, "http://localhost:4318");
+            },
+        );
+    }
+
+    #[test]
+    fn the_protocol_env_var_moves_the_default_endpoint() {
+        temp_env::with_vars(
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", None::<&str>),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", Some("http/protobuf")),
+            ],
+            || {
+                let resolved = resolve_config(&OtelMetricsConfig::default());
+                assert_eq!(resolved.protocol, OtelProtocol::Http);
+                assert_eq!(resolved.endpoint, "http://localhost:4318");
+            },
+        );
+    }
+
+    #[test]
+    fn a_configured_or_env_endpoint_is_used_as_given() {
+        temp_env::with_vars(
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", None::<&str>),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", None::<&str>),
+            ],
+            || {
+                let cfg = OtelMetricsConfig {
+                    protocol: OtelProtocol::Http,
+                    endpoint: "http://collector:4317".to_string(),
+                    ..OtelMetricsConfig::default()
+                };
+                assert_eq!(resolve_config(&cfg).endpoint, "http://collector:4317");
+            },
+        );
+        temp_env::with_vars(
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", Some("http://localhost:4317")),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", Some("http/protobuf")),
+            ],
+            || {
+                let resolved = resolve_config(&OtelMetricsConfig::default());
+                assert_eq!(resolved.endpoint, "http://localhost:4317");
             },
         );
     }
