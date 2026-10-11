@@ -232,7 +232,7 @@ my-loader config-check --config config/settings.yaml
 # Print the metric catalogue
 my-loader metrics-manifest > metrics-manifest.json
 
-# Generate deployment artefacts (Dockerfile, chart/, argocd-application.yaml)
+# Generate deployment artefacts (contract, container manifest, Dockerfile.runtime)
 my-loader generate-artefacts --output-dir ci/
 
 # Run it
@@ -273,8 +273,8 @@ What you skipped:
 | `MemoryGuard`, cgroup-aware OOM prevention | `memory` (wired by `ServiceRuntime`) |
 | Rayon pool sizing, pressure-based scaling | `worker_pool` (wired by `ServiceRuntime`) |
 | Disk-spillover spool, circuit breaker, retry, DLQ fallback | `tiered_sink` (composed in `run_service`) |
-| Dockerfile, Helm chart, ArgoCD Application, container manifest | `deployment_contract()` + `generate_*` |
-| KEDA ScaledObject + TriggerAuthentication | `KedaContract` (auto-included in Helm chart) |
+| Dockerfile, container manifest, Compose fragment | `deployment_contract()` + `generate_*` |
+| Kubernetes Deployment, Services, KEDA ScaledObject + TriggerAuthentication | `deployment_contract()` + `KedaContract`, rendered by the scalo-service chart |
 
 See [auto-wiring.md](auto-wiring.md) for the full
 "if-you-call-X-you-get-Y" model.

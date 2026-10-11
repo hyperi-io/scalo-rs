@@ -26,9 +26,6 @@
 //!   image_registry: registry.example.com/team          # no default -- required
 //!   base_image: debian:trixie-slim@sha256:<digest>     # default: DEFAULT_BASE_IMAGE
 //!   base_distro: trixie                                # default: derived from base_image
-//!   argocd:
-//!     repo_url: https://git.example.com/team/my-app    # no default -- no Application without it
-//!     dest_namespace: my-namespace                     # default: the app name
 //! ```
 //!
 //! # Defaults
@@ -163,26 +160,6 @@ pub fn resolve_base_distro(base_image: &str) -> Option<BaseDistro> {
     base_distro_from_cascade().or_else(|| BaseDistro::from_base_image(base_image))
 }
 
-/// Read the git repo URL for ArgoCD generation from the config cascade.
-///
-/// Reads `deployment.argocd.repo_url` from the YAML cascade. `None` when it is
-/// not set: where an app's chart lives is not something a library can guess,
-/// so `generate-artefacts` writes no ArgoCD `Application` without it.
-#[must_use]
-pub fn argocd_repo_url_from_cascade() -> Option<String> {
-    cascade_string("deployment.argocd.repo_url")
-}
-
-/// Read the ArgoCD destination namespace from the config cascade.
-///
-/// Reads `deployment.argocd.dest_namespace` from the YAML cascade. `None` when
-/// it is not set, which leaves [`ArgocdConfig::dest_namespace`](super::ArgocdConfig::dest_namespace)
-/// empty and deploys the app into a namespace named after it.
-#[must_use]
-pub fn argocd_dest_namespace_from_cascade() -> Option<String> {
-    cascade_string("deployment.argocd.dest_namespace")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,11 +181,8 @@ mod tests {
 
     #[test]
     fn cascade_falls_back_to_defaults_when_no_config() {
-        // No config setup -> the base image has a default, and the registry and
-        // the ArgoCD source and namespace have none.
+        // No config setup -> the base image has a default, and the registry has none.
         assert_eq!(image_registry_from_cascade(), None);
-        assert_eq!(argocd_repo_url_from_cascade(), None);
-        assert_eq!(argocd_dest_namespace_from_cascade(), None);
         assert_eq!(base_image_from_cascade(), DEFAULT_BASE_IMAGE);
     }
 

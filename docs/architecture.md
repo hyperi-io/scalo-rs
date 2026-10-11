@@ -129,7 +129,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | `cli` | `cli` | `clap` types: `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
 | `cli::service` | `cli-service` | `ServiceApp` trait, `run_app`, `ServiceRuntime` - full data-plane app scaffolding |
 | `top` | `top` | TUI metrics dashboard (`ratatui`) |
-| `deployment` | `deployment`, `deployment-smoke` | `DeploymentContract`, generators for Dockerfile / Helm chart / ArgoCD Application / container manifest |
+| `deployment` | `deployment`, `deployment-smoke` | `DeploymentContract`, generators for Dockerfile / runtime stage / Compose fragment / container manifest; the scalo-service chart renders the Kubernetes objects |
 | `version_check` | `version-check` | Startup HTTP probe to the version API |
 
 ---

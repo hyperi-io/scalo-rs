@@ -1,25 +1,29 @@
 // Project:   scalo
 // File:      src/deployment/mod.rs
-// Purpose:   Deployment contract validation and generation for Helm charts and Dockerfiles
+// Purpose:   Deployment contract, its validation, and Dockerfile and Compose generation
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Deployment contract validation and generation for Kubernetes/Helm/Docker.
+//! Deployment contract validation and generation for Kubernetes and Docker.
 //!
 //! Apps provide ~20% customisation via [`DeploymentContract`]; this module
-//! generates ~80% boilerplate (Dockerfile, Helm chart, Compose fragment) and
-//! validates existing artifacts against the contract.
+//! generates ~80% boilerplate (Dockerfile, runtime stage, Compose fragment,
+//! container manifest) and validates an existing Dockerfile against the
+//! contract. The Kubernetes objects come from the scalo-service library chart
+//! (`charts/scalo-service`), which renders the serialised contract that
+//! `generate-artefacts` writes.
 //!
 //! # Architecture
 //!
 //! ```text
-//! App Config::default()  ->  DeploymentContract  ->  generate_chart("chart/")
-//!                                                 ->  generate_dockerfile()
+//! App Config::default()  ->  DeploymentContract  ->  generate_dockerfile()
+//!                                                 ->  generate_runtime_stage()
 //!                                                 ->  generate_compose_fragment()
-//!                                                 ->  validate_helm_values("chart/")
+//!                                                 ->  generate_container_manifest()
 //!                                                 ->  validate_dockerfile("Dockerfile")
+//!                                                 ->  deployment-contract.json -> scalo-service chart
 //! ```
 //!
 //! The config cascade (figment) is the SSoT for app defaults. The contract
@@ -33,7 +37,7 @@
 //!     CONTRACT_SCHEMA_VERSION, DEFAULT_BASE_DISTRO, DeploymentContract, HealthContract,
 //!     ImageProfile, KedaContract, NativeDepsContract, ResourcesContract, SecurityContract,
 //!     ServiceAccount, WritablePath, base_image_from_cascade, generate_dockerfile,
-//!     generate_chart, generate_compose_fragment,
+//!     generate_compose_fragment,
 //! };
 //!
 //! let contract = DeploymentContract {
@@ -79,9 +83,6 @@
 //! // Generate development Dockerfile (same binary, adds debug tools)
 //! let dev_dockerfile = generate_dockerfile(&contract.with_dev_profile(), None);
 //!
-//! // Generate Helm chart directory
-//! // generate_chart(&contract, "chart/").unwrap();
-//!
 //! // Generate Docker Compose service fragment
 //! let compose = generate_compose_fragment(&contract);
 //! ```
@@ -123,23 +124,22 @@ pub use dials::{DIAL_KEYWORD, DIAL_TIERS, DialError, dials};
 #[cfg(feature = "config-schema")]
 pub use emit::config_schema_json;
 pub use emit::{
-    ChartPatch, assert_listeners_declared, assert_no_chart_drift, assert_no_config_artifact_drift,
-    check_chart_drift, check_config_artifact_drift, emit_config_artifacts,
+    assert_listeners_declared, assert_no_config_artifact_drift, check_config_artifact_drift,
+    emit_config_artifacts,
 };
 pub use error::{ContractMismatch, DeploymentError};
 pub use generate::{
-    ArgocdConfig, generate_argocd_application, generate_chart, generate_compose_fragment,
-    generate_container_manifest, generate_dockerfile, generate_runtime_stage,
+    generate_compose_fragment, generate_container_manifest, generate_dockerfile,
+    generate_runtime_stage,
 };
 pub use keda::{KafkaLagTrigger, KedaConfig, KedaContract};
 pub use native_deps::{AptRepoContract, BaseDistro, NativeDepsContract};
 pub use registry::{
-    DEFAULT_BASE_DISTRO, DEFAULT_BASE_IMAGE, argocd_dest_namespace_from_cascade,
-    argocd_repo_url_from_cascade, base_distro_from_cascade, base_image_from_cascade,
+    DEFAULT_BASE_DISTRO, DEFAULT_BASE_IMAGE, base_distro_from_cascade, base_image_from_cascade,
     image_registry_from_cascade, resolve_base_distro,
 };
 pub use schema_compat::{SchemaBreak, SchemaBreakKind, breaking_changes};
-pub use validate::{validate_dockerfile, validate_helm_values};
+pub use validate::validate_dockerfile;
 pub use waves::{WAVE_APPS, WAVE_CRDS, WAVE_OPERATORS, WAVE_POST, WAVE_TOPICS};
 
 #[cfg(test)]

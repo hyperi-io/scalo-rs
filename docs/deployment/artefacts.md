@@ -18,29 +18,14 @@ ci/
 |-- deployment-contract.json     # when ServiceApp::deployment_contract() is Some
 |-- container-manifest.json      # minimal CI-consumable subset
 |-- Dockerfile.runtime           # runtime-stage fragment for CI composition
-`-- argocd-application.yaml      # ArgoCD Application CR, when deployment.argocd.repo_url is set
+|-- config-schema.{json,yaml}    # when the contract carries config_schema
+`-- capability-catalog.{json,yaml}  # when the contract carries capabilities
 ```
 
-The Helm `chart/` tree is NOT written by `generate-artefacts`. Apps
-call `generate_chart()` directly (typically from a build script),
-because the chart is a directory tree, not a single file:
-
-```text
-chart/
-|-- Chart.yaml
-|-- values.yaml
-`-- templates/
-    |-- _helpers.tpl
-    |-- deployment.yaml
-    |-- service.yaml
-    |-- serviceaccount.yaml
-    |-- configmap.yaml
-    |-- secret.yaml
-    |-- hpa.yaml
-    |-- keda-scaledobject.yaml   # only when keda.is_some()
-    |-- keda-triggerauth.yaml    # only when keda.is_some()
-    `-- NOTES.txt
-```
+scalo writes no Helm chart. A chart assembler turns `deployment-contract.json`
+into a thin chart on the [scalo-service](../../charts/scalo-service/README.md)
+library chart, which renders every Kubernetes object from the contract -- see
+[Kubernetes objects](#kubernetes-objects) below.
 
 ---
 
@@ -186,101 +171,18 @@ The pragma only works on the line directly above its instruction, so nothing goe
 Dynamic OCI labels (`source`, `revision`, `version`, `created`)
 arrive via `--build-arg` from CI at build time.
 
-### `argocd-application.yaml`
+### Kubernetes objects
 
-ArgoCD `Application` CR pointing at the Helm chart in the app's git repo. `generate-artefacts` writes it only when `deployment.argocd.repo_url` names that repo, and warns on stderr when it does not. Defaults: namespace `argocd`, destination namespace the app's own name (set `deployment.argocd.dest_namespace` to share one), chart path `chart`, target revision `main`, self-healing on, prune on. Override via `ArgocdConfig`.
+The [scalo-service](../../charts/scalo-service/README.md) library chart renders
+them from `deployment-contract.json`: the Deployment, Services, ConfigMaps,
+ServiceAccount, claims, disruption budget, KEDA ScaledObject and
+TriggerAuthentication, fallback HPA and NetworkPolicy. Its README lists what
+each contract field and value renders, and how to assemble the thin chart a
+service ships.
 
-### `chart/` -- Helm chart
-
-`generate_chart()` writes a complete chart (apps call it directly). It predates
-contract schema 4 and renders none of the v4 fields (`writable_paths`,
-`termination_grace_seconds`, `resources`, `security`, `singleton`,
-`service_account`, `startup_budget_seconds`, `public`, `app_protocol`, `optional`); the
-[scalo-service](../../charts/scalo-service/README.md) library chart renders them
-from the contract itself.
-
-| File | Purpose |
-| ------ | --------- |
-| `Chart.yaml` | Chart metadata |
-| `values.yaml` | Configurable defaults -- image, resources, probes, secrets, KEDA, HPA, `otel`, `podSecurityContext` / `securityContext` |
-| `templates/_helpers.tpl` | Standard name helpers + one `<group>SecretName` helper per secret group |
-| `templates/deployment.yaml` | `Deployment` with probes, security contexts, observability env, env from secrets, config mount, service-account files without the token. The pod template carries `checksum/config` and, with any secret group, `checksum/secret`, so a changed ConfigMap or chart-managed Secret rolls the pods. A group on `existingSecret` renders nothing into `secret.yaml`, so rotating that Secret is the operator's roll |
-| `templates/service.yaml` | `Service` exposing metrics port + any `extra_ports`; a port gated with `when` renders only while its condition holds, here and in the `Deployment` |
-| `templates/serviceaccount.yaml` | `ServiceAccount` (auto-disable token mount) |
-| `templates/configmap.yaml` | `ConfigMap` rendering `values.yaml.config` to mounted file |
-| `templates/secret.yaml` | `Secret` per group (skipped when `existingSecret` is set) |
-| `templates/hpa.yaml` | HPA fallback for clusters without KEDA |
-| `templates/keda-scaledobject.yaml` | KEDA `ScaledObject` -- **only when `contract.keda` is `Some` with `enabled: true`** |
-| `templates/keda-triggerauth.yaml` | KEDA `TriggerAuthentication` -- **same condition**; a comment stub when there is no kafka secret group or no Kafka lag trigger |
-| `templates/NOTES.txt` | Post-install hints (port-forward, log tail) |
-
-#### Security contexts on the Deployment
-
-The pod drops to a non-root user and the container gives up every capability,
-by default. Both blocks come from values, so an app with a genuine need opts
-out rather than forking the chart.
-
-| Values key | Default | What it settles |
-| --- | --- | --- |
-| `podSecurityContext.runAsNonRoot` | `true` | refuse to start as root |
-| `podSecurityContext.runAsUser` / `runAsGroup` / `fsGroup` | `1000` | the uid the image already switches to |
-| `podSecurityContext.seccompProfile.type` | `RuntimeDefault` | the runtime's syscall filter |
-| `securityContext.allowPrivilegeEscalation` | `false` | no setuid climb |
-| `securityContext.privileged` | `false` | not a privileged container |
-| `securityContext.capabilities.drop` | `[ALL]` | no Linux capabilities |
-| `securityContext.readOnlyRootFilesystem` | `false` | see below |
-
-**`runAsUser` is coupled to the Dockerfile.** The generated image does
-`useradd --uid 1000 appuser` and `USER 1000`. Change one without the other
-and the container will not start, so a test pins both.
-
-**`readOnlyRootFilesystem` is deliberately `false`.** The spool and DLQ write
-to the container filesystem, and every volume this chart mounts is read-only.
-An app that spools nowhere can set it `true`; an app that spools needs a
-writable volume first.
-
-#### Service-account files without the token
-
-The chart mounts no service-account token. `automountServiceAccountToken: false` sits on the `ServiceAccount` and on the pod, so an account the operator supplies with `serviceAccount.create: false` mounts none either.
-
-The pod still carries the two files the [version check](../version-check.md) derives its instance id from. A projected volume holds them, read-only at `/var/run/secrets/kubernetes.io/serviceaccount`:
-
-| File | Source |
-| --- | --- |
-| `ca.crt` | the `kube-root-ca.crt` ConfigMap Kubernetes publishes into every namespace |
-| `namespace` | the Downward API, `metadata.namespace` |
-
-These are the sources of Kubernetes' own token volume, minus the token, so the id matches the one a token-mounting pod derives. Without them every pod restart reports as a new install.
-
-#### Observability env on the Deployment
-
-Two pathways get wired, not one. The pod annotations carry the Prometheus
-scrape config (metrics, for alerting and autoscaling); the container env
-carries OTLP (traces, for a collector).
-
-`templates/deployment.yaml` always emits these, secrets or no secrets:
-
-| Env var | Value |
-| --- | --- |
-| `OTEL_SERVICE_NAME` | the contract's `app_name` |
-| `POD_NAME` / `POD_NAMESPACE` / `POD_UID` / `NODE_NAME` | k8s Downward API field refs |
-| `OTEL_RESOURCE_ATTRIBUTES` | `k8s.pod.name` / `k8s.namespace.name` / `k8s.pod.uid` / `k8s.node.name`, built from those four |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` / `_PROTOCOL` | from `values.otel`, only when `otel.endpoint` is set |
-
-The OTel SDK reads `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` natively.
-The Downward API supplies what the SDK cannot work out for itself -- `k8s.pod.uid`
-is the anchor a collector's k8sattributes processor keys on. Per-pod and per-app
-differentiation rides on these labels, NEVER on metric names.
-
-`values.otel.endpoint` is empty by default, which leaves tracing off. That is
-deliberate: a chart installed where no collector exists should do nothing, not
-sit retrying an endpoint.
-
-```yaml
-otel:
-  endpoint: ""        # e.g. http://opentelemetry-collector.observability:4317
-  protocol: grpc
-```
+To preview a service's chart locally, assemble it from the contract with a
+chart assembler such as `hyperi-ci chart assemble --image <repo>:<tag>@sha256:<digest>`,
+then run `helm dependency build` and `helm template` on the directory it prints.
 
 ---
 
@@ -319,38 +221,9 @@ diff -r /tmp/fresh ci/   # zero output -> no drift
 Any diff fails the build, forcing regenerate-and-commit so deployment
 artefacts always match the binary that ships.
 
-`validate_helm_values()` and `validate_dockerfile()` are programmatic
-alternatives when committed files carry intentional deviations (e.g.
-CI's prepended builder stages). Each returns the list of
-`ContractMismatch`es rather than a hard diff.
-
-### Keeping a hand-fixed chart under the guard
-
-The committed chart should come straight from `generate_chart()`. When it cannot yet -- a generator defect you have to work round until the fix ships -- pin the hand edit rather than exempting the file. An exemption only proves the file differs from the generator, and a stale edit differs too, so an exempt file rots with the guard green.
-
-```rust
-use std::path::Path;
-use scalo::deployment::{ChartPatch, assert_no_chart_drift};
-
-#[test]
-fn committed_chart_matches_the_generator() {
-    let patches = [ChartPatch::new(
-        "templates/keda-scaledobject.yaml",
-        "        tls: disable\n",
-        "        tls: enable\n",
-    )];
-    assert_no_chart_drift(&contract(), Path::new("chart"), &patches);
-}
-```
-
-`check_chart_drift()` renders the chart fresh, applies each patch to the file it names, and requires the committed file to match byte for byte. It fails when:
-
-- a committed file differs from the fresh output with its patches applied -- a difference only in line endings (CRLF) or trailing newlines is named as that
-- a patch's `from` no longer occurs in the generated file -- the generator changed under the hand fix, so drop the patch or pin it again
-- a patch's `from` occurs more than once, so it pins no one edit -- lengthen it until it is unique; the patch replaces that one occurrence
-- a generated file is missing from the chart, or a file in the chart root or `templates/` is one the generator does not write
-
-It renders without identity annotations, the same as a committed chart. Once a scalo release fixes the defect a patch works round, the patch's `from` stops appearing and the check says to drop it.
+`validate_dockerfile()` is the programmatic alternative when a committed
+Dockerfile carries intentional deviations (e.g. CI's prepended builder
+stages). It returns the list of `ContractMismatch`es rather than a hard diff.
 
 ---
 
@@ -362,8 +235,8 @@ CI diff check reliable.
 
 The input is more than the source. `generate-artefacts` loads the app's
 config first, once, and every artefact follows that cascade: the
-contract's base image and registry, the metrics namespace, the ArgoCD
-repo URL. So a dev box and CI with different settings files or env
+contract's base image and registry, and the metrics namespace. So a dev
+box and CI with different settings files or env
 vars can generate different artefacts from one commit. A config that
 does not load is reported on stderr and the defaults are taken. The
 manifest's `version` and `commit` also change with each build.
@@ -378,7 +251,7 @@ before anything is written -- see [contract.md](contract.md#ports).
 - [contract.md](contract.md) -- the input
 - [../../charts/scalo-service/README.md](../../charts/scalo-service/README.md) -- the library chart and the thin-chart format
 - [native-deps.md](native-deps.md) -- what populates the APT block
-- [keda.md](keda.md) -- when the KEDA templates fire
+- [keda.md](keda.md) -- when the chart renders a ScaledObject
 - [../integration.md](../integration.md) -- `ServiceApp::deployment_contract`
 - [../feature-flags.md](../feature-flags.md) -- `deployment`, `cli`
 - Source: [../../src/deployment/generate/mod.rs](../../src/deployment/generate/mod.rs),

@@ -11,7 +11,8 @@
 //! [`KedaConfig`] lives in the app's config cascade so thresholds are
 //! overridable via env vars (e.g., `MY_APP__KEDA__KAFKA_LAG_THRESHOLD=5000`).
 //!
-//! [`KedaContract`] is the subset validated against Helm `values.yaml`.
+//! [`KedaContract`] is the subset the scalo-service chart renders into its
+//! ScaledObject.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +59,7 @@ impl Default for KedaConfig {
     }
 }
 
-/// KEDA contract points validated against Helm `values.yaml`.
+/// KEDA contract points the scalo-service chart renders into its ScaledObject.
 ///
 /// Built from [`KedaConfig`] defaults. Use [`KedaContract::from_config`]
 /// to convert.

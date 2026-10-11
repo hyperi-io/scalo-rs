@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "DeploymentContract",
-  "description": "Deployment-facing contract points derived from the app config cascade.\n\nApps build this from their `Config::default()`. Validation functions\ncompare Helm charts and Dockerfiles against these values. Generation\nfunctions create deployment artifacts (Dockerfile, Helm chart, Compose\nfragment) from scratch.",
+  "description": "Deployment-facing contract points derived from the app config cascade.\n\nApps build this from their `Config::default()`. `validate_dockerfile`\ncompares a Dockerfile against these values, the generation functions create\nthe Dockerfile, Compose fragment and container manifest from scratch, and\nthe scalo-service library chart renders the Kubernetes objects from the\nserialised contract.",
   "type": "object",
   "properties": {
     "schema_version": {
@@ -409,7 +409,7 @@
       ]
     },
     "KedaContract": {
-      "description": "KEDA contract points validated against Helm `values.yaml`.\n\nBuilt from [`KedaConfig`] defaults. Use [`KedaContract::from_config`]\nto convert.",
+      "description": "KEDA contract points the scalo-service chart renders into its ScaledObject.\n\nBuilt from [`KedaConfig`] defaults. Use [`KedaContract::from_config`]\nto convert.",
       "type": "object",
       "properties": {
         "enabled": {

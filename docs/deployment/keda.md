@@ -1,18 +1,19 @@
 # KEDA
 
-KEDA (Kubernetes Event-driven Autoscaling) scales pods on triggers the standard HPA can't see -- Kafka consumer-group lag, Prometheus queries, cron schedules, queue depth. `KedaContract` is the deployment-side declaration, and the chart it generates scales on Kafka consumer-group lag and CPU. `ScalingPressure` is a runtime-side signal that chart does not read: a deployment that wants scale-out to track pipeline pressure adds a trigger for it, as the `ScalingPressure` section below describes.
+KEDA (Kubernetes Event-driven Autoscaling) scales pods on triggers the standard HPA can't see -- Kafka consumer-group lag, Prometheus queries, cron schedules, queue depth. `KedaContract` is the deployment-side declaration, and the [scalo-service](../../charts/scalo-service/README.md) chart renders it into a ScaledObject that scales on Kafka consumer-group lag and CPU. `ScalingPressure` is a runtime-side signal that chart does not read: a deployment that wants scale-out to track pipeline pressure adds a trigger for it, as the `ScalingPressure` section below describes.
 
 ---
 
 ## `KedaContract`
 
-The contract subset that lands in `values.yaml.keda` and the generated
-`ScaledObject`. Built from `KedaConfig` (cascade-loaded runtime config)
-via `KedaContract::from_config(&cfg)`.
+The contract subset the scalo-service chart renders into its `ScaledObject`;
+the chart's `keda.*` values override each field per deployment. Built from
+`KedaConfig` (cascade-loaded runtime config) via
+`KedaContract::from_config(&cfg)`.
 
 ```rust
 pub struct KedaContract {
-    pub enabled: bool,                // false generates what `keda: None` does
+    pub enabled: bool,                // false renders what `keda: None` does
     pub min_replicas: u32,
     pub max_replicas: u32,
     pub polling_interval: u32,        // seconds between KEDA polls
@@ -45,12 +46,12 @@ when there's nothing to do, KEDA spins them back up when lag exceeds
 `activation_lag_threshold`. It needs the Kafka lag trigger: KEDA's CPU
 scaler cannot wake a workload from zero on its own, so a contract with
 the Kafka trigger off and `min_replicas: 0` is refused with
-`InvalidContract` on `keda.min_replicas` by `generate_chart()`, and
-`validate_helm_values()` reports it.
+`InvalidContract` on `keda.min_replicas` by `validate()`, and the chart
+refuses to render the same combination when values set it.
 
-`enabled` comes across from `KedaConfig::enabled`. Off produces exactly
-the chart `keda: None` does, so either way of saying it gives the same
-result.
+`enabled` comes across from `KedaConfig::enabled`. Off renders exactly
+what `keda: None` does -- no ScaledObject -- so either way of saying it
+gives the same result.
 
 ### `KafkaLagTrigger` -- where the lag trigger looks
 
@@ -74,130 +75,90 @@ let keda = KedaContract::from_config(&cfg)
 ```
 
 `KafkaLagTrigger::under(base)` reads `base.brokers`, `base.group_id` and
-`base.topics`. Every segment must be a Go identifier (letters, digits,
-`_`), because the chart addresses it with dot syntax. Anything else and
-`generate_chart()` returns `DeploymentError::InvalidContract` rather than
-writing a chart that cannot render.
+`base.topics`. The chart reads each path against the config the app ends
+up running -- the contract's `default_config`, then `config`, then
+`configOverrides` -- and refuses to render when one has no value. Set it,
+or turn the trigger off for that deployment with `keda.kafka.enabled: false`.
 
 `KafkaLagTrigger::disabled()` is for an app that does not consume from
-Kafka. The ScaledObject then carries only the CPU trigger and renders
-only while `keda.cpu.enabled` is true, `values.yaml` drops `keda.kafka`,
-and `keda-triggerauth.yaml` is written as a one-line comment so the
-chart's file set stays the same. Turning off the Kafka trigger AND
-`cpu_enabled` is an error -- KEDA would have nothing to scale on. Use
-`keda: None` for that. So is the Kafka trigger off with `min_replicas: 0`,
-since CPU alone cannot scale from zero.
+Kafka. The ScaledObject then carries only the CPU trigger. Turning off
+the Kafka trigger AND `cpu_enabled` is an error -- KEDA would have
+nothing to scale on, so `validate()` refuses the contract and the chart
+refuses a ScaledObject with no trigger. Use `keda: None` for that. So is
+the Kafka trigger off with `min_replicas: 0`, since CPU alone cannot
+scale from zero.
 
 `KafkaLagTrigger` is `#[non_exhaustive]`: build it with `under()` or
 `disabled()`, then set any path that sits elsewhere on the value they
 return.
 
 `DeploymentContract::unresolved_values_paths()` lists every trigger path
-that `default_config` does not set (or sets to null), and
-`validate_helm_values()` reports each one as a mismatch. A path the
-chart reads but the config never sets renders empty, and an empty
-`bootstrapServers` is admitted by KEDA and then never scales.
+that `default_config` does not set (or sets to null). Each one is a path
+every deployment has to set in values, or the chart refuses to render, so
+assert the list is empty in a test.
 
 ---
 
-## When templates are generated
+## When the chart renders a ScaledObject
 
-`generate_chart()` writes `keda-scaledobject.yaml` and
-`keda-triggerauth.yaml` **only when `contract.keda` is `Some` with
-`enabled: true`**. Non-autoscaling services (one-shot jobs, singleton
-coordinators) set `keda: None`, or build the contract from a
-`KedaConfig` with `enabled: false`, and get just the HPA fallback.
+The scalo-service chart renders a ScaledObject named `<fullname>-scaler`
+**while KEDA is on**: `contract.keda` is `Some` with `enabled: true`,
+unless `keda.enabled` in values says otherwise. A singleton never gets
+one. Non-autoscaling services (one-shot jobs, singleton coordinators)
+set `keda: None`, or build the contract from a `KedaConfig` with
+`enabled: false`.
 
-`hpa.yaml` is always written. It guards itself with
-`{{- if and .Values.autoscaling.enabled (not .Values.keda.enabled) }}`
--- mutually exclusive with KEDA at runtime, so clusters without the
-KEDA operator still scale on CPU by setting `autoscaling.enabled: true`
-and `keda.enabled: false`.
+With KEDA off, `autoscaling.enabled: true` renders a CPU
+HorizontalPodAutoscaler instead, so clusters without the KEDA operator
+still scale on CPU by setting `keda.enabled: false` and
+`autoscaling.enabled: true`.
 
-The Deployment sets `replicas: <replicaCount>` exactly when neither the
-ScaledObject nor the HPA renders, because whichever renders owns the
-replica count and a Deployment without `replicas` runs one pod. That
-includes a CPU-only chart installed with `keda.cpu.enabled: false`,
-where no ScaledObject renders even though `keda.enabled` is true.
+The Deployment sets `replicas: <replicaCount>` exactly when neither KEDA
+nor the HPA is on, because whichever is on owns the replica count and a
+GitOps sync must not revert a scale.
 
 ---
 
-## Generated `ScaledObject`
+## The triggers it derives
 
-Triggers KEDA gets:
+1. **CPU** (unless `cpu_enabled` or `keda.cpu.enabled` turns it off) --
+   utilisation target `cpu_threshold`, `metricType: Utilization`;
+   `keda.cpu.targetUtilization` overrides the target.
+2. **Kafka** (unless `kafka_trigger` or `keda.kafka.enabled` turns it
+   off) -- `lagThreshold` per partition and `activationLagThreshold` for
+   wake-from-zero, from the contract or `keda.kafka.*`. Brokers, consumer
+   group and topic come from the `kafka_trigger` paths: a broker list is
+   joined with commas, and the first topic is taken whether the topics are
+   a list or a comma-separated string.
 
-1. **Kafka** (unless `kafka_trigger` is disabled) -- `lagThreshold`
-   per partition, `activationLagThreshold` for wake-from-zero. Brokers,
-   topic and consumer group come from the `kafka_trigger` paths
-   (`config.kafka.*` by default); `keda.kafka.topic` and
-   `keda.kafka.consumerGroup` override them per deployment.
-2. **CPU** (optional, when `keda.cpu.enabled`) -- utilisation
-   percentage via `metricType: Utilization`.
-
-With the default trigger paths:
+`keda.triggers` replaces both, and `keda.extraTriggers` is appended after
+them. With the default trigger paths and `config.kafka` set to one broker,
+group `event-stage` and topic `events`, the triggers render as:
 
 ```yaml
-{{- if .Values.keda.enabled }}
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: {{ include "my-app.fullname" . }}
-spec:
-  scaleTargetRef:
-    name: {{ include "my-app.fullname" . }}
-  minReplicaCount: {{ .Values.keda.minReplicaCount }}
-  maxReplicaCount: {{ .Values.keda.maxReplicaCount }}
-  pollingInterval: {{ .Values.keda.pollingInterval }}
-  cooldownPeriod: {{ .Values.keda.cooldownPeriod }}
-  triggers:
-    - type: kafka
-      authenticationRef:
-        name: {{ include "my-app.fullname" . }}-kafka-auth
-      metadata:
-        bootstrapServers: {{ join "," ((.Values.config).kafka).brokers | quote }}
-        consumerGroup: {{ .Values.keda.kafka.consumerGroup | default ((.Values.config).kafka).group_id | quote }}
-        {{- $topics := join "," ((.Values.config).kafka).topics }}
-        {{- if .Values.keda.kafka.topic }}
-        topic: {{ .Values.keda.kafka.topic | quote }}
-        {{- else if $topics }}
-        topic: {{ splitList "," $topics | first | quote }}
-        {{- else }}
-        topic: ""
-        {{- end }}
-        lagThreshold: {{ .Values.keda.kafka.lagThreshold | quote }}
-        activationLagThreshold: {{ .Values.keda.kafka.activationLagThreshold | quote }}
-        sasl: scram_sha512
-        tls: disable
-    {{- if .Values.keda.cpu.enabled }}
-    - type: cpu
-      metricType: Utilization
-      metadata:
-        value: {{ .Values.keda.cpu.threshold | quote }}
-    {{- end }}
-{{- end }}
+triggers:
+  - type: cpu
+    metricType: Utilization
+    metadata:
+      value: "80"
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka:9092
+      consumerGroup: event-stage
+      topic: events
+      lagThreshold: "1000"
+      activationLagThreshold: "0"
 ```
-
-Why it is shaped like that:
-
-- `join ","` before `quote`, because `quote` on a list renders
-  `"[kafka:9092]"`, which KEDA reads as a host called `[kafka`. `join`
-  also passes a comma-separated string through untouched and turns null
-  into an empty string.
-- The parenthesised lookups (`((.Values.config).kafka).brokers`) render
-  empty when a parent key is missing or null, instead of failing the
-  render with a nil pointer.
-- The topics are joined and split rather than indexed, because `index`
-  on a string topic gives back a single byte.
 
 KEDA scales to the **max** of all triggers -- high lag OR high CPU
 grows the pool; both must subside to shrink.
 
-The `TriggerAuthentication` template wires SASL credentials from the
-`kafka` secret group. With no `kafka` group, no `TriggerAuthentication`
-is written, and both `authenticationRef` and the `sasl` line are
-omitted -- a SASL mechanism with no credentials cannot authenticate.
-That suits clusters where Kafka auth is bypassed via mesh mTLS. `tls`
-is still the literal `disable` whatever the listener uses.
+The chart renders a TriggerAuthentication named `<fullname>-trigger-auth`
+only when `keda.triggerAuthentication.secretTargetRef` is set, and the
+Kafka trigger then references it. The trigger carries no `sasl` or `tls`:
+KEDA's Kafka scaler takes both as authentication parameters, so the
+operator sets them in that `secretTargetRef` beside the credentials, to
+match the listener. With neither set KEDA uses no SASL and no TLS.
 
 ---
 
@@ -233,7 +194,7 @@ gate when both fire:
 | Circuit-breaker open | Downstream sink unreachable | `0.0` -- scaling won't help |
 | Memory >= threshold | Pod approaching OOM | `100.0` -- scale before kill |
 
-Outside the gates, components are weighted (sum to 1.0) and each saturates at its configured ceiling. The generated chart does not read the score. The app sets it on the `scaling_pressure` gauge through the `ServiceMetrics` helper, with the `metrics.namespace` prefix when one is set. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it; [../pipeline/scaling.md](../pipeline/scaling.md#how-keda-reads-it) shows the trigger.
+Outside the gates, components are weighted (sum to 1.0) and each saturates at its configured ceiling. The scalo-service chart does not read the score. The app sets it on the `scaling_pressure` gauge through the `ServiceMetrics` helper, with the `metrics.namespace` prefix when one is set. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it; [../pipeline/scaling.md](../pipeline/scaling.md#how-keda-reads-it) shows the trigger.
 
 ---
 
@@ -266,7 +227,7 @@ KEDA takes the max; either fires scale-out independently.
 | Item | Purpose |
 | ------ | --------- |
 | `KedaConfig` | Cascade-loaded runtime config (`enabled`, thresholds) |
-| `KedaContract` | Deployment-time subset; `enabled: false` generates what `keda: None` does |
+| `KedaContract` | Deployment-time subset; `enabled: false` renders what `keda: None` does |
 | `KedaContract::from_config(&cfg)` | Build contract from config, `enabled` included |
 | `KedaContract::with_kafka_trigger(t)` | Point the Kafka lag trigger at another values layout, or turn it off |
 | `KedaContract::default()` | Defaults table above |
@@ -282,7 +243,7 @@ KEDA takes the max; either fires scale-out independently.
 ## Related
 
 - [contract.md](contract.md) -- `keda: Option<KedaContract>` field
-- [artefacts.md](artefacts.md) -- when KEDA templates are written
+- [../../charts/scalo-service/README.md](../../charts/scalo-service/README.md) -- every `keda.*` value the chart reads
 - [../core-pillars/metrics.md](../core-pillars/metrics.md) -- metric
   exposition pipeline that powers Prometheus triggers
 - Source: [../../src/deployment/keda.rs](../../src/deployment/keda.rs),

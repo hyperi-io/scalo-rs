@@ -8,6 +8,18 @@ release and the target before bumping.
 
 ## Unreleased
 
+### scalo writes no Helm chart or ArgoCD Application (API CHANGE)
+
+The chart generator, its drift guard and the ArgoCD generator are removed: `generate_chart`, `check_chart_drift`, `assert_no_chart_drift`, `ChartPatch`, `generate_argocd_application`, `ArgocdConfig`, `argocd_repo_url_from_cascade`, `argocd_dest_namespace_from_cascade`, `validate_helm_values` and `DeploymentError::ParseYaml`. `generate-artefacts` stops writing `argocd-application.yaml` and reads no `deployment.argocd.*` key. The Kubernetes objects come from the thin chart a chart assembler builds from `deployment-contract.json` on the [scalo-service](../charts/scalo-service/README.md) library chart. To preview a service's chart locally, run `hyperi-ci chart assemble` -- see [deployment/artefacts.md](deployment/artefacts.md#kubernetes-objects).
+
+**Consumer adjustment** -- remove the emit-chart command and its tests in the same change as the bump, along with any `ChartPatch` drift guard, `validate_helm_values` call, committed `chart/` or `argocd-application.yaml`, and `deployment.argocd.*` setting. Deploy from the thin chart.
+
+### The disruption budget never holds an unready pod (BEHAVIOUR CHANGE)
+
+The scalo-service PodDisruptionBudget sets `unhealthyPodEvictionPolicy: AlwaysAllow`, so a pod that is not Ready can always be evicted and a crash-looping pod no longer blocks a node drain. When it renders is unchanged.
+
+**Consumer adjustment** -- none.
+
 ### A `get()` that reaches the backend reports rotations (BEHAVIOUR CHANGE)
 
 `SecretsManager::get` now sends a `RotationEvent` when a fetch from the backend, on a cache miss or an expired entry, returns a version that differs from the one the cache last held -- the check `refresh_all()` already made. Before, a rotation picked up by `get()` was cached silently, and `refresh_all()` then saw nothing new, so a subscriber never heard of it. A fresh cache hit still reports nothing. See [api/secrets.md](api/secrets.md#rotation-events).

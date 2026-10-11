@@ -58,14 +58,6 @@ pub enum DeploymentError {
         source: std::io::Error,
     },
 
-    /// Failed to parse YAML.
-    #[error("failed to parse YAML in {path}: {source}")]
-    ParseYaml {
-        path: String,
-        #[source]
-        source: serde_yaml_ng::Error,
-    },
-
     /// File not found.
     #[error("file not found: {0}")]
     NotFound(String),
@@ -82,14 +74,13 @@ pub enum DeploymentError {
     /// The contract describes an artefact that cannot be generated as asked.
     #[error("invalid deployment contract field {field}: {reason}")]
     InvalidContract {
-        /// The contract field at fault (e.g. "keda.kafka_trigger.brokers_path").
+        /// The contract field at fault (e.g. "keda.min_replicas").
         field: String,
         /// Why that value cannot be generated.
         reason: String,
     },
 
-    /// A committed artefact (config artefacts or a chart) drifted from the
-    /// freshly generated output.
+    /// A committed config artefact drifted from the freshly generated output.
     #[error("artefact drift in {path}:\n{detail}")]
     Drift {
         /// The artefact path that drifted.

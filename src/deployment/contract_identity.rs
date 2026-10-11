@@ -8,8 +8,9 @@
 
 //! Contract Identity Annotation Scheme v1.
 //!
-//! Stamps every deployment artefact (OCI image, Helm chart, ArgoCD Application)
-//! with three uniform, greppable identity annotations:
+//! Stamps the OCI image with three uniform, greppable identity labels, and
+//! renders the same three keys as YAML annotations for a chart or ArgoCD
+//! Application built elsewhere:
 //!
 //! | Key                               | Meaning                              | Format                            |
 //! |-----------------------------------|--------------------------------------|-----------------------------------|
@@ -26,13 +27,13 @@
 //! # Pre-push vs post-push image_ref
 //!
 //! At Dockerfile-emit time the image isn't built, so its digest is unknown:
-//! the image label carries the TAG form (`<reg>/<repo>:<tag>`). The push step
-//! re-renders `Chart.yaml` and the ArgoCD `Application` with the DIGEST form
-//! returned by the registry, for digest-pinned reproducibility.
+//! the image label carries the TAG form (`<reg>/<repo>:<tag>`). A YAML surface
+//! rendered after the push can carry the DIGEST form returned by the registry,
+//! for digest-pinned reproducibility.
 //!
 //! # Rollout phase
 //!
-//! Phase 1 (today): generators accept `Option<&ContractIdentity>` --
+//! Phase 1 (today): the Dockerfile generator accepts `Option<&ContractIdentity>` --
 //! `Some` emits the annotations, `None` is silent (backwards-compat for
 //! consumers not yet migrated). Phase 2 makes it required once all
 //! consumer services pass identity. Phase 3 drops the `Option` wrapper.

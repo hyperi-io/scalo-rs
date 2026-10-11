@@ -651,7 +651,7 @@ mod tests {
     ///
     /// `Env::prefixed` strips exactly `{prefix}_`, so `TEST__DATABASE__HOST`
     /// resolved to `_database.host` -- a leading-underscore key nothing reads
-    /// and serde drops. That is the spelling generated charts emit for secret
+    /// and serde drops. That is the spelling the contract's secret groups use for
     /// env vars, so Kafka SASL credentials, ClickHouse passwords and cloud
     /// credentials all arrived at a key no app consults.
     #[test]

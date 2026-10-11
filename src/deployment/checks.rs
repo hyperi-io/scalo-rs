@@ -31,15 +31,12 @@ const MAX_WRITABLE_NAME_LEN: usize = 50;
 impl DeploymentContract {
     /// Check that every artefact generated from this contract comes out valid.
     ///
-    /// [`generate_chart`](super::generate_chart),
-    /// [`generate_container_manifest`](super::generate_container_manifest),
-    /// [`check_chart_drift`](super::check_chart_drift) and the
-    /// `generate-artefacts` subcommand run it before writing anything, and
-    /// [`validate_helm_values`](super::validate_helm_values) reports it.
+    /// [`generate_container_manifest`](super::generate_container_manifest) and
+    /// the `generate-artefacts` subcommand run it before writing anything.
     ///
     /// `app_name` is a Kubernetes Service name -- 1 to 63 lowercase letters,
     /// digits and inner hyphens, starting with a letter -- because every object
-    /// the chart renders is named after it.
+    /// the scalo-service chart renders is named after it.
     ///
     /// `image_registry` must be set: there is no default, and an image named
     /// without one resolves to Docker Hub's library namespace. `metrics_port`
@@ -474,6 +471,35 @@ mod tests {
         c.keda = Some(KedaContract::default());
         assert_eq!(refused_field(&c), "keda");
         c.keda = None;
+        c.validate().unwrap();
+    }
+
+    /// KEDA left on needs a trigger, and KEDA's CPU scaler cannot wake a
+    /// workload from zero, so CPU alone refuses a minimum of zero.
+    #[test]
+    fn keda_needs_a_trigger_and_cpu_alone_cannot_scale_from_zero() {
+        let cpu_only = KedaContract::default()
+            .with_kafka_trigger(crate::deployment::KafkaLagTrigger::disabled());
+        let mut c = contract();
+
+        let mut keda = cpu_only.clone();
+        keda.cpu_enabled = false;
+        c.keda = Some(keda);
+        assert_eq!(refused_field(&c), "keda");
+
+        let mut keda = cpu_only.clone();
+        keda.min_replicas = 0;
+        c.keda = Some(keda);
+        assert_eq!(refused_field(&c), "keda.min_replicas");
+
+        c.keda = Some(cpu_only);
+        c.validate().unwrap();
+
+        // With the Kafka lag trigger on, lag wakes the workload from zero.
+        c.keda = Some(KedaContract {
+            min_replicas: 0,
+            ..KedaContract::default()
+        });
         c.validate().unwrap();
     }
 

@@ -84,9 +84,9 @@ scalo publishes the value two ways, and KEDA reads neither until the deployment 
 - **`/scaling/pressure`** on the metrics listener answers `format!("{:.2}", pressure.calculate())` as plain text once `MetricsManager::set_scaling_pressure` has attached a pressure, which `ServiceRuntime` does, and 404 until then.
 - **The `scaling_pressure` gauge**, `{namespace}_scaling_pressure` when `metrics.namespace` sets a prefix, carries the number only once the app sets it. Nothing copies `calculate()` into it: an app that scales on the gauge calls `ServiceMetrics::scaling_pressure(pressure.calculate())` on a tick.
 
-The chart `generate_chart()` writes reads neither. Its ScaledObject carries a Kafka consumer-group lag trigger unless the contract turns it off, and a CPU utilisation trigger while `keda.cpu.enabled` is true. See [../deployment/keda.md](../deployment/keda.md).
+The [scalo-service](../../charts/scalo-service/README.md) chart reads neither. Its ScaledObject carries a Kafka consumer-group lag trigger unless the contract or `keda.kafka.enabled` turns it off, and a CPU utilisation trigger unless `cpu_enabled` or `keda.cpu.enabled` does. See [../deployment/keda.md](../deployment/keda.md).
 
-To scale on the composite, the deployment adds its own trigger. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it, beside the CPU trigger:
+To scale on the composite, the deployment adds its own trigger, through the chart's `keda.extraTriggers` (appended to the derived ones) or `keda.triggers` (in their place). A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it, beside the CPU trigger:
 
 ```yaml
 # ScaledObject triggers, deployment-side

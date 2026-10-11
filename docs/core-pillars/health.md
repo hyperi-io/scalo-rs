@@ -138,7 +138,7 @@ if any are degraded but none unhealthy, `unhealthy` if any are unhealthy:
 > **Point the startupProbe at `/livez`.** There is no startup endpoint.
 > Kubernetes suspends liveness until the startup probe passes, so one path
 > gives both a generous boot budget (`failureThreshold`) and a tight liveness
-> period, without the two drifting apart. This is what the generated Helm
+> period, without the two drifting apart. This is what the scalo-service
 > chart does.
 
 ```yaml

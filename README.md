@@ -87,8 +87,8 @@ Which is the part you would otherwise build:
 - the cascade feeds the CLI, so `run`, `version` and `config-check` work without
   you parsing an argument
 - metrics and health feed the Kubernetes probes
-- the deployment contract writes your Helm chart, Dockerfile and Argo manifests
-  from the config the app already declares
+- the deployment contract, built from the config the app already declares, writes
+  your Dockerfile and drives the scalo-service chart that renders your Kubernetes objects
 
 ## Documentation
 

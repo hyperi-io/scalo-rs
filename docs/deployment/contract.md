@@ -1,12 +1,13 @@
 # Contract
 
 `DeploymentContract` is the one struct each service fills in.
-From it, scalo derives every deployment artefact -- Dockerfile, Helm
-chart, Compose fragment, ArgoCD `Application`, container manifest,
-runtime-stage fragment -- with no YAML templates in the app.
+From it, scalo derives the Dockerfile, runtime-stage fragment, Compose
+fragment and container manifest, and the
+[scalo-service](../../charts/scalo-service/README.md) library chart renders
+the Kubernetes objects from its JSON -- with no YAML templates in the app.
 
 Fill in the 20% that's app-specific, get the 80% boilerplate for free.
-`validate_*` catches contract-vs-artefact drift in CI.
+`validate_dockerfile` catches contract-vs-Dockerfile drift in CI.
 
 ---
 
@@ -73,8 +74,7 @@ flowchart LR
     P[Python service<br/>uses scalo-py] -->|generate-artefacts| C
     O[bash / TS / Go service<br/>via hyperi-ci templater] -.roadmap.-> C
     C --> D[Dockerfile]
-    C --> H[Helm chart/]
-    C --> A[argocd-application.yaml]
+    C --> H[thin chart on scalo-service]
     C --> CM[container-manifest.json]
     C --> CS[compose.yaml fragment]
 ```
@@ -198,7 +198,7 @@ let contract = DeploymentContract {
 | ------- | --------- | ------------- |
 | `liveness_path` | `/livez` | Dockerfile `HEALTHCHECK`, Helm `livenessProbe` AND `startupProbe` |
 | `readiness_path` | `/readyz` | Helm `readinessProbe` |
-| `metrics_path` | `/metrics` | Prometheus scrape annotation in `values.yaml` |
+| `metrics_path` | `/metrics` | Prometheus scrape annotation on the pod |
 | `startup_budget_seconds` | `150` | How long the scalo-service startup probe waits for the liveness path before a restart; at least 1 (v4) |
 
 Those three paths are the whole probe surface. There are no aliases -- a
@@ -225,9 +225,9 @@ token).
 
 | Field | Purpose |
 | ------- | --------- |
-| `group_name` | Section name in `values.yaml`, helper template suffix (`kafkaSecretName`) |
+| `group_name` | The chart's `secrets.<group>` values section; the Secret defaults to `<fullname>-<group>` |
 | `env_vars[].env_var` | The full env var name injected into the pod (`EVENT_LOADER__KAFKA__PASSWORD`) |
-| `env_vars[].key_name` | Field name in `values.yaml.<group>.secretKeys.<key_name>` |
+| `env_vars[].key_name` | The values key `secrets.<group>.keys.<key_name>` that overrides the data key |
 | `env_vars[].secret_key` | Default K8s Secret data key (`kafka-password`) |
 | `optional` | The app starts without the group, so a missing Secret or key leaves the variable unset (v4); build with `SecretGroupContract::new(..).optional()` |
 
@@ -237,7 +237,7 @@ token).
 
 These v4 fields describe what the container needs from the pod. The
 [scalo-service](../../charts/scalo-service/README.md) library chart renders
-them; the older `generate_chart` does not read them.
+them.
 
 ```rust
 writable_paths: vec![
@@ -329,13 +329,13 @@ A service with two transports binds its push listener on one of them only. Witho
 | `Equals { path, value }` | `.when_equals(path, value)` | as a string, equals `value` |
 | `OneOf { path, values }` | `.when_one_of(path, values)` | as a string, is one of `values` (for a setting with an alias) |
 
-`path` is a dotted `.Values` path, the same convention as the KEDA trigger's, so app config sits under `config.` -- `config.source.transport`. Each segment must be a Go identifier. A bad segment, or a `one_of` with no values, makes `generate_chart` return `InvalidContract` before it writes anything. A missing or null key reads as off, never as a render error.
+`path` is a dotted `.Values` path, the same convention as the KEDA trigger's, so app config sits under `config.` -- `config.source.transport`. The scalo-service chart reads it against the config the app ends up running: the contract's `default_config`, then `config`, then `configOverrides`. A missing or null key reads as off, never as a render error, and a `one_of` with no values never holds.
 
 Gate `equals` and `one_of` on a string or boolean setting. Both compare the chart's `toString` of the value, and Helm reads a large number in `values.yaml` as a float, so `1000000` in the config prints as `1e+06` and never matches. A numeric gate compares unreliably.
 
 | Artefact | A gated port |
 | --- | --- |
-| chart `Deployment` + `Service` | wrapped in `{{- if <condition> }}`, so it renders only when the listener is on |
+| scalo-service `Deployment` + `Service` | rendered only while the condition holds, so only when the listener is on |
 | Dockerfile + runtime stage | left out of `EXPOSE`, listed in a comment right under it with its condition |
 | `container-manifest.json` | left out of `expose_ports`, listed under `conditional_ports` (key present only when a port is gated) |
 | compose fragment | published when the condition holds for `default_config`; otherwise a commented-out line to uncomment |
@@ -345,7 +345,7 @@ A port without `when` is always on: in every `EXPOSE`, `expose_ports` and publis
 
 ### What every port must be
 
-`DeploymentContract::validate()` is the one check the generators that can refuse run first: `generate_chart`, `generate_container_manifest`, `check_chart_drift` and `generate-artefacts` return `InvalidContract` and write nothing when it fails, and `validate_helm_values` reports it. It requires, for each extra port:
+`DeploymentContract::validate()` is the one check the generators that can refuse run first: `generate_container_manifest` and `generate-artefacts` return `InvalidContract` and write nothing when it fails. It requires, for each extra port:
 
 - a name Kubernetes takes -- 1 to 15 lowercase letters, digits and single inner hyphens, with at least one letter (`syslog-udp`, not `Syslog_UDP`)
 - a protocol of TCP, UDP or SCTP, in any case
@@ -403,7 +403,7 @@ scalo stamps a few keys of its own beside the standard `org.opencontainers.image
 | `<namespace>.profile` | Dockerfile, runtime stage, container manifest | `production` or `development` |
 | `<namespace>.app` | container manifest | `app_name` |
 | `<namespace>.metrics_port` | container manifest | `metrics_port` |
-| `<namespace>.contract.version` / `.source-commit` / `.image-ref` | Dockerfile, `Chart.yaml`, ArgoCD `Application`, when a `ContractIdentity` is passed | see `ContractIdentity` |
+| `<namespace>.contract.version` / `.source-commit` / `.image-ref` | Dockerfile, when a `ContractIdentity` is passed; `ContractIdentity::as_yaml_annotations` renders the same keys for a chart or `Application` built elsewhere | see `ContractIdentity` |
 
 An app that already ships its own namespace keeps it by setting `label_namespace`, and every key above moves with it.
 
@@ -423,10 +423,8 @@ source.
 | `image_registry_from_cascade()` | `deployment.image_registry` | none -- returns `None`, and the contract must name a registry |
 | `base_image_from_cascade()` | `deployment.base_image` | `debian:trixie-slim@sha256:...` (`DEFAULT_BASE_IMAGE`) |
 | `resolve_base_distro(base_image)` | `deployment.base_distro` | derived from `base_image` |
-| `argocd_repo_url_from_cascade()` | `deployment.argocd.repo_url` | none -- `generate-artefacts` writes no ArgoCD `Application` without it |
-| `argocd_dest_namespace_from_cascade()` | `deployment.argocd.dest_namespace` | none -- the `Application` deploys into a namespace named after `app_name` |
 
-There is no default registry or ArgoCD source: where an organisation pushes its images and keeps its charts is not something a library can guess, and a guess sends images and syncs to someone else's.
+There is no default registry: where an organisation pushes its images is not something a library can guess, and a guess sends images to someone else's.
 
 The default base image is pinned to its multi-arch index digest, so every build
 of one scalo release gets the same bytes. Renovate moves the digest.
@@ -451,7 +449,7 @@ reference carries no codename.
 | `DeploymentContract::config_filename()` / `config_dir()` | Split `config_mount_path` |
 | `ImageProfile::{Production, Development}` | Profile enum |
 | `HealthContract` | `/livez` / `/readyz` / `/metrics` paths |
-| `PortContract` | Extra container port beyond `metrics_port`; build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` and `expose_ports` as `514/udp`. `generate_chart` refuses a protocol other than TCP, UDP or SCTP (any case) |
+| `PortContract` | Extra container port beyond `metrics_port`; build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` and `expose_ports` as `514/udp`. `validate()` refuses a protocol other than TCP, UDP or SCTP (any case) |
 | `PortCondition` | When a port's listener exists -- see [Ports](#ports) |
 | `DeploymentContract::undeclared_listeners()` / `assert_listeners_declared()` | Listener coverage -- see [Ports](#ports) |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |
@@ -459,9 +457,8 @@ reference carries no codename.
 | `OciLabels` | Static OCI labels (`title`, `description`, `vendor`, `licenses`, `copyright`) and `label_namespace` |
 | `NativeDepsContract` | Runtime APT packages -- see [native-deps.md](native-deps.md) |
 | `KedaContract` | Autoscaling thresholds -- see [keda.md](keda.md) |
-| `ArgocdConfig` | ArgoCD `Application` repo / path / namespace |
 | `DEFAULT_BASE_IMAGE` / `DEFAULT_LABEL_NAMESPACE` | Defaults used when the cascade or the contract is silent |
-| `image_registry_from_cascade()` / `base_image_from_cascade()` / `argocd_repo_url_from_cascade()` / `argocd_dest_namespace_from_cascade()` | Cascade readers |
+| `image_registry_from_cascade()` / `base_image_from_cascade()` | Cascade readers |
 | `Capability` / `FieldSpec` | Capability-catalog entry and its config fields |
 | `config_schema_json::<T>()` | Derive the JSON Schema for the app's `Config` |
 | `CONTRACT_SCHEMA_VERSION` | The contract schema version this crate writes and reads (4) |
@@ -477,8 +474,9 @@ reference carries no codename.
 ## CI integration
 
 `<app> generate-artefacts --output-dir ci/` (a `cli`-feature
-subcommand) emits the contract. CI then runs `validate_*` to confirm
-the repo's chart/Dockerfile still match the contract.
+subcommand) emits the contract. A chart assembler turns it into the thin
+chart the service ships, and `validate_dockerfile` confirms a committed
+Dockerfile still matches the contract.
 
 See [artefacts.md](artefacts.md) for what generation writes and
 [../integration.md](../integration.md) for the `ServiceApp::deployment_contract`
