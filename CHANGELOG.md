@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.9](https://github.com/hyperi-io/scalo-rs/compare/v2.14.8...v2.14.9) (2026-10-11)
+
+### Bug Fixes
+
+* move the default runtime base image to the current debian:trixie-slim digest ([#334](https://github.com/hyperi-io/scalo-rs/issues/334)) ([d559c81](https://github.com/hyperi-io/scalo-rs/commit/d559c81ae07da560eee0638f8a0238f1c7bcc2fa))
+
 ## [2.14.8](https://github.com/hyperi-io/scalo-rs/compare/v2.14.7...v2.14.8) (2026-10-11)
 
 ### Bug Fixes
