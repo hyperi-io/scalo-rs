@@ -8,8 +8,7 @@
 
 //! # scalo
 //!
-//! An integrated runtime for at scale data plane services. Attach and
-//! 'enterprise-up' your application.
+//! Opinionated-for-scale integrated runtime of config, logging, secrets, cli and more for data plane and infrastructure services.
 //!
 //! Opinionated, drop-in, working out of the box. The patterns from blog posts, watercooler chats and beers with your Google mates as actual library -- not a framework you assemble from twenty crates and 8 weeks of munging.
 //!
