@@ -15,6 +15,11 @@
   ],
   "packageRules": [
     {
+      "description": "The skeleton chart is a template the assembler rewrites per app, and its dependency points at oci://registry.example.com, which does not resolve. Looking it up fails DNS, which Renovate reports as 'Error obtaining docker token' on every run.",
+      "matchFileNames": ["charts/scalo-service/skeleton/Chart.yaml"],
+      "enabled": false
+    },
+    {
       "description": "OpenTelemetry SDK + exporters + the tracing bridge + the metrics bridge move in lockstep -- held at 0.31 while metrics-exporter-opentelemetry requires it. Bumping one alone breaks the build.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["/^opentelemetry/", "tracing-opentelemetry", "metrics-exporter-opentelemetry"],
