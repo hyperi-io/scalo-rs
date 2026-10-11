@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.7](https://github.com/hyperi-io/scalo-rs/compare/v2.14.6...v2.14.7) (2026-10-11)
+
+### Bug Fixes
+
+* publish the current one-line description ([#327](https://github.com/hyperi-io/scalo-rs/issues/327)) ([41b27d1](https://github.com/hyperi-io/scalo-rs/commit/41b27d1d2787ecca28ec3bdad202872f85c73bab))
+
 ## [2.14.6](https://github.com/hyperi-io/scalo-rs/compare/v2.14.5...v2.14.6) (2026-10-11)
 
 ### Bug Fixes
