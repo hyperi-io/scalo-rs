@@ -206,9 +206,13 @@ fn build_span_exporter(
             .with_endpoint(&config.endpoint)
             .with_timeout(timeout)
             .build(),
+        // The builder POSTs to the endpoint verbatim, so the base URL needs the signal path.
         OtelTracingProtocol::Http => opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(&config.endpoint)
+            .with_endpoint(crate::otel_backoff::append_signal_path(
+                &config.endpoint,
+                "v1/traces",
+            ))
             .with_timeout(timeout)
             .build(),
     };

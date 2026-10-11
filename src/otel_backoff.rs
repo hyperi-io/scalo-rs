@@ -22,6 +22,9 @@
 //! nothing -- OTLP is cumulative by default, so the next export that lands
 //! carries the full value. For spans it drops the batch, which is the same
 //! outcome as the bounded queue overflowing, only cheaper.
+//!
+//! The OTLP/HTTP signal path lives here too, so metrics and tracing build the
+//! export URL one way. Mirrors `scalo-py` `otel_backoff.py`.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -30,6 +33,26 @@ use crate::backoff::Backoff;
 
 /// Ceiling on the wait between attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(900);
+
+/// Append an OTLP signal path to a base endpoint, for the HTTP protocol.
+///
+/// scalo's `endpoint` and `OTEL_EXPORTER_OTLP_ENDPOINT` are base URLs that each
+/// signal appends its own path to, and the exporter POSTs to whatever endpoint
+/// its builder is handed, unchanged. An endpoint already ending in the signal
+/// path is returned as it is, so a full signal URL is never doubled.
+///
+/// gRPC has no per-signal path, so this applies to the HTTP protocol only.
+pub(crate) fn append_signal_path(endpoint: &str, signal_path: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    let names_the_signal = trimmed
+        .strip_suffix(signal_path)
+        .is_some_and(|base| base.ends_with('/'));
+    if names_the_signal {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/{signal_path}")
+    }
+}
 
 /// Tracks consecutive export failures and how long to stay quiet.
 #[derive(Debug)]
@@ -292,6 +315,51 @@ mod tests {
             let wait = gate.wait_for(failures);
             assert!(wait <= MAX_BACKOFF, "wait {wait:?} exceeded the ceiling");
         }
+    }
+
+    #[test]
+    fn a_base_endpoint_gets_the_signal_path() {
+        assert_eq!(
+            append_signal_path("http://collector:4318", "v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            append_signal_path("http://collector:4318/", "v1/metrics"),
+            "http://collector:4318/v1/metrics"
+        );
+    }
+
+    #[test]
+    fn a_base_path_prefix_is_kept_and_extended() {
+        // The spec appends the signal path to a base URL that carries a path of its own.
+        assert_eq!(
+            append_signal_path("https://gateway.example/otlp/", "v1/traces"),
+            "https://gateway.example/otlp/v1/traces"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_naming_the_signal_is_used_as_given() {
+        assert_eq!(
+            append_signal_path("http://collector:4318/v1/traces", "v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            append_signal_path("http://collector:4318/v1/metrics/", "v1/metrics"),
+            "http://collector:4318/v1/metrics"
+        );
+    }
+
+    #[test]
+    fn a_lookalike_suffix_is_not_the_signal_path() {
+        assert_eq!(
+            append_signal_path("http://collector:4318/xv1/traces", "v1/traces"),
+            "http://collector:4318/xv1/traces/v1/traces"
+        );
+        assert_eq!(
+            append_signal_path("http://collector:4318/v1/traces", "v1/metrics"),
+            "http://collector:4318/v1/traces/v1/metrics"
+        );
     }
 
     #[test]

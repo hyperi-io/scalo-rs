@@ -109,9 +109,13 @@ fn build_otlp_exporter(
                 .build()
                 .map_err(|e| MetricsError::BuildError(format!("OTel gRPC exporter: {e}")))
         }
+        // The builder POSTs to the endpoint verbatim, so the base URL needs the signal path.
         OtelProtocol::Http => opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(&resolved.endpoint)
+            .with_endpoint(crate::otel_backoff::append_signal_path(
+                &resolved.endpoint,
+                "v1/metrics",
+            ))
             .with_timeout(resolved.export_timeout)
             .with_headers(resolved.headers.clone())
             .build()
