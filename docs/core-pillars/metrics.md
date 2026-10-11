@@ -229,7 +229,18 @@ batching config.
 
 On the `http` protocol the endpoint is a base URL and `/v1/metrics` is appended
 to it, because the exporter POSTs to whatever endpoint it is handed, unchanged.
-An endpoint that already ends in `/v1/metrics` is used as it is.
+An endpoint that already ends in `/v1/metrics` is used as it is. With no
+endpoint configured the default follows the protocol: `http://localhost:4317`
+for `grpc`, `http://localhost:4318` for `http`, including when
+`OTEL_EXPORTER_OTLP_PROTOCOL` picks it.
+
+The OTLP resource names the replica, so each pod of a service writes its own
+series. `service.instance.id` comes from the first of `OTEL_RESOURCE_ATTRIBUTES`,
+`POD_NAME`, `HOSTNAME` (the pod name in Kubernetes) and an id generated once per
+process. `k8s.pod.name` is added from `POD_NAME`, or from `HOSTNAME` when running
+in Kubernetes. A key `OTEL_RESOURCE_ATTRIBUTES` sets is never overwritten, and
+`metrics.otel.resource_attributes` wins over all of them. Spans carry the same
+identity.
 
 ---
 
@@ -250,7 +261,7 @@ An endpoint that already ends in `/v1/metrics` is used as it is.
 | `render_handle() -> Option<RenderHandle>` | Cloneable Prometheus text renderer for axum routes |
 | `start_server(addr)` / `start_server_with_routes(addr, extra)` | Built-in router / merge service routes |
 | `shutdown_otel()` | Flush OTLP batch exporter |
-| `ServiceMetrics::register(&mgr)` | Canonical data-plane metric set (feature `service-metrics`) |
+| `ServiceMetrics::register(&mgr)` | Canonical data-plane metric set (feature `metrics` or `otel-metrics`) |
 | `latency_buckets()` / `size_buckets()` | Standard histogram bucket presets |
 
 ---

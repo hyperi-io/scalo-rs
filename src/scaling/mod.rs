@@ -24,8 +24,10 @@
 //!
 //! `MetricsManager` serves `calculate()` as plain text at `/scaling/pressure`
 //! once a pressure is attached with `set_scaling_pressure`, which
-//! `ServiceRuntime` does. Nothing copies it into the `scaling_pressure` gauge:
-//! an app that scales on the gauge sets it itself, with
+//! `ServiceRuntime` does. With the `service-metrics` feature `ServiceRuntime`
+//! also writes the served value into the `scaling_pressure` gauge once a
+//! second, so the scrape and the OTLP push carry it with no app code. A
+//! service built without `ServiceRuntime` sets the gauge itself, with
 //! `ServiceMetrics::scaling_pressure(pressure.calculate())`.
 //!
 //! ## Usage
@@ -64,8 +66,8 @@
 //! CPU utilisation). Configure both triggers independently in your
 //! KEDA `ScaledObject`:
 //!
-//! - `scaling_pressure` gauge, set by the app -> Prometheus scaler
-//!   (app-level signals)
+//! - `scaling_pressure` gauge, set by `ServiceRuntime` or the app -> the
+//!   deployment's pressure trigger (app-level signals)
 //! - CPU utilisation -> CPU scaler (container-level, via metrics-server)
 //!
 //! KEDA scales to the MAX of all triggers.

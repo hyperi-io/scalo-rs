@@ -30,6 +30,8 @@
 //!   which `worker-batch` includes)
 //! - [`ScalingPressure`](crate::scaling::ScalingPressure) -- KEDA signals
 //!   (`scaling` feature)
+//! - The `scaling_pressure` gauge, written once a second from the value
+//!   `/scaling/pressure` serves (`scaling` + `service-metrics` features)
 //!
 //! ## What stays app-specific
 //!
@@ -229,6 +231,15 @@ impl ServiceRuntime {
             pool.start_scaling_loop(shutdown.clone());
         }
 
+        // An OTLP push carries the gauge and never the route, so the served value is copied into it.
+        #[cfg(all(feature = "scaling", feature = "service-metrics"))]
+        spawn_scaling_pressure_gauge(
+            metrics.scaling_pressure_slot(),
+            Arc::clone(&service_metrics),
+            SCALING_PRESSURE_GAUGE_INTERVAL,
+            shutdown.clone(),
+        );
+
         // --- Start metrics server ---
         if let Err(e) = metrics.start_server(metrics_addr).await {
             tracing::error!(error = %e, addr = metrics_addr, "Failed to start metrics server");
@@ -351,6 +362,44 @@ impl ServiceRuntime {
     }
 }
 
+/// How often the runtime writes the served scaling pressure into the
+/// `scaling_pressure` gauge.
+#[cfg(all(feature = "scaling", feature = "service-metrics"))]
+const SCALING_PRESSURE_GAUGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Write the pressure `/scaling/pressure` serves into the `scaling_pressure`
+/// gauge on every `interval` tick, the first at once, until `shutdown` is
+/// cancelled.
+///
+/// Reads the metrics listener's slot rather than the runtime's own pressure, so
+/// an app that attaches a different pressure with
+/// [`MetricsManager::set_scaling_pressure`] gets that value in the gauge too.
+/// Only `scaling_pressure` is written: the circuit and memory gauges are the
+/// app's, measured its own way.
+#[cfg(all(feature = "scaling", feature = "service-metrics"))]
+fn spawn_scaling_pressure_gauge(
+    served: crate::metrics::ScalingPressureSlot,
+    service_metrics: Arc<crate::metrics::ServiceMetrics>,
+    interval: std::time::Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                _ = tick.tick() => {
+                    if let Some(pressure) = crate::metrics::served_scaling_pressure(&served) {
+                        service_metrics.scaling_pressure(pressure);
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Describe every metric the scalo runtime emits into `manager`: the service
 /// set, the app info set, and the worker pool and batch engine sets when their
 /// features are compiled in.
@@ -461,6 +510,297 @@ mod tests {
         assert_eq!(body, "42.00");
 
         runtime.shutdown.cancel();
+    }
+
+    /// OTLP push carries the gauge and not the route, so the runtime keeps the
+    /// gauge current with no app code and no traffic.
+    #[cfg(all(feature = "scaling", feature = "service-metrics"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_writes_the_scaling_pressure_gauge_with_no_traffic() {
+        let runtime = probe_runtime("gauge-probe").await;
+
+        assert_eq!(
+            await_rendered_pressure(&runtime, 0.0).await,
+            Some(0.0),
+            "the gauge is written after build, before the app does anything"
+        );
+
+        runtime
+            .scaling
+            .as_ref()
+            .expect("the scaling feature builds a pressure")
+            .set_component("probe", 42.0);
+        assert_eq!(
+            await_rendered_pressure(&runtime, 42.0).await,
+            Some(42.0),
+            "the gauge follows the pressure within an interval"
+        );
+
+        runtime.shutdown.cancel();
+    }
+
+    /// An app that writes the gauge itself from `runtime.scaling` writes the
+    /// same value the runtime does, so the two writers never disagree.
+    #[cfg(all(feature = "scaling", feature = "service-metrics"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_app_writing_the_gauge_from_the_runtime_engine_agrees_with_the_runtime() {
+        let runtime = probe_runtime("second-writer-probe").await;
+        let engine = runtime
+            .scaling
+            .clone()
+            .expect("the scaling feature builds a pressure");
+
+        let attached = runtime
+            .metrics
+            .scaling_pressure_slot()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .expect("build attaches the runtime's pressure");
+        assert!(
+            Arc::ptr_eq(&attached, &engine),
+            "the gauge ticker reads the engine the app reads from runtime.scaling"
+        );
+
+        engine.set_component("probe", 42.0);
+        runtime.service_metrics.scaling_pressure(engine.calculate());
+        assert_eq!(await_rendered_pressure(&runtime, 42.0).await, Some(42.0));
+
+        // Several more runtime ticks land on the value the app wrote.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(rendered_pressure(&runtime), Some(42.0));
+
+        runtime.shutdown.cancel();
+    }
+
+    /// The ticker on its own, under a paused clock and a thread-local recorder:
+    /// the current-thread runtime polls the spawned task on the test thread.
+    #[cfg(all(feature = "scaling", feature = "service-metrics"))]
+    mod gauge_ticker {
+        use std::sync::{Arc, RwLock};
+        use std::time::Duration;
+
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::{SCALING_PRESSURE_GAUGE_INTERVAL, spawn_scaling_pressure_gauge};
+        use super::pressure_sample;
+        use crate::metrics::{MetricsManager, ScalingPressureSlot, ServiceMetrics};
+        use crate::scaling::{ScalingComponent, ScalingPressure, ScalingPressureConfig};
+
+        /// A pressure whose `probe` component reads straight through.
+        fn probe_pressure() -> Arc<ScalingPressure> {
+            Arc::new(ScalingPressure::new(
+                ScalingPressureConfig::default(),
+                vec![ScalingComponent::new("probe", 1.0, 100.0)],
+            ))
+        }
+
+        fn slot(pressure: Option<Arc<ScalingPressure>>) -> ScalingPressureSlot {
+            Arc::new(RwLock::new(pressure))
+        }
+
+        fn service_metrics() -> Arc<ServiceMetrics> {
+            Arc::new(ServiceMetrics::register(&MetricsManager::new_for_test("")))
+        }
+
+        fn gauge(handle: &metrics_exporter_prometheus::PrometheusHandle) -> Option<f64> {
+            pressure_sample(&handle.render())
+        }
+
+        /// Long enough for the task to take any tick that is due.
+        async fn settle() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_first_tick_writes_the_gauge_at_once() {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = ::metrics::set_default_local_recorder(&recorder);
+
+            let shutdown = CancellationToken::new();
+            let _task = spawn_scaling_pressure_gauge(
+                slot(Some(probe_pressure())),
+                service_metrics(),
+                SCALING_PRESSURE_GAUGE_INTERVAL,
+                shutdown.clone(),
+            );
+            settle().await;
+
+            assert_eq!(
+                gauge(&handle),
+                Some(0.0),
+                "written before any interval passes"
+            );
+            shutdown.cancel();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn each_tick_writes_whichever_pressure_is_attached_now() {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = ::metrics::set_default_local_recorder(&recorder);
+
+            let runtime_pressure = probe_pressure();
+            let served = slot(Some(Arc::clone(&runtime_pressure)));
+            let shutdown = CancellationToken::new();
+            let _task = spawn_scaling_pressure_gauge(
+                Arc::clone(&served),
+                service_metrics(),
+                SCALING_PRESSURE_GAUGE_INTERVAL,
+                shutdown.clone(),
+            );
+            settle().await;
+
+            runtime_pressure.set_component("probe", 42.0);
+            tokio::time::sleep(SCALING_PRESSURE_GAUGE_INTERVAL).await;
+            assert_eq!(
+                gauge(&handle),
+                Some(42.0),
+                "the next tick carries the change"
+            );
+
+            // An app that attaches its own pressure, as set_scaling_pressure does.
+            let app_pressure = probe_pressure();
+            app_pressure.set_component("probe", 77.0);
+            *served.write().unwrap() = Some(app_pressure);
+            tokio::time::sleep(SCALING_PRESSURE_GAUGE_INTERVAL).await;
+            assert_eq!(
+                gauge(&handle),
+                Some(77.0),
+                "the gauge follows what the route serves"
+            );
+
+            shutdown.cancel();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_task_ends_on_shutdown_and_writes_nothing_after() {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = ::metrics::set_default_local_recorder(&recorder);
+
+            let pressure = probe_pressure();
+            pressure.set_component("probe", 10.0);
+            let shutdown = CancellationToken::new();
+            let task = spawn_scaling_pressure_gauge(
+                slot(Some(Arc::clone(&pressure))),
+                service_metrics(),
+                SCALING_PRESSURE_GAUGE_INTERVAL,
+                shutdown.clone(),
+            );
+            settle().await;
+            assert_eq!(gauge(&handle), Some(10.0));
+
+            shutdown.cancel();
+            tokio::time::timeout(SCALING_PRESSURE_GAUGE_INTERVAL, task)
+                .await
+                .expect("the task ends within one interval of the cancel")
+                .expect("the task does not panic");
+
+            pressure.set_component("probe", 90.0);
+            tokio::time::sleep(5 * SCALING_PRESSURE_GAUGE_INTERVAL).await;
+            assert_eq!(gauge(&handle), Some(10.0), "no write after shutdown");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn nothing_is_written_until_a_pressure_is_attached() {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = ::metrics::set_default_local_recorder(&recorder);
+
+            let served = slot(None);
+            let shutdown = CancellationToken::new();
+            let _task = spawn_scaling_pressure_gauge(
+                Arc::clone(&served),
+                service_metrics(),
+                SCALING_PRESSURE_GAUGE_INTERVAL,
+                shutdown.clone(),
+            );
+            tokio::time::sleep(3 * SCALING_PRESSURE_GAUGE_INTERVAL).await;
+            assert_eq!(gauge(&handle), None, "an empty slot is not a zero");
+
+            let pressure = probe_pressure();
+            pressure.set_component("probe", 5.0);
+            *served.write().unwrap() = Some(pressure);
+            tokio::time::sleep(SCALING_PRESSURE_GAUGE_INTERVAL).await;
+            assert_eq!(gauge(&handle), Some(5.0));
+
+            shutdown.cancel();
+        }
+    }
+
+    /// Without `service-metrics` the runtime starts no ticker and writes no gauge.
+    #[cfg(all(feature = "scaling", not(feature = "service-metrics")))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_writes_no_scaling_pressure_gauge_without_service_metrics() {
+        let runtime = probe_runtime("no-gauge-probe").await;
+        runtime
+            .scaling
+            .as_ref()
+            .expect("the scaling feature builds a pressure")
+            .set_component("probe", 42.0);
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            rendered_pressure(&runtime),
+            None,
+            "nothing writes the gauge"
+        );
+
+        runtime.shutdown.cancel();
+    }
+
+    /// A runtime with one `probe` component (weight 1, saturating at 100), so a
+    /// component value reads straight through as the pressure.
+    #[cfg(feature = "scaling")]
+    async fn probe_runtime(name: &str) -> ServiceRuntime {
+        ServiceRuntime::build(
+            name,
+            "PROBE",
+            "127.0.0.1:0",
+            "1.2.3",
+            "probe",
+            vec![crate::ScalingComponent::new("probe", 1.0, 100.0)],
+            #[cfg(feature = "version-check")]
+            crate::VersionCheckConfig::default(),
+        )
+        .await
+        .expect("the runtime builds")
+    }
+
+    /// The bare `scaling_pressure` sample in the runtime's Prometheus output.
+    #[cfg(feature = "scaling")]
+    fn rendered_pressure(runtime: &ServiceRuntime) -> Option<f64> {
+        pressure_sample(&runtime.metrics.render())
+    }
+
+    /// The bare `scaling_pressure` sample in Prometheus text, or `None` when the
+    /// gauge was never set.
+    #[cfg(feature = "scaling")]
+    fn pressure_sample(rendered: &str) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            line.strip_prefix("scaling_pressure ")?
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+    }
+
+    /// The rendered gauge once it reads `want`, or the last value seen when
+    /// three seconds pass without it.
+    #[cfg(all(feature = "scaling", feature = "service-metrics"))]
+    async fn await_rendered_pressure(runtime: &ServiceRuntime, want: f64) -> Option<f64> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let seen = rendered_pressure(runtime);
+            if seen.is_some_and(|v| (v - want).abs() < 1e-9)
+                || tokio::time::Instant::now() >= deadline
+            {
+                return seen;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// A loopback address with a port nothing is bound to.

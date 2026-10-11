@@ -85,7 +85,8 @@ pub struct OtelTracingConfig {
     /// Set `false`, or blank the [`endpoint`](Self::endpoint), to export
     /// nothing. Either way the `tracing` logger is untouched.
     pub enabled: bool,
-    /// OTLP endpoint (default `http://localhost:4317` for gRPC).
+    /// OTLP endpoint, `http://localhost:4317` by default. Left at that default,
+    /// it resolves to `http://localhost:4318` when the protocol is HTTP.
     pub endpoint: String,
     /// Wire protocol.
     pub protocol: OtelTracingProtocol,
@@ -116,7 +117,7 @@ impl Default for OtelTracingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            endpoint: "http://localhost:4317".into(),
+            endpoint: crate::otel_backoff::DEFAULT_GRPC_ENDPOINT.into(),
             protocol: OtelTracingProtocol::Grpc,
             service_name: String::new(),
             sample_ratio: 0.05,
@@ -173,16 +174,23 @@ pub enum OtelTracingError {
 
 fn resolve(config: &OtelTracingConfig) -> OtelTracingConfig {
     let mut resolved = config.clone();
-    if let Ok(v) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        resolved.endpoint = v;
-    }
-    resolved.endpoint = resolved.endpoint.trim().to_string();
     if let Ok(v) = std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL") {
         resolved.protocol = match v.as_str() {
             "http/protobuf" | "http" => OtelTracingProtocol::Http,
             _ => OtelTracingProtocol::Grpc,
         };
     }
+    // Resolved after the protocol, as the default endpoint depends on it.
+    resolved.endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| {
+            crate::otel_backoff::endpoint_for_protocol(
+                &config.endpoint,
+                resolved.protocol == OtelTracingProtocol::Http,
+            )
+            .to_string()
+        })
+        .trim()
+        .to_string();
     if let Ok(v) = std::env::var("OTEL_SERVICE_NAME") {
         resolved.service_name = v;
     }
@@ -222,6 +230,15 @@ fn build_span_exporter(
     })
 }
 
+/// The OTLP resource every exported span carries: `service.name` and the
+/// replica's identity, the same identity the metrics resource carries.
+fn resource(resolved: &OtelTracingConfig) -> Resource {
+    Resource::builder()
+        .with_service_name(resolved.service_name.clone())
+        .with_attributes(crate::otel_resource::instance_attributes())
+        .build()
+}
+
 /// Build an OTel tracer + tracing-subscriber layer ready for composition.
 ///
 /// Sets the resulting [`SdkTracerProvider`] as the **global** tracer
@@ -251,9 +268,7 @@ where
 
     let exporter = build_span_exporter(&resolved)?;
 
-    let resource = Resource::builder()
-        .with_service_name(resolved.service_name.clone())
-        .build();
+    let resource = resource(&resolved);
 
     // Bounded queue: spans are dropped once it fills, so an unreachable
     // collector costs telemetry and never memory.
@@ -530,6 +545,78 @@ mod tests {
                 "OTEL_TRACES_SAMPLER_ARG must win over the configured ratio"
             );
         });
+    }
+
+    #[test]
+    fn the_span_resource_names_the_replica() {
+        temp_env::with_vars(
+            [
+                ("OTEL_RESOURCE_ATTRIBUTES", None::<&str>),
+                ("POD_NAME", Some("vrl-5c4b-xyz12")),
+                ("HOSTNAME", Some("node-host")),
+            ],
+            || {
+                let resource = resource(&resolve(&OtelTracingConfig::default()));
+                let id = resource
+                    .get(&opentelemetry::Key::from_static_str("service.instance.id"))
+                    .map(|value| value.to_string());
+                assert_eq!(id.as_deref(), Some("vrl-5c4b-xyz12"));
+            },
+        );
+    }
+
+    #[test]
+    fn the_default_endpoint_follows_the_protocol() {
+        temp_env::with_vars(
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", None::<&str>),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", None::<&str>),
+            ],
+            || {
+                assert_eq!(
+                    resolve(&OtelTracingConfig::default()).endpoint,
+                    "http://localhost:4317"
+                );
+                let http = OtelTracingConfig {
+                    protocol: OtelTracingProtocol::Http,
+                    ..OtelTracingConfig::default()
+                };
+                assert_eq!(resolve(&http).endpoint, "http://localhost:4318");
+            },
+        );
+    }
+
+    #[test]
+    fn the_protocol_env_var_moves_the_default_endpoint() {
+        temp_env::with_vars(
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", None::<&str>),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", Some("http/protobuf")),
+            ],
+            || {
+                let r = resolve(&OtelTracingConfig::default());
+                assert_eq!(r.protocol, OtelTracingProtocol::Http);
+                assert_eq!(r.endpoint, "http://localhost:4318");
+            },
+        );
+    }
+
+    #[test]
+    fn a_configured_endpoint_is_used_as_given() {
+        temp_env::with_vars(
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", None::<&str>),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", None::<&str>),
+            ],
+            || {
+                let cfg = OtelTracingConfig {
+                    protocol: OtelTracingProtocol::Http,
+                    endpoint: "http://collector:4317".to_string(),
+                    ..OtelTracingConfig::default()
+                };
+                assert_eq!(resolve(&cfg).endpoint, "http://collector:4317");
+            },
+        );
     }
 
     #[test]

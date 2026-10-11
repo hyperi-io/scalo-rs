@@ -117,7 +117,7 @@ type ReadinessSlot = Arc<RwLock<Option<ReadinessFn>>>;
 /// [`MetricsManager::set_scaling_pressure`] takes effect after the listener
 /// has started.
 #[cfg(all(feature = "metrics", feature = "scaling"))]
-type ScalingPressureSlot = Arc<RwLock<Option<Arc<crate::scaling::ScalingPressure>>>>;
+pub(crate) type ScalingPressureSlot = Arc<RwLock<Option<Arc<crate::scaling::ScalingPressure>>>>;
 
 /// Shared slot the running server reads on every `/memory/pressure`.
 ///
@@ -868,6 +868,13 @@ impl MetricsManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sp);
     }
 
+    /// The slot `/scaling/pressure` answers from, shared rather than copied, so
+    /// a reader sees whichever pressure was attached last.
+    #[cfg(all(feature = "cli-service", feature = "service-metrics"))]
+    pub(crate) fn scaling_pressure_slot(&self) -> ScalingPressureSlot {
+        Arc::clone(&self.scaling_pressure)
+    }
+
     /// Attach a `MemoryGuard` instance.
     ///
     /// When set and using `start_server_with_routes`, `/memory/pressure`
@@ -1404,12 +1411,22 @@ fn readiness_response(rf: ReadinessSlot) -> axum::response::Response {
 /// pressure attached after the listener started is served.
 #[cfg(all(feature = "metrics", feature = "scaling"))]
 fn scaling_pressure_body(slot: &ScalingPressureSlot) -> Option<String> {
+    served_scaling_pressure(slot).map(|value| format!("{value:.2}"))
+}
+
+/// The pressure `/scaling/pressure` serves, or `None` when nothing is attached.
+///
+/// The route and the runtime's `scaling_pressure` gauge both read this, so the
+/// value KEDA polls and the value the metrics carry cannot differ.
+#[cfg(all(feature = "metrics", feature = "scaling"))]
+#[must_use]
+pub(crate) fn served_scaling_pressure(slot: &ScalingPressureSlot) -> Option<f64> {
     let attached = slot
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
 
-    attached.map(|sp| format!("{:.2}", sp.calculate()))
+    attached.map(|sp| sp.calculate())
 }
 
 /// Build the `/scaling/pressure` response, or 404 when nothing is attached.

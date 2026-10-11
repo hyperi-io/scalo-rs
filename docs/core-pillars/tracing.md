@@ -127,12 +127,17 @@ wiring.
 ## Exporter
 
 OTLP gRPC over `tonic` by default (endpoint `http://localhost:4317`), OTLP
-HTTP/protobuf optional. On the `http` protocol `endpoint` is a base URL, the
+HTTP/protobuf optional. With no endpoint configured the default follows the
+protocol: `http://localhost:4318` once `protocol` or `OTEL_EXPORTER_OTLP_PROTOCOL`
+picks `http`. On the `http` protocol `endpoint` is a base URL, the
 way the OTel spec defines `OTEL_EXPORTER_OTLP_ENDPOINT`, and `/v1/traces` is
 appended to it. An endpoint that already ends in `/v1/traces` is used as given.
 The batch processor coalesces spans every 5 seconds
 (`batch_scheduled_delay_ms`) with a 2 048-span queue (`batch_max_queue_size`);
 tune both for high-volume services.
+
+The span resource carries the replica's identity, the same as the metrics
+resource: see [metrics.md](metrics.md#otel-mode).
 
 If the collector is unreachable the SDK batch processor drops spans on a full
 queue and the process keeps running -- there is no built-in retry, fallback metric,

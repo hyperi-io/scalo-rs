@@ -194,7 +194,7 @@ gate when both fire:
 | Circuit-breaker open | Downstream sink unreachable | `0.0` -- scaling won't help |
 | Memory >= threshold | Pod approaching OOM | `100.0` -- scale before kill |
 
-Outside the gates, components are weighted (sum to 1.0) and each saturates at its configured ceiling. The scalo-service chart does not read the score. The app sets it on the `scaling_pressure` gauge through the `ServiceMetrics` helper, with the `metrics.namespace` prefix when one is set. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it; [../pipeline/scaling.md](../pipeline/scaling.md#how-keda-reads-it) shows the trigger.
+Outside the gates, components are weighted (sum to 1.0) and each saturates at its configured ceiling. The scalo-service chart does not read the score. It reaches the `scaling_pressure` gauge, with the `metrics.namespace` prefix when one is set: `ServiceRuntime` writes it once a second when `service-metrics` is on, and a service outside the runtime writes it through the `ServiceMetrics` helper. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it; [../pipeline/scaling.md](../pipeline/scaling.md#how-keda-reads-it) shows the trigger.
 
 ---
 
