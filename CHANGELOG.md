@@ -3,6 +3,14 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.8](https://github.com/hyperi-io/scalo-rs/compare/v2.14.7...v2.14.8) (2026-10-11)
+
+### Bug Fixes
+
+* **deps:** update docker-images ([#332](https://github.com/hyperi-io/scalo-rs/issues/332)) ([21e111e](https://github.com/hyperi-io/scalo-rs/commit/21e111e55a207590828c3617ca5794f866a2d322))
+* post OTLP/HTTP spans and metrics to the signal path ([#330](https://github.com/hyperi-io/scalo-rs/issues/330)) ([3d438e2](https://github.com/hyperi-io/scalo-rs/commit/3d438e20331ac99a0770b54863e91833fd94efb0))
+* runtime writes the scaling pressure gauge ([#331](https://github.com/hyperi-io/scalo-rs/issues/331)) ([dce9849](https://github.com/hyperi-io/scalo-rs/commit/dce98491f753f17054e5a71fbad05d7e74a499ff))
+
 ## [2.14.7](https://github.com/hyperi-io/scalo-rs/compare/v2.14.6...v2.14.7) (2026-10-11)
 
 ### Bug Fixes
