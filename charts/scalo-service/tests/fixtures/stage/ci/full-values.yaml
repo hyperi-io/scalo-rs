@@ -5,6 +5,8 @@ commonLabels:
   team: data
 commonAnnotations:
   owner: data-team
+  # KEDA owns the replica count, so the Deployment carries none and the linter reads 1.
+  ignore-check.kube-linter.io/pdb-min-available: "replicas are KEDA-owned (keda.maxReplicaCount 20)"
 podLabels:
   tier: stage
 podAnnotations:
@@ -84,9 +86,19 @@ initContainers:
   - name: wait
     image: busybox:1.37
     command: ["sh", "-c", "echo {{ .Release.Namespace }}"]
+    resources:
+      requests: {cpu: 10m, memory: 16Mi}
+      limits: {memory: 32Mi}
+    securityContext:
+      readOnlyRootFilesystem: true
 sidecars:
   - name: proxy
     image: envoyproxy/envoy:v1.36.0
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {memory: 128Mi}
+    securityContext:
+      readOnlyRootFilesystem: true
 extraVolumes:
   - name: certs
     secret:

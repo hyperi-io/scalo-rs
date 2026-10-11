@@ -2,6 +2,8 @@
 keda:
   enabled: false
 replicaCount: 3
+commonAnnotations:
+  ignore-check.kube-linter.io/no-anti-affinity: "library default pending scalo-rs#325"
 configMount:
   subPath: true
 config:
