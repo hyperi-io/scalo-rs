@@ -15,8 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use vaultrs::api::kv2::requests::ReadSecretRequest;
 use vaultrs::client::{Client, VaultClient, VaultClientSettingsBuilder};
-use vaultrs::kv2;
 
 use super::error::{SecretsError, SecretsResult};
 use super::provider::SecretProvider;
@@ -365,6 +365,8 @@ impl OpenBaoProvider {
 
     /// Get a secret from Vault KV v2.
     ///
+    /// The returned metadata carries the KV version the value was read at.
+    ///
     /// # Errors
     ///
     /// Returns an error if the secret cannot be fetched.
@@ -375,19 +377,27 @@ impl OpenBaoProvider {
         // mount; a path with no "/" reads from the "secret" mount.
         let (mount, secret_path) = Self::parse_path(path)?;
 
-        // Read the secret
+        let endpoint = ReadSecretRequest::builder()
+            .mount(mount)
+            .path(secret_path)
+            .build()
+            .map_err(|e| SecretsError::ConfigError(format!("invalid vault path '{path}': {e}")))?;
+
+        // One KV v2 read returns the data and its version metadata together.
+        let response = vaultrs::api::exec_with_result(&client, endpoint)
+            .await
+            .map_err(|e| {
+                // Check for auth errors (token expired)
+                if e.to_string().contains("403") || e.to_string().contains("permission denied") {
+                    SecretsError::AuthError("Vault token expired or invalid".into())
+                } else {
+                    SecretsError::ProviderError(format!("failed to read secret {path}: {e}"))
+                }
+            })?;
         let secret: std::collections::HashMap<String, String> =
-            kv2::read(&client, &mount, &secret_path)
-                .await
-                .map_err(|e| {
-                    // Check for auth errors (token expired)
-                    if e.to_string().contains("403") || e.to_string().contains("permission denied")
-                    {
-                        SecretsError::AuthError("Vault token expired or invalid".into())
-                    } else {
-                        SecretsError::ProviderError(format!("failed to read secret {path}: {e}"))
-                    }
-                })?;
+            serde_json::from_value(response.data).map_err(|e| {
+                SecretsError::ProviderError(format!("failed to read secret {path}: {e}"))
+            })?;
 
         // Extract the requested key
         let value = secret.get(key).ok_or_else(|| {
@@ -395,7 +405,7 @@ impl OpenBaoProvider {
         })?;
 
         let metadata = SecretMetadata {
-            version: None, // KV v2 version would require additional API call
+            version: Some(response.metadata.version.to_string()),
             source_path: Some(path.to_string()),
             provider: Some("openbao".into()),
         };
@@ -409,7 +419,7 @@ impl OpenBaoProvider {
     /// Parse a Vault path into its mount and the secret path under that mount.
     ///
     /// The first segment is the mount; a `data` segment after it is the KV v2
-    /// API prefix `kv2::read` adds itself, not part of the secret path:
+    /// API prefix the read request adds itself, not part of the secret path:
     /// - "secret/data/myapp/tls" -> ("secret", "myapp/tls")
     /// - "kv/myapp/tls" -> ("kv", "myapp/tls")
     /// - "myapp" -> ("secret", "myapp"), the only path with no mount to read

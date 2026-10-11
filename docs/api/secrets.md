@@ -4,7 +4,7 @@
 runtime -- passwords, API tokens, TLS keys. Backends include a file
 provider that's always available, OpenBao/Vault, and AWS Secrets
 Manager. The manager caches values with a TTL and broadcasts rotation
-events when an underlying source changes.
+events when a refresh finds that a source's version has changed.
 
 Where `SensitiveString` (from `config`) covers values that arrive
 through the config cascade, `SecretsManager` covers values that need
@@ -32,16 +32,16 @@ Backend-specific providers are opt-in.
 ```rust
 use scalo::secrets::{SecretsConfig, SecretsManager};
 
-let mgr = SecretsManager::new(SecretsConfig::from_cascade()?)?;
+let mgr = SecretsManager::new(SecretsConfig::from_cascade())?;
 
-let pwd = mgr.get("kafka/password").await?;
+let pwd = mgr.get("db_password").await?;
 let key = mgr.get_file("/var/secrets/tls/tls.key").await?;
 
 let creds = format!("{}:{}", username, pwd.as_str()?);
 ```
 
-`get()` resolves through whichever backend the secret name routes to
-(based on config). `get_file()` reads from a local path -- useful for
+`get()` takes a source name from `secrets.sources` and reads it from the backend that entry names (see [Config shape](#config-shape)).
+`get_file()` reads from a local path -- useful for
 K8s `Secret` volume mounts that come through as files.
 
 ---
@@ -79,29 +79,50 @@ feature is off.
 
 ## Caching
 
-Results are cached with a configurable TTL. Cache hits skip the
-network. `refresh_all()` forces re-fetch of every cached secret;
-`clear_cache()` drops the cache without re-fetching.
+`get()` serves a cached value until `ttl_secs` passes, then goes back to the backend. If the backend fails, `get()` serves the expired value for up to `stale_grace_secs` more before returning the error. The disk tier is written only with an `encryption_key`, or with `allow_plaintext_disk_cache` outside production. Without either the cache is memory-only.
+
+`refresh_all()` re-fetches every source in `secrets.sources` from its backend, fresh entries included, and replaces the cached values, so the next `get()` returns them. A source that fails is named in the returned `SecretsError::RefreshFailed` and keeps its cached value, and the other sources still refresh. Unlike `get()`, `refresh_all()` never answers a failed source from the stale cache. Paths read with `get_file()` are not refreshed. `clear_cache()` drops the cache without re-fetching.
+
+scalo runs no background refresh. Call `refresh_all()` on your own schedule, a `tokio::time::interval` loop for example.
 
 ```rust
-let stats = mgr.cache_stats();    // hits, misses, size
+let stats = mgr.cache_stats();    // memory and disk entries, hits, misses, stale hits
 mgr.clear_cache();                // e.g. after a known rotation
-mgr.refresh_all().await?;         // force re-fetch
+mgr.refresh_all().await?;         // re-fetch every configured source
 ```
+
+### Turning caching off
+
+`cache.enabled: false` turns off both tiers. Nothing is held in memory, nothing is written to disk and no cache directory is created. With it off:
+
+- every `get()` and `get_file()` reads from the backend
+- a backend failure is returned to the caller, never answered from a stale value
+- `refresh_all()` re-reads every source but sends no rotation events, because there is no previous version to compare against
+
+The TTL, grace period, directory, encryption and file-mode settings have no effect while it is off.
 
 ---
 
 ## Rotation events
 
-Subscribers see a `RotationEvent` when the manager detects a backend
-secret has changed (next refresh after the cache TTL expires, or after
-an explicit `refresh_all`):
+`refresh_all()` sends a `RotationEvent` when the version it fetches for a source differs from the version the cache last held for that source, expired or not. The event carries both versions. `get()` never sends one.
+
+Only backends that report a version can rotate: OpenBao (the KV v2 version number) and AWS Secrets Manager (the version id). A file source reports none, and with caching off there is no previous version, so neither produces an event.
 
 ```rust
+use tokio::sync::broadcast::error::RecvError;
+
 let mut rx = mgr.subscribe_rotations();
-while let Ok(event) = rx.recv().await {
-    tracing::info!(name = %event.name, "secret rotated");
-    // tear down and rebuild any client that uses the old value
+loop {
+    match rx.recv().await {
+        Ok(event) => {
+            tracing::info!(name = %event.name, version = %event.new_version, "secret rotated");
+            // tear down and rebuild any client that uses the old value
+        }
+        // The channel holds 16 events, so a slow subscriber skips the oldest.
+        Err(RecvError::Lagged(_)) => continue,
+        Err(RecvError::Closed) => break,
+    }
 }
 ```
 
@@ -128,23 +149,72 @@ HealthRegistry::register("secrets", move || async move {
 
 ## Config shape
 
+`SecretsConfig::from_cascade()` reads the `secrets` key. Every block is optional, and every `cache` value below is its default except `directory`.
+
 ```yaml
 secrets:
-  default_backend: file       # file | vault | aws
-  cache_ttl: 300s
-  file:
-    base_path: /var/secrets
-  vault:
-    address: https://vault.internal:8200
-    auth: kubernetes          # token | kubernetes | approle
-    mount: secret/
-  aws:
+  cache:
+    enabled: true
+    ttl_secs: 3600
+    stale_grace_secs: 86400
+    directory: /var/cache/myapp/secrets
+    allow_plaintext_disk_cache: false
+  openbao:                    # needs the secrets-vault feature
+    address: https://openbao.example.com:8200
+    auth:
+      method: kubernetes      # token | app_role | kubernetes
+      role: myapp
+    ca_cert: /etc/ssl/openbao-ca.pem
+  aws:                        # needs the secrets-aws feature
     region: ap-southeast-2
+  sources:
+    db_password:
+      provider: open_bao
+      path: secret/data/myapp/db
+      key: password
+    tls_key:
+      provider: file
+      path: /var/secrets/tls/tls.key
+    api_token:
+      provider: aws
+      secret_id: myapp/api
+      key: token
 ```
 
-Per-secret backend routing is configurable -- e.g. send
-`kafka/password` to Vault and leave `local/dev/token` on the file
-backend.
+Each entry under `sources` is a name `get()` takes, routed to one backend:
+
+| `provider` | Fields | Feature |
+| ---------- | ------ | ------- |
+| `file` | `path` | `secrets` |
+| `open_bao` | `path` as `<mount>/<path>` (the KV v2 `data` segment optional), `key` | `secrets-vault` |
+| `aws` | `secret_id`, plus an optional `key` that picks one key out of a JSON secret | `secrets-aws` |
+
+A source whose backend's feature is off fails with `SecretsError::ProviderNotConfigured`.
+
+`cache`:
+
+| Field | Default | Effect |
+| ----- | ------- | ------ |
+| `enabled` | `true` | `false` turns the cache off, see [Turning caching off](#turning-caching-off) |
+| `ttl_secs` | `3600` | Seconds a cached value is served without going to the backend |
+| `stale_grace_secs` | `86400` | Seconds past the TTL that `get()` still serves a cached value when the backend fails |
+| `directory` | the platform cache directory (`~/.cache` on Linux) + `scalo/secrets` | Where the disk tier writes, created when the manager is built |
+| `encryption_key` | unset | Encrypts the disk tier with AES-256-GCM. Unset, the disk tier is skipped and the cache is memory-only |
+| `allow_plaintext_disk_cache` | `false` | Writes the disk tier unencrypted when no `encryption_key` is set. Rejected under a production profile |
+| `dir_mode` | `0o700` | Unix mode forced on `directory`. `null` skips the chmod |
+| `file_mode` | `0o600` | Unix mode for cache files. `null` skips the chmod |
+| `refresh_interval_secs` | `1800` | Parsed, read by nothing: there is no background refresh |
+| `refresh_jitter_secs` | `300` | Parsed, read by nothing, as above |
+
+`openbao` takes `address`, `auth`, and optionally `namespace`, `ca_cert` (a PEM CA file) and `skip_verify` (default `false`, rejected under a production profile). `auth.method` picks the fields that go with it:
+
+| `method` | Fields |
+| -------- | ------ |
+| `token` | `token` |
+| `app_role` | `role_id`, `secret_id`, `mount` (default `approle`) |
+| `kubernetes` | `role`, `token_path` (default the pod's service account token), `mount` (default `kubernetes`) |
+
+`aws` takes `region` and `endpoint_url`, both optional. An unset region is left to the AWS SDK's own resolution chain.
 
 ---
 
@@ -156,12 +226,12 @@ backend.
 | `SecretsConfig::from_cascade()` | Build config from the global cascade (pass to `SecretsManager::new`) |
 | `.get(name) -> SecretValue` | Fetch a secret by name through routed backend |
 | `.get_file(path) -> SecretValue` | Read a secret from a local file |
-| `.refresh_all()` | Re-fetch every cached secret |
+| `.refresh_all()` | Re-fetch every configured source, report rotated versions |
 | `.clear_cache()` | Drop the cache without re-fetching |
-| `.cache_stats() -> CacheStats` | Hits, misses, current size |
+| `.cache_stats() -> CacheStats` | Memory and disk entries, hits, misses, stale hits |
 | `.subscribe_rotations() -> broadcast::Receiver<RotationEvent>` | Subscribe to rotation notifications |
 | `.health_check() -> HashMap<String, bool>` | Per-backend up/down status |
-| `SecretProvider` trait | Implement to add a custom backend |
+| `SecretProvider` trait | The interface the built-in backends implement. `SecretsManager` takes no custom backend |
 | `SecretValue::as_str() -> SecretsResult<&str>` | Reveal the raw value as UTF-8 (grep-able call site) |
 | `SecretValue::as_bytes() -> &[u8]` | Reveal the raw value as bytes |
 | `resolve(spec) -> String` | Resolve a `vault:<mount>/<path>:<key>`, `bao:`, `openbao:`, `file:`, `aws:`, `env:` or literal credential spec |
