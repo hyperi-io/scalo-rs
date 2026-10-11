@@ -276,8 +276,8 @@ is unavoidable. Reactive Streams / Flink / Kafka pause-resume all agree.
 ### External (k8s)
 
 - scalo: emits `ScalingPressure` 0-100 for the KEDA external-scaler API,
-  plus a `deployment` module that generates Dockerfile/Helm/Argo from a
-  `DeploymentContract`. So scalo ships an opinion about *how* it should be
+  plus a `DeploymentContract` the scalo-service library chart renders into
+  a Deployment and ScaledObject. So scalo ships an opinion about *how* it should be
   horizontally scaled (custom signal that already blends Kafka lag, queue
   depth, memory).
 - Vector: **does not self-scale horizontally** - explicit in the docs

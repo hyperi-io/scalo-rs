@@ -3,7 +3,9 @@ scalo-service.pdb -- a PodDisruptionBudget once replicaCount or the autoscaler f
 or more, never for a singleton, where any budget blocks every node drain. Its form follows
 the floor, the fewest pods anything can leave: minAvailable 1 at two or more, else
 maxUnavailable 1, which still lets a scaled-to-one pod move. pdb.minAvailable or
-pdb.maxUnavailable pins the form; pdb.enabled: false turns it off.
+pdb.maxUnavailable pins the form; pdb.enabled: false turns it off. A pod that is not
+Ready can always be evicted (unhealthyPodEvictionPolicy AlwaysAllow), so a crash-looping
+pod never blocks a node drain.
 */}}
 {{- define "scalo-service.pdb" -}}
 {{- $pdb := .Values.pdb | default dict -}}
@@ -24,7 +26,7 @@ pdb.maxUnavailable pins the form; pdb.enabled: false turns it off.
 {{- $floor = $autoscalerFloor -}}
 {{- end -}}
 {{- if and $enabled (not (include "scalo-service.singleton" .)) (or (ge $replicas 2) (ge $autoscalerFloor 2)) -}}
-{{- $spec := dict "selector" (dict "matchLabels" (include "scalo-service.selectorLabelSet" . | fromJson)) -}}
+{{- $spec := dict "selector" (dict "matchLabels" (include "scalo-service.selectorLabelSet" . | fromJson)) "unhealthyPodEvictionPolicy" "AlwaysAllow" -}}
 {{- if $pdb.maxUnavailable -}}
 {{- $_ := set $spec "maxUnavailable" $pdb.maxUnavailable -}}
 {{- else if $pdb.minAvailable -}}

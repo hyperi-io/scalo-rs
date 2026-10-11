@@ -163,7 +163,7 @@ writing any extra code:
 | `version` | Print `version_info()` and exit |
 | `config-check` | Load logger + config, print summary, exit non-zero on failure |
 | `metrics-manifest` | Load config (best-effort, for `metrics.namespace`), describe the scalo runtime set, call `register_metrics`, print manifest JSON to stdout, exit. Warnings go to stderr |
-| `generate-artefacts --output-dir <dir>` | Load config once (best-effort, a failure warned on stderr), then emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, `argocd-application.yaml`. Refuses, writing nothing, a contract whose `default_config` binds a listener no port declares |
+| `generate-artefacts --output-dir <dir>` | Load config once (best-effort, a failure warned on stderr), then emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, and `config-schema.*` / `capability-catalog.*` when the contract carries them. Refuses, writing nothing, a contract whose `default_config` binds a listener no port declares |
 | `top` | Live metrics TUI (when `top` feature is on) |
 
 `config-check` exists so CI can validate config without booting the

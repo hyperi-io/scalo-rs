@@ -51,10 +51,11 @@ pub const CONTRACT_SCHEMA_VERSION: u32 = 4;
 
 /// Deployment-facing contract points derived from the app config cascade.
 ///
-/// Apps build this from their `Config::default()`. Validation functions
-/// compare Helm charts and Dockerfiles against these values. Generation
-/// functions create deployment artifacts (Dockerfile, Helm chart, Compose
-/// fragment) from scratch.
+/// Apps build this from their `Config::default()`. `validate_dockerfile`
+/// compares a Dockerfile against these values, the generation functions create
+/// the Dockerfile, Compose fragment and container manifest from scratch, and
+/// the scalo-service library chart renders the Kubernetes objects from the
+/// serialised contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct DeploymentContract {
@@ -663,8 +664,8 @@ impl PortCondition {
         }
     }
 
-    /// Whether the condition holds for `default_config` rendered under
-    /// `config`, as the generated chart would evaluate it.
+    /// Whether the condition holds for `default_config` read under `config`,
+    /// as the scalo-service chart evaluates it when values set nothing.
     ///
     /// `None` when the path is not under `config.` or names nothing in
     /// `default_config`, so the answer depends on values set at install time.
@@ -848,14 +849,14 @@ impl DeploymentContract {
         self.keda.as_ref().filter(|keda| keda.enabled)
     }
 
-    /// `.Values` paths the generated chart reads that `default_config` does not
-    /// supply.
+    /// `.Values` paths the scalo-service chart reads that `default_config` does
+    /// not supply.
     ///
-    /// The chart writes `default_config` under `config`, so only a path under
+    /// The chart reads `default_config` under `config`, so only a path under
     /// `config.` can resolve. A path that resolves to null is reported as well,
-    /// because the chart renders it empty, except a port gate's path, where
-    /// null reads as off. An empty result means every path the chart reads has
-    /// a value to render.
+    /// because the chart refuses to render a Kafka lag trigger without a value,
+    /// except a port gate's path, where null reads as off. An empty result
+    /// means every path the chart reads has a value unless values unset it.
     #[must_use]
     pub fn unresolved_values_paths(&self) -> Vec<String> {
         self.chart_values_paths()
@@ -865,7 +866,7 @@ impl DeploymentContract {
             .collect()
     }
 
-    /// Every `.Values` path the generated chart reads from app config, gathered
+    /// Every `.Values` path the scalo-service chart reads from app config, gathered
     /// from each part of the contract that names one.
     fn chart_values_paths(&self) -> Vec<(&str, ValuesRead)> {
         let mut paths = Vec::new();

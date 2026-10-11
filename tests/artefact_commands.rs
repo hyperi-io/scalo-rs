@@ -351,15 +351,17 @@ fn config_schema_loads_the_config_and_survives_a_broken_one() {
     );
 }
 
-/// With no repo named for it, the ArgoCD Application is not written and the
-/// reason is on stderr; every other artefact still is.
+/// `generate-artefacts` writes no ArgoCD Application, whatever the cascade
+/// says about one: the scalo-service chart deploys from the contract.
 #[test]
-fn no_argocd_application_without_a_repo() {
-    const TEST: &str = "no_argocd_application_without_a_repo";
+fn generate_artefacts_writes_no_argocd_application() {
+    const TEST: &str = "generate_artefacts_writes_no_argocd_application";
     if ran_as_probe() {
         return;
     }
-    let config = settings_dir("metrics:\n  namespace: probe\n");
+    let config = settings_dir(
+        "deployment:\n  argocd:\n    repo_url: https://git.example.com/team/artefact-probe\n",
+    );
     let out = tempfile::tempdir().expect("artefact tempdir");
 
     let streams = probe(
@@ -370,42 +372,12 @@ fn no_argocd_application_without_a_repo() {
 
     assert!(
         !out.path().join("argocd-application.yaml").exists(),
-        "an Application was written with no repo to sync"
+        "an Application was written"
     );
     assert!(
-        streams
-            .stderr
-            .contains("deployment.argocd.repo_url is not set"),
-        "no warning on stderr:\n{}",
+        !streams.stderr.contains("argocd"),
+        "stderr still names ArgoCD:\n{}",
         streams.stderr
     );
-    assert!(out.path().join("Dockerfile.runtime").is_file());
-}
-
-/// The repo and destination namespace the cascade names are the ones the
-/// Application carries.
-#[test]
-fn the_argocd_application_follows_the_config_cascade() {
-    const TEST: &str = "the_argocd_application_follows_the_config_cascade";
-    if ran_as_probe() {
-        return;
-    }
-    let config = settings_dir(
-        "deployment:\n  argocd:\n    repo_url: https://git.example.com/team/artefact-probe\n    \
-         dest_namespace: probes\n",
-    );
-    let out = tempfile::tempdir().expect("artefact tempdir");
-
-    probe(
-        TEST,
-        config.path(),
-        &["generate-artefacts", "--output-dir", path_str(out.path())],
-    );
-
-    let app = read(out.path(), "argocd-application.yaml");
-    assert!(
-        app.contains("repoURL: https://git.example.com/team/artefact-probe\n"),
-        "{app}"
-    );
-    assert!(app.contains("    namespace: probes\n"), "{app}");
+    assert!(out.path().join("deployment-contract.json").is_file());
 }

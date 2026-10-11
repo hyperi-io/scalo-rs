@@ -67,8 +67,8 @@ flowchart TB
     subgraph Deploy["Deployment artefacts"]
         DC["DeploymentContract"]
         DF["Dockerfile"]
-        CH["chart/"]
-        AC["argocd-application.yaml"]
+        CJ["deployment-contract.json"]
+        CH["scalo-service chart"]
     end
 
     SR --> Pillars
@@ -79,8 +79,8 @@ flowchart TB
     TS --> SPL
     TS --> DLQ
     DC --> DF
-    DC --> CH
-    DC --> AC
+    DC --> CJ
+    CJ --> CH
 ```
 
 Solid arrows are runtime data/control flow. Dashed arrows mark embedded
@@ -135,7 +135,7 @@ Section landing: [runtime/README.md](runtime/README.md)
 Section landing: [deployment/README.md](deployment/README.md)
 
 - [deployment/contract.md](deployment/contract.md) - `DeploymentContract` struct, schema versioning
-- [deployment/artefacts.md](deployment/artefacts.md) - generated Dockerfile, Helm chart, ArgoCD Application
+- [deployment/artefacts.md](deployment/artefacts.md) - generated Dockerfile, container manifest, contract JSON
 - [deployment/native-deps.md](deployment/native-deps.md) - `NativeDepsContract`, feature -> APT package map
 - [deployment/keda.md](deployment/keda.md) - `KedaContract`, scaler triggers, fallback HPA
 

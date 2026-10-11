@@ -503,11 +503,10 @@ fn refuse_undeclared_listeners(
 /// Generate all CI artefacts for this service.
 ///
 /// Loads the app's config once, best-effort, before the contract is built, so
-/// the contract, the manifest and the ArgoCD Application all follow the config
-/// cascade, and a dev box and CI with different config can differ. Writes the
-/// metrics manifest, deployment contract, container manifest and runtime stage
-/// into the output directory, and the ArgoCD Application when
-/// `deployment.argocd.repo_url` is set. The same build and config give
+/// the contract and the manifest follow the config cascade, and a dev box and
+/// CI with different config can differ. Writes the metrics manifest,
+/// deployment contract, container manifest, runtime stage and config
+/// artefacts into the output directory. The same build and config give
 /// the same bytes on every run: nothing is stamped per run. A contract that
 /// fails [`DeploymentContract::validate`](crate::deployment::DeploymentContract::validate),
 /// or has an undeclared listener, is refused before anything is written.
@@ -564,7 +563,7 @@ fn generate_artefacts<A: ServiceApp>(
     }
     #[cfg(feature = "deployment")]
     if let Some(contract) = deployment_contract {
-        // Full deployment contract (secrets, KEDA, Helm, everything)
+        // Full deployment contract, the input the scalo-service chart renders
         let path = output_dir.join("deployment-contract.json");
         let json = artefact_json(&contract, "deployment contract")?;
         std::fs::write(&path, &json)
@@ -588,30 +587,6 @@ fn generate_artefacts<A: ServiceApp>(
             CliError::Service(format!("failed to write {}: {e}", rt_path.display()))
         })?;
         generated.push("Dockerfile.runtime".to_string());
-
-        // ArgoCD Application CR, written only when the cascade names the repo
-        // the chart lives in -- an Application without a source syncs nothing.
-        if let Some(repo_url) = crate::deployment::argocd_repo_url_from_cascade() {
-            let argo_path = output_dir.join("argocd-application.yaml");
-            let argo_cfg = crate::deployment::ArgocdConfig {
-                repo_url,
-                dest_namespace: crate::deployment::argocd_dest_namespace_from_cascade()
-                    .unwrap_or_default(),
-                ..Default::default()
-            };
-            let argo_content = crate::deployment::generate::generate_argocd_application(
-                &contract, &argo_cfg, None,
-            );
-            std::fs::write(&argo_path, &argo_content).map_err(|e| {
-                CliError::Service(format!("failed to write {}: {e}", argo_path.display()))
-            })?;
-            generated.push("argocd-application.yaml".to_string());
-        } else {
-            output::print_warn(
-                "deployment.argocd.repo_url is not set, so no argocd-application.yaml was \
-                 written. Set it to the git repo that holds the chart",
-            );
-        }
 
         // Reflectable config artefacts (config-schema.{json,yaml} +
         // capability-catalog.{json,yaml}). Emitted only when the contract carries a

@@ -108,7 +108,7 @@ are tools you compose into your `run_service`.
 | Any `Transport` impl | 3-tier filter engine, DLQ routing, per-direction/action metrics, traceparent propagation |
 | `TieredSink::new(...)` | Transport + spool + circuit breaker + retry + DLQ + backpressure signal |
 | `BatchEngine::process_mid_tier()` | SIMD JSON parse, pre-route filter, field interning, parallel transform on the worker pool, commit-token plumbing |
-| `DeploymentContract { ... }` | Dockerfile, Helm chart (with KEDA + secrets + values), ArgoCD Application, container manifest, metrics manifest, OCI labels |
+| `DeploymentContract { ... }` | Dockerfile, container manifest, metrics manifest, OCI labels, and the Kubernetes objects (with KEDA + secrets) the scalo-service chart renders from it |
 | `HealthRegistry::register("module", ...)` | Module appears in `/readyz` aggregate; reports go through the same JSON shape every app uses |
 
 Read each subsystem doc for the implementation detail behind a given

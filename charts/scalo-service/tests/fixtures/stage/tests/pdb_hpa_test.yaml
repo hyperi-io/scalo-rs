@@ -21,6 +21,7 @@ tests:
             selector:
               matchLabels:
                 app.kubernetes.io/name: event-stage
+            unhealthyPodEvictionPolicy: AlwaysAllow
 
   - it: lets one pod go when replicaCount is two but KEDA can scale to one
     template: pdb.yaml
@@ -30,6 +31,21 @@ tests:
       - equal:
           path: spec.maxUnavailable
           value: 1
+
+  - it: lets a pod that is not Ready be evicted under a maxUnavailable budget too
+    template: pdb.yaml
+    set:
+      replicaCount: 2
+      pdb.maxUnavailable: 1
+    asserts:
+      - equal:
+          path: spec
+          value:
+            maxUnavailable: 1
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: event-stage
+            unhealthyPodEvictionPolicy: AlwaysAllow
 
   - it: honours pdb.enabled false
     template: pdb.yaml

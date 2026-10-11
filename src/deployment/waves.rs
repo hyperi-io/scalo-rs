@@ -9,8 +9,7 @@
 //!
 //! Convention for the order in which ArgoCD applies resources during a
 //! sync. Lower waves run first. Used as the `argocd.argoproj.io/sync-wave`
-//! annotation on Application resources and as the default for
-//! [`crate::deployment::ArgocdConfig::sync_wave`].
+//! annotation on Application resources.
 //!
 //! The numeric values are gaps wide enough that consumer projects can
 //! slot custom waves (e.g. `-15` for "between operators and CRDs", `-3`

@@ -75,7 +75,7 @@ Config keys that are not dials still reach the app, through `config` or `configO
 | ConfigMap | `<fullname>-<set>` | per `fileSets` entry |
 | ServiceAccount | `serviceAccount.name`, else `<fullname>` | `serviceAccount.create` when set, else unless the contract's `service_account` is `none` |
 | PersistentVolumeClaim | `<fullname>-<path name>` | per persistent writable path without `existingClaim` |
-| PodDisruptionBudget | `<fullname>` | `replicaCount` or the autoscaler floor is two or more, never for a singleton |
+| PodDisruptionBudget | `<fullname>` | `replicaCount` or the autoscaler floor is two or more, never for a singleton; `unhealthyPodEvictionPolicy: AlwaysAllow`, so a pod that is not Ready never blocks a drain |
 | ScaledObject | `<fullname>-scaler` | KEDA on |
 | TriggerAuthentication | `<fullname>-trigger-auth` | KEDA on and `keda.triggerAuthentication.secretTargetRef` set |
 | HorizontalPodAutoscaler | `<fullname>` | `autoscaling.enabled` with KEDA off |

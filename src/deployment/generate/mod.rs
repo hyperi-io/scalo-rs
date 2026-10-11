@@ -6,33 +6,25 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Generate deployment artifacts (Dockerfile, Helm chart, Compose fragment,
-//! container manifest, ArgoCD Application) from a
+//! Generate deployment artifacts (Dockerfile, runtime stage, Compose fragment,
+//! container manifest) from a
 //! [`DeploymentContract`](crate::deployment::DeploymentContract).
 //!
-//! Apps provide ~20% customisation (ports, secrets, config); this module
-//! generates ~80% boilerplate. Split by artefact kind into submodules;
-//! the public surface is unchanged (re-exported here).
+//! The Kubernetes objects come from the scalo-service library chart, which
+//! renders the serialised contract itself (`charts/scalo-service`).
 
-mod argocd;
 mod common;
 mod compose;
 mod dockerfile;
-mod helm;
 mod manifest;
 
-pub use argocd::{ArgocdConfig, generate_argocd_application};
 pub use compose::generate_compose_fragment;
 pub use dockerfile::{generate_dockerfile, generate_runtime_stage};
-pub(crate) use helm::chart_files;
-pub use helm::generate_chart;
 pub use manifest::generate_container_manifest;
 
-// Tests call these private helpers + contract types directly via `use super::*`.
+// Tests call these contract types directly via `use super::*`.
 #[cfg(test)]
 use crate::deployment::contract::{DeploymentContract, ImageProfile};
-#[cfg(test)]
-use common::{is_go_identifier, safe_template_lookup, to_camel_suffix};
 
 #[cfg(test)]
 mod tests {
@@ -40,8 +32,7 @@ mod tests {
     use crate::deployment::contract::{
         OciLabels, PortContract, SecretEnvContract, SecretGroupContract,
     };
-    use crate::deployment::error::DeploymentError;
-    use crate::deployment::keda::{KafkaLagTrigger, KedaConfig, KedaContract};
+    use crate::deployment::keda::KedaContract;
     use crate::deployment::native_deps::NativeDepsContract;
 
     fn test_contract() -> DeploymentContract {
@@ -373,33 +364,6 @@ mod tests {
             PortContract::tcp("http", 8080),
             PortContract::udp("syslog", 514),
         ];
-        let files = render_chart(&contract);
-
-        assert!(files["templates/deployment.yaml"].contains(
-            "          ports:\n\
-             \x20           - name: metrics\n\
-             \x20             containerPort: {{ .Values.service.port }}\n\
-             \x20             protocol: TCP\n\
-             \x20           - name: http\n\
-             \x20             containerPort: 8080\n\
-             \x20             protocol: TCP\n\
-             \x20           - name: syslog\n\
-             \x20             containerPort: 514\n\
-             \x20             protocol: UDP\n\
-             \x20         env:\n"
-        ));
-        assert!(files["templates/service.yaml"].contains(
-            "      name: metrics\n\
-             \x20   - port: 8080\n\
-             \x20     targetPort: 8080\n\
-             \x20     protocol: TCP\n\
-             \x20     name: http\n\
-             \x20   - port: 514\n\
-             \x20     targetPort: 514\n\
-             \x20     protocol: UDP\n\
-             \x20     name: syslog\n\
-             \x20 selector:\n"
-        ));
         for (name, text) in [
             ("dockerfile", generate_dockerfile(&contract, None)),
             ("runtime stage", generate_runtime_stage(&contract)),
@@ -421,112 +385,6 @@ mod tests {
             serde_json::json!([9090, 8080, "514/udp"])
         );
         assert!(manifest.get("conditional_ports").is_none());
-    }
-
-    #[test]
-    fn test_chart_gates_each_kind_of_condition() {
-        let mut contract = test_contract();
-        contract.extra_ports = gated_ports();
-        let files = render_chart(&contract);
-
-        let deployment = &files["templates/deployment.yaml"];
-        assert!(
-            deployment.contains(
-                "            - name: http\n\
-                 \x20             containerPort: 8080\n\
-                 \x20             protocol: TCP\n\
-                 \x20           {{- if ((.Values.config).grpc).enabled }}\n\
-                 \x20           - name: grpc\n\
-                 \x20             containerPort: 6000\n\
-                 \x20             protocol: TCP\n\
-                 \x20           {{- end }}\n\
-                 \x20           {{- if eq (toString ((.Values.config).source).transport) \"direct\" }}\n\
-                 \x20           - name: push\n\
-                 \x20             containerPort: 6001\n\
-                 \x20             protocol: TCP\n\
-                 \x20           {{- end }}\n\
-                 \x20           {{- if has (toString ((.Values.config).source).transport) (list \"direct\" \"grpc\") }}\n\
-                 \x20           - name: relay\n\
-                 \x20             containerPort: 6002\n\
-                 \x20             protocol: UDP\n\
-                 \x20           {{- end }}\n\
-                 \x20         env:\n"
-            ),
-            "deployment ports not gated:\n{deployment}"
-        );
-
-        let service = &files["templates/service.yaml"];
-        assert!(
-            service.contains(
-                "    - port: 8080\n\
-                 \x20     targetPort: 8080\n\
-                 \x20     protocol: TCP\n\
-                 \x20     name: http\n\
-                 \x20   {{- if ((.Values.config).grpc).enabled }}\n\
-                 \x20   - port: 6000\n\
-                 \x20     targetPort: 6000\n\
-                 \x20     protocol: TCP\n\
-                 \x20     name: grpc\n\
-                 \x20   {{- end }}\n\
-                 \x20   {{- if eq (toString ((.Values.config).source).transport) \"direct\" }}\n\
-                 \x20   - port: 6001\n\
-                 \x20     targetPort: 6001\n\
-                 \x20     protocol: TCP\n\
-                 \x20     name: push\n\
-                 \x20   {{- end }}\n\
-                 \x20   {{- if has (toString ((.Values.config).source).transport) (list \"direct\" \"grpc\") }}\n\
-                 \x20   - port: 6002\n\
-                 \x20     targetPort: 6002\n\
-                 \x20     protocol: UDP\n\
-                 \x20     name: relay\n\
-                 \x20   {{- end }}\n\
-                 \x20 selector:\n"
-            ),
-            "service ports not gated:\n{service}"
-        );
-    }
-
-    /// A quote in a gate value must not end the template string early.
-    #[test]
-    fn test_chart_gate_value_is_quoted_for_the_template() {
-        let mut contract = test_contract();
-        contract.extra_ports =
-            vec![PortContract::tcp("odd", 7000).when_equals("config.mode", r#"a"b\c"#)];
-        let files = render_chart(&contract);
-        assert!(
-            files["templates/service.yaml"]
-                .contains(r#"{{- if eq (toString (.Values.config).mode) "a\"b\\c" }}"#),
-            "{}",
-            files["templates/service.yaml"]
-        );
-    }
-
-    #[test]
-    fn test_chart_rejects_a_gate_it_cannot_render() {
-        for (port, field) in [
-            (
-                PortContract::tcp("grpc", 6000).when_enabled("config.my-grpc.enabled"),
-                "extra_ports[grpc].when",
-            ),
-            (
-                PortContract::tcp("push", 6001)
-                    .when_one_of("config.source.transport", Vec::<String>::new()),
-                "extra_ports[push].when",
-            ),
-        ] {
-            let mut contract = test_contract();
-            contract.extra_ports = vec![port];
-            let dir = tempfile::tempdir().unwrap();
-            let err = generate_chart(&contract, dir.path(), None).unwrap_err();
-            assert!(
-                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
-                "unexpected error: {err}"
-            );
-            assert!(
-                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-                "a rejected contract left files behind"
-            );
-        }
     }
 
     /// A gated port leaves EXPOSE, since the image cannot know whether its
@@ -626,7 +484,6 @@ mod tests {
         }
         annotated.unbound_listen_paths = vec!["sink.bind_address".into()];
 
-        assert_eq!(render_chart(&plain), render_chart(&annotated));
         assert_eq!(
             generate_dockerfile(&plain, None),
             generate_dockerfile(&annotated, None)
@@ -666,170 +523,11 @@ mod tests {
         assert!(compose.contains("memory: ${DFE_LOADER_MEM_LIMIT:-1G}"));
     }
 
+    /// The image creates and switches to appuser uid 1000, the uid the
+    /// scalo-service chart runs the pod as by default.
     #[test]
-    fn test_generate_chart() {
+    fn test_image_runs_as_uid_1000() {
         let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        // Verify files exist
-        assert!(dir.path().join("Chart.yaml").exists());
-        assert!(dir.path().join("values.yaml").exists());
-        assert!(dir.path().join("templates/_helpers.tpl").exists());
-        assert!(dir.path().join("templates/deployment.yaml").exists());
-        assert!(dir.path().join("templates/service.yaml").exists());
-        assert!(dir.path().join("templates/serviceaccount.yaml").exists());
-        assert!(dir.path().join("templates/configmap.yaml").exists());
-        assert!(dir.path().join("templates/secret.yaml").exists());
-        assert!(dir.path().join("templates/hpa.yaml").exists());
-        assert!(dir.path().join("templates/keda-scaledobject.yaml").exists());
-        assert!(dir.path().join("templates/keda-triggerauth.yaml").exists());
-        assert!(dir.path().join("templates/NOTES.txt").exists());
-    }
-
-    #[test]
-    fn test_chart_yaml_content() {
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let content = std::fs::read_to_string(dir.path().join("Chart.yaml")).unwrap();
-        assert!(content.contains("name: dfe-loader"));
-        assert!(content.contains("description: High-performance Kafka to ClickHouse data loader"));
-    }
-
-    #[test]
-    fn test_values_yaml_content() {
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let content = std::fs::read_to_string(dir.path().join("values.yaml")).unwrap();
-        assert!(content.contains("port: 9090"));
-        assert!(content.contains("prometheus.io/port: \"9090\""));
-        assert!(content.contains("prometheus.io/path: \"/metrics\""));
-        assert!(content.contains("lagThreshold: \"1000\""));
-        assert!(content.contains("kafka-username"));
-        assert!(content.contains("kafka-password"));
-        assert!(content.contains("clickhouse-password"));
-    }
-
-    #[test]
-    fn test_helpers_contain_secret_helpers() {
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let content = std::fs::read_to_string(dir.path().join("templates/_helpers.tpl")).unwrap();
-        assert!(content.contains("kafkaSecretName"));
-        assert!(content.contains("clickhouseSecretName"));
-    }
-
-    #[test]
-    fn test_deployment_contains_env_vars() {
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let content =
-            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        assert!(content.contains("DFE_LOADER__KAFKA__USERNAME"));
-        assert!(content.contains("DFE_LOADER__KAFKA__PASSWORD"));
-        assert!(content.contains("DFE_LOADER__CLICKHOUSE__PASSWORD"));
-        assert!(content.contains("path: /livez"));
-        assert!(content.contains("path: /readyz"));
-        assert!(content.contains("/etc/dfe"));
-        // Observability identity: OTel service.name + k8s downward-API resource
-        // attrs. Per-pod differentiation comes from these, not metric names.
-        assert!(content.contains("name: OTEL_SERVICE_NAME"));
-        assert!(content.contains("name: OTEL_RESOURCE_ATTRIBUTES"));
-        assert!(content.contains("fieldPath: metadata.uid"));
-        assert!(content.contains("k8s.pod.uid=$(POD_UID)"));
-    }
-
-    #[test]
-    fn test_deployment_env_present_without_secrets() {
-        // Even with NO secret env, the observability env block must be emitted.
-        let mut contract = test_contract();
-        contract.secrets.clear();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-        let content =
-            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        assert!(content.contains("          env:\n"));
-        assert!(content.contains("name: OTEL_SERVICE_NAME"));
-    }
-
-    /// secretKeyRef env is read once at start, so the pod template carries a
-    /// checksum of the chart-managed Secret; a group on existingSecret renders
-    /// nothing into secret.yaml, so the operator's own Secret cannot move it.
-    #[test]
-    fn a_chart_managed_secret_is_checksummed_into_the_pod_template() {
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-        let deployment =
-            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        assert!(
-            deployment.contains(
-                "        checksum/secret: {{ include (print $.Template.BasePath \"/secret.yaml\") . | sha256sum }}\n"
-            ),
-            "{deployment}"
-        );
-        let secret = std::fs::read_to_string(dir.path().join("templates/secret.yaml")).unwrap();
-        assert!(secret.contains("{{- if not .Values.kafka.existingSecret }}"));
-
-        let mut no_secrets = test_contract();
-        no_secrets.secrets.clear();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&no_secrets, dir.path(), None).unwrap();
-        let deployment =
-            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        assert!(!deployment.contains("checksum/secret"), "{deployment}");
-    }
-
-    #[test]
-    fn test_otlp_export_is_wired_and_opt_in() {
-        // The scrape annotations get metrics to Prometheus; this is the other
-        // pathway. Off unless an endpoint is set, so a chart installed without
-        // a collector does not sit there retrying.
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let values = std::fs::read_to_string(dir.path().join("values.yaml")).unwrap();
-        assert!(values.contains("otel:"));
-        assert!(values.contains("endpoint: \"\""));
-        assert!(values.contains("protocol: grpc"));
-
-        let deployment =
-            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        // Parenthesised so `otel: null` yields no env rather than a Helm
-        // nil-pointer error.
-        assert!(deployment.contains("{{- if (.Values.otel).endpoint }}"));
-        assert!(deployment.contains("name: OTEL_EXPORTER_OTLP_ENDPOINT"));
-        assert!(deployment.contains("name: OTEL_EXPORTER_OTLP_PROTOCOL"));
-    }
-
-    #[test]
-    fn test_chart_hardens_the_pod_and_container() {
-        // Without these the chart admits a container that can escalate
-        // privilege and keeps the full default capability set. Values-driven
-        // so an app with a real need can opt back out, but the DEFAULT has to
-        // be the hardened one -- a default nobody sets is the one that ships.
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let values = std::fs::read_to_string(dir.path().join("values.yaml")).unwrap();
-        assert!(values.contains("runAsNonRoot: true"));
-        assert!(values.contains("type: RuntimeDefault"));
-        assert!(values.contains("allowPrivilegeEscalation: false"));
-        assert!(values.contains("- ALL"));
-        // The image creates and switches to appuser uid 1000; the chart must
-        // assert the same uid, not a different one that would fail to start.
-        assert!(values.contains("runAsUser: 1000"));
         for image in [
             generate_dockerfile(&contract, None),
             generate_runtime_stage(&contract),
@@ -837,56 +535,6 @@ mod tests {
             assert!(image.contains("useradd --create-home --uid 1000 appuser\n"));
             assert!(image.contains("\nUSER 1000\n"), "{image}");
         }
-        // Deliberately false: the spool and DLQ write to the container
-        // filesystem and every volume mounted is read-only.
-        assert!(values.contains("readOnlyRootFilesystem: false"));
-
-        let deployment =
-            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        assert!(deployment.contains("{{- with .Values.podSecurityContext }}"));
-        assert!(deployment.contains("{{- with .Values.securityContext }}"));
-    }
-
-    #[test]
-    fn test_chart_projects_the_service_account_files_without_the_token() {
-        // The version check derives its instance id from ca.crt and namespace
-        // here; with neither present every pod restart reports as a new install.
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let account =
-            std::fs::read_to_string(dir.path().join("templates/serviceaccount.yaml")).unwrap();
-        assert!(account.contains("\nautomountServiceAccountToken: false\n"));
-
-        let deployment =
-            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-        // On the pod as well, so an operator-supplied account mounts no token either.
-        assert!(deployment.contains(
-            "      serviceAccountName: {{ include \"dfe-loader.serviceAccountName\" . }}\n\
-             \x20     automountServiceAccountToken: false\n"
-        ));
-        assert!(deployment.contains(
-            "            - name: serviceaccount-files\n\
-             \x20             mountPath: /var/run/secrets/kubernetes.io/serviceaccount\n\
-             \x20             readOnly: true\n"
-        ));
-        assert!(deployment.contains(
-            "        - name: serviceaccount-files\n\
-             \x20         projected:\n\
-             \x20           sources:\n\
-             \x20             - configMap:\n\
-             \x20                 name: kube-root-ca.crt\n\
-             \x20                 items:\n\
-             \x20                   - key: ca.crt\n\
-             \x20                     path: ca.crt\n\
-             \x20             - downwardAPI:\n\
-             \x20                 items:\n\
-             \x20                   - path: namespace\n\
-             \x20                     fieldRef:\n\
-             \x20                       fieldPath: metadata.namespace\n"
-        ));
-        assert!(!deployment.contains("serviceAccountToken:"));
     }
 
     #[test]
@@ -1000,288 +648,6 @@ mod tests {
         assert!(!dockerfile.contains("# WARNING:"));
     }
 
-    #[test]
-    fn test_is_go_identifier() {
-        // Valid Go identifiers
-        assert!(is_go_identifier("foo"));
-        assert!(is_go_identifier("FOO"));
-        assert!(is_go_identifier("foo_bar"));
-        assert!(is_go_identifier("_underscore_start"));
-        assert!(is_go_identifier("foo123"));
-        assert!(is_go_identifier("a"));
-
-        // Invalid -- would break Go templates
-        assert!(!is_go_identifier("bearer-tokens")); // hyphen
-        assert!(!is_go_identifier("foo.bar")); // dot
-        assert!(!is_go_identifier("123foo")); // digit-leading
-        assert!(!is_go_identifier("")); // empty
-        assert!(!is_go_identifier("foo bar")); // space
-        assert!(!is_go_identifier("foo:bar")); // colon
-    }
-
-    #[test]
-    fn test_safe_template_lookup_chooses_form() {
-        assert_eq!(
-            safe_template_lookup(".Values.auth", "username"),
-            ".Values.auth.username"
-        );
-        assert_eq!(
-            safe_template_lookup(".Values.auth", "bearer-tokens"),
-            "(index .Values.auth \"bearer-tokens\")"
-        );
-        assert_eq!(
-            safe_template_lookup(".Values.kafka.secretKeys", "kafka-username"),
-            "(index .Values.kafka.secretKeys \"kafka-username\")"
-        );
-    }
-
-    /// `helm lint` rejects `default (index .Values.config.kafka.topics 0)` with
-    /// `index of untyped nil`, because Sprig's `default` evaluates both
-    /// operands, so the topic lookup is an `if/else if/else` block, and it takes
-    /// the first topic by splitting a joined string because `index` on a string
-    /// topic yields a byte rather than the topic.
-    #[test]
-    fn test_keda_scaledobject_topic_lookup_is_lint_safe() {
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let keda_yaml =
-            std::fs::read_to_string(dir.path().join("templates/keda-scaledobject.yaml")).unwrap();
-
-        // Old broken form must not appear
-        assert!(
-            !keda_yaml.contains(
-                ".Values.keda.kafka.topic | default (index .Values.config.kafka.topics 0)"
-            ),
-            "keda-scaledobject.yaml still uses the eagerly-evaluated `default (index ...)` form:\n{keda_yaml}"
-        );
-        assert!(
-            !keda_yaml.contains("(index .Values.config.kafka.topics 0)"),
-            "keda-scaledobject.yaml still indexes the topics value, which breaks on a string:\n{keda_yaml}"
-        );
-
-        // New conditional form must appear
-        assert!(
-            keda_yaml.contains("if .Values.keda.kafka.topic"),
-            "keda-scaledobject.yaml missing if/else guard for topic lookup:\n{keda_yaml}"
-        );
-        assert!(
-            keda_yaml.contains(r#"{{- $topics := join "," ((.Values.config).kafka).topics }}"#),
-            "keda-scaledobject.yaml does not join the topics value nil-safely:\n{keda_yaml}"
-        );
-        assert!(
-            keda_yaml.contains("else if $topics"),
-            "keda-scaledobject.yaml missing fallback branch for the configured topics:\n{keda_yaml}"
-        );
-        assert!(
-            keda_yaml.contains(r#"topic: {{ splitList "," $topics | first | quote }}"#),
-            "keda-scaledobject.yaml does not take the first configured topic:\n{keda_yaml}"
-        );
-    }
-
-    /// Every file `generate_chart` wrote, keyed by its path under the chart root.
-    fn render_chart(contract: &DeploymentContract) -> std::collections::BTreeMap<String, String> {
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(contract, dir.path(), None).unwrap();
-        let mut files = std::collections::BTreeMap::new();
-        for sub in ["", "templates"] {
-            for entry in std::fs::read_dir(dir.path().join(sub)).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_file() {
-                    let rel = path.strip_prefix(dir.path()).unwrap();
-                    files.insert(
-                        rel.display().to_string(),
-                        std::fs::read_to_string(&path).unwrap(),
-                    );
-                }
-            }
-        }
-        files
-    }
-
-    /// `brokers` is a list, and `quote` on a list renders `"[a b]"`, which KEDA
-    /// reads as one host named `[a`, so the list has to be joined first.
-    #[test]
-    fn test_keda_brokers_are_joined_before_quoting() {
-        let files = render_chart(&test_contract());
-        let scaled = &files["templates/keda-scaledobject.yaml"];
-        assert!(
-            scaled.contains(
-                r#"bootstrapServers: {{ join "," ((.Values.config).kafka).brokers | quote }}"#
-            ),
-            "broker list is not joined before quoting:\n{scaled}"
-        );
-        assert!(
-            !scaled.contains(".Values.config.kafka.brokers | quote"),
-            "broker list is still quoted as a list:\n{scaled}"
-        );
-    }
-
-    /// With no kafka secret group there is no TriggerAuthentication, so telling
-    /// KEDA to do SCRAM would leave it authenticating with no credentials.
-    #[test]
-    fn test_keda_sasl_only_with_a_kafka_secret_group() {
-        let with_secret = render_chart(&test_contract());
-        assert!(
-            with_secret["templates/keda-scaledobject.yaml"].contains("sasl: scram_sha512"),
-            "a kafka secret group must still set the SASL mechanism"
-        );
-
-        let mut contract = test_contract();
-        contract.secrets.retain(|g| g.group_name != "kafka");
-        let without_secret = render_chart(&contract);
-        let scaled = &without_secret["templates/keda-scaledobject.yaml"];
-        assert!(
-            !scaled.contains("authenticationRef:"),
-            "no kafka secret group, yet an authenticationRef was emitted:\n{scaled}"
-        );
-        assert!(
-            !scaled.contains("sasl:"),
-            "SASL mechanism emitted with no credentials to go with it:\n{scaled}"
-        );
-        assert!(
-            scaled.contains("tls: disable"),
-            "the tls line is out of scope here and must be left as it was:\n{scaled}"
-        );
-    }
-
-    /// `KedaConfig::enabled` is the documented off switch, so turning it off must
-    /// produce exactly what an absent KEDA contract does.
-    #[test]
-    fn test_keda_config_disabled_generates_what_no_keda_does() {
-        let mut off = test_contract();
-        off.keda = Some(KedaContract::from_config(&KedaConfig {
-            enabled: false,
-            ..KedaConfig::default()
-        }));
-        let mut absent = test_contract();
-        absent.keda = None;
-
-        assert_eq!(render_chart(&off), render_chart(&absent));
-    }
-
-    /// An app whose Kafka settings live under `config.source` has no
-    /// `config.kafka` key at all, so the trigger must not address one.
-    #[test]
-    fn test_keda_trigger_under_source_never_addresses_config_kafka() {
-        let mut contract = test_contract();
-        contract.keda = Some(
-            KedaContract::default().with_kafka_trigger(KafkaLagTrigger::under("config.source")),
-        );
-        let files = render_chart(&contract);
-        let scaled = &files["templates/keda-scaledobject.yaml"];
-
-        assert!(
-            !scaled.contains("config.kafka") && !scaled.contains("(.Values.config).kafka"),
-            "trigger still addresses the kafka section:\n{scaled}"
-        );
-        assert!(scaled.contains(
-            r#"bootstrapServers: {{ join "," ((.Values.config).source).brokers | quote }}"#
-        ));
-        assert!(scaled.contains(
-            "consumerGroup: {{ .Values.keda.kafka.consumerGroup | default ((.Values.config).source).group_id | quote }}"
-        ));
-        assert!(scaled.contains(r#"{{- $topics := join "," ((.Values.config).source).topics }}"#));
-    }
-
-    /// With the Kafka lag trigger off, CPU is the only scaler: no kafka trigger,
-    /// no kafka values, and no ScaledObject unless CPU scaling is on.
-    #[test]
-    fn test_keda_trigger_disabled_scales_on_cpu_only() {
-        let mut contract = test_contract();
-        contract.keda =
-            Some(KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled()));
-        let files = render_chart(&contract);
-
-        let scaled = &files["templates/keda-scaledobject.yaml"];
-        assert!(
-            !scaled.contains("type: kafka"),
-            "kafka trigger emitted:\n{scaled}"
-        );
-        assert!(
-            scaled.contains("- type: cpu"),
-            "cpu trigger missing:\n{scaled}"
-        );
-        assert!(
-            scaled.starts_with("{{- if and .Values.keda.enabled .Values.keda.cpu.enabled }}\n"),
-            "ScaledObject is not gated on CPU scaling:\n{scaled}"
-        );
-
-        // Kept as a stub so the chart's file set is the same either way.
-        let auth = &files["templates/keda-triggerauth.yaml"];
-        assert!(
-            auth.lines().all(|line| line.starts_with('#')),
-            "TriggerAuthentication generated with no Kafka lag trigger:\n{auth}"
-        );
-
-        let values = &files["values.yaml"];
-        assert!(values.contains("keda:\n  enabled: true\n"));
-        assert!(
-            !values.contains("lagThreshold") && !values.contains("  kafka:\n    #"),
-            "keda.kafka offered with no trigger to read it:\n{values}"
-        );
-        assert!(values.contains("  cpu:\n    enabled: true\n"));
-    }
-
-    /// Kubernetes accepts only TCP, UDP and SCTP in upper case, so a contract
-    /// spelling the protocol in lower case must still render a valid manifest.
-    #[test]
-    fn test_chart_writes_port_protocols_in_upper_case() {
-        let mut contract = test_contract();
-        contract.extra_ports = vec![
-            PortContract {
-                protocol: "tcp".into(),
-                ..PortContract::tcp("http", 8080)
-            },
-            PortContract {
-                protocol: "udp".into(),
-                ..PortContract::udp("netflow", 2055)
-            },
-            PortContract {
-                protocol: "Sctp".into(),
-                ..PortContract::tcp("diameter", 3868)
-            },
-        ];
-        let files = render_chart(&contract);
-        for name in ["templates/deployment.yaml", "templates/service.yaml"] {
-            let text = &files[name];
-            let protocols: Vec<&str> = text
-                .lines()
-                .filter_map(|line| line.trim().strip_prefix("protocol: "))
-                .collect();
-            assert_eq!(protocols, ["TCP", "TCP", "UDP", "SCTP"], "{name}:\n{text}");
-        }
-    }
-
-    /// A protocol Kubernetes does not take would render a Deployment and
-    /// Service that fail to apply, so the chart is refused before any file.
-    #[test]
-    fn test_chart_rejects_a_protocol_kubernetes_does_not_take() {
-        for protocol in ["http", "grpc", ""] {
-            let mut contract = test_contract();
-            contract.extra_ports = vec![PortContract {
-                protocol: protocol.into(),
-                ..PortContract::tcp("web", 8080)
-            }];
-            let dir = tempfile::tempdir().unwrap();
-            let err = generate_chart(&contract, dir.path(), None)
-                .expect_err("a protocol other than TCP, UDP or SCTP is refused");
-            assert!(
-                matches!(
-                    err,
-                    DeploymentError::InvalidContract { ref field, .. }
-                        if field == "extra_ports[web].protocol"
-                ),
-                "unexpected error for {protocol:?}: {err}"
-            );
-            assert!(
-                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-                "a rejected contract left files behind"
-            );
-        }
-    }
-
     /// One extra port per fault the contract check names, with the field it names.
     fn faulty_ports() -> Vec<(PortContract, &'static str)> {
         let name = "extra_ports[0].name";
@@ -1321,34 +687,16 @@ mod tests {
         ]
     }
 
-    /// Every generator that can refuse a contract refuses each fault the one
-    /// contract check names, before it writes anything.
+    /// The container manifest, the generator that can refuse a contract,
+    /// refuses each fault the one contract check names.
     #[test]
-    fn test_every_refusing_generator_refuses_a_faulty_port() {
+    fn test_container_manifest_refuses_a_faulty_port() {
         for (port, field) in faulty_ports() {
             let mut contract = test_contract();
             contract.extra_ports = vec![port];
 
-            let dir = tempfile::tempdir().unwrap();
-            let err = generate_chart(&contract, dir.path(), None).expect_err(field);
-            assert!(
-                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
-                "chart, {field}: {err}"
-            );
-            assert!(
-                std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-                "a rejected contract left files behind"
-            );
-
             let err = generate_container_manifest(&contract).expect_err(field);
             assert!(err.contains(field), "container manifest, {field}: {err}");
-
-            let err =
-                crate::deployment::check_chart_drift(&contract, dir.path(), &[]).expect_err(field);
-            assert!(
-                matches!(err, DeploymentError::InvalidContract { field: ref f, .. } if f == field),
-                "chart drift check, {field}: {err}"
-            );
         }
     }
 
@@ -1376,342 +724,11 @@ mod tests {
         }
     }
 
-    /// KEDA's CPU scaler cannot wake a workload from zero on its own, so a
-    /// ScaledObject whose only trigger is CPU is refused a minimum of zero.
-    #[test]
-    fn test_a_cpu_only_scaled_object_cannot_scale_to_zero() {
-        let mut contract = test_contract();
-        let mut keda = KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled());
-        keda.min_replicas = 0;
-        contract.keda = Some(keda);
-
-        let dir = tempfile::tempdir().unwrap();
-        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
-        assert!(
-            matches!(err, DeploymentError::InvalidContract { ref field, .. } if field == "keda.min_replicas"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-            "a rejected contract left files behind"
-        );
-
-        // With the Kafka lag trigger on, lag wakes the workload from zero.
-        let mut lag = test_contract();
-        if let Some(keda) = lag.keda.as_mut() {
-            keda.min_replicas = 0;
-        }
-        generate_chart(&lag, tempfile::tempdir().unwrap().path(), None)
-            .expect("the lag trigger can scale from zero");
-    }
-
-    /// Whatever renders owns the replica count -- the ScaledObject, else the
-    /// HPA -- and the Deployment sets `replicas` exactly when neither does,
-    /// since a Deployment without it runs one pod.
-    #[test]
-    fn test_deployment_replicas_gate_is_the_inverse_of_every_scaler() {
-        let replicas_gate = |contract: &DeploymentContract| {
-            let files = render_chart(contract);
-            files["templates/deployment.yaml"]
-                .lines()
-                .take_while(|line| !line.contains("replicas:"))
-                .last()
-                .unwrap_or_default()
-                .trim()
-                .to_string()
-        };
-
-        // The Kafka lag trigger renders the ScaledObject whenever KEDA is on,
-        // and the HPA only while it is off, so the gate folds to this.
-        assert_eq!(
-            replicas_gate(&test_contract()),
-            "{{- if not (or .Values.keda.enabled .Values.autoscaling.enabled) }}"
-        );
-
-        let mut cpu_only = test_contract();
-        cpu_only.keda =
-            Some(KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled()));
-        assert_eq!(
-            replicas_gate(&cpu_only),
-            "{{- if not (or (and .Values.keda.enabled .Values.keda.cpu.enabled) \
-             (and .Values.autoscaling.enabled (not .Values.keda.enabled))) }}"
-        );
-
-        let mut no_keda = test_contract();
-        no_keda.keda = None;
-        assert_eq!(
-            replicas_gate(&no_keda),
-            "{{- if not (and .Values.autoscaling.enabled (not .Values.keda.enabled)) }}"
-        );
-    }
-
-    #[test]
-    fn test_keda_with_no_trigger_at_all_is_rejected() {
-        let mut contract = test_contract();
-        let mut keda = KedaContract::default().with_kafka_trigger(KafkaLagTrigger::disabled());
-        keda.cpu_enabled = false;
-        contract.keda = Some(keda);
-
-        let dir = tempfile::tempdir().unwrap();
-        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
-        assert!(
-            matches!(err, DeploymentError::InvalidContract { ref field, .. } if field == "keda"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
-            "a rejected contract left files behind"
-        );
-    }
-
-    #[test]
-    fn test_keda_trigger_rejects_a_path_the_chart_cannot_address() {
-        let mut contract = test_contract();
-        contract.keda = Some(
-            KedaContract::default().with_kafka_trigger(KafkaLagTrigger::under("config.my-source")),
-        );
-
-        let dir = tempfile::tempdir().unwrap();
-        let err = generate_chart(&contract, dir.path(), None).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                DeploymentError::InvalidContract { ref field, .. }
-                    if field == "keda.kafka_trigger.brokers_path"
-            ),
-            "unexpected error: {err}"
-        );
-        assert!(err.to_string().contains("config.my-source.brokers"));
-    }
-
-    /// KEDA's Kafka scaler takes `sasl` (the MECHANISM), `username` and
-    /// `password`, and ignores `saslType`, so the TriggerAuthentication binds
-    /// the username to `username` and the trigger names the mechanism under
-    /// `sasl`; wired any other way, authentication fails and the scaler never
-    /// reads lag.
-    #[test]
-    fn test_keda_kafka_auth_uses_the_parameters_keda_recognises() {
-        let contract = test_contract();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        let auth =
-            std::fs::read_to_string(dir.path().join("templates/keda-triggerauth.yaml")).unwrap();
-        assert!(
-            auth.contains("- parameter: username"),
-            "TriggerAuthentication supplies no `username`, so SASL cannot authenticate:\n{auth}"
-        );
-        assert!(
-            auth.contains("- parameter: password"),
-            "TriggerAuthentication supplies no `password`:\n{auth}"
-        );
-        assert!(
-            !auth.contains("- parameter: sasl\n"),
-            "TriggerAuthentication still binds `sasl` to a credential; `sasl` is the \
-             mechanism, not the username:\n{auth}"
-        );
-
-        let scaled =
-            std::fs::read_to_string(dir.path().join("templates/keda-scaledobject.yaml")).unwrap();
-        assert!(
-            !scaled.contains("saslType:"),
-            "keda-scaledobject.yaml still uses `saslType`, which the kafka trigger does not \
-             recognise (the key is `sasl`):\n{scaled}"
-        );
-        assert!(
-            scaled.contains("sasl: scram_sha512"),
-            "keda-scaledobject.yaml supplies no SASL mechanism:\n{scaled}"
-        );
-    }
-
-    /// Go templates reject a dot-walked `.Values.x.bearer-tokens` ("bad
-    /// character U+002D '-'"), so a hyphenated key renders in the
-    /// `(index .Values.x "bearer-tokens")` form.
-    #[test]
-    fn test_secret_yaml_handles_hyphenated_key_names() {
-        let mut contract = test_contract();
-        // A hyphenated key_name, as a token group carries.
-        contract.secrets.push(SecretGroupContract {
-            group_name: "auth".into(),
-            env_vars: vec![SecretEnvContract {
-                env_var: "MY_APP__AUTH__BEARER_TOKENS".into(),
-                key_name: "bearer-tokens".into(),
-                secret_key: "bearer-tokens".into(),
-            }],
-            optional: false,
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        // A Helm template of key names and .Values references, holding no secret value.
-        let secret_yaml =
-            std::fs::read_to_string(dir.path().join("templates/secret.yaml")).unwrap();
-        let deployment_yaml =
-            std::fs::read_to_string(dir.path().join("templates/deployment.yaml")).unwrap();
-
-        // Old broken form must not appear anywhere
-        assert!(
-            !secret_yaml.contains(".Values.auth.bearer-tokens"),
-            "secret.yaml still uses broken dot-walked form for hyphenated key:\n{secret_yaml}"
-        );
-        assert!(
-            !secret_yaml.contains(".Values.auth.secretKeys.bearer-tokens"),
-            "secret.yaml still uses broken dot-walked form for hyphenated secretKeys lookup:\n{secret_yaml}"
-        );
-        assert!(
-            !deployment_yaml.contains(".Values.auth.secretKeys.bearer-tokens"),
-            "deployment.yaml still uses broken dot-walked form for hyphenated secretKeys lookup:\n{deployment_yaml}"
-        );
-
-        // Safe index form must appear
-        assert!(
-            secret_yaml.contains("(index .Values.auth.secretKeys \"bearer-tokens\")"),
-            "secret.yaml missing index-form lookup for secretKeys.bearer-tokens:\n{secret_yaml}"
-        );
-        assert!(
-            secret_yaml.contains("(index .Values.auth \"bearer-tokens\")"),
-            "secret.yaml missing index-form lookup for value bearer-tokens:\n{secret_yaml}"
-        );
-        assert!(
-            deployment_yaml.contains("(index .Values.auth.secretKeys \"bearer-tokens\")"),
-            "deployment.yaml missing index-form lookup for secretKeys.bearer-tokens:\n{deployment_yaml}"
-        );
-
-        // Sanity: Go-safe keys (e.g. existing kafka.username) still use dot form
-        assert!(
-            secret_yaml.contains(".Values.kafka.secretKeys.username"),
-            "Go-safe key 'username' should still use dot-walked form:\n{secret_yaml}"
-        );
-    }
-
-    #[test]
-    fn test_generate_argocd_application_default() {
-        let contract = test_contract();
-        let argo = ArgocdConfig {
-            repo_url: "https://git.example.com/team/event-loader".into(),
-            ..Default::default()
-        };
-        let yaml = generate_argocd_application(&contract, &argo, None);
-
-        assert!(yaml.contains("apiVersion: argoproj.io/v1alpha1"));
-        assert!(yaml.contains("kind: Application"));
-        assert!(yaml.contains("name: dfe-loader"));
-        assert!(yaml.contains("namespace: argocd"));
-        assert!(yaml.contains("repoURL: https://git.example.com/team/event-loader"));
-        assert!(yaml.contains("targetRevision: main"));
-        assert!(yaml.contains("path: chart"));
-        assert!(yaml.contains("CreateNamespace=true"));
-        assert!(yaml.contains("Schema version: "));
-    }
-
-    /// With no destination namespace set, the app deploys into one named after it.
-    #[test]
-    fn test_argocd_destination_defaults_to_the_app_name() {
-        assert_eq!(ArgocdConfig::default().dest_namespace, "");
-        let yaml =
-            generate_argocd_application(&namespaced_contract(), &ArgocdConfig::default(), None);
-        assert!(
-            yaml.contains("  destination:\n    server: https://kubernetes.default.svc\n    namespace: event-loader\n"),
-            "{yaml}"
-        );
-    }
-
-    #[test]
-    fn test_generate_argocd_custom_namespace_and_path() {
-        let contract = test_contract();
-        let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
-            dest_namespace: "production".into(),
-            chart_path: "deploy/chart".into(),
-            target_revision: "v1.0.0".into(),
-            sync_wave: 5,
-            ..Default::default()
-        };
-        let yaml = generate_argocd_application(&contract, &argo, None);
-        assert!(yaml.contains("namespace: production"));
-        assert!(yaml.contains("path: deploy/chart"));
-        assert!(yaml.contains("targetRevision: v1.0.0"));
-        assert!(yaml.contains("sync-wave: \"5\""));
-    }
-
-    #[test]
-    fn argocd_config_default_uses_wave_apps() {
-        let cfg = ArgocdConfig::default();
-        assert_eq!(cfg.sync_wave, crate::deployment::WAVE_APPS);
-    }
-
-    #[test]
-    fn argocd_config_default_has_no_extra_ignore_differences() {
-        let cfg = ArgocdConfig::default();
-        assert_eq!(cfg.extra_ignore_differences, [] as [std::string::String; 0]);
-    }
-
-    #[test]
-    fn generate_argocd_application_emits_default_ignore_differences() {
-        let contract = test_contract();
-        let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
-            ..Default::default()
-        };
-        let yaml = generate_argocd_application(&contract, &argo, None);
-        assert!(yaml.contains("ignoreDifferences:"));
-        assert!(yaml.contains("/spec/replicas"));
-        assert!(yaml.contains("/spec/clusterIP"));
-        assert!(yaml.contains(".webhooks[].clientConfig.caBundle"));
-    }
-
-    #[test]
-    fn generate_argocd_application_appends_extra_ignore_differences() {
-        let contract = test_contract();
-        let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
-            extra_ignore_differences: vec![
-                "- group: apps\n  kind: Deployment\n  jsonPointers:\n    - /spec/template/spec/containers/0/image".into(),
-            ],
-            ..Default::default()
-        };
-        let yaml = generate_argocd_application(&contract, &argo, None);
-        assert!(yaml.contains("/spec/template/spec/containers/0/image"));
-    }
-
-    #[test]
-    fn generate_argocd_application_sync_wave_annotation_uses_config_value() {
-        let contract = test_contract();
-        let argo = ArgocdConfig {
-            repo_url: "https://github.com/hyperi-io/dfe-loader".into(),
-            sync_wave: crate::deployment::WAVE_TOPICS,
-            ..Default::default()
-        };
-        let yaml = generate_argocd_application(&contract, &argo, None);
-        assert!(yaml.contains(r#"argocd.argoproj.io/sync-wave: "-5""#));
-    }
-
-    #[test]
-    fn test_no_keda_files_when_disabled() {
-        let mut contract = test_contract();
-        contract.keda = None;
-
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&contract, dir.path(), None).unwrap();
-
-        assert!(!dir.path().join("templates/keda-scaledobject.yaml").exists());
-        assert!(!dir.path().join("templates/keda-triggerauth.yaml").exists());
-    }
-
-    #[test]
-    fn test_to_camel_suffix() {
-        assert_eq!(to_camel_suffix("kafka"), "kafka");
-        assert_eq!(to_camel_suffix("clickhouse"), "clickhouse");
-        assert_eq!(to_camel_suffix("click_house"), "clickHouse");
-        assert_eq!(to_camel_suffix("my-service"), "myService");
-    }
-
     // ============================================================================
     // Contract Identity Annotation Scheme v1 -- end-to-end wiring tests.
     // The unit tests for ContractIdentity itself live in
-    // src/deployment/contract_identity.rs; these verify the three
-    // generators each emit the three keys in the right surface.
+    // src/deployment/contract_identity.rs; these verify the Dockerfile
+    // generator emits the three keys as image labels.
     // ============================================================================
 
     fn test_identity() -> crate::deployment::ContractIdentity {
@@ -1743,77 +760,11 @@ mod tests {
         assert!(dockerfile.contains("LABEL io.scalo.profile=\"production\""));
     }
 
+    /// The documented grep payoff: the prefix appears exactly once per key.
     #[test]
-    fn chart_yaml_omits_identity_block_when_none() {
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&test_contract(), dir.path(), None).unwrap();
-        let chart = std::fs::read_to_string(dir.path().join("Chart.yaml")).unwrap();
-        assert!(!chart.contains("io.scalo.contract"));
-    }
-
-    #[test]
-    fn chart_yaml_emits_three_identity_annotations_when_some() {
-        let id = test_identity();
-        let dir = tempfile::tempdir().unwrap();
-        generate_chart(&test_contract(), dir.path(), Some(&id)).unwrap();
-        let chart = std::fs::read_to_string(dir.path().join("Chart.yaml")).unwrap();
-        // Top-level annotations block present.
-        assert!(chart.contains("\nannotations:\n"));
-        assert!(chart.contains("io.scalo.contract.version: \"v1\""));
-        assert!(chart.contains(
-            "io.scalo.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
-        ));
-        assert!(
-            chart.contains(
-                "io.scalo.contract.image-ref: \"registry.example.com/event-loader:v2.7.2\""
-            )
-        );
-    }
-
-    #[test]
-    fn argocd_application_omits_identity_block_when_none() {
-        let argo = ArgocdConfig::default();
-        let yaml = generate_argocd_application(&test_contract(), &argo, None);
-        assert!(!yaml.contains("io.scalo.contract"));
-        // sync-wave is unaffected.
-        assert!(yaml.contains("argocd.argoproj.io/sync-wave:"));
-    }
-
-    #[test]
-    fn argocd_application_emits_three_identity_annotations_when_some() {
-        let id = test_identity();
-        let argo = ArgocdConfig::default();
-        let yaml = generate_argocd_application(&test_contract(), &argo, Some(&id));
-        // Both the existing sync-wave AND the three identity keys must appear
-        // under the same metadata.annotations block.
-        assert!(yaml.contains("argocd.argoproj.io/sync-wave:"));
-        assert!(yaml.contains("io.scalo.contract.version: \"v1\""));
-        assert!(yaml.contains(
-            "io.scalo.contract.source-commit: \"0123456789abcdef0123456789abcdef01234567\""
-        ));
-        assert!(
-            yaml.contains(
-                "io.scalo.contract.image-ref: \"registry.example.com/event-loader:v2.7.2\""
-            )
-        );
-    }
-
-    #[test]
-    fn all_three_surfaces_share_the_same_key_prefix() {
-        let id = test_identity();
-        let argo = ArgocdConfig::default();
-        let dir = tempfile::tempdir().unwrap();
-
-        let dockerfile = generate_dockerfile(&test_contract(), Some(&id));
-        generate_chart(&test_contract(), dir.path(), Some(&id)).unwrap();
-        let chart = std::fs::read_to_string(dir.path().join("Chart.yaml")).unwrap();
-        let app = generate_argocd_application(&test_contract(), &argo, Some(&id));
-
-        // The documented grep payoff: every surface mentions the prefix
-        // exactly three times (once per key).
+    fn dockerfile_carries_each_identity_key_once() {
+        let dockerfile = generate_dockerfile(&test_contract(), Some(&test_identity()));
         assert_eq!(dockerfile.matches("io.scalo.contract").count(), 3);
-        assert_eq!(chart.matches("io.scalo.contract").count(), 3);
-        assert_eq!(app.matches("io.scalo.contract").count(), 3);
     }
 
     /// A contract with its own name, label namespace, vendor and licence.
@@ -1836,20 +787,14 @@ mod tests {
     fn every_scalo_key_follows_the_label_namespace() {
         let id = test_identity();
         let contract = namespaced_contract();
-        let dir = tempfile::tempdir().unwrap();
 
         let dockerfile = generate_dockerfile(&contract, Some(&id));
         let runtime = generate_runtime_stage(&contract);
         let manifest = generate_container_manifest(&contract).unwrap();
-        generate_chart(&contract, dir.path(), Some(&id)).unwrap();
-        let chart = std::fs::read_to_string(dir.path().join("Chart.yaml")).unwrap();
-        let app = generate_argocd_application(&contract, &ArgocdConfig::default(), Some(&id));
 
         assert!(dockerfile.contains("LABEL com.example.profile=\"production\""));
         assert!(runtime.contains("LABEL com.example.profile=\"production\""));
         assert_eq!(dockerfile.matches("com.example.contract.").count(), 3);
-        assert_eq!(chart.matches("com.example.contract.").count(), 3);
-        assert_eq!(app.matches("com.example.contract.").count(), 3);
         let labels = &serde_json::from_str::<serde_json::Value>(&manifest).unwrap()["labels"];
         assert_eq!(labels["com.example.profile"], "production");
         assert_eq!(labels["com.example.app"], "event-loader");
@@ -1858,8 +803,6 @@ mod tests {
             ("dockerfile", &dockerfile),
             ("runtime stage", &runtime),
             ("manifest", &manifest),
-            ("chart", &chart),
-            ("argocd", &app),
         ] {
             assert!(
                 !out.contains("io.scalo"),

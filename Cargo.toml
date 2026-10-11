@@ -202,7 +202,7 @@ output-file = ["io", "serde_json", "tracing"]
 # CEL expression evaluation
 expression = ["dep:cel", "serde_json"]
 
-# Deployment contract validation (Helm chart + Dockerfile sync)
+# Deployment contract, Dockerfile and Compose generation, Dockerfile validation
 deployment = ["serde_yaml_ng", "serde_json"]
 # Smoke-test helper that runs `docker build` + `docker run` against a
 # generated Dockerfile. Requires Docker daemon at test time. Opt-in.
