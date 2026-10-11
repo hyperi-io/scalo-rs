@@ -227,6 +227,10 @@ flush the batch exporter, or lose the last interval's data. See
 [`OtelMetricsConfig`](../../src/metrics/otel_types.rs) for endpoint / protocol /
 batching config.
 
+On the `http` protocol the endpoint is a base URL and `/v1/metrics` is appended
+to it, because the exporter POSTs to whatever endpoint it is handed, unchanged.
+An endpoint that already ends in `/v1/metrics` is used as it is.
+
 ---
 
 ## API surface
