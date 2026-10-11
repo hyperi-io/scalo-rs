@@ -3,6 +3,14 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.6](https://github.com/hyperi-io/scalo-rs/compare/v2.14.5...v2.14.6) (2026-10-11)
+
+### Bug Fixes
+
+* refresh_all re-fetches and reports rotations ([#319](https://github.com/hyperi-io/scalo-rs/issues/319)) ([a94e193](https://github.com/hyperi-io/scalo-rs/commit/a94e19301d9022924f7d537975ebee06e34ac074))
+* report a rotation seen by get ([#323](https://github.com/hyperi-io/scalo-rs/issues/323)) ([4604e63](https://github.com/hyperi-io/scalo-rs/commit/4604e637a1ce7122e17c4e5a9f03065c6c8b370f))
+* retire the chart and argocd generators ([#324](https://github.com/hyperi-io/scalo-rs/issues/324)) ([239e68a](https://github.com/hyperi-io/scalo-rs/commit/239e68a97125a6a7aaaaf0f68d802615f6c5b7a8)), closes [#149](https://github.com/hyperi-io/scalo-rs/issues/149) [#287](https://github.com/hyperi-io/scalo-rs/issues/287)
+
 ## [2.14.5](https://github.com/hyperi-io/scalo-rs/compare/v2.14.4...v2.14.5) (2026-10-10)
 
 ### Bug Fixes
