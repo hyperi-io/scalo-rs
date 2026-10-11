@@ -11,12 +11,12 @@
 # --cpus` to observe the KERNEL outcome (CPU burned + cgroup throttling) with a
 # parked-pool vs busy-spin control.
 
-FROM rust:1-trixie@sha256:3745c050d12adc738eff16ebfc81ed044bfb2cc27c6828850ff1666beb1c7a49 AS builder
+FROM rust:1-trixie@sha256:6ff07edce8775d0f64be7aba9197229407301bddf2054d62c27b541a6238a181 AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --example cpu_loadgen --features worker
 
-FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 RUN useradd --create-home --uid 1000 appuser
 COPY --from=builder /build/target/release/examples/cpu_loadgen /usr/local/bin/cpu_loadgen
 USER 1000
