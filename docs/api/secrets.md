@@ -97,7 +97,7 @@ mgr.refresh_all().await?;         // re-fetch every configured source
 
 - every `get()` and `get_file()` reads from the backend
 - a backend failure is returned to the caller, never answered from a stale value
-- `refresh_all()` re-reads every source but sends no rotation events, because there is no previous version to compare against
+- `get()` and `refresh_all()` send no rotation events, because there is no previous version to compare against
 
 The TTL, grace period, directory, encryption and file-mode settings have no effect while it is off.
 
@@ -105,7 +105,7 @@ The TTL, grace period, directory, encryption and file-mode settings have no effe
 
 ## Rotation events
 
-`refresh_all()` sends a `RotationEvent` when the version it fetches for a source differs from the version the cache last held for that source, expired or not. The event carries both versions. `get()` never sends one.
+A `RotationEvent` is sent whenever a fetch from the backend returns a version that differs from the one the cache last held for that source, expired or not. `refresh_all()` fetches every source, and `get()` fetches on a cache miss or an expired entry, so both report a rotation, once. A fresh cache hit never reaches the backend and reports nothing. The event carries both versions.
 
 Only backends that report a version can rotate: OpenBao (the KV v2 version number) and AWS Secrets Manager (the version id). A file source reports none, and with caching off there is no previous version, so neither produces an event.
 
@@ -134,16 +134,39 @@ database pool) -- react to rotation by rebuilding the client.
 ## Health checks
 
 `health_check()` calls into each enabled backend and returns a map of
-backend name to up/down status. Wire into the `HealthRegistry` so
-`/readyz` reflects backend availability:
+backend name to up/down status. A `HealthRegistry` check is synchronous and
+must be cheap, so poll the backends from a task and let the check read the
+last answer. `/readyz` then reflects backend availability:
 
 ```rust
-HealthRegistry::register("secrets", move || async move {
-    let status = mgr.health_check().await;
-    if status.values().all(|&ok| ok) { HealthStatus::Healthy }
-    else { HealthStatus::Unhealthy("one or more backends down".into()) }
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use scalo::{HealthRegistry, HealthStatus};
+
+let backends_up = Arc::new(AtomicBool::new(true));
+let poller = (Arc::clone(&mgr), Arc::clone(&backends_up));
+tokio::spawn(async move {
+    let (mgr, backends_up) = poller;
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tick.tick().await;
+        let up = mgr.health_check().await.values().all(|&ok| ok);
+        backends_up.store(up, Ordering::Relaxed);
+    }
+});
+HealthRegistry::register("secrets", move || {
+    if backends_up.load(Ordering::Relaxed) {
+        HealthStatus::Healthy
+    } else {
+        HealthStatus::Unhealthy
+    }
 });
 ```
+
+`mgr` is an `Arc<SecretsManager>`. The same code is a compiled example on
+`SecretsManager::health_check`.
 
 ---
 
@@ -226,7 +249,7 @@ A source whose backend's feature is off fails with `SecretsError::ProviderNotCon
 | `SecretsConfig::from_cascade()` | Build config from the global cascade (pass to `SecretsManager::new`) |
 | `.get(name) -> SecretValue` | Fetch a secret by name through routed backend |
 | `.get_file(path) -> SecretValue` | Read a secret from a local file |
-| `.refresh_all()` | Re-fetch every configured source, report rotated versions |
+| `.refresh_all()` | Re-fetch every configured source; a rotated version is reported, as on any `get()` that reaches the backend |
 | `.clear_cache()` | Drop the cache without re-fetching |
 | `.cache_stats() -> CacheStats` | Memory and disk entries, hits, misses, stale hits |
 | `.subscribe_rotations() -> broadcast::Receiver<RotationEvent>` | Subscribe to rotation notifications |

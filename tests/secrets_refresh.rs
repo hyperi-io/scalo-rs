@@ -312,6 +312,47 @@ mod openbao {
         assert_rotated(&mut rx, "1", "2");
     }
 
+    /// A `get` that reaches the provider reports a rotation the same way
+    /// `refresh_all` does, once, so a subscriber hears of it before any refresh.
+    #[tokio::test]
+    async fn a_get_past_expiry_reports_a_rotation_once() {
+        let Some((_container, address)) = start_openbao().await else {
+            return;
+        };
+        let cache = TempDir::new().unwrap();
+        let manager = manager(&address, caching(cache.path(), 0));
+        put_secret(&address, PATH, KEY, "first").await;
+        read(&manager).await;
+        let mut rx = manager.subscribe_rotations();
+
+        put_secret(&address, PATH, KEY, "second").await;
+        assert_eq!(read(&manager).await, "second");
+        assert_rotated(&mut rx, "1", "2");
+
+        read(&manager).await;
+        assert_no_event(&mut rx, "a second get of the same version");
+        manager.refresh_all().await.expect("refresh");
+        assert_no_event(&mut rx, "a refresh after the get already reported it");
+    }
+
+    /// A fresh cache hit never reaches the provider, so it reports nothing
+    /// even after the store moved on.
+    #[tokio::test]
+    async fn a_fresh_cache_hit_reports_nothing() {
+        let Some((_container, address)) = start_openbao().await else {
+            return;
+        };
+        let cache = TempDir::new().unwrap();
+        let manager = manager(&address, caching(cache.path(), 3600));
+        put_secret(&address, PATH, KEY, "first").await;
+        read(&manager).await;
+        let mut rx = manager.subscribe_rotations();
+
+        put_secret(&address, PATH, KEY, "second").await;
+        assert_eq!(read(&manager).await, "first");
+        assert_no_event(&mut rx, "a fresh cache hit");
+    }
+
     /// With caching off there is no previous version to compare against, so
     /// refresh reports no rotation, whether or not the secret changed.
     #[tokio::test]
