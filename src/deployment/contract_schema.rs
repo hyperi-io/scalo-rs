@@ -12,7 +12,7 @@
 //! It is derived from [`DeploymentContract`] by schemars and committed as
 //! `charts/scalo-service/schema/deployment-contract.v<N>.schema.json`, where a
 //! chart assembler outside Rust reads it. A test fails when the committed file
-//! and the derivation differ.
+//! and the derivation differ as JSON values; object key order is not compared.
 
 use std::borrow::Cow;
 
@@ -88,26 +88,51 @@ mod tests {
             .join(contract_schema_file_name(CONTRACT_SCHEMA_VERSION))
     }
 
+    /// `value` with every object's keys in sorted order.
+    fn sort_keys(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => map
+                .iter()
+                .map(|(key, item)| (key.clone(), sort_keys(item)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+            Value::Array(items) => items.iter().map(sort_keys).collect(),
+            other => other.clone(),
+        }
+    }
+
+    /// `value` pretty-printed with sorted keys, so a diff of two shows content only.
+    fn sorted_pretty(value: &Value) -> String {
+        serde_json::to_string_pretty(&sort_keys(value)).unwrap()
+    }
+
     /// Regenerate with `env SCALO_WRITE_CONTRACT_SCHEMA=1 cargo nextest run
     /// --all-features -E 'test(committed_contract_schema)'`.
+    ///
+    /// Compared as JSON values, so a schemars release that only reorders keys
+    /// does not fail it.
     #[test]
     fn committed_contract_schema_matches_the_rust_types() {
-        let generated = format!(
-            "{}\n",
-            serde_json::to_string_pretty(&contract_json_schema()).unwrap()
-        );
+        let derived = contract_json_schema();
         let path = committed_path();
         if std::env::var_os("SCALO_WRITE_CONTRACT_SCHEMA").is_some() {
-            std::fs::write(&path, &generated).unwrap();
+            let text = format!("{}\n", serde_json::to_string_pretty(&derived).unwrap());
+            std::fs::write(&path, text).unwrap();
             return;
         }
-        let committed = std::fs::read_to_string(&path)
+        let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        pretty_assertions::assert_eq!(
-            committed,
-            generated,
-            "{} differs from the schema the contract types derive; regenerate it (see this test's docs)",
-            path.display()
+        let committed: Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        assert!(
+            committed == derived,
+            "{} differs from the schema the contract types derive; regenerate it (see this test's docs)\n{}",
+            path.display(),
+            pretty_assertions::StrComparison::new(
+                &sorted_pretty(&committed),
+                &sorted_pretty(&derived)
+            ),
         );
     }
 
