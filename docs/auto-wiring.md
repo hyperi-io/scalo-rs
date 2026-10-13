@@ -87,7 +87,7 @@ What's **not** auto-wired and still requires an explicit call from the app:
   it does not serve `/metrics`. The observability port is the
   metrics server above. See [api/http-server.md](api/http-server.md).
 
-- `TieredSink::new(...)` -- you choose which transport, which spool, which DLQ
+- `TieredSink::new(...)` -- you choose which transport and which spool path, and where its errors go
 - `BatchEngine::process_*` -- you choose the parsing strategy and the transform closure
 - `Transport::from_config(...)` -- you name the config section (`transport.output`, `transport.input`)
 - Anything in `directory-config`, `secrets`, `cache`, `database` -- these are tools you reach for when needed
@@ -106,7 +106,7 @@ are tools you compose into your `run_service`.
 | `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint, process metrics, cardinality cap, `/metrics/manifest` |
 | `run_app(app)` | All of the above + memory guard + scaling pressure + worker pool + shutdown token + K8s pre-stop + runtime context + metrics server |
 | Any `Transport` impl | 3-tier filter engine, DLQ routing, per-direction/action metrics, traceparent propagation |
-| `TieredSink::new(...)` | Transport + spool + circuit breaker + retry + DLQ + backpressure signal |
+| `TieredSink::new(...)` | Transport + spool + circuit breaker + background drain + backpressure signal |
 | `BatchEngine::process_mid_tier()` | SIMD JSON parse, pre-route filter, field interning, parallel transform on the worker pool, commit-token plumbing |
 | `DeploymentContract { ... }` | Dockerfile, container manifest, metrics manifest, OCI labels, and the Kubernetes objects (with KEDA + secrets) the scalo-service chart renders from it |
 | `HealthRegistry::register("module", ...)` | Module appears in `/readyz` aggregate; reports go through the same JSON shape every app uses |
@@ -157,8 +157,8 @@ that has one), the auto-wiring contract is:
 1. **If the module has configurable behaviour**, load via the cascade --
    `T::from_cascade()` or `Config::unmarshal_key_registered::<T>(...)`.
    Don't read env vars directly.
-2. **If the module does I/O or processing**, add `#[cfg(feature = "metrics-core")]`
-   counters/gauges/histograms via the macros. No handle passing.
+2. **If the module does I/O or processing**, add `#[cfg(feature = "metrics")]`
+   counters/gauges/histograms via the macros, the gate scalo's own emitters use. No handle passing.
 3. **If the module can fail or has interesting state**, add
    `tracing::` log calls at the right level. No handle passing.
 4. **If the module affects service readiness**, register into the

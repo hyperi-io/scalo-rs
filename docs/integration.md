@@ -272,7 +272,7 @@ What you skipped:
 | SIGTERM/SIGINT, K8s pre-stop delay, cancellation propagation | `shutdown` (wired by `ServiceRuntime`) |
 | `MemoryGuard`, cgroup-aware OOM prevention | `memory` (wired by `ServiceRuntime`) |
 | Rayon pool sizing, pressure-based scaling | `worker_pool` (wired by `ServiceRuntime`) |
-| Disk-spillover spool, circuit breaker, retry, DLQ fallback | `tiered_sink` (composed in `run_service`) |
+| Disk-spillover spool, circuit breaker, drain back on recovery | `tiered_sink` (composed in `run_service`) |
 | Dockerfile, container manifest, Compose fragment | `deployment_contract()` + `generate_*` |
 | Kubernetes Deployment, Services, KEDA ScaledObject + TriggerAuthentication | `deployment_contract()` + `KedaContract`, rendered by the scalo-service chart |
 

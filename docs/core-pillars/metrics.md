@@ -21,12 +21,13 @@ features are on; container metrics read cgroup v1 and v2 transparently.
 
 | Feature | Adds | Use |
 | --- | --- | --- |
-| `metrics-core` | Macros + `MetricRegistry` | Library crates that record but don't host the exporter |
-| `metrics-process` | `metrics-core` + sysinfo process probe | Single binaries wanting RSS/CPU without an HTTP server |
-| `metrics` | `metrics-process` + Prometheus exporter + `/metrics` server | Services |
+| `metrics-core` | scalo's own dependency on the `metrics` crate. No `MetricsManager` or `MetricRegistry`: the `scalo::metrics` module needs `metrics` or `otel-metrics` | The base the tiers below build on |
+| `metrics-process` | `metrics-core` + sysinfo. Exposes no API on its own | The shared base of `metrics` and `otel-metrics` |
+| `metrics` | `metrics-process` + Prometheus exporter + `/metrics` server + OTLP metric push and span export | Services |
 
-Data-plane services pull `metrics`; published library crates pull `metrics-core` so they
-don't drag a TCP listener into dependents.
+scalo gates the series it emits itself, the tiered sink's, the transports' and the spool's among them, on the `metrics` feature. A build where nothing enables `metrics` compiles them out, `otel-metrics` on its own included. Cargo unifies features across the build, so a library that depends on scalo without `metrics` still gets them once the service binary enables it.
+
+A library crate that records its own series depends on the `metrics` crate directly, on the semver-compatible release scalo depends on so both share one global recorder, and leaves scalo's metrics feature to the service binary. scalo does not re-export the `metrics` crate, so `metrics-core` gives a dependent crate no macros.
 
 ---
 
@@ -38,21 +39,21 @@ use scalo::metrics::MetricsManager;
 let mut mgr = MetricsManager::new("dfe_loader");
 
 // Construct metrics -- each call also registers a descriptor
-let sent = mgr.counter("transport_sent_total", "Messages sent");
+let flushed = mgr.counter("batches_flushed_total", "Batches flushed");
 let lag = mgr.histogram("send_latency_seconds", "Send latency");
 
 // Declare label keys + group at construction:
-mgr.counter_with_labels("transport_sent_total", "Messages sent",
-    &["transport", "topic"], "transport");
-// Apply label values at recording time:
-metrics::counter!("dfe_loader_transport_sent_total",
-    "transport" => "kafka", "topic" => "events").increment(1);
+mgr.counter_with_labels("events_routed_total", "Events routed",
+    &["route", "topic"], "routing");
+// Apply label values at recording time, under the bare name:
+metrics::counter!("events_routed_total",
+    "route" => "default", "topic" => "events").increment(1);
 
 mgr.start_server("0.0.0.0:9090").await?;
 ```
 
 Names are namespace-prefixed automatically -- `counter("foo")` records as
-`dfe_loader_foo`. Use `*_with_labels` so the label keys and group land in the
+`dfe_loader_foo`. The `metrics::counter!` / `gauge!` / `histogram!` macros take the bare name too: the recorder prefixes every key, so `counter!("dfe_loader_foo")` records as `dfe_loader_dfe_loader_foo`. Use `*_with_labels` so the label keys and group land in the
 manifest (i.e. nearly always; unlabeled metrics are rare in data-plane pipelines).
 
 Single-binary services use `ServiceRuntime` from `cli`, which constructs the manager, attaches its `ScalingPressure` so `/scaling/pressure` serves it, and starts the listener with `start_server`. The app sets its own readiness callback. `/memory/pressure` is served by `start_server_with_routes` only, so a service on `ServiceRuntime` does not answer it. See [../runtime/service-runtime.md](../runtime/service-runtime.md).
@@ -114,9 +115,10 @@ my-app generate-artefacts --output-dir docs/
 Add metadata after registration:
 
 ```rust
-mgr.set_use_cases("dfe_loader_send_latency_seconds",
+// Bare names: the registry adds the namespace, and a prefixed name matches nothing.
+mgr.set_use_cases("send_latency_seconds",
     &["SLO p99 < 500ms", "Page on sustained > 1s"]);
-mgr.set_dashboard_hint("dfe_loader_send_latency_seconds", "heatmap");
+mgr.set_dashboard_hint("send_latency_seconds", "heatmap");
 mgr.set_build_info(env!("CARGO_PKG_VERSION"), env!("GIT_COMMIT"));
 ```
 
@@ -127,7 +129,7 @@ and both manifest subcommands describe it for you, with app info (feature
 `service-metrics`) and the worker pool and batch engine sets when those features are
 compiled in, so a service's `register_metrics` override describes only its own.
 
-The tiered sink's own series are listed in [../pipeline/tiered-sink.md](../pipeline/tiered-sink.md#metrics). Of them only `spool_bytes` and `spool_messages` are described here.
+`ServiceMetrics::register` also describes the tiered sink's series when `tiered-sink` is compiled in, and the standalone spool's when `spool` is. The tiered sink's are listed in [../pipeline/tiered-sink.md](../pipeline/tiered-sink.md#metrics).
 
 ### Count each thing once
 

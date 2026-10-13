@@ -42,8 +42,8 @@ pub struct TieredSinkConfig {
     #[serde(default)]
     pub ordering: OrderingMode,
 
-    /// Maximum spool file size in bytes.
-    /// Spool operations fail when exceeded.
+    /// Maximum spool size in bytes, as stored. A spill past it is handled by
+    /// [`when_full`](Self::when_full).
     #[serde(default)]
     pub max_spool_bytes: Option<u64>,
 
@@ -77,7 +77,8 @@ pub struct TieredSinkConfig {
     /// Prepend a CRC32C checksum to each spilled record and verify it on drain.
     /// Detects torn writes / bit-rot that the queue's length-only header cannot
     /// (a flipped payload byte would otherwise replay silently-wrong). A drained
-    /// record that fails the check is dropped (logged + counted), never sent.
+    /// record that fails the check is dropped and logged at error level, never
+    /// sent. No metric counts it.
     /// Default false (on-disk format unchanged unless enabled).
     #[serde(default)]
     pub crc: bool,
@@ -320,13 +321,12 @@ impl DrainStrategy {
 ///
 /// `Block` (default) preserves scalo's lossless contract: the write errors so
 /// the caller backpressures the inbound source (doctrine: gate the source,
-/// never silently drop the drain). The other variants are EXPLICIT opt-in loss
-/// / diversion and emit `tiered_sink_overflow_total{policy}` (plus a
-/// `tiered_sink_dropped_total{policy}` for the drop variants) so loss is never
-/// silent and always alertable.
+/// never silently drop the drain). `DropNewest` is explicit opt-in loss, and
+/// each record it sheds counts in `tiered_sink_overflow_total{policy}` and
+/// `tiered_sink_dropped_total{policy}` so the loss is alertable.
 ///
-/// `Dlq` is the scalo no-silent-drop variant: overflow is diverted to the DLQ
-/// instead of being dropped or crashing the spool.
+/// `Dlq` and `DropOldest` are not wired yet: both behave as `Block`, log a
+/// warning on every spool-full event, and count in neither metric.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -335,13 +335,14 @@ pub enum WhenFull {
     /// source. Lossless. Default (matches pre-2.10 behaviour).
     #[default]
     Block,
-    /// Divert the overflowing record to the DLQ -- no silent loss, no crash.
+    /// Meant to divert the overflowing record to the DLQ. Not wired yet:
+    /// behaves as `Block`, with a warning.
     Dlq,
     /// Drop the incoming (newest) record. Explicit opt-in loss; keeps the
     /// older, lower-latency records already spooled.
     DropNewest,
-    /// Drop the oldest spooled record to make room for the newest. Explicit
-    /// opt-in loss; keeps the freshest data.
+    /// Meant to drop the oldest spooled record to make room for the newest.
+    /// Not wired yet: behaves as `Block`, with a warning.
     DropOldest,
 }
 

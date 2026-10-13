@@ -2,7 +2,7 @@
 
 The DLQ (dead-letter queue) is the last-resort sink for messages the
 primary pipeline couldn't deliver -- parse errors, validation
-failures, persistent transport failure, `TieredSink::SpoolFull`,
+failures, persistent transport failure, `TieredSinkError::SpoolFull`,
 poison records. Every data-plane service shares one DLQ orchestrator built
 from cascade config.
 
@@ -244,7 +244,7 @@ clone can call `shutdown()`.
 
 ## Related
 
-- [tiered-sink.md](tiered-sink.md) -- common upstream caller (routes `SpoolFull` / `Fatal` to DLQ)
+- [tiered-sink.md](tiered-sink.md) -- common upstream: its caller routes the sink's `SpoolFull` and `Sink` (fatal) errors here
 - [batch-engine.md](batch-engine.md) -- parse errors and pre-route DLQ outcomes flow here
 - [../transport/README.md](../transport/README.md) -- Kafka backend reuses `KafkaConfig`
 - [../transport/filter-engine.md](../transport/filter-engine.md) -- wire-level filter drains DLQ entries here
