@@ -4,7 +4,10 @@ all-features = true
 
 [advisories]
 yanked = "warn"
-ignore = []
+ignore = [
+    # unsafe-libyaml arrives via figment's yaml feature and serde_yaml_ng; tracked in scalo-rs#341.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained, not vulnerable; it parses only operator-supplied config YAML via serde_yaml and serde_yaml_ng (figment, scalo), never untrusted input; drop when scalo moves to a maintained YAML parser" },
+]
 
 [licenses]
 allow = [
