@@ -401,10 +401,10 @@ rdkafka = { version = ">=0.39.0, <0.40", features = ["dynamic-linking"], optiona
 # not by hand-written source — cargo-machete won't see it but it's required.
 # tls-aws-lc: client/server TLS on the aws-lc-rs backend (matches crate::tls's
 # explicit provider). tls-native-roots: ClientTlsConfig::with_native_roots().
-tonic = { version = ">=0.14.1, <0.15", features = ["gzip", "tls-aws-lc", "tls-native-roots"], optional = true }
-tonic-prost = { version = ">=0.14.5, <0.15", optional = true }
-prost = { version = ">=0.14, <0.15", optional = true }
-prost-types = { version = ">=0.14, <0.15", optional = true }
+tonic = { version = ">=0.14.6, <0.15", features = ["gzip", "tls-aws-lc", "tls-native-roots"], optional = true }
+tonic-prost = { version = ">=0.14.6, <0.15", optional = true }
+prost = { version = ">=0.14.4, <0.15", optional = true }
+prost-types = { version = ">=0.14.4, <0.15", optional = true }
 # TcpListenerStream — lets GrpcTransport::new bind the listener synchronously
 # and serve_with_incoming_shutdown, so server readiness is guaranteed on return.
 # The `net` feature does not exist before 0.1.1, and tonic pins the real floor
@@ -511,8 +511,8 @@ aws-config = { version = ">=1.8, <2", default-features = false, features = ["def
 aws-sdk-secretsmanager = { version = ">=1.117, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
 [build-dependencies]
-tonic-prost-build = { version = ">=0.14.5, <0.15", optional = true }
-prost-build = { version = ">=0.14, <0.15", optional = true }
+tonic-prost-build = { version = ">=0.14.6, <0.15", optional = true }
+prost-build = { version = ">=0.14.4, <0.15", optional = true }
 
 [dev-dependencies]
 tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
