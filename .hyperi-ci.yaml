@@ -31,6 +31,10 @@ quality:
     - tool: osv-scanner
       id: GHSA-w9wp-h8wv-79jx
       reason: "CVE-2026-48504, opentelemetry_sdk 0.31.x: BaggagePropagator::extract_with_context is unreachable, as scalo registers no text-map propagator and never touches Baggage. The fix (0.32.1) waits on metrics-exporter-opentelemetry, whose newest release (0.2.1) requires opentelemetry ^0.31 (renovate.json holds the 0.31 line). Drop on that bump, tracked in scalo-rs#281."
+    # unsafe-libyaml arrives via figment's yaml feature and serde_yaml_ng; tracked in scalo-rs#341.
+    - tool: osv-scanner
+      id: RUSTSEC-2024-0449
+      reason: "unsafe-libyaml is unmaintained, not vulnerable; it parses only operator-supplied config YAML via serde_yaml and serde_yaml_ng (figment, scalo), never untrusted input; drop when scalo moves to a maintained YAML parser"
 test:
   enabled: true
   coverage: false
