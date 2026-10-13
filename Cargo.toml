@@ -316,9 +316,9 @@ clap = { version = ">=4.5, <5", features = ["derive", "env"], optional = true }
 
 # Logging
 tracing = { version = ">=0.1.44, <0.2", optional = true }
-tracing-subscriber = { version = ">=0.3.22, <0.4", features = ["json", "env-filter", "fmt", "time"], optional = true }
+tracing-subscriber = { version = ">=0.3.23, <0.4", features = ["json", "env-filter", "fmt", "time"], optional = true }
 owo-colors = { version = ">=4.2.3, <5", optional = true }
-tracing-throttle = { version = ">=0.4.2, <0.5", default-features = false, optional = true }
+tracing-throttle = { version = ">=0.4.4, <0.5", default-features = false, optional = true }
 
 # OpenTelemetry (modern observability - OTLP native)
 # Held at 0.31: metrics-exporter-opentelemetry 0.2.1, its newest crates.io
