@@ -50,7 +50,9 @@ Schema, draft 2020-12, from these types with schemars, `schema_version` pinned
 and required. It is committed as
 `charts/scalo-service/schema/deployment-contract.v4.schema.json`, where a chart
 assembler in any language validates a contract against it. A test fails when the
-committed file and the derivation differ; regenerate with:
+committed file and the derivation differ as JSON values; key order does not count,
+so a schemars release that only reorders properties leaves it passing. Regenerate
+with:
 
 ```bash
 env SCALO_WRITE_CONTRACT_SCHEMA=1 cargo nextest run --all-features -E 'test(committed_contract_schema)'
