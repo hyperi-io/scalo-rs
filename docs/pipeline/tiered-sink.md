@@ -116,8 +116,7 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
-The drain task is `tokio::spawn`'d at construction and stops on
-`shutdown.notify_one()`.
+The drain task is `tokio::spawn`'d at construction. It and the disk poller both stop when the sink's shutdown `CancellationToken` is cancelled, by `shutdown()` or by drop. With the `shutdown` feature the drain task also stops on the global token.
 
 ---
 
@@ -177,13 +176,14 @@ common cases without writing the full struct.
 | `hot_path_count() / cold_path_count()` | Cumulative path counters |
 | `is_disk_available()` | Disk-aware poller flag |
 | `inner() -> &S` | Borrow the wrapped backend |
-| `shutdown()` | Stop the drain task and drainer-side join |
+| `shutdown()` | Stop the drain task and the disk poller, and wait for both to exit |
 | `Sink` trait | `type Error: StdError + Send + Sync; async fn try_send(&self, data: &[u8]) -> Result<(), SinkError<Self::Error>>` |
 | `SinkError<E>` | `Full / Unavailable / Fatal(E)` -- drives spillover behaviour |
 | `CircuitBreaker` / `CircuitState` | Exposed for tests and custom integrations |
 
-Drop fires `shutdown.notify_one()` -- the drain exits cleanly even if
-the consumer forgets to call `shutdown().await`.
+`shutdown()` lets a drain already in flight finish its send and commit, then returns. It does not drain the spill cache to the sink: records still spooled stay on disk and replay on the next open, so shutdown loses nothing `send` accepted.
+
+Drop cancels the same token, so both background tasks exit even if the consumer forgets to call `shutdown().await`, but drop cannot wait for them.
 
 ---
 

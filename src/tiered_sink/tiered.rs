@@ -15,9 +15,10 @@ use crate::tiered_sink::{
 use crate::transport::{Record, SendResult, TransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use yaque::{Receiver, Sender};
 
 /// A tiered sink with automatic disk spillover.
@@ -42,10 +43,10 @@ pub struct TieredSink<S: TransportSender> {
     circuit: Arc<CircuitBreaker>,
     codec: CompressionCodec,
     config: TieredSinkConfig,
-    shutdown: Arc<Notify>,
+    /// Stops the drainer and the disk poller; every waiter sees the cancel, even one that waits after it.
+    shutdown: CancellationToken,
     drain_handle: Option<JoinHandle<()>>,
     disk_available: Arc<std::sync::atomic::AtomicBool>,
-    #[allow(dead_code)]
     disk_poller_handle: Option<JoinHandle<()>>,
 
     /// Serialises send + drain in `StrictFifo`. `None` otherwise.
@@ -101,7 +102,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             config.circuit_failure_threshold,
             config.circuit_reset_timeout(),
         ));
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
         let codec = config.compression;
         let disk_available = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
@@ -114,7 +115,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         let disk_poller_handle = config.disk_aware.as_ref().map(|disk_cfg| {
             let spool_path = config.spool_path.clone();
             let disk_flag = Arc::clone(&disk_available);
-            let shutdown_clone = Arc::clone(&shutdown);
+            let shutdown_clone = shutdown.clone();
             let poll_interval = std::time::Duration::from_secs(disk_cfg.poll_interval_secs);
             let max_usage = disk_cfg.max_usage_percent;
 
@@ -138,7 +139,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             config.crc,
             config.drain_strategy,
             config.drain_interval(),
-            Arc::clone(&shutdown),
+            shutdown.clone(),
             fifo_gate.as_ref().map(Arc::clone),
         ));
 
@@ -462,10 +463,14 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         self.circuit.reset().await;
     }
 
-    /// Shutdown the drain task gracefully.
+    /// Stop the drain task and the disk poller, and wait for both to exit.
+    ///
+    /// A drain already in flight finishes its send and commit first. Records
+    /// still in the spill cache stay on disk and replay on the next open.
     pub async fn shutdown(mut self) {
-        self.shutdown.notify_one();
-        if let Some(handle) = self.drain_handle.take() {
+        self.shutdown.cancel();
+        let handles = [self.drain_handle.take(), self.disk_poller_handle.take()];
+        for handle in handles.into_iter().flatten() {
             let _ = handle.await;
         }
     }
@@ -607,11 +612,12 @@ async fn disk_capacity_poller(
     disk_available: Arc<std::sync::atomic::AtomicBool>,
     max_usage_percent: f64,
     poll_interval: std::time::Duration,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
 ) {
     loop {
         tokio::select! {
-            () = shutdown.notified() => {
+            biased;
+            () = shutdown.cancelled() => {
                 #[cfg(feature = "tracing")]
                 tracing::debug!("Disk capacity poller shutting down");
                 return;
@@ -651,8 +657,8 @@ async fn disk_capacity_poller(
 impl<S: TransportSender> Drop for TieredSink<S> {
     fn drop(&mut self) {
         // Durability requires explicit `shutdown().await`.
-        // Drop can only notify the background drainer -- it can't
-        // await it. If anything's still spooled at drop time, the
+        // Drop can only cancel the background tasks -- it can't
+        // await them. If anything's still spooled at drop time, the
         // caller has skipped the explicit shutdown and risks losing
         // that data. Warn + count so this shows up in dashboards.
         let pending = self.spool_count.load(AtomicOrdering::Relaxed);
@@ -665,7 +671,7 @@ impl<S: TransportSender> Drop for TieredSink<S> {
                 "TieredSink dropped with spooled work pending -- call shutdown().await for durability"
             );
         }
-        self.shutdown.notify_one();
+        self.shutdown.cancel();
     }
 }
 
@@ -1366,6 +1372,82 @@ mod tests {
 
     fn payloads(n: usize) -> Vec<Vec<u8>> {
         (0..n).map(|i| format!("rec-{i:02}").into_bytes()).collect()
+    }
+
+    /// How long a shutdown may take before the test calls it hung.
+    const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Spilling config with the disk poller on; its 5 s poll keeps it parked on the shutdown signal.
+    fn disk_aware_config(path: &std::path::Path) -> TieredSinkConfig {
+        spilling_config(path).disk_aware(crate::tiered_sink::DiskAwareConfig {
+            max_usage_percent: 1.0,
+            poll_interval_secs: 5,
+        })
+    }
+
+    /// Lets both background tasks reach their shutdown wait, the poller first, as in a running sink.
+    async fn let_background_tasks_park() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_with_the_disk_poller_running() {
+        let dir = tempdir().unwrap();
+        let tiered = TieredSink::new(
+            TestSink::new(),
+            disk_aware_config(&dir.path().join("spool")),
+        )
+        .await
+        .unwrap();
+        let_background_tasks_park().await;
+        tokio::time::timeout(SHUTDOWN_BOUND, tiered.shutdown())
+            .await
+            .expect("shutdown must return while the disk poller is running");
+    }
+
+    #[tokio::test]
+    async fn drop_stops_the_drainer_and_the_disk_poller() {
+        let dir = tempdir().unwrap();
+        let mut tiered = TieredSink::new(
+            TestSink::new(),
+            disk_aware_config(&dir.path().join("spool")),
+        )
+        .await
+        .unwrap();
+        let drainer = tiered.drain_handle.take().unwrap();
+        let poller = tiered.disk_poller_handle.take().unwrap();
+        let_background_tasks_park().await;
+        drop(tiered);
+        tokio::time::timeout(SHUTDOWN_BOUND, async {
+            drainer.await.unwrap();
+            poller.await.unwrap();
+        })
+        .await
+        .expect("dropping the sink must stop both background tasks");
+    }
+
+    #[tokio::test]
+    async fn records_spilled_before_shutdown_are_replayed_after_it() {
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let tiered = TieredSink::new(sink, disk_aware_config(&spool))
+            .await
+            .unwrap();
+        for p in payloads(5) {
+            tiered.send(&rec(&p)).await.unwrap();
+        }
+        assert_eq!(tiered.spool_len().await, 5);
+        let_background_tasks_park().await;
+        tokio::time::timeout(SHUTDOWN_BOUND, tiered.shutdown())
+            .await
+            .expect("shutdown must return with records spilled");
+        assert_eq!(
+            reopen_and_drain(&spool, 5).await,
+            payloads(5),
+            "every record accepted before shutdown is replayed after it"
+        );
     }
 
     /// Entries of `dir` whose name starts with `prefix`.

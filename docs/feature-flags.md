@@ -269,9 +269,7 @@ A handful of dependencies aren't visible from the feature name alone:
 - `worker-batch` pulls `worker-pool` and `metrics`. `BatchEngine` is
   metric-aware.
 - `parse_guard` -- `json_depth_within` and `MAX_PARSE_DEPTH`, the nesting-depth check to run before parsing untrusted JSON -- compiles with `transport` or `worker-batch`, and both pull `wide` for its SIMD byte compares. There is no feature for the guard alone.
-- `tiered-sink` pulls `tokio` and the spill cache's own crates (`yaque`,
-  `zstd`), not the `spool` feature: `TieredSink` keeps its own cache, and
-  the standalone `Spool` type needs `spool`.
+- `tiered-sink` pulls `tokio`, `tokio-util` (its shutdown token) and the spill cache's own crates (`yaque`, `zstd`), not the `spool` feature: `TieredSink` keeps its own cache, and the standalone `Spool` type needs `spool`.
 - `spool` pulls `tokio`: `Spool::open` opens the queue on tokio's blocking
   pool, so it needs a tokio runtime.
 - `dlq` requires `concurrency` (for the `BackgroundSink` actor that
