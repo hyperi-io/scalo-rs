@@ -8,6 +8,20 @@ release and the target before bumping.
 
 ## Unreleased
 
+### A tiered sink drain send is cut off at `send_timeout_ms` (BEHAVIOUR CHANGE)
+
+The `TieredSink` drainer's send of a spooled record had no time limit, and is now bounded by `send_timeout_ms`, the hot path's limit (default 1000 ms). A downstream slower than that used to finish its drain. Now the send is cut off and counts as a circuit failure, and the record stays uncommitted at the head of the spool for the next pass.
+
+A downstream slower than the limit on every send never drains the spool, and each retry can duplicate a record it did take. See [pipeline/tiered-sink.md](pipeline/tiered-sink.md#drain-strategies).
+
+**Consumer adjustment** -- set `send_timeout_ms` above the downstream's real latency for one record, its worst case included.
+
+### `TieredSink::shutdown()` returns when `disk_aware` is set (BEHAVIOUR CHANGE)
+
+With `disk_aware` set, `shutdown()` never returned and drop left the drain task running. Both now stop the drain task and the disk poller.
+
+**Consumer adjustment** -- none. Code that skipped `shutdown().await` on a disk-aware sink because it hung can call it.
+
 ### scalo writes no Helm chart or ArgoCD Application (API CHANGE)
 
 The chart generator, its drift guard and the ArgoCD generator are removed: `generate_chart`, `check_chart_drift`, `assert_no_chart_drift`, `ChartPatch`, `generate_argocd_application`, `ArgocdConfig`, `argocd_repo_url_from_cascade`, `argocd_dest_namespace_from_cascade`, `validate_helm_values` and `DeploymentError::ParseYaml`. `generate-artefacts` stops writing `argocd-application.yaml` and reads no `deployment.argocd.*` key. The Kubernetes objects come from the thin chart a chart assembler builds from `deployment-contract.json` on the [scalo-service](../charts/scalo-service/README.md) library chart. To preview a service's chart locally, run `hyperi-ci chart assemble` -- see [deployment/artefacts.md](deployment/artefacts.md#kubernetes-objects).
