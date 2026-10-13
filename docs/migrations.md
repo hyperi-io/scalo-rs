@@ -8,6 +8,14 @@ release and the target before bumping.
 
 ## Unreleased
 
+### `TieredSink::shutdown()` is not reported as a drop (BEHAVIOUR CHANGE)
+
+`shutdown()` ended by dropping the sink, so a sink shut down with records still spooled logged "TieredSink dropped with spooled work pending" and counted one in `spool_dropped_without_shutdown_total`. After `shutdown().await` neither happens. A sink dropped without it still warns and counts.
+
+**Consumer adjustment** -- none. An alert on `spool_dropped_without_shutdown_total` now fires only for a sink dropped without `shutdown().await`.
+
+## 2.14.10
+
 ### A tiered sink drain send is cut off at `send_timeout_ms` (BEHAVIOUR CHANGE)
 
 The `TieredSink` drainer's send of a spooled record had no time limit, and is now bounded by `send_timeout_ms`, the hot path's limit (default 1000 ms). A downstream slower than that used to finish its drain. Now the send is cut off and counts as a circuit failure, and the record stays uncommitted at the head of the spool for the next pass.
@@ -21,6 +29,8 @@ A downstream slower than the limit on every send never drains the spool, and eac
 With `disk_aware` set, `shutdown()` never returned and drop left the drain task running. Both now stop the drain task and the disk poller.
 
 **Consumer adjustment** -- none. Code that skipped `shutdown().await` on a disk-aware sink because it hung can call it.
+
+## 2.14.6
 
 ### scalo writes no Helm chart or ArgoCD Application (API CHANGE)
 
@@ -40,11 +50,15 @@ The scalo-service PodDisruptionBudget sets `unhealthyPodEvictionPolicy: AlwaysAl
 
 **Consumer adjustment** -- none for a subscriber that rebuilds its client on a `RotationEvent`: it now rebuilds on the first read of the new version rather than not at all.
 
+## 2.14.5
+
 ### The contract says whether the pod gets a ServiceAccount (API CHANGE)
 
 `DeploymentContract` gains `service_account` (`ServiceAccount::Own` or `ServiceAccount::None`, `"own"` or `"none"` in the JSON), default `Own` and left out of the JSON while it is. On `none` the scalo-service chart creates no ServiceAccount and leaves `serviceAccountName` off the pod. The chart also stops naming an account it did not create: `serviceAccount.create: false` without `serviceAccount.name` now renders no `serviceAccountName`, where it named `<fullname>`, an account that did not exist. See [deployment/contract.md](deployment/contract.md#writable-paths-resources-and-security).
 
 **Consumer adjustment** -- a `DeploymentContract` struct literal names the new field: `service_account: ServiceAccount::Own` keeps today's chart. A committed `deployment-contract.json` does not change. A deployment that set `serviceAccount.create: false` with no name now runs its pod as the namespace's `default` account instead of being refused admission.
+
+## 2.14.3
 
 ### The secret schema marker is `x-scalo-secret` alone (BEHAVIOUR CHANGE)
 

@@ -48,6 +48,8 @@ pub struct TieredSink<S: TransportSender> {
     drain_handle: Option<JoinHandle<()>>,
     disk_available: Arc<std::sync::atomic::AtomicBool>,
     disk_poller_handle: Option<JoinHandle<()>>,
+    /// Set once `shutdown` has joined both tasks, so its own drop of `self` is not reported as one.
+    shut_down: bool,
 
     /// Serialises send + drain in `StrictFifo`. `None` otherwise.
     fifo_gate: Option<Arc<Mutex<()>>>,
@@ -157,6 +159,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             drain_handle: Some(drain_handle),
             disk_available,
             disk_poller_handle,
+            shut_down: false,
             fifo_gate,
             hot_path_count: AtomicU64::new(0),
             cold_path_count: AtomicU64::new(0),
@@ -475,6 +478,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         for handle in handles.into_iter().flatten() {
             let _ = handle.await;
         }
+        self.shut_down = true;
     }
 }
 
@@ -658,13 +662,11 @@ async fn disk_capacity_poller(
 
 impl<S: TransportSender> Drop for TieredSink<S> {
     fn drop(&mut self) {
-        // Durability requires explicit `shutdown().await`.
-        // Drop can only cancel the background tasks -- it can't
-        // await them. If anything's still spooled at drop time, the
-        // caller has skipped the explicit shutdown and risks losing
-        // that data. Warn + count so this shows up in dashboards.
+        // Drop can only cancel the background tasks, not await them. With records
+        // still spooled and no completed `shutdown().await`, warn and count so the
+        // skipped shutdown shows up in dashboards.
         let pending = self.spool_count.load(AtomicOrdering::Relaxed);
-        if pending > 0 {
+        if pending > 0 && !self.shut_down {
             #[cfg(feature = "metrics")]
             ::metrics::counter!("spool_dropped_without_shutdown_total").increment(1);
             #[cfg(feature = "tracing")]
@@ -1344,8 +1346,8 @@ mod tests {
         config
     }
 
-    /// Spill `payloads` into a spool at `path`, then close it cleanly.
-    async fn spill(path: &std::path::Path, payloads: &[Vec<u8>]) {
+    /// A sink at `path` with its downstream down and every one of `payloads` in its spool.
+    async fn spilled(path: &std::path::Path, payloads: &[Vec<u8>]) -> TieredSink<TestSink> {
         let sink = TestSink::new();
         sink.set_available(false);
         let tiered = TieredSink::new(sink, spilling_config(path)).await.unwrap();
@@ -1353,7 +1355,12 @@ mod tests {
             tiered.send(&rec(p)).await.unwrap();
         }
         assert_eq!(tiered.spool_len().await, payloads.len());
-        tiered.shutdown().await;
+        tiered
+    }
+
+    /// Spill `payloads` into a spool at `path`, then close it cleanly.
+    async fn spill(path: &std::path::Path, payloads: &[Vec<u8>]) {
+        spilled(path, payloads).await.shutdown().await;
     }
 
     /// Reopen the spool at `path` against a healthy sink and wait for the drain.
@@ -1426,6 +1433,93 @@ mod tests {
         })
         .await
         .expect("dropping the sink must stop both background tasks");
+    }
+
+    /// What `Drop` reported on this thread: the drop counter and the WARN-level log text.
+    #[cfg(all(feature = "metrics", feature = "logger"))]
+    struct DropReport {
+        metrics: metrics_exporter_prometheus::PrometheusHandle,
+        logs: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    #[cfg(all(feature = "metrics", feature = "logger"))]
+    impl DropReport {
+        fn drops_counted(&self) -> u64 {
+            self.metrics
+                .render()
+                .lines()
+                .find_map(|line| line.strip_prefix("spool_dropped_without_shutdown_total "))
+                .map_or(0, |value| value.trim().parse().unwrap())
+        }
+
+        fn warned(&self) -> bool {
+            String::from_utf8_lossy(&self.logs.lock().unwrap())
+                .contains("dropped with spooled work pending")
+        }
+    }
+
+    /// Runs `close` on a sink holding three spooled records, with this thread's recorder and subscriber capturing `Drop`.
+    #[cfg(all(feature = "metrics", feature = "logger"))]
+    async fn report_drop<F, Fut>(close: F) -> DropReport
+    where
+        F: FnOnce(TieredSink<TestSink>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics = recorder.handle();
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || Logs(Arc::clone(&writer))),
+            );
+
+        let dir = tempdir().unwrap();
+        {
+            let _metrics = ::metrics::set_default_local_recorder(&recorder);
+            let _logs = tracing::subscriber::set_default(subscriber);
+            let tiered = spilled(&dir.path().join("spool"), &payloads(3)).await;
+            close(tiered).await;
+        }
+        DropReport { metrics, logs }
+    }
+
+    #[cfg(all(feature = "metrics", feature = "logger"))]
+    #[tokio::test]
+    async fn shutdown_with_records_spooled_is_not_reported_as_a_drop() {
+        let report = report_drop(TieredSink::shutdown).await;
+        assert_eq!(
+            (report.drops_counted(), report.warned()),
+            (0, false),
+            "(drops counted, warned) after shutdown"
+        );
+    }
+
+    #[cfg(all(feature = "metrics", feature = "logger"))]
+    #[tokio::test]
+    async fn dropping_a_sink_with_records_spooled_is_reported() {
+        let report = report_drop(|tiered| async move { drop(tiered) }).await;
+        assert_eq!(
+            (report.drops_counted(), report.warned()),
+            (1, true),
+            "(drops counted, warned) after a drop without shutdown"
+        );
     }
 
     #[tokio::test]

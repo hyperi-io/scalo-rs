@@ -21,8 +21,12 @@ pub struct TieredSinkConfig {
     /// Path to the spool file for disk fallback.
     pub spool_path: PathBuf,
 
-    /// Timeout for primary sink operations.
-    /// If exceeded, message is spooled to disk.
+    /// Time limit for one send to the primary sink, on the hot path and the drain alike.
+    ///
+    /// A hot-path send past it spools its record to disk. A drain send past it
+    /// leaves its record uncommitted at the head of the spool for the next pass,
+    /// so `shutdown()` waits at most this long for a drain in flight. Either way
+    /// the timeout counts as a circuit failure.
     #[serde(default = "default_send_timeout_ms")]
     pub send_timeout_ms: u64,
 
