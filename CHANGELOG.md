@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.12](https://github.com/hyperi-io/scalo-rs/compare/v2.14.11...v2.14.12) (2026-10-13)
+
+### Bug Fixes
+
+* make the tiered sink's docs and metric manifest match the code ([#349](https://github.com/hyperi-io/scalo-rs/issues/349)) ([42d97df](https://github.com/hyperi-io/scalo-rs/commit/42d97df1cdbfd54b4261e8b024eef2921c3bef5d))
+
 ## [2.14.11](https://github.com/hyperi-io/scalo-rs/compare/v2.14.10...v2.14.11) (2026-10-13)
 
 ### Bug Fixes
