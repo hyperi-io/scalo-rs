@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use yaque::Receiver;
 
@@ -122,6 +123,9 @@ enum DrainResult {
     Success,
     /// Sink is unavailable / backpressured
     SinkUnavailable,
+    /// The send outlived `send_timeout`. The entry is still on disk,
+    /// uncommitted, and is offered again on the next pass.
+    SendTimedOut,
     /// Fatal error sending
     Fatal(String),
     /// Decompression error
@@ -140,7 +144,65 @@ enum DrainResult {
     CommitFailed(String),
 }
 
+/// Feed one drain outcome back into the rate controller and the breaker.
+async fn settle(
+    result: DrainResult,
+    drainer: &mut Drainer,
+    circuit: &CircuitBreaker,
+    send_timeout: Duration,
+) {
+    match result {
+        DrainResult::Success => {
+            drainer.record_success();
+            circuit.record_success().await;
+            #[cfg(feature = "tracing")]
+            tracing::debug!(rate = drainer.current_rate(), "Drained message to sink");
+        }
+        DrainResult::SinkUnavailable => {
+            drainer.record_failure();
+            circuit.record_failure().await;
+            #[cfg(feature = "tracing")]
+            tracing::debug!("Sink unavailable during drain, circuit may open");
+        }
+        DrainResult::SendTimedOut => {
+            // Counts toward the breaker as the hot path's timeout does.
+            drainer.record_failure();
+            circuit.record_failure().await;
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                send_timeout = ?send_timeout,
+                "Sink send timed out during drain; record stays spooled, will retry"
+            );
+        }
+        DrainResult::Fatal(e) => {
+            #[cfg(feature = "tracing")]
+            tracing::error!(error = %e, "Fatal error during drain, dropping message");
+        }
+        DrainResult::DecompressError(e) => {
+            #[cfg(feature = "tracing")]
+            tracing::error!(error = %e, "Failed to decompress spooled message, dropping");
+        }
+        DrainResult::DecodeError(e) => {
+            #[cfg(feature = "tracing")]
+            tracing::error!(error = %e, "Failed to decode spooled record, dropping");
+        }
+        DrainResult::Empty | DrainResult::IoError => {
+            // Nothing to do, just continue
+        }
+        DrainResult::CommitFailed(e) => {
+            // Counters intact; entry still on disk. Treat as
+            // failure so StrictFifo stays gated until retry.
+            drainer.record_failure();
+            #[cfg(feature = "tracing")]
+            tracing::error!(error = %e, "yaque commit failed; counters preserved, will retry");
+        }
+    }
+}
+
 /// Drain loop. Runs until shutdown signalled.
+///
+/// `send_timeout`: bounds each downstream send, the hot path's limit, so a hung
+/// sink cannot pin the spool lock, the StrictFifo gate or `shutdown()`.
 ///
 /// `fifo_gate`: `Some` in StrictFifo, acquired per delivery cycle
 /// to serialise with senders. `None` in Interleaved (lock-free).
@@ -155,6 +217,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     crc: bool,
     strategy: DrainStrategy,
     interval: Duration,
+    send_timeout: Duration,
     shutdown: CancellationToken,
     fifo_gate: Option<Arc<Mutex<()>>>,
 ) {
@@ -224,8 +287,13 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                             // never block the queue forever on a poison entry.
                             match Record::decode(&data) {
                                 Ok(record) => {
-                                    match sink.send_batch(std::slice::from_ref(&record)).await {
-                                        SendResult::Ok | SendResult::FilteredDlq => {
+                                    match timeout(
+                                        send_timeout,
+                                        sink.send_batch(std::slice::from_ref(&record)),
+                                    )
+                                    .await
+                                    {
+                                        Ok(SendResult::Ok | SendResult::FilteredDlq) => {
                                             // Commit FIRST; only decrement on commit
                                             // success so counters never drift while
                                             // the entry still sits in the queue.
@@ -242,12 +310,19 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                                                 Err(e) => DrainResult::CommitFailed(e.to_string()),
                                             }
                                         }
-                                        SendResult::Backpressured => {
+                                        Ok(SendResult::Backpressured) => {
                                             // Don't commit - guard rolls back, retry later.
                                             drop(guard);
                                             DrainResult::SinkUnavailable
                                         }
-                                        SendResult::Fatal(e) => match guard.commit() {
+                                        Err(_elapsed) => {
+                                            // The send future is dropped; the entry
+                                            // may or may not have reached the sink, so
+                                            // roll back and retry (at-least-once).
+                                            drop(guard);
+                                            DrainResult::SendTimedOut
+                                        }
+                                        Ok(SendResult::Fatal(e)) => match guard.commit() {
                                             Ok(()) => {
                                                 spool_count.fetch_sub(1, AtomicOrdering::Relaxed);
                                                 spool_bytes.fetch_sub(
@@ -295,42 +370,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
         };
 
         // Handle the result outside the lock
-        match result {
-            DrainResult::Success => {
-                drainer.record_success();
-                circuit.record_success().await;
-                #[cfg(feature = "tracing")]
-                tracing::debug!(rate = drainer.current_rate(), "Drained message to sink");
-            }
-            DrainResult::SinkUnavailable => {
-                drainer.record_failure();
-                circuit.record_failure().await;
-                #[cfg(feature = "tracing")]
-                tracing::debug!("Sink unavailable during drain, circuit may open");
-            }
-            DrainResult::Fatal(e) => {
-                #[cfg(feature = "tracing")]
-                tracing::error!(error = %e, "Fatal error during drain, dropping message");
-            }
-            DrainResult::DecompressError(e) => {
-                #[cfg(feature = "tracing")]
-                tracing::error!(error = %e, "Failed to decompress spooled message, dropping");
-            }
-            DrainResult::DecodeError(e) => {
-                #[cfg(feature = "tracing")]
-                tracing::error!(error = %e, "Failed to decode spooled record, dropping");
-            }
-            DrainResult::Empty | DrainResult::IoError => {
-                // Nothing to do, just continue
-            }
-            DrainResult::CommitFailed(e) => {
-                // Counters intact; entry still on disk. Treat as
-                // failure so StrictFifo stays gated until retry.
-                drainer.record_failure();
-                #[cfg(feature = "tracing")]
-                tracing::error!(error = %e, "yaque commit failed; counters preserved, will retry");
-            }
-        }
+        settle(result, &mut drainer, &circuit, send_timeout).await;
 
         // Apply rate limiting
         let delay = drainer.delay();

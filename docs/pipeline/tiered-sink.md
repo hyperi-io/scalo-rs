@@ -118,6 +118,8 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 
 The drain task is `tokio::spawn`'d at construction. It and the disk poller both stop when the sink's shutdown `CancellationToken` is cancelled, by `shutdown()` or by drop. With the `shutdown` feature the drain task also stops on the global token.
 
+Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A send that runs past it counts as a circuit failure. The record stays at the head of the spool, uncommitted, and is offered again on the next drain pass. The downstream may have taken the record before the timeout, so the retry can duplicate it (at-least-once).
+
 ---
 
 ## Spool sizing and disk awareness
@@ -181,7 +183,7 @@ common cases without writing the full struct.
 | `SinkError<E>` | `Full / Unavailable / Fatal(E)` -- drives spillover behaviour |
 | `CircuitBreaker` / `CircuitState` | Exposed for tests and custom integrations |
 
-`shutdown()` lets a drain already in flight finish its send and commit, then returns. It does not drain the spill cache to the sink: records still spooled stay on disk and replay on the next open, so shutdown loses nothing `send` accepted.
+`shutdown()` lets a drain already in flight finish its send and commit, then returns. A drain send to a downstream that never answers is cut off at `send_timeout_ms`, so `shutdown()` waits at most that long. It does not drain the spill cache to the sink: records still spooled stay on disk and replay on the next open, so shutdown loses nothing `send` accepted.
 
 Drop cancels the same token, so both background tasks exit even if the consumer forgets to call `shutdown().await`, but drop cannot wait for them.
 
