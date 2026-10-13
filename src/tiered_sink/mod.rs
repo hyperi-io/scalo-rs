@@ -8,9 +8,9 @@
 
 //! Tiered sink with automatic disk spillover for resilient message delivery.
 //!
-//! This module provides a wrapper around any async sink (Kafka, S3, HTTP, etc.)
-//! that automatically spills messages to disk when the primary sink is unavailable
-//! or backpressuring, then drains them back when the sink recovers.
+//! Wraps any [`TransportSender`](crate::transport::TransportSender) (Kafka,
+//! gRPC, HTTP, file, pipe) and spills records to disk when the sender
+//! backpressures or times out, then drains them back when it recovers.
 //!
 //! ## Design
 //!
@@ -18,13 +18,13 @@
 //!                     +-------------------------------------+
 //!                     |           TieredSink                |
 //!                     |                                     |
-//!    Message -------->|  try_send() to primary sink        |
+//!    Record --------->|  send_batch() to the sender         |
 //!                     |         |                           |
 //!                     |         v                           |
 //!                     |    +---------+                      |
 //!                     |    | Success |--> Done (hot path)   |
 //!                     |    +----+----+                      |
-//!                     |         | Err(Full/Unavailable)     |
+//!                     |         | Backpressured / timeout   |
 //!                     |         v                           |
 //!                     |    +---------+                      |
 //!                     |    |  Spool  |--> Disk (cold path)  |

@@ -24,7 +24,7 @@ for how features cascade into one another.
 | `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint, process metrics, cardinality cap, `/metrics/manifest` catalogue | Stand up an exporter, wire a process collector, hand-roll a manifest |
 | `ServiceRuntime::new(...)` | All of the above + memory guard + scaling pressure + worker pool + batch engine + shutdown token + K8s pre-stop delay + runtime context | Glue them together manually; six modules wire themselves |
 | Any `Transport` impl | 3-tier filter engine, DLQ routing, per-direction/action metrics, W3C traceparent propagation | Add filters, wire DLQ, instrument send/recv |
-| `TieredSink::new(...)` | Transport + disk-spillover spool + circuit breaker + retry + DLQ fallback + backpressure signal | Compose those primitives by hand |
+| `TieredSink::new(...)` | Transport + disk-spillover spool + circuit breaker + background drain + backpressure signal (`SpoolFull` for the caller to route, usually to the DLQ) | Compose those primitives by hand |
 
 That's the value proposition. Everything else in these docs is "and here's
 how the pieces work".

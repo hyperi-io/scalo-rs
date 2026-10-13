@@ -1,9 +1,6 @@
 # Tiered Sink
 
-`TieredSink<S>` wraps any `Sink` backend (Kafka, gRPC, S3, HTTP) with
-the resilience primitives every production data-plane pipeline needs --
-timeout, circuit breaker, disk spillover, background drain. Apps call
-`sink.send(msg).await?` and the sink picks the right failure response.
+`TieredSink<S>` wraps any `TransportSender` (Kafka, gRPC, HTTP, file, pipe, or the factory's `AnySender`) with the resilience primitives every production data-plane pipeline needs -- timeout, circuit breaker, disk spillover, background drain. Apps call `sink.send(&record).await?` and the sink picks the right failure response.
 
 This is the canonical "resilient delivery" primitive. Every downstream
 write in the data plane should sit behind one.
@@ -14,18 +11,17 @@ write in the data plane should sit behind one.
 
 ```mermaid
 flowchart TB
-    Send["send()"] --> Hot
-    subgraph TS["TieredSink wraps sink S"]
-        Hot["Hot path<br/>circuit Closed? try_send with timeout + retry/backoff"]
-        Cold["Cold path<br/>compress (LZ4/Snappy/Zstd), append to yaque spool"]
-        Fatal["Fatal<br/>Sink::Fatal -- propagate error"]
-        Drain["Background drain, always running<br/>circuit recovers -> spool -> sink"]
-        Hot -->|&quot;Full / Unavailable / timeout&quot;| Cold
-        Cold -->|&quot;SpoolFull / DiskUnavailable&quot;| Fatal
+    Send["send(&record)"] --> Hot
+    subgraph TS["TieredSink wraps sender S"]
+        Hot["Hot path<br/>breaker admits? one send_batch, bounded by send_timeout_ms"]
+        Cold["Cold path<br/>encode, compress (Zstd/LZ4/Snappy), append to the yaque spool"]
+        Drain["Background drain, always running<br/>spool -> send_batch once the breaker admits"]
+        Hot -->|&quot;Backpressured / timeout / breaker refuses&quot;| Cold
     end
-    Hot -->|Ok| Caller["caller"]
-    Cold -->|Ok| Caller
-    Fatal --> CallerErr["caller (Err)"]
+    Hot -->|&quot;Ok / FilteredDlq&quot;| Caller["caller (Ok)"]
+    Cold -->|spooled| Caller
+    Hot -->|Fatal| CallerErr["caller (Err)"]
+    Cold -->|&quot;SpoolFull / DiskUnavailable&quot;| CallerErr
 ```
 
 A `disk_capacity_poller` watches the spool filesystem when
@@ -39,37 +35,33 @@ A `disk_capacity_poller` watches the spool filesystem when
 
 ```mermaid
 flowchart TB
-    S[send msg] --> CB{Circuit breaker}
-    CB -->|Closed/HalfOpen| P[Primary sink]
-    CB -->|Open| Sp[Spool to disk]
-    P -->|Ok| Done[Done]
-    P -->|Full| Sp
-    P -->|Unavailable| Sp
-    P -->|Timeout| Sp
-    P -->|Fatal| Err[Return Err to caller]
-    Sp -->|Spool ok| Done
-    Sp -->|Spool full| DLQ[DLQ fallback]
-    DLQ -->|DLQ ok| Done
-    DLQ -->|DLQ full or no DLQ| Err
+    S["send(&record)"] --> CB{"Breaker admits, and<br/>StrictFifo spool empty?"}
+    CB -->|yes| P["sender.send_batch"]
+    CB -->|no| Sp[Spool to disk]
+    P -->|"Ok / FilteredDlq"| Done["Ok to caller"]
+    P -->|Backpressured| Sp
+    P -->|"past send_timeout_ms"| Sp
+    P -->|Fatal| Err["Err(Sink) to caller"]
+    Sp -->|spooled| Done
+    Sp -->|"spool full, when_full: drop_newest"| Shed["Ok to caller, record dropped and counted"]
+    Sp -->|"spool full, any other when_full"| Full["Err(SpoolFull) to caller"]
+    Sp -->|"disk_aware threshold crossed"| Disk["Err(DiskUnavailable) to caller"]
 ```
 
-| Sink result | Disposition | Circuit effect |
+| `send_batch` result | Disposition | Circuit effect |
 | ------------- | ------------- | ---------------- |
-| `Ok(())` | Done | Records success -- closes circuit if Open/HalfOpen |
-| `Err(Full)` | Spool to disk | No failure counted (backpressure != unhealthy) |
-| `Err(Unavailable)` | Spool to disk | Failure counted, may open circuit |
-| `Err(Fatal(e))` | Return `Err` to caller | No spool, no circuit change |
-| Timeout | Spool to disk | Failure counted, may open circuit |
+| `Ok` / `FilteredDlq` | `Ok` to the caller | Success recorded: failure count reset, circuit closes |
+| `Backpressured` | Spool to disk | Failure recorded and counted in `spool_circuit_trips_total`, may open the circuit |
+| `Fatal(e)` | `Err(TieredSinkError::Sink)` to the caller | None. Not spooled |
+| No answer within `send_timeout_ms` | Spool to disk | Failure recorded and counted in `spool_circuit_trips_total`, may open the circuit |
 
-Backends classify errors via the three-way `SinkError<E>` enum (`Full`
-| `Unavailable` | `Fatal`). The `is_retryable` / `is_fatal` /
-`should_circuit_break` helpers on `SinkError` document the semantics.
+The sink reads the `SendResult` every `TransportSender` already returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for is dropped and logged.
 
 ---
 
 ## Circuit breaker
 
-Three states, evaluated per `send`:
+Three states, evaluated per `send` and per drain pass:
 
 ```mermaid
 stateDiagram-v2
@@ -82,7 +74,7 @@ stateDiagram-v2
 
 - **Closed** -- hot path active, failures counted.
 - **Open** -- hot path skipped, every message goes straight to spool.
-- **Half-open** -- one probe allowed; success -> Closed, failure -> Open.
+- **Half-open** -- one probe allowed, taken by whichever of a `send` or the drain asks first; success -> Closed, failure -> Open.
 
 Hooks into the global `HealthRegistry` (when `health` feature is on)
 so `/readyz` reports the sink as Degraded (HalfOpen) or Unhealthy
@@ -124,16 +116,22 @@ Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A 
 
 ## Spool sizing and disk awareness
 
-- `max_spool_items` -- reject new spool writes once the count is hit.
-- `max_spool_bytes` -- same, in bytes (post-compression).
+- `max_spool_items` -- record limit for the spool.
+- `max_spool_bytes` -- byte limit, as stored (post-compression).
 - `disk_aware: { max_usage_percent, poll_interval_secs }` -- background
   `statvfs` poller; once filesystem use crosses the threshold,
   `disk_available` flips false and spool writes return
   `DiskUnavailable`.
 
-Hitting any limit causes `send` to return
-`TieredSinkError::SpoolFull` or `DiskUnavailable`. The caller decides
-what to do -- typical pattern is to route to the DLQ.
+A spill past `max_spool_items` or `max_spool_bytes` applies `when_full`:
+
+| `when_full` | `send` returns |
+| --- | --- |
+| `block` (default) | `Err(TieredSinkError::SpoolFull)` |
+| `drop_newest` | `Ok`. The record is dropped and counted in `tiered_sink_dropped_total{policy="drop_newest"}` |
+| `dlq`, `drop_oldest` | Not wired yet: behaves as `block`, with a warning logged on each spool-full event |
+
+Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailable)` whatever `when_full` says. The caller decides what to do with either error -- the typical pattern is to route the record to the DLQ.
 
 `TieredSink::new` clears spool locks a killed process left behind and refuses a `spool_path` another live sink holds, so each sink needs its own path. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. See [spool.md](spool.md#locks-after-a-hard-kill).
 
@@ -145,7 +143,7 @@ what to do -- typical pattern is to route to the DLQ.
 tiered_sink:
   spool_path: /var/spool/myapp/clickhouse
   send_timeout_ms: 1000
-  compression: { type: zstd, level: 1 }
+  compression: { zstd: { level: 1 } }   # or none, lz4, snappy
   drain_strategy:
     type: adaptive
     initial_rate: 100
@@ -153,6 +151,9 @@ tiered_sink:
   ordering: interleaved
   max_spool_items: 1000000
   max_spool_bytes: 10737418240   # 10 GiB
+  when_full: block
+  crc: false
+  on_corruption: quarantine
   circuit_failure_threshold: 5
   circuit_reset_timeout_ms: 30000
   drain_interval_ms: 100
@@ -168,7 +169,7 @@ common cases without writing the full struct.
 
 ## Metrics
 
-Emitted through the `metrics` crate, and only when scalo is built with the `metrics` feature (`metrics-core` alone does not emit them). Names are bare. A `metrics.namespace` prefixes each with `{namespace}_`, see [../core-pillars/metrics.md](../core-pillars/metrics.md).
+Emitted through the `metrics` crate, and only when scalo is built with the `metrics` feature (`metrics-core` alone does not emit them). Names are bare. A `metrics.namespace` prefixes each with `{namespace}_`, see [../core-pillars/metrics.md](../core-pillars/metrics.md). `ServiceMetrics::register` describes every one of them in `/metrics/manifest`.
 
 | Metric | Type | Labels | What it reports |
 | --- | --- | --- | --- |
@@ -194,7 +195,7 @@ Alert on:
 - `1 - spool_disk_available_bytes / spool_disk_total_bytes` nearing `max_usage_percent`. Spool writes then return `DiskUnavailable`.
 - `spool_quarantined_total` above 0. A spill cache was set aside and its records are not replayed.
 
-`SpoolFull`, `DiskUnavailable` and records the drainer discards (a CRC, decompression or decode failure, or a `Fatal` answer) are logged but counted by no metric.
+No metric counts a `SpoolFull` or `DiskUnavailable` error, which goes back to the caller, or a record the drainer discards (a CRC, decompression or decode failure, or a `Fatal` answer), which is logged at error level.
 
 ---
 
@@ -202,8 +203,8 @@ Alert on:
 
 | Item | Purpose |
 | ------ | --------- |
-| `TieredSink::new(sink, config)` | Construct, open spool, spawn drain task |
-| `send(data) -> Result<()>` | Send with hot-path -> spool -> DLQ-by-caller fallback |
+| `TieredSink::new(sender, config)` | Construct, open spool, spawn drain task. `S` is any `TransportSender`; the sink calls its `send_batch` with one record and acts on the `SendResult` |
+| `send(&Record) -> Result<()>` | Hot path, else spool. Errors go back to the caller, which routes the record (usually to the DLQ) |
 | `spool_len() / spool_is_empty() / spool_bytes()` | Spool depth introspection |
 | `circuit_state()` | Current `CircuitState` |
 | `reset_circuit()` | Manual reset (admin / test) |
@@ -211,8 +212,8 @@ Alert on:
 | `is_disk_available()` | Disk-aware poller flag |
 | `inner() -> &S` | Borrow the wrapped backend |
 | `shutdown()` | Stop the drain task and the disk poller, and wait for both to exit |
-| `Sink` trait | `type Error: StdError + Send + Sync; async fn try_send(&self, data: &[u8]) -> Result<(), SinkError<Self::Error>>` |
-| `SinkError<E>` | `Full / Unavailable / Fatal(E)` -- drives spillover behaviour |
+| `TieredSinkError` | `SpoolOpen` from `new`. From `send`: `Sink` (a `Fatal` answer), `SpoolFull`, `DiskUnavailable`, `Spool` (the spool write failed), `Codec` (compression failed) |
+| `TieredSinkConfig` / `WhenFull` / `OrderingMode` / `DrainStrategy` / `DiskAwareConfig` / `CompressionCodec` / `CorruptionPolicy` | Configuration, see [Configuration](#configuration) |
 | `CircuitBreaker` / `CircuitState` | Exposed for tests and custom integrations |
 
 `shutdown()` lets a drain already in flight finish its send and commit, then returns. A drain send to a downstream that never answers is cut off at `send_timeout_ms`, so `shutdown()` waits at most that long. It does not drain the spill cache to the sink: records still spooled stay on disk and replay on the next open, so shutdown loses nothing `send` accepted.
@@ -235,7 +236,7 @@ Drop cancels the same token, so both background tasks exit even if the consumer 
 
 ## Related
 
-- [spool.md](spool.md) -- the yaque-backed disk queue under the hood
+- [spool.md](spool.md) -- the standalone yaque queue; this sink runs its own, with the same lock recovery and quarantine
 - [dlq.md](dlq.md) -- where to send `SpoolFull` / `Fatal` errors
 - [batch-engine.md](batch-engine.md) -- the run loops this is a common sink for
 - [../transport/README.md](../transport/README.md)

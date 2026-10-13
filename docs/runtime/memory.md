@@ -26,7 +26,6 @@ memory). See the backpressure doctrine in SELF-REGULATION.
 | ---------- | -------------------------------- |
 | HTTP server | 503 Service Unavailable |
 | Kafka receiver | Pause partition assignment |
-| `TieredSink` | Spill in-memory buffer to disk |
 | `BatchEngine` | Smaller batches, more frequent flushes |
 | `ScalingPressure` | Bump KEDA signal toward 1.0 |
 

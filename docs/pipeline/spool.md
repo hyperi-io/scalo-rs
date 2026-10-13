@@ -1,10 +1,6 @@
 # Spool
 
-Disk-backed async FIFO queue built on
-[yaque](https://crates.io/crates/yaque). Crash-safe, persistent, with
-optional zstd compression and bounded size. Used by `TieredSink` as
-the disk-spillover tier; available as a standalone primitive for any
-pipeline that needs durable store-and-forward.
+Disk-backed async FIFO queue built on [yaque](https://crates.io/crates/yaque). Crash-safe, persistent, with optional zstd compression and bounded size, for any pipeline that needs durable store-and-forward. `TieredSink` does not use `Spool`: it runs its own yaque queue for disk spillover and shares only the lock recovery and quarantine below.
 
 For most workloads you want `TieredSink` (transport + spool + circuit
 breaker + drain). Reach for `Spool` directly only when you're building
@@ -128,7 +124,7 @@ with `push` (newest) under your own lock.
 
 Use `TieredSink` if the answer to all of these is yes:
 
-- The primary destination is a network sink (Kafka, gRPC, HTTP, S3).
+- The primary destination is a `TransportSender` (Kafka, gRPC, HTTP, file, pipe).
 - You want automatic spillover on transport failure.
 - You want a circuit breaker and background drain back to primary.
 
@@ -217,7 +213,7 @@ arrives). `pop_front` is the try-style alternative that returns
 
 ## Related
 
-- [tiered-sink.md](tiered-sink.md) -- the primary consumer; handles the retry / circuit / drain semantics on top
+- [tiered-sink.md](tiered-sink.md) -- transport, its own spill queue, circuit breaker and drain in one
 - [dlq.md](dlq.md) -- where to send messages when spool is full
 - [../feature-flags.md](../feature-flags.md) -- `spool` (pulls `zstd`)
 - [../architecture.md](../architecture.md)

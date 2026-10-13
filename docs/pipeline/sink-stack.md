@@ -88,6 +88,6 @@ concurrency cap, ARC off, queue-don't-shed.
 ARC sub-knobs (`adaptive`): `initial_limit` (`10`), `min_limit` (`1`),
 `max_limit` (`100`), `increase_by` (`1`), `decrease_factor` (`0.5`).
 
-See also [tiered-sink.md](tiered-sink.md) for the breaker/spool/DLQ delivery
+See also [tiered-sink.md](tiered-sink.md) for the breaker and spool delivery
 path that sits around the sender, and [../self-regulation.md](../self-regulation.md)
 for the inbound side that the outbound ARC is kept separate from.

@@ -49,12 +49,11 @@ flowchart LR
 
 | Feature | Adds |
 | --------- | ------ |
-| `metrics-core` | `metrics` crate + macros (`counter!`, `gauge!`, `histogram!`). Emit-only -- no exporter |
-| `metrics-process` | Above + `sysinfo` for cgroup-aware process gauges (RSS, CPU, FDs) |
-| `metrics` | Above + Prometheus exporter, `/metrics` HTTP endpoint, manifest dump |
+| `metrics-core` | scalo's own dependency on the `metrics` crate. No exporter and no `scalo::metrics` API |
+| `metrics-process` | Above + `sysinfo`, which the cgroup-aware process gauges (RSS, CPU, FDs) use. Exposes no API on its own: the gauges come with `metrics` or `otel-metrics` |
+| `metrics` | Above + Prometheus exporter, `/metrics` HTTP endpoint, manifest dump, OTLP push |
 
-Pick `metrics-core` for libraries that emit but should let the consumer
-own the exporter. Pick `metrics` for service binaries.
+Pick `metrics` for service binaries. scalo's own series, the tiered sink's and the transports' among them, are compiled only when `metrics` is on somewhere in the build. A library that emits its own series depends on the `metrics` crate directly and leaves the exporter to the service. See [core-pillars/metrics.md](core-pillars/metrics.md#feature-tiers).
 
 ### Worker pool
 

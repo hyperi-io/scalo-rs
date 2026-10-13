@@ -116,7 +116,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | Module | Feature | Purpose |
 | -------- | --------- | --------- |
 | `spool` | `spool` | Disk-backed async FIFO queue (`yaque` + `zstd`), per-record CRC32C integrity |
-| `tiered_sink` | `tiered-sink` | Transport + spool + circuit breaker + retry + DLQ fallback |
+| `tiered_sink` | `tiered-sink` | Transport + spool + circuit breaker + background drain |
 | `sink_stack` | `sink-stack` | Outbound control stack - composes timeout, load-shed, concurrency-limit, retry/backoff and rate-limit around a transport sender (tower `ServiceBuilder`); preserves at-least-once |
 | `worker::pool` | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio), pressure-based scaling |
 | `worker::engine` | `worker-batch` | `BatchEngine` - SIMD parse (`sonic-rs`), pre-route filter, field interning |
@@ -148,8 +148,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
    are configured the engine is present as a no-op (a single
    `has_inbound_filters()` branch on every send/recv). Zero-cost when empty.
 5. **L4 pipeline modules compose L3 transports with L2 runtime concerns.**
-   `tiered_sink` is the canonical example: a transport plus spool plus
-   memory pressure plus circuit breaker plus DLQ.
+   `tiered_sink` is the canonical example: a transport plus a disk spool plus a circuit breaker that reports to the `HealthRegistry`.
 6. **L5 scaffolding glues the whole stack.** `ServiceRuntime::new` wires
    the pillars, runtime, pipeline primitives, and shutdown into one
    object the app holds. `DeploymentContract` does the same job for the

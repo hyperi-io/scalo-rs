@@ -168,18 +168,19 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
     /// Send a message through the tiered sink.
     ///
-    /// The message goes through the hot path (direct to sink) if:
-    /// - Circuit is closed AND ordering mode is Interleaved
-    /// - OR circuit is closed AND ordering is StrictFifo AND spool is empty
-    ///
-    /// Otherwise, the message is spooled to disk.
+    /// The message goes through the hot path (direct to sink) when the circuit
+    /// breaker admits it (closed, or the single half-open probe) and, in
+    /// StrictFifo, the spool is empty. A `Backpressured` answer or a send past
+    /// `send_timeout_ms` spools it instead, as does a refused hot path.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The sink returns a fatal error
-    /// - The spool is full
-    /// - Compression fails
+    /// - The sink answers `Fatal` ([`TieredSinkError::Sink`])
+    /// - The spool is full and `when_full` is `block`, `dlq` or `drop_oldest`
+    ///   ([`TieredSinkError::SpoolFull`])
+    /// - The `disk_aware` threshold is crossed ([`TieredSinkError::DiskUnavailable`])
+    /// - Compression or the spool write fails
     pub async fn send(&self, record: &Record) -> Result<()> {
         // StrictFifo: serialise decision + send + enqueue against
         // other senders and the drainer. Interleaved: no gate.
@@ -1014,8 +1015,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_crc_drops_corrupt_spilled_record() {
-        // CRC enabled: a corrupt spilled record must be DROPPED on drain (logged +
-        // counted), never replayed as garbage downstream.
+        // CRC enabled: a corrupt spilled record must be DROPPED on drain (logged),
+        // never replayed as garbage downstream.
         let dir = tempdir().unwrap();
         let spool_path = dir.path().join("crc-corrupt-queue");
 

@@ -521,33 +521,133 @@ impl ServiceMetrics {
         }
 
         // --- Spool ---
-        metrics::describe_gauge!("spool_bytes", "Current spool size in bytes");
-        metrics::describe_gauge!("spool_messages", "Current spool message count");
-        metrics::describe_gauge!(
-            "spool_disk_available",
-            "Available disk space for spool in bytes"
+        describe_platform(
+            &reg,
+            &[
+                (
+                    "spool_bytes",
+                    "Current spool size in bytes",
+                    MetricType::Gauge,
+                    "",
+                    &[],
+                ),
+                (
+                    "spool_messages",
+                    "Current spool message count",
+                    MetricType::Gauge,
+                    "",
+                    &[],
+                ),
+                (
+                    "spool_disk_available",
+                    "Available disk space for spool in bytes",
+                    MetricType::Gauge,
+                    "",
+                    &[],
+                ),
+            ],
         );
-
-        for (name, desc) in [
-            ("spool_bytes", "Current spool size in bytes"),
-            ("spool_messages", "Current spool message count"),
-            (
-                "spool_disk_available",
-                "Available disk space for spool in bytes",
-            ),
-        ] {
-            reg.push(MetricDescriptor {
-                name: name.into(),
-                metric_type: MetricType::Gauge,
-                description: desc.into(),
-                unit: String::new(),
-                labels: vec![],
-                group: "platform".into(),
-                buckets: None,
-                use_cases: vec![],
-                dashboard_hint: None,
-            });
-        }
+        // A feature-gated series is described only in a build that can write it.
+        #[cfg(feature = "tiered-sink")]
+        describe_platform(
+            &reg,
+            &[
+                (
+                    "spool_hot_path_total",
+                    "Records the tiered sink's sender took on the hot path (Ok or FilteredDlq)",
+                    MetricType::Counter,
+                    "",
+                    &[],
+                ),
+                (
+                    "spool_cold_path_total",
+                    "Tiered sink sends that ended on the spool path without error",
+                    MetricType::Counter,
+                    "",
+                    &[],
+                ),
+                (
+                    "spool_circuit_trips_total",
+                    "Tiered sink hot-path sends that failed (backpressured or timed out), one per send",
+                    MetricType::Counter,
+                    "",
+                    &[],
+                ),
+                (
+                    "spool_circuit_state",
+                    "Tiered sink circuit breaker state at the last send (0=closed, 1=half-open, 2=open)",
+                    MetricType::Gauge,
+                    "",
+                    &[],
+                ),
+                (
+                    "tiered_sink_overflow_total",
+                    "Records the tiered sink shed because the spool was full, by when_full policy",
+                    MetricType::Counter,
+                    "",
+                    &["policy"],
+                ),
+                (
+                    "tiered_sink_dropped_total",
+                    "Records the tiered sink dropped on spool overflow, by when_full policy",
+                    MetricType::Counter,
+                    "",
+                    &["policy"],
+                ),
+                (
+                    "spool_disk_available_bytes",
+                    "Bytes free to unprivileged users on the tiered sink spool's filesystem",
+                    MetricType::Gauge,
+                    "bytes",
+                    &[],
+                ),
+                (
+                    "spool_disk_total_bytes",
+                    "Size of the tiered sink spool's filesystem in bytes",
+                    MetricType::Gauge,
+                    "bytes",
+                    &[],
+                ),
+                (
+                    "spool_dropped_without_shutdown_total",
+                    "Tiered sinks dropped with records spooled and no completed shutdown",
+                    MetricType::Counter,
+                    "",
+                    &[],
+                ),
+            ],
+        );
+        #[cfg(any(feature = "spool", feature = "tiered-sink"))]
+        describe_platform(
+            &reg,
+            &[
+                (
+                    "spool_stale_locks_cleared_total",
+                    "Spool lock files left by a dead process and removed on open, by lock and reason",
+                    MetricType::Counter,
+                    "",
+                    &["lock", "reason"],
+                ),
+                (
+                    "spool_quarantined_total",
+                    "Spool caches moved aside into a corrupt-* subdirectory, by trigger",
+                    MetricType::Counter,
+                    "",
+                    &["trigger"],
+                ),
+            ],
+        );
+        #[cfg(feature = "spool")]
+        describe_platform(
+            &reg,
+            &[(
+                "spool_queue_depth",
+                "Records in a standalone spool queue",
+                MetricType::Gauge,
+                "",
+                &[],
+            )],
+        );
 
         // --- DLQ ---
         for (name, desc, labels) in [
@@ -779,6 +879,9 @@ impl ServiceMetrics {
     }
 
     /// Set available disk space for spool.
+    ///
+    /// The tiered sink's disk poller writes `spool_disk_available_bytes` and
+    /// `spool_disk_total_bytes`, not this series.
     #[inline]
     pub fn spool_disk_available(&self, bytes: f64) {
         metrics::gauge!("spool_disk_available").set(bytes);
@@ -796,6 +899,32 @@ impl ServiceMetrics {
     #[inline]
     pub fn validation_failure(&self, reason: super::ValidationFailureReason) {
         metrics::counter!("validation_failures_total", "reason" => reason.as_label()).increment(1);
+    }
+}
+
+/// Describe each `(name, description, type, unit, label keys)` with the global
+/// recorder and push it into the manifest as a platform metric.
+fn describe_platform(
+    reg: &super::MetricRegistry,
+    series: &[(&'static str, &'static str, MetricType, &str, &[&str])],
+) {
+    for &(name, desc, mt, unit, labels) in series {
+        match mt {
+            MetricType::Gauge => metrics::describe_gauge!(name, desc),
+            MetricType::Counter => metrics::describe_counter!(name, desc),
+            MetricType::Histogram => metrics::describe_histogram!(name, desc),
+        }
+        reg.push(MetricDescriptor {
+            name: name.into(),
+            metric_type: mt,
+            description: desc.into(),
+            unit: unit.into(),
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
     }
 }
 
@@ -893,6 +1022,63 @@ mod tests {
                 .iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} missing from the manifest"));
+            assert_eq!(found.labels, labels, "{name}");
+        }
+        // Every series the tiered sink writes, with the type and label keys its emitters use.
+        #[cfg(feature = "tiered-sink")]
+        for (name, metric_type, labels) in [
+            ("test_app_spool_hot_path_total", MetricType::Counter, vec![]),
+            (
+                "test_app_spool_cold_path_total",
+                MetricType::Counter,
+                vec![],
+            ),
+            (
+                "test_app_spool_circuit_trips_total",
+                MetricType::Counter,
+                vec![],
+            ),
+            ("test_app_spool_circuit_state", MetricType::Gauge, vec![]),
+            (
+                "test_app_tiered_sink_overflow_total",
+                MetricType::Counter,
+                vec!["policy"],
+            ),
+            (
+                "test_app_tiered_sink_dropped_total",
+                MetricType::Counter,
+                vec!["policy"],
+            ),
+            ("test_app_spool_messages", MetricType::Gauge, vec![]),
+            ("test_app_spool_bytes", MetricType::Gauge, vec![]),
+            (
+                "test_app_spool_disk_available_bytes",
+                MetricType::Gauge,
+                vec![],
+            ),
+            ("test_app_spool_disk_total_bytes", MetricType::Gauge, vec![]),
+            (
+                "test_app_spool_dropped_without_shutdown_total",
+                MetricType::Counter,
+                vec![],
+            ),
+            (
+                "test_app_spool_stale_locks_cleared_total",
+                MetricType::Counter,
+                vec!["lock", "reason"],
+            ),
+            (
+                "test_app_spool_quarantined_total",
+                MetricType::Counter,
+                vec!["trigger"],
+            ),
+        ] {
+            let found = manifest
+                .metrics
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the manifest"));
+            assert_eq!(found.metric_type, metric_type, "{name}");
             assert_eq!(found.labels, labels, "{name}");
         }
     }
