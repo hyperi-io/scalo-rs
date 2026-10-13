@@ -3,6 +3,14 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.10](https://github.com/hyperi-io/scalo-rs/compare/v2.14.9...v2.14.10) (2026-10-13)
+
+### Bug Fixes
+
+* bound the tiered sink drain send by send_timeout ([#345](https://github.com/hyperi-io/scalo-rs/issues/345)) ([4c11997](https://github.com/hyperi-io/scalo-rs/commit/4c11997a6e9d263c997e1e33f9d0a37b428f2e3e))
+* compare the committed contract schema as JSON values ([#343](https://github.com/hyperi-io/scalo-rs/issues/343)) ([5248b18](https://github.com/hyperi-io/scalo-rs/commit/5248b18700b223f7037f3d4e5a50e5fcc2b840d9))
+* stop both tiered sink tasks on shutdown ([#344](https://github.com/hyperi-io/scalo-rs/issues/344)) ([1e00c5d](https://github.com/hyperi-io/scalo-rs/commit/1e00c5d938994dd56e807e18a5ffadc47c4f8d8a))
+
 ## [2.14.9](https://github.com/hyperi-io/scalo-rs/compare/v2.14.8...v2.14.9) (2026-10-11)
 
 ### Bug Fixes
