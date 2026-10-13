@@ -13,7 +13,8 @@ use crate::transport::{Record, SendResult, TransportSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use yaque::Receiver;
 
 /// Drainer state and rate tracking.
@@ -154,7 +155,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     crc: bool,
     strategy: DrainStrategy,
     interval: Duration,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
     fifo_gate: Option<Arc<Mutex<()>>>,
 ) {
     let mut drainer = Drainer::new(strategy);
@@ -163,11 +164,12 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     let global_shutdown = crate::shutdown::token();
 
     loop {
-        // Check for shutdown (local notify or global shutdown token)
+        // Check for shutdown (the sink's own token or the global shutdown token)
         tokio::select! {
-            () = shutdown.notified() => {
+            biased;
+            () = shutdown.cancelled() => {
                 #[cfg(feature = "tracing")]
-                tracing::info!("Drain task shutting down (local notify)");
+                tracing::info!("Drain task shutting down (sink shutdown)");
                 return;
             }
             () = async {
