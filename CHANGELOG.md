@@ -3,6 +3,17 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.11](https://github.com/hyperi-io/scalo-rs/compare/v2.14.10...v2.14.11) (2026-10-13)
+
+### Bug Fixes
+
+* **deps:** update aws-sdk ([#338](https://github.com/hyperi-io/scalo-rs/issues/338)) ([331e8ec](https://github.com/hyperi-io/scalo-rs/commit/331e8ecc1c5d6ad1d073c8df5606c6d57177a35a))
+* **deps:** update dependency vectordotdev/vector to v0.58.0 ([#339](https://github.com/hyperi-io/scalo-rs/issues/339)) ([af9da27](https://github.com/hyperi-io/scalo-rs/commit/af9da2784af8a9deab854ebfce4af1f8b64bc750))
+* **deps:** update Rust crate metrics-util to >=0.20.4, <0.21 ([#335](https://github.com/hyperi-io/scalo-rs/issues/335)) ([ea5fed9](https://github.com/hyperi-io/scalo-rs/commit/ea5fed9595e5cdce5ac3f78af05c9ffecbf32222))
+* **deps:** update tonic-prost ([#336](https://github.com/hyperi-io/scalo-rs/issues/336)) ([443ed47](https://github.com/hyperi-io/scalo-rs/commit/443ed47ad86b64547bc2f5610bf3cb8e93719e2e))
+* **deps:** update tracing ([#337](https://github.com/hyperi-io/scalo-rs/issues/337)) ([1ec365d](https://github.com/hyperi-io/scalo-rs/commit/1ec365db758b9c086ebb325955c76bdfdada0f28))
+* stop reporting a tiered sink shutdown as a drop ([#347](https://github.com/hyperi-io/scalo-rs/issues/347)) ([81758ca](https://github.com/hyperi-io/scalo-rs/commit/81758caa44e5b30c5bdaa0d80a807c7e08604ea1))
+
 ## [2.14.10](https://github.com/hyperi-io/scalo-rs/compare/v2.14.9...v2.14.10) (2026-10-13)
 
 ### Bug Fixes
