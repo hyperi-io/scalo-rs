@@ -139,6 +139,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             config.crc,
             config.drain_strategy,
             config.drain_interval(),
+            config.send_timeout_duration(),
             shutdown.clone(),
             fifo_gate.as_ref().map(Arc::clone),
         ));
@@ -465,8 +466,9 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
     /// Stop the drain task and the disk poller, and wait for both to exit.
     ///
-    /// A drain already in flight finishes its send and commit first. Records
-    /// still in the spill cache stay on disk and replay on the next open.
+    /// A drain already in flight finishes its send and commit first, or is cut
+    /// off at `send_timeout_ms` if the downstream never answers. Records still
+    /// in the spill cache stay on disk and replay on the next open.
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
         let handles = [self.drain_handle.take(), self.disk_poller_handle.take()];
@@ -678,7 +680,7 @@ impl<S: TransportSender> Drop for TieredSink<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{PayloadFormat, RecordMeta, TransportResult};
+    use crate::transport::{PayloadFormat, RecordMeta, TransportBase, TransportResult};
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
 
@@ -696,7 +698,7 @@ mod tests {
     }
 
     /// Poll until the drainer has emptied the spool and released its byte count; a fixed sleep flakes on a loaded runner.
-    async fn wait_for_drain(tiered: &TieredSink<TestSink>) {
+    async fn wait_for_drain<S: TransportSender + 'static>(tiered: &TieredSink<S>) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !(tiered.spool_is_empty().await && tiered.spool_bytes() == 0) {
             assert!(
@@ -1448,6 +1450,127 @@ mod tests {
             payloads(5),
             "every record accepted before shutdown is replayed after it"
         );
+    }
+
+    /// A downstream that takes the batch and never answers, as a peer that accepts the connection and stalls.
+    struct HangingSink {
+        inner: TestSink,
+        hang: AtomicBool,
+        /// `send_batch` calls that started while `hang` was set.
+        hung_sends: AtomicU64,
+    }
+
+    impl HangingSink {
+        fn new() -> Self {
+            Self {
+                inner: TestSink::new(),
+                hang: AtomicBool::new(false),
+                hung_sends: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl TransportBase for HangingSink {
+        async fn close(&self) -> TransportResult<()> {
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            self.inner.is_healthy()
+        }
+        fn name(&self) -> &'static str {
+            "hanging-sink"
+        }
+    }
+
+    impl TransportSender for HangingSink {
+        async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
+            self.inner.send(destination, payload).await
+        }
+
+        async fn send_batch(&self, records: &[Record]) -> SendResult {
+            if self.hang.load(AtomicOrdering::SeqCst) {
+                self.hung_sends.fetch_add(1, AtomicOrdering::SeqCst);
+                return std::future::pending().await;
+            }
+            self.inner.send_batch(records).await
+        }
+    }
+
+    /// Spilling config with a send timeout short enough to cut a hung send off inside a test.
+    fn hung_downstream_config(path: &std::path::Path) -> TieredSinkConfig {
+        let mut config = spilling_config(path);
+        config.send_timeout_ms = 200;
+        config
+    }
+
+    /// Spill `payloads(n)` through a down `HangingSink`, then make it hang.
+    async fn spill_then_hang(path: &std::path::Path, n: usize) -> TieredSink<HangingSink> {
+        let sink = HangingSink::new();
+        sink.inner.set_available(false);
+        let tiered = TieredSink::new(sink, hung_downstream_config(path))
+            .await
+            .unwrap();
+        for p in payloads(n) {
+            tiered.send(&rec(&p)).await.unwrap();
+        }
+        assert_eq!(tiered.spool_len().await, n);
+        tiered.inner().hang.store(true, AtomicOrdering::SeqCst);
+        tiered
+    }
+
+    /// Poll until the drainer has started `at_least` hung sends; it runs on its own task.
+    async fn wait_for_hung_sends(tiered: &TieredSink<HangingSink>, at_least: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tiered.inner().hung_sends.load(AtomicOrdering::SeqCst) < at_least {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drainer started {} hung sends, wanted {at_least}",
+                tiered.inner().hung_sends.load(AtomicOrdering::SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_while_the_drainer_send_hangs() {
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        let tiered = spill_then_hang(&spool, 3).await;
+        wait_for_hung_sends(&tiered, 1).await;
+
+        tokio::time::timeout(SHUTDOWN_BOUND, tiered.shutdown())
+            .await
+            .expect("shutdown must return while a drain send to the downstream hangs");
+        assert_eq!(
+            reopen_and_drain(&spool, 3).await,
+            payloads(3),
+            "a send that never completed leaves its record spooled for the next open"
+        );
+    }
+
+    #[tokio::test]
+    async fn drainer_retries_a_record_whose_send_timed_out() {
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        let tiered = spill_then_hang(&spool, 3).await;
+
+        // The second hung send is the first record offered again after its send was cut off.
+        wait_for_hung_sends(&tiered, 2).await;
+        assert_eq!(
+            tiered.spool_len().await,
+            3,
+            "a timed-out send commits nothing"
+        );
+
+        tiered.inner().hang.store(false, AtomicOrdering::SeqCst);
+        tiered.inner().inner.set_available(true);
+        wait_for_drain(&tiered).await;
+        assert_eq!(
+            tiered.inner().inner.received_payloads().await,
+            payloads(3),
+            "every record is delivered once the downstream answers, in order"
+        );
+        tiered.shutdown().await;
     }
 
     /// Entries of `dir` whose name starts with `prefix`.
