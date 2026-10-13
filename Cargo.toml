@@ -505,10 +505,10 @@ vaultrs = { version = ">=0.8, <0.9", optional = true }
 # pulls in rustls 0.21 + rustls-webpki 0.101 (RUSTSEC-2026-0098, -0099, -0104).
 # `default-https-client` uses the modern aws-smithy-http-client/rustls-aws-lc
 # path with rustls 0.23 + rustls-webpki 0.103 — that's what we want.
-aws-config = { version = ">=1.8, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+aws-config = { version = ">=1.12.0, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
 # Floor is 1.117, the first release to require aws-smithy-json 0.63.1: 0.63.0 does
 # not compile against the aws-smithy-types 1.7 Document::Object reshape (E0308).
-aws-sdk-secretsmanager = { version = ">=1.117, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-secretsmanager = { version = ">=1.120.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = ">=0.14.5, <0.15", optional = true }
