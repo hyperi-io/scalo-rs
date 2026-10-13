@@ -127,6 +127,8 @@ and both manifest subcommands describe it for you, with app info (feature
 `service-metrics`) and the worker pool and batch engine sets when those features are
 compiled in, so a service's `register_metrics` override describes only its own.
 
+The tiered sink's own series are listed in [../pipeline/tiered-sink.md](../pipeline/tiered-sink.md#metrics). Of them only `spool_bytes` and `spool_messages` are described here.
+
 ### Count each thing once
 
 A name with no labels is one series, whichever handle writes it, so two call sites

@@ -166,6 +166,38 @@ common cases without writing the full struct.
 
 ---
 
+## Metrics
+
+Emitted through the `metrics` crate, and only when scalo is built with the `metrics` feature (`metrics-core` alone does not emit them). Names are bare. A `metrics.namespace` prefixes each with `{namespace}_`, see [../core-pillars/metrics.md](../core-pillars/metrics.md).
+
+| Metric | Type | Labels | What it reports |
+| --- | --- | --- | --- |
+| `spool_hot_path_total` | counter | none | Records the sink took directly, answering `Ok` or `FilteredDlq` within `send_timeout_ms` |
+| `spool_cold_path_total` | counter | none | `send` calls that ended on the spool path without error. Includes records shed by `drop_newest`, since `send` returns `Ok` for them |
+| `spool_circuit_trips_total` | counter | none | Hot-path sends that failed against the breaker (`Backpressured`, or past `send_timeout_ms`). One per failed send, not per Closed-to-Open change. Drain failures are not counted |
+| `spool_circuit_state` | gauge | none | Breaker state at the last `send`: `0` closed, `1` half-open, `2` open. Half-open shows once the reset timeout has passed, before a probe goes out. An idle sink keeps its last value |
+| `tiered_sink_overflow_total` | counter | `policy` | Records shed because the spool was full. Only `drop_newest` emits it. `block` returns `SpoolFull`, and `dlq` and `drop_oldest` fall back to `block`, so none of them count |
+| `tiered_sink_dropped_total` | counter | `policy` | Records dropped on overflow. Moves with `tiered_sink_overflow_total` |
+| `spool_messages` | gauge | none | Records in the spool after the last spill. The drainer never updates it, so it goes stale once draining starts. `spool_len()` is the live count. `ServiceMetrics::spool_messages` writes the same series |
+| `spool_bytes` | gauge | none | Bytes in the spool as stored (compressed, plus the CRC header when `crc` is on). Stale the same way. `spool_bytes()` is the live figure. `ServiceMetrics::spool_bytes` writes the same series |
+| `spool_disk_available_bytes` | gauge | none | Bytes free to unprivileged users on the spool's filesystem, set every `poll_interval_secs` by the disk poller, so only with `disk_aware` |
+| `spool_disk_total_bytes` | gauge | none | Size of that filesystem, set with `spool_disk_available_bytes` |
+| `spool_dropped_without_shutdown_total` | counter | none | Sinks dropped with records still spooled and no completed `shutdown().await`. Flat after a clean `shutdown()` |
+| `spool_stale_locks_cleared_total` | counter | `lock`, `reason` | Lock files left by a dead process, removed on `TieredSink::new`. `lock` is `send`, `recv` or `version`, `reason` is `dead_owner` or `unparseable`. Non-zero means a previous run ended without releasing its locks. See [spool.md](spool.md#locks-after-a-hard-kill) |
+| `spool_quarantined_total` | counter | `trigger` | A spill cache that would not open, moved into `corrupt-*` under `spool_path`. The tiered sink emits only `trigger="open_failed"`. See [spool.md](spool.md#quarantine) |
+
+Alert on:
+
+- `spool_dropped_without_shutdown_total` above 0. A sink was dropped with records still spooled and no completed `shutdown().await`, so fix the caller. Spooled records stay on disk and replay on the next open, but `Drop` does not wait for a drain in flight.
+- `tiered_sink_dropped_total` rising. `drop_newest` is discarding records.
+- `spool_circuit_state` held at `2`. The sink is down and everything is going to the spool.
+- `1 - spool_disk_available_bytes / spool_disk_total_bytes` nearing `max_usage_percent`. Spool writes then return `DiskUnavailable`.
+- `spool_quarantined_total` above 0. A spill cache was set aside and its records are not replayed.
+
+`SpoolFull`, `DiskUnavailable` and records the drainer discards (a CRC, decompression or decode failure, or a `Fatal` answer) are logged but counted by no metric.
+
+---
+
 ## API surface
 
 | Item | Purpose |
