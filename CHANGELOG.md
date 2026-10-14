@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.15](https://github.com/hyperi-io/scalo-rs/compare/v2.14.14...v2.14.15) (2026-10-14)
+
+### Bug Fixes
+
+* mask credential values that never close ([#360](https://github.com/hyperi-io/scalo-rs/issues/360)) ([c29eff7](https://github.com/hyperi-io/scalo-rs/commit/c29eff75386090a7965412ce6a9223692e200cad))
+
 ## [2.14.14](https://github.com/hyperi-io/scalo-rs/compare/v2.14.13...v2.14.14) (2026-10-14)
 
 ### Bug Fixes
