@@ -276,8 +276,9 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             let config_path = args.config.as_deref();
 
             // Config loads before the logger: logger setup composes the OTLP
-            // span exporter, whose settings live in the cascade. The cascade
-            // has no subscriber while it loads, so its own log lines are lost.
+            // span exporter, whose settings live in the cascade. `load_typed`
+            // holds its lines until logger setup emits them. Anything else the
+            // cascade logs while it loads has no subscriber and is lost.
             let loaded = app.load_config(config_path);
             #[cfg(feature = "logger")]
             init_logger_for_service(args, app.name(), &version_info.version)?;

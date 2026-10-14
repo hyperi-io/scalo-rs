@@ -92,6 +92,8 @@ fn load_config(&self, path: Option<&str>) -> Result<LoaderConfig, CliError> {
 
 The config type derives `Serialize` as well as `Deserialize`, because the env merge round-trips it. A `#[serde(skip)]` field comes back at its default, so set it after the call.
 
+`run_app` loads the config before it sets up logging, because the logger reads its own settings from that config. So `load_typed` holds the lines it would log until a subscriber exists, and `logger::setup` emits them. An app that installs its own subscriber calls `config::log_deferred()` after doing so.
+
 ### Registered sections
 
 `unmarshal_key_registered::<T>(key)` deserialises a section AND auto-registers it
@@ -221,6 +223,7 @@ inside the cluster. See [http_server/config.rs](../../src/http_server/config.rs)
 | `Config::unmarshal_key::<T>(key)` | Deserialise one section |
 | `Config::unmarshal_key_registered::<T>(key)` | Same, plus registers the section |
 | `config::load_typed(path, prefix)` | An app's config struct: the named file or the cascade, then nested env, flat env and `Normalize` |
+| `config::log_deferred()` | Log what `load_typed` noted before a subscriber existed (`logger::setup` calls it) |
 | `config::flat_env::ApplyFlatEnv` | K8s flat-env bridge trait |
 | `config::flat_env::load_config(path, prefix)` | Cascade with `path` as the settings layer, then flat env and `Normalize` |
 | `yaml::from_str` / `from_path` / `from_str_reporting` / `to_value` / `to_string` | Parse and emit YAML by the rules above |

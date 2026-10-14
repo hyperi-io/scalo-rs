@@ -58,7 +58,7 @@ pub mod registry;
 pub mod sensitive;
 mod yaml_file;
 
-pub use load::load_typed;
+pub use load::{load_typed, log_deferred};
 
 #[cfg(feature = "config-reload")]
 pub mod reloader;

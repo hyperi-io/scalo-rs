@@ -402,6 +402,9 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
     #[cfg(feature = "otel-tracing")]
     crate::otel_tracing::log_init_status();
 
+    #[cfg(feature = "config")]
+    crate::config::log_deferred();
+
     Ok(())
 }
 

@@ -24,7 +24,7 @@ Every YAML scalo reads or writes -- the config cascade, `kafka_config` files, di
 
 ### `config::load_typed` loads an app's config struct (API CHANGE)
 
-New `config::load_typed(path, prefix)`: the `--config` file parsed into `T` with unknown keys logged, or the cascade without one, then nested env, `ApplyFlatEnv` and `Normalize`. `T` needs `Serialize` as well as `Deserialize`. `ConfigError` gains `Yaml(YamlError)` for a file that cannot be read or parsed.
+New `config::load_typed(path, prefix)`: the `--config` file parsed into `T` with unknown keys logged, or the cascade without one, then nested env, `ApplyFlatEnv` and `Normalize`. `T` needs `Serialize` as well as `Deserialize`. `ConfigError` gains `Yaml(YamlError)` for a file that cannot be read or parsed. Lines it logs before any subscriber exists, as under `run_app`, are held and emitted by `logger::setup`, or by `config::log_deferred()` in an app with its own subscriber.
 
 **Consumer adjustment** -- none required. An app whose `load_config` hand-rolls this sequence can replace it with one call.
 
