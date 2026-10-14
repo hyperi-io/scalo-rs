@@ -512,6 +512,28 @@ fn quoted_end(text: &str, from: usize, multiline: bool) -> Option<usize> {
     None
 }
 
+/// The end of the quoted string opening at `from` at its next quote, escaped or not.
+///
+/// `None` when no quote follows, or when `multiline` is false and a line ends first.
+fn plain_quoted_end(text: &str, from: usize, multiline: bool) -> Option<usize> {
+    let quote = char::from(text.as_bytes()[from]);
+    let rest = &text[from + 1..];
+    let close = if multiline {
+        rest.find(quote)
+    } else {
+        rest.find([quote, '\n'])
+    }?;
+    (rest.as_bytes()[close] != b'\n').then_some(from + 1 + close + 1)
+}
+
+/// The end of the quoted value opening at `from`: its first quote no `\` escapes, else its next quote.
+///
+/// The fallback keeps a value whose escape swallows its closing quote, as in
+/// `"abc\"`, from masking less than a reading that ignores escapes.
+fn quoted_value_end(text: &str, from: usize, multiline: bool) -> Option<usize> {
+    quoted_end(text, from, multiline).or_else(|| plain_quoted_end(text, from, multiline))
+}
+
 /// The end of a `Name(...)` value such as `Some("...")`, with nested parentheses and quotes honoured.
 fn wrapper_end(text: &str, from: usize) -> Option<usize> {
     let bytes = text.as_bytes();
@@ -589,12 +611,12 @@ fn ends_equals_value(c: char) -> bool {
 fn colon_value(text: &str, from: usize) -> Option<(usize, bool)> {
     let bytes = text.as_bytes();
     if bytes.get(from) == Some(&b'"')
-        && let Some(end) = quoted_end(text, from, true)
+        && let Some(end) = quoted_value_end(text, from, true)
     {
         return Some((end, true));
     }
     if bytes.get(from) == Some(&b'\'')
-        && let Some(end) = quoted_end(text, from, false)
+        && let Some(end) = quoted_value_end(text, from, false)
     {
         return Some((end, false));
     }
@@ -624,7 +646,7 @@ fn colon_value(text: &str, from: usize) -> Option<(usize, bool)> {
 fn equals_value(text: &str, from: usize) -> usize {
     let bytes = text.as_bytes();
     if matches!(bytes.get(from), Some(b'"' | b'\''))
-        && let Some(end) = quoted_end(text, from, false)
+        && let Some(end) = quoted_value_end(text, from, false)
     {
         return end;
     }
@@ -768,6 +790,31 @@ mod tests {
         let matcher = CredentialMatcher::default_terms();
         let line = "processed 1200 records from topic raw_events";
         assert!(matches!(mask_text(line, matcher, "M"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_quoted_value_closes_at_its_first_unescaped_quote_else_its_next() {
+        assert_eq!(quoted_value_end(r#""a\"b" x"#, 0, true), Some(6));
+        assert_eq!(quoted_value_end(r#""abc\"}"#, 0, true), Some(6));
+        assert_eq!(quoted_value_end(r"'a\' b", 0, false), Some(4));
+        assert_eq!(quoted_value_end("\"a\\\nb\"", 0, true), Some(6));
+        assert_eq!(quoted_value_end("\"a\\\nb\"", 0, false), None);
+        assert_eq!(quoted_value_end("\"a\\\"\nb\"", 0, false), Some(4));
+        assert_eq!(quoted_value_end("\"abc", 0, true), None);
+        assert_eq!(quoted_value_end("\"abc\\", 0, true), None);
+    }
+
+    #[test]
+    fn a_single_quoted_value_an_escape_leaves_open_masks_to_its_next_quote() {
+        let defaults = CredentialMatcher::default_terms();
+        assert_eq!(
+            mask_text(r"password: 'a b\' next", defaults, "M"),
+            "password: M next"
+        );
+        assert_eq!(
+            mask_text(r"password='a b\' next", defaults, "M"),
+            "password=M next"
+        );
     }
 
     #[test]

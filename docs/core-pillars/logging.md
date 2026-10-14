@@ -103,7 +103,7 @@ Text-mode lines, and every string in a JSON line, are masked for:
 
 - the password in `scheme://user:password@host`, up to the last `@` a host follows, so one holding `@`, `/`, `?` or `#` goes whole. Nothing tells such a password from an `@` later in the path or query, so `https://u:p@host/x?to=ops@example.com` is masked through to `example.com`. `logger::mask_url_userinfo(text, mask, keep_user)` applies the same rule to any string.
 - the token after the word `bearer`.
-- the value after `key: value` and `key=value` whose key names a credential. A quoted value runs to its closing quote, past escaped quotes, and a `Name(...)` value such as `Some("...")` goes whole. An unquoted value runs on across digit groups, so `TFN: 123 456 782` goes whole. A Rust path such as the log target `app::auth:` is never read as a key.
+- the value after `key: value` and `key=value` whose key names a credential. A quoted value runs to its closing quote, past escaped quotes. One that no unescaped quote closes, such as `"abc\"`, runs to its next quote instead, so honouring escapes never masks less than ignoring them. A `Name(...)` value such as `Some("...")` goes whole. An unquoted value runs on across digit groups, so `TFN: 123 456 782` goes whole. A Rust path such as the log target `app::auth:` is never read as a key.
 
 All of it writes `[REDACTED]` in place. A coloured text line holding a credential is written without its colour, since its escapes split `name=value` apart.
 

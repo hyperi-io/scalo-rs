@@ -232,6 +232,89 @@ proptest! {
     }
 }
 
+/// The end of the quoted value opening at `start`, past `\` escapes, or `None` when it never closes.
+fn reference_escaped_end(value: &[char], start: usize, multiline: bool) -> Option<usize> {
+    let quote = value[start];
+    let mut at = start + 1;
+    while at < value.len() {
+        match value[at] {
+            '\\' if at + 1 == value.len() || (!multiline && value[at + 1] == '\n') => return None,
+            '\\' => at += 2,
+            '\n' if !multiline => return None,
+            c if c == quote => return Some(at + 1),
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// The end of the quoted value opening at `start` at its next quote, escaped or not.
+fn reference_plain_end(value: &[char], start: usize, multiline: bool) -> Option<usize> {
+    let close = (start + 1..value.len()).find(|&at| value[at] == value[start])?;
+    (multiline || !value[start..close].contains(&'\n')).then_some(close + 1)
+}
+
+/// `value` with its leading quoted value masked, read one character at a time, as a check on the scanner.
+///
+/// The value opens at the first character `skip` stops at and closes at its
+/// first quote no `\` escapes, else at its next quote. `mask` gives the
+/// replacement for an opening quote and whether the value may cross a line.
+/// `None` when no quote opens the value, or none closes it.
+fn reference_quoted(
+    value: &str,
+    skip: fn(char) -> bool,
+    mask: fn(char) -> (String, bool),
+) -> Option<String> {
+    let chars: Vec<char> = value.chars().collect();
+    let start = chars.iter().take_while(|&&c| skip(c)).count();
+    let quote = *chars.get(start).filter(|c| matches!(c, '"' | '\''))?;
+    let (masked, multiline) = mask(quote);
+    let end = reference_escaped_end(&chars, start, multiline)
+        .or_else(|| reference_plain_end(&chars, start, multiline))?;
+    Some(String::from_iter(&chars[..start]) + &masked + &String::from_iter(&chars[end..]))
+}
+
+/// `password=<value>` with a quoted value masked whole, never past a line break.
+fn reference_equals(value: &str) -> Option<String> {
+    let masked = reference_quoted(
+        value,
+        |c| matches!(c, ' ' | '\t'),
+        |_| (MASK.to_string(), false),
+    )?;
+    Some(format!("password={masked}"))
+}
+
+/// `{"password": <value>` with a double-quoted value masked inside its quotes across lines, and a single-quoted one masked whole within its line.
+fn reference_colon(value: &str) -> Option<String> {
+    let masked = reference_quoted(value, char::is_whitespace, |quote| {
+        if quote == '"' {
+            (format!("\"{MASK}\""), true)
+        } else {
+            (MASK.to_string(), false)
+        }
+    })?;
+    Some(format!("{{\"password\": {masked}"))
+}
+
+const QUOTED_ALPHABET: [&str; 10] = ["a", "b", " ", "\n", "\"", "\"", "'", "'", "\\", "\\"];
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+    #[test]
+    fn a_quoted_value_is_read_as_a_scanner_reads_it(
+        parts in proptest::collection::vec(proptest::sample::select(QUOTED_ALPHABET.to_vec()), 0..16)
+    ) {
+        let value = parts.concat();
+        if let Some(expected) = reference_equals(&value) {
+            prop_assert_eq!(mask_text(&format!("password={value}")), expected);
+        }
+        if let Some(expected) = reference_colon(&value) {
+            prop_assert_eq!(mask_text(&format!("{{\"password\": {value}")), expected);
+        }
+    }
+}
+
 #[test]
 fn a_long_line_is_masked_in_linear_time() {
     let lines = [
@@ -247,6 +330,14 @@ fn a_long_line_is_masked_in_linear_time() {
         "password: \"".repeat(20_000),
         "token=".repeat(40_000),
         "bearer ".repeat(30_000),
+        "password: \"".to_string() + &"\\".repeat(200_000),
+        "password: \"".to_string() + &"\\\"".repeat(100_000),
+        "password=\"".to_string() + &"\\\"".repeat(100_000),
+        "password: '".to_string() + &"\\'".repeat(100_000),
+        "{\"password\": \"".to_string() + &"\\\\".repeat(100_000) + "\"}",
+        "password: \"".to_string() + &"password: \\\"".repeat(16_000),
+        "password=\"\\\" ".repeat(15_000),
+        "\"\\".repeat(100_000),
     ];
     for line in &lines {
         let started = Instant::now();
