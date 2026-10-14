@@ -11,8 +11,9 @@
 //! These tests require a running Kafka broker. They are ignored by default.
 //! Run with: `TEST_KAFKA_BROKERS=localhost:9092 cargo test --features transport-kafka -- --ignored`
 //!
-//! The held-acknowledgement tests start their own broker in a container instead:
-//! they build with the `testcontainers` feature and need a Docker daemon.
+//! The container tests start their own broker instead: they build with the
+//! `testcontainers` feature and need a Docker daemon. Without one they skip,
+//! except in CI, where they fail.
 //!
 //! Or set up via environment variables:
 //! - `TEST_KAFKA_BROKERS`: Kafka broker addresses (default: localhost:9092)
@@ -702,8 +703,8 @@ async fn test_kafka_consumer_lag() {
 
 /// A real broker in a container, for the tests below.
 ///
-/// Built with the `testcontainers` feature, which CI's Test job enables, and
-/// needs a Docker daemon.
+/// Built with the `testcontainers` feature, which CI's Test job enables. A
+/// test skips when no Docker daemon answers, and fails instead in CI.
 #[cfg(feature = "testcontainers")]
 mod broker {
     use std::ops::Range;
@@ -734,7 +735,13 @@ mod broker {
     /// others can exit before it logs that it is ready.
     const START_ATTEMPTS: u32 = 3;
 
-    pub(super) async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
+    /// Start a broker and return it with its bootstrap address, or `None` when
+    /// no Docker daemon answers outside CI. In CI that fails the test.
+    pub(super) async fn start_kafka() -> Option<(ContainerAsync<Kafka>, String)> {
+        if !crate::common::docker_answers() {
+            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
+            return None;
+        }
         let mut attempt = 1;
         let node = loop {
             match Kafka::default()
@@ -756,7 +763,7 @@ mod broker {
             .get_host_port_ipv4(apache::KAFKA_PORT)
             .await
             .expect("kafka host port");
-        (node, format!("127.0.0.1:{port}"))
+        Some((node, format!("127.0.0.1:{port}")))
     }
 
     /// Create a one-partition `topic` and wait for its metadata.
@@ -920,7 +927,9 @@ mod held_acknowledgements {
 
     #[tokio::test]
     async fn offsets_stay_uncommitted_until_the_sink_delivers() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "held-acks";
         let group = "held-acks-group";
         topic_with_records(&bootstrap, topic).await;
@@ -970,7 +979,9 @@ mod held_acknowledgements {
 
     #[tokio::test]
     async fn acknowledgements_disabled_commits_at_receipt() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "acks-off";
         let group = "acks-off-group";
         topic_with_records(&bootstrap, topic).await;
@@ -1064,7 +1075,9 @@ mod lag {
 
     #[tokio::test]
     async fn lag_counts_from_the_commit_and_the_read_position_and_rises_while_paused() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "lag";
         create_topic(&bootstrap, topic).await;
         produce(&bootstrap, topic, 0..READ).await;
@@ -1159,7 +1172,9 @@ mod lag {
             )
         };
 
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "fresh";
         let group = "fresh-group";
         create_topic(&bootstrap, topic).await;
@@ -1393,7 +1408,9 @@ mod group_protocol {
     /// classic consumer that reads, never keep polling the dead client.
     #[tokio::test]
     async fn a_consumer_refused_by_a_classic_group_is_rebuilt_as_classic_and_reads() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let (topic, group) = ("mixed-group", "mixed-group-group");
         let member = rebalanced_classic_group(&bootstrap, topic, group).await;
 
@@ -1412,7 +1429,9 @@ mod group_protocol {
     /// one left with no partition both stay on KIP-848.
     #[tokio::test]
     async fn opted_in_consumers_keep_kip_848_with_or_without_partitions() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let (topic, group) = ("fresh-group", "fresh-group-group");
         create_topic(&bootstrap, topic).await;
         produce(&bootstrap, topic, 0..RECORDS).await;
@@ -1507,7 +1526,9 @@ mod group_protocol {
 
     #[tokio::test]
     async fn cooperative_sticky_members_each_report_lag_for_what_they_hold() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "split-cooperative";
         let config = fast_statistics(
             KafkaConfig {
@@ -1521,7 +1542,9 @@ mod group_protocol {
 
     #[tokio::test]
     async fn kip_848_members_each_report_lag_for_what_they_hold() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "split-kip-848";
         let config = fast_statistics(kip_848_config(&bootstrap, topic, "split-kip-848-group"));
         a_second_member_takes_one_partition_from_the_first(&bootstrap, topic, &config).await;
@@ -1533,7 +1556,9 @@ mod group_protocol {
     /// source's is. The same consumer reads once the topic is back.
     #[tokio::test]
     async fn a_permanent_receive_failure_leaves_readiness_alone() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "late-topic";
         let config = KafkaConfig {
             consumer_protocol: ConsumerProtocol::Classic,
@@ -1792,7 +1817,9 @@ mod revoked_mid_buffer {
     /// records of what it lost.
     #[tokio::test]
     async fn a_cooperative_member_discards_only_what_it_lost() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "revoke-cooperative";
         let config = KafkaConfig {
             consumer_protocol: ConsumerProtocol::Classic,
@@ -1816,7 +1843,9 @@ mod revoked_mid_buffer {
     /// write both, and the lease writes one.
     #[tokio::test]
     async fn an_eager_member_writes_one_copy_of_a_partition_given_straight_back() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "revoke-eager";
         let config = KafkaConfig {
             consumer_protocol: ConsumerProtocol::Classic,
@@ -1843,7 +1872,9 @@ mod revoked_mid_buffer {
     /// incrementally, as cooperative-sticky does.
     #[tokio::test]
     async fn a_kip_848_member_discards_only_what_it_lost() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "revoke-kip-848";
         let config = KafkaConfig {
             consumer_protocol: ConsumerProtocol::Consumer,
@@ -1877,7 +1908,9 @@ mod partition_fetch {
     /// whole: librdkafka grows the fetch until the record fits.
     #[tokio::test]
     async fn a_record_larger_than_the_partition_fetch_arrives_whole() {
-        let (_node, bootstrap) = start_kafka().await;
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
         let topic = "fetch-larger-record";
         create_topic(&bootstrap, topic).await;
         let large = vec![b'x'; 4 * usize::try_from(PARTITION_FETCH_BYTES).expect("fits")];
