@@ -25,6 +25,9 @@ mod chart_fixtures;
 mod contract_parity;
 
 #[cfg(feature = "logger")]
+mod credential_masking;
+
+#[cfg(feature = "logger")]
 mod logger_output;
 
 #[cfg(feature = "metrics")]

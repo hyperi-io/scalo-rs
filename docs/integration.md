@@ -258,8 +258,9 @@ my-loader generate-artefacts --output-dir ci/
 my-loader run --config config/settings.yaml
 ```
 
-`config-check` walks the cascade and prints what got loaded. Use it in
-CI to catch config-file mistakes before container build.
+`config-check` walks the cascade and prints what got loaded, with each
+credential value masked. Use it in CI to catch config-file mistakes before
+container build.
 
 `generate-artefacts` writes the full `ci/` directory deployment side
 needs. See [deployment/artefacts.md](deployment/artefacts.md) for what

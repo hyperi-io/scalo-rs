@@ -78,29 +78,45 @@ So text piped to a file or another process carries no ANSI escapes unless one of
 
 ## Sensitive-field masking
 
-Applied at the write boundary, so it is the catch-all regardless of how a value
-reaches a log line. Default list (case-insensitive substring match on field name)
-covers password / token / api_key / secret / credential / auth / bearer /
-private_key / client_secret / refresh_token / access_token / ssn / credit_card /
-cvv / pin and their common spellings. See
-[`default_sensitive_fields()`](../../src/logger/masking.rs).
+Applied at the write boundary, so it is the catch-all regardless of how a value reaches a log line. One rule decides whether a name holds a credential, `logger::is_credential_name`: a name does when one of the [`default_sensitive_fields()`](../../src/logger/credential.rs) sits anywhere in it, case-insensitively. The name is also read word by word, so separators and camelCase do not hide a field: `db_password`, `PGPASSWORD`, `x-api-key`, `api.key` and `secretAccessKey` all match. The rule over-masks, and that is accepted: `token_count`, `tokenizer`, `mapping` (on `pin`), `author` (on `auth`) and `email_count` are masked too.
 
-JSON mode walks the object tree and redacts at any depth; text mode scans for
-`name=value` and `name="value"`. Both write `[REDACTED]` in place.
+The default list covers passwords, tokens, API keys, secrets, keys a qualifying word makes a credential (`signing_key`, `tls_key`, `ssh_key` and the rest, where `routing_key` is not one), auth and session values, certificates, connection strings, and personal data (`ssn`, `tfn`, `medicare`, `credit_card`, `card_number`, `cvv`, `pin`, `email`, `phone`). scalo-py's logger uses the same list and the same rule, and both are checked against one corpus, `tests/fixtures/credential_masking_parity.json`.
+
+JSON mode walks the object tree, and a key naming a credential masks its whole value at any depth. A bare `key` or `value` is judged with its parent's name, so `"tls": {"key": ...}` and `"accepted_headers": [{"values": [...]}]` mask while `"partitioner": {"key": ...}` does not. Inside an array, a two-item array whose first item names a credential, the shape a header list takes, masks its second item; a two-item array directly under a key is a list. Every string, the message included, is then masked as text, as below.
 
 Extend rather than replace:
 
 ```rust
 let mut fields = logger::default_sensitive_fields();
-fields.push("internal_session_id".into());
+fields.push("employee_ref".into());
 setup(LoggerOptions { sensitive_fields: fields, ..Default::default() })?;
 ```
 
-For values with no recognisable field name (e.g. a token in a URL), use
-`SensitiveString` from [config](config.md) -- it serialises as `***REDACTED***`
-regardless of caller.
+For a value with no recognisable name or shape, use `SensitiveString` from
+[config](config.md) -- it serialises as `***REDACTED***` regardless of caller.
 
-Masking reads field names, never values. An email address, literal or percent-encoded (`sentinel.user%40example.com` in a URL), or an opaque provider user id such as Okta's `00u1sentinel2abc3`, is written as-is unless the field carrying it is on the list, and `email` is not on the default list. scalo-py's logger redacts email addresses by value; scalo-rs has no value scrubber yet (see [Planned](../README.md#planned-not-in-current-release)).
+---
+
+## Masking text
+
+Text-mode lines, and every string in a JSON line, are masked for:
+
+- the password in `scheme://user:password@host`, up to the last `@` a host follows, so one holding `@`, `/`, `?` or `#` goes whole. Nothing tells such a password from an `@` later in the path or query, so `https://u:p@host/x?to=ops@example.com` is masked through to `example.com`. `logger::mask_url_userinfo(text, mask, keep_user)` applies the same rule to any string.
+- the token after the word `bearer`.
+- the value after `key: value` and `key=value` whose key names a credential. A quoted value runs to its closing quote, past escaped quotes, and a `Name(...)` value such as `Some("...")` goes whole. An unquoted value runs on across digit groups, so `TFN: 123 456 782` goes whole. A Rust path such as the log target `app::auth:` is never read as a key.
+
+All of it writes `[REDACTED]` in place. A coloured text line holding a credential is written without its colour, since its escapes split `name=value` apart.
+
+| Input | Output |
+| --- | --- |
+| `password=secret123` | `password=[REDACTED]` |
+| `{"clientSecret": "secret123"}` | `{"clientSecret": "[REDACTED]"}` |
+| `x-api-key: secret123` | `x-api-key: [REDACTED]` |
+| `postgres://svc:p@ss/w@db/app` | `postgres://svc:[REDACTED]@db/app` |
+| `token_count=5` | `token_count=[REDACTED]` (over-masked) |
+| `partition_key=order_id` | unchanged |
+
+Beyond URL passwords and bearer tokens, masking reads names, not values. An email address, literal or percent-encoded (`sentinel.user%40example.com` in a URL), or an opaque provider user id such as Okta's `00u1sentinel2abc3`, is written as-is unless the name carrying it holds a field: `email=...` masks, an address inside a sentence does not. scalo-py's logger also redacts email addresses by value; scalo-rs has no value scrubber yet (see [Planned](../README.md#planned-not-in-current-release)).
 
 ---
 
@@ -151,7 +167,9 @@ collapse into one.
 | `LoggerSettings` | `level`, `format`, `color` under the `logger` config key; `LoggerSettings::from_cascade()` |
 | `ThrottleConfig` | `enabled`, `burst`, `rate`, `max_signatures`, `excluded_fields` |
 | `logger::default_sensitive_fields() -> Vec<String>` | Baseline mask list -- extend, don't replace |
-| `logger::mask_sensitive_string(input, patterns) -> String` | Ad-hoc redaction outside the logger |
+| `logger::is_credential_name(name, parent) -> bool` | Whether a field name holds a credential, by the default list; `parent` qualifies a bare `key` or `value` |
+| `logger::mask_url_userinfo(text, mask, keep_user) -> Cow<str>` | Mask every URL password in a string; `keep_user: false` masks the whole `user:password` |
+| `logger::mask_sensitive_string(input, patterns) -> String` | Ad-hoc redaction outside the logger, by the text rules above and the fields in `patterns` |
 | `MaskingLayer` / `MaskingWriter<W>` | Detector + the writer wrapper `setup` installs |
 | `log_state_change(&AtomicBool, new) -> bool` | Transition gate |
 | `log_sampled(&AtomicU64, every_n) -> bool` | Nth-occurrence gate |
@@ -177,4 +195,4 @@ forbids unsafe.
 - [tracing.md](tracing.md) -- spans and `#[instrument]` feed OTel
 - [../auto-wiring.md](../auto-wiring.md) -- singleton install pattern
 - [../feature-flags.md](../feature-flags.md) -- `logger`
-- Source: [`src/logger/mod.rs`](../../src/logger/mod.rs), [`src/logger/helpers.rs`](../../src/logger/helpers.rs), [`src/logger/masking.rs`](../../src/logger/masking.rs)
+- Source: [`src/logger/mod.rs`](../../src/logger/mod.rs), [`src/logger/helpers.rs`](../../src/logger/helpers.rs), [`src/logger/masking.rs`](../../src/logger/masking.rs), [`src/logger/credential.rs`](../../src/logger/credential.rs)
