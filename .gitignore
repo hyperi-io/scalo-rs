@@ -16,7 +16,7 @@ Thumbs.db
 .env.*
 .env.local
 .env.*.local
-!.env*.example
+!.env.example
 !.env.example.*
 
 # Build
@@ -46,12 +46,16 @@ cobertura.xml
 !.cargo/config.toml
 !.cargo/audit.toml
 
+# bacon (cargo watcher) state
+.bacon-locations
+.bacon.pid
+
 # Git worktrees (local dev convenience)
 .worktrees/
 
-# Local working files (not committed)
-# Mirrored in .git/info/exclude, because a tracked .gitignore alone does not
-# protect a clone that has not pulled it yet.
+# AI agent working files -- local-only, never committed. Mirrored in
+# .git/info/exclude, because a tracked .gitignore alone does not protect a
+# clone that has not pulled it yet.
 docs/superpowers/
 .hyperi-ai
 CLAUDE.md
@@ -65,13 +69,6 @@ GEMINI.md
 .codex/
 .cursor/
 .gemini/
-.superpowers/
-.playwright-mcp/
-.secrets/
-
-# bacon (cargo watcher) state
-.bacon-locations
-.bacon.pid
 
 # Local scratch / tmp (CORE.md: scratch goes here, gitignored, NOT
 # /tmp). Bare patterns (no leading slash) match a tmp dir at ANY
