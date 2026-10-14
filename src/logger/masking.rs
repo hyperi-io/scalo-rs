@@ -354,9 +354,9 @@ fn redact_json_value(
 /// of `patterns`, every URL password and every bearer token, writing
 /// `[REDACTED]` in place. A key is judged as [`MaskingLayer::should_mask`]
 /// judges a field name, so `secretAccessKey` matches `secret_access_key`. A
-/// value runs to its closing quote, past escaped quotes, and a `Name(...)` value
-/// such as `Some("...")` goes whole, so a `{:#?}` dump of a config is safe to
-/// print.
+/// value runs to its closing quote, past escaped quotes, or to its next quote
+/// when no unescaped one closes it, and a `Name(...)` value such as
+/// `Some("...")` goes whole, so a `{:#?}` dump of a config is safe to print.
 ///
 /// # Examples
 ///
