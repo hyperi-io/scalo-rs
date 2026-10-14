@@ -3,6 +3,14 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.13](https://github.com/hyperi-io/scalo-rs/compare/v2.14.12...v2.14.13) (2026-10-14)
+
+### Bug Fixes
+
+* **deps:** update dependency ubuntu to v26 ([#353](https://github.com/hyperi-io/scalo-rs/issues/353)) ([e677753](https://github.com/hyperi-io/scalo-rs/commit/e67775347b70820e7738f3b30504179b24ff055b))
+* **deps:** update rust:1-trixie Docker digest to 8101567 ([#352](https://github.com/hyperi-io/scalo-rs/issues/352)) ([dfa3b01](https://github.com/hyperi-io/scalo-rs/commit/dfa3b013e426329c602ea5c6174cbff1e436bebe))
+* parse YAML through serde-saphyr and drop unsafe-libyaml ([#355](https://github.com/hyperi-io/scalo-rs/issues/355)) ([cad2f07](https://github.com/hyperi-io/scalo-rs/commit/cad2f079142e7525e2b60fcfacccfcf9bf8d0ed9))
+
 ## [2.14.12](https://github.com/hyperi-io/scalo-rs/compare/v2.14.11...v2.14.12) (2026-10-13)
 
 ### Bug Fixes
