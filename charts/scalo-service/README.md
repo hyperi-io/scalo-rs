@@ -147,7 +147,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `config` | `{}` | App config file; dials are validated, other keys pass |
 | `configOverrides` | `{}` | Merged over `config`, unvalidated |
 | `configMount.subPath` | false | Mount the config as one file rather than its directory |
-| `fileSets.<set>.mountPath`, `fileSets.<set>.files[{name, content}]` | none | Files mounted read-only from a ConfigMap |
+| `fileSets.<set>.mountPath`, `fileSets.<set>.files[{name, content}]` | none | Files mounted read-only from a ConfigMap, each file base64-encoded under `binaryData` so its bytes reach the pod unchanged (Helm deletes the text `<no value>` from anything it renders as plain data). Base64 adds a third to the size, inside the ConfigMap's 1 MiB limit |
 | `writablePaths.<name>.enabled`, `.sizeLimit` | on, contract | Per contract path |
 | `writablePaths.<name>.persistence.enabled`, `.size`, `.storageClass`, `.accessModes`, `.existingClaim`, `.annotations` | contract, `[ReadWriteOnce]` | The path's claim |
 | `secrets.<group>.enabled`, `.existingSecret`, `.keys.<key_name>`, `.optional` | on, `<fullname>-<group>`, contract `secret_key`, contract | Per contract secret group; `existingSecret` through `tpl` |

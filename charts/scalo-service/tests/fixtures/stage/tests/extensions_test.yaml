@@ -50,9 +50,13 @@ tests:
           path: metadata.name
           value: event-stage-transforms
         template: filesets.yaml
+      # base64 of "  .indented = true\n.flat = true\n"
       - equal:
-          path: data["main.vrl"]
-          value: "  .indented = true\n.flat = true\n"
+          path: binaryData["main.vrl"]
+          value: ICAuaW5kZW50ZWQgPSB0cnVlCi5mbGF0ID0gdHJ1ZQo=
+        template: filesets.yaml
+      - notExists:
+          path: data
         template: filesets.yaml
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
@@ -64,6 +68,23 @@ tests:
       - exists:
           path: spec.template.metadata.annotations["checksum/files"]
         template: deployment.yaml
+
+  # Helm deletes the text `<no value>` from rendered output, so a file sent as
+  # plain data reaches the pod with `.tag = ""`. The expected value is the
+  # base64 of the exact bytes set below, so equality is byte equality.
+  - it: carries a file set's bytes unchanged, template text and non-ASCII included
+    template: filesets.yaml
+    set:
+      fileSets:
+        transforms:
+          mountPath: /etc/event-stage-transforms
+          files:
+            - name: filebeat.vrl
+              content: ".tag = \"<no value>\"\n.tpl = \"{{ .Values.secret }}\"\n.close = \"}}\"\n  .text = \"caf\u00e9 \u20ac \u00fc\"\n"
+    asserts:
+      - equal:
+          path: binaryData["filebeat.vrl"]
+          value: LnRhZyA9ICI8bm8gdmFsdWU+IgoudHBsID0gInt7IC5WYWx1ZXMuc2VjcmV0IH19IgouY2xvc2UgPSAifX0iCiAgLnRleHQgPSAiY2Fmw6kg4oKsIMO8Igo=
 
   - it: renders extraObjects through tpl
     template: extra-objects.yaml
