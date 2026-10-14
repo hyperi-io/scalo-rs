@@ -101,9 +101,9 @@ For a value with no recognisable name or shape, use `SensitiveString` from
 
 Text-mode lines, and every string in a JSON line, are masked for:
 
-- the password in `scheme://user:password@host`, up to the last `@` a host follows, so one holding `@`, `/`, `?` or `#` goes whole. Nothing tells such a password from an `@` later in the path or query, so `https://u:p@host/x?to=ops@example.com` is masked through to `example.com`. `logger::mask_url_userinfo(text, mask, keep_user)` applies the same rule to any string.
+- the password in `scheme://user:password@host`, up to the last `@` a host follows, so one holding `@`, `/`, `?` or `#` goes whole. Nothing tells such a password from an `@` later in the path or query, so `https://u:p@host/x?to=ops@example.com` is masked through to `example.com`. `logger::mask_url_userinfo(text, mask, keep_user)` applies the same rule to any string, and `logger::url_passwords(text)` returns every non-empty password it masks, in order, read by the same scanner.
 - the token after the word `bearer`.
-- the value after `key: value` and `key=value` whose key names a credential. A quoted value runs to its closing quote, past escaped quotes. One that no unescaped quote closes, such as `"abc\"`, runs to its next quote instead, so honouring escapes never masks less than ignoring them. A `Name(...)` value such as `Some("...")` goes whole. An unquoted value runs on across digit groups, so `TFN: 123 456 782` goes whole. A Rust path such as the log target `app::auth:` is never read as a key.
+- the value after `key: value` and `key=value` whose key names a credential. A quoted value runs to its closing quote, past escaped quotes. One that no unescaped quote closes, such as `"abc\"`, runs to its next quote instead, so honouring escapes never masks less than ignoring them. One with no closing quote at all is masked to the end of its line, or, for a double-quoted value after `:`, which may cross lines, to the end of the text short of a line break that ends it. A `Name(...)` value such as `Some("...")` goes whole: the name is letters, digits and `_`, parentheses nest, and a quoted string inside may hold `)`, span lines, and close at its next quote when no unescaped one follows. One that does not close within 4096 bytes is masked to the end of the text, short of a line break that ends it. An unquoted value runs on across digit groups, so `TFN: 123 456 782` goes whole. A Rust path such as the log target `app::auth:` is never read as a key.
 
 All of it writes `[REDACTED]` in place. A coloured text line holding a credential is written without its colour, since its escapes split `name=value` apart.
 
@@ -169,6 +169,7 @@ collapse into one.
 | `logger::default_sensitive_fields() -> Vec<String>` | Baseline mask list -- extend, don't replace |
 | `logger::is_credential_name(name, parent) -> bool` | Whether a field name holds a credential, by the default list; `parent` qualifies a bare `key` or `value` |
 | `logger::mask_url_userinfo(text, mask, keep_user) -> Cow<str>` | Mask every URL password in a string; `keep_user: false` masks the whole `user:password` |
+| `logger::url_passwords(text) -> Vec<&str>` | Every non-empty URL password `mask_url_userinfo` masks, in order |
 | `logger::mask_sensitive_string(input, patterns) -> String` | Ad-hoc redaction outside the logger, by the text rules above and the fields in `patterns` |
 | `MaskingLayer` / `MaskingWriter<W>` | Detector + the writer wrapper `setup` installs |
 | `log_state_change(&AtomicBool, new) -> bool` | Transition gate |

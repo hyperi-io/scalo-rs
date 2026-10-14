@@ -111,7 +111,7 @@ pub(super) const SENSITIVE_FIELDS: &[&str] = &[
 /// Names that say nothing until their parent qualifies them, as `tls` does `key`.
 const BARE_NAMES: [&str; 4] = ["key", "keys", "value", "values"];
 
-/// The longest `Name(...)` value read as one value; a longer one is read as unquoted text, which keeps a line of unclosed parentheses linear.
+/// The longest `Name(...)` value read as one value, in bytes; one that does not close within it is masked to the end of the text, and the bound keeps a line of unclosed parentheses linear.
 const MAX_WRAPPER_LEN: usize = 4096;
 
 /// The matcher over [`SENSITIVE_FIELDS`].
@@ -311,24 +311,9 @@ fn scan_until(text: &str, from: usize, stop: impl Fn(char) -> bool) -> usize {
 /// ```
 #[must_use]
 pub fn mask_url_userinfo<'a>(text: &'a str, mask: &str, keep_user: bool) -> Cow<'a, str> {
-    let bytes = text.as_bytes();
     let mut out: Option<String> = None;
     let mut copied = 0;
-    let mut from = 0;
-    while let Some(found) = text[from..].find("://") {
-        let head = from + found;
-        let colon = scan_until(text, head + 3, |c| {
-            is_space(c) || matches!(c, ':' | '/' | '@')
-        });
-        if bytes.get(colon) != Some(&b':') {
-            from = head + 1;
-            continue;
-        }
-        let run_end = password_run_end(text, colon + 1);
-        let Some(at) = last_host_at(text, colon + 1, run_end) else {
-            from = head + 1;
-            continue;
-        };
+    for (head, colon, at) in url_userinfo(text) {
         if keep_user && at > colon + 1 {
             let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
             buf.push_str(&text[copied..=colon]);
@@ -341,9 +326,60 @@ pub fn mask_url_userinfo<'a>(text: &'a str, mask: &str, keep_user: bool) -> Cow<
             buf.push_str(mask);
             copied = at;
         }
-        from = at;
     }
     finish(text, out, copied)
+}
+
+/// Every non-empty URL password in `text`, in order, as [`mask_url_userinfo`] masks them.
+///
+/// Both read the text with one scanner, so a password listed here is exactly
+/// one the masker replaces. Code that checks or refuses a URL password needs
+/// no pattern of its own.
+///
+/// # Examples
+///
+/// ```
+/// use scalo::logger::url_passwords;
+///
+/// let line = "a://u:p@ss/w@db/app b://v:@h c://git@h";
+/// assert_eq!(url_passwords(line), ["p@ss/w"]);
+/// ```
+#[must_use]
+pub fn url_passwords(text: &str) -> Vec<&str> {
+    url_userinfo(text)
+        .filter(|&(_, colon, at)| at > colon + 1)
+        .map(|(_, colon, at)| &text[colon + 1..at])
+        .collect()
+}
+
+/// Where the `://`, the `:` ending the user, and the `@` ending the password sit, for each URL in `text`.
+///
+/// The password runs from the user's `:` to the last `@` a host follows,
+/// never past white space or the next `://`. The next URL is looked for from
+/// that `@`.
+fn url_userinfo(text: &str) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        while let Some(found) = text[from..].find("://") {
+            let head = from + found;
+            let colon = scan_until(text, head + 3, |c| {
+                is_space(c) || matches!(c, ':' | '/' | '@')
+            });
+            if bytes.get(colon) != Some(&b':') {
+                from = head + 1;
+                continue;
+            }
+            let run_end = password_run_end(text, colon + 1);
+            let Some(at) = last_host_at(text, colon + 1, run_end) else {
+                from = head + 1;
+                continue;
+            };
+            from = at;
+            return Some((head, colon, at));
+        }
+        None
+    })
 }
 
 /// Where the run that may hold a password ends: the next white space, or the next `://`.
@@ -534,41 +570,20 @@ fn quoted_value_end(text: &str, from: usize, multiline: bool) -> Option<usize> {
     quoted_end(text, from, multiline).or_else(|| plain_quoted_end(text, from, multiline))
 }
 
-/// The end of a `Name(...)` value such as `Some("...")`, with nested parentheses and quotes honoured.
-fn wrapper_end(text: &str, from: usize) -> Option<usize> {
+/// The last `quote` in `text` that no backslash escapes, so a string can close at it.
+fn last_closable(text: &str, quote: u8) -> Option<usize> {
     let bytes = text.as_bytes();
-    let first = *bytes.get(from)?;
-    if !(first.is_ascii_alphabetic() || first == b'_') {
-        return None;
-    }
-    let name_end = from
-        + bytes[from..]
+    let mut end = bytes.len();
+    while let Some(at) = bytes[..end].iter().rposition(|&b| b == quote) {
+        let escapes = bytes[..at]
             .iter()
-            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .rev()
+            .take_while(|&&b| b == b'\\')
             .count();
-    if bytes.get(name_end) != Some(&b'(') {
-        return None;
-    }
-    let mut limit = text.len().min(from + MAX_WRAPPER_LEN);
-    while !text.is_char_boundary(limit) {
-        limit -= 1;
-    }
-    let window = &text[..limit];
-    let mut depth = 0usize;
-    let mut at = name_end;
-    while at < limit {
-        match bytes[at] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(at + 1);
-                }
-            }
-            b'"' | b'\'' => at = quoted_end(window, at, true)? - 1,
-            _ => {}
+        if escapes.is_multiple_of(2) {
+            return Some(at);
         }
-        at += 1;
+        end = at;
     }
     None
 }
@@ -607,69 +622,270 @@ fn ends_equals_value(c: char) -> bool {
     is_space(c) || c == '&'
 }
 
-/// The value after a colon at `from`, and whether the mask keeps its quotes.
-fn colon_value(text: &str, from: usize) -> Option<(usize, bool)> {
-    let bytes = text.as_bytes();
-    if bytes.get(from) == Some(&b'"')
-        && let Some(end) = quoted_value_end(text, from, true)
-    {
-        return Some((end, true));
-    }
-    if bytes.get(from) == Some(&b'\'')
-        && let Some(end) = quoted_value_end(text, from, false)
-    {
-        return Some((end, false));
-    }
+/// The end of the unquoted value after a colon at `from`, which must end at white space, `,`, `}` or the end of the text.
+fn unquoted_colon_end(text: &str, from: usize) -> Option<usize> {
     let run_end = scan_until(text, from, ends_colon_value);
-    // The value must end at white space, `,`, `}` or the end of the text.
     let clean_end = |at: usize| {
         text[at..]
             .chars()
             .next()
             .is_none_or(|c| is_space(c) || matches!(c, ',' | '}'))
     };
-    let unquoted = (run_end > from)
+    (run_end > from)
         .then(|| {
             digit_group_ends(text, run_end, ends_colon_value)
                 .into_iter()
                 .rev()
                 .find(|&end| clean_end(end))
         })
-        .flatten();
-    // A `Name(...)` value such as `Some("...")` goes whole, never less than the unquoted reading.
-    unquoted
-        .max(wrapper_end(text, from))
-        .map(|end| (end, false))
+        .flatten()
 }
 
-/// The end of the value after an equals sign at `from`, which may be empty.
-fn equals_value(text: &str, from: usize) -> usize {
-    let bytes = text.as_bytes();
-    if matches!(bytes.get(from), Some(b'"' | b'\''))
-        && let Some(end) = quoted_value_end(text, from, false)
-    {
-        return end;
-    }
+/// The end of the unquoted value after an equals sign at `from`, which may be empty.
+fn unquoted_equals_end(text: &str, from: usize) -> usize {
     let run_end = scan_until(text, from, ends_equals_value);
-    let unquoted = digit_group_ends(text, run_end, ends_equals_value)
+    digit_group_ends(text, run_end, ends_equals_value)
         .last()
         .copied()
-        .unwrap_or(run_end);
-    // A `Name(...)` value such as `Some("...")` goes whole, never less than the unquoted reading.
-    wrapper_end(text, from).map_or(unquoted, |end| end.max(unquoted))
+        .unwrap_or(run_end)
 }
 
-/// `text` with the value after every `separator` key that names a credential replaced by `mask`.
+/// What replaces a span of text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cover {
+    /// The mask.
+    Mask,
+    /// The mask inside double quotes, so a JSON line stays valid JSON.
+    QuotedMask,
+    /// Nothing, for a run straight after a mask that already stands for it.
+    Cut,
+}
+
+impl Cover {
+    /// How many bytes this cover writes in place of a span.
+    fn len(self, mask: &str) -> usize {
+        match self {
+            Self::Mask => mask.len(),
+            Self::QuotedMask => mask.len() + 2,
+            Self::Cut => 0,
+        }
+    }
+}
+
+/// A span of text and what replaces it.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    start: usize,
+    end: usize,
+    cover: Cover,
+}
+
+/// A value as a pass reads it.
+#[derive(Debug, Clone, Copy)]
+struct Read {
+    /// Where the pass ends the value, or `None` when it replaces nothing.
+    end: Option<usize>,
+    /// What replaces the value, and the run past it when the pass replaces nothing.
+    cover: Cover,
+    /// How far the value runs, never short of `end`.
+    reach: usize,
+}
+
+impl Read {
+    /// A value the pass replaces whole, up to `end`.
+    fn whole(end: usize, cover: Cover) -> Self {
+        Self {
+            end: Some(end),
+            cover,
+            reach: end,
+        }
+    }
+}
+
+/// Reads the value after each key in one text, keys taken in rising order of position.
+///
+/// A quoted value that never closes runs to the end of its line, or, when its
+/// reading may cross lines, as a double-quoted value after `:` and a
+/// `Name(...)` value may, to the end of the text short of a line break that
+/// ends it. A `Name(...)` value runs to its close, or to the end of the text
+/// when it does not close within [`MAX_WRAPPER_LEN`] bytes.
+struct Values<'a> {
+    text: &'a str,
+    /// Where the line holding the last value read on one line ends.
+    line_end: Option<usize>,
+    /// The last quote of each kind, `"` then `'`, that no backslash escapes, found on first need.
+    closable: Option<[Option<usize>; 2]>,
+}
+
+impl<'a> Values<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            line_end: None,
+            closable: None,
+        }
+    }
+
+    /// Read the value after a colon at `from`.
+    fn colon(&mut self, from: usize) -> Read {
+        let text = self.text;
+        match text.as_bytes().get(from) {
+            Some(b'"') => match quoted_value_end(text, from, true) {
+                Some(end) => Read::whole(end, Cover::QuotedMask),
+                None => Read {
+                    end: None,
+                    cover: Cover::QuotedMask,
+                    reach: self.text_end(),
+                },
+            },
+            Some(b'\'') => match quoted_value_end(text, from, false) {
+                Some(end) => Read::whole(end, Cover::Mask),
+                None => Read {
+                    end: unquoted_colon_end(text, from),
+                    cover: Cover::Mask,
+                    reach: self.line(from),
+                },
+            },
+            _ => self.unquoted(from, unquoted_colon_end(text, from)),
+        }
+    }
+
+    /// Read the value after an equals sign at `from`.
+    fn equals(&mut self, from: usize) -> Read {
+        let text = self.text;
+        if matches!(text.as_bytes().get(from), Some(b'"' | b'\'')) {
+            return match quoted_value_end(text, from, false) {
+                Some(end) => Read::whole(end, Cover::Mask),
+                None => Read {
+                    end: Some(unquoted_equals_end(text, from)),
+                    cover: Cover::Mask,
+                    reach: self.line(from),
+                },
+            };
+        }
+        self.unquoted(from, Some(unquoted_equals_end(text, from)))
+    }
+
+    /// Read an unquoted value ending at `end`, or further when a `Name(...)` value starts at `from`.
+    fn unquoted(&mut self, from: usize, end: Option<usize>) -> Read {
+        let (wrapped, reach) = self.wrapper(from);
+        let end = end.max(wrapped);
+        let low = end.unwrap_or(from);
+        Read {
+            end,
+            cover: Cover::Mask,
+            reach: reach.map_or(low, |reach| reach.max(low)),
+        }
+    }
+
+    /// Where a pass ends the `Name(...)` value at `from`, and how far the value runs.
+    ///
+    /// The name is ASCII letters, digits and `_`. Parentheses nest, and a
+    /// string inside, single or double quoted, may span lines; it closes at its
+    /// first quote no backslash escapes or, when the text holds no such quote
+    /// after it, at its next quote. A pass ends the value at its close only when
+    /// the name starts with a letter or `_`, every string in it closes at a
+    /// quote no backslash escapes, and it closes within [`MAX_WRAPPER_LEN`]
+    /// bytes; otherwise the first is `None`. The value runs to its close, or to
+    /// the end of the text when it does not close within the window. Both are
+    /// `None` when no `Name(` starts at `from`. The walk scans each byte of the
+    /// window at most once, so a value costs at most the window.
+    fn wrapper(&mut self, from: usize) -> (Option<usize>, Option<usize>) {
+        let text = self.text;
+        let bytes = text.as_bytes();
+        let name_end = from
+            + bytes[from..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                .count();
+        if name_end == from || bytes.get(name_end) != Some(&b'(') {
+            return (None, None);
+        }
+        let never = (None, Some(self.text_end()));
+        let mut limit = text.len().min(from + MAX_WRAPPER_LEN);
+        while !text.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let window = &text[..limit];
+        let mut escaped = false;
+        let mut depth = 0usize;
+        let mut at = name_end;
+        while at < limit {
+            match bytes[at] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = at + 1;
+                        let replaced = !(escaped || bytes[from].is_ascii_digit());
+                        return (replaced.then_some(end), Some(end));
+                    }
+                }
+                quote @ (b'"' | b'\'') => {
+                    let close = if self.closes_after(at) {
+                        quoted_end(window, at, true)
+                    } else {
+                        escaped = true;
+                        window[at + 1..]
+                            .find(char::from(quote))
+                            .map(|i| at + 1 + i + 1)
+                    };
+                    let Some(close) = close else {
+                        return never;
+                    };
+                    at = close - 1;
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        never
+    }
+
+    /// Whether a quote like the one at `at` that no backslash escapes lies anywhere after it.
+    fn closes_after(&mut self, at: usize) -> bool {
+        let text = self.text;
+        let closable = *self
+            .closable
+            .get_or_insert_with(|| [last_closable(text, b'"'), last_closable(text, b'\'')]);
+        let kind = usize::from(text.as_bytes()[at] == b'\'');
+        closable[kind].is_some_and(|last| last > at)
+    }
+
+    /// Where a value whose reading may cross lines runs to: the end of the text, short of a line break that ends it.
+    fn text_end(&self) -> usize {
+        self.text
+            .strip_suffix('\n')
+            .map_or(self.text.len(), str::len)
+    }
+
+    /// Where the line holding `from` ends: its line break, or the end of the text.
+    fn line(&mut self, from: usize) -> usize {
+        if let Some(end) = self.line_end
+            && from <= end
+        {
+            return end;
+        }
+        let end = self.text[from..]
+            .find('\n')
+            .map_or(self.text.len(), |i| from + i);
+        self.line_end = Some(end);
+        end
+    }
+}
+
+/// The value after every `separator` key that `matcher` names a credential, and the run past each one.
 ///
 /// Only a credential key's value is consumed, so a key inside another pair's
 /// value, as in `config:password:x`, is still judged.
-fn mask_pairs<'a>(
-    text: &'a str,
+fn pair_spans(
+    text: &str,
     separator: Separator,
     matcher: &CredentialMatcher,
-    mask: &str,
-) -> Cow<'a, str> {
-    let mut out: Option<String> = None;
+) -> (Vec<Span>, Vec<Span>) {
+    let mut values = Values::new(text);
+    let mut spans = Vec::new();
+    let mut runs = Vec::new();
     let mut copied = 0;
     let mut from = 0;
     while let Some(head) = next_head(text, from, separator) {
@@ -677,25 +893,120 @@ fn mask_pairs<'a>(
         if head.start < copied || !matcher.matches(&text[head.start..head.key_end], "") {
             continue;
         }
-        let value = match separator {
-            Separator::Colon => colon_value(text, head.end),
-            Separator::Equals => Some((equals_value(text, head.end), false)),
+        let read = match separator {
+            Separator::Colon => values.colon(head.end),
+            Separator::Equals => values.equals(head.end),
         };
-        let Some((value_end, keep_quotes)) = value else {
-            continue;
-        };
-        let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
-        buf.push_str(&text[copied..head.end]);
-        if keep_quotes {
-            buf.push('"');
-            buf.push_str(mask);
-            buf.push('"');
-        } else {
-            buf.push_str(mask);
+        let low = read.end.unwrap_or(head.end);
+        if let Some(end) = read.end {
+            spans.push(Span {
+                start: head.end,
+                end,
+                cover: read.cover,
+            });
+            copied = end;
         }
-        copied = value_end;
+        if read.reach > low {
+            let cover = if read.end.is_some() {
+                Cover::Cut
+            } else {
+                read.cover
+            };
+            runs.push(Span {
+                start: low,
+                end: read.reach,
+                cover,
+            });
+        }
     }
-    finish(text, out, copied)
+    (spans, runs)
+}
+
+/// `runs`, placed in the text `spans` were read from, as they sit once each span is replaced by its cover.
+///
+/// A run ending inside a span ends after that span's cover.
+fn placed_after(runs: Vec<Span>, spans: &[Span], mask: &str) -> Vec<Span> {
+    let mut cover_ends = Vec::with_capacity(spans.len());
+    let mut written = 0;
+    let mut copied = 0;
+    for span in spans {
+        written += span.start - copied + span.cover.len(mask);
+        cover_ends.push(written);
+        copied = span.end;
+    }
+    let place = |at: usize| {
+        let Some(index) = spans
+            .partition_point(|span| span.start <= at)
+            .checked_sub(1)
+        else {
+            return at;
+        };
+        let span = spans[index];
+        if at >= span.end {
+            cover_ends[index] + (at - span.end)
+        } else if at > span.start {
+            cover_ends[index]
+        } else {
+            cover_ends[index] - span.cover.len(mask)
+        }
+    };
+    runs.into_iter()
+        .map(|run| Span {
+            start: place(run.start),
+            end: place(run.end),
+            cover: run.cover,
+        })
+        .collect()
+}
+
+/// `text` with each span replaced by its cover, still borrowed when there are none.
+///
+/// Spans that overlap or touch merge, and the first of them decides the cover,
+/// so a value and the run past it come out as one mask.
+fn apply<'a>(text: &'a str, mut spans: Vec<Span>, mask: &str) -> Cow<'a, str> {
+    if spans.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    spans.sort_by_key(|span| (span.start, span.cover == Cover::Cut));
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut spans = spans.into_iter().peekable();
+    while let Some(first) = spans.next() {
+        let mut end = first.end;
+        while let Some(next) = spans.next_if(|next| next.start <= end) {
+            end = end.max(next.end);
+        }
+        out.push_str(&text[copied..first.start]);
+        match first.cover {
+            Cover::Mask => out.push_str(mask),
+            Cover::QuotedMask => {
+                out.push('"');
+                out.push_str(mask);
+                out.push('"');
+            }
+            Cover::Cut => {}
+        }
+        copied = end;
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+/// `text` with the value after every `key: value`, then every `key=value`, whose key `matcher` names a credential replaced by `mask`.
+///
+/// Each pass replaces a value only as far as its first reading goes, and the
+/// equals pass reads the colon pass's output. The run past a value that never
+/// closes, or past a `Name(...)` value that first reading does not take
+/// whole, is masked after both passes, so a key inside a run is still read
+/// and its value still masked.
+fn mask_pairs<'a>(text: &'a str, matcher: &CredentialMatcher, mask: &str) -> Cow<'a, str> {
+    let (spans, runs) = pair_spans(text, Separator::Colon, matcher);
+    let runs = placed_after(runs, &spans, mask);
+    let colon_masked = apply(text, spans, mask);
+    let (mut spans, more) = pair_spans(&colon_masked, Separator::Equals, matcher);
+    spans.extend(more);
+    spans.extend(runs);
+    then(colon_masked, |t| apply(t, spans, mask))
 }
 
 /// `text` with every credential in it replaced by `mask`.
@@ -709,8 +1020,7 @@ pub(super) fn mask_text<'a>(
 ) -> Cow<'a, str> {
     let text = mask_url_userinfo(text, mask, true);
     let text = then(text, |t| mask_bearer(t, mask));
-    let text = then(text, |t| mask_pairs(t, Separator::Colon, matcher, mask));
-    then(text, |t| mask_pairs(t, Separator::Equals, matcher, mask))
+    then(text, |t| mask_pairs(t, matcher, mask))
 }
 
 /// `text` after `step`, still borrowed when neither changed it.
@@ -817,13 +1127,148 @@ mod tests {
         );
     }
 
+    fn wrapper(text: &str, from: usize) -> (Option<usize>, Option<usize>) {
+        Values::new(text).wrapper(from)
+    }
+
     #[test]
     fn a_wrapper_closes_at_its_own_parenthesis() {
-        assert_eq!(wrapper_end("Some(\"a)b\") rest", 0), Some(11));
-        assert_eq!(wrapper_end("f(g(x), y) rest", 0), Some(10));
-        assert_eq!(wrapper_end("Some(\"never closes", 0), None);
-        assert_eq!(wrapper_end("(x)", 0), None);
-        assert_eq!(wrapper_end("name (x)", 0), None);
+        assert_eq!(wrapper("Some(\"a)b\") rest", 0), (Some(11), Some(11)));
+        assert_eq!(wrapper("f(g(x), y) rest", 0), (Some(10), Some(10)));
+        assert_eq!(wrapper("(x)", 0), (None, None));
+        assert_eq!(wrapper("name (x)", 0), (None, None));
+    }
+
+    #[test]
+    fn a_wrapper_that_never_closes_runs_to_the_end_of_the_text() {
+        assert_eq!(wrapper("Some(\"never closes", 0), (None, Some(18)));
+        assert_eq!(wrapper("Some(a\nb\n", 0), (None, Some(8)));
+    }
+
+    #[test]
+    fn a_string_with_no_unescaped_close_closes_at_its_next_quote_and_no_pass_replaces_it() {
+        assert_eq!(wrapper(r#"Some("a\") x"#, 0), (None, Some(10)));
+        assert_eq!(wrapper(r"T(v='a\') x", 0), (None, Some(9)));
+    }
+
+    #[test]
+    fn a_name_starting_with_a_digit_runs_to_its_close_and_no_pass_replaces_it() {
+        assert_eq!(wrapper("1(a b) c", 0), (None, Some(6)));
+    }
+
+    #[test]
+    fn the_last_closable_quote_has_an_even_run_of_backslashes_before_it() {
+        assert_eq!(last_closable(r#"a"b\"c"#, b'"'), Some(1));
+        assert_eq!(last_closable(r#"a"b\\"c"#, b'"'), Some(5));
+        assert_eq!(last_closable(r#"\"\""#, b'"'), None);
+        assert_eq!(last_closable("abc", b'\''), None);
+    }
+
+    #[test]
+    fn a_wrapped_value_closes_within_4096_bytes() {
+        let defaults = CredentialMatcher::default_terms();
+        for (value, whole) in [
+            (format!("f({}b)", "a ".repeat(2046)), true),
+            (format!("f({}bc)", "a ".repeat(2046)), false),
+            (format!("f({}a)", "\u{e9} ".repeat(1364)), true),
+            (format!("f({}ab)", "\u{e9} ".repeat(1364)), false),
+        ] {
+            let expected = if whole { "token=M next" } else { "token=M" };
+            assert_eq!(
+                mask_text(&format!("token={value} next"), defaults, "M"),
+                expected
+            );
+            let reach = if whole { value.len() } else { value.len() + 5 };
+            assert_eq!(
+                wrapper(&format!("{value} next"), 0),
+                (whole.then_some(value.len()), Some(reach))
+            );
+        }
+    }
+
+    /// The first quote matching the one at `at` that no backslash escapes, anywhere after it.
+    fn reference_escaped_close(text: &str, at: usize) -> Option<usize> {
+        let quote = char::from(text.as_bytes()[at]);
+        let mut chars = text[at + 1..].char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                chars.next();
+            } else if c == quote {
+                return Some(at + 1 + i);
+            }
+        }
+        None
+    }
+
+    /// The `Name(...)` value at `from`, read one character at a time, as a check on the walk.
+    fn reference_wrapper(text: &str, from: usize) -> (Option<usize>, Option<usize>) {
+        let name_len = text[from..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .count();
+        if name_len == 0 || !text[from + name_len..].starts_with('(') {
+            return (None, None);
+        }
+        let never = (
+            None,
+            Some(text.strip_suffix('\n').map_or(text.len(), str::len)),
+        );
+        let mut limit = text.len().min(from + MAX_WRAPPER_LEN);
+        while !text.is_char_boundary(limit) {
+            limit -= 1;
+        }
+        let mut depth = 0;
+        let mut escaped = false;
+        let mut at = from + name_len;
+        while at < limit {
+            let c = text[at..].chars().next().unwrap_or_default();
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let replaced = !escaped && !text.as_bytes()[from].is_ascii_digit();
+                        return (replaced.then_some(at + 1), Some(at + 1));
+                    }
+                }
+                '"' | '\'' => {
+                    let close = reference_escaped_close(text, at).or_else(|| {
+                        escaped = true;
+                        text[at + 1..].find(c).map(|i| at + 1 + i)
+                    });
+                    match close {
+                        Some(close) if close < limit => at = close,
+                        _ => return never,
+                    }
+                }
+                _ => {}
+            }
+            at += c.len_utf8();
+        }
+        never
+    }
+
+    const WRAPPER_ALPHABET: [&str; 17] = [
+        "a", "_", "1", "(", "(", ")", ")", "\"", "\"", "'", "'", "\\", "\\", " ", "\n", "x(",
+        "\u{e9}",
+    ];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(5_000))]
+
+        #[test]
+        fn a_wrapped_value_ends_where_a_character_scan_ends_it(
+            parts in proptest::collection::vec(proptest::sample::select(WRAPPER_ALPHABET.to_vec()), 0..40)
+        ) {
+            let text = parts.concat();
+            for (from, _) in text.char_indices() {
+                proptest::prop_assert_eq!(
+                    Values::new(&text).wrapper(from),
+                    reference_wrapper(&text, from),
+                    "{:?} at {}", text, from
+                );
+            }
+        }
     }
 
     #[test]

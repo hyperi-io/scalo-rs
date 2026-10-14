@@ -54,7 +54,7 @@ use tracing_throttle::{Policy, TracingRateLimitLayer};
 
 use crate::env::ConsoleContext;
 
-pub use credential::{is_credential_name, mask_url_userinfo};
+pub use credential::{is_credential_name, mask_url_userinfo, url_passwords};
 pub use helpers::{log_debounced, log_sampled, log_state_change};
 pub use masking::{MaskingLayer, MaskingWriter, default_sensitive_fields, mask_sensitive_string};
 pub use security::{SecurityEvent, SecurityOutcome};
