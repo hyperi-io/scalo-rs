@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.14](https://github.com/hyperi-io/scalo-rs/compare/v2.14.13...v2.14.14) (2026-10-14)
+
+### Bug Fixes
+
+* credential masking parity with scalo-py ([#358](https://github.com/hyperi-io/scalo-rs/issues/358)) ([263f080](https://github.com/hyperi-io/scalo-rs/commit/263f0805d85c0be75f86f708b2eb6d195161623d)), closes [#357](https://github.com/hyperi-io/scalo-rs/issues/357)
+* mask a quoted value an escape leaves unclosed ([#359](https://github.com/hyperi-io/scalo-rs/issues/359)) ([23d4a9d](https://github.com/hyperi-io/scalo-rs/commit/23d4a9dad2ea409619b3be744ee04477373eb978))
+
 ## [2.14.13](https://github.com/hyperi-io/scalo-rs/compare/v2.14.12...v2.14.13) (2026-10-14)
 
 ### Bug Fixes
