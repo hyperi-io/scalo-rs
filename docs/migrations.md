@@ -52,11 +52,11 @@ Both returned an empty string when serialisation failed. They now return `Result
 
 **Consumer adjustment** -- none.
 
-### File sets mount from `binaryData` (BEHAVIOUR CHANGE)
+### The config file and file sets mount from `binaryData` (BEHAVIOUR CHANGE)
 
-The scalo-service chart wrote each file set into its ConfigMap's `data`, and Helm deletes the text `<no value>` from everything it renders. A VRL program holding `.tag = "<no value>"` was mounted as `.tag = ""`, so the pod ran different bytes from the ones the values carried. Each file is now base64-encoded under `binaryData`. Mount paths and file names are unchanged, and the pod reads the exact bytes sent. Base64 adds a third to each file's size, which counts against the ConfigMap's 1 MiB limit.
+The scalo-service chart wrote the config file and each file set into its ConfigMap's `data`, and Helm deletes the text `<no value>` from everything it renders. A VRL program holding `.tag = "<no value>"` was mounted as `.tag = ""`, and a config value `tag: <no value>` as `tag:`, a null. So the pod ran different bytes from the ones the values carried. Each file is now base64-encoded under `binaryData`. Mount paths and file names are unchanged, and the pod reads the exact bytes sent. Base64 adds a third to each file's size, which counts against the ConfigMap's 1 MiB limit.
 
-**Consumer adjustment** -- regenerate every thin chart against this library release. A tool that reads a file set back out of its ConfigMap reads `binaryData` and decodes it.
+**Consumer adjustment** -- regenerate every thin chart against this library release. A tool that reads the config file or a file set back out of its ConfigMap reads `binaryData` and decodes it.
 
 ### `TieredSink::shutdown()` is not reported as a drop (BEHAVIOUR CHANGE)
 

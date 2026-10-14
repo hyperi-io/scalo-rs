@@ -86,6 +86,8 @@ Config keys that are not dials still reach the app, through `config` or `configO
 
 A persistent writable path is a claim beside a Deployment that recreates its pod, not a StatefulSet: the claim keeps the name `<fullname>-<path name>` across upgrades, where a StatefulSet's claim template names claims after the set and the ordinal.
 
+The config file and every file set sit base64-encoded under the ConfigMap's `binaryData`, because Helm deletes the text `<no value>` from anything it renders as plain data. A value holding it would otherwise reach the pod as an empty string or a null. The mounted files are the plain bytes, and base64 adds a third to their size inside the ConfigMap's 1 MiB limit.
+
 ## Contract fields the library reads
 
 | Field | Renders | When absent |
@@ -147,7 +149,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `config` | `{}` | App config file; dials are validated, other keys pass |
 | `configOverrides` | `{}` | Merged over `config`, unvalidated |
 | `configMount.subPath` | false | Mount the config as one file rather than its directory |
-| `fileSets.<set>.mountPath`, `fileSets.<set>.files[{name, content}]` | none | Files mounted read-only from a ConfigMap, each file base64-encoded under `binaryData` so its bytes reach the pod unchanged (Helm deletes the text `<no value>` from anything it renders as plain data). Base64 adds a third to the size, inside the ConfigMap's 1 MiB limit |
+| `fileSets.<set>.mountPath`, `fileSets.<set>.files[{name, content}]` | none | Files mounted read-only from a ConfigMap, each byte for byte (see [What the library renders](#what-the-library-renders)) |
 | `writablePaths.<name>.enabled`, `.sizeLimit` | on, contract | Per contract path |
 | `writablePaths.<name>.persistence.enabled`, `.size`, `.storageClass`, `.accessModes`, `.existingClaim`, `.annotations` | contract, `[ReadWriteOnce]` | The path's claim |
 | `secrets.<group>.enabled`, `.existingSecret`, `.keys.<key_name>`, `.optional` | on, `<fullname>-<group>`, contract `secret_key`, contract | Per contract secret group; `existingSecret` through `tpl` |
