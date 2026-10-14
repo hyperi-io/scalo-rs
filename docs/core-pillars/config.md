@@ -115,8 +115,11 @@ Masking is applied at the serialisation boundary, not at the call site. Three
 concentric defences:
 
 1. `#[serde(skip_serializing)]` on secret fields -- explicit but easy to forget.
-2. Name-based redaction (registry dump + logger) -- catches commonly-named fields
-   (`password`, `token`, `api_key`, `client_secret`, ...).
+2. Name-based redaction -- the registry dump masks a field whose name holds
+   `password`, `secret`, `token`, `key`, `credential`, `auth`, `private`, `cert`,
+   `encryption`, `connection_string` or `dsn`; the logger, and the config dump
+   `config-check` prints, judge a name by `logger::is_credential_name` (see
+   [logging.md](logging.md#sensitive-field-masking)).
 3. `SensitiveString` newtype -- always serialises as `"***REDACTED***"`, prints
    the same in `Debug` / `Display`. Only `.expose()` reveals the value, and call
    sites are grep-able for review.

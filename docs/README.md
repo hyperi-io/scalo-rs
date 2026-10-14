@@ -166,8 +166,8 @@ Section landing: [api/README.md](api/README.md)
 ### Planned (not in current release)
 
 - **Content-based log scrubbing** (gitleaks rules + PII validators
-  composed via `strmatch`). The current release ships field-name
-  masking via `MaskingWriter` only - see
+  composed via `strmatch`). The current release ships field-name,
+  URL-password and bearer-token masking via `MaskingWriter` only - see
   [core-pillars/logging.md](core-pillars/logging.md) for what's
   shipped.
 - **`cache` module** (moka TinyLFU async cache). Documented in

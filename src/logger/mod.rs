@@ -16,7 +16,8 @@
 //!
 //! - RFC 3339 timestamps with timezone
 //! - JSON or human-readable text, coloured only on a terminal unless configured
-//! - Sensitive data masking (passwords, tokens, API keys)
+//! - Sensitive data masking (passwords, tokens, API keys, URL passwords),
+//!   judged by [`is_credential_name`]
 //! - Environment variable overrides (LOG_LEVEL, LOG_FORMAT, LOG_COLOR, NO_COLOR)
 //!
 //! ## Example
@@ -32,6 +33,7 @@
 //! tracing::error!(error = "connection failed", "Database error");
 //! ```
 
+mod credential;
 pub mod format;
 pub mod helpers;
 mod masking;
@@ -52,6 +54,7 @@ use tracing_throttle::{Policy, TracingRateLimitLayer};
 
 use crate::env::ConsoleContext;
 
+pub use credential::{is_credential_name, mask_url_userinfo};
 pub use helpers::{log_debounced, log_sampled, log_state_change};
 pub use masking::{MaskingLayer, MaskingWriter, default_sensitive_fields, mask_sensitive_string};
 pub use security::{SecurityEvent, SecurityOutcome};

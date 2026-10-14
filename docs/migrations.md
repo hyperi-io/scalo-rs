@@ -8,6 +8,14 @@ release and the target before bumping.
 
 ## Unreleased
 
+### Credential names match in any spelling, and text masks `key: value` and URL passwords (BEHAVIOUR CHANGE)
+
+The logger decides every credential name through the new `logger::is_credential_name`: a name holding a default field anywhere in it, read as written and word by word. So `secretAccessKey`, `signingKey`, `api.key` and `ssl.key.pem`, which were logged in clear, are masked. `default_sensitive_fields()` adds `passphrase`, more token and secret spellings, the qualified keys (`signing_key`, `tls_key`, `ssh_key` and the rest), `jaas_config`, `header_value`, `session`, `cookie`, `csrf`, `cert`, `private`, `creds`, `connection_string`, `tfn`, `medicare`, `card_number`, `email` and `phone`. A bare `key` or `value` in a JSON line is judged with its parent's name.
+
+Text-format lines, and every string in a JSON line including the message, now mask `key: value` as well as `key=value`, the password of every URL up to the last `@` a host follows, and bearer tokens; the new `logger::mask_url_userinfo` applies the URL rule to any string. `mask_sensitive_string` uses the same rules, so the `{:#?}` config dump `config-check` prints masks its credential fields, where it wrote each value straight after the mask. See [core-pillars/logging.md](core-pillars/logging.md#sensitive-field-masking).
+
+**Consumer adjustment** -- expect more masking. A name that only contains a field is masked too: `token_count`, `tokenizer`, `mapping` (`pin`), `author` (`auth`), `session_timeout_ms` (`session`) and `email_count` (`email`), and so is a `key: value` pair inside a message. Log a value an operator must read under a name that holds no field. An `@` later in the path or query of a URL that carries a password is masked with it.
+
 ### YAML parses through `scalo::yaml` (BEHAVIOUR CHANGE)
 
 Every YAML scalo reads or writes -- the config cascade, `kafka_config` files, directory-config tables and the deployment artefacts -- now goes through the new `yaml` module on serde-saphyr. `serde_yaml_ng`, figment's `yaml` feature and with them `unsafe-libyaml` (RUSTSEC-2024-0449) are out of the graph. The parse rules that differ from before:
