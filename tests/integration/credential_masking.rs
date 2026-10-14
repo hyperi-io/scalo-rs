@@ -22,7 +22,7 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use scalo::logger::{
     MaskingWriter, default_sensitive_fields, is_credential_name, mask_sensitive_string,
-    mask_url_userinfo,
+    mask_url_userinfo, url_passwords,
 };
 
 const MASK: &str = "[REDACTED]";
@@ -37,6 +37,7 @@ fn fill(text: &str, mask: &str) -> String {
     let secret = secret();
     text.replace("{pw}", &format!("p@{secret}"))
         .replace("{secret}", &secret)
+        .replace("{window}", &"x".repeat(4096))
         .replace("{mask}", mask)
 }
 
@@ -159,13 +160,12 @@ fn coarse_cases_match_the_corpus() {
     }
 }
 
-/// Masks URL userinfo by reading the grammar one step at a time, as a check on the scanner.
+/// Where each URL's `://`, the `:` ending its user and the `@` ending its password sit, in chars, reading the grammar one step at a time, as a check on the scanner.
 ///
 /// A URL starts at `://`. The user holds no white space, `:`, `/` or `@` and ends
 /// at a `:`. The password runs to the last `@` a host follows, never past white
 /// space or the next `://`. The next URL is looked for from that `@`.
-fn reference_mask(text: &str, mask: &str, keep_user: bool) -> String {
-    let chars: Vec<char> = text.chars().collect();
+fn reference_userinfo(chars: &[char]) -> Vec<(usize, usize, usize)> {
     let starts_head = |i: usize| chars.get(i..i + 3) == Some(&[':', '/', '/'][..]);
     let host_follows = |at: usize| {
         let mut end = at + 1;
@@ -175,8 +175,7 @@ fn reference_mask(text: &str, mask: &str, keep_user: bool) -> String {
         end == chars.len() || chars[end].is_whitespace() || "/?#".contains(chars[end])
     };
     let find_head = |from: usize| (from..chars.len()).find(|&i| starts_head(i));
-    let mut out = String::new();
-    let mut copied = 0;
+    let mut found = Vec::new();
     let mut head = find_head(0);
     while let Some(h) = head {
         let mut colon = h + 3;
@@ -194,25 +193,53 @@ fn reference_mask(text: &str, mask: &str, keep_user: bool) -> String {
                 .filter(|&i| chars[i] == '@' && host_follows(i))
                 .collect();
             if let Some(&at) = ats.last() {
-                if !keep_user {
-                    out.extend(&chars[copied..h]);
-                    out.push_str("://");
-                    out.push_str(mask);
-                } else if at > colon + 1 {
-                    out.extend(&chars[copied..=colon]);
-                    out.push_str(mask);
-                } else {
-                    out.extend(&chars[copied..at]);
-                }
-                copied = at;
+                found.push((h, colon, at));
                 head = find_head(at);
                 continue;
             }
         }
         head = find_head(h + 1);
     }
+    found
+}
+
+/// Masks URL userinfo where [`reference_userinfo`] finds it.
+fn reference_mask(text: &str, mask: &str, keep_user: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut copied = 0;
+    for (h, colon, at) in reference_userinfo(&chars) {
+        if !keep_user {
+            out.extend(&chars[copied..h]);
+            out.push_str("://");
+            out.push_str(mask);
+        } else if at > colon + 1 {
+            out.extend(&chars[copied..=colon]);
+            out.push_str(mask);
+        } else {
+            out.extend(&chars[copied..at]);
+        }
+        copied = at;
+    }
     out.extend(&chars[copied..]);
     out
+}
+
+/// The non-empty URL passwords [`reference_userinfo`] finds, in order.
+fn reference_passwords(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    reference_userinfo(&chars)
+        .into_iter()
+        .filter(|&(_, colon, at)| at > colon + 1)
+        .map(|(_, colon, at)| chars[colon + 1..at].iter().collect())
+        .collect()
+}
+
+#[test]
+fn url_passwords_lists_each_password_in_order() {
+    let secret = secret();
+    let line = format!("a://u:{secret}@h1 b://v:@h2 c://w:p@ss/x@h3/path d://git@h4");
+    assert_eq!(url_passwords(&line), [secret.as_str(), "p@ss/x"]);
 }
 
 const ALPHABET: [&str; 16] = [
@@ -229,6 +256,7 @@ proptest! {
         let text = parts.concat();
         prop_assert_eq!(mask_url_userinfo(&text, MASK, true), reference_mask(&text, MASK, true));
         prop_assert_eq!(mask_url_userinfo(&text, "***", false), reference_mask(&text, "***", false));
+        prop_assert_eq!(url_passwords(&text), reference_passwords(&text));
     }
 }
 
@@ -254,12 +282,24 @@ fn reference_plain_end(value: &[char], start: usize, multiline: bool) -> Option<
     (multiline || !value[start..close].contains(&'\n')).then_some(close + 1)
 }
 
+/// Where a quoted value that closes at no quote runs to: the end of its line, or, when it may cross lines, the end of the text short of a final line break.
+fn reference_never_closes(value: &[char], start: usize, multiline: bool) -> usize {
+    if multiline {
+        value.len() - usize::from(value.last() == Some(&'\n'))
+    } else {
+        (start..value.len())
+            .find(|&at| value[at] == '\n')
+            .unwrap_or(value.len())
+    }
+}
+
 /// `value` with its leading quoted value masked, read one character at a time, as a check on the scanner.
 ///
 /// The value opens at the first character `skip` stops at and closes at its
-/// first quote no `\` escapes, else at its next quote. `mask` gives the
-/// replacement for an opening quote and whether the value may cross a line.
-/// `None` when no quote opens the value, or none closes it.
+/// first quote no `\` escapes, else at its next quote, else where
+/// [`reference_never_closes`] says. `mask` gives the replacement for an
+/// opening quote and whether the value may cross a line. `None` when no quote
+/// opens the value.
 fn reference_quoted(
     value: &str,
     skip: fn(char) -> bool,
@@ -270,7 +310,8 @@ fn reference_quoted(
     let quote = *chars.get(start).filter(|c| matches!(c, '"' | '\''))?;
     let (masked, multiline) = mask(quote);
     let end = reference_escaped_end(&chars, start, multiline)
-        .or_else(|| reference_plain_end(&chars, start, multiline))?;
+        .or_else(|| reference_plain_end(&chars, start, multiline))
+        .unwrap_or_else(|| reference_never_closes(&chars, start, multiline));
     Some(String::from_iter(&chars[..start]) + &masked + &String::from_iter(&chars[end..]))
 }
 
@@ -338,6 +379,14 @@ fn a_long_line_is_masked_in_linear_time() {
         "password: \"".to_string() + &"password: \\\"".repeat(16_000),
         "password=\"\\\" ".repeat(15_000),
         "\"\\".repeat(100_000),
+        "password: 'a ".repeat(20_000),
+        "password='a\n".repeat(20_000),
+        "password: \"a \n".repeat(20_000),
+        "token=Some(\"\\\" ".repeat(15_000),
+        "token=1(\n".repeat(25_000),
+        "pin: f(\\' x) ".repeat(16_000),
+        "token=".to_string() + &"a(".repeat(100_000),
+        "token=Some(".to_string() + &"(".repeat(200_000),
     ];
     for line in &lines {
         let started = Instant::now();

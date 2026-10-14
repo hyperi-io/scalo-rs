@@ -356,7 +356,9 @@ fn redact_json_value(
 /// judges a field name, so `secretAccessKey` matches `secret_access_key`. A
 /// value runs to its closing quote, past escaped quotes, or to its next quote
 /// when no unescaped one closes it, and a `Name(...)` value such as
-/// `Some("...")` goes whole, so a `{:#?}` dump of a config is safe to print.
+/// `Some("...")` goes whole, so a `{:#?}` dump of a config is safe to print. A
+/// quoted or `Name(...)` value that never closes is masked to the end of its
+/// line, or to the end of the text when its reading may cross lines.
 ///
 /// # Examples
 ///
