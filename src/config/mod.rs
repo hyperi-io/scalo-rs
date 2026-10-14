@@ -53,8 +53,12 @@
 
 pub mod env_compat;
 pub mod flat_env;
+mod load;
 pub mod registry;
 pub mod sensitive;
+mod yaml_file;
+
+pub use load::{load_typed, log_deferred};
 
 #[cfg(feature = "config-reload")]
 pub mod reloader;
@@ -70,10 +74,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use figment::Figment;
-use figment::providers::{Env, Format, Serialized, Yaml};
+use figment::providers::{Env, Serialized};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use self::yaml_file::YamlFile;
 use crate::env::get_app_env;
 
 /// Global configuration singleton.
@@ -89,6 +94,10 @@ pub enum ConfigError {
     /// Failed to extract configuration value.
     #[error("failed to extract config: {0}")]
     ExtractError(#[from] figment::Error),
+
+    /// A config file could not be read or parsed.
+    #[error(transparent)]
+    Yaml(#[from] crate::yaml::YamlError),
 
     /// Missing required configuration key.
     #[error("missing required config key: {0}")]
@@ -200,18 +209,18 @@ impl Config {
 
         // 6. defaults.yaml
         for path in Self::find_config_files("defaults", &opts.config_paths, app_name_ref) {
-            figment = figment.merge(Yaml::file(&path));
+            figment = figment.merge(YamlFile::new(path));
         }
 
         // 5. settings.yaml
         for path in Self::find_config_files("settings", &opts.config_paths, app_name_ref) {
-            figment = figment.merge(Yaml::file(&path));
+            figment = figment.merge(YamlFile::new(path));
         }
 
         // 4. settings.{env}.yaml
         let env_settings = format!("settings.{app_env}");
         for path in Self::find_config_files(&env_settings, &opts.config_paths, app_name_ref) {
-            figment = figment.merge(Yaml::file(&path));
+            figment = figment.merge(YamlFile::new(path));
         }
 
         // 3. .env file values are already loaded into env vars

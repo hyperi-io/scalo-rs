@@ -2,15 +2,24 @@ suite: configmap
 templates:
   - configmap.yaml
 tests:
+  # base64 of "{}\n"
   - it: renders an empty config when no value is set, never the contract's default_config
     asserts:
       - equal:
           path: metadata.name
           value: event-stage-config
       - equal:
-          path: data["config.yaml"]
-          value: "{}\n"
+          path: binaryData["config.yaml"]
+          value: e30K
+      - notExists:
+          path: data
 
+  # base64 of:
+  #   buffer:
+  #     flush_rows: 5000
+  #   loader:
+  #     endpoint: loader:6000
+  #   log_level: warn
   - it: renders only the keys values set, with configOverrides winning
     set:
       config:
@@ -23,10 +32,24 @@ tests:
           endpoint: loader:6000
     asserts:
       - equal:
-          path: data["config.yaml"]
-          value: |
-            buffer:
-              flush_rows: 5000
-            loader:
-              endpoint: loader:6000
-            log_level: warn
+          path: binaryData["config.yaml"]
+          value: YnVmZmVyOgogIGZsdXNoX3Jvd3M6IDUwMDAKbG9hZGVyOgogIGVuZHBvaW50OiBsb2FkZXI6NjAwMApsb2dfbGV2ZWw6IHdhcm4K
+
+  # Helm deletes the text `<no value>` from rendered output, so a config sent as
+  # plain data reaches the pod as `tag:`, a null. The expected value is the
+  # base64 of:
+  #   close: '}}'
+  #   tag: <no value>
+  #   text: <the UTF-8 text set below>
+  #   tpl: '{{ .Values.secret }}'
+  - it: carries config values unchanged, template text and non-ASCII included
+    set:
+      config:
+        tag: "<no value>"
+        tpl: "{{ .Values.secret }}"
+        close: "}}"
+        text: "caf\u00e9 \u20ac \u00fc"
+    asserts:
+      - equal:
+          path: binaryData["config.yaml"]
+          value: Y2xvc2U6ICd9fScKdGFnOiA8bm8gdmFsdWU+CnRleHQ6IGNhZsOpIOKCrCDDvAp0cGw6ICd7eyAuVmFsdWVzLnNlY3JldCB9fScK

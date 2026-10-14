@@ -64,16 +64,17 @@ For light apps that just need config + logs, the defaults (`config`,
 The cascade does the heavy lifting; you write a plain `serde` struct.
 
 ```rust
-use serde::Deserialize;
+use scalo::config::flat_env::{ApplyFlatEnv, Normalize, flat_env_list};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct LoaderConfig {
     pub kafka: KafkaConfig,
     pub clickhouse: ClickHouseConfig,
     pub batch_size: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct KafkaConfig {
     pub brokers: Vec<String>,
     pub topic: String,
@@ -82,16 +83,32 @@ pub struct KafkaConfig {
     #[serde(default)]
     pub password: Option<scalo::SensitiveString>,
 }
+
+// Flat K8s spellings (`DFE_LOADER_KAFKA_BROKERS`) the struct accepts.
+impl ApplyFlatEnv for LoaderConfig {
+    fn apply_flat_env(&mut self, prefix: &str) {
+        if let Some(brokers) = flat_env_list(prefix, "KAFKA_BROKERS") {
+            self.kafka.brokers = brokers;
+        }
+    }
+}
+
+// Settings implied by other settings. The default does nothing.
+impl Normalize for LoaderConfig {}
 ```
+
+`Serialize` is there for the env merge, which round-trips the struct.
 
 Use `SensitiveString` for anything that should never appear in logs or in
 the `/config` admin endpoint. See
 [core-pillars/config.md](core-pillars/config.md#sensitive-fields).
 
 YAML config files (`defaults.yaml`, `settings.yaml`,
-`settings.{env}.yaml`) populate these structs through the cascade. ENV
-vars override (`DFE_LOADER__KAFKA__BROKERS=...`, double underscore for
-nesting).
+`settings.{env}.yaml`), or the one file `--config` names, populate these
+structs. ENV vars override (`DFE_LOADER__KAFKA__BROKERS=...`, double
+underscore for nesting). YAML follows scalo's rules -- `yes` is text, a
+repeated key is an error, a null into a `String` field is an error -- see
+[core-pillars/config.md](core-pillars/config.md#yaml-parsing-rules).
 
 ---
 
@@ -173,7 +190,9 @@ impl ServiceApp for LoaderCli {
 Notes on the trait surface:
 
 - `load_config` is yours to define -- typically one call into
-  `config::load_typed` or `Config::from_cascade::<T>`.
+  `config::load_typed`, which reads the `--config` file (or the cascade
+  without one), logs the keys `LoaderConfig` does not take, and applies the
+  env overrides.
 - `run_service` is where the actual work lives. Everything else is
   scaffolding.
 - `scaling_components`, `register_metrics`, `deployment_contract` all

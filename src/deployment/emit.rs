@@ -94,13 +94,12 @@ fn to_json<T: serde::Serialize>(value: &T, what: &str) -> Result<String, Deploym
     Ok(s)
 }
 
-/// YAML with a single trailing newline (serde_yaml_ng already appends one).
+/// YAML with a single trailing newline, checked to read back to `value`.
 fn to_yaml<T: serde::Serialize>(value: &T, what: &str) -> Result<String, DeploymentError> {
-    let s = serde_yaml_ng::to_string(value).map_err(|e| DeploymentError::Serialise {
+    crate::yaml::to_string(value).map_err(|e| DeploymentError::Serialise {
         what: what.to_string(),
-        message: e.to_string(),
-    })?;
-    Ok(s)
+        message: e.message().to_string(),
+    })
 }
 
 /// Emit the reflectable config artefacts for a contract into `dir`.

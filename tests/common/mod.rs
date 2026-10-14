@@ -11,10 +11,33 @@
 //! Shared test fixtures and utilities.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
 #[cfg(feature = "secrets-vault")]
 pub mod openbao;
+
+/// Fail in CI rather than skip: a skipped container test reports green while
+/// exercising nothing, and CI does provide a container runtime.
+pub fn skip_or_fail(reason: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{reason} in CI, which provides a container runtime. This test must RUN here."
+    );
+    eprintln!("skipping: {reason}");
+}
+
+/// Whether a Docker daemon answers `docker info`, asked once per test binary.
+pub fn docker_answers() -> bool {
+    static ANSWERS: OnceLock<bool> = OnceLock::new();
+    *ANSWERS.get_or_init(|| {
+        Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
 
 /// The file DLQ's current file name; a rotation appends a timestamp to it.
 const DLQ_FILE: &str = "dlq.ndjson";

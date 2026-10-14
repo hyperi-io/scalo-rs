@@ -218,11 +218,16 @@ mod tests {
     #[cfg(feature = "config")]
     #[test]
     fn max_hold_secs_parses_and_zero_is_accepted() {
-        let cfg: SelfRegulationConfig = serde_yaml_ng::from_str("max_hold_secs: 5\n").unwrap();
+        let cfg: SelfRegulationConfig =
+            crate::yaml::from_str("max_hold_secs: 5\n", "test", crate::yaml::Profile::Config)
+                .unwrap();
         assert_eq!(cfg.max_hold_secs, 5);
-        let cfg: SelfRegulationConfig = serde_yaml_ng::from_str("max_hold_secs: 0\n").unwrap();
+        let cfg: SelfRegulationConfig =
+            crate::yaml::from_str("max_hold_secs: 0\n", "test", crate::yaml::Profile::Config)
+                .unwrap();
         assert_eq!(cfg.max_hold_secs, 0);
-        let cfg: SelfRegulationConfig = serde_yaml_ng::from_str("enabled: true\n").unwrap();
+        let cfg: SelfRegulationConfig =
+            crate::yaml::from_str("enabled: true\n", "test", crate::yaml::Profile::Config).unwrap();
         assert_eq!(cfg.max_hold_secs, 30, "absent -> default");
     }
 
@@ -294,7 +299,8 @@ mod tests {
     #[test]
     fn serde_roundtrip_and_disabled_parse() {
         let yaml = "enabled: false\nprofile: low_latency\n";
-        let cfg: SelfRegulationConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let cfg: SelfRegulationConfig =
+            crate::yaml::from_str(yaml, "test", crate::yaml::Profile::Config).unwrap();
         assert!(!cfg.enabled);
         assert_eq!(cfg.profile, SelfRegulationProfile::LowLatency);
         // Defaults fill the rest.

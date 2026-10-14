@@ -24,8 +24,9 @@
 #![cfg(feature = "auth")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use scalo::auth::{Cached, CredentialSource, Static};
 
@@ -33,19 +34,29 @@ use scalo::auth::{Cached, CredentialSource, Static};
 /// hide, small enough to stay instant.
 const READS: usize = 10_000;
 
-static ARMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Set on the measuring thread only: the test harness's own thread allocates
+    /// while it tracks the running test, and those allocations are not the read's.
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
-/// The system allocator, counting while armed.
+/// Whether this thread is counting. False once the thread's locals are gone.
+fn armed() -> bool {
+    ARMED.try_with(Cell::get).unwrap_or(false)
+}
+
+/// The system allocator, counting the armed thread's allocations.
 struct Counting;
 
 // SAFETY: every call forwards to the system allocator with the layout and
 // pointer it was given, so the contract is the system allocator's own. The
-// counter is two atomics and allocates nothing, so it cannot re-enter.
+// counter is an atomic and a const-initialised thread-local, and neither
+// allocates, so it cannot re-enter.
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if armed() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.alloc(layout) }
@@ -56,7 +67,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
+        if armed() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -66,13 +77,13 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Count what `body` allocates. The runtime is current-thread and this binary
-/// holds one test, so nothing else is running on another thread to be counted.
+/// Count what `body` allocates on this thread. The runtime is current-thread,
+/// so every read runs here.
 fn allocations_during(body: impl FnOnce()) -> usize {
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    ARMED.store(true, Ordering::Relaxed);
+    ARMED.set(true);
     body();
-    ARMED.store(false, Ordering::Relaxed);
+    ARMED.set(false);
     ALLOCATIONS.load(Ordering::Relaxed)
 }
 

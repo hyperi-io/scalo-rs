@@ -46,6 +46,33 @@ use serde::ser::Serializer;
 
 const REDACTED: &str = "***REDACTED***";
 
+/// Name fragments that mark a field as secret.
+///
+/// Any field name whose lowercase form contains one of these is treated as a
+/// secret by the config registry dump and the YAML error snippet. A safety net
+/// only: [`SensitiveString`] on the field type is the primary protection.
+#[cfg(any(feature = "config", feature = "yaml"))]
+pub(crate) const SENSITIVE_PATTERNS: &[&str] = &[
+    "password",
+    "secret",
+    "token",
+    "key",
+    "credential",
+    "auth",
+    "private",
+    "cert",
+    "encryption",
+    "connection_string",
+    "dsn",
+];
+
+/// Whether `name` contains one of the [`SENSITIVE_PATTERNS`], ignoring case.
+#[cfg(any(feature = "config", feature = "yaml"))]
+pub(crate) fn is_sensitive_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SENSITIVE_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 thread_local! {
     /// Per-thread serde-exposure flag. When set (via [`expose_during`])
     /// [`SensitiveString::serialize`] writes the inner value verbatim
@@ -144,7 +171,8 @@ where
 /// obviously-sensitive names (e.g., `connection_string`, `dsn`, `uri`).
 ///
 /// - `Serialize` always outputs `"***REDACTED***"`
-/// - `Deserialize` reads the actual value normally
+/// - `Deserialize` reads the actual value normally, and null (`key:` or
+///   `key: ~` in YAML) as empty
 /// - `Display` shows `***REDACTED***`
 /// - `Debug` shows `SensitiveString(***REDACTED***)`
 /// - Inner value accessible via `.expose()` for application logic
@@ -193,7 +221,8 @@ impl serde::Serialize for SensitiveString {
 
 impl<'de> serde::Deserialize<'de> for SensitiveString {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer).map(SensitiveString)
+        // A config generator writes an unset secret as `key:`, which is null.
+        Option::<String>::deserialize(deserializer).map(|v| SensitiveString(v.unwrap_or_default()))
     }
 }
 
@@ -272,6 +301,31 @@ mod tests {
         let json = "\"my_actual_secret\"";
         let s: SensitiveString = serde_json::from_str(json).unwrap();
         assert_eq!(s.expose(), "my_actual_secret");
+    }
+
+    /// A generator writes an unset secret as null, which reads as empty, not an error.
+    #[cfg(feature = "serde_json")]
+    #[test]
+    fn deserialize_reads_null_as_empty() {
+        let s: SensitiveString = serde_json::from_str("null").unwrap();
+        assert!(s.is_empty());
+    }
+
+    /// A non-text value is still refused.
+    #[cfg(feature = "serde_json")]
+    #[test]
+    fn deserialize_refuses_a_sequence() {
+        assert!(serde_json::from_str::<SensitiveString>("[1]").is_err());
+    }
+
+    #[cfg(any(feature = "config", feature = "yaml"))]
+    #[test]
+    fn sensitive_names_match_case_insensitively_by_fragment() {
+        assert!(is_sensitive_name("DB_PASSWORD"));
+        assert!(is_sensitive_name("api_key"));
+        assert!(is_sensitive_name("sasl.Token"));
+        assert!(!is_sensitive_name("hostname"));
+        assert!(!is_sensitive_name("port"));
     }
 
     #[test]

@@ -134,6 +134,10 @@ pub mod health;
 #[cfg_attr(docsrs, doc(cfg(feature = "config")))]
 pub mod config;
 
+#[cfg(feature = "yaml")]
+#[cfg_attr(docsrs, doc(cfg(feature = "yaml")))]
+pub mod yaml;
+
 #[cfg(feature = "lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lifecycle")))]
 pub mod lifecycle;

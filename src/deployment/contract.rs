@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::error::DeploymentError;
 use super::keda::KedaContract;
 use super::native_deps::NativeDepsContract;
 
@@ -822,15 +823,28 @@ impl DeploymentContract {
     }
 
     /// Serialise the contract to JSON for `--emit-contract` CLI support.
-    #[must_use]
-    pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
+    ///
+    /// # Errors
+    ///
+    /// [`DeploymentError::Serialise`] when the contract cannot be serialised.
+    pub fn to_json(&self) -> Result<String, DeploymentError> {
+        serde_json::to_string_pretty(self).map_err(|e| DeploymentError::Serialise {
+            what: "deployment contract JSON".to_string(),
+            message: e.to_string(),
+        })
     }
 
-    /// Serialise the contract to YAML.
-    #[must_use]
-    pub fn to_yaml(&self) -> String {
-        serde_yaml_ng::to_string(self).unwrap_or_default()
+    /// Serialise the contract to YAML, checked to read back to the same value.
+    ///
+    /// # Errors
+    ///
+    /// [`DeploymentError::Serialise`] when the contract cannot be serialised or
+    /// its YAML would not read back to it.
+    pub fn to_yaml(&self) -> Result<String, DeploymentError> {
+        crate::yaml::to_string(self).map_err(|e| DeploymentError::Serialise {
+            what: "deployment contract YAML".to_string(),
+            message: e.message().to_string(),
+        })
     }
 
     /// Return a clone with [`ImageProfile::Development`] set.
@@ -967,9 +981,16 @@ mod tests {
             singleton: false,
             service_account: ServiceAccount::Own,
         };
-        let json = contract.to_json();
+        let json = contract.to_json().unwrap();
         assert!(json.contains("test-app"));
         assert!(json.contains("9090"));
+
+        // The YAML reads back to the same value the JSON carries.
+        let yaml = contract.to_yaml().unwrap();
+        let from_yaml: serde_json::Value =
+            crate::yaml::from_str(&yaml, "contract.yaml", crate::yaml::Profile::Trusted).unwrap();
+        let from_json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_yaml, from_json);
     }
 
     #[test]
@@ -1005,7 +1026,7 @@ mod tests {
             singleton: false,
             service_account: ServiceAccount::Own,
         };
-        let json = contract.to_json();
+        let json = contract.to_json().unwrap();
         let parsed: DeploymentContract = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.app_name, "roundtrip");
         assert_eq!(parsed.metrics_port, 8080);
@@ -1166,7 +1187,7 @@ mod tests {
             [] as [std::string::String; 0]
         );
 
-        let out = contract.to_json();
+        let out = contract.to_json().unwrap();
         for key in ["\"when\"", "\"bound_from\"", "\"unbound_listen_paths\""] {
             assert!(!out.contains(key), "{key} serialised when unset:\n{out}");
         }
@@ -1186,10 +1207,10 @@ mod tests {
         let mut contract: DeploymentContract = serde_json::from_str(json).unwrap();
         assert_eq!(contract.service_account, ServiceAccount::Own);
         assert_eq!(ServiceAccount::default(), ServiceAccount::Own);
-        assert!(!contract.to_json().contains("service_account"));
+        assert!(!contract.to_json().unwrap().contains("service_account"));
 
         contract.service_account = ServiceAccount::None;
-        let value: serde_json::Value = serde_json::from_str(&contract.to_json()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&contract.to_json().unwrap()).unwrap();
         assert_eq!(value["service_account"], "none");
         let back: DeploymentContract = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(back.service_account, ServiceAccount::None);

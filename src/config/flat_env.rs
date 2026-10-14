@@ -181,44 +181,45 @@ pub struct EnvVarDoc {
 
 /// Load config with full cascade: YAML -> figment env -> flat env -> normalise.
 ///
-/// This replaces the copy-pasted `Config::load()` functions across data-plane services.
 /// It orchestrates:
 /// 1. `.env` loading (via dotenvy, handled by `config::setup`)
-/// 2. YAML file discovery and loading
+/// 2. YAML file discovery and loading, with `config_path` as the settings
+///    layer when given
 /// 3. Figment env var merging (double-underscore nesting)
 /// 4. Flat env overrides (single-underscore, K8s-friendly)
 /// 5. Normalisation (infer implied settings)
 ///
+/// [`load_typed`](super::load_typed) reads a named file directly instead,
+/// and reports the keys `T` skipped.
+///
 /// # Errors
 ///
-/// Returns a [`ConfigError`](super::ConfigError) if config loading or
-/// deserialisation fails.
+/// Returns a [`ConfigError`](super::ConfigError) if `config_path` names no
+/// file, or loading or deserialisation fails.
 pub fn load_config<T>(config_path: Option<&str>, env_prefix: &str) -> Result<T, super::ConfigError>
 where
-    T: Default + serde::de::DeserializeOwned + ApplyFlatEnv + Normalize,
+    T: serde::de::DeserializeOwned + ApplyFlatEnv + Normalize,
 {
-    // Build config options
     let mut opts = super::ConfigOptions {
         env_prefix: env_prefix.to_string(),
         ..Default::default()
     };
 
-    // Add explicit config path if provided
+    // The named file joins the settings layer. A path that names no file would
+    // otherwise be searched as a directory and silently contribute nothing.
     if let Some(path) = config_path {
-        let path_buf = std::path::PathBuf::from(path);
-        if let Some(parent) = path_buf.parent() {
-            if parent.as_os_str().is_empty() {
-                // Relative path with no directory component -- use current dir
-                opts.config_paths.push(std::path::PathBuf::from("."));
-            } else {
-                opts.config_paths.push(parent.to_path_buf());
-            }
+        let path = std::path::PathBuf::from(path);
+        if !path.is_file() {
+            return Err(super::ConfigError::LoadError {
+                message: "no such file".to_string(),
+                path,
+            });
         }
+        opts.config_paths.push(path);
     }
 
-    // Load via scalo cascade (dotenv + YAML + figment env)
     let cfg = super::Config::new(opts)?;
-    let mut config: T = cfg.unmarshal().unwrap_or_default();
+    let mut config: T = cfg.unmarshal()?;
 
     // Apply flat env overrides (single-underscore, K8s-friendly)
     config.apply_flat_env(env_prefix);
@@ -491,5 +492,72 @@ mod tests {
     #[test]
     fn test_flat_env_bool_missing() {
         assert_eq!(flat_env_bool("NONEXISTENT_PREFIX", "FLAG"), None);
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Loaded {
+        host: String,
+        #[serde(default)]
+        normalised: bool,
+    }
+
+    impl ApplyFlatEnv for Loaded {
+        fn apply_flat_env(&mut self, prefix: &str) {
+            if let Some(host) = flat_env_string(prefix, "HOST") {
+                self.host = host;
+            }
+        }
+    }
+
+    impl Normalize for Loaded {
+        fn normalize(&mut self) {
+            self.normalised = true;
+        }
+    }
+
+    /// The named file itself is read, wherever it lives and whatever its name.
+    #[test]
+    fn load_config_reads_the_file_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loader.yaml");
+        std::fs::write(&path, "host: from-the-file\n").unwrap();
+
+        let loaded: Loaded = load_config(path.to_str(), "FLATLOADTEST").unwrap();
+        assert_eq!(loaded.host, "from-the-file");
+        assert!(loaded.normalised);
+    }
+
+    /// A parse failure is returned, not swapped for a default.
+    #[test]
+    fn load_config_returns_the_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loader.yaml");
+        std::fs::write(&path, "host: [unterminated\n").unwrap();
+
+        let err = load_config::<Loaded>(path.to_str(), "FLATLOADTEST").unwrap_err();
+        assert!(err.to_string().contains("loader.yaml"), "{err}");
+    }
+
+    #[test]
+    fn load_config_refuses_a_path_that_names_no_file() {
+        let err =
+            load_config::<Loaded>(Some("/nonexistent/loader.yaml"), "FLATLOADTEST").unwrap_err();
+        assert!(
+            matches!(err, super::super::ConfigError::LoadError { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Flat env wins over the file.
+    #[test]
+    fn load_config_applies_flat_env_over_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loader.yaml");
+        std::fs::write(&path, "host: from-the-file\n").unwrap();
+
+        temp_env::with_var("FLATLOADTEST_HOST", Some("from-env"), || {
+            let loaded: Loaded = load_config(path.to_str(), "FLATLOADTEST").unwrap();
+            assert_eq!(loaded.host, "from-env");
+        });
     }
 }

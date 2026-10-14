@@ -13,20 +13,12 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+use super::skip_or_fail;
+
 /// renovate: datasource=docker depName=openbao/openbao
 pub const OPENBAO_TAG: &str = "2.6.1";
 
 pub const ROOT_TOKEN: &str = "root";
-
-/// Fail in CI rather than skip: a skipped container test reports green while
-/// exercising nothing, and CI does provide a container runtime.
-pub fn skip_or_fail(reason: &str) {
-    assert!(
-        std::env::var_os("CI").is_none(),
-        "no OpenBao available in CI: {reason}. This test must RUN here."
-    );
-    eprintln!("skipping: {reason}");
-}
 
 /// Start a dev-mode OpenBao and return `(container, address)`.
 ///

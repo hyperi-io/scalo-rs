@@ -36,6 +36,26 @@ A `ConfigOptions::config_paths` entry that is a directory is searched like the l
 
 ---
 
+## YAML parsing rules
+
+Every YAML file the cascade reads, every file `load_typed` reads, and every table the directory store reads goes through `scalo::yaml` (feature `yaml`, on with `config`). The rules are the same everywhere:
+
+| YAML | Reads as |
+| --- | --- |
+| `yes`, `no`, `on`, `off` | Text. Only `true` and `false` are booleans |
+| `key:` or `key: ~` into a `String` field | An error at that line. `Option<String>` reads it as `None` and `SensitiveString` as empty. `#[serde(deserialize_with = "scalo::yaml::de::null_as_empty")]` opts a `String` field in |
+| A key repeated in one mapping | An error |
+| `<<: *anchor` | Merged into the mapping |
+| `.inf`, `.nan` in the cascade or an untyped value | An error. A typed `f64` field reads them |
+| `0123`, `1_000` in the cascade or an untyped value | The numbers `123` and `1000`, which a `String` field read through the cascade refuses. A file parsed straight into a struct keeps the text in a `String` field. Quote values that must stay text |
+| More than one document (`---`) | An error |
+
+A config file may be up to 16 MiB, 100,000 nodes and 32 levels deep. An error names the file, line and column and quotes nothing, so it is safe to log. `YamlError::render_snippet` shows the failing line with a secret-looking value masked, for a person at a terminal.
+
+`scalo::yaml::from_str_reporting` also returns the keys the target type did not take and lints: indentation that is not a multiple of two, and plain leading-zero or `_`-separated numbers.
+
+---
+
 ## Usage
 
 ### Setup + ad-hoc reads
@@ -59,6 +79,20 @@ the primitive lookups.
 let cfg: LoaderConfig = config::get().unmarshal()?;          // whole cascade
 let kafka: KafkaConfig = config::get().unmarshal_key("kafka")?;  // one section
 ```
+
+### An app's whole config
+
+`config::load_typed(path, prefix)` is the loader a `ServiceApp::load_config` calls. With `--config <file>` it parses that file into the app's struct and logs every key the struct does not take: a misspelt nested key at WARN, a top-level key at INFO, since it may be a runtime section. With no file it reads the cascade. Either way it then merges `{PREFIX}_` env vars with `__` nesting (empty values count as unset), applies the flat spellings through `ApplyFlatEnv`, and runs `Normalize`. It also sets up the global cascade with the file as its settings layer, so runtime sections (`metrics`, `version_check`) resolve from the same file.
+
+```rust
+fn load_config(&self, path: Option<&str>) -> Result<LoaderConfig, CliError> {
+    scalo::config::load_typed(path, self.env_prefix()).map_err(CliError::from)
+}
+```
+
+The config type derives `Serialize` as well as `Deserialize`, because the env merge round-trips it. A `#[serde(skip)]` field comes back at its default, so set it after the call.
+
+`run_app` loads the config before it sets up logging, because the logger reads its own settings from that config. So `load_typed` holds the lines it would log until a subscriber exists, and `logger::setup` emits them. An app that installs its own subscriber calls `config::log_deferred()` after doing so.
 
 ### Registered sections
 
@@ -112,18 +146,27 @@ K8s `ConfigMap` / `env:` blocks emit flat env vars (`DFE_LOADER_KAFKA_BROKERS=..
 but Figment's nested convention is double-underscore (`DFE_LOADER__KAFKA__BROKERS`).
 Without bridging, K8s overrides silently fail to apply.
 
-```rust
-use scalo::config::flat_env::ApplyFlatEnv;
+`ApplyFlatEnv` is implemented on the config struct, and names each flat variable
+it reads:
 
-let cfg = Figment::new()
-    .merge(Yaml::file("settings.yaml"))
-    .apply_flat_env("DFE_LOADER_");
+```rust
+use scalo::config::flat_env::{ApplyFlatEnv, flat_env_list};
+
+impl ApplyFlatEnv for LoaderConfig {
+    fn apply_flat_env(&mut self, prefix: &str) {
+        if let Some(brokers) = flat_env_list(prefix, "KAFKA_BROKERS") {
+            self.kafka.brokers = brokers;
+        }
+    }
+}
+
+let mut cfg: LoaderConfig = config::get().unmarshal()?;
+cfg.apply_flat_env("DFE_LOADER");
 ```
 
-`apply_flat_env` reads `DFE_LOADER_KAFKA_BROKERS` and merges it as `kafka.brokers`,
-so apps accept both flat (K8s) and nested (double-underscore) forms.
-`flat_env::load_config(path, prefix)` and the `ServiceApp::load_config` recipe wire
-this in. See [flat_env.rs](../../src/config/flat_env.rs).
+This reads `DFE_LOADER_KAFKA_BROKERS` into `kafka.brokers`, so apps accept both
+flat (K8s) and nested (double-underscore) forms. `config::load_typed` and
+`flat_env::load_config` call it for you. See [flat_env.rs](../../src/config/flat_env.rs).
 
 ---
 
@@ -179,8 +222,11 @@ inside the cluster. See [http_server/config.rs](../../src/http_server/config.rs)
 | `Config::unmarshal::<T>()` | Deserialise the whole cascade into `T` |
 | `Config::unmarshal_key::<T>(key)` | Deserialise one section |
 | `Config::unmarshal_key_registered::<T>(key)` | Same, plus registers the section |
+| `config::load_typed(path, prefix)` | An app's config struct: the named file or the cascade, then nested env, flat env and `Normalize` |
+| `config::log_deferred()` | Log what `load_typed` noted before a subscriber existed (`logger::setup` calls it) |
 | `config::flat_env::ApplyFlatEnv` | K8s flat-env bridge trait |
-| `config::flat_env::load_config(path, prefix)` | Cascade + flat-env loader returning `T` |
+| `config::flat_env::load_config(path, prefix)` | Cascade with `path` as the settings layer, then flat env and `Normalize` |
+| `yaml::from_str` / `from_path` / `from_str_reporting` / `to_value` / `to_string` | Parse and emit YAML by the rules above |
 | `config::registry::on_change(key, cb)` | Subscribe to reloads of a section |
 | `config::registry::update(key, &value)` | Re-register a section + notify subscribers |
 | `config::registry::sections() -> Vec<...>` | Dump the registry (powers `/config`) |

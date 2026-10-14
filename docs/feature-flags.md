@@ -28,7 +28,7 @@ version = "2"
 
 That's it. The default set covers:
 
-- 7-layer config cascade
+- 7-layer config cascade, with YAML parsed through `scalo::yaml`
 - Structured logging via `tracing-subscriber`
 
 If you only need those two, you can stop reading.
@@ -130,7 +130,7 @@ For full distributed tracing through Kafka/gRPC, enable
 
 | Feature | Adds |
 | --------- | ------ |
-| `directory-config` | YAML directory store with file locking |
+| `directory-config` | YAML directory store with file locking (pulls `yaml`) |
 | `directory-config-git` | Above + `git2` for commit/push of config changes |
 
 ---
@@ -139,6 +139,7 @@ For full distributed tracing through Kafka/gRPC, enable
 
 | Feature | Adds |
 | --------- | ------ |
+| `yaml` | `scalo::yaml`: parse and emit YAML with scalo's rules, budgets, located errors and unknown-key reports -- pulls `serde-saphyr` (safe Rust, no libyaml), `serde_ignored` and `serde_json`. On with `config`, `directory-config` and `deployment`. See [core-pillars/config.md](core-pillars/config.md#yaml-parsing-rules) |
 | `geoip-download` | MMDB database provisioning -- pulls `http` (the shared `HttpClient`), plus `flate2` and `tar` for the provider archive formats. Files onto disk only, no lookup engine. See [api/geoip-download.md](api/geoip-download.md) |
 | `auth` | Credential acquisition and placement -- pulls `http` (an exchange is an `HttpClient` call, a placement its signing hook), `arc-swap` for the held credential, and reqwest's `form` and `query` encoders. No signing scheme and no crypto dependency. See [api/auth.md](api/auth.md) |
 
@@ -265,6 +266,14 @@ Enable these explicitly when you need them.
 
 A handful of dependencies aren't visible from the feature name alone:
 
+- `config`, `directory-config` and `deployment` each pull `yaml`, so every
+  YAML scalo reads or writes goes through `scalo::yaml`. No feature pulls
+  `serde_yaml`, `serde_yaml_ng` or `unsafe-libyaml`, and figment is built
+  without its own `yaml` feature.
+- `directory-config` turns on serde_json's `preserve_order`, so a table
+  written back keeps its key order. Cargo unifies features, so every
+  `serde_json::Map` in a build with `directory-config` keeps insertion order.
+  `config-schema` does the same through schemars.
 - `worker-batch` pulls `worker-pool` and `metrics`. `BatchEngine` is
   metric-aware.
 - `parse_guard` -- `json_depth_within` and `MAX_PARSE_DEPTH`, the nesting-depth check to run before parsing untrusted JSON -- compiles with `transport` or `worker-batch`, and both pull `wide` for its SIMD byte compares. There is no feature for the guard alone.

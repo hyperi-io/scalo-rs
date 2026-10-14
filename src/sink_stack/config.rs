@@ -234,6 +234,7 @@ mod tests {
         assert!(c.attempt_timeout() >= Duration::from_secs(3600));
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn deserialise_from_yaml() {
         let yaml = r"
@@ -244,7 +245,8 @@ max_retries: 5
 rate_limit:
   rps: 100
 ";
-        let c: SinkStackConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let c: SinkStackConfig =
+            crate::yaml::from_str(yaml, "test", crate::yaml::Profile::Config).unwrap();
         assert_eq!(c.max_concurrency, 8);
         assert_eq!(c.attempt_timeout_ms, 5000);
         assert!(c.load_shed);

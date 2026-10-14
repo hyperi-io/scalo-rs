@@ -416,9 +416,13 @@ mod documented_config {
         let Some(yaml) = documented_yaml("## Config shape") else {
             return;
         };
-        let secrets = serde_yaml_ng::from_str::<Root>(&yaml)
-            .expect("the documented example parses")
-            .secrets;
+        let secrets = scalo::yaml::from_str::<Root>(
+            &yaml,
+            "docs/api/secrets.md",
+            scalo::yaml::Profile::Config,
+        )
+        .expect("the documented example parses")
+        .secrets;
 
         let defaults = CacheConfig::default();
         assert_eq!(secrets.cache.enabled, defaults.enabled);
@@ -454,13 +458,24 @@ mod documented_config {
     /// give.
     #[test]
     fn the_documented_spellings_parse() {
-        let token: OpenBaoAuth = serde_yaml_ng::from_str("method: token\ntoken: t\n").unwrap();
+        let token: OpenBaoAuth = scalo::yaml::from_str(
+            "method: token\ntoken: t\n",
+            "test",
+            scalo::yaml::Profile::Config,
+        )
+        .unwrap();
         assert!(matches!(token, OpenBaoAuth::Token { .. }));
-        let approle: OpenBaoAuth =
-            serde_yaml_ng::from_str("method: app_role\nrole_id: r\nsecret_id: s\n").unwrap();
+        let approle: OpenBaoAuth = scalo::yaml::from_str(
+            "method: app_role\nrole_id: r\nsecret_id: s\n",
+            "test",
+            scalo::yaml::Profile::Config,
+        )
+        .unwrap();
         assert!(matches!(approle, OpenBaoAuth::AppRole { ref mount, .. } if mount == "approle"));
 
-        let cache: CacheConfig = serde_yaml_ng::from_str("dir_mode: null\n").unwrap();
+        let cache: CacheConfig =
+            scalo::yaml::from_str("dir_mode: null\n", "test", scalo::yaml::Profile::Config)
+                .unwrap();
         assert!(cache.dir_mode.is_none());
     }
 }
