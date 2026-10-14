@@ -38,7 +38,7 @@ sequenceDiagram
 
     Main->>Run: app
     Run->>App: load_config(path)
-    App->>Pillars: config::setup() / Config::from_cascade
+    App->>Pillars: config::load_typed() / config::setup()
     Run->>Pillars: logger::setup(opts)
     Run->>SR: build runtime
     SR->>Pillars: env::runtime_context()

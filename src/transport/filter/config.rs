@@ -164,25 +164,31 @@ impl TransportFilterTierConfig {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn filter_rule_deserializes_from_yaml() {
         let yaml = "expression: 'has(_table)'\naction: drop\n";
-        let rule: FilterRule = serde_yaml_ng::from_str(yaml).unwrap();
+        let rule: FilterRule =
+            crate::yaml::from_str(yaml, "test", crate::yaml::Profile::Config).unwrap();
         assert_eq!(rule.expression, "has(_table)");
         assert_eq!(rule.action, FilterAction::Drop);
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn filter_action_defaults_to_drop() {
         let yaml = "expression: 'has(_table)'";
-        let rule: FilterRule = serde_yaml_ng::from_str(yaml).unwrap();
+        let rule: FilterRule =
+            crate::yaml::from_str(yaml, "test", crate::yaml::Profile::Config).unwrap();
         assert_eq!(rule.action, FilterAction::Drop);
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn filter_action_dlq_variant() {
         let yaml = "expression: 'status == \"poison\"'\naction: dlq\n";
-        let rule: FilterRule = serde_yaml_ng::from_str(yaml).unwrap();
+        let rule: FilterRule =
+            crate::yaml::from_str(yaml, "test", crate::yaml::Profile::Config).unwrap();
         assert_eq!(rule.action, FilterAction::Dlq);
     }
 

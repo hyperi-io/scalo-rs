@@ -159,36 +159,13 @@ pub fn dump_defaults() -> JsonValue {
     JsonValue::Object(map)
 }
 
-/// Field name patterns that trigger automatic redaction.
-///
-/// Any JSON field whose name (lowercased) contains one of these
-/// substrings will have its value replaced with `"***REDACTED***"`.
-///
-/// Safety net only -- the primary protection is
-/// [`SensitiveString`](crate::SensitiveString) on the field type (compile-time
-/// safe). This heuristic catches fields
-/// that developers forgot to mark as sensitive.
-const SENSITIVE_PATTERNS: &[&str] = &[
-    "password",
-    "secret",
-    "token",
-    "key",
-    "credential",
-    "auth",
-    "private",
-    "cert",
-    "encryption",
-    "connection_string",
-    "dsn",
-];
-
 const REDACTED: &str = "***REDACTED***";
 
-/// Recursively redact fields with sensitive names.
+/// Recursively redact fields whose name matches
+/// [`SENSITIVE_PATTERNS`](crate::sensitive::SENSITIVE_PATTERNS).
 fn redact_sensitive_fields(obj: &mut serde_json::Map<String, JsonValue>) {
     for (key, value) in obj.iter_mut() {
-        let lower = key.to_lowercase();
-        if SENSITIVE_PATTERNS.iter().any(|p| lower.contains(p)) {
+        if crate::sensitive::is_sensitive_name(key) {
             *value = JsonValue::String(REDACTED.into());
             continue;
         }

@@ -106,6 +106,7 @@ mod tests {
         assert!(config.user_agent.is_none());
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn deserialise_from_yaml() {
         let yaml = r#"
@@ -113,7 +114,8 @@ timeout_secs: 60
 max_retries: 5
 user_agent: "my-app/1.0"
 "#;
-        let config: HttpClientConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let config: HttpClientConfig =
+            crate::yaml::from_str(yaml, "test", crate::yaml::Profile::Config).unwrap();
         assert_eq!(config.timeout_secs, 60);
         assert_eq!(config.max_retries, 5);
         assert_eq!(config.user_agent.as_deref(), Some("my-app/1.0"));

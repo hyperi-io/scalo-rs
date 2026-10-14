@@ -106,7 +106,7 @@ async fn test_get_returns_full_table() {
         .await
         .unwrap();
     let value = store.get("app").await.unwrap();
-    assert!(value.is_mapping());
+    assert!(value.is_object());
 }
 
 #[tokio::test]
@@ -131,7 +131,7 @@ async fn test_get_key_top_level() {
         .await
         .unwrap();
     let value = store.get_key("app", "name").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("myapp".to_string()));
+    assert_eq!(value, serde_json::Value::String("myapp".to_string()));
 }
 
 #[tokio::test]
@@ -147,7 +147,7 @@ async fn test_get_key_nested() {
         .await
         .unwrap();
     let value = store.get_key("app", "database.host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("db.local".to_string()));
+    assert_eq!(value, serde_json::Value::String("db.local".to_string()));
 }
 
 #[tokio::test]
@@ -204,7 +204,7 @@ async fn test_set_creates_new_table() {
         .set(
             "new-service",
             "host",
-            serde_yaml_ng::Value::String("localhost".to_string()),
+            serde_json::Value::String("localhost".to_string()),
             None,
         )
         .await
@@ -215,7 +215,7 @@ async fn test_set_creates_new_table() {
 
     // Verify in cache
     let value = store.get_key("new-service", "host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("localhost".to_string()));
+    assert_eq!(value, serde_json::Value::String("localhost".to_string()));
 
     // Verify on disk
     let on_disk = std::fs::read_to_string(tmp.path().join("new-service.yaml")).unwrap();
@@ -235,18 +235,18 @@ async fn test_set_updates_existing_key() {
         .set(
             "app",
             "host",
-            serde_yaml_ng::Value::String("new-host".to_string()),
+            serde_json::Value::String("new-host".to_string()),
             None,
         )
         .await
         .unwrap();
 
     let value = store.get_key("app", "host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("new-host".to_string()));
+    assert_eq!(value, serde_json::Value::String("new-host".to_string()));
 
     // Port should be unchanged
     let port = store.get_key("app", "port").await.unwrap();
-    assert_eq!(port, serde_yaml_ng::Value::Number(8080.into()));
+    assert_eq!(port, serde_json::Value::Number(8080.into()));
 }
 
 #[tokio::test]
@@ -262,14 +262,14 @@ async fn test_set_nested_key() {
         .set(
             "app",
             "database.host",
-            serde_yaml_ng::Value::String("new-host".to_string()),
+            serde_json::Value::String("new-host".to_string()),
             None,
         )
         .await
         .unwrap();
 
     let value = store.get_key("app", "database.host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("new-host".to_string()));
+    assert_eq!(value, serde_json::Value::String("new-host".to_string()));
 }
 
 #[tokio::test]
@@ -294,7 +294,7 @@ async fn test_delete_key() {
 
     // Other keys remain
     let host = store.get_key("app", "host").await.unwrap();
-    assert_eq!(host, serde_yaml_ng::Value::String("localhost".to_string()));
+    assert_eq!(host, serde_json::Value::String("localhost".to_string()));
 }
 
 #[tokio::test]
@@ -354,7 +354,7 @@ async fn test_read_only_rejects_writes() {
         .set(
             "test",
             "key",
-            serde_yaml_ng::Value::String("val".to_string()),
+            serde_json::Value::String("val".to_string()),
             None,
         )
         .await;
@@ -433,7 +433,7 @@ async fn test_background_refresh_picks_up_changes() {
     tokio::time::sleep(Duration::from_millis(350)).await;
 
     let value = store.get_key("app", "version").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::Number(2.into()));
+    assert_eq!(value, serde_json::Value::Number(2.into()));
 
     store.stop().await.unwrap();
 }
@@ -497,7 +497,7 @@ async fn test_on_change_receives_write_events() {
         .set(
             "app",
             "key",
-            serde_yaml_ng::Value::String("value".to_string()),
+            serde_json::Value::String("value".to_string()),
             None,
         )
         .await
@@ -536,10 +536,7 @@ async fn test_corrupt_yaml_keeps_last_good() {
         .await
         .unwrap();
     let original = store.get_key("app", "host").await.unwrap();
-    assert_eq!(
-        original,
-        serde_yaml_ng::Value::String("localhost".to_string())
-    );
+    assert_eq!(original, serde_json::Value::String("localhost".to_string()));
 
     store.start().await.unwrap();
 
@@ -550,7 +547,7 @@ async fn test_corrupt_yaml_keeps_last_good() {
 
     // Should still have the last good value
     let value = store.get_key("app", "host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("localhost".to_string()));
+    assert_eq!(value, serde_json::Value::String("localhost".to_string()));
 
     store.stop().await.unwrap();
 }
@@ -570,10 +567,7 @@ async fn test_yml_extension_supported() {
     assert_eq!(tables, vec!["service"]);
 
     let value = store.get_key("service", "name").await.unwrap();
-    assert_eq!(
-        value,
-        serde_yaml_ng::Value::String("test-service".to_string())
-    );
+    assert_eq!(value, serde_json::Value::String("test-service".to_string()));
 }
 
 // --- Subdirectory support ---
@@ -616,7 +610,7 @@ async fn test_subdirectory_get() {
         .unwrap();
 
     let value = store.get_key("loaders/dfe-loader", "host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("dfe-host".to_string()));
+    assert_eq!(value, serde_json::Value::String("dfe-host".to_string()));
 }
 
 #[tokio::test]
@@ -630,7 +624,7 @@ async fn test_subdirectory_get_normalises_slashes() {
 
     // Leading/trailing slashes should be stripped
     let value = store.get_key("/loaders/dfe-loader/", "host").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::String("dfe-host".to_string()));
+    assert_eq!(value, serde_json::Value::String("dfe-host".to_string()));
 }
 
 #[tokio::test]
@@ -645,7 +639,7 @@ async fn test_subdirectory_set_creates_dirs() {
         .set(
             "new-group/my-service",
             "enabled",
-            serde_yaml_ng::Value::Bool(true),
+            serde_json::Value::Bool(true),
             None,
         )
         .await
@@ -656,7 +650,7 @@ async fn test_subdirectory_set_creates_dirs() {
         .get_key("new-group/my-service", "enabled")
         .await
         .unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::Bool(true));
+    assert_eq!(value, serde_json::Value::Bool(true));
 
     // Verify on disk
     let on_disk = tmp.path().join("new-group/my-service.yaml");
@@ -674,17 +668,14 @@ async fn test_subdirectory_set_deep_nesting() {
         .set(
             "a/b/c/deep",
             "key",
-            serde_yaml_ng::Value::String("deep-value".to_string()),
+            serde_json::Value::String("deep-value".to_string()),
             None,
         )
         .await
         .unwrap();
 
     let value = store.get_key("a/b/c/deep", "key").await.unwrap();
-    assert_eq!(
-        value,
-        serde_yaml_ng::Value::String("deep-value".to_string())
-    );
+    assert_eq!(value, serde_json::Value::String("deep-value".to_string()));
 }
 
 #[tokio::test]
@@ -710,7 +701,7 @@ async fn test_subdirectory_delete_key() {
 
     // Other key remains
     let host = store.get_key("loaders/dfe-loader", "host").await.unwrap();
-    assert_eq!(host, serde_yaml_ng::Value::String("dfe".to_string()));
+    assert_eq!(host, serde_json::Value::String("dfe".to_string()));
 }
 
 #[tokio::test]
@@ -728,10 +719,7 @@ async fn test_subdirectory_yml_extension() {
     assert_eq!(tables, vec!["configs/service"]);
 
     let value = store.get_key("configs/service", "name").await.unwrap();
-    assert_eq!(
-        value,
-        serde_yaml_ng::Value::String("yml-service".to_string())
-    );
+    assert_eq!(value, serde_json::Value::String("yml-service".to_string()));
 }
 
 #[tokio::test]
@@ -796,7 +784,7 @@ async fn test_subdirectory_background_refresh() {
     tokio::time::sleep(Duration::from_millis(350)).await;
 
     let value = store.get_key("loaders/dfe", "version").await.unwrap();
-    assert_eq!(value, serde_yaml_ng::Value::Number(2.into()));
+    assert_eq!(value, serde_json::Value::Number(2.into()));
 
     store.stop().await.unwrap();
 }
@@ -921,7 +909,7 @@ mod git_tests {
             .set(
                 "app",
                 "host",
-                serde_yaml_ng::Value::String("localhost".to_string()),
+                serde_json::Value::String("localhost".to_string()),
                 Some("test: add app config"),
             )
             .await
@@ -956,7 +944,7 @@ mod git_tests {
             .set(
                 "app",
                 "debug",
-                serde_yaml_ng::Value::Bool(true),
+                serde_json::Value::Bool(true),
                 Some("add debug flag"),
             )
             .await
@@ -1052,7 +1040,7 @@ mod git_tests {
             .set(
                 "loaders/dfe-loader",
                 "host",
-                serde_yaml_ng::Value::String("dfe-host".to_string()),
+                serde_json::Value::String("dfe-host".to_string()),
                 Some("add dfe-loader config"),
             )
             .await
@@ -1082,7 +1070,7 @@ mod git_tests {
             .set(
                 "svc",
                 "port",
-                serde_yaml_ng::Value::Number(9090.into()),
+                serde_json::Value::Number(9090.into()),
                 Some("set port"),
             )
             .await

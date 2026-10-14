@@ -19,7 +19,7 @@ use crate::directory_config::types::{
 };
 
 /// Table cache: table name -> parsed YAML value.
-pub(crate) type TableCache = Arc<RwLock<HashMap<String, serde_yaml_ng::Value>>>;
+pub(crate) type TableCache = Arc<RwLock<HashMap<String, serde_json::Value>>>;
 
 /// Timestamp cache: table name -> last modified time (for change detection).
 pub(crate) type TimestampCache = Arc<RwLock<HashMap<String, std::time::SystemTime>>>;
@@ -135,10 +135,13 @@ impl DirectoryConfigStore {
         tables
     }
 
-    /// Get the entire contents of a table as a YAML value.
+    /// Get the entire contents of a table as an untyped value.
+    ///
+    /// Tables parse with [`crate::yaml::Profile::Data`]: a plain `0123` or
+    /// `1_000` is a number here, so quote values that must stay text.
     ///
     /// Table names may include subdirectory prefixes (e.g. `loaders/orders-loader`).
-    pub async fn get(&self, table: &str) -> DirectoryConfigResult<serde_yaml_ng::Value> {
+    pub async fn get(&self, table: &str) -> DirectoryConfigResult<serde_json::Value> {
         validate_table_name(table)?;
         let table = normalize_table_name(table);
         let cache = self.cache.read().await;
@@ -157,7 +160,7 @@ impl DirectoryConfigStore {
         &self,
         table: &str,
         key: &str,
-    ) -> DirectoryConfigResult<serde_yaml_ng::Value> {
+    ) -> DirectoryConfigResult<serde_json::Value> {
         let value = self.get(table).await?;
         let table = normalize_table_name(table);
         navigate_yaml(&value, key).ok_or_else(|| DirectoryConfigError::KeyNotFound {
@@ -175,7 +178,7 @@ impl DirectoryConfigStore {
     ) -> DirectoryConfigResult<T> {
         let value = self.get(table).await?;
         let table = normalize_table_name(table);
-        serde_yaml_ng::from_value(value).map_err(|e| DirectoryConfigError::ParseError {
+        serde_json::from_value(value).map_err(|e| DirectoryConfigError::ParseError {
             file: table.to_string(),
             message: e.to_string(),
         })
@@ -191,7 +194,7 @@ impl DirectoryConfigStore {
         &self,
         table: &str,
         key: &str,
-        value: serde_yaml_ng::Value,
+        value: serde_json::Value,
         message: Option<&str>,
     ) -> DirectoryConfigResult<WriteResult> {
         self.check_writable()?;
@@ -211,7 +214,7 @@ impl DirectoryConfigStore {
         let mut doc = if file_path.exists() {
             load_yaml_file(&file_path)?
         } else {
-            serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new())
+            serde_json::Value::Object(serde_json::Map::new())
         };
 
         // Set the key (supports dot-notation). A conflict placed nothing, so
@@ -536,7 +539,7 @@ async fn load_tables_recursive(
     current: &Path,
     cache: &TableCache,
     timestamps: &TimestampCache,
-    new_cache: &mut HashMap<String, serde_yaml_ng::Value>,
+    new_cache: &mut HashMap<String, serde_json::Value>,
     new_timestamps: &mut HashMap<String, std::time::SystemTime>,
 ) -> DirectoryConfigResult<()> {
     let mut entries = tokio::fs::read_dir(current).await?;
@@ -588,7 +591,7 @@ async fn load_tables_recursive(
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         match tokio::fs::read_to_string(&path).await {
-            Ok(contents) => match serde_yaml_ng::from_str(&contents) {
+            Ok(contents) => match parse_table(&contents, &path) {
                 Ok(value) => {
                     new_cache.insert(table_name.clone(), value);
                     new_timestamps.insert(table_name, modified);
@@ -621,13 +624,23 @@ async fn load_tables_recursive(
     Ok(())
 }
 
-/// Load a single YAML file (blocking, for write operations).
-fn load_yaml_file(path: &Path) -> DirectoryConfigResult<serde_yaml_ng::Value> {
-    let contents = std::fs::read_to_string(path)?;
-    serde_yaml_ng::from_str(&contents).map_err(|e| DirectoryConfigError::ParseError {
+/// Parse one table file. Tables are operator data, so they take the data budget.
+fn parse_table(contents: &str, path: &Path) -> DirectoryConfigResult<serde_json::Value> {
+    crate::yaml::to_value(
+        contents,
+        &path.display().to_string(),
+        crate::yaml::Profile::Data,
+    )
+    .map_err(|e| DirectoryConfigError::ParseError {
         file: path.display().to_string(),
-        message: e.to_string(),
+        message: e.message().to_string(),
     })
+}
+
+/// Load a single YAML file (blocking, for write operations).
+fn load_yaml_file(path: &Path) -> DirectoryConfigResult<serde_json::Value> {
+    let contents = std::fs::read_to_string(path)?;
+    parse_table(&contents, path)
 }
 
 /// Write YAML to file with advisory file lock.
@@ -639,11 +652,11 @@ fn load_yaml_file(path: &Path) -> DirectoryConfigResult<serde_yaml_ng::Value> {
 /// handle -- meaning both the truncate AND the write happened outside
 /// the locked handle, defeating the advisory protection the function
 /// name promises.
-fn write_yaml_locked(path: &Path, value: &serde_yaml_ng::Value) -> DirectoryConfigResult<()> {
+fn write_yaml_locked(path: &Path, value: &serde_json::Value) -> DirectoryConfigResult<()> {
     use std::io::{Seek, SeekFrom, Write};
 
-    let yaml_str = serde_yaml_ng::to_string(value)
-        .map_err(|e| DirectoryConfigError::SerializationError(e.to_string()))?;
+    let yaml_str = crate::yaml::to_string(value)
+        .map_err(|e| DirectoryConfigError::SerializationError(e.message().to_string()))?;
 
     // Open/create the file WITHOUT truncating yet -- we want to hold the
     // lock before we destructively modify it. If two writers race, the
@@ -670,116 +683,92 @@ fn write_yaml_locked(path: &Path, value: &serde_yaml_ng::Value) -> DirectoryConf
     Ok(())
 }
 
-/// Navigate a YAML value using dot-notation key path.
-fn navigate_yaml(value: &serde_yaml_ng::Value, key: &str) -> Option<serde_yaml_ng::Value> {
-    let parts: Vec<&str> = key.split('.').collect();
+/// Navigate a table value using dot-notation key path.
+fn navigate_yaml(value: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
     let mut current = value;
-
-    for part in &parts {
-        match current {
-            serde_yaml_ng::Value::Mapping(map) => {
-                let yaml_key = serde_yaml_ng::Value::String((*part).to_string());
-                current = map.get(&yaml_key)?;
-            }
-            _ => return None,
-        }
+    for part in key.split('.') {
+        current = current.as_object()?.get(part)?;
     }
-
     Some(current.clone())
 }
 
-/// Set a value at a dot-notation key path in a YAML document.
+/// Set a value at a dot-notation key path in a table value.
 ///
 /// A null node is absent, not a value, so it becomes a mapping the same way a
 /// missing one does. Any other non-mapping node on the path is a conflict: the
 /// document is left untouched and the dotted prefix of the offending node is
 /// returned (empty for the document root).
 fn set_yaml_key(
-    doc: &mut serde_yaml_ng::Value,
+    doc: &mut serde_json::Value,
     key: &str,
-    value: serde_yaml_ng::Value,
+    value: serde_json::Value,
 ) -> Result<(), String> {
     let parts: Vec<&str> = key.split('.').collect();
-    let mut current = doc;
 
+    // Find the conflict before touching anything, so a refusal changes nothing.
+    let mut probe = &*doc;
     for (i, part) in parts.iter().enumerate() {
-        let yaml_key = serde_yaml_ng::Value::String((*part).to_string());
+        match probe {
+            serde_json::Value::Null => break,
+            serde_json::Value::Object(map) => match map.get(*part) {
+                Some(next) if i < parts.len() - 1 => probe = next,
+                _ => break,
+            },
+            _ => return Err(parts[..i].join(".")),
+        }
+    }
 
+    let mut current = doc;
+    for (i, part) in parts.iter().enumerate() {
+        if current.is_null() {
+            *current = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let serde_json::Value::Object(map) = current else {
+            return Err(parts[..i].join("."));
+        };
         if i == parts.len() - 1 {
-            // Last part -- set the value
-            if matches!(current, serde_yaml_ng::Value::Null) {
-                *current = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
-            }
-            let serde_yaml_ng::Value::Mapping(map) = current else {
-                return Err(parts[..i].join("."));
-            };
-            map.insert(yaml_key, value);
+            map.insert((*part).to_string(), value);
             return Ok(());
         }
-
-        // Intermediate part -- navigate or create mapping
-        if !current.is_mapping() {
-            *current = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
-        }
-        let map = current.as_mapping_mut().unwrap();
-        if !map.contains_key(&yaml_key) {
-            map.insert(
-                yaml_key.clone(),
-                serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new()),
-            );
-        }
-        current = map.get_mut(&yaml_key).unwrap();
+        current = map
+            .entry((*part).to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     }
 
     Ok(())
 }
 
 /// Remove a key at a dot-notation path. Returns true if the key existed.
-fn remove_yaml_key(doc: &mut serde_yaml_ng::Value, key: &str) -> bool {
-    let parts: Vec<&str> = key.split('.').collect();
+fn remove_yaml_key(doc: &mut serde_json::Value, key: &str) -> bool {
+    let Some((parent_path, last_key)) = key.rsplit_once('.') else {
+        return doc
+            .as_object_mut()
+            .is_some_and(|map| map.remove(key).is_some());
+    };
 
-    if parts.len() == 1 {
-        if let serde_yaml_ng::Value::Mapping(map) = doc {
-            let yaml_key = serde_yaml_ng::Value::String(parts[0].to_string());
-            return map.remove(&yaml_key).is_some();
-        }
-        return false;
-    }
-
-    // Navigate to parent, then remove last key
-    let parent_parts = &parts[..parts.len() - 1];
-    let last_key = parts[parts.len() - 1];
-    let mut current = &mut *doc;
-
-    for part in parent_parts {
-        let yaml_key = serde_yaml_ng::Value::String((*part).to_string());
-        match current {
-            serde_yaml_ng::Value::Mapping(map) => {
-                if let Some(next) = map.get_mut(&yaml_key) {
-                    current = next;
-                } else {
-                    return false;
-                }
-            }
-            _ => return false,
+    let mut current = doc;
+    for part in parent_path.split('.') {
+        match current.as_object_mut().and_then(|map| map.get_mut(part)) {
+            Some(next) => current = next,
+            None => return false,
         }
     }
-
-    if let serde_yaml_ng::Value::Mapping(map) = current {
-        let yaml_key = serde_yaml_ng::Value::String(last_key.to_string());
-        map.remove(&yaml_key).is_some()
-    } else {
-        false
-    }
+    current
+        .as_object_mut()
+        .is_some_and(|map| map.remove(last_key).is_some())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn table(text: &str) -> DirectoryConfigResult<serde_json::Value> {
+        parse_table(text, Path::new("test.yaml"))
+    }
+
     #[test]
     fn test_navigate_yaml() {
-        let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        let yaml: serde_json::Value = table(
             r"
             database:
               host: localhost
@@ -791,11 +780,11 @@ mod tests {
 
         assert_eq!(
             navigate_yaml(&yaml, "name"),
-            Some(serde_yaml_ng::Value::String("test".to_string()))
+            Some(serde_json::Value::String("test".to_string()))
         );
         assert_eq!(
             navigate_yaml(&yaml, "database.host"),
-            Some(serde_yaml_ng::Value::String("localhost".to_string()))
+            Some(serde_json::Value::String("localhost".to_string()))
         );
         assert!(navigate_yaml(&yaml, "missing").is_none());
         assert!(navigate_yaml(&yaml, "database.missing").is_none());
@@ -803,29 +792,29 @@ mod tests {
 
     #[test]
     fn test_set_yaml_key() {
-        let mut doc = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
+        let mut doc = serde_json::Value::Object(serde_json::Map::new());
 
         set_yaml_key(
             &mut doc,
             "name",
-            serde_yaml_ng::Value::String("test".to_string()),
+            serde_json::Value::String("test".to_string()),
         )
         .unwrap();
         assert_eq!(
             navigate_yaml(&doc, "name"),
-            Some(serde_yaml_ng::Value::String("test".to_string()))
+            Some(serde_json::Value::String("test".to_string()))
         );
 
         // Nested key
         set_yaml_key(
             &mut doc,
             "database.host",
-            serde_yaml_ng::Value::String("localhost".to_string()),
+            serde_json::Value::String("localhost".to_string()),
         )
         .unwrap();
         assert_eq!(
             navigate_yaml(&doc, "database.host"),
-            Some(serde_yaml_ng::Value::String("localhost".to_string()))
+            Some(serde_json::Value::String("localhost".to_string()))
         );
     }
 
@@ -833,67 +822,100 @@ mod tests {
     fn set_yaml_key_refuses_to_overwrite_a_scalar_parent() {
         // `database: localhost`, then set("database.host"): the leaf's parent
         // is a scalar, so the value has nowhere to go.
-        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str("database: localhost").unwrap();
+        let mut doc: serde_json::Value = table("database: localhost").unwrap();
 
         let holder = set_yaml_key(
             &mut doc,
             "database.host",
-            serde_yaml_ng::Value::String("10.0.0.1".to_string()),
+            serde_json::Value::String("10.0.0.1".to_string()),
         )
         .expect_err("a scalar parent must refuse the write");
 
         assert_eq!(holder, "database");
         assert_eq!(
             navigate_yaml(&doc, "database"),
-            Some(serde_yaml_ng::Value::String("localhost".to_string())),
+            Some(serde_json::Value::String("localhost".to_string())),
             "a refused write leaves the document alone"
+        );
+    }
+
+    /// A scalar anywhere on the path refuses the write, not only the leaf's
+    /// parent, and the document is left as it was.
+    #[test]
+    fn set_yaml_key_refuses_a_scalar_grandparent() {
+        let mut doc = table("database: localhost\n").unwrap();
+        let before = doc.clone();
+
+        let holder = set_yaml_key(&mut doc, "database.primary.host", "10.0.0.1".into())
+            .expect_err("a scalar grandparent must refuse the write");
+
+        assert_eq!(holder, "database");
+        assert_eq!(doc, before, "a refused write leaves the document alone");
+    }
+
+    /// Writing one key keeps the order of every other key in the file.
+    #[tokio::test]
+    async fn set_keeps_the_key_order_of_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t.yaml");
+        std::fs::write(&path, "zeta: 1\nalpha: 2\nmid:\n  port: 3\n  b: 4\n").unwrap();
+
+        let store = DirectoryConfigStore::new(DirectoryConfigStoreConfig {
+            directory: tmp.path().to_path_buf(),
+            git_enabled: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        store.set("t", "mid.b", 5.into(), None).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "zeta: 1\nalpha: 2\nmid:\n  port: 3\n  b: 5\n"
         );
     }
 
     #[test]
     fn set_yaml_key_refuses_a_non_mapping_document() {
-        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str("- a\n- b").unwrap();
+        let mut doc: serde_json::Value = table("- a\n- b").unwrap();
 
         let holder = set_yaml_key(
             &mut doc,
             "name",
-            serde_yaml_ng::Value::String("test".to_string()),
+            serde_json::Value::String("test".to_string()),
         )
         .expect_err("a sequence document must refuse the write");
 
         assert_eq!(holder, "", "the document root is the blocker");
-        assert!(
-            doc.is_sequence(),
-            "a refused write leaves the document alone"
-        );
+        assert!(doc.is_array(), "a refused write leaves the document alone");
     }
 
     #[test]
     fn set_yaml_key_treats_null_as_absent() {
         // An empty file parses to null, and so does `database:` with no value.
         // Neither is a value somebody put there, so both are created.
-        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str("").unwrap();
+        let mut doc: serde_json::Value = table("").unwrap();
         set_yaml_key(
             &mut doc,
             "name",
-            serde_yaml_ng::Value::String("test".to_string()),
+            serde_json::Value::String("test".to_string()),
         )
         .expect("an empty document accepts a key");
         assert_eq!(
             navigate_yaml(&doc, "name"),
-            Some(serde_yaml_ng::Value::String("test".to_string()))
+            Some(serde_json::Value::String("test".to_string()))
         );
 
-        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str("database:").unwrap();
+        let mut doc: serde_json::Value = table("database:").unwrap();
         set_yaml_key(
             &mut doc,
             "database.host",
-            serde_yaml_ng::Value::String("localhost".to_string()),
+            serde_json::Value::String("localhost".to_string()),
         )
         .expect("a null node accepts a nested key");
         assert_eq!(
             navigate_yaml(&doc, "database.host"),
-            Some(serde_yaml_ng::Value::String("localhost".to_string()))
+            Some(serde_json::Value::String("localhost".to_string()))
         );
     }
 
@@ -918,7 +940,7 @@ mod tests {
             .set(
                 "t",
                 "database.host",
-                serde_yaml_ng::Value::String("10.0.0.1".to_string()),
+                serde_json::Value::String("10.0.0.1".to_string()),
                 None,
             )
             .await;
@@ -938,14 +960,14 @@ mod tests {
         );
         assert_eq!(
             store.get_key("t", "database").await.unwrap(),
-            serde_yaml_ng::Value::String("localhost".to_string()),
+            serde_json::Value::String("localhost".to_string()),
             "the cache must be untouched"
         );
     }
 
     #[test]
     fn test_remove_yaml_key() {
-        let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        let mut doc: serde_json::Value = table(
             r"
             database:
               host: localhost

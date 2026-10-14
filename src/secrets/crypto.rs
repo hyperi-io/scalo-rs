@@ -45,11 +45,10 @@
 //! - Wrong key, wrong AAD -- same path, same error (no oracle).
 //! - Truncated nonce / bad base64 -> malformed envelope error.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::aead::{Aead, Generate, KeyInit, Nonce, Payload};
+use aes_gcm::{Aes256Gcm, Key};
 use base64::Engine;
 use hkdf::Hkdf;
-use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -120,18 +119,14 @@ fn derive_key(user_key: &str) -> [u8; 32] {
 ///
 /// `SecretsError::CacheError` on encrypt or serialise failure.
 pub(super) fn seal(user_key: &str, plaintext: &[u8], aad: &[u8]) -> SecretsResult<String> {
-    let key_bytes = derive_key(user_key);
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(derive_key(user_key)));
 
-    // Output buffer, not a nonce: OsRng::fill_bytes overwrites every byte or panics.
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::<Aes256Gcm>::try_generate()
+        .map_err(|e| SecretsError::CacheError(format!("nonce generation failed: {e}")))?;
 
     let ct = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad,
@@ -141,7 +136,7 @@ pub(super) fn seal(user_key: &str, plaintext: &[u8], aad: &[u8]) -> SecretsResul
 
     let envelope = Envelope {
         v: ENVELOPE_VERSION,
-        nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_bytes),
+        nonce: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
         ct: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&ct),
     };
 
@@ -169,24 +164,21 @@ pub(super) fn open(user_key: &str, envelope_bytes: &[u8], aad: &[u8]) -> Secrets
     let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(envelope.nonce.as_bytes())
         .map_err(|e| SecretsError::CacheError(format!("nonce base64: {e}")))?;
-    if nonce_bytes.len() != NONCE_LEN {
-        return Err(SecretsError::CacheError(format!(
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce_bytes.as_slice()).map_err(|_| {
+        SecretsError::CacheError(format!(
             "nonce length {} (expected {NONCE_LEN})",
             nonce_bytes.len()
-        )));
-    }
+        ))
+    })?;
     let ct = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(envelope.ct.as_bytes())
         .map_err(|e| SecretsError::CacheError(format!("ct base64: {e}")))?;
 
-    let key_bytes = derive_key(user_key);
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(derive_key(user_key)));
 
     cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: ct.as_ref(),
                 aad,
@@ -271,6 +263,25 @@ mod tests {
     fn looks_like_envelope_rejects_legacy_plaintext() {
         let legacy = br#"{"data":"abc","fetched_at_secs":1234,"metadata":{}}"#;
         assert!(!Envelope::looks_like(legacy));
+    }
+
+    /// An envelope sealed by aes-gcm 0.10 / hkdf 0.12 / sha2 0.10 still opens,
+    /// so a crypto crate upgrade cannot strand the caches already on disk.
+    #[test]
+    fn opens_an_envelope_sealed_by_an_earlier_build() {
+        let sealed =
+            br#"{"v":1,"nonce":"e6lzvA4Se6gKh6aj","ct":"3YO8ohZ66vGVtcUY3Tv9tgEgzuCFLCA3le_fTcM"}"#;
+        let opened = open("kat-key", sealed, &aad_for("kat_slot")).unwrap();
+        assert_eq!(opened, b"kat plaintext");
+    }
+
+    /// A nonce that is not 12 bytes is refused before decryption.
+    #[test]
+    fn short_nonce_returns_error() {
+        let sealed =
+            br#"{"v":1,"nonce":"e6lzvA4Se6g","ct":"3YO8ohZ66vGVtcUY3Tv9tgEgzuCFLCA3le_fTcM"}"#;
+        let err = open("kat-key", sealed, &aad_for("kat_slot")).unwrap_err();
+        assert!(err.to_string().contains("nonce length 8"), "{err}");
     }
 
     #[test]

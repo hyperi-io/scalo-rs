@@ -786,6 +786,7 @@ fn engine_dlq_filter_detection() {
     assert!(!engine.has_dlq_filters_out());
 }
 
+#[cfg(feature = "yaml")]
 #[test]
 fn config_deserializes_from_yaml() {
     let yaml = r#"
@@ -807,7 +808,8 @@ filters_out:
         filters_out: Vec<FilterRule>,
     }
 
-    let config: TestConfig = serde_yaml_ng::from_str(yaml).unwrap();
+    let config: TestConfig =
+        scalo::yaml::from_str(yaml, "test", scalo::yaml::Profile::Config).unwrap();
     assert_eq!(config.filters_in.len(), 2);
     assert_eq!(config.filters_out.len(), 1);
     assert_eq!(config.filters_in[0].expression, "has(_table)");
@@ -815,19 +817,22 @@ filters_out:
     assert_eq!(config.filters_in[1].action, FilterAction::Dlq);
 }
 
+#[cfg(feature = "yaml")]
 #[test]
 fn tier_config_deserializes_from_yaml() {
     let yaml = r#"
 allow_cel_filters_in: true
 allow_complex_filters_out: true
 "#;
-    let config: TransportFilterTierConfig = serde_yaml_ng::from_str(yaml).unwrap();
+    let config: TransportFilterTierConfig =
+        scalo::yaml::from_str(yaml, "test", scalo::yaml::Profile::Config).unwrap();
     assert!(config.allow_cel_filters_in);
     assert!(!config.allow_cel_filters_out);
     assert!(!config.allow_complex_filters_in);
     assert!(config.allow_complex_filters_out);
 }
 
+#[cfg(feature = "yaml")]
 #[test]
 fn empty_filters_config_deserializes() {
     let yaml = "{}";
@@ -836,7 +841,8 @@ fn empty_filters_config_deserializes() {
         #[serde(default)]
         filters_in: Vec<FilterRule>,
     }
-    let config: TestConfig = serde_yaml_ng::from_str(yaml).unwrap();
+    let config: TestConfig =
+        scalo::yaml::from_str(yaml, "test", scalo::yaml::Profile::Config).unwrap();
     assert_eq!(
         config.filters_in,
         [] as [scalo::transport::filter::FilterRule; 0]

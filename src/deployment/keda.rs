@@ -264,8 +264,9 @@ mod tests {
     #[test]
     fn test_keda_config_serde_roundtrip() {
         let cfg = KedaConfig::default();
-        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
-        let parsed: KedaConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let yaml = crate::yaml::to_string(&cfg).unwrap();
+        let parsed: KedaConfig =
+            crate::yaml::from_str(&yaml, "test", crate::yaml::Profile::Trusted).unwrap();
         assert_eq!(parsed.kafka_lag_threshold, cfg.kafka_lag_threshold);
     }
 }

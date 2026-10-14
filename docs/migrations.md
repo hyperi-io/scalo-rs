@@ -8,6 +8,50 @@ release and the target before bumping.
 
 ## Unreleased
 
+### YAML parses through `scalo::yaml` (BEHAVIOUR CHANGE)
+
+Every YAML scalo reads or writes -- the config cascade, `kafka_config` files, directory-config tables and the deployment artefacts -- now goes through the new `yaml` module on serde-saphyr. `serde_yaml_ng`, figment's `yaml` feature and with them `unsafe-libyaml` (RUSTSEC-2024-0449) are out of the graph. The parse rules that differ from before:
+
+- `yes`, `no`, `on`, `off` are text everywhere. Only `true` and `false` are booleans.
+- `key:` or `key: ~` into a `String` field is an error at that line (it read as `""` or `"~"`). `Option<String>` reads `None` and `SensitiveString` reads empty.
+- A key repeated in a map or untyped value is an error (the last one won).
+- `<<: *anchor` merge keys are merged (they were dropped).
+- `.inf` and `.nan` in the cascade or an untyped value are errors (they read as null).
+- `0123` and `1_000` in the cascade or an untyped value are the numbers 123 and 1000 (they were text). A struct parsed straight from a file still keeps them as text in a `String` field.
+- Emitted YAML quotes YAML-1.1-ambiguous strings in double quotes and folds long strings. Every emitted document is read back and refused if its value differs.
+
+**Consumer adjustment** -- drop `serde_yaml_ng` from `[dependencies]` and `[dev-dependencies]` and call `scalo::yaml::from_str(text, origin, Profile::Config)` / `from_path` / `to_string` instead, then drop the RUSTSEC-2024-0449 ignore. Regenerate committed `config-schema.yaml` and `capability-catalog.yaml`: their text changes and their values do not. Check config generators for `key:` on a `String` field and quote any value that must stay text. See [core-pillars/config.md](core-pillars/config.md#yaml-parsing-rules).
+
+### `config::load_typed` loads an app's config struct (API CHANGE)
+
+New `config::load_typed(path, prefix)`: the `--config` file parsed into `T` with unknown keys logged, or the cascade without one, then nested env, `ApplyFlatEnv` and `Normalize`. `T` needs `Serialize` as well as `Deserialize`. `ConfigError` gains `Yaml(YamlError)` for a file that cannot be read or parsed.
+
+**Consumer adjustment** -- none required. An app whose `load_config` hand-rolls this sequence can replace it with one call.
+
+### `flat_env::load_config` reads the file it is given (BEHAVIOUR CHANGE)
+
+`load_config(Some(path), prefix)` searched the file's parent directory for `settings.yaml` and never read the named file, and a parse error returned `T::default()`. It now reads the named file as the settings layer, refuses a path that names no file, and returns the parse error. `T: Default` is no longer required.
+
+**Consumer adjustment** -- none for a working config. A config that silently defaulted now fails to load and names its line.
+
+### `DirectoryConfigStore` tables are `serde_json::Value` (API CHANGE)
+
+`get` and `get_key` return `serde_json::Value`, and `set` takes one, where they used `serde_yaml_ng::Value`. A write keeps the file's key order. A key path through a scalar at any depth is now refused with `KeyPathConflict`, where a scalar above the leaf's parent was overwritten.
+
+**Consumer adjustment** -- swap the value type. `serde_json::json!` builds one.
+
+### `DeploymentContract::to_json` and `to_yaml` return `Result` (API CHANGE)
+
+Both returned an empty string when serialisation failed. They now return `Result<String, DeploymentError>`.
+
+**Consumer adjustment** -- add `?` or `.expect(...)` at each call, typically the `--emit-contract` print and its tests.
+
+### `kafka_config` YAML needs the `yaml` feature (BEHAVIOUR CHANGE)
+
+`config_from_file` reads `.yaml` with the `yaml` feature, which `config` (a default) turns on, where it needed `directory-config`. A null value is an error, and numbers and booleans read as their text.
+
+**Consumer adjustment** -- none.
+
 ### `TieredSink::shutdown()` is not reported as a drop (BEHAVIOUR CHANGE)
 
 `shutdown()` ended by dropping the sink, so a sink shut down with records still spooled logged "TieredSink dropped with spooled work pending" and counted one in `spool_dropped_without_shutdown_total`. After `shutdown().await` neither happens. A sink dropped without it still warns and counts.

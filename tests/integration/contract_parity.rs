@@ -212,7 +212,7 @@ fn parity_contract() -> DeploymentContract {
 
 /// The contract as `generate-artefacts` writes it: pretty JSON and one newline.
 fn emitted() -> String {
-    format!("{}\n", parity_contract().to_json())
+    format!("{}\n", parity_contract().to_json().expect("contract JSON"))
 }
 
 #[test]
@@ -288,7 +288,28 @@ fn contract_parity_fixture_carries_every_optional_key() {
 #[test]
 fn contract_parity_fixture_round_trips() {
     let parsed: DeploymentContract = serde_json::from_str(&emitted()).expect("contract JSON");
-    assert_eq!(format!("{}\n", parsed.to_json()), emitted());
+    assert_eq!(
+        format!("{}\n", parsed.to_json().expect("contract JSON")),
+        emitted()
+    );
+}
+
+/// The parity contract, every optional key set, reads back from its YAML as
+/// the same value its JSON carries.
+#[test]
+fn contract_parity_yaml_reads_back_as_the_json_value() {
+    let contract = parity_contract();
+    let yaml = contract.to_yaml().expect("contract YAML");
+    let from_yaml: serde_json::Value =
+        scalo::yaml::from_str(&yaml, "contract.yaml", scalo::yaml::Profile::Trusted)
+            .expect("re-read the YAML");
+    let from_json: serde_json::Value =
+        serde_json::from_str(&contract.to_json().expect("contract JSON")).expect("JSON");
+    assert_eq!(from_yaml, from_json);
+    assert!(
+        yaml.lines().all(|line| line.trim_end() == line),
+        "no line of the emitted YAML ends in whitespace"
+    );
 }
 
 /// The committed contract JSON Schema for the current version, as a validator.

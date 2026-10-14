@@ -10,8 +10,9 @@
 //!
 //! This module is always available (no feature gate). The core profile constants
 //! and merge helper have zero external dependencies. File loading supports
-//! `.properties` without any feature gate; YAML and JSON require the
-//! `directory-config` and `config` features respectively.
+//! `.properties` without any feature gate. YAML needs the `yaml` feature (on
+//! with `config`, `directory-config` or `deployment`) and JSON the `config`
+//! feature.
 //!
 //! ## Loading from Config Git Directory
 //!
@@ -68,8 +69,11 @@ pub type KafkaConfigResult<T> = Result<T, KafkaConfigError>;
 /// | Extension | Format | Requires |
 /// |-----------|--------|---------|
 /// | `.properties` | Java-style `key=value` | nothing (always available) |
-/// | `.yaml`, `.yml` | YAML flat mapping | `directory-config` feature |
+/// | `.yaml`, `.yml` | YAML flat mapping | `yaml` feature |
 /// | `.json` | JSON object | `config` feature |
+///
+/// Every YAML value reads as its text, numbers and booleans included. A null
+/// value (`retries:`) is an error.
 ///
 /// The returned map passes directly to [`merge_with_overrides`] or as
 /// `librdkafka_overrides` in `KafkaConfig`.
@@ -135,18 +139,20 @@ pub fn config_from_properties_str(content: &str) -> HashMap<String, String> {
 }
 
 fn parse_yaml(content: &str, path: String) -> KafkaConfigResult<HashMap<String, String>> {
-    #[cfg(feature = "directory-config")]
+    #[cfg(feature = "yaml")]
     {
-        serde_yaml_ng::from_str(content).map_err(|e| KafkaConfigError::ParseError {
-            path,
-            message: e.to_string(),
+        crate::yaml::from_str(content, &path, crate::yaml::Profile::Config).map_err(|e| {
+            KafkaConfigError::ParseError {
+                path,
+                message: e.message().to_string(),
+            }
         })
     }
-    #[cfg(not(feature = "directory-config"))]
+    #[cfg(not(feature = "yaml"))]
     {
         let _ = (content, path);
         Err(KafkaConfigError::UnsupportedFormat {
-            ext: "yaml -- enable the `directory-config` feature".to_string(),
+            ext: "yaml -- enable the `yaml` feature".to_string(),
         })
     }
 }
@@ -660,6 +666,43 @@ sasl.mechanism=SCRAM-SHA-512
         let config = config_from_file(&path).unwrap();
         assert_eq!(config["bootstrap.servers"], "kafka:9092");
         assert_eq!(config["compression.type"], "zstd");
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn config_from_file_yaml_reads_every_value_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kafka.yaml");
+        std::fs::write(
+            &path,
+            "bootstrap.servers: kafka:9092\nretries: 3\nenable.idempotence: true\nlinger.ms: 0100\n",
+        )
+        .unwrap();
+
+        let config = config_from_file(&path).unwrap();
+        assert_eq!(config["bootstrap.servers"], "kafka:9092");
+        assert_eq!(config["retries"], "3");
+        assert_eq!(config["enable.idempotence"], "true");
+        assert_eq!(
+            config["linger.ms"], "0100",
+            "a typed string keeps the leading zero"
+        );
+    }
+
+    /// A null value is refused with its line, rather than read as `"~"`.
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn config_from_file_yaml_refuses_a_null_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kafka.yaml");
+        std::fs::write(&path, "bootstrap.servers: kafka:9092\nretries:\n").unwrap();
+
+        match config_from_file(&path) {
+            Err(KafkaConfigError::ParseError { message, .. }) => {
+                assert!(message.contains("line 2"), "{message}");
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
     }
 
     #[test]
