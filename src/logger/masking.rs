@@ -358,7 +358,9 @@ fn redact_json_value(
 /// when no unescaped one closes it, and a `Name(...)` value such as
 /// `Some("...")` goes whole, so a `{:#?}` dump of a config is safe to print. A
 /// quoted or `Name(...)` value that never closes is masked to the end of its
-/// line, or to the end of the text when its reading may cross lines.
+/// line, or to the end of the text when its reading may cross lines. After a
+/// key naming an authorization header, an unquoted value is the scheme and the
+/// credentials after it, so `Authorization: Basic ...` masks whole.
 ///
 /// # Examples
 ///
