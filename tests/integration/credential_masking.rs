@@ -121,11 +121,20 @@ fn a_parent_qualifies_only_a_bare_key_or_value() {
 #[test]
 fn text_cases_match_the_corpus() {
     let corpus = corpus();
-    for case in cases(&corpus, "text_cases") {
-        let input = fill(text_field(case, "input"), MASK);
-        let expected = fill(text_field(case, "expected"), MASK);
-        assert_eq!(mask_text(&input), expected, "case {}", case["id"]);
-    }
+    let wrong: Vec<String> = cases(&corpus, "text_cases")
+        .iter()
+        .filter_map(|case| {
+            let input = fill(text_field(case, "input"), MASK);
+            let expected = fill(text_field(case, "expected"), MASK);
+            let masked = mask_text(&input);
+            (masked != expected).then(|| format!("{}: {masked:?}", case["id"]))
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "cases masked wrongly:\n{}",
+        wrong.join("\n")
+    );
 }
 
 #[test]
@@ -392,6 +401,12 @@ fn a_long_line_is_masked_in_linear_time() {
         "authorization: a b=\"".to_string() + &"x".repeat(200_000),
         "authorization=a b=\"\n".repeat(25_000),
         "authorization: a b=\"\\\" ".repeat(15_000),
+        "token: basic ".repeat(30_000),
+        "x-api-key: Token ".to_string() + &"b, ".repeat(70_000),
+        "password::".repeat(40_000),
+        "authorization: a ".to_string() + &"b&".repeat(100_000),
+        "?sig=a".repeat(40_000),
+        "&si".repeat(70_000),
     ];
     for line in &lines {
         let started = Instant::now();
@@ -493,6 +508,23 @@ fn a_json_line_masks_fields_in_any_spelling_and_url_passwords_in_text() {
     assert_eq!(
         fields["message"],
         format!("connecting to postgres://svc:{MASK}@db:5432/app")
+    );
+}
+
+#[test]
+fn a_json_line_keeps_its_target_and_masks_its_message() {
+    let secret = secret();
+    let captured = Captured::new();
+    captured.run(true, || {
+        tracing::warn!(target: "aws_credential_types::provider", "retrying, x-api-key: Token {secret}");
+    });
+    let output = captured.text();
+    assert!(!output.contains(&secret), "{output}");
+    let line: Value = serde_json::from_str(output.trim()).expect("one JSON line");
+    assert_eq!(line["target"], "aws_credential_types::provider");
+    assert_eq!(
+        line["fields"]["message"],
+        format!("retrying, x-api-key: {MASK}")
     );
 }
 

@@ -31,6 +31,9 @@
 //! probe permit (Open -> HalfOpen) and proceeds; concurrent callers are
 //! refused until the probe resolves (success -> Closed, failure -> Open). This
 //! stops a recovery thundering-herd from hammering a still-fragile downstream.
+//! A probe that never reports, because its caller's future was dropped or its
+//! outcome recorded neither, is lost once the reset timeout has passed since it
+//! was admitted, and the next caller probes again.
 //! [`state`](CircuitBreaker::state) / [`is_open`](CircuitBreaker::is_open) are
 //! side-effect-free observers (they report the *effective* phase for gauges and
 //! tests) and never take the probe permit -- only `allow_request` does.
@@ -68,10 +71,8 @@ struct Inner {
     state: CircuitState,
     consecutive_failures: u32,
     last_failure_ms: u64,
-    /// HalfOpen only: `true` while the single recovery-probe permit is still
-    /// available to be claimed. Cleared the instant a probe is admitted, and
-    /// whenever we (re)enter Open or Closed.
-    probe_available: bool,
+    /// HalfOpen only: when the outstanding probe was admitted.
+    probe_admitted_ms: u64,
 }
 
 /// Circuit breaker for protecting against unhealthy sinks.
@@ -112,7 +113,7 @@ impl CircuitBreaker {
                 state: CircuitState::Closed,
                 consecutive_failures: 0,
                 last_failure_ms: 0,
-                probe_available: false,
+                probe_admitted_ms: 0,
             }),
             failure_threshold,
             reset_timeout,
@@ -136,40 +137,32 @@ impl CircuitBreaker {
         self.health_state.store(new.code(), Ordering::Release);
     }
 
-    /// Whether the Open reset timeout has elapsed relative to `last_failure_ms`.
-    fn reset_elapsed(&self, inner: &Inner) -> bool {
+    /// Whether the reset timeout has elapsed since `since_ms`.
+    fn reset_elapsed(&self, since_ms: u64) -> bool {
         let now = current_epoch_millis();
-        Duration::from_millis(now.saturating_sub(inner.last_failure_ms)) >= self.reset_timeout
+        Duration::from_millis(now.saturating_sub(since_ms)) >= self.reset_timeout
     }
 
     /// Gate a request through the breaker, claiming the half-open probe permit
     /// when appropriate. This is the ONLY method that transitions Open ->
-    /// HalfOpen, and it admits exactly one probe.
+    /// HalfOpen, and it admits one probe at a time: another only once the
+    /// reset timeout has passed with no outcome recorded for the last.
     ///
     /// Returns `true` if the caller may proceed to the sink.
     pub async fn allow_request(&self) -> bool {
         let mut inner = self.lock();
-        match inner.state {
-            CircuitState::Closed => true,
-            CircuitState::Open => {
-                if self.reset_elapsed(&inner) {
-                    // First caller past the timeout claims the sole probe.
-                    self.set_state(&mut inner, CircuitState::HalfOpen);
-                    inner.probe_available = false;
-                    true
-                } else {
-                    false
-                }
-            }
-            CircuitState::HalfOpen => {
-                if inner.probe_available {
-                    inner.probe_available = false;
-                    true
-                } else {
-                    false
-                }
-            }
+        let since = match inner.state {
+            CircuitState::Closed => return true,
+            CircuitState::Open => inner.last_failure_ms,
+            CircuitState::HalfOpen => inner.probe_admitted_ms,
+        };
+        if !self.reset_elapsed(since) {
+            return false;
         }
+        // First caller past the timeout claims the sole probe.
+        self.set_state(&mut inner, CircuitState::HalfOpen);
+        inner.probe_admitted_ms = current_epoch_millis();
+        true
     }
 
     /// Get the current *effective* circuit state (side-effect-free).
@@ -179,7 +172,7 @@ impl CircuitBreaker {
     /// permit -- only [`allow_request`](Self::allow_request) does.
     pub async fn state(&self) -> CircuitState {
         let inner = self.lock();
-        if inner.state == CircuitState::Open && self.reset_elapsed(&inner) {
+        if inner.state == CircuitState::Open && self.reset_elapsed(inner.last_failure_ms) {
             CircuitState::HalfOpen
         } else {
             inner.state
@@ -200,7 +193,6 @@ impl CircuitBreaker {
     pub async fn record_success(&self) {
         let mut inner = self.lock();
         inner.consecutive_failures = 0;
-        inner.probe_available = false;
         self.set_state(&mut inner, CircuitState::Closed);
     }
 
@@ -213,7 +205,6 @@ impl CircuitBreaker {
         inner.last_failure_ms = current_epoch_millis();
 
         if inner.consecutive_failures >= self.failure_threshold {
-            inner.probe_available = false;
             self.set_state(&mut inner, CircuitState::Open);
         }
     }
@@ -229,7 +220,6 @@ impl CircuitBreaker {
         let mut inner = self.lock();
         inner.consecutive_failures = 0;
         inner.last_failure_ms = 0;
-        inner.probe_available = false;
         self.set_state(&mut inner, CircuitState::Closed);
     }
 }
@@ -343,7 +333,8 @@ mod tests {
 
     #[tokio::test]
     async fn allow_request_admits_exactly_one_half_open_probe() {
-        let cb = CircuitBreaker::new(1, Duration::from_millis(10));
+        // The timeout also bounds an unanswered probe, so it outlasts the asserts below.
+        let cb = CircuitBreaker::new(1, Duration::from_millis(100));
 
         // Closed: always admitted.
         assert!(cb.allow_request().await);
@@ -354,7 +345,7 @@ mod tests {
 
         // After the timeout, exactly ONE probe is admitted; the next is refused
         // until the probe resolves.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(cb.allow_request().await, "first caller takes the probe");
         assert!(
             !cb.allow_request().await,
@@ -366,13 +357,37 @@ mod tests {
         assert!(cb.allow_request().await);
     }
 
+    #[tokio::test]
+    async fn a_probe_whose_caller_is_dropped_is_readmitted_after_the_reset_timeout() {
+        let cb = CircuitBreaker::new(1, Duration::from_millis(100));
+        cb.record_failure().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // The caller admitted as the probe is dropped before it reports.
+        let caller = async {
+            assert!(cb.allow_request().await, "the caller is the probe");
+            std::future::pending::<()>().await;
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), caller)
+                .await
+                .is_err()
+        );
+
+        assert!(!cb.allow_request().await, "the probe is still out");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(cb.allow_request().await, "a lost probe is readmitted");
+        assert!(!cb.allow_request().await, "one probe at a time");
+    }
+
     // Concurrency race test: hammer record_failure + allow_request from many
     // tasks at once. The unified lock must keep the failure count and phase
     // consistent (no double-transition / torn state) and never admit more than
     // one probe per half-open window.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_failures_and_probes_stay_consistent() {
-        let cb = Arc::new(CircuitBreaker::new(5, Duration::from_millis(10)));
+        // The timeout also bounds an unanswered probe, so it outlasts the race below.
+        let cb = Arc::new(CircuitBreaker::new(5, Duration::from_millis(500)));
 
         // 50 tasks each record a failure concurrently.
         let mut handles = Vec::new();
@@ -392,7 +407,7 @@ mod tests {
 
         // After the timeout, race many allow_request calls: AT MOST one may win
         // the probe permit.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(550)).await;
         let mut probes = Vec::new();
         for _ in 0..50 {
             let cb = Arc::clone(&cb);

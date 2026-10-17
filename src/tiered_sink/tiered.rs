@@ -100,6 +100,15 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         let spool_count = Arc::new(AtomicU64::new(initial_count));
         let spool_bytes = Arc::new(AtomicU64::new(initial_bytes));
 
+        // An unanswered probe is lost after the reset timeout, so a shorter one lets a second probe join a slow send.
+        #[cfg(feature = "tracing")]
+        if config.circuit_reset_timeout_ms < config.send_timeout_ms {
+            tracing::warn!(
+                circuit_reset_timeout_ms = config.circuit_reset_timeout_ms,
+                send_timeout_ms = config.send_timeout_ms,
+                "circuit_reset_timeout_ms is below send_timeout_ms, so a half-open probe still sending can be joined by a second"
+            );
+        }
         let circuit = Arc::new(CircuitBreaker::new(
             config.circuit_failure_threshold,
             config.circuit_reset_timeout(),
@@ -1499,6 +1508,63 @@ mod tests {
             close(tiered).await;
         }
         DropReport { metrics, logs }
+    }
+
+    /// What a sink built from `config` logs at WARN on this thread while it starts and shuts down.
+    #[cfg(feature = "logger")]
+    async fn startup_warnings(config: TieredSinkConfig) -> String {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || Logs(Arc::clone(&writer))),
+            );
+        {
+            let _logs = tracing::subscriber::set_default(subscriber);
+            let tiered = TieredSink::new(TestSink::new(), config).await.unwrap();
+            tiered.shutdown().await;
+        }
+        String::from_utf8_lossy(&logs.lock().unwrap()).into_owned()
+    }
+
+    #[cfg(feature = "logger")]
+    #[tokio::test]
+    async fn a_reset_timeout_below_the_send_timeout_warns_at_startup() {
+        let dir = tempdir().unwrap();
+        let mut config = TieredSinkConfig::new(dir.path().join("spool"));
+        config.send_timeout_ms = 2000;
+        config.circuit_reset_timeout_ms = 500;
+
+        let logs = startup_warnings(config).await;
+
+        assert!(logs.contains("circuit_reset_timeout_ms=500"), "{logs}");
+        assert!(logs.contains("send_timeout_ms=2000"), "{logs}");
+    }
+
+    #[cfg(feature = "logger")]
+    #[tokio::test]
+    async fn the_default_timeouts_do_not_warn_at_startup() {
+        let dir = tempdir().unwrap();
+
+        let logs = startup_warnings(TieredSinkConfig::new(dir.path().join("spool"))).await;
+
+        assert!(!logs.contains("circuit_reset_timeout_ms"), "{logs}");
     }
 
     #[cfg(all(feature = "metrics", feature = "logger"))]

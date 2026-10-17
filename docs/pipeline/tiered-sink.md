@@ -74,7 +74,7 @@ stateDiagram-v2
 
 - **Closed** -- hot path active, failures counted.
 - **Open** -- hot path skipped, every message goes straight to spool.
-- **Half-open** -- one probe allowed, taken by whichever of a `send` or the drain asks first; success -> Closed, failure -> Open.
+- **Half-open** -- one probe allowed, taken by whichever of a `send` or the drain asks first. Success -> Closed, failure -> Open. A probe that records neither, because its future was dropped or its outcome counts as neither, is lost once `reset_timeout` has passed since it went out, and the next caller probes again.
 
 Hooks into the global `HealthRegistry` (when `health` feature is on)
 so `/readyz` reports the sink as Degraded (HalfOpen) or Unhealthy
@@ -161,6 +161,8 @@ tiered_sink:
     max_usage_percent: 0.8
     poll_interval_secs: 5
 ```
+
+A `circuit_reset_timeout_ms` below `send_timeout_ms` logs a WARN naming both when the sink starts. A half-open probe still sending is then lost before its send can time out, so a second probe can join it.
 
 `TieredSinkConfig::new(path)` plus the builder methods cover the
 common cases without writing the full struct.
