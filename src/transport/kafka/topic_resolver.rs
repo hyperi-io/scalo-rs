@@ -29,6 +29,7 @@
 
 use regex::Regex;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::admin::KafkaAdmin;
 use super::config::{KafkaConfig, SuppressionRule};
@@ -188,6 +189,18 @@ pub fn passes_filters(topic: &str, include: &[Regex], exclude: &[Regex]) -> bool
     true
 }
 
+/// [`TopicResolver::resolve`] on tokio's blocking pool, where its broker
+/// metadata fetch can wait out its 10 s timeout without holding a runtime worker.
+///
+/// Dropping the future leaves the fetch to finish on the blocking pool.
+pub(super) async fn resolve_off_runtime(
+    resolver: Arc<TopicResolver>,
+) -> TransportResult<Vec<String>> {
+    tokio::task::spawn_blocking(move || resolver.resolve())
+        .await
+        .map_err(|e| TransportError::Internal(format!("topic resolve task failed: {e}")))?
+}
+
 fn compile_patterns(patterns: &[String]) -> TransportResult<Vec<Regex>> {
     patterns
         .iter()
@@ -266,10 +279,14 @@ impl TopicResolver {
     /// The resolver is moved into the background task. The handle provides
     /// `check_changed()` for polling from the main event loop.
     ///
-    /// The loop skips the first tick (waits `interval` before first refresh),
-    /// so the initial topic list is taken from `resolve()` at construction time.
+    /// The initial topic list comes from a `resolve()` on the calling thread,
+    /// which waits up to 10 s when no broker answers: call this where blocking
+    /// is allowed, such as inside `tokio::task::spawn_blocking`. The loop
+    /// waits `interval` before its first refresh, and runs every refresh on
+    /// tokio's blocking pool.
     ///
-    /// If the shutdown token is cancelled, the background task exits cleanly.
+    /// The background task exits when the shutdown token is cancelled or the
+    /// handle is dropped, without waiting for a refresh still in flight.
     #[must_use]
     pub fn start_refresh_loop(
         self,
@@ -277,6 +294,17 @@ impl TopicResolver {
         shutdown: tokio_util::sync::CancellationToken,
     ) -> TopicRefreshHandle {
         let initial = self.resolve().unwrap_or_default();
+        Arc::new(self).refresh_from(initial, interval, shutdown)
+    }
+
+    /// [`start_refresh_loop`](Self::start_refresh_loop) from `initial`, a
+    /// topic list already resolved.
+    pub(super) fn refresh_from(
+        self: Arc<Self>,
+        initial: Vec<String>,
+        interval: std::time::Duration,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> TopicRefreshHandle {
         let (tx, rx) = tokio::sync::watch::channel(initial.clone());
 
         let task = tokio::spawn(async move {
@@ -284,26 +312,28 @@ impl TopicResolver {
             ticker.tick().await; // skip immediate first tick
 
             loop {
-                tokio::select! {
+                let refresh = async {
+                    ticker.tick().await;
+                    resolve_off_runtime(Arc::clone(&self)).await
+                };
+                let resolved = tokio::select! {
                     biased;
-                    () = shutdown.cancelled() => {
-                        tracing::debug!("Topic refresh loop shutting down");
-                        break;
-                    }
-                    _tick = ticker.tick() => {
-                        match self.resolve() {
-                            Ok(new_topics) => {
-                                if tx.send(new_topics).is_err() {
-                                    break; // receiver dropped -- no point continuing
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Topic refresh failed, retaining previous list");
-                            }
+                    () = shutdown.cancelled() => break,
+                    () = tx.closed() => break,
+                    resolved = refresh => resolved,
+                };
+                match resolved {
+                    Ok(new_topics) => {
+                        if tx.send(new_topics).is_err() {
+                            break; // receiver dropped -- no point continuing
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Topic refresh failed, retaining previous list");
                     }
                 }
             }
+            tracing::debug!("Topic refresh loop stopped");
         });
 
         TopicRefreshHandle {
@@ -456,6 +486,43 @@ mod tests {
         let result = compile_patterns(&["^auth".to_string(), "_land$".to_string()]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 2);
+    }
+
+    /// A shutdown ends the loop at once, not when the broker metadata fetch of
+    /// the refresh in flight gives up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_ends_the_refresh_loop_while_a_refresh_waits_on_the_broker() {
+        let unreachable = KafkaConfig {
+            // A loopback port that refuses every connection.
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "refresh-shutdown".to_string(),
+            auto_discover: true,
+            ..KafkaConfig::default()
+        };
+        let resolver = TopicResolver::new(&unreachable).expect("resolver");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle =
+            resolver.start_refresh_loop(std::time::Duration::from_millis(50), shutdown.clone());
+        // The first refresh is now waiting on a broker that never answers.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let cancelled = std::time::Instant::now();
+        shutdown.cancel();
+        // The loop task owns the sender, so the receiver errors once the task has ended.
+        while handle.rx.has_changed().is_ok() {
+            assert!(
+                cancelled.elapsed() < std::time::Duration::from_secs(2),
+                "the refresh loop was still running {:?} after shutdown",
+                cancelled.elapsed()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Checked again here: a worker held by a refresh also holds back this test's timer.
+        let took = cancelled.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "the refresh loop ended {took:?} after shutdown"
+        );
     }
 
     #[test]

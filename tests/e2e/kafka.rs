@@ -738,32 +738,52 @@ mod broker {
     /// Start a broker and return it with its bootstrap address, or `None` when
     /// no Docker daemon answers outside CI. In CI that fails the test.
     pub(super) async fn start_kafka() -> Option<(ContainerAsync<Kafka>, String)> {
+        let node = start_node(None).await?;
+        let port = node
+            .get_host_port_ipv4(apache::KAFKA_PORT)
+            .await
+            .expect("kafka host port");
+        Some((node, format!("127.0.0.1:{port}")))
+    }
+
+    /// Start a broker on host `port`, for a client given the address before
+    /// the broker existed. `None` as for [`start_kafka`].
+    pub(super) async fn start_kafka_on(port: u16) -> Option<ContainerAsync<Kafka>> {
+        start_node(Some(port)).await
+    }
+
+    /// A free loopback port, which refuses connections until a broker takes it.
+    pub(super) fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("bind an ephemeral port")
+            .port()
+    }
+
+    async fn start_node(port: Option<u16>) -> Option<ContainerAsync<Kafka>> {
         if !crate::common::docker_answers() {
             crate::common::skip_or_fail("no Docker daemon answers `docker info`");
             return None;
         }
         let mut attempt = 1;
-        let node = loop {
-            match Kafka::default()
+        loop {
+            let request = Kafka::default()
                 .with_jvm_image()
                 .with_tag(format!("{KAFKA_TAG}@{KAFKA_DIGEST}"))
-                .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
-                .start()
-                .await
-            {
-                Ok(node) => break node,
+                .with_startup_timeout(KAFKA_STARTUP_TIMEOUT);
+            let request = match port {
+                Some(port) => request.with_mapped_port(port, apache::KAFKA_PORT),
+                None => request,
+            };
+            match request.start().await {
+                Ok(node) => return Some(node),
                 Err(e) if attempt < START_ATTEMPTS => {
                     eprintln!("kafka container attempt {attempt} did not start: {e}");
                     attempt += 1;
                 }
                 Err(e) => panic!("start kafka container: {e}"),
             }
-        };
-        let port = node
-            .get_host_port_ipv4(apache::KAFKA_PORT)
-            .await
-            .expect("kafka host port");
-        Some((node, format!("127.0.0.1:{port}")))
+        }
     }
 
     /// Create a one-partition `topic` and wait for its metadata.
@@ -1938,5 +1958,158 @@ mod partition_fetch {
             sizes.extend(batch.records.iter().map(|r| r.payload.len()));
         }
         assert_eq!(sizes, [large.len(), b"after".len()]);
+    }
+}
+
+/// Topic auto-discovery started while no broker answers at its address.
+///
+/// The outage is a loopback port nothing listens on, so it refuses every
+/// connection, until a broker container takes that port.
+#[cfg(feature = "testcontainers")]
+mod broker_down_at_start {
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    use scalo::transport::kafka::{KafkaConfig, KafkaTransport};
+    use scalo::transport::{TransportBase, TransportReceiver};
+    use tokio_util::sync::CancellationToken;
+
+    use super::broker::{create_topic, free_port, produce, start_kafka_on};
+
+    const TOPIC: &str = "starts-down";
+
+    /// A short refresh, so the test waits seconds rather than the 60 s default.
+    const REFRESH: Duration = Duration::from_secs(3);
+
+    /// One refresh, plus the next `recv` that applies it, which an outage
+    /// spaces up to 2 s apart.
+    const SUBSCRIBED_WITHIN: Duration = Duration::from_secs(6);
+
+    /// Group join plus the first fetch, on a cold single-node broker.
+    const CONSUMED_WITHIN: Duration = Duration::from_secs(60);
+
+    /// When the shutdown fires, measured from the start of construction.
+    const SHUTDOWN_AFTER: Duration = Duration::from_millis(200);
+
+    const RECORDS: usize = 20;
+
+    fn discovering(bootstrap: &str, group: &str) -> KafkaConfig {
+        KafkaConfig {
+            brokers: vec![bootstrap.to_string()],
+            group: group.to_string(),
+            auto_discover: true,
+            topic_include: vec![format!("^{TOPIC}$")],
+            topic_refresh_secs: REFRESH.as_secs(),
+            ..Default::default()
+        }
+        // librdkafka's reconnect backoff, up to 10 s by default, would otherwise
+        // decide when a refresh first reaches the new broker.
+        .with_override("reconnect.backoff.max.ms", "500")
+    }
+
+    /// Whether `transport` subscribes to [`TOPIC`], which only its `Debug` shows.
+    fn subscribed(transport: &KafkaTransport) -> bool {
+        format!("{transport:?}").contains(&format!("{TOPIC:?}"))
+    }
+
+    #[tokio::test]
+    async fn a_consumer_built_with_no_broker_consumes_once_one_is_up() {
+        if !crate::common::docker_answers() {
+            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
+            return;
+        }
+        let port = free_port();
+        let bootstrap = format!("127.0.0.1:{port}");
+
+        let building = Instant::now();
+        let consumer = KafkaTransport::new(&discovering(&bootstrap, "starts-down"))
+            .await
+            .unwrap_or_else(|e| panic!("auto-discovery with no broker refused to build: {e}"));
+        eprintln!("built with no broker in {:?}", building.elapsed());
+        let batch = consumer.recv(100).await.expect("recv with no broker");
+        assert!(batch.records.is_empty(), "no broker, so no records");
+
+        let Some(_node) = start_kafka_on(port).await else {
+            return;
+        };
+        create_topic(&bootstrap, TOPIC).await;
+        produce(&bootstrap, TOPIC, 0..RECORDS).await;
+        let ready = Instant::now();
+
+        let want: BTreeSet<String> = (0..RECORDS)
+            .map(|seq| format!("{{\"seq\":{seq}}}"))
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut subscribed_after = None;
+        while !want.is_subset(&seen) {
+            assert!(
+                ready.elapsed() < SUBSCRIBED_WITHIN + CONSUMED_WITHIN,
+                "consumed {} of {RECORDS} records within {:?} of the topic existing, \
+                 subscribed after {subscribed_after:?}",
+                want.intersection(&seen).count(),
+                ready.elapsed()
+            );
+            let batch = consumer
+                .recv(100)
+                .await
+                .expect("recv once the broker is up");
+            if subscribed_after.is_none() && subscribed(&consumer) {
+                subscribed_after = Some(ready.elapsed());
+            }
+            seen.extend(
+                batch
+                    .records
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(&r.payload).into_owned()),
+            );
+        }
+        let subscribed_after = subscribed_after.expect("records arrive only once subscribed");
+        eprintln!(
+            "subscribed {subscribed_after:?} and consumed all {RECORDS} records {:?} after \
+             the topic existed",
+            ready.elapsed()
+        );
+        assert!(
+            subscribed_after <= SUBSCRIBED_WITHIN,
+            "subscribed {subscribed_after:?} after the topic existed, past one {REFRESH:?} refresh"
+        );
+        consumer.close().await.expect("close");
+    }
+
+    /// On a current-thread runtime, the shape that shows a held worker: the
+    /// shutdown can only fire while construction leaves the thread free.
+    #[tokio::test]
+    async fn a_shutdown_during_the_outage_is_not_held_by_auto_discovery() {
+        let config = discovering(
+            &format!("127.0.0.1:{}", free_port()),
+            "starts-down-shutdown",
+        );
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SHUTDOWN_AFTER).await;
+            trigger.cancel();
+        });
+
+        let started = Instant::now();
+        let outcome = tokio::select! {
+            () = shutdown.cancelled() => "shut down".to_string(),
+            built = KafkaTransport::new(&config) => {
+                match built {
+                    Ok(_) => "built".to_string(),
+                    Err(e) => format!("failed: {e}"),
+                }
+            }
+        };
+        let took = started.elapsed();
+        eprintln!("construction raced against a shutdown: {outcome} after {took:?}");
+        assert_eq!(
+            outcome, "shut down",
+            "construction finished first, after {took:?}"
+        );
+        assert!(
+            took < SHUTDOWN_AFTER + Duration::from_secs(1),
+            "the shutdown was acted on {took:?} after construction began"
+        );
     }
 }

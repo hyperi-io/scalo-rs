@@ -1112,6 +1112,8 @@ covers both the race and the legitimate case of an app deployed
 before its first source exists. Set `topic_refresh_secs: 0` and a
 transport that discovered nothing consumes nothing until restart.
 
+A broker that does not answer at construction starts the transport subscribed to nothing in the same way, and the first refresh that reaches it subscribes. With `topic_refresh_secs: 0`, construction fails instead.
+
 ### `KafkaTransport` always allocates both roles
 
 `KafkaTransport::new` builds BOTH a `BaseConsumer` and a `FutureProducer` (the producer from its own `ClientConfig`). A producer-only config (empty `group`) constructs: the idle consumer takes the derived stand-in group `<client_id>-producer-only` and subscribes to nothing. It still connects and looks up that group's coordinator, so the broker has to grant the app's group prefix.

@@ -4,7 +4,7 @@ One idea: a byte-budget envelope with a time bound, so a single config takes a
 stage from "SME on a laptop" to hyperscale without re-tuning. Covered here: the
 three batch sizes, the sizing profile, the librdkafka property names the code
 uses (several differ from the Java client), how the byte budget moves, wire compression,
-static membership, the raw escape hatch, the partition-limited diagnostic.
+topic auto-discovery, static membership, the raw escape hatch, the partition-limited diagnostic.
 
 Code: `src/transport/kafka/config.rs` (sizing surface),
 `src/transport/kafka/mod.rs` (transport + diagnostic). See
@@ -245,6 +245,16 @@ librdkafka will not build a consumer without a `group.id`, and a consumer asks t
 An app granted `myapp-*` with `group: myapp-consumer` gets `myapp-consumer-admin`, and a producer with `client_id: myapp-producer` gets `myapp-producer-producer-only`, both inside the grant. With `group` and `client_id` both empty the anchor is the default client id, `scalo`.
 
 An empty `group` is what marks a transport producer-only. It subscribes to nothing even when `topics` is set -- subscribing would join the stand-in group with a member that is never polled.
+
+---
+
+## Topic auto-discovery
+
+With `topics` empty and `auto_discover: true`, the transport subscribes to the broker's topics that pass `topic_include`, `topic_exclude` and the suppression rules. It lists them once at construction and again every `topic_refresh_secs` (60 s by default), and the next `recv` after a change re-subscribes. Each listing is a metadata fetch of up to 10 s, run on tokio's blocking pool so it never holds a runtime worker.
+
+A broker that does not answer at construction is not fatal. The transport logs a warning with the error, builds subscribed to nothing, and the first refresh that lists the matching topics subscribes it. With `topic_refresh_secs: 0` nothing would recover, so construction fails with `TransportError::Admin`. Explicit `topics` never contact the broker at construction: librdkafka connects later.
+
+`close()`, or dropping the transport, ends the refresh loop at once, even while a fetch is still waiting on the broker.
 
 ---
 
