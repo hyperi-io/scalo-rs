@@ -1329,6 +1329,9 @@ pub struct KafkaConfig {
 
     /// Periodic topic refresh interval in seconds (0 = disabled).
     /// Only applies when `topics` is empty (auto-discovery mode).
+    /// Above 0, a broker that cannot list its topics at construction is not
+    /// fatal: the transport starts subscribed to nothing and a later refresh
+    /// subscribes. At 0, construction fails instead.
     #[serde(default = "default_topic_refresh_secs")]
     pub topic_refresh_secs: u64,
 
