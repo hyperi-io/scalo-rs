@@ -103,6 +103,7 @@ Text-mode lines, and every string in a JSON line, are masked for:
 
 - the password in `scheme://user:password@host`, up to the last `@` a host follows, so one holding `@`, `/`, `?` or `#` goes whole. Nothing tells such a password from an `@` later in the path or query, so `https://u:p@host/x?to=ops@example.com` is masked through to `example.com`. `logger::mask_url_userinfo(text, mask, keep_user)` applies the same rule to any string, and `logger::url_passwords(text)` returns every non-empty password it masks, in order, read by the same scanner.
 - the token after the word `bearer`.
+- signed URL parameters. See [Signed URL parameters](#signed-url-parameters).
 - the scheme and credentials after an authorization key, or after any credential key whose value opens with an authentication scheme. See [Authorization and schemes](#authorization-and-schemes).
 - the value after `key: value` and `key=value` whose key names a credential. A quoted value runs to its closing quote, past escaped quotes. One that no unescaped quote closes, such as `"abc\"`, runs to its next quote instead, so honouring escapes never masks less than ignoring them. One with no closing quote at all is masked to the end of its line, or, for a double-quoted value after `:`, which may cross lines, to the end of the text short of a line break that ends it. A `Name(...)` value such as `Some("...")` goes whole: the name is letters, digits and `_`, parentheses nest, and a quoted string inside may hold `)`, span lines, and close at its next quote when no unescaped one follows. One that does not close within 4096 bytes is masked to the end of the text, short of a line break that ends it. An unquoted value runs on across digit groups, so `TFN: 123 456 782` goes whole. For `key::value` and Rust paths, see [Double-colon keys](#double-colon-keys).
 
@@ -135,6 +136,12 @@ After any other credential key, a value whose first word is an authentication sc
 A key may be joined to its value by `::`, so `password::abc` becomes `password::[REDACTED]`. A key after `::` ends a path, such as the log target `app::auth:`, and is never read as a key. In text, a path whose first segment names a credential loses the rest: `aws_sdk_secretsmanager::client` becomes `aws_sdk_secretsmanager::[REDACTED]`. A JSON line's root `target` is never masked, since it is the module path tracing writes and holds no user data.
 
 A Hiera-style key such as `profile::db::password: x` is left in clear, while scalo-py masks it, because in text it reads exactly like a log target and scalo-rs cannot tell the two apart.
+
+---
+
+## Signed URL parameters
+
+The value of `sig`, `X-Amz-Signature`, `X-Amz-Security-Token` and `X-Goog-Signature`, named in any case right after `?` or `&` and followed by `=`, is masked up to the next `&`, white space, quote or the end of the text. So an Azure SAS URL keeps everything but its `sig=`, and S3 and GCS presigned URLs lose their signatures. A name that only holds `sig`, such as `signal=`, `design=` or `?signature_type=`, is left alone.
 
 ---
 

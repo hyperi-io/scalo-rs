@@ -405,6 +405,8 @@ fn a_long_line_is_masked_in_linear_time() {
         "x-api-key: Token ".to_string() + &"b, ".repeat(70_000),
         "password::".repeat(40_000),
         "authorization: a ".to_string() + &"b&".repeat(100_000),
+        "?sig=a".repeat(40_000),
+        "&si".repeat(70_000),
     ];
     for line in &lines {
         let started = Instant::now();

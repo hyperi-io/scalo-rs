@@ -129,7 +129,8 @@ pub fn make_masking_writer(
 /// item of a two-item array inside an array whose first item names one, and
 /// every string with the text rules, except the root `target`, the module path
 /// tracing writes. Text mode masks the line with the text rules: URL
-/// passwords, bearer tokens, `key: value` and `key=value`.
+/// passwords, signed URL query parameters, bearer tokens, `key: value` and
+/// `key=value`.
 pub struct MaskingWriter<W: io::Write> {
     inner: W,
     buffer: Vec<u8>,

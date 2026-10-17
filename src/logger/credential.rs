@@ -13,8 +13,9 @@
 //! `db_password`, `PGPASSWORD`, `x-api-key` and `secretAccessKey` all match, and
 //! so do `tokenizer` and `mapping`: the substring rule over-masks by design.
 //!
-//! [`mask_text`] applies that rule to free text: every URL password, every bearer
-//! token, and the value after every `key: value` or `key=value` whose key names a
+//! [`mask_text`] applies that rule to free text: every URL password, every
+//! signed URL query parameter such as `&sig=`, every bearer token, and the value
+//! after every `key: value` or `key=value` whose key names a
 //! credential. After a key naming an authorization header, an unquoted value is
 //! the scheme and the credentials after it, so `Authorization: Basic ...` masks
 //! whole, and after any other credential key so is one opening with an
@@ -440,6 +441,46 @@ fn host_follows(text: &str, at: usize) -> bool {
         .chars()
         .next()
         .is_none_or(|c| is_space(c) || matches!(c, '/' | '?' | '#'))
+}
+
+/// Query parameters whose value is a signature or a session token, named in any case, the names scalo-py reads too.
+const SIGNATURE_PARAMS: [&str; 4] = [
+    "sig",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-goog-signature",
+];
+
+/// `text` with the value of every [`SIGNATURE_PARAMS`] parameter named right after `?` or `&` replaced by `mask`.
+///
+/// The value runs to the next `&`, white space, quote or the end of the text.
+fn mask_query_signatures<'a>(text: &'a str, mask: &str) -> Cow<'a, str> {
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(found) = text[from..].find(['?', '&']) {
+        let name_start = from + found + 1;
+        from = name_start;
+        let value_start = SIGNATURE_PARAMS.iter().find_map(|name| {
+            let name_end = name_start + name.len();
+            let named = text
+                .get(name_start..name_end)
+                .is_some_and(|written| written.eq_ignore_ascii_case(name));
+            (named && text.as_bytes().get(name_end) == Some(&b'=')).then_some(name_end + 1)
+        });
+        let Some(value_start) = value_start else {
+            continue;
+        };
+        let value_end = scan_until(text, value_start, |c| {
+            is_space(c) || matches!(c, '&' | '"' | '\'')
+        });
+        let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
+        buf.push_str(&text[copied..value_start]);
+        buf.push_str(mask);
+        copied = value_end;
+        from = value_end;
+    }
+    finish(text, out, copied)
 }
 
 /// `text` with every bearer token after the word `bearer` replaced by `mask`.
@@ -1147,7 +1188,8 @@ fn mask_pairs<'a>(text: &'a str, matcher: &CredentialMatcher, mask: &str) -> Cow
 
 /// `text` with every credential in it replaced by `mask`.
 ///
-/// Masks, in order: URL passwords, bearer tokens, the value after `key: value`
+/// Masks, in order: URL passwords, signed URL query parameters such as
+/// `?sig=` and `&X-Amz-Signature=`, bearer tokens, the value after `key: value`
 /// or `key::value` and the value after `key=value`, where `matcher` names the
 /// key a credential. After an authorization header key the value is the scheme
 /// and its credentials, so `Authorization: Basic ...` masks whole, and so is a
@@ -1158,6 +1200,7 @@ pub(super) fn mask_text<'a>(
     mask: &str,
 ) -> Cow<'a, str> {
     let text = mask_url_userinfo(text, mask, true);
+    let text = then(text, |t| mask_query_signatures(t, mask));
     let text = then(text, |t| mask_bearer(t, mask));
     then(text, |t| mask_pairs(t, matcher, mask))
 }
