@@ -799,7 +799,12 @@ impl<'a> Values<'a> {
                     reach: self.line(from),
                 },
             },
-            _ => self.unquoted(from, unquoted_colon_end(text, from), header),
+            _ => self.unquoted(
+                from,
+                unquoted_colon_end(text, from),
+                header,
+                Separator::Colon,
+            ),
         }
     }
 
@@ -816,22 +821,34 @@ impl<'a> Values<'a> {
                 },
             };
         }
-        self.unquoted(from, Some(unquoted_equals_end(text, from)), header)
+        self.unquoted(
+            from,
+            Some(unquoted_equals_end(text, from)),
+            header,
+            Separator::Equals,
+        )
     }
 
     /// Read an unquoted value ending at `end`, or further when a `Name(...)` value starts at `from`.
     ///
     /// With no `Name(...)` value there, the value ending at `end` is a scheme
     /// when `header` is set or it is one of the [`AUTH_SCHEMES`], and then the
-    /// credentials after it are read too.
-    fn unquoted(&mut self, from: usize, end: Option<usize>, header: bool) -> Read {
+    /// credentials after it are read too, as the `separator` before them
+    /// reads them.
+    fn unquoted(
+        &mut self,
+        from: usize,
+        end: Option<usize>,
+        header: bool,
+        separator: Separator,
+    ) -> Read {
         let (wrapped, reach) = self.wrapper(from);
         let mut end = end.max(wrapped);
         if reach.is_none()
             && let Some(scheme_end) = end.filter(|&scheme_end| scheme_end > from)
             && (header || is_auth_scheme(&self.text[from..scheme_end]))
         {
-            end = Some(self.credentials(scheme_end));
+            end = Some(self.credentials(scheme_end, separator));
         }
         let low = end.unwrap_or(from);
         Read {
@@ -910,7 +927,7 @@ impl<'a> Values<'a> {
     /// Spaces or tabs separate the scheme from its credentials, which are items
     /// separated by commas, as in `Digest username="u", response="r"`. They
     /// never cross a line.
-    fn credentials(&mut self, scheme_end: usize) -> usize {
+    fn credentials(&mut self, scheme_end: usize, separator: Separator) -> usize {
         let text = self.text;
         let blanks_end = |from: usize| scan_until(text, from, |c| !matches!(c, ' ' | '\t'));
         let mut at = blanks_end(scheme_end);
@@ -919,7 +936,7 @@ impl<'a> Values<'a> {
         }
         let mut end = scheme_end;
         loop {
-            let item_end = self.credential_item(at);
+            let item_end = self.credential_item(at, separator);
             if item_end == at {
                 return end;
             }
@@ -934,12 +951,14 @@ impl<'a> Values<'a> {
 
     /// Where the credential item at `from` ends, or `from` when none starts there.
     ///
-    /// An item runs to white space, `,`, `&`, `}` or `"`. A quoted string opens
-    /// at the item's start or after `=`, and one that does not close on its
-    /// line takes the item to the end of the line.
-    fn credential_item(&mut self, from: usize) -> usize {
+    /// An item runs to white space, `,`, `}` or `"`, and after `=` also to
+    /// `&`, which separates form fields there. A quoted string opens at the
+    /// item's start or after `=`, and one that does not close on its line
+    /// takes the item to the end of the line.
+    fn credential_item(&mut self, from: usize, separator: Separator) -> usize {
         let text = self.text;
         let bytes = text.as_bytes();
+        let ends_at_ampersand = separator == Separator::Equals;
         let mut at = from;
         while let Some(c) = text[at..].chars().next() {
             if c == '"' && (at == from || bytes[at - 1] == b'=') {
@@ -947,7 +966,8 @@ impl<'a> Values<'a> {
                     Some(close) => at = close,
                     None => return self.line(at),
                 }
-            } else if is_space(c) || matches!(c, ',' | '&' | '}' | '"') {
+            } else if is_space(c) || matches!(c, ',' | '}' | '"') || (c == '&' && ends_at_ampersand)
+            {
                 break;
             } else {
                 at += c.len_utf8();

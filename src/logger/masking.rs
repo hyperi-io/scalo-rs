@@ -21,6 +21,9 @@ use super::credential::{CredentialMatcher, SENSITIVE_FIELDS, mask_text};
 /// Redacted value placeholder.
 pub const REDACTED: &str = "[REDACTED]";
 
+/// The root key of a JSON line that holds the event's module path.
+const TARGET_KEY: &str = "target";
+
 /// Default list of sensitive field names to mask.
 ///
 /// A field name holding any of these anywhere in it, in any case and with any
@@ -124,8 +127,9 @@ pub fn make_masking_writer(
 /// JSON mode masks the value of every key that names a credential at any
 /// depth, a bare `key` or `value` judged with its parent's name, the second
 /// item of a two-item array inside an array whose first item names one, and
-/// every string with the text rules. Text mode masks the line with the text
-/// rules: URL passwords, bearer tokens, `key: value` and `key=value`.
+/// every string with the text rules, except the root `target`, the module path
+/// tracing writes. Text mode masks the line with the text rules: URL
+/// passwords, bearer tokens, `key: value` and `key=value`.
 pub struct MaskingWriter<W: io::Write> {
     inner: W,
     buffer: Vec<u8>,
@@ -242,8 +246,8 @@ fn strip_ansi(line: &str) -> Cow<'_, str> {
 ///
 /// Parses the line as JSON, inserts `service` and `version` at the root level
 /// (if provided), walks the object tree and replaces values of sensitive keys
-/// with `[REDACTED]`, then re-serialises. A line that is not JSON is masked as
-/// text.
+/// with `[REDACTED]`, leaving the root `target` as written, then re-serialises.
+/// A line that is not JSON is masked as text.
 fn inject_and_redact_json_line(
     line: &str,
     matcher: &CredentialMatcher,
@@ -288,7 +292,15 @@ fn inject_and_redact_json_line(
             }
         }
         if !matcher.is_empty() {
+            // The root target is the module path tracing writes, never user data, so it keeps its path.
+            let target = value
+                .get_mut(TARGET_KEY)
+                .filter(|target| target.is_string())
+                .map(std::mem::take);
             redact_json_value(&mut value, "", false, matcher);
+            if let (Some(target), Some(slot)) = (target, value.get_mut(TARGET_KEY)) {
+                *slot = target;
+            }
         }
         let mut result = serde_json::to_string(&value).unwrap_or_else(|_| trimmed.to_string());
         if line.ends_with('\n') {
@@ -531,6 +543,16 @@ mod tests {
             line["fields"]["message"],
             "connecting to postgres://svc:[REDACTED]@db/app as apiKey=[REDACTED]"
         );
+    }
+
+    #[test]
+    fn only_the_root_target_keeps_its_value() {
+        let input = r#"{"target":"password::x","fields":{"target":"password::x"}}"#;
+        let result =
+            inject_and_redact_json_line(input, CredentialMatcher::default_terms(), None, None);
+        let line: serde_json::Value = serde_json::from_str(&result).expect("still JSON");
+        assert_eq!(line["target"], "password::x");
+        assert_eq!(line["fields"]["target"], "password::[REDACTED]");
     }
 
     #[test]

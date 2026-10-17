@@ -124,7 +124,7 @@ Beyond URL passwords and bearer tokens, masking reads names, not values. An emai
 
 ## Authorization and schemes
 
-After a key holding `authorization`, such as `Proxy-Authorization` or `HTTP_AUTHORIZATION`, an unquoted value is the scheme and the credentials after it, masked together. The credentials are comma-separated items, so a `Digest username="u", response="r"` list goes whole. An item runs to white space, `,`, `&`, `}` or `"`, takes a quoted string after `=` whole, and never crosses a line, so `Authorization: Basic abc status=401` keeps `status=401`. A key such as `authorization_url` loses its next item too.
+After a key holding `authorization`, such as `Proxy-Authorization` or `HTTP_AUTHORIZATION`, an unquoted value is the scheme and the credentials after it, masked together. The credentials are comma-separated items, so a `Digest username="u", response="r"` list goes whole. An item runs to white space, `,`, `}` or `"`, takes a quoted string after `=` whole, and never crosses a line, so `Authorization: Basic abc status=401` keeps `status=401`. After `=` an item also ends at `&`, which separates form fields there, so `Authorization: SharedAccessSignature sr=x&sig=y` masks whole while `authorization=Basic abc&page=2` keeps `&page=2`. A key such as `authorization_url` loses its next item too.
 
 After any other credential key, a value whose first word is an authentication scheme is read the same way, so `x-api-key: Token abc` and `header_value=Basic abc` mask whole. The schemes are the IANA registry's (`Basic`, `Bearer`, `Concealed`, `Digest`, `DPoP`, `GNAP`, `HOBA`, `Mutual`, `Negotiate`, `OAuth`, `PrivateToken`, `SCRAM-SHA-1`, `SCRAM-SHA-256`, `vapid`) and `ApiKey`, `AWS4-HMAC-SHA256`, `NTLM`, `SharedAccessSignature`, `SharedKey`, `SharedKeyLite`, `Splunk`, `SSWS` and `Token`, in any case. Any other first word keeps the word after it, so `password: abc later` keeps `later`, while `auth=basic user=bob` loses `user=bob`.
 
@@ -132,7 +132,9 @@ After any other credential key, a value whose first word is an authentication sc
 
 ## Double-colon keys
 
-A key may be joined to its value by `::`, so `password::abc` becomes `password::[REDACTED]`. A key after `::` ends a path, such as the log target `app::auth:`, and is never read as a key. A path whose first segment names a credential loses the rest: `aws_sdk_secretsmanager::client` becomes `aws_sdk_secretsmanager::[REDACTED]`.
+A key may be joined to its value by `::`, so `password::abc` becomes `password::[REDACTED]`. A key after `::` ends a path, such as the log target `app::auth:`, and is never read as a key. In text, a path whose first segment names a credential loses the rest: `aws_sdk_secretsmanager::client` becomes `aws_sdk_secretsmanager::[REDACTED]`. A JSON line's root `target` is never masked, since it is the module path tracing writes and holds no user data.
+
+A Hiera-style key such as `profile::db::password: x` is left in clear, while scalo-py masks it, because in text it reads exactly like a log target and scalo-rs cannot tell the two apart.
 
 ---
 

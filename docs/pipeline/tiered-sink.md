@@ -162,6 +162,8 @@ tiered_sink:
     poll_interval_secs: 5
 ```
 
+A `circuit_reset_timeout_ms` below `send_timeout_ms` logs a WARN naming both when the sink starts. A half-open probe still sending is then lost before its send can time out, so a second probe can join it.
+
 `TieredSinkConfig::new(path)` plus the builder methods cover the
 common cases without writing the full struct.
 

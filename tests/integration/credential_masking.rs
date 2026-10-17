@@ -404,6 +404,7 @@ fn a_long_line_is_masked_in_linear_time() {
         "token: basic ".repeat(30_000),
         "x-api-key: Token ".to_string() + &"b, ".repeat(70_000),
         "password::".repeat(40_000),
+        "authorization: a ".to_string() + &"b&".repeat(100_000),
     ];
     for line in &lines {
         let started = Instant::now();
@@ -505,6 +506,23 @@ fn a_json_line_masks_fields_in_any_spelling_and_url_passwords_in_text() {
     assert_eq!(
         fields["message"],
         format!("connecting to postgres://svc:{MASK}@db:5432/app")
+    );
+}
+
+#[test]
+fn a_json_line_keeps_its_target_and_masks_its_message() {
+    let secret = secret();
+    let captured = Captured::new();
+    captured.run(true, || {
+        tracing::warn!(target: "aws_credential_types::provider", "retrying, x-api-key: Token {secret}");
+    });
+    let output = captured.text();
+    assert!(!output.contains(&secret), "{output}");
+    let line: Value = serde_json::from_str(output.trim()).expect("one JSON line");
+    assert_eq!(line["target"], "aws_credential_types::provider");
+    assert_eq!(
+        line["fields"]["message"],
+        format!("retrying, x-api-key: {MASK}")
     );
 }
 
