@@ -121,11 +121,20 @@ fn a_parent_qualifies_only_a_bare_key_or_value() {
 #[test]
 fn text_cases_match_the_corpus() {
     let corpus = corpus();
-    for case in cases(&corpus, "text_cases") {
-        let input = fill(text_field(case, "input"), MASK);
-        let expected = fill(text_field(case, "expected"), MASK);
-        assert_eq!(mask_text(&input), expected, "case {}", case["id"]);
-    }
+    let wrong: Vec<String> = cases(&corpus, "text_cases")
+        .iter()
+        .filter_map(|case| {
+            let input = fill(text_field(case, "input"), MASK);
+            let expected = fill(text_field(case, "expected"), MASK);
+            let masked = mask_text(&input);
+            (masked != expected).then(|| format!("{}: {masked:?}", case["id"]))
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "cases masked wrongly:\n{}",
+        wrong.join("\n")
+    );
 }
 
 #[test]
@@ -392,6 +401,9 @@ fn a_long_line_is_masked_in_linear_time() {
         "authorization: a b=\"".to_string() + &"x".repeat(200_000),
         "authorization=a b=\"\n".repeat(25_000),
         "authorization: a b=\"\\\" ".repeat(15_000),
+        "token: basic ".repeat(30_000),
+        "x-api-key: Token ".to_string() + &"b, ".repeat(70_000),
+        "password::".repeat(40_000),
     ];
     for line in &lines {
         let started = Instant::now();

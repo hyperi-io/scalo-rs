@@ -360,7 +360,9 @@ fn redact_json_value(
 /// quoted or `Name(...)` value that never closes is masked to the end of its
 /// line, or to the end of the text when its reading may cross lines. After a
 /// key naming an authorization header, an unquoted value is the scheme and the
-/// credentials after it, so `Authorization: Basic ...` masks whole.
+/// credentials after it, so `Authorization: Basic ...` masks whole, and so is
+/// one opening with an authentication scheme after any credential key, as in
+/// `x-api-key: Token ...`.
 ///
 /// # Examples
 ///

@@ -17,7 +17,8 @@
 //! token, and the value after every `key: value` or `key=value` whose key names a
 //! credential. After a key naming an authorization header, an unquoted value is
 //! the scheme and the credentials after it, so `Authorization: Basic ...` masks
-//! whole.
+//! whole, and after any other credential key so is one opening with an
+//! authentication scheme, as in `x-api-key: Token ...`.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -118,6 +119,33 @@ const MAX_WRAPPER_LEN: usize = 4096;
 
 /// A key holding this, in any case, names an authorization header, whose value is a scheme followed by its credentials.
 const AUTHORIZATION: &[u8] = b"authorization";
+
+/// HTTP authentication schemes, the IANA registry then vendor ones, the list scalo-py carries too.
+const AUTH_SCHEMES: [&str; 23] = [
+    "basic",
+    "bearer",
+    "concealed",
+    "digest",
+    "dpop",
+    "gnap",
+    "hoba",
+    "mutual",
+    "negotiate",
+    "oauth",
+    "privatetoken",
+    "scram-sha-1",
+    "scram-sha-256",
+    "vapid",
+    "apikey",
+    "aws4-hmac-sha256",
+    "ntlm",
+    "sharedaccesssignature",
+    "sharedkey",
+    "sharedkeylite",
+    "splunk",
+    "ssws",
+    "token",
+];
 
 /// The matcher over [`SENSITIVE_FIELDS`].
 static DEFAULT_MATCHER: LazyLock<CredentialMatcher> =
@@ -483,6 +511,13 @@ fn names_authorization(key: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(AUTHORIZATION))
 }
 
+/// Whether `word` is one of the [`AUTH_SCHEMES`], in any case.
+fn is_auth_scheme(word: &str) -> bool {
+    AUTH_SCHEMES
+        .iter()
+        .any(|scheme| word.eq_ignore_ascii_case(scheme))
+}
+
 /// The next key followed by `separator` that starts at or after `from`.
 fn next_head(text: &str, from: usize, separator: Separator) -> Option<Head> {
     let bytes = text.as_bytes();
@@ -522,10 +557,13 @@ fn separator_end(text: &str, start: usize, key_end: usize, separator: Separator)
             if bytes.get(at) != Some(&b':') {
                 return None;
             }
-            // `a::b` is a Rust path, such as a log target, never a key and a value.
-            if bytes.get(at + 1) == Some(&b':') || (start >= 2 && &bytes[start - 2..start] == b"::")
-            {
+            // A key after `::` ends a path, such as the log target `app::auth:`, and is never a key.
+            if start >= 2 && &bytes[start - 2..start] == b"::" {
                 return None;
+            }
+            // `key::value` separates with both colons, so the value starts after the second.
+            if bytes.get(at + 1) == Some(&b':') {
+                at += 1;
             }
             Some(scan_until(text, at + 1, |c| !is_space(c)))
         }
@@ -722,7 +760,8 @@ impl Read {
 /// ends it. A `Name(...)` value runs to its close, or to the end of the text
 /// when it does not close within [`MAX_WRAPPER_LEN`] bytes. An unquoted value
 /// read as an authorization header's runs on past its scheme through the
-/// credentials after it.
+/// credentials after it, and so does one whose first word is an
+/// authentication scheme.
 struct Values<'a> {
     text: &'a str,
     /// Where the line holding the last value read on one line ends.
@@ -782,14 +821,15 @@ impl<'a> Values<'a> {
 
     /// Read an unquoted value ending at `end`, or further when a `Name(...)` value starts at `from`.
     ///
-    /// With `header` set and no `Name(...)` value there, the value ending at
-    /// `end` is the scheme and the credentials after it are read too.
+    /// With no `Name(...)` value there, the value ending at `end` is a scheme
+    /// when `header` is set or it is one of the [`AUTH_SCHEMES`], and then the
+    /// credentials after it are read too.
     fn unquoted(&mut self, from: usize, end: Option<usize>, header: bool) -> Read {
         let (wrapped, reach) = self.wrapper(from);
         let mut end = end.max(wrapped);
-        if header
-            && reach.is_none()
+        if reach.is_none()
             && let Some(scheme_end) = end.filter(|&scheme_end| scheme_end > from)
+            && (header || is_auth_scheme(&self.text[from..scheme_end]))
         {
             end = Some(self.credentials(scheme_end));
         }
@@ -1088,9 +1128,10 @@ fn mask_pairs<'a>(text: &'a str, matcher: &CredentialMatcher, mask: &str) -> Cow
 /// `text` with every credential in it replaced by `mask`.
 ///
 /// Masks, in order: URL passwords, bearer tokens, the value after `key: value`
-/// and the value after `key=value`, where `matcher` names the key a credential.
-/// After an authorization header key the value is the scheme and its
-/// credentials, so `Authorization: Basic ...` masks whole.
+/// or `key::value` and the value after `key=value`, where `matcher` names the
+/// key a credential. After an authorization header key the value is the scheme
+/// and its credentials, so `Authorization: Basic ...` masks whole, and so is a
+/// value opening with an authentication scheme after any credential key.
 pub(super) fn mask_text<'a>(
     text: &'a str,
     matcher: &CredentialMatcher,
