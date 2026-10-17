@@ -387,6 +387,11 @@ fn a_long_line_is_masked_in_linear_time() {
         "pin: f(\\' x) ".repeat(16_000),
         "token=".to_string() + &"a(".repeat(100_000),
         "token=Some(".to_string() + &"(".repeat(200_000),
+        "authorization: a \"".repeat(30_000),
+        "authorization: a ".to_string() + &"b, ".repeat(70_000),
+        "authorization: a b=\"".to_string() + &"x".repeat(200_000),
+        "authorization=a b=\"\n".repeat(25_000),
+        "authorization: a b=\"\\\" ".repeat(15_000),
     ];
     for line in &lines {
         let started = Instant::now();

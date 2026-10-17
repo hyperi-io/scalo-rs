@@ -103,6 +103,7 @@ Text-mode lines, and every string in a JSON line, are masked for:
 
 - the password in `scheme://user:password@host`, up to the last `@` a host follows, so one holding `@`, `/`, `?` or `#` goes whole. Nothing tells such a password from an `@` later in the path or query, so `https://u:p@host/x?to=ops@example.com` is masked through to `example.com`. `logger::mask_url_userinfo(text, mask, keep_user)` applies the same rule to any string, and `logger::url_passwords(text)` returns every non-empty password it masks, in order, read by the same scanner.
 - the token after the word `bearer`.
+- the scheme and credentials after a key holding `authorization`, such as `Proxy-Authorization` or `HTTP_AUTHORIZATION`. The credentials are comma-separated items, so a `Digest username="u", response="r"` list goes whole. An item runs to white space, `,`, `&`, `}` or `"`, takes a quoted string after `=` whole, and never crosses a line, so `Authorization: Basic abc status=401` keeps `status=401`. A key such as `authorization_url` loses its next item too.
 - the value after `key: value` and `key=value` whose key names a credential. A quoted value runs to its closing quote, past escaped quotes. One that no unescaped quote closes, such as `"abc\"`, runs to its next quote instead, so honouring escapes never masks less than ignoring them. One with no closing quote at all is masked to the end of its line, or, for a double-quoted value after `:`, which may cross lines, to the end of the text short of a line break that ends it. A `Name(...)` value such as `Some("...")` goes whole: the name is letters, digits and `_`, parentheses nest, and a quoted string inside may hold `)`, span lines, and close at its next quote when no unescaped one follows. One that does not close within 4096 bytes is masked to the end of the text, short of a line break that ends it. An unquoted value runs on across digit groups, so `TFN: 123 456 782` goes whole. A Rust path such as the log target `app::auth:` is never read as a key.
 
 All of it writes `[REDACTED]` in place. A coloured text line holding a credential is written without its colour, since its escapes split `name=value` apart.
@@ -112,6 +113,7 @@ All of it writes `[REDACTED]` in place. A coloured text line holding a credentia
 | `password=secret123` | `password=[REDACTED]` |
 | `{"clientSecret": "secret123"}` | `{"clientSecret": "[REDACTED]"}` |
 | `x-api-key: secret123` | `x-api-key: [REDACTED]` |
+| `Authorization: SSWS secret123` | `Authorization: [REDACTED]` |
 | `postgres://svc:p@ss/w@db/app` | `postgres://svc:[REDACTED]@db/app` |
 | `token_count=5` | `token_count=[REDACTED]` (over-masked) |
 | `partition_key=order_id` | unchanged |

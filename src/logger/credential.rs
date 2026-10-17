@@ -15,7 +15,9 @@
 //!
 //! [`mask_text`] applies that rule to free text: every URL password, every bearer
 //! token, and the value after every `key: value` or `key=value` whose key names a
-//! credential.
+//! credential. After a key naming an authorization header, an unquoted value is
+//! the scheme and the credentials after it, so `Authorization: Basic ...` masks
+//! whole.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -113,6 +115,9 @@ const BARE_NAMES: [&str; 4] = ["key", "keys", "value", "values"];
 
 /// The longest `Name(...)` value read as one value, in bytes; one that does not close within it is masked to the end of the text, and the bound keeps a line of unclosed parentheses linear.
 const MAX_WRAPPER_LEN: usize = 4096;
+
+/// A key holding this, in any case, names an authorization header, whose value is a scheme followed by its credentials.
+const AUTHORIZATION: &[u8] = b"authorization";
 
 /// The matcher over [`SENSITIVE_FIELDS`].
 static DEFAULT_MATCHER: LazyLock<CredentialMatcher> =
@@ -471,6 +476,13 @@ fn is_key_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
 }
 
+/// Whether `key` names an authorization header, as `Authorization`, `Proxy-Authorization` and `HTTP_AUTHORIZATION` do.
+fn names_authorization(key: &str) -> bool {
+    key.as_bytes()
+        .windows(AUTHORIZATION.len())
+        .any(|window| window.eq_ignore_ascii_case(AUTHORIZATION))
+}
+
 /// The next key followed by `separator` that starts at or after `from`.
 fn next_head(text: &str, from: usize, separator: Separator) -> Option<Head> {
     let bytes = text.as_bytes();
@@ -708,7 +720,9 @@ impl Read {
 /// reading may cross lines, as a double-quoted value after `:` and a
 /// `Name(...)` value may, to the end of the text short of a line break that
 /// ends it. A `Name(...)` value runs to its close, or to the end of the text
-/// when it does not close within [`MAX_WRAPPER_LEN`] bytes.
+/// when it does not close within [`MAX_WRAPPER_LEN`] bytes. An unquoted value
+/// read as an authorization header's runs on past its scheme through the
+/// credentials after it.
 struct Values<'a> {
     text: &'a str,
     /// Where the line holding the last value read on one line ends.
@@ -726,8 +740,8 @@ impl<'a> Values<'a> {
         }
     }
 
-    /// Read the value after a colon at `from`.
-    fn colon(&mut self, from: usize) -> Read {
+    /// Read the value after a colon at `from`, as an authorization header's when `header` is set.
+    fn colon(&mut self, from: usize, header: bool) -> Read {
         let text = self.text;
         match text.as_bytes().get(from) {
             Some(b'"') => match quoted_value_end(text, from, true) {
@@ -746,12 +760,12 @@ impl<'a> Values<'a> {
                     reach: self.line(from),
                 },
             },
-            _ => self.unquoted(from, unquoted_colon_end(text, from)),
+            _ => self.unquoted(from, unquoted_colon_end(text, from), header),
         }
     }
 
-    /// Read the value after an equals sign at `from`.
-    fn equals(&mut self, from: usize) -> Read {
+    /// Read the value after an equals sign at `from`, as an authorization header's when `header` is set.
+    fn equals(&mut self, from: usize, header: bool) -> Read {
         let text = self.text;
         if matches!(text.as_bytes().get(from), Some(b'"' | b'\'')) {
             return match quoted_value_end(text, from, false) {
@@ -763,13 +777,22 @@ impl<'a> Values<'a> {
                 },
             };
         }
-        self.unquoted(from, Some(unquoted_equals_end(text, from)))
+        self.unquoted(from, Some(unquoted_equals_end(text, from)), header)
     }
 
     /// Read an unquoted value ending at `end`, or further when a `Name(...)` value starts at `from`.
-    fn unquoted(&mut self, from: usize, end: Option<usize>) -> Read {
+    ///
+    /// With `header` set and no `Name(...)` value there, the value ending at
+    /// `end` is the scheme and the credentials after it are read too.
+    fn unquoted(&mut self, from: usize, end: Option<usize>, header: bool) -> Read {
         let (wrapped, reach) = self.wrapper(from);
-        let end = end.max(wrapped);
+        let mut end = end.max(wrapped);
+        if header
+            && reach.is_none()
+            && let Some(scheme_end) = end.filter(|&scheme_end| scheme_end > from)
+        {
+            end = Some(self.credentials(scheme_end));
+        }
         let low = end.unwrap_or(from);
         Read {
             end,
@@ -842,6 +865,57 @@ impl<'a> Values<'a> {
         never
     }
 
+    /// Where the credentials after a scheme ending at `scheme_end` end, or `scheme_end` when none follow.
+    ///
+    /// Spaces or tabs separate the scheme from its credentials, which are items
+    /// separated by commas, as in `Digest username="u", response="r"`. They
+    /// never cross a line.
+    fn credentials(&mut self, scheme_end: usize) -> usize {
+        let text = self.text;
+        let blanks_end = |from: usize| scan_until(text, from, |c| !matches!(c, ' ' | '\t'));
+        let mut at = blanks_end(scheme_end);
+        if at == scheme_end {
+            return scheme_end;
+        }
+        let mut end = scheme_end;
+        loop {
+            let item_end = self.credential_item(at);
+            if item_end == at {
+                return end;
+            }
+            end = item_end;
+            let comma = blanks_end(end);
+            if text.as_bytes().get(comma) != Some(&b',') {
+                return end;
+            }
+            at = blanks_end(comma + 1);
+        }
+    }
+
+    /// Where the credential item at `from` ends, or `from` when none starts there.
+    ///
+    /// An item runs to white space, `,`, `&`, `}` or `"`. A quoted string opens
+    /// at the item's start or after `=`, and one that does not close on its
+    /// line takes the item to the end of the line.
+    fn credential_item(&mut self, from: usize) -> usize {
+        let text = self.text;
+        let bytes = text.as_bytes();
+        let mut at = from;
+        while let Some(c) = text[at..].chars().next() {
+            if c == '"' && (at == from || bytes[at - 1] == b'=') {
+                match quoted_value_end(text, at, false) {
+                    Some(close) => at = close,
+                    None => return self.line(at),
+                }
+            } else if is_space(c) || matches!(c, ',' | '&' | '}' | '"') {
+                break;
+            } else {
+                at += c.len_utf8();
+            }
+        }
+        at
+    }
+
     /// Whether a quote like the one at `at` that no backslash escapes lies anywhere after it.
     fn closes_after(&mut self, at: usize) -> bool {
         let text = self.text;
@@ -890,12 +964,14 @@ fn pair_spans(
     let mut from = 0;
     while let Some(head) = next_head(text, from, separator) {
         from = head.end;
-        if head.start < copied || !matcher.matches(&text[head.start..head.key_end], "") {
+        let key = &text[head.start..head.key_end];
+        if head.start < copied || !matcher.matches(key, "") {
             continue;
         }
+        let header = names_authorization(key);
         let read = match separator {
-            Separator::Colon => values.colon(head.end),
-            Separator::Equals => values.equals(head.end),
+            Separator::Colon => values.colon(head.end, header),
+            Separator::Equals => values.equals(head.end, header),
         };
         let low = read.end.unwrap_or(head.end);
         if let Some(end) = read.end {
@@ -1013,6 +1089,8 @@ fn mask_pairs<'a>(text: &'a str, matcher: &CredentialMatcher, mask: &str) -> Cow
 ///
 /// Masks, in order: URL passwords, bearer tokens, the value after `key: value`
 /// and the value after `key=value`, where `matcher` names the key a credential.
+/// After an authorization header key the value is the scheme and its
+/// credentials, so `Authorization: Basic ...` masks whole.
 pub(super) fn mask_text<'a>(
     text: &'a str,
     matcher: &CredentialMatcher,
