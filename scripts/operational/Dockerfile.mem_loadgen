@@ -10,7 +10,7 @@
 # is light. Built + run by scripts/operational-mem-test.sh under `docker run
 # --memory` to observe the KERNEL outcome (OOM-killed vs survives).
 
-FROM rust:1-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS builder
+FROM rust:1-trixie@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --example mem_loadgen --features memory
