@@ -54,7 +54,8 @@ impl DeploymentContract {
     ///
     /// Each writable path needs a unique name of 1 to 50 lowercase letters,
     /// digits and inner hyphens, a unique absolute path, and a claim size when
-    /// it is persistent. Each added
+    /// it is persistent. Each hot path is a unique dotted path of letters,
+    /// digits, `_` and `-` segments, and needs a config file. Each added
     /// capability is an upper-case Linux capability name such as `NET_ADMIN`.
     /// Every `x-scalo-dial` marker in `config_schema` is `big` or `small`, and
     /// every `$ref` the dial search follows resolves.
@@ -90,6 +91,7 @@ impl DeploymentContract {
             check_port(index, port)?;
         }
         self.check_writable_paths()?;
+        self.check_hot_paths()?;
         self.check_security()?;
         if let Some(schema) = &self.config_schema {
             super::dials(schema)
@@ -121,6 +123,41 @@ impl DeploymentContract {
                     format!("{:?} is mounted by another writable path", writable.path),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The `hot_paths` half of [`validate`](Self::validate).
+    fn check_hot_paths(&self) -> Result<(), DeploymentError> {
+        let mut seen = BTreeSet::new();
+        for (index, path) in self.hot_paths.iter().enumerate() {
+            let field = format!("hot_paths[{index}]");
+            let named = path.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            });
+            if !named {
+                return Err(invalid(
+                    field,
+                    format!(
+                        "{path:?} is not a dotted config path of letters, digits, '_' and '-' \
+                         segments, e.g. routing.rules"
+                    ),
+                ));
+            }
+            if !seen.insert(path.as_str()) {
+                return Err(invalid(field, format!("{path:?} is listed twice")));
+            }
+        }
+        if !self.hot_paths.is_empty() && self.config_mount_path.is_empty() {
+            return Err(invalid(
+                "hot_paths".to_string(),
+                "names config paths, but the contract mounts no config file to reload them \
+                 from. Set config_mount_path"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -387,6 +424,7 @@ mod tests {
             security: SecurityContract::default(),
             singleton: false,
             service_account: ServiceAccount::Own,
+            hot_paths: vec![],
         }
     }
 
@@ -395,6 +433,29 @@ mod tests {
             Err(DeploymentError::InvalidContract { field, .. }) => field,
             other => panic!("the contract passed: {other:?}"),
         }
+    }
+
+    #[test]
+    fn hot_paths_are_dotted_unique_and_need_a_config_file() {
+        let mut c = contract();
+        c.config_mount_path = "/etc/app/config.yaml".into();
+        c.hot_paths = vec!["rules".into(), "routing.source-rules".into()];
+        c.validate().unwrap();
+
+        for (paths, field) in [
+            (vec!["rules", "rules"], "hot_paths[1]"),
+            (vec!["routing..rules"], "hot_paths[0]"),
+            (vec!["rules."], "hot_paths[0]"),
+            (vec!["a b"], "hot_paths[0]"),
+            (vec![""], "hot_paths[0]"),
+        ] {
+            c.hot_paths = paths.iter().map(|p| (*p).to_string()).collect();
+            assert_eq!(refused_field(&c), field, "{paths:?}");
+        }
+
+        c.hot_paths = vec!["rules".into()];
+        c.config_mount_path = String::new();
+        assert_eq!(refused_field(&c), "hot_paths");
     }
 
     #[test]

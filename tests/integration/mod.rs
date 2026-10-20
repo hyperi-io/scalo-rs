@@ -39,6 +39,9 @@ mod directory_config;
 #[cfg(feature = "expression")]
 mod expression;
 
+#[cfg(feature = "rules")]
+mod rules;
+
 #[cfg(feature = "http")]
 mod http_client_signed;
 

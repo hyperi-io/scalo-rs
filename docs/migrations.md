@@ -8,6 +8,24 @@ release and the target before bumping.
 
 ## Unreleased
 
+### The contract declares `hot_paths`, and the chart's checksum skips them (API CHANGE)
+
+`DeploymentContract` gains `hot_paths`, the dotted config paths the app reloads while it runs, left out of the JSON while empty. The scalo-service chart drops them from the pod's `checksum/config`, so an edit there reaches the mounted file without rolling the pods. `validate()` refuses a path that is not dotted letters, digits, `_` and `-`, one listed twice, and any path without a `config_mount_path`. See [deployment/contract.md](deployment/contract.md#hot-paths).
+
+**Consumer adjustment** -- a `DeploymentContract` struct literal names the new field: `hot_paths: vec![]` keeps today's chart. Copy `tests/fixtures/contract-parity/deployment-contract.json` to scalo-py, whose models must carry the field.
+
+### `rules` feature: ordered first-match rules (additive)
+
+New `scalo::rules`: a rule set that, per target field in order, takes the first row that matches and resolves a value. Native tests or CEL Fast conditions, literal, copy and bounded-lookup values, a per-call clamp to an allowed set, per-row hit counters (`rules_hits_total`, `rules_clamped_total`), and a reloader that keeps the last good set when a new one does not compile. See [pipeline/rules.md](pipeline/rules.md).
+
+**Consumer adjustment** -- none.
+
+### `expression::diagnose` spans each finding (additive)
+
+`diagnose` and `diagnose_with_config` return `Diagnostic { message, span }`, where `validate` returns strings: the profile scanner's findings span the function name, and a syntax error the character the parser stopped at. `scan_profile` is `check_profile_with_config` with spans.
+
+**Consumer adjustment** -- none.
+
 ### Credential names match in any spelling, and text masks `key: value` and URL passwords (BEHAVIOUR CHANGE)
 
 The logger decides every credential name through the new `logger::is_credential_name`: a name holding a default field anywhere in it, read as written and word by word. So `secretAccessKey`, `signingKey`, `api.key` and `ssl.key.pem`, which were logged in clear, are masked. `default_sensitive_fields()` adds `passphrase`, more token and secret spellings, the qualified keys (`signing_key`, `tls_key`, `ssh_key` and the rest), `jaas_config`, `header_value`, `session`, `cookie`, `csrf`, `cert`, `private`, `creds`, `connection_string`, `tfn`, `medicare`, `card_number`, `email` and `phone`. A bare `key` or `value` in a JSON line is judged with its parent's name.

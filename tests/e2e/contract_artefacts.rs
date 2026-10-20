@@ -99,6 +99,7 @@ fn test_contract() -> DeploymentContract {
         security: scalo::deployment::SecurityContract::default(),
         singleton: false,
         service_account: scalo::deployment::ServiceAccount::Own,
+        hot_paths: vec![],
         keda: None,
         default_config: None,
         depends_on: vec![],

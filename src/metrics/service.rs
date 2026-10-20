@@ -648,6 +648,26 @@ impl ServiceMetrics {
                 &[],
             )],
         );
+        #[cfg(feature = "rules")]
+        describe_platform(
+            &reg,
+            &[
+                (
+                    "rules_hits_total",
+                    "Records a rule set row set its target on, by rule set and row id",
+                    MetricType::Counter,
+                    "",
+                    &["rule_set", "rule"],
+                ),
+                (
+                    "rules_clamped_total",
+                    "Records whose clamped target the default replaced, by the row that set the refused value, or (record)",
+                    MetricType::Counter,
+                    "",
+                    &["rule_set", "rule"],
+                ),
+            ],
+        );
 
         // --- DLQ ---
         for (name, desc, labels) in [

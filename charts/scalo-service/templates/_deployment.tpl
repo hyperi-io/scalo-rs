@@ -14,7 +14,7 @@ scalo-service.containerPorts -- the metrics port, then every port the app listen
 {{/*
 scalo-service.deployment -- the app's Deployment. Its selector is the name label alone,
 and its pod template carries a checksum of the config file and file sets, so a config
-change rolls the pods.
+change rolls the pods, except at a contract hot path the app reloads in place.
 */}}
 {{- define "scalo-service.deployment" -}}
 {{- $contract := include "scalo-service.contract" . | fromJson -}}
@@ -46,7 +46,7 @@ change rolls the pods.
 {{- $_ = set $pod "volumes" $volumes.volumes -}}
 {{- $podAnnotations := include "scalo-service.prometheusAnnotations" . | fromJson -}}
 {{- if $contract.config_mount_path -}}
-{{- $_ = set $podAnnotations "checksum/config" (include "scalo-service.configFile" . | sha256sum) -}}
+{{- $_ = set $podAnnotations "checksum/config" (include "scalo-service.configChecksumInput" . | sha256sum) -}}
 {{- end -}}
 {{- with .Values.fileSets -}}
 {{- $_ = set $podAnnotations "checksum/files" (toJson . | sha256sum) -}}

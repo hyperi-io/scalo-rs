@@ -13,6 +13,8 @@
 //! unbounded or unpredictable cost are blocked by default but can be
 //! unlocked per-category via [`ProfileConfig`].
 
+use super::diagnostic::{Diagnostic, Span};
+
 /// CEL functions allowed unconditionally in the profile.
 ///
 /// Enforced as an ALLOWLIST: a function in neither this slice nor a restricted
@@ -134,6 +136,16 @@ pub fn check_profile(expr: &str) -> Vec<String> {
 /// Returns a list of error strings (empty if compliant).
 #[must_use]
 pub fn check_profile_with_config(expr: &str, config: &ProfileConfig) -> Vec<String> {
+    scan_profile(expr, config)
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+/// [`check_profile_with_config`] with the byte span of each offending function
+/// name.
+#[must_use]
+pub fn scan_profile(expr: &str, config: &ProfileConfig) -> Vec<Diagnostic> {
     // No early return on an empty blocked list. `blocked_functions()` is empty
     // when all three categories are unlocked, and returning here skipped the
     // allowlist check too -- so the most permissive config was also the one that
@@ -177,18 +189,25 @@ pub fn check_profile_with_config(expr: &str, config: &ProfileConfig) -> Vec<Stri
                 continue;
             }
 
+            let span = Some(Span::new(start, i));
             if blocked.contains(&name) {
                 let reason = restriction_reason(name);
-                errors.push(format!(
-                    "Function '{name}()' is not allowed in the expression profile. {reason}"
+                errors.push(Diagnostic::new(
+                    format!(
+                        "Function '{name}()' is not allowed in the expression profile. {reason}"
+                    ),
+                    span,
                 ));
             } else if !ALLOWED_FUNCTIONS.contains(&name) && !DISALLOWED_FUNCTIONS.contains(&name) {
                 // In neither list. A restricted-but-unlocked function IS in
                 // DISALLOWED_FUNCTIONS, so it falls through here and passes.
-                errors.push(format!(
-                    "Function '{name}()' is not in the expression profile. Check \
-                     the spelling, or add it to ALLOWED_FUNCTIONS if it belongs \
-                     in the profile."
+                errors.push(Diagnostic::new(
+                    format!(
+                        "Function '{name}()' is not in the expression profile. Check \
+                         the spelling, or add it to ALLOWED_FUNCTIONS if it belongs \
+                         in the profile."
+                    ),
+                    span,
                 ));
             }
         }
@@ -559,5 +578,47 @@ mod tests {
     fn multiple_violations_reported() {
         let errors = check_profile("[1].map(x, x).filter(y, y > 0)");
         assert_eq!(errors.len(), 2);
+    }
+
+    // -- Spans ----------------------------------------------------
+
+    /// Each finding carries the byte range of the function name, so an editor
+    /// can underline the call rather than the whole expression.
+    #[test]
+    fn scan_spans_cover_the_function_name() {
+        let expr = r#"host.startsWith("w") && name.matches("^x") || nosuch(y)"#;
+        let found = scan_profile(expr, &ProfileConfig::default());
+        let named: Vec<&str> = found
+            .iter()
+            .map(|d| {
+                let span = d.span.expect("a profile finding has a span");
+                &expr[span.start..span.end]
+            })
+            .collect();
+        assert_eq!(named, ["matches", "nosuch"]);
+    }
+
+    /// The string-only API reports exactly what the span scan finds.
+    #[test]
+    fn check_profile_is_the_span_scan_without_spans() {
+        let expr = "[1].map(x, x) && bogus(z)";
+        let config = ProfileConfig::default();
+        let messages: Vec<String> = scan_profile(expr, &config)
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert_eq!(check_profile_with_config(expr, &config), messages);
+    }
+
+    /// A name inside a string literal is skipped, so a later call's span is
+    /// still the call's own bytes.
+    #[test]
+    fn a_span_after_a_string_literal_is_the_calls_own() {
+        let expr = r#"msg.contains("map(") && x.map(a, a)"#;
+        let found = scan_profile(expr, &ProfileConfig::default());
+        assert_eq!(found.len(), 1);
+        let span = found[0].span.expect("span");
+        assert_eq!(&expr[span.start..span.end], "map");
+        assert_eq!(span.start, expr.rfind("map").expect("second map"));
     }
 }

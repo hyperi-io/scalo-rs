@@ -207,6 +207,7 @@ fn parity_contract() -> DeploymentContract {
         },
         singleton: false,
         service_account: ServiceAccount::None,
+        hot_paths: vec!["rules".into(), "routing.source_rules".into()],
     }
 }
 
@@ -266,6 +267,7 @@ fn contract_parity_fixture_carries_every_optional_key() {
         "/security/capabilities_add",
         "/singleton",
         "/service_account",
+        "/hot_paths",
         "/config_schema/$defs/SourceSection/properties/batch_size/x-scalo-dial",
     ] {
         assert!(
@@ -343,7 +345,7 @@ fn contract_parity_fixture_passes_the_committed_schema() {
 fn contracts_the_committed_schema_refuses() {
     let validator = committed_schema_validator();
     let base: serde_json::Value = serde_json::from_str(&emitted()).expect("contract JSON");
-    let broken: [(&str, fn(&mut serde_json::Value)); 8] = [
+    let broken: [(&str, fn(&mut serde_json::Value)); 9] = [
         ("app_name missing", |c| {
             c.as_object_mut().unwrap().remove("app_name");
         }),
@@ -368,6 +370,9 @@ fn contracts_the_committed_schema_refuses() {
         }),
         ("service account unknown", |c| {
             c["service_account"] = "external".into();
+        }),
+        ("hot path not dotted", |c| {
+            c["hot_paths"][0] = "routing..rules".into();
         }),
     ];
     for (case, mutate) in broken {

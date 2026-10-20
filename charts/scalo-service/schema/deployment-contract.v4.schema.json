@@ -195,6 +195,14 @@
       "description": "Whether the chart gives the pod a ServiceAccount of its own. Left out of\nthe serialised contract while it is [`ServiceAccount::Own`].",
       "$ref": "#/$defs/ServiceAccount",
       "default": "own"
+    },
+    "hot_paths": {
+      "description": "Dotted config paths the app reloads while it runs, e.g. `rules`. The\nscalo-service chart leaves them out of the pod's config checksum, so an\nedit there reaches the mounted file without rolling the pods. Each\nsegment is letters, digits, `_` or `-`.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$"
+      }
     }
   },
   "required": [

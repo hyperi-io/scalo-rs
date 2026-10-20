@@ -45,6 +45,11 @@
 //! // Validate (returns errors list, empty if valid)
 //! assert!(validate(r#"severity == "critical""#).is_empty());
 //!
+//! // Diagnose: the same findings, each with the byte span it covers
+//! let expr = r#"name.matches("^x")"#;
+//! let found = scalo::expression::diagnose(expr);
+//! assert_eq!(found[0].span.map(|s| &expr[s.start..s.end]), Some("matches"));
+//!
 //! // One-shot evaluation
 //! let mut data = HashMap::new();
 //! data.insert("amount".into(), json!(15000));
@@ -59,16 +64,18 @@
 //! // ... program.execute(&context) per record
 //! ```
 
+pub mod diagnostic;
 pub mod error;
 pub mod evaluator;
 pub mod profile;
 
+pub use diagnostic::{Diagnostic, Span};
 pub use error::{ExpressionError, ExpressionResult};
 pub use evaluator::{
-    build_context, compile, compile_with_config, evaluate, evaluate_condition, validate,
-    validate_with_config,
+    build_context, compile, compile_with_config, diagnose, diagnose_with_config, evaluate,
+    evaluate_condition, validate, validate_with_config,
 };
 pub use profile::{
     ALLOWED_FUNCTIONS, DISALLOWED_FUNCTIONS, ProfileConfig, RESTRICTED_ITERATION, RESTRICTED_REGEX,
-    RESTRICTED_TIME, check_profile_with_config,
+    RESTRICTED_TIME, check_profile_with_config, scan_profile,
 };

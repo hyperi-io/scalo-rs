@@ -109,6 +109,7 @@ The config file and every file set sit base64-encoded under the ConfigMap's `bin
 | `security` | uid, gid, fsGroup, read-only root filesystem, added capabilities | 1000, 1000, 1000, read-only, none |
 | `singleton` | one replica, Recreate, no autoscaler, no budget | false |
 | `service_account` | `own`: a ServiceAccount the pod runs as; `none`: no ServiceAccount, and the pod names none, so it runs as the namespace's `default` account | `own` |
+| `hot_paths` | dotted config paths left out of the pod's `checksum/config`, with any parent the removal empties, so an edit there reaches the mounted file without rolling the pods. Ignored under `configMount.subPath`, whose file never refreshes | every config key counts |
 
 A condition reads its `path` from values. A path under `config.` reads the config the app ends up running: the contract's `default_config`, then `config`, then `configOverrides`. So a port the app opens by default is open without anyone setting it. A missing or null value never satisfies a condition.
 

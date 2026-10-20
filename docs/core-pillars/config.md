@@ -198,6 +198,7 @@ config::registry::on_change("kafka", |new_section| {
 ```
 
 See [reloader.rs](../../src/config/reloader.rs) and [shared.rs](../../src/config/shared.rs).
+`scalo::rules::reloader` builds one for a rule set in a section of the config file ([../pipeline/rules.md](../pipeline/rules.md#hot-reload)), and the contract's `hot_paths` keeps an edit there from rolling the pods ([../deployment/contract.md](../deployment/contract.md#hot-paths)).
 
 ---
 

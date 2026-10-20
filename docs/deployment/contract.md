@@ -35,7 +35,7 @@ library chart renders version 4 only.
 | 1 | Initial shape -- no `image_profile`, no `oci_labels` |
 | 2 | `ImageProfile`, `OciLabels`, `SecretGroupContract` |
 | 3 | Adds `config_schema` + `capabilities` |
-| 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `service_account`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, the `x-scalo-dial` keyword in `config_schema`; `config_mount_path` may be empty |
+| 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `service_account`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, `hot_paths`, the `x-scalo-dial` keyword in `config_schema`, and `config_mount_path` may be empty |
 
 An app that writes `schema_version: 3` in its struct literal still emits 3, and
 a version-4 reader refuses it; write `CONTRACT_SCHEMA_VERSION` instead. Serde
@@ -157,6 +157,7 @@ let contract = DeploymentContract {
     security: SecurityContract::default(),
     singleton: false,
     service_account: ServiceAccount::Own,
+    hot_paths: vec!["routing.rules".into()],
 };
 ```
 
@@ -193,6 +194,7 @@ let contract = DeploymentContract {
 | `security` | `SecurityContract` | uid/gid/fsGroup 1000, read-only root | Identity and capabilities the image runs with (v4) |
 | `singleton` | `bool` | `false` | Exactly one pod: no autoscaling, Recreate rollout (v4) |
 | `service_account` | `ServiceAccount` | `Own` | `none` for an app that calls no Kubernetes API: the chart creates no ServiceAccount and the pod names none. Omitted from the JSON while `own` (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
+| `hot_paths` | `Vec<String>` | `[]` | Dotted config paths the app reloads while it runs. Omitted from the JSON while empty (v4) -- see [Hot paths](#hot-paths) |
 
 `HealthContract` fields:
 
@@ -271,6 +273,24 @@ singleton: true,
 A chart always adds a scratch `/tmp` beside the declared paths.
 
 `service_account: ServiceAccount::None` (`"none"` in the JSON) is for an app with no Kubernetes client and no use for a token. The scalo-service chart then creates no ServiceAccount and leaves `serviceAccountName` off the pod, so it runs as the namespace's `default` account with the token still unmounted. Values can still set `serviceAccount.create` either way, or `serviceAccount.name` to run as an account the operator supplies.
+
+---
+
+## Hot paths
+
+`hot_paths` names the config sections an app reloads from its mounted config file while it runs, such as a rule set behind a [`ConfigReloader`](../core-pillars/config.md#hot-reload) ([../pipeline/rules.md](../pipeline/rules.md#hot-reload)). The scalo-service chart hashes the config into the pod's `checksum/config` annotation to roll the pods on a change, and leaves these paths out of that hash. An edit under a hot path then reaches the running pods through the ConfigMap the kubelet refreshes, and an edit anywhere else still rolls them.
+
+```rust
+hot_paths: vec!["rules".into(), "routing.source_rules".into()],
+```
+
+| Rule | Why |
+| --- | --- |
+| Each path is dotted, each segment letters, digits, `_` or `-` | The chart splits it on `.` to walk the values |
+| Unique | Listed once |
+| Needs `config_mount_path` | No config file, nothing to reload |
+
+A parent the removal leaves empty is dropped from the hash too, so adding the first entry under a hot path rolls nothing. The ConfigMap itself keeps every key. With `configMount.subPath` the kubelet never refreshes the file, so the chart hashes every path and an edit rolls the pods. `validate()` refuses a path that breaks the rules above.
 
 ---
 
@@ -353,7 +373,13 @@ A port without `when` is always on: in every `EXPOSE`, `expose_ports` and publis
 - a protocol of TCP, UDP or SCTP, in any case
 - no control character in a `when` path or value, in `bound_from`, or in `app_protocol`
 
-Beyond the ports, `validate()` requires each writable path to have a unique name of 1 to 50 lowercase letters, digits and inner hyphens, a unique absolute path, and a size when it is persistent; each `security.capabilities_add` entry to be an upper-case capability name such as `NET_ADMIN`; a `singleton` to leave KEDA off; and every `x-scalo-dial` in `config_schema` to be `big` or `small`, with every `$ref` the dial search follows resolving.
+Beyond the ports, `validate()` requires:
+
+- each writable path to have a unique name of 1 to 50 lowercase letters, digits and inner hyphens, a unique absolute path, and a size when it is persistent
+- each hot path to be a unique dotted path beside a config file ([Hot paths](#hot-paths))
+- each `security.capabilities_add` entry to be an upper-case capability name such as `NET_ADMIN`
+- a `singleton` to leave KEDA off
+- every `x-scalo-dial` in `config_schema` to be `big` or `small`, with every `$ref` the dial search follows resolving
 
 `generate_dockerfile`, `generate_runtime_stage` and `generate_compose_fragment` return text rather than a `Result`, so they cannot refuse. They print a gated port's name and condition onto one comment line with any control character escaped, so a newline in a contract value cannot start a Dockerfile instruction or a YAML key. Run `validate()` in a test to catch the contract itself.
 

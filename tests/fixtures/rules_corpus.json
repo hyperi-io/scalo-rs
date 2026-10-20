@@ -1,0 +1,220 @@
+{
+  "_comment": "Shared corpus for the rules engine. scalo-rs runs it in tests/integration/rules.rs and scalo-py keeps a copy for its validator and evaluator: both must give these findings and outcomes. Spans are byte offsets into the `when` text, end exclusive. Keep the file ASCII so byte and character offsets agree.",
+  "_columns": "compile: config, allow_regex, findings[] of {severity, location, rule, span, contains}. evaluate: config, clamp {target, allowed, default}, cases[] of {record, expect {target: {value, rule}}, clamp kept|replaced|defaulted}.",
+  "compile": [
+    {
+      "name": "a clean set has no findings",
+      "config": {
+        "name": "clean",
+        "targets": ["_source", "_org_id"],
+        "lookups": { "aliases": { "logs_syslog": "syslog" } },
+        "rules": [
+          { "id": "alias", "set": { "_source": { "lookup": "aliases", "from": "tags.event.category" } } },
+          { "id": "web", "match": { "field": "host", "op": "starts_with", "value": "web-" }, "set": { "_source": { "value": "web" } } },
+          { "id": "org", "when": "has(tags.event) && size(host) > 3", "set": { "_org_id": { "from": "tags.event.org_id" } } }
+        ]
+      },
+      "findings": []
+    },
+    {
+      "name": "a restricted function in a condition is spanned by the scanner",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "r1", "when": "severity == \"high\" && host.matches(\"^w\")", "set": { "_source": { "value": "x" } } }
+        ]
+      },
+      "findings": [
+        { "severity": "error", "location": "rules[0].when", "rule": "r1", "span": [27, 34], "contains": "matches()" }
+      ]
+    },
+    {
+      "name": "an unknown function in a condition is spanned by the scanner",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "r1", "when": "sizeof(tags) > 3", "set": { "_source": { "value": "x" } } }
+        ]
+      },
+      "findings": [
+        { "severity": "error", "location": "rules[0].when", "rule": "r1", "span": [0, 6], "contains": "not in the expression profile" }
+      ]
+    },
+    {
+      "name": "a syntax error is spanned at the parser position",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "r1", "when": "severity == && x", "set": { "_source": { "value": "x" } } }
+        ]
+      },
+      "findings": [
+        { "severity": "error", "location": "rules[0].when", "rule": "r1", "span": [12, 13], "contains": "Syntax error" }
+      ]
+    },
+    {
+      "name": "a duplicate id is refused",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "dup", "set": { "_source": { "value": "a" } } },
+          { "id": "dup", "match": { "field": "h", "op": "exists" }, "set": { "_source": { "value": "b" } } }
+        ]
+      },
+      "findings": [
+        { "severity": "error", "location": "rules[1].id", "rule": "dup", "span": null, "contains": "earlier row" }
+      ]
+    },
+    {
+      "name": "regex is refused while the profile turns it off",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "re", "match": { "field": "host", "op": "regex", "value": "^web-[0-9]+$" }, "set": { "_source": { "value": "web" } } }
+        ]
+      },
+      "findings": [
+        { "severity": "error", "location": "rules[0].match.op", "rule": "re", "span": null, "contains": "allow_regex" }
+      ]
+    },
+    {
+      "name": "regex compiles where the profile allows it",
+      "allow_regex": true,
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "re", "match": { "field": "host", "op": "regex", "value": "^web-[0-9]+$" }, "set": { "_source": { "value": "web" } } }
+        ]
+      },
+      "findings": []
+    },
+    {
+      "name": "a lookup naming no table, and a row for an unlisted target",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "a", "set": { "_source": { "lookup": "nowhere", "from": "cat" } } },
+          { "id": "b", "set": { "_tags": { "value": "x" } } }
+        ]
+      },
+      "findings": [
+        { "severity": "error", "location": "rules[0].set._source.lookup", "rule": "a", "span": null, "contains": "no table" },
+        { "severity": "error", "location": "rules[1].set._tags", "rule": "b", "span": null, "contains": "not one of the set's targets" }
+      ]
+    },
+    {
+      "name": "operands an op does not take, and match beside when",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "a", "match": { "field": "h", "op": "equals", "value": "x", "min": 2 }, "set": { "_source": { "value": "x" } } },
+          { "id": "b", "match": { "field": "h", "op": "exists" }, "when": "h == 1", "set": { "_source": { "value": "y" } } },
+          { "id": "c", "set": { "_source": { "value": "" } } }
+        ]
+      },
+      "findings": [
+        { "severity": "error", "location": "rules[0].match.min", "rule": "a", "span": null, "contains": "does not apply" },
+        { "severity": "error", "location": "rules[1]", "rule": "b", "span": null, "contains": "both" },
+        { "severity": "error", "location": "rules[2].set._source.value", "rule": "c", "span": null, "contains": "empty" }
+      ]
+    },
+    {
+      "name": "shadowed rows are warnings, and the set still compiles",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "has-host", "match": { "field": "host", "op": "exists" }, "set": { "_source": { "value": "a" } } },
+          { "id": "web", "match": { "field": "host", "op": "starts_with", "value": "web" }, "set": { "_source": { "value": "b" } } },
+          { "id": "catch-all", "set": { "_source": { "value": "main" } } },
+          { "id": "late", "match": { "field": "kind", "op": "equals", "value": "x" }, "set": { "_source": { "value": "c" } } }
+        ]
+      },
+      "findings": [
+        { "severity": "warning", "location": "rules[1]", "rule": "web", "span": null, "contains": "has-host" },
+        { "severity": "warning", "location": "rules[3]", "rule": "late", "span": null, "contains": "catch-all" }
+      ]
+    }
+  ],
+  "evaluate": [
+    {
+      "name": "targets in order: a header compatibility shape",
+      "config": {
+        "name": "compat",
+        "targets": ["_source", "_org_id"],
+        "lookups": { "aliases": { "logs_syslog": "syslog", "logs_beats_winlog": "windows" } },
+        "rules": [
+          { "id": "category", "set": { "_source": { "lookup": "aliases", "from": "tags.event.category" } } },
+          { "id": "main", "set": { "_source": { "value": "main" } } },
+          { "id": "org-tags", "match": { "field": "tags.event.org_id", "op": "exists" }, "set": { "_org_id": { "from": "tags.event.org_id" } } },
+          { "id": "org-flat", "match": { "field": "org_id", "op": "exists" }, "set": { "_org_id": { "from": "org_id" } } },
+          { "id": "org-windows", "match": { "field": "_source", "op": "equals", "value": "windows" }, "set": { "_org_id": { "value": "win-ops" } } }
+        ]
+      },
+      "cases": [
+        {
+          "record": { "tags": { "event": { "category": "logs_syslog", "org_id": "acme" } }, "org_id": "beta" },
+          "expect": { "_source": { "value": "syslog", "rule": "category" }, "_org_id": { "value": "acme", "rule": "org-tags" } }
+        },
+        {
+          "record": { "tags": { "event": { "category": "logs_unheard_of" } }, "org_id": "beta" },
+          "expect": { "_source": { "value": "main", "rule": "main" }, "_org_id": { "value": "beta", "rule": "org-flat" } }
+        },
+        {
+          "record": { "tags": { "event": { "category": "logs_beats_winlog", "org_id": "" } } },
+          "expect": { "_source": { "value": "windows", "rule": "category" }, "_org_id": { "value": "win-ops", "rule": "org-windows" } }
+        },
+        {
+          "record": {},
+          "expect": { "_source": { "value": "main", "rule": "main" } }
+        }
+      ]
+    },
+    {
+      "name": "the clamp holds the org to the allowed set",
+      "config": {
+        "targets": ["_source", "_org_id"],
+        "rules": [
+          { "id": "sender", "set": { "_org_id": { "from": "tenant" } } },
+          { "id": "web", "match": { "field": "host", "op": "starts_with", "value": "web" }, "set": { "_org_id": { "value": "web-org" } } }
+        ]
+      },
+      "clamp": { "target": "_org_id", "allowed": ["acme", "default"], "default": "default" },
+      "cases": [
+        { "record": { "tenant": "acme" }, "expect": { "_org_id": { "value": "acme", "rule": "sender" } }, "clamp": "kept" },
+        { "record": { "tenant": "evil" }, "expect": { "_org_id": { "value": "default", "rule": null } }, "clamp": "replaced" },
+        { "record": { "host": "web-1" }, "expect": { "_org_id": { "value": "default", "rule": null } }, "clamp": "replaced" },
+        { "record": { "_org_id": "evil" }, "expect": { "_org_id": { "value": "default", "rule": null } }, "clamp": "replaced" },
+        { "record": { "_org_id": "acme" }, "expect": {}, "clamp": "kept" },
+        { "record": {}, "expect": { "_org_id": { "value": "default", "rule": null } }, "clamp": "defaulted" }
+      ]
+    },
+    {
+      "name": "every native test",
+      "config": {
+        "targets": ["_source"],
+        "rules": [
+          { "id": "eq", "match": { "field": "h", "op": "equals", "value": "exact" }, "set": { "_source": { "value": "eq" } } },
+          { "id": "sw", "match": { "field": "h", "op": "starts_with", "value": "web-" }, "set": { "_source": { "value": "sw" } } },
+          { "id": "ew", "match": { "field": "h", "op": "ends_with", "value": ".internal" }, "set": { "_source": { "value": "ew" } } },
+          { "id": "ps", "match": { "field": "h", "op": "prefix_and_suffix", "prefix": "db", "suffix": "prod" }, "set": { "_source": { "value": "ps" } } },
+          { "id": "ct", "match": { "field": "h", "op": "contains", "value": "cache" }, "set": { "_source": { "value": "ct" } } },
+          { "id": "len", "match": { "field": "h", "op": "length", "min": 1, "max": 3 }, "set": { "_source": { "value": "len" } } },
+          { "id": "all", "match": { "all": [ { "field": "h", "op": "starts_with", "value": "q" }, { "field": "env", "op": "equals", "value": "dev" } ] }, "set": { "_source": { "value": "all" } } },
+          { "id": "nc", "match": { "field": "h", "op": "contains", "value": "x", "negate": true }, "set": { "_source": { "value": "nc" } } }
+        ]
+      },
+      "cases": [
+        { "record": { "h": "exact" }, "expect": { "_source": { "value": "eq", "rule": "eq" } } },
+        { "record": { "h": "web-01" }, "expect": { "_source": { "value": "sw", "rule": "sw" } } },
+        { "record": { "h": "x.internal" }, "expect": { "_source": { "value": "ew", "rule": "ew" } } },
+        { "record": { "h": "db-x-prod" }, "expect": { "_source": { "value": "ps", "rule": "ps" } } },
+        { "record": { "h": "xcachex" }, "expect": { "_source": { "value": "ct", "rule": "ct" } } },
+        { "record": { "h": "abc" }, "expect": { "_source": { "value": "len", "rule": "len" } } },
+        { "record": { "h": "qxyz", "env": "dev" }, "expect": { "_source": { "value": "all", "rule": "all" } } },
+        { "record": { "h": "qxyz", "env": "prod" }, "expect": {} },
+        { "record": { "h": "abcd" }, "expect": { "_source": { "value": "nc", "rule": "nc" } } },
+        { "record": {}, "expect": { "_source": { "value": "nc", "rule": "nc" } } }
+      ]
+    }
+  ]
+}
