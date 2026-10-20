@@ -51,7 +51,7 @@ Rows are listed in one sequence and grouped by target when they compile, each ta
 
 ### Native tests
 
-Every test but `exists` reads the field's text: a string as written, a number or boolean as its JSON text. A missing field, null, an object or an array fails every test, and so passes a negated one.
+Every test but `exists` reads the field's text: a string as written, a number or boolean as its JSON text. From raw JSON bytes (`JsonPayload`) a number reads as written, but a `serde_json::Value` formats it with `to_string()`, so `1.50` reads `1.50` from bytes and `1.5` from a `Value`. A missing field, null, an object or an array fails every test, and so passes a negated one.
 
 | `op` | Operands | Holds when the text |
 | --- | --- | --- |
@@ -116,7 +116,7 @@ One pass reports every finding, so an editor shows them all at once. A `RuleDiag
 
 Warnings are reported once the set has no errors. Errors: a duplicate or malformed id, a row setting zero or several targets or one the set does not list, `match` beside `when`, a missing or stray operand, `regex` with the profile off, a pattern that does not compile, a lookup naming no table, an empty literal, a table over its bound, a CEL condition the profile refuses or that does not parse. Warnings: a row an earlier row of the same target always fires before, because the earlier row sets a literal and is unconditional, has the same test, or is a plain `exists` on the field the later row needs. `RuleSet::warnings()` keeps the warnings of a compiled set.
 
-`tests/fixtures/rules_corpus.json` pins findings, spans and outcomes, and scalo-py keeps a copy for its own validator.
+`tests/fixtures/rules_corpus.json` pins findings, spans and outcomes, and is the parity fixture a scalo-py implementation is tested against.
 
 ---
 
@@ -144,6 +144,8 @@ A record is anything that implements `FieldSource`. `JsonPayload` reads raw JSON
 | `get(target)` / `value(target)` | The assignment, `None` when no row set it and the clamp left the record's value |
 | `iter()` | Each assigned field with its value and row, in target order |
 | `clamp()` | `Kept`, `Replaced { was, rule }` or `Defaulted`, `None` without a clamp |
+
+`set.target(field)` returns a `TargetId`, an index into the set it came from. On another set it names that set's target at the same position, or nothing when that set has fewer targets, so a caller that keeps one must resolve it again after a reload.
 
 ### The clamp
 
