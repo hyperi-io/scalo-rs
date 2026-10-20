@@ -3,6 +3,14 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.18](https://github.com/hyperi-io/scalo-rs/compare/v2.14.17...v2.14.18) (2026-10-20)
+
+### Bug Fixes
+
+* add the rules engine and contract hot paths ([#370](https://github.com/hyperi-io/scalo-rs/issues/370)) ([e11f3ce](https://github.com/hyperi-io/scalo-rs/commit/e11f3ce696ce2cfca25e2510a2c2793863fdfc97))
+* **deps:** update rust:1-trixie Docker digest to e259494 ([#365](https://github.com/hyperi-io/scalo-rs/issues/365)) ([bea6e46](https://github.com/hyperi-io/scalo-rs/commit/bea6e46e8374ddc682b4e5518ac601595682e16b))
+* start Kafka auto-discovery with broker down ([#364](https://github.com/hyperi-io/scalo-rs/issues/364)) ([a09fb85](https://github.com/hyperi-io/scalo-rs/commit/a09fb85a019a3dc4413fa215435dafb21dd661bb))
+
 ## [2.14.17](https://github.com/hyperi-io/scalo-rs/compare/v2.14.16...v2.14.17) (2026-10-17)
 
 ### Bug Fixes
