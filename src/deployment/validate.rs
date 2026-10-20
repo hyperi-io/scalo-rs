@@ -153,6 +153,7 @@ mod tests {
             security: super::super::SecurityContract::default(),
             singleton: false,
             service_account: super::super::ServiceAccount::Own,
+            hot_paths: vec![],
         }
     }
 

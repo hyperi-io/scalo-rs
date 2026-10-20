@@ -9,6 +9,42 @@ defaults stay authoritative and no stale key is frozen into a deployment.
 {{- end -}}
 
 {{/*
+scalo-service.configChecksumInput -- the rendered app config with the contract's hot_paths
+removed, which the pod's checksum/config hashes: the app reloads those paths from the
+mounted file, so an edit there must not roll the pods. A parent map the removal leaves
+empty goes too, so adding the first entry under a hot path rolls nothing either. A subPath
+mount never sees the file change, so with configMount.subPath every path counts.
+*/}}
+{{- define "scalo-service.configChecksumInput" -}}
+{{- $contract := include "scalo-service.contract" . | fromJson -}}
+{{- $config := mergeOverwrite (deepCopy (.Values.config | default dict)) (deepCopy (.Values.configOverrides | default dict)) -}}
+{{- if not (.Values.configMount | default dict).subPath -}}
+{{- range $path := $contract.hot_paths | default list -}}
+{{- $segments := splitList "." $path -}}
+{{- range $depth := untilStep (len $segments) 0 -1 -}}
+{{- $prefix := slice $segments 0 $depth -}}
+{{- $node := $config -}}
+{{- range $segment := initial $prefix -}}
+{{- if and (kindIs "map" $node) (hasKey $node $segment) -}}
+{{- $node = get $node $segment -}}
+{{- else -}}
+{{- $node = dict -}}
+{{- end -}}
+{{- end -}}
+{{- $key := last $prefix -}}
+{{- if and (kindIs "map" $node) (hasKey $node $key) -}}
+{{- $child := get $node $key -}}
+{{- if or (eq $depth (len $segments)) (and (kindIs "map" $child) (empty $child)) -}}
+{{- $_ := unset $node $key -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- printf "%s\n" (ternary (toYaml $config) "{}" (not (empty $config))) -}}
+{{- end -}}
+
+{{/*
 scalo-service.volumes -- the pod's volumes and the app container's mounts, as
 {"volumes": [...], "mounts": [...]}: the config ConfigMap when the contract names a
 config file, each writable path as an emptyDir or its claim, each file set, the

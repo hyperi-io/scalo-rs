@@ -31,6 +31,7 @@ when the happy path is failing.
 | [spool.md](spool.md) | disk-backed async FIFO |
 | [dlq.md](dlq.md) | file, Kafka and HTTP backends |
 | [strmatch.md](strmatch.md) | 4-tier regex to fast-path matcher |
+| [rules.md](rules.md) | ordered first-match rules that set target fields, clamp, hit counters, hot reload |
 | [scaling.md](scaling.md) | `ScalingPressure`, KEDA external scaler signal |
 
 For why the pipeline throttles the way it does, read

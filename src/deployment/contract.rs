@@ -212,6 +212,17 @@ pub struct DeploymentContract {
     // schemars drops the default of a field serde skips at its default, and a reader outside Rust needs it.
     #[cfg_attr(feature = "config-schema", schemars(extend("default" = "own")))]
     pub service_account: ServiceAccount,
+
+    /// Dotted config paths the app reloads while it runs, e.g. `rules`. The
+    /// scalo-service chart leaves them out of the pod's config checksum, so an
+    /// edit there reaches the mounted file without rolling the pods. Each
+    /// segment is letters, digits, `_` or `-`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(inner(regex(pattern = r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$")))
+    )]
+    pub hot_paths: Vec<String>,
 }
 
 /// Whether the chart gives the pod a ServiceAccount of its own.
@@ -980,6 +991,7 @@ mod tests {
             security: SecurityContract::default(),
             singleton: false,
             service_account: ServiceAccount::Own,
+            hot_paths: vec![],
         };
         let json = contract.to_json().unwrap();
         assert!(json.contains("test-app"));
@@ -1025,6 +1037,7 @@ mod tests {
             security: SecurityContract::default(),
             singleton: false,
             service_account: ServiceAccount::Own,
+            hot_paths: vec![],
         };
         let json = contract.to_json().unwrap();
         let parsed: DeploymentContract = serde_json::from_str(&json).unwrap();
@@ -1064,6 +1077,7 @@ mod tests {
             security: SecurityContract::default(),
             singleton: false,
             service_account: ServiceAccount::Own,
+            hot_paths: vec![],
         };
         assert_eq!(contract.binary(), "my-app");
     }
@@ -1100,6 +1114,7 @@ mod tests {
             security: SecurityContract::default(),
             singleton: false,
             service_account: ServiceAccount::Own,
+            hot_paths: vec![],
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
         assert_eq!(contract.config_dir(), "/etc/dfe");
@@ -1137,6 +1152,7 @@ mod tests {
             security: SecurityContract::default(),
             singleton: false,
             service_account: ServiceAccount::Own,
+            hot_paths: vec![],
         }
     }
 

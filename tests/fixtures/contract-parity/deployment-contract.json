@@ -332,5 +332,9 @@
     ]
   },
   "singleton": false,
-  "service_account": "none"
+  "service_account": "none",
+  "hot_paths": [
+    "rules",
+    "routing.source_rules"
+  ]
 }

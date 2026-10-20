@@ -158,5 +158,6 @@
     "fs_group": 1000,
     "read_only_root_filesystem": true
   },
-  "singleton": false
+  "singleton": false,
+  "hot_paths": ["rules", "routing.rules"]
 }

@@ -60,6 +60,7 @@ use std::sync::OnceLock;
 use cel::{Context, Program, Value};
 use serde_json::Value as JsonValue;
 
+use super::diagnostic::{Diagnostic, span_at};
 use super::error::{ExpressionError, ExpressionResult};
 use super::profile::{self, ProfileConfig};
 
@@ -78,7 +79,7 @@ static DEFAULT_PROFILE_CONFIG: OnceLock<ProfileConfig> = OnceLock::new();
 /// The default is returned WITHOUT latching the cache: an expression
 /// evaluated before config loads would otherwise pin defaults for the life of
 /// the process, and the config would never take effect.
-fn get_profile_config() -> &'static ProfileConfig {
+pub(crate) fn get_profile_config() -> &'static ProfileConfig {
     if let Some(cached) = PROFILE_CONFIG.get() {
         return cached;
     }
@@ -123,6 +124,51 @@ pub fn validate_with_config(expr: &str, config: &ProfileConfig) -> Vec<String> {
         Ok(_) => vec![],
         Err(e) => vec![format!("{e}")],
     }
+}
+
+// -- Diagnose ------------------------------------------------------
+
+/// [`validate`] with the byte span of each problem, for an editor to underline.
+///
+/// Profile findings span the function name. A syntax error spans the character
+/// the parser stopped at.
+#[must_use]
+pub fn diagnose(expr: &str) -> Vec<Diagnostic> {
+    diagnose_with_config(expr, get_profile_config())
+}
+
+/// [`diagnose`] with an explicit profile config.
+#[must_use]
+pub fn diagnose_with_config(expr: &str, config: &ProfileConfig) -> Vec<Diagnostic> {
+    compile_diagnosed(expr, config).err().unwrap_or_default()
+}
+
+/// Compile under `config`, or every located problem that stops it.
+pub(crate) fn compile_diagnosed(
+    expr: &str,
+    config: &ProfileConfig,
+) -> Result<Program, Vec<Diagnostic>> {
+    if expr.trim().is_empty() {
+        return Err(vec![Diagnostic::new("Expression is empty", None)]);
+    }
+    let profile_errors = profile::scan_profile(expr, config);
+    if !profile_errors.is_empty() {
+        return Err(profile_errors);
+    }
+    Program::compile(expr).map_err(|errors| {
+        errors
+            .errors
+            .iter()
+            .map(|e| {
+                // The parser's top-level failure carries its cause in `source`.
+                let message = match (&e.source, e.msg.as_str()) {
+                    (Some(source), "UNKNOWN") => source.to_string(),
+                    _ => e.msg.clone(),
+                };
+                Diagnostic::new(message, span_at(expr, e.pos.0, e.pos.1))
+            })
+            .collect()
+    })
 }
 
 // -- Compile -------------------------------------------------------
@@ -222,7 +268,7 @@ pub fn evaluate_condition<'a>(
 // -- Helpers -------------------------------------------------------
 
 /// Convert a `serde_json::Value` to a CEL `Value`.
-fn json_to_cel(json: &JsonValue) -> Value {
+pub(crate) fn json_to_cel(json: &JsonValue) -> Value {
     match json {
         JsonValue::Null => Value::Null,
         JsonValue::Bool(b) => Value::Bool(*b),
@@ -271,5 +317,42 @@ mod tests {
             PROFILE_CONFIG.get().is_none(),
             "the default was cached, so a later config::setup would never take effect"
         );
+    }
+
+    #[test]
+    fn diagnose_finds_nothing_in_a_valid_expression() {
+        let config = ProfileConfig::default();
+        assert_eq!(
+            diagnose_with_config(r#"severity == "high""#, &config),
+            vec![]
+        );
+    }
+
+    /// A syntax error spans the character the parser stopped at, so the span
+    /// lands inside the expression rather than on it as a whole.
+    #[test]
+    fn diagnose_spans_a_syntax_error_at_the_parser_position() {
+        let expr = "severity == && x";
+        let found = diagnose_with_config(expr, &ProfileConfig::default());
+        assert!(!found.is_empty(), "a syntax error must be found");
+        let span = found[0].span.expect("a syntax error has a span");
+        assert!(span.end <= expr.len(), "{span} is past the end of {expr:?}");
+        assert_eq!(&expr[span.start..span.end], "&", "{found:?}");
+    }
+
+    #[test]
+    fn diagnose_reports_a_profile_finding_before_parsing() {
+        let expr = r#"x.matches("a") &&"#;
+        let found = diagnose_with_config(expr, &ProfileConfig::default());
+        assert_eq!(found.len(), 1, "{found:?}");
+        let span = found[0].span.expect("span");
+        assert_eq!(&expr[span.start..span.end], "matches");
+    }
+
+    #[test]
+    fn diagnose_refuses_an_empty_expression_without_a_span() {
+        let found = diagnose_with_config("  ", &ProfileConfig::default());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].span, None);
     }
 }

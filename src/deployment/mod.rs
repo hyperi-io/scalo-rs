@@ -73,6 +73,7 @@
 //!     security: SecurityContract::default(),
 //!     singleton: false,
 //!     service_account: ServiceAccount::Own,
+//!     hot_paths: vec![],
 //! };
 //!
 //! // Generate production Dockerfile (without identity annotations -- Phase 1

@@ -150,6 +150,7 @@ Section landing: [pipeline/README.md](pipeline/README.md)
 - [pipeline/dlq.md](pipeline/dlq.md) - file, Kafka, HTTP backends
 - [pipeline/spool.md](pipeline/spool.md) - disk-backed async FIFO (yaque)
 - [pipeline/strmatch.md](pipeline/strmatch.md) - 4-tier regex->fast-path matcher (Byte / Literal / LiteralSet / Regex)
+- [pipeline/rules.md](pipeline/rules.md) - ordered first-match rules that set target fields: native tests or CEL Fast, clamp, hit counters, hot reload
 - [pipeline/scaling.md](pipeline/scaling.md) - `ScalingPressure`, KEDA external scaler signal
 
 ### Less-common subsystems

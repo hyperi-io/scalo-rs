@@ -99,6 +99,43 @@ tests:
           path: spec.template.metadata.annotations["checksum/config"]
           value: ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
 
+  # The contract names rules and routing.rules as hot paths. ca3d... is the sha256 of "{}\n".
+  - it: keeps the checksum when only a contract hot path changes
+    set:
+      config:
+        rules:
+          name: ingest
+          rules: [{ id: web, set: { _source: { value: web } } }]
+        routing:
+          rules: { targets: [_source] }
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+
+  # 6be0... is the sha256 of "routing:\n  default_table: main\n", the hot path left out.
+  - it: rolls the pods for a key beside a nested hot path, and not for the hot path
+    set:
+      config:
+        routing:
+          default_table: main
+          rules: { targets: [_source] }
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: 6be0870d58f465718b7ebb28705e8078886b50800ceb8161f14a062f97512f9f
+
+  - it: rolls the pods for a hot path change when the config mounts by subPath
+    set:
+      configMount.subPath: true
+      config:
+        rules:
+          name: ingest
+    asserts:
+      - notEqual:
+          path: spec.template.metadata.annotations["checksum/config"]
+          value: ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+
   - it: scrapes the contract's metrics port and path
     asserts:
       - equal:

@@ -45,7 +45,7 @@ features = [
     "dlq", "dlq-http",
     "output-file",
     "deployment", "config-schema",
-    "expression", "version-check",
+    "expression", "rules", "version-check",
     "geoip-download",
     "auth",
 ]
@@ -210,6 +210,12 @@ output-file = ["io", "serde_json", "tracing"]
 # CEL expression evaluation
 expression = ["dep:cel", "serde_json"]
 
+# Ordered first-match rules that set target fields (src/rules): native tests or
+# CEL Fast conditions, literal / copy / bounded-lookup values, a per-call clamp,
+# hit counters. sonic-rs reads a JSON payload lazily behind the parse_guard
+# depth check (wide), and strmatch compiles the regex test.
+rules = ["expression", "strmatch", "sonic-rs", "memchr", "serde_json", "dep:wide", "tracing"]
+
 # Deployment contract, Dockerfile and Compose generation, Dockerfile validation
 deployment = ["yaml", "serde_json"]
 # Smoke-test helper that runs `docker build` + `docker run` against a
@@ -281,7 +287,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:web
 dangerous-diagnostics = []
 
 # Full feature set
-full = ["config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "output-file", "expression", "tls", "geoip-download", "auth"]
+full = ["config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "output-file", "expression", "rules", "tls", "geoip-download", "auth"]
 
 [dependencies]
 # Serialisation (always needed)
@@ -632,6 +638,12 @@ required-features = ["concurrency"]
 name = "strmatch"
 harness = false
 required-features = ["strmatch"]
+
+# Gated by scripts/bench-gate.sh: no median over 5% slower than the saved baseline.
+[[bench]]
+name = "rules_benchmark"
+harness = false
+required-features = ["rules"]
 
 # The credential cache-hit path: a number for the record, not a CI gate.
 [[bench]]

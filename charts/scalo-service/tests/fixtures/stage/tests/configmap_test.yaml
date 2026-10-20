@@ -35,6 +35,20 @@ tests:
           path: binaryData["config.yaml"]
           value: YnVmZmVyOgogIGZsdXNoX3Jvd3M6IDUwMDAKbG9hZGVyOgogIGVuZHBvaW50OiBsb2FkZXI6NjAwMApsb2dfbGV2ZWw6IHdhcm4K
 
+  # A hot path leaves the checksum only: the file the app reloads still holds it.
+  # base64 of:
+  #   rules:
+  #     name: ingest
+  - it: keeps a contract hot path in the mounted config file
+    set:
+      config:
+        rules:
+          name: ingest
+    asserts:
+      - equal:
+          path: binaryData["config.yaml"]
+          value: cnVsZXM6CiAgbmFtZTogaW5nZXN0Cg==
+
   # Helm deletes the text `<no value>` from rendered output, so a config sent as
   # plain data reaches the pod as `tag:`, a null. The expected value is the
   # base64 of:

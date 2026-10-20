@@ -105,8 +105,11 @@ pub mod sensitive;
 // Parse-path depth guard, shared by the transport codec (JSON/MsgPack), the
 // worker engine parse stage and any consumer that parses untrusted JSON itself.
 // Compiled whenever either scalo parse path is enabled.
-#[cfg(any(feature = "transport", feature = "worker-batch"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "transport", feature = "worker-batch"))))]
+#[cfg(any(feature = "transport", feature = "worker-batch", feature = "rules"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "transport", feature = "worker-batch", feature = "rules")))
+)]
 pub mod parse_guard;
 
 // Retry backoff, compiled only with a feature that retries.
@@ -247,6 +250,10 @@ pub mod output;
 #[cfg(feature = "expression")]
 #[cfg_attr(docsrs, doc(cfg(feature = "expression")))]
 pub mod expression;
+
+#[cfg(feature = "rules")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rules")))]
+pub mod rules;
 
 #[cfg(feature = "deployment")]
 #[cfg_attr(docsrs, doc(cfg(feature = "deployment")))]
