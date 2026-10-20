@@ -805,7 +805,33 @@ fn create_consumer(
     client_config
         .create_with_context(context)
         .map(Arc::new)
-        .map_err(|e| TransportError::Connection(format!("Failed to create consumer: {e}")))
+        .map_err(|e| client_build_error("consumer", &e))
+}
+
+/// The transport error for a librdkafka `client` that would not build:
+/// `Config` for a key, value or combination librdkafka refuses, which no retry
+/// fixes, and `Connection` for a failure to start the client's threads.
+///
+/// The message names the key, never its value, which may be a credential.
+fn client_build_error(client: &str, error: &KafkaError) -> TransportError {
+    match error {
+        KafkaError::ClientConfig(_, description, key, _) => TransportError::Config(format!(
+            "Failed to create {client}: librdkafka refused {key}: {description}"
+        )),
+        KafkaError::Nul(_) => TransportError::Config(format!(
+            "Failed to create {client}: a librdkafka key or value holds a NUL byte"
+        )),
+        KafkaError::ClientCreation(reason) if !is_thread_start_failure(reason) => {
+            TransportError::Config(format!("Failed to create {client}: {reason}"))
+        }
+        other => TransportError::Connection(format!("Failed to create {client}: {other}")),
+    }
+}
+
+/// Whether `rd_kafka_new` failed starting a thread, its only failures that are
+/// not about the config it was given.
+fn is_thread_start_failure(reason: &str) -> bool {
+    reason.starts_with("Failed to create") || reason.starts_with("Timed out waiting for")
 }
 
 /// Subscribe the consumer to `topics`, or do nothing when the list is empty
@@ -888,9 +914,11 @@ impl KafkaTransport {
     ///
     /// `TransportError::Config` when the provider preset or
     /// [`KafkaConfig::validate`] refuses the config, before any client is
-    /// built. `TransportError::Admin` when auto-discovery with
-    /// `topic_refresh_secs: 0` cannot list the broker's topics. Otherwise an
-    /// error if Kafka client creation fails.
+    /// built, and when librdkafka refuses a key, a value or their combination
+    /// while building the consumer or producer. `TransportError::Connection`
+    /// when librdkafka cannot start a client's threads.
+    /// `TransportError::Admin` when auto-discovery with `topic_refresh_secs: 0`
+    /// cannot list the broker's topics.
     // Large but linear constructor (config -> client -> subscribe -> assemble),
     // over the 150-line soft cap with the config building already factored out.
     #[allow(clippy::too_many_lines)]
@@ -993,7 +1021,7 @@ impl KafkaTransport {
         // Create producer with StatsContext for metrics collection.
         let producer: FutureProducer<StatsContext> = producer_config
             .create_with_context(StatsContext::new())
-            .map_err(|e| TransportError::Connection(format!("Failed to create producer: {e}")))?;
+            .map_err(|e| client_build_error("producer", &e))?;
 
         let healthy = Arc::new(AtomicBool::new(true));
 
@@ -3060,6 +3088,107 @@ mod tests {
             .map(|e| e.topic().to_string())
             .collect();
         assert_eq!(topics, vec!["syslog_load".to_string()]);
+    }
+
+    /// A key librdkafka does not know, a value it refuses or a combination it
+    /// rejects fails the build as `Config`, which is fatal, so the app stops
+    /// rather than retrying a config no retry fixes. Broker-free.
+    #[tokio::test]
+    async fn a_config_librdkafka_refuses_fails_the_build_as_config() {
+        let base = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "scalo-refused".to_string(),
+            topics: vec!["events".to_string()],
+            ..Default::default()
+        };
+        // Only the producer reads `sizing.producer_librdkafka`, so the consumer
+        // builds first and the producer is the client that fails.
+        let producer_only = |key: &str, value: &str| {
+            let mut config = base.clone();
+            config
+                .sizing
+                .producer_librdkafka
+                .insert(key.to_string(), value.to_string());
+            config
+        };
+        let mut idempotent_acks_one = producer_only("enable.idempotence", "true");
+        idempotent_acks_one
+            .sizing
+            .producer_librdkafka
+            .insert("acks".to_string(), "1".to_string());
+        let cases = [
+            (
+                base.clone().with_override("no.such.property", "1"),
+                "consumer",
+                "no.such.property",
+            ),
+            (
+                base.clone().with_override("fetch.wait.max.ms", "soon"),
+                "consumer",
+                "fetch.wait.max.ms",
+            ),
+            (
+                producer_only("no.such.property", "1"),
+                "producer",
+                "no.such.property",
+            ),
+            (producer_only("linger.ms", "soon"), "producer", "linger.ms"),
+            // librdkafka accepts each key alone and rd_kafka_new refuses the pair.
+            (idempotent_acks_one, "producer", "acks"),
+        ];
+        for (config, client, key) in cases {
+            match KafkaTransport::new(&config).await {
+                Err(error @ TransportError::Config(_)) => {
+                    let why = error.to_string();
+                    assert!(error.is_fatal(), "{why}");
+                    assert!(why.contains(client), "{why} does not name the {client}");
+                    assert!(why.contains(key), "{why} does not name {key}");
+                }
+                Err(other) => panic!("{key} on the {client} failed as {other}, not as config"),
+                Ok(_) => panic!("built a transport with {key} on the {client}"),
+            }
+        }
+    }
+
+    /// The refusal names the key, never the value, which may be a credential.
+    #[tokio::test]
+    async fn a_refused_property_never_carries_its_value() {
+        let config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..Default::default()
+        }
+        .with_override("sasl.passwrd", "hunter2-not-logged");
+        let Err(error) = KafkaTransport::new(&config).await else {
+            panic!("built a transport with an unknown key");
+        };
+        let why = error.to_string();
+        assert!(why.contains("sasl.passwrd"), "{why}");
+        assert!(!why.contains("hunter2-not-logged"), "{why}");
+    }
+
+    /// Only a failure to start the client's threads stays `Connection`: those
+    /// are the `rd_kafka_new` failures a retry can outlast.
+    #[test]
+    fn a_thread_start_failure_stays_a_connection_error() {
+        for reason in [
+            "Failed to create thread: Resource temporarily unavailable (11)",
+            "Failed to create background thread: Resource temporarily unavailable",
+            "Timed out waiting for 2 background thread(s) to initialize",
+        ] {
+            let error = client_build_error("producer", &KafkaError::ClientCreation(reason.into()));
+            assert!(
+                matches!(error, TransportError::Connection(_)),
+                "{reason} became {error}"
+            );
+        }
+        let error = client_build_error(
+            "consumer",
+            &KafkaError::ClientCreation("`acks` must be set to `all`".into()),
+        );
+        assert!(matches!(error, TransportError::Config(_)), "{error}");
+        let error = client_build_error("consumer", &KafkaError::Global(RDKafkaErrorCode::Fail));
+        assert!(matches!(error, TransportError::Connection(_)), "{error}");
     }
 
     /// With no refresh loop to recover, auto-discovery that cannot reach the
