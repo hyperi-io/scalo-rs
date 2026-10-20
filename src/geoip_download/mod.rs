@@ -43,6 +43,7 @@
 
 pub mod config;
 mod fetch;
+mod mmdb;
 
 pub use config::{AutoDownloadConfig, GeoIpConfig, GeoIpProvider};
 
@@ -114,6 +115,23 @@ pub enum GeoIpDownloadError {
         provider: String,
         /// Database kind: `city` or `asn`.
         kind: &'static str,
+    },
+
+    /// The transfer, or the database decompressed from it, passed
+    /// `auto_download.max_database_bytes`.
+    #[error("the {what} passed max_database_bytes ({limit} bytes)")]
+    TooLarge {
+        /// `download` for the transferred body, `database` for the MMDB.
+        what: &'static str,
+        /// The configured cap, in bytes.
+        limit: u64,
+    },
+
+    /// The downloaded file does not read as an MMDB database.
+    #[error("the downloaded file is not an MMDB database: {reason}")]
+    NotMmdb {
+        /// The first structural fault found.
+        reason: &'static str,
     },
 }
 
@@ -266,7 +284,9 @@ fn is_fresh(path: &Path, max_age_secs: u64) -> bool {
 
 /// Build and run the transfer for one database.
 async fn download(kind: Kind, config: &GeoIpConfig) -> Result<PathBuf, GeoIpDownloadError> {
-    plan(kind, config)?.run().await
+    plan(kind, config)?
+        .run(config.auto_download.max_database_bytes)
+        .await
 }
 
 /// Map (provider, kind) onto a concrete transfer.
