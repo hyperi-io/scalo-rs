@@ -878,11 +878,19 @@ impl KafkaTransport {
     /// fatal is rebuilt by the next receive, as `classic` when the broker
     /// refused KIP-848. See [`ConsumerProtocol`].
     ///
+    /// Explicit `topics` need no broker here: librdkafka connects later. Topic
+    /// auto-discovery lists the broker's topics on tokio's blocking pool,
+    /// waiting up to 10 s. When that fails and `topic_refresh_secs` is above
+    /// 0, the transport is built subscribed to nothing, and the first refresh
+    /// that lists the matching topics subscribes the next receive.
+    ///
     /// # Errors
     ///
     /// `TransportError::Config` when the provider preset or
     /// [`KafkaConfig::validate`] refuses the config, before any client is
-    /// built; otherwise an error if Kafka client creation fails.
+    /// built. `TransportError::Admin` when auto-discovery with
+    /// `topic_refresh_secs: 0` cannot list the broker's topics. Otherwise an
+    /// error if Kafka client creation fails.
     // Large but linear constructor (config -> client -> subscribe -> assemble),
     // over the 150-line soft cap with the config building already factored out.
     #[allow(clippy::too_many_lines)]
@@ -916,20 +924,36 @@ impl KafkaTransport {
             (Vec::new(), None, tokio_util::sync::CancellationToken::new())
         } else if config.topics.is_empty() && config.auto_discover {
             tracing::info!("Topics empty -- auto-discovering from broker");
-            let resolver = topic_resolver::TopicResolver::new(config)?;
-            let discovered = resolver.resolve()?;
-            if discovered.is_empty() {
-                // No match yet is not a misconfiguration: the refresh loop
-                // subscribes when the first matching topic appears.
-                tracing::warn!(
-                    "Auto-discovery found no matching topics -- consuming nothing until one appears"
-                );
-            }
+            let resolver = Arc::new(topic_resolver::TopicResolver::new(config)?);
+            let discovered = match topic_resolver::resolve_off_runtime(Arc::clone(&resolver)).await
+            {
+                Ok(discovered) => {
+                    if discovered.is_empty() {
+                        // No match yet is not a misconfiguration: the refresh loop
+                        // subscribes when the first matching topic appears.
+                        tracing::warn!(
+                            "Auto-discovery found no matching topics -- consuming nothing until one appears"
+                        );
+                    }
+                    discovered
+                }
+                // The refresh loop subscribes once a refresh reaches the broker.
+                Err(e) if config.topic_refresh_secs > 0 => {
+                    tracing::warn!(
+                        error = %e,
+                        refresh_secs = config.topic_refresh_secs,
+                        "Auto-discovery could not list the broker's topics -- consuming nothing \
+                         until a refresh does"
+                    );
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            };
 
             let token = tokio_util::sync::CancellationToken::new();
             let refresh = if config.topic_refresh_secs > 0 {
-                let refresh_resolver = topic_resolver::TopicResolver::new(config)?;
-                let handle = refresh_resolver.start_refresh_loop(
+                let handle = resolver.refresh_from(
+                    discovered.clone(),
                     Duration::from_secs(config.topic_refresh_secs),
                     token.clone(),
                 );
@@ -3036,6 +3060,26 @@ mod tests {
             .map(|e| e.topic().to_string())
             .collect();
         assert_eq!(topics, vec!["syslog_load".to_string()]);
+    }
+
+    /// With no refresh loop to recover, auto-discovery that cannot reach the
+    /// broker still fails construction.
+    #[tokio::test]
+    async fn auto_discovery_with_no_refresh_fails_when_no_broker_answers() {
+        let config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "no-refresh".to_string(),
+            auto_discover: true,
+            topic_refresh_secs: 0,
+            ..Default::default()
+        };
+        match KafkaTransport::new(&config).await {
+            Err(TransportError::Admin(detail)) => assert!(
+                detail.contains("Failed to fetch metadata"),
+                "not the metadata failure: {detail}"
+            ),
+            other => panic!("expected the metadata failure, got {other:?}"),
+        }
     }
 
     /// A producer-only transport's consumer is never polled, so every
