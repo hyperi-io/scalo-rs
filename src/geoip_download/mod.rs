@@ -261,7 +261,7 @@ fn provider_filenames(provider: GeoIpProvider) -> (Option<&'static str>, Option<
         GeoIpProvider::MaxMindGeoLite2 => (Some("GeoLite2-City.mmdb"), Some("GeoLite2-ASN.mmdb")),
         GeoIpProvider::IpLocate => (None, Some("iplocate-asn.mmdb")),
         GeoIpProvider::IpInfoLite => (Some("ipinfo-lite.mmdb"), None),
-        GeoIpProvider::Sapics => (None, Some("sapics-asn-country.mmdb")),
+        GeoIpProvider::Sapics => (None, Some("sapics-dbip-asn.mmdb")),
         GeoIpProvider::Custom => (None, None),
     }
 }
@@ -363,17 +363,19 @@ fn plan(kind: Kind, config: &GeoIpConfig) -> Result<Transfer, GeoIpDownloadError
         },
 
         (GeoIpProvider::IpLocate, Kind::Asn) => Transfer {
-            url: "https://github.com/sapics/ip-location-db/raw/main/dbip-asn/dbip-asn.mmdb"
-                .to_string(),
+            url:
+                "https://github.com/iplocate/ip-address-databases/raw/main/ip-to-asn/ip-to-asn.mmdb"
+                    .to_string(),
             dest: dir.join("iplocate-asn.mmdb"),
             archive: Archive::Raw,
             credential: Credential::None,
         },
 
+        // The release tagged `latest`, the form the project documents.
         (GeoIpProvider::Sapics, Kind::Asn) => Transfer {
-            url: "https://github.com/sapics/ip-location-db/raw/main/geo-whois-asn-country/geo-whois-asn-country.mmdb"
+            url: "https://github.com/sapics/ip-location-db/releases/download/latest/dbip-asn.mmdb"
                 .to_string(),
-            dest: dir.join("sapics-asn-country.mmdb"),
+            dest: dir.join("sapics-dbip-asn.mmdb"),
             archive: Archive::Raw,
             credential: Credential::None,
         },

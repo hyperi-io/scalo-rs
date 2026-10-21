@@ -72,13 +72,14 @@ pub enum GeoIpProvider {
     /// MaxMind GeoLite2 -- free account required (account id + licence key).
     MaxMindGeoLite2,
 
-    /// IPLocate.io -- free, anonymous, country + ASN only.
+    /// IPLocate.io IP to ASN -- free, anonymous, ASN only, CC BY-SA 4.0.
     IpLocate,
 
     /// IPinfo Lite -- free token required, country + ASN only.
     IpInfoLite,
 
-    /// sapics/ip-location-db -- free CC0, country + ASN only.
+    /// DB-IP Lite ASN as sapics/ip-location-db republishes it -- free,
+    /// anonymous, ASN only, CC BY 4.0.
     Sapics,
 
     /// Caller supplies the MMDB paths directly; nothing is downloaded.

@@ -67,6 +67,8 @@ if let Some(city) = paths.city {
 | `sapics` | none | no | yes | raw |
 | `custom` | n/a | explicit path | explicit path | n/a |
 
+`ip_locate` is IPLocate.io's IP to ASN database, under CC BY-SA 4.0. `sapics` is DB-IP Lite ASN as sapics/ip-location-db republishes it, under CC BY 4.0.
+
 Set `city_db_path` or `asn_db_path` and the provider is bypassed
 entirely: those paths are returned verbatim and nothing is downloaded or
 checked. That is the escape hatch for an operator who mounts the
