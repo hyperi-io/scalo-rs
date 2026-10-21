@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.19](https://github.com/hyperi-io/scalo-rs/compare/v2.14.18...v2.14.19) (2026-10-21)
+
+### Bug Fixes
+
+* harden CEL lexing, Kafka errors, geoip ([#371](https://github.com/hyperi-io/scalo-rs/issues/371)) ([cfd166d](https://github.com/hyperi-io/scalo-rs/commit/cfd166dbbed435eb230228186d223c8729066753))
+
 ## [2.14.18](https://github.com/hyperi-io/scalo-rs/compare/v2.14.17...v2.14.18) (2026-10-20)
 
 ### Bug Fixes
