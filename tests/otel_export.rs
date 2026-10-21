@@ -22,7 +22,8 @@
 //! The global metrics recorder installs once per process, so this file owns
 //! one `MetricsManager` and every phase shares it.
 
-#![cfg(feature = "otel-metrics")]
+// The Prometheus endpoint these tests read is the `metrics` feature's.
+#![cfg(all(feature = "otel-metrics", feature = "metrics"))]
 
 use std::time::Duration;
 

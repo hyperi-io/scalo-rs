@@ -396,6 +396,7 @@ fn test_kafka_config_chained_builders() {
     assert_eq!(built.get("fetch.min.bytes"), Some(&"2097152".to_string()));
 }
 
+#[cfg(feature = "config")]
 #[test]
 fn test_kafka_config_from_env() {
     temp_env::with_vars(
@@ -440,6 +441,7 @@ fn test_kafka_librdkafka_overrides_win() {
     assert_eq!(built.get("queued.min.messages"), Some(&"50000".to_string()));
 }
 
+#[cfg(feature = "config")]
 #[test]
 fn test_kafka_config_from_env_with_profile() {
     temp_env::with_vars(
