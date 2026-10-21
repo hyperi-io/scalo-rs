@@ -218,7 +218,7 @@ fn method_label(method: &Method) -> &'static str {
 
 /// The `status` label of `http_client_requests_total` for a finished call:
 /// `success` for a 2xx answer, `error` for any other answer or no answer.
-#[cfg(any(feature = "metrics", test))]
+#[cfg(feature = "metrics")]
 fn outcome_label(result: &Result<Response, HttpError>) -> &'static str {
     match result {
         Ok(resp) if resp.status().is_success() => "success",
