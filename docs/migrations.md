@@ -8,6 +8,24 @@ release and the target before bumping.
 
 ## Unreleased
 
+### The CEL profile reads literals and comments as cel does (BEHAVIOUR CHANGE)
+
+The profile scanner, and with it the transport filter classifier, now reads one-line, triple-quoted and raw string and bytes literals, `//` comments and backtick-quoted names as cel's lexer does, and takes any whitespace or comment before `(` as part of a call. An expression that hid a restricted call behind one of those forms now fails `validate`, `compile` and `RuleSet::compile`, and a transport filter with such a call classifies as Tier 3.
+
+**Consumer adjustment** -- where the call is wanted, set the category's `expression.allow_*` flag, or open the Tier 3 gate for a filter.
+
+### Kafka client build errors are `Config` (BEHAVIOUR CHANGE)
+
+When librdkafka refuses a key, a value or a combination of them, `KafkaTransport::new`, `KafkaProducer::new`, `KafkaAdmin::new` and the admin's group consumers return `TransportError::Config`, which `is_fatal()` reports, where they returned `Connection`. The message names the client and the key, never the value. A failure to start librdkafka's threads stays `Connection`.
+
+**Consumer adjustment** -- startup code that retried on `Connection` now stops on a bad librdkafka key or value. Fix the config.
+
+### GeoIP downloads are capped and checked (API CHANGE)
+
+`auto_download.max_database_bytes` (default 512 MiB) caps each download and the database decompressed from it, and a file that does not read as an MMDB never replaces the local copy. Both old provider URLs returned 404, so `ip_locate` now downloads IPLocate.io's IP to ASN database (CC BY-SA 4.0), and `sapics` downloads DB-IP Lite ASN from sapics' `latest` release (CC BY 4.0) to `sapics-dbip-asn.mmdb`.
+
+**Consumer adjustment** -- an `AutoDownloadConfig` struct literal names `max_database_bytes` or ends in `..Default::default()`. An exhaustive match on `GeoIpDownloadError` adds `TooLarge` and `NotMmdb`. A `sapics` deployment that reads `sapics-asn-country.mmdb` reads `sapics-dbip-asn.mmdb`.
+
 ### The contract declares `hot_paths`, and the chart's checksum skips them (API CHANGE)
 
 `DeploymentContract` gains `hot_paths`, the dotted config paths the app reloads while it runs, left out of the JSON while empty. The scalo-service chart drops them from the pod's `checksum/config`, so an edit there reaches the mounted file without rolling the pods. `validate()` refuses a path that is not dotted letters, digits, `_` and `-`, one listed twice, and any path without a `config_mount_path`. See [deployment/contract.md](deployment/contract.md#hot-paths).
