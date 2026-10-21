@@ -156,19 +156,21 @@ impl KafkaAdmin {
     ///
     /// `TransportError::Config` when the provider preset or
     /// [`KafkaConfig::validate`] refuses the config, as
-    /// [`KafkaTransport::new`](super::KafkaTransport::new) does;
-    /// `TransportError::Connection` when librdkafka cannot build a client.
+    /// [`KafkaTransport::new`](super::KafkaTransport::new) does, or when
+    /// librdkafka refuses a key, a value or their combination.
+    /// `TransportError::Connection` when librdkafka cannot start a client's
+    /// threads.
     pub fn new(config: &KafkaConfig) -> TransportResult<Self> {
         let config = &super::checked_config(config)?;
         let client_config = admin_client_config(config);
 
-        let admin: AdminClient<DefaultClientContext> = client_config.create().map_err(|e| {
-            TransportError::Connection(format!("Failed to create admin client: {e}"))
-        })?;
+        let admin: AdminClient<DefaultClientContext> = client_config
+            .create()
+            .map_err(|e| super::client_build_error("admin client", &e))?;
 
         let consumer: BaseConsumer = offset_query_consumer_config(&client_config, config)
             .create()
-            .map_err(|e| TransportError::Connection(format!("Failed to create consumer: {e}")))?;
+            .map_err(|e| super::client_build_error("consumer", &e))?;
 
         Ok(Self {
             admin,
@@ -308,7 +310,7 @@ impl KafkaAdmin {
         group_config.set("group.id", group_id);
         let group_consumer: BaseConsumer = group_config
             .create()
-            .map_err(|e| TransportError::Connection(format!("Failed to create consumer: {e}")))?;
+            .map_err(|e| super::client_build_error("consumer", &e))?;
 
         let metadata = self
             .consumer
@@ -630,9 +632,9 @@ impl KafkaAdmin {
         group_config.set("group.id", group_id);
         group_config.set("enable.auto.commit", "false");
 
-        let group_consumer: BaseConsumer = group_config.create().map_err(|e| {
-            TransportError::Connection(format!("Failed to create group consumer: {e}"))
-        })?;
+        let group_consumer: BaseConsumer = group_config
+            .create()
+            .map_err(|e| super::client_build_error("group consumer", &e))?;
 
         group_consumer
             .commit(offsets, rdkafka::consumer::CommitMode::Sync)
@@ -665,6 +667,71 @@ mod tests {
         client_gate::assert_builds_under_production(|config| {
             client_gate::config_refusal(KafkaAdmin::new(config))
         });
+    }
+
+    /// At a loopback port that refuses at once, so no client waits on a broker.
+    fn unreachable() -> KafkaConfig {
+        KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "scalo-admin".to_string(),
+            ..KafkaConfig::default()
+        }
+    }
+
+    /// Fail with `Config` naming `client` and `key`, or panic.
+    fn assert_config_refusal<T>(result: TransportResult<T>, client: &str, key: &str) {
+        match result {
+            Err(error @ TransportError::Config(_)) => {
+                let why = error.to_string();
+                assert!(why.contains(client), "{why} does not name the {client}");
+                assert!(why.contains(key), "{why} does not name {key}");
+                assert!(!why.contains("value-not-logged"), "{why}");
+            }
+            Err(other) => panic!("the {client} failed as {other}, not as config"),
+            Ok(_) => panic!("the {client} built despite {key}"),
+        }
+    }
+
+    /// Each of `KafkaAdmin::new`'s two clients fails as `Config` on a config
+    /// librdkafka refuses, naming the key but never carrying the value.
+    #[test]
+    fn a_config_librdkafka_refuses_fails_the_admin_as_config() {
+        let unknown = unreachable().with_override("no.such.property", "value-not-logged");
+        assert_config_refusal(
+            KafkaAdmin::new(&unknown),
+            "admin client",
+            "no.such.property",
+        );
+        // The admin client ignores consumer properties, and a classic consumer
+        // refuses a poll interval under its session timeout.
+        let consumer_only = unreachable().with_overrides(&[
+            ("max.poll.interval.ms", "10000"),
+            ("session.timeout.ms", "45000"),
+        ]);
+        assert_config_refusal(
+            KafkaAdmin::new(&consumer_only),
+            "consumer",
+            "max.poll.interval.ms",
+        );
+    }
+
+    /// The per-group consumers fail as `Config` on a group id librdkafka cannot
+    /// take, before any broker round trip.
+    #[tokio::test]
+    async fn a_group_id_librdkafka_refuses_fails_the_group_consumers_as_config() {
+        let admin = KafkaAdmin::new(&unreachable()).expect("an admin builds broker-free");
+        assert_config_refusal(
+            admin.get_consumer_lag("bad\0group", "events").await,
+            "consumer",
+            "NUL",
+        );
+        assert_config_refusal(
+            admin
+                .commit_offsets_for_group("bad\0group", &TopicPartitionList::new())
+                .await,
+            "group consumer",
+            "NUL",
+        );
     }
 
     /// The offset-query consumer asks for its group's coordinator on connect,
