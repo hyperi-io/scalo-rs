@@ -69,6 +69,8 @@ tier-1 operation are tried in order of expected frequency
 none match, scan for restricted function names -- match means tier 3.
 Otherwise tier 2.
 
+The scan reads literals, comments and backtick-quoted names with the same lexer as the expression profile, so a restricted call it finds is one the profile refuses, and a name inside a literal or comment is neither a call nor a field.
+
 This is conservative on purpose: only expressions that obviously fit a
 tier-1 pattern execute outside the CEL engine. Anything subtle drops
 to tier 2 or 3 where the actual CEL interpreter validates the

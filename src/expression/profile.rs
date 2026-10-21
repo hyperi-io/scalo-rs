@@ -14,6 +14,7 @@
 //! unlocked per-category via [`ProfileConfig`].
 
 use super::diagnostic::{Diagnostic, Span};
+use crate::cel_lexer::{self, Kind};
 
 /// CEL functions allowed unconditionally in the profile.
 ///
@@ -118,16 +119,6 @@ const SKIP_NAMES: &[&str] = &[
     "true", "false", "null", "in", "has", "int", "uint", "double", "string", "bool",
 ];
 
-/// Bytes between a function name and its `(` that still leave it a call.
-const CALL_GAP: &[u8] = b" \t\r\n\x0c\x0b";
-
-/// Whole names that open a string or bytes literal when a quote follows directly.
-const LITERAL_PREFIXES: &[&[u8]] = &[b"r", b"R", b"b", b"B", b"br", b"bR", b"Br", b"BR"];
-
-/// Bytes cel's lexer accepts inside a backtick-quoted identifier.
-const ESCAPED_IDENT_BYTES: &[u8] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/ ";
-
 /// Scan an expression for restricted function calls using default config.
 ///
 /// Returns a list of error strings (empty if all function calls are
@@ -143,7 +134,8 @@ pub fn check_profile(expr: &str) -> Vec<String> {
 /// The scanner reads string and bytes literals (quoted, triple-quoted and
 /// raw), `//` comments and backtick-quoted identifiers the way cel's lexer
 /// does, so a name inside one is never reported, and whitespace or a comment
-/// between a name and its `(` does not hide a call.
+/// between a name and its `(` does not hide a call. The transport filter's
+/// tier classifier reads expressions with the same lexer.
 ///
 /// Returns a list of error strings (empty if compliant).
 #[must_use]
@@ -165,143 +157,37 @@ pub fn scan_profile(expr: &str, config: &ProfileConfig) -> Vec<Diagnostic> {
     let blocked = config.blocked_functions();
 
     let mut errors = Vec::new();
-    let bytes = expr.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        let byte = bytes[i];
-        if is_quote(byte) {
-            i = string_end(bytes, i, false);
+    for token in cel_lexer::tokens(expr) {
+        if token.kind != Kind::Call {
             continue;
         }
-        if bytes[i..].starts_with(b"//") {
-            i = gap_end(bytes, i);
-            continue;
-        }
-        if byte == b'`' {
-            i = escaped_ident_end(bytes, i);
-            continue;
-        }
-        if !is_ident_start(byte) {
-            i += 1;
+        let name = &expr[token.start..token.end];
+        if SKIP_NAMES.contains(&name) {
             continue;
         }
 
-        let start = i;
-        while i < len && is_ident_char(bytes[i]) {
-            i += 1;
-        }
-        let word = &bytes[start..i];
-        if i < len && is_quote(bytes[i]) && LITERAL_PREFIXES.contains(&word) {
-            let raw = word.iter().any(|b| b.eq_ignore_ascii_case(&b'r'));
-            i = string_end(bytes, i, raw);
-            continue;
-        }
-        // An identifier is ASCII, so its bounds are char boundaries.
-        let name = &expr[start..i];
-
-        let peek = gap_end(bytes, i);
-        if peek < len && bytes[peek] == b'(' {
-            if SKIP_NAMES.contains(&name) {
-                continue;
-            }
-
-            let span = Some(Span::new(start, i));
-            if blocked.contains(&name) {
-                let reason = restriction_reason(name);
-                errors.push(Diagnostic::new(
-                    format!(
-                        "Function '{name}()' is not allowed in the expression profile. {reason}"
-                    ),
-                    span,
-                ));
-            } else if !ALLOWED_FUNCTIONS.contains(&name) && !DISALLOWED_FUNCTIONS.contains(&name) {
-                // In neither list. A restricted-but-unlocked function IS in
-                // DISALLOWED_FUNCTIONS, so it falls through here and passes.
-                errors.push(Diagnostic::new(
-                    format!(
-                        "Function '{name}()' is not in the expression profile. Check \
-                         the spelling, or add it to ALLOWED_FUNCTIONS if it belongs \
-                         in the profile."
-                    ),
-                    span,
-                ));
-            }
+        let span = Some(Span::new(token.start, token.end));
+        if blocked.contains(&name) {
+            let reason = restriction_reason(name);
+            errors.push(Diagnostic::new(
+                format!("Function '{name}()' is not allowed in the expression profile. {reason}"),
+                span,
+            ));
+        } else if !ALLOWED_FUNCTIONS.contains(&name) && !DISALLOWED_FUNCTIONS.contains(&name) {
+            // In neither list. A restricted-but-unlocked function IS in
+            // DISALLOWED_FUNCTIONS, so it falls through here and passes.
+            errors.push(Diagnostic::new(
+                format!(
+                    "Function '{name}()' is not in the expression profile. Check \
+                     the spelling, or add it to ALLOWED_FUNCTIONS if it belongs \
+                     in the profile."
+                ),
+                span,
+            ));
         }
     }
 
     errors
-}
-
-/// The index after the string literal whose opening quote is at `quote_at`.
-///
-/// Three quotes open a literal that runs to the next three, a raw literal has
-/// no escapes, and a one-line literal ends at a CR or LF, which cel refuses.
-fn string_end(bytes: &[u8], quote_at: usize, raw: bool) -> usize {
-    let quote = bytes[quote_at];
-    let step = |b: u8| if !raw && b == b'\\' { 2 } else { 1 };
-    let triple = [quote; 3];
-    if bytes[quote_at..].starts_with(&triple) {
-        let mut i = quote_at + 3;
-        while i < bytes.len() {
-            if bytes[i..].starts_with(&triple) {
-                return i + 3;
-            }
-            i += step(bytes[i]);
-        }
-        // With no closing triple, cel reads an empty literal and opens a new one
-        // at the third quote.
-        return quote_at + 2;
-    }
-    let mut i = quote_at + 1;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == quote {
-            return i + 1;
-        }
-        if b == b'\n' || b == b'\r' {
-            return i;
-        }
-        i += step(b);
-    }
-    bytes.len()
-}
-
-/// The index after the whitespace and `//` comments starting at `i`.
-fn gap_end(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() {
-        if CALL_GAP.contains(&bytes[i]) {
-            i += 1;
-        } else if bytes[i..].starts_with(b"//") {
-            i = bytes[i..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(bytes.len(), |n| i + n);
-        } else {
-            break;
-        }
-    }
-    i
-}
-
-/// The index after the backtick-quoted identifier at `start`, or after the
-/// backtick alone when none closes.
-fn escaped_ident_end(bytes: &[u8], start: usize) -> usize {
-    let body = bytes[start + 1..]
-        .iter()
-        .take_while(|b| ESCAPED_IDENT_BYTES.contains(b))
-        .count();
-    let close = start + 1 + body;
-    if body > 0 && bytes.get(close) == Some(&b'`') {
-        close + 1
-    } else {
-        start + 1
-    }
-}
-
-fn is_quote(b: u8) -> bool {
-    b == b'"' || b == b'\''
 }
 
 fn restriction_reason(name: &str) -> &'static str {
@@ -319,17 +205,10 @@ fn restriction_reason(name: &str) -> &'static str {
     }
 }
 
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cel_lexer::is_ident_char;
 
     // -- Default config (all restricted) -------------------------
 
