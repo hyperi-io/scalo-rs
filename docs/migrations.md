@@ -10,7 +10,7 @@ release and the target before bumping.
 
 ### The CEL profile reads literals and comments as cel does (BEHAVIOUR CHANGE)
 
-The profile scanner, and with it the transport filter classifier, now reads one-line, triple-quoted and raw string and bytes literals, `//` comments and backtick-quoted names as cel's lexer does, and takes any whitespace or comment before `(` as part of a call. An expression that hid a restricted call behind one of those forms now fails `validate`, `compile` and `RuleSet::compile`, and a transport filter with such a call classifies as Tier 3.
+The profile scanner, and with it the transport filter classifier, now reads one-line, triple-quoted and raw string and bytes literals, `//` comments and backtick-quoted names as cel's lexer does, and takes any whitespace or comment before `(` as part of a call. An expression that hid a restricted call behind one of those forms now fails `validate`, `compile` and `RuleSet::compile`, and a transport filter with such a call classifies as Tier 3. `existsOne`, which cel expands as `exists_one`, is restricted iteration too: `allow_iteration` now allows it, where it was refused as an unknown function, and a filter with it classifies as Tier 3.
 
 **Consumer adjustment** -- where the call is wanted, set the category's `expression.allow_*` flag, or open the Tier 3 gate for a filter.
 

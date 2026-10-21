@@ -704,6 +704,30 @@ fn profile_config_default_blocks_all_restricted() {
     assert!(blocked.contains(&"timestamp"));
 }
 
+/// Both spellings of the exists_one macro compile and run under
+/// `allow_iteration`, and are refused as iteration without it.
+#[test]
+fn exists_one_runs_only_under_allow_iteration() {
+    let allowed = ProfileConfig {
+        allow_iteration: true,
+        ..Default::default()
+    };
+    for name in ["exists_one", "existsOne"] {
+        let expr = format!("[1, 2, 3].{name}(v, v > 2)");
+        let program = scalo::expression::compile_with_config(&expr, &allowed)
+            .unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let result = program.execute(&cel::Context::default());
+        assert_eq!(result.ok(), Some(true.into()), "{expr}");
+        match scalo::expression::compile_with_config(&expr, &ProfileConfig::default()) {
+            Err(ExpressionError::Validation(errors)) => {
+                assert!(errors[0].contains("allow_iteration"), "{expr}: {errors:?}");
+            }
+            Err(other) => panic!("{expr} failed as {other}"),
+            Ok(_) => panic!("{expr} compiled without allow_iteration"),
+        }
+    }
+}
+
 #[test]
 fn profile_config_selective_unlock() {
     let config = ProfileConfig {

@@ -88,6 +88,7 @@ const RESTRICTED_FUNCTIONS: &[&str] = &[
     "exists",
     "all",
     "exists_one",
+    "existsOne",
     "timestamp",
     "duration",
 ];
@@ -115,6 +116,7 @@ const CEL_KEYWORDS: &[&str] = &[
     "exists",
     "all",
     "exists_one",
+    "existsOne",
     "timestamp",
     "duration",
 ];
@@ -372,6 +374,21 @@ mod tests {
     fn classify_regex_is_tier3() {
         let result = classify(r#"field.matches("^prod-.*")"#).unwrap();
         assert_eq!(result.tier(), FilterTier::Tier3);
+    }
+
+    /// cel expands `exists_one` and `existsOne` as one macro, so both take the
+    /// tier `exists` does.
+    #[test]
+    fn exists_one_classifies_as_exists_does() {
+        let tier = |name: &str| {
+            classify(&format!(r#"tags.{name}(t, t == "pii")"#))
+                .unwrap()
+                .tier()
+        };
+        assert_eq!(tier("exists"), FilterTier::Tier3);
+        for name in ["exists_one", "existsOne"] {
+            assert_eq!(tier(name), tier("exists"), "{name}");
+        }
     }
 
     #[test]

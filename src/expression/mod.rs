@@ -32,7 +32,8 @@
 //!
 //! **Restricted (blocked by default, opt-in via [`ProfileConfig`]):**
 //! - Regex: `matches()` -- unbounded cost per record
-//! - Iteration: `map()`, `filter()`, `exists()`, `all()` -- O(n) per collection
+//! - Iteration: `map()`, `filter()`, `exists()`, `all()`, `exists_one()` and
+//!   `existsOne()` -- O(n) per collection
 //! - Time: `timestamp()`, `duration()` -- ClickHouse handles natively
 //!
 //! # Usage
