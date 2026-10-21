@@ -16,7 +16,7 @@ The profile scanner, and with it the transport filter classifier, now reads one-
 
 ### Kafka client build errors are `Config` (BEHAVIOUR CHANGE)
 
-When librdkafka refuses a key, a value or a combination of them, `KafkaTransport::new`, `KafkaProducer::new`, `KafkaAdmin::new` and the admin's group consumers return `TransportError::Config`, which `is_fatal()` reports, where they returned `Connection`. The message names the client and the key, never the value. A failure to start librdkafka's threads stays `Connection`.
+When librdkafka refuses a key, a value or a combination of them, `KafkaTransport::new`, `KafkaProducer::new`, `KafkaAdmin::new` and the admin's group consumers return `TransportError::Config`, which `is_fatal()` reports, where they returned `Connection`. The message names the client, the key and librdkafka's reason, with the configured value, whole and token by token, replaced by `<redacted>`. A failure to start librdkafka's threads stays `Connection`.
 
 **Consumer adjustment** -- startup code that retried on `Connection` now stops on a bad librdkafka key or value. Fix the config.
 

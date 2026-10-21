@@ -812,11 +812,13 @@ fn create_consumer(
 /// `Config` for a key, value or combination librdkafka refuses, which no retry
 /// fixes, and `Connection` for a failure to start the client's threads.
 ///
-/// The message names the key, never its value, which may be a credential.
+/// A refused key is named with librdkafka's reason, and the configured value,
+/// which may be a credential, is redacted out of that reason.
 fn client_build_error(client: &str, error: &KafkaError) -> TransportError {
     match error {
-        KafkaError::ClientConfig(_, description, key, _) => TransportError::Config(format!(
-            "Failed to create {client}: librdkafka refused {key}: {description}"
+        KafkaError::ClientConfig(_, description, key, value) => TransportError::Config(format!(
+            "Failed to create {client}: librdkafka refused {key}: {}",
+            redact_value(description, value)
         )),
         KafkaError::Nul(_) => TransportError::Config(format!(
             "Failed to create {client}: a librdkafka key or value holds a NUL byte"
@@ -832,6 +834,56 @@ fn client_build_error(client: &str, error: &KafkaError) -> TransportError {
 /// not about the config it was given.
 fn is_thread_start_failure(reason: &str) -> bool {
     reason.starts_with("Failed to create") || reason.starts_with("Timed out waiting for")
+}
+
+/// What stands in for a configured value in an error message.
+const REDACTED: &str = "<redacted>";
+
+/// `text` with every occurrence of `value`, and of each whitespace- or
+/// comma-separated token of it, replaced by [`REDACTED`].
+///
+/// librdkafka quotes a refused value whole or one token of it, and its 512-byte
+/// error buffer can cut the quote short, so a tail of `text` that starts one of
+/// them is redacted too. Over-redacting text that merely matches is accepted.
+fn redact_value(text: &str, value: &str) -> String {
+    let parts: Vec<&str> = std::iter::once(value)
+        .chain(value.split(|c: char| c.is_whitespace() || c == ','))
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    let mut hidden = vec![false; text.len()];
+    for part in &parts {
+        for (at, _) in text.match_indices(part) {
+            hidden[at..at + part.len()].fill(true);
+        }
+    }
+    // A cut-short quote may end in a replacement character for a split UTF-8 byte.
+    let body_end = text.trim_end_matches('\u{FFFD}').len();
+    let body = &text[..body_end];
+    for part in &parts {
+        // Every prefix of the part, longest first.
+        let cut = part
+            .char_indices()
+            .rev()
+            .map(|(at, ch)| at + ch.len_utf8())
+            .find(|&len| body.ends_with(&part[..len]));
+        if let Some(len) = cut {
+            hidden[body_end - len..].fill(true);
+        }
+    }
+    let mut redacted = String::with_capacity(text.len());
+    let mut in_run = false;
+    for (at, ch) in text.char_indices() {
+        if hidden[at] {
+            if !in_run {
+                redacted.push_str(REDACTED);
+            }
+            in_run = true;
+        } else {
+            redacted.push(ch);
+            in_run = false;
+        }
+    }
+    redacted
 }
 
 /// Subscribe the consumer to `topics`, or do nothing when the list is empty
@@ -3150,7 +3202,7 @@ mod tests {
         }
     }
 
-    /// The refusal names the key, never the value, which may be a credential.
+    /// An unknown key is named, and its value, which may be a credential, is not.
     #[tokio::test]
     async fn a_refused_property_never_carries_its_value() {
         let config = KafkaConfig {
@@ -3165,6 +3217,151 @@ mod tests {
         let why = error.to_string();
         assert!(why.contains("sasl.passwrd"), "{why}");
         assert!(!why.contains("hunter2-not-logged"), "{why}");
+    }
+
+    /// librdkafka quotes a value it refuses for some property types, whole or
+    /// one comma-separated token of it, and its 512-byte error buffer can cut a
+    /// long one short. None of it reaches any client's error, in `Display` or
+    /// `Debug`, while the key and librdkafka's reason do.
+    #[tokio::test]
+    async fn a_value_librdkafka_quotes_never_reaches_the_error() {
+        let long = format!("hunter2-long-{}", "x".repeat(600));
+        let cases = [
+            // S2F, which echoes the token it refused.
+            ("debug", "hunter2-s2f", "hunter2-s2f", "Invalid value"),
+            (
+                "debug",
+                "broker,hunter2-csv",
+                "hunter2-csv",
+                "Invalid value",
+            ),
+            (
+                "builtin.features",
+                "hunter2-s2f",
+                "hunter2-s2f",
+                "Invalid value",
+            ),
+            // S2I.
+            (
+                "compression.type",
+                "hunter2-s2i",
+                "hunter2-s2i",
+                "Invalid value",
+            ),
+            (
+                "security.protocol",
+                "hunter2-s2i",
+                "hunter2-s2i",
+                "Invalid value",
+            ),
+            (
+                "ssl.endpoint.identification.algorithm",
+                "hunter2-s2i",
+                "hunter2-s2i",
+                "Invalid value",
+            ),
+            // Validated strings, which echo the whole value.
+            (
+                "sasl.mechanism",
+                "SCRAM-SHA-512 hunter2-multi",
+                "hunter2-multi",
+                "Invalid value",
+            ),
+            (
+                "sasl.mechanisms",
+                "SCRAM-SHA-512,hunter2-csv",
+                "hunter2-csv",
+                "Invalid value",
+            ),
+            (
+                "partitioner",
+                "hunter2-part",
+                "hunter2-part",
+                "Invalid value",
+            ),
+            // Past the error buffer, which keeps only the start of the value.
+            ("debug", long.as_str(), &long[..40], "Invalid value"),
+        ];
+        let mut faults = Vec::new();
+        for (key, value, planted, reason) in cases {
+            let config = KafkaConfig {
+                brokers: vec!["127.0.0.1:1".to_string()],
+                group: "scalo-quoted".to_string(),
+                topics: vec!["events".to_string()],
+                ..Default::default()
+            }
+            .with_override(key, value);
+            let errors = [
+                ("transport", KafkaTransport::new(&config).await.err()),
+                (
+                    "producer",
+                    KafkaProducer::new(&config, ProducerProfile::HighThroughput).err(),
+                ),
+                ("admin", KafkaAdmin::new(&config).err()),
+            ];
+            for (client, error) in errors {
+                let error = error.unwrap_or_else(|| panic!("the {client} built with {key}"));
+                let shown = format!("{error} {error:?}");
+                let fault = if !matches!(error, TransportError::Config(_)) {
+                    "not Config"
+                } else if shown.contains(planted) {
+                    "leaked the value"
+                } else if !shown.contains(key) {
+                    "lost the key"
+                } else if !shown.contains(reason) {
+                    "lost librdkafka's reason"
+                } else if !shown.contains("<redacted>") {
+                    "no redaction marker"
+                } else {
+                    continue;
+                };
+                faults.push(format!("{client} / {key}: {fault}: {shown}"));
+            }
+        }
+        assert!(faults.is_empty(), "{faults:#?}");
+    }
+
+    /// The value goes whole, token by token and when cut short, mid-character
+    /// included, and one marker stands for each run it covers.
+    #[test]
+    fn redact_value_covers_every_form_librdkafka_quotes() {
+        let reason = "for configuration property \"debug\"";
+        for (text, value, want) in [
+            (
+                format!("Invalid value \"s3cret\" {reason}"),
+                "s3cret",
+                format!("Invalid value \"<redacted>\" {reason}"),
+            ),
+            (
+                format!("Invalid value \"s3cret\" {reason}"),
+                "broker, s3cret",
+                format!("Invalid value \"<redacted>\" {reason}"),
+            ),
+            (
+                "Invalid value for configuration property \"sasl.mechanisms\": SCRAM s3cret"
+                    .to_string(),
+                "SCRAM s3cret",
+                "Invalid value for configuration property \"sasl.mechanisms\": <redacted>"
+                    .to_string(),
+            ),
+            (
+                "Invalid value \"s3cr".to_string(),
+                "s3cret-cut-short",
+                "Invalid value \"<redacted>".to_string(),
+            ),
+            (
+                "Invalid value \"s3cr\u{FFFD}".to_string(),
+                "s3cr\u{e9}t",
+                "Invalid value \"<redacted>".to_string(),
+            ),
+            (
+                format!("Invalid value \"x\" {reason}"),
+                " , ",
+                format!("Invalid value \"x\" {reason}"),
+            ),
+        ] {
+            assert_eq!(redact_value(&text, value), want, "{value:?}");
+        }
     }
 
     /// Only a failure to start the client's threads stays `Connection`: those

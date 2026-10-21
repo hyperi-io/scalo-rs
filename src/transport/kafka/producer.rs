@@ -549,8 +549,8 @@ mod tests {
         });
     }
 
-    /// A key, value or pair librdkafka refuses fails the producer as `Config`,
-    /// and the message names the key but never carries the value. Broker-free.
+    /// A key, value or pair librdkafka refuses fails the producer as `Config`
+    /// naming the key, with the value it was set to redacted. Broker-free.
     #[test]
     fn a_config_librdkafka_refuses_fails_the_producer_as_config() {
         let base = KafkaConfig {

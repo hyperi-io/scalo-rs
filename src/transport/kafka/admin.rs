@@ -693,7 +693,7 @@ mod tests {
     }
 
     /// Each of `KafkaAdmin::new`'s two clients fails as `Config` on a config
-    /// librdkafka refuses, naming the key but never carrying the value.
+    /// librdkafka refuses, naming the key, with the value it was set to redacted.
     #[test]
     fn a_config_librdkafka_refuses_fails_the_admin_as_config() {
         let unknown = unreachable().with_override("no.such.property", "value-not-logged");
