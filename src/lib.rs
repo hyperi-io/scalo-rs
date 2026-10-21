@@ -112,6 +112,10 @@ pub mod sensitive;
 )]
 pub mod parse_guard;
 
+// CEL lexer shared by the expression profile and the transport filter classifier.
+#[cfg(any(feature = "expression", feature = "transport"))]
+pub(crate) mod cel_lexer;
+
 // Retry backoff, compiled only with a feature that retries.
 #[cfg(any(
     feature = "otel-metrics",

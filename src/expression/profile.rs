@@ -14,6 +14,7 @@
 //! unlocked per-category via [`ProfileConfig`].
 
 use super::diagnostic::{Diagnostic, Span};
+use crate::cel_lexer::{self, Kind};
 
 /// CEL functions allowed unconditionally in the profile.
 ///
@@ -62,7 +63,9 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
 ///
 /// Each category has a reason for restriction and a config flag to unlock.
 pub const RESTRICTED_REGEX: &[&str] = &["matches"];
-pub const RESTRICTED_ITERATION: &[&str] = &["map", "filter", "exists", "all", "exists_one"];
+/// cel expands `existsOne` as the `exists_one` macro, so both spellings are listed.
+pub const RESTRICTED_ITERATION: &[&str] =
+    &["map", "filter", "exists", "all", "exists_one", "existsOne"];
 pub const RESTRICTED_TIME: &[&str] = &["timestamp", "duration"];
 
 /// All restricted functions (union of all categories).
@@ -73,6 +76,7 @@ pub const DISALLOWED_FUNCTIONS: &[&str] = &[
     "exists",
     "all",
     "exists_one",
+    "existsOne",
     "timestamp",
     "duration",
 ];
@@ -86,7 +90,8 @@ pub struct ProfileConfig {
     /// Allow `matches()` (regex). Unbounded cost per record -- use only
     /// when `contains()`/`startsWith()`/`endsWith()` are insufficient.
     pub allow_regex: bool,
-    /// Allow `map()`, `filter()`, `exists()`, `all()`, `exists_one()`.
+    /// Allow `map()`, `filter()`, `exists()`, `all()`, `exists_one()` and
+    /// `existsOne()`.
     /// O(n) per collection element -- cost proportional to data size.
     pub allow_iteration: bool,
     /// Allow `timestamp()`, `duration()`. Excluded because ClickHouse
@@ -130,8 +135,11 @@ pub fn check_profile(expr: &str) -> Vec<String> {
 
 /// Scan an expression for restricted function calls.
 ///
-/// The scanner skips string literals to avoid false positives on
-/// function names that appear inside quoted values.
+/// The scanner reads string and bytes literals (quoted, triple-quoted and
+/// raw), `//` comments and backtick-quoted identifiers the way cel's lexer
+/// does, so a name inside one is never reported, and whitespace or a comment
+/// between a name and its `(` does not hide a call. The transport filter's
+/// tier classifier reads expressions with the same lexer.
 ///
 /// Returns a list of error strings (empty if compliant).
 #[must_use]
@@ -153,89 +161,37 @@ pub fn scan_profile(expr: &str, config: &ProfileConfig) -> Vec<Diagnostic> {
     let blocked = config.blocked_functions();
 
     let mut errors = Vec::new();
-    let bytes = expr.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // Skip string literals (double-quoted and single-quoted)
-        if bytes[i] == b'"' || bytes[i] == b'\'' {
-            i = skip_string_literal(bytes, i);
+    for token in cel_lexer::tokens(expr) {
+        if token.kind != Kind::Call {
+            continue;
+        }
+        let name = &expr[token.start..token.end];
+        if SKIP_NAMES.contains(&name) {
             continue;
         }
 
-        // Skip non-identifier characters
-        if !is_ident_start(bytes[i]) {
-            i += 1;
-            continue;
-        }
-
-        // Read identifier
-        let start = i;
-        while i < len && is_ident_char(bytes[i]) {
-            i += 1;
-        }
-        let name = &expr[start..i];
-
-        // Skip whitespace between identifier and potential `(`
-        let mut peek = i;
-        while peek < len && bytes[peek] == b' ' {
-            peek += 1;
-        }
-
-        // Check if followed by `(`
-        if peek < len && bytes[peek] == b'(' {
-            if SKIP_NAMES.contains(&name) {
-                continue;
-            }
-
-            let span = Some(Span::new(start, i));
-            if blocked.contains(&name) {
-                let reason = restriction_reason(name);
-                errors.push(Diagnostic::new(
-                    format!(
-                        "Function '{name}()' is not allowed in the expression profile. {reason}"
-                    ),
-                    span,
-                ));
-            } else if !ALLOWED_FUNCTIONS.contains(&name) && !DISALLOWED_FUNCTIONS.contains(&name) {
-                // In neither list. A restricted-but-unlocked function IS in
-                // DISALLOWED_FUNCTIONS, so it falls through here and passes.
-                errors.push(Diagnostic::new(
-                    format!(
-                        "Function '{name}()' is not in the expression profile. Check \
-                         the spelling, or add it to ALLOWED_FUNCTIONS if it belongs \
-                         in the profile."
-                    ),
-                    span,
-                ));
-            }
+        let span = Some(Span::new(token.start, token.end));
+        if blocked.contains(&name) {
+            let reason = restriction_reason(name);
+            errors.push(Diagnostic::new(
+                format!("Function '{name}()' is not allowed in the expression profile. {reason}"),
+                span,
+            ));
+        } else if !ALLOWED_FUNCTIONS.contains(&name) && !DISALLOWED_FUNCTIONS.contains(&name) {
+            // In neither list. A restricted-but-unlocked function IS in
+            // DISALLOWED_FUNCTIONS, so it falls through here and passes.
+            errors.push(Diagnostic::new(
+                format!(
+                    "Function '{name}()' is not in the expression profile. Check \
+                     the spelling, or add it to ALLOWED_FUNCTIONS if it belongs \
+                     in the profile."
+                ),
+                span,
+            ));
         }
     }
 
     errors
-}
-
-/// Skip past a string literal, handling escape sequences.
-///
-/// `start` must point to the opening quote character.
-/// Returns the index after the closing quote (or end of input).
-fn skip_string_literal(bytes: &[u8], start: usize) -> usize {
-    let quote = bytes[start];
-    let mut i = start + 1;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            // Skip escaped character
-            i += 2;
-            continue;
-        }
-        if bytes[i] == quote {
-            return i + 1;
-        }
-        i += 1;
-    }
-    // Unterminated string -- return end of input
-    bytes.len()
 }
 
 fn restriction_reason(name: &str) -> &'static str {
@@ -243,7 +199,7 @@ fn restriction_reason(name: &str) -> &'static str {
         "matches" => {
             "Regex has unbounded cost per record. Use contains()/startsWith()/endsWith() instead, or set allow_regex: true in expression config."
         }
-        "map" | "filter" | "exists" | "all" | "exists_one" => {
+        "map" | "filter" | "exists" | "all" | "exists_one" | "existsOne" => {
             "Per-element iteration has O(n) cost proportional to collection size. Set allow_iteration: true in expression config to permit."
         }
         "timestamp" | "duration" => {
@@ -253,17 +209,10 @@ fn restriction_reason(name: &str) -> &'static str {
     }
 }
 
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cel_lexer::is_ident_char;
 
     // -- Default config (all restricted) -------------------------
 
@@ -519,6 +468,32 @@ mod tests {
         );
     }
 
+    /// cel expands `exists_one` and `existsOne` as the same macro, so both are
+    /// iteration: refused for `allow_iteration`, as `exists` is, and allowed by it.
+    #[test]
+    fn exists_one_is_iteration_in_both_spellings() {
+        let allowed = ProfileConfig {
+            allow_iteration: true,
+            ..Default::default()
+        };
+        for name in ["exists", "exists_one", "existsOne"] {
+            let expr = format!("[1, 2].{name}(v, v > 1)");
+            assert!(cel::Program::compile(&expr).is_ok(), "{expr} is not CEL");
+            let refused = check_profile(&expr);
+            assert_eq!(refused.len(), 1, "{expr}: {refused:?}");
+            assert!(
+                refused[0].contains(&format!("'{name}()' is not allowed"))
+                    && refused[0].contains("allow_iteration"),
+                "{expr}: {refused:?}"
+            );
+            assert_eq!(
+                check_profile_with_config(&expr, &allowed),
+                [] as [String; 0],
+                "{expr}"
+            );
+        }
+    }
+
     #[test]
     fn time_allowed_with_config() {
         let config = ProfileConfig {
@@ -620,5 +595,317 @@ mod tests {
         let span = found[0].span.expect("span");
         assert_eq!(&expr[span.start..span.end], "map");
         assert_eq!(span.start, expr.rfind("map").expect("second map"));
+    }
+
+    // -- Lexer forms ----------------------------------------------
+
+    /// One restricted call per category, as a receiver, a name and its arguments.
+    const RESTRICTED_CALLS: &[(&str, &str, &str)] = &[
+        ("x.", "matches", r#""a""#),
+        ("[1].", "map", "v, v"),
+        ("[1].", "filter", "v, v > 0"),
+        ("[1].", "exists", "v, v > 0"),
+        ("[1].", "all", "v, v > 0"),
+        ("[1].", "exists_one", "v, v > 0"),
+        ("", "timestamp", r#""2024-01-01T00:00:00Z""#),
+        ("", "duration", r#""1h""#),
+    ];
+
+    /// Literal and comment forms that hide `{call}` from a scanner reading them
+    /// differently from cel's lexer.
+    const LITERAL_FORMS: &[(&str, &str)] = &[
+        ("raw r double", r#"r"\" == "x" || {call}"#),
+        ("raw R double", r#"R"\" == "x" || {call}"#),
+        ("raw r single", r"r'\' == 'x' || {call}"),
+        ("raw R single", r"R'\' == 'x' || {call}"),
+        ("raw triple double", r#"r"""\""" == "x" || {call}"#),
+        ("raw triple single", r"r'''\''' == 'x' || {call}"),
+        ("triple double", r#""""a"b""" == "x" || {call}"#),
+        ("triple single", "'''a'b''' == 'x' || {call}"),
+        ("raw bytes br", r#"br"\" == b"x" || {call}"#),
+        ("raw bytes bR", r#"bR"\" == b"x" || {call}"#),
+        ("raw bytes Br", r#"Br"\" == b"x" || {call}"#),
+        ("raw bytes BR single", r"BR'\' == b'x' || {call}"),
+        ("bytes triple", r#"b"""a"b""" == b"x" || {call}"#),
+        ("comment holding a quote", "1 == 1 // \"\n || {call}"),
+    ];
+
+    /// Gaps cel accepts between a function name and its `(`.
+    const CALL_GAPS: &[(&str, &str)] = &[
+        ("comment", "//\n"),
+        ("spaced comment", " // note\n"),
+        ("comment line", "\n// note\n "),
+        ("tab", "\t"),
+        ("carriage return", "\r"),
+        ("newline", "\n"),
+        ("form feed", "\x0c"),
+        ("mixed", " \t\n "),
+    ];
+
+    fn call(receiver: &str, name: &str, gap: &str, args: &str) -> String {
+        format!("{receiver}{name}{gap}({args})")
+    }
+
+    /// Every form is valid CEL that runs the call, so the profile has to refuse it.
+    fn assert_refused(form: &str, expr: &str, name: &str) {
+        if let Err(e) = cel::Program::compile(expr) {
+            panic!("{form}: {expr:?} is not valid CEL, so it proves nothing: {e}");
+        }
+        let errors = check_profile(expr);
+        assert!(
+            errors.iter().any(|e| e.contains(&format!("'{name}()'"))),
+            "{form}: {expr:?} hid {name}() from the profile: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn no_literal_or_comment_form_hides_a_restricted_call() {
+        for &(receiver, name, args) in RESTRICTED_CALLS {
+            for &(form, template) in LITERAL_FORMS {
+                let expr = template.replace("{call}", &call(receiver, name, "", args));
+                assert_refused(form, &expr, name);
+            }
+        }
+    }
+
+    #[test]
+    fn no_gap_before_the_bracket_hides_a_restricted_call() {
+        for &(receiver, name, args) in RESTRICTED_CALLS {
+            for &(form, gap) in CALL_GAPS {
+                assert_refused(form, &call(receiver, name, gap, args), name);
+            }
+        }
+    }
+
+    /// cel's lexer refuses a vertical tab, but the scan treats it as a gap so a
+    /// lexer that accepted one could not run the call.
+    #[test]
+    fn a_vertical_tab_before_the_bracket_is_still_a_call() {
+        let errors = check_profile("x.matches\x0b(\"a\")");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("'matches()'"));
+    }
+
+    /// A call inside a literal or a comment is data, so it is not reported.
+    #[test]
+    fn a_call_inside_a_literal_or_comment_is_not_scanned() {
+        for expr in [
+            r#"r"map(" == "x""#,
+            r#""""a"b map( c""" == "x""#,
+            "'''x.matches('a')''' == 'x'",
+            r#"br"duration(" == b"x""#,
+            "R'''filter(''' == 'x'",
+            "x == 1 // map(v, v)",
+            "x == 1 // \"\n",
+            "x == 1 // matches(\r || x == 2",
+        ] {
+            assert!(
+                cel::Program::compile(expr).is_ok(),
+                "{expr:?} is not valid CEL"
+            );
+            assert_eq!(check_profile(expr), [] as [String; 0], "{expr:?}");
+        }
+    }
+
+    /// A line break ends a one-line literal, so a call on the next line is seen.
+    #[test]
+    fn a_line_break_ends_a_one_line_literal() {
+        for expr in ["\"abc\nx.matches(\"a\")", "r'abc\rx.matches('a')"] {
+            let errors = check_profile(expr);
+            assert_eq!(errors.len(), 1, "{expr:?}: {errors:?}");
+            assert!(errors[0].contains("'matches()'"));
+        }
+    }
+
+    /// With no closing triple quote, cel reads an empty literal and opens a new
+    /// one at the third quote, so the call after that literal is still a call.
+    #[test]
+    fn an_unclosed_triple_quote_is_an_empty_literal_then_a_new_one() {
+        let expr = r#""""a" || x.matches("a")"#;
+        assert!(cel::Program::compile(expr).is_err(), "{expr:?} parsed");
+        let found = scan_profile(expr, &ProfileConfig::default());
+        let named: Vec<&str> = found
+            .iter()
+            .filter_map(|d| d.span.map(|s| &expr[s.start..s.end]))
+            .collect();
+        assert_eq!(named, ["matches"]);
+    }
+
+    /// A prefix opens a literal only as a whole name of r, b or both, directly
+    /// before a quote.
+    #[test]
+    fn a_prefix_opens_a_literal_only_as_a_whole_name() {
+        // `rb` and `xr` are names, so the backslash escapes the quote and the
+        // plain literal runs on, which cel refuses as a name beside a string.
+        for expr in [
+            r#"rb"\" == "x" || x.matches("a")"#,
+            r#"xr"\" == "x" || x.matches("a")"#,
+        ] {
+            assert_eq!(check_profile(expr), [] as [String; 0], "{expr:?}");
+            assert!(cel::Program::compile(expr).is_err(), "{expr:?} parsed");
+        }
+        // A space between the prefix and the quote leaves a name and a plain literal.
+        let expr = r#"r "\" || x.matches("a")"#;
+        assert_eq!(check_profile(expr), [] as [String; 0]);
+        assert!(cel::Program::compile(expr).is_err(), "{expr:?} parsed");
+    }
+
+    /// A backtick-quoted name is skipped whole, so `//` inside it is not a comment.
+    #[test]
+    fn a_backtick_name_is_not_a_comment() {
+        let errors = check_profile(r#"x.`a//b` == 1 || x.matches("a")"#);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("'matches()'"));
+        // A lone backtick is one byte, so the scan carries on after it.
+        let errors = check_profile(r#"` x.matches("a")"#);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    /// The span still covers only the function name, whatever the gap.
+    #[test]
+    fn a_span_across_a_gap_covers_only_the_name() {
+        let expr = "x.map // note\n\t (a, a)";
+        let found = scan_profile(expr, &ProfileConfig::default());
+        assert_eq!(found.len(), 1, "{found:?}");
+        let span = found[0].span.expect("span");
+        assert_eq!(&expr[span.start..span.end], "map");
+    }
+
+    // -- Differential against cel's parser -------------------------
+
+    /// Text mixed around a call, covering every literal, comment and gap form.
+    const PIECES: &[&str] = &[
+        "\"", "'", "\"\"\"", "'''", "r", "R", "b", "B", "br", "bR", "Br", "BR", "rb", "\\", "//",
+        "\n", "\r", "\t", "\x0c", " ", "`", "a", "x", "1", "==", "||", "(", ")", ".", ",", "[",
+        "]",
+    ];
+
+    /// Calls the default profile refuses, some with a gap before the bracket.
+    const CALLS: &[&str] = &[
+        "x.matches(\"a\")",
+        "x.matches//\n(\"a\")",
+        "timestamp(\"2024-01-01T00:00:00Z\")",
+        "duration // c\n(\"1h\")",
+        "[1].map(v, v)",
+        "[1].filter\n(v, v > 0)",
+        "[1].exists_one\t(v, v > 0)",
+        "[1].all\r\n(v, v > 0)",
+        "[1].exists(v, v > 0)",
+        "nosuch(1)",
+    ];
+
+    const SHAPES: &[&str] = &[
+        "{h} == \"x\" || {c}",
+        "{h} || {c}",
+        "{c} || {h}",
+        "[{h}] == [] || {c}",
+        "{h}{c}",
+    ];
+
+    /// Macros cel expands into a comprehension rather than a call.
+    const ITERATION_MACROS: &[&str] =
+        &["map", "filter", "exists", "all", "exists_one", "existsOne"];
+
+    /// SplitMix64, so a failing mix reproduces from its seed.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let n = u64::try_from(n).expect("a slice length fits in u64");
+            usize::try_from(z % n).expect("below a slice length")
+        }
+
+        fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+            from[self.below(from.len())]
+        }
+    }
+
+    /// Whether any macro in `e` expanded to a comprehension.
+    fn iterates(e: &cel::IdedExpr) -> bool {
+        use cel::common::ast::{EntryExpr, Expr, IdedEntryExpr};
+        fn entry(e: &IdedEntryExpr) -> bool {
+            match &e.expr {
+                EntryExpr::StructField(f) => iterates(&f.value),
+                EntryExpr::MapEntry(m) => iterates(&m.key) || iterates(&m.value),
+            }
+        }
+        match &e.expr {
+            Expr::Comprehension(_) => true,
+            Expr::Call(c) => {
+                c.target.as_deref().is_some_and(iterates) || c.args.iter().any(iterates)
+            }
+            Expr::List(l) => l.elements.iter().any(iterates),
+            Expr::Map(m) => m.entries.iter().any(entry),
+            Expr::Struct(s) => s.entries.iter().any(entry),
+            Expr::Select(s) => iterates(&s.operand),
+            Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => false,
+        }
+    }
+
+    /// Mix `cases` expressions from `seed` and, for each one cel parses, require
+    /// the scan to report exactly the calls cel's parser read that the default
+    /// profile refuses. Returns how many cel parsed.
+    fn differential(cases: usize, seed: u64) -> usize {
+        let mut rng = SplitMix(seed);
+        let mut parsed = 0;
+        for _ in 0..cases {
+            let head: String = (0..=rng.below(10)).map(|_| rng.pick(PIECES)).collect();
+            let shape = rng.pick(SHAPES);
+            let expr = shape.replace("{h}", &head).replace("{c}", rng.pick(CALLS));
+            let Ok(program) = cel::Program::compile(&expr) else {
+                continue;
+            };
+            parsed += 1;
+            let references = program.references();
+            // Operators are named with punctuation, and a leading-dot call keeps its dot.
+            let called: Vec<&str> = references
+                .functions()
+                .into_iter()
+                .map(|f| f.trim_start_matches('.'))
+                .filter(|f| f.bytes().all(is_ident_char) && !ALLOWED_FUNCTIONS.contains(f))
+                .collect();
+            let iterated = iterates(program.expression());
+            let flagged: Vec<&str> = scan_profile(&expr, &ProfileConfig::default())
+                .iter()
+                .filter_map(|d| d.span.map(|s| &expr[s.start..s.end]))
+                .collect();
+            for name in &called {
+                assert!(
+                    flagged.contains(name),
+                    "{expr:?} hid {name}() from the scan"
+                );
+            }
+            if iterated {
+                assert!(
+                    flagged.iter().any(|f| ITERATION_MACROS.contains(f)),
+                    "{expr:?} iterates, and the scan reported {flagged:?}"
+                );
+            }
+            for name in &flagged {
+                assert!(
+                    called.contains(name) || (iterated && ITERATION_MACROS.contains(name)),
+                    "{expr:?}: the scan reported {name}(), which cel does not call"
+                );
+            }
+        }
+        parsed
+    }
+
+    #[test]
+    fn the_scan_agrees_with_cels_parser_on_mixed_literals() {
+        let parsed = differential(20_000, 20_261_021);
+        assert!(parsed > 1_000, "only {parsed} mixes parsed");
+    }
+
+    #[test]
+    #[ignore = "400K-case differential, slow in a debug build -- run: cargo nextest run --release --features expression --run-ignored all --ignore-default-filter -E 'test(differential)'"]
+    fn the_scan_agrees_with_cels_parser_over_400k_mixes_differential() {
+        let parsed = differential(400_000, 7);
+        assert!(parsed > 20_000, "only {parsed} mixes parsed");
     }
 }

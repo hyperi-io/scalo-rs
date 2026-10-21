@@ -114,6 +114,7 @@ mod tests {
         assert!((config.memory_gate_threshold - 0.8).abs() < f64::EPSILON);
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn test_config_serde_roundtrip() {
         let config = ScalingPressureConfig {

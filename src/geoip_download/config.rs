@@ -25,6 +25,8 @@
 //!     enabled: true
 //!     data_dir: /var/lib/geoip
 //!     max_age_days: 30
+//!     # Cap on a download and on the database decompressed from it.
+//!     max_database_bytes: 536870912
 //!     # Credentials are SensitiveString: redacted in Debug and in any
 //!     # serialised form. Supply them through the secrets layer, not literals.
 //!     maxmind_account_id: null
@@ -43,6 +45,11 @@ const DEFAULT_DATA_DIR: &str = "/var/lib/geoip";
 
 /// Default staleness threshold, in days, before a re-download is attempted.
 const DEFAULT_MAX_AGE_DAYS: u32 = 30;
+
+/// Default cap on a download and on the database inside it: several times the
+/// largest free database the providers publish, so growth does not trip it and
+/// a decompression bomb cannot fill the disk.
+const DEFAULT_MAX_DATABASE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Source of the MMDB databases.
 ///
@@ -65,13 +72,14 @@ pub enum GeoIpProvider {
     /// MaxMind GeoLite2 -- free account required (account id + licence key).
     MaxMindGeoLite2,
 
-    /// IPLocate.io -- free, anonymous, country + ASN only.
+    /// IPLocate.io IP to ASN -- free, anonymous, ASN only, CC BY-SA 4.0.
     IpLocate,
 
     /// IPinfo Lite -- free token required, country + ASN only.
     IpInfoLite,
 
-    /// sapics/ip-location-db -- free CC0, country + ASN only.
+    /// DB-IP Lite ASN as sapics/ip-location-db republishes it -- free,
+    /// anonymous, ASN only, CC BY 4.0.
     Sapics,
 
     /// Caller supplies the MMDB paths directly; nothing is downloaded.
@@ -109,6 +117,10 @@ pub struct AutoDownloadConfig {
 
     /// Age, in days, past which a local database is treated as stale.
     pub max_age_days: u32,
+
+    /// Largest download, and largest database decompressed from it, in bytes.
+    /// A transfer past it is abandoned and the local copy kept. Default 512 MiB.
+    pub max_database_bytes: u64,
 }
 
 impl Default for AutoDownloadConfig {
@@ -120,6 +132,7 @@ impl Default for AutoDownloadConfig {
             maxmind_license_key: None,
             ipinfo_token: None,
             max_age_days: DEFAULT_MAX_AGE_DAYS,
+            max_database_bytes: DEFAULT_MAX_DATABASE_BYTES,
         }
     }
 }
@@ -232,6 +245,7 @@ mod tests {
         assert!(auto.enabled);
         assert_eq!(auto.data_dir, PathBuf::from("/var/lib/geoip"));
         assert_eq!(auto.max_age_days, 30);
+        assert_eq!(auto.max_database_bytes, 512 * 1024 * 1024);
         assert!(auto.maxmind_account_id.is_none());
         assert!(auto.maxmind_license_key.is_none());
         assert!(auto.ipinfo_token.is_none());
@@ -262,6 +276,11 @@ mod tests {
         assert_eq!(config.provider, GeoIpProvider::MaxMindGeoLite2);
         assert_eq!(config.auto_download.data_dir, PathBuf::from("/srv/geoip"));
         assert_eq!(config.auto_download.max_age_days, 7);
+        assert_eq!(
+            config.auto_download.max_database_bytes,
+            512 * 1024 * 1024,
+            "an unset cap keeps its default"
+        );
         assert_eq!(
             config
                 .auto_download

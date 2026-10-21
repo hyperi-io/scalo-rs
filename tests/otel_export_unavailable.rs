@@ -18,7 +18,8 @@
 //! No Docker needed: the point is the ABSENCE of a receiver, and a closed
 //! port is a truer absence than a stopped container.
 
-#![cfg(feature = "otel-metrics")]
+// The Prometheus endpoint this test reads is the `metrics` feature's.
+#![cfg(all(feature = "otel-metrics", feature = "metrics"))]
 
 use std::time::{Duration, Instant};
 

@@ -233,8 +233,10 @@ impl KafkaProducer {
     ///
     /// `TransportError::Config` when the provider preset or
     /// [`KafkaConfig::validate`] refuses the config, as
-    /// [`KafkaTransport::new`](super::KafkaTransport::new) does;
-    /// `TransportError::Connection` when librdkafka cannot build the producer.
+    /// [`KafkaTransport::new`](super::KafkaTransport::new) does, or when
+    /// librdkafka refuses a key, a value or their combination.
+    /// `TransportError::Connection` when librdkafka cannot start the producer's
+    /// threads.
     pub fn new(config: &KafkaConfig, profile: ProducerProfile) -> TransportResult<Self> {
         Self::with_context(config, profile, ProducerContext::default())
     }
@@ -269,7 +271,7 @@ impl KafkaProducer {
         let undelivered = context.undelivered.clone();
         let producer: ThreadedProducer<ProducerContext> = client_config
             .create_with_context(context)
-            .map_err(|e| TransportError::Connection(format!("Failed to create producer: {e}")))?;
+            .map_err(|e| super::client_build_error("producer", &e))?;
 
         Ok(Self {
             producer,
@@ -545,6 +547,41 @@ mod tests {
         client_gate::assert_builds_under_production(|config| {
             client_gate::config_refusal(KafkaProducer::new(config, ProducerProfile::HighThroughput))
         });
+    }
+
+    /// A key, value or pair librdkafka refuses fails the producer as `Config`
+    /// naming the key, with the value it was set to redacted. Broker-free.
+    #[test]
+    fn a_config_librdkafka_refuses_fails_the_producer_as_config() {
+        let base = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: String::new(),
+            ..KafkaConfig::default()
+        };
+        for (config, key) in [
+            (
+                base.clone()
+                    .with_override("no.such.property", "value-not-logged"),
+                "no.such.property",
+            ),
+            (base.clone().with_override("linger.ms", "soon"), "linger.ms"),
+            (
+                base.clone()
+                    .with_overrides(&[("enable.idempotence", "true"), ("acks", "1")]),
+                "acks",
+            ),
+        ] {
+            match KafkaProducer::new(&config, ProducerProfile::HighThroughput) {
+                Err(error @ TransportError::Config(_)) => {
+                    let why = error.to_string();
+                    assert!(why.contains("producer"), "{why}");
+                    assert!(why.contains(key), "{why} does not name {key}");
+                    assert!(!why.contains("value-not-logged"), "{why}");
+                }
+                Err(other) => panic!("{key} failed as {other}, not as config"),
+                Ok(_) => panic!("built a producer with {key}"),
+            }
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::config::FilterTier;
+use crate::cel_lexer::{self, Kind};
 
 /// Recognised Tier 1 operation extracted from the expression text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,7 @@ const RESTRICTED_FUNCTIONS: &[&str] = &[
     "exists",
     "all",
     "exists_one",
+    "existsOne",
     "timestamp",
     "duration",
 ];
@@ -114,6 +116,7 @@ const CEL_KEYWORDS: &[&str] = &[
     "exists",
     "all",
     "exists_one",
+    "existsOne",
     "timestamp",
     "duration",
 ];
@@ -213,39 +216,12 @@ fn try_tier1(expr: &str) -> Option<Tier1Op> {
     None
 }
 
-/// Check if the expression uses any restricted functions (Tier 3).
-///
-/// Walks all occurrences of each `func(` pattern; returns true on
-/// the first match that lands outside a string literal. The previous
-/// "find first occurrence + quote-count" shape missed real calls
-/// when an earlier same-name occurrence sat inside a string.
+/// Whether the expression calls a restricted function (Tier 3), read with the
+/// lexer the expression profile uses, so the two agree on what is a call.
 fn check_restricted_functions(expr: &str) -> bool {
-    for func in RESTRICTED_FUNCTIONS {
-        let pattern = format!("{func}(");
-        for (pos, _) in expr.match_indices(&pattern) {
-            if !position_is_in_string(expr, pos) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// `true` if byte `pos` falls inside a `"..."` string literal,
-/// counting `\"` as escaped.
-fn position_is_in_string(expr: &str, pos: usize) -> bool {
-    let mut in_string = false;
-    let mut prev_was_escape = false;
-    for (i, ch) in expr.char_indices() {
-        if i >= pos {
-            return in_string;
-        }
-        if ch == '"' && !prev_was_escape {
-            in_string = !in_string;
-        }
-        prev_was_escape = ch == '\\' && !prev_was_escape;
-    }
-    in_string
+    cel_lexer::tokens(expr).any(|token| {
+        token.kind == Kind::Call && RESTRICTED_FUNCTIONS.contains(&&expr[token.start..token.end])
+    })
 }
 
 /// Extract field references from an expression (for Tier 2/3 CEL context building).
@@ -260,31 +236,16 @@ fn extract_field_references(expr: &str) -> Vec<String> {
 
     let mut fields: Vec<String> = Vec::new();
 
-    // Build a mask of which byte positions are inside string literals
-    let mut in_string_mask = vec![false; expr.len()];
-    let mut in_string = false;
-    let mut prev_was_escape = false;
-    for (i, ch) in expr.char_indices() {
-        if in_string {
-            in_string_mask[i] = true;
-        }
-        if ch == '"' && !prev_was_escape {
-            in_string = !in_string;
-        }
-        prev_was_escape = ch == '\\' && !prev_was_escape;
-    }
+    // Literals and comments read as spaces, so nothing inside one is a field.
+    let code = cel_lexer::code_only(expr);
 
-    for m in RE_IDENT.find_iter(expr) {
-        if in_string_mask.get(m.start()).copied().unwrap_or(false) {
-            continue;
-        }
-
+    for m in RE_IDENT.find_iter(&code) {
         let mut ident = m.as_str().to_string();
 
         // If this identifier is immediately followed by '(' (a function call),
         // strip the last dotted segment (the method name) -- the receiver is
         // the actual field reference.
-        let after = &expr[m.end()..];
+        let after = &code[m.end()..];
         if after.trim_start().starts_with('(') {
             if let Some(dot_pos) = ident.rfind('.') {
                 // Method call on a field: keep the receiver
@@ -415,6 +376,21 @@ mod tests {
         assert_eq!(result.tier(), FilterTier::Tier3);
     }
 
+    /// cel expands `exists_one` and `existsOne` as one macro, so both take the
+    /// tier `exists` does.
+    #[test]
+    fn exists_one_classifies_as_exists_does() {
+        let tier = |name: &str| {
+            classify(&format!(r#"tags.{name}(t, t == "pii")"#))
+                .unwrap()
+                .tier()
+        };
+        assert_eq!(tier("exists"), FilterTier::Tier3);
+        for name in ["exists_one", "existsOne"] {
+            assert_eq!(tier(name), tier("exists"), "{name}");
+        }
+    }
+
     #[test]
     fn classify_iteration_is_tier3() {
         let result = classify(r#"tags.exists(t, t == "pii")"#).unwrap();
@@ -459,5 +435,81 @@ mod tests {
     fn restricted_call_after_string_literal_decoy_classifies_tier3() {
         let result = classify(r#"message == "matches(" || source.matches("^prod")"#).unwrap();
         assert_eq!(result.tier(), FilterTier::Tier3);
+    }
+
+    /// Restricted calls the profile refuses, written past a literal or with a
+    /// gap before the bracket.
+    const HIDDEN_CALLS: &[&str] = &[
+        "x.matches (\"a\")",
+        "x.matches\t(\"a\")",
+        "x.matches // note\n(\"a\")",
+        r#"r"\" == "x" || x.matches("a")"#,
+        r#"'"' == x || y.matches("a")"#,
+        r#""""a"b""" == x || [1].map(v, v) == [1]"#,
+    ];
+
+    /// Restricted names inside a literal or a comment, which call nothing.
+    const QUOTED_NAMES: &[&str] = &[
+        r#"r"x.matches(" == y || z > 1"#,
+        "'''map(v, v)''' == y || z > 1",
+        "x > 1 // y.matches(\"a\")",
+    ];
+
+    #[test]
+    fn a_restricted_call_past_a_literal_or_gap_classifies_tier3() {
+        for expr in HIDDEN_CALLS {
+            assert_eq!(
+                classify(expr).unwrap().tier(),
+                FilterTier::Tier3,
+                "{expr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restricted_name_in_a_literal_or_comment_stays_tier2() {
+        for expr in QUOTED_NAMES {
+            assert_eq!(
+                classify(expr).unwrap().tier(),
+                FilterTier::Tier2,
+                "{expr:?}"
+            );
+        }
+    }
+
+    /// A quote inside another literal, or a literal's prefix, neither hides
+    /// a field nor reads as one.
+    #[test]
+    fn fields_are_read_as_the_lexer_reads_literals() {
+        let fields = |expr: &str| match classify(expr).unwrap() {
+            ClassifyResult::Tier2 { fields } | ClassifyResult::Tier3 { fields } => fields,
+            other @ ClassifyResult::Tier1(_) => panic!("{expr:?} is {other:?}"),
+        };
+        assert_eq!(fields(r#"'"' == host || port > 1"#), ["host", "port"]);
+        assert_eq!(
+            fields(r#"r"severity" == name && b'x' != tag"#),
+            ["name", "tag"]
+        );
+        assert_eq!(
+            fields("level > 1 // and source\n || other"),
+            ["level", "other"]
+        );
+    }
+
+    /// A filter is Tier 3 exactly when the expression profile would refuse it
+    /// for a restricted call, so the tier gate and the profile never disagree.
+    #[cfg(feature = "expression")]
+    #[test]
+    fn the_tier_agrees_with_the_expression_profile() {
+        use crate::expression::{DISALLOWED_FUNCTIONS, ProfileConfig, scan_profile};
+
+        for expr in HIDDEN_CALLS.iter().chain(QUOTED_NAMES) {
+            let restricted = scan_profile(expr, &ProfileConfig::default())
+                .iter()
+                .filter_map(|d| d.span)
+                .any(|s| DISALLOWED_FUNCTIONS.contains(&&expr[s.start..s.end]));
+            let tier3 = classify(expr).unwrap().tier() == FilterTier::Tier3;
+            assert_eq!(tier3, restricted, "{expr:?}");
+        }
     }
 }

@@ -78,6 +78,8 @@ A route filter table written with separate match types maps onto these:
 
 `when` compiles under the CEL Fast profile ([../../src/expression/profile.rs](../../src/expression/profile.rs)): the options' `profile`, or `expression.*` from the config cascade for `RuleSet::compile`. Each top-level name the condition reads resolves lazily, from an earlier top-level target's new value or from the record. A condition that is not `true`, or fails to evaluate, does not match.
 
+The profile scanner reads the condition as cel's lexer does. A function name inside a string or bytes literal (quoted, triple-quoted or raw, with the `r`, `R`, `b`, `B`, `br`, `bR`, `Br` or `BR` prefix), a `//` comment or a backtick-quoted name is not a call, and whitespace or a comment between a name and its `(` still makes it one.
+
 ### Actions
 
 | Action | Value | When it finds nothing |

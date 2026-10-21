@@ -43,6 +43,7 @@
 
 pub mod config;
 mod fetch;
+mod mmdb;
 
 pub use config::{AutoDownloadConfig, GeoIpConfig, GeoIpProvider};
 
@@ -114,6 +115,23 @@ pub enum GeoIpDownloadError {
         provider: String,
         /// Database kind: `city` or `asn`.
         kind: &'static str,
+    },
+
+    /// The transfer, or the database decompressed from it, passed
+    /// `auto_download.max_database_bytes`.
+    #[error("the {what} passed max_database_bytes ({limit} bytes)")]
+    TooLarge {
+        /// `download` for the transferred body, `database` for the MMDB.
+        what: &'static str,
+        /// The configured cap, in bytes.
+        limit: u64,
+    },
+
+    /// The downloaded file does not read as an MMDB database.
+    #[error("the downloaded file is not an MMDB database: {reason}")]
+    NotMmdb {
+        /// The first structural fault found.
+        reason: &'static str,
     },
 }
 
@@ -243,7 +261,7 @@ fn provider_filenames(provider: GeoIpProvider) -> (Option<&'static str>, Option<
         GeoIpProvider::MaxMindGeoLite2 => (Some("GeoLite2-City.mmdb"), Some("GeoLite2-ASN.mmdb")),
         GeoIpProvider::IpLocate => (None, Some("iplocate-asn.mmdb")),
         GeoIpProvider::IpInfoLite => (Some("ipinfo-lite.mmdb"), None),
-        GeoIpProvider::Sapics => (None, Some("sapics-asn-country.mmdb")),
+        GeoIpProvider::Sapics => (None, Some("sapics-dbip-asn.mmdb")),
         GeoIpProvider::Custom => (None, None),
     }
 }
@@ -266,7 +284,9 @@ fn is_fresh(path: &Path, max_age_secs: u64) -> bool {
 
 /// Build and run the transfer for one database.
 async fn download(kind: Kind, config: &GeoIpConfig) -> Result<PathBuf, GeoIpDownloadError> {
-    plan(kind, config)?.run().await
+    plan(kind, config)?
+        .run(config.auto_download.max_database_bytes)
+        .await
 }
 
 /// Map (provider, kind) onto a concrete transfer.
@@ -343,17 +363,19 @@ fn plan(kind: Kind, config: &GeoIpConfig) -> Result<Transfer, GeoIpDownloadError
         },
 
         (GeoIpProvider::IpLocate, Kind::Asn) => Transfer {
-            url: "https://github.com/sapics/ip-location-db/raw/main/dbip-asn/dbip-asn.mmdb"
-                .to_string(),
+            url:
+                "https://github.com/iplocate/ip-address-databases/raw/main/ip-to-asn/ip-to-asn.mmdb"
+                    .to_string(),
             dest: dir.join("iplocate-asn.mmdb"),
             archive: Archive::Raw,
             credential: Credential::None,
         },
 
+        // The release tagged `latest`, the form the project documents.
         (GeoIpProvider::Sapics, Kind::Asn) => Transfer {
-            url: "https://github.com/sapics/ip-location-db/raw/main/geo-whois-asn-country/geo-whois-asn-country.mmdb"
+            url: "https://github.com/sapics/ip-location-db/releases/download/latest/dbip-asn.mmdb"
                 .to_string(),
-            dest: dir.join("sapics-asn-country.mmdb"),
+            dest: dir.join("sapics-dbip-asn.mmdb"),
             archive: Archive::Raw,
             credential: Credential::None,
         },

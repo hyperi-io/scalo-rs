@@ -650,6 +650,49 @@ fn validate_real_call_after_string_caught() {
     assert!(errors[0].contains("map()"));
 }
 
+/// Raw, triple-quoted and bytes literals and `//` comments are read as cel
+/// reads them, so none of them hides a restricted call from `compile`.
+#[test]
+fn compile_refuses_a_restricted_call_after_any_literal_or_comment_form() {
+    for expr in [
+        r#"r"\" == "x" || x.matches("a")"#,
+        r#"R'\' == 'x' || [1].map(v, v) == [1]"#,
+        r#"r"""\""" == "x" || [1].filter(v, v > 0) == [1]"#,
+        r#""""a"b""" == "x" || [1].exists_one(v, v > 0)"#,
+        r#"'''a'b''' == 'x' || timestamp("2024-01-01T00:00:00Z") > timestamp("2023-01-01T00:00:00Z")"#,
+        r#"br"\" == b"x" || duration("1h") > duration("1m")"#,
+        "1 == 1 // \"\n || x.matches(\"a\")",
+        "x.matches//\n(\"a\")",
+        "[1].all\x0c(v, v > 0)",
+    ] {
+        assert!(
+            cel::Program::compile(expr).is_ok(),
+            "{expr:?} is not valid CEL"
+        );
+        match compile(expr) {
+            Err(ExpressionError::Validation(errors)) => {
+                assert!(
+                    errors.iter().any(|e| e.contains("not allowed")),
+                    "{expr:?}: {errors:?}"
+                );
+            }
+            Err(other) => panic!("{expr:?} failed as {other}, not on the profile"),
+            Ok(_) => panic!("{expr:?} compiled past the profile"),
+        }
+    }
+}
+
+/// The restricted call cel would otherwise run is refused before evaluation.
+#[test]
+fn evaluate_refuses_a_regex_hidden_after_a_raw_literal() {
+    let data: HashMap<String, serde_json::Value> = [("x".to_string(), json!("abc"))].into();
+    let result = evaluate(r#"r"\" == "x" || x.matches("^a")"#, &data);
+    assert!(
+        matches!(result, Err(ExpressionError::Validation(_))),
+        "{result:?}"
+    );
+}
+
 // -- ProfileConfig integration --------------------------------
 
 #[test]
@@ -659,6 +702,30 @@ fn profile_config_default_blocks_all_restricted() {
     assert!(blocked.contains(&"matches"));
     assert!(blocked.contains(&"map"));
     assert!(blocked.contains(&"timestamp"));
+}
+
+/// Both spellings of the exists_one macro compile and run under
+/// `allow_iteration`, and are refused as iteration without it.
+#[test]
+fn exists_one_runs_only_under_allow_iteration() {
+    let allowed = ProfileConfig {
+        allow_iteration: true,
+        ..Default::default()
+    };
+    for name in ["exists_one", "existsOne"] {
+        let expr = format!("[1, 2, 3].{name}(v, v > 2)");
+        let program = scalo::expression::compile_with_config(&expr, &allowed)
+            .unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let result = program.execute(&cel::Context::default());
+        assert_eq!(result.ok(), Some(true.into()), "{expr}");
+        match scalo::expression::compile_with_config(&expr, &ProfileConfig::default()) {
+            Err(ExpressionError::Validation(errors)) => {
+                assert!(errors[0].contains("allow_iteration"), "{expr}: {errors:?}");
+            }
+            Err(other) => panic!("{expr} failed as {other}"),
+            Ok(_) => panic!("{expr} compiled without allow_iteration"),
+        }
+    }
 }
 
 #[test]

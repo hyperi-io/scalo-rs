@@ -17,7 +17,8 @@
 // Kafka ENV Loading Tests
 // =============================================================================
 
-#[cfg(feature = "transport-kafka")]
+// Each `from_env` constructor these modules test exists only with `config`.
+#[cfg(all(feature = "transport-kafka", feature = "config"))]
 mod kafka_env {
     use scalo::transport::kafka::KafkaConfig;
 
@@ -169,7 +170,7 @@ mod kafka_env {
 // Vault/OpenBao ENV Loading Tests
 // =============================================================================
 
-#[cfg(feature = "secrets-vault")]
+#[cfg(all(feature = "secrets-vault", feature = "config"))]
 mod vault_env {
     use scalo::secrets::{OpenBaoAuth, OpenBaoConfig};
 
@@ -364,7 +365,7 @@ mod vault_env {
 // AWS ENV Loading Tests
 // =============================================================================
 
-#[cfg(feature = "secrets-aws")]
+#[cfg(all(feature = "secrets-aws", feature = "config"))]
 mod aws_env {
     use scalo::secrets::AwsConfig;
 

@@ -51,7 +51,7 @@ fn provider_filenames_cover_every_variant() {
         ),
         (GeoIpProvider::IpLocate, None, Some("iplocate-asn.mmdb")),
         (GeoIpProvider::IpInfoLite, Some("ipinfo-lite.mmdb"), None),
-        (GeoIpProvider::Sapics, None, Some("sapics-asn-country.mmdb")),
+        (GeoIpProvider::Sapics, None, Some("sapics-dbip-asn.mmdb")),
         (GeoIpProvider::Custom, None, None),
     ];
 

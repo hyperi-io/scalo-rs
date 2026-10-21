@@ -74,6 +74,7 @@ mod tests {
         assert!(config.compress_rotated);
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn test_rotation_period_serde() {
         let json = r#""hourly""#;
@@ -85,6 +86,7 @@ mod tests {
         assert_eq!(period, RotationPeriod::Daily);
     }
 
+    #[cfg(feature = "serde_json")]
     #[test]
     fn test_config_serde_roundtrip() {
         let config = FileWriterConfig {

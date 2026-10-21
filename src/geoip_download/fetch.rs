@@ -113,10 +113,12 @@ pub(super) struct Transfer {
 }
 
 impl Transfer {
-    /// Fetch, materialise and atomically move the database into place.
+    /// Fetch, materialise, check and atomically move the database into place,
+    /// refusing a body or a database over `max_bytes`.
     ///
-    /// Returns the destination path on success.
-    pub(super) async fn run(self) -> Result<PathBuf, GeoIpDownloadError> {
+    /// Returns the destination path on success. On failure the destination is
+    /// left as it was.
+    pub(super) async fn run(self, max_bytes: u64) -> Result<PathBuf, GeoIpDownloadError> {
         if let Some(parent) = self.dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -131,7 +133,7 @@ impl Transfer {
 
         // A failed transfer must not leave a partial file that a later run
         // mistakes for a complete one.
-        let bytes = match self.stream_to(&part).await {
+        let bytes = match self.stream_to(&part, max_bytes).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 let _ = fs::remove_file(&part);
@@ -143,7 +145,7 @@ impl Transfer {
         let archive = self.archive;
         let staged = with_extension(&dest, STAGE_EXT);
         let final_size = tokio::task::spawn_blocking(move || {
-            let result = materialise(&part, &staged, &dest, archive);
+            let result = materialise(&part, &staged, &dest, archive, max_bytes);
             let _ = fs::remove_file(&part);
             if result.is_err() {
                 let _ = fs::remove_file(&staged);
@@ -161,8 +163,9 @@ impl Transfer {
         Ok(self.dest)
     }
 
-    /// Stream the response body to `part`, returning the byte count.
-    async fn stream_to(&self, part: &Path) -> Result<u64, GeoIpDownloadError> {
+    /// Stream the response body to `part`, returning the byte count, and stop
+    /// once it passes `max_bytes`.
+    async fn stream_to(&self, part: &Path, max_bytes: u64) -> Result<u64, GeoIpDownloadError> {
         // Built per download, so the steady-state path where both databases are
         // fresh constructs no client at all.
         let mut config = HttpClientConfig::from_cascade();
@@ -186,21 +189,29 @@ impl Transfer {
         let mut file = fs::File::create(part)?;
         let mut written = 0u64;
         while let Some(chunk) = response.chunk().await.map_err(HttpError::from)? {
-            io::Write::write_all(&mut file, &chunk)?;
             written += chunk.len() as u64;
+            if written > max_bytes {
+                return Err(GeoIpDownloadError::TooLarge {
+                    what: "download",
+                    limit: max_bytes,
+                });
+            }
+            io::Write::write_all(&mut file, &chunk)?;
         }
         io::Write::flush(&mut file)?;
         Ok(written)
     }
 }
 
-/// Turn the transferred bytes into the destination file. Blocking: gzip and
+/// Turn the transferred bytes into the destination file, refusing a database
+/// over `max_bytes` or one that does not read as an MMDB. Blocking: gzip and
 /// tar decode are synchronous and this runs on the blocking pool.
 fn materialise(
     part: &Path,
     staged: &Path,
     dest: &Path,
     archive: Archive,
+    max_bytes: u64,
 ) -> Result<u64, GeoIpDownloadError> {
     let source = fs::File::open(part)?;
 
@@ -209,19 +220,43 @@ fn materialise(
             fs::rename(part, staged)?;
         }
         Archive::Gzip => {
-            let mut decoder = GzDecoder::new(io::BufReader::new(source));
-            let mut out = io::BufWriter::new(fs::File::create(staged)?);
-            io::copy(&mut decoder, &mut out)?;
-            io::Write::flush(&mut out)?;
+            let decoder = GzDecoder::new(io::BufReader::new(source));
+            write_capped(decoder, staged, max_bytes)?;
         }
         Archive::TarGz { member } => {
-            extract_member(source, staged, member)?;
+            extract_member(source, staged, member, max_bytes)?;
         }
     }
 
     let size = fs::metadata(staged)?.len();
+    if size > max_bytes {
+        return Err(GeoIpDownloadError::TooLarge {
+            what: "database",
+            limit: max_bytes,
+        });
+    }
+    super::mmdb::verify(staged)?;
     fs::rename(staged, dest)?;
     Ok(size)
+}
+
+/// Copy `reader` to `staged`, stopping once it passes `max_bytes`.
+fn write_capped(
+    reader: impl io::Read,
+    staged: &Path,
+    max_bytes: u64,
+) -> Result<(), GeoIpDownloadError> {
+    let mut out = io::BufWriter::new(fs::File::create(staged)?);
+    // One byte past the cap is enough to tell an over-size stream from one at it.
+    let copied = io::copy(&mut reader.take(max_bytes.saturating_add(1)), &mut out)?;
+    if copied > max_bytes {
+        return Err(GeoIpDownloadError::TooLarge {
+            what: "database",
+            limit: max_bytes,
+        });
+    }
+    io::Write::flush(&mut out)?;
+    Ok(())
 }
 
 /// Extract a single named member from a gzip-compressed tar.
@@ -233,18 +268,16 @@ fn extract_member(
     source: fs::File,
     staged: &Path,
     member: &'static str,
+    max_bytes: u64,
 ) -> Result<(), GeoIpDownloadError> {
     let decoder = GzDecoder::new(io::BufReader::new(source));
     let mut archive = tar::Archive::new(decoder);
 
     for entry in archive.entries()? {
-        let mut entry = entry?;
+        let entry = entry?;
         let is_match = entry.path()?.file_name().is_some_and(|name| name == member);
         if is_match {
-            let mut out = io::BufWriter::new(fs::File::create(staged)?);
-            io::copy(&mut entry, &mut out)?;
-            io::Write::flush(&mut out)?;
-            return Ok(());
+            return write_capped(entry, staged, max_bytes);
         }
     }
 
@@ -351,56 +384,29 @@ mod tests {
         assert_eq!(request.url().query(), Some("suffix=tar.gz"));
     }
 
-    #[test]
-    fn materialise_gzip_writes_the_decompressed_file() {
+    /// A cap no test database comes near.
+    const ROOM: u64 = 1 << 20;
+
+    const MEMBER: &str = "GeoLite2-City.mmdb";
+
+    fn gzip(payload: &[u8], path: &Path) {
         use std::io::Write;
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("db.mmdb");
-        let part = with_extension(&dest, PART_EXT);
-        let staged = with_extension(&dest, STAGE_EXT);
-
-        let payload = b"not really an mmdb, but it round-trips";
         let mut encoder = flate2::write::GzEncoder::new(
-            fs::File::create(&part).unwrap(),
+            fs::File::create(path).unwrap(),
             flate2::Compression::fast(),
         );
         encoder.write_all(payload).unwrap();
         encoder.finish().unwrap();
-
-        let size = materialise(&part, &staged, &dest, Archive::Gzip).unwrap();
-        assert_eq!(usize::try_from(size).unwrap(), payload.len());
-        assert_eq!(fs::read(&dest).unwrap(), payload);
-        assert!(!staged.exists(), "staged file must be renamed away");
     }
 
-    #[test]
-    fn materialise_raw_renames_the_body_into_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("db.mmdb");
-        let part = with_extension(&dest, PART_EXT);
-        let staged = with_extension(&dest, STAGE_EXT);
-
-        fs::write(&part, b"raw body").unwrap();
-        let size = materialise(&part, &staged, &dest, Archive::Raw).unwrap();
-
-        assert_eq!(size, 8);
-        assert_eq!(fs::read(&dest).unwrap(), b"raw body");
-    }
-
-    #[test]
-    fn materialise_tar_gz_extracts_the_named_member() {
+    /// A gzip-compressed tar holding `payload` as [`MEMBER`] under a dated
+    /// directory, as the real archives lay it out.
+    fn tar_gz(payload: &[u8], path: &Path) {
         use std::io::Write;
 
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("GeoLite2-City.mmdb");
-        let part = with_extension(&dest, PART_EXT);
-        let staged = with_extension(&dest, STAGE_EXT);
-
-        // Mirror the real layout: the member sits under a dated directory.
-        let payload = b"city database bytes";
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-            fs::File::create(&part).unwrap(),
+            fs::File::create(path).unwrap(),
             flate2::Compression::fast(),
         ));
         let mut header = tar::Header::new_gnu();
@@ -410,8 +416,8 @@ mod tests {
         builder
             .append_data(
                 &mut header,
-                "GeoLite2-City_20241231/GeoLite2-City.mmdb",
-                &payload[..],
+                format!("GeoLite2-City_20241231/{MEMBER}"),
+                payload,
             )
             .unwrap();
         builder
@@ -421,19 +427,179 @@ mod tests {
             .unwrap()
             .flush()
             .unwrap();
+    }
 
-        let size = materialise(
-            &part,
-            &staged,
-            &dest,
-            Archive::TarGz {
-                member: "GeoLite2-City.mmdb",
-            },
-        )
-        .unwrap();
+    /// Write `payload` to `part` in `archive`'s packaging.
+    fn package(archive: Archive, payload: &[u8], part: &Path) {
+        match archive {
+            Archive::Raw => fs::write(part, payload).unwrap(),
+            Archive::Gzip => gzip(payload, part),
+            Archive::TarGz { .. } => tar_gz(payload, part),
+        }
+    }
 
-        assert_eq!(usize::try_from(size).unwrap(), payload.len());
-        assert_eq!(fs::read(&dest).unwrap(), payload);
+    const ARCHIVES: [Archive; 3] = [
+        Archive::Raw,
+        Archive::Gzip,
+        Archive::TarGz { member: MEMBER },
+    ];
+
+    #[test]
+    fn materialise_writes_the_database_in_every_packaging() {
+        let database = super::super::mmdb::sample();
+        for archive in ARCHIVES {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join(MEMBER);
+            let part = with_extension(&dest, PART_EXT);
+            let staged = with_extension(&dest, STAGE_EXT);
+            package(archive, &database, &part);
+
+            let size = materialise(&part, &staged, &dest, archive, ROOM).unwrap();
+            assert_eq!(
+                usize::try_from(size).unwrap(),
+                database.len(),
+                "{archive:?}"
+            );
+            assert_eq!(fs::read(&dest).unwrap(), database, "{archive:?}");
+            assert!(
+                !staged.exists(),
+                "{archive:?}: the staged file is renamed away"
+            );
+        }
+    }
+
+    /// A database past the cap is refused, at any packaging, and the database
+    /// already in place stays.
+    #[test]
+    fn materialise_refuses_a_database_past_the_cap() {
+        let database = super::super::mmdb::sample();
+        let cap = u64::try_from(database.len()).unwrap() - 1;
+        for archive in ARCHIVES {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join(MEMBER);
+            let part = with_extension(&dest, PART_EXT);
+            let staged = with_extension(&dest, STAGE_EXT);
+            fs::write(&dest, b"the working database").unwrap();
+            package(archive, &database, &part);
+
+            let err = materialise(&part, &staged, &dest, archive, cap).unwrap_err();
+            assert!(
+                matches!(err, GeoIpDownloadError::TooLarge { what: "database", limit } if limit == cap),
+                "{archive:?}: {err:?}"
+            );
+            assert_eq!(fs::read(&dest).unwrap(), b"the working database");
+        }
+        // At the cap exactly, it lands.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(MEMBER);
+        let part = with_extension(&dest, PART_EXT);
+        gzip(&database, &part);
+        let at_cap = u64::try_from(database.len()).unwrap();
+        let staged = with_extension(&dest, STAGE_EXT);
+        assert!(materialise(&part, &staged, &dest, Archive::Gzip, at_cap).is_ok());
+    }
+
+    /// An error page or any other file that is not an MMDB never replaces the
+    /// database in place.
+    #[test]
+    fn materialise_refuses_a_file_that_is_not_a_database() {
+        for archive in ARCHIVES {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join(MEMBER);
+            let part = with_extension(&dest, PART_EXT);
+            let staged = with_extension(&dest, STAGE_EXT);
+            fs::write(&dest, b"the working database").unwrap();
+            package(archive, b"<html>rate limited</html>", &part);
+
+            let err = materialise(&part, &staged, &dest, archive, ROOM).unwrap_err();
+            assert!(
+                matches!(err, GeoIpDownloadError::NotMmdb { .. }),
+                "{archive:?}: {err:?}"
+            );
+            assert_eq!(fs::read(&dest).unwrap(), b"the working database");
+        }
+    }
+
+    /// Serve `body` from a loopback listener, returning its URL.
+    async fn serve(body: Vec<u8>) -> String {
+        let app = axum::Router::new().route(
+            "/db",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}/db")
+    }
+
+    fn transfer(url: String, dest: PathBuf, archive: Archive) -> Transfer {
+        Transfer {
+            url,
+            dest,
+            archive,
+            credential: Credential::None,
+        }
+    }
+
+    /// A body past the cap is abandoned mid-stream and leaves no file behind.
+    #[tokio::test]
+    async fn a_download_past_the_cap_is_abandoned() {
+        let url = serve(vec![0u8; 64 * 1024]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("db.mmdb");
+
+        let err = transfer(url, dest.clone(), Archive::Raw)
+            .run(1024)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GeoIpDownloadError::TooLarge {
+                    what: "download",
+                    limit: 1024
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!dest.exists());
+        assert!(
+            !with_extension(&dest, PART_EXT).exists(),
+            "the part file stays behind"
+        );
+    }
+
+    /// A well-formed database under the cap lands, and an error page served
+    /// with a 200 is refused without touching the database in place.
+    #[tokio::test]
+    async fn a_download_lands_only_when_it_is_a_database() {
+        let database = super::super::mmdb::sample();
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("served.gz");
+        gzip(&database, &part);
+        let url = serve(fs::read(&part).unwrap()).await;
+        let dest = dir.path().join("db.mmdb");
+        let landed = transfer(url, dest.clone(), Archive::Gzip)
+            .run(ROOM)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&landed).unwrap(), database);
+
+        let url = serve(b"<html>quota exceeded</html>".to_vec()).await;
+        let err = transfer(url, dest.clone(), Archive::Raw)
+            .run(ROOM)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GeoIpDownloadError::NotMmdb { .. }), "{err:?}");
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            database,
+            "the database in place was replaced"
+        );
+        assert!(!with_extension(&dest, STAGE_EXT).exists());
     }
 
     #[test]
@@ -456,6 +622,7 @@ mod tests {
             Archive::TarGz {
                 member: "GeoLite2-ASN.mmdb",
             },
+            ROOM,
         )
         .unwrap_err();
 

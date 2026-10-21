@@ -27,9 +27,15 @@ third-party outage into an outage of yours.
 The fallback ladder, per database:
 
 1. Local file inside `max_age_days` -- used as is, no request.
-2. Otherwise download; on success, that file.
+2. Otherwise download. A database that passes the checks below replaces the local file.
 3. On failure, the stale local file if there is one (logged at `warn`).
 4. Otherwise `None`.
+
+Each download is held to `auto_download.max_database_bytes` (default 512 MiB) twice: the transferred body, and the database decompressed from it. A transfer past it is abandoned, so a decompression bomb cannot fill the disk.
+
+The database is then read as an MMDB before it replaces the local copy: the metadata marker in its last 128 KiB, `binary_format_major_version` 2, a `record_size` of 24, 28 or 32, an `ip_version` of 4 or 6, a `database_type`, and a search tree that fits in front of the metadata. That refuses an error page served with a 200, a truncated transfer and a file in another format. A refused file is deleted and the local copy kept.
+
+Neither check proves the bytes are the provider's, and no checksum is compared. DB-IP publishes an MD5 and a SHA-1 of the decompressed file on its download page only, with no SHA-256. TLS to the provider is the authenticity check.
 
 ---
 
@@ -61,6 +67,8 @@ if let Some(city) = paths.city {
 | `sapics` | none | no | yes | raw |
 | `custom` | n/a | explicit path | explicit path | n/a |
 
+`ip_locate` is IPLocate.io's IP to ASN database, under CC BY-SA 4.0. `sapics` is DB-IP Lite ASN as sapics/ip-location-db republishes it, under CC BY 4.0.
+
 Set `city_db_path` or `asn_db_path` and the provider is bypassed
 entirely: those paths are returned verbatim and nothing is downloaded or
 checked. That is the escape hatch for an operator who mounts the
@@ -80,6 +88,7 @@ geoip:
     enabled: true
     data_dir: /var/lib/geoip
     max_age_days: 30
+    max_database_bytes: 536870912
     maxmind_account_id: null
     maxmind_license_key: null
     ipinfo_token: null

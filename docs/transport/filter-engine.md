@@ -43,7 +43,7 @@ flowchart LR
 | ------ | ------------------ | ------------ | ------------- |
 | **1** | ~50-100 ns | `has(field)`, `!has(field)`, `field == "literal"`, `field != "literal"`, `field.startsWith(...)`, `field.endsWith(...)`, `field.contains(...)` -- `field` may be a dotted path such as `a.b` | Always on |
 | **2** | ~500 ns - 1 us | Compound CEL (`&&`, `\|\|`), numeric comparison, multi-field access, `size()` | `transport.filter_tiers.allow_cel_filters_in` / `_out` |
-| **3** | ~5-50 us | `matches()` (regex), `exists()`, `filter()`, `map()`, `all()`, `exists_one()`, `timestamp()`, `duration()` | `transport.filter_tiers.allow_complex_filters_in` / `_out` (implies tier-2) |
+| **3** | ~5-50 us | `matches()` (regex), `exists()`, `filter()`, `map()`, `all()`, `exists_one()` (or `existsOne()`), `timestamp()`, `duration()` | `transport.filter_tiers.allow_complex_filters_in` / `_out` (implies tier-2) |
 
 Tier 1 uses `sonic-rs::get_from_slice` for field extraction plus
 single-segment field-name lookups via pre-compiled
@@ -68,6 +68,8 @@ tier-1 operation are tried in order of expected frequency
 (`has`, `!has`, `==`, `!=`, `startsWith`, `endsWith`, `contains`). If
 none match, scan for restricted function names -- match means tier 3.
 Otherwise tier 2.
+
+The scan reads literals, comments and backtick-quoted names with the same lexer as the expression profile, so a restricted call it finds is one the profile refuses, and a name inside a literal or comment is neither a call nor a field.
 
 This is conservative on purpose: only expressions that obviously fit a
 tier-1 pattern execute outside the CEL engine. Anything subtle drops
@@ -163,7 +165,7 @@ The top-level `expression` section sets which CEL functions are usable in the ap
 ```yaml
 expression:
   allow_regex: false        # regex matches() function
-  allow_iteration: false    # filter/map/all/exists/exists_one
+  allow_iteration: false    # filter/map/all/exists/exists_one/existsOne
   allow_time: false         # time-related functions
 ```
 
