@@ -561,7 +561,7 @@ proptest = ">=1.12.0, <2"
 # stop/start it to drive the spill/circuit/drain + at-least-once paths. The
 # `#[ignore]`d integration tests need a Docker daemon (run on a Docker host).
 # MIT/Apache-2.0, web-checked 2026-06-26.
-testcontainers = ">=0.27.0, <0.28"
+testcontainers = ">=0.28.0, <0.29"
 testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["kafka"] }
 # Query Prometheus's own HTTP API in the scrape test, so the assertion is what
 # Prometheus stored rather than what scalo rendered. Declaration must match the
