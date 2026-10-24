@@ -43,13 +43,15 @@
       "description": "The same ceilings Cargo.toml declares, so Renovate stops proposing a minor the lockstep cannot take until metrics-exporter-opentelemetry moves past opentelemetry 0.31.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["/^opentelemetry/"],
-      "allowedVersions": "<0.32"
+      "allowedVersions": "<0.32",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "tracing-opentelemetry's line for opentelemetry 0.31.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["tracing-opentelemetry"],
-      "allowedVersions": "<0.33"
+      "allowedVersions": "<0.33",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "tonic + prost are generated-and-linked together (build.rs codegen); never bump one without the other.",
