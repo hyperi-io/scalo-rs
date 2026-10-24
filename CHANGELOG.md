@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.20](https://github.com/hyperi-io/scalo-rs/compare/v2.14.19...v2.14.20) (2026-10-24)
+
+### Bug Fixes
+
+* move the default base image to the current trixie-slim digest ([#376](https://github.com/hyperi-io/scalo-rs/issues/376)) ([a2598c6](https://github.com/hyperi-io/scalo-rs/commit/a2598c61bbc3a500cd07f30f09bc297c88d1eaf6))
+
 ## [2.14.19](https://github.com/hyperi-io/scalo-rs/compare/v2.14.18...v2.14.19) (2026-10-21)
 
 ### Bug Fixes
