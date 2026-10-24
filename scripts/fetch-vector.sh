@@ -39,7 +39,7 @@ ARCH="$(uname -m)"
 # needed network plus gh/jq on every single test run. Bump deliberately; Vector
 # minor releases change CLI flags and config schema.
 # renovate: datasource=github-releases depName=vectordotdev/vector
-DEFAULT_VECTOR_VERSION="0.58.0"
+DEFAULT_VECTOR_VERSION="0.60.0"
 
 WANT_VERSION="${VECTOR_VERSION:-$DEFAULT_VECTOR_VERSION}"
 
