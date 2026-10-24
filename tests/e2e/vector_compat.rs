@@ -231,7 +231,7 @@ sinks:
     type: vector
     inputs: ["demo"]
     address: "127.0.0.1:{port}"
-    compression: false
+    compression: none
     healthcheck:
       enabled: false
 "#
@@ -306,7 +306,7 @@ sinks:
     type: vector
     inputs: ["demo"]
     address: "127.0.0.1:{port}"
-    compression: false
+    compression: none
     healthcheck:
       enabled: false
 "#
@@ -401,7 +401,7 @@ sinks:
     type: vector
     inputs: ["demo"]
     address: "127.0.0.1:{port}"
-    compression: false
+    compression: none
     healthcheck:
       enabled: false
 "#

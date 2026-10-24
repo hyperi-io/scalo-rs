@@ -113,7 +113,7 @@
     "base_image": {
       "description": "Base container image for the runtime stage.",
       "type": "string",
-      "default": "debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f"
+      "default": "debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad"
     },
     "native_deps": {
       "description": "Runtime native dependencies for the container image.\n\nUse [`NativeDepsContract::for_scalo_features`] to auto-populate from\nscalo feature flags. The Dockerfile generator emits the correct\nAPT repo setup and package installation commands.",

@@ -11,6 +11,19 @@
         "//\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+)\\s+depName=(?<depName>\\S+)[^\\n]*\\n(?:[^\\n\"]*\\n)?[^\\n\"]*\"[^\"@:\\s]+:(?<currentValue>[^\"@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})\""
       ],
       "versioningTemplate": "docker"
+    },
+    {
+      "description": "The two copies of DEFAULT_BASE_IMAGE that carry no renovate comment: the contract schema default and the runtime stage shown in docs/deployment/artefacts.md. A test compares the committed schema with the Rust types, so a pull request that moves registry.rs alone fails CI.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^charts/scalo-service/schema/deployment-contract\\.v\\d+\\.schema\\.json$/",
+        "/^docs/deployment/artefacts\\.md$/"
+      ],
+      "matchStrings": [
+        "(?<depName>debian):(?<currentValue>[a-z0-9][a-z0-9.-]*)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
     }
   ],
   "packageRules": [
@@ -52,6 +65,13 @@
       "matchManagers": ["cargo"],
       "matchPackageNames": ["tracing", "tracing-subscriber", "tracing-throttle"],
       "groupName": "tracing",
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "Every debian pin moves in one pull request: the loadgen Dockerfiles, DEFAULT_BASE_IMAGE and its two copies. The preset files regex-manager pins under annotated-pins, apart from the Dockerfiles, so #332 moved the Dockerfiles alone and #334 moved the rest by hand.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["debian"],
+      "groupName": "docker-images",
       "minimumReleaseAge": "7 days"
     }
   ]

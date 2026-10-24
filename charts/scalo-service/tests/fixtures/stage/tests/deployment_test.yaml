@@ -520,11 +520,11 @@ tests:
     set:
       initContainers:
         - name: wait
-          image: busybox:1.37
+          image: busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
           args: ["{{ .Release.Namespace }}"]
       sidecars:
         - name: proxy
-          image: envoyproxy/envoy:v1.36.0
+          image: envoyproxy/envoy:v1.39.2@sha256:460f8c329f24b2e1c7c5af64cb314a6f351ad1c262ba77b135ac46b35ebd5f85
       extraVolumes:
         - name: certs
           secret:
