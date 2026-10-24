@@ -331,7 +331,7 @@ git2 = { version = ">=0.21.0, <0.22", optional = true }
 
 # CEL expression evaluation
 # Renamed from cel-interpreter — same project, same maintainers, near-identical API.
-cel = { version = ">=0.14.5, <0.15", features = ["json"], optional = true }
+cel = { version = ">=0.15.0, <0.16", features = ["json"], optional = true }
 
 # CLI framework
 clap = { version = ">=4.6.7, <5", features = ["derive", "env"], optional = true }
@@ -444,7 +444,7 @@ ratatui = { version = ">=0.30.2, <0.32", optional = true }
 file-rotate = { version = ">=0.8.0, <0.9", optional = true }
 
 # Filesystem stats (disk-aware capacity management for tiered-sink)
-libc = { version = ">=0.2.190, <0.3", optional = true }
+libc = { version = ">=0.2.191, <0.3", optional = true }
 
 # Gzip + tar decode for the GeoIP database archives the providers publish
 # (`geoip-download`). flate2 is already in the graph via file-rotate; tar is
@@ -576,7 +576,7 @@ axum = ">=0.8.9, <0.9"
 # Validates the emitted contract against the committed contract JSON Schema, the
 # check a chart assembler outside Rust runs. Local refs only, so no HTTP resolver.
 # MIT; 0.58.6 (2026-10-06) read from the crates.io API.
-jsonschema = { version = ">=0.58.6, <0.59", default-features = false }
+jsonschema = { version = ">=0.59.0, <0.60", default-features = false }
 
 [lints.rust]
 unsafe_code = "deny"
