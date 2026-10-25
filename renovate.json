@@ -82,6 +82,13 @@
       "minimumReleaseAge": "7 days"
     },
     {
+      "description": "cel stays on 0.14, the line the Python common-expression-language 0.10 package evaluates on, so an expression evaluates the same in scalo-rs and scalo-py. cel 0.15 changes expression semantics (size() counts code points, numbers compare by value, a repeated map key is rejected, timestamp and duration ranges are enforced). Move it with the Python package, and record the change in docs/migrations.md.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["cel"],
+      "allowedVersions": "<0.15",
+      "minimumReleaseAge": "7 days"
+    },
+    {
       "description": "tracing core + subscriber + throttle.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["tracing", "tracing-subscriber", "tracing-throttle"],

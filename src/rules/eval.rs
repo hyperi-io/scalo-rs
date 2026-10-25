@@ -17,9 +17,6 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
-use cel::common::types::CelString;
-use cel::common::value::CowVal;
-
 use super::MAX_TARGETS;
 use super::compile::{Action, Condition, FieldId, Matcher, RuleSet, Test};
 use super::field::{FieldSource, Lookup};
@@ -522,15 +519,14 @@ struct Resolver<'p, 'a, R: ?Sized> {
 }
 
 impl<R: FieldSource + ?Sized> cel::context::VariableResolver for Resolver<'_, '_, R> {
-    fn resolve<'b>(&'b self, name: &str) -> Option<CowVal<'b, 'b>> {
+    fn resolve(&self, name: &str) -> Option<cel::Value> {
         let earlier = self.pass.set.targets[..self.pass.target]
             .iter()
             .position(|t| t.field.as_str() == name);
         if let Some(assigned) = earlier.and_then(|i| self.slots[i].as_ref()) {
-            return Some(CowVal::owned(CelString::from(assigned.value.as_ref())));
+            return Some(cel::Value::String(Arc::new(assigned.value.to_string())));
         }
-        let value = self.pass.record.cel_value(name)?;
-        value.try_into().ok().map(CowVal::Owned)
+        self.pass.record.cel_value(name)
     }
 }
 
