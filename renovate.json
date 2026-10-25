@@ -75,6 +75,13 @@
       "minimumReleaseAge": "7 days"
     },
     {
+      "description": "testcontainers-modules 0.15.0 requires testcontainers ^0.27, so testcontainers 0.28 does not resolve. Lift this once a testcontainers-modules release requires testcontainers 0.28, and move both in one pull request.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["testcontainers"],
+      "allowedVersions": "<0.28",
+      "minimumReleaseAge": "7 days"
+    },
+    {
       "description": "tracing core + subscriber + throttle.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["tracing", "tracing-subscriber", "tracing-throttle"],

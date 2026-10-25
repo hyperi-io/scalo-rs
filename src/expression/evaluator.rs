@@ -231,7 +231,7 @@ pub fn evaluate<'a>(
 /// json feature (serde integration).
 pub fn build_context<'a>(
     data: impl IntoIterator<Item = (&'a String, &'a JsonValue)>,
-) -> ExpressionResult<Context<'a>> {
+) -> ExpressionResult<Context<'a, 'a>> {
     let mut context = Context::default();
     for (key, value) in data {
         context.add_variable_from_value(key, json_to_cel(value));
