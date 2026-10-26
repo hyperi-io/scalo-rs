@@ -355,7 +355,7 @@ tracing-throttle = { version = ">=0.4.4, <0.5", default-features = false, option
 # context is carried by hand in src/transport/propagation.rs.
 opentelemetry = { version = ">=0.31.0, <0.32", optional = true }
 opentelemetry_sdk = { version = ">=0.31.0, <0.32", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = ">=0.31.0, <0.32", features = ["grpc-tonic", "http-proto", "metrics", "logs"], optional = true }
+opentelemetry-otlp = { version = ">=0.31.1, <0.32", features = ["grpc-tonic", "http-proto", "metrics", "logs"], optional = true }
 tracing-opentelemetry = { version = ">=0.32.1, <0.33", optional = true }
 
 # Metrics (Prometheus-native)
