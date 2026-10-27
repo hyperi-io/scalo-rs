@@ -25,6 +25,10 @@
 //! would panic at runtime ("no process-level CryptoProvider"). Selecting
 //! aws-lc-rs explicitly matches the reqwest / AWS path and removes that footgun.
 //!
+//! scalo installs no process default. A binary that builds a server config,
+//! tonic server TLS included, calls [`install_default_provider`] first thing
+//! in `main`.
+//!
 //! ## Trust model
 //!
 //! [`TlsTrust`] composes roots from up to three sources:
@@ -261,6 +265,31 @@ pub fn build_client_config_with(
             Ok(Arc::new(cfg))
         }
     }
+}
+
+/// Install aws-lc-rs as the process-default rustls [`CryptoProvider`], and
+/// return whether this call installed it.
+///
+/// For an application's `main`, before anything builds a TLS config. With
+/// both aws-lc-rs and ring linked and no default installed, rustls panics in
+/// `ServerConfig::builder()` and `ClientConfig::builder()`. A provider already
+/// installed stays the default and this returns `false`.
+///
+/// ```rust,no_run
+/// scalo::tls::install_default_provider();
+/// ```
+pub fn install_default_provider() -> bool {
+    let installed = rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_ok();
+    if let Some(provider) = CryptoProvider::get_default() {
+        tracing::debug!(
+            key_provider = ?provider.key_provider,
+            installed,
+            "rustls process-default crypto provider"
+        );
+    }
+    installed
 }
 
 /// Is `group` a hybrid post-quantum (ML-KEM) key-exchange group?

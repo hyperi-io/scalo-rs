@@ -172,7 +172,7 @@ pub trait ServiceApp: Sized {
 /// Drive the standard data-plane service lifecycle.
 ///
 /// Handles subcommand dispatch:
-/// - `run` (default): init logger -> load config -> run service
+/// - `run` (default): load config -> init logger -> run service
 /// - `version`: print version info and exit
 /// - `config-check`: load config, validate, print summary
 ///
