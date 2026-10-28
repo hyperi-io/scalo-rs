@@ -38,9 +38,7 @@ use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::error::KafkaError;
 use rdkafka::statistics::Statistics;
 use std::collections::HashMap;
-#[cfg(feature = "governor")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 /// Kafka metrics snapshot. Mirrors the Python `KafkaMetrics` dataclass.
@@ -148,10 +146,14 @@ pub struct StatsContext {
     /// Whether the inbound gate has this consumer's assignment paused.
     #[cfg(feature = "governor")]
     paused: AtomicBool,
-    /// Log ends asked of the broker while paused, since librdkafka learns a
-    /// partition's end only from a fetch and fetches nothing it has paused.
-    #[cfg(feature = "governor")]
-    paused_ends: RwLock<HashMap<(String, i32), i64>>,
+    /// Whether the last statistics showed a local queue full enough that
+    /// librdkafka stops fetching.
+    starved: AtomicBool,
+    /// The local queue size at which librdkafka stops fetching.
+    queue_cap: QueueCap,
+    /// Log ends asked of the broker while librdkafka fetches nothing, paused
+    /// or starved, since it learns a partition's end only from a fetch.
+    asked_ends: RwLock<HashMap<(String, i32), i64>>,
     /// Where this consumer may read to, and so the end an uncommitted
     /// partition's lag counts to.
     isolation: Isolation,
@@ -288,6 +290,57 @@ pub(crate) enum Rebalanced {
     Assigned(Vec<(String, i32)>),
 }
 
+/// The local queue size at which librdkafka stops fetching: a partition
+/// holding `queued.min.messages`, or the consumer's queue holding
+/// `queued.max.messages.kbytes` across every partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueueCap {
+    messages: i64,
+    bytes: u64,
+}
+
+impl Default for QueueCap {
+    /// librdkafka's defaults.
+    fn default() -> Self {
+        Self {
+            messages: 100_000,
+            bytes: 65_536 * 1024,
+        }
+    }
+}
+
+impl QueueCap {
+    /// The caps `config` sets, each librdkafka's default when it sets none.
+    pub(crate) fn of(config: &ClientConfig) -> Self {
+        let default = Self::default();
+        let read = |key| config.get(key).and_then(|v| v.trim().parse::<u64>().ok());
+        Self {
+            messages: read("queued.min.messages")
+                .and_then(|n| i64::try_from(n).ok())
+                .unwrap_or(default.messages),
+            bytes: read("queued.max.messages.kbytes").map_or(default.bytes, |kib| kib * 1024),
+        }
+    }
+
+    /// Whether `stats` show a queue at either cap, over the `held` partitions
+    /// when rebalances have given an assignment.
+    fn reached(self, stats: &Statistics, held: Option<&HashMap<(String, i32), u64>>) -> bool {
+        let mut bytes = 0_u64;
+        for (topic, t) in &stats.topics {
+            for (id, p) in &t.partitions {
+                if held.is_some_and(|held| !held.contains_key(&(topic.clone(), *id))) {
+                    continue;
+                }
+                if p.fetchq_cnt >= self.messages {
+                    return true;
+                }
+                bytes = bytes.saturating_add(p.fetchq_size);
+            }
+        }
+        bytes >= self.bytes
+    }
+}
+
 impl Default for StatsContext {
     fn default() -> Self {
         Self::new()
@@ -309,8 +362,9 @@ impl StatsContext {
             assigned: RwLock::new(HashMap::new()),
             #[cfg(feature = "governor")]
             paused: AtomicBool::new(false),
-            #[cfg(feature = "governor")]
-            paused_ends: RwLock::new(HashMap::new()),
+            starved: AtomicBool::new(false),
+            queue_cap: QueueCap::default(),
+            asked_ends: RwLock::new(HashMap::new()),
             isolation: Isolation::default(),
             #[cfg(feature = "metrics")]
             client: std::sync::OnceLock::new(),
@@ -333,6 +387,13 @@ impl StatsContext {
         self
     }
 
+    /// This context, judging the local queue full at `cap`.
+    #[must_use]
+    pub(crate) fn queueing(mut self, cap: QueueCap) -> Self {
+        self.queue_cap = cap;
+        self
+    }
+
     /// This context, labelling its `consumer_` series with `group`, the
     /// `group.id` its consumer joins.
     #[cfg(feature = "metrics")]
@@ -343,12 +404,14 @@ impl StatsContext {
     }
 
     /// Record that the inbound gate paused or resumed the assignment. A
-    /// resume drops the ends asked of the broker: fetches report the end
-    /// again from then on.
+    /// resume drops the ends asked of the broker unless the local queue is
+    /// still full: fetches report the end again from then on.
     #[cfg(feature = "governor")]
     pub(crate) fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Release);
-        if !paused && let Ok(mut ends) = self.paused_ends.write() {
+        if !self.needs_asked_ends()
+            && let Ok(mut ends) = self.asked_ends.write()
+        {
             ends.clear();
         }
     }
@@ -359,14 +422,24 @@ impl StatsContext {
         self.paused.load(Ordering::Acquire)
     }
 
-    /// The log ends the broker reported for the paused assignment, used by
-    /// every statistics callback until the next refresh or a resume.
-    #[cfg(feature = "governor")]
-    pub(crate) fn set_paused_ends(&self, ends: HashMap<(String, i32), i64>) {
-        // Checked under the lock `set_paused` clears under, so a refresh that
-        // lands after a resume leaves nothing behind.
-        if let Ok(mut held) = self.paused_ends.write()
-            && self.is_paused()
+    /// Whether librdkafka is fetching nothing for some held partition, so its
+    /// end has to be asked of the broker: the gate has the assignment paused,
+    /// or the last statistics showed a local queue at its cap.
+    pub(crate) fn needs_asked_ends(&self) -> bool {
+        #[cfg(feature = "governor")]
+        if self.is_paused() {
+            return true;
+        }
+        self.starved.load(Ordering::Acquire)
+    }
+
+    /// The log ends the broker reported, used by every statistics callback
+    /// until the next refresh, or until fetching resumes.
+    pub(crate) fn set_asked_ends(&self, ends: HashMap<(String, i32), i64>) {
+        // Checked under the lock a resume clears under, so a refresh that
+        // lands after one leaves nothing behind.
+        if let Ok(mut held) = self.asked_ends.write()
+            && self.needs_asked_ends()
         {
             *held = ends;
         }
@@ -617,19 +690,20 @@ impl ClientContext for StatsContext {
         }
         #[cfg(feature = "metrics")]
         self.client.get_or_init(|| Client::of(&statistics));
-        // Only the inbound gate pauses an assignment, so only it asks for ends.
-        #[cfg(feature = "governor")]
-        let asked_ends = self
-            .paused_ends
-            .read()
-            .map(|ends| ends.clone())
-            .unwrap_or_default();
-        #[cfg(not(feature = "governor"))]
-        let asked_ends = HashMap::new();
         let (metrics, unread) = {
             let assigned = self.assigned.read().unwrap_or_else(PoisonError::into_inner);
             // With no rebalance served, the empty set means unknown, not nothing held.
             let held = (self.rebalances() > 0).then_some(&*assigned);
+            self.starved
+                .store(self.queue_cap.reached(&statistics, held), Ordering::Release);
+            let asked_ends = match self.asked_ends.write() {
+                Ok(mut ends) if !self.needs_asked_ends() => {
+                    ends.clear();
+                    HashMap::new()
+                }
+                Ok(ends) => ends.clone(),
+                Err(_) => HashMap::new(),
+            };
             (
                 Self::convert_stats(&statistics, &asked_ends, held, self.isolation),
                 position_lag(&statistics, &asked_ends, held, self.isolation),
@@ -1254,16 +1328,124 @@ mod tests {
     fn a_resume_drops_the_asked_ends_and_a_late_answer_is_ignored() {
         let context = StatsContext::new();
         let ends = || HashMap::from([(("events".to_string(), 0), 50)]);
-        context.set_paused_ends(ends());
+        context.set_asked_ends(ends());
         assert!(
-            context.paused_ends.read().expect("lock").is_empty(),
-            "not paused, so nothing is kept"
+            context.asked_ends.read().expect("lock").is_empty(),
+            "fetching, so nothing is kept"
         );
         context.set_paused(true);
-        context.set_paused_ends(ends());
-        assert_eq!(context.paused_ends.read().expect("lock").len(), 1);
+        context.set_asked_ends(ends());
+        assert_eq!(context.asked_ends.read().expect("lock").len(), 1);
         context.set_paused(false);
-        assert!(context.paused_ends.read().expect("lock").is_empty());
+        assert!(context.asked_ends.read().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn the_queue_cap_comes_from_the_client_config() {
+        let default = QueueCap::default();
+        let cases = [
+            ("unset", vec![], default),
+            (
+                "both set",
+                vec![
+                    ("queued.min.messages", "10"),
+                    ("queued.max.messages.kbytes", "4"),
+                ],
+                QueueCap {
+                    messages: 10,
+                    bytes: 4096,
+                },
+            ),
+            (
+                "unparsable falls back",
+                vec![
+                    ("queued.min.messages", "lots"),
+                    ("queued.max.messages.kbytes", "-1"),
+                ],
+                default,
+            ),
+        ];
+        for (name, set, want) in cases {
+            let mut config = ClientConfig::new();
+            for (key, value) in set {
+                config.set(key, value);
+            }
+            assert_eq!(QueueCap::of(&config), want, "{name}");
+        }
+    }
+
+    /// librdkafka stops fetching a partition holding `queued.min.messages`,
+    /// or once the consumer's queue holds `queued.max.messages.kbytes`.
+    #[test]
+    fn a_queue_at_either_cap_is_starved() {
+        let cap = QueueCap {
+            messages: 10,
+            bytes: 1000,
+        };
+        let queued = |count, size| {
+            stats_with(rdkafka::statistics::Partition {
+                partition: 0,
+                fetchq_cnt: count,
+                fetchq_size: size,
+                ..Default::default()
+            })
+        };
+        let held = assigned_events_0();
+        let other = HashMap::from([(("other".to_string(), 0), 1)]);
+        let cases = [
+            ("empty", queued(0, 0), None, false),
+            ("under both", queued(9, 999), None, false),
+            ("at the message cap", queued(10, 0), None, true),
+            ("at the byte cap", queued(0, 1000), None, true),
+            ("held and full", queued(10, 0), Some(&held), true),
+            ("full but not held", queued(10, 1000), Some(&other), false),
+        ];
+        for (name, stats, held, want) in cases {
+            assert_eq!(cap.reached(&stats, held), want, "{name}");
+        }
+    }
+
+    /// With the local queue at its cap librdkafka fetches nothing, so the end
+    /// the broker reports moves the lag, and once the queue drains it is
+    /// dropped for the fetched end again. No gate is involved.
+    #[test]
+    fn a_full_local_queue_takes_the_end_asked_of_the_broker() {
+        let context = StatsContext::new().queueing(QueueCap {
+            messages: 10,
+            bytes: u64::MAX,
+        });
+        let at = |queued| {
+            stats_with(rdkafka::statistics::Partition {
+                partition: 0,
+                app_offset: 20,
+                committed_offset: 5,
+                hi_offset: 20,
+                ls_offset: 20,
+                consumer_lag: 15,
+                fetchq_cnt: queued,
+                ..Default::default()
+            })
+        };
+        let ends = || HashMap::from([(events_0(), 50)]);
+
+        context.stats(at(10));
+        assert!(context.needs_asked_ends(), "the queue is at its cap");
+        context.set_asked_ends(ends());
+        context.stats(at(10));
+        assert_eq!(
+            context.total_position_lag(),
+            30,
+            "read to 20, end asked at 50"
+        );
+
+        context.stats(at(0));
+        assert!(!context.needs_asked_ends(), "the queue drained");
+        assert_eq!(context.total_position_lag(), 0, "the fetched end again");
+        context.set_asked_ends(ends());
+        assert!(
+            context.asked_ends.read().expect("lock").is_empty(),
+            "an answer landing after the drain is dropped"
+        );
     }
 
     /// Statistics for partition 0 of `events` just assigned, with nothing

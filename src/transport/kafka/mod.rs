@@ -284,9 +284,9 @@ pub struct KafkaTransport {
     /// directions.
     #[cfg(all(feature = "governor", feature = "health"))]
     partition_limited_flag: Arc<AtomicBool>,
-    /// Asks the broker for the log end of an assignment the gate has paused.
-    #[cfg(feature = "governor")]
-    paused_ends: PausedEnds,
+    /// Asks the broker for the log ends of an assignment librdkafka is not
+    /// fetching.
+    asked_ends: AskedEnds,
     /// Source acknowledgement config, arming and held offsets.
     acks: acks::KafkaAcks,
     /// The producer's `message.max.bytes`, for screening records before a send.
@@ -765,7 +765,8 @@ fn create_consumer(
 ) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
     let context = StatsContext::new()
         .sharing(Arc::clone(auth))
-        .reading(metrics::Isolation::of(client_config));
+        .reading(metrics::Isolation::of(client_config))
+        .queueing(metrics::QueueCap::of(client_config));
     #[cfg(feature = "metrics")]
     let context = context.in_group(client_config.get("group.id"));
     client_config
@@ -1179,8 +1180,7 @@ impl KafkaTransport {
             partition_limited_warn: PartitionLimitedDiagnostic::default(),
             #[cfg(all(feature = "governor", feature = "health"))]
             partition_limited_flag,
-            #[cfg(feature = "governor")]
-            paused_ends: PausedEnds::new(consumer_config.as_ref()),
+            asked_ends: AskedEnds::new(consumer_config.as_ref()),
             acks: acks::KafkaAcks::default(),
             message_max_bytes,
         })
@@ -2249,8 +2249,7 @@ impl KafkaTransport {
                 }
             }
         }
-        #[cfg(feature = "governor")]
-        self.paused_ends.refresh(&consumer);
+        self.asked_ends.refresh(&consumer);
 
         // Check for topic changes from the background refresh loop
         if let Some(ref refresh) = self.topic_refresh
@@ -2960,23 +2959,22 @@ impl crate::governor::GateActuator for KafkaGateActuator {
     }
 }
 
-/// Least time between two asks for a paused assignment's log end.
-#[cfg(feature = "governor")]
-const PAUSED_END_FLOOR: Duration = Duration::from_secs(1);
+/// Least time between two asks for an assignment's log end.
+const ASKED_END_FLOOR: Duration = Duration::from_secs(1);
 
-/// Longest an ask for a paused assignment's log end waits on the broker.
-#[cfg(feature = "governor")]
-const PAUSED_END_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest an ask for an assignment's log end waits on the broker.
+const ASKED_END_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Keeps the lag of a paused assignment moving.
+/// Keeps the lag of an assignment librdkafka is not fetching moving.
 ///
-/// librdkafka learns a partition's log end only from a fetch reply, and never
-/// fetches a partition that is paused, so while the gate holds the lag it
-/// reports stops rising however much is written. This asks the broker for the
-/// ends instead, in one `ListOffsets` per leader, once per statistics interval
-/// and no more often than [`PAUSED_END_FLOOR`], with one ask in flight at most.
-#[cfg(feature = "governor")]
-struct PausedEnds {
+/// librdkafka learns a partition's log end only from a fetch reply. It never
+/// fetches a partition the gate has paused, nor one whose local queue is at
+/// `queued.min.messages` (or a consumer queue at `queued.max.messages.kbytes`),
+/// so the lag it reports stops rising however much is written. This asks the
+/// broker for the ends instead, in one `ListOffsets` per leader, once per
+/// statistics interval and no more often than [`ASKED_END_FLOOR`], with one
+/// ask in flight at most.
+struct AskedEnds {
     /// How often to ask, or `None` when statistics, and so lag, are off.
     every: Option<Duration>,
     /// When the last ask started.
@@ -2984,14 +2982,13 @@ struct PausedEnds {
     in_flight: Arc<AtomicBool>,
 }
 
-#[cfg(feature = "governor")]
-impl PausedEnds {
+impl AskedEnds {
     fn new(consumer_config: Option<&ClientConfig>) -> Self {
         let every = consumer_config
             .and_then(|c| c.get("statistics.interval.ms"))
             .and_then(|ms| ms.parse::<u64>().ok())
             .filter(|&ms| ms > 0)
-            .map(|ms| Duration::from_millis(ms).max(PAUSED_END_FLOOR));
+            .map(|ms| Duration::from_millis(ms).max(ASKED_END_FLOOR));
         Self {
             every,
             asked: parking_lot::Mutex::new(None),
@@ -2999,14 +2996,14 @@ impl PausedEnds {
         }
     }
 
-    /// Ask the broker for the paused assignment's ends on the blocking pool,
-    /// when one is due. Called from every `recv`, which the run loop keeps
-    /// making while the gate holds.
+    /// Ask the broker for the assignment's ends on the blocking pool, when one
+    /// is due. Called from every `recv`, which the run loop keeps making while
+    /// the gate holds and while it works through a full local queue.
     fn refresh(&self, consumer: &Arc<BaseConsumer<StatsContext>>) {
         let Some(every) = self.every else {
             return;
         };
-        if !consumer.context().is_paused() {
+        if !consumer.context().needs_asked_ends() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -3026,7 +3023,7 @@ impl PausedEnds {
         let in_flight = Arc::clone(&self.in_flight);
         runtime.spawn_blocking(move || {
             if let Some(ends) = assignment_ends(&consumer) {
-                consumer.context().set_paused_ends(ends);
+                consumer.context().set_asked_ends(ends);
             }
             in_flight.store(false, Ordering::Release);
         });
@@ -3034,7 +3031,6 @@ impl PausedEnds {
 }
 
 /// The log end of every partition assigned to `consumer`, from the broker.
-#[cfg(feature = "governor")]
 fn assignment_ends(consumer: &BaseConsumer<StatsContext>) -> Option<HashMap<(String, i32), i64>> {
     let mut assignment = consumer.assignment().ok()?;
     if assignment.count() == 0 {
@@ -3042,10 +3038,10 @@ fn assignment_ends(consumer: &BaseConsumer<StatsContext>) -> Option<HashMap<(Str
     }
     // A ListOffsets for timestamp -1 answers with the end, as the watermark query does.
     assignment.set_all_offsets(Offset::End).ok()?;
-    let found = match consumer.offsets_for_times(assignment, PAUSED_END_TIMEOUT) {
+    let found = match consumer.offsets_for_times(assignment, ASKED_END_TIMEOUT) {
         Ok(found) => found,
         Err(e) => {
-            tracing::debug!(error = %e, "kafka: asking the broker for a paused assignment's end failed");
+            tracing::debug!(error = %e, "kafka: asking the broker for an assignment's end failed");
             return None;
         }
     };

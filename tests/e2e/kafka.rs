@@ -1152,6 +1152,56 @@ mod lag {
         );
     }
 
+    /// librdkafka stops fetching a partition whose local queue holds
+    /// `queued.min.messages`, so while an unpaused consumer works through a
+    /// full queue the fetched end stands still. The lag must follow the
+    /// broker's end anyway. A consumer reading one record a call keeps its
+    /// queue at the cap for the whole check.
+    #[tokio::test]
+    async fn lag_follows_the_end_while_the_local_queue_is_full() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let topic = "lag-full-queue";
+        create_topic(&bootstrap, topic).await;
+        produce(&bootstrap, topic, 0..READ).await;
+        let mut config = consumer_config(&bootstrap, topic, "lag-full-queue-group");
+        for (key, value) in [
+            ("statistics.interval.ms", "200"),
+            ("queued.min.messages", "1"),
+        ] {
+            config
+                .librdkafka_overrides
+                .insert(key.to_string(), value.to_string());
+        }
+        let transport = KafkaTransport::new(&config).await.expect("kafka consumer");
+
+        let mut tokens = Vec::new();
+        read_to(&transport, &mut tokens, 1).await;
+        produce(&bootstrap, topic, READ..READ + WRITTEN_PAUSED).await;
+        let end = offset(READ + WRITTEN_PAUSED);
+
+        // Fewer reads than the first fetch queued, so fetching never resumes.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last = (0, 0);
+        while tokens.len() < READ - 2 && Instant::now() < deadline {
+            last = lags(&transport);
+            let read = offset(tokens.len());
+            if last.1 >= end - read - 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let batch = transport.recv(1).await.expect("recv");
+            tokens.extend(batch.commit_tokens);
+        }
+        panic!(
+            "position lag {} after reading {} of {end}: it stopped at the end the first \
+             fetch saw ({READ}) while the local queue held it at the cap",
+            last.1,
+            tokens.len()
+        );
+    }
+
     /// The value of the series `name` whose labels include every one of
     /// `labels`, as the scrape renders it.
     #[cfg(feature = "metrics")]
