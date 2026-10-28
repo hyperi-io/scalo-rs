@@ -32,6 +32,7 @@
 //! no `openssl` and the keys are a different implementation from the one under
 //! test (librdkafka links OpenSSL, the broker is a JVM).
 
+use std::fs::Permissions;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -326,16 +327,21 @@ impl Pki {
             String::from_utf8_lossy(&out.stderr)
         );
         let tar = dir.path().join("pki.tar");
-        std::fs::write(&tar, &out.stdout).unwrap_or_else(|e| panic!("write pki.tar: {e}"));
-        let status = std::process::Command::new("tar")
+        tokio::fs::write(&tar, &out.stdout)
+            .await
+            .unwrap_or_else(|e| panic!("write pki.tar: {e}"));
+        let status = Command::new("tar")
             .arg("-xf")
             .arg(&tar)
             .arg("-C")
             .arg(dir.path())
             .status()
+            .await
             .unwrap_or_else(|e| panic!("tar could not run: {e}"));
         assert!(status.success(), "tar could not unpack the certificates");
-        std::fs::remove_file(&tar).unwrap_or_else(|e| panic!("remove pki.tar: {e}"));
+        tokio::fs::remove_file(&tar)
+            .await
+            .unwrap_or_else(|e| panic!("remove pki.tar: {e}"));
         Self { dir }
     }
 
@@ -428,19 +434,22 @@ impl TlsBroker {
 
         let scratch = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
         for name in ["ca.crt", "server.pem"] {
-            std::fs::copy(pki.dir().join(name), scratch.path().join(name))
+            tokio::fs::copy(pki.dir().join(name), scratch.path().join(name))
+                .await
                 .map_err(|e| format!("stage {name}: {e}"))?;
         }
         write(
             &scratch.path().join("server.properties"),
             &server_properties(controller, tls, sasl_ssl, mtls),
-        )?;
-        write(&scratch.path().join("start.sh"), &start_script())?;
+        )
+        .await?;
+        write(&scratch.path().join("start.sh"), &start_script()).await?;
         // The broker runs as its image's user, whose uid need not match this process's.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
+            tokio::fs::set_permissions(scratch.path(), Permissions::from_mode(0o755))
+                .await
                 .map_err(|e| format!("chmod scratch dir: {e}"))?;
         }
 
@@ -550,8 +559,10 @@ impl TlsBroker {
     }
 }
 
-fn write(path: &Path, text: &str) -> Result<(), String> {
-    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+async fn write(path: &Path, text: &str) -> Result<(), String> {
+    tokio::fs::write(path, text)
+        .await
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 impl Drop for TlsBroker {
