@@ -251,7 +251,8 @@ fn secrets_config_for_lookup() -> Result<super::SecretsConfig, CredentialError> 
     if config.openbao.is_none() {
         return Err(CredentialError::Vault(
             "no OpenBao connection configured. Set VAULT_ADDR plus one of \
-             VAULT_TOKEN, VAULT_ROLE_ID + VAULT_SECRET_ID or VAULT_K8S_ROLE \
+             VAULT_TOKEN, a token in VAULT_TOKEN_FILE or ~/.vault-token, \
+             VAULT_ROLE_ID + VAULT_SECRET_ID or VAULT_K8S_ROLE \
              (OPENBAO_* and BAO_* are accepted as legacy fallbacks), or declare \
              a `secrets.openbao` section in the config"
                 .to_string(),
