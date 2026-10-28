@@ -19,14 +19,14 @@
 //!
 //! NO mocks: a real broker, filled by a raw rdkafka producer.
 //!
-//! `#[ignore]` because they need a running Docker daemon -- run on a Docker host:
+//! They need a Docker daemon: without one they skip on a developer's machine and
+//! fail when `CI` is set.
 //!
 //! ```text
-//! cargo nextest run --features transport-kafka --test kafka_recv_runtime \
-//!     --run-ignored only --no-capture
+//! cargo nextest run --features transport-kafka,transport-kafka-test-support --test kafka_recv_runtime --no-capture
 //! ```
 
-#![cfg(feature = "transport-kafka")]
+#![cfg(feature = "transport-kafka-test-support")]
 
 use std::io::Read as _;
 use std::sync::Arc;
@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use rdkafka::ClientConfig;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::{TransportBase, TransportReceiver};
 use testcontainers_modules::kafka::apache::{self, Kafka};
@@ -45,15 +46,6 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-
-/// Kafka to test against, pinned by digest. The JVM image: `apache/kafka-native` before 4.4.0
-/// segfaults in `getpwuid` on ~2% of starts.
-// renovate: datasource=docker depName=apache/kafka
-const KAFKA_TAG: &str = "4.3.1";
-
-/// Digest of `KAFKA_TAG`, apart from it because the Renovate regex stops at a colon.
-const KAFKA_DIGEST: &str =
-    "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
 
 /// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
 const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
@@ -73,7 +65,7 @@ const PAD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
     let node = Kafka::default()
         .with_jvm_image()
-        .with_tag(format!("{KAFKA_TAG}@{KAFKA_DIGEST}"))
+        .with_tag(kafka_tag())
         .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
         .start()
         .await
@@ -335,8 +327,10 @@ async fn idle_loop_leaves_the_runtime_free(runtime: Runtime, label: &str, group:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn an_idle_recv_loop_leaves_a_current_thread_runtime_free() {
+    if !require_docker() {
+        return;
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -348,8 +342,10 @@ async fn an_idle_recv_loop_leaves_a_current_thread_runtime_free() {
 /// deterministic form of the two-worker freeze, where it depends on which worker
 /// held the driver when the loop took the other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn an_idle_recv_loop_leaves_a_one_worker_runtime_free() {
+    if !require_docker() {
+        return;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -361,8 +357,10 @@ async fn an_idle_recv_loop_leaves_a_one_worker_runtime_free() {
 /// A loop that always finds records must yield too, not only once the topic
 /// runs dry: the timer has to fire while records are still arriving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_busy_recv_loop_leaves_the_runtime_free() {
+    if !require_docker() {
+        return;
+    }
     const RECORDS: usize = 400_000;
     let (_node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, "busy").await;
@@ -393,8 +391,10 @@ async fn a_busy_recv_loop_leaves_the_runtime_free() {
 /// Every other `select!` below drops `recv` mid-poll, the way a `BatchEngine`
 /// ticker arm does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_recv_dropped_mid_poll_loses_no_record() {
+    if !require_docker() {
+        return;
+    }
     const RECORDS: usize = 50_000;
     let (_node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, "dropped").await;
@@ -454,8 +454,10 @@ async fn a_recv_dropped_mid_poll_loses_no_record() {
 /// librdkafka's local queue before the clock starts, so the figure is the cost
 /// of `recv` itself rather than of the broker round trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn recv_throughput_on_a_filled_topic() {
+    if !require_docker() {
+        return;
+    }
     const RECORDS: usize = 500_000;
     let (_node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, "throughput").await;

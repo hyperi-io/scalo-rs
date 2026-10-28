@@ -12,14 +12,14 @@
 //! landed. The broker is paused, stopped and restarted under a live DLQ, and
 //! it refuses records past its own size ceiling.
 //!
-//! `#[ignore]` because they need a running Docker daemon -- run on a Docker host:
+//! They need a Docker daemon: without one they skip on a developer's machine and
+//! fail when `CI` is set.
 //!
 //! ```text
-//! cargo nextest run --features dlq-kafka --test dlq_kafka_durable \
-//!     --run-ignored only --no-capture
+//! cargo nextest run --features dlq-kafka,transport-kafka-test-support --test dlq_kafka_durable --no-capture
 //! ```
 
-#![cfg(feature = "dlq-kafka")]
+#![cfg(all(feature = "dlq-kafka", feature = "transport-kafka-test-support"))]
 
 mod common;
 
@@ -38,20 +38,12 @@ use scalo::dlq::{
     Dlq, DlqConfig, DlqEntry, DlqError, DlqMode, DlqRouting, FileDlqConfig, KafkaDlqConfig,
     RotationPeriod,
 };
+use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig};
 use testcontainers_modules::kafka::apache::{self, Kafka};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tokio_util::sync::CancellationToken;
-
-/// Kafka to test against, pinned by digest. The JVM image: `apache/kafka-native` before 4.4.0
-/// segfaults in `getpwuid` on ~2% of starts.
-// renovate: datasource=docker depName=apache/kafka
-const KAFKA_TAG: &str = "4.3.1";
-
-/// Digest of `KAFKA_TAG`, apart from it because the Renovate regex stops at a colon.
-const KAFKA_DIGEST: &str =
-    "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
 
 /// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
 const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
@@ -97,13 +89,42 @@ async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
     let port = free_port();
     let node = Kafka::default()
         .with_jvm_image()
-        .with_tag(format!("{KAFKA_TAG}@{KAFKA_DIGEST}"))
+        .with_tag(kafka_tag())
         .with_mapped_port(port, apache::KAFKA_PORT)
         .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
         .start()
         .await
         .expect("start kafka container");
-    (node, format!("127.0.0.1:{port}"))
+    let bootstrap = format!("127.0.0.1:{port}");
+    warm_up(&bootstrap).await;
+    (node, bootstrap)
+}
+
+/// Wait until the broker has taken a record, off the topics under test.
+///
+/// A JVM broker that has just logged "started" can take longer than the 5 s
+/// ack wait to answer its first produce, most of all with several brokers
+/// starting on one host. A test whose own warm-up flush paid that cost failed
+/// on the ack wait rather than on what it checks.
+async fn warm_up(bootstrap: &str) {
+    const WARM_UP_WITHIN: Duration = Duration::from_secs(120);
+    let topic = "dlq.broker-warm-up";
+    create_topic(bootstrap, topic).await;
+    let producer: rdkafka::producer::FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .expect("warm-up producer");
+    producer
+        .send(
+            rdkafka::producer::FutureRecord::to(topic)
+                .payload("warm")
+                .key("warm"),
+            WARM_UP_WITHIN,
+        )
+        .await
+        .unwrap_or_else(|(e, _)| {
+            panic!("the broker took no record within {WARM_UP_WITHIN:?}: {e}")
+        });
 }
 
 /// The producer side of the DLQ: an empty group subscribes to nothing, and a
@@ -267,8 +288,10 @@ fn break_file_backend(dir: &Path) {
 /// A flush returns only once the broker has acked what it covers. With the
 /// broker paused nothing can be acked, so the flush must still be waiting.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_flush_returns_only_after_the_broker_acks() {
+    if !require_docker() {
+        return;
+    }
     let topic = "dlq.acked";
     let (node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, topic).await;
@@ -313,8 +336,10 @@ async fn a_flush_returns_only_after_the_broker_acks() {
 /// loss, and counts every entry once -- and not again once the broker returns.
 /// The long ack wait gives the producer time to find the restarted broker.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss() {
+    if !require_docker() {
+        return;
+    }
     let topic = "dlq.down";
     let (node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, topic).await;
@@ -367,8 +392,10 @@ async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss
 /// The flush waits on Kafka off the runtime: a single-threaded runtime keeps
 /// running a ticking task for the whole wait.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn the_runtime_keeps_running_while_a_flush_waits_on_kafka() {
+    if !require_docker() {
+        return;
+    }
     let topic = "dlq.runtime";
     let (node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, topic).await;
@@ -419,8 +446,10 @@ async fn the_runtime_keeps_running_while_a_flush_waits_on_kafka() {
 /// A record the broker refuses fails the flush that covers it and is counted
 /// once; entries acked around it are not.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_delivery_the_broker_refuses_fails_the_flush_and_is_counted_once() {
+    if !require_docker() {
+        return;
+    }
     let topic = "dlq.refused";
     let (_node, bootstrap) = start_kafka().await;
     create_small_topic(&bootstrap, topic).await;
@@ -464,8 +493,10 @@ async fn a_delivery_the_broker_refuses_fails_the_flush_and_is_counted_once() {
 /// Fan-out: a record Kafka loses is not a loss while the file backend holds it,
 /// and is one once the file backend refused it too.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn fan_out_counts_a_kafka_loss_only_where_no_other_backend_holds_the_entry() {
+    if !require_docker() {
+        return;
+    }
     let topic = "dlq.fanout";
     let (_node, bootstrap) = start_kafka().await;
     create_small_topic(&bootstrap, topic).await;
@@ -503,8 +534,10 @@ async fn fan_out_counts_a_kafka_loss_only_where_no_other_backend_holds_the_entry
 /// Cascade: when Kafka queues part of a batch and refuses the rest, the next
 /// backend takes only the rest, so no entry is held twice or counted twice.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn cascade_hands_the_next_backend_only_what_kafka_refused() {
+    if !require_docker() {
+        return;
+    }
     let topic = "dlq.cascade";
     let (_node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, topic).await;
@@ -535,8 +568,10 @@ async fn cascade_hands_the_next_backend_only_what_kafka_refused() {
 /// keeps the entries queued in the producer when the drain exits, which is
 /// when dropping the producer discards them.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn shutdown_without_a_flush_delivers_what_the_producer_held() {
+    if !require_docker() {
+        return;
+    }
     let topic = "dlq.shutdown.healthy";
     let (_node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, topic).await;
@@ -561,8 +596,10 @@ async fn shutdown_without_a_flush_delivers_what_the_producer_held() {
 /// Shutdown with no flush and the broker stopped counts every entry no broker
 /// acked, within the ack wait plus the purge.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn shutdown_without_a_flush_counts_what_a_stopped_broker_never_acked() {
+    if !require_docker() {
+        return;
+    }
     let topic = "dlq.shutdown.down";
     let (node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap, topic).await;
@@ -592,8 +629,10 @@ async fn shutdown_without_a_flush_counts_what_a_stopped_broker_never_acked() {
 /// `send_timeout_ms` is the barrier's ack wait: a value other than the
 /// default bounds the flush.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn the_configured_send_timeout_bounds_the_flush() {
+    if !require_docker() {
+        return;
+    }
     const SEND_TIMEOUT: Duration = Duration::from_secs(15);
     let topic = "dlq.timeout";
     let (node, bootstrap) = start_kafka().await;

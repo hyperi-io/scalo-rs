@@ -14,14 +14,14 @@
 //! does not override it, so both legs run in the same harness against the same
 //! broker.
 //!
-//! `#[ignore]` because they need a running Docker daemon -- run on a Docker host:
+//! They need a Docker daemon: without one they skip on a developer's machine and
+//! fail when `CI` is set.
 //!
 //! ```text
-//! cargo nextest run --features transport-kafka --test kafka_send_batch \
-//!     --run-ignored only --no-capture
+//! cargo nextest run --features transport-kafka,transport-kafka-test-support --test kafka_send_batch --no-capture
 //! ```
 
-#![cfg(feature = "transport-kafka")]
+#![cfg(feature = "transport-kafka-test-support")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,6 +31,7 @@ use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message as _;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::{
     PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportResult, TransportSender,
@@ -38,18 +39,6 @@ use scalo::transport::{
 use testcontainers_modules::kafka::apache::{self, Kafka};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-
-/// Kafka to test against, pinned by digest. The JVM image: `apache/kafka-native` before 4.4.0
-/// segfaults in `getpwuid` on ~2% of starts.
-///
-/// testcontainers-modules defaults to 3.8.0; hoisting the reference into our
-/// own source puts it under dependency review.
-// renovate: datasource=docker depName=apache/kafka
-const KAFKA_TAG: &str = "4.3.1";
-
-/// Digest of `KAFKA_TAG`, apart from it because the Renovate regex stops at a colon.
-const KAFKA_DIGEST: &str =
-    "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
 
 /// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
 const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
@@ -64,7 +53,7 @@ const PARTITIONS: i32 = 3;
 async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
     let node = Kafka::default()
         .with_jvm_image()
-        .with_tag(format!("{KAFKA_TAG}@{KAFKA_DIGEST}"))
+        .with_tag(kafka_tag())
         .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
         .start()
         .await
@@ -194,8 +183,10 @@ fn landed(payloads: Vec<Vec<u8>>) -> HashMap<Vec<u8>, usize> {
 }
 
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn send_batch_pipelines_the_block_and_lands_each_record_once() {
+    if !require_docker() {
+        return;
+    }
     let (_node, bootstrap) = start_kafka().await;
     let (warm, per_record_topic, batch_topic) = ("warm", "per-record", "batch");
     create_topics(&bootstrap, &[warm, per_record_topic, batch_topic]).await;
@@ -271,8 +262,10 @@ async fn send_batch_pipelines_the_block_and_lands_each_record_once() {
 /// confirmed and lands, and the block still reports failure, so the caller
 /// retries it instead of committing records that were never delivered.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn send_batch_fails_a_partly_delivered_block() {
+    if !require_docker() {
+        return;
+    }
     let (_node, bootstrap) = start_kafka().await;
     let good_topic = "partial-good";
     create_topics(&bootstrap, &[good_topic]).await;

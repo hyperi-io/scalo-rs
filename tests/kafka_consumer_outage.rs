@@ -12,20 +12,21 @@
 //! started again. A raw rdkafka producer writes the records, so scalo's write
 //! path never feeds scalo's read path.
 //!
-//! `#[ignore]` because they need a running Docker daemon -- run on a Docker host:
+//! They need a Docker daemon: without one they skip on a developer's machine and
+//! fail when `CI` is set.
 //!
 //! ```text
-//! cargo nextest run --features transport-kafka --test kafka_consumer_outage \
-//!     --run-ignored only --no-capture
+//! cargo nextest run --features transport-kafka,transport-kafka-test-support --test kafka_consumer_outage --no-capture
 //! ```
 
-#![cfg(feature = "transport-kafka")]
+#![cfg(feature = "transport-kafka-test-support")]
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
 use scalo::transport::kafka::{
     ConsumerProtocol, KafkaAdmin, KafkaConfig, KafkaToken, KafkaTransport,
 };
@@ -33,15 +34,6 @@ use scalo::transport::{TransportError, TransportReceiver};
 use testcontainers_modules::kafka::apache::{self, Kafka};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-
-/// Kafka to test against, pinned by digest. The JVM image: `apache/kafka-native` before 4.4.0
-/// segfaults in `getpwuid` on ~2% of starts.
-// renovate: datasource=docker depName=apache/kafka
-const KAFKA_TAG: &str = "4.3.1";
-
-/// Digest of `KAFKA_TAG`, apart from it because the Renovate regex stops at a colon.
-const KAFKA_DIGEST: &str =
-    "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
 
 /// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
 const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
@@ -71,7 +63,7 @@ async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
     let port = free_port();
     let node = Kafka::default()
         .with_jvm_image()
-        .with_tag(format!("{KAFKA_TAG}@{KAFKA_DIGEST}"))
+        .with_tag(kafka_tag())
         .with_mapped_port(port, apache::KAFKA_PORT)
         .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
         .start()
@@ -242,14 +234,18 @@ async fn ride_out_an_outage(protocol: ConsumerProtocol, group: &str) {
 }
 
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_consumer_rides_out_a_broker_outage() {
+    if !require_docker() {
+        return;
+    }
     ride_out_an_outage(ConsumerProtocol::Consumer, "outage-kip848").await;
 }
 
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_classic_consumer_rides_out_a_broker_outage() {
+    if !require_docker() {
+        return;
+    }
     ride_out_an_outage(ConsumerProtocol::Classic, "outage-classic").await;
 }
 
@@ -257,8 +253,10 @@ async fn a_classic_consumer_rides_out_a_broker_outage() {
 /// failure, rather than holding the caller until the broker returns; the
 /// consumer carries on once it does.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_commit_during_an_outage_reports_instead_of_hanging() {
+    if !require_docker() {
+        return;
+    }
     let (node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap).await;
     let producer = raw_producer(&bootstrap);
@@ -307,8 +305,10 @@ async fn a_commit_during_an_outage_reports_instead_of_hanging() {
 /// a rejoin, and a 100 ms reconnect backoff keeps queueing errors through it.
 /// The JVM broker takes about 15 s to restart, which counts towards that session.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
+    if !require_docker() {
+        return;
+    }
     const UNPOLLED: Duration = Duration::from_secs(15);
     const RESUME_WITHIN: Duration = Duration::from_secs(30);
 
@@ -354,8 +354,10 @@ async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
 /// Classic protocol: under KIP-848 librdkafka waits for a missing topic to
 /// appear instead of raising an error.
 #[tokio::test]
-#[ignore = "needs a Docker daemon (run on a Docker host with --ignored)"]
 async fn a_missing_topic_still_ends_the_consumer() {
+    if !require_docker() {
+        return;
+    }
     let (_node, bootstrap) = start_kafka().await;
     let config = KafkaConfig {
         topics: vec!["no-such-topic".to_string()],

@@ -8,14 +8,12 @@
 
 //! Integration tests for Kafka transport.
 //!
-//! These tests require a running Kafka broker. They are ignored by default.
-//! Run with: `TEST_KAFKA_BROKERS=localhost:9092 cargo test --features transport-kafka -- --ignored`
+//! The integration tests need a Kafka broker. `TEST_KAFKA_BROKERS` names an
+//! existing one, for example `TEST_KAFKA_BROKERS=localhost:9092`. Without it they
+//! start their own in a container: they build with the `testcontainers` feature
+//! and need a Docker daemon. With neither they skip, except in CI, where they fail.
 //!
-//! The container tests start their own broker instead: they build with the
-//! `testcontainers` feature and need a Docker daemon. Without one they skip,
-//! except in CI, where they fail.
-//!
-//! Or set up via environment variables:
+//! Settings for an existing broker:
 //! - `TEST_KAFKA_BROKERS`: Kafka broker addresses (default: localhost:9092)
 //! - `TEST_KAFKA_TOPIC`: Test topic name (default: scalo-test)
 //! - `TEST_KAFKA_GROUP`: Consumer group ID (default: scalo-test-group)
@@ -572,7 +570,7 @@ fn test_topic_info_debug() {
     assert!(debug.contains('3'));
 }
 
-// --- Integration Tests (require running Kafka) ---
+// --- Integration Tests (an existing broker, else a container) ---
 
 fn get_test_config() -> Option<KafkaConfig> {
     let brokers = std::env::var("TEST_KAFKA_BROKERS").ok()?;
@@ -587,13 +585,39 @@ fn get_test_config() -> Option<KafkaConfig> {
     })
 }
 
+/// Keeps a test's container alive until the test ends.
+type BrokerGuard = Option<Box<dyn std::any::Any + Send>>;
+
+/// The broker the tests below use: the one `TEST_KAFKA_BROKERS` names, else a
+/// container with the default topic created. `None` means skip.
+async fn test_config() -> Option<(KafkaConfig, BrokerGuard)> {
+    if let Some(config) = get_test_config() {
+        return Some((config, None));
+    }
+    #[cfg(feature = "testcontainers")]
+    {
+        let (node, bootstrap) = broker::start_kafka().await?;
+        broker::create_topic(&bootstrap, "scalo-test").await;
+        let config = KafkaConfig {
+            brokers: vec![bootstrap],
+            group: "scalo-test-group".to_string(),
+            topics: vec!["scalo-test".to_string()],
+            ..Default::default()
+        };
+        Some((config, Some(Box::new(node))))
+    }
+    #[cfg(not(feature = "testcontainers"))]
+    {
+        eprintln!("Skipping: TEST_KAFKA_BROKERS not set and the `testcontainers` feature is off");
+        None
+    }
+}
+
 #[tokio::test]
-#[ignore = "requires Kafka broker - set TEST_KAFKA_BROKERS to run"]
 async fn test_kafka_transport_connection() {
     use scalo::transport::kafka::KafkaTransport;
 
-    let Some(config) = get_test_config() else {
-        eprintln!("Skipping: TEST_KAFKA_BROKERS not set");
+    let Some((config, _broker)) = test_config().await else {
         return;
     };
 
@@ -606,10 +630,8 @@ async fn test_kafka_transport_connection() {
 }
 
 #[tokio::test]
-#[ignore = "requires Kafka broker - set TEST_KAFKA_BROKERS to run"]
 async fn test_kafka_admin_list_topics() {
-    let Some(config) = get_test_config() else {
-        eprintln!("Skipping: TEST_KAFKA_BROKERS not set");
+    let Some((config, _broker)) = test_config().await else {
         return;
     };
 
@@ -624,10 +646,8 @@ async fn test_kafka_admin_list_topics() {
 }
 
 #[tokio::test]
-#[ignore = "requires Kafka broker - set TEST_KAFKA_BROKERS to run"]
 async fn test_kafka_admin_describe_topic() {
-    let Some(config) = get_test_config() else {
-        eprintln!("Skipping: TEST_KAFKA_BROKERS not set");
+    let Some((config, _broker)) = test_config().await else {
         return;
     };
 
@@ -645,12 +665,10 @@ async fn test_kafka_admin_describe_topic() {
 }
 
 #[tokio::test]
-#[ignore = "requires Kafka broker - set TEST_KAFKA_BROKERS to run"]
 async fn test_kafka_send_receive_batch() {
     use scalo::transport::{TransportReceiver, TransportSender, kafka::KafkaTransport};
 
-    let Some(mut config) = get_test_config() else {
-        eprintln!("Skipping: TEST_KAFKA_BROKERS not set");
+    let Some((mut config, _broker)) = test_config().await else {
         return;
     };
 
@@ -682,10 +700,8 @@ async fn test_kafka_send_receive_batch() {
 }
 
 #[tokio::test]
-#[ignore = "requires Kafka broker - set TEST_KAFKA_BROKERS to run"]
 async fn test_kafka_consumer_lag() {
-    let Some(config) = get_test_config() else {
-        eprintln!("Skipping: TEST_KAFKA_BROKERS not set");
+    let Some((config, _broker)) = test_config().await else {
         return;
     };
 
@@ -716,19 +732,11 @@ mod broker {
     use rdkafka::consumer::{BaseConsumer, Consumer};
     use rdkafka::producer::{FutureProducer, FutureRecord};
     use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+    use scalo::transport::kafka::test_support::kafka_tag;
     use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
     use testcontainers_modules::kafka::apache::{self, Kafka};
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-
-    /// Kafka to test against, pinned by digest. The JVM image: `apache/kafka-native` before
-    /// 4.4.0 segfaults in `getpwuid` on ~2% of starts.
-    // renovate: datasource=docker depName=apache/kafka
-    const KAFKA_TAG: &str = "4.3.1";
-
-    /// Digest of `KAFKA_TAG`, apart from it because the Renovate regex stops at a colon.
-    const KAFKA_DIGEST: &str =
-        "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
 
     /// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
     const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
@@ -771,7 +779,7 @@ mod broker {
         loop {
             let request = Kafka::default()
                 .with_jvm_image()
-                .with_tag(format!("{KAFKA_TAG}@{KAFKA_DIGEST}"))
+                .with_tag(kafka_tag())
                 .with_startup_timeout(KAFKA_STARTUP_TIMEOUT);
             let request = match port {
                 Some(port) => request.with_mapped_port(port, apache::KAFKA_PORT),

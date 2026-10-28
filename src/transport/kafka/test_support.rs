@@ -1,13 +1,21 @@
 // Project:   scalo
-// File:      tests/common/tls_broker.rs
-// Purpose:   A real Apache Kafka broker with TLS, mTLS and SASL_SSL SCRAM listeners, in Docker
+// File:      src/transport/kafka/test_support.rs
+// Purpose:   Kafka test fixtures for consumer suites: pinned images and a TLS broker in Docker
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! One single-node KRaft broker with three secured listeners, and the
-//! certificates for it.
+//! Kafka test fixtures, behind the `transport-kafka-test-support` feature.
+//!
+//! An app's integration tests depend on this instead of copying it, so the
+//! broker image is pinned in [`KAFKA_IMAGE`] and nowhere else, and a fix to the
+//! fixture reaches every suite on its next scalo bump. It starts containers, so
+//! the test host needs a Docker daemon. [`require_docker`] skips a test without
+//! one on a developer's machine and fails it when `CI` is set.
+//!
+//! [`TlsBroker`] is one single-node KRaft broker with three secured listeners,
+//! and the certificates for it.
 //!
 //! The broker is Apache Kafka's own image, driven by the docker CLI so the
 //! certificates and `server.properties` are in place before it starts. It runs
@@ -26,6 +34,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
@@ -36,13 +45,76 @@ use tokio::process::Command;
 const OPENSSL_IMAGE: &str =
     "alpine/openssl:3.5.9@sha256:1c361a204e9791bec6202bccbd1065eafaa65cb5a1a9a06ae000238569fba6a2";
 
-/// The JVM image: `apache/kafka-native` before 4.4.0 segfaults in `getpwuid` on ~2% of starts.
+/// The broker image every Kafka test starts, as `image:tag@digest`.
 ///
+/// The JVM image: `apache/kafka-native` before 4.4.0 segfaults in `getpwuid` on ~2% of starts.
 /// The line the DFE stack deploys.
 ///
 /// renovate: datasource=docker depName=apache/kafka
-const KAFKA_IMAGE: &str =
+pub const KAFKA_IMAGE: &str =
     "apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
+
+/// [`KAFKA_IMAGE`] without the image name, as `tag@digest`.
+///
+/// What `testcontainers-modules`' `with_tag` takes, with the image set by `with_jvm_image`.
+#[must_use]
+pub fn kafka_tag() -> &'static str {
+    KAFKA_IMAGE
+        .split_once(':')
+        .map_or(KAFKA_IMAGE, |(_, tag)| tag)
+}
+
+/// Whether a Docker daemon answers `docker info`, asked once per test binary.
+#[must_use]
+pub fn docker_answers() -> bool {
+    static ANSWERS: OnceLock<bool> = OnceLock::new();
+    *ANSWERS.get_or_init(|| {
+        std::process::Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+/// Fail in CI rather than skip: a skipped container test reports green while
+/// exercising nothing, and CI does provide a container runtime.
+///
+/// # Panics
+///
+/// When the `CI` environment variable is set.
+pub fn skip_or_fail(reason: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{reason} in CI, which provides a container runtime. This test must RUN here."
+    );
+    eprintln!("skipping: {reason}");
+}
+
+/// Whether a test that needs Docker can run. Without a daemon it skips on a
+/// developer's machine (`false`, with the reason printed) and fails when `CI`
+/// is set.
+///
+/// ```rust,ignore
+/// #[tokio::test]
+/// async fn against_a_real_broker() {
+///     if !require_docker() {
+///         return;
+///     }
+///     // start a broker
+/// }
+/// ```
+///
+/// # Panics
+///
+/// When no Docker daemon answers and the `CI` environment variable is set.
+#[must_use]
+pub fn require_docker() -> bool {
+    if docker_answers() {
+        return true;
+    }
+    skip_or_fail("no Docker daemon answers");
+    false
+}
 
 /// Directory inside the broker container the test's files are copied to.
 const BROKER_DIR: &str = "/dfe-test";

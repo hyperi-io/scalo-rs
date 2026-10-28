@@ -39,16 +39,15 @@
 //!
 //! Skips when Docker is absent, and fails instead of skipping under CI.
 
-#![cfg(feature = "transport-kafka")]
+#![cfg(feature = "transport-kafka-test-support")]
 #![allow(clippy::large_futures)]
-
-mod common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::tls_broker::{SCRAM_PASSWORD, SCRAM_USER, TlsBroker};
-use common::{docker_answers, skip_or_fail};
+use scalo::transport::kafka::test_support::{
+    SCRAM_PASSWORD, SCRAM_USER, TlsBroker, require_docker, skip_or_fail,
+};
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::{
     SendResult, TransportBase, TransportError, TransportReceiver, TransportSender,
@@ -415,8 +414,7 @@ async fn report(phase: &str, rows: Vec<Outcome>, failures: &mut Vec<String>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kafka_transport_against_a_tls_broker() {
-    if !docker_answers() {
-        skip_or_fail("no Docker daemon answers");
+    if !require_docker() {
         return;
     }
     let broker = match TlsBroker::start("kafka-tls").await {
