@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### /readyz answers 503 until the app runs, and a paused gate is not ready (BEHAVIOUR CHANGE)
+
+A service built by `run_app` answers `/readyz` 503 `{"status":"starting"}` from the moment its metrics listener binds until `run_app` hands control to `run_service`. `ServiceApp::readiness_check` supplies the app's check before that handoff, so there is no window where the service reads ready before it has said what ready means. An idle service stays ready. With the `health` feature each inbound gate registers a `self_regulation:<source>` component that is unhealthy while the source is paused. A metrics listener that cannot bind now fails `ServiceRuntime::build` with `CliError::Metrics` instead of logging and running on.
+
+**Consumer adjustment** -- move a check set at the top of `run_service` into `ServiceApp::readiness_check`. A deployment whose metrics address was already taken now exits at start, so fix the address.
+
 ### The CEL profile reads literals and comments as cel does (BEHAVIOUR CHANGE)
 
 The profile scanner, and with it the transport filter classifier, now reads one-line, triple-quoted and raw string and bytes literals, `//` comments and backtick-quoted names as cel's lexer does, and takes any whitespace or comment before `(` as part of a call. An expression that hid a restricted call behind one of those forms now fails `validate`, `compile` and `RuleSet::compile`, and a transport filter with such a call classifies as Tier 3. `existsOne`, which cel expands as `exists_one`, is restricted iteration too: `allow_iteration` now allows it, where it was refused as an unknown function, and a filter with it classifies as Tier 3.

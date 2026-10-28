@@ -17,13 +17,13 @@ exists only to detect a deadlocked process.
 | Endpoint | Semantics | Fails when | K8s action |
 | --- | --- | --- | --- |
 | `/livez` | Liveness -- process alive | Never (always 200) | Kill + restart pod |
-| `/readyz` | Readiness -- deps OK + app says ready | Registry has an `Unhealthy` component OR the readiness callback returns false | Remove from Service endpoints (no traffic), don't restart |
+| `/readyz` | Readiness -- started + deps OK + app says ready | The runtime has not handed control to the app yet, OR the registry has an `Unhealthy` component, OR the readiness callback returns false | Remove from Service endpoints (no traffic), don't restart |
 
 That is the whole surface. There are no aliases and no startup endpoint --
 every retired path returns 404. A `startupProbe` targets `/livez`.
 
-Bodies: `{"status":"alive"}` / `{"status":"ready"}` on 200;
-`{"status":"not_ready"}` on 503.
+Bodies: `{"status":"alive"}` / `{"status":"ready"}` on 200,
+`{"status":"starting"}` or `{"status":"not_ready"}` on 503.
 
 ### Why no aliases
 
@@ -51,7 +51,9 @@ in later.
 Readiness is the registry AND the callback set with
 `mgr.set_readiness_check`. No callback counts as ready, and without the
 `health` feature there is no registry half, so a bare `MetricsManager`
-answers 200. `MetricsManager` has no ready flag and no `set_ready`.
+answers 200. A service built by `run_app` also answers 503 `starting`
+until it hands control to the app, see
+[service-runtime.md](../runtime/service-runtime.md#readiness-check).
 
 Nothing in the metrics server changes readiness at shutdown. The ready flag
 belongs to `HttpServer`, the separate optional listener: with `health` on it

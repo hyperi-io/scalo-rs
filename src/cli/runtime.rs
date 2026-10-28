@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use crate::env::{RuntimeContext, runtime_context};
 #[cfg(feature = "memory")]
 use crate::memory::{MemoryGuard, MemoryGuardConfig};
-use crate::metrics::MetricsManager;
+use crate::metrics::{MetricsManager, ServicePhase};
 
 use super::error::CliError;
 
@@ -141,6 +141,9 @@ impl ServiceRuntime {
         let metrics_config = crate::metrics::MetricsSettings::from_cascade().into_config(app_name);
         let mut metrics = MetricsManager::with_config(metrics_config);
         metrics.registry().set_app_name(app_name);
+        // /readyz answers 503 from the moment the listener binds until run_app
+        // hands control to the app.
+        metrics.set_service_phase(ServicePhase::Starting);
         let service_metrics = Arc::new(register_runtime_metrics(&metrics, version, commit));
 
         // --- Memory guard ---
@@ -241,8 +244,13 @@ impl ServiceRuntime {
         );
 
         // --- Start metrics server ---
+        // Fatal: a service with no listener has no probes and no scrape, and
+        // would run on looking healthy to everything but its own log.
         if let Err(e) = metrics.start_server(metrics_addr).await {
-            tracing::error!(error = %e, addr = metrics_addr, "Failed to start metrics server");
+            shutdown.cancel();
+            return Err(CliError::Metrics(format!(
+                "metrics server could not start on {metrics_addr}: {e}"
+            )));
         }
 
         // --- Version check (fire-and-forget) ---
@@ -286,9 +294,10 @@ impl ServiceRuntime {
 
     /// Set the readiness check callback.
     ///
-    /// Each app defines its own readiness criteria. Call this in `run_service()`
-    /// once you know what "ready" means for your app: the metrics listener is
-    /// already serving by then, and the callback is picked up regardless.
+    /// Each app defines its own readiness criteria. Prefer
+    /// [`ServiceApp::readiness_check`](super::ServiceApp::readiness_check),
+    /// which is in place before `run_service()` starts. A check set here
+    /// replaces it, and until one is set `/readyz` answers ready.
     pub fn set_readiness_check<F: Fn() -> bool + Send + Sync + 'static>(&mut self, check: F) {
         self.metrics.set_readiness_check(check);
     }
@@ -434,6 +443,7 @@ pub(crate) fn register_runtime_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::test_http::{free_local_addr, get};
 
     /// The runtime builds under whichever pool features are compiled in, and
     /// its pool metrics are described exactly when those features are on.
@@ -475,6 +485,43 @@ mod tests {
         assert!(runtime.batch_engine.is_some(), "and an engine on it");
 
         runtime.shutdown.cancel();
+    }
+
+    /// `/readyz` answers 503 `starting` from the moment `build` binds the
+    /// listener, until `run_app` hands control to the app.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readyz_is_starting_from_bind_until_the_handoff() {
+        let addr = free_local_addr();
+        let runtime = probe_runtime_at("starting-probe", &addr).await;
+
+        let (status, body) = get(&addr, "/readyz").await;
+        assert_eq!((status, body.as_str()), (503, r#"{"status":"starting"}"#));
+
+        runtime.metrics.set_service_phase(ServicePhase::Running);
+        let (status, body) = get(&addr, "/readyz").await;
+        assert_eq!((status, body.as_str()), (200, r#"{"status":"ready"}"#));
+
+        runtime.shutdown.cancel();
+    }
+
+    /// A listener that cannot bind fails the build instead of leaving a
+    /// service with no probes and no scrape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_metrics_bind_failure_fails_the_build() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let addr = held.local_addr().expect("the held address").to_string();
+        let cases = [
+            ("port already in use", addr.as_str()),
+            ("not an address", "nowhere"),
+        ];
+        for (name, addr) in cases {
+            let built = build_at("bind-failure-probe", addr).await;
+            assert!(
+                matches!(built, Err(CliError::Metrics(_))),
+                "{name}: got {:?}",
+                built.as_ref().map(|_| "a runtime")
+            );
+        }
     }
 
     /// KEDA reads `/scaling/pressure` from the metrics listener `build` starts,
@@ -753,12 +800,21 @@ mod tests {
 
     /// A runtime with one `probe` component (weight 1, saturating at 100), so a
     /// component value reads straight through as the pressure.
-    #[cfg(feature = "scaling")]
     async fn probe_runtime(name: &str) -> ServiceRuntime {
+        probe_runtime_at(name, "127.0.0.1:0").await
+    }
+
+    /// [`probe_runtime`] with its metrics listener on `addr`.
+    async fn probe_runtime_at(name: &str, addr: &str) -> ServiceRuntime {
+        build_at(name, addr).await.expect("the runtime builds")
+    }
+
+    /// Build the probe runtime with its metrics listener on `addr`.
+    async fn build_at(name: &str, addr: &str) -> Result<ServiceRuntime, CliError> {
         ServiceRuntime::build(
             name,
             "PROBE",
-            "127.0.0.1:0",
+            addr,
             "1.2.3",
             "probe",
             vec![crate::ScalingComponent::new("probe", 1.0, 100.0)],
@@ -766,7 +822,6 @@ mod tests {
             crate::VersionCheckConfig::default(),
         )
         .await
-        .expect("the runtime builds")
     }
 
     /// The bare `scaling_pressure` sample in the runtime's Prometheus output.
@@ -801,40 +856,5 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-    }
-
-    /// A loopback address with a port nothing is bound to.
-    #[cfg(feature = "scaling")]
-    fn free_local_addr() -> String {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-        probe.local_addr().expect("the bound address").to_string()
-    }
-
-    /// One HTTP/1.1 GET, returning the status code and the body.
-    #[cfg(feature = "scaling")]
-    async fn get(addr: &str, path: &str) -> (u16, String) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let mut stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connect to the metrics listener");
-        let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .expect("send the request");
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .await
-            .expect("read the response");
-
-        let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
-        let status = head
-            .split(' ')
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .expect("a status code");
-        (status, body.to_string())
     }
 }

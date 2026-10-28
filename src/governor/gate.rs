@@ -56,17 +56,47 @@ pub trait GateActuator: Send + Sync {
 /// ONCE, the `inbound_paused` gauge and `self_regulation_inbound_pauses_total`
 /// counter track real transitions, not per-evaluate noise -- a `paused`/
 /// `resumed` log pair and a gauge dashboards can graph.
+///
+/// With the `health` feature it also registers a `self_regulation:<source>`
+/// health component that is `Unhealthy` while the source is paused, so
+/// `/readyz` reports not ready instead of ready while nothing is consumed.
+/// The component holds a weak reference, so a dropped gate reads healthy.
 pub struct ObservingActuator {
     inner: Box<dyn GateActuator>,
     /// Stable source label for the log line (e.g. `"kafka"`, `"http"`).
     source: &'static str,
+    /// Whether the last edge was a pause, read by the health component.
+    paused: Arc<AtomicBool>,
 }
 
 impl ObservingActuator {
     /// Wrap `inner` so pause/resume edges emit metrics + logs under `source`.
     #[must_use]
     pub fn new(source: &'static str, inner: Box<dyn GateActuator>) -> Self {
-        Self { inner, source }
+        let paused = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "health")]
+        {
+            let seen = Arc::downgrade(&paused);
+            crate::health::HealthRegistry::register(
+                format!("self_regulation:{source}"),
+                move || paused_health(seen.upgrade().is_some_and(|p| p.load(Ordering::Acquire))),
+            );
+        }
+        Self {
+            inner,
+            source,
+            paused,
+        }
+    }
+}
+
+/// A paused source consumes nothing, so it is not ready.
+#[cfg(feature = "health")]
+const fn paused_health(paused: bool) -> crate::health::HealthStatus {
+    if paused {
+        crate::health::HealthStatus::Unhealthy
+    } else {
+        crate::health::HealthStatus::Healthy
     }
 }
 
@@ -87,6 +117,7 @@ impl GateActuator for ObservingActuator {
             source = self.source,
             "self-regulation: inbound PAUSED under pressure (memory/back-pressure brake)"
         );
+        self.paused.store(true, Ordering::Release);
         self.inner.pause();
     }
 
@@ -95,6 +126,7 @@ impl GateActuator for ObservingActuator {
         ::metrics::gauge!("self_regulation_inbound_paused", "source" => self.source).set(0.0);
         // A hold that reached max_hold resumes too, with the pressure not cleared.
         tracing::info!(source = self.source, "self-regulation: inbound RESUMED");
+        self.paused.store(false, Ordering::Release);
         self.inner.resume();
     }
 }
@@ -632,5 +664,63 @@ mod tests {
         mem.set(0.10);
         assert_eq!(gate.evaluate(), Admit::Yes);
         assert!(!gate.is_held());
+    }
+
+    /// A paused gate is a not-ready component, a released or dropped one is not.
+    #[cfg(feature = "health")]
+    #[test]
+    fn a_paused_gate_reports_unhealthy_until_it_resumes_or_drops() {
+        use crate::health::{HealthRegistry, HealthStatus};
+
+        let component = "self_regulation:readiness-probe";
+        let status = || {
+            HealthRegistry::components()
+                .into_iter()
+                .find(|(name, _)| name == component)
+                .map(|(_, status)| status)
+        };
+        let mem = Arc::new(MockSource::new(0.10, true));
+        let gate = InboundGate::new(
+            governor_with(Arc::clone(&mem)),
+            Box::new(ObservingActuator::new(
+                "readiness-probe",
+                Box::new(NoopActuator),
+            )),
+        );
+
+        let cases = [
+            (
+                "open before any pressure",
+                0.10,
+                Admit::Yes,
+                HealthStatus::Healthy,
+            ),
+            (
+                "paused under pressure",
+                0.90,
+                Admit::Hold,
+                HealthStatus::Unhealthy,
+            ),
+            (
+                "still held inside the band",
+                0.70,
+                Admit::Hold,
+                HealthStatus::Unhealthy,
+            ),
+            ("resumed", 0.50, Admit::Yes, HealthStatus::Healthy),
+            ("paused again", 0.90, Admit::Hold, HealthStatus::Unhealthy),
+        ];
+        for (name, level, admit, want) in cases {
+            mem.set(level);
+            assert_eq!(gate.evaluate(), admit, "{name}");
+            assert_eq!(status(), Some(want), "{name}");
+        }
+
+        drop(gate);
+        assert_eq!(
+            status(),
+            Some(HealthStatus::Healthy),
+            "a dropped gate must not hold readiness red for the life of the process"
+        );
     }
 }

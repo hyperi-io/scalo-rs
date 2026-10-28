@@ -90,7 +90,9 @@ pub mod otel_types;
 
 #[cfg(feature = "metrics")]
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+#[cfg(all(feature = "metrics", any(feature = "scaling", feature = "memory")))]
+use std::sync::RwLock;
 use std::time::Duration;
 
 use metrics::{Counter, Gauge, Histogram, Unit};
@@ -102,13 +104,16 @@ use tokio::sync::oneshot;
 /// Readiness check callback type.
 pub type ReadinessFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Shared slot the running server reads on every `/readyz`.
-///
-/// The callback is stored behind a shared handle rather than moved into the
-/// server task, so [`MetricsManager::set_readiness_check`] takes effect after
-/// the listener has started -- which is the only order an app can achieve when
-/// readiness depends on state built after the runtime.
-type ReadinessSlot = Arc<RwLock<Option<ReadinessFn>>>;
+#[cfg_attr(
+    not(feature = "metrics"),
+    allow(dead_code, reason = "only the metrics listener answers /readyz")
+)]
+mod readiness;
+use readiness::ReadinessSlot;
+#[cfg(test)]
+use readiness::ReadyAnswer;
+#[cfg(feature = "cli-service")]
+pub(crate) use readiness::ServicePhase;
 
 /// Shared slot the running server reads on every `/scaling/pressure`.
 ///
@@ -837,16 +842,25 @@ impl MetricsManager {
     ///
     /// When set, `/readyz` calls this function and returns 503 Service
     /// Unavailable if it returns `false`. Without a callback, the endpoint
-    /// always returns 200.
+    /// returns 200 once the service is running.
     ///
     /// Takes effect immediately whether or not the server is already running,
     /// because the callback lives in a slot the request handler reads rather
     /// than a value the server task captured at start.
     pub fn set_readiness_check(&mut self, f: impl Fn() -> bool + Send + Sync + 'static) {
-        *self
-            .readiness_fn
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(f));
+        self.readiness_fn.set_check(Arc::new(f));
+    }
+
+    /// Install a readiness check that is already shared.
+    #[cfg(feature = "cli-service")]
+    pub(crate) fn set_readiness_fn(&self, check: ReadinessFn) {
+        self.readiness_fn.set_check(check);
+    }
+
+    /// Move the service to `phase`, which `/readyz` reads before the check.
+    #[cfg(feature = "cli-service")]
+    pub(crate) fn set_service_phase(&self, phase: ServicePhase) {
+        self.readiness_fn.set_phase(phase);
     }
 
     /// Attach a `ScalingPressure` instance.
@@ -1086,7 +1100,7 @@ impl MetricsManager {
                 "/readyz",
                 axum::routing::get(move || {
                     let rf = readiness_fn.clone();
-                    async move { readiness_response(rf) }
+                    async move { readiness_response(&rf) }
                 }),
             );
 
@@ -1322,31 +1336,13 @@ async fn handle_connection(
             r#"{"status":"alive"}"#.to_string(),
         )
     } else if request_line.starts_with("GET /readyz") {
-        let callback_ready = readiness_fn
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .is_none_or(|f| f());
-
-        #[cfg(feature = "health")]
-        let registry_ready = crate::health::HealthRegistry::is_ready();
-        #[cfg(not(feature = "health"))]
-        let registry_ready = true;
-
-        let ready = callback_ready && registry_ready;
-        if ready {
-            (
-                "200 OK",
-                Some("application/json"),
-                r#"{"status":"ready"}"#.to_string(),
-            )
+        let (ready, body) = readiness_fn.answer().wire();
+        let status = if ready {
+            "200 OK"
         } else {
-            (
-                "503 Service Unavailable",
-                Some("application/json"),
-                r#"{"status":"not_ready"}"#.to_string(),
-            )
-        }
+            "503 Service Unavailable"
+        };
+        (status, Some("application/json"), body.to_string())
     } else if let Some(answer) = scaling_answer {
         answer
     } else {
@@ -1367,41 +1363,23 @@ async fn handle_connection(
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
-/// Build the readiness response.
-///
-/// Checks the caller-supplied readiness callback AND (when the `health`
-/// feature is enabled) the global [`HealthRegistry`](crate::health::HealthRegistry).
-/// Both must be true for a 200 response.
+/// Build the readiness response from the shared [`Readiness`](readiness::Readiness) answer.
 #[cfg(all(feature = "metrics", feature = "http-server"))]
-fn readiness_response(rf: ReadinessSlot) -> axum::response::Response {
+fn readiness_response(rf: &ReadinessSlot) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let callback_ready = rf
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .is_none_or(|f| f());
-
-    #[cfg(feature = "health")]
-    let registry_ready = crate::health::HealthRegistry::is_ready();
-    #[cfg(not(feature = "health"))]
-    let registry_ready = true;
-
-    let ready = callback_ready && registry_ready;
-    if ready {
-        (
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            r#"{"status":"ready"}"#,
-        )
-            .into_response()
+    let (ready, body) = rf.answer().wire();
+    let status = if ready {
+        axum::http::StatusCode::OK
     } else {
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            r#"{"status":"not_ready"}"#,
-        )
-            .into_response()
-    }
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 /// The `/scaling/pressure` body, or `None` when nothing is attached.
@@ -1541,24 +1519,22 @@ mod tests {
         // ready means, so a callback registered later must still be read.
         let manager = MetricsManager::new("");
         let slot = manager.readiness_fn.clone();
-        assert!(readiness_slot_ready(&slot), "no callback means ready");
+        assert_eq!(slot.answer(), ReadyAnswer::Ready, "no callback means ready");
 
         let mut manager = manager;
         manager.set_readiness_check(|| false);
-        assert!(
-            !readiness_slot_ready(&slot),
+        assert_eq!(
+            slot.answer(),
+            ReadyAnswer::NotReady,
             "the handle the server holds must see a callback set after start"
         );
 
         manager.set_readiness_check(|| true);
-        assert!(readiness_slot_ready(&slot), "a later callback replaces it");
-    }
-
-    fn readiness_slot_ready(slot: &ReadinessSlot) -> bool {
-        slot.read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .is_none_or(|f| f())
+        assert_eq!(
+            slot.answer(),
+            ReadyAnswer::Ready,
+            "a later callback replaces it"
+        );
     }
 
     /// A Prometheus handle without installing a global recorder.

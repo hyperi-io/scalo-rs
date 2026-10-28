@@ -212,7 +212,7 @@ Kafka emits the `transport_ack_*` series once armed. An armed gRPC server emits 
 | `/metrics` | Prometheus text |
 | `/metrics/manifest` | JSON catalogue |
 | `/livez` | `{"status":"alive"}` -- process alive |
-| `/readyz` | 200 if readiness callback + [`HealthRegistry`](health.md) both pass, else 503 |
+| `/readyz` | 200 if the service has started and the readiness callback + [`HealthRegistry`](health.md) both pass, else 503 |
 | `/scaling/pressure` | Float `0.00-100.00` (feature `scaling` + `set_scaling_pressure`) |
 | `/memory/pressure` | JSON ratio + bytes (feature `memory` + `set_memory_guard`, `start_server_with_routes` only) |
 

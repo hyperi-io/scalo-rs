@@ -92,7 +92,10 @@ Step by step inside `run_app` for the default `run` subcommand:
    - With `service-metrics`, start a task that writes the value
      `/scaling/pressure` serves into the `scaling_pressure` gauge once a
      second until the token is cancelled.
-   - Start the metrics server on `args.metrics_addr`.
+   - Start the metrics server on `args.metrics_addr`. A bind failure fails
+     the build with `CliError::Metrics`: a service with no listener has no
+     probes and no scrape. From the bind until step 6, `/readyz` answers 503
+     `{"status":"starting"}`.
    - Fire-and-forget version check if `version-check` is on: enabled by
      default, inert until `version_check_defaults()` or config supplies an
      `api_url`, and `version_check.enabled: false` in any config layer
@@ -200,26 +203,29 @@ cascade, so different settings or env vars give different artefacts.
 
 ## Readiness check
 
-The runtime installs no readiness check of its own. Until an app sets
-one, `/readyz` answers from the health registry alone: ready as soon as
-the metrics listener serves and no registered component is unhealthy.
-Each app sets its check once it knows what "ready" means for its
-domain:
+`/readyz` follows the service through three phases:
+
+| Phase | From | `/readyz` |
+| --- | --- | --- |
+| Starting | the metrics listener binds | 503 `{"status":"starting"}` |
+| Idle | `work_state` returns `Idle` | 200 while no health component is `Unhealthy`. The app's check is not consulted |
+| Running | `run_app` hands control to `run_service` | the app's check AND the health registry |
+
+An app supplies its check up front with `ServiceApp::readiness_check`.
+`run_app` installs it before the handoff, so the service never reads
+ready before the app has said what ready means:
 
 ```rust
-async fn run_service(&self, config: Self::Config, mut runtime: ServiceRuntime)
-    -> Result<(), CliError>
-{
-    // ... wire pipeline ...
-    let p = Arc::clone(&pipeline);
-    runtime.set_readiness_check(move || p.is_consuming());
-    // ... run loop ...
+fn readiness_check(&self, _config: &Self::Config) -> Option<ReadinessFn> {
+    let bound = Arc::clone(&self.listeners_bound);
+    Some(Arc::new(move || bound.load(Ordering::Acquire)))
 }
 ```
 
-`set_readiness_check` takes a `Fn() -> bool + Send + Sync + 'static`
-closure that the metrics server's `/readyz` handler calls on every
-probe.
+Without one, the service reads ready from the handoff until `run_service`
+calls `runtime.set_readiness_check`, which replaces any check in place.
+Both take a `Fn() -> bool + Send + Sync + 'static` closure that the
+metrics server's `/readyz` handler calls on every probe.
 
 ---
 
@@ -243,7 +249,8 @@ remain in app code because they're genuinely domain-specific:
 | `ServiceApp` trait | Service contract -- implement to get the standard lifecycle |
 | `run_app::<A>(app)` | Drives the lifecycle; matches subcommand, builds runtime, calls `run_service` |
 | `ServiceRuntime` | Pre-wired infrastructure bundle -- built by `run_app`, passed to `run_service` |
-| `ServiceRuntime::set_readiness_check(fn)` | Install the app's readiness criterion |
+| `ServiceApp::readiness_check(&config)` | The app's readiness criterion, installed before `run_service` starts |
+| `ServiceRuntime::set_readiness_check(fn)` | Replace the readiness criterion from inside `run_service` |
 | `ServiceRuntime::batch_engine()` | Borrow the batch engine if `worker-batch` is on |
 | `ServiceRuntime::governed_receiver(key)` | Build a receive transport with the governor's inbound brake wired in (cfg `governor` + `transport`); falls back to a plain receiver when the governor is off |
 | `StandardCommand` | Subcommand enum -- apps embed via `#[command(flatten)]` |

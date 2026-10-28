@@ -194,6 +194,11 @@ see it.
 | `self_regulation_max_hold_releases_total` | counter | Holds ended by `max_hold_secs` with the level still above `resume_below`, `signal` label = the source setting the level (`memory`, `ack_held`). A steady rate means memory the brake cannot free is holding the level up |
 | `self_regulation_kafka_gate_errors_total` | counter | Kafka pause/resume actuator failures, `op` label = `pause` or `resume`. A sustained non-zero rate means the brake is silently disabled for the Kafka source -- alert on it |
 
+With the `health` feature, each gate also registers a
+`self_regulation:<source>` health component that is `Unhealthy` while
+the source is paused, so `/readyz` answers 503 while nothing is consumed.
+A dropped gate reads healthy.
+
 Because the gate fires each edge EXACTLY ONCE (`ObservingActuator` in
 `src/governor/gate.rs`), the `self_regulation_inbound_paused` gauge and the
 `self_regulation_inbound_pauses_total` counter track real transitions, not

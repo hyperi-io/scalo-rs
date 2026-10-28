@@ -125,6 +125,28 @@ pub trait ServiceApp: Sized {
         crate::lifecycle::WorkState::Active
     }
 
+    /// The check `/readyz` consults once the service is running.
+    ///
+    /// [`run_app`] installs it before handing control to `run_service`, so
+    /// there is no window where the service reads ready before the app has
+    /// said what ready means. `/readyz` answers 503 from the moment the
+    /// metrics listener binds until that handoff, then this check decides,
+    /// together with the health registry. Build it over state the app flips
+    /// once its listeners and transports are up:
+    ///
+    /// ```rust,ignore
+    /// fn readiness_check(&self, _config: &Self::Config) -> Option<ReadinessFn> {
+    ///     let bound = Arc::clone(&self.listeners_bound);
+    ///     Some(Arc::new(move || bound.load(Ordering::Acquire)))
+    /// }
+    /// ```
+    ///
+    /// The default is `None`: the service reads ready from the handoff until
+    /// `run_service` sets a check of its own.
+    fn readiness_check(&self, _config: &Self::Config) -> Option<crate::metrics::ReadinessFn> {
+        None
+    }
+
     /// Provide scaling pressure components for KEDA autoscaling.
     ///
     /// Override to register app-specific scaling signals (buffer depth,
@@ -311,12 +333,12 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             // /livez and /readyz are already serving -- and not before, or an
             // app with nothing to do would crash-loop with no probe surface.
             #[cfg(feature = "lifecycle")]
-            let result = match wait_for_work(&app, config, config_path).await {
-                Some(config) => app.run_service(config, runtime).await,
+            let result = match wait_for_work(&app, config, config_path, &runtime.metrics).await {
+                Some(config) => hand_over(&app, config, runtime).await,
                 None => Ok(()),
             };
             #[cfg(not(feature = "lifecycle"))]
-            let result = app.run_service(config, runtime).await;
+            let result = hand_over(&app, config, runtime).await;
 
             // Flush what is queued before the process goes away. Both calls
             // are bounded and safe when nothing was ever wired up.
@@ -336,6 +358,22 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
     }
 }
 
+/// Hand control to the app: install its readiness check, then let `/readyz`
+/// consult it, then run the service.
+async fn hand_over<A: ServiceApp>(
+    app: &A,
+    config: A::Config,
+    runtime: super::ServiceRuntime,
+) -> Result<(), CliError> {
+    if let Some(check) = app.readiness_check(&config) {
+        runtime.metrics.set_readiness_fn(check);
+    }
+    runtime
+        .metrics
+        .set_service_phase(crate::metrics::ServicePhase::Running);
+    app.run_service(config, runtime).await
+}
+
 /// Hold the service at the idle gate until its configuration gives it work.
 ///
 /// Returns the config to run with, or `None` when shutdown arrived while the
@@ -348,6 +386,7 @@ async fn wait_for_work<A: ServiceApp>(
     app: &A,
     mut config: A::Config,
     config_path: Option<&str>,
+    metrics: &crate::metrics::MetricsManager,
 ) -> Option<A::Config> {
     use crate::lifecycle::{GateWake, IdleGate, WorkState, wait_for_config_change};
 
@@ -358,7 +397,10 @@ async fn wait_for_work<A: ServiceApp>(
                 gate.leave_idle();
                 return Some(config);
             }
-            WorkState::Idle(reason) => gate.enter_idle(&reason),
+            WorkState::Idle(reason) => {
+                gate.enter_idle(&reason);
+                metrics.set_service_phase(crate::metrics::ServicePhase::Idle);
+            }
         }
 
         if wait_for_config_change(config_path.map(std::path::Path::new)).await
@@ -662,6 +704,8 @@ mod tests {
     use super::*;
     use crate::cli::ServiceRuntime;
     use crate::metrics::{ManifestResponse, MetricsManager, ServiceMetrics};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn test_standard_command_default_is_run() {
@@ -994,5 +1038,68 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         generate_into(&push_gated_app(vec![push]), out.path()).expect("a declared listener passes");
         assert!(out.path().join("deployment-contract.json").is_file());
+    }
+
+    /// A service whose readiness check reads a flag it flips once running.
+    struct ReadyApp {
+        common: CommonArgs,
+        listeners_bound: Arc<AtomicBool>,
+    }
+
+    impl ServiceApp for ReadyApp {
+        type Config = ();
+
+        fn name(&self) -> &'static str {
+            "ready-app"
+        }
+        fn env_prefix(&self) -> &'static str {
+            "READY_APP"
+        }
+        fn version_info(&self) -> VersionInfo {
+            VersionInfo::new("ready-app", "1.2.3")
+        }
+        fn common_args(&self) -> &CommonArgs {
+            &self.common
+        }
+        fn load_config(&self, _path: Option<&str>) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn readiness_check(&self, _config: &()) -> Option<crate::metrics::ReadinessFn> {
+            let bound = Arc::clone(&self.listeners_bound);
+            Some(Arc::new(move || bound.load(Ordering::Acquire)))
+        }
+        async fn run_service(&self, _config: (), runtime: ServiceRuntime) -> Result<(), CliError> {
+            use crate::cli::test_http::get;
+
+            let addr = self.common.effective_metrics_addr();
+            let (status, body) = get(&addr, "/readyz").await;
+            assert_eq!(
+                (status, body.as_str()),
+                (503, r#"{"status":"not_ready"}"#),
+                "the app's own check is in place before run_service starts"
+            );
+
+            self.listeners_bound.store(true, Ordering::Release);
+            let (status, body) = get(&addr, "/readyz").await;
+            assert_eq!((status, body.as_str()), (200, r#"{"status":"ready"}"#));
+
+            runtime.shutdown.cancel();
+            Ok(())
+        }
+    }
+
+    /// The app's builder check decides `/readyz` from the handoff on, so the
+    /// service never reads ready before the app says it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_builder_readiness_check_decides_from_the_handoff() {
+        let mut args = common();
+        args.metrics_addr = Some(crate::cli::test_http::free_local_addr());
+        let app = ReadyApp {
+            common: args,
+            listeners_bound: Arc::new(AtomicBool::new(false)),
+        };
+        run_app(app)
+            .await
+            .expect("the service runs and exits cleanly");
     }
 }
