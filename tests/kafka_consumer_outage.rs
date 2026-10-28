@@ -301,9 +301,11 @@ async fn a_commit_during_an_outage_reports_instead_of_hanging() {
 /// the broker returns, not after one backoff per error librdkafka queued
 /// meanwhile.
 ///
-/// The outage stays inside the 45 s group session, so the broker never holds
-/// a rejoin, and a 100 ms reconnect backoff keeps queueing errors through it.
-/// The JVM broker takes about 15 s to restart, which counts towards that session.
+/// The outage must stay inside the group session, or the broker drops the
+/// member and the consumer waits out a rejoin that is not what this test
+/// measures. A JVM broker restart takes 15 s idle and 36 s on a busy
+/// host, so the session is set well past any restart rather than racing it.
+/// A 100 ms reconnect backoff keeps queueing errors through the outage.
 #[tokio::test]
 async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
     if !require_docker() {
@@ -311,13 +313,17 @@ async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
     }
     const UNPOLLED: Duration = Duration::from_secs(15);
     const RESUME_WITHIN: Duration = Duration::from_secs(30);
+    const SESSION_TIMEOUT_MS: u32 = 240_000;
 
     let (node, bootstrap) = start_kafka().await;
     create_topic(&bootstrap).await;
     let producer = raw_producer(&bootstrap);
     let consumer = KafkaTransport::new(
-        &consumer_config(&bootstrap, "outage-unpolled", ConsumerProtocol::Classic)
-            .with_override("reconnect.backoff.max.ms", "100"),
+        &KafkaConfig {
+            session_timeout_ms: SESSION_TIMEOUT_MS,
+            ..consumer_config(&bootstrap, "outage-unpolled", ConsumerProtocol::Classic)
+        }
+        .with_override("reconnect.backoff.max.ms", "100"),
     )
     .await
     .expect("kafka consumer");
@@ -335,6 +341,8 @@ async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
     tokio::time::sleep(UNPOLLED).await;
     (*node).start().await.expect("restart the broker");
 
+    // Delivery is the broker's own readiness signal: the clock starts once it
+    // is serving again, however long the restart took.
     let after = produce(&producer, "after").await;
     let delivered = Instant::now();
     let tokens = consume_all(&consumer, &after, RESUME_WITHIN).await;
