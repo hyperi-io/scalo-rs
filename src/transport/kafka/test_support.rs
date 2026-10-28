@@ -1,13 +1,21 @@
 // Project:   scalo
-// File:      tests/common/tls_broker.rs
-// Purpose:   A real Apache Kafka broker with TLS, mTLS and SASL_SSL SCRAM listeners, in Docker
+// File:      src/transport/kafka/test_support.rs
+// Purpose:   Kafka test fixtures for consumer suites: pinned images and a TLS broker in Docker
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! One single-node KRaft broker with three secured listeners, and the
-//! certificates for it.
+//! Kafka test fixtures, behind the `transport-kafka-test-support` feature.
+//!
+//! An app's integration tests depend on this instead of copying it, so the
+//! broker image is pinned in [`KAFKA_IMAGE`] and nowhere else, and a fix to the
+//! fixture reaches every suite on its next scalo bump. It starts containers, so
+//! the test host needs a Docker daemon. [`require_docker`] skips a test without
+//! one on a developer's machine and fails it when `CI` is set.
+//!
+//! [`TlsBroker`] is one single-node KRaft broker with three secured listeners,
+//! and the certificates for it.
 //!
 //! The broker is Apache Kafka's own image, driven by the docker CLI so the
 //! certificates and `server.properties` are in place before it starts. It runs
@@ -24,8 +32,10 @@
 //! no `openssl` and the keys are a different implementation from the one under
 //! test (librdkafka links OpenSSL, the broker is a JVM).
 
+use std::fs::Permissions;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
@@ -36,13 +46,76 @@ use tokio::process::Command;
 const OPENSSL_IMAGE: &str =
     "alpine/openssl:3.5.9@sha256:1c361a204e9791bec6202bccbd1065eafaa65cb5a1a9a06ae000238569fba6a2";
 
-/// The JVM image: `apache/kafka-native` before 4.4.0 segfaults in `getpwuid` on ~2% of starts.
+/// The broker image every Kafka test starts, as `image:tag@digest`.
 ///
+/// The JVM image: `apache/kafka-native` before 4.4.0 segfaults in `getpwuid` on ~2% of starts.
 /// The line the DFE stack deploys.
 ///
 /// renovate: datasource=docker depName=apache/kafka
-const KAFKA_IMAGE: &str =
+pub const KAFKA_IMAGE: &str =
     "apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
+
+/// [`KAFKA_IMAGE`] without the image name, as `tag@digest`.
+///
+/// What `testcontainers-modules`' `with_tag` takes, with the image set by `with_jvm_image`.
+#[must_use]
+pub fn kafka_tag() -> &'static str {
+    KAFKA_IMAGE
+        .split_once(':')
+        .map_or(KAFKA_IMAGE, |(_, tag)| tag)
+}
+
+/// Whether a Docker daemon answers `docker info`, asked once per test binary.
+#[must_use]
+pub fn docker_answers() -> bool {
+    static ANSWERS: OnceLock<bool> = OnceLock::new();
+    *ANSWERS.get_or_init(|| {
+        std::process::Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+/// Fail in CI rather than skip: a skipped container test reports green while
+/// exercising nothing, and CI does provide a container runtime.
+///
+/// # Panics
+///
+/// When the `CI` environment variable is set.
+pub fn skip_or_fail(reason: &str) {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{reason} in CI, which provides a container runtime. This test must RUN here."
+    );
+    eprintln!("skipping: {reason}");
+}
+
+/// Whether a test that needs Docker can run. Without a daemon it skips on a
+/// developer's machine (`false`, with the reason printed) and fails when `CI`
+/// is set.
+///
+/// ```rust,ignore
+/// #[tokio::test]
+/// async fn against_a_real_broker() {
+///     if !require_docker() {
+///         return;
+///     }
+///     // start a broker
+/// }
+/// ```
+///
+/// # Panics
+///
+/// When no Docker daemon answers and the `CI` environment variable is set.
+#[must_use]
+pub fn require_docker() -> bool {
+    if docker_answers() {
+        return true;
+    }
+    skip_or_fail("no Docker daemon answers");
+    false
+}
 
 /// Directory inside the broker container the test's files are copied to.
 const BROKER_DIR: &str = "/dfe-test";
@@ -147,11 +220,8 @@ fn free_port() -> u16 {
 // Container naming
 // ---------------------------------------------------------------------------
 
-/// Label marking every container this suite starts, for bulk cleanup.
-const SUITE_LABEL: (&str, &str) = ("io.hyperi.test.suite", "scalo-rs-integration");
-
-/// Container name: `scalo-rs-test-integration-<test>-<service>`.
-fn container_name(test: &str, service: &str) -> String {
+/// Container name: `<repo>-test-integration-<test>-<service>`.
+fn container_name(repo: &str, test: &str, service: &str) -> String {
     let slug = |s: &str| {
         s.chars()
             .map(|c| {
@@ -163,7 +233,12 @@ fn container_name(test: &str, service: &str) -> String {
             })
             .collect::<String>()
     };
-    format!("scalo-rs-test-integration-{}-{}", slug(test), slug(service))
+    format!(
+        "{}-test-integration-{}-{}",
+        slug(repo),
+        slug(test),
+        slug(service)
+    )
 }
 
 /// Whether process `pid` is alive on this host. `ps` failing to run counts as
@@ -252,16 +327,21 @@ impl Pki {
             String::from_utf8_lossy(&out.stderr)
         );
         let tar = dir.path().join("pki.tar");
-        std::fs::write(&tar, &out.stdout).unwrap_or_else(|e| panic!("write pki.tar: {e}"));
-        let status = std::process::Command::new("tar")
+        tokio::fs::write(&tar, &out.stdout)
+            .await
+            .unwrap_or_else(|e| panic!("write pki.tar: {e}"));
+        let status = Command::new("tar")
             .arg("-xf")
             .arg(&tar)
             .arg("-C")
             .arg(dir.path())
             .status()
+            .await
             .unwrap_or_else(|e| panic!("tar could not run: {e}"));
         assert!(status.success(), "tar could not unpack the certificates");
-        std::fs::remove_file(&tar).unwrap_or_else(|e| panic!("remove pki.tar: {e}"));
+        tokio::fs::remove_file(&tar)
+            .await
+            .unwrap_or_else(|e| panic!("remove pki.tar: {e}"));
         Self { dir }
     }
 
@@ -338,36 +418,42 @@ fn start_script() -> String {
 impl TlsBroker {
     /// Generate the certificates, start the broker and wait until it serves.
     ///
-    /// `test` names the owning test in the container name.
+    /// `repo` and `test` name the owning repo and test in the container name
+    /// (`<repo>-test-integration-<test>-kafka`) and in the `io.hyperi.test.suite`
+    /// (`<repo>-integration`) and `io.hyperi.test.repo` labels, so a leftover
+    /// container says whose it is.
     ///
     /// # Errors
     ///
     /// The docker CLI's complaint when an image will not pull, the files will
     /// not copy in, or the broker does not come up.
-    pub async fn start(test: &str) -> Result<Self, String> {
+    pub async fn start(repo: &str, test: &str) -> Result<Self, String> {
         let pki = Pki::generate().await;
         let controller = free_port();
         let (tls, sasl_ssl, mtls) = (free_port(), free_port(), free_port());
 
         let scratch = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
         for name in ["ca.crt", "server.pem"] {
-            std::fs::copy(pki.dir().join(name), scratch.path().join(name))
+            tokio::fs::copy(pki.dir().join(name), scratch.path().join(name))
+                .await
                 .map_err(|e| format!("stage {name}: {e}"))?;
         }
         write(
             &scratch.path().join("server.properties"),
             &server_properties(controller, tls, sasl_ssl, mtls),
-        )?;
-        write(&scratch.path().join("start.sh"), &start_script())?;
+        )
+        .await?;
+        write(&scratch.path().join("start.sh"), &start_script()).await?;
         // The broker runs as its image's user, whose uid need not match this process's.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
+            tokio::fs::set_permissions(scratch.path(), Permissions::from_mode(0o755))
+                .await
                 .map_err(|e| format!("chmod scratch dir: {e}"))?;
         }
 
-        let name = claim_container_name(&container_name(test, "kafka"));
+        let name = claim_container_name(&container_name(repo, test, "kafka"));
         let mut create: Vec<String> = [
             "create",
             "--name",
@@ -377,9 +463,9 @@ impl TlsBroker {
             "--env",
             "KAFKA_HEAP_OPTS=-Xms256m -Xmx768m",
             "--label",
-            &format!("{}={}", SUITE_LABEL.0, SUITE_LABEL.1),
+            &format!("io.hyperi.test.suite={repo}-integration"),
             "--label",
-            "io.hyperi.test.repo=scalo-rs",
+            &format!("io.hyperi.test.repo={repo}"),
             "--label",
             "io.hyperi.test.service=kafka",
             "--label",
@@ -473,8 +559,10 @@ impl TlsBroker {
     }
 }
 
-fn write(path: &Path, text: &str) -> Result<(), String> {
-    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+async fn write(path: &Path, text: &str) -> Result<(), String> {
+    tokio::fs::write(path, text)
+        .await
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 impl Drop for TlsBroker {

@@ -94,6 +94,10 @@ librdkafka reconnects and rejoins by itself, so an outage ends neither the consu
 
 An auth or TLS failure is permanent only until the credentials first work (a broker `UP`, a delivered record or a received one); after that it is a restarting broker. [classify.rs](../../src/transport/kafka/classify.rs) lists the transient codes; an unlisted code is permanent and logged by name. A missing topic is transient only with `allow.auto.create.topics: "true"`. A permanent error met mid-drain comes back on the next `recv`, after the drained records. The next `recv` clears the errors queued while nothing polled, and any rebalance behind them, backing off once only if no record follows. Counters: [../core-pillars/metrics.md](../core-pillars/metrics.md).
 
+#### Testing against a real broker
+
+`transport-kafka-test-support` ([feature-flags.md](../feature-flags.md)) gives an app's integration tests the broker scalo's own suite uses, so the image is pinned once and not copied per repo. `TlsBroker::start(test)` brings up Apache Kafka with TLS, mTLS and SASL_SSL listeners and generates the certificates (`broker.pki.file("ca.crt")`). `tests/kafka_tls.rs` is the worked example, with a refused row for each way a client can be turned away.
+
 #### Refused credentials
 
 A bad CA, a rejected client certificate or a wrong SASL password never fails a produce call. librdkafka retries the connection and the record times out, which looks the same as an unreachable broker. The refusal arrives separately, on the client's error callback, with the code `SSL` or `Authentication`. The transport keeps it, so a client no broker has yet accepted behaves like this:

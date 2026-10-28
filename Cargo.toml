@@ -229,7 +229,7 @@ deployment-test-support = ["deployment"]
 
 # Real-broker tests against testcontainers. Needs a Docker daemon at test time;
 # CI's Test job builds with every feature, so it runs them.
-testcontainers = []
+testcontainers = ["transport-kafka-test-support"]
 
 # Reflectable config schema + capability catalog (scalo-rs#6). Derives a JSON
 # Schema of the app `Config` via schemars and carries a hand-authored capability
@@ -263,6 +263,10 @@ transport = ["tokio", "serde_json", "rmpv", "chrono", "regex", "memchr", "sonic-
 transport-trace = ["transport", "dep:opentelemetry"]
 transport-memory = ["transport"]
 transport-kafka = ["transport", "rdkafka", "regex", "tokio-util"]
+# Kafka test fixtures for consumer suites (`scalo::transport::kafka::test_support`):
+# the pinned broker image and a TLS / mTLS / SASL_SSL broker driven through the
+# docker CLI. Needs a Docker daemon at test time. Opt-in, for dev-dependencies.
+transport-kafka-test-support = ["transport-kafka", "dep:tempfile", "tokio/process"]
 transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util"]
 transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
@@ -485,6 +489,7 @@ memchr = { version = ">=2.8.3, <3", optional = true }
 
 # Secrets management
 parking_lot = { version = ">=0.13.0, <0.14", optional = true }
+tempfile = { version = ">=3.27.0, <4", optional = true }
 
 # Token-bucket / GCRA rate limiter (governor crate). Imported as `gcra` to
 # avoid a name clash with scalo's own `governor` module/feature (the crate and

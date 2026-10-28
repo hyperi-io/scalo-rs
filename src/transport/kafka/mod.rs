@@ -58,6 +58,8 @@ mod lease;
 mod metrics;
 mod producer;
 pub mod providers;
+#[cfg(feature = "transport-kafka-test-support")]
+pub mod test_support;
 mod token;
 pub mod topic_resolver;
 

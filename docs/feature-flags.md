@@ -257,8 +257,9 @@ diagnostic, smoke-test, or specialty:
   built-with -- the YAML cascade already handles centralised config.
 - `worker-msgpack` -- MsgPack batch serialisation for the worker pool.
   Specialty use.
+- `transport-kafka-test-support` -- Kafka fixtures for a consumer's tests, in `scalo::transport::kafka::test_support`: `KAFKA_IMAGE` (the one pinned `apache/kafka` image, as `image:tag@digest`), `kafka_tag()` for `testcontainers-modules`, `require_docker()` (skip without Docker locally, fail when `CI` is set), and `TlsBroker`, a single-node broker with TLS, mTLS and SASL_SSL SCRAM-SHA-512 listeners and the certificates for them, driven through the docker CLI. Enable it on a dev-dependency. It pulls `transport-kafka`, `tempfile` and tokio's `process`, and needs a Docker daemon when the tests run.
 - `testcontainers` -- builds scalo's own real-broker tests, which start Kafka
-  in a container and need a Docker daemon. Adds no code to the library.
+  in a container and need a Docker daemon. Implies `transport-kafka-test-support`, which holds the image pin.
 
 Enable these explicitly when you need them.
 
