@@ -11,13 +11,13 @@
 //!
 //! A caller that holds records before it writes them -- a buffer that fills
 //! for seconds, a retry queue -- takes each record's lease when `recv` hands
-//! it over, and asks [`KafkaTransport::holds`](super::KafkaTransport::holds)
+//! it over, and asks `KafkaTransport::holds`
 //! before the write and before the commit. Once the lease has ended, the
 //! partition's next owner, another member or this one under a new lease,
 //! reads the record again from the committed offset, so the buffered copy is
 //! a duplicate: discard it and commit nothing for it.
 
-/// This consumer's claim on one partition. See [`KafkaTransport::lease`](super::KafkaTransport::lease).
+/// This consumer's claim on one partition. See `KafkaTransport::lease`.
 ///
 /// Leases compare equal only when they are the same claim. A partition
 /// revoked and given back, or held by a rebuilt consumer, is under a new
@@ -32,7 +32,7 @@ pub struct PartitionLease {
 }
 
 impl PartitionLease {
-    pub(super) const fn new(client: u64, assignment: u64) -> Self {
+    pub(in crate::transport::kafka) const fn new(client: u64, assignment: u64) -> Self {
         Self { client, assignment }
     }
 }

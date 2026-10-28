@@ -52,37 +52,22 @@
 mod acks;
 mod admin;
 mod classify;
-mod config;
-pub mod contract;
-mod lease;
 mod metrics;
 mod producer;
-pub mod providers;
 #[cfg(feature = "transport-kafka-test-support")]
 pub mod test_support;
-mod token;
 pub mod topic_resolver;
+mod types;
 
 pub use admin::{KafkaAdmin, TopicInfo};
-#[allow(deprecated)]
-pub use config::{
-    CLASSIC_ONLY_CONSUMER_KEYS, ConsumerKnobs, ConsumerProtocol, DEVTEST_PROFILE,
-    HIGH_THROUGHPUT_CONSUMER_DEFAULTS, KafkaConfig, KafkaProfile, KafkaSizingConfig,
-    LOW_LATENCY_CONSUMER_DEFAULTS, MESSAGE_MAX_BYTES, PARTITION_FETCH_BYTES, PRODUCER_DEFAULTS,
-    PRODUCER_DEVTEST, PRODUCER_EXACTLY_ONCE, PRODUCER_HIGH_THROUGHPUT, PRODUCER_LOW_LATENCY,
-    PRODUCTION_PROFILE, ProducerKnobs, SelfRegulationProfile, SuppressionRule,
-    merge_with_overrides,
-};
-pub use lease::PartitionLease;
 pub use metrics::{
     BrokerMetrics, KafkaMetrics, StatsContext, healthy_broker_count, total_consumer_lag,
 };
 pub use producer::{KafkaProducer, ProducerMetrics, ProducerProfile};
-pub use providers::{
-    AuthKind, KafkaProvider, KnownProvider, MetadataMode, ProviderCapabilities, SchemaRegistry,
-};
-pub use token::KafkaToken;
 pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
+use types::config;
+#[allow(deprecated)]
+pub use types::*;
 
 use config::{librdkafka_alias, raw_layer};
 use metrics::Rebalanced;

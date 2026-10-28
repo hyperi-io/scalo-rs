@@ -91,6 +91,7 @@ flowchart LR
 | `transport` | Base trait architecture, factory, `AnySender`, and the `parse_guard` JSON depth pre-check (`wide`) |
 | `transport-trace` | Above + W3C traceparent propagation (pulls `opentelemetry`) |
 | `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends -- each pulls only its own deps |
+| `transport-kafka-config` | `transport::kafka`'s config and token types with no client: `KafkaConfig` and `validate`, the provider presets, `KafkaToken`, `PartitionLease` and the profile constants. Builds and links no librdkafka. `transport-kafka` includes it |
 | `transport-grpc-vector-compat` | Vector.dev wire-compat for a transform consumer |
 | `transport-all` | All six backends |
 
@@ -168,6 +169,7 @@ needs runtime libs.
 | Feature | `-sys` crate | Build package | Runtime package |
 | --------- | -------------- | --------------- | ----------------- |
 | `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (>= 2.12.1, Confluent APT repo) | `librdkafka1` |
+| `transport-kafka-config` | -- | -- | -- |
 | `directory-config-git` | `libgit2-sys` | `libgit2-dev` | `libgit2-1.9` (release-specific) |
 | `spool` / `tiered-sink` | `zstd-sys` | `libzstd-dev` | `libzstd1` |
 | (transitive via several) | `openssl-sys` | `libssl-dev` | `libssl3t64` (release-specific) |
