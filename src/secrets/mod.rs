@@ -104,6 +104,36 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+/// Which providers are mid-outage, so a failing health check is logged once when
+/// it starts and once when it ends, not on every poll.
+#[cfg(any(feature = "secrets-vault", feature = "secrets-aws"))]
+#[derive(Default)]
+struct HealthLog {
+    down: parking_lot::Mutex<std::collections::HashSet<&'static str>>,
+}
+
+#[cfg(any(feature = "secrets-vault", feature = "secrets-aws"))]
+impl HealthLog {
+    /// Log the outcome of one check and return whether the provider is healthy.
+    fn record(&self, provider: &'static str, result: &SecretsResult<()>) -> bool {
+        let mut down = self.down.lock();
+        match result {
+            Ok(()) => {
+                if down.remove(provider) {
+                    info!(provider, "Secrets provider is healthy again");
+                }
+                true
+            }
+            Err(e) => {
+                if down.insert(provider) {
+                    warn!(provider, error = %e, "Secrets provider health check failed");
+                }
+                false
+            }
+        }
+    }
+}
+
 /// Secrets manager that coordinates providers and caching.
 pub struct SecretsManager {
     config: SecretsConfig,
@@ -113,6 +143,8 @@ pub struct SecretsManager {
     vault_provider: Option<OpenBaoProvider>,
     #[cfg(feature = "secrets-aws")]
     aws_provider: Option<AwsProvider>,
+    #[cfg(any(feature = "secrets-vault", feature = "secrets-aws"))]
+    health_log: HealthLog,
     rotation_tx: broadcast::Sender<RotationEvent>,
 }
 
@@ -145,6 +177,8 @@ impl SecretsManager {
             vault_provider,
             #[cfg(feature = "secrets-aws")]
             aws_provider,
+            #[cfg(any(feature = "secrets-vault", feature = "secrets-aws"))]
+            health_log: HealthLog::default(),
             rotation_tx,
         })
     }
@@ -352,7 +386,9 @@ impl SecretsManager {
 
     /// Check health of all configured providers.
     ///
-    /// Returns a map of provider names to their health status. A
+    /// Returns a map of provider names to their health status. A provider whose
+    /// check fails is logged at `warn` with the reason once per outage, and at
+    /// `info` once when it recovers. A
     /// `HealthRegistry` check is synchronous, so poll this from a task and let
     /// the check read the last answer:
     ///
@@ -393,12 +429,14 @@ impl SecretsManager {
 
         #[cfg(feature = "secrets-vault")]
         if let Some(ref provider) = self.vault_provider {
-            health.insert("openbao".into(), provider.health_check().await.is_ok());
+            let result = provider.health_check().await;
+            health.insert("openbao".into(), self.health_log.record("openbao", &result));
         }
 
         #[cfg(feature = "secrets-aws")]
         if let Some(ref provider) = self.aws_provider {
-            health.insert("aws".into(), provider.health_check().await.is_ok());
+            let result = provider.health_check().await;
+            health.insert("aws".into(), self.health_log.record("aws", &result));
         }
 
         health
@@ -505,5 +543,129 @@ mod tests {
         let manager = SecretsManager::new(SecretsConfig::default()).unwrap();
         let health = manager.health_check().await;
         assert!(health.get("file").copied().unwrap_or(false));
+    }
+
+    #[cfg(all(
+        feature = "logger",
+        any(feature = "secrets-vault", feature = "secrets-aws")
+    ))]
+    mod health_log {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use super::*;
+
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn capture() -> (impl tracing::Subscriber + Send + Sync, Arc<Mutex<Vec<u8>>>) {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let writer = Arc::clone(&buf);
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || Sink(Arc::clone(&writer))),
+            );
+            (subscriber, buf)
+        }
+
+        fn logged(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+            String::from_utf8_lossy(&buf.lock().unwrap()).into_owned()
+        }
+
+        fn refused() -> SecretsResult<()> {
+            Err(SecretsError::ProviderError(
+                "Vault health check failed: connection refused".into(),
+            ))
+        }
+
+        #[test]
+        fn an_outage_logs_why_once_and_the_recovery_once() {
+            let log = HealthLog::default();
+            let (subscriber, buf) = capture();
+            tracing::subscriber::with_default(subscriber, || {
+                for _ in 0..50 {
+                    assert!(!log.record("openbao", &refused()));
+                }
+                assert!(log.record("openbao", &Ok(())));
+                assert!(log.record("openbao", &Ok(())));
+                assert!(!log.record("openbao", &refused()));
+            });
+
+            let out = logged(&buf);
+            let count = |needle: &str| out.matches(needle).count();
+            assert_eq!(count(" WARN "), 2, "one warning per outage: {out}");
+            assert_eq!(count("connection refused"), 2, "{out}");
+            assert_eq!(
+                count("provider=\"openbao\"") + count("provider=openbao"),
+                3,
+                "{out}"
+            );
+            assert_eq!(count(" INFO "), 1, "one line on recovery: {out}");
+        }
+
+        #[test]
+        fn providers_are_tracked_apart() {
+            let log = HealthLog::default();
+            let (subscriber, buf) = capture();
+            tracing::subscriber::with_default(subscriber, || {
+                log.record("openbao", &refused());
+                log.record("aws", &refused());
+                log.record("openbao", &refused());
+            });
+            assert_eq!(
+                logged(&buf).matches(" WARN ").count(),
+                2,
+                "{}",
+                logged(&buf)
+            );
+        }
+
+        #[cfg(feature = "secrets-vault")]
+        #[tokio::test]
+        async fn health_check_warns_once_with_the_reason_while_a_provider_stays_down() {
+            let config = SecretsConfig {
+                openbao: Some(OpenBaoConfig {
+                    // Port 1 refuses the connection at once, so the check fails without a server.
+                    address: "http://127.0.0.1:1".into(),
+                    auth: OpenBaoAuth::Token {
+                        token: "unused".to_string().into(),
+                    },
+                    namespace: None,
+                    ca_cert: None,
+                    skip_verify: false,
+                }),
+                ..SecretsConfig::default()
+            };
+            let manager = SecretsManager::new(config).unwrap();
+            let (subscriber, buf) = capture();
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            for _ in 0..3 {
+                let health = manager.health_check().await;
+                assert_eq!(health.get("openbao"), Some(&false));
+            }
+
+            let out = logged(&buf);
+            assert_eq!(out.matches(" WARN ").count(), 1, "{out}");
+            assert!(
+                out.contains("health check failed"),
+                "the reason is logged: {out}"
+            );
+            assert!(
+                !out.contains("unused"),
+                "the token never reaches the log: {out}"
+            );
+        }
     }
 }
