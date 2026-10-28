@@ -417,7 +417,7 @@ async fn kafka_transport_against_a_tls_broker() {
     if !require_docker() {
         return;
     }
-    let broker = match TlsBroker::start("kafka-tls").await {
+    let broker = match TlsBroker::start("scalo-rs", "kafka-tls").await {
         Ok(broker) => Arc::new(broker),
         Err(e) => {
             skip_or_fail(&format!("the TLS broker would not start ({e})"));

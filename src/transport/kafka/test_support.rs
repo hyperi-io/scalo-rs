@@ -219,11 +219,8 @@ fn free_port() -> u16 {
 // Container naming
 // ---------------------------------------------------------------------------
 
-/// Label marking every container this suite starts, for bulk cleanup.
-const SUITE_LABEL: (&str, &str) = ("io.hyperi.test.suite", "scalo-rs-integration");
-
-/// Container name: `scalo-rs-test-integration-<test>-<service>`.
-fn container_name(test: &str, service: &str) -> String {
+/// Container name: `<repo>-test-integration-<test>-<service>`.
+fn container_name(repo: &str, test: &str, service: &str) -> String {
     let slug = |s: &str| {
         s.chars()
             .map(|c| {
@@ -235,7 +232,12 @@ fn container_name(test: &str, service: &str) -> String {
             })
             .collect::<String>()
     };
-    format!("scalo-rs-test-integration-{}-{}", slug(test), slug(service))
+    format!(
+        "{}-test-integration-{}-{}",
+        slug(repo),
+        slug(test),
+        slug(service)
+    )
 }
 
 /// Whether process `pid` is alive on this host. `ps` failing to run counts as
@@ -410,13 +412,16 @@ fn start_script() -> String {
 impl TlsBroker {
     /// Generate the certificates, start the broker and wait until it serves.
     ///
-    /// `test` names the owning test in the container name.
+    /// `repo` and `test` name the owning repo and test in the container name
+    /// (`<repo>-test-integration-<test>-kafka`) and in the `io.hyperi.test.suite`
+    /// (`<repo>-integration`) and `io.hyperi.test.repo` labels, so a leftover
+    /// container says whose it is.
     ///
     /// # Errors
     ///
     /// The docker CLI's complaint when an image will not pull, the files will
     /// not copy in, or the broker does not come up.
-    pub async fn start(test: &str) -> Result<Self, String> {
+    pub async fn start(repo: &str, test: &str) -> Result<Self, String> {
         let pki = Pki::generate().await;
         let controller = free_port();
         let (tls, sasl_ssl, mtls) = (free_port(), free_port(), free_port());
@@ -439,7 +444,7 @@ impl TlsBroker {
                 .map_err(|e| format!("chmod scratch dir: {e}"))?;
         }
 
-        let name = claim_container_name(&container_name(test, "kafka"));
+        let name = claim_container_name(&container_name(repo, test, "kafka"));
         let mut create: Vec<String> = [
             "create",
             "--name",
@@ -449,9 +454,9 @@ impl TlsBroker {
             "--env",
             "KAFKA_HEAP_OPTS=-Xms256m -Xmx768m",
             "--label",
-            &format!("{}={}", SUITE_LABEL.0, SUITE_LABEL.1),
+            &format!("io.hyperi.test.suite={repo}-integration"),
             "--label",
-            "io.hyperi.test.repo=scalo-rs",
+            &format!("io.hyperi.test.repo={repo}"),
             "--label",
             "io.hyperi.test.service=kafka",
             "--label",

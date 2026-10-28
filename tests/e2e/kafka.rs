@@ -590,6 +590,10 @@ type BrokerGuard = Option<Box<dyn std::any::Any + Send>>;
 
 /// The broker the tests below use: the one `TEST_KAFKA_BROKERS` names, else a
 /// container with the default topic created. `None` means skip.
+#[cfg_attr(
+    not(feature = "testcontainers"),
+    allow(clippy::unused_async, reason = "only the container path awaits")
+)]
 async fn test_config() -> Option<(KafkaConfig, BrokerGuard)> {
     if let Some(config) = get_test_config() {
         return Some((config, None));
