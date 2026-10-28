@@ -4,7 +4,9 @@ all-features = true
 
 [advisories]
 yanked = "warn"
-ignore = []
+ignore = [
+    { id = "GHSA-qwgh-2vcv-g2f7", reason = "Reached via digest 0.10 <- sha1 <- aws-config, with scalo's aws-config feature on. The advisory needs a caught panic inside a hasher's compress callback followed by reuse of that buffer, and the SHA-1 compress does not panic. Drop when that chain moves to digest 0.11, which pulls block-buffer 0.12.1." },
+]
 
 [licenses]
 allow = [
