@@ -54,7 +54,9 @@
 //! # }
 //! ```
 
-use super::classify::{DegradedLatch, DeliveryState, SendFailure, classify_send_failure};
+use super::classify::{
+    AuthState, DegradedLatch, DeliveryState, SendFailure, classify_send_failure,
+};
 use super::config::KafkaConfig;
 use crate::transport::error::{TransportError, TransportResult};
 use rdkafka::config::ClientConfig;
@@ -149,12 +151,20 @@ pub struct KafkaProducer {
 #[derive(Clone, Default)]
 pub struct ProducerContext {
     state: Arc<DeliveryState>,
+    /// Logs a refusal of this producer's credentials or TLS setup once.
+    auth: Arc<AuthState>,
     /// Keeps the payload of every failed delivery, for a producer built to hand them on.
     #[cfg(feature = "dlq-kafka")]
     undelivered: Option<Arc<Undelivered>>,
 }
 
-impl rdkafka::ClientContext for ProducerContext {}
+impl rdkafka::ClientContext for ProducerContext {
+    fn error(&self, error: rdkafka::error::KafkaError, reason: &str) {
+        if !self.auth.on_error(&error, reason) {
+            tracing::debug!(target: "librdkafka", error = %error, "{reason}");
+        }
+    }
+}
 
 impl rdkafka::producer::ProducerContext for ProducerContext {
     type DeliveryOpaque = ();
@@ -165,6 +175,9 @@ impl rdkafka::producer::ProducerContext for ProducerContext {
         _opaque: Self::DeliveryOpaque,
     ) {
         self.state.record(result);
+        if result.is_ok() {
+            self.auth.mark_proven();
+        }
         #[cfg(feature = "dlq-kafka")]
         if let (Some(kept), Err((err, msg))) = (&self.undelivered, result) {
             kept.keep(err, msg);

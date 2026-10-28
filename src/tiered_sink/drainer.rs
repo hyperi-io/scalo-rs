@@ -322,6 +322,14 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                                             drop(guard);
                                             DrainResult::SendTimedOut
                                         }
+                                        Ok(SendResult::Fatal(e)) if e.is_fatal() => {
+                                            // The sink is closed or misconfigured (a
+                                            // refused credential, say), which says
+                                            // nothing about this record. Keep it
+                                            // spooled until the sink is fixed.
+                                            drop(guard);
+                                            DrainResult::SinkUnavailable
+                                        }
                                         Ok(SendResult::Fatal(e)) => match guard.commit() {
                                             Ok(()) => {
                                                 spool_count.fetch_sub(1, AtomicOrdering::Relaxed);

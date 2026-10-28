@@ -19,6 +19,11 @@
 //! itself, so an unavailable broker is never a reason to end the consumer; only
 //! a failure no retry can clear is surfaced.
 //!
+//! An authentication or TLS refusal reaches a client only through librdkafka's
+//! error callback. The message it leaves behind times out like any message sent
+//! to an unreachable broker, so [`AuthState`] keeps the refusal and the send path
+//! reads it back, rather than guessing from the timeout.
+//!
 //! The classification reads [`KafkaError::rdkafka_error_code`], never the
 //! rendered message. `Cargo.toml` pins `rdkafka` with `dynamic-linking`, so the
 //! error STRING comes from whichever system librdkafka the image ships and can
@@ -173,7 +178,7 @@ fn is_consumer_retryable(code: RDKafkaErrorCode) -> bool {
 
 /// Authentication and TLS handshake failures: permanent on first contact,
 /// transient once the same credentials have worked.
-fn is_auth_failure(code: RDKafkaErrorCode) -> bool {
+pub(crate) fn is_auth_failure(code: RDKafkaErrorCode) -> bool {
     matches!(
         code,
         RDKafkaErrorCode::Authentication
@@ -343,6 +348,93 @@ impl DegradedLatch {
     }
 }
 
+/// Whether a client's credentials and TLS setup are being refused, kept from
+/// librdkafka's error callback so the send path and readiness can say why.
+///
+/// A refusal counts only until a broker first accepts the client. After that an
+/// authentication or TLS failure is most likely a broker restarting, which
+/// librdkafka rides out, so it is logged once and changes nothing else. One
+/// state serves a transport's producer and every consumer it builds, because
+/// they present the same credentials: a broker accepting either proves both.
+#[derive(Debug, Default)]
+pub(crate) struct AuthState {
+    /// A broker has accepted this client, by reaching `UP` or confirming a record.
+    proven: AtomicBool,
+    /// The client is refused and no broker has accepted it yet.
+    refused: AtomicBool,
+    /// Latches the log line to the first refusal of a run.
+    latch: DegradedLatch,
+    /// The last refusal, for the message a caller sees.
+    reason: parking_lot::Mutex<Option<String>>,
+}
+
+impl AuthState {
+    /// Take an error from librdkafka's error callback. Returns whether it was an
+    /// authentication or TLS failure, which this state has then handled.
+    pub(crate) fn on_error(&self, err: &KafkaError, detail: &str) -> bool {
+        let Some(code) = err.rdkafka_error_code().filter(|c| is_auth_failure(*c)) else {
+            return false;
+        };
+        if self.proven.load(Ordering::Relaxed) {
+            if self.latch.enter() {
+                tracing::warn!(
+                    code = ?code,
+                    detail,
+                    "kafka authentication or TLS failed after the credentials had worked; \
+                     treating it as a restarting broker"
+                );
+            }
+            return true;
+        }
+        *self.reason.lock() = Some(format!("{code:?}: {detail}"));
+        self.refused.store(true, Ordering::Relaxed);
+        if self.latch.enter() {
+            tracing::error!(
+                code = ?code,
+                detail,
+                "kafka refused this client's credentials or TLS setup. Sends fail and \
+                 readiness reports not-ready until a broker accepts it. Check the broker \
+                 CA, the client certificate and the SASL user and password"
+            );
+        }
+        true
+    }
+
+    /// Record that a broker accepted this client: ends a refusal, and re-arms the
+    /// log line for a later one.
+    pub(crate) fn mark_proven(&self) {
+        if self.proven.load(Ordering::Relaxed) {
+            self.latch.clear();
+            return;
+        }
+        self.proven.store(true, Ordering::Relaxed);
+        self.refused.store(false, Ordering::Relaxed);
+        *self.reason.lock() = None;
+        if self.latch.clear() {
+            tracing::info!("kafka: a broker accepted this client's credentials");
+        }
+    }
+
+    /// Whether a broker has accepted this client.
+    pub(crate) fn is_proven(&self) -> bool {
+        self.proven.load(Ordering::Relaxed)
+    }
+
+    /// Whether the client is being refused and has never been accepted.
+    pub(crate) fn is_refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    /// The last refusal, while the client is refused.
+    pub(crate) fn refusal(&self) -> Option<String> {
+        if self.is_refused() {
+            self.reason.lock().clone()
+        } else {
+            None
+        }
+    }
+}
+
 /// Broker-side delivery outcomes, recorded from librdkafka's poll thread.
 ///
 /// A produce call only reports that a message was QUEUED. Whether the broker
@@ -446,6 +538,85 @@ mod tests {
         assert!(latch.clear(), "recovery is a transition too");
         assert!(!latch.clear(), "a healthy run must not log per record");
         assert!(latch.enter(), "the latch re-arms after recovery");
+    }
+
+    #[test]
+    fn auth_state_takes_only_authentication_and_tls_errors() {
+        for (code, handled) in [
+            (RDKafkaErrorCode::Authentication, true),
+            (RDKafkaErrorCode::SSL, true),
+            (RDKafkaErrorCode::SaslAuthenticationFailed, true),
+            (RDKafkaErrorCode::AllBrokersDown, false),
+            (RDKafkaErrorCode::BrokerTransportFailure, false),
+            (RDKafkaErrorCode::MessageTimedOut, false),
+            (RDKafkaErrorCode::TopicAuthorizationFailed, false),
+        ] {
+            let auth = AuthState::default();
+            let taken = auth.on_error(&KafkaError::Global(code), "ssl://broker/bootstrap: refused");
+            assert_eq!(taken, handled, "{code:?} handled");
+            assert_eq!(auth.is_refused(), handled, "{code:?} refused");
+            assert_eq!(auth.refusal().is_some(), handled, "{code:?} reason kept");
+        }
+    }
+
+    #[test]
+    fn a_refusal_ends_once_a_broker_accepts_the_client_and_does_not_return() {
+        let auth = AuthState::default();
+        let refusal = KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed);
+        assert!(auth.on_error(&refusal, "bad password"));
+        assert!(auth.refusal().is_some_and(|r| r.contains("bad password")));
+
+        auth.mark_proven();
+        assert!(auth.is_proven() && !auth.is_refused() && auth.refusal().is_none());
+
+        // The same code after the credentials worked is a restarting broker.
+        assert!(auth.on_error(&refusal, "broker restarting"));
+        assert!(!auth.is_refused(), "a proven client is never refused again");
+    }
+
+    #[cfg(feature = "logger")]
+    #[test]
+    fn a_refusal_is_logged_once_at_error_and_a_proven_blip_once_at_warn() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&buf);
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || Sink(Arc::clone(&writer))),
+        );
+        let refusal = KafkaError::Global(RDKafkaErrorCode::SSL);
+        let auth = AuthState::default();
+        tracing::subscriber::with_default(subscriber, || {
+            // librdkafka repeats the error on every reconnect.
+            for _ in 0..1000 {
+                auth.on_error(&refusal, "certificate verify failed");
+            }
+            auth.mark_proven();
+            for _ in 0..1000 {
+                auth.on_error(&refusal, "broker restarting");
+            }
+        });
+
+        let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let count = |needle: &str| out.matches(needle).count();
+        assert_eq!(count("ERROR"), 1, "{out}");
+        assert_eq!(count("refused this client's credentials"), 1, "{out}");
+        assert_eq!(count("accepted this client's credentials"), 1, "{out}");
+        assert_eq!(count("WARN"), 1, "{out}");
     }
 
     #[test]

@@ -38,8 +38,10 @@ use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::error::KafkaError;
 use rdkafka::statistics::Statistics;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, RwLock};
+#[cfg(feature = "governor")]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 /// Kafka metrics snapshot. Mirrors the Python `KafkaMetrics` dataclass.
 #[derive(Debug, Clone, Default)]
@@ -127,9 +129,10 @@ pub struct StatsContext {
     latest_metrics: RwLock<KafkaMetrics>,
     /// Broker-side delivery outcomes, when this context drives a producer.
     delivery: super::classify::DeliveryState,
-    /// Set once statistics report a broker `UP`, which librdkafka reaches only
-    /// after the TLS and SASL handshakes succeed.
-    connected: AtomicBool,
+    /// Whether the client's credentials are refused or have been accepted. A
+    /// broker `UP` in the statistics proves them, because librdkafka reaches it
+    /// only after the TLS and SASL handshakes succeed.
+    auth: Arc<super::classify::AuthState>,
     /// Records past this consumer's read position, summed over its partitions.
     position_lag: AtomicI64,
     /// Ownership changes since the transport last looked, each numbered as
@@ -299,7 +302,7 @@ impl StatsContext {
             stats: RwLock::new(None),
             latest_metrics: RwLock::new(KafkaMetrics::default()),
             delivery: super::classify::DeliveryState::default(),
-            connected: AtomicBool::new(false),
+            auth: Arc::default(),
             position_lag: AtomicI64::new(0),
             rebalanced: Mutex::new(Vec::new()),
             rebalances: AtomicU64::new(0),
@@ -314,6 +317,13 @@ impl StatsContext {
             #[cfg(feature = "metrics")]
             group: Group::default(),
         }
+    }
+
+    /// This context, sharing `auth` with the other clients of one transport.
+    #[must_use]
+    pub(crate) fn sharing(mut self, auth: Arc<super::classify::AuthState>) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// This context, counting lag to where a consumer at `isolation` may read.
@@ -474,10 +484,10 @@ impl StatsContext {
         self.position_lag.load(Ordering::Relaxed)
     }
 
-    /// Whether any broker has ever reached `UP`, meaning this client's
-    /// credentials were accepted at least once.
-    pub(crate) fn has_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+    /// What the client knows about its credentials: refused, or accepted by a
+    /// broker.
+    pub(crate) fn auth(&self) -> &Arc<super::classify::AuthState> {
+        &self.auth
     }
 
     /// Messages the broker refused or never acknowledged.
@@ -602,10 +612,8 @@ impl StatsContext {
 
 impl ClientContext for StatsContext {
     fn stats(&self, statistics: Statistics) {
-        if !self.connected.load(Ordering::Relaxed)
-            && statistics.brokers.values().any(|b| b.state == "UP")
-        {
-            self.connected.store(true, Ordering::Relaxed);
+        if !self.auth.is_proven() && statistics.brokers.values().any(|b| b.state == "UP") {
+            self.auth.mark_proven();
         }
         #[cfg(feature = "metrics")]
         self.client.get_or_init(|| Client::of(&statistics));
@@ -678,6 +686,10 @@ impl ClientContext for StatsContext {
     }
 
     fn error(&self, error: KafkaError, reason: &str) {
+        // librdkafka repeats a refusal on every reconnect, so it is logged once.
+        if self.auth.on_error(&error, reason) {
+            return;
+        }
         #[cfg(feature = "logger")]
         tracing::error!(target: "librdkafka", error = %error, "{}", reason);
         #[cfg(not(feature = "logger"))]

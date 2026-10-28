@@ -26,6 +26,14 @@
 //!    listener and the topic are fine, so a refusal means the changed setting.
 //!    The broker's log then names each refusal.
 //!
+//!    librdkafka reports a rejected certificate or SASL login to the client as
+//!    `SSL` or `Authentication`, and the transport turns those into a `Fatal`
+//!    send and a failed readiness check that names the cause. A broker that
+//!    drops the connection before the client learns why (a missing client
+//!    certificate under TLS 1.3, a plaintext client on a TLS port) reaches the
+//!    client as a plain transport failure, so those rows stay `Backpressured`
+//!    and ready. Each row says which it expects.
+//!
 //! The test sets no environment and installs no process-global state, so the
 //! transport starts the way an app's `main` leaves it.
 //!
@@ -42,7 +50,9 @@ use std::time::{Duration, Instant};
 use common::tls_broker::{SCRAM_PASSWORD, SCRAM_USER, TlsBroker};
 use common::{docker_answers, skip_or_fail};
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
-use scalo::transport::{TransportBase, TransportReceiver, TransportSender};
+use scalo::transport::{
+    SendResult, TransportBase, TransportError, TransportReceiver, TransportSender,
+};
 
 /// Group join plus the first fetch, on a single-node broker busy with a JVM start.
 const ROUND_TRIP_WITHIN: Duration = Duration::from_secs(90);
@@ -68,6 +78,19 @@ struct Refused {
     security: Security,
     /// The line the broker logs when it turns the client away.
     broker_says: &'static str,
+    /// What the client is told.
+    client_sees: ClientSees,
+}
+
+/// How a refusal reaches the client.
+#[derive(Clone, Copy)]
+enum ClientSees {
+    /// librdkafka names the cause, with this error code, so the send is `Fatal`
+    /// and readiness fails.
+    Cause(&'static str),
+    /// The broker drops the connection and librdkafka reports a transport
+    /// failure, so the send is `Backpressured` and readiness is unchanged.
+    DroppedConnection,
 }
 
 #[derive(Clone, Copy)]
@@ -131,18 +154,21 @@ const REFUSED: &[Refused] = &[
         from: "tls",
         security: Security::Tls { ca: "rogue-ca.crt" },
         broker_says: "SSL handshake failed",
+        client_sees: ClientSees::Cause("SSL"),
     },
     Refused {
         name: "tls-client-trusts-the-system-store-only",
         from: "tls",
         security: Security::TlsDefaultTrust,
         broker_says: "SSL handshake failed",
+        client_sees: ClientSees::Cause("SSL"),
     },
     Refused {
         name: "tls-listener-meets-a-plaintext-client",
         from: "tls",
         security: Security::Plaintext,
         broker_says: "SSL handshake failed",
+        client_sees: ClientSees::DroppedConnection,
     },
     Refused {
         name: "sasl-ssl-scram-wrong-password",
@@ -152,12 +178,14 @@ const REFUSED: &[Refused] = &[
             password: "not-the-password",
         },
         broker_says: "invalid credentials with SASL mechanism SCRAM-SHA-512",
+        client_sees: ClientSees::Cause("Authentication"),
     },
     Refused {
         name: "mtls-client-presents-no-certificate",
         from: "mtls",
         security: Security::Tls { ca: "ca.crt" },
         broker_says: "SSL handshake failed",
+        client_sees: ClientSees::DroppedConnection,
     },
     Refused {
         name: "mtls-client-certificate-from-another-ca",
@@ -168,6 +196,7 @@ const REFUSED: &[Refused] = &[
             key: "rogue-client.key",
         },
         broker_says: "SSL handshake failed",
+        client_sees: ClientSees::DroppedConnection,
     },
 ];
 
@@ -293,15 +322,48 @@ async fn refusal(broker: &TlsBroker, row: &Refused) -> Result<String, String> {
         )
         .await
         .map_err(|_| format!("send still pending after {REFUSED_WITHIN:?}"))?;
-        if sent.is_ok() {
-            return Err::<String, String>(
-                "the producer delivered a record the broker should have refused".to_string(),
-            );
-        }
-        Ok::<String, String>(format!(
-            "send failed after {:?}: {sent:?}",
-            started.elapsed()
-        ))
+        let took = started.elapsed();
+        let healthcheck = transport.healthcheck().await;
+        let told = match (row.client_sees, &sent) {
+            (_, SendResult::Ok) => {
+                return Err::<String, String>(
+                    "the producer delivered a record the broker should have refused".to_string(),
+                );
+            }
+            (ClientSees::Cause(code), SendResult::Fatal(TransportError::Config(why))) => {
+                if !why.contains(code) {
+                    return Err(format!("the Fatal send does not name {code}: {why}"));
+                }
+                if transport.is_healthy() {
+                    return Err("readiness stayed ready after the broker refused the client".into());
+                }
+                match &healthcheck {
+                    Err(e) if e.is_fatal() && e.to_string().contains(code) => {}
+                    other => {
+                        return Err(format!("the health check does not name {code}: {other:?}"));
+                    }
+                }
+                format!("Fatal naming {code}, not ready")
+            }
+            (ClientSees::DroppedConnection, SendResult::Backpressured) => {
+                if !transport.is_healthy() || healthcheck.is_err() {
+                    return Err(format!(
+                        "readiness failed for a connection the broker dropped: {healthcheck:?}"
+                    ));
+                }
+                "Backpressured, still ready (the client was never told why)".to_string()
+            }
+            (expected, got) => {
+                return Err(format!(
+                    "expected {}, the send returned {got:?}",
+                    match expected {
+                        ClientSees::Cause(code) => format!("Fatal naming {code}"),
+                        ClientSees::DroppedConnection => "Backpressured".to_string(),
+                    }
+                ));
+            }
+        };
+        Ok::<String, String>(format!("send after {took:?}: {told}"))
     };
     let metadata = async {
         let admin = KafkaAdmin::new(&config)
