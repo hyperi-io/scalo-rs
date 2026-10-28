@@ -52,9 +52,9 @@ rayon is not compiled.
 flowchart LR
     A[main] --> B["run_app::&lt;A: ServiceApp&gt;"]
     B --> C[parse CommonArgs]
-    C --> D[init logger]
-    D --> E[app.load_config]
-    E --> F[ServiceRuntime::build]
+    C --> E[app.load_config]
+    E --> D[init logger]
+    D --> F[ServiceRuntime::build]
     F --> W{"app.work_state"}
     W -->|Idle| P["park until config change"]
     P --> E
@@ -65,10 +65,11 @@ flowchart LR
 Step by step inside `run_app` for the default `run` subcommand:
 
 1. Resolve the subcommand from `app.command()` -- defaults to `Run`.
-2. Install the logger with the service name and version injected for
-   JSON output.
-3. Call `app.load_config(args.config.as_deref())` -- apps own this
+2. Call `app.load_config(args.config.as_deref())` -- apps own this
    step so they can deserialise into their own typed config.
+3. Install the logger with the service name and version injected for
+   JSON output. It comes after the config because the OTLP span exporter
+   reads its settings from the cascade.
 4. Build `ServiceRuntime`:
    - Construct `MetricsManager` under `metrics.namespace`, describe the
      scalo runtime set (`ServiceMetrics`, app info, worker pool and batch
@@ -101,8 +102,28 @@ Step by step inside `run_app` for the default `run` subcommand:
    [../core-pillars/lifecycle.md](../core-pillars/lifecycle.md).
 6. Call `app.run_service(config, runtime)`.
 
-The service author's code starts at step 6 -- everything before that
-is the framework.
+Apart from `load_config` and `work_state`, the service author's code
+starts at step 6 -- everything before that is the framework.
+
+### TLS servers install the rustls crypto provider in `main`
+
+`run_app` installs no rustls crypto provider, and nothing else in scalo does.
+A binary that links both aws-lc-rs and ring and has no process default panics
+in `rustls::ServerConfig::builder()`, which tonic's server TLS also calls.
+scalo itself enables aws-lc-rs only, so ring comes from the app's own
+dependencies (tonic's `tls-ring` feature, for one).
+
+A service that builds any server TLS config, or calls
+`ClientConfig::builder()` itself, installs the provider first thing in
+`main`, before `run_app`:
+
+```rust
+scalo::tls::install_default_provider(); // `tls` feature
+```
+
+It installs aws-lc-rs, the provider scalo's client TLS uses, and keeps one
+already installed. Without the `tls` feature the equivalent line is
+`let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();`.
 
 ---
 
