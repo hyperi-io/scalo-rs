@@ -104,8 +104,11 @@ pub(crate) enum RecvFailure {
     /// A broker, network, coordinator or group-membership condition that
     /// librdkafka recovers from by itself. The caller keeps polling.
     Transient,
+    /// A subscribed topic does not exist yet: one not deployed yet, a topic
+    /// ensure that failed, a broker rebuilt. The consumer waits for it.
+    MissingTopic,
     /// Retrying cannot help -- authentication on first contact, authorisation,
-    /// a missing topic, invalid configuration, or an error flagged fatal.
+    /// invalid configuration, or an error flagged fatal.
     Permanent,
     /// A code this module does not classify. Treated as permanent, and logged
     /// by name so it can be classified.
@@ -115,9 +118,6 @@ pub(crate) enum RecvFailure {
 /// What the consumer knows when it classifies a poll failure.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RecvContext {
-    /// The consumer's `allow.auto.create.topics`: only with it on does a
-    /// missing topic clear without operator action.
-    pub(crate) auto_create_topics: bool,
     /// Whether this consumer has reached a broker with its credentials before.
     /// An authentication or TLS failure after that is most likely a restarting
     /// broker; before it, a misconfiguration that should fail fast.
@@ -134,10 +134,8 @@ pub(crate) fn classify_recv_failure(err: &KafkaError, ctx: RecvContext) -> RecvF
             Some(code) if is_retryable(code) || is_consumer_retryable(code) => {
                 RecvFailure::Transient
             }
-            Some(RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic)
-                if ctx.auto_create_topics =>
-            {
-                RecvFailure::Transient
+            Some(RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic) => {
+                RecvFailure::MissingTopic
             }
             Some(code) if is_auth_failure(code) && ctx.credentials_proven => RecvFailure::Transient,
             Some(code) if is_auth_failure(code) || is_recv_permanent(code) => {
@@ -197,9 +195,7 @@ fn is_recv_permanent(code: RDKafkaErrorCode) -> bool {
         RDKafkaErrorCode::TopicAuthorizationFailed
             | RDKafkaErrorCode::GroupAuthorizationFailed
             | RDKafkaErrorCode::ClusterAuthorizationFailed
-            // Missing topic or partition.
-            | RDKafkaErrorCode::UnknownTopicOrPartition
-            | RDKafkaErrorCode::UnknownTopic
+            // A partition the topic does not have.
             | RDKafkaErrorCode::UnknownPartition
             // Configuration the broker or client refuses.
             | RDKafkaErrorCode::InvalidArgument
@@ -246,6 +242,8 @@ pub(crate) struct RecvState {
     /// Transient failures since the last record arrived; drives the backoff.
     consecutive: AtomicU32,
     degraded: DegradedLatch,
+    /// Latches the missing-topic warn to the first of a run.
+    missing: DegradedLatch,
     /// Set by the first record, which proves the credentials were accepted.
     received: AtomicBool,
 }
@@ -269,16 +267,37 @@ impl RecvState {
         }
     }
 
+    /// Count a poll that found a subscribed topic missing, in the backoff
+    /// with the transient failures; warn on the first of a run only.
+    pub(crate) fn record_missing_topic(&self, err: &KafkaError) {
+        self.consecutive.fetch_add(1, Ordering::Relaxed);
+        count_recv_error("missing_topic");
+        if self.missing.enter() {
+            tracing::warn!(
+                error = %err,
+                "kafka: a subscribed topic does not exist; waiting for it, consuming once \
+                 librdkafka's next metadata refresh finds it"
+            );
+        } else {
+            tracing::debug!(error = %err, "kafka: a subscribed topic is still missing");
+        }
+    }
+
     /// Note a received record: report the first after a run of transient
-    /// failures, and remember that the credentials work.
+    /// failures or a missing topic, and remember that the credentials work.
     pub(crate) fn record_success(&self) {
         // Load first: this runs once per poll and the flag is set only once.
         if !self.received.load(Ordering::Relaxed) {
             self.received.store(true, Ordering::Relaxed);
         }
+        if self.missing.clear() {
+            tracing::info!("kafka: the missing topic is being consumed");
+        }
         if self.degraded.clear() {
             let failures = self.consecutive.swap(0, Ordering::Relaxed);
             tracing::info!(failures, "kafka consume resumed");
+        } else {
+            self.consecutive.store(0, Ordering::Relaxed);
         }
     }
 
@@ -703,13 +722,11 @@ mod tests {
 
     /// A consumer that has not yet reached a broker with its credentials.
     const FIRST_CONTACT: RecvContext = RecvContext {
-        auto_create_topics: false,
         credentials_proven: false,
     };
 
     /// A consumer whose credentials a broker has already accepted.
     const PROVEN: RecvContext = RecvContext {
-        auto_create_topics: false,
         credentials_proven: true,
     };
 
@@ -759,8 +776,6 @@ mod tests {
             RDKafkaErrorCode::TopicAuthorizationFailed,
             RDKafkaErrorCode::GroupAuthorizationFailed,
             RDKafkaErrorCode::ClusterAuthorizationFailed,
-            RDKafkaErrorCode::UnknownTopicOrPartition,
-            RDKafkaErrorCode::UnknownTopic,
             RDKafkaErrorCode::UnknownPartition,
             RDKafkaErrorCode::InvalidArgument,
             RDKafkaErrorCode::InvalidConfig,
@@ -831,32 +846,40 @@ mod tests {
         assert_eq!(classify_recv_failure(&err, PROVEN), RecvFailure::Permanent);
     }
 
+    /// A missing topic is waited for, whether or not the consumer may create
+    /// it and whatever its history: nothing about it ends the consumer.
     #[test]
-    fn a_missing_topic_clears_only_when_the_consumer_may_create_it() {
-        let may_create = RecvContext {
-            auto_create_topics: true,
-            credentials_proven: false,
-        };
+    fn a_missing_topic_is_waited_for() {
         for code in [
             RDKafkaErrorCode::UnknownTopicOrPartition,
             RDKafkaErrorCode::UnknownTopic,
         ] {
-            let err = KafkaError::MessageConsumption(code);
-            assert_eq!(
-                classify_recv_failure(&err, FIRST_CONTACT),
-                RecvFailure::Permanent
-            );
-            assert_eq!(
-                classify_recv_failure(&err, may_create),
-                RecvFailure::Transient
-            );
+            for ctx in [FIRST_CONTACT, PROVEN] {
+                let err = KafkaError::MessageConsumption(code);
+                assert_eq!(
+                    classify_recv_failure(&err, ctx),
+                    RecvFailure::MissingTopic,
+                    "{code:?}, {ctx:?}"
+                );
+            }
         }
-        // Auto-create never excuses an authorisation failure.
+        // An authorisation failure on a topic is still the operator's to fix.
         let denied = KafkaError::MessageConsumption(RDKafkaErrorCode::TopicAuthorizationFailed);
         assert_eq!(
-            classify_recv_failure(&denied, may_create),
+            classify_recv_failure(&denied, PROVEN),
             RecvFailure::Permanent
         );
+    }
+
+    #[test]
+    fn a_missing_topic_backs_off_and_a_record_resets_the_run() {
+        let state = RecvState::default();
+        let err = KafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition);
+        state.record_missing_topic(&err);
+        state.record_missing_topic(&err);
+        assert_eq!(state.failures(), 2, "each wait counts toward the backoff");
+        state.record_success();
+        assert_eq!(state.failures(), 0);
     }
 
     #[test]

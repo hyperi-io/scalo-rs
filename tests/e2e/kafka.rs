@@ -1634,12 +1634,12 @@ mod group_protocol {
         a_second_member_takes_one_partition_from_the_first(&bootstrap, topic, &config).await;
     }
 
-    /// A failure no retry clears is returned and leaves readiness alone: a
-    /// caller that reads an error plus an unhealthy transport as closed would
-    /// otherwise stop over a topic that is only briefly gone, as a removed
-    /// source's is. The same consumer reads once the topic is back.
+    /// A consumer started before its topic exists waits for it: no receive
+    /// fails, readiness is false while it holds no partition, and once the
+    /// topic is created it reads it and is ready again. Classic protocol:
+    /// under KIP-848 librdkafka waits by itself and reports nothing.
     #[tokio::test]
-    async fn a_permanent_receive_failure_leaves_readiness_alone() {
+    async fn a_consumer_waits_for_a_topic_created_late() {
         let Some((_node, bootstrap)) = start_kafka().await else {
             return;
         };
@@ -1652,19 +1652,17 @@ mod group_protocol {
         let transport = KafkaTransport::new(&config).await.expect("kafka consumer");
 
         let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
+        while transport.is_healthy() {
             assert!(
                 Instant::now() < deadline,
-                "recv never reported the missing topic"
+                "readiness never reported the missing topic"
             );
-            if transport.recv(100).await.is_err() {
-                break;
-            }
+            let batch = transport
+                .recv(100)
+                .await
+                .expect("a missing topic never fails a receive");
+            assert_eq!(batch.records.len(), 0, "the topic does not exist yet");
         }
-        assert!(
-            transport.is_healthy(),
-            "a returned receive error leaves readiness to the caller"
-        );
 
         create_topic(&bootstrap, topic).await;
         produce(&bootstrap, topic, 0..RECORDS).await;
@@ -1675,11 +1673,14 @@ mod group_protocol {
                 Instant::now() < deadline,
                 "read {read} of {RECORDS} records"
             );
-            if let Ok(batch) = transport.recv(100).await {
-                read += batch.records.len();
-            }
+            read += transport
+                .recv(100)
+                .await
+                .expect("the topic is created, so a receive cannot fail on it")
+                .records
+                .len();
         }
-        assert!(transport.is_healthy());
+        assert!(transport.is_healthy(), "reading again, so ready again");
     }
 }
 

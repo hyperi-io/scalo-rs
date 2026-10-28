@@ -237,8 +237,9 @@ pub struct KafkaTransport {
     /// A permanent poll error met mid-drain, held for the next `recv` so the
     /// records drained before it still reach the caller.
     deferred_recv_error: parking_lot::Mutex<Option<KafkaError>>,
-    /// The consumer's `allow.auto.create.topics`: whether a missing topic can clear.
-    auto_create_topics: bool,
+    /// Set while a subscribed topic is missing and the consumer holds no
+    /// partition, which fails readiness: nothing can be consumed.
+    topic_missing: Arc<AtomicBool>,
     /// Topics we're subscribed to (for cache warming and Debug).
     /// Behind RwLock so recv() can update after topic refresh re-subscribe.
     subscribed_topics: parking_lot::RwLock<Vec<String>>,
@@ -1008,10 +1009,6 @@ impl KafkaTransport {
         // Consumer and producer each get their own context instance.
         let protocol = config.effective_consumer_protocol();
         let consumer_config = reads.then(|| consumer_client_config(config, protocol));
-        // librdkafka defaults this off, so only an explicit `true` counts.
-        let auto_create_topics = consumer_config
-            .as_ref()
-            .is_some_and(|c| c.get("allow.auto.create.topics") == Some("true"));
         let auth = Arc::new(classify::AuthState::default());
         let consumer = consumer_config
             .as_ref()
@@ -1107,6 +1104,7 @@ impl KafkaTransport {
         };
 
         let healthy = Arc::new(AtomicBool::new(true));
+        let topic_missing = Arc::new(AtomicBool::new(false));
 
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
@@ -1118,8 +1116,12 @@ impl KafkaTransport {
         {
             let h = Arc::clone(&healthy);
             let refused = Arc::clone(&auth);
+            let missing = Arc::clone(&topic_missing);
             crate::health::HealthRegistry::register("transport:kafka", move || {
-                if h.load(Ordering::Relaxed) && !refused.is_refused() {
+                if h.load(Ordering::Relaxed)
+                    && !refused.is_refused()
+                    && !missing.load(Ordering::Relaxed)
+                {
                     crate::health::HealthStatus::Healthy
                 } else {
                     crate::health::HealthStatus::Unhealthy
@@ -1167,7 +1169,7 @@ impl KafkaTransport {
             send_degraded: classify::DegradedLatch::default(),
             recv_state: classify::RecvState::default(),
             deferred_recv_error: parking_lot::Mutex::new(None),
-            auto_create_topics,
+            topic_missing,
             subscribed_topics: parking_lot::RwLock::new(subscribed_topics),
             #[cfg(feature = "governor")]
             group_id: config.group.clone(),
@@ -1807,7 +1809,9 @@ impl TransportBase for KafkaTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed) && !self.auth.is_refused()
+        self.healthy.load(Ordering::Relaxed)
+            && !self.auth.is_refused()
+            && !self.topic_missing.load(Ordering::Relaxed)
     }
 
     async fn healthcheck(&self) -> TransportResult<()> {
@@ -2275,6 +2279,13 @@ impl KafkaTransport {
         let (polled, rebalanced) = self
             .poll_off_runtime(&consumer, max_msgs, max_bytes)
             .await?;
+        // A partition to consume ends the wait for a missing topic.
+        if rebalanced
+            .iter()
+            .any(|(_, change)| matches!(change, Rebalanced::Assigned(given) if !given.is_empty()))
+        {
+            self.topic_missing.store(false, Ordering::Relaxed);
+        }
         // Rebalances run inside the poll, so what one changed is known before
         // anything this poll read is held or handed out.
         let revoked_at = self.acks.rebalanced(rebalanced);
@@ -2306,10 +2317,12 @@ impl KafkaTransport {
                 if !self.closed.load(Ordering::Relaxed) {
                     self.healthy.store(true, Ordering::Relaxed);
                 }
+                self.topic_missing.store(false, Ordering::Relaxed);
                 match stopped_by {
                     None => {}
                     // Records are in hand; the next call backs off if it persists.
                     Some(DrainStop::Transient(e)) => self.recv_state.record_transient(&e),
+                    Some(DrainStop::MissingTopic(e)) => self.recv_state.record_missing_topic(&e),
                     // Returned by the next call, after these records.
                     Some(DrainStop::Permanent(e, class)) => {
                         classify::record_permanent_recv_failure(&e, class);
@@ -2396,7 +2409,6 @@ impl KafkaTransport {
                 topic_cache: Arc::clone(&self.topic_cache),
                 max_msgs,
                 max_bytes,
-                auto_create_topics: self.auto_create_topics,
                 received_before: self.recv_state.has_received(),
                 #[cfg(feature = "transport-trace")]
                 span: tracing::Span::current(),
@@ -2437,6 +2449,13 @@ impl KafkaTransport {
             classify::RecvFailure::Transient => {
                 self.recv_state.record_transient(&err);
                 // Spaces the polls while the broker stays down, yielding the runtime meanwhile.
+                tokio::time::sleep(self.recv_state.backoff()).await;
+            }
+            classify::RecvFailure::MissingTopic => {
+                self.recv_state.record_missing_topic(&err);
+                if consumer.assignment().map_or(true, |held| held.count() == 0) {
+                    self.topic_missing.store(true, Ordering::Relaxed);
+                }
                 tokio::time::sleep(self.recv_state.backoff()).await;
             }
             classify::RecvFailure::Permanent | classify::RecvFailure::Unclassified => {
@@ -2657,6 +2676,8 @@ enum Polled {
 enum DrainStop {
     /// A condition librdkafka recovers from; the next call backs off if it persists.
     Transient(KafkaError),
+    /// A subscribed topic is missing while another delivers records.
+    MissingTopic(KafkaError),
     /// A failure no retry clears, returned by the next call.
     Permanent(KafkaError, classify::RecvFailure),
 }
@@ -2670,8 +2691,6 @@ struct PollJob {
     topic_cache: Arc<parking_lot::RwLock<HashMap<String, Arc<str>>>>,
     max_msgs: usize,
     max_bytes: Option<u64>,
-    /// The consumer's `allow.auto.create.topics`, for classifying a poll failure.
-    auto_create_topics: bool,
     /// Whether a record reached this consumer before the job started, which
     /// proves its credentials.
     received_before: bool,
@@ -2754,7 +2773,6 @@ impl PollJob {
 
         // A record has arrived, which proves the credentials.
         let ctx = classify::RecvContext {
-            auto_create_topics: self.auto_create_topics,
             credentials_proven: true,
         };
         let mut stopped_by = None;
@@ -2802,6 +2820,10 @@ impl PollJob {
                     classify::RecvFailure::EndOfPartition => {}
                     classify::RecvFailure::Transient => {
                         stopped_by = Some(DrainStop::Transient(e));
+                        break;
+                    }
+                    classify::RecvFailure::MissingTopic => {
+                        stopped_by = Some(DrainStop::MissingTopic(e));
                         break;
                     }
                     class @ (classify::RecvFailure::Permanent
@@ -2882,7 +2904,6 @@ impl PollJob {
         classify::classify_recv_failure(
             err,
             classify::RecvContext {
-                auto_create_topics: self.auto_create_topics,
                 credentials_proven: self.received_before
                     || self.consumer.context().auth().is_proven(),
             },
