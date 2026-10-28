@@ -681,6 +681,11 @@ impl ServiceMetrics {
                 "Dead letters a later cascade backend took after an earlier one gave them up",
                 &["from", "to", "reason"],
             ),
+            (
+                "dlq_payload_truncated_total",
+                "Dead letters whose payload was cut to max_payload_bytes",
+                &[],
+            ),
         ] {
             metrics::describe_counter!(name, desc);
             reg.push(MetricDescriptor {

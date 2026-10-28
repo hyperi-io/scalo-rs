@@ -58,6 +58,11 @@ pub enum DlqMode {
     KafkaOnly,
 }
 
+/// The default [`DlqConfig::max_payload_bytes`], 512 KiB. Base64 grows it to
+/// 699,052 bytes, under Kafka's and librdkafka's default `message.max.bytes`
+/// (1,048,588 and 1,000,000) with room for the envelope.
+pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 512 * 1024;
+
 /// Top-level DLQ configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
@@ -82,6 +87,12 @@ pub struct DlqConfig {
     /// Default 100 ms.
     pub flush_interval_ms: u64,
 
+    /// Payload bytes an entry keeps: a longer payload is cut to this and the
+    /// entry marked `truncated` with its original length, so it lands where
+    /// the whole record could not. `None` keeps every payload whole. Default
+    /// [`DEFAULT_MAX_PAYLOAD_BYTES`].
+    pub max_payload_bytes: Option<usize>,
+
     /// File backend configuration.
     pub file: FileDlqConfig,
 
@@ -102,6 +113,7 @@ impl Default for DlqConfig {
             queue_capacity: 10_000,
             batch_size: 256,
             flush_interval_ms: 100,
+            max_payload_bytes: Some(DEFAULT_MAX_PAYLOAD_BYTES),
             file: FileDlqConfig::default(),
             #[cfg(feature = "dlq-kafka")]
             kafka: KafkaDlqConfig::default(),

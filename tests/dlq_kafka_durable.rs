@@ -250,6 +250,15 @@ async fn send_all(dlq: &Dlq, prefix: &str, count: usize) {
 /// The `reason` of every entry on `topic`, read from the start of partition 0
 /// up to its high watermark.
 fn read_reasons(bootstrap: &str, topic: &str) -> Vec<String> {
+    read_entries(bootstrap, topic)
+        .iter()
+        .map(|entry| entry["reason"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Every entry on `topic` as JSON, read from the start of partition 0 up to
+/// its high watermark.
+fn read_entries(bootstrap: &str, topic: &str) -> Vec<serde_json::Value> {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", format!("verify-{topic}"))
@@ -267,24 +276,21 @@ fn read_reasons(bootstrap: &str, topic: &str) -> Vec<String> {
 
     let expected = usize::try_from(high - low).expect("non-negative record count");
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut reasons = Vec::with_capacity(expected);
-    while reasons.len() < expected && Instant::now() < deadline {
+    let mut entries = Vec::with_capacity(expected);
+    while entries.len() < expected && Instant::now() < deadline {
         match consumer.poll(Duration::from_millis(200)) {
-            Some(Ok(msg)) => {
-                let body: serde_json::Value =
-                    serde_json::from_slice(msg.payload().unwrap_or_default()).expect("DLQ JSON");
-                reasons.push(body["reason"].as_str().unwrap_or_default().to_string());
-            }
+            Some(Ok(msg)) => entries
+                .push(serde_json::from_slice(msg.payload().unwrap_or_default()).expect("DLQ JSON")),
             Some(Err(e)) => panic!("verify consumer error on {topic}: {e}"),
             None => {}
         }
     }
     assert_eq!(
-        reasons.len(),
+        entries.len(),
         expected,
         "read {topic} up to its high watermark"
     );
-    reasons
+    entries
 }
 
 async fn read_reasons_async(bootstrap: &str, topic: &str) -> Vec<String> {
@@ -468,6 +474,47 @@ async fn the_runtime_keeps_running_while_a_flush_waits_on_kafka() {
         advanced * 2 >= possible,
         "the ticker advanced {advanced} of a possible {possible} times -- the flush \
          held the runtime thread"
+    );
+}
+
+/// A payload whose whole entry is over the topic's ceiling lands cut to
+/// `max_payload_bytes`, saying how long it was, and nothing is lost.
+#[tokio::test]
+async fn an_oversize_payload_lands_truncated() {
+    if !require_docker() {
+        return;
+    }
+    let topic = "dlq.truncated";
+    let (_node, bootstrap) = start_kafka().await;
+    create_small_topic(&bootstrap, topic).await;
+    let cap = 100_000;
+    let dlq = spawn_dlq(
+        &DlqConfig {
+            max_payload_bytes: Some(cap),
+            ..dlq_config(DlqMode::KafkaOnly, topic, None)
+        },
+        &kafka_config(&bootstrap),
+    );
+
+    dlq.send(oversize_entry("oversize")).await.expect("queued");
+    dlq.flush().await.expect("the truncated entry lands");
+    assert_eq!(dlq.dropped(), 0);
+
+    let bootstrap_for_read = bootstrap.clone();
+    let entries = tokio::task::spawn_blocking(move || read_entries(&bootstrap_for_read, topic))
+        .await
+        .expect("verify task");
+    let [entry] = entries.as_slice() else {
+        panic!("one entry on {topic}, got {}", entries.len());
+    };
+    let landed: DlqEntry = serde_json::from_value(entry.clone()).expect("a DLQ entry");
+    assert_eq!(
+        (
+            landed.payload.len(),
+            landed.truncated,
+            landed.original_bytes
+        ),
+        (cap, true, Some(OVER_BROKER_LIMIT))
     );
 }
 
