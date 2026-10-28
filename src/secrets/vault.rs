@@ -93,6 +93,23 @@ fn default_k8s_mount() -> String {
     "kubernetes".to_string()
 }
 
+/// The token the `vault` and `bao` CLIs fall back to when `VAULT_TOKEN` is
+/// unset: the file `VAULT_TOKEN_FILE` names, else `~/.vault-token`, trimmed.
+#[cfg(feature = "config")]
+fn token_from_file() -> Option<String> {
+    let path = std::env::var_os("VAULT_TOKEN_FILE")
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".vault-token")))?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let token = text.trim();
+    if token.is_empty() {
+        return None;
+    }
+    debug!(path = %path.display(), "Using the OpenBao token from the token file");
+    Some(token.to_string())
+}
+
 impl OpenBaoConfig {
     /// Load configuration from environment variables.
     ///
@@ -103,6 +120,7 @@ impl OpenBaoConfig {
     ///
     /// - `VAULT_ADDR` - Vault/OpenBao server address
     /// - `VAULT_TOKEN` - Authentication token (for token auth)
+    /// - `VAULT_TOKEN_FILE` - File holding the token, `~/.vault-token` when unset
     /// - `VAULT_ROLE_ID` + `VAULT_SECRET_ID` - AppRole authentication
     /// - `VAULT_K8S_ROLE` - Kubernetes authentication role
     /// - `VAULT_NAMESPACE` - Vault namespace (Enterprise)
@@ -111,7 +129,8 @@ impl OpenBaoConfig {
     ///
     /// ## Authentication Priority
     ///
-    /// 1. If `VAULT_TOKEN` is set, uses token authentication
+    /// 1. If `VAULT_TOKEN` is set, or else the token file holds a token, uses
+    ///    token authentication
     /// 2. If `VAULT_ROLE_ID` and `VAULT_SECRET_ID` are set, uses AppRole
     /// 3. If `VAULT_K8S_ROLE` is set, uses Kubernetes authentication
     /// 4. Otherwise, returns an error
@@ -128,7 +147,7 @@ impl OpenBaoConfig {
         let address = vault::addr().get()?;
 
         // Determine authentication method
-        let auth = if let Some(token) = vault::token().get() {
+        let auth = if let Some(token) = vault::token().get().or_else(token_from_file) {
             OpenBaoAuth::Token {
                 token: token.into(),
             }
@@ -471,6 +490,94 @@ impl SecretProvider for OpenBaoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The token `from_env` resolved, with every other source of one cleared and
+    /// `HOME` pointed at `home`.
+    #[cfg(feature = "config")]
+    fn token_from_env(
+        env_token: Option<&str>,
+        file_var: Option<&str>,
+        home: &std::path::Path,
+    ) -> Option<String> {
+        temp_env::with_vars(
+            [
+                ("VAULT_ADDR", Some("http://127.0.0.1:1")),
+                ("VAULT_TOKEN", env_token),
+                ("OPENBAO_TOKEN", None),
+                ("BAO_TOKEN", None),
+                ("OPENBAO_ROOT_TOKEN", None),
+                ("VAULT_ROLE_ID", None),
+                ("VAULT_SECRET_ID", None),
+                ("VAULT_K8S_ROLE", None),
+                ("VAULT_TOKEN_FILE", file_var),
+                ("HOME", home.to_str()),
+            ],
+            || match OpenBaoConfig::from_env()?.auth {
+                OpenBaoAuth::Token { token } => Some(token.expose().to_string()),
+                _ => None,
+            },
+        )
+    }
+
+    /// With `VAULT_TOKEN` unset the token comes from `VAULT_TOKEN_FILE`, else
+    /// `~/.vault-token`, trimmed, and the environment variable always wins.
+    #[test]
+    #[cfg(feature = "config")]
+    fn the_token_file_is_read_when_vault_token_is_unset() {
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let named = other.path().join("token");
+        std::fs::write(&named, "from-named-file").unwrap();
+        let named = named.to_str().unwrap();
+        let missing = other.path().join("absent");
+        let missing = missing.to_str().unwrap();
+
+        let write_home =
+            |body: &str| std::fs::write(home.path().join(".vault-token"), body).unwrap();
+        let cases: [(&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>); 6] = [
+            (
+                "env wins over the file",
+                Some("from-env"),
+                None,
+                Some("from-home\n"),
+                Some("from-env"),
+            ),
+            (
+                "home file, trimmed",
+                None,
+                None,
+                Some("from-home\n"),
+                Some("from-home"),
+            ),
+            (
+                "VAULT_TOKEN_FILE beats home",
+                None,
+                Some(named),
+                Some("from-home"),
+                Some("from-named-file"),
+            ),
+            ("empty file", None, None, Some("  \n"), None),
+            ("no file", None, None, None, None),
+            (
+                "VAULT_TOKEN_FILE names a missing file",
+                None,
+                Some(missing),
+                Some("from-home"),
+                None,
+            ),
+        ];
+        for (label, env_token, file_var, home_body, expected) in cases {
+            let _ = std::fs::remove_file(home.path().join(".vault-token"));
+            if let Some(body) = home_body {
+                write_home(body);
+            }
+            assert_eq!(
+                token_from_env(env_token, file_var, home.path()).as_deref(),
+                expected,
+                "{label}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_path_with_mount() {
