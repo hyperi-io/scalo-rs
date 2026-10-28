@@ -18,6 +18,9 @@ use tempfile::TempDir;
 #[cfg(feature = "secrets-vault")]
 pub mod openbao;
 
+#[cfg(feature = "transport-kafka")]
+pub mod tls_broker;
+
 /// Fail in CI rather than skip: a skipped container test reports green while
 /// exercising nothing, and CI does provide a container runtime.
 pub fn skip_or_fail(reason: &str) {
