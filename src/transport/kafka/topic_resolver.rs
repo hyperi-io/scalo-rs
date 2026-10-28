@@ -56,15 +56,17 @@ impl TopicResolver {
     /// Create a new `TopicResolver` from a `KafkaConfig`.
     ///
     /// Compiles include/exclude regex patterns at construction time so that
-    /// `resolve()` is cheap to call repeatedly.
+    /// `resolve()` is cheap to call repeatedly. Builds the admin client once,
+    /// to refuse a config librdkafka refuses now, and drops it: each
+    /// `resolve()` builds its own, so no idle client lives between refreshes.
     ///
     /// # Errors
     ///
     /// Returns error if the config is one [`KafkaAdmin::new`] refuses, or any
     /// regex pattern is invalid.
     pub fn new(config: &KafkaConfig) -> TransportResult<Self> {
-        // Refuse a bad config now rather than at the first refresh.
-        super::checked_config(config)?;
+        // Refuse a bad config now: a refresh treats a failure as transient.
+        drop(KafkaAdmin::new(config)?);
         let include_patterns = compile_patterns(&config.topic_include)?;
         let exclude_patterns = compile_patterns(&config.topic_exclude)?;
         Ok(Self {
@@ -365,6 +367,22 @@ mod tests {
         client_gate::assert_refuses_as_the_transport_does(|config| {
             client_gate::config_refusal(TopicResolver::new(config))
         });
+    }
+
+    /// A key librdkafka refuses fails construction, not every refresh after
+    /// it, which would leave auto-discovery retrying a config that never works.
+    #[test]
+    fn a_config_librdkafka_refuses_fails_construction() {
+        let config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            ..Default::default()
+        }
+        .with_override("no.such.property", "1");
+        let refused = TopicResolver::new(&config).err();
+        assert!(
+            matches!(refused, Some(TransportError::Config(ref m)) if m.contains("no.such.property")),
+            "{refused:?}"
+        );
     }
 
     #[test]
