@@ -1973,6 +1973,71 @@ mod partition_fetch {
         }
         assert_eq!(sizes, [large.len(), b"after".len()]);
     }
+
+    /// A broker or topic ceiling below the client's lets a record through the
+    /// client and refuses it at the broker. The refusal dead-letters that
+    /// record (`FilteredDlq`), never stalls the sender, and the next record
+    /// is delivered.
+    #[tokio::test]
+    async fn a_record_the_broker_refuses_as_too_large_is_dead_lettered() {
+        use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+        use rdkafka::client::DefaultClientContext;
+        use scalo::transport::kafka::{KafkaConfig, KafkaTransport};
+        use scalo::transport::{SendResult, TransportSender};
+
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let topic = "broker-refuses-large";
+        let topic_ceiling = 1_000_000_usize;
+        let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap)
+            .create()
+            .expect("raw admin");
+        let ceiling = topic_ceiling.to_string();
+        let created = admin
+            .create_topics(
+                &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))
+                    .set("max.message.bytes", &ceiling)],
+                &AdminOptions::new(),
+            )
+            .await
+            .expect("create topic");
+        for result in created {
+            result.expect("topic created");
+        }
+
+        let sender = KafkaTransport::new(&KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: String::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("kafka sender");
+        assert!(
+            usize::try_from(MESSAGE_MAX_BYTES).expect("fits") > 2 * topic_ceiling,
+            "the client ceiling lets the record through"
+        );
+        // Incompressible, since the broker judges the compressed batch.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let noise: Vec<u8> = (0..2 * topic_ceiling)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        let refused = sender.send(topic, bytes::Bytes::from(noise)).await;
+        assert!(
+            matches!(refused, SendResult::FilteredDlq),
+            "the broker's refusal dead-letters the record: {refused:?}"
+        );
+        let next = sender
+            .send(topic, bytes::Bytes::from_static(b"after"))
+            .await;
+        assert!(next.is_ok(), "the sender carries on: {next:?}");
+    }
 }
 
 /// Topic auto-discovery started while no broker answers at its address.
