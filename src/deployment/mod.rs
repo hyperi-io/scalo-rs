@@ -114,9 +114,10 @@ pub mod waves;
 pub use app_project::{AppProjectContract, AppProjectDestination, generate_argocd_app_project};
 pub use capability::{Capability, FieldSpec, FieldType};
 pub use contract::{
-    CONTRACT_SCHEMA_VERSION, DEFAULT_LABEL_NAMESPACE, DeploymentContract, HealthContract,
-    ImageProfile, OciLabels, PortCondition, PortContract, ResourceList, ResourcesContract,
-    SecretEnvContract, SecretGroupContract, SecurityContract, ServiceAccount, WritablePath,
+    CONTRACT_SCHEMA_VERSION, DEFAULT_LABEL_NAMESPACE, DEFAULT_METRICS_PORT, DeploymentContract,
+    HealthContract, ImageProfile, OciLabels, PortCondition, PortContract, ResourceList,
+    ResourcesContract, SecretEnvContract, SecretGroupContract, SecurityContract, ServiceAccount,
+    WritablePath,
 };
 pub use contract_identity::{ContractIdentity, IdentityError, KEY_SEGMENT, VERSION};
 #[cfg(feature = "config-schema")]

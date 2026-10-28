@@ -8,6 +8,7 @@
 
 #![allow(clippy::format_push_string)]
 
+use crate::deployment::DeploymentError;
 use crate::deployment::contract::DeploymentContract;
 
 use super::common::{on_one_line, udp_port_suffix};
@@ -17,8 +18,13 @@ use super::common::{on_one_line, udp_port_suffix};
 // ============================================================================
 
 /// Generate a Docker Compose service fragment from the deployment contract.
-#[must_use]
-pub fn generate_compose_fragment(contract: &DeploymentContract) -> String {
+///
+/// # Errors
+///
+/// Returns the [`DeploymentContract::validate`] error naming the field at
+/// fault, so a contract the chart refuses renders no fragment either.
+pub fn generate_compose_fragment(contract: &DeploymentContract) -> Result<String, DeploymentError> {
+    contract.validate()?;
     let binary = contract.binary();
     let mut out = String::with_capacity(512);
 
@@ -123,5 +129,5 @@ pub fn generate_compose_fragment(contract: &DeploymentContract) -> String {
         out.push_str("]\n");
     }
 
-    out
+    Ok(out)
 }

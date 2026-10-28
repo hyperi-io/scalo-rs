@@ -50,9 +50,11 @@ pub fn validate_dockerfile(
         });
     }
 
-    // HEALTHCHECK port
+    // HEALTHCHECK port: an HTTP client's URL, or the bash `/dev/tcp` form the
+    // generator writes.
     let port_str = format!("localhost:{}", contract.metrics_port);
-    if !content.contains(&port_str) {
+    let tcp_str = format!("/dev/tcp/localhost/{}", contract.metrics_port);
+    if !content.contains(&port_str) && !content.contains(&tcp_str) {
         mismatches.push(ContractMismatch {
             field: "Dockerfile HEALTHCHECK port".into(),
             expected: port_str,
@@ -198,7 +200,7 @@ mod tests {
         );
         std::fs::write(
             &dockerfile,
-            super::super::generate_dockerfile(&contract, None),
+            super::super::generate_dockerfile(&contract, None).unwrap(),
         )
         .unwrap();
         let mismatches = validate_dockerfile(&contract, &dockerfile).unwrap();

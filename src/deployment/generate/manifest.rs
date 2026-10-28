@@ -6,6 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
+use crate::deployment::DeploymentError;
 use crate::deployment::contract::{DeploymentContract, ImageProfile, PortContract};
 
 use super::common::udp_port_suffix;
@@ -21,10 +22,12 @@ use super::common::udp_port_suffix;
 ///
 /// # Errors
 ///
-/// Returns an error string naming the field at fault if the contract fails
-/// [`DeploymentContract::validate`], or if JSON serialisation fails.
-pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<String, String> {
-    contract.validate().map_err(|e| e.to_string())?;
+/// Returns the [`DeploymentContract::validate`] error naming the field at
+/// fault, or [`DeploymentError::Serialise`] if JSON serialisation fails.
+pub fn generate_container_manifest(
+    contract: &DeploymentContract,
+) -> Result<String, DeploymentError> {
+    contract.validate()?;
     let binary = contract.binary();
 
     let apt_repos: Vec<serde_json::Value> = contract
@@ -147,8 +150,10 @@ pub fn generate_container_manifest(contract: &DeploymentContract) -> Result<Stri
         );
     }
 
-    serde_json::to_string_pretty(&manifest)
-        .map_err(|e| format!("container manifest JSON failed: {e}"))
+    serde_json::to_string_pretty(&manifest).map_err(|e| DeploymentError::Serialise {
+        what: "container manifest JSON".to_string(),
+        message: e.to_string(),
+    })
 }
 
 /// A port as `expose_ports` lists it: a bare number for TCP and `<port>/udp`

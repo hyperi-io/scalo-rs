@@ -14,6 +14,18 @@ A service built by `run_app` answers `/readyz` 503 `{"status":"starting"}` from 
 
 **Consumer adjustment** -- move a check set at the top of `run_service` into `ServiceApp::readiness_check`. A deployment whose metrics address was already taken now exits at start, so fix the address.
 
+### `DeploymentContract` has a `Default`, and every generator refuses a bad contract (API CHANGE)
+
+`DeploymentContract` implements `Default` with every field at its documented default, and so does `SecretEnvContract`, so a consumer writes `..DeploymentContract::default()` and a field a later release adds no longer breaks its build. `generate_dockerfile`, `generate_runtime_stage` and `generate_compose_fragment` now return `Result<String, DeploymentError>` and run `validate()` first, as `generate_container_manifest` did, which now returns `DeploymentError` too instead of a `String`. `SmokeError` gains `Contract`.
+
+**Consumer adjustment** -- end the `DeploymentContract` literal in `..DeploymentContract::default()` and drop the fields left at their default. A direct call to one of the three generators adds `?`, or `.expect(...)` in a test. A match on `SmokeError` adds `Contract`.
+
+### The generated image has a working directory, owns its writable paths, and carries no fetch or network tools (BEHAVIOUR CHANGE)
+
+`generate_dockerfile` and `generate_runtime_stage` set `WORKDIR /home/appuser` and, before `USER`, create every `writable_paths` entry and chown it to 1000:1000. A production image no longer installs `netcat-openbsd` or `iputils-ping`, and purges `curl` and `gnupg` in the same layer once a repo's packages are in. The `HEALTHCHECK` is an exec-form bash `/dev/tcp` request, so it needs no HTTP client. `validate_dockerfile` accepts that form. A development image keeps `curl`, `netcat-openbsd` and `iputils-ping`.
+
+**Consumer adjustment** -- regenerate the committed `Dockerfile` and `Dockerfile.runtime` (`<app> generate-artefacts`). A compose file that chowned a volume through a root sidecar or set `working_dir` for the app no longer needs either. Anything that ran `curl` or `nc` inside a production container uses the development image.
+
 ### The CEL profile reads literals and comments as cel does (BEHAVIOUR CHANGE)
 
 The profile scanner, and with it the transport filter classifier, now reads one-line, triple-quoted and raw string and bytes literals, `//` comments and backtick-quoted names as cel's lexer does, and takes any whitespace or comment before `(` as part of a call. An expression that hid a restricted call behind one of those forms now fails `validate`, `compile` and `RuleSet::compile`, and a transport filter with such a call classifies as Tier 3. `existsOne`, which cel expands as `exists_one`, is restricted iteration too: `allow_iteration` now allows it, where it was refused as an unknown function, and a filter with it classifies as Tier 3.

@@ -80,6 +80,10 @@ pub enum SmokeError {
     #[error("I/O error during smoke test: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The contract fails validation, so no Dockerfile was generated.
+    #[error("contract refused: {0}")]
+    Contract(#[from] super::DeploymentError),
+
     /// `docker build` failed (image didn't build).
     #[error("docker build failed (exit {exit_code}): {stderr}")]
     BuildFailed {
@@ -123,6 +127,7 @@ pub fn docker_available() -> bool {
 /// - [`SmokeError::BinaryMissing`] if `binary_path` doesn't exist
 /// - [`SmokeError::BuildFailed`] if `docker build` fails
 /// - [`SmokeError::Io`] for filesystem errors during context setup
+/// - [`SmokeError::Contract`] if the contract fails validation
 pub fn smoke_test_build(
     contract: &DeploymentContract,
     binary_path: &Path,
@@ -148,7 +153,7 @@ pub fn smoke_test_build(
     set_executable(&dst)?;
 
     // Write Dockerfile.
-    let dockerfile = generate_dockerfile(contract, None);
+    let dockerfile = generate_dockerfile(contract, None)?;
     std::fs::write(context.join("Dockerfile"), dockerfile)?;
 
     // Build.

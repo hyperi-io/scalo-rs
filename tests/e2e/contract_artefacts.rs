@@ -164,7 +164,7 @@ impl BuiltImage {
         identity: Option<&ContractIdentity>,
         tag_suffix: &str,
     ) -> Self {
-        let dockerfile = generate_dockerfile(contract, identity);
+        let dockerfile = generate_dockerfile(contract, identity).expect("the contract is valid");
 
         let ctx = tempfile::tempdir().expect("tempdir");
         let dockerfile_path = ctx.path().join("Dockerfile");
@@ -393,8 +393,14 @@ fn tier_a_generated_dockerfiles_lint_clean() {
     // Run from an empty directory so no .hadolint.yaml in the checkout applies.
     let dir = tempfile::tempdir().expect("tempdir");
     for (file, text) in [
-        ("Dockerfile", generate_dockerfile(&contract, None)),
-        ("Dockerfile.runtime", generate_runtime_stage(&contract)),
+        (
+            "Dockerfile",
+            generate_dockerfile(&contract, None).expect("valid contract"),
+        ),
+        (
+            "Dockerfile.runtime",
+            generate_runtime_stage(&contract).expect("valid contract"),
+        ),
     ] {
         let path = dir.path().join(file);
         std::fs::write(&path, &text).expect("write Dockerfile");

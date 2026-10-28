@@ -100,7 +100,7 @@ LABEL io.scalo.profile="production"
 # Apt versions are unpinned because Debian drops superseded ones, so the digest-pinned base is what fixes the release.
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl netcat-openbsd iputils-ping gnupg \
+    ca-certificates curl gnupg \
     && curl -fsSL https://packages.confluent.io/clients/deb/archive.key -o /tmp/repo-key.asc \
     && gpg --show-keys --with-colons --with-fingerprint /tmp/repo-key.asc \
        > /tmp/repo-key.info \
@@ -113,6 +113,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        > /etc/apt/sources.list.d/confluent-clients.list \
     && apt-get update && apt-get install -y --no-install-recommends \
        librdkafka1 libssl3t64 zlib1g libzstd1 \
+    && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 # Dynamic OCI labels (injected by CI at build time)
@@ -130,17 +131,17 @@ LABEL org.opencontainers.image.created="${OCI_CREATED}"
 COPY --from=builder /app/target/release/my-app /usr/local/bin/my-app
 RUN chmod +x /usr/local/bin/my-app
 
-# Ubuntu 24.04 ships with ubuntu user at UID 1000 -- remove before creating appuser
+# A base image may ship its own user at UID 1000 (Ubuntu's `ubuntu`), so remove it first.
 RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi && useradd --create-home --uid 1000 appuser
+WORKDIR /home/appuser
 # Numeric, so Kubernetes runAsNonRoot can verify it without reading /etc/passwd.
 USER 1000
 
 EXPOSE 9090
 
-# Shell form maps any curl failure to exit 1, the only unhealthy status Docker defines.
-# hadolint ignore=DL3025
+# bash builtins only, so the image needs no HTTP client. A status other than 200 exits 1.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -sf http://localhost:9090/livez > /dev/null || exit 1
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/localhost/9090 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r _ code _ <&3 && [ \"$code\" = 200 ]"]
 
 ENTRYPOINT ["my-app"]
 CMD ["--config", "/etc/my-app/config.yaml"]
@@ -157,6 +158,16 @@ unless it is removed first. Debian trixie slim has no such account, so the
 guard makes the line a no-op there rather than a build failure.
 
 `USER` is numeric because Kubernetes `runAsNonRoot` can only verify a numeric user. The uid still resolves to `appuser`: `id` in the image prints `uid=1000(appuser) gid=1000(appuser)`.
+
+The process starts in `/home/appuser`, which `useradd --create-home` gives to appuser, so a relative path the app writes lands somewhere it owns. A contract with `writable_paths` gets one more line before `WORKDIR`, which creates each path and hands it to appuser while the build still runs as root:
+
+```dockerfile
+RUN mkdir -p '/var/spool/my-app' '/var/data/my-app' && chown 1000:1000 '/var/spool/my-app' '/var/data/my-app'
+```
+
+A production image carries `ca-certificates`, the runtime libraries and the binary. `curl` and `gnupg` are there only to import a repo's signing key, and the same `RUN` purges them once the repo's packages are in. The healthcheck speaks HTTP with bash builtins, so it needs no client. A development image (`with_dev_profile`) keeps `curl`, `netcat-openbsd` and `iputils-ping` beside the diagnostic tools.
+
+All four generators run [`DeploymentContract::validate`](contract.md) first and return its error, so a contract the chart would refuse renders no Dockerfile, runtime stage, compose fragment or container manifest either.
 
 The generated Dockerfile and fragment lint clean under hadolint, which gates the build. Three findings are suppressed at the instruction they concern, each with its reason on the line above:
 

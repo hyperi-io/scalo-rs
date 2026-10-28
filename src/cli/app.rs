@@ -625,7 +625,8 @@ fn generate_artefacts<A: ServiceApp>(
 
         // Runtime stage Dockerfile fragment (for CI composition)
         let rt_path = output_dir.join("Dockerfile.runtime");
-        let rt_content = crate::deployment::generate::generate_runtime_stage(&contract);
+        let rt_content = crate::deployment::generate::generate_runtime_stage(&contract)
+            .map_err(|e| CliError::Service(format!("runtime stage failed: {e}")))?;
         std::fs::write(&rt_path, &rt_content).map_err(|e| {
             CliError::Service(format!("failed to write {}: {e}", rt_path.display()))
         })?;
