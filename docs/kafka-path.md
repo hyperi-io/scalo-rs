@@ -255,7 +255,7 @@ An empty `group` is what marks a transport producer-only. It subscribes to nothi
 
 ## Topic auto-discovery
 
-With `topics` empty and `auto_discover: true`, the transport subscribes to the broker's topics that pass `topic_include`, `topic_exclude` and the suppression rules. It lists them once at construction and again every `topic_refresh_secs` (60 s by default), and the next `recv` after a change re-subscribes. Each listing is a metadata fetch of up to 10 s, run on tokio's blocking pool so it never holds a runtime worker.
+With `topics` empty and `auto_discover: true`, the transport subscribes to the broker's topics that pass `topic_include`, `topic_exclude` and the suppression rules. It lists them once at construction and again every `topic_refresh_secs` (60 s by default), and the next `recv` after a change re-subscribes. Each listing is a metadata fetch of up to 10 s, run on tokio's blocking pool so it never holds a runtime worker. The listing builds a `KafkaAdmin`, fetches and drops it, so no client sits unpolled between refreshes. A `KafkaAdmin`'s two handles never emit librdkafka statistics, whatever the profile or `librdkafka_overrides` set, because nothing polls them for it.
 
 A broker that does not answer at construction is not fatal. The transport logs a warning with the error, builds subscribed to nothing, and the first refresh that lists the matching topics subscribes it. With `topic_refresh_secs: 0` nothing would recover, so construction fails with `TransportError::Admin`. Explicit `topics` never contact the broker at construction: librdkafka connects later.
 

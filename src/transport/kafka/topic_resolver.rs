@@ -40,8 +40,13 @@ use crate::transport::error::{TransportError, TransportResult};
 // ============================================================================
 
 /// Resolves Kafka topics from the broker with filtering and suppression.
+///
+/// Holds the config, not a client: each [`resolve`](Self::resolve) builds a
+/// [`KafkaAdmin`], lists the topics and drops it. A client kept between
+/// refreshes is never polled, so librdkafka's queued events on it are never
+/// freed.
 pub struct TopicResolver {
-    admin: KafkaAdmin,
+    config: KafkaConfig,
     suppression_rules: Vec<SuppressionRule>,
     include_patterns: Vec<Regex>,
     exclude_patterns: Vec<Regex>,
@@ -55,15 +60,16 @@ impl TopicResolver {
     ///
     /// # Errors
     ///
-    /// Returns error if [`KafkaAdmin::new`] refuses the config or cannot build
-    /// its client, or any regex pattern is invalid.
+    /// Returns error if the config is one [`KafkaAdmin::new`] refuses, or any
+    /// regex pattern is invalid.
     pub fn new(config: &KafkaConfig) -> TransportResult<Self> {
-        let admin = KafkaAdmin::new(config)?;
+        // Refuse a bad config now rather than at the first refresh.
+        super::checked_config(config)?;
         let include_patterns = compile_patterns(&config.topic_include)?;
         let exclude_patterns = compile_patterns(&config.topic_exclude)?;
         Ok(Self {
-            admin,
             suppression_rules: config.topic_suppression_rules.clone(),
+            config: config.clone(),
             include_patterns,
             exclude_patterns,
         })
@@ -79,9 +85,10 @@ impl TopicResolver {
     ///
     /// # Errors
     ///
-    /// Returns error if the broker metadata fetch fails.
+    /// Returns error if the admin client cannot be built or the broker
+    /// metadata fetch fails.
     pub fn resolve(&self) -> TransportResult<Vec<String>> {
-        let all_topics = self.admin.list_topics()?;
+        let all_topics = KafkaAdmin::new(&self.config)?.list_topics()?;
         tracing::debug!(total = all_topics.len(), "Fetched broker topic list");
 
         let after_suppression = apply_suppression_rules(all_topics, &self.suppression_rules);

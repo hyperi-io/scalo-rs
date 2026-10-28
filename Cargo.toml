@@ -88,7 +88,7 @@ strmatch = ["regex", "regex-automata", "regex-syntax", "aho-corasick", "memchr",
 # that wants gauges without any exporter.
 metrics-core = ["dep:metrics", "tracing"]
 metrics-process = ["metrics-core", "sysinfo"]
-metrics = ["metrics-process", "metrics-exporter-prometheus", "tokio", "serde_json", "otel-metrics", "otel-tracing"]
+metrics = ["metrics-process", "metrics-exporter-prometheus", "dep:crossbeam-epoch", "tokio", "serde_json", "otel-metrics", "otel-tracing"]
 
 # OpenTelemetry support (modern observability)
 # `otel` is the umbrella enabling all OTel SDK deps. `otel-metrics` exports
@@ -368,6 +368,8 @@ tracing-opentelemetry = { version = ">=0.32.1, <0.33", optional = true }
 # Metrics (Prometheus-native)
 metrics = { version = ">=0.24.6, <0.25", optional = true }
 metrics-exporter-prometheus = { version = ">=0.18.3, <0.19", default-features = false, optional = true }
+# Frees the histogram blocks the Prometheus upkeep drains (see metrics::run_upkeep).
+crossbeam-epoch = { version = ">=0.9.21, <0.10", optional = true }
 metrics-util = { version = ">=0.20.4, <0.21", optional = true }
 metrics-exporter-opentelemetry = { version = ">=0.2.1, <0.3", optional = true }
 sysinfo = { version = ">=0.39.6, <0.40", optional = true }
