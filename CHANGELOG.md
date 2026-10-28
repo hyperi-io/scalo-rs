@@ -3,6 +3,25 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.21](https://github.com/hyperi-io/scalo-rs/compare/v2.14.20...v2.14.21) (2026-10-28)
+
+### Bug Fixes
+
+* accept the block-buffer advisory, unreachable here ([#387](https://github.com/hyperi-io/scalo-rs/issues/387)) ([c98d940](https://github.com/hyperi-io/scalo-rs/commit/c98d9408486bd959d14e691cd8506731727801d8))
+* add tls::install_default_provider for an app's main ([#386](https://github.com/hyperi-io/scalo-rs/issues/386)) ([4df0265](https://github.com/hyperi-io/scalo-rs/commit/4df02659f6b8cca913b02865101f1f9dbc1eff69)), closes [hyperi-io/dfe-receiver#216](https://github.com/hyperi-io/dfe-receiver/issues/216)
+* cap the OpenTelemetry crates in Renovate at the lockstep ceiling ([#377](https://github.com/hyperi-io/scalo-rs/issues/377)) ([d101bd4](https://github.com/hyperi-io/scalo-rs/commit/d101bd4f7f19f986bf55747f684acb17ec3030d6))
+* **deps:** take the pending bumps, hold cel and testcontainers ([#380](https://github.com/hyperi-io/scalo-rs/issues/380)) ([4dd78b2](https://github.com/hyperi-io/scalo-rs/commit/4dd78b2a3becb868a3c1184f62871a05d4771813))
+* **deps:** update Rust crate opentelemetry-otlp to >=0.31.1, <0.32 ([#383](https://github.com/hyperi-io/scalo-rs/issues/383)) ([ea66ef0](https://github.com/hyperi-io/scalo-rs/commit/ea66ef0437ac3622045da210d8e20b36c0e52cb8))
+* **deps:** update rust-dependencies ([#381](https://github.com/hyperi-io/scalo-rs/issues/381)) ([7cedc27](https://github.com/hyperi-io/scalo-rs/commit/7cedc279479ed4c4a9fe67ca41543570af7e31a1))
+* give the OpenTelemetry ceiling rules their own Renovate release age ([#378](https://github.com/hyperi-io/scalo-rs/issues/378)) ([59b92ab](https://github.com/hyperi-io/scalo-rs/commit/59b92ab136a52d2390831a7ea750f091e064ff4b))
+* judge the slow-drain test against the drain it simulates ([#394](https://github.com/hyperi-io/scalo-rs/issues/394)) ([d2e50f2](https://github.com/hyperi-io/scalo-rs/commit/d2e50f2879f5cb1539ba0429551e1574a5a2d539))
+* keep the unpolled-consumer outage test inside the group session ([#393](https://github.com/hyperi-io/scalo-rs/issues/393)) ([f308061](https://github.com/hyperi-io/scalo-rs/commit/f30806117b2d86ac1ecdb9a37a8e32b77e8093b4))
+* log why a secrets provider health check failed ([#391](https://github.com/hyperi-io/scalo-rs/issues/391)) ([03adc71](https://github.com/hyperi-io/scalo-rs/commit/03adc717d5934a6d5eeae99b3de3b637701771a7))
+* read the OpenBao token from VAULT_TOKEN_FILE or ~/.vault-token ([#392](https://github.com/hyperi-io/scalo-rs/issues/392)) ([2331331](https://github.com/hyperi-io/scalo-rs/commit/2331331fd5366e0901a3a2ecc338ad1a0e620003))
+* report refused Kafka credentials and TLS as fatal, not backpressure ([#389](https://github.com/hyperi-io/scalo-rs/issues/389)) ([4bd3f86](https://github.com/hyperi-io/scalo-rs/commit/4bd3f863ef81a555ba08b7a354b88811cb7e4bbc))
+* share the Kafka test fixtures and run the Kafka tests in CI ([#390](https://github.com/hyperi-io/scalo-rs/issues/390)) ([95d5945](https://github.com/hyperi-io/scalo-rs/commit/95d59456b5be4c20f2fd6077937bfb83201dced1))
+* test the Kafka transport against a real TLS broker ([#388](https://github.com/hyperi-io/scalo-rs/issues/388)) ([06311ec](https://github.com/hyperi-io/scalo-rs/commit/06311ecb7137f22a2f150b51bdc98775d3a3658e))
+
 ## [2.14.20](https://github.com/hyperi-io/scalo-rs/compare/v2.14.19...v2.14.20) (2026-10-24)
 
 ### Bug Fixes
