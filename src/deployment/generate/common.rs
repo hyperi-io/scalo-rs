@@ -34,3 +34,24 @@ pub(super) fn on_one_line(text: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The generators refuse a control character through `validate`, and this
+    /// escape keeps a value on its line if one ever gets past it.
+    #[test]
+    fn a_control_character_is_written_as_its_escape() {
+        let cases = [
+            ("plain", "web", "web"),
+            ("newline", "on\nRUN id", r"on\nRUN id"),
+            ("carriage return", "a\rb", r"a\rb"),
+            ("tab", "a\tb", r"a\tb"),
+            ("empty", "", ""),
+        ];
+        for (name, input, want) in cases {
+            assert_eq!(on_one_line(input), want, "{name}");
+        }
+    }
+}

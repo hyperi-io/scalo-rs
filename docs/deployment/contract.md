@@ -100,20 +100,15 @@ producers both exist today. Cross-language consumers read
 use scalo::deployment::*;
 
 let contract = DeploymentContract {
-    schema_version: CONTRACT_SCHEMA_VERSION,
     app_name: "event-loader".into(),
     binary_name: "event-loader".into(),
     description: "Kafka -> ClickHouse data loader".into(),
-    metrics_port: 9090,
-    health: HealthContract::default(),     // /livez, /readyz, /metrics
     env_prefix: "EVENT_LOADER".into(),
     metric_prefix: "loader".into(),
     config_mount_path: "/etc/event-loader/config.yaml".into(),
     image_registry: image_registry_from_cascade()    // org registry -- required
         .unwrap_or_else(|| "registry.example.com/team".into()),
     base_image: base_image_from_cascade(),           // org base image
-    extra_ports: vec![],
-    unbound_listen_paths: vec![],
     entrypoint_args: vec!["--config".into(), "/etc/event-loader/config.yaml".into()],
     secrets: vec![
         SecretGroupContract::new(
@@ -132,34 +127,31 @@ let contract = DeploymentContract {
             ],
         ),
     ],
-    default_config: None,
     depends_on: vec!["kafka".into(), "clickhouse".into()],
     keda: Some(KedaContract::default()),
     native_deps: NativeDepsContract::for_scalo_features(
         &["transport-kafka", "spool", "tiered-sink"],
         &base_image_from_cascade(),
     ),
-    image_profile: ImageProfile::Production,
-    oci_labels: OciLabels::default(),
-    // v3 fields -- both optional
     config_schema: Some(config_schema_json::<Config>()),
     capabilities: vec![
         Capability::transport("kafka")
             .description("Kafka source and sink")
             .maturity("stable"),
     ],
-    // v4 fields
     writable_paths: vec![
         WritablePath::new("spool", "/var/lib/event-loader/spool").size_limit("2Gi"),
     ],
-    termination_grace_seconds: 45,
-    resources: ResourcesContract::default(),
-    security: SecurityContract::default(),
-    singleton: false,
-    service_account: ServiceAccount::Own,
     hot_paths: vec!["routing.rules".into()],
+    ..DeploymentContract::default()
 };
 ```
+
+Name what the app sets and end with `..DeploymentContract::default()`. Every
+other field takes the default in the table below, so a field a later scalo
+release adds does not break the build. `DeploymentContract::default()` alone
+leaves `app_name`, `env_prefix`, `metric_prefix` and `image_registry` empty,
+and `validate()` refuses it until they are set.
 
 ### Fields
 
@@ -169,7 +161,7 @@ let contract = DeploymentContract {
 | `app_name` | `String` | required | Matches `Chart.yaml` `name`; image repo segment |
 | `binary_name` | `String` | `""` | Falls back to `app_name` via `.binary()` |
 | `description` | `String` | `""` | Chart description |
-| `metrics_port` | `u16` | required | Metrics + health listen port |
+| `metrics_port` | `u16` | `9090` (`DEFAULT_METRICS_PORT`) | Metrics + health listen port |
 | `health` | `HealthContract` | default | Probe paths -- see below |
 | `env_prefix` | `String` | required | Config env prefix; `__` is the nesting separator |
 | `metric_prefix` | `String` | required | Prometheus namespace |
@@ -470,7 +462,8 @@ reference carries no codename.
 
 | Item | Purpose |
 | ------ | --------- |
-| `DeploymentContract` | Top-level contract struct |
+| `DeploymentContract` | Top-level contract struct. `Default` fills every field with its documented default, for the `..DeploymentContract::default()` form |
+| `DeploymentContract::validate()` | Refuse a contract the chart would refuse. Every generator runs it first |
 | `DeploymentContract::with_dev_profile()` | Clone with `ImageProfile::Development` |
 | `DeploymentContract::to_json()` / `to_yaml()` | Serialise for CI consumption |
 | `DeploymentContract::binary()` | Effective binary name (falls back to `app_name`) |
@@ -485,7 +478,7 @@ reference carries no codename.
 | `OciLabels` | Static OCI labels (`title`, `description`, `vendor`, `licenses`, `copyright`) and `label_namespace` |
 | `NativeDepsContract` | Runtime APT packages -- see [native-deps.md](native-deps.md) |
 | `KedaContract` | Autoscaling thresholds -- see [keda.md](keda.md) |
-| `DEFAULT_BASE_IMAGE` / `DEFAULT_LABEL_NAMESPACE` | Defaults used when the cascade or the contract is silent |
+| `DEFAULT_BASE_IMAGE` / `DEFAULT_LABEL_NAMESPACE` / `DEFAULT_METRICS_PORT` | Defaults used when the cascade or the contract is silent |
 | `image_registry_from_cascade()` / `base_image_from_cascade()` | Cascade readers |
 | `Capability` / `FieldSpec` | Capability-catalog entry and its config fields |
 | `config_schema_json::<T>()` | Derive the JSON Schema for the app's `Config` |

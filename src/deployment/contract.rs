@@ -225,6 +225,52 @@ pub struct DeploymentContract {
     pub hot_paths: Vec<String>,
 }
 
+/// The metrics and health port a contract names when it sets none.
+pub const DEFAULT_METRICS_PORT: u16 = 9090;
+
+/// Every field at its documented default, so a consumer writes
+/// `..DeploymentContract::default()` and a field added later does not break
+/// its build.
+///
+/// `app_name`, `env_prefix`, `metric_prefix` and `image_registry` are empty,
+/// and [`validate`](Self::validate) refuses a contract until they are set.
+impl Default for DeploymentContract {
+    fn default() -> Self {
+        Self {
+            schema_version: default_schema_version(),
+            app_name: String::new(),
+            binary_name: String::new(),
+            description: String::new(),
+            metrics_port: DEFAULT_METRICS_PORT,
+            health: HealthContract::default(),
+            env_prefix: String::new(),
+            metric_prefix: String::new(),
+            config_mount_path: String::new(),
+            image_registry: String::new(),
+            extra_ports: Vec::new(),
+            unbound_listen_paths: Vec::new(),
+            entrypoint_args: Vec::new(),
+            secrets: Vec::new(),
+            default_config: None,
+            depends_on: Vec::new(),
+            keda: None,
+            base_image: default_base_image(),
+            native_deps: NativeDepsContract::default(),
+            image_profile: ImageProfile::default(),
+            oci_labels: OciLabels::default(),
+            config_schema: None,
+            capabilities: Vec::new(),
+            writable_paths: Vec::new(),
+            termination_grace_seconds: default_termination_grace_seconds(),
+            resources: ResourcesContract::default(),
+            security: SecurityContract::default(),
+            singleton: false,
+            service_account: ServiceAccount::default(),
+            hot_paths: Vec::new(),
+        }
+    }
+}
+
 /// Whether the chart gives the pod a ServiceAccount of its own.
 ///
 /// Serialised lower case: `own` or `none`.
@@ -783,7 +829,7 @@ impl SecretGroupContract {
 }
 
 /// A single environment variable sourced from a K8s Secret.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct SecretEnvContract {
     /// Full env var name (e.g., "MY_APP__KAFKA__PASSWORD").
@@ -1007,42 +1053,66 @@ mod tests {
 
     #[test]
     fn test_contract_roundtrip_json() {
+        // The spread form a consumer writes: a field added later has a default
+        // and does not break this literal.
         let contract = DeploymentContract {
             app_name: "roundtrip".into(),
             metrics_port: 8080,
-            health: HealthContract::default(),
             env_prefix: "RT".into(),
             metric_prefix: "rt".into(),
             config_mount_path: "/config.yaml".into(),
-            keda: None,
-            binary_name: String::new(),
-            description: String::new(),
             image_registry: "registry.example.com".into(),
-            extra_ports: vec![],
-            unbound_listen_paths: vec![],
-            entrypoint_args: vec![],
-            secrets: vec![],
-            default_config: None,
-            depends_on: vec![],
-            base_image: "ubuntu:24.04".into(),
-            native_deps: NativeDepsContract::default(),
-            image_profile: ImageProfile::default(),
-            schema_version: 3,
-            oci_labels: OciLabels::default(),
-            config_schema: None,
-            capabilities: vec![],
-            writable_paths: vec![],
-            termination_grace_seconds: 45,
-            resources: ResourcesContract::default(),
-            security: SecurityContract::default(),
-            singleton: false,
-            service_account: ServiceAccount::Own,
-            hot_paths: vec![],
+            ..DeploymentContract::default()
         };
         let json = contract.to_json().unwrap();
         let parsed: DeploymentContract = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.app_name, "roundtrip");
         assert_eq!(parsed.metrics_port, 8080);
+        contract
+            .validate()
+            .expect("the spread form with the required fields set is valid");
+    }
+
+    /// `Default` and the serde field defaults are two statements of one
+    /// contract, so JSON naming only the required fields reads back as
+    /// `Default` with those fields set.
+    #[test]
+    fn default_agrees_with_the_serde_field_defaults() {
+        let minimal = serde_json::json!({
+            "app_name": "minimal",
+            "metrics_port": DEFAULT_METRICS_PORT,
+            "health": HealthContract::default(),
+            "env_prefix": "MINIMAL",
+            "metric_prefix": "minimal",
+            "keda": null,
+        });
+        let read: DeploymentContract = serde_json::from_value(minimal).unwrap();
+        let spread = DeploymentContract {
+            app_name: "minimal".into(),
+            env_prefix: "MINIMAL".into(),
+            metric_prefix: "minimal".into(),
+            ..DeploymentContract::default()
+        };
+        assert_eq!(read.to_json().unwrap(), spread.to_json().unwrap());
+    }
+
+    #[test]
+    fn a_default_contract_is_refused_until_its_required_fields_are_set() {
+        let cases = [
+            ("all defaults", DeploymentContract::default()),
+            (
+                "no image registry",
+                DeploymentContract {
+                    app_name: "app".into(),
+                    env_prefix: "APP".into(),
+                    metric_prefix: "app".into(),
+                    ..DeploymentContract::default()
+                },
+            ),
+        ];
+        for (name, contract) in cases {
+            assert!(contract.validate().is_err(), "{name} must be refused");
+        }
     }
 
     #[test]

@@ -123,7 +123,7 @@ Dockerfile fragment (suite `bookworm`, from a trixie base):
 # Apt versions are unpinned because Debian drops superseded ones, so the digest-pinned base is what fixes the release.
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl netcat-openbsd iputils-ping gnupg \
+    ca-certificates curl gnupg \
     && curl -fsSL https://packages.confluent.io/clients/deb/archive.key -o /tmp/repo-key.asc \
     && gpg --show-keys --with-colons --with-fingerprint /tmp/repo-key.asc \
        > /tmp/repo-key.info \
@@ -136,6 +136,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        > /etc/apt/sources.list.d/confluent-clients.list \
     && apt-get update && apt-get install -y --no-install-recommends \
        librdkafka1 libssl3t64 zlib1g \
+    && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 ```
 
@@ -242,9 +243,9 @@ when the dependency is absent -- no panic, no surprise build break.
 ## Empty by default
 
 `NativeDepsContract::default()` is empty. A contract that doesn't
-populate `native_deps` gives a Dockerfile with only base packages
-(`ca-certificates`, `curl`, `netcat-openbsd`, `iputils-ping`). Apps
-opt in by populating the field, usually via `for_scalo_features()`.
+populate `native_deps` gives a production Dockerfile with
+`ca-certificates` alone. Apps opt in by populating the field, usually via
+`for_scalo_features()`.
 
 A pure-Rust-feature service shouldn't carry unused system libraries.
 Opt-in keeps the image lean.
