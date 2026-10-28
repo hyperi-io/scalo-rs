@@ -201,7 +201,7 @@ ways:
   reason, and carries on.
 
 Nothing times a KIP-848 consumer out. `kafka.consumer_protocol_probe_ms` is
-still parsed and has no effect. A producer-only transport joins no group.
+still parsed and has no effect. A transport with no consumer joins no group.
 
 ### A fatal client is rebuilt, unless it was fenced
 
@@ -240,16 +240,25 @@ applies its own default, `uniform`.
 
 ## Internal consumer groups and broker ACLs
 
-librdkafka will not build a consumer without a `group.id`, and a consumer asks the broker for its group's coordinator as soon as it connects, whether or not it ever subscribes. A broker that grants groups by prefix refuses that lookup for any group outside the prefix, and logs it as `GroupAuthorizationFailed`. So the two consumers scalo builds for its own use take a group id derived from the app's config, never a fixed literal:
+librdkafka will not build a consumer without a `group.id`, and a consumer asks the broker for its group's coordinator as soon as it connects, whether or not it ever subscribes. A broker that grants groups by prefix refuses that lookup for any group outside the prefix, and logs it as `GroupAuthorizationFailed`. So the consumer scalo builds for its own use takes a group id derived from the app's config, never a fixed literal:
 
 | Client | Group id | Joins or commits |
 | --- | --- | --- |
 | `KafkaAdmin` offset-query consumer (also behind topic auto-discovery) | `<group>-admin`, or `<client_id>-admin` when `group` is empty | Never |
-| Idle consumer of a producer-only transport | `<client_id>-producer-only` | Never |
 
-An app granted `myapp-*` with `group: myapp-consumer` gets `myapp-consumer-admin`, and a producer with `client_id: myapp-producer` gets `myapp-producer-producer-only`, both inside the grant. With `group` and `client_id` both empty the anchor is the default client id, `scalo`.
+An app granted `myapp-*` with `group: myapp-consumer` gets `myapp-consumer-admin`, inside the grant. With `group` and `client_id` both empty the anchor is the default client id, `scalo`.
 
-An empty `group` is what marks a transport producer-only. It subscribes to nothing even when `topics` is set -- subscribing would join the stand-in group with a member that is never polled.
+## Which clients a transport builds
+
+A direction the app does not use builds no client, so it opens no broker connection and runs no librdkafka threads.
+
+| Constructor | Consumer | Producer |
+| --- | --- | --- |
+| `KafkaTransport::receiver` (the factory's `AnyReceiver`) | Always. An empty `group` is refused as `Config` | Never |
+| `KafkaTransport::sender` (the factory's `AnySender`) | Never, whatever `group` and `topics` hold | Always |
+| `KafkaTransport::new` | When `group` is set | Always |
+
+A transport with no consumer subscribes to nothing even when `topics` is set. Its `recv` and commits return `TransportError::Config`, and `stats()` is empty. A `send` or `send_batch` on a transport with no producer is `SendResult::Fatal(TransportError::Config)`. Both refusals stop the app rather than retrying.
 
 ---
 

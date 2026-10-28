@@ -209,7 +209,8 @@ pub struct KafkaTransport {
     /// a client replaced after a fatal error is the one the actuator pauses.
     /// Every `Consumer` method used takes `&self`; the lock guards only the
     /// swap, and each caller works on an `Arc` clone of the current client.
-    consumer: SharedConsumer,
+    /// `None` on a transport that only sends.
+    consumer: Option<SharedConsumer>,
     /// The resolved config the consumer was built from, kept to rebuild it.
     /// Boxed: it is read only on a rebuild, and inline it makes the transport
     /// the oversized variant of every receiver enum that holds it.
@@ -223,7 +224,8 @@ pub struct KafkaTransport {
     rebuild_latch: classify::DegradedLatch,
     /// Latches the fenced-member error to one line.
     fenced_latch: classify::DegradedLatch,
-    producer: FutureProducer<StatsContext>,
+    /// `None` on a transport that only receives.
+    producer: Option<FutureProducer<StatsContext>>,
     /// Persistent topic-string interner. Shared across `recv()` calls so a
     /// newly-discovered topic is interned once (not re-`Arc`'d every batch) --
     /// the previous per-recv clone discarded new entries. RwLock: reads
@@ -377,25 +379,6 @@ fn settle_stale_poll(polled: Polled) -> Polled {
     }
 }
 
-/// Role naming a producer-only transport's idle consumer in its derived group id.
-const PRODUCER_ONLY_GROUP_ROLE: &str = "producer-only";
-
-/// Resolve the group.id to set on the consumer client: the caller's group when
-/// set, else a stand-in for a producer-only transport.
-///
-/// librdkafka >= 2.x rejects an empty group.id at consumer creation, and the
-/// consumer queries the stand-in's coordinator on connect, so the stand-in is
-/// derived from the config (see [`KafkaConfig::internal_group_id`]) to sit
-/// under the prefix the broker's group ACLs grant. A producer-only transport
-/// never subscribes, so the stand-in group is never joined.
-fn effective_consumer_group_id(config: &KafkaConfig) -> String {
-    if config.group.is_empty() {
-        config.internal_group_id(PRODUCER_ONLY_GROUP_ROLE)
-    } else {
-        config.group.clone()
-    }
-}
-
 /// Build the consumer's librdkafka config for one group protocol.
 ///
 /// Every documented layer runs first -- explicit fields, profile defaults, the
@@ -403,20 +386,12 @@ fn effective_consumer_group_id(config: &KafkaConfig) -> String {
 /// LAST, because under `consumer` librdkafka refuses the client outright if a
 /// classic-only property was set by any of them.
 ///
-/// A producer-only config (empty `group`) gets `statistics.interval.ms=0`
-/// whatever the layers set: its consumer is never polled. The producer's own
-/// statistics are unaffected.
+/// Only a transport with a `group` builds a consumer.
 fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> ClientConfig {
     let mut client_config = ClientConfig::new();
 
     client_config.set("bootstrap.servers", config.brokers.join(","));
-    // librdkafka >= 2.x refuses to create a consumer client with an EMPTY
-    // group.id -- `rd_kafka_poll_set_consumer` returns "consumer queue not
-    // available". A producer-only transport legitimately carries no consumer
-    // group (callers signal this by clearing `config.group`), but the
-    // constructor still builds a consumer client (it is non-optional). See
-    // effective_consumer_group_id for the stand-in.
-    client_config.set("group.id", effective_consumer_group_id(config));
+    client_config.set("group.id", &config.group);
     // Static membership (KIP-345): opt-in, must be unique per replica.
     if let Some(ref id) = config.group_instance_id {
         client_config.set("group.instance.id", id);
@@ -500,10 +475,7 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
         client_config.set("client.rack", rack);
     }
 
-    if config.group.is_empty() {
-        // Nothing polls a producer-only consumer, so its statistics events would queue unread.
-        client_config.set("statistics.interval.ms", "0");
-    } else if client_config.get("statistics.interval.ms").is_none() {
+    if client_config.get("statistics.interval.ms").is_none() {
         // Ensure statistics callbacks fire (all profiles already set this, but
         // guarantee it as a fallback for manual configs).
         client_config.set("statistics.interval.ms", "5000");
@@ -896,7 +868,7 @@ fn redact_value(text: &str, value: &str) -> String {
 }
 
 /// Subscribe the consumer to `topics`, or do nothing when the list is empty
-/// (the producer-only case).
+/// (a transport whose `group` subscribes it to nothing yet).
 fn subscribe_consumer(
     consumer: &BaseConsumer<StatsContext>,
     topics: &[String],
@@ -937,6 +909,13 @@ const REVOKE_STAGE_RECEIVE: &str = "receive";
 /// The `stage` of a record a caller discarded from its own buffer.
 const REVOKE_STAGE_BUFFER: &str = "buffer";
 
+/// The refusal of a send on a transport built by [`KafkaTransport::receiver`].
+fn receive_only() -> TransportError {
+    TransportError::Config(
+        "this kafka transport only receives: it was built without a producer".into(),
+    )
+}
+
 /// Count `records` a revoke kept from a write, by where they were discarded.
 fn count_revoke_discarded(stage: &'static str, records: u64) {
     #[cfg(feature = "metrics")]
@@ -952,8 +931,43 @@ fn count_revoke_discarded(stage: &'static str, records: u64) {
     let _ = (stage, records);
 }
 
+/// The directions a transport serves. A direction it does not serve builds no
+/// librdkafka client, so it opens no broker connections and runs no threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// A producer always, and a consumer when `group` is set.
+    Both,
+    /// A consumer only. `group` must be set.
+    Receive,
+    /// A producer only, whatever `group` and `topics` hold.
+    Send,
+}
+
 impl KafkaTransport {
-    /// Create a new high-throughput Kafka transport.
+    /// A transport that consumes and produces: a producer always, and a
+    /// consumer when `group` is set. Use [`receiver`](Self::receiver) or
+    /// [`sender`](Self::sender) for a transport that only goes one way.
+    ///
+    /// # Errors
+    ///
+    /// As [`receiver`](Self::receiver), less the empty-`group` refusal.
+    pub async fn new(config: &KafkaConfig) -> TransportResult<Self> {
+        Self::build(config, Role::Both).await
+    }
+
+    /// A transport that only sends: it builds no consumer, whatever `group`
+    /// and `topics` hold. [`recv`](TransportReceiver::recv) and commits on it
+    /// return `TransportError::Config`.
+    ///
+    /// # Errors
+    ///
+    /// As [`receiver`](Self::receiver), less the empty-`group` refusal.
+    pub async fn sender(config: &KafkaConfig) -> TransportResult<Self> {
+        Self::build(config, Role::Send).await
+    }
+
+    /// A transport that only receives, built with no producer.
+    /// [`send`](TransportSender::send) on it is `SendResult::Fatal`.
     ///
     /// The transport is optimized for batch consumption at PB/day scale.
     /// Configuration defaults are tuned for high throughput:
@@ -973,44 +987,57 @@ impl KafkaTransport {
     ///
     /// # Errors
     ///
-    /// `TransportError::Config` when the provider preset or
-    /// [`KafkaConfig::validate`] refuses the config, before any client is
+    /// `TransportError::Config` when `group` is empty, when the provider preset
+    /// or [`KafkaConfig::validate`] refuses the config, before any client is
     /// built, and when librdkafka refuses a key, a value or their combination
-    /// while building the consumer or producer. `TransportError::Connection`
-    /// when librdkafka cannot start a client's threads.
-    /// `TransportError::Admin` when auto-discovery with `topic_refresh_secs: 0`
-    /// cannot list the broker's topics.
+    /// while building a client. `TransportError::Connection` when librdkafka
+    /// cannot start a client's threads. `TransportError::Admin` when
+    /// auto-discovery with `topic_refresh_secs: 0` cannot list the broker's
+    /// topics.
+    pub async fn receiver(config: &KafkaConfig) -> TransportResult<Self> {
+        Self::build(config, Role::Receive).await
+    }
+
     // Large but linear constructor (config -> client -> subscribe -> assemble),
     // over the 150-line soft cap with the config building already factored out.
     #[allow(clippy::too_many_lines)]
-    pub async fn new(config: &KafkaConfig) -> TransportResult<Self> {
+    async fn build(config: &KafkaConfig, role: Role) -> TransportResult<Self> {
         let owned = checked_config(config)?;
         let config = &owned;
+        if role == Role::Receive && config.group.is_empty() {
+            return Err(TransportError::Config(
+                "a receiving kafka transport needs a consumer group: set `group`".into(),
+            ));
+        }
+        let reads = role != Role::Send && !config.group.is_empty();
+        if !reads && (!config.topics.is_empty() || config.auto_discover) {
+            tracing::debug!(
+                topics = ?config.topics,
+                "kafka: this transport only sends, so it builds no consumer and subscribes to nothing"
+            );
+        }
 
         // StatsContext receives librdkafka statistics callbacks and auto-emits
         // rdkafka_* Prometheus metrics when a recorder is installed.
         // Consumer and producer each get their own context instance.
         let protocol = config.effective_consumer_protocol();
-        let consumer_config = consumer_client_config(config, protocol);
+        let consumer_config = reads.then(|| consumer_client_config(config, protocol));
         // librdkafka defaults this off, so only an explicit `true` counts.
-        let auto_create_topics = consumer_config.get("allow.auto.create.topics") == Some("true");
+        let auto_create_topics = consumer_config
+            .as_ref()
+            .is_some_and(|c| c.get("allow.auto.create.topics") == Some("true"));
         let auth = Arc::new(classify::AuthState::default());
-        let consumer = create_consumer(&consumer_config, &auth)?;
+        let consumer = consumer_config
+            .as_ref()
+            .map(|c| create_consumer(c, &auth))
+            .transpose()?;
 
         // Resolve effective topics:
-        // - Empty group -> producer-only: no subscription, whatever `topics` holds
+        // - No consumer -> no subscription, whatever `topics` holds
         // - Explicit list -> subscribe to those
         // - Empty + auto_discover -> auto-discover from broker
-        // - Empty + !auto_discover -> no subscription (producer-only)
-        let (effective_topics, topic_refresh, shutdown_token) = if config.group.is_empty() {
-            // Subscribing here would join the producer-only stand-in group.
-            if !config.topics.is_empty() || config.auto_discover {
-                tracing::debug!(
-                    topics = ?config.topics,
-                    "kafka: group is empty, so this transport is producer-only and \
-                     subscribes to nothing"
-                );
-            }
+        // - Empty + !auto_discover -> no subscription
+        let (effective_topics, topic_refresh, shutdown_token) = if !reads {
             (Vec::new(), None, tokio_util::sync::CancellationToken::new())
         } else if config.topics.is_empty() && config.auto_discover {
             tracing::info!("Topics empty -- auto-discovering from broker");
@@ -1066,7 +1093,9 @@ impl KafkaTransport {
         };
 
         let subscribed_topics = effective_topics;
-        subscribe_consumer(&consumer, &subscribed_topics)?;
+        if let Some(consumer) = &consumer {
+            subscribe_consumer(consumer, &subscribed_topics)?;
+        }
 
         // Pre-populate topic cache -- eliminates locks in the hot path.
         let mut topic_cache = HashMap::with_capacity(subscribed_topics.len());
@@ -1081,9 +1110,15 @@ impl KafkaTransport {
             .unwrap_or(LIBRDKAFKA_MESSAGE_MAX_BYTES);
 
         // Create producer with StatsContext for metrics collection.
-        let producer: FutureProducer<StatsContext> = producer_config
-            .create_with_context(StatsContext::new().sharing(Arc::clone(&auth)))
-            .map_err(|e| client_build_error("producer", &e))?;
+        let producer: Option<FutureProducer<StatsContext>> = if role == Role::Receive {
+            None
+        } else {
+            Some(
+                producer_config
+                    .create_with_context(StatsContext::new().sharing(Arc::clone(&auth)))
+                    .map_err(|e| client_build_error("producer", &e))?,
+            )
+        };
 
         let healthy = Arc::new(AtomicBool::new(true));
 
@@ -1125,11 +1160,13 @@ impl KafkaTransport {
         }
 
         Ok(Self {
-            consumer: Arc::new(parking_lot::RwLock::new(ConsumerSlot {
-                client: consumer,
-                protocol,
-                epoch: 0,
-            })),
+            consumer: consumer.map(|client| {
+                Arc::new(parking_lot::RwLock::new(ConsumerSlot {
+                    client,
+                    protocol,
+                    epoch: 0,
+                }))
+            }),
             config: Box::new(owned.clone()),
             rebuilds: std::sync::atomic::AtomicU32::new(0),
             rebuild_not_before: parking_lot::Mutex::new(None),
@@ -1158,7 +1195,7 @@ impl KafkaTransport {
             #[cfg(all(feature = "governor", feature = "health"))]
             partition_limited_flag,
             #[cfg(feature = "governor")]
-            paused_ends: PausedEnds::new(&consumer_config),
+            paused_ends: PausedEnds::new(consumer_config.as_ref()),
             acks: acks::KafkaAcks::default(),
             message_max_bytes,
         })
@@ -1230,20 +1267,40 @@ impl KafkaTransport {
     #[must_use]
     pub fn gate_actuator(&self) -> Box<dyn crate::governor::GateActuator> {
         Box::new(KafkaGateActuator {
-            consumer: Arc::clone(&self.consumer),
+            consumer: self.consumer.clone(),
         })
     }
 
-    /// The current consumer client.
+    /// The current consumer client, `None` on a transport that only sends.
+    fn client(&self) -> Option<Arc<BaseConsumer<StatsContext>>> {
+        self.consumer
+            .as_ref()
+            .map(|slot| Arc::clone(&slot.read().client))
+    }
+
+    /// The current consumer client, refused on a transport that only sends.
+    fn receiving_client(&self) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
+        self.client().ok_or_else(|| {
+            TransportError::Config(
+                "this kafka transport only sends: it was built without a consumer".into(),
+            )
+        })
+    }
+
+    /// The current consumer client, for a test that built one.
+    #[cfg(test)]
     fn consumer(&self) -> Arc<BaseConsumer<StatsContext>> {
-        Arc::clone(&self.consumer.read().client)
+        self.client().expect("the transport has a consumer")
     }
 
     /// The consumer-group protocol the consumer is joined with now: the one
     /// requested, or `classic` once the transport has fallen back to it.
     #[must_use]
     pub fn group_protocol(&self) -> ConsumerProtocol {
-        self.consumer.read().protocol
+        self.consumer.as_ref().map_or_else(
+            || self.config.effective_consumer_protocol(),
+            |slot| slot.read().protocol,
+        )
     }
 
     /// The lease this consumer holds `topic`/`partition` under, or `None`
@@ -1284,7 +1341,7 @@ impl KafkaTransport {
     /// ```
     #[must_use]
     pub fn lease(&self, topic: &str, partition: i32) -> Option<PartitionLease> {
-        let slot = self.consumer.read();
+        let slot = self.consumer.as_ref()?.read();
         slot.client
             .context()
             .assignment(topic, partition)
@@ -1348,10 +1405,15 @@ impl KafkaTransport {
         } else {
             tracing::debug!(protocol = %protocol, reason, "kafka: rebuilding the consumer again");
         }
+        let Some(shared) = &self.consumer else {
+            return Err(TransportError::Config(
+                "this kafka transport only sends: it has no consumer to rebuild".into(),
+            ));
+        };
         let client = create_consumer(&consumer_client_config(&self.config, protocol), &self.auth)?;
         subscribe_consumer(&client, &self.subscribed_topics.read())?;
         let old = {
-            let mut slot = self.consumer.write();
+            let mut slot = shared.write();
             let epoch = slot.epoch.saturating_add(1);
             std::mem::replace(
                 &mut *slot,
@@ -1448,7 +1510,10 @@ impl KafkaTransport {
     /// broker RTT, consumer lag, rebalance count, etc.
     #[must_use]
     pub fn stats(&self) -> KafkaMetrics {
-        self.consumer().context().get_metrics()
+        self.client()
+            .map_or_else(KafkaMetrics::default, |consumer| {
+                consumer.context().get_metrics()
+            })
     }
 
     /// Records past this consumer's read position, summed over its assigned
@@ -1456,7 +1521,8 @@ impl KafkaTransport {
     /// inflate. See [`StatsContext::total_position_lag`].
     #[must_use]
     pub fn total_position_lag(&self) -> i64 {
-        self.consumer().context().total_position_lag()
+        self.client()
+            .map_or(0, |consumer| consumer.context().total_position_lag())
     }
 
     /// Run the `kafka_partition_limited` DIAGNOSTIC against the live group
@@ -1480,7 +1546,9 @@ impl KafkaTransport {
     /// Returns an error if the broker metadata / group-list fetch fails.
     #[cfg(feature = "governor")]
     pub fn check_partition_limited(&self) -> TransportResult<bool> {
-        let consumer = self.consumer();
+        let Some(consumer) = self.client() else {
+            return Ok(false);
+        };
         // Total consumer lag across all assigned partitions.
         let metrics = consumer.context().get_metrics();
         let lag = u64::try_from(total_consumer_lag(&metrics).max(0)).unwrap_or(0);
@@ -1613,12 +1681,12 @@ impl KafkaTransport {
         payload: &[u8],
         headers: Option<&OwnedHeaders>,
     ) -> Result<DeliveryFuture, SendResult> {
+        let Some(producer) = &self.producer else {
+            return Err(SendResult::Fatal(receive_only()));
+        };
         let mut queue_full_since: Option<std::time::Instant> = None;
         loop {
-            match self
-                .producer
-                .send_result(produce_record(destination, payload, headers))
-            {
+            match producer.send_result(produce_record(destination, payload, headers)) {
                 Ok(delivery) => return Ok(delivery),
                 Err((err, _)) => {
                     let queue_full =
@@ -1782,6 +1850,9 @@ impl TransportSender for KafkaTransport {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
+        let Some(producer) = &self.producer else {
+            return SendResult::Fatal(receive_only());
+        };
 
         if let Some(settled) = self.outbound_disposition(&payload) {
             return settled;
@@ -1796,7 +1867,7 @@ impl TransportSender for KafkaTransport {
         let result = self.delivery_result(
             destination,
             payload.len(),
-            self.producer
+            producer
                 .send(record, Timeout::After(QUEUE_FULL_TIMEOUT))
                 .await,
         );
@@ -1849,6 +1920,9 @@ impl TransportSender for KafkaTransport {
         }
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
+        }
+        if self.producer.is_none() {
+            return SendResult::Fatal(receive_only());
         }
 
         let headers = trace_headers();
@@ -2092,7 +2166,7 @@ impl KafkaTransport {
         let started = std::time::Instant::now();
         let mut failures = 0_u32;
         loop {
-            let consumer = self.consumer();
+            let consumer = self.receiving_client()?;
             let (returned, result) = tokio::task::spawn_blocking(move || {
                 let result = consumer.commit(&tpl, CommitMode::Sync);
                 (tpl, result)
@@ -2150,7 +2224,7 @@ impl KafkaTransport {
         }
 
         self.wait_rebuild_backoff().await?;
-        let consumer = self.consumer();
+        let consumer = self.receiving_client()?;
         if let Some((code, detail)) = fatal_error(&consumer) {
             return self.replace_fatal_consumer(code, &detail);
         }
@@ -2414,7 +2488,7 @@ impl KafkaTransport {
             return Ok(());
         }
         let tpl = build_commit_tpl(tokens)?;
-        self.consumer()
+        self.receiving_client()?
             .commit(&tpl, CommitMode::Async)
             .map_err(|e| TransportError::Commit(e.to_string()))?;
         Ok(())
@@ -2847,20 +2921,25 @@ impl PollJob {
 /// ingesting", never a deadlock.
 #[cfg(feature = "governor")]
 struct KafkaGateActuator {
-    consumer: SharedConsumer,
+    /// `None` for a transport that only sends: pause and resume do nothing.
+    consumer: Option<SharedConsumer>,
 }
 
 #[cfg(feature = "governor")]
 impl KafkaGateActuator {
-    fn client(&self) -> Arc<BaseConsumer<StatsContext>> {
-        Arc::clone(&self.consumer.read().client)
+    fn client(&self) -> Option<Arc<BaseConsumer<StatsContext>>> {
+        self.consumer
+            .as_ref()
+            .map(|slot| Arc::clone(&slot.read().client))
     }
 }
 
 #[cfg(feature = "governor")]
 impl crate::governor::GateActuator for KafkaGateActuator {
     fn pause(&self) {
-        let consumer = self.client();
+        let Some(consumer) = self.client() else {
+            return;
+        };
         match consumer.assignment() {
             Ok(tpl) => match consumer.pause(&tpl) {
                 Ok(()) => consumer.context().set_paused(true),
@@ -2877,7 +2956,9 @@ impl crate::governor::GateActuator for KafkaGateActuator {
     }
 
     fn resume(&self) {
-        let consumer = self.client();
+        let Some(consumer) = self.client() else {
+            return;
+        };
         match consumer.assignment() {
             Ok(tpl) => match consumer.resume(&tpl) {
                 Ok(()) => consumer.context().set_paused(false),
@@ -2920,9 +3001,9 @@ struct PausedEnds {
 
 #[cfg(feature = "governor")]
 impl PausedEnds {
-    fn new(consumer_config: &ClientConfig) -> Self {
+    fn new(consumer_config: Option<&ClientConfig>) -> Self {
         let every = consumer_config
-            .get("statistics.interval.ms")
+            .and_then(|c| c.get("statistics.interval.ms"))
             .and_then(|ms| ms.parse::<u64>().ok())
             .filter(|&ms| ms > 0)
             .map(|ms| Duration::from_millis(ms).max(PAUSED_END_FLOOR));
@@ -3110,56 +3191,93 @@ mod tests {
         client_gate::assert_builds_under_production(transport_refusal);
     }
 
-    /// A producer-only transport's consumer still asks for its group's
-    /// coordinator, so the stand-in must sit under the app's own client-id
-    /// prefix, and must never be empty (librdkafka >= 2.x refuses).
-    #[test]
-    fn producer_only_stand_in_group_derives_from_the_client_id() {
-        let producer = KafkaConfig {
-            group: String::new(),
-            client_id: "producer-a".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            effective_consumer_group_id(&producer),
-            "producer-a-producer-only"
-        );
-        let built = consumer_client_config(&producer, ConsumerProtocol::Classic);
-        assert_eq!(built.get("group.id"), Some("producer-a-producer-only"));
-
-        // A real group is passed through unchanged.
-        let consumer = KafkaConfig {
-            group: "consumer-a".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(effective_consumer_group_id(&consumer), "consumer-a");
+    /// A direction the transport does not serve builds no client: no broker
+    /// connection, no group coordinator lookup. Topics on a config with no
+    /// consumer name where it sends, so nothing subscribes. Broker-free:
+    /// construction connects lazily and nothing is polled.
+    #[tokio::test]
+    async fn each_constructor_builds_only_the_clients_its_directions_use() {
+        const NEW: u8 = 0;
+        const RECEIVER: u8 = 1;
+        const SENDER: u8 = 2;
+        // (case, constructor, group, consumer built, producer built)
+        let cases = [
+            ("new with a group", NEW, "consumer-a", true, true),
+            ("new without a group", NEW, "", false, true),
+            ("receiver", RECEIVER, "consumer-a", true, false),
+            ("sender with a group", SENDER, "consumer-a", false, true),
+            ("sender without a group", SENDER, "", false, true),
+        ];
+        for (name, constructor, group, reads, produces) in cases {
+            let config = KafkaConfig {
+                brokers: vec!["127.0.0.1:1".to_string()],
+                group: group.to_string(),
+                topics: vec!["syslog_load".to_string()],
+                ..Default::default()
+            };
+            let transport = match constructor {
+                NEW => KafkaTransport::new(&config).await,
+                RECEIVER => KafkaTransport::receiver(&config).await,
+                _ => KafkaTransport::sender(&config).await,
+            }
+            .unwrap_or_else(|e| panic!("{name}: builds broker-free: {e}"));
+            assert_eq!(transport.client().is_some(), reads, "{name}: consumer");
+            assert_eq!(transport.producer.is_some(), produces, "{name}: producer");
+            assert_eq!(
+                transport.subscribed_topics.read().is_empty(),
+                !reads,
+                "{name}: subscription"
+            );
+        }
     }
 
-    /// Topics on a producer-only config name where it sends, not what it reads:
-    /// subscribing would join the stand-in group and leave an idle member there.
-    /// Broker-free: construction connects lazily and nothing is polled.
+    /// Each direction a transport was built without refuses its calls as a
+    /// config error, which stops the app rather than retrying.
     #[tokio::test]
-    async fn producer_only_transport_subscribes_to_nothing() {
-        let producer = KafkaConfig {
+    async fn a_missing_direction_refuses_as_config() {
+        let config = |group: &str| KafkaConfig {
             brokers: vec!["127.0.0.1:1".to_string()],
-            group: String::new(),
-            client_id: "app-producer-main".to_string(),
-            topics: vec!["syslog_load".to_string()],
+            group: group.to_string(),
             ..Default::default()
         };
-        let transport = KafkaTransport::new(&producer)
-            .await
-            .expect("a producer-only transport constructs broker-free");
-        let subscription = transport
-            .consumer()
-            .subscription()
-            .expect("librdkafka reports the subscription");
-        assert_eq!(
-            subscription.count(),
-            0,
-            "a producer-only transport joined a group"
+        let refused = KafkaTransport::receiver(&config("")).await;
+        assert!(
+            matches!(refused, Err(TransportError::Config(ref m)) if m.contains("`group`")),
+            "a receiver without a group: {refused:?}"
         );
-        assert!(transport.subscribed_topics.read().is_empty());
+
+        let sender = KafkaTransport::sender(&config("consumer-a"))
+            .await
+            .expect("a sender builds broker-free");
+        let recv = sender.recv(10).await;
+        assert!(
+            matches!(recv, Err(TransportError::Config(ref m)) if m.contains("only sends")),
+            "recv on a sender: {:?}",
+            recv.err()
+        );
+        let commit = sender.commit_weak_async(&[KafkaToken::new(Arc::from("t"), 0, 1)]);
+        assert!(
+            matches!(commit, Err(TransportError::Config(_))),
+            "{commit:?}"
+        );
+        assert_eq!(sender.total_position_lag(), 0);
+
+        let receiver = KafkaTransport::receiver(&config("consumer-a"))
+            .await
+            .expect("a receiver builds broker-free");
+        let records = [batch_record(b"{}")];
+        for (name, result) in [
+            (
+                "send",
+                receiver.send("t", bytes::Bytes::from_static(b"{}")).await,
+            ),
+            ("send_batch", receiver.send_batch(&records).await),
+        ] {
+            assert!(
+                matches!(result, SendResult::Fatal(TransportError::Config(ref m)) if m.contains("only receives")),
+                "{name} on a receiver: {result:?}"
+            );
+        }
     }
 
     /// The control for the test above: the same topics with a group set DO
@@ -3454,59 +3572,34 @@ mod tests {
         }
     }
 
-    /// A producer-only transport's consumer is never polled, so every
-    /// statistics event it emitted would queue unread for the life of the
-    /// process. Its config turns them off whatever a profile or override set,
-    /// and the producer beside it keeps its own.
+    /// The transport's producer reports statistics, which feed its metrics:
+    /// 5 s unless a profile or override sets an interval.
     #[test]
-    fn a_producer_only_consumer_emits_no_statistics() {
-        let producer_only = KafkaConfig {
+    fn the_transport_producer_reports_statistics() {
+        let sender = KafkaConfig {
             brokers: vec!["127.0.0.1:1".to_string()],
-            group: String::new(),
             ..Default::default()
         };
         let cases = [
-            (producer_only.clone(), "5000"),
+            ("no layer", sender.clone(), "5000"),
             (
-                producer_only.clone().with_profile(KafkaProfile::DevTest),
+                "dev-test profile",
+                sender.clone().with_profile(KafkaProfile::DevTest),
                 "5000",
             ),
             (
-                producer_only
-                    .clone()
-                    .with_override("statistics.interval.ms", "1000"),
+                "override",
+                sender.with_override("statistics.interval.ms", "1000"),
                 "1000",
             ),
         ];
-        for (config, producer_interval) in &cases {
-            for protocol in [ConsumerProtocol::Classic, ConsumerProtocol::Consumer] {
-                let consumer = consumer_client_config(config, protocol);
-                assert_eq!(
-                    consumer.get("statistics.interval.ms"),
-                    Some("0"),
-                    "{:?} profile, {protocol}",
-                    config.profile
-                );
-            }
-            let classic = consumer_client_config(config, ConsumerProtocol::Classic);
-            assert_eq!(librdkafka_resolves(&classic, "statistics.interval.ms"), "0");
+        for (name, config, interval) in &cases {
             assert_eq!(
                 transport_producer_config(config).get("statistics.interval.ms"),
-                Some(*producer_interval),
-                "the producer's statistics feed its metrics"
+                Some(*interval),
+                "{name}"
             );
         }
-
-        // The control: a consumer that is polled keeps the profile's interval.
-        let consumer = KafkaConfig {
-            group: "events-reader".to_string(),
-            ..producer_only
-        };
-        assert_eq!(
-            consumer_client_config(&consumer, ConsumerProtocol::Classic)
-                .get("statistics.interval.ms"),
-            Some("1000")
-        );
     }
 
     /// The consumer's context counts lag to the end its own config lets it
@@ -5251,13 +5344,16 @@ mod tests {
         serve(&transport, true, 0);
         transport.consumer().context().emit_prometheus_metrics();
         // Each statistics callback ends in an emit, the producers' included.
-        transport.producer.context().stats(Statistics::default());
-        producer_only
+        transport
             .producer
+            .as_ref()
+            .expect("a producer")
             .context()
             .stats(Statistics::default());
         producer_only
-            .consumer()
+            .producer
+            .as_ref()
+            .expect("a producer")
             .context()
             .stats(Statistics::default());
 
@@ -5393,9 +5489,13 @@ mod tests {
 
         // Contexts that have served no rebalance, each reporting partition 1 with lag 0.
         let unheld = events_committed_at_5(&[(1, 0)]);
-        transport.producer.context().stats(unheld.clone());
-        producer_only.producer.context().stats(unheld.clone());
-        producer_only.consumer().context().stats(unheld);
+        for t in [&transport, &producer_only] {
+            t.producer
+                .as_ref()
+                .expect("a producer")
+                .context()
+                .stats(unheld.clone());
+        }
 
         let rendered = handle.render();
         let consumer_lag = |partition: &str| {

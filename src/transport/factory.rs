@@ -312,7 +312,7 @@ impl AnySender {
                     .kafka
                     .as_ref()
                     .ok_or_else(|| TransportError::Config("kafka config missing".into()))?;
-                let transport = super::kafka::KafkaTransport::new(kafka_config).await?;
+                let transport = super::kafka::KafkaTransport::sender(kafka_config).await?;
                 Ok(Self::Kafka(transport))
             }
 
@@ -1215,7 +1215,7 @@ impl AnyReceiver {
                     .kafka
                     .as_ref()
                     .ok_or_else(|| TransportError::Config("kafka config missing".into()))?;
-                let transport = super::kafka::KafkaTransport::new(kafka_config).await?;
+                let transport = super::kafka::KafkaTransport::receiver(kafka_config).await?;
                 Ok(Self::Kafka(transport))
             }
 
@@ -1350,7 +1350,7 @@ impl AnyReceiver {
                     .kafka
                     .as_ref()
                     .ok_or_else(|| TransportError::Config("kafka config missing".into()))?;
-                let transport = super::kafka::KafkaTransport::new(kafka_config).await?;
+                let transport = super::kafka::KafkaTransport::receiver(kafka_config).await?;
                 // Attach the inbound gate over the governor's shared pressure:
                 // pauses assigned partitions while the latch holds (member stays
                 // in the group -- no rebalance).
@@ -1557,7 +1557,7 @@ mod governor_tests {
     }
 
     /// A factory-built Kafka receiver MUST carry an inbound gate when a governor
-    /// is supplied. Broker-free: `KafkaTransport::new` lazily connects and an
+    /// is supplied. Broker-free: `KafkaTransport::receiver` lazily connects and an
     /// empty topic list means no subscribe/poll happens at construction.
     #[cfg(feature = "transport-kafka")]
     #[tokio::test]
