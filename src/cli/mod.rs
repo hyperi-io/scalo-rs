@@ -67,6 +67,8 @@ mod version;
 mod app;
 #[cfg(feature = "cli-service")]
 mod runtime;
+#[cfg(all(test, feature = "cli-service"))]
+mod test_http;
 
 pub use args::CommonArgs;
 pub use commands::StandardCommand;

@@ -38,8 +38,8 @@ flowchart TB
     C --> D["main returns<br/>process exits"]
 ```
 
-The shutdown module does signal + delay + cancel and nothing else. Neither it nor
-`ServiceRuntime` touches readiness, so `/readyz` answers from the readiness
+The shutdown module does signal + delay + cancel and nothing else. Nothing in
+the shutdown path touches readiness, so `/readyz` answers from the readiness
 callback and the health registry throughout. The one flag that does clear is
 `HttpServer`'s, when the cancelled token stops it -- see [health.md](health.md).
 An app that wants `/readyz` to fail while it drains wires that itself.
