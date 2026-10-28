@@ -55,7 +55,7 @@ flowchart TB
 | `Fatal(e)` | `Err(TieredSinkError::Sink)` to the caller | None. Not spooled |
 | No answer within `send_timeout_ms` | Spool to disk | Failure recorded and counted in `spool_circuit_trips_total`, may open the circuit |
 
-The sink reads the `SendResult` every `TransportSender` already returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for is dropped and logged.
+The sink reads the `SendResult` every `TransportSender` already returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for is dropped and logged, unless the error is `TransportError::Config` or `Closed`. Those describe the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
 
 ---
 
@@ -197,7 +197,7 @@ Alert on:
 - `1 - spool_disk_available_bytes / spool_disk_total_bytes` nearing `max_usage_percent`. Spool writes then return `DiskUnavailable`.
 - `spool_quarantined_total` above 0. A spill cache was set aside and its records are not replayed.
 
-No metric counts a `SpoolFull` or `DiskUnavailable` error, which goes back to the caller, or a record the drainer discards (a CRC, decompression or decode failure, or a `Fatal` answer), which is logged at error level.
+No metric counts a `SpoolFull` or `DiskUnavailable` error, which goes back to the caller, or a record the drainer discards (a CRC, decompression or decode failure, or a `Fatal` answer about the record itself), which is logged at error level.
 
 ---
 

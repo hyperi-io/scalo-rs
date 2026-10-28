@@ -219,6 +219,11 @@ A fenced static member (`FENCED_INSTANCE_ID`: another consumer holds its
 consumer back. Every `recv` returns `TransportError::Recv` and `/readyz` fails:
 this instance has to stop.
 
+A broker that refuses the client's credentials or TLS setup, with no broker
+having accepted them yet, also fails `/readyz` until one does. That covers the
+consumer and the producer alike: see
+[Refused credentials](transport/backends.md#refused-credentials).
+
 Any other error `recv` returns leaves `/readyz` alone. A caller that treats an
 error plus an unhealthy transport as closed would otherwise stop over a topic
 that is only briefly gone, as a removed source's is.

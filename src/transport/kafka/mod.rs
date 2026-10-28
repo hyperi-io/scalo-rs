@@ -236,6 +236,10 @@ pub struct KafkaTransport {
     /// fenced member, a failed rebuild and a second rebuild with no record
     /// between clear it; a record sets it again, except after `close()`.
     healthy: Arc<AtomicBool>,
+    /// Whether the broker refuses this transport's credentials or TLS setup,
+    /// shared by its producer and every consumer it builds. A refusal fails
+    /// readiness, and turns a send that would only time out into `Fatal`.
+    auth: Arc<classify::AuthState>,
     /// Latches a sustained retryable send failure so the warn fires on the edge,
     /// not once per record.
     send_degraded: classify::DegradedLatch,
@@ -798,8 +802,11 @@ fn apply_group_protocol(client_config: &mut ClientConfig, protocol: ConsumerProt
 /// and labels its `consumer_` series with the group `client_config` joins.
 fn create_consumer(
     client_config: &ClientConfig,
+    auth: &Arc<classify::AuthState>,
 ) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
-    let context = StatsContext::new().reading(metrics::Isolation::of(client_config));
+    let context = StatsContext::new()
+        .sharing(Arc::clone(auth))
+        .reading(metrics::Isolation::of(client_config));
     #[cfg(feature = "metrics")]
     let context = context.in_group(client_config.get("group.id"));
     client_config
@@ -985,7 +992,8 @@ impl KafkaTransport {
         let consumer_config = consumer_client_config(config, protocol);
         // librdkafka defaults this off, so only an explicit `true` counts.
         let auto_create_topics = consumer_config.get("allow.auto.create.topics") == Some("true");
-        let consumer = create_consumer(&consumer_config)?;
+        let auth = Arc::new(classify::AuthState::default());
+        let consumer = create_consumer(&consumer_config, &auth)?;
 
         // Resolve effective topics:
         // - Empty group -> producer-only: no subscription, whatever `topics` holds
@@ -1072,7 +1080,7 @@ impl KafkaTransport {
 
         // Create producer with StatsContext for metrics collection.
         let producer: FutureProducer<StatsContext> = producer_config
-            .create_with_context(StatsContext::new())
+            .create_with_context(StatsContext::new().sharing(Arc::clone(&auth)))
             .map_err(|e| client_build_error("producer", &e))?;
 
         let healthy = Arc::new(AtomicBool::new(true));
@@ -1086,8 +1094,9 @@ impl KafkaTransport {
         #[cfg(feature = "health")]
         {
             let h = Arc::clone(&healthy);
+            let refused = Arc::clone(&auth);
             crate::health::HealthRegistry::register("transport:kafka", move || {
-                if h.load(Ordering::Relaxed) {
+                if h.load(Ordering::Relaxed) && !refused.is_refused() {
                     crate::health::HealthStatus::Healthy
                 } else {
                     crate::health::HealthStatus::Unhealthy
@@ -1129,6 +1138,7 @@ impl KafkaTransport {
             in_flight: tokio::sync::Mutex::new(None),
             closed: AtomicBool::new(false),
             healthy,
+            auth,
             send_degraded: classify::DegradedLatch::default(),
             recv_state: classify::RecvState::default(),
             deferred_recv_error: parking_lot::Mutex::new(None),
@@ -1336,7 +1346,7 @@ impl KafkaTransport {
         } else {
             tracing::debug!(protocol = %protocol, reason, "kafka: rebuilding the consumer again");
         }
-        let client = create_consumer(&consumer_client_config(&self.config, protocol))?;
+        let client = create_consumer(&consumer_client_config(&self.config, protocol), &self.auth)?;
         subscribe_consumer(&client, &self.subscribed_topics.read())?;
         let old = {
             let mut slot = self.consumer.write();
@@ -1638,6 +1648,7 @@ impl KafkaTransport {
                     ::metrics::counter!("transport_sent_bytes_total", "transport" => "kafka")
                         .increment(bytes as u64);
                 }
+                self.auth.mark_proven();
                 if self.send_degraded.clear() {
                     tracing::info!(destination, "kafka send recovered");
                 }
@@ -1649,7 +1660,23 @@ impl KafkaTransport {
 
     /// Classify a failed produce, at enqueue or in the delivery report.
     fn failure_result(&self, destination: &str, bytes: usize, err: &KafkaError) -> SendResult {
-        match classify::classify_send_failure(err) {
+        let class = classify::classify_send_failure(err);
+        // A full queue or a timed-out record is what a refused client looks like
+        // from the producer: nothing is delivered, whatever the cause. The
+        // error callback has named the cause, and no retry clears it.
+        if matches!(
+            class,
+            classify::SendFailure::QueueFull | classify::SendFailure::Retryable
+        ) && let Some(refusal) = self.auth.refusal()
+        {
+            #[cfg(feature = "metrics")]
+            ::metrics::counter!("transport_send_errors_total", "transport" => "kafka").increment(1);
+            return SendResult::Fatal(TransportError::Config(format!(
+                "kafka refused this client's credentials or TLS setup ({refusal}): \
+                 the record was not delivered"
+            )));
+        }
+        match class {
             classify::SendFailure::QueueFull => {
                 #[cfg(feature = "metrics")]
                 ::metrics::counter!(
@@ -1725,7 +1752,22 @@ impl TransportBase for KafkaTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        self.healthy.load(Ordering::Relaxed) && !self.auth.is_refused()
+    }
+
+    async fn healthcheck(&self) -> TransportResult<()> {
+        if let Some(refusal) = self.auth.refusal() {
+            return Err(TransportError::Config(format!(
+                "kafka refused this client's credentials or TLS setup ({refusal})"
+            )));
+        }
+        if self.is_healthy() {
+            Ok(())
+        } else {
+            Err(TransportError::Connection(
+                "kafka transport failed boot healthcheck (not healthy)".to_string(),
+            ))
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -2196,6 +2238,7 @@ impl KafkaTransport {
                     gate.note_received(spans.len());
                 }
                 self.recv_state.record_success();
+                self.auth.mark_proven();
                 self.rebuilds.store(0, Ordering::Relaxed);
                 if self.rebuild_latch.clear() {
                     tracing::info!("kafka: the rebuilt consumer is reading");
@@ -2780,7 +2823,8 @@ impl PollJob {
             err,
             classify::RecvContext {
                 auto_create_topics: self.auto_create_topics,
-                credentials_proven: self.received_before || self.consumer.context().has_connected(),
+                credentials_proven: self.received_before
+                    || self.consumer.context().auth().is_proven(),
             },
         )
     }
@@ -3492,7 +3536,8 @@ mod tests {
         };
         let lag_under = |config: &KafkaConfig| {
             let built = consumer_client_config(config, ConsumerProtocol::Classic);
-            let consumer = create_consumer(&built).expect("a consumer builds broker-free");
+            let consumer =
+                create_consumer(&built, &Arc::default()).expect("a consumer builds broker-free");
             consumer.context().stats(stats.clone());
             consumer.context().total_position_lag()
         };
@@ -4239,6 +4284,59 @@ mod tests {
             group: String::new(),
             ..Default::default()
         }
+    }
+
+    /// A refused client sees every record time out or queue up. Once the error
+    /// callback has named the refusal, those become `Fatal` so the caller stops
+    /// retrying, and readiness fails with the reason. A broker that accepts the
+    /// client ends the refusal. Other failures keep their class.
+    #[tokio::test]
+    async fn a_refused_client_fails_sends_and_readiness_until_a_broker_accepts_it() {
+        let transport = KafkaTransport::new(&unreachable_config())
+            .await
+            .expect("a producer-only transport constructs broker-free");
+        let produce = |code| KafkaError::MessageProduction(code);
+        let classes = |transport: &KafkaTransport| {
+            [
+                RDKafkaErrorCode::MessageTimedOut,
+                RDKafkaErrorCode::QueueFull,
+                RDKafkaErrorCode::MessageSizeTooLarge,
+                RDKafkaErrorCode::UnknownTopicOrPartition,
+            ]
+            .map(|code| transport.failure_result("t", 10, &produce(code)))
+        };
+
+        let before = classes(&transport);
+        assert!(before[0].is_backpressured() && before[1].is_backpressured());
+        assert!(transport.is_healthy());
+        assert!(transport.healthcheck().await.is_ok());
+
+        transport.auth.on_error(
+            &KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed),
+            "invalid credentials",
+        );
+        let [timed_out, queue_full, too_large, unknown_topic] = classes(&transport);
+        for refused in [&timed_out, &queue_full] {
+            assert!(
+                matches!(refused, SendResult::Fatal(TransportError::Config(m)) if m.contains("invalid credentials")),
+                "a refused client's undelivered record is Fatal, got {refused:?}"
+            );
+        }
+        assert!(
+            too_large.is_filtered_dlq(),
+            "an oversize record is still dead-lettered"
+        );
+        assert!(
+            matches!(unknown_topic, SendResult::Fatal(TransportError::Send(_))),
+            "a missing topic keeps its own error, got {unknown_topic:?}"
+        );
+        assert!(!transport.is_healthy());
+        let health = transport.healthcheck().await.expect_err("not ready");
+        assert!(health.is_fatal() && health.to_string().contains("invalid credentials"));
+
+        transport.auth.mark_proven();
+        assert!(classes(&transport)[0].is_backpressured());
+        assert!(transport.is_healthy());
     }
 
     #[test]

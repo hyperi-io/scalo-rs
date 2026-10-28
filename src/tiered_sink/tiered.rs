@@ -692,7 +692,9 @@ impl<S: TransportSender> Drop for TieredSink<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{PayloadFormat, RecordMeta, TransportBase, TransportResult};
+    use crate::transport::{
+        PayloadFormat, RecordMeta, TransportBase, TransportError, TransportResult,
+    };
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
 
@@ -727,6 +729,8 @@ mod tests {
     /// toggled unavailable to drive the spill/circuit/drain paths.
     struct TestSink {
         available: AtomicBool,
+        /// When set, every send answers `Fatal` with this error instead.
+        fatal: std::sync::Mutex<Option<fn() -> TransportError>>,
         received: Mutex<Vec<Record>>,
     }
 
@@ -734,8 +738,20 @@ mod tests {
         fn new() -> Self {
             Self {
                 available: AtomicBool::new(true),
+                fatal: std::sync::Mutex::new(None),
                 received: Mutex::new(Vec::new()),
             }
+        }
+
+        fn answer_fatal(&self, error: Option<fn() -> TransportError>) {
+            *self.fatal.lock().unwrap() = error;
+        }
+
+        fn fatal_answer(&self) -> Option<SendResult> {
+            self.fatal
+                .lock()
+                .unwrap()
+                .map(|error| SendResult::Fatal(error()))
         }
 
         fn set_available(&self, available: bool) {
@@ -771,6 +787,9 @@ mod tests {
 
     impl TransportSender for TestSink {
         async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
+            if let Some(fatal) = self.fatal_answer() {
+                return fatal;
+            }
             if self.available.load(AtomicOrdering::SeqCst) {
                 self.received.lock().await.push(rec(&payload));
                 SendResult::Ok
@@ -780,6 +799,9 @@ mod tests {
         }
 
         async fn send_batch(&self, records: &[Record]) -> SendResult {
+            if let Some(fatal) = self.fatal_answer() {
+                return fatal;
+            }
             if self.available.load(AtomicOrdering::SeqCst) {
                 let mut r = self.received.lock().await;
                 r.extend(records.iter().cloned());
@@ -892,6 +914,59 @@ mod tests {
         );
 
         tiered.shutdown().await;
+    }
+
+    /// A spooled record the sink refuses with `Fatal` is dropped when the error
+    /// is about that record, and kept when the sink itself is closed or
+    /// misconfigured: dropping then would lose the whole spool to a wrong
+    /// password.
+    #[tokio::test]
+    async fn a_fatal_drain_answer_drops_only_what_is_the_records_fault() {
+        let cases: [(&str, fn() -> TransportError, bool); 3] = [
+            (
+                "record specific",
+                || TransportError::Send("poison".into()),
+                false,
+            ),
+            (
+                "sink misconfigured",
+                || TransportError::Config("credentials refused".into()),
+                true,
+            ),
+            ("sink closed", || TransportError::Closed, true),
+        ];
+        for (name, fatal, kept) in cases {
+            let dir = tempdir().unwrap();
+            let sink = TestSink::new();
+            sink.set_available(false);
+            let tiered = TieredSink::new(sink, spilling_config(&dir.path().join("q")))
+                .await
+                .unwrap();
+            tiered.send(&rec(b"spooled")).await.unwrap();
+            assert_eq!(tiered.spool_len().await, 1, "{name}: record spooled");
+
+            tiered.inner().answer_fatal(Some(fatal));
+            tiered.inner().set_available(true);
+            // The drainer retries every few ms, so a record it keeps is offered
+            // again and again. Give it several attempts before judging.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                tiered.spool_len().await,
+                usize::from(kept),
+                "{name}: spool after the sink answered Fatal"
+            );
+
+            if kept {
+                tiered.inner().answer_fatal(None);
+                wait_for_drain(&tiered).await;
+                assert_eq!(
+                    tiered.inner().received_payloads().await,
+                    vec![b"spooled".to_vec()],
+                    "{name}: the kept record is delivered once the sink is fixed"
+                );
+            }
+            tiered.shutdown().await;
+        }
     }
 
     #[tokio::test]
