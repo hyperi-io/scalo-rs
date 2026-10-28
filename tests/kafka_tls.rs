@@ -221,12 +221,25 @@ async fn round_trip(broker: &TlsBroker, row: &Accepted) -> Result<String, String
         .create_topics(&[(topic.as_str(), 1, 1)])
         .await
         .map_err(|e| format!("create topic over {}: {e}", row.name))?;
-    let listed = tokio::task::spawn_blocking(move || admin.list_topics())
+    // A consumer that subscribes before the metadata lists the topic is told it does not exist.
+    {
+        let topic = topic.clone();
+        tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match admin.describe_topic(&topic) {
+                    Ok(info) if info.partition_count > 0 => return Ok(()),
+                    other if Instant::now() > deadline => {
+                        return Err(format!(
+                            "topic {topic} never appeared in metadata: {other:?}"
+                        ));
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(200)),
+                }
+            }
+        })
         .await
-        .map_err(|e| format!("metadata task: {e}"))?
-        .map_err(|e| format!("list topics: {e}"))?;
-    if !listed.contains(&topic) {
-        return Err(format!("topic {topic} missing from metadata {listed:?}"));
+        .map_err(|e| format!("metadata task: {e}"))??;
     }
 
     let config = client_config(broker, row.listener, &row.security, &group, &topic);

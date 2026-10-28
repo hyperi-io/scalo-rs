@@ -135,10 +135,12 @@ fn free_port() -> u16 {
             return port;
         }
     }
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|addr| addr.port())
-        .unwrap_or_else(|e| panic!("no loopback port could be bound: {e}"))
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("no loopback port could be bound: {e}"));
+    listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("no local address: {e}"))
+        .port()
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +291,7 @@ pub struct TlsBroker {
     pub sasl_ssl: String,
     /// `SSL_MTLS` listener: TLS, a client certificate required.
     pub mtls: String,
-    _scratch: tempfile::TempDir,
+    scratch: tempfile::TempDir,
 }
 
 fn server_properties(controller: u16, tls: u16, sasl_ssl: u16, mtls: u16) -> String {
@@ -407,10 +409,10 @@ impl TlsBroker {
             tls: format!("127.0.0.1:{tls}"),
             sasl_ssl: format!("127.0.0.1:{sasl_ssl}"),
             mtls: format!("127.0.0.1:{mtls}"),
-            _scratch: scratch,
+            scratch,
         };
 
-        let src = format!("{}/.", broker._scratch.path().display());
+        let src = format!("{}/.", broker.scratch.path().display());
         let dest = format!("{}:{BROKER_DIR}", broker.name);
         let copied = docker(&["cp", &src, &dest]).await?;
         if !copied.status.success() {
