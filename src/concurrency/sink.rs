@@ -987,12 +987,13 @@ mod tests {
     /// inside write_batch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn slow_drain_doesnt_block_consumer() {
+        const DRAIN: Duration = Duration::from_millis(50);
         struct SlowDrain {
             count: Arc<AtomicU64>,
         }
         impl SinkDrain<u32> for SlowDrain {
             async fn write_batch(&mut self, batch: Vec<u32>) -> Result<(), DrainError> {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(DRAIN).await;
                 self.count.fetch_add(batch.len() as u64, Ordering::SeqCst);
                 Ok(())
             }
@@ -1015,20 +1016,17 @@ mod tests {
             shutdown.clone(),
         );
 
-        // Push 200 messages while the drain takes 50ms per batch.
-        // Consumer should NOT see 50ms latencies on try_push.
-        let mut max_us: u128 = 0;
+        // A drain that leaked back would cost a whole batch drain per push. Half of one
+        // separates that from scheduler noise on a loaded runner, which reached 11ms.
+        let mut max = Duration::ZERO;
         for i in 0..200_u32 {
             let t0 = Instant::now();
             sink.try_push(i).expect("queue has space");
-            let elapsed_us = t0.elapsed().as_micros();
-            if elapsed_us > max_us {
-                max_us = elapsed_us;
-            }
+            max = max.max(t0.elapsed());
         }
         assert!(
-            max_us < 5_000,
-            "max try_push latency was {max_us}us -- slow drain leaked back to consumer",
+            max < DRAIN / 2,
+            "max try_push latency was {max:?} against a {DRAIN:?} drain -- slow drain leaked back to consumer",
         );
         shutdown.cancel();
     }
