@@ -50,4 +50,5 @@ jobs:
       tag: ${{ inputs.tag || '' }}
       from-head: ${{ inputs.from-head || '' }}
       bump: ${{ inputs.bump || 'auto' }}
+      runner-quality: namespace-profile-hyperi-amd64-8x16
     secrets: inherit
