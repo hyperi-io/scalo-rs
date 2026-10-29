@@ -20,6 +20,12 @@ release and the target before bumping.
 
 **Consumer adjustment** -- an app that uses `KafkaConfig` but builds no Kafka client swaps `transport-kafka` for `transport-kafka-config`, and keeps `transport-kafka` on the dev-dependency if its tests talk to a broker.
 
+### Lag follows the broker while the local queue is full (BEHAVIOUR CHANGE)
+
+librdkafka stops fetching a partition whose local queue holds `queued.min.messages`, or once the consumer's queue holds `queued.max.messages.kbytes`, so the end it reports stood still and `total_position_lag`, `total_consumer_lag` and the lag gauges under-read until the app worked the queue down. The transport now asks the broker for the ends then, as it already did while the gate paused the assignment, with or without the `governor` feature: one `ListOffsets` per leader, once per statistics interval and no more often than once a second.
+
+**Consumer adjustment** -- none. A KEDA trigger on lag reads the real backlog sooner.
+
 ### /readyz answers 503 until the app runs, and a paused gate is not ready (BEHAVIOUR CHANGE)
 
 A service built by `run_app` answers `/readyz` 503 `{"status":"starting"}` from the moment its metrics listener binds until `run_app` hands control to `run_service`. `ServiceApp::readiness_check` supplies the app's check before that handoff, so there is no window where the service reads ready before it has said what ready means. An idle service stays ready. With the `health` feature each inbound gate registers a `self_regulation:<source>` component that is unhealthy while the source is paused. A metrics listener that cannot bind now fails `ServiceRuntime::build` with `CliError::Metrics` instead of logging and running on.
