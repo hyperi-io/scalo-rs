@@ -192,7 +192,9 @@ Notes on the trait surface:
 - `load_config` is yours to define -- typically one call into
   `config::load_typed`, which reads the `--config` file (or the cascade
   without one), logs the keys `LoaderConfig` does not take, and applies the
-  env overrides.
+  env overrides. `run_app` has already set up the cascade from `--config`, so
+  `load_config` needs no `config::setup` of its own, and one that treats
+  `ConfigError::AlreadyInitialised` as an error now fails.
 - `run_service` is where the actual work lives. Everything else is
   scaffolding.
 - `scaling_components`, `register_metrics`, `deployment_contract` all

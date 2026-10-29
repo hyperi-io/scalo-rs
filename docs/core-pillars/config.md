@@ -1,7 +1,9 @@
 # Config
 
 Call `config::setup` once at startup; every module then reads one typed view of
-the whole cascade through the same API.
+the whole cascade through the same API. A `ServiceApp` doesn't call it:
+`run_app` sets the cascade up from `--config` and `env_prefix()` before
+`load_config`, for every command but `version`.
 
 The cascade is **7 layers** -- one typed view assembled from CLI args, env vars,
 `.env`, the YAML files, and hard-coded defaults.

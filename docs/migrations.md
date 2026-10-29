@@ -44,6 +44,12 @@ A service built by `run_app` answers `/readyz` 503 `{"status":"starting"}` from 
 
 **Consumer adjustment** -- move a check set at the top of `run_service` into `ServiceApp::readiness_check`. A deployment whose metrics address was already taken now exits at start, so fix the address.
 
+### `run_app` sets up the config cascade (BEHAVIOUR CHANGE)
+
+Every `run_app` command but `version` calls `config::setup(common_args().to_config_options(env_prefix()))` before `load_config`, treating `AlreadyInitialised` as done. Every cascade reader (`version_check`, `scaling`, `logger`, `self_regulation` and the rest) now sees the app's `--config` file, however `load_config` reads it. A cascade setup that fails (an unreadable `--config`, say) ends `run_app` with `CliError::Config`.
+
+**Consumer adjustment** -- delete the app's own `config::setup` / `init_cascade` from `load_config`. One that maps `AlreadyInitialised` to an error must go, or startup fails.
+
 ### `DeploymentContract` has a `Default`, and every generator refuses a bad contract (API CHANGE)
 
 `DeploymentContract` implements `Default` with every field at its documented default, and so does `SecretEnvContract`, so a consumer writes `..DeploymentContract::default()` and a field a later release adds no longer breaks its build. `generate_dockerfile`, `generate_runtime_stage` and `generate_compose_fragment` now return `Result<String, DeploymentError>` and run `validate()` first, as `generate_container_manifest` did, which now returns `DeploymentError` too instead of a `String`. `SmokeError` gains `Contract`.
