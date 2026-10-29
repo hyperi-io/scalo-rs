@@ -23,6 +23,9 @@
 //! * **Kind cluster lifecycle** -- [`KindClusterGuard`] +
 //!   [`ensure_kind_cluster`]: per-test uniquely-named cluster, torn down on
 //!   Drop so parallel runs never collide on cluster name.
+//! * **Memory budget** -- [`assert_peak_memory`]: the test's peak resident
+//!   set fails over the contract's memory limit and warns over its request,
+//!   so no test carries a budget of its own.
 //!
 //! # Usage from a consumer's `tests/e2e/`
 //!
@@ -420,4 +423,292 @@ pub fn wait_until(deadline: Duration, interval: Duration, mut f: impl FnMut() ->
         std::thread::sleep(interval);
     }
     f()
+}
+
+// ============================================================================
+// Memory budget -- a test held to the contract's memory request and limit.
+// ============================================================================
+
+/// The peak resident set of this process (`VmHWM`), in bytes. `None` where
+/// `/proc/self/status` does not report it, which is anything but Linux.
+#[must_use]
+pub fn peak_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+/// The bytes in a Kubernetes memory quantity: `512Mi`, `1G`, `1.5Gi`,
+/// `129e6` or a plain `134217728`. A fraction of a byte rounds up, as
+/// Kubernetes rounds it. `None` for anything else, a negative included.
+#[must_use]
+pub fn memory_quantity_bytes(quantity: &str) -> Option<u64> {
+    let quantity = quantity.trim();
+    let split = quantity
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(quantity.len());
+    let (number, suffix) = quantity.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let binary = |power: i32| 1024_f64.powi(power);
+    let scale = match suffix {
+        "" => 1.0,
+        "Ki" => binary(1),
+        "Mi" => binary(2),
+        "Gi" => binary(3),
+        "Ti" => binary(4),
+        "Pi" => binary(5),
+        "Ei" => binary(6),
+        "m" => 1e-3,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "E" => 1e18,
+        exponent if exponent.starts_with(['e', 'E']) => {
+            10_f64.powi(exponent[1..].parse::<i32>().ok()?)
+        }
+        _ => return None,
+    };
+    let bytes = (number * scale).ceil();
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "range-checked against u64 just before the cast"
+    )]
+    let in_range = bytes.is_finite() && bytes >= 0.0 && bytes <= u64::MAX as f64;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "range-checked on the line above"
+    )]
+    in_range.then_some(bytes as u64)
+}
+
+/// How a peak resident set stands against a contract's memory request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryVerdict {
+    /// At or under the request, or no request is declared.
+    Within,
+    /// Over the request and under the limit: the pod runs, but the
+    /// scheduler reserves less than it uses.
+    OverRequest {
+        /// The peak resident set, in bytes.
+        peak: u64,
+        /// The contract's memory request, in bytes.
+        request: u64,
+    },
+}
+
+/// Judge `peak` bytes against `resources`. `Err` is why the test fails: a
+/// peak over `limits.memory`, no memory limit declared, or a quantity that
+/// does not parse.
+///
+/// # Errors
+///
+/// As above, with the figures in the message.
+pub fn judge_peak_memory(
+    peak: u64,
+    resources: &super::ResourcesContract,
+) -> Result<MemoryVerdict, String> {
+    let quantity = |name: &str, value: &str| {
+        memory_quantity_bytes(value)
+            .ok_or_else(|| format!("the contract's memory {name} {value:?} is not a quantity"))
+    };
+    if resources.limits.memory.is_empty() {
+        return Err("the contract declares no memory limit to hold the test to".into());
+    }
+    let limit = quantity("limit", &resources.limits.memory)?;
+    if peak > limit {
+        return Err(format!(
+            "peak resident set {} over the contract's memory limit {} ({}): the pod would be OOM-killed",
+            mib(peak),
+            mib(limit),
+            resources.limits.memory
+        ));
+    }
+    if resources.requests.memory.is_empty() {
+        return Ok(MemoryVerdict::Within);
+    }
+    let request = quantity("request", &resources.requests.memory)?;
+    Ok(if peak > request {
+        MemoryVerdict::OverRequest { peak, request }
+    } else {
+        MemoryVerdict::Within
+    })
+}
+
+/// Hold this process's peak resident set to the contract: panic over
+/// `limits.memory`, and warn over `requests.memory`. Returns the peak, or
+/// `None` after a [`skip`] line where the peak is not reported.
+///
+/// Call it at the end of the test. The peak is the process's, so the test
+/// needs a process of its own: nextest gives every test one, and under
+/// `cargo test` the test goes in an integration test file by itself.
+///
+/// The warning goes to stderr, to stdout as a GitHub `::warning::`
+/// annotation, and to `$GITHUB_STEP_SUMMARY` when set. nextest hides a
+/// passing test's output, so the step summary is where CI shows it.
+///
+/// # Panics
+///
+/// Over the limit, with no memory limit declared, or on a quantity that
+/// does not parse.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "a test asserts and moves on; the peak is for one that also reports it"
+)]
+pub fn assert_peak_memory(test_name: &str, resources: &super::ResourcesContract) -> Option<u64> {
+    let Some(peak) = peak_rss_bytes() else {
+        skip(
+            "memory",
+            test_name,
+            "this platform reports no peak resident set",
+        );
+        return None;
+    };
+    match judge_peak_memory(peak, resources) {
+        Ok(MemoryVerdict::Within) => {}
+        Ok(MemoryVerdict::OverRequest { peak, request }) => {
+            let message = format!(
+                "{test_name}: peak resident set {} over the contract's memory request {} ({})",
+                mib(peak),
+                mib(request),
+                resources.requests.memory
+            );
+            eprintln!("warning: {message}");
+            println!("::warning title=memory over request::{message}");
+            if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
+                let _ = append_line(Path::new(&summary), &format!("- WARNING: {message}"));
+            }
+        }
+        Err(reason) => panic!("{test_name}: {reason}"),
+    }
+    Some(peak)
+}
+
+/// `bytes` in MiB, to one decimal place.
+fn mib(bytes: u64) -> String {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a figure in a message; a rounding past 2^52 bytes does not matter"
+    )]
+    let mib = bytes as f64 / 1_048_576.0;
+    format!("{mib:.1} MiB")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deployment::{ResourceList, ResourcesContract};
+
+    #[test]
+    fn memory_quantities_read_as_kubernetes_reads_them() {
+        let cases = [
+            ("134217728", Some(134_217_728)),
+            ("128Mi", Some(134_217_728)),
+            ("1.5Gi", Some(1_610_612_736)),
+            ("512Ki", Some(524_288)),
+            ("1G", Some(1_000_000_000)),
+            ("129e6", Some(129_000_000)),
+            (" 64Mi ", Some(67_108_864)),
+            ("1500m", Some(2)),
+            ("", None),
+            ("Mi", None),
+            ("-1Mi", None),
+            ("1.2.3Mi", None),
+            ("12MB", None),
+            ("1e999", None),
+        ];
+        for (quantity, want) in cases {
+            assert_eq!(memory_quantity_bytes(quantity), want, "{quantity:?}");
+        }
+    }
+
+    fn resources(request: &str, limit: &str) -> ResourcesContract {
+        ResourcesContract {
+            requests: ResourceList {
+                memory: request.into(),
+                ..ResourceList::default()
+            },
+            limits: ResourceList {
+                memory: limit.into(),
+                ..ResourceList::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_peak_fails_over_the_limit_and_warns_over_the_request() {
+        const MIB: u64 = 1_048_576;
+        let over_request = MemoryVerdict::OverRequest {
+            peak: 200 * MIB,
+            request: 128 * MIB,
+        };
+        // (case, peak, request, limit, verdict, or a word the failure carries)
+        let cases: [(&str, u64, &str, &str, Result<MemoryVerdict, &str>); 7] = [
+            (
+                "under the request",
+                100 * MIB,
+                "128Mi",
+                "512Mi",
+                Ok(MemoryVerdict::Within),
+            ),
+            (
+                "at the request",
+                128 * MIB,
+                "128Mi",
+                "512Mi",
+                Ok(MemoryVerdict::Within),
+            ),
+            (
+                "over the request",
+                200 * MIB,
+                "128Mi",
+                "512Mi",
+                Ok(over_request),
+            ),
+            (
+                "no request",
+                200 * MIB,
+                "",
+                "512Mi",
+                Ok(MemoryVerdict::Within),
+            ),
+            (
+                "over the limit",
+                513 * MIB,
+                "128Mi",
+                "512Mi",
+                Err("OOM-killed"),
+            ),
+            ("no limit", 1, "128Mi", "", Err("no memory limit")),
+            ("a bad quantity", 1, "lots", "512Mi", Err("not a quantity")),
+        ];
+        for (name, peak, request, limit, want) in cases {
+            let got = judge_peak_memory(peak, &resources(request, limit));
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{name}"),
+                (Err(reason), Err(word)) => assert!(reason.contains(word), "{name}: {reason}"),
+                (got, _) => panic!("{name}: {got:?}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reports_a_peak_and_a_roomy_contract_passes_it() {
+        let before = peak_rss_bytes().expect("VmHWM on Linux");
+        assert!(before > 0);
+        // A high-water mark only rises, so the helper reads at least as much.
+        let held = assert_peak_memory("roomy", &resources("1Ei", "1Ei")).expect("a peak");
+        assert!(held >= before, "{held} < {before}");
+    }
 }

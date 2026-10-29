@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### Tests hold their memory to the contract (API CHANGE)
+
+`deployment-test-support` adds `assert_peak_memory(test_name, &contract.resources)`: it reads the process's peak resident set (`VmHWM`), panics over `limits.memory`, and warns over `requests.memory` to stderr, as a GitHub `::warning::` and in `$GITHUB_STEP_SUMMARY`. `judge_peak_memory`, `memory_quantity_bytes` and `peak_rss_bytes` are the pieces under it.
+
+**Consumer adjustment** -- a test with its own memory budget constant calls `assert_peak_memory` with the app's contract resources instead, and the budget comes from the contract.
+
 ### Kafka config types without librdkafka: `transport-kafka-config` (API CHANGE)
 
 `transport-kafka-config` compiles `KafkaConfig` with `validate` and `apply_provider`, the provider presets, `KafkaToken`, `PartitionLease` and the profile constants, at the same paths as before, and builds no librdkafka. `transport-kafka` includes it, so nothing changes for an app with a client.
