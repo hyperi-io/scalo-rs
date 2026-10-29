@@ -21,18 +21,20 @@ use super::usage::{UsageReader, UsageSource};
 /// jemalloc `stats.allocated`).
 static HEAP_SOURCE: OnceLock<fn() -> usize> = OnceLock::new();
 
-/// Register a process-wide source of total live-heap bytes, overriding the
-/// [`UsageSource`] the guard would otherwise detect.
+/// Register a process-wide source of total live-heap bytes, read beside the
+/// [`UsageSource`] the guard detects.
 ///
-/// This is rarely needed. The default source is the cgroup's `memory.current`,
-/// which is both allocator-independent and the number the OOM killer acts on;
-/// an allocator statistic is narrower, since it cannot see thread stacks,
-/// mmap'd buffers, or pages the allocator retains after a free. Register one
-/// only where the allocator figure is the one you want to gate on.
+/// The guard's own source is the cgroup's `memory.current`, which is both
+/// allocator-independent and the number the OOM killer acts on. An allocator
+/// statistic is narrower: it cannot see thread stacks, mmap'd buffers, a C
+/// library's own allocations, or pages the allocator retains after a free.
 ///
-/// When set, every [`MemoryGuard`] switches its read path
+/// When set, every [`MemoryGuard`] reads the larger of the two
 /// ([`current_bytes`](MemoryGuard::current_bytes), pressure checks, and
-/// [`try_reserve`](MemoryGuard::try_reserve) admission) to this source.
+/// [`try_reserve`](MemoryGuard::try_reserve) admission), so registering a
+/// source never lets the guard see less than the kernel charges. Where the
+/// guard has no usage source to read (its reservation counter, off Linux),
+/// the heap source is the reading.
 ///
 /// **Why a global hook and not a dependency:** a tracking allocator must be
 /// the binary's single `#[global_allocator]`, which is the *application's*
@@ -76,6 +78,28 @@ pub fn set_heap_source(source: fn() -> usize) -> bool {
 #[inline]
 fn heap_bytes() -> Option<u64> {
     HEAP_SOURCE.get().map(|f| f() as u64)
+}
+
+/// The larger of two optional readings, or whichever exists.
+#[inline]
+fn larger(heap: Option<u64>, usage: Option<u64>) -> Option<u64> {
+    match (heap, usage) {
+        (Some(heap), Some(usage)) => Some(heap.max(usage)),
+        (heap, usage) => heap.or(usage),
+    }
+}
+
+/// The name of the reading a guard on `source` takes, for logs.
+fn source_name(source: &UsageSource) -> &'static str {
+    if HEAP_SOURCE.get().is_none() {
+        return source.name();
+    }
+    match source {
+        UsageSource::CgroupV2(_) => "max(explicit,cgroup-v2)",
+        UsageSource::CgroupV1(_) => "max(explicit,cgroup-v1)",
+        UsageSource::ProcStatus(_) => "max(explicit,proc-status)",
+        UsageSource::Reservations => "explicit",
+    }
 }
 
 /// Read an env var `{PREFIX}_{SUFFIX}` and parse it.
@@ -382,12 +406,8 @@ impl MemoryGuard {
         // divides by it.
         let limit_bytes = raw_limit.max(1);
 
-        let usage_source = if HEAP_SOURCE.get().is_some() {
-            "explicit"
-        } else {
-            usage.source().name()
-        };
-        let usage_bytes = heap_bytes().or_else(|| usage.read());
+        let usage_source = source_name(usage.source());
+        let usage_bytes = larger(heap_bytes(), usage.read());
         tracing::info!(
             limit_bytes,
             pressure_threshold,
@@ -426,12 +446,16 @@ impl MemoryGuard {
     /// exceed the limit).
     #[inline]
     pub fn try_reserve(&self, bytes: u64) -> bool {
-        if let Some(heap) = heap_bytes() {
-            // A registered heap source is read live, so it needs no ledger.
-            return heap.saturating_add(bytes) <= self.limit_bytes;
+        // A registered heap source is read live, so it needs no ledger.
+        let heap = heap_bytes();
+        if heap.is_some_and(|heap| heap.saturating_add(bytes) > self.limit_bytes) {
+            return false;
         }
         if let Some(sampled) = self.usage.read() {
             return self.usage.try_admit(sampled, bytes, self.limit_bytes);
+        }
+        if heap.is_some() {
+            return true;
         }
         let current = self.reserved_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if current > self.limit_bytes {
@@ -514,9 +538,10 @@ impl MemoryGuard {
     /// read from the guard's [`UsageSource`], plus the bytes admitted since
     /// that reading was taken.
     ///
-    /// A registered [`set_heap_source`] overrides it. Where neither is
-    /// readable this falls back to [`reserved_bytes`](Self::reserved_bytes),
-    /// which sees only what callers reserved by hand.
+    /// With a registered [`set_heap_source`] it is the larger of the two.
+    /// Where neither is readable this falls back to
+    /// [`reserved_bytes`](Self::reserved_bytes), which sees only what callers
+    /// reserved by hand.
     #[inline]
     pub fn current_bytes(&self) -> u64 {
         self.usage_bytes()
@@ -535,19 +560,15 @@ impl MemoryGuard {
     /// The name of the usage source in force, for logs and diagnostics.
     #[must_use]
     pub fn usage_source(&self) -> &'static str {
-        if HEAP_SOURCE.get().is_some() {
-            "explicit"
-        } else {
-            self.usage.source().name()
-        }
+        source_name(self.usage.source())
     }
 
-    /// Process usage from the explicit heap source, else the usage source plus
+    /// Process usage: the larger of the heap source and the usage source plus
     /// its ledger of bytes admitted since the sample. `None` only where
     /// neither is readable.
     #[inline]
     fn usage_bytes(&self) -> Option<u64> {
-        heap_bytes().or_else(|| self.usage.estimate())
+        larger(heap_bytes(), self.usage.estimate())
     }
 
     /// Configured memory limit in bytes.
@@ -1118,8 +1139,12 @@ mod tests {
         TEST_HEAP.load(Ordering::Relaxed)
     }
 
+    /// A registered heap source is read beside the cgroup and the larger
+    /// figure wins, so an allocator that sees only its own bytes never hides
+    /// what the kernel charges. With no usage source to read, it is the
+    /// reading on its own.
     #[test]
-    fn heap_source_overrides_read_path_and_admission() {
+    fn a_heap_source_never_lets_the_guard_see_less_than_the_cgroup() {
         if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
             eprintln!(
                 "skipped: registers a process-global heap source, so it runs only under \
@@ -1132,40 +1157,52 @@ mod tests {
             !set_heap_source(test_heap_source),
             "second set is a no-op (first-wins)"
         );
-
-        let guard = MemoryGuard::new(MemoryGuardConfig {
+        let config = || MemoryGuardConfig {
             limit_bytes: 1_000,
             pressure_threshold: 0.8,
             ..Default::default()
-        });
+        };
 
-        // Reads come from the heap source, not the reservation counter.
-        TEST_HEAP.store(250, Ordering::Relaxed);
-        assert_eq!(guard.current_bytes(), 250);
-        assert!((guard.pressure_ratio() - 0.25).abs() < 0.001);
-        assert!(!guard.under_pressure());
-
-        // Pressure tracks the live heap -- including growth never reserved,
-        // which the per-batch counter would have been blind to.
+        // No usage source: the heap source is the reading, and admission
+        // judges it without touching the reservation counter.
+        let alone = MemoryGuard::with_usage_source(config(), UsageSource::Reservations);
+        assert_eq!(alone.usage_source(), "explicit");
         TEST_HEAP.store(850, Ordering::Relaxed);
-        assert!(
-            guard.under_pressure(),
-            "85% live heap is over the 80% threshold"
-        );
-        assert_eq!(guard.pressure(), MemoryPressure::High);
-
-        // try_reserve is a projected-admission check against the true heap and
-        // does NOT mutate the reservation counter.
+        assert_eq!(alone.current_bytes(), 850);
+        assert!(alone.under_pressure(), "85% is over the 80% threshold");
         TEST_HEAP.store(900, Ordering::Relaxed);
-        assert!(guard.try_reserve(100), "900 + 100 == limit, admitted");
-        assert!(!guard.try_reserve(200), "900 + 200 > limit, rejected");
-        assert_eq!(guard.current_bytes(), 900, "still the heap source");
+        assert!(alone.try_reserve(100), "900 + 100 == limit, admitted");
+        assert!(!alone.try_reserve(200), "900 + 200 > limit, rejected");
         assert_eq!(
-            guard.reserved_bytes(),
+            alone.reserved_bytes(),
             0,
             "counter untouched by try_reserve"
         );
-        assert_eq!(guard.usage_source(), "explicit");
+
+        // With a cgroup: the larger of the two, whichever it is.
+        let dir = cgroup_fixture(&[("memory.current", "600\n")]);
+        let cgroup = MemoryGuard::with_usage_source(
+            config(),
+            UsageSource::CgroupV2(dir.path().to_path_buf()),
+        );
+        assert_eq!(cgroup.usage_source(), "max(explicit,cgroup-v2)");
+        // (case, heap source, cgroup, reading, admits 150 more)
+        let cases = [
+            ("the cgroup sees more", 300, "600", 600, true),
+            ("the heap source sees more", 900, "600", 900, false),
+            ("the cgroup is near the limit", 100, "900", 900, false),
+        ];
+        for (name, heap, current, want, admits) in cases {
+            TEST_HEAP.store(heap, Ordering::Relaxed);
+            std::fs::write(dir.path().join("memory.current"), format!("{current}\n"))
+                .expect("write");
+            std::thread::sleep(std::time::Duration::from_millis(60)); // past the read cache
+            assert_eq!(cgroup.current_bytes(), want, "{name}");
+            assert_eq!(cgroup.try_reserve(150), admits, "{name}");
+            if admits {
+                cgroup.release(150);
+            }
+        }
     }
 
     #[test]

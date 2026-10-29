@@ -84,7 +84,8 @@ They are NOT interchangeable; each answers a different question.
   v1 `memory.usage_in_bytes`, else `/proc/self/status` `VmRSS`, each plus the
   bytes admitted since that reading. Only where none is readable (non-Linux)
   does the guard fall back to the bytes callers reserve and release. A heap
-  source registered with `set_heap_source` overrides all of them. The limit is
+  source registered with `set_heap_source` is read beside them and the larger
+  figure wins, or it is the reading where none is readable. The limit is
   `min(cgroup_headroom * memory.max, memory.high)`, with `cgroup_headroom`
   defaulting to 0.85, or `memory.limit_bytes` when set. Detail:
   [runtime/memory.md](runtime/memory.md). The ratio feeds the governor as a

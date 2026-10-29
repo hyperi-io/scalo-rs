@@ -68,6 +68,12 @@ Every `run_app` command but `version` calls `config::setup(common_args().to_conf
 
 **Consumer adjustment** -- regenerate the committed `Dockerfile` and `Dockerfile.runtime` (`<app> generate-artefacts`). A compose file that chowned a volume through a root sidecar or set `working_dir` for the app no longer needs either. Anything that ran `curl` or `nc` inside a production container uses the development image.
 
+### A registered heap source adds to the cgroup reading instead of replacing it (BEHAVIOUR CHANGE)
+
+`MemoryGuard` reads a `set_heap_source` allocator figure beside its usage source (cgroup v2 or v1 `memory.current`, else `VmRSS`) and gates on the larger, so a jemalloc reader no longer hides what librdkafka, thread stacks and retained pages hold. Where no usage source is readable, the heap source is the reading, as before. `usage_source()` reports `max(explicit,cgroup-v2)` and the like, or `explicit` alone.
+
+**Consumer adjustment** -- an app that registers its heap source only when `UsageSource::detect()` is `Reservations` may register it unconditionally. A dashboard or alert matching `usage_source="explicit"` matches the new names too.
+
 ### A Kafka transport builds only the clients its directions use (API CHANGE)
 
 `KafkaTransport::receiver` builds a consumer and no producer, and refuses an empty `group` as `TransportError::Config`. `KafkaTransport::sender` builds a producer and no consumer, whatever `group` and `topics` hold. `KafkaTransport::new` builds a consumer only when `group` is set, so an empty `group` no longer builds an idle consumer under the stand-in group `<client_id>-producer-only`, and nothing asks the broker for that group's coordinator. `AnyReceiver` builds through `receiver` and `AnySender` through `sender`, so a sender built from a config that also carries `group` and `topics` no longer subscribes a member that is never polled.

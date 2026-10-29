@@ -93,10 +93,14 @@ They are different numbers and both are exposed.
 ### Heap source (allocator override, opt-in)
 
 `memory::set_heap_source(fn() -> usize)` registers a process-wide
-total-live-heap reader (set once at startup) that overrides the
-detected source, for a service that wants to gate on the allocator's
-own figure. It is narrower than the cgroup: it cannot see thread
-stacks, mmap'd buffers, or pages the allocator retains after a free.
+total-live-heap reader (set once at startup). The guard reads it beside
+the detected source and gates on the larger figure, so the reading is
+never below what the kernel charges. On its own the allocator figure is
+narrower than the cgroup: it cannot see thread stacks, mmap'd buffers,
+a C library's own allocations, or pages the allocator retains after a
+free. Where the guard has no usage source (its reservation counter, off
+Linux), the heap source is the reading. `usage_source()` names it
+`max(explicit,cgroup-v2)`, or `explicit` on its own.
 
 The source is allocator-agnostic: pass `cap::Cap::allocated`, a
 jemalloc `stats.allocated` reader (advance the epoch inside the
@@ -116,7 +120,7 @@ admission.
 
 scalo picks no allocator. The binary does, and jemalloc is the usual pick for a long-running, multi-threaded data-plane service: one set of heap stats and one profiling story.
 
-The guard does not read the allocator. In a container it reads the kernel's `memory.current`, which counts every page the process holds, arenas the allocator keeps after a free included. An allocator figure such as jemalloc's `stats.allocated` is read only when the binary registers it with `set_heap_source`, and it then replaces the kernel figure. A binary that wants the kernel figure in a container and the allocator figure elsewhere registers the source only when no cgroup usage file is readable.
+The guard does not read the allocator. In a container it reads the kernel's `memory.current`, which counts every page the process holds, arenas the allocator keeps after a free included. An allocator figure such as jemalloc's `stats.allocated` is read only when the binary registers it with `set_heap_source`, and the guard then takes the larger of it and the kernel figure.
 
 Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project carries it on as `tikv-jemallocator`, from the same repo: <https://github.com/tikv/jemallocator>. As of 2026-09-26 `tikv-jemalloc-sys` is at 0.7.1, published 2026-05-25. So `tikv-` is the maintained line, not a side fork.
 
@@ -229,7 +233,7 @@ Env vars:
 
 | Item | Purpose |
 | ------ | --------- |
-| `memory::set_heap_source(fn() -> usize) -> bool` | Override the detected source with an allocator reader (set-once; returns false if already set) |
+| `memory::set_heap_source(fn() -> usize) -> bool` | Read an allocator figure beside the detected source, the larger winning (set-once; returns false if already set) |
 | `MemoryGuard::new(config)` | Construct; detects the usage source, and the limit if `limit_bytes == 0` |
 | `MemoryGuard::with_usage_source(config, source)` | Construct reading usage from a pinned `UsageSource` |
 | `MemoryGuard::try_reserve(n) -> bool` | Projected-admission check against current usage |
