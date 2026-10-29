@@ -39,15 +39,19 @@ refusing a structurally invalid config exactly as before.
 `run_app` evaluates `work_state` AFTER `ServiceRuntime::build`, so the metrics
 server, `/livez` and `/readyz` are already serving before anything can park.
 `run_service` is never entered while idle, so the app constructs no transports.
+`on_config_loaded` runs on each config before the gate judges it, so an idle
+app has already logged what it accepted but will not apply.
 
 ```mermaid
 flowchart LR
-    L["load_config"] --> R["ServiceRuntime::build<br/>probes serving"]
+    L["load_config"] --> H["on_config_loaded"]
+    H --> R["ServiceRuntime::build<br/>probes serving"]
     R --> W{"work_state"}
     W -->|Active| S["run_service"]
     W -->|"Idle(reason)"| P["park on config change"]
     P -->|"file mtime / SIGHUP"| L2["load_config again"]
-    L2 --> W
+    L2 --> H2["on_config_loaded"]
+    H2 --> W
     P -->|shutdown| X["exit 0"]
 ```
 
@@ -87,6 +91,7 @@ immediate.
 | Item | Purpose |
 | --- | --- |
 | `ServiceApp::work_state(&config) -> WorkState` | The app's emptiness predicate; defaults to `Active` |
+| `ServiceApp::on_config_loaded(&config)` | Once per loaded config, logger up, before the gate: where startup config warnings go; defaults to nothing |
 | `WorkState::{Active, Idle(reason)}` | Whether the config names work |
 | `WorkState::idle_if(empty, reason)` | The shape almost every predicate takes |
 | `IdleGate` | Gauge + health component + state, held by `run_app` |

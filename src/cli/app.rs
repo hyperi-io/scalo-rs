@@ -101,6 +101,16 @@ pub trait ServiceApp: Sized {
         runtime: super::ServiceRuntime,
     ) -> impl std::future::Future<Output = Result<(), CliError>> + Send;
 
+    /// Report on a configuration the service has just loaded: what it
+    /// accepted but will not apply, a setting that is inert, a deprecated
+    /// spelling.
+    ///
+    /// [`run_app`] calls it once per loaded config, after the logger is up
+    /// and before the idle gate, and again for each config the gate reloads.
+    /// So an app idling with no work has already said what is wrong with its
+    /// config. The default does nothing.
+    fn on_config_loaded(&self, _config: &Self::Config) {}
+
     /// Does this configuration give the service work to do?
     ///
     /// The app's EMPTINESS PREDICATE, and nothing else: `load_config` still
@@ -323,6 +333,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             );
 
             tracing::debug!(?config, "configuration loaded");
+            app.on_config_loaded(&config);
 
             // Build ServiceRuntime -- all common infrastructure for free
             let runtime = super::ServiceRuntime::build(
@@ -420,7 +431,10 @@ async fn wait_for_work<A: ServiceApp>(
         }
 
         match app.load_config(config_path) {
-            Ok(reloaded) => config = reloaded,
+            Ok(reloaded) => {
+                app.on_config_loaded(&reloaded);
+                config = reloaded;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "config reload while idle failed, keeping the current config");
             }
@@ -1218,5 +1232,75 @@ mod tests {
         run_app(app)
             .await
             .expect("the service runs and exits cleanly");
+    }
+
+    /// A service that records the order `run_app` calls it in.
+    struct OrderApp {
+        common: CommonArgs,
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl OrderApp {
+        fn record(&self, call: &'static str) {
+            self.calls.lock().expect("lock").push(call);
+        }
+    }
+
+    impl ServiceApp for OrderApp {
+        type Config = ();
+
+        fn name(&self) -> &'static str {
+            "order-app"
+        }
+        fn env_prefix(&self) -> &'static str {
+            "ORDER_APP"
+        }
+        fn version_info(&self) -> VersionInfo {
+            VersionInfo::new("order-app", "1.2.3")
+        }
+        fn common_args(&self) -> &CommonArgs {
+            &self.common
+        }
+        fn load_config(&self, _path: Option<&str>) -> Result<(), CliError> {
+            self.record("load_config");
+            Ok(())
+        }
+        fn on_config_loaded(&self, _config: &()) {
+            self.record("on_config_loaded");
+        }
+        #[cfg(feature = "lifecycle")]
+        fn work_state(&self, _config: &()) -> crate::lifecycle::WorkState {
+            self.record("work_state");
+            crate::lifecycle::WorkState::Active
+        }
+        fn run_service(
+            &self,
+            _config: (),
+            _runtime: ServiceRuntime,
+        ) -> impl std::future::Future<Output = Result<(), CliError>> + Send {
+            self.record("run_service");
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// The config hook runs once the config is loaded, before the idle gate
+    /// judges it and before the service runs.
+    #[tokio::test]
+    async fn the_config_hook_runs_before_the_idle_gate() {
+        let mut args = common();
+        args.metrics_addr = Some(crate::cli::test_http::free_local_addr());
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_app(OrderApp {
+            common: args,
+            calls: Arc::clone(&calls),
+        })
+        .await
+        .expect("the service runs and exits cleanly");
+        let mut want = vec!["load_config", "on_config_loaded"];
+        if cfg!(feature = "lifecycle") {
+            want.push("work_state");
+        }
+        want.push("run_service");
+        assert_eq!(*calls.lock().expect("lock"), want);
     }
 }
