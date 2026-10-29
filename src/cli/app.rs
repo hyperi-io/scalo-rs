@@ -193,6 +193,12 @@ pub trait ServiceApp: Sized {
 
 /// Drive the standard data-plane service lifecycle.
 ///
+/// Every command but `version` first sets up scalo's config cascade from
+/// `--config` and [`env_prefix`](ServiceApp::env_prefix), so each cascade
+/// reader (`version_check`, `scaling`, `logger` and the rest) sees the app's
+/// config however `load_config` reads it. A cascade the app set up already is
+/// kept.
+///
 /// Handles subcommand dispatch:
 /// - `run` (default): load config -> init logger -> run service
 /// - `version`: print version info and exit
@@ -204,6 +210,9 @@ pub trait ServiceApp: Sized {
 pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
     let command = app.command().cloned().unwrap_or(StandardCommand::Run);
     let args = app.common_args();
+    if !matches!(command, StandardCommand::Version) {
+        setup_cascade(&app)?;
+    }
 
     match command {
         StandardCommand::Version => {
@@ -448,6 +457,26 @@ fn init_logger_for_service(
 ///
 /// Best-effort: a load that fails is reported on stderr, so stdout stays pure
 /// output, and the artefacts take the defaults.
+/// Set up the config cascade from `--config` and the app's env prefix.
+#[cfg(feature = "config")]
+fn setup_cascade<A: ServiceApp>(app: &A) -> Result<(), CliError> {
+    let options = app.common_args().to_config_options(app.env_prefix());
+    match crate::config::setup(options) {
+        Ok(()) | Err(crate::config::ConfigError::AlreadyInitialised) => Ok(()),
+        Err(e) => Err(CliError::Config(e.to_string())),
+    }
+}
+
+/// Without the `config` feature there is no cascade to set up.
+#[cfg(not(feature = "config"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as the config-feature build"
+)]
+const fn setup_cascade<A: ServiceApp>(_app: &A) -> Result<(), CliError> {
+    Ok(())
+}
+
 fn load_config_for_artefacts<A: ServiceApp>(app: &A) {
     if let Err(e) = app.load_config(app.common_args().config.as_deref()) {
         output::print_warn(&format!(
@@ -713,6 +742,93 @@ mod tests {
         // When command() returns None, run_app defaults to Run
         let cmd = StandardCommand::Run;
         assert!(matches!(cmd, StandardCommand::Run));
+    }
+
+    /// A service whose `load_config` reports the cascade's `probe` key, as
+    /// an app reading its config straight from `--config` would see it.
+    #[cfg(feature = "config")]
+    struct CascadeApp {
+        common: CommonArgs,
+        command: StandardCommand,
+        seen: Arc<std::sync::Mutex<Vec<Option<i64>>>>,
+    }
+
+    #[cfg(feature = "config")]
+    impl ServiceApp for CascadeApp {
+        type Config = ();
+
+        fn name(&self) -> &'static str {
+            "cascade-app"
+        }
+        fn env_prefix(&self) -> &'static str {
+            "CASCADE_APP"
+        }
+        fn version_info(&self) -> VersionInfo {
+            VersionInfo::new("cascade-app", "1.2.3")
+        }
+        fn common_args(&self) -> &CommonArgs {
+            &self.common
+        }
+        fn command(&self) -> Option<&StandardCommand> {
+            Some(&self.command)
+        }
+        fn load_config(&self, _path: Option<&str>) -> Result<(), CliError> {
+            self.seen
+                .lock()
+                .expect("lock")
+                .push(crate::config::try_get().and_then(|c| c.get_int("probe")));
+            Ok(())
+        }
+        fn run_service(
+            &self,
+            _config: (),
+            _runtime: ServiceRuntime,
+        ) -> impl std::future::Future<Output = Result<(), CliError>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// `run_app` sets the cascade up from `--config` before `load_config`,
+    /// and `version` leaves it alone.
+    #[cfg(feature = "config")]
+    #[tokio::test]
+    async fn run_app_sets_up_the_cascade_from_the_config_file() {
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+            eprintln!(
+                "skipped: sets up the process-global config cascade, so it runs only under \
+                 cargo nextest's process-per-test mode"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("app.yaml");
+        std::fs::write(&file, "probe: 7\n").expect("write config");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = |command| CascadeApp {
+            common: CommonArgs {
+                config: Some(file.to_string_lossy().into_owned()),
+                ..common()
+            },
+            command,
+            seen: Arc::clone(&seen),
+        };
+
+        run_app(app(StandardCommand::Version))
+            .await
+            .expect("version");
+        assert!(
+            crate::config::try_get().is_none(),
+            "version sets nothing up"
+        );
+
+        run_app(app(StandardCommand::ConfigCheck))
+            .await
+            .expect("config-check");
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            [Some(7)],
+            "load_config ran once and saw the cascade from --config"
+        );
     }
 
     fn common() -> CommonArgs {
