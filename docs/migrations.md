@@ -32,6 +32,14 @@ A service built by `run_app` answers `/readyz` 503 `{"status":"starting"}` from 
 
 **Consumer adjustment** -- regenerate the committed `Dockerfile` and `Dockerfile.runtime` (`<app> generate-artefacts`). A compose file that chowned a volume through a root sidecar or set `working_dir` for the app no longer needs either. Anything that ran `curl` or `nc` inside a production container uses the development image.
 
+### A Kafka transport builds only the clients its directions use (API CHANGE)
+
+`KafkaTransport::receiver` builds a consumer and no producer, and refuses an empty `group` as `TransportError::Config`. `KafkaTransport::sender` builds a producer and no consumer, whatever `group` and `topics` hold. `KafkaTransport::new` builds a consumer only when `group` is set, so an empty `group` no longer builds an idle consumer under the stand-in group `<client_id>-producer-only`, and nothing asks the broker for that group's coordinator. `AnyReceiver` builds through `receiver` and `AnySender` through `sender`, so a sender built from a config that also carries `group` and `topics` no longer subscribes a member that is never polled.
+
+On a transport with no consumer, `recv`, `release`, `commit` and `commit_weak_async` return `TransportError::Config`, `stats()` is empty and `total_position_lag()` is 0. On one with no producer, `send` and `send_batch` are `SendResult::Fatal(TransportError::Config)`.
+
+**Consumer adjustment** -- an app that only consumes calls `KafkaTransport::receiver`, and one that only produces calls `KafkaTransport::sender`. A receiver config without a `group` now fails at startup.
+
 ### The CEL profile reads literals and comments as cel does (BEHAVIOUR CHANGE)
 
 The profile scanner, and with it the transport filter classifier, now reads one-line, triple-quoted and raw string and bytes literals, `//` comments and backtick-quoted names as cel's lexer does, and takes any whitespace or comment before `(` as part of a call. An expression that hid a restricted call behind one of those forms now fails `validate`, `compile` and `RuleSet::compile`, and a transport filter with such a call classifies as Tier 3. `existsOne`, which cel expands as `exists_one`, is restricted iteration too: `allow_iteration` now allows it, where it was refused as an unknown function, and a filter with it classifies as Tier 3.
@@ -1178,7 +1186,7 @@ A broker that does not answer at construction starts the transport subscribed to
 
 `KafkaTransport::new` builds BOTH a `BaseConsumer` and a `FutureProducer` (the producer from its own `ClientConfig`). A producer-only config (empty `group`) constructs: the idle consumer takes the derived stand-in group `<client_id>-producer-only` and subscribes to nothing. It still connects and looks up that group's coordinator, so the broker has to grant the app's group prefix.
 
-**Workaround:** none needed. Do not set `group.id` in `librdkafka_overrides` on a producer config -- the override replaces the derived stand-in with a group the broker may not grant.
+**Workaround:** none needed. Do not set `group.id` in `librdkafka_overrides` on a producer config -- the override replaces the derived stand-in with a group the broker may not grant. Superseded in Unreleased: see "A Kafka transport builds only the clients its directions use".
 
 ### `TransportSender::send` takes a destination, not a partition key
 
