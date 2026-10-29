@@ -82,6 +82,12 @@ On a transport with no consumer, `recv`, `release`, `commit` and `commit_weak_as
 
 **Consumer adjustment** -- an app that only consumes calls `KafkaTransport::receiver`, and one that only produces calls `KafkaTransport::sender`. A receiver config without a `group` now fails at startup.
 
+### A Kafka send to a missing topic backpressures instead of failing (BEHAVIOUR CHANGE)
+
+`KafkaTransport::send` and `send_batch` return `SendResult::Backpressured` for a destination topic that does not exist, where they returned `Fatal`, and `KafkaProducer::send` returns `TransportError::Backpressure`. The caller keeps the record and retries. The transport logs one warning per run, counts `transport_send_missing_topic_total`, and fails readiness until a send to that topic is delivered.
+
+**Consumer adjustment** -- none for a `BatchEngine` app. Code that stopped on the `Fatal` should retry the record instead. librdkafka waits `topic.metadata.propagation.max.ms` (30 s by default) for a topic before reporting it missing.
+
 ### The CEL profile reads literals and comments as cel does (BEHAVIOUR CHANGE)
 
 The profile scanner, and with it the transport filter classifier, now reads one-line, triple-quoted and raw string and bytes literals, `//` comments and backtick-quoted names as cel's lexer does, and takes any whitespace or comment before `(` as part of a call. An expression that hid a restricted call behind one of those forms now fails `validate`, `compile` and `RuleSet::compile`, and a transport filter with such a call classifies as Tier 3. `existsOne`, which cel expands as `exists_one`, is restricted iteration too: `allow_iteration` now allows it, where it was refused as an unknown function, and a filter with it classifies as Tier 3.

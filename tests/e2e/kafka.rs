@@ -1682,6 +1682,52 @@ mod group_protocol {
         }
         assert!(transport.is_healthy(), "reading again, so ready again");
     }
+
+    /// A send to a topic that does not exist yet backpressures: the caller
+    /// keeps the record, readiness is false, and once the topic is created the
+    /// same record is delivered and the transport is ready again. The client
+    /// asks for no auto-creation, as against a broker that refuses it.
+    #[tokio::test]
+    async fn a_sender_backpressures_until_its_topic_is_created() {
+        use scalo::transport::{SendResult, TransportSender};
+
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let topic = "late-sent-topic";
+        let config = KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            ..KafkaConfig::default()
+        }
+        .with_override("allow.auto.create.topics", "false")
+        .with_override("topic.metadata.propagation.max.ms", "1000");
+        let sender = KafkaTransport::sender(&config).await.expect("kafka sender");
+        let record = || bytes::Bytes::from_static(br#"{"seq":0}"#);
+
+        let refused = sender.send(topic, record()).await;
+        assert!(
+            matches!(refused, SendResult::Backpressured),
+            "a missing topic backpressures: {refused:?}"
+        );
+        assert!(!sender.is_healthy(), "not ready while the topic is missing");
+
+        create_topic(&bootstrap, topic).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match sender.send(topic, record()).await {
+                SendResult::Ok => break,
+                SendResult::Backpressured => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "never delivered once the topic existed"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                other => panic!("a retried send to a created topic: {other:?}"),
+            }
+        }
+        assert!(sender.is_healthy(), "delivered, so ready again");
+    }
 }
 
 /// A member that holds records in a buffer before it writes them, as a loader

@@ -48,6 +48,9 @@ pub(crate) enum SendFailure {
     /// A transient broker, leader or network condition. The message is still
     /// deliverable, so the caller retries rather than dropping it.
     Retryable,
+    /// The destination topic does not exist yet. The caller keeps the record
+    /// and retries, as it does a retryable failure.
+    MissingTopic,
     /// Retrying cannot help -- authorisation or a permanent topic error.
     Fatal,
 }
@@ -58,6 +61,9 @@ pub(crate) fn classify_send_failure(err: &KafkaError) -> SendFailure {
         Some(RDKafkaErrorCode::QueueFull) => SendFailure::QueueFull,
         Some(RDKafkaErrorCode::MessageSizeTooLarge) => SendFailure::TooLarge,
         Some(code) if is_retryable(code) => SendFailure::Retryable,
+        Some(RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic) => {
+            SendFailure::MissingTopic
+        }
         _ => SendFailure::Fatal,
     }
 }
@@ -65,9 +71,8 @@ pub(crate) fn classify_send_failure(err: &KafkaError) -> SendFailure {
 /// Codes that clear without operator action, so the message is worth retrying.
 ///
 /// Mirrors Kafka's own retriable-error set plus the librdkafka-local transport
-/// and timeout codes. `UnknownTopic` / `UnknownTopicOrPartition` is deliberately
-/// absent: treating a missing topic as retryable hides a misconfigured
-/// destination behind a retry loop.
+/// and timeout codes. A missing topic is retried too, as
+/// [`SendFailure::MissingTopic`], so it fails readiness and counts on its own.
 fn is_retryable(code: RDKafkaErrorCode) -> bool {
     matches!(
         code,
@@ -682,7 +687,6 @@ mod tests {
         for code in [
             RDKafkaErrorCode::TopicAuthorizationFailed,
             RDKafkaErrorCode::ClusterAuthorizationFailed,
-            RDKafkaErrorCode::UnknownTopicOrPartition,
             RDKafkaErrorCode::InvalidArgument,
         ] {
             let err = KafkaError::MessageProduction(code);
@@ -690,6 +694,22 @@ mod tests {
                 classify_send_failure(&err),
                 SendFailure::Fatal,
                 "{code:?} should be fatal"
+            );
+        }
+    }
+
+    /// A send to a topic that does not exist yet is retried, never fatal: a
+    /// topic ensure that failed or a rebuilt broker clears on its own.
+    #[test]
+    fn a_missing_destination_topic_is_retried() {
+        for code in [
+            RDKafkaErrorCode::UnknownTopicOrPartition,
+            RDKafkaErrorCode::UnknownTopic,
+        ] {
+            assert_eq!(
+                classify_send_failure(&KafkaError::MessageProduction(code)),
+                SendFailure::MissingTopic,
+                "{code:?}"
             );
         }
     }
