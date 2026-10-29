@@ -1,0 +1,16 @@
+# Every test that starts a Kafka broker container runs in one group, so a
+# loaded runner never holds more than three JVM brokers at once. More than
+# that pushed the outage ride-out tests close to their windows.
+[test-groups]
+kafka-broker = { max-threads = 3 }
+
+[[profile.default.overrides]]
+filter = '''
+binary(dlq_kafka_durable)
+| binary(kafka_consumer_outage)
+| binary(kafka_recv_runtime)
+| binary(kafka_send_batch)
+| binary(kafka_tls)
+| (binary(e2e_tests) & test(/^e2e::kafka::/))
+'''
+test-group = 'kafka-broker'
