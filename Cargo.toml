@@ -39,7 +39,7 @@ features = [
     "http", "http-server",
     "transport", "transport-trace",
     "transport-memory", "transport-grpc", "transport-file",
-    "transport-pipe", "transport-http",
+    "transport-pipe", "transport-http", "transport-kafka-config",
     "directory-config",
     "secrets", "secrets-vault",
     "dlq", "dlq-http",
@@ -262,7 +262,10 @@ config-reload = ["config", "parking_lot", "tokio", "tracing"]
 transport = ["tokio", "serde_json", "rmpv", "chrono", "regex", "memchr", "sonic-rs", "parking_lot", "tracing", "metrics-core", "bytes", "dep:wide"]
 transport-trace = ["transport", "dep:opentelemetry"]
 transport-memory = ["transport"]
-transport-kafka = ["transport", "rdkafka", "regex", "tokio-util"]
+# Kafka config, provider and token types with no librdkafka: for an app that
+# reads or checks Kafka config without a client.
+transport-kafka-config = ["transport"]
+transport-kafka = ["transport-kafka-config", "rdkafka", "regex", "tokio-util"]
 # Kafka test fixtures for consumer suites (`scalo::transport::kafka::test_support`):
 # the pinned broker image and a TLS / mTLS / SASL_SSL broker driven through the
 # docker CLI. Needs a Docker daemon at test time. Opt-in, for dev-dependencies.

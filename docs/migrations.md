@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### Kafka config types without librdkafka: `transport-kafka-config` (API CHANGE)
+
+`transport-kafka-config` compiles `KafkaConfig` with `validate` and `apply_provider`, the provider presets, `KafkaToken`, `PartitionLease` and the profile constants, at the same paths as before, and builds no librdkafka. `transport-kafka` includes it, so nothing changes for an app with a client.
+
+**Consumer adjustment** -- an app that uses `KafkaConfig` but builds no Kafka client swaps `transport-kafka` for `transport-kafka-config`, and keeps `transport-kafka` on the dev-dependency if its tests talk to a broker.
+
 ### /readyz answers 503 until the app runs, and a paused gate is not ready (BEHAVIOUR CHANGE)
 
 A service built by `run_app` answers `/readyz` 503 `{"status":"starting"}` from the moment its metrics listener binds until `run_app` hands control to `run_service`. `ServiceApp::readiness_check` supplies the app's check before that handoff, so there is no window where the service reads ready before it has said what ready means. An idle service stays ready. With the `health` feature each inbound gate registers a `self_regulation:<source>` component that is unhealthy while the source is paused. A metrics listener that cannot bind now fails `ServiceRuntime::build` with `CliError::Metrics` instead of logging and running on.

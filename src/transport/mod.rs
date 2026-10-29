@@ -82,6 +82,14 @@ pub use detect::{DetectedFormat, FormatDetector, FormatMode, detect_format};
 #[cfg(feature = "transport-kafka")]
 pub mod kafka;
 
+/// Kafka config, provider and token types, without the librdkafka clients.
+#[cfg(all(feature = "transport-kafka-config", not(feature = "transport-kafka")))]
+pub mod kafka {
+    mod types;
+    #[allow(deprecated)]
+    pub use types::*;
+}
+
 #[cfg(feature = "transport-grpc")]
 pub mod grpc;
 
@@ -120,7 +128,9 @@ pub use types::{Message, SendResult, TransportConfig, TransportType};
 pub use work_batch::{FramingError, Record, RecordCodecError, RecordMeta, WorkBatch};
 
 #[cfg(feature = "transport-kafka")]
-pub use kafka::{KafkaConfig, KafkaToken, KafkaTransport};
+pub use kafka::KafkaTransport;
+#[cfg(feature = "transport-kafka-config")]
+pub use kafka::{KafkaConfig, KafkaToken};
 
 #[cfg(feature = "transport-grpc")]
 pub use grpc::{GrpcConfig, GrpcToken, GrpcTransport, GrpcTransportBuilder};
