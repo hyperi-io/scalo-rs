@@ -219,6 +219,8 @@ Kafka emits the `transport_ack_*` series once armed. An armed gRPC server emits 
 `/metrics/manifest` is matched before `/metrics` in the prefix-match handler --
 don't reorder.
 
+The listener drains recorded histogram samples into their series every 5 s, scrape or no scrape, and frees the drained blocks, so a service nobody scrapes does not hold every sample it ever recorded.
+
 ---
 
 ## OTel mode

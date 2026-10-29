@@ -40,8 +40,13 @@ use crate::transport::error::{TransportError, TransportResult};
 // ============================================================================
 
 /// Resolves Kafka topics from the broker with filtering and suppression.
+///
+/// Holds the config, not a client: each [`resolve`](Self::resolve) builds a
+/// [`KafkaAdmin`], lists the topics and drops it. A client kept between
+/// refreshes is never polled, so librdkafka's queued events on it are never
+/// freed.
 pub struct TopicResolver {
-    admin: KafkaAdmin,
+    config: KafkaConfig,
     suppression_rules: Vec<SuppressionRule>,
     include_patterns: Vec<Regex>,
     exclude_patterns: Vec<Regex>,
@@ -51,19 +56,22 @@ impl TopicResolver {
     /// Create a new `TopicResolver` from a `KafkaConfig`.
     ///
     /// Compiles include/exclude regex patterns at construction time so that
-    /// `resolve()` is cheap to call repeatedly.
+    /// `resolve()` is cheap to call repeatedly. Builds the admin client once,
+    /// to refuse a config librdkafka refuses now, and drops it: each
+    /// `resolve()` builds its own, so no idle client lives between refreshes.
     ///
     /// # Errors
     ///
-    /// Returns error if [`KafkaAdmin::new`] refuses the config or cannot build
-    /// its client, or any regex pattern is invalid.
+    /// Returns error if the config is one [`KafkaAdmin::new`] refuses, or any
+    /// regex pattern is invalid.
     pub fn new(config: &KafkaConfig) -> TransportResult<Self> {
-        let admin = KafkaAdmin::new(config)?;
+        // Refuse a bad config now: a refresh treats a failure as transient.
+        drop(KafkaAdmin::new(config)?);
         let include_patterns = compile_patterns(&config.topic_include)?;
         let exclude_patterns = compile_patterns(&config.topic_exclude)?;
         Ok(Self {
-            admin,
             suppression_rules: config.topic_suppression_rules.clone(),
+            config: config.clone(),
             include_patterns,
             exclude_patterns,
         })
@@ -79,9 +87,10 @@ impl TopicResolver {
     ///
     /// # Errors
     ///
-    /// Returns error if the broker metadata fetch fails.
+    /// Returns error if the admin client cannot be built or the broker
+    /// metadata fetch fails.
     pub fn resolve(&self) -> TransportResult<Vec<String>> {
-        let all_topics = self.admin.list_topics()?;
+        let all_topics = KafkaAdmin::new(&self.config)?.list_topics()?;
         tracing::debug!(total = all_topics.len(), "Fetched broker topic list");
 
         let after_suppression = apply_suppression_rules(all_topics, &self.suppression_rules);
@@ -358,6 +367,22 @@ mod tests {
         client_gate::assert_refuses_as_the_transport_does(|config| {
             client_gate::config_refusal(TopicResolver::new(config))
         });
+    }
+
+    /// A key librdkafka refuses fails construction, not every refresh after
+    /// it, which would leave auto-discovery retrying a config that never works.
+    #[test]
+    fn a_config_librdkafka_refuses_fails_construction() {
+        let config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            ..Default::default()
+        }
+        .with_override("no.such.property", "1");
+        let refused = TopicResolver::new(&config).err();
+        assert!(
+            matches!(refused, Some(TransportError::Config(ref m)) if m.contains("no.such.property")),
+            "{refused:?}"
+        );
     }
 
     #[test]

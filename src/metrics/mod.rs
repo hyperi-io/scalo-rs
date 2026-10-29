@@ -1040,12 +1040,13 @@ impl MetricsManager {
         let process_metrics = self.process_metrics.clone();
         let container_metrics = self.container_metrics.clone();
 
-        let app = self.build_router(handle, extra_routes);
+        let app = self.build_router(handle.clone(), extra_routes);
 
         tokio::spawn(async move {
             run_axum_server(
                 listener,
                 app,
+                handle,
                 shutdown_rx,
                 update_interval,
                 process_metrics,
@@ -1222,12 +1223,14 @@ async fn run_server(
     #[cfg(feature = "scaling")] scaling_pressure: ScalingPressureSlot,
 ) {
     let mut update_interval = tokio::time::interval(update_interval);
+    let mut upkeep = upkeep_interval();
 
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
                 break;
             }
+            _ = upkeep.tick() => run_upkeep(&handle),
             _ = update_interval.tick() => {
                 if let Some(ref pm) = process_metrics {
                     pm.update();
@@ -1258,6 +1261,32 @@ async fn run_server(
             }
         }
     }
+}
+
+/// How often the listener drains recorded histogram samples into their
+/// buckets. A recorder built with `build_recorder` keeps every sample until a
+/// render or an upkeep runs, so an unscraped service would hold them all.
+#[cfg(feature = "metrics")]
+const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A ticker for [`PROMETHEUS_UPKEEP_INTERVAL`] that does not burst after a stall.
+#[cfg(feature = "metrics")]
+fn upkeep_interval() -> tokio::time::Interval {
+    let mut upkeep = tokio::time::interval(PROMETHEUS_UPKEEP_INTERVAL);
+    upkeep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    upkeep
+}
+
+/// Drain recorded histogram samples into their series and free the drained
+/// blocks.
+///
+/// The recorder hands drained blocks to crossbeam's epoch collector, which
+/// frees them only after enough later pins. An idle service pins too rarely
+/// for that, so the flush runs the collector here.
+#[cfg(feature = "metrics")]
+fn run_upkeep(handle: &PrometheusHandle) {
+    handle.run_upkeep();
+    crossbeam_epoch::pin().flush();
 }
 
 /// Longest request line we will read before giving up.
@@ -1452,12 +1481,14 @@ fn memory_pressure_response(slot: &MemoryGuardSlot) -> axum::response::Response 
 async fn run_axum_server(
     listener: TcpListener,
     app: axum::Router,
+    handle: PrometheusHandle,
     shutdown_rx: oneshot::Receiver<()>,
     update_interval: Duration,
     process_metrics: Option<ProcessMetrics>,
     container_metrics: Option<ContainerMetrics>,
 ) {
     let mut interval = tokio::time::interval(update_interval);
+    let mut upkeep = upkeep_interval();
 
     // Spawn the metrics update loop
     let (update_stop_tx, mut update_stop_rx) = oneshot::channel::<()>();
@@ -1465,6 +1496,7 @@ async fn run_axum_server(
         loop {
             tokio::select! {
                 _ = &mut update_stop_rx => break,
+                _ = upkeep.tick() => run_upkeep(&handle),
                 _ = interval.tick() => {
                     if let Some(ref pm) = process_metrics {
                         pm.update();

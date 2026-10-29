@@ -115,6 +115,9 @@ fn admin_client_config(config: &KafkaConfig) -> ClientConfig {
     // Profile defaults and user overrides.
     let rdkafka_config = config.build_librdkafka_config();
     super::apply_layer(&mut client_config, &raw_layer(&rdkafka_config));
+    // Nothing polls the admin's handles for statistics, so each event would
+    // sit on the client's queue for the life of the process.
+    client_config.set("statistics.interval.ms", "0");
     client_config
 }
 
@@ -136,6 +139,7 @@ fn offset_query_consumer_config(
         "group.id",
         config.internal_group_id(OFFSET_QUERY_GROUP_ROLE),
     );
+    consumer_config.set("statistics.interval.ms", "0");
     consumer_config
 }
 
@@ -653,6 +657,7 @@ impl std::fmt::Debug for KafkaAdmin {
 #[cfg(test)]
 mod tests {
     use super::super::client_gate;
+    use super::super::config::KafkaProfile;
     use super::*;
 
     #[test]
@@ -667,6 +672,43 @@ mod tests {
         client_gate::assert_builds_under_production(|config| {
             client_gate::config_refusal(KafkaAdmin::new(config))
         });
+    }
+
+    /// The admin's handles are never polled for statistics, so neither may
+    /// emit them, whatever the profile or an override asks for.
+    #[test]
+    fn neither_admin_handle_emits_statistics() {
+        let cases = [
+            ("production", KafkaProfile::Production, None),
+            ("devtest", KafkaProfile::DevTest, None),
+            (
+                "production, 5000 override",
+                KafkaProfile::Production,
+                Some("5000"),
+            ),
+            (
+                "devtest, 1000 override",
+                KafkaProfile::DevTest,
+                Some("1000"),
+            ),
+        ];
+        for (name, profile, interval) in cases {
+            let mut config = unreachable().with_profile(profile);
+            if let Some(ms) = interval {
+                config
+                    .librdkafka_overrides
+                    .insert("statistics.interval.ms".to_string(), ms.to_string());
+            }
+            let admin = admin_client_config(&config);
+            let consumer = offset_query_consumer_config(&admin, &config);
+            for (handle, client) in [("admin client", &admin), ("offset consumer", &consumer)] {
+                assert_eq!(
+                    client.get("statistics.interval.ms"),
+                    Some("0"),
+                    "{name}: {handle}"
+                );
+            }
+        }
     }
 
     /// At a loopback port that refuses at once, so no client waits on a broker.
