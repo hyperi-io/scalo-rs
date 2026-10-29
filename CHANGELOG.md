@@ -3,6 +3,26 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.22](https://github.com/hyperi-io/scalo-rs/compare/v2.14.21...v2.14.22) (2026-10-29)
+
+### Bug Fixes
+
+* /readyz waits for the handoff, the app's check and the gate ([#397](https://github.com/hyperi-io/scalo-rs/issues/397)) ([16fef49](https://github.com/hyperi-io/scalo-rs/commit/16fef49947d2f8342b912ae53f069bc55ed33a67)), closes [#8](https://github.com/hyperi-io/scalo-rs/issues/8) [#211](https://github.com/hyperi-io/scalo-rs/issues/211) [#170](https://github.com/hyperi-io/scalo-rs/issues/170)
+* backpressure a Kafka send to a missing topic instead of failing ([#417](https://github.com/hyperi-io/scalo-rs/issues/417)) ([4e69ed8](https://github.com/hyperi-io/scalo-rs/commit/4e69ed85332f2e0e300faf2344974e1a860582e9)), closes [#406](https://github.com/hyperi-io/scalo-rs/issues/406)
+* build Kafka config types without librdkafka ([#403](https://github.com/hyperi-io/scalo-rs/issues/403)) ([912ee16](https://github.com/hyperi-io/scalo-rs/commit/912ee16cb556a460dbe8c7fa019cd9349422cdd5))
+* build only the Kafka clients a transport's directions use ([#402](https://github.com/hyperi-io/scalo-rs/issues/402)) ([2f62023](https://github.com/hyperi-io/scalo-rs/commit/2f62023c87ee661a8f369a509a654f0c82da4dc8)), closes [#396](https://github.com/hyperi-io/scalo-rs/issues/396)
+* build the Prometheus exporter without its push gateway ([#401](https://github.com/hyperi-io/scalo-rs/issues/401)) ([0fdf700](https://github.com/hyperi-io/scalo-rs/commit/0fdf700bfd7d5831b6a99f55350d5c8ca3555d5c))
+* cap DLQ entry payloads so an oversize dead letter still lands ([#408](https://github.com/hyperi-io/scalo-rs/issues/408)) ([9f038ba](https://github.com/hyperi-io/scalo-rs/commit/9f038ba744ba425374914645c8266d1d947f3cb1)), closes [#80](https://github.com/hyperi-io/scalo-rs/issues/80)
+* contract defaults, refusing generators and a leaner image ([#399](https://github.com/hyperi-io/scalo-rs/issues/399)) ([36b27b5](https://github.com/hyperi-io/scalo-rs/commit/36b27b5a7b02194bb9c52ce1c70405bc45cff4ce)), closes [#329](https://github.com/hyperi-io/scalo-rs/issues/329) [#148](https://github.com/hyperi-io/scalo-rs/issues/148) [#107](https://github.com/hyperi-io/scalo-rs/issues/107) [#93](https://github.com/hyperi-io/scalo-rs/issues/93)
+* hold a test's memory to the contract's request and limit ([#410](https://github.com/hyperi-io/scalo-rs/issues/410)) ([47387f0](https://github.com/hyperi-io/scalo-rs/commit/47387f0be6342b60a12bc2262351992a5f762a4f)), closes [#409](https://github.com/hyperi-io/scalo-rs/issues/409)
+* idle Kafka apps stop growing their heap ([#400](https://github.com/hyperi-io/scalo-rs/issues/400)) ([2e28d27](https://github.com/hyperi-io/scalo-rs/commit/2e28d276f59274707efaedb64b3cc1e7ed5a2f99)), closes [#396](https://github.com/hyperi-io/scalo-rs/issues/396)
+* make Kafka lag follow the broker while the local queue is full ([#404](https://github.com/hyperi-io/scalo-rs/issues/404)) ([564232d](https://github.com/hyperi-io/scalo-rs/commit/564232d4dcc90762c8a01e9a3ef31296e29d2119)), closes [#223](https://github.com/hyperi-io/scalo-rs/issues/223)
+* read a registered heap source beside the cgroup, not instead of it ([#411](https://github.com/hyperi-io/scalo-rs/issues/411)) ([86246a6](https://github.com/hyperi-io/scalo-rs/commit/86246a6e3ad002855ec5c11fa15e4631cdf9b642)), closes [#146](https://github.com/hyperi-io/scalo-rs/issues/146)
+* report config warnings before the idle gate ([#415](https://github.com/hyperi-io/scalo-rs/issues/415)) ([ac93af4](https://github.com/hyperi-io/scalo-rs/commit/ac93af441318ceb39a185b3f4463f2e3354c70d3)), closes [#69](https://github.com/hyperi-io/scalo-rs/issues/69)
+* run at most three Kafka broker tests at once ([#412](https://github.com/hyperi-io/scalo-rs/issues/412)) ([24bd5b7](https://github.com/hyperi-io/scalo-rs/commit/24bd5b702c58a1fd212c1bc70bd6685c50710211)), closes [#395](https://github.com/hyperi-io/scalo-rs/issues/395)
+* set up the config cascade in run_app ([#414](https://github.com/hyperi-io/scalo-rs/issues/414)) ([5f01de4](https://github.com/hyperi-io/scalo-rs/commit/5f01de4b05d8404386006473946cd2ecd88733ee)), closes [#242](https://github.com/hyperi-io/scalo-rs/issues/242)
+* wait for a missing Kafka topic instead of ending the consumer ([#405](https://github.com/hyperi-io/scalo-rs/issues/405)) ([af6463f](https://github.com/hyperi-io/scalo-rs/commit/af6463fd8776da4ee26e5b56a61584e86adf7cc8)), closes [#288](https://github.com/hyperi-io/scalo-rs/issues/288)
+
 ## [2.14.21](https://github.com/hyperi-io/scalo-rs/compare/v2.14.20...v2.14.21) (2026-10-28)
 
 ### Bug Fixes
