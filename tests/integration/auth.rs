@@ -35,6 +35,10 @@ use scalo::auth::{
 use scalo::http_client::{HttpClient, HttpClientConfig, HttpError, SignError};
 use scalo::sensitive::SensitiveString;
 
+/// An address no connection is ever accepted on. A port bound and dropped can
+/// be taken by another test's server before the request reaches it.
+const REFUSED: &str = "127.0.0.1:0";
+
 /// One request the fixture saw on the API route.
 #[derive(Debug, Clone, Default)]
 struct Seen {
@@ -899,11 +903,8 @@ async fn a_refusal_that_echoes_the_form_keeps_the_secret_out_of_the_error() {
 /// is where reqwest's own copy of the request URL puts it.
 #[tokio::test]
 async fn a_transport_error_on_a_query_signed_call_carries_no_secret() {
-    // A port that was free and is now closed, so the connection is refused
-    // rather than answered: the transport-error arm rather than a status.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead = listener.local_addr().unwrap();
-    drop(listener);
+    // Port 0 refuses every connection: the transport-error arm, not a status.
+    let dead = REFUSED;
 
     let placement = QueryPlacement::new("token", Cached::new(Static::new(SECRET)));
     let error = client()
@@ -1409,9 +1410,7 @@ async fn no_log_line_carries_the_secret() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let (addr, _state) = fixture().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead = listener.local_addr().unwrap();
-    drop(listener);
+    let dead = REFUSED;
     let exchange = |recipe: &str| {
         ClientCredentials::new(
             &client(),

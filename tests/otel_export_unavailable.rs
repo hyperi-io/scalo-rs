@@ -26,12 +26,10 @@ use std::time::{Duration, Instant};
 use metrics::counter;
 use scalo::metrics::{MetricsConfig, MetricsManager, OtelMetricsConfig};
 
-/// A port with nothing on it: bind, read the port, drop the listener.
+/// A port no connection is ever accepted on. A port bound and dropped can be
+/// taken by another test's server before the exporter reaches it.
 fn closed_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
+    0
 }
 
 fn resident_bytes() -> u64 {
