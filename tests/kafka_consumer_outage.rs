@@ -30,7 +30,7 @@ use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
 use scalo::transport::kafka::{
     ConsumerProtocol, KafkaAdmin, KafkaConfig, KafkaToken, KafkaTransport,
 };
-use scalo::transport::{TransportError, TransportReceiver};
+use scalo::transport::{TransportBase, TransportError, TransportReceiver};
 use testcontainers_modules::kafka::apache::{self, Kafka};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
@@ -84,7 +84,7 @@ async fn create_topic(bootstrap: &str) {
         .await
         .expect("create topic");
     // A consumer that subscribes before the broker's metadata lists the new
-    // topic is told it does not exist, which ends it.
+    // topic waits for the next metadata refresh, minutes by default.
     tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
         while admin
@@ -357,12 +357,12 @@ async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
 }
 
 /// A topic that does not exist, with the consumer barred from creating it, is
-/// a failure no retry clears, so recv must still return it.
+/// waited for: every receive returns an empty batch and readiness is false.
 ///
 /// Classic protocol: under KIP-848 librdkafka waits for a missing topic to
 /// appear instead of raising an error.
 #[tokio::test]
-async fn a_missing_topic_still_ends_the_consumer() {
+async fn a_missing_topic_fails_readiness_not_the_consumer() {
     if !require_docker() {
         return;
     }
@@ -374,19 +374,20 @@ async fn a_missing_topic_still_ends_the_consumer() {
     let consumer = KafkaTransport::new(&config).await.expect("kafka consumer");
 
     let deadline = Instant::now() + Duration::from_secs(60);
-    let err = loop {
+    while consumer.is_healthy() {
         assert!(
             Instant::now() < deadline,
-            "recv never reported the missing topic"
+            "readiness never reported the missing topic"
         );
-        match consumer.recv(100).await {
-            Ok(batch) => assert_eq!(batch.records, [] as [scalo::Record; 0]),
-            Err(e) => break e,
-        }
-    };
-    eprintln!("missing topic reported as: {err}");
+        let batch = consumer
+            .recv(100)
+            .await
+            .expect("a missing topic never fails a receive");
+        assert_eq!(batch.records, [] as [scalo::Record; 0]);
+    }
+    let healthcheck = consumer.healthcheck().await;
     assert!(
-        matches!(&err, TransportError::Recv(detail) if detail.contains("UnknownTopicOrPartition")),
-        "expected a receive error naming the missing topic, got {err:?}"
+        matches!(healthcheck, Err(TransportError::Connection(_))),
+        "{healthcheck:?}"
     );
 }

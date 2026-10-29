@@ -26,6 +26,12 @@ librdkafka stops fetching a partition whose local queue holds `queued.min.messag
 
 **Consumer adjustment** -- none. A KEDA trigger on lag reads the real backlog sooner.
 
+### A Kafka consumer waits for a missing topic (BEHAVIOUR CHANGE)
+
+A subscribed topic that does not exist no longer ends the consumer with `TransportError::Recv`. `recv` returns empty batches with the transient backoff, logs one warning, counts `transport_recv_errors_total{class="missing_topic"}`, and fails readiness while the consumer holds no partition. It reads the topic once librdkafka's next metadata refresh lists it. `allow.auto.create.topics` no longer changes how a missing topic is classified.
+
+**Consumer adjustment** -- none for a `BatchEngine` app. An app that matched a missing-topic `Recv` error to stop, alert or recreate the topic watches readiness or the counter instead. Lower `topic.metadata.refresh.interval.ms` to pick a late topic up sooner than 5 min.
+
 ### /readyz answers 503 until the app runs, and a paused gate is not ready (BEHAVIOUR CHANGE)
 
 A service built by `run_app` answers `/readyz` 503 `{"status":"starting"}` from the moment its metrics listener binds until `run_app` hands control to `run_service`. `ServiceApp::readiness_check` supplies the app's check before that handoff, so there is no window where the service reads ready before it has said what ready means. An idle service stays ready. With the `health` feature each inbound gate registers a `self_regulation:<source>` component that is unhealthy while the source is paused. A metrics listener that cannot bind now fails `ServiceRuntime::build` with `CliError::Metrics` instead of logging and running on.
