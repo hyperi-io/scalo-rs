@@ -381,7 +381,7 @@ impl KafkaProducer {
                         bytes: payload.len(),
                         detail: err.to_string(),
                     }),
-                    SendFailure::Retryable => {
+                    SendFailure::Retryable | SendFailure::MissingTopic => {
                         // Backpressure is the recoverable outcome the caller
                         // acts on; the cause only survives in this line.
                         if self.enqueue_degraded.enter() {

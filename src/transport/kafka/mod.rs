@@ -240,6 +240,11 @@ pub struct KafkaTransport {
     /// Set while a subscribed topic is missing and the consumer holds no
     /// partition, which fails readiness: nothing can be consumed.
     topic_missing: Arc<AtomicBool>,
+    /// Destination topics a send found missing and no send has delivered to
+    /// since. Readiness fails while any is listed.
+    missing_destinations: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// Latches the missing-destination warn to the first of a run.
+    destination_latch: classify::DegradedLatch,
     /// Topics we're subscribed to (for cache warming and Debug).
     /// Behind RwLock so recv() can update after topic refresh re-subscribe.
     subscribed_topics: parking_lot::RwLock<Vec<String>>,
@@ -1105,6 +1110,8 @@ impl KafkaTransport {
 
         let healthy = Arc::new(AtomicBool::new(true));
         let topic_missing = Arc::new(AtomicBool::new(false));
+        let missing_destinations =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
 
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
@@ -1117,10 +1124,12 @@ impl KafkaTransport {
             let h = Arc::clone(&healthy);
             let refused = Arc::clone(&auth);
             let missing = Arc::clone(&topic_missing);
+            let destinations = Arc::clone(&missing_destinations);
             crate::health::HealthRegistry::register("transport:kafka", move || {
                 if h.load(Ordering::Relaxed)
                     && !refused.is_refused()
                     && !missing.load(Ordering::Relaxed)
+                    && destinations.lock().is_empty()
                 {
                     crate::health::HealthStatus::Healthy
                 } else {
@@ -1170,6 +1179,8 @@ impl KafkaTransport {
             recv_state: classify::RecvState::default(),
             deferred_recv_error: parking_lot::Mutex::new(None),
             topic_missing,
+            missing_destinations,
+            destination_latch: classify::DegradedLatch::default(),
             subscribed_topics: parking_lot::RwLock::new(subscribed_topics),
             #[cfg(feature = "governor")]
             group_id: config.group.clone(),
@@ -1709,6 +1720,7 @@ impl KafkaTransport {
                 if self.send_degraded.clear() {
                     tracing::info!(destination, "kafka send recovered");
                 }
+                self.destination_delivered(destination);
                 SendResult::Ok
             }
             Err((err, _)) => self.failure_result(destination, bytes, &err),
@@ -1778,6 +1790,26 @@ impl KafkaTransport {
                 }
                 SendResult::Backpressured
             }
+            classify::SendFailure::MissingTopic => {
+                #[cfg(feature = "metrics")]
+                ::metrics::counter!(
+                    "transport_send_missing_topic_total",
+                    "transport" => "kafka"
+                )
+                .increment(1);
+                self.missing_destinations
+                    .lock()
+                    .insert(destination.to_string());
+                if self.destination_latch.enter() {
+                    tracing::warn!(
+                        destination,
+                        error = %err,
+                        "kafka: the destination topic does not exist; the caller keeps the \
+                         record and retries until it does"
+                    );
+                }
+                SendResult::Backpressured
+            }
             classify::SendFailure::Fatal => {
                 #[cfg(feature = "metrics")]
                 ::metrics::counter!(
@@ -1787,6 +1819,18 @@ impl KafkaTransport {
                 .increment(1);
                 SendResult::Fatal(TransportError::Send(err.to_string()))
             }
+        }
+    }
+
+    /// A delivery to `destination` proves the topic exists: readiness no
+    /// longer fails on it.
+    fn destination_delivered(&self, destination: &str) {
+        let mut missing = self.missing_destinations.lock();
+        if missing.remove(destination) && missing.is_empty() && self.destination_latch.clear() {
+            tracing::info!(
+                destination,
+                "kafka: the missing destination topic is being written"
+            );
         }
     }
 }
@@ -1812,6 +1856,7 @@ impl TransportBase for KafkaTransport {
         self.healthy.load(Ordering::Relaxed)
             && !self.auth.is_refused()
             && !self.topic_missing.load(Ordering::Relaxed)
+            && self.missing_destinations.lock().is_empty()
     }
 
     async fn healthcheck(&self) -> TransportResult<()> {
@@ -4330,13 +4375,12 @@ mod tests {
             )),
             classify::SendFailure::QueueFull
         );
-        // A missing topic stays fatal: retrying past it hides a misconfigured
-        // destination behind the retry loop.
+        // A missing topic is retried: the topic may yet appear.
         assert_eq!(
             classify::classify_send_failure(&KafkaError::MessageProduction(
                 RDKafkaErrorCode::UnknownTopicOrPartition
             )),
-            classify::SendFailure::Fatal
+            classify::SendFailure::MissingTopic
         );
     }
 
@@ -4398,7 +4442,6 @@ mod tests {
                 RDKafkaErrorCode::MessageTimedOut,
                 RDKafkaErrorCode::QueueFull,
                 RDKafkaErrorCode::MessageSizeTooLarge,
-                RDKafkaErrorCode::UnknownTopicOrPartition,
             ]
             .map(|code| transport.failure_result("t", 10, &produce(code)))
         };
@@ -4412,7 +4455,7 @@ mod tests {
             &KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed),
             "invalid credentials",
         );
-        let [timed_out, queue_full, too_large, unknown_topic] = classes(&transport);
+        let [timed_out, queue_full, too_large] = classes(&transport);
         for refused in [&timed_out, &queue_full] {
             assert!(
                 matches!(refused, SendResult::Fatal(TransportError::Config(m)) if m.contains("invalid credentials")),
@@ -4423,10 +4466,6 @@ mod tests {
             too_large.is_filtered_dlq(),
             "an oversize record is still dead-lettered"
         );
-        assert!(
-            matches!(unknown_topic, SendResult::Fatal(TransportError::Send(_))),
-            "a missing topic keeps its own error, got {unknown_topic:?}"
-        );
         assert!(!transport.is_healthy());
         let health = transport.healthcheck().await.expect_err("not ready");
         assert!(health.is_fatal() && health.to_string().contains("invalid credentials"));
@@ -4434,6 +4473,44 @@ mod tests {
         transport.auth.mark_proven();
         assert!(classes(&transport)[0].is_backpressured());
         assert!(transport.is_healthy());
+    }
+
+    /// A missing destination backpressures and fails readiness until a send
+    /// to that same topic is delivered. A delivery elsewhere does not clear it.
+    #[tokio::test]
+    async fn a_missing_destination_fails_readiness_until_it_is_written() {
+        let transport = KafkaTransport::sender(&unreachable_config())
+            .await
+            .expect("a sender constructs broker-free");
+        let missing = KafkaError::MessageProduction(RDKafkaErrorCode::UnknownTopicOrPartition);
+        let delivered = |topic: &str| {
+            transport.delivery_result(
+                topic,
+                10,
+                Ok(rdkafka::producer::future_producer::Delivery {
+                    partition: 0,
+                    offset: 0,
+                    timestamp: rdkafka::Timestamp::NotAvailable,
+                }),
+            )
+        };
+
+        assert!(
+            transport
+                .failure_result("absent", 10, &missing)
+                .is_backpressured()
+        );
+        assert!(
+            !transport.is_healthy(),
+            "a missing destination fails readiness"
+        );
+        assert!(delivered("other").is_ok());
+        assert!(
+            !transport.is_healthy(),
+            "another topic's delivery leaves it missing"
+        );
+        assert!(delivered("absent").is_ok());
+        assert!(transport.is_healthy(), "a delivery to it clears it");
     }
 
     #[test]
