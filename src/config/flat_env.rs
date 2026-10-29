@@ -182,7 +182,7 @@ pub struct EnvVarDoc {
 /// Load config with full cascade: YAML -> figment env -> flat env -> normalise.
 ///
 /// It orchestrates:
-/// 1. `.env` loading (via dotenvy, handled by `config::setup`)
+/// 1. `.env` loading (via dotenvy), only when no `config_path` is given
 /// 2. YAML file discovery and loading, with `config_path` as the settings
 ///    layer when given
 /// 3. Figment env var merging (double-underscore nesting)
@@ -202,6 +202,7 @@ where
 {
     let mut opts = super::ConfigOptions {
         env_prefix: env_prefix.to_string(),
+        load_dotenv: config_path.is_none(),
         ..Default::default()
     };
 
@@ -515,15 +516,25 @@ mod tests {
         }
     }
 
-    /// The named file itself is read, wherever it lives and whatever its name.
+    /// The named file itself is read, wherever it lives and whatever its name,
+    /// and a `.env` in the working directory does not override it.
     #[test]
     fn load_config_reads_the_file_it_is_given() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("loader.yaml");
         std::fs::write(&path, "host: from-the-file\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "FLATLOADTEST_HOST=from-dotenv\n").unwrap();
+        // The working directory is process-global, so only move it when this
+        // test has the process to itself.
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test") {
+            std::env::set_current_dir(dir.path()).unwrap();
+        }
 
         let loaded: Loaded = load_config(path.to_str(), "FLATLOADTEST").unwrap();
-        assert_eq!(loaded.host, "from-the-file");
+        assert_eq!(
+            loaded.host, "from-the-file",
+            "the .env in the working directory reached a named file's config"
+        );
         assert!(loaded.normalised);
     }
 

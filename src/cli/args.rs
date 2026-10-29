@@ -192,11 +192,15 @@ impl CommonArgs {
     }
 
     /// Convert to `ConfigOptions` for use with `config::setup()`.
+    ///
+    /// `.env` is read only when `--config` is absent, so a working tree's
+    /// `.env` never reaches a service that names its file.
     #[cfg(feature = "config")]
     #[must_use]
     pub fn to_config_options(&self, env_prefix: &str) -> crate::config::ConfigOptions {
         let mut opts = crate::config::ConfigOptions {
             env_prefix: env_prefix.to_string(),
+            load_dotenv: self.config.is_none(),
             ..Default::default()
         };
         if let Some(ref path) = self.config {
@@ -226,6 +230,34 @@ mod tests {
             metrics_addr: None,
             verbose: false,
             quiet: false,
+        }
+    }
+
+    /// A named file is the whole config, so `.env` is read only without one.
+    #[cfg(feature = "config")]
+    #[test]
+    fn to_config_options_reads_dotenv_only_without_a_named_file() {
+        let cases = [
+            (
+                Some("/etc/app/app.yaml"),
+                false,
+                vec!["/etc/app/app.yaml".into()],
+            ),
+            (None, true, Vec::<std::path::PathBuf>::new()),
+        ];
+        for (config, want_dotenv, want_paths) in cases {
+            let args = CommonArgs {
+                config: config.map(String::from),
+                ..bare_args()
+            };
+            let opts = args.to_config_options("APP");
+            assert_eq!(opts.env_prefix, "APP");
+            assert_eq!(
+                opts.load_dotenv, want_dotenv,
+                "--config {config:?} gave load_dotenv {}",
+                opts.load_dotenv
+            );
+            assert_eq!(opts.config_paths, want_paths, "--config {config:?}");
         }
     }
 

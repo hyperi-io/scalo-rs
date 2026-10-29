@@ -16,7 +16,7 @@ The cascade is **7 layers** -- one typed view assembled from CLI args, env vars,
 | --- | -------- | ------- |
 | 1 | CLI args | `Config::merge_cli(args)` after `Config::new` |
 | 2 | Environment variables | Prefix from `ConfigOptions::env_prefix`, double-underscore for nesting (`DFE_LOADER__KAFKA__BROKERS`) |
-| 3 | `.env` file | `./.env` (plus `~/.env` beneath it with `load_home_dotenv`), loaded by `dotenvy` into env vars -- same precedence as layer 2. Parent directories are not searched |
+| 3 | `.env` file | `./.env` (plus `~/.env` beneath it with `load_home_dotenv`), loaded by `dotenvy` into env vars -- same precedence as layer 2. Parent directories are not searched. Not read at all when a file is named: `--config`, or a path given to `load_typed` or `flat_env::load_config` |
 | 4 | `settings.{env}.yaml` | `{env}` from `APP_ENV` / `ENVIRONMENT` / `ENV` (default `development`) |
 | 5 | `settings.yaml` | Team defaults, committed |
 | 6 | `defaults.yaml` | Fallback baseline |
