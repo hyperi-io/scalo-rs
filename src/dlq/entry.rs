@@ -29,12 +29,21 @@ pub struct DlqEntry {
     /// How many times the message was retried before being sent to DLQ.
     pub attempts: u32,
 
-    /// Original message payload (base64-encoded in JSON).
+    /// Original message payload (base64-encoded in JSON), or its first bytes
+    /// when `truncated`.
     #[serde(
         serialize_with = "serialize_payload",
         deserialize_with = "deserialize_payload"
     )]
     pub payload: Vec<u8>,
+
+    /// Whether `payload` holds only the start of the original.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+
+    /// The original payload's length in bytes, when `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_bytes: Option<usize>,
 
     /// Intended destination (e.g. "db.table" or topic name).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +79,8 @@ impl DlqEntry {
             reason: reason.into(),
             attempts: 0,
             payload,
+            truncated: false,
+            original_bytes: None,
             destination: None,
             source: None,
         }
@@ -93,6 +104,21 @@ impl DlqEntry {
     #[must_use]
     pub fn with_attempts(mut self, attempts: u32) -> Self {
         self.attempts = attempts;
+        self
+    }
+
+    /// Keep the first `max_bytes` of a longer payload, marking the entry
+    /// `truncated` with the original length. A payload within it is kept
+    /// whole.
+    #[must_use]
+    pub fn truncate_to(mut self, max_bytes: usize) -> Self {
+        let len = self.payload.len();
+        if len > max_bytes {
+            self.payload.truncate(max_bytes);
+            self.payload.shrink_to_fit();
+            self.truncated = true;
+            self.original_bytes = Some(self.original_bytes.unwrap_or(len));
+        }
         self
     }
 }
@@ -155,6 +181,47 @@ mod tests {
         assert_eq!(src.topic.as_deref(), Some("events"));
         assert_eq!(src.partition, Some(3));
         assert_eq!(src.offset, Some(12345));
+    }
+
+    #[test]
+    fn truncate_to_keeps_the_start_and_says_how_long_it_was() {
+        let entry = |len: usize| DlqEntry::new("svc", "r", vec![b'x'; len]);
+        // (case, payload length, cap, kept, original_bytes)
+        let cases = [
+            ("under the cap", 3, 4, 3, None),
+            ("at the cap", 4, 4, 4, None),
+            ("one byte over", 5, 4, 4, Some(5)),
+            ("a zero cap", 5, 0, 0, Some(5)),
+        ];
+        for (name, len, cap, kept, original) in cases {
+            let capped = entry(len).truncate_to(cap);
+            assert_eq!(capped.payload.len(), kept, "{name}");
+            assert_eq!(capped.original_bytes, original, "{name}");
+            assert_eq!(capped.truncated, original.is_some(), "{name}");
+        }
+        let twice = entry(10).truncate_to(6).truncate_to(2);
+        assert_eq!(
+            twice.original_bytes,
+            Some(10),
+            "a second cut keeps the first length"
+        );
+    }
+
+    #[test]
+    fn only_a_truncated_entry_carries_the_truncation_fields() {
+        let whole = serde_json::to_value(DlqEntry::new("svc", "r", b"abc".to_vec())).expect("json");
+        assert!(whole.get("truncated").is_none() && whole.get("original_bytes").is_none());
+
+        let cut = DlqEntry::new("svc", "r", b"abcdef".to_vec()).truncate_to(2);
+        let json = serde_json::to_string(&cut).expect("serialise");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["original_bytes"], 6);
+        let parsed: DlqEntry = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(
+            (parsed.payload, parsed.truncated, parsed.original_bytes),
+            (b"ab".to_vec(), true, Some(6))
+        );
     }
 
     #[test]

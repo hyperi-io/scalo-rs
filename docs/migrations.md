@@ -20,6 +20,12 @@ release and the target before bumping.
 
 **Consumer adjustment** -- an app that uses `KafkaConfig` but builds no Kafka client swaps `transport-kafka` for `transport-kafka-config`, and keeps `transport-kafka` on the dev-dependency if its tests talk to a broker.
 
+### DLQ entries cap their payload at 512 KiB (BEHAVIOUR CHANGE)
+
+`DlqConfig::max_payload_bytes` (default `Some(DEFAULT_MAX_PAYLOAD_BYTES)`, 512 KiB) cuts a longer payload on every send, so a dead letter that was too large for Kafka lands in a Kafka DLQ instead of failing it the same way. The entry carries `truncated: true` and `original_bytes`, and each cut counts in `dlq_payload_truncated_total`. `Dlq::cap` applies the cap, and the `BatchEngine` applies it before `Dlq::refusal`, so an entry the cap brings under the backend's ceiling is written rather than dropped. `DlqEntry` gains `truncated`, `original_bytes` and `truncate_to`.
+
+**Consumer adjustment** -- a DLQ that must keep whole payloads, such as a file DLQ that is replayed, sets `max_payload_bytes: null`. A `DlqEntry` struct literal adds the two fields or uses `DlqEntry::new`. A caller of `Dlq::refusal` passes the entry through `Dlq::cap` first.
+
 ### Lag follows the broker while the local queue is full (BEHAVIOUR CHANGE)
 
 librdkafka stops fetching a partition whose local queue holds `queued.min.messages`, or once the consumer's queue holds `queued.max.messages.kbytes`, so the end it reports stood still and `total_position_lag`, `total_consumer_lag` and the lag gauges under-read until the app worked the queue down. The transport now asks the broker for the ends then, as it already did while the gate paused the assignment, with or without the `governor` feature: one `ListOffsets` per leader, once per statistics interval and no more often than once a second.

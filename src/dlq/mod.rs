@@ -69,7 +69,7 @@ mod http;
 
 // Core types (always available with `dlq` feature)
 pub use backend::DlqBackend;
-pub use config::{DlqConfig, DlqMode, FileDlqConfig, RotationPeriod};
+pub use config::{DEFAULT_MAX_PAYLOAD_BYTES, DlqConfig, DlqMode, FileDlqConfig, RotationPeriod};
 pub use entry::{DlqEntry, DlqSource};
 pub use error::DlqError;
 pub use orchestrator::Dlq;

@@ -87,6 +87,8 @@ pub struct Dlq {
         allow(dead_code, reason = "read by `refusal` only")
     )]
     ceiling: Option<usize>,
+    /// Payload bytes an entry keeps; see [`DlqConfig::max_payload_bytes`].
+    max_payload_bytes: Option<usize>,
 }
 
 /// Counts the bytes written to it, to size an entry without keeping its body.
@@ -160,6 +162,7 @@ impl Dlq {
             lost: Arc::new(AtomicU64::new(0)),
             lost_log_ms: Arc::new(AtomicU64::new(0)),
             ceiling: None,
+            max_payload_bytes: None,
         }
     }
 
@@ -239,6 +242,7 @@ impl Dlq {
             lost,
             lost_log_ms,
             ceiling,
+            max_payload_bytes: config.max_payload_bytes,
         })
     }
 
@@ -298,7 +302,7 @@ impl Dlq {
             self.note_dropped(1);
             return Ok(());
         };
-        sink.try_push(entry).map_err(map_sink_err)
+        sink.try_push(self.cap(entry)).map_err(map_sink_err)
     }
 
     /// Async submission that awaits queue space.
@@ -314,7 +318,9 @@ impl Dlq {
             self.note_dropped(1);
             return Ok(());
         };
-        sink.push_blocking(entry).await.map_err(map_sink_err)
+        sink.push_blocking(self.cap(entry))
+            .await
+            .map_err(map_sink_err)
     }
 
     /// Async batch submission. Each entry is queued individually; the
@@ -329,7 +335,9 @@ impl Dlq {
             return Ok(());
         };
         for entry in entries {
-            sink.push_blocking(entry).await.map_err(map_sink_err)?;
+            sink.push_blocking(self.cap(entry))
+                .await
+                .map_err(map_sink_err)?;
         }
         Ok(())
     }
@@ -382,7 +390,31 @@ impl Dlq {
             self.note_dropped(entries.len() as u64);
             return Ok(());
         };
+        let entries = entries.into_iter().map(|entry| self.cap(entry)).collect();
         sink.write_confirmed(entries).await.map_err(map_sink_err)
+    }
+
+    /// `entry` as this DLQ writes it: a payload over
+    /// [`DlqConfig::max_payload_bytes`] cut to it, the entry marked
+    /// `truncated`, and `dlq_payload_truncated_total` counted. Every send
+    /// applies it. Apply it before [`refusal`](Self::refusal), which judges
+    /// the entry it is given.
+    #[must_use]
+    pub fn cap(&self, entry: DlqEntry) -> DlqEntry {
+        match self.max_payload_bytes {
+            Some(max) if entry.payload.len() > max => {
+                #[cfg(feature = "metrics")]
+                ::metrics::counter!("dlq_payload_truncated_total").increment(1);
+                tracing::debug!(
+                    bytes = entry.payload.len(),
+                    max,
+                    reason = %entry.reason,
+                    "DLQ entry payload truncated"
+                );
+                entry.truncate_to(max)
+            }
+            _ => entry,
+        }
     }
 
     /// Why no backend of this DLQ can ever hold `entry`, or `None` when one
@@ -397,6 +429,7 @@ impl Dlq {
     /// no retry can land it. Every other `write_confirmed` error can clear, so
     /// that caller holds the block and writes again. A broker or topic ceiling
     /// below the producer's is not seen here, and fails the write instead.
+    /// Pass the entry through [`cap`](Self::cap) first.
     #[cfg(feature = "transport")]
     #[must_use]
     pub fn refusal(&self, entry: &DlqEntry) -> Option<crate::transport::DeadLetterReason> {
@@ -851,6 +884,69 @@ mod tests {
                     .reason
             })
             .collect()
+    }
+
+    /// Every way into the DLQ cuts a payload over `max_payload_bytes` to it,
+    /// and the entry that lands says how long the payload was. One within the
+    /// cap, and every payload under `None`, lands whole.
+    #[tokio::test]
+    async fn every_send_lands_an_oversize_payload_truncated() {
+        const VIA: [&str; 4] = ["send", "try_send", "send_batch", "write_confirmed"];
+        // (case, cap, payload length, kept, original_bytes)
+        let cases = [
+            ("one byte over", Some(8), 9, 8, Some(9)),
+            ("at the cap", Some(8), 8, 8, None),
+            ("no cap", None, 64, 64, None),
+        ];
+        for (name, cap, len, kept, original) in cases {
+            for via in VIA {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let shutdown = CancellationToken::new();
+                let dlq = spawn_dlq(
+                    &DlqConfig {
+                        max_payload_bytes: cap,
+                        ..tmp_config(dir.path())
+                    },
+                    &shutdown,
+                );
+                let entry = DlqEntry::new("test", via, vec![b'x'; len]);
+                match via {
+                    "send" => dlq.send(entry).await.expect("queued"),
+                    "try_send" => dlq.try_send(entry).expect("queued"),
+                    "send_batch" => dlq.send_batch(vec![entry]).await.expect("queued"),
+                    _ => dlq.write_confirmed(vec![entry]).await.expect("written"),
+                }
+                dlq.flush().await.expect("flush");
+                let lines = crate::dlq::test_files::written_lines(dir.path(), "svc");
+                let landed: DlqEntry =
+                    serde_json::from_str(&lines[0]).expect("a whole DLQ entry per line");
+                assert_eq!(landed.payload.len(), kept, "{name} via {via}");
+                assert_eq!(landed.original_bytes, original, "{name} via {via}");
+                assert_eq!(landed.truncated, original.is_some(), "{name} via {via}");
+                dlq.shutdown().await.expect("shutdown");
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_cap_lands_under_a_default_kafka_ceiling() {
+        use base64::Engine;
+        let cap = DlqConfig::default()
+            .max_payload_bytes
+            .expect("a default cap");
+        assert_eq!(cap, crate::dlq::DEFAULT_MAX_PAYLOAD_BYTES);
+        let entry = DlqEntry::new("svc", "too_large", vec![0xff; cap + 1])
+            .with_destination("a.destination")
+            .truncate_to(cap);
+        let written = serde_json::to_vec(&entry).expect("serialise").len();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .encode(&entry.payload)
+                .len(),
+            699_052
+        );
+        // librdkafka's own default `message.max.bytes`, the lower of the two.
+        assert!(written < 1_000_000, "{written} bytes");
     }
 
     /// A write that rotates the file moves what it held aside; the readers
@@ -1342,6 +1438,11 @@ mod tests {
                 "the file backend takes what Kafka refuses"
             );
             assert_eq!(Dlq::disabled().refusal(&over), None);
+            assert_eq!(
+                alone.refusal(&alone.cap(over)),
+                None,
+                "the default payload cap brings it under the ceiling"
+            );
         }
 
         #[tokio::test]

@@ -808,10 +808,10 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         let mut entries: Vec<crate::dlq::DlqEntry> = Vec::with_capacity(dead.len());
         for d in dead {
             let entry = crate::dlq::DlqEntry::new(DLQ_SERVICE, d.entry.reason, d.entry.payload);
-            let entry = match d.entry.key {
+            let entry = dlq.cap(match d.entry.key {
                 Some(key) => entry.with_destination(key.as_ref()),
                 None => entry,
-            };
+            });
             if !enabled {
                 disabled_reasons.push(d.screened.unwrap_or(PRODUCED_DEAD_LETTER));
             } else if let Some(refused) = dlq.refusal(&entry) {

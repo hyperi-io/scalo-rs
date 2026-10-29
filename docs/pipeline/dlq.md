@@ -161,6 +161,12 @@ The count lands only if the drain gets to finish. Await `shutdown()`, or keep th
 
 ---
 
+## Payload cap
+
+A dead letter is often in the DLQ because it was too large, and its entry is a third larger again once the payload is base64'd, so a Kafka backend would refuse it the same way. So every send cuts a payload over `max_payload_bytes` (default 512 KiB, `DEFAULT_MAX_PAYLOAD_BYTES`) to that length, on every backend, and the entry carries `"truncated": true` and `"original_bytes"`, the length it had. Each cut counts in `dlq_payload_truncated_total`. 512 KiB base64'd is 699,052 bytes, under Kafka's and librdkafka's default `message.max.bytes`. Set `max_payload_bytes: null` to keep every payload whole, for a file DLQ that is replayed, say.
+
+---
+
 ## Configuration
 
 ```yaml
@@ -170,6 +176,7 @@ dlq:
   queue_capacity: 10000         # in-memory mpsc bound
   batch_size: 256                # drain coalescence
   flush_interval_ms: 100         # partial-batch flush
+  max_payload_bytes: 524288      # longer payloads are cut and marked truncated; null keeps them whole
   file:
     enabled: true
     path: /var/spool/scalo/dlq   # the service name is appended as a subdirectory
@@ -214,11 +221,12 @@ The version-keyed upgrade path lives in [migrations.md](../migrations.md).
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
 | `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka; `Err(File)` if any batch written since the previous flush was refused by every backend, `Err(Kafka)` if Kafka lost entries only it held (see [Queue-admission semantics](#queue-admission-semantics)) |
 | `write_confirmed(entries).await` | Write these entries as a batch of their own and answer whether a backend holds them, to this caller alone (see [Queue-admission semantics](#queue-admission-semantics)) |
-| `refusal(&entry)` | Why no backend can ever hold this entry, or `None`: the permanent refusal a held source releases `Dropped` (needs `transport`) |
+| `cap(entry)` | The entry as the DLQ writes it: a payload over `max_payload_bytes` cut to it. Every send applies it, so call it only before `refusal` |
+| `refusal(&entry)` | Why no backend can ever hold this entry, or `None`: the permanent refusal a held source releases `Dropped` (needs `transport`). It judges the entry it is given, so pass it through `cap` first |
 | `shutdown().await` | Stop the drain and join it; the drain first waits for Kafka acks and counts what none confirmed in `dropped()` (see [Shutdown](#shutdown)) |
 | `is_enabled() / mode() / pending() / dropped()` | Introspection -- `dropped()` totals queue overflow (`dlq_dropped_total{reason="overflow"}`) + disabled-DLQ sends + batches every backend refused + Kafka entries a barrier or the shutdown found lost (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
-| `DlqEntry::new(service, error_type, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_metadata(...)` | Entry builder |
-| `DlqSource::kafka(topic, partition, offset) / ::http(url) / ...` | Provenance for the entry |
+| `DlqEntry::new(service, reason, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_attempts(...)`, `.truncate_to(max_bytes)` | Entry builder |
+| `DlqSource::kafka(topic, partition, offset)` | Provenance for the entry |
 | `DlqBackend` (enum) | `File / Kafka / Http` -- feature-gated variants |
 | `DlqMode` | `Cascade / FanOut / FileOnly / KafkaOnly` |
 | `DlqError` | `Io / Serialization / File / Kafka / BackendError / AllBackendsFailed / NotConfigured / QueueFull / Closed` |

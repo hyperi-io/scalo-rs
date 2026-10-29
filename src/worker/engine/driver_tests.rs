@@ -4800,7 +4800,8 @@ async fn a_refused_dlq_write_is_retried_with_the_block_held() {
 }
 
 /// An entry no DLQ backend can ever hold is dropped and counted, not retried:
-/// a Kafka-only DLQ whose ceiling the base64 entry is over.
+/// a Kafka-only DLQ whose ceiling the base64 entry is over, with no payload
+/// cap to bring it under.
 #[cfg(all(feature = "dlq-kafka", feature = "metrics"))]
 #[tokio::test(flavor = "current_thread")]
 async fn a_dead_letter_no_dlq_backend_can_hold_is_dropped_and_counted() {
@@ -4820,6 +4821,7 @@ async fn a_dead_letter_no_dlq_backend_can_hold_is_dropped_and_counted() {
             enabled: true,
             ..crate::dlq::KafkaDlqConfig::default()
         },
+        max_payload_bytes: None,
         ..crate::dlq::DlqConfig::default()
     };
     let dlq_shutdown = CancellationToken::new();
