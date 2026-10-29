@@ -107,9 +107,18 @@ async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
 /// starting on one host. A test whose own warm-up flush paid that cost failed
 /// on the ack wait rather than on what it checks.
 async fn warm_up(bootstrap: &str) {
+    create_topic(bootstrap, WARM_UP_TOPIC).await;
+    broker_takes_a_record(bootstrap).await;
+}
+
+/// The topic [`warm_up`] writes to, apart from the topics under test.
+const WARM_UP_TOPIC: &str = "dlq.broker-warm-up";
+
+/// Wait until the broker acks a record on [`WARM_UP_TOPIC`]: after a start,
+/// and after a restart, which can take longer than the 30 s ack wait.
+async fn broker_takes_a_record(bootstrap: &str) {
     const WARM_UP_WITHIN: Duration = Duration::from_secs(120);
-    let topic = "dlq.broker-warm-up";
-    create_topic(bootstrap, topic).await;
+    let topic = WARM_UP_TOPIC;
     let producer: rdkafka::producer::FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .create()
@@ -144,6 +153,24 @@ async fn create_topic(bootstrap: &str, topic: &str) {
         .create_topics(&[(topic, 1, 1)])
         .await
         .expect("create topic");
+}
+
+/// Create `topic` and land one entry on it through a DLQ of its own with
+/// [`LONG_ACK_WAIT`], so the topic's first produce is paid before the test's
+/// own DLQ, whose ack wait is the default 5 s, writes to it. Under load that
+/// first produce outlasted 5 s and failed a warm-up flush, not the check.
+async fn create_warm_topic(bootstrap: &str, topic: &str) {
+    create_topic(bootstrap, topic).await;
+    let warmer = spawn_dlq(
+        &long_ack_wait(dlq_config(DlqMode::KafkaOnly, topic, None)),
+        &kafka_config(bootstrap),
+    );
+    warmer.send(entry("topic-warm-up")).await.expect("queued");
+    warmer
+        .flush()
+        .await
+        .expect("the topic took its first entry");
+    warmer.shutdown().await.expect("warm-up DLQ shutdown");
 }
 
 /// A topic whose own record ceiling is [`SMALL_TOPIC_MAX_BYTES`], so the
@@ -294,7 +321,7 @@ async fn a_flush_returns_only_after_the_broker_acks() {
     }
     let topic = "dlq.acked";
     let (node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, topic).await;
+    create_warm_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &long_ack_wait(dlq_config(DlqMode::KafkaOnly, topic, None)),
         &kafka_config(&bootstrap),
@@ -342,7 +369,7 @@ async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss
     }
     let topic = "dlq.down";
     let (node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, topic).await;
+    create_warm_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &long_ack_wait(dlq_config(DlqMode::KafkaOnly, topic, None)),
         &kafka_config(&bootstrap),
@@ -369,6 +396,7 @@ async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss
     assert_eq!(dlq.dropped(), ENTRIES as u64, "every unacked entry counted");
 
     (*node).start().await.expect("restart the broker");
+    broker_takes_a_record(&bootstrap).await;
     send_all(&dlq, "after", ENTRIES).await;
     dlq.flush()
         .await
@@ -398,7 +426,7 @@ async fn the_runtime_keeps_running_while_a_flush_waits_on_kafka() {
     }
     let topic = "dlq.runtime";
     let (node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, topic).await;
+    create_warm_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &dlq_config(DlqMode::KafkaOnly, topic, None),
         &kafka_config(&bootstrap),
@@ -602,7 +630,7 @@ async fn shutdown_without_a_flush_counts_what_a_stopped_broker_never_acked() {
     }
     let topic = "dlq.shutdown.down";
     let (node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, topic).await;
+    create_warm_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &dlq_config(DlqMode::KafkaOnly, topic, None),
         &kafka_config(&bootstrap),
@@ -636,7 +664,7 @@ async fn the_configured_send_timeout_bounds_the_flush() {
     const SEND_TIMEOUT: Duration = Duration::from_secs(15);
     let topic = "dlq.timeout";
     let (node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, topic).await;
+    create_warm_topic(&bootstrap, topic).await;
     let mut config = dlq_config(DlqMode::KafkaOnly, topic, None);
     config.kafka.send_timeout_ms = u64::try_from(SEND_TIMEOUT.as_millis()).expect("fits");
     let dlq = spawn_dlq(&config, &kafka_config(&bootstrap));
