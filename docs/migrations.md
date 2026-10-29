@@ -38,6 +38,12 @@ A service built by `run_app` answers `/readyz` 503 `{"status":"starting"}` from 
 
 **Consumer adjustment** -- end the `DeploymentContract` literal in `..DeploymentContract::default()` and drop the fields left at their default. A direct call to one of the three generators adds `?`, or `.expect(...)` in a test. A match on `SmokeError` adds `Contract`.
 
+### `ServiceApp::on_config_loaded` runs before the idle gate (API CHANGE)
+
+`run_app` calls `on_config_loaded(&config)` once per loaded config, after the logger is up and before `work_state`, and again for each config the idle gate reloads. The default does nothing.
+
+**Consumer adjustment** -- move startup config warnings from `run_service` into `on_config_loaded`, so an app idling with no work still reports them.
+
 ### The generated image has a working directory, owns its writable paths, and carries no fetch or network tools (BEHAVIOUR CHANGE)
 
 `generate_dockerfile` and `generate_runtime_stage` set `WORKDIR /home/appuser` and, before `USER`, create every `writable_paths` entry and chown it to 1000:1000. A production image no longer installs `netcat-openbsd` or `iputils-ping`, and purges `curl` and `gnupg` in the same layer once a repo's packages are in. The `HEALTHCHECK` is an exec-form bash `/dev/tcp` request, so it needs no HTTP client. `validate_dockerfile` accepts that form. A development image keeps `curl`, `netcat-openbsd` and `iputils-ping`.
