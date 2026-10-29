@@ -466,11 +466,6 @@ fn init_logger_for_service(
     Ok(())
 }
 
-/// Load the app's config for a subcommand that generates artefacts, once and
-/// before anything reads the cascade.
-///
-/// Best-effort: a load that fails is reported on stderr, so stdout stays pure
-/// output, and the artefacts take the defaults.
 /// Set up the config cascade from `--config` and the app's env prefix.
 #[cfg(feature = "config")]
 fn setup_cascade<A: ServiceApp>(app: &A) -> Result<(), CliError> {
@@ -491,6 +486,11 @@ const fn setup_cascade<A: ServiceApp>(_app: &A) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Load the app's config for a subcommand that generates artefacts, once and
+/// before anything reads the cascade.
+///
+/// Best-effort: a load that fails is reported on stderr, so stdout stays pure
+/// output, and the artefacts take the defaults.
 fn load_config_for_artefacts<A: ServiceApp>(app: &A) {
     if let Err(e) = app.load_config(app.common_args().config.as_deref()) {
         output::print_warn(&format!(
@@ -803,20 +803,23 @@ mod tests {
     }
 
     /// `run_app` sets the cascade up from `--config` before `load_config`,
-    /// and `version` leaves it alone.
+    /// `version` leaves it alone, and a `.env` in the working directory does
+    /// not reach a service that names its file.
     #[cfg(feature = "config")]
     #[tokio::test]
     async fn run_app_sets_up_the_cascade_from_the_config_file() {
         if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
             eprintln!(
-                "skipped: sets up the process-global config cascade, so it runs only under \
-                 cargo nextest's process-per-test mode"
+                "skipped: sets up the process-global config cascade and changes the working \
+                 directory, so it runs only under cargo nextest's process-per-test mode"
             );
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("app.yaml");
         std::fs::write(&file, "probe: 7\n").expect("write config");
+        std::fs::write(dir.path().join(".env"), "CASCADE_APP_PROBE=9\n").expect("write .env");
+        std::env::set_current_dir(dir.path()).expect("chdir");
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let app = |command| CascadeApp {
             common: CommonArgs {
@@ -841,7 +844,7 @@ mod tests {
         assert_eq!(
             *seen.lock().expect("lock"),
             [Some(7)],
-            "load_config ran once and saw the cascade from --config"
+            "load_config ran once and saw the cascade from --config, not the .env"
         );
     }
 

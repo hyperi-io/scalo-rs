@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### A service named by `--config` no longer reads `./.env` (BEHAVIOUR CHANGE)
+
+`CommonArgs::to_config_options` and `flat_env::load_config` set `load_dotenv` only when no file is named, as `load_typed` already did. Under `run_app` the first cascade set up wins, so since 2.14.22 every service started with `--config` read `./.env` into its environment.
+
+**Consumer adjustment** -- none for a deployed service. A local run that relied on a `.env` beside a named file exports those values in the shell instead.
+
 ### Tests hold their memory to the contract (API CHANGE)
 
 `deployment-test-support` adds `assert_peak_memory(test_name, &contract.resources)`: it reads the process's peak resident set (`VmHWM`), panics over `limits.memory`, and warns over `requests.memory` to stderr, as a GitHub `::warning::` and in `$GITHUB_STEP_SUMMARY`. `judge_peak_memory`, `memory_quantity_bytes` and `peak_rss_bytes` are the pieces under it.
