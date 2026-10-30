@@ -644,6 +644,7 @@ mod tests {
                     namespace: None,
                     ca_cert: None,
                     skip_verify: false,
+                    timeout_secs: 60,
                 }),
                 ..SecretsConfig::default()
             };

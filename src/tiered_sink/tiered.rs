@@ -72,13 +72,53 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     /// live owner, or cannot be opened and was not quarantined (see
     /// `TieredSinkConfig::on_corruption`).
     pub async fn new(sink: S, config: TieredSinkConfig) -> Result<Self> {
-        // Reads the process table and may wait out a lock mid-write, so it runs off the runtime.
-        let open_path = config.spool_path.clone();
-        let policy = config.on_corruption;
+        Self::with_volume_limits(
+            sink,
+            config,
+            std::env::var(crate::tiered_sink::WRITABLE_PATH_LIMITS_ENV).ok(),
+            crate::env::runtime_context().is_kubernetes(),
+        )
+        .await
+    }
+
+    /// [`new`](Self::new) with the volume limits and the Kubernetes check
+    /// given rather than read from the process.
+    async fn with_volume_limits(
+        sink: S,
+        mut config: TieredSinkConfig,
+        volume_limits: Option<String>,
+        kubernetes: bool,
+    ) -> Result<Self> {
+        if config.max_spool_bytes.is_none()
+            && let Some(cap) = volume_limits
+                .as_deref()
+                .and_then(|limits| config.volume_spool_cap(limits))
+        {
+            config.max_spool_bytes = Some(cap);
+            #[cfg(feature = "tracing")]
+            tracing::info!(
+                spool_path = %config.spool_path.display(),
+                max_spool_bytes = cap,
+                "spool capped below its volume's size limit"
+            );
+        }
+        // statvfs on an emptyDir reads the node's disk, so disk_aware alone lets
+        // the spool pass the volume's sizeLimit, and kubelet evicts the pod.
         let spool_open_err = |message: String| TieredSinkError::SpoolOpen {
             path: config.spool_path.display().to_string(),
             message,
         };
+        if kubernetes && config.disk_aware.is_some() && config.max_spool_bytes.is_none() {
+            return Err(spool_open_err(
+                "disk_aware needs max_spool_bytes on Kubernetes, or the spool on a writable \
+                 path with a size limit"
+                    .to_string(),
+            ));
+        }
+
+        // Reads the process table and may wait out a lock mid-write, so it runs off the runtime.
+        let open_path = config.spool_path.clone();
+        let policy = config.on_corruption;
         let (sender, receiver) =
             tokio::task::spawn_blocking(move || crate::spool_codec::open_queue(&open_path, policy))
                 .await
@@ -692,6 +732,7 @@ impl<S: TransportSender> Drop for TieredSink<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiered_sink::DiskAwareConfig;
     use crate::transport::{
         PayloadFormat, RecordMeta, TransportBase, TransportError, TransportResult,
     };
@@ -881,6 +922,102 @@ mod tests {
         tiered.shutdown().await;
     }
 
+    /// Counters already short of what is on disk stop at zero when the drain
+    /// commits, rather than wrapping to `u64::MAX`, which would keep
+    /// StrictFifo's hot path shut and refuse every spill.
+    #[tokio::test]
+    async fn spool_counters_never_wrap_below_zero() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let tiered = TieredSink::new(sink, spilling_config(&dir.path().join("q")))
+            .await
+            .unwrap();
+        tiered.send(&rec(b"uncounted")).await.unwrap();
+        tiered.spool_count.store(0, AtomicOrdering::Relaxed);
+        tiered.spool_bytes.store(0, AtomicOrdering::Relaxed);
+
+        tiered.inner().set_available(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tiered.inner().received_count().await == 0 {
+            assert!(std::time::Instant::now() < deadline, "never drained");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(tiered.spool_len().await, 0);
+        assert_eq!(tiered.spool_bytes(), 0);
+        tiered.shutdown().await;
+    }
+
+    /// A spool on a size-limited volume is capped below the limit, and on
+    /// Kubernetes `disk_aware` with no cap at all is refused: statvfs there
+    /// reads the node's disk, so kubelet would evict the pod first.
+    #[tokio::test]
+    async fn a_spool_on_a_size_limited_volume_is_capped_below_the_limit() {
+        const GI: u64 = 1_073_741_824;
+        // name, volume limits, disk_aware, on Kubernetes, explicit cap, and the
+        // cap the sink runs with (None: refused).
+        type Case = (&'static str, Option<String>, bool, bool, Option<u64>);
+        let dir = tempdir().unwrap();
+        let volume = dir.path().display().to_string();
+        let on_volume = Some(format!("/elsewhere=1Gi,{volume}=2Gi"));
+        let cases: [(Case, Option<Option<u64>>); 6] = [
+            (
+                (
+                    "capped from the volume",
+                    on_volume.clone(),
+                    true,
+                    true,
+                    None,
+                ),
+                Some(Some(2 * GI / 10 * 9)),
+            ),
+            (
+                ("an explicit cap wins", on_volume, true, true, Some(5)),
+                Some(Some(5)),
+            ),
+            (
+                (
+                    "another volume's limit",
+                    Some("/elsewhere=1Gi".into()),
+                    false,
+                    true,
+                    None,
+                ),
+                Some(None),
+            ),
+            (("refused on Kubernetes", None, true, true, None), None),
+            (
+                ("disk_aware with a cap", None, true, true, Some(7)),
+                Some(Some(7)),
+            ),
+            (
+                ("bare metal reads its own disk", None, true, false, None),
+                Some(None),
+            ),
+        ];
+        for ((name, limits, disk_aware, kubernetes, cap), want) in cases {
+            let mut config = TieredSinkConfig::new(dir.path().join(format!("q-{}", name.len())));
+            config.disk_aware = disk_aware.then(DiskAwareConfig::default);
+            config.max_spool_bytes = cap;
+            let built =
+                TieredSink::with_volume_limits(TestSink::new(), config, limits, kubernetes).await;
+            match (built, want) {
+                (Ok(tiered), Some(want)) => {
+                    assert_eq!(tiered.config.max_spool_bytes, want, "{name}");
+                    tiered.shutdown().await;
+                }
+                (Err(TieredSinkError::SpoolOpen { message, .. }), None) => {
+                    assert!(message.contains("max_spool_bytes"), "{name}: {message}");
+                }
+                (Ok(_), None) => panic!("{name}: built"),
+                (Err(e), _) => panic!("{name}: {e}"),
+            }
+        }
+    }
+
+    /// A backlog drains in order, byte for byte, and on the default drain
+    /// interval: 200 records at one per interval would take 20 s, twice the
+    /// `wait_for_drain` deadline.
     #[tokio::test]
     async fn test_drain_recovers_messages() {
         let dir = tempdir().unwrap();
@@ -892,25 +1029,27 @@ mod tests {
         let mut config = TieredSinkConfig::new(&spool_path);
         config.circuit_failure_threshold = 1;
         config.circuit_reset_timeout_ms = 50;
-        config.drain_interval_ms = 10;
+        assert_eq!(config.drain_interval_ms, 100, "the default interval");
 
         let tiered = TieredSink::new(sink, config).await.unwrap();
 
-        // Spool a message
-        tiered.send(&rec(b"recover me")).await.unwrap();
-        assert_eq!(tiered.spool_len().await, 1);
+        let payloads: Vec<Vec<u8>> = (0..200)
+            .map(|i| format!("recover me {i}").into_bytes())
+            .collect();
+        for payload in &payloads {
+            tiered.send(&rec(payload)).await.unwrap();
+        }
+        assert_eq!(tiered.spool_len().await, payloads.len());
 
         tiered.inner().set_available(true);
         wait_for_drain(&tiered).await;
 
-        // Should have drained -- and the EXACT payload must survive the
-        // encode -> spool -> drain -> decode round-trip (full Record fidelity).
-        assert!(tiered.spool_is_empty().await);
-        assert_eq!(tiered.inner().received_count().await, 1);
+        // The EXACT payloads survive the encode -> spool -> drain -> decode
+        // round-trip, in the order they were spilled.
         assert_eq!(
             tiered.inner().received_payloads().await,
-            vec![b"recover me".to_vec()],
-            "drained record content must match what was spilled"
+            payloads,
+            "drained records must match what was spilled"
         );
 
         tiered.shutdown().await;

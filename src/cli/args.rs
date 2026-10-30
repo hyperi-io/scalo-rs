@@ -33,9 +33,10 @@ pub struct CommonArgs {
     #[arg(short = 'c', long = "config")]
     pub config: Option<String>,
 
-    /// Log level (trace, debug, info, warn, error).
+    /// Log level (trace, debug, info, warn, error), any case, with scalo-py's
+    /// `warning`, `critical` and `fatal` accepted too.
     ///
-    /// Unset here falls through to `logger.level` in the config cascade, then
+    /// Unset or blank here falls through to `logger.level` in the config cascade, then
     /// to `info`. Carrying no clap default is what makes that fall-through
     /// possible: a default is indistinguishable from an explicit flag.
     #[arg(short = 'l', long = "log-level", env = "LOG_LEVEL")]
@@ -51,7 +52,7 @@ pub struct CommonArgs {
 
     /// Metrics server bind address.
     ///
-    /// Unset falls through to `metrics.address` in the config cascade, then
+    /// Unset or blank falls through to `metrics.address` in the config cascade, then
     /// to `0.0.0.0:9090`. Carrying no clap default is what makes that
     /// fall-through possible: a default is indistinguishable from an
     /// explicit flag.
@@ -96,11 +97,15 @@ impl CommonArgs {
         if self.quiet {
             return "error".to_string();
         }
-        if let Some(level) = &self.log_level {
-            return level.clone();
+        if let Some(level) = non_blank(self.log_level.as_deref()) {
+            return level;
         }
         #[cfg(feature = "logger")]
-        if let Some(level) = crate::logger::LoggerSettings::from_cascade().level {
+        if let Some(level) = non_blank(
+            crate::logger::LoggerSettings::from_cascade()
+                .level
+                .as_deref(),
+        ) {
             return level;
         }
         Self::DEFAULT_LOG_LEVEL.to_string()
@@ -155,11 +160,15 @@ impl CommonArgs {
     /// config, then [`DEFAULT_METRICS_ADDR`](Self::DEFAULT_METRICS_ADDR).
     #[must_use]
     pub fn effective_metrics_addr(&self) -> String {
-        if let Some(addr) = &self.metrics_addr {
-            return addr.clone();
+        if let Some(addr) = non_blank(self.metrics_addr.as_deref()) {
+            return addr;
         }
         #[cfg(feature = "metrics")]
-        if let Some(addr) = crate::metrics::MetricsSettings::from_cascade().address {
+        if let Some(addr) = non_blank(
+            crate::metrics::MetricsSettings::from_cascade()
+                .address
+                .as_deref(),
+        ) {
             return addr;
         }
         Self::DEFAULT_METRICS_ADDR.to_string()
@@ -177,9 +186,10 @@ impl CommonArgs {
         use std::str::FromStr;
 
         let resolved_level = self.effective_log_level();
-        let level: tracing::Level = resolved_level.to_uppercase().parse().map_err(|_| {
-            super::CliError::InvalidArgument(format!("invalid log level: {resolved_level}"))
-        })?;
+        let level: tracing::Level =
+            crate::logger::parse_level(&resolved_level).ok_or_else(|| {
+                super::CliError::InvalidArgument(format!("invalid log level: {resolved_level}"))
+            })?;
 
         let format = crate::logger::LogFormat::from_str(&self.effective_log_format())
             .map_err(|e| super::CliError::InvalidArgument(format!("invalid log format: {e}")))?;
@@ -210,10 +220,15 @@ impl CommonArgs {
     }
 }
 
+/// The selector trimmed, or `None` when it is unset or blank so the next one decides.
+fn non_blank(selector: Option<&str>) -> Option<String> {
+    let selector = selector?.trim();
+    (!selector.is_empty()).then(|| selector.to_string())
+}
+
 /// The selector trimmed, or `None` when it is unset, blank or `auto` so the next one decides.
 fn concrete_format(selector: Option<&str>) -> Option<String> {
-    let selector = selector?.trim();
-    (!selector.is_empty() && !selector.eq_ignore_ascii_case("auto")).then(|| selector.to_string())
+    non_blank(selector).filter(|format| !format.eq_ignore_ascii_case("auto"))
 }
 
 #[cfg(test)]
@@ -417,6 +432,60 @@ mod tests {
         temp_env::with_var("LOG_FORMAT", Some("yaml"), || {
             assert!(with_format(Some("auto")).to_logger_options().is_err());
         });
+    }
+
+    /// What an operator writes in `LOG_LEVEL`, read through clap as the
+    /// service reads it, to the level the service runs at or the refusal.
+    /// `warning` and `critical` are scalo-py's names for the same levels, and
+    /// a blank value is unset, as it is for `LOG_FORMAT`.
+    #[cfg(feature = "logger")]
+    #[test]
+    fn log_level_spellings_reach_the_level_or_refuse() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            common: CommonArgs,
+        }
+
+        let cases: [(&str, &str, Option<tracing::Level>); 10] = [
+            ("tracing name", "warn", Some(tracing::Level::WARN)),
+            ("upper case", "INFO", Some(tracing::Level::INFO)),
+            ("scalo-py warning", "WARNING", Some(tracing::Level::WARN)),
+            ("scalo-py critical", "critical", Some(tracing::Level::ERROR)),
+            ("fatal", "FATAL", Some(tracing::Level::ERROR)),
+            ("padded", " debug ", Some(tracing::Level::DEBUG)),
+            ("number", "5", Some(tracing::Level::TRACE)),
+            ("blank is unset", "", Some(tracing::Level::INFO)),
+            ("spaces are unset", "   ", Some(tracing::Level::INFO)),
+            ("unknown refuses", "loud", None),
+        ];
+        for (name, env, want) in cases {
+            temp_env::with_vars(
+                [("LOG_LEVEL", Some(env)), ("LOG_FORMAT", Some("json"))],
+                || {
+                    let cli = Cli::try_parse_from(["probe"]).expect("no arguments parse");
+                    let got = cli.common.to_logger_options().ok().map(|o| o.level);
+                    assert_eq!(got, want, "{name}: LOG_LEVEL={env:?}");
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn blank_metrics_addr_falls_back_to_the_hard_coded_default() {
+        for blank in ["", "  "] {
+            let args = CommonArgs {
+                metrics_addr: Some(blank.to_string()),
+                ..bare_args()
+            };
+            assert_eq!(
+                args.effective_metrics_addr(),
+                CommonArgs::DEFAULT_METRICS_ADDR,
+                "METRICS_ADDR={blank:?}"
+            );
+        }
     }
 
     #[test]

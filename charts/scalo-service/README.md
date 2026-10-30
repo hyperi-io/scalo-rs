@@ -103,7 +103,7 @@ The config file and every file set sit base64-encoded under the ConfigMap's `bin
 | `env_prefix` | `<env_prefix>_VERSION_CHECK__*` | required; an empty prefix gives bare `VERSION_CHECK__*` |
 | `secrets[]` | one `secretKeyRef` per variable, `optional` where the group is | none |
 | `keda` | ScaledObject bounds and triggers | KEDA off |
-| `writable_paths[]` | emptyDir or claim per path; `/tmp` is always added | `/tmp` only |
+| `writable_paths[]` | emptyDir or claim per path; `/tmp` is always added. Each emptyDir with a `size_limit` is named in `SCALO_WRITABLE_PATH_LIMITS` as `path=quantity`, so a scalo spool there stays under the limit | `/tmp` only |
 | `termination_grace_seconds` | `terminationGracePeriodSeconds` | 45 |
 | `resources` | requests and limits over the library default | 100m / 128Mi requested, 500m / 512Mi limit |
 | `security` | uid, gid, fsGroup, read-only root filesystem, added capabilities | 1000, 1000, 1000, read-only, none |

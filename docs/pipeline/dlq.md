@@ -58,6 +58,8 @@ Delivery failures are read at every write, at the barrier and at [shutdown](#shu
 
 Cascade is the production default -- Kafka primary, file fallback. An entry falls through to the file when the producer refuses to queue it (a full producer queue, or an entry over its `message.max.bytes`), and when the producer queued it but the broker refused it or never acked it. So an unreachable broker loses no dead letters while the file backend takes them: they land in the file at the next `flush()` or shutdown, which purge what is unacked, or at the next write once librdkafka has failed the delivery (`message.timeout.ms`, 300 s unless set). See [The Kafka barrier](#the-kafka-barrier). FanOut is for compliance setups that need every entry mirrored to two destinations.
 
+A backend that cannot start is left out, and the others run. On a read-only root filesystem the file backend's default `file.path` under `/var/spool` cannot be created, so a `Cascade` DLQ runs on Kafka alone, with a WARN and a count in `dlq_backend_start_failures_total{backend="file"}`. Mount a writable volume at `file.path` to keep the fallback. With no backend running the DLQ is disabled and counts every entry in `dropped()`.
+
 ```mermaid
 flowchart LR
     E[entry] --> K{Kafka queues it?}

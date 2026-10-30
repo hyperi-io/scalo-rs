@@ -94,14 +94,15 @@ pub fn generate_compose_fragment(contract: &DeploymentContract) -> Result<String
         contract.config_mount_path,
     ));
 
-    // Healthcheck
+    // The image's own check, since the image has no curl. `$$` keeps compose
+    // from interpolating the shell's `$code`.
     out.push_str(&format!(
         "    healthcheck:\n\
-         \x20     test: [\"CMD\", \"curl\", \"-sf\", \"http://localhost:{}{}\"]
-      interval: 10s\n\
+         \x20     test: [\"CMD\", \"bash\", \"-c\", {check}]\n\
+         \x20     interval: 10s\n\
          \x20     timeout: 3s\n\
          \x20     retries: 5\n",
-        contract.metrics_port, contract.health.liveness_path,
+        check = super::dockerfile::liveness_check(contract).replace('$', "$$"),
     ));
 
     // Resource limits -- conservative local-development default so a stray

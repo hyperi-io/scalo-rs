@@ -91,7 +91,7 @@ pub struct ReloaderConfig {
     pub config_path: Option<PathBuf>,
 
     /// File polling interval. Only used when `config_path` is Some.
-    /// Default: 5 seconds.
+    /// `Duration::ZERO` turns the poll off. Default: 5 seconds.
     pub poll_interval: Duration,
 
     /// Periodic reload interval. Set to `Duration::ZERO` to disable.

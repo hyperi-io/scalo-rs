@@ -108,6 +108,8 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
+A pass that takes a record off the spool starts the next at once, so the strategy sets the rate. `drain_interval_ms` (100 ms) is the wait after a pass that found the spool empty or the sink down.
+
 The drain task is `tokio::spawn`'d at construction. It and the disk poller both stop when the sink's shutdown `CancellationToken` is cancelled, by `shutdown()` or by drop. With the `shutdown` feature the drain task also stops on the global token.
 
 Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A send that runs past it counts as a circuit failure. The record stays at the head of the spool, uncommitted, and is offered again on the next drain pass. The downstream may have taken the record before the timeout, so the retry can duplicate it (at-least-once).
@@ -122,6 +124,8 @@ Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A 
   `statvfs` poller; once filesystem use crosses the threshold,
   `disk_available` flips false and spool writes return
   `DiskUnavailable`.
+
+On a Kubernetes emptyDir `statvfs` reads the node's disk, not the volume's `sizeLimit`, so a spool past the limit gets the pod evicted and the spool lost. The scalo-service chart sets `SCALO_WRITABLE_PATH_LIMITS` to each emptyDir writable path with a `sizeLimit`. With `max_spool_bytes` unset, `TieredSink::new` caps a spool on such a path at nine tenths of its limit. On Kubernetes, `disk_aware` with no cap at all is refused with `SpoolOpen`.
 
 A spill past `max_spool_items` or `max_spool_bytes` applies `when_full`:
 

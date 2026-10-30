@@ -361,6 +361,13 @@ pub mod vault {
             .with_description("Skip TLS certificate verification")
     }
 
+    /// Seconds one Vault request may take, as the Vault CLI reads it.
+    pub fn client_timeout() -> EnvVar {
+        EnvVar::new("VAULT_CLIENT_TIMEOUT")
+            .with_legacy_names(&["OPENBAO_CLIENT_TIMEOUT", "BAO_CLIENT_TIMEOUT"])
+            .with_description("Seconds one Vault/OpenBao request may take")
+    }
+
     /// Vault CA certificate path.
     pub fn ca_cert() -> EnvVar {
         EnvVar::new("VAULT_CACERT")

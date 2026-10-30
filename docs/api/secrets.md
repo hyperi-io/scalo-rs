@@ -229,7 +229,7 @@ A source whose backend's feature is off fails with `SecretsError::ProviderNotCon
 | `refresh_interval_secs` | `1800` | Parsed, read by nothing: there is no background refresh |
 | `refresh_jitter_secs` | `300` | Parsed, read by nothing, as above |
 
-`openbao` takes `address`, `auth`, and optionally `namespace`, `ca_cert` (a PEM CA file) and `skip_verify` (default `false`, rejected under a production profile). `auth.method` picks the fields that go with it:
+`openbao` takes `address`, `auth`, and optionally `namespace`, `ca_cert` (a PEM CA file), `skip_verify` (default `false`, rejected under a production profile) and `timeout_secs`, the seconds one request may take, a login included (default 60, `VAULT_CLIENT_TIMEOUT` in the environment, `0` for none), so a server that never answers fails the lookup rather than hanging startup. `auth.method` picks the fields that go with it:
 
 | `method` | Fields |
 | -------- | ------ |

@@ -424,6 +424,21 @@ tests:
             name: writable-spool
             emptyDir:
               sizeLimit: 2Gi
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SCALO_WRITABLE_PATH_LIMITS
+            value: /var/lib/event-stage/spool=2Gi
+
+  - it: names no path limit for a claim or a path with no size cap
+    set:
+      writablePaths.spool.persistence.enabled: true
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SCALO_WRITABLE_PATH_LIMITS
+            value: /var/lib/event-stage/spool=2Gi
 
   - it: drops the spool when its condition no longer holds
     set:

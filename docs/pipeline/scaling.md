@@ -41,13 +41,13 @@ precedence over memory by design.
 ## Composite scoring
 
 ```text
-score_i = min(value_i / saturation_i, 1.0) * weight_i * 100.0
+score_i = clamp(value_i / saturation_i, 0.0, 1.0) * weight_i * 100.0
 pressure = min(sum score_i, 100.0)
 ```
 
 Each component contributes `weight_i * 100` when it reaches its
 saturation point, scales linearly below that, and is capped at its
-weight (no over-contribution). Weights should sum to ~1.0 -- the cap
+weight (no over-contribution). A negative reading scores 0, and so does one that is not a finite number (NaN or infinity), so a bad sample never reads as full pressure. Weights should sum to ~1.0 -- the cap
 on the total keeps the output well-formed even if they don't.
 
 Example composition for a loader:

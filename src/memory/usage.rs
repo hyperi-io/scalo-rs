@@ -8,17 +8,21 @@
 
 //! Process memory usage, read from what the kernel charges.
 //!
-//! The OOM killer acts on the cgroup's `memory.current`, so that is what the
-//! guard reads by default. An allocator statistic is not equivalent: it is
+//! The OOM killer acts on what the cgroup charges, so that is what the guard
+//! reads by default. An allocator statistic is not equivalent: it is
 //! blind to everything the allocator did not hand out (thread stacks, mmap'd
 //! buffers, pages jemalloc retains after a free), and it is unavailable at all
 //! unless the application installs a tracking `#[global_allocator]` and
 //! registers it with [`set_heap_source`](super::set_heap_source).
 //!
+//! A cgroup reading is the working set kubelet evicts on: the usage less the
+//! inactive page cache in `memory.stat`, which the kernel reclaims before it
+//! kills anything.
+//!
 //! Four sources, tried in that order of fidelity to the kill decision:
 //!
-//! - **cgroup v2** `memory.current` -- the number `memory.max` is compared to.
-//! - **cgroup v1** `memory.usage_in_bytes` -- the same signal on an older host.
+//! - **cgroup v2** `memory.current` less `inactive_file`.
+//! - **cgroup v1** `memory.usage_in_bytes` less `total_inactive_file`.
 //! - **`/proc/self/status`** `VmRSS` -- this process alone, for a Linux host
 //!   running no cgroup memory controller.
 //! - **reservations** -- the guard's own outstanding leases, which is all that
@@ -103,12 +107,31 @@ impl UsageSource {
     #[must_use]
     pub fn read(&self) -> Option<u64> {
         match self {
-            Self::CgroupV2(root) => read_u64_file(&root.join("memory.current")),
-            Self::CgroupV1(root) => read_u64_file(&root.join("memory.usage_in_bytes")),
+            Self::CgroupV2(root) => working_set(root, "memory.current", "inactive_file"),
+            Self::CgroupV1(root) => {
+                working_set(root, "memory.usage_in_bytes", "total_inactive_file")
+            }
             Self::ProcStatus(root) => read_vm_rss(root),
             Self::Reservations => None,
         }
     }
+}
+
+/// The cgroup's usage less its inactive page cache, which the kernel reclaims
+/// before it OOM-kills: kubelet's working set. The plain usage where
+/// `memory.stat` is unreadable.
+fn working_set(root: &Path, usage_file: &str, inactive_key: &str) -> Option<u64> {
+    let usage = read_u64_file(&root.join(usage_file))?;
+    let inactive = std::fs::read_to_string(root.join("memory.stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.lines()
+                .filter_map(|line| line.split_once(' '))
+                .find(|(key, _)| *key == inactive_key)
+                .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    Some(usage.saturating_sub(inactive))
 }
 
 fn read_u64_file(path: &Path) -> Option<u64> {
@@ -368,19 +391,58 @@ mod tests {
         );
     }
 
+    /// Each cgroup source reads its usage file less the reclaimable page
+    /// cache in `memory.stat`, kubelet's working set, and the plain usage
+    /// where there is no stat file.
     #[test]
-    fn cgroup_sources_read_their_own_file() {
-        let v2 = fixture(&[("memory.current", "198299648\n")]);
-        assert_eq!(
-            UsageSource::CgroupV2(v2.path().to_path_buf()).read(),
-            Some(198_299_648)
-        );
-
-        let v1 = fixture(&[("memory.usage_in_bytes", "4096\n")]);
-        assert_eq!(
-            UsageSource::CgroupV1(v1.path().to_path_buf()).read(),
-            Some(4096)
-        );
+    fn cgroup_sources_read_the_working_set() {
+        let v2_stat = "anon 1000\nfile 9000\ninactive_file 6000\nactive_file 3000\n";
+        let v1_stat = "cache 9000\ninactive_file 1\ntotal_inactive_file 6000\n";
+        let cases: [(&str, bool, &[(&str, &str)], u64); 5] = [
+            (
+                "v2 no stat",
+                true,
+                &[("memory.current", "198299648\n")],
+                198_299_648,
+            ),
+            (
+                "v2 page cache",
+                true,
+                &[("memory.current", "10000\n"), ("memory.stat", v2_stat)],
+                4000,
+            ),
+            (
+                "v2 stat over usage",
+                true,
+                &[("memory.current", "10\n"), ("memory.stat", v2_stat)],
+                0,
+            ),
+            (
+                "v1 no stat",
+                false,
+                &[("memory.usage_in_bytes", "4096\n")],
+                4096,
+            ),
+            (
+                "v1 page cache",
+                false,
+                &[
+                    ("memory.usage_in_bytes", "10000\n"),
+                    ("memory.stat", v1_stat),
+                ],
+                4000,
+            ),
+        ];
+        for (name, v2, files, want) in cases {
+            let dir = fixture(files);
+            let root = dir.path().to_path_buf();
+            let source = if v2 {
+                UsageSource::CgroupV2(root)
+            } else {
+                UsageSource::CgroupV1(root)
+            };
+            assert_eq!(source.read(), Some(want), "{name}");
+        }
 
         assert_eq!(UsageSource::Reservations.read(), None);
     }

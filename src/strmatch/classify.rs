@@ -92,7 +92,7 @@ pub fn classify(pattern: &str, case_insensitive: bool) -> Result<Classified, Bui
 
     // 1. Hard rejection: any feature we can't safely reduce.
     if let Some((reason, hint)) = hard_reject(&hir) {
-        return Ok(meta_plan(pattern, reason, hint));
+        return meta_plan(pattern, reason, hint);
     }
 
     // 2. Single-pattern simple shape (skipped when case-insensitive --
@@ -171,13 +171,13 @@ pub fn classify(pattern: &str, case_insensitive: bool) -> Result<Classified, Bui
     }
 
     // 6. Fall through to the meta engine.
-    Ok(meta_plan(
+    meta_plan(
         pattern,
         "complex-shape",
         "the pattern combines anchors, classes, and quantifiers in a way that \
          prevents safe literal reduction; consider splitting into smaller \
          patterns or accepting Meta-tier cost",
-    ))
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -544,23 +544,27 @@ fn try_extractor_fallback(
 // Meta engine fall-through
 // ---------------------------------------------------------------------------
 
-fn meta_plan(pattern: &str, reason: &'static str, hint: &'static str) -> Classified {
-    use regex_automata::meta;
-
-    // We've already parsed the pattern with `regex_syntax::parse` in
-    // the caller, so `meta::Regex::new` will accept the same input
-    // (regex-automata wraps the same parser). The meta engine has its
-    // own internal `(?i)` handling -- no wrapper required here.
-    let meta = meta::Regex::new(pattern)
-        .expect("meta::Regex::new should not fail after regex_syntax::parse succeeded");
-    Classified {
+/// A parsed pattern can still be refused here: parsing applies none of the
+/// meta engine's size limits. The engine handles `(?i)` itself.
+fn meta_plan(
+    pattern: &str,
+    reason: &'static str,
+    hint: &'static str,
+) -> Result<Classified, BuildError> {
+    let meta = regex_automata::meta::Regex::new(pattern).map_err(|e| BuildError::Compile {
+        pattern: pattern.to_string(),
+        source: Box::new(e),
+        hint: "shorten the pattern, or replace a large bounded repetition such as \
+               `\\w{5000}` with `\\w+` or a length check",
+    })?;
+    Ok(Classified {
         plan: Plan::Meta(Box::new(meta)),
         descriptor: Descriptor {
             tier: MatcherTier::Regex,
             reason,
             hint,
         },
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

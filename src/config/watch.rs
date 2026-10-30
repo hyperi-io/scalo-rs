@@ -62,14 +62,18 @@ pub struct ConfigWatch {
 }
 
 impl ConfigWatch {
-    /// Watch `path` (when given) every `poll_interval`. SIGHUP is off and the
+    /// Watch `path` (when given) every `poll_interval`, where
+    /// [`Duration::ZERO`] turns the file poll off. SIGHUP is off and the
     /// periodic tick is disabled until asked for.
     ///
     /// The initial mtime is read lazily on the first poll tick, so construction
     /// never blocks and never touches the filesystem.
     #[must_use]
     pub fn new(path: Option<PathBuf>, poll_interval: Duration) -> Self {
-        let poll_timer = path.as_ref().map(|_| tokio::time::interval(poll_interval));
+        let poll_timer = path
+            .as_ref()
+            .filter(|_| poll_interval > Duration::ZERO)
+            .map(|_| tokio::time::interval(poll_interval));
         Self {
             path,
             last_modified: None,
@@ -203,10 +207,23 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// No file, or a zero poll interval, arms nothing. A zero interval is off,
+    /// as it is for the periodic tick, rather than a panic in the reloader.
     #[tokio::test]
     async fn unarmed_watch_reports_no_triggers() {
-        let watch = ConfigWatch::new(None, Duration::from_millis(1));
-        assert!(!watch.is_armed());
+        let dir = TempDir::new().expect("tempdir");
+        let cases = [
+            ("no file", None, Duration::from_millis(1)),
+            (
+                "zero interval",
+                Some(dir.path().join("c.yaml")),
+                Duration::ZERO,
+            ),
+        ];
+        for (name, path, interval) in cases {
+            let watch = ConfigWatch::new(path, interval);
+            assert!(!watch.is_armed(), "{name}");
+        }
     }
 
     #[tokio::test]

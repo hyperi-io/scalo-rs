@@ -411,6 +411,20 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
     Ok(())
 }
 
+/// A log level as an operator writes it: the `tracing` names or `1`-`5`, and
+/// the `warning`, `critical` and `fatal` that scalo-py accepts, in any case.
+/// `None` for a blank or unknown name.
+pub(crate) fn parse_level(name: &str) -> Option<Level> {
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("warning") {
+        return Some(Level::WARN);
+    }
+    if name.eq_ignore_ascii_case("critical") || name.eq_ignore_ascii_case("fatal") {
+        return Some(Level::ERROR);
+    }
+    name.parse().ok()
+}
+
 /// Initialise the global logger with default settings.
 ///
 /// Respects environment variables:
@@ -433,7 +447,7 @@ pub fn setup_default() -> Result<(), LoggerError> {
     let level = std::env::var("LOG_LEVEL")
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| parse_level(&s))
         .unwrap_or(Level::INFO);
 
     let format = first_concrete_format([

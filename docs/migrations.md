@@ -8,6 +8,30 @@ release and the target before bumping.
 
 ## Unreleased
 
+### Startup refuses config it used to run past (BEHAVIOUR CHANGE)
+
+`config::setup` fails with `ConfigError::LoadError` on a `config_paths` entry that does not exist, or a file it cannot read or parse, so `--config` with a typo stops the service. `ServiceRuntime::build` fails on `batch_processing.max_chunk_size: 0`, which capped every receive at no records. `KafkaConfig::apply_provider` refuses `msk_iam`, whose IAM token nothing in scalo can produce. On Kubernetes `TieredSink::new` refuses `disk_aware` with no byte cap and no `SCALO_WRITABLE_PATH_LIMITS` entry for the spool.
+
+**Consumer adjustment** -- a test or a deploy that names a config path must create it first. Set `max_chunk_size` to at least 1, use provider `msk` with SCRAM, and put a spool on a writable path with a `size_limit` (the scalo-service chart then sets `SCALO_WRITABLE_PATH_LIMITS`) or set `max_spool_bytes`.
+
+### Startup takes config it used to refuse (BEHAVIOUR CHANGE)
+
+`LOG_LEVEL` and `logger.level` accept `warning`, `critical` and `fatal`, and a blank `LOG_LEVEL` or `METRICS_ADDR` is unset. A DLQ backend that cannot start is left out with a WARN and `dlq_backend_start_failures_total{backend}`, and `Dlq::spawn` returns the others, or a disabled DLQ, rather than `Err`. A zero config watch `poll_interval` turns the file poll off. `version_check` reads each key on its own, so one bad value no longer drops the rest.
+
+**Consumer adjustment** -- a caller that treated `Dlq::spawn`'s `Err` as "no DLQ" checks `is_enabled()` instead.
+
+### The runtime memory guard reads the `memory` section and the working set (BEHAVIOUR CHANGE)
+
+`ServiceRuntime`'s guard takes `memory.*` from the config, with the flat `{PREFIX}_MEMORY_*` variables over it, where it read only the variables. A cgroup reading is the usage less `inactive_file` (`total_inactive_file` on v1), kubelet's working set, so page cache from file writes no longer reads as pressure.
+
+**Consumer adjustment** -- a `memory:` section a config already carries now applies.
+
+### The OpenBao client times out (BEHAVIOUR CHANGE)
+
+`OpenBaoConfig` gains `timeout_secs` (default 60, `VAULT_CLIENT_TIMEOUT`, `0` none), so a server that never answers fails the lookup. A struct literal of `OpenBaoConfig` adds the field.
+
+**Consumer adjustment** -- none unless a literal builds the config.
+
 ### A service named by `--config` no longer reads `./.env` (BEHAVIOUR CHANGE)
 
 `CommonArgs::to_config_options` and `flat_env::load_config` set `load_dotenv` only when no file is named, as `load_typed` already did. Under `run_app` the first cascade set up wins, so since 2.14.22 every service started with `--config` read `./.env` into its environment.

@@ -1786,13 +1786,23 @@ impl KafkaConfig {
     /// `provider` is `None`. Call BEFORE [`validate`](Self::validate).
     ///
     /// # Errors
-    /// Returns `Err` if `provider` names an unknown provider.
+    /// Returns `Err` if `provider` names an unknown provider, or `msk_iam`,
+    /// whose AWS IAM token neither librdkafka nor scalo can produce.
     pub fn apply_provider(&mut self) -> Result<(), String> {
         use super::providers::{KafkaProvider, KnownProvider};
         let Some(name) = self.provider.clone() else {
             return Ok(());
         };
-        KnownProvider::parse(&name)?.apply_auth(self);
+        let provider = KnownProvider::parse(&name)?;
+        if provider == KnownProvider::MskIam {
+            return Err(
+                "kafka provider msk_iam needs an AWS IAM (SigV4) OAUTHBEARER token, \
+                        which scalo's Kafka client cannot generate; use provider msk with \
+                        SCRAM on a provisioned MSK cluster"
+                    .to_string(),
+            );
+        }
+        provider.apply_auth(self);
         Ok(())
     }
 
@@ -2737,6 +2747,19 @@ mod tests {
         cfg.apply_provider().unwrap();
         assert_eq!(cfg.security_protocol, "sasl_ssl");
         assert_eq!(cfg.sasl_mechanism.as_deref(), Some("PLAIN"));
+    }
+
+    /// librdkafka cannot sign the AWS IAM token MSK IAM auth needs and scalo
+    /// installs no token source, so `msk_iam` is refused rather than building
+    /// a client that can never authenticate.
+    #[test]
+    fn apply_provider_refuses_msk_iam() {
+        let mut cfg = KafkaConfig {
+            provider: Some("msk_iam".to_string()),
+            ..Default::default()
+        };
+        let err = cfg.apply_provider().unwrap_err();
+        assert!(err.contains("msk_iam") && err.contains("IAM"), "{err}");
     }
 
     #[test]

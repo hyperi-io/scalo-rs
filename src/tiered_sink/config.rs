@@ -217,6 +217,56 @@ impl TieredSinkConfig {
     pub fn drain_interval(&self) -> Duration {
         Duration::from_millis(self.drain_interval_ms)
     }
+
+    /// The byte cap a spool on a size-limited volume gets when none is set:
+    /// nine tenths of the `sizeLimit` [`WRITABLE_PATH_LIMITS_ENV`] gives for
+    /// the deepest writable path holding `spool_path`, leaving room for
+    /// quarantined segments and the queue's own files.
+    #[must_use]
+    pub fn volume_spool_cap(&self, limits: &str) -> Option<u64> {
+        limits
+            .split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .filter(|(path, _)| self.spool_path.starts_with(path.trim()))
+            .max_by_key(|(path, _)| path.trim().len())
+            .and_then(|(_, quantity)| parse_quantity(quantity.trim()))
+            .map(|limit| limit / 10 * 9)
+    }
+}
+
+/// The env var the scalo-service chart sets to each emptyDir writable path
+/// with a `sizeLimit`, as `path=quantity` pairs joined by commas.
+pub const WRITABLE_PATH_LIMITS_ENV: &str = "SCALO_WRITABLE_PATH_LIMITS";
+
+/// Bytes in a Kubernetes quantity (`2Gi`, `500M`, `1.5Ti`, `1048576`), or
+/// `None` for one that is not a size in bytes.
+fn parse_quantity(quantity: &str) -> Option<u64> {
+    const SUFFIXES: [(&str, f64); 12] = [
+        ("Ki", 1024.0),
+        ("Mi", 1_048_576.0),
+        ("Gi", 1_073_741_824.0),
+        ("Ti", 1_099_511_627_776.0),
+        ("Pi", 1_125_899_906_842_624.0),
+        ("Ei", 1_152_921_504_606_846_976.0),
+        ("k", 1e3),
+        ("M", 1e6),
+        ("G", 1e9),
+        ("T", 1e12),
+        ("P", 1e15),
+        ("E", 1e18),
+    ];
+    let (number, scale) = SUFFIXES
+        .iter()
+        .find_map(|(suffix, scale)| quantity.strip_suffix(suffix).map(|n| (n, *scale)))
+        .unwrap_or((quantity, 1.0));
+    let value: f64 = number.parse().ok()?;
+    let bytes = value * scale;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked finite, positive and under u64::MAX"
+    )]
+    (bytes.is_finite() && bytes >= 1.0 && bytes < u64::MAX as f64).then_some(bytes as u64)
 }
 
 /// Configuration for disk-aware capacity management.
@@ -365,6 +415,25 @@ pub enum OrderingMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kubernetes_quantities_read_as_bytes_or_refuse() {
+        let cases: [(&str, Option<u64>); 10] = [
+            ("2Gi", Some(2_147_483_648)),
+            ("512Mi", Some(536_870_912)),
+            ("1.5Ki", Some(1536)),
+            ("10G", Some(10_000_000_000)),
+            ("500k", Some(500_000)),
+            ("1048576", Some(1_048_576)),
+            ("", None),
+            ("500m", None),
+            ("-1Gi", None),
+            ("lots", None),
+        ];
+        for (quantity, want) in cases {
+            assert_eq!(parse_quantity(quantity), want, "{quantity:?}");
+        }
+    }
 
     #[test]
     fn test_default_config() {

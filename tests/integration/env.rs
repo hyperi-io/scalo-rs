@@ -192,9 +192,11 @@ mod vault_env {
     ];
 
     /// Every vault/openbao var unset except `overrides` -- so a leftover value
-    /// from the host environment never leaks into a test.
+    /// from the host environment never leaks into a test. `VAULT_TOKEN_FILE`
+    /// names a file that does not exist, or the host's `~/.vault-token` would
+    /// supply a token.
     fn vault_env(overrides: &[(&str, &str)]) -> Vec<(&'static str, Option<String>)> {
-        VAULT_ENV_VARS
+        let mut env: Vec<(&'static str, Option<String>)> = VAULT_ENV_VARS
             .iter()
             .map(|&name| {
                 let value = overrides
@@ -203,7 +205,12 @@ mod vault_env {
                     .map(|(_, v)| (*v).to_string());
                 (name, value)
             })
-            .collect()
+            .collect();
+        env.push((
+            "VAULT_TOKEN_FILE",
+            Some("/nonexistent/scalo-test/vault-token".to_string()),
+        ));
+        env
     }
 
     #[test]

@@ -258,21 +258,32 @@ impl MemoryGuardConfig {
     #[must_use]
     #[cfg(feature = "config")]
     pub fn from_env(prefix: &str) -> Self {
+        Self::default().with_flat_env(prefix)
+    }
+
+    /// The `memory` section of the cascade with the flat `{PREFIX}_MEMORY_*`
+    /// variables of [`from_env`](Self::from_env) over it: the config a service
+    /// runtime builds its guard from.
+    #[cfg(feature = "cli-service")]
+    #[must_use]
+    pub(crate) fn from_cascade_and_env(prefix: &str) -> Self {
+        Self::from_cascade().with_flat_env(prefix)
+    }
+
+    #[cfg(feature = "config")]
+    fn with_flat_env(mut self, prefix: &str) -> Self {
         use crate::config::flat_env::flat_env_parsed;
 
-        let mut config = Self::default();
-
         if let Some(v) = flat_env_parsed::<u64>(prefix, "MEMORY_LIMIT_BYTES") {
-            config.limit_bytes = v;
+            self.limit_bytes = v;
         }
         if let Some(v) = flat_env_parsed::<f64>(prefix, "MEMORY_PRESSURE_THRESHOLD") {
-            config.pressure_threshold = v;
+            self.pressure_threshold = v;
         }
         if let Some(v) = flat_env_parsed::<f64>(prefix, "MEMORY_CGROUP_HEADROOM") {
-            config.cgroup_headroom = v;
+            self.cgroup_headroom = v;
         }
-
-        config
+        self
     }
 
     /// Create config from environment variables without requiring `config` feature.

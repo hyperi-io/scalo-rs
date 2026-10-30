@@ -56,7 +56,8 @@ use super::KafkaConfig;
 pub enum AuthKind {
     /// SASL username + password (SCRAM or PLAIN) -- the common contract.
     UserPassword,
-    /// AWS IAM (OAUTHBEARER token via the MSK IAM callback) -- quarantined.
+    /// AWS IAM over OAUTHBEARER -- quarantined. scalo has no token source for
+    /// it, so [`KafkaConfig::apply_provider`] refuses `msk_iam`.
     Iam,
     /// No auth (local dev plaintext).
     None,
