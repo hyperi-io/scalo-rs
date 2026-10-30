@@ -1611,11 +1611,14 @@ mod tests {
     const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// Spilling config with the disk poller on; its 5 s poll keeps it parked on the shutdown signal.
+    /// The byte cap keeps it valid when the tests run inside a Kubernetes pod, as CI runners do.
     fn disk_aware_config(path: &std::path::Path) -> TieredSinkConfig {
-        spilling_config(path).disk_aware(crate::tiered_sink::DiskAwareConfig {
-            max_usage_percent: 1.0,
-            poll_interval_secs: 5,
-        })
+        spilling_config(path)
+            .max_spool_bytes(64 * 1024 * 1024)
+            .disk_aware(crate::tiered_sink::DiskAwareConfig {
+                max_usage_percent: 1.0,
+                poll_interval_secs: 5,
+            })
     }
 
     /// Lets both background tasks reach their shutdown wait, the poller first, as in a running sink.
