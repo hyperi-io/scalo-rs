@@ -178,7 +178,7 @@ A handful of dependencies aren't visible from layer naming alone:
 - `transport-trace` is the *only* feature that pulls in the OpenTelemetry
   SDK on the transport side. Apps that send/receive without distributed
   tracing avoid that dep entirely.
-- `cli-service` (L5) reaches across the whole stack - it pulls `cli + metrics + memory + scaling + shutdown + governor + sink-stack + lifecycle` because `ServiceRuntime::new` wires all of them. It does not pull `worker-pool`; an app that runs one declares it.
+- `cli-service` (L5) reaches across the whole stack - it pulls `cli + metrics + memory + scaling + shutdown + governor + lifecycle` because `ServiceRuntime::new` wires all of them. It pulls no transport, and neither `sink-stack` nor `worker-pool`: an app that moves data or runs a pool declares what it uses.
 
 Read [feature-flags.md](feature-flags.md) for the full feature-to-feature
 edges and [auto-wiring.md](auto-wiring.md) for which dependencies are

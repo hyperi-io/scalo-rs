@@ -80,7 +80,7 @@ flowchart LR
 | Feature | Adds |
 | --------- | ------ |
 | `cli` | `clap`-based `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
-| `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + shutdown + governor + sink-stack + lifecycle`). The worker pool is opt-in: add `worker-pool`, or `worker-batch` for the pool plus `BatchEngine` |
+| `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + shutdown + governor + lifecycle`). No transport comes with it: add the `transport-*` backends, and `sink-stack` for `outbound_sink_stack`. The worker pool is opt-in: add `worker-pool`, or `worker-batch` for the pool plus `BatchEngine` |
 | `lifecycle` | Idle-until-configured gate (`WorkState`, `IdleGate`, `pipeline_idle`) -- folded into `cli-service` |
 | `top` | Above + `ratatui` TUI metrics dashboard |
 
@@ -213,7 +213,8 @@ features = ["cli-service", "http-server", "transport-http"]
 ```
 
 `cli-service` brings `metrics`, `memory`, `scaling`, `shutdown`,
-`governor`, `sink-stack`, `lifecycle`. Add an HTTP transport. It does
+`governor`, `lifecycle`. Add an HTTP transport, and `sink-stack` if the
+service wraps its sender in the outbound control stack. It does
 not bring the worker pool: add `worker-pool` (or `worker-batch`) only
 if the service processes batches on it, and the runtime builds it.
 
@@ -288,7 +289,7 @@ A handful of dependencies aren't visible from the feature name alone:
   pool, so it needs a tokio runtime.
 - `dlq` requires `concurrency` (for the `BackgroundSink` actor that
   drains queued entries).
-- `cli-service` reaches across the stack -- `metrics + memory + scaling + shutdown + governor + sink-stack + lifecycle`. It does not pull `worker-pool`, so rayon is compiled only by a service that asks for `worker-pool` or `worker-batch`.
+- `cli-service` reaches across the stack -- `metrics + memory + scaling + shutdown + governor + lifecycle`. It pulls no transport, so a control or admin service built on it compiles none, and `ServiceRuntime::outbound_sink_stack` needs `sink-stack` declared. It does not pull `worker-pool` either, so rayon is compiled only by a service that asks for `worker-pool` or `worker-batch`.
 - `top` pulls `cli-service` (and through that, the full L2 runtime).
 - `expression` pulls the `cel` crate; needed only if any transport
   filter uses Tier 2 or Tier 3 CEL (see

@@ -328,7 +328,7 @@ impl BatchEngine {
 
     /// Test-only: wire a `MemoryGuard` directly so memory-lease behaviour can be
     /// exercised without a full `auto_wire`.
-    #[cfg(all(test, feature = "memory"))]
+    #[cfg(all(test, feature = "memory", feature = "transport-memory"))]
     pub(crate) fn set_memory_guard_for_test(&mut self, guard: Arc<crate::memory::MemoryGuard>) {
         self.memory_guard = Some(guard);
     }
@@ -641,7 +641,7 @@ impl BatchEngine {
 /// the reservation.
 ///
 /// [`MemoryGuard`]: crate::memory::MemoryGuard
-#[cfg(feature = "memory")]
+#[cfg(all(feature = "memory", feature = "transport"))]
 #[must_use = "the lease must be held for the lifetime of the in-flight block; \
               dropping it immediately releases the reservation and corrupts the \
               in-flight byte accounting"]
@@ -650,7 +650,7 @@ pub(crate) struct IngressLease<'a> {
     bytes: u64,
 }
 
-#[cfg(feature = "memory")]
+#[cfg(all(feature = "memory", feature = "transport"))]
 impl<'a> IngressLease<'a> {
     /// Construct a lease over already-accounted ingress bytes. The caller must
     /// have already called `guard.add_bytes(bytes)`; `Drop` releases them. Used
@@ -660,7 +660,7 @@ impl<'a> IngressLease<'a> {
     }
 }
 
-#[cfg(feature = "memory")]
+#[cfg(all(feature = "memory", feature = "transport"))]
 impl Drop for IngressLease<'_> {
     fn drop(&mut self) {
         self.guard.release(self.bytes);

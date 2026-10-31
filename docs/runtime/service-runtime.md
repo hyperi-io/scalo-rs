@@ -38,8 +38,9 @@ which case nothing is constructed and the data path is byte-identical
 to pre-governor. See [self-regulation.md](../self-regulation.md).
 
 The bundle is enabled via the `cli-service` feature, which pulls in
-`metrics + memory + scaling + shutdown + governor + sink-stack +
-lifecycle`. The worker pool is opt-in: add `worker-pool` for
+`metrics + memory + scaling + shutdown + governor + lifecycle`. It pulls
+no transport: a service that moves data adds its `transport-*` backends,
+and `sink-stack` for `outbound_sink_stack`. The worker pool is opt-in: add `worker-pool` for
 `worker_pool`, or `worker-batch` for it and `batch_engine`, and the
 runtime builds and wires them. Without either, neither field exists and
 rayon is not compiled.
