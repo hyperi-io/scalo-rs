@@ -1357,7 +1357,7 @@ impl BatchEngine {
     /// sub-blocks; this wrapper keeps the byte-split unit tests (which assert the
     /// sub-block shapes) ergonomic. Same splitting contract as
     /// [`SubBlockDrain::next_sub_block`].
-    #[cfg(all(test, feature = "transport"))]
+    #[cfg(all(test, feature = "transport-memory"))]
     fn split_into_sub_blocks(records: Vec<Record>, target_bytes: u64) -> Vec<Vec<Record>> {
         let mut drain = SubBlockDrain::new(records, target_bytes);
         let mut out = Vec::new();
