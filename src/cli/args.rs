@@ -115,10 +115,10 @@ impl CommonArgs {
     ///
     /// The first selector that is neither blank nor `auto` wins: `--log-format`,
     /// then `LOG_FORMAT`, then `logger.format` from config. A value that is not
-    /// a known format is returned as given, so
-    /// [`to_logger_options`](Self::to_logger_options) rejects it. With none
-    /// set, `json` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, else `text`
-    /// under a CI runner or when stderr is a terminal, else `json`.
+    /// a known format is returned as given, so `to_logger_options` (`logger`
+    /// feature) rejects it. With none set, `json` when
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, else `text` under a CI runner or
+    /// when stderr is a terminal, else `json`.
     #[must_use]
     pub fn effective_log_format(&self) -> String {
         self.effective_log_format_in(crate::env::ConsoleContext::detect())

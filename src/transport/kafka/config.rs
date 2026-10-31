@@ -1246,11 +1246,11 @@ pub struct KafkaConfig {
 
     /// Consumer group ID.
     ///
-    /// Empty means [`KafkaTransport::new`](super::KafkaTransport::new) builds
-    /// no consumer, and [`KafkaTransport::receiver`](super::KafkaTransport::receiver)
-    /// refuses the config. The admin's offset-query consumer takes a group id
-    /// derived from this field, or from `client_id` when it is empty, so a
-    /// broker granting groups by prefix covers it too.
+    /// Empty means `KafkaTransport::new` (`transport-kafka` feature) builds no
+    /// consumer, and `KafkaTransport::receiver` refuses the config. The admin's
+    /// offset-query consumer takes a group id derived from this field, or from
+    /// `client_id` when it is empty, so a broker granting groups by prefix
+    /// covers it too.
     #[serde(default = "default_group")]
     pub group: String,
 
