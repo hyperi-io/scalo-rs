@@ -1,10 +1,31 @@
 {{/*
+scalo-service.dropNulls -- removes every null-valued key from a map in place, in nested
+maps and in maps inside lists too, so a deployer who nulls a key gets the app's default
+rather than a null written into its config file. Renders nothing.
+*/}}
+{{- define "scalo-service.dropNulls" -}}
+{{- $node := . -}}
+{{- range $key, $value := $node -}}
+{{- if kindIs "invalid" $value -}}
+{{- $_ := unset $node $key -}}
+{{- else if kindIs "map" $value -}}
+{{- include "scalo-service.dropNulls" $value -}}
+{{- else if kindIs "slice" $value -}}
+{{- range $item := $value -}}
+{{- if kindIs "map" $item }}{{ include "scalo-service.dropNulls" $item }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 scalo-service.configFile -- the rendered app config: `config` with `configOverrides`
-merged over it. The contract's default_config is never merged in, so the app's own
-defaults stay authoritative and no stale key is frozen into a deployment.
+merged over it, null keys dropped. The contract's default_config is never merged in, so
+the app's own defaults stay authoritative and no stale key is frozen into a deployment.
 */}}
 {{- define "scalo-service.configFile" -}}
 {{- $config := mergeOverwrite (deepCopy (.Values.config | default dict)) (deepCopy (.Values.configOverrides | default dict)) -}}
+{{- include "scalo-service.dropNulls" $config -}}
 {{- printf "%s\n" (ternary (toYaml $config) "{}" (not (empty $config))) -}}
 {{- end -}}
 
@@ -18,6 +39,7 @@ mount never sees the file change, so with configMount.subPath every path counts.
 {{- define "scalo-service.configChecksumInput" -}}
 {{- $contract := include "scalo-service.contract" . | fromJson -}}
 {{- $config := mergeOverwrite (deepCopy (.Values.config | default dict)) (deepCopy (.Values.configOverrides | default dict)) -}}
+{{- include "scalo-service.dropNulls" $config -}}
 {{- if not (.Values.configMount | default dict).subPath -}}
 {{- range $path := $contract.hot_paths | default list -}}
 {{- $segments := splitList "." $path -}}

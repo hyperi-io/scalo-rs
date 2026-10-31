@@ -35,6 +35,31 @@ tests:
           path: binaryData["config.yaml"]
           value: YnVmZmVyOgogIGZsdXNoX3Jvd3M6IDUwMDAKbG9hZGVyOgogIGVuZHBvaW50OiBsb2FkZXI6NjAwMApsb2dfbGV2ZWw6IHdhcm4K
 
+  # A null key is left out at every depth, inside list items too, so the app's own
+  # default applies. The schema refuses a null dial, so these keys are not dials.
+  # base64 of:
+  #   buffer: {}
+  #   routes:
+  #   - name: a
+  #   source:
+  #     group_id: kept
+  - it: drops a key set to null rather than writing null into the file
+    set:
+      config:
+        buffer:
+          spill_path: null
+        trace_header: null
+        routes:
+          - name: a
+            topic: null
+        source:
+          auto_offset_reset: null
+          group_id: kept
+    asserts:
+      - equal:
+          path: binaryData["config.yaml"]
+          value: YnVmZmVyOiB7fQpyb3V0ZXM6Ci0gbmFtZTogYQpzb3VyY2U6CiAgZ3JvdXBfaWQ6IGtlcHQK
+
   # A hot path leaves the checksum only: the file the app reloads still holds it.
   # base64 of:
   #   rules:
