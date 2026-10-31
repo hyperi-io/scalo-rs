@@ -81,14 +81,15 @@ feature is off.
 
 `get()` serves a cached value until `ttl_secs` passes, then goes back to the backend. If the backend fails, `get()` serves the expired value for up to `stale_grace_secs` more before returning the error. The disk tier is written only with an `encryption_key`, or with `allow_plaintext_disk_cache` outside production. Without either the cache is memory-only.
 
-`refresh_all()` re-fetches every source in `secrets.sources` from its backend, fresh entries included, and replaces the cached values, so the next `get()` returns them. A source that fails is named in the returned `SecretsError::RefreshFailed` and keeps its cached value, and the other sources still refresh. Unlike `get()`, `refresh_all()` never answers a failed source from the stale cache. Paths read with `get_file()` are not refreshed. `clear_cache()` drops the cache without re-fetching.
+`refresh_all()` re-fetches every source in `secrets.sources` from its backend, fresh entries included, and replaces the cached values, so the next `get()` returns them. A source that fails is named in the returned `SecretsError::RefreshFailed` and keeps its cached value, and the other sources still refresh. Unlike `get()`, `refresh_all()` never answers a failed source from the stale cache. Paths read with `get_file()` are not refreshed. Fetches of one source run one at a time across `get()` and `refresh_all()`, so the cache ends on the value read last, and a `get()` that waited returns what the fetch before it cached. `clear_cache()` drops the cache without re-fetching.
 
-scalo runs no background refresh. Call `refresh_all()` on your own schedule, a `tokio::time::interval` loop for example.
+`spawn_refresh(shutdown)` runs `refresh_all()` in the background until the `CancellationToken` fires. Each wait is `refresh_interval_secs` plus up to `refresh_jitter_secs`, drawn afresh every time so replicas do not refresh in step, and the first refresh comes after one wait. A failed source is logged and the next refresh runs on schedule. It starts nothing and returns `None` when the interval is `0`, caching is off, or `sources` is empty. `mgr` is an `Arc<SecretsManager>`, and the handle it returns ends once the token fires.
 
 ```rust
 let stats = mgr.cache_stats();    // memory and disk entries, hits, misses, stale hits
 mgr.clear_cache();                // e.g. after a known rotation
 mgr.refresh_all().await?;         // re-fetch every configured source
+let refresher = mgr.spawn_refresh(shutdown.clone()); // ... and keep doing it on a timer
 ```
 
 ### Turning caching off
@@ -226,8 +227,8 @@ A source whose backend's feature is off fails with `SecretsError::ProviderNotCon
 | `allow_plaintext_disk_cache` | `false` | Writes the disk tier unencrypted when no `encryption_key` is set. Rejected under a production profile |
 | `dir_mode` | `0o700` | Unix mode forced on `directory`. `null` skips the chmod |
 | `file_mode` | `0o600` | Unix mode for cache files. `null` skips the chmod |
-| `refresh_interval_secs` | `1800` | Parsed, read by nothing: there is no background refresh |
-| `refresh_jitter_secs` | `300` | Parsed, read by nothing, as above |
+| `refresh_interval_secs` | `1800` | Seconds between the refreshes `spawn_refresh()` runs. `0` turns it off |
+| `refresh_jitter_secs` | `300` | Up to this many seconds added to each of those waits |
 
 `openbao` takes `address`, `auth`, and optionally `namespace`, `ca_cert` (a PEM CA file), `skip_verify` (default `false`, rejected under a production profile) and `timeout_secs`, the seconds one request may take, a login included (default 60, `VAULT_CLIENT_TIMEOUT` in the environment, `0` for none), so a server that never answers fails the lookup rather than hanging startup. `auth.method` picks the fields that go with it:
 
@@ -250,6 +251,7 @@ A source whose backend's feature is off fails with `SecretsError::ProviderNotCon
 | `.get(name) -> SecretValue` | Fetch a secret by name through routed backend |
 | `.get_file(path) -> SecretValue` | Read a secret from a local file |
 | `.refresh_all()` | Re-fetch every configured source; a rotated version is reported, as on any `get()` that reaches the backend |
+| `.spawn_refresh(shutdown) -> Option<JoinHandle<()>>` | Run `refresh_all()` every `refresh_interval_secs` plus jitter until `shutdown` fires |
 | `.clear_cache()` | Drop the cache without re-fetching |
 | `.cache_stats() -> CacheStats` | Memory and disk entries, hits, misses, stale hits |
 | `.subscribe_rotations() -> broadcast::Receiver<RotationEvent>` | Subscribe to rotation notifications |

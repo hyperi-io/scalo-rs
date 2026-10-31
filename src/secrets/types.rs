@@ -80,14 +80,13 @@ pub struct CacheConfig {
     /// Stale cache grace period in seconds (how long to use expired cache on provider failure).
     pub stale_grace_secs: u64,
 
-    /// Background refresh interval in seconds. Nothing reads it: there is no
-    /// background refresh, so call
-    /// [`SecretsManager::refresh_all`](crate::secrets::SecretsManager::refresh_all)
-    /// on your own schedule.
+    /// Seconds between the refreshes
+    /// [`SecretsManager::spawn_refresh`](crate::secrets::SecretsManager::spawn_refresh)
+    /// runs. `0` turns the background refresh off.
     pub refresh_interval_secs: u64,
 
-    /// Refresh jitter in seconds. Nothing reads it, for the reason
-    /// `refresh_interval_secs` gives.
+    /// Up to this many seconds added to each wait between background
+    /// refreshes, drawn afresh each time, so replicas do not refresh in step.
     pub refresh_jitter_secs: u64,
 
     /// Disk-cache encryption key. When set, on-disk cache entries are sealed

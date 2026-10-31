@@ -22,8 +22,8 @@
 //! - Multi-provider support with unified API
 //! - Local disk cache with TTL for resilience
 //! - Stale cache fallback when providers are unavailable
-//! - On-demand refresh of every configured source (`refresh_all`), with no
-//!   background refresh loop
+//! - Refresh of every configured source, on demand (`refresh_all`) or on a
+//!   jittered timer (`spawn_refresh`)
 //! - Rotation events for application notification
 //!
 //! ## Credential specs
@@ -99,9 +99,12 @@ pub use aws::{AwsConfig, AwsProvider};
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Which providers are mid-outage, so a failing health check is logged once when
@@ -146,6 +149,51 @@ pub struct SecretsManager {
     #[cfg(any(feature = "secrets-vault", feature = "secrets-aws"))]
     health_log: HealthLog,
     rotation_tx: broadcast::Sender<RotationEvent>,
+    /// One lock per cache key, held across a fetch, so a slow read of an old
+    /// value never lands after a newer one. An entry lives only while a fetch
+    /// holds it or waits on it.
+    in_flight: InFlight,
+}
+
+type InFlight = parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// A held fetch lock. Dropping it releases the lock and removes the map
+/// entry when no other caller holds or waits on it.
+struct Fetching<'a> {
+    in_flight: &'a InFlight,
+    key: &'a str,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Fetching<'_> {
+    async fn acquire<'a>(in_flight: &'a InFlight, key: &'a str) -> Fetching<'a> {
+        let lock = Arc::clone(in_flight.lock().entry(key.to_string()).or_default());
+        let mut fetching = Fetching {
+            in_flight,
+            key,
+            lock,
+            guard: None,
+        };
+        fetching.guard = Some(Arc::clone(&fetching.lock).lock_owned().await);
+        fetching
+    }
+}
+
+impl Drop for Fetching<'_> {
+    fn drop(&mut self) {
+        // Under the map's lock, so no caller can clone the entry between the
+        // count and the removal. The map and `self.lock` are the two left.
+        let mut locks = self.in_flight.lock();
+        drop(self.guard.take());
+        if Arc::strong_count(&self.lock) == 2
+            && locks
+                .get(self.key)
+                .is_some_and(|l| Arc::ptr_eq(l, &self.lock))
+        {
+            locks.remove(self.key);
+        }
+    }
 }
 
 impl SecretsManager {
@@ -180,6 +228,7 @@ impl SecretsManager {
             #[cfg(any(feature = "secrets-vault", feature = "secrets-aws"))]
             health_log: HealthLog::default(),
             rotation_tx,
+            in_flight: parking_lot::Mutex::default(),
         })
     }
 
@@ -225,7 +274,12 @@ impl SecretsManager {
         #[cfg(feature = "metrics")]
         metrics::counter!("secrets_cache_misses_total").increment(1);
 
-        // Fetch from file
+        let _fetching = Fetching::acquire(&self.in_flight, &cache_key).await;
+        // A concurrent read may have filled the cache while this one waited.
+        if let Some(cached) = self.cache.read().get(&cache_key) {
+            return Ok(cached);
+        }
+
         let value = self.file_provider.get(path).await?;
 
         #[cfg(feature = "metrics")]
@@ -256,6 +310,13 @@ impl SecretsManager {
 
         #[cfg(feature = "metrics")]
         metrics::counter!("secrets_cache_misses_total").increment(1);
+
+        let _fetching = Fetching::acquire(&self.in_flight, cache_key).await;
+        // A concurrent read or refresh may have filled the cache while this
+        // one waited.
+        if let Some(cached) = self.cache.read().get(cache_key) {
+            return Ok(cached);
+        }
 
         match self.fetch(cache_key, source).await {
             Ok(value) => Ok(value),
@@ -362,6 +423,10 @@ impl SecretsManager {
     /// previous version, so no event is sent, and a source whose provider
     /// reports no version (a file) never produces one.
     ///
+    /// Fetches of one source run one at a time across `get` and
+    /// `refresh_all`, so the cache ends on the value read last. A `get` that
+    /// waited on a fetch returns what that fetch cached.
+    ///
     /// # Errors
     ///
     /// Returns [`SecretsError::RefreshFailed`] naming every source that
@@ -371,6 +436,7 @@ impl SecretsManager {
         let mut errors = Vec::new();
 
         for (name, source) in &self.config.sources {
+            let _fetching = Fetching::acquire(&self.in_flight, name).await;
             if let Err(e) = self.fetch(name, source).await {
                 warn!(name = %name, error = %e, "Failed to refresh secret");
                 errors.push(format!("{name}: {e}"));
@@ -382,6 +448,63 @@ impl SecretsManager {
         } else {
             Err(SecretsError::RefreshFailed(errors.join("; ")))
         }
+    }
+
+    /// Run [`refresh_all`](Self::refresh_all) on a timer until `shutdown`
+    /// fires.
+    ///
+    /// Each wait is `cache.refresh_interval_secs` plus up to
+    /// `cache.refresh_jitter_secs`, drawn afresh for every wait, and the
+    /// first refresh comes after one wait, not at start. A failed refresh is
+    /// logged per source by `refresh_all`, and the next one runs on
+    /// schedule. Returns `None`, and starts nothing, when the interval is
+    /// `0`, caching is off (a refresh would hold nothing) or no source is
+    /// configured.
+    ///
+    /// ```no_run
+    /// # async fn wire(shutdown: tokio_util::sync::CancellationToken) -> scalo::secrets::SecretsResult<()> {
+    /// use std::sync::Arc;
+    ///
+    /// use scalo::secrets::{SecretsConfig, SecretsManager};
+    ///
+    /// let mgr = Arc::new(SecretsManager::new(SecretsConfig::from_cascade())?);
+    /// let refresher = mgr.spawn_refresh(shutdown.clone());
+    /// // ... run the service, then on shutdown:
+    /// shutdown.cancel();
+    /// if let Some(task) = refresher {
+    ///     let _ = task.await;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use = "the refresh stops only when `shutdown` fires; keep the handle to await it"]
+    pub fn spawn_refresh(self: &Arc<Self>, shutdown: CancellationToken) -> Option<JoinHandle<()>> {
+        let cache = &self.config.cache;
+        if !cache.enabled || self.config.sources.is_empty() {
+            return None;
+        }
+        let interval = Duration::from_secs(cache.refresh_interval_secs);
+        let jitter = Duration::from_secs(cache.refresh_jitter_secs);
+        refresh_wait(interval, jitter, 0)?;
+        let manager = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            loop {
+                let Some(wait) = refresh_wait(interval, jitter, clock_seed()) else {
+                    return;
+                };
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(wait) => {}
+                }
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    // refresh_all logs every source that failed.
+                    _ = manager.refresh_all() => {}
+                }
+            }
+        }))
     }
 
     /// Check health of all configured providers.
@@ -452,6 +575,24 @@ impl SecretsManager {
     pub fn cache_stats(&self) -> CacheStats {
         self.cache.read().stats()
     }
+}
+
+/// The wait before the next background refresh: `interval` plus `seed`
+/// folded into `0..=jitter` milliseconds. `None` for a zero interval.
+fn refresh_wait(interval: Duration, jitter: Duration, seed: u64) -> Option<Duration> {
+    if interval.is_zero() {
+        return None;
+    }
+    let span = u64::try_from(jitter.as_millis()).unwrap_or(u64::MAX);
+    let extra = seed % span.saturating_add(1);
+    Some(interval.saturating_add(Duration::from_millis(extra)))
+}
+
+/// Sub-second clock nanoseconds: replicas only need different offsets.
+fn clock_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()))
 }
 
 /// Cache statistics.
@@ -543,6 +684,231 @@ mod tests {
         let manager = SecretsManager::new(SecretsConfig::default()).unwrap();
         let health = manager.health_check().await;
         assert!(health.get("file").copied().unwrap_or(false));
+    }
+
+    #[test]
+    fn refresh_waits_add_jitter_within_its_bound() {
+        let secs = Duration::from_secs;
+        let ms = Duration::from_millis;
+        // (case, interval, jitter, seed, wait)
+        let cases = [
+            ("interval off", secs(0), secs(300), 7, None),
+            ("no jitter", secs(1800), secs(0), 123_456, Some(secs(1800))),
+            (
+                "seed inside the jitter",
+                secs(60),
+                secs(5),
+                4_999,
+                Some(ms(64_999)),
+            ),
+            (
+                "seed at the bound",
+                secs(60),
+                secs(5),
+                5_000,
+                Some(secs(65)),
+            ),
+            (
+                "seed past the bound wraps",
+                secs(60),
+                secs(5),
+                5_001,
+                Some(secs(60)),
+            ),
+            ("seed wraps twice", secs(1), secs(1), 2_002, Some(secs(1))),
+            ("huge jitter", secs(1), Duration::MAX, 9, Some(ms(1_009))),
+        ];
+        for (case, interval, jitter, seed, want) in cases {
+            assert_eq!(refresh_wait(interval, jitter, seed), want, "{case}");
+        }
+    }
+
+    fn file_sources(
+        dir: &std::path::Path,
+        cache: CacheConfig,
+    ) -> (SecretsConfig, std::path::PathBuf) {
+        let path = dir.join("token");
+        std::fs::write(&path, "first").unwrap();
+        let config = SecretsConfig {
+            cache,
+            sources: [(
+                "token".to_string(),
+                SecretSource::File {
+                    path: path.to_str().unwrap().to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        (config, path)
+    }
+
+    /// A cache in `dir` that holds entries for an hour, refreshed every
+    /// `interval_secs` with no jitter.
+    fn refreshing(dir: &std::path::Path, interval_secs: u64) -> CacheConfig {
+        CacheConfig {
+            directory: Some(dir.join("cache")),
+            ttl_secs: 3600,
+            refresh_interval_secs: interval_secs,
+            refresh_jitter_secs: 0,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_refresh_starts_nothing_when_it_could_hold_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let off = |enabled: bool, interval: u64| CacheConfig {
+            enabled,
+            ..refreshing(dir.path(), interval)
+        };
+        for (case, cache, with_source) in [
+            ("interval 0", off(true, 0), true),
+            ("caching off", off(false, 1), true),
+            ("no source", off(true, 1), false),
+        ] {
+            let (mut config, _) = file_sources(dir.path(), cache);
+            if !with_source {
+                config.sources.clear();
+            }
+            let manager = Arc::new(SecretsManager::new(config).unwrap());
+            assert!(
+                manager.spawn_refresh(CancellationToken::new()).is_none(),
+                "{case}: a refresh task started"
+            );
+        }
+    }
+
+    /// The timer re-reads a fresh entry the cache would otherwise serve for
+    /// an hour, and the task ends once shutdown fires.
+    #[tokio::test]
+    async fn spawn_refresh_rereads_on_its_interval_and_stops_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, path) = file_sources(dir.path(), refreshing(dir.path(), 1));
+        let manager = Arc::new(SecretsManager::new(config).unwrap());
+        assert_eq!(
+            manager.get("token").await.unwrap().as_str().unwrap(),
+            "first"
+        );
+
+        let shutdown = CancellationToken::new();
+        let task = manager
+            .spawn_refresh(shutdown.clone())
+            .expect("a refresh task");
+        std::fs::write(&path, "second").unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let seen = manager.get("token").await.unwrap();
+            if seen.as_str().unwrap() == "second" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no refresh within 30 s of a 1 s interval"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the refresh task outlived shutdown by 10 s")
+            .expect("the refresh task panicked");
+    }
+
+    /// A slow read of the old value never lands over a newer one: a `get`
+    /// whose read of v1 is held open, then a refresh that reads v2, leaves the
+    /// cache on v2.
+    ///
+    /// The source is a FIFO, so the `get`'s read blocks until the test writes
+    /// v1. While it blocks, the path is swapped for a file holding v2. Unlocked,
+    /// the refresh reads v2 and caches it, then the `get` caches v1 over it.
+    /// A fetch lock lives only while a caller holds or waits on it, so reads
+    /// of ever-changing paths leave nothing behind, failed reads included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_locks_are_dropped_once_no_caller_needs_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SecretsManager::new(SecretsConfig::default()).unwrap());
+        for i in 0..10_000 {
+            let path = dir.path().join(format!("missing-{i}"));
+            assert!(manager.get_file(path.to_str().unwrap()).await.is_err());
+        }
+        assert_eq!(manager.in_flight.lock().len(), 0, "sequential reads");
+
+        let path = dir.path().join("missing-shared");
+        let mut readers = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let manager = Arc::clone(&manager);
+            let path = path.to_str().unwrap().to_string();
+            readers.spawn(async move { manager.get_file(&path).await.is_err() });
+        }
+        while let Some(failed) = readers.join_next().await {
+            assert!(failed.unwrap());
+        }
+        assert_eq!(
+            manager.in_flight.lock().len(),
+            0,
+            "concurrent reads of one path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_read_of_the_old_value_never_overwrites_a_newer_one() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (config, path) = file_sources(dir.path(), refreshing(dir.path(), 0));
+        std::fs::remove_file(&path).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo {}", path.display());
+        let writer_path = dir.path().join("token-writer");
+        std::fs::hard_link(&path, &writer_path).unwrap();
+        let manager = Arc::new(SecretsManager::new(config).unwrap());
+
+        let get = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.get("token").await }
+        });
+        // Opening a FIFO for writing returns once the get's read has opened it.
+        let mut writer = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(writer_path)
+                .expect("open the FIFO")
+        })
+        .await
+        .unwrap();
+
+        let newer = dir.path().join("token-v2");
+        std::fs::write(&newer, "v2").unwrap();
+        std::fs::rename(&newer, &path).unwrap();
+        let mut refresh = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.refresh_all().await }
+        });
+        // Unlocked, the refresh finishes here on v2. Locked, it waits on the get.
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut refresh).await;
+
+        writer.write_all(b"v1").unwrap();
+        drop(writer);
+        let read = get.await.unwrap().unwrap();
+        assert_eq!(read.as_str().unwrap(), "v1", "the get read what it opened");
+        if !refresh.is_finished() {
+            refresh.await.unwrap().expect("refresh");
+        }
+
+        let cached = manager.get("token").await.unwrap();
+        assert_eq!(
+            cached.as_str().unwrap(),
+            "v2",
+            "the get's late v1 replaced the refresh's v2 in the cache"
+        );
     }
 
     #[cfg(all(

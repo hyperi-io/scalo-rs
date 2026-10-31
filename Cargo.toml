@@ -283,7 +283,7 @@ transport-http = ["transport", "http"]
 transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http"]
 
 # Secrets management
-secrets = ["tokio", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2"]
+secrets = ["tokio", "tokio-util", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2"]
 secrets-vault = ["secrets", "vaultrs"]
 secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager"]
 secrets-all = ["secrets-vault", "secrets-aws"]
