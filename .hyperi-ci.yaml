@@ -20,6 +20,13 @@ quality:
   # The thin-chart skeleton renders only once an assembler adds files/contract.json.
   exclude_paths:
     - charts/scalo-service/skeleton
+  # A consumer enables a narrow feature set, so a lint that fires or a test target that
+  # fails to compile under one feature alone fails the stage rather than printing a
+  # warning nobody reads.
+  rust:
+    feature_matrix:
+      warnings: blocking
+    feature_matrix_tests: blocking
   # Jobs of .github/workflows/scalo-service.yml, repeated so a local check predicts them.
   local_gates:
     - name: scalo-service chart tests

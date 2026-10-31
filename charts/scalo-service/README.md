@@ -147,7 +147,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints`, `priorityClassName` | none | Scheduling |
 | `workingDir`, `args` | none, contract `entrypoint_args` | Container |
 | `startupProbe`, `livenessProbe`, `readinessProbe` | derived | Merged over each probe |
-| `config` | `{}` | App config file; dials are validated, other keys pass |
+| `config` | `{}` | App config file; dials are validated, other keys pass, and a key set to null is left out so the app's default applies |
 | `configOverrides` | `{}` | Merged over `config`, unvalidated |
 | `configMount.subPath` | false | Mount the config as one file rather than its directory |
 | `fileSets.<set>.mountPath`, `fileSets.<set>.files[{name, content}]` | none | Files mounted read-only from a ConfigMap, each byte for byte (see [What the library renders](#what-the-library-renders)) |

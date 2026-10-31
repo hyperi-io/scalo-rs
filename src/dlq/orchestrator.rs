@@ -421,8 +421,8 @@ impl Dlq {
     /// `entry` as this DLQ writes it: a payload over
     /// [`DlqConfig::max_payload_bytes`] cut to it, the entry marked
     /// `truncated`, and `dlq_payload_truncated_total` counted. Every send
-    /// applies it. Apply it before [`refusal`](Self::refusal), which judges
-    /// the entry it is given.
+    /// applies it. Apply it before `refusal` (`transport` feature), which
+    /// judges the entry it is given.
     #[must_use]
     pub fn cap(&self, entry: DlqEntry) -> DlqEntry {
         match self.max_payload_bytes {
