@@ -657,6 +657,112 @@ mod tests {
         assert!(text.contains("WORKDIR /home/appuser"), "{text}");
     }
 
+    /// A DLQ that writes files gets its directory in every render: the
+    /// chart's contract JSON, the Dockerfile and the runtime stage. One that
+    /// writes none, or whose directory is already writable, adds nothing.
+    #[cfg(feature = "dlq")]
+    #[test]
+    fn a_file_dlq_renders_its_directory_writable() {
+        use crate::deployment::WritablePath;
+        use crate::dlq::{DlqConfig, DlqMode};
+
+        let dlq = |enabled: bool, file: bool, mode: DlqMode, path: &str| {
+            let mut c = DlqConfig {
+                enabled,
+                mode,
+                ..DlqConfig::default()
+            };
+            c.file.enabled = file;
+            c.file.path = path.into();
+            c
+        };
+        let fleet = "/var/spool/dfe/dlq";
+        // (case, existing writable paths, dlq config, the paths after)
+        let cases: [(&str, Vec<WritablePath>, DlqConfig, Vec<&str>); 8] = [
+            (
+                "scalo's default",
+                vec![],
+                DlqConfig::default(),
+                vec!["/var/spool/scalo/dlq"],
+            ),
+            (
+                "cascade",
+                vec![],
+                dlq(true, true, DlqMode::Cascade, fleet),
+                vec![fleet],
+            ),
+            (
+                "fan out",
+                vec![],
+                dlq(true, true, DlqMode::FanOut, fleet),
+                vec![fleet],
+            ),
+            (
+                "file only",
+                vec![],
+                dlq(true, true, DlqMode::FileOnly, fleet),
+                vec![fleet],
+            ),
+            (
+                "kafka only",
+                vec![],
+                dlq(true, true, DlqMode::KafkaOnly, fleet),
+                vec![],
+            ),
+            (
+                "dlq off",
+                vec![],
+                dlq(false, true, DlqMode::Cascade, fleet),
+                vec![],
+            ),
+            (
+                "file backend off",
+                vec![],
+                dlq(true, false, DlqMode::Cascade, fleet),
+                vec![],
+            ),
+            (
+                "already under a writable path",
+                vec![WritablePath::new("spool", "/var/spool/dfe")],
+                dlq(true, true, DlqMode::Cascade, fleet),
+                vec!["/var/spool/dfe"],
+            ),
+        ];
+        for (case, existing, config, want) in cases {
+            let mut contract = test_contract();
+            contract.writable_paths = existing;
+            let contract = contract.with_dlq(&config);
+            let paths: Vec<&str> = contract
+                .writable_paths
+                .iter()
+                .map(|w| w.path.as_str())
+                .collect();
+            assert_eq!(paths, want, "{case}");
+            contract
+                .validate()
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+
+            let json: serde_json::Value =
+                serde_json::from_str(&contract.to_json().unwrap()).unwrap();
+            let rendered: Vec<&str> = json["writable_paths"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|w| w["path"].as_str()).collect())
+                .unwrap_or_default();
+            assert_eq!(rendered, want, "{case}: the chart's contract JSON");
+            for (name, text) in [
+                ("dockerfile", generate_dockerfile(&contract, None).unwrap()),
+                ("runtime stage", generate_runtime_stage(&contract).unwrap()),
+            ] {
+                for path in &want {
+                    assert!(
+                        text.contains(&format!("mkdir -p '{path}'")),
+                        "{case}: the {name} does not create {path}:\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A production image keeps librdkafka and drops every tool it needed to
     /// fetch the key, and the healthcheck needs no HTTP client.
     #[test]

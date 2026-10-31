@@ -264,6 +264,8 @@ singleton: true,
 
 A chart always adds a scratch `/tmp` beside the declared paths.
 
+An app with a file DLQ builds its contract with `.with_dlq(&dlq_config)` (feature `dlq`), passing the `DlqConfig` it spawns the DLQ with. That adds a `dlq` path at `file.path` whenever the DLQ writes files, so the file backend starts on the read-only root filesystem. A `kafka_only` DLQ, a DLQ or file backend that is off, or a directory already under a declared path adds nothing.
+
 `service_account: ServiceAccount::None` (`"none"` in the JSON) is for an app with no Kubernetes client and no use for a token. The scalo-service chart then creates no ServiceAccount and leaves `serviceAccountName` off the pod, so it runs as the namespace's `default` account with the token still unmounted. Values can still set `serviceAccount.create` either way, or `serviceAccount.name` to run as an account the operator supplies.
 
 ---
