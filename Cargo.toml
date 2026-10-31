@@ -15,6 +15,9 @@ rust-version = "1.95"
 description = "Opinionated-for-scale integrated runtime of config, logging, secrets, cli and more for data plane and infrastructure services."
 license = "Apache-2.0"
 repository = "https://github.com/hyperi-io/scalo-rs"
+documentation = "https://docs.rs/scalo"
+# The crates.io page. README.md stays the GitHub front page.
+readme = "docs/crate.md"
 publish = true
 keywords = ["data-plane", "backpressure", "observability", "kafka", "autoscaling"]
 categories = ["asynchronous", "config", "network-programming", "concurrency", "development-tools"]
