@@ -1,28 +1,24 @@
 # scalo
 
 <!-- BADGES:START -->
-<!-- Build Status and docs.rs badges omitted. The repo is private, so GitHub's
-     Actions SVG 404s for anonymous crates.io viewers, and the docs.rs badge
-     renders its own build state, which is worse than absent when it is red.
-     Re-add the Actions one at the public-visibility flip:
-     [![Build Status](https://github.com/hyperi-io/scalo-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/scalo-rs/actions) -->
+[![Build Status](https://github.com/hyperi-io/scalo-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/scalo-rs/actions)
 [![Crates.io](https://img.shields.io/crates/v/scalo?logo=rust)](https://crates.io/crates/scalo)
 [![Rust Version](https://img.shields.io/badge/rust-1.95%2B-blue?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](https://www.apache.org/licenses/LICENSE-2.0)
 <!-- BADGES:END -->
 
-Opinionated-for-scale integrated runtime of config, logging, secrets, cli and more for data plane and infrastructure services.
+The runtime layer for Rust data-plane services: config, logging, metrics, health probes, memory backpressure, transports and secrets, already wired together. In a DFE deployment every Rust service is built on it, so they all read config, log, report and shed load the same way.
 
-## Key features
+## What it gives you
 
-- configuration cascade for local test through at scale k8s deployments (env, config, cli)
-- automatically configured and integrated logger (line and json) for enterprise deployments
-- auto enabled Otel and Prometheus metrics in expected forms and buckets for cloud and k8s deployments
-- secrets management integration
-- authentication and secrets integration for most common deployments and services
-- deployment contracts, your code automatically generates docker, and k8s artefacts for deployment consumption
-- memory capping, align your apps throughput to memory caps with back-pressure by default. Avoid OOMs
-- built in transport layer for kafka and gRPC
+- A seven-layer config cascade, from CLI args and env vars down to YAML files and defaults, read the same way in a laptop shell and a Kubernetes pod.
+- Structured logs, JSON in a container and readable text at a terminal, with passwords, tokens, keys and named personal-data fields written as `[REDACTED]`.
+- Prometheus and OpenTelemetry metrics, with `/livez` and `/readyz` on the same listener as `/metrics`.
+- A cgroup-aware memory guard, so a service stops taking work before the kernel OOM-kills it.
+- Kafka, gRPC, HTTP, file, pipe and in-memory transports behind one sender and receiver interface.
+- A tiered sink that spills to a disk spool when the downstream is slow or gone, and a dead letter queue to a file, Kafka or HTTP.
+- Secrets from files, OpenBao or Vault, and AWS Secrets Manager, cached with a TTL and re-read when you call `refresh_all`.
+- A deployment contract: fill in one struct and scalo writes the Dockerfile and the JSON the scalo-service Helm chart renders from.
 
 ## Quick Start
 
@@ -167,9 +163,9 @@ result, never a local summary.
 
 ### Where this sits
 
-Generated from `dfe-infra/suite.yaml` via `dfe-stack suite`. Six DFE Rust
-consumers declare this crate: receiver, loader, fetcher, archiver, transform-vrl
-and transform-vector.
+Generated from `dfe-infra/suite.yaml` via `dfe-stack suite`. Seven DFE Rust
+consumers declare this crate: receiver, loader, fetcher, archiver, transform-vrl,
+transform-vector and transform-elastic.
 
 ## Issues
 
