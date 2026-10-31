@@ -3,6 +3,15 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.23](https://github.com/hyperi-io/scalo-rs/compare/v2.14.22...v2.14.23) (2026-10-31)
+
+### Bug Fixes
+
+* a service named by --config no longer reads ./.env ([#419](https://github.com/hyperi-io/scalo-rs/issues/419)) ([6f321ef](https://github.com/hyperi-io/scalo-rs/commit/6f321eff2d7f524d12e06af025310e05f0ef3aa3))
+* build test helpers only with the tests that call them ([#421](https://github.com/hyperi-io/scalo-rs/issues/421)) ([999cc5c](https://github.com/hyperi-io/scalo-rs/commit/999cc5c7b5bebdb10ed28a30e0a38a129c97157a))
+* close the startup and recovery holes the tests never reached ([#420](https://github.com/hyperi-io/scalo-rs/issues/420)) ([0ccd05f](https://github.com/hyperi-io/scalo-rs/commit/0ccd05fb610f3a92ca952a8183e5e0c88c1b4d61))
+* narrow cli-service, block per-feature CI warnings, drop null chart config ([#422](https://github.com/hyperi-io/scalo-rs/issues/422)) ([8647b99](https://github.com/hyperi-io/scalo-rs/commit/8647b99d554dad9c8968b6b5d00a49e16a8b5a7f)), closes [#142](https://github.com/hyperi-io/scalo-rs/issues/142) [#144](https://github.com/hyperi-io/scalo-rs/issues/144) [#351](https://github.com/hyperi-io/scalo-rs/issues/351) [#328](https://github.com/hyperi-io/scalo-rs/issues/328)
+
 ## [2.14.22](https://github.com/hyperi-io/scalo-rs/compare/v2.14.21...v2.14.22) (2026-10-29)
 
 ### Bug Fixes
