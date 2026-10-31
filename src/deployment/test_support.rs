@@ -574,24 +574,61 @@ pub fn assert_peak_memory(test_name: &str, resources: &super::ResourcesContract)
         );
         return None;
     };
-    match judge_peak_memory(peak, resources) {
-        Ok(MemoryVerdict::Within) => {}
-        Ok(MemoryVerdict::OverRequest { peak, request }) => {
-            let message = format!(
-                "{test_name}: peak resident set {} over the contract's memory request {} ({})",
-                mib(peak),
-                mib(request),
-                resources.requests.memory
-            );
-            eprintln!("warning: {message}");
-            println!("::warning title=memory over request::{message}");
-            if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
-                let _ = append_line(Path::new(&summary), &format!("- WARNING: {message}"));
-            }
-        }
-        Err(reason) => panic!("{test_name}: {reason}"),
-    }
+    assert_peak_memory_of(test_name, peak, resources);
     Some(peak)
+}
+
+/// Hold a peak of `peak_bytes` to `resources`, for a test that measured the
+/// peak itself: panic over `limits.memory`, and warn over `requests.memory`.
+///
+/// Use it where the peak belongs to a child process, which
+/// [`assert_peak_memory`] cannot see. The warning goes to stderr, to stdout
+/// as a GitHub `::warning::` annotation, and to `$GITHUB_STEP_SUMMARY` when
+/// set, exactly as [`assert_peak_memory`] reports it.
+///
+/// # Panics
+///
+/// Over the limit, with no memory limit declared, or on a quantity that
+/// does not parse.
+pub fn assert_peak_memory_of(
+    test_name: &str,
+    peak_bytes: u64,
+    resources: &super::ResourcesContract,
+) {
+    let summary = std::env::var("GITHUB_STEP_SUMMARY").ok();
+    if let Err(reason) = report_peak(
+        test_name,
+        peak_bytes,
+        resources,
+        summary.as_deref().map(Path::new),
+    ) {
+        panic!("{test_name}: {reason}");
+    }
+}
+
+/// Judge `peak_bytes` and report an over-request warning to the given sinks.
+/// `Err` is the failure reason, and nothing is reported for it.
+fn report_peak(
+    test_name: &str,
+    peak_bytes: u64,
+    resources: &super::ResourcesContract,
+    summary: Option<&Path>,
+) -> Result<MemoryVerdict, String> {
+    let verdict = judge_peak_memory(peak_bytes, resources)?;
+    if let MemoryVerdict::OverRequest { peak, request } = verdict {
+        let message = format!(
+            "{test_name}: peak resident set {} over the contract's memory request {} ({})",
+            mib(peak),
+            mib(request),
+            resources.requests.memory
+        );
+        eprintln!("warning: {message}");
+        println!("::warning title=memory over request::{message}");
+        if let Some(summary) = summary {
+            let _ = append_line(summary, &format!("- WARNING: {message}"));
+        }
+    }
+    Ok(verdict)
 }
 
 /// `bytes` in MiB, to one decimal place.
@@ -693,13 +730,42 @@ mod tests {
             ("a bad quantity", 1, "lots", "512Mi", Err("not a quantity")),
         ];
         for (name, peak, request, limit, want) in cases {
-            let got = judge_peak_memory(peak, &resources(request, limit));
+            let got = report_peak(name, peak, &resources(request, limit), None);
             match (got, want) {
                 (Ok(got), Ok(want)) => assert_eq!(got, want, "{name}"),
                 (Err(reason), Err(word)) => assert!(reason.contains(word), "{name}: {reason}"),
                 (got, _) => panic!("{name}: {got:?}"),
             }
         }
+    }
+
+    #[test]
+    fn an_over_request_peak_appends_a_step_summary_line() {
+        const MIB: u64 = 1_048_576;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let summary = dir.path().join("summary.md");
+        let got = report_peak(
+            "summarised",
+            200 * MIB,
+            &resources("128Mi", "512Mi"),
+            Some(&summary),
+        );
+        assert!(
+            matches!(got, Ok(MemoryVerdict::OverRequest { .. })),
+            "{got:?}"
+        );
+        let text = std::fs::read_to_string(&summary).expect("the summary was written");
+        assert!(
+            text.starts_with("- WARNING: summarised: peak resident set 200.0 MiB"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "over the contract's memory limit")]
+    fn assert_peak_memory_of_fails_over_the_limit() {
+        const MIB: u64 = 1_048_576;
+        assert_peak_memory_of("oom", 513 * MIB, &resources("128Mi", "512Mi"));
     }
 
     #[cfg(target_os = "linux")]

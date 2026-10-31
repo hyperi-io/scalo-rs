@@ -254,7 +254,7 @@ diagnostic, smoke-test, or specialty:
 
 - `deployment-smoke` -- runs `docker build` + `docker run` as part of
   tests. Requires a Docker daemon.
-- `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, `assert_peak_memory` (a test's peak resident set fails over the contract's memory limit and warns over its request, read from `ResourcesContract`, so no test hard-codes a budget), and with `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)).
+- `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, `assert_peak_memory` (a test's peak resident set fails over the contract's memory limit and warns over its request, read from `ResourcesContract`, so no test hard-codes a budget). `assert_peak_memory_of` judges a peak the caller measured, for a child process. With `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)).
 - `config-postgres` -- PostgreSQL-backed config source. Built-for, not
   built-with -- the YAML cascade already handles centralised config.
 - `worker-msgpack` -- MsgPack batch serialisation for the worker pool.

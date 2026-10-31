@@ -733,8 +733,16 @@ mod broker {
     use std::time::{Duration, Instant};
 
     use rdkafka::ClientConfig;
+    #[cfg(any(
+        feature = "worker-batch",
+        all(feature = "governor", feature = "metrics")
+    ))]
     use rdkafka::consumer::{BaseConsumer, Consumer};
     use rdkafka::producer::{FutureProducer, FutureRecord};
+    #[cfg(any(
+        feature = "worker-batch",
+        all(feature = "governor", feature = "metrics")
+    ))]
     use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
     use scalo::transport::kafka::test_support::kafka_tag;
     use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
@@ -872,6 +880,10 @@ mod broker {
 
     /// The offset `group` last committed on partition 0 of `topic`, asked of
     /// the broker by a client that joins no group.
+    #[cfg(any(
+        feature = "worker-batch",
+        all(feature = "governor", feature = "metrics")
+    ))]
     pub(super) async fn committed(bootstrap: &str, group: &str, topic: &str) -> Option<i64> {
         let (bootstrap, group, topic) =
             (bootstrap.to_string(), group.to_string(), topic.to_string());
