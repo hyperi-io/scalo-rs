@@ -66,6 +66,9 @@ pub struct Dlq {
     sink: Option<BackgroundSink<DlqEntry>>,
     join: Arc<AsyncMutex<Option<BackgroundSinkHandle>>>,
     enabled: bool,
+    /// Enabled by config, but no backend started: a confirmed write fails, so
+    /// a caller holding a source acknowledgement keeps it.
+    unavailable: bool,
     mode: DlqMode,
     /// Child of the user-supplied shutdown token. The drain task runs
     /// on this child, so [`Dlq::shutdown`] can cancel only the DLQ
@@ -157,6 +160,7 @@ impl Dlq {
             sink: None,
             join: Arc::new(AsyncMutex::new(None)),
             enabled: false,
+            unavailable: false,
             mode: DlqMode::default(),
             cancel: CancellationToken::new(),
             lost: Arc::new(AtomicU64::new(0)),
@@ -201,8 +205,16 @@ impl Dlq {
         );
 
         if backends.is_empty() {
-            warn!("DLQ enabled but no backend runs -- entries are dropped and counted");
-            return Ok(Self::disabled());
+            error!(
+                "DLQ enabled but no backend started -- confirmed dead letters stay unacknowledged \
+                 at their source until a restart finds a backend"
+            );
+            return Ok(Self {
+                enabled: true,
+                unavailable: true,
+                mode: config.mode,
+                ..Self::disabled()
+            });
         }
 
         let names: Vec<&'static str> = backends.iter().map(DlqBackend::name).collect();
@@ -242,6 +254,7 @@ impl Dlq {
             sink: Some(sink),
             join: Arc::new(AsyncMutex::new(Some(handle))),
             enabled: true,
+            unavailable: false,
             mode: config.mode,
             cancel,
             lost,
@@ -389,9 +402,15 @@ impl Dlq {
     ///
     /// `File` or `Kafka` when no backend holds the entries, the durable flush
     /// after them found a loss, or the Kafka backend purged entries it has
-    /// not yet heard back about. `Closed` if the drain has exited.
+    /// not yet heard back about. `AllBackendsFailed` when the DLQ is enabled
+    /// but no backend started. `Closed` if the drain has exited.
     pub async fn write_confirmed(&self, entries: Vec<DlqEntry>) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
+            if self.unavailable {
+                return Err(DlqError::AllBackendsFailed(
+                    "no DLQ backend started".to_string(),
+                ));
+            }
             self.note_dropped(entries.len() as u64);
             return Ok(());
         };
@@ -1025,16 +1044,26 @@ mod tests {
         assert_eq!(dlq.clone().dropped(), 5);
     }
 
-    /// With no backend that starts, the DLQ runs disabled and counts what it
-    /// drops, rather than failing the service that spawned it.
+    /// With no backend that starts (its directory is a file, as on a read-only
+    /// root filesystem), the service still starts. A confirmed write is refused,
+    /// so a caller holding a source acknowledgement keeps it, and a
+    /// fire-and-forget send is counted as dropped.
     #[tokio::test]
-    async fn a_dlq_whose_only_backend_cannot_start_runs_disabled() {
+    async fn a_dlq_whose_only_backend_cannot_start_holds_confirmed_writes() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("svc"), b"not a directory").expect("plant file");
         let dlq = spawn_dlq(&tmp_config(dir.path()), &CancellationToken::new());
-        assert!(!dlq.is_enabled());
+        assert!(dlq.is_enabled(), "the config enables it");
+
+        let written = dlq.write_confirmed(vec![test_entry("held")]).await;
+        assert!(
+            matches!(written, Err(DlqError::AllBackendsFailed(_))),
+            "{written:?}"
+        );
+        assert_eq!(dlq.dropped(), 0, "a held entry is not a dropped one");
+
         dlq.send(test_entry("a")).await.expect("noop send");
-        assert_eq!(dlq.dropped(), 1, "the entry counts as dropped");
+        assert_eq!(dlq.dropped(), 1, "the unconfirmed send counts as dropped");
     }
 
     /// Put back the service directory [`break_file_backend`] replaced.
