@@ -1583,6 +1583,13 @@ mod governor_tests {
                 t.has_inbound_gate(),
                 "factory-built Kafka receiver must have the governor's inbound gate attached"
             ),
+            #[cfg(any(
+                feature = "transport-grpc",
+                feature = "transport-memory",
+                feature = "transport-pipe",
+                feature = "transport-file",
+                feature = "transport-http"
+            ))]
             _ => panic!("expected Kafka variant"),
         }
 
@@ -1596,6 +1603,13 @@ mod governor_tests {
                 !t.has_inbound_gate(),
                 "non-governor constructor must leave the inbound gate unattached"
             ),
+            #[cfg(any(
+                feature = "transport-grpc",
+                feature = "transport-memory",
+                feature = "transport-pipe",
+                feature = "transport-file",
+                feature = "transport-http"
+            ))]
             _ => panic!("expected Kafka variant"),
         }
     }
