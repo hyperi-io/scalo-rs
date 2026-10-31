@@ -165,7 +165,7 @@ Loaded from the `batch_processing` cascade key:
 
 ```yaml
 batch_processing:
-  max_chunk_size: 10000          # 0 = whole batch in one chunk
+  max_chunk_size: 10000          # at least 1
   format: auto                    # auto | json | msgpack
   routing_field: _table           # null disables pre-route
   pre_route_filters:
@@ -184,7 +184,7 @@ batch_processing:
     - event_type
 ```
 
-`max_chunk_size = 0` processes the whole batch in a single rayon job.
+`max_chunk_size` also caps the records one pipeline receive takes, so `0` is refused at load with `ConfigError::InvalidValue`, and a service fails to start on it.
 
 Inbound braking under memory pressure is the self-regulation governor's
 job (the inbound gate plus the AIMD byte-budget lever), not a per-chunk

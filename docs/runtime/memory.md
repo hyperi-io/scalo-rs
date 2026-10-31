@@ -62,14 +62,12 @@ is resolved once per guard, in this order:
 
 | Priority | Source | File | Name in the init log |
 | ---------- | -------- | ------ | ---------------------- |
-| 1 | cgroup v2 | `/sys/fs/cgroup/memory.current` | `cgroup-v2` |
-| 2 | cgroup v1 | `/sys/fs/cgroup/memory/memory.usage_in_bytes` | `cgroup-v1` |
+| 1 | cgroup v2 | `/sys/fs/cgroup/memory.current` less `inactive_file` in `memory.stat` | `cgroup-v2` |
+| 2 | cgroup v1 | `/sys/fs/cgroup/memory/memory.usage_in_bytes` less `total_inactive_file` | `cgroup-v1` |
 | 3 | procfs | `/proc/self/status` `VmRSS` | `proc-status` |
 | 4 | reservations | -- | `reservations` |
 
-Rung 1 is the number `memory.max` is compared against, so the guard
-sheds on the same figure the OOM killer acts on, whatever allocator the
-binary installed. Rung 3 covers a Linux host running no cgroup memory
+Rungs 1 and 2 read the working set kubelet evicts on: the usage less the inactive page cache, which the kernel reclaims before it OOM-kills. So file writes (a spool, staged uploads) do not trip the guard, whatever allocator the binary installed. Rung 3 covers a Linux host running no cgroup memory
 controller; it reads kB, so no page-size constant can be wrong on a 16K
 or 64K kernel. Rung 4 is the last resort where no kernel accounting is
 readable at all (non-Linux): the guard then sees only bytes callers

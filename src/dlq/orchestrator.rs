@@ -66,6 +66,9 @@ pub struct Dlq {
     sink: Option<BackgroundSink<DlqEntry>>,
     join: Arc<AsyncMutex<Option<BackgroundSinkHandle>>>,
     enabled: bool,
+    /// Enabled by config, but no backend started: a confirmed write fails, so
+    /// a caller holding a source acknowledgement keeps it.
+    unavailable: bool,
     mode: DlqMode,
     /// Child of the user-supplied shutdown token. The drain task runs
     /// on this child, so [`Dlq::shutdown`] can cancel only the DLQ
@@ -157,6 +160,7 @@ impl Dlq {
             sink: None,
             join: Arc::new(AsyncMutex::new(None)),
             enabled: false,
+            unavailable: false,
             mode: DlqMode::default(),
             cancel: CancellationToken::new(),
             lost: Arc::new(AtomicU64::new(0)),
@@ -170,13 +174,18 @@ impl Dlq {
     ///
     /// `kafka_config` is required if the config has `kafka.enabled =
     /// true` (or the mode demands Kafka). Pass `None` if the service
-    /// has no Kafka transport -- Kafka mode/enabled flags are honoured
-    /// where possible and a clear `Err(DlqError::NotConfigured)` is
-    /// returned if Kafka is required but unavailable.
+    /// has no Kafka transport.
+    ///
+    /// An enabled backend that does not start (no `kafka_config`, a file
+    /// path that cannot be created) is left out with a WARN and a count in
+    /// `dlq_backend_start_failures_total{backend}`, and the others run. With
+    /// none running the DLQ is [`disabled`](Self::disabled) and counts what
+    /// it drops.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if any enabled backend fails to initialise.
+    /// None today: the `Result` keeps room for a refusal that is not a
+    /// backend's.
     pub fn spawn(
         config: &DlqConfig,
         service_name: &str,
@@ -193,11 +202,19 @@ impl Dlq {
             service_name,
             #[cfg(feature = "dlq-kafka")]
             kafka_config,
-        )?;
+        );
 
         if backends.is_empty() {
-            warn!("DLQ enabled but no backends configured -- entries will be dropped");
-            return Ok(Self::disabled());
+            error!(
+                "DLQ enabled but no backend started -- confirmed dead letters stay unacknowledged \
+                 at their source until a restart finds a backend"
+            );
+            return Ok(Self {
+                enabled: true,
+                unavailable: true,
+                mode: config.mode,
+                ..Self::disabled()
+            });
         }
 
         let names: Vec<&'static str> = backends.iter().map(DlqBackend::name).collect();
@@ -237,6 +254,7 @@ impl Dlq {
             sink: Some(sink),
             join: Arc::new(AsyncMutex::new(Some(handle))),
             enabled: true,
+            unavailable: false,
             mode: config.mode,
             cancel,
             lost,
@@ -384,9 +402,15 @@ impl Dlq {
     ///
     /// `File` or `Kafka` when no backend holds the entries, the durable flush
     /// after them found a loss, or the Kafka backend purged entries it has
-    /// not yet heard back about. `Closed` if the drain has exited.
+    /// not yet heard back about. `AllBackendsFailed` when the DLQ is enabled
+    /// but no backend started. `Closed` if the drain has exited.
     pub async fn write_confirmed(&self, entries: Vec<DlqEntry>) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
+            if self.unavailable {
+                return Err(DlqError::AllBackendsFailed(
+                    "no DLQ backend started".to_string(),
+                ));
+            }
             self.note_dropped(entries.len() as u64);
             return Ok(());
         };
@@ -505,11 +529,24 @@ fn map_drain_err(d: DrainError) -> DlqError {
     }
 }
 
+/// Keep a backend that started, and warn about one that did not, so one bad
+/// backend never stops the DLQ or the service that spawns it.
+fn keep_started(backends: &mut Vec<DlqBackend>, name: &str, built: Result<DlqBackend, DlqError>) {
+    match built {
+        Ok(backend) => backends.push(backend),
+        Err(e) => {
+            warn!(backend = name, error = %e, "DLQ backend did not start, running without it");
+            ::metrics::counter!("dlq_backend_start_failures_total", "backend" => name.to_string())
+                .increment(1);
+        }
+    }
+}
+
 fn build_backends(
     config: &DlqConfig,
     service_name: &str,
     #[cfg(feature = "dlq-kafka")] kafka_config: Option<&crate::transport::KafkaConfig>,
-) -> Result<Vec<DlqBackend>, DlqError> {
+) -> Vec<DlqBackend> {
     let mut backends: Vec<DlqBackend> = Vec::new();
     let mode = config.mode;
 
@@ -521,35 +558,32 @@ fn build_backends(
             DlqMode::Cascade | DlqMode::FanOut | DlqMode::KafkaOnly
         );
         if want_kafka && config.kafka.enabled {
-            let kc = kafka_config.ok_or_else(|| {
-                DlqError::Kafka(
-                    "DLQ Kafka backend enabled but no KafkaConfig provided to Dlq::spawn".into(),
-                )
-            })?;
-            backends.push(DlqBackend::Kafka(super::kafka::KafkaDlqInner::new(
-                kc,
-                &config.kafka,
-                service_name,
-            )?));
+            let built = kafka_config
+                .ok_or_else(|| {
+                    DlqError::Kafka(
+                        "DLQ Kafka backend enabled but no KafkaConfig provided to Dlq::spawn"
+                            .into(),
+                    )
+                })
+                .and_then(|kc| super::kafka::KafkaDlqInner::new(kc, &config.kafka, service_name))
+                .map(DlqBackend::Kafka);
+            keep_started(&mut backends, "kafka", built);
         }
     }
 
     // File second (fallback in cascade) -- always available.
     let want_file = matches!(mode, DlqMode::Cascade | DlqMode::FanOut | DlqMode::FileOnly);
     if want_file && config.file.enabled {
-        backends.push(DlqBackend::File(FileDlqInner::new(
-            &config.file,
-            service_name,
-        )?));
+        let built = FileDlqInner::new(&config.file, service_name).map(DlqBackend::File);
+        keep_started(&mut backends, "file", built);
     }
 
     // HTTP -- feature-gated, added when explicitly enabled.
     #[cfg(feature = "dlq-http")]
     {
         if config.http.enabled {
-            backends.push(DlqBackend::Http(super::http::HttpDlqInner::new(
-                &config.http,
-            )?));
+            let built = super::http::HttpDlqInner::new(&config.http).map(DlqBackend::Http);
+            keep_started(&mut backends, "http", built);
         }
     }
 
@@ -562,7 +596,7 @@ fn build_backends(
         kafka.hand_on_unacked();
     }
 
-    Ok(backends)
+    backends
 }
 
 /// Where entries falling through the cascade came from, for
@@ -1008,6 +1042,28 @@ mod tests {
         assert_eq!(dlq.dropped(), 5, "every routed entry counts as dropped");
         // Clones share the counter, matching the shared drain contract.
         assert_eq!(dlq.clone().dropped(), 5);
+    }
+
+    /// With no backend that starts (its directory is a file, as on a read-only
+    /// root filesystem), the service still starts. A confirmed write is refused,
+    /// so a caller holding a source acknowledgement keeps it, and a
+    /// fire-and-forget send is counted as dropped.
+    #[tokio::test]
+    async fn a_dlq_whose_only_backend_cannot_start_holds_confirmed_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("svc"), b"not a directory").expect("plant file");
+        let dlq = spawn_dlq(&tmp_config(dir.path()), &CancellationToken::new());
+        assert!(dlq.is_enabled(), "the config enables it");
+
+        let written = dlq.write_confirmed(vec![test_entry("held")]).await;
+        assert!(
+            matches!(written, Err(DlqError::AllBackendsFailed(_))),
+            "{written:?}"
+        );
+        assert_eq!(dlq.dropped(), 0, "a held entry is not a dropped one");
+
+        dlq.send(test_entry("a")).await.expect("noop send");
+        assert_eq!(dlq.dropped(), 1, "the unconfirmed send counts as dropped");
     }
 
     /// Put back the service directory [`break_file_backend`] replaced.
@@ -1472,6 +1528,18 @@ mod tests {
                 CancellationToken::new(),
             )
             .expect("spawn")
+        }
+
+        /// A file backend that cannot start (its directory is a file here, as
+        /// it is unwritable on a read-only root filesystem) is dropped, and the
+        /// cascade runs on Kafka.
+        #[tokio::test]
+        async fn a_cascade_runs_on_kafka_when_its_file_backend_cannot_start() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("svc"), b"not a directory").expect("plant file");
+            let dlq = spawn_cascade(dir.path(), &unreachable_broker());
+            assert!(dlq.is_enabled(), "the Kafka backend still runs");
+            dlq.shutdown().await.expect("shutdown");
         }
 
         const FALLTHROUGH: &str = "dlq_cascade_fallthrough_total";

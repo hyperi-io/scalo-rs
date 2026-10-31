@@ -33,7 +33,8 @@ setup(LoggerOptions {
 
 | Var | Effect |
 | --- | --- |
-| `LOG_LEVEL` / `RUST_LOG` | Level filter; falls back to `EnvFilter` for per-module filters (`hyper=warn,my_app=debug`) |
+| `LOG_LEVEL` | The level: `trace`, `debug`, `info`, `warn` or `warning`, `error`, `critical` or `fatal`, any case. Blank is unset. A `CommonArgs` service refuses an unknown name at start, and `setup_default()` reads it as `info` |
+| `RUST_LOG` | `EnvFilter` directives layered over the level, for per-module filters (`hyper=warn,my_app=debug`). Read as the level when `LOG_LEVEL` is unset and it names a bare level |
 | `LOG_FORMAT` | `json` / `text` / `auto` (default). Unset, blank, `auto` or unrecognised defers to `logger.format`, then to the derived default |
 | `LOG_COLOR` | Text-mode colour: `true` / `1` / `yes` (any case) is on, any other value off. Outranks `NO_COLOR` and `logger.color` |
 | `NO_COLOR` | Disable ANSI colour, even on a TTY, when `LOG_COLOR` is unset |

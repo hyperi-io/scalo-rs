@@ -110,6 +110,31 @@ mod tests {
         assert!(dockerfile.contains("CMD [\"--config\", \"/etc/dfe/loader.yaml\"]"));
     }
 
+    /// A production image has no HTTP client, so the compose healthcheck runs
+    /// the image's own bash check, with `$` doubled for compose.
+    #[test]
+    fn compose_healthcheck_runs_the_images_own_check() {
+        let contract = test_contract();
+        let compose = generate_compose_fragment(&contract).unwrap();
+        let dockerfile = generate_dockerfile(&contract, None).unwrap();
+
+        assert!(!dockerfile.contains("curl"), "{dockerfile}");
+        assert!(!compose.contains("curl"), "{compose}");
+        let check = dockerfile::liveness_check(&contract);
+        assert!(
+            dockerfile.contains(&format!("CMD [\"bash\", \"-c\", {check}]")),
+            "{dockerfile}"
+        );
+        assert!(
+            compose.contains(&format!(
+                "test: [\"CMD\", \"bash\", \"-c\", {}]",
+                check.replace('$', "$$")
+            )),
+            "{compose}"
+        );
+        assert!(compose.contains("\\\"$$code\\\""), "{compose}");
+    }
+
     /// The header lines every generated Dockerfile starts with, before the
     /// licence and copyright.
     const HEADER_TOP: &str = "# Project:   dfe-loader\n\

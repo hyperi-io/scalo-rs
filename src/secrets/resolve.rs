@@ -258,6 +258,12 @@ fn secrets_config_for_lookup() -> Result<super::SecretsConfig, CredentialError> 
                 .to_string(),
         ));
     }
+    // A one-off lookup builds only its own provider: `AwsProvider::new` blocks
+    // on the runtime, which panics on the task a `vault:` lookup runs on.
+    #[cfg(feature = "secrets-aws")]
+    {
+        config.aws = None;
+    }
     without_cache(&mut config);
     Ok(config)
 }
@@ -324,6 +330,10 @@ fn secrets_config_for_aws_lookup() -> super::SecretsConfig {
         {
             config.aws = Some(super::AwsConfig::default());
         }
+    }
+    #[cfg(feature = "secrets-vault")]
+    {
+        config.openbao = None;
     }
     without_cache(&mut config);
     config
@@ -446,6 +456,36 @@ mod tests {
             err.contains("VAULT_ADDR"),
             "the error must name VAULT_ADDR: {err}"
         );
+    }
+
+    /// A `vault:` lookup builds the OpenBao provider alone, so a cascaded
+    /// `secrets.aws` section, whose provider blocks on the runtime, cannot
+    /// panic the task the lookup runs on.
+    #[tokio::test]
+    #[cfg(all(feature = "secrets-vault", feature = "secrets-aws", feature = "config"))]
+    async fn a_vault_lookup_ignores_a_cascaded_aws_section() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "secrets:\n  aws:\n    region: us-east-1\n",
+        )
+        .unwrap();
+        crate::config::setup(crate::config::ConfigOptions {
+            config_paths: vec![dir.path().to_path_buf()],
+            ..crate::config::ConfigOptions::default()
+        })
+        .unwrap();
+
+        // Nothing listens on the discard port, so the lookup fails fast.
+        let err = temp_env::async_with_vars(
+            [
+                ("VAULT_ADDR", Some("http://127.0.0.1:9")),
+                ("VAULT_TOKEN", Some("probe")),
+            ],
+            async { resolve("vault:kv/x:k").await.unwrap_err() },
+        )
+        .await;
+        assert!(matches!(err, CredentialError::Vault(_)), "{err:?}");
     }
 
     #[tokio::test]

@@ -43,6 +43,16 @@ pub struct OpenBaoConfig {
     /// Skip TLS verification (not recommended for production).
     #[serde(default)]
     pub skip_verify: bool,
+
+    /// Seconds one request to OpenBao may take, a login included, so a server
+    /// that accepts and never answers fails the lookup rather than hanging it.
+    /// `0` sets no limit. Default 60, the Vault CLI's.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_timeout_secs() -> u64 {
+    60
 }
 
 /// OpenBao/Vault authentication method.
@@ -126,6 +136,7 @@ impl OpenBaoConfig {
     /// - `VAULT_NAMESPACE` - Vault namespace (Enterprise)
     /// - `VAULT_CACERT` - Path to CA certificate
     /// - `VAULT_SKIP_VERIFY` - Skip TLS verification
+    /// - `VAULT_CLIENT_TIMEOUT` - Seconds one request may take (default 60, `0` none)
     ///
     /// ## Authentication Priority
     ///
@@ -178,6 +189,10 @@ impl OpenBaoConfig {
             namespace: vault::namespace().get(),
             ca_cert: vault::ca_cert().get(),
             skip_verify: vault::skip_verify().get_bool().unwrap_or(false),
+            timeout_secs: vault::client_timeout()
+                .get()
+                .and_then(|v| v.trim().trim_end_matches('s').parse().ok())
+                .unwrap_or_else(default_timeout_secs),
         })
     }
 
@@ -192,6 +207,7 @@ impl OpenBaoConfig {
             namespace: None,
             ca_cert: None,
             skip_verify: false,
+            timeout_secs: default_timeout_secs(),
         }
     }
 
@@ -208,6 +224,7 @@ impl OpenBaoConfig {
             namespace: None,
             ca_cert: None,
             skip_verify: false,
+            timeout_secs: default_timeout_secs(),
         }
     }
 
@@ -307,6 +324,11 @@ impl OpenBaoProvider {
             settings.ca_certs(vec![ca.clone()]);
         }
         settings.verify(!self.config.skip_verify);
+        if self.config.timeout_secs > 0 {
+            settings.timeout(Some(std::time::Duration::from_secs(
+                self.config.timeout_secs,
+            )));
+        }
 
         let settings = settings.build().map_err(|e| {
             SecretsError::ConfigError(format!("failed to build Vault client settings: {e}"))
@@ -490,6 +512,26 @@ impl SecretProvider for OpenBaoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that takes the connection and never answers fails the lookup
+    /// within `timeout_secs`, rather than hanging the service's startup.
+    #[tokio::test]
+    async fn a_server_that_never_answers_fails_the_lookup_in_time() {
+        // Bound but never accepted from: the kernel completes the handshake
+        // and nothing ever replies.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config =
+            OpenBaoConfig::with_token(&format!("http://{}", silent.local_addr().unwrap()), "t");
+        config.timeout_secs = 1;
+        let provider = OpenBaoProvider::new(&config).unwrap();
+
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            provider.get("kv/x", "k"),
+        )
+        .await;
+        assert!(matches!(got, Ok(Err(_))), "the lookup hung or succeeded");
+    }
 
     /// The token `from_env` resolved, with every other source of one cleared and
     /// `HOME` pointed at `home`.
@@ -736,6 +778,7 @@ mod tests {
             namespace: Some("myorg".into()),
             ca_cert: None,
             skip_verify: false,
+            timeout_secs: 60,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("vault.example.com"));

@@ -202,6 +202,20 @@ pub enum BuildError {
         hint: &'static str,
     },
 
+    /// The pattern parsed, but the regex engine refused to compile it, most
+    /// often because it is over the engine's size limit.
+    #[error(
+        "strmatch: pattern {pattern:?} does not compile\n  \
+         reason: {source}\n  \
+         hint: {hint}"
+    )]
+    Compile {
+        pattern: String,
+        #[source]
+        source: Box<regex_automata::meta::BuildError>,
+        hint: &'static str,
+    },
+
     /// The pattern compiled to a tier below the builder's minimum.
     #[error(
         "strmatch: pattern {pattern:?} compiles to tier {got}, but builder \

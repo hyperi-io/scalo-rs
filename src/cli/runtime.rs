@@ -116,7 +116,8 @@ impl ServiceRuntime {
     ///
     /// # Errors
     ///
-    /// Returns `CliError` if the metrics server fails to start.
+    /// Returns `CliError` if the metrics server fails to start, or
+    /// `CliError::Config` if the `batch_processing` section is invalid.
     pub(crate) async fn build(
         app_name: &str,
         env_prefix: &str,
@@ -148,7 +149,9 @@ impl ServiceRuntime {
 
         // --- Memory guard ---
         #[cfg(feature = "memory")]
-        let memory_guard = Arc::new(MemoryGuard::new(MemoryGuardConfig::from_env(env_prefix)));
+        let memory_guard = Arc::new(MemoryGuard::new(MemoryGuardConfig::from_cascade_and_env(
+            env_prefix,
+        )));
 
         // --- Self-regulation governor (default-ON, opt-out) ---
         //
@@ -205,7 +208,7 @@ impl ServiceRuntime {
             if let Some(ref pool) = worker_pool {
                 let config =
                     crate::worker::engine::BatchProcessingConfig::from_cascade("batch_processing")
-                        .unwrap_or_default();
+                        .map_err(|e| CliError::Config(e.to_string()))?;
                 let mut engine = crate::worker::BatchEngine::with_pool(Arc::clone(pool), config);
                 engine.auto_wire(
                     &metrics,
@@ -502,6 +505,75 @@ mod tests {
         assert_eq!((status, body.as_str()), (200, r#"{"status":"ready"}"#));
 
         runtime.shutdown.cancel();
+    }
+
+    /// The guard every runtime consumer shares takes the `memory` section of
+    /// the config, and a flat `{PREFIX}_MEMORY_*` variable still wins over it.
+    #[cfg(feature = "memory")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_memory_guard_reads_the_config_section_and_the_env_over_it() {
+        let dir = tempfile::tempdir().expect("config dir");
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "memory:\n  limit_bytes: 268435456\n  pressure_threshold: 0.5\n",
+        )
+        .expect("write settings.yaml");
+        crate::config::setup(crate::config::ConfigOptions {
+            env_prefix: "GUARD_PROBE".into(),
+            config_paths: vec![dir.path().to_path_buf()],
+            ..crate::config::ConfigOptions::default()
+        })
+        .expect("config setup");
+
+        let runtime = probe_runtime_at("guard-probe", "127.0.0.1:0").await;
+        assert_eq!(
+            runtime.memory_guard.limit_bytes(),
+            268_435_456,
+            "from config"
+        );
+        let config = MemoryGuardConfig::from_cascade_and_env("GUARD_PROBE");
+        assert!(
+            (config.pressure_threshold - 0.5).abs() < f64::EPSILON,
+            "config, env unset"
+        );
+        temp_env::with_var("GUARD_PROBE_MEMORY_PRESSURE_THRESHOLD", Some("0.9"), || {
+            let config = MemoryGuardConfig::from_cascade_and_env("GUARD_PROBE");
+            assert!(
+                (config.pressure_threshold - 0.9).abs() < f64::EPSILON,
+                "env wins"
+            );
+        });
+        runtime.shutdown.cancel();
+    }
+
+    /// `max_chunk_size: 0` caps every receive at no records, so the pipeline
+    /// would spin on empty batches: the build refuses it.
+    #[cfg(feature = "worker-batch")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_max_chunk_size_fails_the_build() {
+        let dir = tempfile::tempdir().expect("config dir");
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "batch_processing:\n  max_chunk_size: 0\n",
+        )
+        .expect("write settings.yaml");
+        crate::config::setup(crate::config::ConfigOptions {
+            config_paths: vec![dir.path().to_path_buf()],
+            ..crate::config::ConfigOptions::default()
+        })
+        .expect("config setup");
+
+        let built = build_at("chunk-probe", "127.0.0.1:0").await;
+        match built {
+            Err(CliError::Config(message)) => {
+                assert!(message.contains("max_chunk_size"), "{message}");
+            }
+            Err(other) => panic!("expected a config refusal, got {other}"),
+            Ok(runtime) => {
+                runtime.shutdown.cancel();
+                panic!("the runtime built with max_chunk_size 0");
+            }
+        }
     }
 
     /// A listener that cannot bind fails the build instead of leaving a

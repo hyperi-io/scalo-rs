@@ -80,8 +80,9 @@ They are NOT interchangeable; each answers a different question.
 
 - **MemoryGuard** (`src/memory/`) is the source of truth. Its
   `pressure_ratio()` is the process's memory usage over an effective limit.
-  Usage is what the kernel charges: cgroup v2 `memory.current`, else cgroup
-  v1 `memory.usage_in_bytes`, else `/proc/self/status` `VmRSS`, each plus the
+  Usage is what the kernel charges less its inactive page cache: cgroup v2
+  `memory.current` less `inactive_file`, else cgroup v1 `memory.usage_in_bytes`
+  less `total_inactive_file`, else `/proc/self/status` `VmRSS`, each plus the
   bytes admitted since that reading. Only where none is readable (non-Linux)
   does the guard fall back to the bytes callers reserve and release. A heap
   source registered with `set_heap_source` is read beside them and the larger
@@ -129,7 +130,7 @@ The HARD memory source reads the container's own cgroup, not host `used/total`
 cgroup v2 inputs, container-first:
 
 - **`memory.max`** -- the hard ceiling. Cross it and the kernel OOM-kills the
-  pod. The guard's ratio is `memory.current / (0.85 * memory.max)`, so the
+  pod. The guard's ratio is `(memory.current - inactive_file) / (0.85 * memory.max)`, so the
   default `pause_above` of 0.80 arms at 68% of `memory.max`.
 - **`memory.high`** -- the soft throttle. The kernel reclaims hard and throttles
   allocations here, BEFORE the OOM-kill. When `memory.high` is below

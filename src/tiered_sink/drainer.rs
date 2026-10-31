@@ -199,6 +199,18 @@ async fn settle(
     }
 }
 
+/// Take one committed entry of `bytes` off the spool counters, stopping at
+/// zero: a count already short of what is on disk must not wrap to
+/// `u64::MAX`, which keeps StrictFifo's hot path shut and refuses every spill.
+fn release(count: &AtomicU64, total: &AtomicU64, bytes: u64) {
+    let _ = count.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
+        Some(n.saturating_sub(1))
+    });
+    let _ = total.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
+        Some(n.saturating_sub(bytes))
+    });
+}
+
 /// Drain loop. Runs until shutdown signalled.
 ///
 /// `send_timeout`: bounds each downstream send, the hot path's limit, so a hung
@@ -226,6 +238,11 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     #[cfg(feature = "shutdown")]
     let global_shutdown = crate::shutdown::token();
 
+    // `interval` paces an idle or failing spool. After a pass that took an
+    // entry off the queue the next starts at once, so a backlog drains at the
+    // strategy's rate rather than one record per interval.
+    let mut pause = interval;
+
     loop {
         // Check for shutdown (the sink's own token or the global shutdown token)
         tokio::select! {
@@ -245,8 +262,9 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                 tracing::info!("Drain task shutting down (global shutdown)");
                 return;
             }
-            () = tokio::time::sleep(interval) => {}
+            () = tokio::time::sleep(pause) => {}
         }
+        pause = interval;
 
         // Gate the drain through the breaker. When half-open this claims the
         // single recovery-probe permit, so the drainer alone probes the
@@ -299,11 +317,10 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                                             // the entry still sits in the queue.
                                             match guard.commit() {
                                                 Ok(()) => {
-                                                    spool_count
-                                                        .fetch_sub(1, AtomicOrdering::Relaxed);
-                                                    spool_bytes.fetch_sub(
+                                                    release(
+                                                        &spool_count,
+                                                        &spool_bytes,
                                                         compressed_len,
-                                                        AtomicOrdering::Relaxed,
                                                     );
                                                     DrainResult::Success
                                                 }
@@ -332,11 +349,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                                         }
                                         Ok(SendResult::Fatal(e)) => match guard.commit() {
                                             Ok(()) => {
-                                                spool_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                                                spool_bytes.fetch_sub(
-                                                    compressed_len,
-                                                    AtomicOrdering::Relaxed,
-                                                );
+                                                release(&spool_count, &spool_bytes, compressed_len);
                                                 DrainResult::Fatal(e.to_string())
                                             }
                                             Err(commit_err) => {
@@ -347,9 +360,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                                 }
                                 Err(decode_err) => match guard.commit() {
                                     Ok(()) => {
-                                        spool_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                                        spool_bytes
-                                            .fetch_sub(compressed_len, AtomicOrdering::Relaxed);
+                                        release(&spool_count, &spool_bytes, compressed_len);
                                         DrainResult::DecodeError(decode_err.to_string())
                                     }
                                     Err(commit_err) => {
@@ -360,8 +371,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                         }
                         Err(e) => match guard.commit() {
                             Ok(()) => {
-                                spool_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                                spool_bytes.fetch_sub(compressed_len, AtomicOrdering::Relaxed);
+                                release(&spool_count, &spool_bytes, compressed_len);
                                 DrainResult::DecompressError(e)
                             }
                             Err(commit_err) => DrainResult::CommitFailed(commit_err.to_string()),
@@ -376,6 +386,16 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                 }
             }
         };
+
+        if matches!(
+            result,
+            DrainResult::Success
+                | DrainResult::Fatal(_)
+                | DrainResult::DecompressError(_)
+                | DrainResult::DecodeError(_)
+        ) {
+            pause = Duration::ZERO;
+        }
 
         // Handle the result outside the lock
         settle(result, &mut drainer, &circuit, send_timeout).await;

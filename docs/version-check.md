@@ -65,6 +65,8 @@ version_check:
 | `send_instance_id` | `true` | `false` strips the instance id from the payload. |
 | `instance_id` | empty | Explicit id, sent verbatim -- overrides the derived one. |
 
+A boolean reads `true`/`false`, `1`/`0` and `yes`/`no`/`on`/`off` in any case, `timeout` takes `5` or `"5s"`, and a number for a text key is read as its text. A value that is still unreadable is warned about and falls to the default, and the other keys still apply, so `VERSION_CHECK__ENABLED=0` holds beside a bad `timeout`.
+
 `from_cascade_or` overlays the cascade on the caller's defaults: a key
 the cascade sets wins, an unset key falls to the given default. Plain
 `from_cascade` is the same overlay on this type's own defaults.

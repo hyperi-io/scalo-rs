@@ -193,6 +193,17 @@ fn ip_header(labels: &OciLabels) -> String {
     out
 }
 
+/// The liveness check the image and the compose fragment both run, as the
+/// quoted `bash -c` argument of an exec array: bash builtins only, because a
+/// production image has no HTTP client. A status other than 200 exits 1.
+pub(super) fn liveness_check(contract: &DeploymentContract) -> String {
+    format!(
+        r#""exec 3<>/dev/tcp/localhost/{port} && printf 'GET {path} HTTP/1.0\\r\\n\\r\\n' >&3 && read -r _ code _ <&3 && [ \"$code\" = 200 ]""#,
+        port = contract.metrics_port,
+        path = contract.health.liveness_path,
+    )
+}
+
 /// The instructions both generators end on: the non-root user and the
 /// directories it writes, the exposed ports, the Docker healthcheck and the
 /// entrypoint.
@@ -220,14 +231,13 @@ EXPOSE {expose_ports}
 
 # bash builtins only, so the image needs no HTTP client. A status other than 200 exits 1.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["bash", "-c", "exec 3<>/dev/tcp/localhost/{metrics_port} && printf 'GET {liveness_path} HTTP/1.0\\r\\n\\r\\n' >&3 && read -r _ code _ <&3 && [ \"$code\" = 200 ]"]
+    CMD ["bash", "-c", {liveness_check}]
 
 ENTRYPOINT ["{binary}"]{cmd}
 "#,
         writable_dirs = writable_dirs(contract),
         expose_ports = expose_ports(contract),
-        metrics_port = contract.metrics_port,
-        liveness_path = contract.health.liveness_path,
+        liveness_check = liveness_check(contract),
     )
 }
 

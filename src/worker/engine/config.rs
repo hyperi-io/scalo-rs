@@ -129,7 +129,8 @@ impl BatchProcessingConfig {
     ///
     /// # Errors
     ///
-    /// Returns a `ConfigError` only if the cascade is initialised and the key
+    /// `ConfigError::InvalidValue` for a `max_chunk_size` of 0. Otherwise a
+    /// `ConfigError` only if the cascade is initialised and the key
     /// contains data that cannot be deserialised into `BatchProcessingConfig`.
     pub fn from_cascade(key: &str) -> Result<Self, crate::config::ConfigError> {
         let config: Self = if let Some(cfg) = crate::config::try_get() {
@@ -138,6 +139,12 @@ impl BatchProcessingConfig {
             tracing::debug!("Config cascade not initialised, using default BatchProcessingConfig");
             Self::default()
         };
+        if config.max_chunk_size == 0 {
+            return Err(crate::config::ConfigError::InvalidValue {
+                key: format!("{key}.max_chunk_size"),
+                reason: "must be at least 1: 0 caps every receive at no records".to_string(),
+            });
+        }
         Ok(config)
     }
 }

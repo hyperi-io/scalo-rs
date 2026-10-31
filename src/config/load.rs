@@ -64,13 +64,16 @@ where
         load_dotenv: path.is_none(),
         ..ConfigOptions::default()
     };
+    // The file is read first so its errors are `Yaml`, located, before the
+    // cascade refuses the same file.
+    let from_file: Option<T> = path.map(|path| read_file(Path::new(path))).transpose()?;
     match setup(options.clone()) {
         Ok(()) | Err(ConfigError::AlreadyInitialised) => {}
         Err(e) => return Err(e),
     }
 
-    let mut config: T = match path {
-        Some(path) => read_file(Path::new(path))?,
+    let mut config: T = match from_file {
+        Some(config) => config,
         None => Config::new(options)?.unmarshal()?,
     };
     merge_nested_env(&mut config, env_prefix)?;

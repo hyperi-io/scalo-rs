@@ -32,7 +32,7 @@ Each YAML layer reads every location below that holds the file and merges them i
 <config_paths dir>/<name>.yaml        <config_paths dir>/<name>.yml
 ```
 
-A `ConfigOptions::config_paths` entry that is a directory is searched like the locations above. An entry that is a file, which is what `--config` passes, joins the `settings` layer only and merges after every other `settings.yaml`, so it outranks those and `defaults.yaml`. `settings.{env}.yaml` and env vars still outrank it.
+A `ConfigOptions::config_paths` entry that is a directory is searched like the locations above. An entry that is a file, which is what `--config` passes, joins the `settings` layer only and merges after every other `settings.yaml`, so it outranks those and `defaults.yaml`. `settings.{env}.yaml` and env vars still outrank it. An entry that does not exist, or a file that cannot be read or parsed, fails `config::setup` with `ConfigError::LoadError`, so `--config` with a typo stops the service at start.
 
 `<app_name>` resolves from `ConfigOptions::app_name`, then `APP_NAME`, with no other fallback. No name -> the home-config path is skipped.
 

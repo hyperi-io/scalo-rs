@@ -212,6 +212,15 @@ fn meta_lookahead_rejected_at_parse() {
     }
 }
 
+/// The parser accepts a pattern the compiler then refuses as too large, and
+/// that refusal is an error to report, not a panic.
+#[test]
+fn a_pattern_too_large_to_compile_is_an_error() {
+    let err = StrMatcher::new(r"\w{5000}").unwrap_err();
+    assert!(matches!(err, BuildError::Compile { .. }), "{err:?}");
+    assert!(err.to_string().contains("hint:"), "missing hint in: {err}");
+}
+
 #[test]
 fn empty_pattern_is_error() {
     let err = StrMatcher::new("").unwrap_err();

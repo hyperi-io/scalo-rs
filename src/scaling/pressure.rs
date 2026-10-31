@@ -83,6 +83,18 @@ struct ComponentEntry {
     value: AtomicU64,
 }
 
+impl ComponentEntry {
+    /// This component's share of the composite for `value`, 0 for a reading
+    /// that is not a finite number, and never below 0 or above its weight.
+    fn score(&self, value: f64) -> f64 {
+        if self.saturation > 0.0 && value.is_finite() {
+            (value / self.saturation).clamp(0.0, 1.0) * self.weight * 100.0
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Lock-free scaling pressure calculator.
 ///
 /// Produces a 0.0-100.0 composite metric for KEDA (or any autoscaler)
@@ -238,13 +250,7 @@ impl ScalingPressure {
         // Weighted composite
         let mut total = 0.0_f64;
         for entry in &self.components {
-            let value = f64::from_bits(entry.value.load(Ordering::Relaxed));
-            let score = if entry.saturation > 0.0 {
-                (value / entry.saturation).min(1.0) * entry.weight * 100.0
-            } else {
-                0.0
-            };
-            total += score;
+            total += entry.score(f64::from_bits(entry.value.load(Ordering::Relaxed)));
         }
 
         total.min(100.0)
@@ -279,11 +285,7 @@ impl ScalingPressure {
             .iter()
             .map(|entry| {
                 let raw_value = f64::from_bits(entry.value.load(Ordering::Relaxed));
-                let score = if entry.saturation > 0.0 {
-                    (raw_value / entry.saturation).min(1.0) * entry.weight * 100.0
-                } else {
-                    0.0
-                };
+                let score = entry.score(raw_value);
                 ComponentSnapshot {
                     name: entry.name.clone(),
                     raw_value,
@@ -352,6 +354,26 @@ mod tests {
         assert!(!p.warn_unregistered("worker_pool_saturation"));
         assert!(p.has_component("kafka_lag"));
         assert!(!p.has_component("worker_pool_saturation"));
+    }
+
+    /// A component reading that is not a finite non-negative number adds
+    /// nothing, beside one that adds its share, so a NaN never reads as full
+    /// pressure and a negative never pulls the others down.
+    #[test]
+    fn a_non_finite_or_negative_component_adds_nothing() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -50_000.0] {
+            let p = test_pressure();
+            p.set_component("kafka_lag", bad);
+            p.set_component("errors", 100.0);
+            let value = p.calculate();
+            assert!((value - 10.0).abs() < 0.01, "{bad}: got {value}");
+            let snapshot = p.snapshot();
+            let lag = snapshot.components.iter().find(|c| c.name == "kafka_lag");
+            assert!(
+                lag.is_some_and(|c| c.score.abs() < f64::EPSILON),
+                "{bad}: {lag:?}"
+            );
+        }
     }
 
     #[test]

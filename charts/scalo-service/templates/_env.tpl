@@ -31,14 +31,36 @@ leaves the group out.
 {{- end -}}
 
 {{/*
+scalo-service.writableLimitsEnv -- SCALO_WRITABLE_PATH_LIMITS as {"items": [...]}: each
+emptyDir writable path with a sizeLimit, as path=quantity joined by commas, so the app
+caps what it writes there below the size kubelet evicts the pod at. No item when no
+emptyDir path has a sizeLimit.
+*/}}
+{{- define "scalo-service.writableLimitsEnv" -}}
+{{- $pairs := list -}}
+{{- range $path := (include "scalo-service.writablePaths" . | fromJson).items -}}
+{{- if and (not $path.persistent) $path.sizeLimit -}}
+{{- $pairs = append $pairs (printf "%s=%s" $path.path $path.sizeLimit) -}}
+{{- end -}}
+{{- end -}}
+{{- $items := list -}}
+{{- if $pairs -}}
+{{- $items = append $items (dict "name" "SCALO_WRITABLE_PATH_LIMITS" "value" (join "," $pairs)) -}}
+{{- end -}}
+{{- dict "items" $items | toJson -}}
+{{- end -}}
+
+{{/*
 scalo-service.env -- the container env as {"items": [...]}: `extraEnv` first, then the
-namespace, OTel identity, version-check overrides and secret references. A name the chart
-derives is dropped from extraEnv, so a server-side apply never meets one name twice.
+namespace, OTel identity, version-check overrides, writable path limits and secret
+references. A name the chart derives is dropped from extraEnv, so a server-side apply
+never meets one name twice.
 */}}
 {{- define "scalo-service.env" -}}
 {{- $derived := list (include "scalo-service.podNamespaceEnv" . | fromJson) -}}
 {{- $derived = concat $derived (include "scalo-service.otelEnv" . | fromJson).items -}}
 {{- $derived = concat $derived (include "scalo-service.versionCheckEnv" . | fromJson).items -}}
+{{- $derived = concat $derived (include "scalo-service.writableLimitsEnv" . | fromJson).items -}}
 {{- $derived = concat $derived (include "scalo-service.secretEnv" . | fromJson).items -}}
 {{- $names := list -}}
 {{- range $derived }}{{ $names = append $names .name }}{{ end -}}

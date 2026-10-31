@@ -195,17 +195,80 @@ impl VersionCheckConfig {
 }
 
 /// Cascade overlay for [`VersionCheckConfig::from_cascade_or`]: a key the
-/// cascade sets wins, an absent key falls to the caller's defaults.
+/// cascade sets wins, an absent key falls to the caller's defaults, and a key
+/// it cannot read is warned about and falls to the defaults alone, so one bad
+/// value never drops the others.
 #[cfg(feature = "config")]
 #[derive(Debug, Default, Deserialize)]
 struct PartialVersionCheckConfig {
+    #[serde(default, deserialize_with = "lenient_bool")]
     enabled: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_string")]
     api_url: Option<String>,
-    #[serde(default, deserialize_with = "opt_duration_secs")]
+    #[serde(default, deserialize_with = "lenient_secs")]
     timeout: Option<Duration>,
+    #[serde(default, deserialize_with = "lenient_bool")]
     send_instance_id: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_string")]
     instance_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
     deployment: Option<String>,
+}
+
+/// `true`/`false`, `1`/`0`, and `yes`/`no`/`on`/`off` in any case, as YAML,
+/// the env and the flat env spell them.
+#[cfg(feature = "config")]
+fn lenient_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let read = match &value {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Number(n) => match n.as_u64() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        },
+        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    Ok(read.or_else(|| unreadable(&value, "a boolean")))
+}
+
+/// A string, or a number taken as its text.
+#[cfg(feature = "config")]
+fn lenient_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(match &value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => unreadable(&value, "a string"),
+    })
+}
+
+/// Whole seconds, as a number or as text with an optional `s`.
+#[cfg(feature = "config")]
+fn lenient_secs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let secs = match &value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().trim_end_matches('s').parse().ok(),
+        _ => None,
+    };
+    Ok(secs
+        .map(Duration::from_secs)
+        .or_else(|| unreadable(&value, "whole seconds")))
+}
+
+/// Warn about a `version_check` value the overlay skips.
+#[cfg(feature = "config")]
+fn unreadable<T>(value: &serde_json::Value, wanted: &str) -> Option<T> {
+    if !value.is_null() {
+        tracing::warn!(%value, wanted, "version_check: value not read, using the default");
+    }
+    None
 }
 
 #[cfg(feature = "config")]
@@ -222,11 +285,6 @@ impl PartialVersionCheckConfig {
             instance_id: self.instance_id.unwrap_or(defaults.instance_id),
         }
     }
-}
-
-#[cfg(feature = "config")]
-fn opt_duration_secs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
-    Ok(Option::<u64>::deserialize(d)?.map(Duration::from_secs))
 }
 
 /// Startup version checker.
@@ -641,6 +699,32 @@ mod tests {
         });
         assert!(!merged.enabled);
         assert_eq!(merged.api_url, "https://releases.example.com/api/v1/check");
+    }
+
+    /// One field the overlay cannot read is skipped, and the rest still win,
+    /// so `enabled: 0` beside a bad timeout still turns the check off.
+    #[cfg(feature = "config")]
+    #[test]
+    fn a_bad_overlay_field_leaves_the_others_standing() {
+        let cases: [(&str, bool, u64); 6] = [
+            (r#"{"enabled": "no"}"#, false, 5),
+            (r#"{"enabled": 0}"#, false, 5),
+            (r#"{"enabled": "False"}"#, false, 5),
+            (r#"{"enabled": "maybe"}"#, true, 5),
+            (r#"{"enabled": false, "timeout": "9s"}"#, false, 9),
+            (r#"{"enabled": "off", "timeout": "soon"}"#, false, 5),
+        ];
+        for (json, enabled, timeout) in cases {
+            let partial: PartialVersionCheckConfig =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"));
+            let merged = partial.over(VersionCheckConfig {
+                enabled: true,
+                api_url: "https://releases.example.com/api/v1/check".into(),
+                ..Default::default()
+            });
+            assert_eq!(merged.enabled, enabled, "{json}");
+            assert_eq!(merged.timeout, Duration::from_secs(timeout), "{json}");
+        }
     }
 
     #[cfg(feature = "config")]

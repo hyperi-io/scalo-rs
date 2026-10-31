@@ -189,8 +189,12 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if configuration loading fails.
+    /// [`ConfigError::LoadError`] when a `config_paths` entry does not exist,
+    /// or names a file that cannot be read or parsed.
     pub fn new(opts: ConfigOptions) -> Result<Self, ConfigError> {
+        for path in &opts.config_paths {
+            Self::check_named_path(path)?;
+        }
         let app_env = opts.app_env.unwrap_or_else(get_app_env);
         let resolved_app_name = Self::resolve_app_name(opts.app_name.as_deref());
         let app_name_ref = resolved_app_name.as_deref();
@@ -283,6 +287,24 @@ impl Config {
                 }
             }
         }
+    }
+
+    /// Refuse a path the operator named that the cascade cannot use: a typo or
+    /// an unreadable file would otherwise be an empty layer, and the service
+    /// would run on hard-coded defaults.
+    fn check_named_path(path: &Path) -> Result<(), ConfigError> {
+        let refused = |message: String| ConfigError::LoadError {
+            path: path.to_path_buf(),
+            message,
+        };
+        if !path.exists() {
+            return Err(refused("no such file or directory".to_string()));
+        }
+        if path.is_file() {
+            figment::Provider::data(&YamlFile::new(path.to_path_buf()))
+                .map_err(|e| refused(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Find config files with the given base name.
@@ -720,6 +742,42 @@ mod tests {
             Some("from-the-named-file".to_string()),
             "a file passed as --config did not reach the cascade"
         );
+    }
+
+    /// A named config path the cascade cannot read refuses the setup, rather
+    /// than leaving every reader on its hard-coded default.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_config_path_it_cannot_read_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("unreadable.yaml");
+        std::fs::write(&unreadable, "host: x\n").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let malformed = dir.path().join("malformed.yaml");
+        std::fs::write(&malformed, "a: 1\na: 2\n").unwrap();
+
+        let mut cases = vec![
+            ("missing file", dir.path().join("typo.yaml")),
+            ("missing directory", dir.path().join("no-such-dir")),
+            ("malformed file", malformed),
+        ];
+        // Root reads a mode-000 file, so the case proves nothing there.
+        if std::fs::read(&unreadable).is_err() {
+            cases.push(("unreadable file", unreadable));
+        }
+        for (name, path) in cases {
+            let result = Config::new(ConfigOptions {
+                config_paths: vec![path.clone()],
+                ..Default::default()
+            });
+            match result {
+                Err(ConfigError::LoadError { path: got, .. }) => assert_eq!(got, path, "{name}"),
+                Err(other) => panic!("{name}: expected LoadError, got {other:?}"),
+                Ok(_) => panic!("{name}: {} loaded", path.display()),
+            }
+        }
     }
 
     /// A `.env` above the project directory is never read.
