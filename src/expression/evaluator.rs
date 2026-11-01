@@ -79,21 +79,34 @@ static DEFAULT_PROFILE_CONFIG: OnceLock<ProfileConfig> = OnceLock::new();
 /// The default is returned WITHOUT latching the cache: an expression
 /// evaluated before config loads would otherwise pin defaults for the life of
 /// the process, and the config would never take effect.
+///
+/// A section that does not parse is refused at startup by
+/// [`check_runtime_sections`](crate::cascade::check_runtime_sections). Read
+/// here, it is logged and the default profile serves.
 pub(crate) fn get_profile_config() -> &'static ProfileConfig {
     if let Some(cached) = PROFILE_CONFIG.get() {
         return cached;
     }
 
     #[cfg(feature = "config")]
-    {
-        if let Some(cfg) = crate::config::try_get()
-            && let Ok(profile) = cfg.unmarshal_key_registered::<ProfileConfig>("expression")
-        {
-            return PROFILE_CONFIG.get_or_init(|| profile);
+    if crate::config::try_get().is_some_and(|cfg| cfg.contains("expression")) {
+        match profile_from_cascade() {
+            Ok(profile) => return PROFILE_CONFIG.get_or_init(|| profile),
+            Err(e) => tracing::error!(error = %e, "expression profile ignored"),
         }
     }
 
     DEFAULT_PROFILE_CONFIG.get_or_init(ProfileConfig::default)
+}
+
+/// The `expression` section of the cascade, or the default profile.
+///
+/// # Errors
+///
+/// [`CascadeError`](crate::cascade::CascadeError) when the section is present
+/// but does not parse.
+pub(crate) fn profile_from_cascade() -> Result<ProfileConfig, crate::cascade::CascadeError> {
+    crate::cascade::section("expression")
 }
 
 // -- Validate ------------------------------------------------------

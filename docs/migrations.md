@@ -38,11 +38,31 @@ With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`,
 
 **Consumer adjustment** -- regenerate a committed compose file (`<app> generate-artefacts`). dfe-fetcher's `docker-compose.yaml` carries `command: ["dfe-fetcher", "--config", "/etc/dfe/fetcher.yaml"]`.
 
+### Every `from_cascade()` refuses a section that does not parse (API CHANGE)
+
+These return `Result<Self, scalo::cascade::CascadeError>`, where they answered a present section that does not deserialise with the defaults: `HttpClientConfig`, `OtelTracingConfig`, `SecretsConfig`, `GeoIpConfig`, `MetricsSettings`, `ScalingPressureConfig`, `TransportFilterTierConfig`, `LoggerSettings`, `MemoryGuardConfig`, `SelfRegulationConfig` and `rules::CompileOptions`. `WorkerPoolConfig::from_cascade` returns `ConfigError::ExtractError` for one. An absent section still takes the defaults. `scalo::cascade::section(key)` is the shared reader, and `FromCascade` uses it.
+
+`run_app` refuses to start on a bad `logger`, `metrics`, `memory`, `self_regulation`, `scaling`, `otel_tracing`, `transport.filter_tiers`, `expression` or `sink_stack` section (`cascade::check_runtime_sections`), `config-check` included. `ServiceRuntime::build`, `logger::setup`, `RuleSet::compile`, `HttpClient::from_cascade` and the transports' constructors return the error. `LoggerError`, `HttpClientError` and `RulesError` gain a `Config(CascadeError)` variant, and `TransportError`, `CliError` and `SecretsError` convert from it. `VersionCheckConfig::from_cascade_or` keeps its per-key leniency.
+
+**Consumer adjustment** -- at each consumer's `origin/main`:
+
+- dfe-loader (b54cae3):
+  - `src/pipeline/startup.rs:37` (`retry_until_shutdown`, no error path for it): `SinkStackConfig::from_cascade().unwrap_or_default()`. `run_app` has already refused a bad `sink_stack` section.
+  - `src/main.rs:353` (test `the_scaling_gate_reaches_the_cascade_through_the_env`): `scalo::ScalingPressureConfig::from_cascade().unwrap()`.
+- dfe-receiver (662e3d0):
+  - `src/routing/mod.rs:188` (`compile_rules`, returns `Result`): `CompileOptions::from_cascade().map_err(|e| Error::Config(format!("rules: {e}")))?`.
+- dfe-archiver (f2cc428):
+  - `crates/archiver/src/archiver.rs:1030` (inside `buffer_config`, no error path): `scalo::scaling::ScalingPressureConfig::from_cascade().unwrap_or_default()`. `run_app` has already refused a bad `scaling` section.
+- dfe-transform-elastic (05489a4):
+  - `src/config/loader.rs:304` and `:311` (test `a_config_file_is_a_layer_of_the_scalo_cascade`): add `.unwrap()` to `LoggerSettings::from_cascade()` and `ScalingPressureConfig::from_cascade()`.
+  - `src/service.rs:361` (`log_effective_scaling`, no error path): `ScalingPressureConfig::from_cascade().unwrap_or_default()`.
+- dfe-fetcher (795ae60), dfe-transform-vrl (adc9fd0), dfe-transform-vector (c9bf05d) and culvert (4310b91): none. They call only `VersionCheckConfig::from_cascade_or` and `base_image_from_cascade`, which are unchanged.
+
 ### Transport config sections that do not parse fail the load (API CHANGE)
 
 `FromCascade::from_cascade_key` returns `TransportResult<Self>`, and so do `HttpTransportConfig::from_cascade`, `FileTransportConfig::from_cascade`, `PipeTransportConfig::from_cascade`, `GrpcConfig::from_cascade` and `SinkStackConfig::from_cascade`. A present section that does not deserialise is `TransportError::Config` naming its key, where it became the defaults. `SinkStackConfig` implements `FromCascade` in place of its own `from_cascade_key`, and `ServiceRuntime::outbound_sink_stack` returns the error. An absent section still takes the defaults.
 
-**Consumer adjustment** -- a caller of any of these adds `?`. None of the seven DFE consumers calls them.
+**Consumer adjustment** -- a caller of any of these adds `?`. The one DFE call site, dfe-loader `src/pipeline/startup.rs:37`, is listed in the entry above.
 
 ### A batch_processing section that does not parse fails startup (BEHAVIOUR CHANGE)
 

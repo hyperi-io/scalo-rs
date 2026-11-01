@@ -111,6 +111,9 @@ pub enum RulesError {
         /// Why.
         message: String,
     },
+    /// The `expression` config section does not parse.
+    #[error(transparent)]
+    Config(#[from] crate::cascade::CascadeError),
 }
 
 impl RulesError {
@@ -119,7 +122,7 @@ impl RulesError {
     pub fn diagnostics(&self) -> &[RuleDiagnostic] {
         match self {
             Self::Invalid(found) => found,
-            Self::Load { .. } => &[],
+            Self::Load { .. } | Self::Config(_) => &[],
         }
     }
 }

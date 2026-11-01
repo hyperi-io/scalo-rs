@@ -63,7 +63,7 @@ fn settings_yaml_supplies_the_level_and_the_cli_still_outranks_it() {
                 "logger.format from settings.yaml must beat the hard-coded default"
             );
             assert_eq!(
-                scalo::logger::LoggerSettings::from_cascade().color,
+                scalo::logger::LoggerSettings::from_cascade().unwrap().color,
                 Some(true),
                 "a string logger.color is read as scalo-py reads it"
             );

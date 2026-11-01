@@ -546,7 +546,7 @@ impl SecretsManager {
     ///
     /// use scalo::secrets::{SecretsConfig, SecretsManager};
     ///
-    /// let mgr = Arc::new(SecretsManager::new(SecretsConfig::from_cascade())?);
+    /// let mgr = Arc::new(SecretsManager::new(SecretsConfig::from_cascade()?)?);
     /// let refresher = mgr.spawn_refresh(shutdown.clone());
     /// // ... run the service, then on shutdown:
     /// shutdown.cancel();

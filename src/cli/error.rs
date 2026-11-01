@@ -51,3 +51,9 @@ impl From<crate::config::ConfigError> for CliError {
         Self::Config(e.to_string())
     }
 }
+
+impl From<crate::cascade::CascadeError> for CliError {
+    fn from(e: crate::cascade::CascadeError) -> Self {
+        Self::Config(e.to_string())
+    }
+}

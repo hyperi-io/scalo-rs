@@ -76,17 +76,13 @@ impl Default for HttpClientConfig {
 
 impl HttpClientConfig {
     /// Load from the config cascade under the `http_client` key.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(hc) = cfg.unmarshal_key_registered::<Self>("http_client")
-            {
-                return hc;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `http_client` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("http_client")
     }
 }
 

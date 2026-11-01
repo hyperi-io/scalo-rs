@@ -474,17 +474,7 @@ pub trait FromCascade: Default + serde::Serialize + serde::de::DeserializeOwned 
     /// [`TransportError::Config`] naming `key` when the section is present
     /// but does not deserialise into `Self`.
     fn from_cascade_key(key: &str) -> TransportResult<Self> {
-        #[cfg(feature = "config")]
-        if let Some(cfg) = crate::config::try_get()
-            && cfg.contains(key)
-        {
-            return cfg
-                .unmarshal_key_registered::<Self>(key)
-                .map_err(|e| TransportError::Config(format!("config section {key}: {e}")));
-        }
-        #[cfg(not(feature = "config"))]
-        let _ = key;
-        Ok(Self::default())
+        crate::cascade::section(key).map_err(|e| TransportError::Config(e.to_string()))
     }
 }
 

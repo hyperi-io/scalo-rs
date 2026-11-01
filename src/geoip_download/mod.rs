@@ -33,7 +33,7 @@
 //! use scalo::geoip_download::{GeoIpConfig, ensure_databases};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let paths = ensure_databases(&GeoIpConfig::from_cascade()).await?;
+//! let paths = ensure_databases(&GeoIpConfig::from_cascade()?).await?;
 //! if let Some(city) = paths.city {
 //!     println!("city database at {}", city.display());
 //! }

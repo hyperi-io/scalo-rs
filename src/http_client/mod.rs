@@ -86,6 +86,10 @@ pub enum HttpClientError {
     /// Failed to build the underlying reqwest client.
     #[error("failed to build HTTP client: {0}")]
     BuildError(#[from] reqwest::Error),
+
+    /// The `http_client` config section does not parse.
+    #[error(transparent)]
+    Config(#[from] crate::cascade::CascadeError),
 }
 
 /// Error from an HTTP request.
@@ -293,7 +297,7 @@ impl HttpClient {
     /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
     /// client cannot be constructed.
     pub fn from_cascade() -> Result<Self, HttpClientError> {
-        Self::new(HttpClientConfig::from_cascade())
+        Self::new(HttpClientConfig::from_cascade()?)
     }
 
     /// Exponential backoff schedule from config (jittered to avoid sync'd

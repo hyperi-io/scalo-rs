@@ -72,6 +72,12 @@ pub enum TransportError {
     Admin(String),
 }
 
+impl From<crate::cascade::CascadeError> for TransportError {
+    fn from(e: crate::cascade::CascadeError) -> Self {
+        Self::Config(e.to_string())
+    }
+}
+
 impl TransportError {
     /// Returns true if this error is recoverable (retry may succeed).
     #[must_use]

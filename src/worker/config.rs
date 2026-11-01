@@ -105,11 +105,16 @@ impl WorkerPoolConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if validation fails (e.g. thresholds out of order, or
-    /// a user-explicit `min_threads > max_threads`).
+    /// Returns an error if the section is present but does not parse, or if
+    /// validation fails (e.g. thresholds out of order, or a user-explicit
+    /// `min_threads > max_threads`).
     pub fn from_cascade(key: &str) -> Result<Self, crate::config::ConfigError> {
         let (mut pool_cfg, min_explicit) = if let Some(cfg) = crate::config::try_get() {
-            let parsed: Self = cfg.unmarshal_key(key).unwrap_or_default();
+            let parsed: Self = if cfg.contains(key) {
+                cfg.unmarshal_key(key)?
+            } else {
+                Self::default()
+            };
             // contains() separates a user-supplied min_threads from the serde default.
             let explicit = cfg.contains(&format!("{key}.min_threads"));
             (parsed, explicit)

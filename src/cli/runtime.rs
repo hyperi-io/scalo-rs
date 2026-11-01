@@ -139,7 +139,7 @@ impl ServiceRuntime {
         // The whole `metrics` section is carried through, not just the
         // namespace: `metrics.otel.*` configures the OTLP push, and the app
         // name supplies `service.name` when config leaves it unset.
-        let metrics_config = crate::metrics::MetricsSettings::from_cascade().into_config(app_name);
+        let metrics_config = crate::metrics::MetricsSettings::from_cascade()?.into_config(app_name);
         let mut metrics = MetricsManager::with_config(metrics_config);
         metrics.registry().set_app_name(app_name);
         // /readyz answers 503 from the moment the listener binds until run_app
@@ -151,7 +151,7 @@ impl ServiceRuntime {
         #[cfg(feature = "memory")]
         let memory_guard = Arc::new(MemoryGuard::new(MemoryGuardConfig::from_cascade_and_env(
             env_prefix,
-        )));
+        )?));
 
         // --- Self-regulation governor (default-ON, opt-out) ---
         //
@@ -162,12 +162,13 @@ impl ServiceRuntime {
         // is constructed: every downstream Option stays None and the data path
         // is byte-identical to pre-governor behaviour.
         #[cfg(feature = "governor")]
-        let governor = crate::SelfRegulationConfig::from_cascade().build(Arc::clone(&memory_guard));
+        let governor =
+            crate::SelfRegulationConfig::from_cascade()?.build(Arc::clone(&memory_guard));
 
         // --- Scaling pressure ---
         #[cfg(feature = "scaling")]
         let scaling = {
-            let config = crate::ScalingPressureConfig::from_cascade();
+            let config = crate::ScalingPressureConfig::from_cascade()?;
             let pressure = Arc::new(crate::ScalingPressure::new(config, scaling_components));
             metrics.set_scaling_pressure(Arc::clone(&pressure));
             Some(pressure)
@@ -531,13 +532,13 @@ mod tests {
             268_435_456,
             "from config"
         );
-        let config = MemoryGuardConfig::from_cascade_and_env("GUARD_PROBE");
+        let config = MemoryGuardConfig::from_cascade_and_env("GUARD_PROBE").unwrap();
         assert!(
             (config.pressure_threshold - 0.5).abs() < f64::EPSILON,
             "config, env unset"
         );
         temp_env::with_var("GUARD_PROBE_MEMORY_PRESSURE_THRESHOLD", Some("0.9"), || {
-            let config = MemoryGuardConfig::from_cascade_and_env("GUARD_PROBE");
+            let config = MemoryGuardConfig::from_cascade_and_env("GUARD_PROBE").unwrap();
             assert!(
                 (config.pressure_threshold - 0.9).abs() < f64::EPSILON,
                 "env wins"

@@ -223,17 +223,13 @@ impl MemoryGuardConfig {
     /// When the `config` feature is enabled and `config::setup()` has been
     /// called, reads the `memory` key from the cascade. Otherwise returns
     /// [`MemoryGuardConfig::default()`].
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(memory) = cfg.unmarshal_key_registered::<Self>("memory")
-            {
-                return memory;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `memory` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("memory")
     }
 
     /// Create config from environment variables with a prefix.
@@ -265,9 +261,8 @@ impl MemoryGuardConfig {
     /// variables of [`from_env`](Self::from_env) over it: the config a service
     /// runtime builds its guard from.
     #[cfg(feature = "cli-service")]
-    #[must_use]
-    pub(crate) fn from_cascade_and_env(prefix: &str) -> Self {
-        Self::from_cascade().with_flat_env(prefix)
+    pub(crate) fn from_cascade_and_env(prefix: &str) -> Result<Self, crate::cascade::CascadeError> {
+        Ok(Self::from_cascade()?.with_flat_env(prefix))
     }
 
     #[cfg(feature = "config")]

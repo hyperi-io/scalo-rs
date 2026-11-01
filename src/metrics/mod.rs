@@ -272,17 +272,13 @@ impl MetricsSettings {
     /// Falls back to [`MetricsSettings::default()`] (bare namespace) if config
     /// is not initialised or the key is absent -- so an app that sets nothing
     /// gets bare metrics, never an `{app_name}_` prefix.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(settings) = cfg.unmarshal_key_registered::<Self>("metrics")
-            {
-                return settings;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `metrics` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("metrics")
     }
 
     /// Convert cascade settings into a full [`MetricsConfig`].
@@ -1735,7 +1731,7 @@ mod tests {
             "default metrics namespace must be bare, not derived from app_name"
         );
         // from_cascade with no cascade initialised must also fall back to bare.
-        assert_eq!(MetricsSettings::from_cascade().namespace, "");
+        assert_eq!(MetricsSettings::from_cascade().unwrap().namespace, "");
     }
 
     #[test]

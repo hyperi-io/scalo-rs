@@ -111,7 +111,10 @@ call: `TransportFilterEngine::from_cascade("filters")?`. The transport configs
 (`HttpTransportConfig`, `FileTransportConfig`, `PipeTransportConfig`,
 `GrpcConfig`, `AcknowledgementsConfig`) and `SinkStackConfig` read through
 `transport::FromCascade`: an absent section takes the defaults, and a present one
-that does not parse is `TransportError::Config` naming its key.
+that does not parse is `TransportError::Config` naming its key. Every other
+module's `from_cascade()` reads through `scalo::cascade::section` the same way and
+returns a `CascadeError`, and `run_app` refuses to start, `config-check` included,
+when a section its own runtime reads does not parse (`check_runtime_sections`).
 
 ---
 

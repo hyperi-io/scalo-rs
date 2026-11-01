@@ -111,7 +111,7 @@ impl MemoryTransport {
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
             &config.filters_out,
-            &crate::transport::filter::TransportFilterTierConfig::from_cascade(),
+            &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
         Ok(Self {
             sender,

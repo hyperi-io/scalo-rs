@@ -180,17 +180,13 @@ impl Default for GeoIpConfig {
 
 impl GeoIpConfig {
     /// Load from the config cascade under the `geoip` key, else defaults.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(geoip) = cfg.unmarshal_key_registered::<Self>("geoip")
-            {
-                return geoip;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `geoip` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("geoip")
     }
 }
 
@@ -331,7 +327,7 @@ mod tests {
     fn from_cascade_falls_back_to_defaults() {
         // No cascade is initialised in the unit-test process, so this exercises
         // the fallback arm rather than the config lookup.
-        let config = GeoIpConfig::from_cascade();
+        let config = GeoIpConfig::from_cascade().unwrap();
         assert_eq!(config.provider, GeoIpProvider::DbIpLite);
         assert!(config.enabled);
     }

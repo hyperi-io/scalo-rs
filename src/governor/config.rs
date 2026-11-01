@@ -153,17 +153,13 @@ impl SelfRegulationConfig {
     ///
     /// Falls back to [`SelfRegulationConfig::default()`] (default-ON) when the
     /// cascade is not initialised or the key is absent.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(value) = cfg.unmarshal_key_registered::<Self>("self_regulation")
-            {
-                return value;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `self_regulation` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("self_regulation")
     }
 
     /// Build the [`Hysteresis`] band from the config.
@@ -234,7 +230,7 @@ mod tests {
     #[test]
     fn from_cascade_falls_back_to_default_on() {
         // No cascade initialised in this unit test -> default (enabled).
-        let cfg = SelfRegulationConfig::from_cascade();
+        let cfg = SelfRegulationConfig::from_cascade().unwrap();
         assert!(cfg.enabled);
     }
 

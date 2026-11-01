@@ -168,7 +168,8 @@ impl Transfer {
     async fn stream_to(&self, part: &Path, max_bytes: u64) -> Result<u64, GeoIpDownloadError> {
         // Built per download, so the steady-state path where both databases are
         // fresh constructs no client at all.
-        let mut config = HttpClientConfig::from_cascade();
+        let mut config =
+            HttpClientConfig::from_cascade().map_err(crate::http_client::HttpClientError::from)?;
         // The cascade timeout is sized for API calls; an MMDB transfer needs
         // minutes, so this one is not operator-tunable.
         config.timeout_secs = DOWNLOAD_TIMEOUT_SECS;

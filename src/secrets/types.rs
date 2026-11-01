@@ -47,17 +47,13 @@ pub struct SecretsConfig {
 
 impl SecretsConfig {
     /// Load from the config cascade under the `secrets` key.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(secrets) = cfg.unmarshal_key_registered::<Self>("secrets")
-            {
-                return secrets;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `secrets` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("secrets")
     }
 }
 

@@ -32,7 +32,7 @@ Backend-specific providers are opt-in.
 ```rust
 use scalo::secrets::{SecretsConfig, SecretsManager};
 
-let mgr = SecretsManager::new(SecretsConfig::from_cascade())?;
+let mgr = SecretsManager::new(SecretsConfig::from_cascade()?)?;
 
 let pwd = mgr.get("db_password").await?;
 let key = mgr.get_file("/var/secrets/tls/tls.key").await?;
