@@ -445,11 +445,12 @@ impl SecretsManager {
     }
 
     /// The version last cached for `key`, fresh or not: memory, then disk.
+    /// TTL and grace period are ignored, and no hit or miss is counted.
     async fn last_version(&self, key: &str) -> Option<String> {
         let disk = {
             let cache = self.cache.read();
-            if let Some(version) = cache.memory_version(key) {
-                return version;
+            if let Some(value) = cache.in_memory(key) {
+                return value.metadata.version.clone();
             }
             cache.disk_tier()?
         };

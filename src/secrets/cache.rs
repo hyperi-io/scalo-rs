@@ -45,7 +45,7 @@ use super::types::{CacheConfig, CacheEntry, SecretValue};
 ///
 /// The methods here read and write the disk tier synchronously.
 /// [`SecretsManager`](super::SecretsManager) instead takes the memory tier
-/// under its lock and runs [`DiskTier`] calls on the blocking pool with no lock
+/// under its lock and runs disk-tier calls on the blocking pool with no lock
 /// held, so a slow cache volume stalls only the lookup waiting on it.
 pub struct SecretCache {
     /// In-memory cache.
@@ -159,9 +159,10 @@ impl SecretCache {
     /// Memory first, then disk. TTL and grace period are ignored, and no hit
     /// or miss is counted. `None` when nothing is held, the held value carries
     /// no version, or caching is disabled (a disabled cache holds nothing).
-    pub(crate) fn last_version(&self, key: &str) -> Option<String> {
-        match self.memory_version(key) {
-            Some(version) => version,
+    #[must_use]
+    pub fn last_version(&self, key: &str) -> Option<String> {
+        match self.in_memory(key) {
+            Some(value) => value.metadata.version.clone(),
             None => self
                 .disk
                 .as_ref()
@@ -207,10 +208,9 @@ impl SecretCache {
         Some(value.clone())
     }
 
-    /// The version the memory tier holds for `key`: `None` when it holds no
-    /// value, `Some(None)` for a value with no version.
-    pub(crate) fn memory_version(&self, key: &str) -> Option<Option<String>> {
-        self.memory.get(key).map(|v| v.metadata.version.clone())
+    /// The memory tier's value for `key`, however old, counted as nothing.
+    pub(crate) fn in_memory(&self, key: &str) -> Option<&SecretValue> {
+        self.memory.get(key)
     }
 
     /// Put `value` in the memory tier. A disabled cache holds nothing.

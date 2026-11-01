@@ -1606,7 +1606,7 @@ mod tests {
         let mut buf = [0_u8; 16];
         let read = tokio::time::timeout(Duration::from_secs(3), over.read(&mut buf)).await;
         assert!(
-            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            matches!(read, Ok(Ok(0) | Err(_))),
             "connection {} past the cap was held open: {read:?}",
             CAP + 1
         );
