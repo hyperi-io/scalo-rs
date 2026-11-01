@@ -2645,6 +2645,7 @@ fn build_batch_from_spans(arena: bytes::Bytes, spans: Vec<Span>) -> Vec<Message<
             token: span.token,
             timestamp_ms: span.timestamp_ms,
             format: span.format,
+            headers: Vec::new(),
         })
         .collect()
 }

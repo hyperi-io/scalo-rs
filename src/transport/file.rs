@@ -424,6 +424,7 @@ impl TransportReceiver for FileTransport {
                 token: FileToken { offset: *offset },
                 timestamp_ms: Some(timestamp_ms),
                 format,
+                headers: Vec::new(),
             });
         }
         // A call with a smaller `max` than the dropped one leaves the rest queued.

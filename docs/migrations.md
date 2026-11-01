@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### Received records keep their headers (API CHANGE)
+
+`Message<T>` gains `headers: Vec<(String, Vec<u8>)>`, and the `WorkBatch` conversions move it onto each `Record`. The gRPC receiver fills it from each `RouteBatch` record, so the dedup key a sender set reaches the receiving app, where it was dropped. Every other receiver leaves it empty.
+
+**Consumer adjustment** -- a struct literal of `Message` adds `headers: Vec::new()`, or builds through `Message::new`.
+
 ### HTTP sends retry every 5xx (BEHAVIOUR CHANGE)
 
 `HttpTransport::send` answers `Backpressured` for every 5xx, where 500, 501 and 505 to 599 were `Fatal(Send)`. A wrong credential or endpoint (401, 403, 404, 405, 407, 410, 421) is `Fatal(Config)` and 413 is `Fatal(MessageTooLarge)`, so a tiered sink's drain keeps a spooled record through a server fault or a refused credential and drops it only for a 4xx about the payload.

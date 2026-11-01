@@ -294,6 +294,7 @@ impl TransportReceiver for MemoryTransport {
                 token: MemoryToken { seq: internal.seq },
                 timestamp_ms: Some(internal.timestamp_ms),
                 format,
+                headers: Vec::new(),
             });
         }
 

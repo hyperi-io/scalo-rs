@@ -583,6 +583,7 @@ async fn ingest_handler(
         token: HttpToken::with_source(seq, addr.to_string()),
         timestamp_ms: Some(timestamp_ms),
         format,
+        headers: Vec::new(),
     };
 
     match state.sender.try_send(msg) {

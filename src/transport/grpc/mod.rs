@@ -1626,6 +1626,7 @@ impl TransportServiceImpl {
             token: GrpcToken::new(seq),
             timestamp_ms: record.metadata.timestamp_ms,
             format,
+            headers: record.headers,
         }
     }
 
@@ -1685,6 +1686,7 @@ impl proto::transport_server::Transport for TransportServiceImpl {
             token: GrpcToken::new(seq),
             timestamp_ms: None,
             format,
+            headers: Vec::new(),
         };
 
         match self.sender.try_send(msg) {
@@ -2407,6 +2409,53 @@ mod tests {
         let server = GrpcTransport::new(&config).await.unwrap();
         let addr = server.local_addr().expect("server mode binds a listener");
         (server, format!("http://{addr}"))
+    }
+
+    /// Record headers, the dedup key among them, reach `recv` from a
+    /// `RouteBatch` that fits the receive queue and from one held whole
+    /// because it outnumbers `recv_buffer_size`.
+    #[tokio::test]
+    async fn route_batch_headers_reach_recv() {
+        for (name, records) in [("queued", 1_usize), ("held whole", 3)] {
+            let mut config = GrpcConfig::server("127.0.0.1:0");
+            config.recv_buffer_size = 2;
+            let (server, endpoint) = receiver(config).await;
+            let client = GrpcTransport::new(&GrpcConfig::client(&endpoint))
+                .await
+                .unwrap();
+            let sent: Vec<Record> = (0..records)
+                .map(|i| {
+                    let mut record = json_record(b"{}").with_dedup_key(format!("dedup-{i}"));
+                    record
+                        .headers
+                        .push(("tenant".to_string(), b"acme".to_vec()));
+                    record
+                })
+                .collect();
+            let result = client.send_batch(&sent).await;
+            assert!(result.is_ok(), "{name}: send_batch got {result:?}");
+
+            let got = server.recv(10).await.unwrap().records;
+            assert_eq!(got.len(), records, "{name}: records received");
+            for (i, record) in got.iter().enumerate() {
+                assert_eq!(
+                    record.dedup_key(),
+                    Some(format!("dedup-{i}").as_bytes()),
+                    "{name}: record {i} headers {:?}",
+                    record.headers
+                );
+                assert!(
+                    record
+                        .headers
+                        .iter()
+                        .any(|(k, v)| k == "tenant" && v == b"acme"),
+                    "{name}: record {i} lost its tenant header: {:?}",
+                    record.headers
+                );
+            }
+            client.close().await.unwrap();
+            server.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

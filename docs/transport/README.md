@@ -151,7 +151,7 @@ into the DLQ when downstream processing fails.
 
 `commit_tokens.len()` is not tied to `records.len()`: it includes the tokens of records an inbound filter removed, and a fan-out transform can change the record count without touching the acks. Commit `commit_tokens` once the whole block is handled.
 
-A backend collects `Message<Token>` values (`key`, `payload: Bytes`, `token`, `timestamp_ms`, `format`) into a `RecvBatch`, which converts into a `WorkBatch` through `From`.
+A backend collects `Message<Token>` values (`key`, `payload: Bytes`, `token`, `timestamp_ms`, `format`, `headers`) into a `RecvBatch`, which converts into a `WorkBatch` through `From`, headers carried onto each `Record`.
 
 ---
 

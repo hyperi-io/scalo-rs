@@ -374,6 +374,7 @@ impl TransportReceiver for PipeTransport {
                         token: PipeToken { seq },
                         timestamp_ms: Some(timestamp_ms),
                         format,
+                        headers: Vec::new(),
                     });
                 }
                 Err(e) => {

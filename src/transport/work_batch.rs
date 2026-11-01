@@ -702,7 +702,7 @@ impl<T: CommitToken> From<crate::Message<T>> for WorkBatch<T> {
         let record = Record {
             payload: msg.payload,
             key: msg.key,
-            headers: Vec::new(),
+            headers: msg.headers,
             metadata: RecordMeta {
                 timestamp_ms: msg.timestamp_ms,
                 format: msg.format,
@@ -735,7 +735,7 @@ impl<T: CommitToken> From<crate::transport::traits::RecvBatch<T>> for WorkBatch<
             records.push(Record {
                 payload: msg.payload,
                 key: msg.key,
-                headers: Vec::new(),
+                headers: msg.headers,
                 metadata: RecordMeta {
                     timestamp_ms: msg.timestamp_ms,
                     format: msg.format,
