@@ -222,6 +222,8 @@ don't reorder.
 
 The listener drains recorded histogram samples into their series every 5 s, scrape or no scrape, and frees the drained blocks, so a service nobody scrapes does not hold every sample it ever recorded.
 
+`start_server` serves at most 64 connections at once and closes one past that unanswered, counted in `metrics_server_connections_refused_total`. Each gets 5 s to send a request line of at most 8 KiB and 10 s for its response to be written, so a client that stops reading releases its socket and the rendered body.
+
 ---
 
 ## OTel mode

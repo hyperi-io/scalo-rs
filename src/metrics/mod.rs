@@ -1224,12 +1224,16 @@ async fn run_server(
 ) {
     let mut update_interval = tokio::time::interval(update_interval);
     let mut upkeep = upkeep_interval();
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    // Owned, so connections still open at shutdown are aborted with the loop.
+    let mut tasks = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
                 break;
             }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             _ = upkeep.tick() => run_upkeep(&handle),
             _ = update_interval.tick() => {
                 if let Some(ref pm) = process_metrics {
@@ -1241,12 +1245,18 @@ async fn run_server(
             }
             result = listener.accept() => {
                 if let Ok((stream, _)) = result {
+                    // Over the cap the connection is closed unanswered.
+                    let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                        metrics::counter!("metrics_server_connections_refused_total").increment(1);
+                        continue;
+                    };
                     let handle = handle.clone();
                     let registry = registry.clone();
                     let readiness_fn = readiness_fn.clone();
                     #[cfg(feature = "scaling")]
                     let scaling_pressure = scaling_pressure.clone();
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
+                        let _permit = permit;
                         handle_connection(
                             stream,
                             handle,
@@ -1304,6 +1314,16 @@ const MAX_REQUEST_LINE: u64 = 8 * 1024;
 /// port of a data-plane binary, so it must not be a way to exhaust it.
 #[cfg(feature = "metrics")]
 const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Connections the listener serves at once. One past it is closed unanswered,
+/// so idle or stalled clients cannot pile up tasks and response buffers.
+#[cfg(feature = "metrics")]
+const MAX_CONNECTIONS: usize = 64;
+
+/// How long a response gets to reach the client, so one that stops reading
+/// releases its socket and its rendered body.
+#[cfg(feature = "metrics")]
+const RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Handle a single HTTP connection.
 ///
@@ -1389,7 +1409,11 @@ async fn handle_connection(
         body.len()
     );
 
-    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = tokio::time::timeout(
+        RESPONSE_WRITE_TIMEOUT,
+        stream.write_all(response.as_bytes()),
+    )
+    .await;
 }
 
 /// Build the readiness response from the shared [`Readiness`](readiness::Readiness) answer.
@@ -1543,6 +1567,51 @@ pub fn size_buckets() -> Vec<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The listener serves at most `MAX_CONNECTIONS` at once: with that many
+    /// idle clients connected, the next is closed at once rather than given a
+    /// task that waits out its read timeout.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn the_metrics_listener_bounds_its_connections() {
+        use tokio::io::AsyncReadExt;
+
+        /// The cap in force, as the server's own constant sets it.
+        const CAP: usize = 64;
+
+        let manager = MetricsManager::with_config(MetricsConfig::offline("conn_cap"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(run_server(
+            listener,
+            manager.handle.clone().expect("recorder handle"),
+            manager.registry(),
+            shutdown_rx,
+            Duration::from_secs(60),
+            None,
+            None,
+            manager.readiness_fn.clone(),
+            #[cfg(feature = "scaling")]
+            manager.scaling_pressure.clone(),
+        ));
+
+        let mut idle = Vec::with_capacity(CAP);
+        for _ in 0..CAP {
+            idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        // A served connection is held open for the read timeout (5 s); one over
+        // the cap is closed straight away, so the read below sees EOF.
+        let mut over = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0_u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(3), over.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "connection {} past the cap was held open: {read:?}",
+            CAP + 1
+        );
+        drop(idle);
+    }
     use super::*;
 
     #[test]
