@@ -365,9 +365,9 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         }
     }
 
-    /// Reserve capacity (`try_update`) before enqueue; roll back
-    /// on failure. Atomic reservation prevents two concurrent
-    /// callers from both passing the cap check and overshooting.
+    /// Reserve capacity (`try_update`) before enqueue; a failure or a
+    /// cancelled future gives it back. Atomic reservation prevents two
+    /// concurrent callers from both passing the cap check and overshooting.
     async fn spool_message(&self, record: &Record) -> Result<()> {
         // Check disk availability first
         if !self.disk_available.load(AtomicOrdering::Relaxed) {
@@ -410,8 +410,16 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         } else {
             self.spool_count.fetch_add(1, AtomicOrdering::AcqRel);
         }
+        // From here every early return, and a cancel at either await below,
+        // gives the reservation back.
+        let mut reservation = SpoolReservation {
+            count: &self.spool_count,
+            bytes: &self.spool_bytes,
+            len: 0,
+            kept: false,
+        };
 
-        // Reserve byte budget; roll back item slot on failure.
+        // Reserve byte budget.
         if let Some(max_bytes) = self.config.max_spool_bytes {
             if let Err(current_bytes) = self.spool_bytes.try_update(
                 AtomicOrdering::AcqRel,
@@ -421,8 +429,6 @@ impl<S: TransportSender + 'static> TieredSink<S> {
                         .filter(|new| *new <= max_bytes)
                 },
             ) {
-                // Roll back the item-slot reservation taken above.
-                self.spool_count.fetch_sub(1, AtomicOrdering::AcqRel);
                 // Spool full on byte budget -> apply the WhenFull policy.
                 if self.drop_on_full() {
                     Self::record_overflow_drop();
@@ -437,17 +443,15 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             self.spool_bytes
                 .fetch_add(compressed_len, AtomicOrdering::AcqRel);
         }
+        reservation.len = compressed_len;
 
-        // Enqueue; roll back both reservations on failure.
         let mut sender = self.spool_sender.lock().await;
-        if let Err(e) = sender.send(compressed).await {
-            drop(sender);
-            self.spool_count.fetch_sub(1, AtomicOrdering::AcqRel);
-            self.spool_bytes
-                .fetch_sub(compressed_len, AtomicOrdering::AcqRel);
-            return Err(TieredSinkError::Spool(e.to_string()));
-        }
+        sender
+            .send(compressed)
+            .await
+            .map_err(|e| TieredSinkError::Spool(e.to_string()))?;
         drop(sender);
+        reservation.kept = true;
 
         #[cfg(feature = "metrics")]
         {
@@ -529,6 +533,23 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             let _ = handle.await;
         }
         self.shut_down = true;
+    }
+}
+
+/// One spill's item slot and `len` bytes of spool capacity, given back on drop
+/// unless `kept` is set once the record is on the spool.
+struct SpoolReservation<'a> {
+    count: &'a AtomicU64,
+    bytes: &'a AtomicU64,
+    len: u64,
+    kept: bool,
+}
+
+impl Drop for SpoolReservation<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            drainer::release(self.count, self.bytes, self.len);
+        }
     }
 }
 
@@ -919,6 +940,44 @@ mod tests {
         tiered.send(&rec(b"3")).await.unwrap();
         assert_eq!(tiered.circuit_state().await, CircuitState::Open);
 
+        tiered.shutdown().await;
+    }
+
+    /// A spill cancelled while it waits on the spool writer leaves no item or
+    /// byte reserved: a phantom would keep StrictFifo off the hot path and,
+    /// repeated, refuse every spill as full.
+    #[tokio::test]
+    async fn a_cancelled_spill_releases_its_reservation() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.max_spool_items = Some(1);
+        config.max_spool_bytes = Some(1 << 20);
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+
+        let writer = tiered.spool_sender.lock().await;
+        for i in 0..3 {
+            let cancelled = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                tiered.send(&rec(b"cancelled")),
+            )
+            .await;
+            assert!(
+                cancelled.is_err(),
+                "spill {i} returned {cancelled:?} instead of waiting on the writer"
+            );
+        }
+        drop(writer);
+        assert_eq!(
+            (tiered.spool_len().await, tiered.spool_bytes()),
+            (0, 0),
+            "cancelled spills left a reservation behind"
+        );
+        tiered
+            .send(&rec(b"next"))
+            .await
+            .expect("the cap of 1 item still has room after three cancelled spills");
         tiered.shutdown().await;
     }
 

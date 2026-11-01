@@ -127,7 +127,7 @@ Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A 
 
 On a Kubernetes emptyDir `statvfs` reads the node's disk, not the volume's `sizeLimit`, so a spool past the limit gets the pod evicted and the spool lost. The scalo-service chart sets `SCALO_WRITABLE_PATH_LIMITS` to each emptyDir writable path with a `sizeLimit`. With `max_spool_bytes` unset, `TieredSink::new` caps a spool on such a path at nine tenths of its limit. On Kubernetes, `disk_aware` with no cap at all is refused with `SpoolOpen`.
 
-A spill past `max_spool_items` or `max_spool_bytes` applies `when_full`:
+A spill reserves its item slot and bytes before it writes, and gives them back if the write fails or the `send` future is dropped, so a cancelled spill leaves nothing counted. A spill past `max_spool_items` or `max_spool_bytes` applies `when_full`:
 
 | `when_full` | `send` returns |
 | --- | --- |

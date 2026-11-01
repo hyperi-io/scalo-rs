@@ -199,10 +199,10 @@ async fn settle(
     }
 }
 
-/// Take one committed entry of `bytes` off the spool counters, stopping at
+/// Take one entry of `bytes` off the spool counters, stopping at
 /// zero: a count already short of what is on disk must not wrap to
 /// `u64::MAX`, which keeps StrictFifo's hot path shut and refuses every spill.
-fn release(count: &AtomicU64, total: &AtomicU64, bytes: u64) {
+pub(crate) fn release(count: &AtomicU64, total: &AtomicU64, bytes: u64) {
     let _ = count.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
         Some(n.saturating_sub(1))
     });
