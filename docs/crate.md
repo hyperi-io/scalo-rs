@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The default is `config` and `logger`. Everything else is opt-in, so you pay only for what you use.
 
 | Feature | Adds |
-|---|---|
+| --- | --- |
 | `config`, `logger` | The cascade and the logger (default) |
 | `metrics` | Prometheus `/metrics` and the health probes, OTLP metric push and span export, process gauges |
 | `memory` | The cgroup-aware memory guard |

@@ -38,6 +38,10 @@ quality:
     - tool: osv-scanner
       id: GHSA-w9wp-h8wv-79jx
       reason: "CVE-2026-48504, opentelemetry_sdk 0.31.x: BaggagePropagator::extract_with_context is unreachable, as scalo registers no text-map propagator and never touches Baggage. The fix (0.32.1) waits on metrics-exporter-opentelemetry, whose newest release (0.2.1) requires opentelemetry ^0.31 (renovate.json holds the 0.31 line). Drop on that bump, tracked in scalo-rs#281."
+    # renovate.json is JSON, which has no comment syntax for a line-level nosemgrep.
+    - tool: semgrep
+      id: package_managers.renovate.renovate-missing-minimum-release-age.renovate-missing-minimum-release-age
+      reason: "renovate.json gives rdkafka and rdkafka-sys minimumReleaseAge 0 days on purpose: docs/deployment/native-deps.md records that they take each release with no cooldown. Every other packageRule sets 7 days."
 test:
   enabled: true
   coverage: false

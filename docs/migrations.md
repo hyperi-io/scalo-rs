@@ -48,7 +48,7 @@ With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`,
 
 `transport::kafka::test_support::SCRAM_PASSWORD` is replaced by `scram_password()`, which returns a password generated once per test process, so the test broker carries no credential in source.
 
-**Consumer adjustment** -- `SCRAM_PASSWORD` becomes `scram_password()`. None of the seven DFE consumers uses it: dfe-loader keeps its own copy in `tests/common/tls_broker.rs`.
+**Consumer adjustment** -- `SCRAM_PASSWORD` becomes `scram_password()`. dfe-loader's Kafka TLS startup test uses it and moves with the release.
 
 ### The spool drains in batches (BEHAVIOUR CHANGE)
 

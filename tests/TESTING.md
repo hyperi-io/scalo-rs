@@ -5,7 +5,7 @@ The general rules are hyperi-ai's testing standard (`standards/universal/testing
 ## Levels
 
 | Level | Runs | Command |
-|---|---|---|
+| --- | --- | --- |
 | core | locally, every push and PR | `cargo nextest run --all-features` |
 | full | nightly (`schedule` in `.github/workflows/ci.yml`) and before every release (`test.full.required_for_release: true`) | `cargo nextest run --all-features --run-ignored all --ignore-default-filter` |
 
@@ -24,7 +24,7 @@ Full adds the rest of the real-broker tests (`kafka_send_batch`, `kafka_recv_run
 ## Services, one instance each per run
 
 | Service | Image | Container port |
-|---|---|---|
+| --- | --- | --- |
 | Kafka | `apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837` | 9092 PLAINTEXT |
 | OpenBao | `openbao/openbao:2.6.1@sha256:5b2486ab0fb90bbc788cc345b0a08616dfb375873ee8be5df3a2fd4d378a67e0` | 8200, dev mode, root token `root` |
 
