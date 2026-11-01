@@ -654,17 +654,39 @@ impl TransportBase for HttpTransport {
     }
 }
 
-/// Response statuses that mean the endpoint, or the gateway in front of it, is
-/// busy or down rather than refusing this request, so the send is retried.
-fn downstream_unavailable(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::REQUEST_TIMEOUT
-            | reqwest::StatusCode::TOO_MANY_REQUESTS
-            | reqwest::StatusCode::BAD_GATEWAY
-            | reqwest::StatusCode::SERVICE_UNAVAILABLE
-            | reqwest::StatusCode::GATEWAY_TIMEOUT
-    )
+/// What a failure status says about the send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusClass {
+    /// The endpoint, or the gateway in front of it, is busy or failing: retry.
+    Unavailable,
+    /// The credential or the endpoint is wrong, which says nothing about this
+    /// record: keep it until the sink is fixed.
+    Misconfigured,
+    /// The body is over the endpoint's limit: it can never be accepted.
+    TooLarge,
+    /// The endpoint refused this record as malformed: it can never be accepted.
+    Refused,
+}
+
+/// Classify a non-2xx response. Every 5xx is retried, and only a 4xx that is
+/// the payload's fault marks the record undeliverable.
+fn classify_status(status: reqwest::StatusCode) -> StatusClass {
+    use reqwest::StatusCode as S;
+    match status {
+        S::REQUEST_TIMEOUT | S::TOO_MANY_REQUESTS => StatusClass::Unavailable,
+        s if s.is_server_error() => StatusClass::Unavailable,
+        S::PAYLOAD_TOO_LARGE => StatusClass::TooLarge,
+        S::UNAUTHORIZED
+        | S::FORBIDDEN
+        | S::NOT_FOUND
+        | S::METHOD_NOT_ALLOWED
+        | S::PROXY_AUTHENTICATION_REQUIRED
+        | S::GONE
+        | S::MISDIRECTED_REQUEST => StatusClass::Misconfigured,
+        s if s.is_client_error() => StatusClass::Refused,
+        // 1xx and an unfollowed 3xx: the endpoint is not one that takes a POST.
+        _ => StatusClass::Misconfigured,
+    }
 }
 
 impl TransportSender for HttpTransport {
@@ -713,11 +735,8 @@ impl TransportSender for HttpTransport {
             request_builder
         };
 
-        #[cfg(feature = "logger")]
+        // Wire size, taken before `payload` moves into the request body.
         let payload_len = payload.len();
-        // Capture wire size before `payload` moves into the request body.
-        #[cfg(feature = "metrics")]
-        let payload_bytes = payload.len();
         let result = match request_builder.body(payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 #[cfg(feature = "logger")]
@@ -727,11 +746,11 @@ impl TransportSender for HttpTransport {
                 {
                     metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
                     metrics::counter!("transport_sent_bytes_total", "transport" => "http")
-                        .increment(payload_bytes as u64);
+                        .increment(payload_len as u64);
                 }
                 SendResult::Ok
             }
-            Ok(resp) if downstream_unavailable(resp.status()) => {
+            Ok(resp) if classify_status(resp.status()) == StatusClass::Unavailable => {
                 #[cfg(feature = "logger")]
                 tracing::warn!(status = %resp.status(), url = %url, "HTTP transport: backpressure");
 
@@ -741,17 +760,22 @@ impl TransportSender for HttpTransport {
                 SendResult::Backpressured
             }
             Ok(resp) => {
+                let status = resp.status();
                 #[cfg(feature = "logger")]
-                tracing::warn!(status = %resp.status(), url = %url, "HTTP transport: send error");
+                tracing::warn!(status = %status, url = %url, "HTTP transport: send error");
 
                 #[cfg(feature = "metrics")]
                 metrics::counter!("transport_send_errors_total", "transport" => "http")
                     .increment(1);
-                SendResult::Fatal(TransportError::Send(format!(
-                    "HTTP {} from {}",
-                    resp.status(),
-                    url
-                )))
+                let detail = format!("HTTP {status} from {url}");
+                SendResult::Fatal(match classify_status(status) {
+                    StatusClass::Misconfigured => TransportError::Config(detail),
+                    StatusClass::TooLarge => TransportError::MessageTooLarge {
+                        bytes: payload_len,
+                        detail,
+                    },
+                    StatusClass::Refused | StatusClass::Unavailable => TransportError::Send(detail),
+                })
             }
             Err(e) => {
                 #[cfg(feature = "logger")]
@@ -1025,19 +1049,33 @@ mod tests {
         addr
     }
 
-    /// Busy and gateway statuses mean the endpoint is not there right now; any
-    /// other failure status is the endpoint refusing this request.
+    /// How the sender answers each failure status: every 5xx and the busy 4xx
+    /// are retried, a wrong credential or endpoint is the sink's fault (the
+    /// record is kept), and only a 4xx about the payload marks it undeliverable.
     #[tokio::test]
-    async fn only_busy_and_gateway_statuses_are_backpressure() {
-        for (status, retried) in [
-            (408, true),
-            (429, true),
-            (502, true),
-            (503, true),
-            (504, true),
-            (400, false),
-            (404, false),
-            (500, false),
+    async fn a_failure_status_is_retried_unless_the_payload_is_at_fault() {
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Retried,
+            SinkFault,
+            Undeliverable,
+            Refused,
+        }
+        for (status, want) in [
+            (408, Want::Retried),
+            (429, Want::Retried),
+            (500, Want::Retried),
+            (501, Want::Retried),
+            (502, Want::Retried),
+            (503, Want::Retried),
+            (504, Want::Retried),
+            (599, Want::Retried),
+            (401, Want::SinkFault),
+            (403, Want::SinkFault),
+            (404, Want::SinkFault),
+            (413, Want::Undeliverable),
+            (400, Want::Refused),
+            (422, Want::Refused),
         ] {
             let addr = status_endpoint(status).await;
             let transport =
@@ -1047,12 +1085,100 @@ mod tests {
             let result = transport
                 .send("ingest", bytes::Bytes::from_static(b"{}"))
                 .await;
-            if retried {
-                assert!(result.is_backpressured(), "HTTP {status}: got {result:?}");
-            } else {
-                assert!(result.is_fatal(), "HTTP {status}: got {result:?}");
-            }
+            let got = match &result {
+                SendResult::Backpressured => Want::Retried,
+                SendResult::Fatal(e) if e.is_fatal() => Want::SinkFault,
+                SendResult::Fatal(e) if e.is_undeliverable() => Want::Undeliverable,
+                SendResult::Fatal(TransportError::Send(_)) => Want::Refused,
+                other => panic!("HTTP {status}: unexpected {other:?}"),
+            };
+            assert_eq!(got, want, "HTTP {status}: got {result:?}");
         }
+    }
+
+    /// A record spooled while the endpoint answers 500 stays spooled through
+    /// the 500s and is delivered once the endpoint recovers.
+    #[cfg(feature = "tiered-sink")]
+    #[tokio::test]
+    async fn a_spooled_record_survives_a_server_error_and_is_delivered() {
+        use crate::tiered_sink::{TieredSink, TieredSinkConfig};
+
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let addr = switchable_endpoint(Arc::clone(&status)).await;
+        let sender = HttpTransport::new(&HttpTransportConfig::sender(&format!("http://{addr}")))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = TieredSinkConfig::new(dir.path().join("q"));
+        config.circuit_failure_threshold = 1;
+        config.circuit_reset_timeout_ms = 20;
+        config.drain_interval_ms = 5;
+        let tiered = TieredSink::new(sender, config).await.unwrap();
+
+        let record = crate::transport::Record {
+            payload: bytes::Bytes::from_static(b"{\"keep\":1}"),
+            key: None,
+            headers: Vec::new(),
+            metadata: crate::transport::RecordMeta {
+                timestamp_ms: None,
+                format: PayloadFormat::Json,
+            },
+        };
+        tiered.send(&record).await.expect("spooled on the 500");
+        assert_eq!(tiered.spool_len().await, 1, "the 500 spools the record");
+
+        // The drainer offers it to the failing endpoint many times over.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            tiered.spool_len().await,
+            1,
+            "a server error must not remove the spooled record"
+        );
+
+        status.store(200, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tiered.spool_len().await > 0 {
+            assert!(std::time::Instant::now() < deadline, "never drained");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tiered.shutdown().await;
+    }
+
+    /// A loopback endpoint that answers every request with whatever `status`
+    /// holds at the time.
+    #[cfg(feature = "tiered-sink")]
+    async fn switchable_endpoint(
+        status: Arc<std::sync::atomic::AtomicU16>,
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let status = Arc::clone(&status);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if request_complete(&buf) {
+                            break;
+                        }
+                    }
+                    let code = status.load(Ordering::SeqCst);
+                    let reply = format!(
+                        "HTTP/1.1 {code} Canned\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        addr
     }
 
     #[tokio::test]

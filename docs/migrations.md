@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### HTTP sends retry every 5xx (BEHAVIOUR CHANGE)
+
+`HttpTransport::send` answers `Backpressured` for every 5xx, where 500, 501 and 505 to 599 were `Fatal(Send)`. A wrong credential or endpoint (401, 403, 404, 405, 407, 410, 421) is `Fatal(Config)` and 413 is `Fatal(MessageTooLarge)`, so a tiered sink's drain keeps a spooled record through a server fault or a refused credential and drops it only for a 4xx about the payload.
+
+**Consumer adjustment** -- a caller that matched `Fatal(TransportError::Send(_))` for an auth or not-found answer from the HTTP sender matches `Fatal(TransportError::Config(_))`.
+
 ### Test support shares one container per service per run (API CHANGE)
 
 `deployment-test-support` carries `test_support::shared_service`, and `transport-kafka-test-support` pulls it and adds `shared_kafka` and `kafka_spec` (see [feature-flags.md](feature-flags.md)). `TlsBroker::start` and `Pki::generate` take its `Suite`, so the broker and the openssl container are named under `HYPERI_TEST_CONTAINER_PREFIX`, else `<repo>-test`, and carry its owner labels.
