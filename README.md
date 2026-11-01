@@ -50,13 +50,14 @@ All 40 feature flags, what each pulls in and which combinations matter are in
 `metrics`, `http-server` (health probes), `transport-kafka`, `worker` (adaptive
 pool plus SIMD batching), `memory` (the cgroup-aware guard), `secrets-vault`.
 
-**This crate dynamically links system C libraries**, so the build host and the
-deployment target both need packages -- `-dev` to build, the `.so` runtimes to
-run, and which ones depends on your features. The matrix, the Confluent APT repo
-a current `librdkafka` needs, and a worked Dockerfile are in
+**A release build links librdkafka and OpenSSL statically**, from a static-only
+prefix hyperi-ci builds once per library release, so the image needs no C
+runtime packages beyond libgit2 for `directory-config-git`. A local dev build
+links the system `librdkafka-dev` instead. The prefix, the build variables and
+a worked Dockerfile are in
 [docs/deployment/native-deps.md](docs/deployment/native-deps.md). The `deployment`
-feature derives all of it from the contract, so a generated Dockerfile already
-carries the right names.
+feature derives the image's packages from the contract, so a generated
+Dockerfile already carries the right names.
 
 ## What it is for
 

@@ -162,29 +162,17 @@ ship.
 
 ## Native dependencies
 
-Some features pull in `*-sys` crates that link against system C
-libraries. The build host needs `-dev` packages; the deployment host
-needs runtime libs.
+Some features pull in `*-sys` crates that link C libraries. A release build links them statically, so only libgit2 needs a runtime package.
 
 | Feature | `-sys` crate | Build package | Runtime package |
 | --------- | -------------- | --------------- | ----------------- |
-| `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (>= 2.12.1, Confluent APT repo) | `librdkafka1` |
+| `transport-kafka` | `rdkafka-sys` | release: hyperi-ci's static librdkafka and OpenSSL prefix. dev: `librdkafka-dev` (>= 2.12.1) | -- (statically linked) |
 | `transport-kafka-config` | -- | -- | -- |
-| `directory-config-git` | `libgit2-sys` | `libgit2-dev` | `libgit2-1.9` (release-specific) |
-| `spool` / `tiered-sink` | `zstd-sys` | `libzstd-dev` | `libzstd1` |
-| (transitive via several) | `openssl-sys` | `libssl-dev` | `libssl3t64` (release-specific) |
-| (transitive via several) | `libz-sys` | `zlib1g-dev` | `zlib1g` |
+| `directory-config-git` | `libgit2-sys`, `libz-sys` | `libgit2-dev`, `zlib1g-dev` | `libgit2-1.9` (release-specific) |
+| `spool` / `tiered-sink` | `zstd-sys` | -- (bundled source) | -- (statically linked) |
 | `secrets-aws` | `aws-lc-sys` | -- (compiled from source, ~20-30s, sccache-cached) | -- (statically linked) |
 
-The two rows marked release-specific bake a library version into the package name,
-so they differ per base release - the values above are for the default base.
-The full table is in [deployment/native-deps.md](deployment/native-deps.md).
-
-`hyperi-ci` auto-detects which `-sys` crates appear in `Cargo.lock` and
-installs the matching packages. The Confluent APT repo is added
-automatically when `rdkafka-sys` is present and the installed version is
-below the minimum. See [deployment/native-deps.md](deployment/native-deps.md)
-for the `NativeDepsContract` that wires this into generated artefacts.
+The libgit2 package name carries the library version, so it differs per base release - the value above is for the default base. The build variables, the full table and the `NativeDepsContract` that wires this into generated artefacts are in [deployment/native-deps.md](deployment/native-deps.md).
 
 ---
 

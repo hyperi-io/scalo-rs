@@ -6,7 +6,7 @@ feature flag -- apps pull only what they ship.
 
 | Backend | Feature flag | Native dep | Use case | Holds its source acknowledgement |
 | --------- | -------------- | ------------ | ---------- | ---------- |
-| Kafka | `transport-kafka` | `librdkafka1` (runtime), `librdkafka-dev` (build) | Production default, persistence, replay | Yes |
+| Kafka | `transport-kafka` | none at runtime (static), `librdkafka-dev` for a dev build | Production default, persistence, replay | Yes |
 | gRPC | `transport-grpc` | None (pure Rust -- `tonic`) | Inter-service mesh, low latency | Yes |
 | Memory | `transport-memory` | None | Unit tests, same-process pipelines | No, none to hold |
 | File | `transport-file` | None | Debugging, audit trails, replay | Not yet |

@@ -26,6 +26,12 @@ release and the target before bumping.
 
 **Consumer adjustment** -- none, until an app wants the refresh.
 
+### Generated images install no Kafka C libraries (API CHANGE)
+
+`NativeDepsContract` no longer maps any feature to `librdkafka1`, the Confluent repo, `libssl`, `zlib1g` or `libzstd1`, because a release build links them statically ([native-deps.md](deployment/native-deps.md)). `directory-config-git` still maps to libgit2. `BaseDistro::confluent_suite` and `BaseDistro::libssl_package` are gone. An `AptRepoContract` with an empty `codename` now takes the resolved release instead of writing an empty suite.
+
+**Consumer adjustment** -- regenerate the committed `Dockerfile` and `Dockerfile.runtime` (`<app> generate-artefacts`), and build releases with hyperi-ci's static prefix. A local build still links the system `librdkafka-dev`.
+
 ## 2.14.23
 
 ### Startup refuses config it used to run past (BEHAVIOUR CHANGE)

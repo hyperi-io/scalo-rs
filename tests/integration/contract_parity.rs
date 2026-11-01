@@ -25,11 +25,11 @@ use std::path::PathBuf;
 
 use scalo::SensitiveString;
 use scalo::deployment::{
-    BaseDistro, CONTRACT_SCHEMA_VERSION, Capability, DeploymentContract, FieldSpec, HealthContract,
-    ImageProfile, KafkaLagTrigger, KedaConfig, KedaContract, NativeDepsContract, OciLabels,
-    PortCondition, PortContract, ResourceList, ResourcesContract, SecretEnvContract,
-    SecretGroupContract, SecurityContract, ServiceAccount, WritablePath, config_schema_json,
-    contract_schema_file_name,
+    AptRepoContract, BaseDistro, CONTRACT_SCHEMA_VERSION, Capability, DeploymentContract,
+    FieldSpec, HealthContract, ImageProfile, KafkaLagTrigger, KedaConfig, KedaContract,
+    NativeDepsContract, OciLabels, PortCondition, PortContract, ResourceList, ResourcesContract,
+    SecretEnvContract, SecretGroupContract, SecurityContract, ServiceAccount, WritablePath,
+    config_schema_json, contract_schema_file_name,
 };
 use scalo::schemars;
 
@@ -81,6 +81,14 @@ fn parity_contract() -> DeploymentContract {
         &["transport-kafka", "spool", "directory-config-git"],
         BaseDistro::Trixie,
     );
+    native_deps.apt_repos.push(AptRepoContract {
+        key_url: "https://apt.vendor.example/archive.key".into(),
+        keyring: "/usr/share/keyrings/vendor.gpg".into(),
+        url: "https://apt.vendor.example/deb".into(),
+        codename: "trixie".into(),
+        key_fingerprint: "0123456789ABCDEF0123456789ABCDEF01234567".into(),
+        packages: vec!["vendor-runtime".into()],
+    });
     native_deps.unresolved_base_image = Some("registry.example.com/base@sha256:0123".into());
     native_deps.contradicted_base_image = Some("debian:bookworm-slim".into());
 

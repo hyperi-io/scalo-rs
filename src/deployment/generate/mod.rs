@@ -33,7 +33,25 @@ mod tests {
         OciLabels, PortContract, SecretEnvContract, SecretGroupContract,
     };
     use crate::deployment::keda::KedaContract;
-    use crate::deployment::native_deps::NativeDepsContract;
+    use crate::deployment::native_deps::{AptRepoContract, NativeDepsContract};
+
+    const VENDOR_FINGERPRINT: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
+
+    /// A distro package plus a signed vendor repo with no codename of its own,
+    /// which takes the apt block through every step.
+    fn deps_with_repo(base_image: &str) -> NativeDepsContract {
+        let mut deps =
+            NativeDepsContract::for_scalo_features(&["directory-config-git"], base_image);
+        deps.apt_repos.push(AptRepoContract {
+            key_url: "https://apt.vendor.example/archive.key".into(),
+            keyring: "/usr/share/keyrings/vendor.gpg".into(),
+            url: "https://apt.vendor.example/deb".into(),
+            codename: String::new(),
+            key_fingerprint: VENDOR_FINGERPRINT.into(),
+            packages: vec!["vendor-runtime".into()],
+        });
+        deps
+    }
 
     fn test_contract() -> DeploymentContract {
         DeploymentContract {
@@ -204,49 +222,60 @@ mod tests {
     #[test]
     fn test_generate_dockerfile_with_native_deps() {
         let mut contract = test_contract();
-        contract.native_deps = NativeDepsContract::for_scalo_features(
-            &["transport-kafka", "spool", "tiered-sink"],
-            "ubuntu:24.04",
-        );
+        contract.native_deps = deps_with_repo("ubuntu:24.04");
 
         let dockerfile = generate_dockerfile(&contract, None).unwrap();
 
-        // Should contain Confluent APT repo setup
-        assert!(dockerfile.contains("packages.confluent.io"));
-        assert!(dockerfile.contains("confluent-clients.gpg"));
-        // Should contain runtime packages
-        assert!(dockerfile.contains("librdkafka1"));
-        assert!(dockerfile.contains("libssl3"));
-        assert!(dockerfile.contains("libzstd1"));
-        // Should include gnupg for key import
+        assert!(dockerfile.contains("https://apt.vendor.example/deb"));
+        assert!(dockerfile.contains("signed-by=/usr/share/keyrings/vendor.gpg"));
+        assert!(dockerfile.contains("vendor-runtime"));
+        assert!(dockerfile.contains("libgit2-1.7"));
+        // The key import needs gnupg.
         assert!(dockerfile.contains("gnupg"));
     }
 
     #[test]
     fn test_generate_dockerfile_no_native_deps() {
         let mut contract = test_contract();
+        // The Kafka transport and the spool link their C libraries statically.
         contract.native_deps = NativeDepsContract::for_scalo_features(
-            &["cli", "deployment", "logger"],
+            &["cli", "deployment", "logger", "transport-kafka", "spool"],
             "ubuntu:24.04",
         );
 
-        let dockerfile = generate_dockerfile(&contract, None).unwrap();
-
-        // No Confluent repo, no runtime packages
-        assert!(!dockerfile.contains("confluent"));
-        assert!(!dockerfile.contains("librdkafka1"));
-        assert!(!dockerfile.contains("gnupg"));
+        // The static OpenSSL reads the CA store under /etc/ssl/certs, which
+        // ca-certificates provides.
+        for image in [
+            generate_dockerfile(&contract, None).unwrap(),
+            generate_runtime_stage(&contract).unwrap(),
+        ] {
+            for absent in [
+                "librdkafka",
+                "libssl",
+                "zlib1g",
+                "libzstd",
+                "signed-by",
+                "gnupg",
+            ] {
+                assert!(!image.contains(absent), "{absent}:\n{image}");
+            }
+            assert!(image.contains(" ca-certificates"), "{image}");
+        }
     }
 
+    /// A repo with no codename takes the base image's release, and one with a
+    /// codename keeps it.
     #[test]
     fn test_generate_dockerfile_bookworm_codename() {
-        let mut contract = test_contract();
-        contract.base_image = "debian:bookworm-slim".into();
-        contract.native_deps =
-            NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:bookworm-slim");
+        for (codename, line) in [("", "deb bookworm main"), ("noble", "deb noble main")] {
+            let mut contract = test_contract();
+            contract.base_image = "debian:bookworm-slim".into();
+            contract.native_deps = deps_with_repo("debian:bookworm-slim");
+            contract.native_deps.apt_repos[0].codename = codename.into();
 
-        let dockerfile = generate_dockerfile(&contract, None).unwrap();
-        assert!(dockerfile.contains("bookworm main"));
+            let dockerfile = generate_dockerfile(&contract, None).unwrap();
+            assert!(dockerfile.contains(line), "{codename:?}:\n{dockerfile}");
+        }
     }
 
     #[test]
@@ -277,15 +306,14 @@ mod tests {
     #[test]
     fn test_generate_dockerfile_dev_with_native_deps() {
         let mut contract = test_contract();
-        contract.native_deps =
-            NativeDepsContract::for_scalo_features(&["transport-kafka", "spool"], "ubuntu:24.04");
+        contract.native_deps = deps_with_repo("ubuntu:24.04");
         let dev = contract.with_dev_profile();
         let dockerfile = generate_dockerfile(&dev, None).unwrap();
 
         // Dev tools present alongside native deps
         assert!(dockerfile.contains("strace"));
-        assert!(dockerfile.contains("librdkafka1"));
-        assert!(dockerfile.contains("libzstd1"));
+        assert!(dockerfile.contains("vendor-runtime"));
+        assert!(dockerfile.contains("libgit2-1.7"));
         assert!(dockerfile.contains("LABEL io.scalo.profile=\"development\""));
     }
 
@@ -571,7 +599,7 @@ mod tests {
         let mut contract = test_contract();
         contract.base_image = "debian@sha256:abc123".into();
         contract.native_deps = super::super::NativeDepsContract::for_scalo_features(
-            &["transport-kafka"],
+            &["directory-config-git"],
             &contract.base_image,
         );
 
@@ -585,14 +613,9 @@ mod tests {
     fn test_dockerfile_pins_the_repo_signing_key() {
         // Without the assertion the key is trust-on-first-use, re-fetched every
         // build: a compromised mirror serves its own key, `signed-by` validates
-        // the attacker's repo, and we install their librdkafka1. Verified by
-        // build in both directions -- the right fingerprint passes, and a
-        // one-digit change fails the RUN.
+        // the attacker's repo, and the image installs their packages.
         let mut contract = test_contract();
-        contract.native_deps = super::super::NativeDepsContract::for_features(
-            &["transport-kafka"],
-            super::super::BaseDistro::Trixie,
-        );
+        contract.native_deps = deps_with_repo("debian:trixie-slim");
 
         let dockerfile = generate_dockerfile(&contract, None).unwrap();
         assert!(
@@ -600,8 +623,8 @@ mod tests {
             "the signing key must be checked before it is trusted"
         );
         assert!(
-            dockerfile.contains("^fpr:::::::::CBBB821E8FAF364F79835C438B1DA6120C2BF624:"),
-            "the pinned Confluent fingerprint must be asserted"
+            dockerfile.contains(&format!("^fpr:::::::::{VENDOR_FINGERPRINT}:")),
+            "the pinned fingerprint must be asserted"
         );
         // The assertion has to precede the dearmor that installs the keyring.
         let check = dockerfile.find("--with-fingerprint").unwrap();
@@ -763,13 +786,12 @@ mod tests {
         }
     }
 
-    /// A production image keeps librdkafka and drops every tool it needed to
-    /// fetch the key, and the healthcheck needs no HTTP client.
+    /// A production image keeps its repo's packages and drops every tool it
+    /// needed to fetch the key, and the healthcheck needs no HTTP client.
     #[test]
     fn a_production_image_carries_no_fetch_or_network_tools() {
         let mut contract = test_contract();
-        contract.native_deps =
-            NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:trixie-slim");
+        contract.native_deps = deps_with_repo("debian:trixie-slim");
         let cases = [
             ("production with a repo", contract.clone(), true),
             ("production, no deps", test_contract(), false),
@@ -807,11 +829,10 @@ mod tests {
     #[test]
     fn test_hadolint_pragmas_sit_directly_above_their_instructions() {
         let plain = test_contract();
-        let mut kafka = test_contract();
-        kafka.native_deps =
-            NativeDepsContract::for_scalo_features(&["transport-kafka"], "ubuntu:24.04");
+        let mut with_repo = test_contract();
+        with_repo.native_deps = deps_with_repo("ubuntu:24.04");
 
-        for contract in [&plain, &kafka] {
+        for contract in [&plain, &with_repo] {
             let dockerfile = generate_dockerfile(contract, None).unwrap();
             let runtime = generate_runtime_stage(contract).unwrap();
             for (name, text) in [("dockerfile", &dockerfile), ("runtime stage", &runtime)] {
@@ -844,7 +865,7 @@ mod tests {
         let mut contract = test_contract();
         contract.base_image = "debian:trixie-slim".into();
         contract.native_deps = super::super::NativeDepsContract::for_scalo_features(
-            &["transport-kafka"],
+            &["directory-config-git"],
             &contract.base_image,
         );
 

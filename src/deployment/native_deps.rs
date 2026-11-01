@@ -67,17 +67,17 @@ pub struct NativeDepsContract {
     pub contradicted_base_image: Option<String>,
 }
 
-/// A custom APT repository (e.g., Confluent for librdkafka).
+/// A custom APT repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct AptRepoContract {
     /// GPG key URL for the repo.
     pub key_url: String,
 
-    /// Local keyring file path (e.g., `/usr/share/keyrings/confluent-clients.gpg`).
+    /// Local keyring file path (e.g., `/usr/share/keyrings/vendor.gpg`).
     pub keyring: String,
 
-    /// Repository base URL (e.g., `https://packages.confluent.io/clients/deb`).
+    /// Repository base URL (e.g., `https://apt.vendor.example/deb`).
     pub url: String,
 
     /// Distribution codename (e.g., `noble`, `bookworm`).
@@ -90,8 +90,8 @@ pub struct AptRepoContract {
     /// When set, the generated build asserts the downloaded key matches before
     /// trusting the repo. Without it the key is trust-on-first-use, re-fetched
     /// on every build: a compromised mirror or a CA-level intercept serves its
-    /// own key, `signed-by` then validates the attacker's repo, and we install
-    /// their `librdkafka1` into a binary the data plane dynamically links.
+    /// own key, `signed-by` then validates the attacker's repo, and the image
+    /// installs the attacker's packages.
     ///
     /// Pinning locks in the key as observed. It does NOT establish that the key
     /// was legitimate in the first place -- it converts an every-build TOFU into
@@ -101,22 +101,6 @@ pub struct AptRepoContract {
 
     /// APT packages to install from this specific repo.
     pub packages: Vec<String>,
-}
-
-/// Confluent APT repository for librdkafka.
-fn confluent_repo(codename: &str) -> AptRepoContract {
-    AptRepoContract {
-        key_url: "https://packages.confluent.io/clients/deb/archive.key".into(),
-        keyring: "/usr/share/keyrings/confluent-clients.gpg".into(),
-        url: "https://packages.confluent.io/clients/deb".into(),
-        codename: codename.into(),
-        // Fingerprint of the key served at key_url, verified by build: the
-        // generated image asserts it with gpg before the repo is trusted. If
-        // Confluent rotates the key this fails loudly at build time, which is
-        // the intended behaviour -- re-derive and update rather than drop it.
-        key_fingerprint: "CBBB821E8FAF364F79835C438B1DA6120C2BF624".into(),
-        packages: vec!["librdkafka1".into()],
-    }
 }
 
 /// A distro release we can generate runtime package names for.
@@ -251,24 +235,6 @@ impl BaseDistro {
         }
     }
 
-    /// The Confluent clients-repo APT suite to pull `librdkafka1` from.
-    ///
-    /// This is the suite used for `packages.confluent.io/clients/deb`, NOT
-    /// necessarily the release's own codename. Confluent's clients repo has no
-    /// `trixie` (debian 13) suite -- its newest debian suite is `bookworm`
-    /// (debian 12), whose `librdkafka1` .deb installs cleanly on trixie (the
-    /// libssl/libsasl2/zlib deps are satisfied by trixie's newer versions), so
-    /// trixie maps to `bookworm`.
-    #[must_use]
-    pub const fn confluent_suite(self) -> &'static str {
-        match self {
-            Self::Trixie | Self::Bookworm => "bookworm",
-            Self::Noble => "noble",
-            Self::Jammy => "jammy",
-            Self::Focal => "focal",
-        }
-    }
-
     /// The libgit2 runtime package (`directory-config-git`).
     ///
     /// The library version is baked into the package name and there is no
@@ -282,21 +248,6 @@ impl BaseDistro {
             Self::Noble => "libgit2-1.7",
             Self::Jammy => "libgit2-1.1",
             Self::Focal => "libgit2-28",
-        }
-    }
-
-    /// The OpenSSL runtime package.
-    ///
-    /// Releases that went through the 64-bit `time_t` transition renamed
-    /// `libssl3` to `libssl3t64`. The old name still resolves there via
-    /// `Provides:`, but naming the real package is clearer and does not depend
-    /// on that `Provides` staying in place. Focal predates OpenSSL 3.
-    #[must_use]
-    pub const fn libssl_package(self) -> &'static str {
-        match self {
-            Self::Trixie | Self::Noble => "libssl3t64",
-            Self::Bookworm | Self::Jammy => "libssl3",
-            Self::Focal => "libssl1.1",
         }
     }
 }
@@ -390,62 +341,20 @@ impl NativeDepsContract {
     /// Both constructors land here. It knows nothing about where the release
     /// came from -- resolution and the "we assumed" / "these disagree" flags are
     /// the callers' business, which is what keeps this a pure mapping.
+    ///
+    /// The release build links librdkafka, OpenSSL, zlib and zstd statically
+    /// (docs/deployment/native-deps.md), and no other feature links OpenSSL,
+    /// so only libgit2 is installed.
     fn packages_for(features: &[&str], distro: BaseDistro) -> Self {
-        let mut apt_repos = Vec::new();
         let mut packages: Vec<String> = Vec::new();
 
-        // At most a handful of packages, so a linear scan beats a HashSet and
-        // its extra String per entry.
-        let mut add = |pkg: &str| {
-            if !packages.iter().any(|p| p == pkg) {
-                packages.push(pkg.into());
-            }
-        };
-
-        let needs_kafka = features
-            .iter()
-            .any(|f| *f == "transport-kafka" || f.starts_with("dlq-kafka"));
-
-        if needs_kafka {
-            // Always source librdkafka1 from the Confluent clients repo so the
-            // image ships the LATEST librdkafka -- the debian/ubuntu distro
-            // packages lag the protocol, which is why we do NOT use them. The
-            // binary dynamic-links librdkafka, so a container gets the current
-            // Confluent build supplied here, while a manual run on a host uses
-            // that host's librdkafka (older is fine). Trixie has no Confluent
-            // suite, so it maps to bookworm (see BaseDistro::confluent_suite).
-            apt_repos.push(confluent_repo(distro.confluent_suite()));
-            add(distro.libssl_package());
-            add("zlib1g");
-        }
-
-        let needs_zstd = features
-            .iter()
-            .any(|f| *f == "spool" || *f == "tiered-sink");
-        if needs_zstd {
-            add("libzstd1");
-        }
-
-        // openssl is a transitive dep for many features (http, secrets, transport)
-        let needs_ssl = features.iter().any(|f| {
-            *f == "http"
-                || f.starts_with("secrets")
-                || f.starts_with("transport")
-                || f.starts_with("otel")
-        });
-        if needs_ssl {
-            add(distro.libssl_package());
-            add("zlib1g");
-        }
-
         // directory-config-git needs libgit2 (soname pkg differs per release)
-        let needs_git2 = features.contains(&"directory-config-git");
-        if needs_git2 {
-            add(distro.libgit2_package());
+        if features.contains(&"directory-config-git") {
+            packages.push(distro.libgit2_package().into());
         }
 
         Self {
-            apt_repos,
+            apt_repos: Vec::new(),
             apt_packages: packages,
             distro: Some(distro),
             unresolved_base_image: None,
@@ -540,74 +449,41 @@ fn extract_scalo_features(content: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Every C library these features use is linked into the binary, so the
+    /// image installs nothing for them.
     #[test]
-    fn test_kafka_features_add_confluent_repo() {
+    fn statically_linked_features_install_nothing() {
         let _env = crate::deployment::env_test_lock::guard();
-        let deps = NativeDepsContract::for_scalo_features(&["transport-kafka"], "ubuntu:24.04");
-        assert_eq!(deps.apt_repos.len(), 1);
-        assert!(deps.apt_repos[0].url.contains("confluent"));
-        assert!(deps.apt_repos[0].packages.contains(&"librdkafka1".into()));
-        assert_eq!(deps.apt_repos[0].codename, "noble");
-        assert!(deps.apt_packages.contains(&"libssl3t64".into()));
-        assert!(deps.apt_packages.contains(&"zlib1g".into()));
-    }
-
-    #[test]
-    fn test_spool_adds_zstd() {
-        let _env = crate::deployment::env_test_lock::guard();
-        let deps = NativeDepsContract::for_scalo_features(&["spool"], "ubuntu:24.04");
-        assert!(deps.apt_packages.contains(&"libzstd1".into()));
-    }
-
-    #[test]
-    fn test_tiered_sink_adds_zstd() {
-        let _env = crate::deployment::env_test_lock::guard();
-        let deps = NativeDepsContract::for_scalo_features(&["tiered-sink"], "ubuntu:24.04");
-        assert!(deps.apt_packages.contains(&"libzstd1".into()));
-    }
-
-    #[test]
-    fn test_no_features_empty() {
-        let _env = crate::deployment::env_test_lock::guard();
-        let deps = NativeDepsContract::for_scalo_features(&[], "ubuntu:24.04");
-        assert!(deps.is_empty());
-    }
-
-    #[test]
-    fn test_pure_rust_features_empty() {
-        let _env = crate::deployment::env_test_lock::guard();
-        let deps = NativeDepsContract::for_scalo_features(
-            &["cli", "deployment", "logger"],
-            "ubuntu:24.04",
-        );
-        assert!(deps.is_empty());
-    }
-
-    #[test]
-    fn test_bookworm_codename() {
-        let _env = crate::deployment::env_test_lock::guard();
-        let deps =
-            NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:bookworm-slim");
-        assert_eq!(deps.apt_repos[0].codename, "bookworm");
-    }
-
-    #[test]
-    fn test_trixie_kafka_uses_confluent_bookworm() {
-        let _env = crate::deployment::env_test_lock::guard();
-        // Trixie has no Confluent suite, so it pulls the LATEST librdkafka1 from
-        // the Confluent clients repo via the bookworm suite (debian's native
-        // package lags the protocol). librdkafka1 comes from the repo, NOT
-        // apt_packages.
-        let deps =
-            NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:trixie-slim");
-        assert_eq!(deps.apt_repos.len(), 1);
-        assert!(deps.apt_repos[0].url.contains("confluent"));
-        assert_eq!(deps.apt_repos[0].codename, "bookworm");
-        assert!(deps.apt_repos[0].packages.contains(&"librdkafka1".into()));
-        assert!(!deps.apt_packages.contains(&"librdkafka1".into()));
-        // Trixie went through the 64-bit time_t transition -- libssl3t64.
-        assert!(deps.apt_packages.contains(&"libssl3t64".into()));
-        assert!(deps.apt_packages.contains(&"zlib1g".into()));
+        let receiver: &[&str] = &[
+            "config",
+            "config-reload",
+            "logger",
+            "metrics",
+            "http-server",
+            "transport-kafka",
+            "transport-grpc",
+            "dlq-kafka",
+            "spool",
+            "tiered-sink",
+            "runtime",
+            "secrets",
+            "scaling",
+            "cli",
+            "deployment",
+        ];
+        for (features, base) in [
+            (&[][..], "ubuntu:24.04"),
+            (&["cli", "deployment", "logger"][..], "ubuntu:24.04"),
+            (&["transport-kafka"][..], "debian:trixie-slim"),
+            (&["transport-kafka"][..], "debian:bookworm-slim"),
+            (&["dlq-kafka"][..], "ubuntu:24.04"),
+            (&["spool", "tiered-sink"][..], "ubuntu:24.04"),
+            (&["http", "secrets", "otel"][..], "debian:trixie-slim"),
+            (receiver, "debian:trixie-slim"),
+        ] {
+            let deps = NativeDepsContract::for_scalo_features(features, base);
+            assert!(deps.is_empty(), "{features:?} on {base}: {deps:?}");
+        }
     }
 
     #[test]
@@ -615,68 +491,18 @@ mod tests {
         let _env = crate::deployment::env_test_lock::guard();
         let deps =
             NativeDepsContract::for_scalo_features(&["directory-config-git"], "debian:trixie-slim");
-        assert!(deps.apt_packages.contains(&"libgit2-1.9".into()));
-    }
-
-    #[test]
-    fn test_no_duplicate_packages() {
-        let _env = crate::deployment::env_test_lock::guard();
-        let deps = NativeDepsContract::for_scalo_features(
-            &["transport-kafka", "http", "secrets"],
-            "ubuntu:24.04",
-        );
-        let ssl_count = deps
-            .apt_packages
-            .iter()
-            .filter(|p| *p == "libssl3t64")
-            .count();
-        assert_eq!(ssl_count, 1);
-    }
-
-    #[test]
-    fn test_dlq_kafka_adds_confluent() {
-        let _env = crate::deployment::env_test_lock::guard();
-        let deps = NativeDepsContract::for_scalo_features(&["dlq-kafka"], "ubuntu:24.04");
-        assert_eq!(deps.apt_repos.len(), 1);
+        assert_eq!(deps.apt_packages, ["libgit2-1.9"]);
+        assert!(deps.apt_repos.is_empty());
     }
 
     #[test]
     fn test_git2_feature() {
         let _env = crate::deployment::env_test_lock::guard();
-        let deps =
-            NativeDepsContract::for_scalo_features(&["directory-config-git"], "ubuntu:24.04");
-        assert!(deps.apt_packages.contains(&"libgit2-1.7".into()));
-    }
-
-    #[test]
-    fn test_full_receiver_features() {
-        let _env = crate::deployment::env_test_lock::guard();
         let deps = NativeDepsContract::for_scalo_features(
-            &[
-                "config",
-                "config-reload",
-                "logger",
-                "metrics",
-                "http-server",
-                "transport-kafka",
-                "transport-grpc",
-                "dlq-kafka",
-                "spool",
-                "tiered-sink",
-                "runtime",
-                "secrets",
-                "scaling",
-                "cli",
-                "deployment",
-            ],
+            &["directory-config-git", "transport-kafka"],
             "ubuntu:24.04",
         );
-        assert_eq!(deps.apt_repos.len(), 1); // confluent only
-        assert!(!deps.apt_packages.contains(&"librdkafka1".to_string())); // in repo packages
-        assert!(deps.apt_repos[0].packages.contains(&"librdkafka1".into()));
-        assert!(deps.apt_packages.contains(&"libssl3t64".into()));
-        assert!(deps.apt_packages.contains(&"libzstd1".into()));
-        assert!(deps.apt_packages.contains(&"zlib1g".into()));
+        assert_eq!(deps.apt_packages, ["libgit2-1.7"]);
     }
 
     // ------------------------------------------------------------------
@@ -810,8 +636,7 @@ mod tests {
         );
         assert_eq!(deps.distro, Some(crate::deployment::DEFAULT_BASE_DISTRO));
         // Trixie names, not the Ubuntu ones the old fallback would have served.
-        assert!(deps.apt_packages.contains(&"libgit2-1.9".into()));
-        assert!(deps.apt_packages.contains(&"libssl3t64".into()));
+        assert_eq!(deps.apt_packages, ["libgit2-1.9"]);
     }
 
     #[test]
@@ -851,7 +676,6 @@ mod tests {
         let deps = NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:13-slim");
         assert!(deps.unresolved_base_image.is_none());
         assert_eq!(deps.distro, Some(BaseDistro::Trixie));
-        assert_eq!(deps.apt_repos[0].codename, "bookworm");
     }
 
     #[test]
@@ -863,9 +687,7 @@ mod tests {
         );
         assert_eq!(deps.distro, Some(BaseDistro::Bookworm));
         assert!(deps.unresolved_base_image.is_none());
-        assert_eq!(deps.apt_repos[0].codename, "bookworm");
-        assert!(deps.apt_packages.contains(&"libgit2-1.5".into()));
-        assert!(deps.apt_packages.contains(&"libssl3".into()));
+        assert_eq!(deps.apt_packages, ["libgit2-1.5"]);
     }
 
     #[test]
@@ -885,17 +707,5 @@ mod tests {
         assert_eq!(BaseDistro::Noble.libgit2_package(), "libgit2-1.7");
         assert_eq!(BaseDistro::Jammy.libgit2_package(), "libgit2-1.1");
         assert_eq!(BaseDistro::Focal.libgit2_package(), "libgit2-28");
-        // Only the time_t-transitioned releases carry the t64 suffix.
-        assert_eq!(BaseDistro::Trixie.libssl_package(), "libssl3t64");
-        assert_eq!(BaseDistro::Noble.libssl_package(), "libssl3t64");
-        assert_eq!(BaseDistro::Bookworm.libssl_package(), "libssl3");
-        assert_eq!(BaseDistro::Focal.libssl_package(), "libssl1.1");
-    }
-
-    #[test]
-    fn confluent_has_no_trixie_suite() {
-        assert_eq!(BaseDistro::Trixie.confluent_suite(), "bookworm");
-        assert_eq!(BaseDistro::Bookworm.confluent_suite(), "bookworm");
-        assert_eq!(BaseDistro::Noble.confluent_suite(), "noble");
     }
 }

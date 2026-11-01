@@ -432,7 +432,11 @@ fn build_apt_block(
              \x20      > /etc/apt/sources.list.d/{list}.list \\\n",
             keyring = repo.keyring,
             url = repo.url,
-            codename = repo.codename,
+            codename = if repo.codename.is_empty() {
+                release.as_str()
+            } else {
+                &repo.codename
+            },
             // Derive a stable filename from the keyring path
             list = std::path::Path::new(&repo.keyring)
                 .file_stem()

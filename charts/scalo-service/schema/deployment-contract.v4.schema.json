@@ -559,7 +559,7 @@
       }
     },
     "AptRepoContract": {
-      "description": "A custom APT repository (e.g., Confluent for librdkafka).",
+      "description": "A custom APT repository.",
       "type": "object",
       "properties": {
         "key_url": {
@@ -567,11 +567,11 @@
           "type": "string"
         },
         "keyring": {
-          "description": "Local keyring file path (e.g., `/usr/share/keyrings/confluent-clients.gpg`).",
+          "description": "Local keyring file path (e.g., `/usr/share/keyrings/vendor.gpg`).",
           "type": "string"
         },
         "url": {
-          "description": "Repository base URL (e.g., `https://packages.confluent.io/clients/deb`).",
+          "description": "Repository base URL (e.g., `https://apt.vendor.example/deb`).",
           "type": "string"
         },
         "codename": {
@@ -580,7 +580,7 @@
           "default": ""
         },
         "key_fingerprint": {
-          "description": "Expected OpenPGP fingerprint of `key_url`, uppercase hex, no spaces.\n\nWhen set, the generated build asserts the downloaded key matches before\ntrusting the repo. Without it the key is trust-on-first-use, re-fetched\non every build: a compromised mirror or a CA-level intercept serves its\nown key, `signed-by` then validates the attacker's repo, and we install\ntheir `librdkafka1` into a binary the data plane dynamically links.\n\nPinning locks in the key as observed. It does NOT establish that the key\nwas legitimate in the first place -- it converts an every-build TOFU into\na one-time one, which is the part worth having.",
+          "description": "Expected OpenPGP fingerprint of `key_url`, uppercase hex, no spaces.\n\nWhen set, the generated build asserts the downloaded key matches before\ntrusting the repo. Without it the key is trust-on-first-use, re-fetched\non every build: a compromised mirror or a CA-level intercept serves its\nown key, `signed-by` then validates the attacker's repo, and the image\ninstalls the attacker's packages.\n\nPinning locks in the key as observed. It does NOT establish that the key\nwas legitimate in the first place -- it converts an every-build TOFU into\na one-time one, which is the part worth having.",
           "type": "string",
           "default": ""
         },

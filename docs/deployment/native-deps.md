@@ -1,13 +1,26 @@
 # Native Deps
 
-scalo dynamically links against system C libraries -- rdkafka,
-libgit2, zstd, openssl, zlib -- instead of static compilation. Saves
-~30 minutes of C++ build per CI run. Cost: the runtime container needs
-the `.so` files present.
+A release build links every C library the Kafka transport and the spool use -- librdkafka, OpenSSL, zlib, zstd -- statically, so the image installs none of them. libgit2 (`directory-config-git`) is the one runtime package left.
 
 `NativeDepsContract` is the bookkeeping. The Dockerfile generator reads
-it and emits the right `apt-get` block -- no per-app hand-coding, no "I
-forgot to add `libssl3`" outages.
+it and emits the right `apt-get` block, with no per-app hand-coding.
+
+rdkafka-sys runs with `dynamic-linking`, which finds librdkafka through pkg-config. The release build points pkg-config at a static-only prefix that hyperi-ci builds once per library release (hyperi-io/hyperi-ci#742): `librdkafka.a` with SSL and zstd, OpenSSL on the 3.5 LTS line, zstd and zlib, each with its `.pc` file. The build sets:
+
+| Variable | Value |
+| --- | --- |
+| `PKG_CONFIG_PATH` | the prefix's `lib/pkgconfig` |
+| `RDKAFKA_STATIC` | `1`, so pkg-config emits the static link line |
+| `OPENSSL_STATIC` | `1` |
+| `OPENSSL_DIR` | the prefix |
+
+The static librdkafka has no libcurl and no libsasl2, so `sasl.oauthbearer.method: oidc` and GSSAPI are unavailable. SCRAM and PLAIN over TLS need neither.
+
+That OpenSSL is built with `--openssldir=/etc/ssl`, so it reads CA certificates from `/etc/ssl/cert.pem` and `/etc/ssl/certs`. Every generated image installs `ca-certificates`, which fills `/etc/ssl/certs`.
+
+A local dev build with none of those set links the system `librdkafka-dev` dynamically.
+
+librdkafka, OpenSSL, `rdkafka` and `rdkafka-sys` take each release with no 7-day cooldown: they are mature, very widely used libraries, and staying current outweighs the delay. The versions are still pinned with checksums.
 
 ---
 
@@ -21,11 +34,11 @@ any custom APT repos:
 use scalo::deployment::NativeDepsContract;
 
 let deps = NativeDepsContract::for_scalo_features(
-    &["transport-kafka", "spool", "tiered-sink", "secrets"],
+    &["transport-kafka", "spool", "secrets", "directory-config-git"],
     "debian:trixie-slim",
 );
-// deps.apt_repos    = [Confluent repo (librdkafka1, suite=bookworm)]
-// deps.apt_packages = ["libssl3t64", "zlib1g", "libzstd1"]
+// deps.apt_repos    = []
+// deps.apt_packages = ["libgit2-1.9"]
 ```
 
 Runtime package names are release-specific, so the mapping needs to know
@@ -79,44 +92,48 @@ DEPLOYMENT__BASE_DISTRO=trixie <app> generate-artefacts --output-dir ci-artefact
 
 What the release decides:
 
-| Release | Confluent suite | libgit2 | libssl |
-| --------- | ----------------- | --------- | -------- |
-| `trixie` (default) | `bookworm` | `libgit2-1.9` | `libssl3t64` |
-| `bookworm` | `bookworm` | `libgit2-1.5` | `libssl3` |
-| `noble` | `noble` | `libgit2-1.7` | `libssl3t64` |
-| `jammy` | `jammy` | `libgit2-1.1` | `libssl3` |
-| `focal` | `focal` | `libgit2-28` | `libssl1.1` |
-
-The Confluent column is the clients-repo APT SUITE, not the release's own
-codename: Confluent publishes no trixie suite, so trixie takes `bookworm`.
-The libssl split is the 64-bit `time_t` transition, which renamed `libssl3`
-to `libssl3t64` on trixie and noble.
+| Release | libgit2 |
+| --------- | --------- |
+| `trixie` (default) | `libgit2-1.9` |
+| `bookworm` | `libgit2-1.5` |
+| `noble` | `libgit2-1.7` |
+| `jammy` | `libgit2-1.1` |
+| `focal` | `libgit2-28` |
 
 ---
 
 ## Feature -> package map
 
-| Feature(s) | APT repo | Runtime packages |
-| ------------ | ---------- | ------------------- |
-| `transport-kafka`, `dlq-kafka` (or any `dlq-kafka-*`) | Confluent (`packages.confluent.io/clients/deb`) | `librdkafka1`, libssl, `zlib1g` |
-| `spool`, `tiered-sink` | -- | `libzstd1` |
-| `http`, `secrets*`, `transport*`, `otel*` | -- | libssl, `zlib1g` |
-| `directory-config-git` | -- | libgit2 |
-| Pure-Rust features (`cli`, `logger`, `deployment`, `metrics`, ...) | -- | none |
+| Feature(s) | Runtime packages |
+| ------------ | ------------------- |
+| `directory-config-git` | libgit2, from the release table above |
+| `transport-kafka`, `dlq-kafka*`, `spool`, `tiered-sink`, `http`, `secrets*`, `otel*` | none: linked statically, or no C library |
+| Pure-Rust features (`cli`, `logger`, `deployment`, `metrics`, ...) | none |
 
-The libssl and libgit2 package names come from the release table above.
-Deduplication is automatic: enabling both `transport-kafka` and `http`
-adds libssl once.
+Only librdkafka brings OpenSSL: `cargo tree --all-features -i openssl-sys` finds no other path.
+
+`NativeDepsContract::default()` is empty too. A contract that doesn't populate `native_deps` gives a production Dockerfile with `ca-certificates` alone.
 
 ---
 
-## Confluent repo auto-add
+## Custom APT repos
 
-`librdkafka` in the Debian/Ubuntu repos lags the protocol, so we never
-use the distro package. The Confluent clients repo carries the current
-build and is added UNCONDITIONALLY whenever a Kafka feature is present -
-there is no distro for which we fall back to the native package. Generated
-Dockerfile fragment (suite `bookworm`, from a trixie base):
+An app that needs a vendor's package adds an `AptRepoContract` to `apt_repos`. An empty `codename` takes the release resolved above, and a set one is used as written, for a vendor whose suites do not follow the distro's:
+
+```rust
+deps.apt_repos.push(AptRepoContract {
+    key_url: "https://apt.vendor.example/archive.key".into(),
+    keyring: "/usr/share/keyrings/vendor.gpg".into(),
+    url: "https://apt.vendor.example/deb".into(),
+    codename: String::new(),
+    key_fingerprint: "0123456789ABCDEF0123456789ABCDEF01234567".into(),
+    packages: vec!["vendor-runtime".into()],
+});
+```
+
+The build asserts the key's OpenPGP fingerprint before it dearmors the key into the keyring, so a compromised mirror cannot substitute its own key. A rotated key fails the build: re-derive the fingerprint rather than dropping the check. Pinning makes trust-on-first-use a one-time event. It does not prove the key was legitimate to begin with.
+
+The generated fragment, on trixie:
 
 ```dockerfile
 # Runtime shared libraries for dynamically-linked Rust crates.
@@ -124,18 +141,18 @@ Dockerfile fragment (suite `bookworm`, from a trixie base):
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg \
-    && curl -fsSL https://packages.confluent.io/clients/deb/archive.key -o /tmp/repo-key.asc \
+    && curl -fsSL https://apt.vendor.example/archive.key -o /tmp/repo-key.asc \
     && gpg --show-keys --with-colons --with-fingerprint /tmp/repo-key.asc \
        > /tmp/repo-key.info \
-    && grep -q "^fpr:::::::::CBBB821E8FAF364F79835C438B1DA6120C2BF624:" /tmp/repo-key.info \
+    && grep -q "^fpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:" /tmp/repo-key.info \
     && rm -f /tmp/repo-key.info \
-    && gpg --dearmor -o /usr/share/keyrings/confluent-clients.gpg /tmp/repo-key.asc \
+    && gpg --dearmor -o /usr/share/keyrings/vendor.gpg /tmp/repo-key.asc \
     && rm -f /tmp/repo-key.asc \
-    && echo "deb [signed-by=/usr/share/keyrings/confluent-clients.gpg] \
-       https://packages.confluent.io/clients/deb bookworm main" \
-       > /etc/apt/sources.list.d/confluent-clients.list \
+    && echo "deb [signed-by=/usr/share/keyrings/vendor.gpg] \
+       https://apt.vendor.example/deb trixie main" \
+       > /etc/apt/sources.list.d/vendor.list \
     && apt-get update && apt-get install -y --no-install-recommends \
-       librdkafka1 libssl3t64 zlib1g \
+       vendor-runtime libgit2-1.9 \
     && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 ```
@@ -159,8 +176,9 @@ package" in a build log.
 
 | Where | Needs |
 | ------- | ------- |
-| **Build host** (CI runner doing `cargo build`) | `-dev` packages: `librdkafka-dev`, `libgit2-dev`, `libzstd-dev`, `libssl-dev`, `zlib1g-dev` |
-| **Runtime host** (the container image) | `.so` runtimes: `librdkafka1`, `libzstd1`, `zlib1g`, plus the release-specific libgit2 / libssl from the table above (on trixie: `libgit2-1.9`, `libssl3t64`) |
+| **Release build** (CI runner doing `cargo build`) | the static prefix above, plus `libgit2-dev` for `directory-config-git` |
+| **Local dev build** | `librdkafka-dev` and `libgit2-dev` |
+| **Runtime host** (the container image) | the release-specific libgit2 from the table above for `directory-config-git` (on trixie: `libgit2-1.9`), nothing else |
 
 `NativeDepsContract` describes the **runtime** side only -- what ships
 in the image. hyperi-ci handles build-host packages separately by
@@ -174,26 +192,12 @@ scalo links glibc dynamically, so the rule is **glibc(runtime image)
 startup on an older one (`version 'GLIBC_x.yz' not found`). The default
 `base_image` is `debian:trixie-slim`, pinned by digest, and the CI builders run
 debian trixie too, so build and runtime glibc are identical -- it just works.
-`librdkafka1` always comes from the Confluent clients repo, on trixie as
-everywhere else. Confluent publishes no trixie suite, so trixie maps to the
-`bookworm` one, and its `librdkafka1` installs cleanly on trixie because the
-libssl / libsasl2 / zlib deps are satisfied by trixie's newer versions.
-
-The repo's signing key is PINNED. The generated build downloads the key, asserts
-its OpenPGP fingerprint with `gpg` and only then dearmors it into the keyring,
-so a compromised mirror or an intercepted TLS session cannot substitute its own
-key and have `signed-by` happily validate the resulting repo. If Confluent
-rotates the key the build fails loudly - re-derive the fingerprint and update
-`confluent_repo()` rather than removing the check.
-
-Pinning converts an every-build trust-on-first-use into a one-time one. It does
-not establish that the key was legitimate to begin with.
 
 That mapping is not taken on trust. `tier_a_dockerfile_with_native_deps_builds`
 (`tests/e2e/contract_artefacts.rs`) generates a Dockerfile for the default base
-with the kafka, spool, secrets and git features, BUILDS it, and then asserts
-inside the image that `librdkafka.so`, `libssl.so`, `libgit2.so` and
-`libzstd.so` are present. A package search would not prove this either way -
+with the kafka, spool, secrets and git features plus a real signed vendor repo,
+BUILDS it, and then asserts inside the image that the repo's package and
+`libgit2.so` are present. A package search would not prove this either way -
 Debian's package pages do not surface `Provides:`, so a package that resolves
 perfectly well can look absent. Only a build settles it.
 
@@ -208,13 +212,8 @@ host's (debian trixie):
 | distroless `cc-debian*` | no -- see below |
 
 Distroless is not a glibc problem: `cc-debian13` is trixie, so the glibc
-matches. It fails on the dependency closure. Our binaries need shared
-objects `cc-debian13` does not carry, and it has no apt to add them - on the
-build recorded in scalo-rs#7 the Confluent `librdkafka1` alone pulled
-`libcurl3t64-gnutls`, `libngtcp2-16` and `libngtcp2-crypto-gnutls8`. You
-would have to copy each `.so` in by hand and keep that list current as
-librdkafka's deps move, which is exactly the outage the contract exists to
-prevent.
+matches. It has no apt, so the contract cannot install a package into it, and
+the generator only builds `apt-get` images.
 
 musl images (alpine) are **not supported**: the native deps above
 (rdkafka, libgit2, openssl, `aws-lc-sys`) link glibc.
@@ -240,39 +239,6 @@ when the dependency is absent -- no panic, no surprise build break.
 
 ---
 
-## Empty by default
-
-`NativeDepsContract::default()` is empty. A contract that doesn't
-populate `native_deps` gives a production Dockerfile with
-`ca-certificates` alone. Apps opt in by populating the field, usually via
-`for_scalo_features()`.
-
-A pure-Rust-feature service shouldn't carry unused system libraries.
-Opt-in keeps the image lean.
-
----
-
-## Codename override
-
-For your own APT repo, set `AptRepoContract::codename` directly. Leave it
-empty and it is derived from the base image at generation time; set it and
-the generator uses your value as-is. This is the per-repo lever. For the
-auto-added Confluent repo, the operator-facing lever is
-`deployment.base_distro` in the cascade (above) - the derived suite is
-already filled in on that entry.
-
-```rust
-let repo = AptRepoContract {
-    key_url: "https://example.com/key.asc".into(),
-    keyring: "/usr/share/keyrings/example.gpg".into(),
-    url: "https://example.com/apt".into(),
-    codename: "trixie".into(),       // explicit, no derivation
-    packages: vec!["libexample0".into()],
-};
-```
-
----
-
 ## Validation
 
 No `validate_native_deps()` -- the generator is the source of truth.
@@ -295,7 +261,7 @@ drift-detection pattern.
 | `BaseDistro` | The distro release the package names target |
 | `base_distro_from_cascade()` / `resolve_base_distro(base)` | Cascade reader / full resolution |
 | `DEFAULT_BASE_DISTRO` | The assumed release when nothing answers (`trixie`) |
-| `AptRepoContract` | One custom APT repo (`key_url`, `keyring`, `url`, `codename`, `packages`) |
+| `AptRepoContract` | One custom APT repo (`key_url`, `keyring`, `url`, `codename`, `key_fingerprint`, `packages`) |
 
 ---
 

@@ -303,11 +303,11 @@ fn tier_a_dockerfile_builds_and_image_runs() {
 /// The apt block is the part that can be wrong in a way only a build catches.
 ///
 /// The fixture above deliberately carries no native deps, so it never installs
-/// anything. This one uses the real default base and a real feature set, which
-/// makes the build resolve every generated package name for that release --
-/// the Confluent repo import, the trixie-to-bookworm suite mapping, and the
-/// release-specific `libssl3t64` / `libgit2-1.9`. A package search is not proof
-/// a package exists (it does not surface `Provides:`); a build is.
+/// anything. This one uses the real default base, the release-specific
+/// `libgit2-1.9` and a real signed vendor repo (Confluent's clients repo, which
+/// has no trixie suite), so the build checks the key fingerprint, the
+/// `signed-by` line and every package name. A package search is not proof a
+/// package exists (it does not surface `Provides:`). A build is.
 #[test]
 fn tier_a_dockerfile_with_native_deps_builds() {
     if !docker_available() {
@@ -330,6 +330,17 @@ fn tier_a_dockerfile_with_native_deps_builds() {
         ],
         scalo::deployment::DEFAULT_BASE_DISTRO,
     );
+    contract
+        .native_deps
+        .apt_repos
+        .push(scalo::deployment::AptRepoContract {
+            key_url: "https://packages.confluent.io/clients/deb/archive.key".into(),
+            keyring: "/usr/share/keyrings/confluent-clients.gpg".into(),
+            url: "https://packages.confluent.io/clients/deb".into(),
+            codename: "bookworm".into(),
+            key_fingerprint: "CBBB821E8FAF364F79835C438B1DA6120C2BF624".into(),
+            packages: vec!["librdkafka1".into()],
+        });
     // A failure here means a generated package name does not resolve on this
     // release -- the assertion inside `build` prints the apt output.
     let image = BuiltImage::build(&contract, None, "deps");
@@ -344,7 +355,7 @@ fn tier_a_dockerfile_with_native_deps_builds() {
             "/bin/sh",
             &image.tag,
             "-c",
-            "ldconfig -p | grep -E 'librdkafka|libssl|libgit2|libzstd'",
+            "ldconfig -p | grep -E 'librdkafka|libgit2'",
         ])
         .output()
         .expect("docker run invocation");
@@ -354,7 +365,7 @@ fn tier_a_dockerfile_with_native_deps_builds() {
         "could not list shared objects in the image: stderr={}",
         String::from_utf8_lossy(&run.stderr),
     );
-    for so in ["librdkafka.so", "libssl.so", "libgit2.so", "libzstd.so"] {
+    for so in ["librdkafka.so", "libgit2.so"] {
         assert!(
             listed.contains(so),
             "{so} missing from the runtime image -- the package installed but the \
@@ -386,7 +397,7 @@ fn tier_a_generated_dockerfiles_lint_clean() {
     let mut contract = test_contract();
     contract.base_image = scalo::deployment::DEFAULT_BASE_IMAGE.to_string();
     contract.native_deps = scalo::deployment::NativeDepsContract::for_features(
-        &["transport-kafka", "spool"],
+        &["directory-config-git"],
         scalo::deployment::DEFAULT_BASE_DISTRO,
     );
 
