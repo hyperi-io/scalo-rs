@@ -1038,6 +1038,14 @@ mod engine_tests {
     #[test]
     fn a_pre_route_filter_reads_its_own_field() {
         use config::PreRouteFilterConfig as F;
+        // name, routing_field, filters, payload, (results, filtered, dlq)
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            Vec<F>,
+            &'static str,
+            (usize, u64, u64),
+        );
         let drop_no_host = || F::DropFieldMissing {
             field: "host".to_string(),
         };
@@ -1045,8 +1053,7 @@ mod engine_tests {
             field: "status".to_string(),
             value: "bad".to_string(),
         };
-        // name, routing_field, filters, payload, (results, filtered, dlq)
-        let cases: Vec<(&str, Option<&str>, Vec<F>, &str, (usize, u64, u64))> = vec![
+        let cases: Vec<Case> = vec![
             (
                 "drop: filter field absent, routing field present",
                 Some("_table"),
