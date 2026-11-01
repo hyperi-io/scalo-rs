@@ -227,10 +227,10 @@ deployment = ["yaml", "serde_json"]
 # generated Dockerfile. Requires Docker daemon at test time. Opt-in.
 deployment-smoke = ["deployment"]
 
-# Public reusable test helpers (probes, skip emitter, kind cluster guard) used
-# by scalo's own e2e tests AND by downstream consumers writing their own
-# contract-artefact e2e tests. See src/deployment/test_support.rs.
-deployment-test-support = ["deployment"]
+# Public reusable test helpers (probes, skip emitter, kind cluster guard, the
+# shared backing-service owner) used by scalo's own tests AND by downstream
+# consumers' suites. See src/deployment/test_support.rs.
+deployment-test-support = ["deployment", "dotenvy", "dep:tempfile"]
 
 # Real-broker tests against testcontainers. Needs a Docker daemon at test time;
 # CI's Test job builds with every feature, so it runs them.
@@ -274,7 +274,7 @@ transport-kafka = ["transport-kafka-config", "rdkafka", "regex", "tokio-util"]
 # Kafka test fixtures for consumer suites (`scalo::transport::kafka::test_support`):
 # the pinned broker image and a TLS / mTLS / SASL_SSL broker driven through the
 # docker CLI. Needs a Docker daemon at test time. Opt-in, for dev-dependencies.
-transport-kafka-test-support = ["transport-kafka", "dep:tempfile", "tokio/process"]
+transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
 transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util"]
 transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]

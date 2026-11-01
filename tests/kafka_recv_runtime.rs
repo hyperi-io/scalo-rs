@@ -26,7 +26,9 @@
 //! cargo nextest run --features transport-kafka,transport-kafka-test-support --test kafka_recv_runtime --no-capture
 //! ```
 
-#![cfg(feature = "transport-kafka-test-support")]
+#![cfg(all(feature = "transport-kafka-test-support", unix))]
+
+mod common;
 
 use std::io::Read as _;
 use std::sync::Arc;
@@ -36,19 +38,15 @@ use std::time::{Duration, Instant};
 use rdkafka::ClientConfig;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
+use scalo::transport::kafka::test_support::require_docker;
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::{TransportBase, TransportReceiver};
-use testcontainers_modules::kafka::apache::{self, Kafka};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+
+use common::kafka::shared_bootstrap;
 use tokio::io::AsyncWriteExt as _;
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-
-/// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
-const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// How long the watched runtime gets to answer each probe.
 const ANSWER_WITHIN: Duration = Duration::from_secs(3);
@@ -61,24 +59,8 @@ const PAD: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
                    0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
                    0123456789abcdef0123456789abcdef";
 
-/// Start a single-node KRaft broker and return it plus its bootstrap address.
-async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
-    let node = Kafka::default()
-        .with_jvm_image()
-        .with_tag(kafka_tag())
-        .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
-        .start()
-        .await
-        .expect("start kafka container");
-    let port = node
-        .get_host_port_ipv4(apache::KAFKA_PORT)
-        .await
-        .expect("kafka host port");
-    (node, format!("127.0.0.1:{port}"))
-}
-
 /// Create a one-partition topic and wait until the broker's metadata lists it.
-async fn create_topic(bootstrap: &str, topic: &'static str) {
+async fn create_topic(bootstrap: &str, topic: &str) {
     let admin = KafkaAdmin::new(&KafkaConfig {
         brokers: vec![bootstrap.to_string()],
         group: String::new(),
@@ -89,12 +71,13 @@ async fn create_topic(bootstrap: &str, topic: &'static str) {
         .create_topics(&[(topic, 1, 1)])
         .await
         .expect("create topic");
+    let topic = topic.to_string();
     // A consumer that subscribes before the metadata lists the topic is told it
     // does not exist.
     tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + Duration::from_secs(30);
         while admin
-            .describe_topic(topic)
+            .describe_topic(&topic)
             .map_or(true, |t| t.partition_count == 0)
         {
             assert!(
@@ -313,9 +296,10 @@ fn assert_answered(answered: Answered, runtime: &str) -> Answered {
 
 /// The archiver's case: an idle consumer group, where every poll comes back empty.
 async fn idle_loop_leaves_the_runtime_free(runtime: Runtime, label: &str, group: &str) {
-    let (_node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, "idle").await;
-    let transport = consumer(&bootstrap, "idle", group).await;
+    let bootstrap = shared_bootstrap().await;
+    let topic = common::unique("idle");
+    create_topic(&bootstrap, &topic).await;
+    let transport = consumer(&bootstrap, &topic, &common::unique(group)).await;
 
     let answered = tokio::task::spawn_blocking(move || {
         probe_beside_recv_loop(runtime, transport, 100, Duration::from_millis(100), false)
@@ -362,10 +346,11 @@ async fn a_busy_recv_loop_leaves_the_runtime_free() {
         return;
     }
     const RECORDS: usize = 400_000;
-    let (_node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, "busy").await;
-    fill(&bootstrap, "busy", RECORDS).await;
-    let transport = consumer(&bootstrap, "busy", "busy").await;
+    let bootstrap = shared_bootstrap().await;
+    let topic = common::unique("busy");
+    create_topic(&bootstrap, &topic).await;
+    fill(&bootstrap, &topic, RECORDS).await;
+    let transport = consumer(&bootstrap, &topic, &topic).await;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -396,10 +381,11 @@ async fn a_recv_dropped_mid_poll_loses_no_record() {
         return;
     }
     const RECORDS: usize = 50_000;
-    let (_node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, "dropped").await;
-    fill(&bootstrap, "dropped", RECORDS).await;
-    let transport = consumer(&bootstrap, "dropped", "dropped").await;
+    let bootstrap = shared_bootstrap().await;
+    let topic = common::unique("dropped");
+    create_topic(&bootstrap, &topic).await;
+    fill(&bootstrap, &topic, RECORDS).await;
+    let transport = consumer(&bootstrap, &topic, &topic).await;
 
     let mut times_seen = vec![0_u32; RECORDS];
     let mut received = 0_usize;
@@ -459,17 +445,18 @@ async fn recv_throughput_on_a_filled_topic() {
         return;
     }
     const RECORDS: usize = 500_000;
-    let (_node, bootstrap) = start_kafka().await;
-    create_topic(&bootstrap, "throughput").await;
+    let bootstrap = shared_bootstrap().await;
+    let topic = common::unique("throughput");
+    create_topic(&bootstrap, &topic).await;
     let filled = Instant::now();
-    fill(&bootstrap, "throughput", RECORDS).await;
+    fill(&bootstrap, &topic, RECORDS).await;
     eprintln!("filled {RECORDS} records in {:?}", filled.elapsed());
 
     for max in [100_usize, 2_000, 10_000] {
         let config = KafkaConfig {
             brokers: vec![bootstrap.clone()],
-            group: format!("throughput-{max}"),
-            topics: vec!["throughput".to_string()],
+            group: format!("{topic}-{max}"),
+            topics: vec![topic.clone()],
             ..Default::default()
         }
         .with_overrides(&[

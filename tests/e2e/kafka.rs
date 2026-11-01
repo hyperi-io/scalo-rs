@@ -723,10 +723,11 @@ async fn test_kafka_consumer_lag() {
     }
 }
 
-/// A real broker in a container, for the tests below.
+/// The run's shared broker, or one a test holds alone, for the tests below.
 ///
 /// Built with the `testcontainers` feature, which CI's Test job enables. A
-/// test skips when no Docker daemon answers, and fails instead in CI.
+/// test skips when no Docker daemon answers, and fails instead in CI. Each
+/// test keeps to topics and consumer groups of its own.
 #[cfg(feature = "testcontainers")]
 mod broker {
     use std::ops::Range;
@@ -744,34 +745,37 @@ mod broker {
         all(feature = "governor", feature = "metrics")
     ))]
     use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
-    use scalo::transport::kafka::test_support::kafka_tag;
+    use scalo::deployment::test_support::shared_service::{self, OwnedContainer};
+    use scalo::transport::kafka::test_support::{KAFKA_PORT, kafka_spec, shared_kafka};
     use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
-    use testcontainers_modules::kafka::apache::{self, Kafka};
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
-    /// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
-    const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+    use crate::common::SUITE;
 
-    /// Container starts to try: on a busy CI runner a broker started alongside
-    /// others can exit before it logs that it is ready.
-    const START_ATTEMPTS: u32 = 3;
-
-    /// Start a broker and return it with its bootstrap address, or `None` when
-    /// no Docker daemon answers outside CI. In CI that fails the test.
-    pub(super) async fn start_kafka() -> Option<(ContainerAsync<Kafka>, String)> {
-        let node = start_node(None).await?;
-        let port = node
-            .get_host_port_ipv4(apache::KAFKA_PORT)
-            .await
-            .expect("kafka host port");
-        Some((node, format!("127.0.0.1:{port}")))
+    /// The run's shared broker's bootstrap address, or `None` when no Docker
+    /// daemon answers outside CI. In CI that fails the test. The unit value
+    /// stands where a container guard stood: the run owns the broker.
+    pub(super) async fn start_kafka() -> Option<((), String)> {
+        if !crate::common::docker_answers() {
+            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
+            return None;
+        }
+        Some(((), shared_kafka(SUITE).await.addr(KAFKA_PORT)))
     }
 
-    /// Start a broker on host `port`, for a client given the address before
-    /// the broker existed. `None` as for [`start_kafka`].
-    pub(super) async fn start_kafka_on(port: u16) -> Option<ContainerAsync<Kafka>> {
-        start_node(Some(port)).await
+    /// Start a broker only `test` uses on host `port`, for a client given the
+    /// address before the broker existed. `None` as for [`start_kafka`].
+    pub(super) async fn start_kafka_on(test: &str, port: u16) -> Option<OwnedContainer> {
+        if !crate::common::docker_answers() {
+            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
+            return None;
+        }
+        let name = shared_service::container_name(&SUITE, Some(test), "kafka");
+        let node = tokio::task::spawn_blocking(move || {
+            shared_service::start_alone(&SUITE, &kafka_spec(Some(port)), &name)
+        })
+        .await
+        .expect("start a broker of the test's own");
+        Some(node)
     }
 
     /// A free loopback port, which refuses connections until a broker takes it.
@@ -780,32 +784,6 @@ mod broker {
             .and_then(|l| l.local_addr())
             .expect("bind an ephemeral port")
             .port()
-    }
-
-    async fn start_node(port: Option<u16>) -> Option<ContainerAsync<Kafka>> {
-        if !crate::common::docker_answers() {
-            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
-            return None;
-        }
-        let mut attempt = 1;
-        loop {
-            let request = Kafka::default()
-                .with_jvm_image()
-                .with_tag(kafka_tag())
-                .with_startup_timeout(KAFKA_STARTUP_TIMEOUT);
-            let request = match port {
-                Some(port) => request.with_mapped_port(port, apache::KAFKA_PORT),
-                None => request,
-            };
-            match request.start().await {
-                Ok(node) => return Some(node),
-                Err(e) if attempt < START_ATTEMPTS => {
-                    eprintln!("kafka container attempt {attempt} did not start: {e}");
-                    attempt += 1;
-                }
-                Err(e) => panic!("start kafka container: {e}"),
-            }
-        }
     }
 
     /// Create a one-partition `topic` and wait for its metadata.
@@ -2217,7 +2195,7 @@ mod broker_down_at_start {
         let batch = consumer.recv(100).await.expect("recv with no broker");
         assert!(batch.records.is_empty(), "no broker, so no records");
 
-        let Some(_node) = start_kafka_on(port).await else {
+        let Some(_node) = start_kafka_on(scalo::test_name!(), port).await else {
             return;
         };
         create_topic(&bootstrap, TOPIC).await;

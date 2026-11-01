@@ -6,7 +6,8 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Real-broker tests for `KafkaTransport::send_batch` against a Kafka container.
+//! Real-broker tests for `KafkaTransport::send_batch` against the run's shared
+//! Kafka broker, each on topics of its own.
 //!
 //! NO mocks: scalo's own transport produces, and a raw rdkafka consumer grades
 //! what landed, so scalo's read path never marks scalo's writes. The per-record
@@ -21,7 +22,9 @@
 //! cargo nextest run --features transport-kafka,transport-kafka-test-support --test kafka_send_batch --no-capture
 //! ```
 
-#![cfg(feature = "transport-kafka-test-support")]
+#![cfg(all(feature = "transport-kafka-test-support", unix))]
+
+mod common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,39 +34,19 @@ use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message as _;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
-use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
+use scalo::transport::kafka::test_support::require_docker;
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::{
     PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportResult, TransportSender,
 };
-use testcontainers_modules::kafka::apache::{self, Kafka};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
-/// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
-const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+use common::kafka::shared_bootstrap;
 
 /// Block size: the order of a real transform batch.
 const RECORDS: usize = 2_000;
 
 /// Partitions per test topic, so the block spreads over more than one.
 const PARTITIONS: i32 = 3;
-
-/// Start a single-node KRaft broker and return it plus its bootstrap address.
-async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
-    let node = Kafka::default()
-        .with_jvm_image()
-        .with_tag(kafka_tag())
-        .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
-        .start()
-        .await
-        .expect("start kafka container");
-    let port = node
-        .get_host_port_ipv4(apache::KAFKA_PORT)
-        .await
-        .expect("kafka host port");
-    (node, format!("127.0.0.1:{port}"))
-}
 
 /// A producer-only transport config: an empty group subscribes to nothing.
 fn producer_config(bootstrap: &str) -> KafkaConfig {
@@ -187,8 +170,17 @@ async fn send_batch_pipelines_the_block_and_lands_each_record_once() {
     if !require_docker() {
         return;
     }
-    let (_node, bootstrap) = start_kafka().await;
-    let (warm, per_record_topic, batch_topic) = ("warm", "per-record", "batch");
+    let bootstrap = shared_bootstrap().await;
+    let (warm, per_record_topic, batch_topic) = (
+        common::unique("warm"),
+        common::unique("per-record"),
+        common::unique("batch"),
+    );
+    let (warm, per_record_topic, batch_topic) = (
+        warm.as_str(),
+        per_record_topic.as_str(),
+        batch_topic.as_str(),
+    );
     create_topics(&bootstrap, &[warm, per_record_topic, batch_topic]).await;
 
     let transport = KafkaTransport::new(&producer_config(&bootstrap))
@@ -266,8 +258,9 @@ async fn send_batch_fails_a_partly_delivered_block() {
     if !require_docker() {
         return;
     }
-    let (_node, bootstrap) = start_kafka().await;
-    let good_topic = "partial-good";
+    let bootstrap = shared_bootstrap().await;
+    let good_topic = common::unique("partial-good");
+    let good_topic = good_topic.as_str();
     create_topics(&bootstrap, &[good_topic]).await;
     // Space and '!' are outside Kafka's topic-name alphabet.
     let bad_topic: Arc<str> = Arc::from("partial bad!");

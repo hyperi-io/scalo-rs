@@ -19,7 +19,7 @@
 //! cargo nextest run --features dlq-kafka,transport-kafka-test-support --test dlq_kafka_durable --no-capture
 //! ```
 
-#![cfg(all(feature = "dlq-kafka", feature = "transport-kafka-test-support"))]
+#![cfg(all(feature = "dlq-kafka", feature = "transport-kafka-test-support", unix))]
 
 mod common;
 
@@ -38,15 +38,10 @@ use scalo::dlq::{
     Dlq, DlqConfig, DlqEntry, DlqError, DlqMode, DlqRouting, FileDlqConfig, KafkaDlqConfig,
     RotationPeriod,
 };
-use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
+use scalo::test_name;
+use scalo::transport::kafka::test_support::require_docker;
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig};
-use testcontainers_modules::kafka::apache::{self, Kafka};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tokio_util::sync::CancellationToken;
-
-/// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
-const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// An ack wait long enough to outlast a paused broker, or one restarting.
 const LONG_ACK_WAIT: Duration = Duration::from_secs(30);
@@ -72,30 +67,22 @@ const OVER_BROKER_LIMIT: usize = 600_000;
 /// Entries sent per phase.
 const ENTRIES: usize = 5;
 
-/// A free loopback port for the broker to keep across a restart.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("bind an ephemeral port")
-        .port()
+/// The run's shared broker, warmed up, and its bootstrap address.
+async fn shared_broker() -> String {
+    let bootstrap = common::kafka::shared_bootstrap().await;
+    warm_up(&bootstrap).await;
+    bootstrap
 }
 
-/// Start a single-node KRaft broker on a fixed host port and return it plus
-/// its bootstrap address.
-///
-/// The port is fixed because Docker hands a restarted container a new
-/// ephemeral port, and the broker advertises the one it started with.
-async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
-    let port = free_port();
-    let node = Kafka::default()
-        .with_jvm_image()
-        .with_tag(kafka_tag())
-        .with_mapped_port(port, apache::KAFKA_PORT)
-        .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
-        .start()
-        .await
-        .expect("start kafka container");
-    let bootstrap = format!("127.0.0.1:{port}");
+/// A broker only `test` uses, because the test pauses or stops it, warmed
+/// up, and its bootstrap address.
+async fn own_broker(
+    test: &str,
+) -> (
+    scalo::deployment::test_support::shared_service::OwnedContainer,
+    String,
+) {
+    let (node, bootstrap) = common::kafka::broker_alone(test).await;
     warm_up(&bootstrap).await;
     (node, bootstrap)
 }
@@ -326,7 +313,7 @@ async fn a_flush_returns_only_after_the_broker_acks() {
         return;
     }
     let topic = "dlq.acked";
-    let (node, bootstrap) = start_kafka().await;
+    let (node, bootstrap) = own_broker(test_name!()).await;
     create_warm_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &long_ack_wait(dlq_config(DlqMode::KafkaOnly, topic, None)),
@@ -336,7 +323,7 @@ async fn a_flush_returns_only_after_the_broker_acks() {
     send_all(&dlq, "warm", 1).await;
     dlq.flush().await.expect("warm-up flush");
 
-    node.pause().await.expect("pause the broker");
+    common::kafka::pause(&node).await;
     send_all(&dlq, "acked", ENTRIES).await;
     let flusher = {
         let dlq = dlq.clone();
@@ -344,7 +331,7 @@ async fn a_flush_returns_only_after_the_broker_acks() {
     };
     tokio::time::sleep(Duration::from_secs(3)).await;
     let waited = !flusher.is_finished();
-    node.unpause().await.expect("unpause the broker");
+    common::kafka::unpause(&node).await;
     assert!(
         waited,
         "flush returned while the paused broker could not have acked anything"
@@ -374,7 +361,7 @@ async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss
         return;
     }
     let topic = "dlq.down";
-    let (node, bootstrap) = start_kafka().await;
+    let (node, bootstrap) = own_broker(test_name!()).await;
     create_warm_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &long_ack_wait(dlq_config(DlqMode::KafkaOnly, topic, None)),
@@ -383,9 +370,7 @@ async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss
     send_all(&dlq, "warm", 1).await;
     dlq.flush().await.expect("warm-up flush");
 
-    node.stop_with_timeout(Some(0))
-        .await
-        .expect("stop the broker");
+    common::kafka::stop(&node).await;
     send_all(&dlq, "lost", ENTRIES).await;
     let started = Instant::now();
     let result = dlq.flush().await;
@@ -401,7 +386,7 @@ async fn a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss
     );
     assert_eq!(dlq.dropped(), ENTRIES as u64, "every unacked entry counted");
 
-    (*node).start().await.expect("restart the broker");
+    common::kafka::restart(&node).await;
     broker_takes_a_record(&bootstrap).await;
     send_all(&dlq, "after", ENTRIES).await;
     dlq.flush()
@@ -431,7 +416,7 @@ async fn the_runtime_keeps_running_while_a_flush_waits_on_kafka() {
         return;
     }
     let topic = "dlq.runtime";
-    let (node, bootstrap) = start_kafka().await;
+    let (node, bootstrap) = own_broker(test_name!()).await;
     create_warm_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &dlq_config(DlqMode::KafkaOnly, topic, None),
@@ -440,9 +425,7 @@ async fn the_runtime_keeps_running_while_a_flush_waits_on_kafka() {
     send_all(&dlq, "warm", 1).await;
     dlq.flush().await.expect("warm-up flush");
 
-    node.stop_with_timeout(Some(0))
-        .await
-        .expect("stop the broker");
+    common::kafka::stop(&node).await;
     send_all(&dlq, "stalled", ENTRIES).await;
 
     let ticks = Arc::new(AtomicU64::new(0));
@@ -484,8 +467,9 @@ async fn an_oversize_payload_lands_truncated() {
     if !require_docker() {
         return;
     }
-    let topic = "dlq.truncated";
-    let (_node, bootstrap) = start_kafka().await;
+    let topic = common::unique("dlq.truncated");
+    let topic = topic.as_str();
+    let bootstrap = shared_broker().await;
     create_small_topic(&bootstrap, topic).await;
     let cap = 100_000;
     let dlq = spawn_dlq(
@@ -501,9 +485,11 @@ async fn an_oversize_payload_lands_truncated() {
     assert_eq!(dlq.dropped(), 0);
 
     let bootstrap_for_read = bootstrap.clone();
-    let entries = tokio::task::spawn_blocking(move || read_entries(&bootstrap_for_read, topic))
-        .await
-        .expect("verify task");
+    let topic_for_read = topic.to_string();
+    let entries =
+        tokio::task::spawn_blocking(move || read_entries(&bootstrap_for_read, &topic_for_read))
+            .await
+            .expect("verify task");
     let [entry] = entries.as_slice() else {
         panic!("one entry on {topic}, got {}", entries.len());
     };
@@ -525,8 +511,9 @@ async fn a_delivery_the_broker_refuses_fails_the_flush_and_is_counted_once() {
     if !require_docker() {
         return;
     }
-    let topic = "dlq.refused";
-    let (_node, bootstrap) = start_kafka().await;
+    let topic = common::unique("dlq.refused");
+    let topic = topic.as_str();
+    let bootstrap = shared_broker().await;
     create_small_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &dlq_config(DlqMode::KafkaOnly, topic, None),
@@ -572,8 +559,9 @@ async fn fan_out_counts_a_kafka_loss_only_where_no_other_backend_holds_the_entry
     if !require_docker() {
         return;
     }
-    let topic = "dlq.fanout";
-    let (_node, bootstrap) = start_kafka().await;
+    let topic = common::unique("dlq.fanout");
+    let topic = topic.as_str();
+    let bootstrap = shared_broker().await;
     create_small_topic(&bootstrap, topic).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let dlq = spawn_dlq(
@@ -613,8 +601,9 @@ async fn cascade_hands_the_next_backend_only_what_kafka_refused() {
     if !require_docker() {
         return;
     }
-    let topic = "dlq.cascade";
-    let (_node, bootstrap) = start_kafka().await;
+    let topic = common::unique("dlq.cascade");
+    let topic = topic.as_str();
+    let bootstrap = shared_broker().await;
     create_topic(&bootstrap, topic).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let mut kafka = kafka_config(&bootstrap);
@@ -647,8 +636,9 @@ async fn shutdown_without_a_flush_delivers_what_the_producer_held() {
     if !require_docker() {
         return;
     }
-    let topic = "dlq.shutdown.healthy";
-    let (_node, bootstrap) = start_kafka().await;
+    let topic = common::unique("dlq.shutdown.healthy");
+    let topic = topic.as_str();
+    let bootstrap = shared_broker().await;
     create_topic(&bootstrap, topic).await;
     let mut kafka = kafka_config(&bootstrap);
     kafka
@@ -676,7 +666,7 @@ async fn shutdown_without_a_flush_counts_what_a_stopped_broker_never_acked() {
         return;
     }
     let topic = "dlq.shutdown.down";
-    let (node, bootstrap) = start_kafka().await;
+    let (node, bootstrap) = own_broker(test_name!()).await;
     create_warm_topic(&bootstrap, topic).await;
     let dlq = spawn_dlq(
         &dlq_config(DlqMode::KafkaOnly, topic, None),
@@ -685,9 +675,7 @@ async fn shutdown_without_a_flush_counts_what_a_stopped_broker_never_acked() {
     send_all(&dlq, "warm", 1).await;
     dlq.flush().await.expect("warm-up flush");
 
-    node.stop_with_timeout(Some(0))
-        .await
-        .expect("stop the broker");
+    common::kafka::stop(&node).await;
     send_all(&dlq, "lost", ENTRIES).await;
     let started = Instant::now();
     dlq.shutdown().await.expect("shutdown");
@@ -710,7 +698,7 @@ async fn the_configured_send_timeout_bounds_the_flush() {
     }
     const SEND_TIMEOUT: Duration = Duration::from_secs(15);
     let topic = "dlq.timeout";
-    let (node, bootstrap) = start_kafka().await;
+    let (node, bootstrap) = own_broker(test_name!()).await;
     create_warm_topic(&bootstrap, topic).await;
     let mut config = dlq_config(DlqMode::KafkaOnly, topic, None);
     config.kafka.send_timeout_ms = u64::try_from(SEND_TIMEOUT.as_millis()).expect("fits");
@@ -718,9 +706,7 @@ async fn the_configured_send_timeout_bounds_the_flush() {
     send_all(&dlq, "warm", 1).await;
     dlq.flush().await.expect("warm-up flush");
 
-    node.stop_with_timeout(Some(0))
-        .await
-        .expect("stop the broker");
+    common::kafka::stop(&node).await;
     send_all(&dlq, "lost", ENTRIES).await;
     let started = Instant::now();
     let result = dlq.flush().await;

@@ -54,7 +54,7 @@ mod admin;
 mod classify;
 mod metrics;
 mod producer;
-#[cfg(feature = "transport-kafka-test-support")]
+#[cfg(all(feature = "transport-kafka-test-support", unix))]
 pub mod test_support;
 pub mod topic_resolver;
 mod types;

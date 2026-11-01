@@ -11,8 +11,9 @@
 //! `docs/api/secrets.md` documents.
 //!
 //! A file source carries no version, so rotation is exercised against OpenBao
-//! (KV v2), which numbers every write. The OpenBao tests skip when Docker is
-//! absent, and fail instead of skipping under CI.
+//! (KV v2), which numbers every write: the run's shared server, each test under
+//! a path of its own. The OpenBao tests skip when Docker is absent, and fail
+//! instead of skipping under CI.
 
 #![cfg(feature = "secrets")]
 
@@ -156,7 +157,7 @@ async fn caching_on_serves_the_stale_value_on_a_provider_failure() {
     assert_eq!(read(&manager).await, "first");
 }
 
-#[cfg(feature = "secrets-vault")]
+#[cfg(all(feature = "secrets-vault", feature = "deployment-test-support", unix))]
 mod openbao {
     use scalo::secrets::{
         CacheConfig, OpenBaoConfig, RotationEvent, SecretSource, SecretsConfig, SecretsManager,
@@ -165,20 +166,19 @@ mod openbao {
     use tokio::sync::broadcast::Receiver;
     use tokio::sync::broadcast::error::TryRecvError;
 
-    use super::common::openbao::{ROOT_TOKEN, put_secret, start_openbao};
+    use super::common::openbao::{ROOT_TOKEN, kv_path, put_secret, start_openbao};
     use super::{NAME, caching, no_caching, read};
 
-    const PATH: &str = "app/creds";
     const KEY: &str = "api-key";
 
-    fn manager(address: &str, cache: CacheConfig) -> SecretsManager {
+    fn manager(address: &str, path: &str, cache: CacheConfig) -> SecretsManager {
         let config = SecretsConfig {
             cache,
             openbao: Some(OpenBaoConfig::with_token(address, ROOT_TOKEN)),
             sources: [(
                 NAME.to_string(),
                 SecretSource::OpenBao {
-                    path: format!("secret/data/{PATH}"),
+                    path: format!("secret/data/{path}"),
                     key: KEY.to_string(),
                 },
             )]
@@ -210,13 +210,14 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
-        let manager = manager(&address, no_caching());
+        let path = kv_path(scalo::test_name!());
+        let manager = manager(&address, &path, no_caching());
 
-        put_secret(&address, PATH, KEY, "first").await;
+        put_secret(&address, &path, KEY, "first").await;
         let first = manager.get(NAME).await.expect("get v1");
         assert_eq!(first.metadata.version.as_deref(), Some("1"));
 
-        put_secret(&address, PATH, KEY, "second").await;
+        put_secret(&address, &path, KEY, "second").await;
         let second = manager.get(NAME).await.expect("get v2");
         assert_eq!(second.as_str().unwrap(), "second");
         assert_eq!(second.metadata.version.as_deref(), Some("2"));
@@ -227,12 +228,13 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
+        let path = kv_path(scalo::test_name!());
         let cache = TempDir::new().unwrap();
-        let manager = manager(&address, caching(cache.path(), 3600));
-        put_secret(&address, PATH, KEY, "first").await;
+        let manager = manager(&address, &path, caching(cache.path(), 3600));
+        put_secret(&address, &path, KEY, "first").await;
         assert_eq!(read(&manager).await, "first");
 
-        put_secret(&address, PATH, KEY, "second").await;
+        put_secret(&address, &path, KEY, "second").await;
         manager.refresh_all().await.expect("refresh");
 
         assert_eq!(
@@ -249,13 +251,14 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
+        let path = kv_path(scalo::test_name!());
         let cache = TempDir::new().unwrap();
-        let manager = manager(&address, caching(cache.path(), 3600));
-        put_secret(&address, PATH, KEY, "first").await;
+        let manager = manager(&address, &path, caching(cache.path(), 3600));
+        put_secret(&address, &path, KEY, "first").await;
         read(&manager).await;
         let mut rx = manager.subscribe_rotations();
 
-        put_secret(&address, PATH, KEY, "second").await;
+        put_secret(&address, &path, KEY, "second").await;
         manager.refresh_all().await.expect("first refresh");
         assert_rotated(&mut rx, "1", "2");
         assert_no_event(&mut rx, "the rotation event");
@@ -269,9 +272,10 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
+        let path = kv_path(scalo::test_name!());
         let cache = TempDir::new().unwrap();
-        let manager = manager(&address, caching(cache.path(), 3600));
-        put_secret(&address, PATH, KEY, "first").await;
+        let manager = manager(&address, &path, caching(cache.path(), 3600));
+        put_secret(&address, &path, KEY, "first").await;
         read(&manager).await;
         let mut rx = manager.subscribe_rotations();
 
@@ -286,9 +290,10 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
+        let path = kv_path(scalo::test_name!());
         let cache = TempDir::new().unwrap();
-        let manager = manager(&address, caching(cache.path(), 0));
-        put_secret(&address, PATH, KEY, "first").await;
+        let manager = manager(&address, &path, caching(cache.path(), 0));
+        put_secret(&address, &path, KEY, "first").await;
         read(&manager).await;
         let mut rx = manager.subscribe_rotations();
 
@@ -301,13 +306,14 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
+        let path = kv_path(scalo::test_name!());
         let cache = TempDir::new().unwrap();
-        let manager = manager(&address, caching(cache.path(), 0));
-        put_secret(&address, PATH, KEY, "first").await;
+        let manager = manager(&address, &path, caching(cache.path(), 0));
+        put_secret(&address, &path, KEY, "first").await;
         read(&manager).await;
         let mut rx = manager.subscribe_rotations();
 
-        put_secret(&address, PATH, KEY, "second").await;
+        put_secret(&address, &path, KEY, "second").await;
         manager.refresh_all().await.expect("refresh");
         assert_rotated(&mut rx, "1", "2");
     }
@@ -319,13 +325,14 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
+        let path = kv_path(scalo::test_name!());
         let cache = TempDir::new().unwrap();
-        let manager = manager(&address, caching(cache.path(), 0));
-        put_secret(&address, PATH, KEY, "first").await;
+        let manager = manager(&address, &path, caching(cache.path(), 0));
+        put_secret(&address, &path, KEY, "first").await;
         read(&manager).await;
         let mut rx = manager.subscribe_rotations();
 
-        put_secret(&address, PATH, KEY, "second").await;
+        put_secret(&address, &path, KEY, "second").await;
         assert_eq!(read(&manager).await, "second");
         assert_rotated(&mut rx, "1", "2");
 
@@ -342,13 +349,14 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
+        let path = kv_path(scalo::test_name!());
         let cache = TempDir::new().unwrap();
-        let manager = manager(&address, caching(cache.path(), 3600));
-        put_secret(&address, PATH, KEY, "first").await;
+        let manager = manager(&address, &path, caching(cache.path(), 3600));
+        put_secret(&address, &path, KEY, "first").await;
         read(&manager).await;
         let mut rx = manager.subscribe_rotations();
 
-        put_secret(&address, PATH, KEY, "second").await;
+        put_secret(&address, &path, KEY, "second").await;
         assert_eq!(read(&manager).await, "first");
         assert_no_event(&mut rx, "a fresh cache hit");
     }
@@ -360,15 +368,16 @@ mod openbao {
         let Some((_container, address)) = start_openbao().await else {
             return;
         };
-        let manager = manager(&address, no_caching());
-        put_secret(&address, PATH, KEY, "first").await;
+        let path = kv_path(scalo::test_name!());
+        let manager = manager(&address, &path, no_caching());
+        put_secret(&address, &path, KEY, "first").await;
         read(&manager).await;
         let mut rx = manager.subscribe_rotations();
 
         manager.refresh_all().await.expect("first refresh");
         assert_no_event(&mut rx, "a refresh with caching off");
 
-        put_secret(&address, PATH, KEY, "second").await;
+        put_secret(&address, &path, KEY, "second").await;
         manager.refresh_all().await.expect("second refresh");
         assert_no_event(&mut rx, "a refresh of a changed secret with caching off");
     }

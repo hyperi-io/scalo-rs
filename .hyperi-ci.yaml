@@ -48,6 +48,10 @@ test:
     # Every feature, `testcontainers` included, so the real-broker tests run on
     # the Test job's Docker-capable runner.
     features: all
+  # A release runs the full tier: every real-broker and OpenBao test and the
+  # docker builds. tests/TESTING.md says which tests are which.
+  full:
+    required_for_release: true
 build:
   enabled: true
   strategies:

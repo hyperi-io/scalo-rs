@@ -39,8 +39,10 @@
 //!
 //! Skips when Docker is absent, and fails instead of skipping under CI.
 
-#![cfg(feature = "transport-kafka-test-support")]
+#![cfg(all(feature = "transport-kafka-test-support", unix))]
 #![allow(clippy::large_futures)]
+
+mod common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -417,7 +419,7 @@ async fn kafka_transport_against_a_tls_broker() {
     if !require_docker() {
         return;
     }
-    let broker = match TlsBroker::start("scalo-rs", "kafka-tls").await {
+    let broker = match TlsBroker::start(&common::SUITE, scalo::test_name!()).await {
         Ok(broker) => Arc::new(broker),
         Err(e) => {
             skip_or_fail(&format!("the TLS broker would not start ({e})"));

@@ -96,7 +96,7 @@ An auth or TLS failure is permanent only until the credentials first work (a bro
 
 #### Testing against a real broker
 
-`transport-kafka-test-support` ([feature-flags.md](../feature-flags.md)) gives an app's integration tests the broker scalo's own suite uses, so the image is pinned once and not copied per repo. `TlsBroker::start(test)` brings up Apache Kafka with TLS, mTLS and SASL_SSL listeners and generates the certificates (`broker.pki.file("ca.crt")`). `tests/kafka_tls.rs` is the worked example, with a refused row for each way a client can be turned away.
+`transport-kafka-test-support` ([feature-flags.md](../feature-flags.md)) gives an app's integration tests the broker scalo's own suite uses, so the image is pinned once and not copied per repo. `shared_kafka(SUITE)` is the run's one PLAINTEXT broker, shared by every test process, and `kafka_spec(host_port)` starts one a test holds alone, on a pinned port when it stops and starts the broker. `TlsBroker::start(&SUITE, test)` brings up Apache Kafka with TLS, mTLS and SASL_SSL listeners and generates the certificates (`broker.pki.file("ca.crt")`). Every container is named and labelled for the suite, as [`shared_service`](../../src/deployment/test_support/shared_service.rs) names them. `tests/kafka_tls.rs` is the worked example, with a refused row for each way a client can be turned away.
 
 #### Refused credentials
 

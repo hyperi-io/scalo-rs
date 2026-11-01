@@ -14,28 +14,36 @@
 //! all -- every consumer (fetcher credentials, transport SASL passwords)
 //! goes through the same `resolve()`.
 //!
-//! Skips when Docker is absent, and fails instead of skipping under CI, where a
-//! container runtime is promised.
+//! Runs against the run's shared OpenBao, under a path of its own. Skips when
+//! Docker is absent, and fails instead of skipping under CI, where a container
+//! runtime is promised.
 
-#![cfg(all(feature = "secrets-vault", feature = "config"))]
+#![cfg(all(
+    feature = "secrets-vault",
+    feature = "config",
+    feature = "deployment-test-support",
+    unix
+))]
 
 mod common;
 
-use common::openbao::{ROOT_TOKEN, put_secret, start_openbao};
+use common::openbao::{ROOT_TOKEN, kv_path, put_secret, start_openbao};
 
 #[tokio::test]
 async fn vault_spec_resolves_a_real_secret() {
     let Some((_container, address)) = start_openbao().await else {
         return;
     };
-    put_secret(&address, "app/creds", "api-key", "super-secret-value").await;
+    let path = kv_path(scalo::test_name!());
+    put_secret(&address, &path, "api-key", "super-secret-value").await;
+    let spec = format!("vault:secret/data/{path}:api-key");
 
     let resolved = temp_env::async_with_vars(
         [
             ("VAULT_ADDR", Some(address.as_str())),
             ("VAULT_TOKEN", Some(ROOT_TOKEN)),
         ],
-        async { scalo::secrets::resolve("vault:secret/data/app/creds:api-key").await },
+        async { scalo::secrets::resolve(&spec).await },
     )
     .await
     .unwrap_or_else(|e| panic!("resolve against {address}: {e}"));
@@ -80,7 +88,9 @@ async fn vault_spec_with_a_bad_token_fails() {
     let Some((_container, address)) = start_openbao().await else {
         return;
     };
-    put_secret(&address, "app/creds", "api-key", "super-secret-value").await;
+    let path = kv_path(scalo::test_name!());
+    put_secret(&address, &path, "api-key", "super-secret-value").await;
+    let spec = format!("vault:secret/data/{path}:api-key");
 
     let err = temp_env::async_with_vars(
         [
@@ -88,7 +98,7 @@ async fn vault_spec_with_a_bad_token_fails() {
             ("VAULT_TOKEN", Some("not-the-root-token")),
         ],
         async {
-            scalo::secrets::resolve("vault:secret/data/app/creds:api-key")
+            scalo::secrets::resolve(&spec)
                 .await
                 .expect_err("a bad token must not resolve the secret")
                 .to_string()
