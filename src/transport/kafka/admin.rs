@@ -118,7 +118,7 @@ pub(super) fn admin_client_config(config: &KafkaConfig) -> ClientConfig {
     // Nothing polls the admin's handles for statistics, so each event would
     // sit on the client's queue for the life of the process.
     client_config.set("statistics.interval.ms", "0");
-    super::probe_system_ca(&mut client_config);
+    super::set_default_ca(&mut client_config);
     client_config
 }
 
