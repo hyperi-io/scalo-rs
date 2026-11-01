@@ -28,8 +28,8 @@ Both take a `&[Record]` slice, chunk it at `max_chunk_size` (default
 
 ```mermaid
 flowchart LR
-    R[Record slice] --> C{routing_field set?}
-    C -->|yes| F[Pre-route filter<br/>SIMD field extract<br/>~100 ns/msg]
+    R[Record slice] --> C{pre_route_filters listed?}
+    C -->|yes| F[Pre-route filter<br/>SIMD extract of each filter's field<br/>~100 ns/field]
     C -->|no| P
     F --> P[Parse<br/>sonic_rs::from_slice<br/>~1-5 us/msg]
     P --> I[Intern known fields<br/>extract into HashMap]
@@ -37,7 +37,7 @@ flowchart LR
     T --> O[Vec&lt;Result&lt;O, E&gt;&gt;]
 ```
 
-Filter-rejected messages are removed from the output. DLQ-routed and
+Each pre-route filter reads the field it names, and the first filter that matches decides. `routing_field` does not gate them. Filter-rejected messages are removed from the output. DLQ-routed and
 parse-error messages become `Err` entries; the action is configured
 via `parse_error_action: dlq | skip | fail_batch`.
 
@@ -167,7 +167,7 @@ Loaded from the `batch_processing` cascade key:
 batch_processing:
   max_chunk_size: 10000          # at least 1
   format: auto                    # auto | json | msgpack
-  routing_field: _table           # null disables pre-route
+  routing_field: _table           # the field the app routes on
   pre_route_filters:
     - type: drop_field_missing
       field: _table

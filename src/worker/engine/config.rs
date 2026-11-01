@@ -32,7 +32,7 @@ pub enum ParseErrorAction {
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PreRouteFilterConfig {
-    /// Route to DLQ if a required field is absent.
+    /// Drop the record, committed with its block, if a required field is absent.
     DropFieldMissing {
         /// Name of the required field.
         field: String,
@@ -72,7 +72,8 @@ pub struct BatchProcessingConfig {
 
     /// Pre-route filters applied before routing decisions.
     ///
-    /// Evaluated in order -- first match wins.
+    /// Evaluated in order -- first match wins. Each reads the field it names,
+    /// whether or not `routing_field` is set.
     #[serde(default)]
     pub pre_route_filters: Vec<PreRouteFilterConfig>,
 

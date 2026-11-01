@@ -6,9 +6,9 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Pre-route phase: extract a routing field from raw JSON bytes using
-//! `sonic_rs::get_from_slice` (SIMD-accelerated), then apply filters
-//! to decide whether the message continues, is dropped, or goes to DLQ.
+//! Pre-route phase: each filter extracts the field it names from raw JSON
+//! bytes using `sonic_rs::get_from_slice` (SIMD-accelerated) and decides
+//! whether the message continues, is dropped, or goes to DLQ.
 //!
 //! Hot path: ~50-100 ns per message.
 
@@ -75,31 +75,40 @@ pub fn extract_routing_field(payload: &[u8], field_name: &str) -> PreRouteExtrac
     }
 }
 
-/// Apply a list of runtime filters to a pre-route extraction result.
+/// Apply `filters` to `payload`, each reading the field it names.
 ///
 /// Filters are evaluated in order -- first match wins. If no filter matches
-/// the message continues.
+/// the message continues. A field two filters in a row name is extracted
+/// once.
 #[must_use]
-pub fn apply_filters(
-    extraction: &PreRouteExtraction,
-    filters: &[PreRouteFilter],
-) -> PreRouteOutcome {
+pub fn apply_filters(payload: &[u8], filters: &[PreRouteFilter]) -> PreRouteOutcome {
+    let mut last: Option<(&str, PreRouteExtraction)> = None;
     for filter in filters {
-        match (filter, extraction) {
-            (PreRouteFilter::DropFieldMissing(_field), PreRouteExtraction::Missing) => {
+        let field = match filter {
+            PreRouteFilter::DropFieldMissing(field)
+            | PreRouteFilter::DlqFieldValue { field, .. } => field.as_str(),
+        };
+        let extraction = match last.take() {
+            Some((seen, extraction)) if seen == field => extraction,
+            _ => extract_routing_field(payload, field),
+        };
+        match (filter, &extraction) {
+            (PreRouteFilter::DropFieldMissing(_), PreRouteExtraction::Missing) => {
                 return PreRouteOutcome::Filtered;
             }
             (
                 PreRouteFilter::DlqFieldValue {
-                    field: _field,
-                    value: expected,
+                    value: expected, ..
                 },
                 PreRouteExtraction::Found(actual),
             ) if actual == expected => {
-                return PreRouteOutcome::Dlq(format!("field value '{actual}' matches DLQ rule"));
+                return PreRouteOutcome::Dlq(format!(
+                    "field '{field}' value '{actual}' matches DLQ rule"
+                ));
             }
             _ => {}
         }
+        last = Some((field, extraction));
     }
 
     // A parse error with no filters still results in Continue -- the parse
@@ -172,57 +181,80 @@ mod tests {
 
     // ---- filter tests -------------------------------------------------------
 
+    /// Each filter reads its own field; first match wins; a parse error or no
+    /// filter continues.
     #[test]
-    fn filter_drop_missing_field() {
-        let filters = vec![PreRouteFilter::DropFieldMissing("_table".to_string())];
-        let result = apply_filters(&PreRouteExtraction::Missing, &filters);
-        assert_eq!(result, PreRouteOutcome::Filtered);
-    }
-
-    #[test]
-    fn filter_dlq_on_specific_value() {
-        let filters = vec![PreRouteFilter::DlqFieldValue {
-            field: "_table".to_string(),
-            value: "poison".to_string(),
-        }];
-        let result = apply_filters(&PreRouteExtraction::Found("poison".to_string()), &filters);
-        assert!(
-            matches!(result, PreRouteOutcome::Dlq(_)),
-            "expected Dlq, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn filter_dlq_does_not_trigger_on_different_value() {
-        let filters = vec![PreRouteFilter::DlqFieldValue {
-            field: "_table".to_string(),
-            value: "poison".to_string(),
-        }];
-        let result = apply_filters(&PreRouteExtraction::Found("events".to_string()), &filters);
-        assert_eq!(result, PreRouteOutcome::Continue);
-    }
-
-    #[test]
-    fn no_filters_always_continue() {
-        assert_eq!(
-            apply_filters(&PreRouteExtraction::Found("x".to_string()), &[]),
-            PreRouteOutcome::Continue
-        );
-        assert_eq!(
-            apply_filters(&PreRouteExtraction::Missing, &[]),
-            PreRouteOutcome::Continue
-        );
-        assert_eq!(
-            apply_filters(&PreRouteExtraction::ParseError("bad".to_string()), &[]),
-            PreRouteOutcome::Continue
-        );
-    }
-
-    #[test]
-    fn filter_drop_missing_does_not_affect_found() {
-        let filters = vec![PreRouteFilter::DropFieldMissing("_table".to_string())];
-        let result = apply_filters(&PreRouteExtraction::Found("events".to_string()), &filters);
-        assert_eq!(result, PreRouteOutcome::Continue);
+    fn filters_read_their_own_field() {
+        let drop_missing = |f: &str| PreRouteFilter::DropFieldMissing(f.to_string());
+        let dlq_on = |f: &str, v: &str| PreRouteFilter::DlqFieldValue {
+            field: f.to_string(),
+            value: v.to_string(),
+        };
+        let cases: Vec<(&str, Vec<PreRouteFilter>, &[u8], PreRouteOutcome)> = vec![
+            (
+                "drop when absent",
+                vec![drop_missing("_table")],
+                br#"{"host":"web1"}"#,
+                PreRouteOutcome::Filtered,
+            ),
+            (
+                "drop keeps present",
+                vec![drop_missing("_table")],
+                br#"{"_table":"events"}"#,
+                PreRouteOutcome::Continue,
+            ),
+            (
+                "drop reads its field, not another",
+                vec![drop_missing("host")],
+                br#"{"_table":"events"}"#,
+                PreRouteOutcome::Filtered,
+            ),
+            (
+                "dlq on value",
+                vec![dlq_on("_table", "poison")],
+                br#"{"_table":"poison"}"#,
+                PreRouteOutcome::Dlq("field '_table' value 'poison' matches DLQ rule".into()),
+            ),
+            (
+                "dlq other value",
+                vec![dlq_on("_table", "poison")],
+                br#"{"_table":"events"}"#,
+                PreRouteOutcome::Continue,
+            ),
+            (
+                "dlq reads its field, not another",
+                vec![dlq_on("status", "bad")],
+                br#"{"_table":"bad","status":"ok"}"#,
+                PreRouteOutcome::Continue,
+            ),
+            (
+                "two fields, second matches",
+                vec![drop_missing("_table"), dlq_on("status", "bad")],
+                br#"{"_table":"t","status":"bad"}"#,
+                PreRouteOutcome::Dlq("field 'status' value 'bad' matches DLQ rule".into()),
+            ),
+            (
+                "first match wins",
+                vec![drop_missing("_table"), dlq_on("_table", "anything")],
+                br#"{"host":"web1"}"#,
+                PreRouteOutcome::Filtered,
+            ),
+            (
+                "no filters",
+                vec![],
+                br#"{"_table":"x"}"#,
+                PreRouteOutcome::Continue,
+            ),
+            (
+                "parse error with a dlq filter continues",
+                vec![dlq_on("_table", "x")],
+                b"not json {{{",
+                PreRouteOutcome::Continue,
+            ),
+        ];
+        for (name, filters, payload, want) in cases {
+            assert_eq!(apply_filters(payload, &filters), want, "{name}");
+        }
     }
 
     #[test]
@@ -240,20 +272,5 @@ mod tests {
         assert_eq!(filters.len(), 2);
         assert!(matches!(filters[0], PreRouteFilter::DropFieldMissing(_)));
         assert!(matches!(filters[1], PreRouteFilter::DlqFieldValue { .. }));
-    }
-
-    #[test]
-    fn first_matching_filter_wins() {
-        // Two filters: drop-missing and DLQ-on-value. With a Missing extraction
-        // only the first (drop-missing) should fire.
-        let filters = vec![
-            PreRouteFilter::DropFieldMissing("_table".to_string()),
-            PreRouteFilter::DlqFieldValue {
-                field: "_table".to_string(),
-                value: "anything".to_string(),
-            },
-        ];
-        let result = apply_filters(&PreRouteExtraction::Missing, &filters);
-        assert_eq!(result, PreRouteOutcome::Filtered);
     }
 }

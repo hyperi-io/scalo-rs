@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### Pre-route filters read the field they name (BEHAVIOUR CHANGE)
+
+Each `pre_route_filters` entry reads its own `field`. They read `routing_field` whatever they named, and ran only when `routing_field` was set, so a `drop_field_missing` on another field passed records missing it. They now run whenever any are listed. `pre_route::apply_filters` takes the payload in place of one extraction: `apply_filters(&payload, &filters)`.
+
+**Consumer adjustment** -- none for a config whose filters name `routing_field`. A direct caller of `apply_filters` passes the payload.
+
 ### Received records keep their headers (API CHANGE)
 
 `Message<T>` gains `headers: Vec<(String, Vec<u8>)>`, and the `WorkBatch` conversions move it onto each `Record`. The gRPC receiver fills it from each `RouteBatch` record, so the dedup key a sender set reaches the receiving app, where it was dropped. Every other receiver leaves it empty.
