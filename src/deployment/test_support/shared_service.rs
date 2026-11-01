@@ -986,9 +986,17 @@ pub fn http_get(host: &str, port: u16, path: &str) -> Option<(u16, String)> {
 fn http_get_at(addrs: Vec<SocketAddr>, host: &str, path: &str) -> Option<(u16, String)> {
     let mut stream = connect_any(addrs, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    write!(stream, "GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n").ok()?;
+    // One write, so a server that reads the request once sees all of it.
+    let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
-    stream.read_to_string(&mut response).ok()?;
+    // A server that closes with bytes unread resets the connection after its
+    // answer: keep what arrived.
+    match stream.read_to_string(&mut response) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !response.is_empty() => {}
+        Err(_) => return None,
+    }
     let (head, body) = response.split_once("\r\n\r\n")?;
     let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
     Some((status, body.to_string()))
@@ -1085,8 +1093,15 @@ mod tests {
         let server = std::thread::spawn(move || {
             for stream in listener.incoming().take(2) {
                 let mut stream = stream.expect("accept");
-                let mut request = [0u8; 256];
-                let _ = stream.read(&mut request);
+                // The whole request head, so closing leaves nothing unread.
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 256];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
                 let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\nOk.");
             }
         });
