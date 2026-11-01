@@ -479,6 +479,7 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
     }
 
     apply_group_protocol(&mut client_config, protocol);
+    probe_system_ca(&mut client_config);
     client_config
 }
 
@@ -540,7 +541,24 @@ pub fn producer_client_config(
     apply_layer(&mut client_config, profile_defaults);
     let settings = config.resolved_producer_settings();
     apply_layer(&mut client_config, &raw_layer(&settings));
+    probe_system_ca(&mut client_config);
     client_config
+}
+
+/// With TLS on and no CA named, have librdkafka probe the usual system bundle
+/// paths. A static OpenSSL's built-in default reads `/etc/ssl/certs` hashed
+/// links, which only Debian-family bases carry. A `ssl.ca.location` or
+/// `ssl.ca.pem` from any layer wins.
+pub(super) fn probe_system_ca(client_config: &mut ClientConfig) {
+    let tls = client_config
+        .get("security.protocol")
+        .is_some_and(|p| p.eq_ignore_ascii_case("ssl") || p.eq_ignore_ascii_case("sasl_ssl"));
+    if tls
+        && client_config.get("ssl.ca.location").is_none()
+        && client_config.get("ssl.ca.pem").is_none()
+    {
+        client_config.set("ssl.ca.location", "probe");
+    }
 }
 
 /// Set every key of `layer` over `client_config`, each replacing the other
@@ -4280,6 +4298,62 @@ mod tests {
     // =========================================================================
     // Consumer config: one property under two librdkafka names
     // =========================================================================
+
+    /// With TLS on and no CA named, every client probes the system CA bundle
+    /// paths, and a CA named by the typed field or by a raw key wins.
+    #[test]
+    fn tls_with_no_ca_probes_the_system_bundle() {
+        let ssl = || KafkaConfig::default().with_tls(None);
+        let cases: Vec<(&str, KafkaConfig, Option<&str>)> = vec![
+            ("plaintext", KafkaConfig::default(), None),
+            ("ssl, no CA", ssl(), Some("probe")),
+            (
+                "sasl_ssl, no CA",
+                KafkaConfig::default().with_scram_ssl("SCRAM-SHA-512", "u", "p"),
+                Some("probe"),
+            ),
+            (
+                "upper-case SSL",
+                KafkaConfig {
+                    security_protocol: "SSL".to_string(),
+                    ..KafkaConfig::default()
+                },
+                Some("probe"),
+            ),
+            (
+                "typed CA",
+                KafkaConfig::default().with_tls(Some("/etc/ca.pem")),
+                Some("/etc/ca.pem"),
+            ),
+            (
+                "raw ssl.ca.location",
+                ssl().with_override("ssl.ca.location", "/raw/ca.pem"),
+                Some("/raw/ca.pem"),
+            ),
+            (
+                "raw ssl.ca.pem",
+                ssl().with_override("ssl.ca.pem", "-----BEGIN CERTIFICATE-----"),
+                None,
+            ),
+        ];
+        for (name, config, want) in cases {
+            let built = [
+                (
+                    "consumer",
+                    consumer_client_config(&config, ConsumerProtocol::Classic),
+                ),
+                ("producer", producer_client_config(&config, &[])),
+                ("admin", admin::admin_client_config(&config)),
+            ];
+            for (client, built) in built {
+                assert_eq!(
+                    built.get("ssl.ca.location"),
+                    want,
+                    "{name}, {client}: ssl.ca.location"
+                );
+            }
+        }
+    }
 
     /// The default partition fetch reaches librdkafka as the 1 MiB memory bound.
     #[test]

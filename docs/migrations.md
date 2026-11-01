@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### Kafka TLS with no CA probes the system bundle (BEHAVIOUR CHANGE)
+
+With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`, `ssl.ca.location` or `ssl.ca.pem`, every Kafka client sets `ssl.ca.location: probe`. A static OpenSSL's built-in default reads `/etc/ssl/certs` hashed links, which a RHEL or UBI base lacks.
+
+**Consumer adjustment** -- none. A deploy that relied on `OPENSSLDIR` alone keeps working on Debian-family images.
+
 ### A dropped transport leaves the health registry (additive)
 
 `HealthRegistry::register_scoped` returns a `HealthRegistration` that removes its check on drop. The HTTP, file, pipe, gRPC and Kafka transports and the tiered sink's circuit breaker register through it, so a closed and dropped one no longer holds `/readyz` at 503 for the rest of the process. `register` is unchanged.

@@ -80,7 +80,7 @@ fn create_topic_requests<'a>(
 /// Build the admin client's config: connection and security, then the profile
 /// defaults and `librdkafka_overrides`, whose keys replace the other librdkafka
 /// name for their property.
-fn admin_client_config(config: &KafkaConfig) -> ClientConfig {
+pub(super) fn admin_client_config(config: &KafkaConfig) -> ClientConfig {
     let mut client_config = ClientConfig::new();
 
     client_config.set("bootstrap.servers", config.brokers.join(","));
@@ -118,6 +118,7 @@ fn admin_client_config(config: &KafkaConfig) -> ClientConfig {
     // Nothing polls the admin's handles for statistics, so each event would
     // sit on the client's queue for the life of the process.
     client_config.set("statistics.interval.ms", "0");
+    super::probe_system_ca(&mut client_config);
     client_config
 }
 
