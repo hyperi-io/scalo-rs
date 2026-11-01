@@ -25,7 +25,6 @@ use super::common::{on_one_line, udp_port_suffix};
 /// fault, so a contract the chart refuses renders no fragment either.
 pub fn generate_compose_fragment(contract: &DeploymentContract) -> Result<String, DeploymentError> {
     contract.validate()?;
-    let binary = contract.binary();
     let mut out = String::with_capacity(512);
 
     // Compose interpolates ${NAME}; the contract's nested `__` separator is not
@@ -121,13 +120,15 @@ pub fn generate_compose_fragment(contract: &DeploymentContract) -> Result<String
         "          memory: ${{{env_prefix}_MEM_LIMIT:-1G}}\n"
     ));
 
-    // Entrypoint args
+    // `command` is appended to the image's ENTRYPOINT, which already names
+    // the binary.
     if !contract.entrypoint_args.is_empty() {
-        out.push_str(&format!("    command: [\"{binary}\""));
-        for arg in &contract.entrypoint_args {
-            out.push_str(&format!(", \"{arg}\""));
-        }
-        out.push_str("]\n");
+        let args: Vec<String> = contract
+            .entrypoint_args
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect();
+        out.push_str(&format!("    command: [{}]\n", args.join(", ")));
     }
 
     Ok(out)

@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### The compose fragment's `command` no longer repeats the binary (BEHAVIOUR CHANGE)
+
+`generate_compose_fragment` wrote `command: ["<binary>", <args>]`, which compose appends to the image's `ENTRYPOINT ["<binary>"]`, so the process started as `<binary> <binary> --config ...`. It writes the args alone.
+
+**Consumer adjustment** -- regenerate a committed compose file (`<app> generate-artefacts`). dfe-fetcher's `docker-compose.yaml` carries `command: ["dfe-fetcher", "--config", "/etc/dfe/fetcher.yaml"]`.
+
 ### A batch_processing section that does not parse fails startup (BEHAVIOUR CHANGE)
 
 `BatchProcessingConfig::from_cascade` returns `ConfigError::ExtractError` for a present section that does not deserialise, where it replaced the whole section with defaults and dropped its filters, `routing_field` and parse policy. `ServiceRuntime::build` passes the error on. An absent section still takes the defaults.

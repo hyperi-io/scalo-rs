@@ -169,7 +169,7 @@ and `validate()` refuses it until they are set.
 | `image_registry` | `String` | required | Container registry base, and `validate()` refuses an empty one |
 | `extra_ports` | `Vec<PortContract>` | `[]` | HTTP / gRPC / data ports beyond metrics -- see [Ports](#ports) |
 | `unbound_listen_paths` | `Vec<String>` | `[]` | `default_config` listen paths no port serves -- see [Ports](#ports) |
-| `entrypoint_args` | `Vec<String>` | `[]` | Default `CMD` args |
+| `entrypoint_args` | `Vec<String>` | `[]` | Default `CMD` args, and the compose fragment's `command`. Both follow the image's `ENTRYPOINT [binary]`, so neither names the binary |
 | `secrets` | `Vec<SecretGroupContract>` | `[]` | K8s secret groups |
 | `default_config` | `Option<Value>` | `None` | Embedded `values.yaml` `config:` block |
 | `depends_on` | `Vec<String>` | `[]` | Compose-only service deps |

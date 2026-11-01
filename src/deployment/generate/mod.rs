@@ -578,6 +578,23 @@ mod tests {
         assert!(compose.contains("memory: ${DFE_LOADER_MEM_LIMIT:-1G}"));
     }
 
+    /// Compose's `command` replaces the image's CMD and is appended to its
+    /// ENTRYPOINT, which already names the binary, so it carries only the args.
+    #[test]
+    fn compose_command_is_the_entrypoint_args_alone() {
+        let contract = test_contract();
+        let dockerfile = generate_dockerfile(&contract, None).unwrap();
+        assert!(
+            dockerfile.contains(&format!("ENTRYPOINT [\"{}\"]", contract.binary())),
+            "{dockerfile}"
+        );
+        let compose = generate_compose_fragment(&contract).unwrap();
+        assert!(
+            compose.contains("    command: [\"--config\", \"/etc/dfe/loader.yaml\"]\n"),
+            "{compose}"
+        );
+    }
+
     /// The image creates and switches to appuser uid 1000, the uid the
     /// scalo-service chart runs the pod as by default.
     #[test]
