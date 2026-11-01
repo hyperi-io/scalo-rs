@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### HTTP receive bounds the bytes it holds (BEHAVIOUR CHANGE)
+
+`HttpTransportConfig` gains `max_in_flight_bytes` (default 64 MiB). The receive server checks the governor and reserves a request's declared length from it before reading the body, and answers 503 when either refuses. Queued records hold their bytes until `recv` takes them. A config with `max_in_flight_bytes` below `max_body_bytes` fails `HttpTransport::new`.
+
+**Consumer adjustment** -- a struct literal of `HttpTransportConfig` adds the field or `..Default::default()`. A receiver whose senders post large bodies concurrently raises `max_in_flight_bytes` within its pod's memory limit.
+
 ### Pre-route filters read the field they name (BEHAVIOUR CHANGE)
 
 Each `pre_route_filters` entry reads its own `field`. They read `routing_field` whatever they named, and ran only when `routing_field` was set, so a `drop_field_missing` on another field passed records missing it. They now run whenever any are listed. `pre_route::apply_filters` takes the payload in place of one extraction: `apply_filters(&payload, &filters)`.
