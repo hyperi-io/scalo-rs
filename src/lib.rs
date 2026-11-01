@@ -137,6 +137,9 @@ pub mod shutdown;
 #[cfg_attr(docsrs, doc(cfg(feature = "health")))]
 pub mod health;
 
+// Section reads every module's `from_cascade()` shares, with or without `config`.
+pub mod cascade;
+
 #[cfg(feature = "config")]
 #[cfg_attr(docsrs, doc(cfg(feature = "config")))]
 pub mod config;

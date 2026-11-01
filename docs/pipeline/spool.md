@@ -18,7 +18,7 @@ buffer, a checkpoint store, or a custom drainer.
 | Crash-safe | Receiver position persisted in `recv-metadata`; commit-then-advance semantics |
 | Async-native | Built on yaque's async receiver -- `recv()` awaits when empty |
 | Optional compression | zstd at construction-time level (1-22, clamped) |
-| Bounded | `max_items` (count) and `max_size_bytes` (directory size) |
+| Bounded | `max_items` (count) and `max_size_bytes` (bytes queued) |
 
 ---
 
@@ -107,11 +107,13 @@ override.
 | `max_items: Some(n)` | `push` returns `Err(MaxItemsReached { max })` |
 | `max_size_bytes: Some(b)` | `push` returns `Err(MaxSizeReached { max_bytes })` |
 
-Both checks happen pre-write. The size check uses `file_size()` which
-sums every regular file in the queue directory -- exact for fresh
-opens, slightly stale between segment rolls. Callers should treat
-these as soft bounds; downstream pressure (DLQ, drop, throttle) is
-the right response when they fire.
+Both checks happen pre-write. The size check adds the record about to be
+written, after compression and framing, to `queued_bytes()`: the bytes of
+the records queued, counted from the segment files once at open and moved
+by every push and take, so a push never walks the directory. A drained
+spool has room again even while its segment file still holds the records
+it consumed. Downstream pressure (DLQ, drop, throttle) is the right
+response when either check fires.
 
 There's no built-in "drop oldest" mode -- yaque is append-only and
 removing oldest would require rewriting segment files. If you need
@@ -195,7 +197,8 @@ arrives). `pop_front` is the try-style alternative that returns
 | `peek().await` | Read without removing (guard rollback) |
 | `pop().await` | Remove front without returning value |
 | `len() / is_empty()` | Item count (tracked internally) |
-| `file_size()` | Directory size in bytes |
+| `queued_bytes()` | Bytes of the records queued, the count `max_size_bytes` caps |
+| `file_size()` | Directory size in bytes, consumed records included; walks the directory |
 | `clear()` | Drain every item; resets count |
 | `config() -> &SpoolConfig` | Active config |
 | `SpoolError` | `Open / Queue / Compression / Decompression / Io / MaxItemsReached / MaxSizeReached / Corrupted` |

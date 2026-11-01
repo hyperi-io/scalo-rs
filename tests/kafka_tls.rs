@@ -39,14 +39,16 @@
 //!
 //! Skips when Docker is absent, and fails instead of skipping under CI.
 
-#![cfg(feature = "transport-kafka-test-support")]
+#![cfg(all(feature = "transport-kafka-test-support", unix))]
 #![allow(clippy::large_futures)]
+
+mod common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use scalo::transport::kafka::test_support::{
-    SCRAM_PASSWORD, SCRAM_USER, TlsBroker, require_docker, skip_or_fail,
+    SCRAM_USER, TlsBroker, require_docker, scram_password, skip_or_fail,
 };
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::{
@@ -118,7 +120,8 @@ enum Security {
     /// TLS trusting `ca`, and SCRAM-SHA-512 with `password`.
     ScramSsl {
         ca: &'static str,
-        password: &'static str,
+        /// Generated per run, so the table holds the function, not the value.
+        password: fn() -> &'static str,
     },
 }
 
@@ -133,7 +136,7 @@ const ACCEPTED: &[Accepted] = &[
         listener: Listener::SaslSsl,
         security: Security::ScramSsl {
             ca: "ca.crt",
-            password: SCRAM_PASSWORD,
+            password: scram_password,
         },
     },
     Accepted {
@@ -174,7 +177,7 @@ const REFUSED: &[Refused] = &[
         from: "sasl-ssl-scram-sha-512",
         security: Security::ScramSsl {
             ca: "ca.crt",
-            password: "not-the-password",
+            password: common::test_password,
         },
         broker_says: "invalid credentials with SASL mechanism SCRAM-SHA-512",
         client_sees: ClientSees::Cause("Authentication"),
@@ -233,7 +236,7 @@ fn client_config(
             .with_tls(Some(file(ca).as_str()))
             .with_client_cert(&file(cert), &file(key)),
         Security::ScramSsl { ca, password } => base
-            .with_scram_ssl("SCRAM-SHA-512", SCRAM_USER, password)
+            .with_scram_ssl("SCRAM-SHA-512", SCRAM_USER, password())
             .with_tls(Some(file(ca).as_str())),
     }
 }
@@ -417,7 +420,7 @@ async fn kafka_transport_against_a_tls_broker() {
     if !require_docker() {
         return;
     }
-    let broker = match TlsBroker::start("scalo-rs", "kafka-tls").await {
+    let broker = match TlsBroker::start(&common::SUITE, scalo::test_name!()).await {
         Ok(broker) => Arc::new(broker),
         Err(e) => {
             skip_or_fail(&format!("the TLS broker would not start ({e})"));

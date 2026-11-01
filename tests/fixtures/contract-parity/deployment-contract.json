@@ -128,20 +128,17 @@
   "native_deps": {
     "apt_repos": [
       {
-        "key_url": "https://packages.confluent.io/clients/deb/archive.key",
-        "keyring": "/usr/share/keyrings/confluent-clients.gpg",
-        "url": "https://packages.confluent.io/clients/deb",
-        "codename": "bookworm",
-        "key_fingerprint": "CBBB821E8FAF364F79835C438B1DA6120C2BF624",
+        "key_url": "https://apt.vendor.example/archive.key",
+        "keyring": "/usr/share/keyrings/vendor.gpg",
+        "url": "https://apt.vendor.example/deb",
+        "codename": "trixie",
+        "key_fingerprint": "0123456789ABCDEF0123456789ABCDEF01234567",
         "packages": [
-          "librdkafka1"
+          "vendor-runtime"
         ]
       }
     ],
     "apt_packages": [
-      "libssl3t64",
-      "zlib1g",
-      "libzstd1",
       "libgit2-1.9"
     ],
     "distro": "trixie",

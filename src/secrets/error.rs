@@ -52,3 +52,9 @@ pub enum SecretsError {
 
 /// Result type for secrets operations.
 pub type SecretsResult<T> = Result<T, SecretsError>;
+
+impl From<crate::cascade::CascadeError> for SecretsError {
+    fn from(e: crate::cascade::CascadeError) -> Self {
+        Self::ConfigError(e.to_string())
+    }
+}

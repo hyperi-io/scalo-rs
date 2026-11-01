@@ -96,24 +96,10 @@ LABEL org.opencontainers.image.title="my-app"
 LABEL org.opencontainers.image.description=""
 LABEL io.scalo.profile="production"
 
-# Runtime shared libraries for dynamically-linked Rust crates.
 # Apt versions are unpinned because Debian drops superseded ones, so the digest-pinned base is what fixes the release.
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg \
-    && curl -fsSL https://packages.confluent.io/clients/deb/archive.key -o /tmp/repo-key.asc \
-    && gpg --show-keys --with-colons --with-fingerprint /tmp/repo-key.asc \
-       > /tmp/repo-key.info \
-    && grep -q "^fpr:::::::::CBBB821E8FAF364F79835C438B1DA6120C2BF624:" /tmp/repo-key.info \
-    && rm -f /tmp/repo-key.info \
-    && gpg --dearmor -o /usr/share/keyrings/confluent-clients.gpg /tmp/repo-key.asc \
-    && rm -f /tmp/repo-key.asc \
-    && echo "deb [signed-by=/usr/share/keyrings/confluent-clients.gpg] \
-       https://packages.confluent.io/clients/deb bookworm main" \
-       > /etc/apt/sources.list.d/confluent-clients.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
-       librdkafka1 libssl3t64 zlib1g libzstd1 \
-    && apt-get purge -y --auto-remove curl gnupg \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Dynamic OCI labels (injected by CI at build time)
@@ -165,7 +151,7 @@ The process starts in `/home/appuser`, which `useradd --create-home` gives to ap
 RUN mkdir -p '/var/spool/my-app' '/var/data/my-app' && chown 1000:1000 '/var/spool/my-app' '/var/data/my-app'
 ```
 
-A production image carries `ca-certificates`, the runtime libraries and the binary. `curl` and `gnupg` are there only to import a repo's signing key, and the same `RUN` purges them once the repo's packages are in. The healthcheck speaks HTTP with bash builtins, so it needs no client. A development image (`with_dev_profile`) keeps `curl`, `netcat-openbsd` and `iputils-ping` beside the diagnostic tools.
+A production image carries `ca-certificates`, any runtime packages the contract lists and the binary. The Kafka transport and the spool link their C libraries statically, so the sample installs nothing else ([native-deps.md](native-deps.md)). `curl` and `gnupg` are there only to import a custom repo's signing key, and the same `RUN` purges them once the repo's packages are in. The healthcheck speaks HTTP with bash builtins, so it needs no client. A development image (`with_dev_profile`) keeps `curl`, `netcat-openbsd` and `iputils-ping` beside the diagnostic tools.
 
 All four generators run [`DeploymentContract::validate`](contract.md) first and return its error, so a contract the chart would refuse renders no Dockerfile, runtime stage, compose fragment or container manifest either.
 

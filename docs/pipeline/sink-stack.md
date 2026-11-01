@@ -71,8 +71,9 @@ flowchart LR
 ## Configuration
 
 Loaded from the cascade under `sink_stack` (`SinkStackConfig::from_cascade`), or
-an explicit key via `from_cascade_key`. Defaults preserve behaviour: no
-concurrency cap, ARC off, queue-don't-shed.
+an explicit key via `FromCascade::from_cascade_key`. An absent section takes the
+defaults, and one that does not parse is `TransportError::Config` naming its key.
+Defaults preserve behaviour: no concurrency cap, ARC off, queue-don't-shed.
 
 | Key | Default | Meaning |
 | ----- | --------- | --------- |

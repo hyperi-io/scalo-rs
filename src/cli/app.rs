@@ -471,8 +471,16 @@ fn init_logger_for_service(
 fn setup_cascade<A: ServiceApp>(app: &A) -> Result<(), CliError> {
     let options = app.common_args().to_config_options(app.env_prefix());
     match crate::config::setup(options) {
-        Ok(()) | Err(crate::config::ConfigError::AlreadyInitialised) => Ok(()),
-        Err(e) => Err(CliError::Config(e.to_string())),
+        Ok(()) | Err(crate::config::ConfigError::AlreadyInitialised) => {}
+        Err(e) => return Err(CliError::Config(e.to_string())),
+    }
+    // Sections the logger and the CLI read where no error can be returned.
+    let bad = crate::cascade::check_runtime_sections();
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        let listed: Vec<String> = bad.iter().map(ToString::to_string).collect();
+        Err(CliError::Config(listed.join("; ")))
     }
 }
 
@@ -507,7 +515,10 @@ fn load_config_for_artefacts<A: ServiceApp>(app: &A) {
 /// Reads the cascade [`load_config_for_artefacts`] has already loaded.
 #[cfg(any(feature = "metrics", feature = "otel-metrics"))]
 fn manifest_manager() -> crate::metrics::MetricsManager {
-    let namespace = crate::metrics::MetricsSettings::from_cascade().namespace;
+    // `setup_cascade` has already refused a `metrics` section that does not parse.
+    let namespace = crate::metrics::MetricsSettings::from_cascade()
+        .unwrap_or_default()
+        .namespace;
     let manager = crate::metrics::MetricsManager::with_config(
         crate::metrics::MetricsConfig::offline(&namespace),
     );

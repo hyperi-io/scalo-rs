@@ -119,7 +119,7 @@ impl RuleSet {
     ///
     /// [`RulesError::Invalid`] with every finding when any is an error.
     pub fn compile(config: &RuleSetConfig) -> Result<Self, RulesError> {
-        Self::compile_with(config, &CompileOptions::from_cascade())
+        Self::compile_with(config, &CompileOptions::from_cascade()?)
     }
 
     /// Compile `config` with explicit options.

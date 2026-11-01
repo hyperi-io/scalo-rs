@@ -42,12 +42,17 @@ use super::error::{SecretsError, SecretsResult};
 use super::types::{CacheConfig, CacheEntry, SecretValue};
 
 /// Secret cache with memory and disk tiers.
+///
+/// The methods here read and write the disk tier synchronously.
+/// [`SecretsManager`](super::SecretsManager) instead takes the memory tier
+/// under its lock and runs disk-tier calls on the blocking pool with no lock
+/// held, so a slow cache volume stalls only the lookup waiting on it.
 pub struct SecretCache {
     /// In-memory cache.
     memory: HashMap<String, SecretValue>,
 
-    /// Disk cache directory.
-    cache_dir: Option<PathBuf>,
+    /// Disk cache tier, `None` when caching is disabled.
+    disk: Option<DiskTier>,
 
     /// Configuration.
     config: CacheConfig,
@@ -109,7 +114,10 @@ impl SecretCache {
 
         Ok(Self {
             memory: HashMap::new(),
-            cache_dir,
+            disk: cache_dir.map(|dir| DiskTier {
+                dir,
+                config: config.clone(),
+            }),
             config: config.clone(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -121,51 +129,29 @@ impl SecretCache {
     ///
     /// Returns `None` if not cached or expired.
     pub fn get(&self, key: &str) -> Option<SecretValue> {
-        // Check memory cache
-        if let Some(value) = self.memory.get(key)
-            && !value.is_expired(self.config.ttl_secs)
-        {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            debug!(key = %key, "Cache hit (memory)");
-            return Some(value.clone());
-        }
-
-        // Check disk cache
-        if let Some(value) = self.load_from_disk(key)
-            && !value.is_expired(self.config.ttl_secs)
-        {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            debug!(key = %key, "Cache hit (disk)");
+        if let Some(value) = self.fresh_in_memory(key) {
             return Some(value);
         }
-
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        None
+        let found = self.disk.as_ref().and_then(|disk| disk.load_fresh(key));
+        self.count_lookup(found.is_some());
+        found
     }
 
     /// Get a stale secret from cache (for fallback on provider failure).
     ///
     /// Returns a cached value even if expired, as long as it's within the grace period.
     pub fn get_stale(&self, key: &str) -> Option<SecretValue> {
-        // Check memory cache
-        if let Some(value) = self.memory.get(key)
-            && value.is_within_grace(self.config.ttl_secs, self.config.stale_grace_secs)
-        {
-            self.stale_hits.fetch_add(1, Ordering::Relaxed);
-            debug!(key = %key, "Stale cache hit (memory)");
-            return Some(value.clone());
-        }
-
-        // Check disk cache
-        if let Some(value) = self.load_from_disk(key)
-            && value.is_within_grace(self.config.ttl_secs, self.config.stale_grace_secs)
-        {
-            self.stale_hits.fetch_add(1, Ordering::Relaxed);
-            debug!(key = %key, "Stale cache hit (disk)");
+        if let Some(value) = self.stale_in_memory(key) {
             return Some(value);
         }
-
-        None
+        let found = self
+            .disk
+            .as_ref()
+            .and_then(|disk| disk.load_within_grace(key));
+        if found.is_some() {
+            self.count_stale_hit();
+        }
+        found
     }
 
     /// The version of the newest value held for `key`, however old it is.
@@ -173,11 +159,14 @@ impl SecretCache {
     /// Memory first, then disk. TTL and grace period are ignored, and no hit
     /// or miss is counted. `None` when nothing is held, the held value carries
     /// no version, or caching is disabled (a disabled cache holds nothing).
-    pub(crate) fn last_version(&self, key: &str) -> Option<String> {
-        match self.memory.get(key) {
+    #[must_use]
+    pub fn last_version(&self, key: &str) -> Option<String> {
+        match self.in_memory(key) {
             Some(value) => value.metadata.version.clone(),
             None => self
-                .load_from_disk(key)
+                .disk
+                .as_ref()
+                .and_then(|disk| disk.load(key))
                 .and_then(|value| value.metadata.version),
         }
     }
@@ -188,24 +177,69 @@ impl SecretCache {
     ///
     /// Returns an error if disk cache write fails.
     pub fn set(&mut self, key: &str, value: &SecretValue) -> SecretsResult<()> {
-        if !self.config.enabled {
-            return Ok(());
+        self.remember(key, value);
+        if let Some(disk) = &self.disk {
+            disk.save(key, value)?;
         }
-
-        // Store in memory
-        self.memory.insert(key.to_string(), value.clone());
-
-        // Store on disk
-        self.save_to_disk(key, value)?;
-
         debug!(key = %key, "Secret cached");
         Ok(())
+    }
+
+    /// A fresh value from the memory tier, counted as a hit.
+    pub(crate) fn fresh_in_memory(&self, key: &str) -> Option<SecretValue> {
+        let value = self
+            .memory
+            .get(key)
+            .filter(|v| !v.is_expired(self.config.ttl_secs))?;
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        debug!(key = %key, "Cache hit (memory)");
+        Some(value.clone())
+    }
+
+    /// A value within the grace period from the memory tier, counted as a
+    /// stale hit.
+    pub(crate) fn stale_in_memory(&self, key: &str) -> Option<SecretValue> {
+        let value = self
+            .memory
+            .get(key)
+            .filter(|v| v.is_within_grace(self.config.ttl_secs, self.config.stale_grace_secs))?;
+        self.count_stale_hit();
+        debug!(key = %key, "Stale cache hit (memory)");
+        Some(value.clone())
+    }
+
+    /// The memory tier's value for `key`, however old, counted as nothing.
+    pub(crate) fn in_memory(&self, key: &str) -> Option<&SecretValue> {
+        self.memory.get(key)
+    }
+
+    /// Put `value` in the memory tier. A disabled cache holds nothing.
+    pub(crate) fn remember(&mut self, key: &str, value: &SecretValue) {
+        if self.config.enabled {
+            self.memory.insert(key.to_string(), value.clone());
+        }
+    }
+
+    /// A handle on the disk tier for a caller to run off its lock.
+    pub(crate) fn disk_tier(&self) -> Option<DiskTier> {
+        self.disk.clone()
+    }
+
+    /// Count a lookup the memory tier missed: a hit when the disk had it.
+    pub(crate) fn count_lookup(&self, hit: bool) {
+        let counter = if hit { &self.hits } else { &self.misses };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a stale hit.
+    pub(crate) fn count_stale_hit(&self) {
+        self.stale_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Clear all cached secrets.
     pub fn clear(&mut self) {
         self.memory.clear();
-        if let Some(ref dir) = self.cache_dir {
+        if let Some(DiskTier { dir, .. }) = &self.disk {
             if let Err(e) = std::fs::remove_dir_all(dir) {
                 warn!(error = %e, "Failed to clear disk cache");
             }
@@ -220,9 +254,9 @@ impl SecretCache {
     /// Get cache statistics.
     pub fn stats(&self) -> CacheStats {
         let disk_entries = self
-            .cache_dir
+            .disk
             .as_ref()
-            .and_then(|dir| std::fs::read_dir(dir).ok())
+            .and_then(|disk| std::fs::read_dir(&disk.dir).ok())
             .map_or(0, |entries| entries.count());
 
         CacheStats {
@@ -233,7 +267,18 @@ impl SecretCache {
             stale_hits: self.stale_hits.load(Ordering::Relaxed),
         }
     }
+}
 
+/// The disk tier of a [`SecretCache`]: its directory and the config that
+/// decides what may be written there. Cheap to clone, so a caller can move one
+/// onto the blocking pool.
+#[derive(Clone)]
+pub(crate) struct DiskTier {
+    dir: PathBuf,
+    config: CacheConfig,
+}
+
+impl DiskTier {
     /// Load a secret from disk cache.
     ///
     /// Detects encryption envelopes by their `"v":` JSON marker and
@@ -243,9 +288,8 @@ impl SecretCache {
     /// never once an `encryption_key` is set: either way it is skipped
     /// with a warning and the secret is fetched from its source, which
     /// rewrites the slot in the configured form.
-    fn load_from_disk(&self, key: &str) -> Option<SecretValue> {
-        let cache_dir = self.cache_dir.as_ref()?;
-        let cache_file = cache_dir.join(Self::key_to_filename(key));
+    pub(crate) fn load(&self, key: &str) -> Option<SecretValue> {
+        let cache_file = self.dir.join(key_to_filename(key));
 
         if !cache_file.exists() {
             return None;
@@ -306,12 +350,8 @@ impl SecretCache {
     /// as plaintext unless `allow_plaintext_disk_cache` is explicitly set,
     /// which `SecretCache::new` warns about at startup and `validate` rejects
     /// under a production profile.
-    fn save_to_disk(&self, key: &str, value: &SecretValue) -> SecretsResult<()> {
-        let Some(ref cache_dir) = self.cache_dir else {
-            return Ok(());
-        };
-
-        let cache_file = cache_dir.join(Self::key_to_filename(key));
+    pub(crate) fn save(&self, key: &str, value: &SecretValue) -> SecretsResult<()> {
+        let cache_file = self.dir.join(key_to_filename(key));
         let entry = CacheEntry::from_value(value);
 
         let plaintext = serde_json::to_vec(&entry).map_err(|e| {
@@ -340,12 +380,30 @@ impl SecretCache {
         Ok(())
     }
 
-    /// Convert a cache key to a safe filename.
-    fn key_to_filename(key: &str) -> String {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
-        format!("{encoded}.json")
+    /// A value from disk that is still fresh.
+    pub(crate) fn load_fresh(&self, key: &str) -> Option<SecretValue> {
+        let value = self
+            .load(key)
+            .filter(|v| !v.is_expired(self.config.ttl_secs))?;
+        debug!(key = %key, "Cache hit (disk)");
+        Some(value)
     }
+
+    /// A value from disk within the grace period.
+    pub(crate) fn load_within_grace(&self, key: &str) -> Option<SecretValue> {
+        let value = self
+            .load(key)
+            .filter(|v| v.is_within_grace(self.config.ttl_secs, self.config.stale_grace_secs))?;
+        debug!(key = %key, "Stale cache hit (disk)");
+        Some(value)
+    }
+}
+
+/// Convert a cache key to a safe filename.
+fn key_to_filename(key: &str) -> String {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+    format!("{encoded}.json")
 }
 
 /// Ensure `dir` exists; chmod to `mode` on Unix when `mode` is
@@ -444,7 +502,7 @@ mod tests {
             ..Default::default()
         };
         let cache = SecretCache::new(&config).unwrap();
-        assert!(cache.cache_dir.is_none());
+        assert!(cache.disk.is_none());
     }
 
     #[test]
@@ -611,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_key_to_filename() {
-        let filename = SecretCache::key_to_filename("test/key:with/special");
+        let filename = key_to_filename("test/key:with/special");
         assert!(
             std::path::Path::new(&filename)
                 .extension()
@@ -664,14 +722,14 @@ mod tests {
             ..Default::default()
         };
         let mut cache = SecretCache::new(&cfg).unwrap();
-        let dir = cache.cache_dir.as_ref().unwrap().clone();
+        let dir = cache.disk.as_ref().unwrap().dir.clone();
 
         let mode_after_new = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode_after_new, 0o700);
 
         cache.set("k", &SecretValue::new(b"v".to_vec())).unwrap();
 
-        let cache_file = dir.join(SecretCache::key_to_filename("k"));
+        let cache_file = dir.join(key_to_filename("k"));
         let file_mode = std::fs::metadata(&cache_file).unwrap().permissions().mode() & 0o7777;
         assert_eq!(file_mode, 0o600);
 
@@ -680,7 +738,7 @@ mod tests {
         assert_eq!(mode_after_clear, 0o700);
 
         cache.set("k2", &SecretValue::new(b"v".to_vec())).unwrap();
-        let post_clear_file_mode = std::fs::metadata(dir.join(SecretCache::key_to_filename("k2")))
+        let post_clear_file_mode = std::fs::metadata(dir.join(key_to_filename("k2")))
             .unwrap()
             .permissions()
             .mode()
@@ -712,7 +770,7 @@ mod tests {
             "memory tier still works"
         );
         // ...but NOTHING was written to disk.
-        let cache_file = dir.join(SecretCache::key_to_filename("k"));
+        let cache_file = dir.join(key_to_filename("k"));
         assert!(
             !cache_file.exists(),
             "default config must not persist plaintext secrets to disk"
@@ -735,7 +793,7 @@ mod tests {
             .set("k", &SecretValue::new(b"plaintext-secret".to_vec()))
             .unwrap();
 
-        let cache_file = dir.join(SecretCache::key_to_filename("k"));
+        let cache_file = dir.join(key_to_filename("k"));
         assert!(cache_file.exists(), "opt-in must persist to disk");
 
         // It is genuinely plaintext, not an AES-GCM envelope: a fresh cache

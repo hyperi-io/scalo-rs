@@ -101,6 +101,12 @@
       "matchPackageNames": ["debian"],
       "groupName": "docker-images",
       "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "The crates that carry librdkafka take each release with no cooldown, as docs/deployment/native-deps.md records.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["rdkafka", "rdkafka-sys"],
+      "minimumReleaseAge": "0 days"
     }
   ]
 }

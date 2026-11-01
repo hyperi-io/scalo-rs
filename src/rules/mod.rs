@@ -104,10 +104,14 @@ impl Default for CompileOptions {
 
 impl CompileOptions {
     /// The profile the config cascade sets in `expression`, or the default
-    /// profile before the cascade loads.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        Self::default().with_profile(crate::expression::evaluator::get_profile_config().clone())
+    /// profile before the cascade loads or when the section is absent.
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `expression`
+    /// section is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        Ok(Self::default().with_profile(crate::expression::evaluator::profile_from_cascade()?))
     }
 
     /// Compile under `profile`.

@@ -195,7 +195,7 @@ mod tests {
         let dockerfile = dir.path().join("Dockerfile");
         let mut contract = test_contract();
         contract.native_deps = super::super::NativeDepsContract::for_scalo_features(
-            &["transport-kafka"],
+            &["directory-config-git"],
             &contract.base_image,
         );
         std::fs::write(

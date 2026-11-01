@@ -95,6 +95,10 @@ pub struct Message<T: CommitToken> {
 
     /// Detected payload format.
     pub format: PayloadFormat,
+
+    /// Record headers the source carried, the dedup key among them. Empty for
+    /// a source with no headers on the wire.
+    pub headers: Vec<(String, Vec<u8>)>,
 }
 
 impl<T: CommitToken> Message<T> {
@@ -117,6 +121,7 @@ impl<T: CommitToken> Message<T> {
             token,
             timestamp_ms,
             format,
+            headers: Vec::new(),
         }
     }
 

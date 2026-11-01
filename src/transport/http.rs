@@ -130,6 +130,10 @@ fn default_max_body_bytes() -> usize {
     16 * 1024 * 1024
 }
 
+fn default_max_in_flight_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
 /// Configuration for HTTP transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpTransportConfig {
@@ -176,6 +180,14 @@ pub struct HttpTransportConfig {
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
 
+    /// Body bytes the receive side holds at once, read and queued for `recv`
+    /// together. Default 64 MiB. A request is admitted only when its declared
+    /// `Content-Length`, or `max_body_bytes` without one, fits what is left,
+    /// and is answered 503 before its body is read otherwise. Must be at
+    /// least `max_body_bytes`.
+    #[serde(default = "default_max_in_flight_bytes")]
+    pub max_in_flight_bytes: usize,
+
     /// Private-CA PEM path for the send-side HTTPS client (needs the `tls`
     /// feature). Trusts this CA *in addition to* the OS native roots. None =
     /// native roots only (reqwest default). Maps to `TlsTrust { native_roots:
@@ -197,15 +209,20 @@ impl Default for HttpTransportConfig {
             connect_timeout_ms: default_connect_timeout_ms(),
             send_timeout_ms: default_send_timeout_ms(),
             max_body_bytes: default_max_body_bytes(),
+            max_in_flight_bytes: default_max_in_flight_bytes(),
             tls_ca_path: None,
         }
     }
 }
 
 impl HttpTransportConfig {
-    /// Load from the config cascade under the `transport.http` key.
-    #[must_use]
-    pub fn from_cascade() -> Self {
+    /// Load from the config cascade under the `transport.http` key, or the defaults
+    /// when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` when the section is present but does not parse.
+    pub fn from_cascade() -> crate::transport::TransportResult<Self> {
         <Self as super::traits::FromCascade>::from_cascade_key("transport.http")
     }
 
@@ -233,6 +250,9 @@ impl HttpTransportConfig {
 /// Supports send (POST to endpoint) and receive (embedded axum server).
 /// The receive side requires the `http-server` feature for axum.
 pub struct HttpTransport {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
     /// reqwest client for sending (always available when transport-http is enabled).
     client: reqwest::Client,
 
@@ -247,6 +267,11 @@ pub struct HttpTransport {
     /// Address the embedded server bound, with any port-0 request resolved.
     #[cfg(feature = "http-server")]
     local_addr: Option<std::net::SocketAddr>,
+
+    /// One permit per body byte read or queued; `recv` returns a record's
+    /// permits as it hands the record over.
+    #[cfg(feature = "http-server")]
+    in_flight: Option<Arc<tokio::sync::Semaphore>>,
 
     /// Graceful-shutdown signal for the server task. Behind a
     /// `Mutex<Option<..>>` so `close(&self)` can take and fire it.
@@ -347,12 +372,13 @@ impl HttpTransport {
             .map_err(|e| TransportError::Config(format!("failed to create HTTP client: {e}")))?;
 
         #[cfg(feature = "http-server")]
-        let (receiver, local_addr, shutdown_tx, server_handle) = if let Some(listen) =
+        let (receiver, local_addr, in_flight, shutdown_tx, server_handle) = if let Some(listen) =
             &config.listen
         {
             let addr: std::net::SocketAddr = listen
                 .parse()
                 .map_err(|e| TransportError::Config(format!("invalid listen address: {e}")))?;
+            let in_flight = Arc::new(in_flight_budget(config)?);
 
             let (tx, rx) = tokio::sync::mpsc::channel(config.recv_buffer_size);
             let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
@@ -361,12 +387,15 @@ impl HttpTransport {
             let recv_path = config.recv_path.clone();
 
             let app = build_receiver_router(
-                tx,
-                sequence,
+                ReceiverState {
+                    sender: tx,
+                    sequence,
+                    in_flight: Arc::clone(&in_flight),
+                    max_body_bytes: config.max_body_bytes,
+                    #[cfg(feature = "governor")]
+                    pressure: pressure.clone(),
+                },
                 &recv_path,
-                config.max_body_bytes,
-                #[cfg(feature = "governor")]
-                pressure.clone(),
             );
 
             let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
@@ -390,11 +419,12 @@ impl HttpTransport {
             (
                 Some(tokio::sync::Mutex::new(rx)),
                 Some(bound),
+                Some(in_flight),
                 Some(sd_tx),
                 Some(handle),
             )
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
 
         // When the governor feature is on but http-server is off there is no
@@ -415,30 +445,34 @@ impl HttpTransport {
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
             &config.filters_out,
-            &crate::transport::filter::TransportFilterTierConfig::from_cascade(),
+            &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
 
         let closed = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let h = Arc::clone(&closed);
-            crate::health::HealthRegistry::register("transport:http", move || {
+            crate::health::HealthRegistry::register_scoped("transport:http", move || {
                 if h.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Unhealthy
                 } else {
                     crate::health::HealthStatus::Healthy
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
             client,
             endpoint: config.endpoint.clone(),
             #[cfg(feature = "http-server")]
             receiver,
             #[cfg(feature = "http-server")]
             local_addr,
+            #[cfg(feature = "http-server")]
+            in_flight,
             #[cfg(feature = "http-server")]
             shutdown_tx: parking_lot::Mutex::new(shutdown_tx),
             #[cfg(feature = "http-server")]
@@ -482,24 +516,40 @@ impl HttpTransport {
     }
 }
 
+/// The receive side's body-byte budget, refusing a `max_in_flight_bytes` that
+/// could never admit a `max_body_bytes` request.
+#[cfg(feature = "http-server")]
+fn in_flight_budget(config: &HttpTransportConfig) -> TransportResult<tokio::sync::Semaphore> {
+    if u32::try_from(config.max_body_bytes).is_err() {
+        return Err(TransportError::Config(format!(
+            "max_body_bytes {} is over the {} a request can reserve",
+            config.max_body_bytes,
+            u32::MAX
+        )));
+    }
+    if config.max_in_flight_bytes < config.max_body_bytes {
+        return Err(TransportError::Config(format!(
+            "max_in_flight_bytes {} is below max_body_bytes {}, so a request of the largest \
+             accepted size could never be admitted",
+            config.max_in_flight_bytes, config.max_body_bytes
+        )));
+    }
+    if config.max_in_flight_bytes > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(TransportError::Config(format!(
+            "max_in_flight_bytes {} is over {}",
+            config.max_in_flight_bytes,
+            tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
+    Ok(tokio::sync::Semaphore::new(config.max_in_flight_bytes))
+}
+
 /// Build the axum router for the receive side.
 #[cfg(feature = "http-server")]
-fn build_receiver_router(
-    sender: tokio::sync::mpsc::Sender<Message<HttpToken>>,
-    sequence: Arc<AtomicU64>,
-    recv_path: &str,
-    max_body_bytes: usize,
-    #[cfg(feature = "governor")] pressure: Option<Arc<crate::governor::UnifiedPressure>>,
-) -> axum::Router {
+fn build_receiver_router(state: ReceiverState, recv_path: &str) -> axum::Router {
     use axum::routing::post;
 
-    let state = ReceiverState {
-        sender,
-        sequence,
-        #[cfg(feature = "governor")]
-        pressure,
-    };
-
+    let max_body_bytes = state.max_body_bytes;
     axum::Router::new()
         .route(recv_path, post(ingest_handler))
         // Reject oversized bodies with 413 before the handler buffers them.
@@ -513,36 +563,34 @@ fn build_receiver_router(
 struct ReceiverState {
     sender: tokio::sync::mpsc::Sender<Message<HttpToken>>,
     sequence: Arc<AtomicU64>,
+    /// Body bytes read or queued, see [`HttpTransportConfig::max_in_flight_bytes`].
+    in_flight: Arc<tokio::sync::Semaphore>,
+    max_body_bytes: usize,
     /// Optional pressure governor (`governor` feature). `None` by default
-    /// -> the handler never consults it and behaviour is byte-identical. When
-    /// `Some`, the handler rejects with 503 while `UnifiedPressure::should_hold`
-    /// holds -- pressure-driven shedding ON TOP of the existing channel-full
-    /// 503, never replacing it.
+    /// -> the handler never consults it. When `Some`, the handler rejects with
+    /// 503 while `UnifiedPressure::should_hold` holds -- pressure-driven
+    /// shedding ON TOP of the channel-full and byte-budget 503s.
     #[cfg(feature = "governor")]
     pressure: Option<Arc<crate::governor::UnifiedPressure>>,
 }
 
 /// POST handler that accepts raw bytes and queues them into the mpsc channel.
 ///
-/// Answers 200 once the record is queued. A full queue, a held inbound gate
+/// The pressure check and the byte reservation come before the body is read,
+/// so a held governor or a spent budget costs no body buffer. Answers 200 once
+/// the record is queued. A full queue, a held inbound gate, a spent byte budget
 /// and a closed receiver answer 503, which a sender retries.
 #[cfg(feature = "http-server")]
 async fn ingest_handler(
     axum::extract::State(state): axum::extract::State<ReceiverState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
+    use axum::extract::FromRequest as _;
     use axum::response::IntoResponse as _;
 
-    if body.is_empty() {
-        return axum::http::StatusCode::BAD_REQUEST.into_response();
-    }
-
-    // Pressure-driven shedding (governor feature, opt-in). BEFORE enqueuing,
-    // if a governor is wired and it says hold, shed the request with 503 --
-    // consistent with the existing channel-full 503 below (NOT 429). Default
-    // `None` -> this is skipped and behaviour is byte-identical.
+    // Pressure-driven shedding (governor feature, opt-in), before any body
+    // byte is read -- consistent with the channel-full 503 below (NOT 429).
     #[cfg(feature = "governor")]
     if let Some(pressure) = &state.pressure
         && pressure.should_hold()
@@ -553,9 +601,34 @@ async fn ingest_handler(
         return shed_503();
     }
 
+    let declared = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    match declared {
+        Some(0) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+        Some(n) if n > state.max_body_bytes => {
+            return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+        _ => {}
+    }
+    // A body with no Content-Length can run to max_body_bytes.
+    let reserved = declared.unwrap_or(state.max_body_bytes);
+    let Some(mut permit) = u32::try_from(reserved)
+        .ok()
+        .and_then(|n| Arc::clone(&state.in_flight).try_acquire_many_owned(n).ok())
+    else {
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_backpressured_total", "transport" => "http", "reason" => "in_flight_bytes")
+            .increment(1);
+        return shed_503();
+    };
+
     // Extract W3C traceparent from incoming HTTP headers for distributed tracing
     #[cfg(feature = "transport-trace")]
-    if let Some(tp) = headers
+    if let Some(tp) = request
+        .headers()
         .get(super::propagation::TRACEPARENT_HEADER)
         .and_then(|v| v.to_str().ok())
         && super::propagation::is_valid_traceparent(tp)
@@ -563,9 +636,16 @@ async fn ingest_handler(
         tracing::Span::current().record("traceparent", tp);
     }
 
-    // Suppress unused variable warning when otel feature is disabled
-    #[cfg(not(feature = "otel"))]
-    let _ = &headers;
+    // Under the DefaultBodyLimit layer, a body over max_body_bytes is a 413.
+    let body = match axum::body::Bytes::from_request(request, &()).await {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if body.is_empty() {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
+    // Keep exactly the bytes read; a short body returns the rest of its reservation.
+    drop(permit.split(permit.num_permits().saturating_sub(body.len())));
 
     let seq = state.sequence.fetch_add(1, Ordering::Relaxed);
     let format = PayloadFormat::detect(&body);
@@ -583,10 +663,13 @@ async fn ingest_handler(
         token: HttpToken::with_source(seq, addr.to_string()),
         timestamp_ms: Some(timestamp_ms),
         format,
+        headers: Vec::new(),
     };
 
     match state.sender.try_send(msg) {
         Ok(()) => {
+            // The queued record holds its bytes until `recv` hands it over.
+            permit.forget();
             #[cfg(feature = "metrics")]
             {
                 metrics::counter!("transport_received_bytes_total", "transport" => "http")
@@ -654,17 +737,39 @@ impl TransportBase for HttpTransport {
     }
 }
 
-/// Response statuses that mean the endpoint, or the gateway in front of it, is
-/// busy or down rather than refusing this request, so the send is retried.
-fn downstream_unavailable(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::REQUEST_TIMEOUT
-            | reqwest::StatusCode::TOO_MANY_REQUESTS
-            | reqwest::StatusCode::BAD_GATEWAY
-            | reqwest::StatusCode::SERVICE_UNAVAILABLE
-            | reqwest::StatusCode::GATEWAY_TIMEOUT
-    )
+/// What a failure status says about the send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusClass {
+    /// The endpoint, or the gateway in front of it, is busy or failing: retry.
+    Unavailable,
+    /// The credential or the endpoint is wrong, which says nothing about this
+    /// record: keep it until the sink is fixed.
+    Misconfigured,
+    /// The body is over the endpoint's limit: it can never be accepted.
+    TooLarge,
+    /// The endpoint refused this record as malformed: it can never be accepted.
+    Refused,
+}
+
+/// Classify a non-2xx response. Every 5xx is retried, and only a 4xx that is
+/// the payload's fault marks the record undeliverable.
+fn classify_status(status: reqwest::StatusCode) -> StatusClass {
+    use reqwest::StatusCode as S;
+    match status {
+        S::REQUEST_TIMEOUT | S::TOO_MANY_REQUESTS => StatusClass::Unavailable,
+        s if s.is_server_error() => StatusClass::Unavailable,
+        S::PAYLOAD_TOO_LARGE => StatusClass::TooLarge,
+        S::UNAUTHORIZED
+        | S::FORBIDDEN
+        | S::NOT_FOUND
+        | S::METHOD_NOT_ALLOWED
+        | S::PROXY_AUTHENTICATION_REQUIRED
+        | S::GONE
+        | S::MISDIRECTED_REQUEST => StatusClass::Misconfigured,
+        s if s.is_client_error() => StatusClass::Refused,
+        // 1xx and an unfollowed 3xx: the endpoint is not one that takes a POST.
+        _ => StatusClass::Misconfigured,
+    }
 }
 
 impl TransportSender for HttpTransport {
@@ -713,11 +818,8 @@ impl TransportSender for HttpTransport {
             request_builder
         };
 
-        #[cfg(feature = "logger")]
+        // Wire size, taken before `payload` moves into the request body.
         let payload_len = payload.len();
-        // Capture wire size before `payload` moves into the request body.
-        #[cfg(feature = "metrics")]
-        let payload_bytes = payload.len();
         let result = match request_builder.body(payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 #[cfg(feature = "logger")]
@@ -727,11 +829,11 @@ impl TransportSender for HttpTransport {
                 {
                     metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
                     metrics::counter!("transport_sent_bytes_total", "transport" => "http")
-                        .increment(payload_bytes as u64);
+                        .increment(payload_len as u64);
                 }
                 SendResult::Ok
             }
-            Ok(resp) if downstream_unavailable(resp.status()) => {
+            Ok(resp) if classify_status(resp.status()) == StatusClass::Unavailable => {
                 #[cfg(feature = "logger")]
                 tracing::warn!(status = %resp.status(), url = %url, "HTTP transport: backpressure");
 
@@ -741,17 +843,22 @@ impl TransportSender for HttpTransport {
                 SendResult::Backpressured
             }
             Ok(resp) => {
+                let status = resp.status();
                 #[cfg(feature = "logger")]
-                tracing::warn!(status = %resp.status(), url = %url, "HTTP transport: send error");
+                tracing::warn!(status = %status, url = %url, "HTTP transport: send error");
 
                 #[cfg(feature = "metrics")]
                 metrics::counter!("transport_send_errors_total", "transport" => "http")
                     .increment(1);
-                SendResult::Fatal(TransportError::Send(format!(
-                    "HTTP {} from {}",
-                    resp.status(),
-                    url
-                )))
+                let detail = format!("HTTP {status} from {url}");
+                SendResult::Fatal(match classify_status(status) {
+                    StatusClass::Misconfigured => TransportError::Config(detail),
+                    StatusClass::TooLarge => TransportError::MessageTooLarge {
+                        bytes: payload_len,
+                        detail,
+                    },
+                    StatusClass::Refused | StatusClass::Unavailable => TransportError::Send(detail),
+                })
             }
             Err(e) => {
                 #[cfg(feature = "logger")]
@@ -825,6 +932,9 @@ impl TransportReceiver for HttpTransport {
                         Err(_elapsed) => break,
                     }
                 };
+                if let Some(in_flight) = &self.in_flight {
+                    in_flight.add_permits(msg.payload.len());
+                }
                 messages.push(msg);
             }
 
@@ -1025,19 +1135,33 @@ mod tests {
         addr
     }
 
-    /// Busy and gateway statuses mean the endpoint is not there right now; any
-    /// other failure status is the endpoint refusing this request.
+    /// How the sender answers each failure status: every 5xx and the busy 4xx
+    /// are retried, a wrong credential or endpoint is the sink's fault (the
+    /// record is kept), and only a 4xx about the payload marks it undeliverable.
     #[tokio::test]
-    async fn only_busy_and_gateway_statuses_are_backpressure() {
-        for (status, retried) in [
-            (408, true),
-            (429, true),
-            (502, true),
-            (503, true),
-            (504, true),
-            (400, false),
-            (404, false),
-            (500, false),
+    async fn a_failure_status_is_retried_unless_the_payload_is_at_fault() {
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Retried,
+            SinkFault,
+            Undeliverable,
+            Refused,
+        }
+        for (status, want) in [
+            (408, Want::Retried),
+            (429, Want::Retried),
+            (500, Want::Retried),
+            (501, Want::Retried),
+            (502, Want::Retried),
+            (503, Want::Retried),
+            (504, Want::Retried),
+            (599, Want::Retried),
+            (401, Want::SinkFault),
+            (403, Want::SinkFault),
+            (404, Want::SinkFault),
+            (413, Want::Undeliverable),
+            (400, Want::Refused),
+            (422, Want::Refused),
         ] {
             let addr = status_endpoint(status).await;
             let transport =
@@ -1047,12 +1171,100 @@ mod tests {
             let result = transport
                 .send("ingest", bytes::Bytes::from_static(b"{}"))
                 .await;
-            if retried {
-                assert!(result.is_backpressured(), "HTTP {status}: got {result:?}");
-            } else {
-                assert!(result.is_fatal(), "HTTP {status}: got {result:?}");
-            }
+            let got = match &result {
+                SendResult::Backpressured => Want::Retried,
+                SendResult::Fatal(e) if e.is_fatal() => Want::SinkFault,
+                SendResult::Fatal(e) if e.is_undeliverable() => Want::Undeliverable,
+                SendResult::Fatal(TransportError::Send(_)) => Want::Refused,
+                other => panic!("HTTP {status}: unexpected {other:?}"),
+            };
+            assert_eq!(got, want, "HTTP {status}: got {result:?}");
         }
+    }
+
+    /// A record spooled while the endpoint answers 500 stays spooled through
+    /// the 500s and is delivered once the endpoint recovers.
+    #[cfg(feature = "tiered-sink")]
+    #[tokio::test]
+    async fn a_spooled_record_survives_a_server_error_and_is_delivered() {
+        use crate::tiered_sink::{TieredSink, TieredSinkConfig};
+
+        let status = Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let addr = switchable_endpoint(Arc::clone(&status)).await;
+        let sender = HttpTransport::new(&HttpTransportConfig::sender(&format!("http://{addr}")))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = TieredSinkConfig::new(dir.path().join("q"));
+        config.circuit_failure_threshold = 1;
+        config.circuit_reset_timeout_ms = 20;
+        config.drain_interval_ms = 5;
+        let tiered = TieredSink::new(sender, config).await.unwrap();
+
+        let record = crate::transport::Record {
+            payload: bytes::Bytes::from_static(b"{\"keep\":1}"),
+            key: None,
+            headers: Vec::new(),
+            metadata: crate::transport::RecordMeta {
+                timestamp_ms: None,
+                format: PayloadFormat::Json,
+            },
+        };
+        tiered.send(&record).await.expect("spooled on the 500");
+        assert_eq!(tiered.spool_len().await, 1, "the 500 spools the record");
+
+        // The drainer offers it to the failing endpoint many times over.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            tiered.spool_len().await,
+            1,
+            "a server error must not remove the spooled record"
+        );
+
+        status.store(200, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tiered.spool_len().await > 0 {
+            assert!(std::time::Instant::now() < deadline, "never drained");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tiered.shutdown().await;
+    }
+
+    /// A loopback endpoint that answers every request with whatever `status`
+    /// holds at the time.
+    #[cfg(feature = "tiered-sink")]
+    async fn switchable_endpoint(
+        status: Arc<std::sync::atomic::AtomicU16>,
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let status = Arc::clone(&status);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if request_complete(&buf) {
+                            break;
+                        }
+                    }
+                    let code = status.load(Ordering::SeqCst);
+                    let reply = format!(
+                        "HTTP/1.1 {code} Canned\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        addr
     }
 
     #[tokio::test]
@@ -1270,6 +1482,15 @@ mod tests {
                 "503 shed must carry Retry-After"
             );
 
+            // A held gate answers before the body is read: the client has
+            // sent only the head.
+            let mut stream = post_head(addr, 64).await;
+            let status = status_line(&mut stream).await;
+            assert!(
+                status.starts_with("HTTP/1.1 503"),
+                "a held gate must refuse before the body, got {status:?}"
+            );
+
             // The shed POST never reached the queue.
             let records = receiver.recv(10).await.unwrap().records;
             assert!(records.is_empty(), "shed request must not be queued");
@@ -1427,6 +1648,91 @@ mod tests {
         );
     }
 
+    /// Send a POST head declaring `content_length` and none of its body.
+    #[cfg(feature = "http-server")]
+    async fn post_head(addr: std::net::SocketAddr, content_length: usize) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let head = format!(
+            "POST /ingest HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {content_length}\r\n\r\n"
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write request head");
+        stream
+    }
+
+    /// POST `body` until the answer is `want`, bounded so a server that never
+    /// answers it fails the test.
+    #[cfg(feature = "http-server")]
+    async fn post_until(addr: std::net::SocketAddr, body: &'static [u8], want: u16) {
+        let client = reqwest::Client::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = None;
+        while std::time::Instant::now() < deadline {
+            let status = client
+                .post(format!("http://{addr}/ingest"))
+                .body(body)
+                .send()
+                .await
+                .map(|r| r.status().as_u16());
+            if matches!(status, Ok(s) if s == want) {
+                return;
+            }
+            last = Some(status);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("never answered {want} within 5 s, last {last:?}");
+    }
+
+    /// Requests are admitted against `max_in_flight_bytes` by their declared
+    /// length before their bodies are read: four that declare the largest
+    /// body take the default budget and the next is refused at once, and the
+    /// budget comes back as those requests end and as `recv` takes records.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn admission_reserves_declared_bytes_before_reading_the_body() {
+        let receiver = HttpTransport::new(&receiver_config(100))
+            .await
+            .expect("receiver");
+        let addr = receiver.local_addr().expect("receiver bound");
+        let largest = HttpTransportConfig::default().max_body_bytes;
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(post_head(addr, largest).await);
+        }
+        post_until(addr, b"{}", 503).await;
+
+        drop(held);
+        post_until(addr, b"{}", 200).await;
+        let records = receiver.recv(10).await.expect("recv").records;
+        assert!(
+            records.iter().all(|r| r.payload.as_ref() == b"{}"),
+            "only the small POSTs were queued: {records:?}"
+        );
+        receiver.close().await.expect("close");
+    }
+
+    /// A budget below the largest accepted body could never admit one.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn an_in_flight_budget_below_the_largest_body_is_refused() {
+        let config = HttpTransportConfig {
+            max_body_bytes: 2048,
+            max_in_flight_bytes: 1024,
+            ..receiver_config(100)
+        };
+        assert!(
+            matches!(
+                HttpTransport::new(&config).await,
+                Err(TransportError::Config(m)) if m.contains("max_in_flight_bytes")
+            ),
+            "a budget under max_body_bytes must be refused"
+        );
+    }
+
     /// A handler that finds the receive queue closed answers 503 with a
     /// `Retry-After`, the status a sender retries, not 410.
     #[cfg(feature = "http-server")]
@@ -1437,6 +1743,8 @@ mod tests {
         let state = ReceiverState {
             sender: tx,
             sequence: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(1024)),
+            max_body_bytes: 1024,
             #[cfg(feature = "governor")]
             pressure: None,
         };
@@ -1444,8 +1752,9 @@ mod tests {
         let response = ingest_handler(
             axum::extract::State(state),
             axum::extract::ConnectInfo("127.0.0.1:9".parse().expect("addr")),
-            axum::http::HeaderMap::new(),
-            axum::body::Bytes::from_static(b"{}"),
+            axum::http::Request::post("/ingest")
+                .body(axum::body::Body::from("{}"))
+                .expect("request"),
         )
         .await;
 

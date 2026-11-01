@@ -67,10 +67,13 @@ report it. See [shutdown.md](shutdown.md).
 
 ## Registry
 
-`HealthRegistry` is a global `OnceLock` -- registered checks live for the process
-lifetime. **Registration is manual** (modules call `register` at construction);
-**aggregation is automatic** (every `/readyz` query walks all entries, no
-endpoint-side wiring).
+`HealthRegistry` is a global `OnceLock`. **Registration is manual** (modules call
+`register` at construction), and **aggregation is automatic** (every `/readyz`
+query walks all entries, no endpoint-side wiring). A check from `register` lives
+for the process. `register_scoped` returns a `HealthRegistration`, and dropping it
+removes the check: scalo's transports and each tiered sink's circuit breaker hold
+one, so a closed and dropped component stops counting against readiness, and a
+replacement is not held unready by the one it replaced.
 
 ```rust
 use scalo::health::{HealthRegistry, HealthStatus};

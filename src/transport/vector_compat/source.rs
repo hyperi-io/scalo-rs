@@ -93,6 +93,7 @@ impl VectorCompatService {
             token: GrpcToken::new(seq),
             timestamp_ms: None,
             format: PayloadFormat::Json,
+            headers: Vec::new(),
         }
     }
 
@@ -231,6 +232,7 @@ mod tests {
             token: GrpcToken::new(seq),
             timestamp_ms: None,
             format: PayloadFormat::Json,
+            headers: Vec::new(),
         }
     }
 

@@ -102,7 +102,9 @@ impl CommonArgs {
         }
         #[cfg(feature = "logger")]
         if let Some(level) = non_blank(
+            // `run_app` has already refused a `logger` section that does not parse.
             crate::logger::LoggerSettings::from_cascade()
+                .unwrap_or_default()
                 .level
                 .as_deref(),
         ) {
@@ -136,7 +138,9 @@ impl CommonArgs {
         }
         #[cfg(feature = "logger")]
         if let Some(format) = concrete_format(
+            // `run_app` has already refused a `logger` section that does not parse.
             crate::logger::LoggerSettings::from_cascade()
+                .unwrap_or_default()
                 .format
                 .as_deref(),
         ) {
@@ -165,7 +169,9 @@ impl CommonArgs {
         }
         #[cfg(feature = "metrics")]
         if let Some(addr) = non_blank(
+            // `run_app` has already refused a `metrics` section that does not parse.
             crate::metrics::MetricsSettings::from_cascade()
+                .unwrap_or_default()
                 .address
                 .as_deref(),
         ) {

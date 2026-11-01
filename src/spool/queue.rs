@@ -21,6 +21,10 @@ pub struct Spool {
     queue: Option<Queue>,
     config: SpoolConfig,
     len: usize,
+    /// Payload bytes of the records queued, as written. Counted at open and
+    /// moved by each push and take, so `max_size_bytes` never walks the
+    /// directory.
+    bytes: u64,
 }
 
 /// The open yaque handles; each holds a lock file in the queue directory.
@@ -53,12 +57,13 @@ impl Spool {
         // segment files, so it runs off the runtime.
         let path = config.path.clone();
         let policy = config.on_corruption;
-        let (sender, receiver, len) = tokio::task::spawn_blocking(move || {
+        let (sender, receiver, len, bytes) = tokio::task::spawn_blocking(move || {
             let (sender, receiver) = open_queue(&path, policy)?;
             // yaque exposes no count API -- parse segment files to count items
             // between the receiver position and the end.
-            let len = count_existing_items(&path).unwrap_or(0);
-            Ok::<_, SpoolError>((sender, receiver, len))
+            let (len, bytes) = crate::spool_codec::queued_items_and_bytes(&path).unwrap_or((0, 0));
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            Ok::<_, SpoolError>((sender, receiver, len, bytes))
         })
         .await
         .map_err(|e| SpoolError::Open {
@@ -70,6 +75,7 @@ impl Spool {
             queue: Some(Queue { sender, receiver }),
             config,
             len,
+            bytes,
         })
     }
 
@@ -83,6 +89,7 @@ impl Spool {
         // yaque handles save state and delete their locks by path on drop, so they close first.
         self.queue = None;
         self.len = 0;
+        self.bytes = 0;
         let moved = crate::spool_codec::quarantine(
             &self.config.path,
             crate::spool_codec::QuarantineTrigger::CrcMismatch,
@@ -123,19 +130,19 @@ impl Spool {
             return Err(SpoolError::MaxItemsReached { max });
         }
 
-        // Approximate -- checked before write.
-        if let Some(max_bytes) = self.config.max_size_bytes
-            && self.file_size()? >= max_bytes
-        {
-            return Err(SpoolError::MaxSizeReached { max_bytes });
-        }
-
         let body = if self.config.compress {
             self.compress(data)?
         } else {
             data.to_vec()
         };
         let to_write = Self::frame(self.config.crc, body);
+        let written = to_write.len() as u64;
+
+        if let Some(max_bytes) = self.config.max_size_bytes
+            && self.bytes.saturating_add(written) > max_bytes
+        {
+            return Err(SpoolError::MaxSizeReached { max_bytes });
+        }
 
         live(&mut self.queue)?
             .sender
@@ -144,9 +151,16 @@ impl Spool {
             .map_err(|e| SpoolError::Queue(e.to_string()))?;
 
         self.len += 1;
+        self.bytes += written;
         #[cfg(feature = "metrics")]
         ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
         Ok(())
+    }
+
+    /// Take one record of `written` bytes off the counts.
+    fn taken(&mut self, written: usize) {
+        self.len = self.len.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(written as u64);
     }
 
     /// Apply the configured [`CorruptionPolicy`] to a read-time error.
@@ -203,17 +217,19 @@ impl Spool {
     ///
     /// Returns an error if an I/O error occurs.
     pub async fn pop(&mut self) -> Result<()> {
-        match live(&mut self.queue)?.receiver.try_recv() {
+        let written = match live(&mut self.queue)?.receiver.try_recv() {
             Ok(guard) => {
+                let written = guard.len();
                 guard
                     .commit()
                     .map_err(|e| SpoolError::Queue(e.to_string()))?;
-                self.len = self.len.saturating_sub(1);
-                Ok(())
+                written
             }
-            Err(yaque::TryRecvError::Io(e)) => Err(SpoolError::Io(e)),
-            Err(yaque::TryRecvError::QueueEmpty) => Ok(()), // Nothing to pop
-        }
+            Err(yaque::TryRecvError::Io(e)) => return Err(SpoolError::Io(e)),
+            Err(yaque::TryRecvError::QueueEmpty) => return Ok(()), // Nothing to pop
+        };
+        self.taken(written);
+        Ok(())
     }
 
     /// Pop and return the first item, atomically receiving and removing it.
@@ -222,27 +238,29 @@ impl Spool {
     ///
     /// Returns an error if decompression fails or an I/O error occurs.
     pub async fn pop_front(&mut self) -> Result<Option<Vec<u8>>> {
-        let step: Option<Result<Vec<u8>>> = match live(&mut self.queue)?.receiver.try_recv() {
-            Ok(guard) => {
-                let decoded = Self::unframe(self.config.crc, guard.to_vec())
-                    .and_then(|body| Self::decode(self.config.compress, body));
-                match decoded {
-                    Ok(data) => match guard.commit() {
-                        Ok(()) => Some(Ok(data)),
-                        Err(e) => Some(Err(SpoolError::Queue(e.to_string()))),
-                    },
-                    Err(e) => {
-                        drop(guard); // roll back -- leave the item for recovery
-                        Some(Err(e))
+        let step: Option<Result<(Vec<u8>, usize)>> =
+            match live(&mut self.queue)?.receiver.try_recv() {
+                Ok(guard) => {
+                    let written = guard.len();
+                    let decoded = Self::unframe(self.config.crc, guard.to_vec())
+                        .and_then(|body| Self::decode(self.config.compress, body));
+                    match decoded {
+                        Ok(data) => match guard.commit() {
+                            Ok(()) => Some(Ok((data, written))),
+                            Err(e) => Some(Err(SpoolError::Queue(e.to_string()))),
+                        },
+                        Err(e) => {
+                            drop(guard); // roll back -- leave the item for recovery
+                            Some(Err(e))
+                        }
                     }
                 }
-            }
-            Err(yaque::TryRecvError::Io(e)) => Some(Err(SpoolError::Io(e))),
-            Err(yaque::TryRecvError::QueueEmpty) => None,
-        };
+                Err(yaque::TryRecvError::Io(e)) => Some(Err(SpoolError::Io(e))),
+                Err(yaque::TryRecvError::QueueEmpty) => None,
+            };
         match step {
-            Some(Ok(data)) => {
-                self.len = self.len.saturating_sub(1);
+            Some(Ok((data, written))) => {
+                self.taken(written);
                 #[cfg(feature = "metrics")]
                 ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
                 Ok(Some(data))
@@ -266,6 +284,7 @@ impl Spool {
 
         // `guard` is a let-binding (not a match temporary), so dropping it fully
         // releases the receiver borrow before any recover.
+        let written = guard.len();
         let decoded = Self::unframe(self.config.crc, guard.to_vec())
             .and_then(|body| Self::decode(self.config.compress, body));
         let data = match decoded {
@@ -286,7 +305,7 @@ impl Spool {
                 ));
             }
         };
-        self.len = self.len.saturating_sub(1);
+        self.taken(written);
         #[cfg(feature = "metrics")]
         ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
         Ok(data)
@@ -324,6 +343,7 @@ impl Spool {
             }
         }
         self.len = 0;
+        self.bytes = 0;
         #[cfg(feature = "metrics")]
         ::metrics::gauge!("spool_queue_depth").set(0.0);
         Ok(())
@@ -335,7 +355,14 @@ impl Spool {
         &self.config
     }
 
-    /// Get the approximate directory size in bytes.
+    /// Payload bytes of the records queued, the count `max_size_bytes` caps.
+    #[must_use]
+    pub fn queued_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Get the approximate directory size in bytes, consumed records still in
+    /// their segment included. Walks the directory with blocking calls.
     ///
     /// # Errors
     ///
@@ -388,85 +415,6 @@ fn open_queue(path: &Path, policy: CorruptionPolicy) -> Result<(Sender, Receiver
     })
 }
 
-/// Count items in a yaque queue dir by walking segment files.
-///
-/// yaque stores messages as `[4-byte Hamming header][payload]` in `<n>.q`
-/// segments; receiver position lives in `recv-metadata`. Count from the
-/// receiver position to the end of the highest segment.
-fn count_existing_items(path: &std::path::Path) -> std::io::Result<usize> {
-    if !path.is_dir() {
-        return Ok(0);
-    }
-
-    // Read receiver state from recv-metadata (two big-endian u64: segment, position)
-    let recv_metadata_path = path.join("recv-metadata");
-    let (recv_segment, recv_position) = if recv_metadata_path.exists() {
-        let data = std::fs::read(&recv_metadata_path)?;
-        if data.len() >= 16 {
-            let segment = u64::from_be_bytes(data[0..8].try_into().unwrap_or([0; 8]));
-            let position = u64::from_be_bytes(data[8..16].try_into().unwrap_or([0; 8]));
-            (segment, position)
-        } else {
-            (0, 0)
-        }
-    } else {
-        (0, 0)
-    };
-
-    // Collect all segment numbers
-    let mut segments: Vec<u64> = Vec::new();
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let file_path = entry.path();
-        if file_path.extension().and_then(|e| e.to_str()) == Some("q")
-            && let Some(stem) = file_path.file_stem().and_then(|s| s.to_str())
-            && let Ok(seg_num) = stem.parse::<u64>()
-            && seg_num >= recv_segment
-        {
-            segments.push(seg_num);
-        }
-    }
-    segments.sort_unstable();
-
-    let mut count = 0usize;
-    // Header EOF marker in yaque
-    let header_eof: [u8; 4] = [255, 255, 255, 255];
-
-    for &seg_num in &segments {
-        let seg_path = path.join(format!("{seg_num}.q"));
-        let file_data = std::fs::read(&seg_path)?;
-
-        // Start position: if this is the receiver's segment, skip to receiver position
-        #[allow(clippy::cast_possible_truncation)]
-        let start = if seg_num == recv_segment {
-            recv_position as usize
-        } else {
-            0
-        };
-
-        let mut pos = start;
-        while pos + 4 <= file_data.len() {
-            let header_bytes: [u8; 4] = file_data[pos..pos + 4].try_into().unwrap_or([0; 4]);
-
-            // Check for EOF marker
-            if header_bytes == header_eof {
-                break; // End of segment, move to next
-            }
-
-            // Decode length from Hamming-encoded header (lower 26 bits)
-            let encoded = u32::from_be_bytes(header_bytes);
-            let payload_len = (encoded & 0x03_FF_FF_FF) as usize;
-
-            pos += 4 + payload_len;
-            if pos <= file_data.len() {
-                count += 1;
-            }
-        }
-    }
-
-    Ok(count)
-}
-
 impl std::fmt::Debug for Spool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Spool")
@@ -500,6 +448,47 @@ mod tests {
         assert_eq!(spool.pop_front().await.unwrap(), Some(b"world".to_vec()));
 
         assert!(spool.is_empty());
+    }
+
+    /// `max_size_bytes` caps the bytes queued, counted as records come and
+    /// go: draining a full spool makes room again, however much of its segment
+    /// file the drained records still occupy. A reopen counts what is queued.
+    #[tokio::test]
+    async fn the_size_cap_counts_queued_bytes_not_the_directory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("capped");
+        let config = SpoolConfig::new(&path).max_size_bytes(1024);
+        let record = [b'r'; 100];
+
+        let mut spool = Spool::open(config.clone()).await.unwrap();
+        let mut pushed = 0;
+        while spool.push(&record).await.is_ok() {
+            pushed += 1;
+            assert!(pushed < 100, "the 1 KiB cap never refused a push");
+        }
+        assert!(pushed > 0, "the first push fits the cap");
+        for _ in 0..pushed {
+            assert!(spool.pop_front().await.unwrap().is_some());
+        }
+        assert!(spool.is_empty());
+        spool
+            .push(&record)
+            .await
+            .expect("an emptied spool has room under its cap");
+
+        drop(spool);
+        let mut reopened = Spool::open(config).await.unwrap();
+        assert_eq!(reopened.len(), 1);
+        for _ in 1..pushed {
+            reopened.push(&record).await.expect("room for the rest");
+        }
+        assert!(
+            matches!(
+                reopened.push(&record).await,
+                Err(SpoolError::MaxSizeReached { .. })
+            ),
+            "the reopened spool counts the record it already holds"
+        );
     }
 
     #[tokio::test]

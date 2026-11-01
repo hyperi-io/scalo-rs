@@ -84,9 +84,13 @@ impl Default for PipeTransportConfig {
 }
 
 impl PipeTransportConfig {
-    /// Load from the config cascade under the `transport.pipe` key.
-    #[must_use]
-    pub fn from_cascade() -> Self {
+    /// Load from the config cascade under the `transport.pipe` key, or the defaults
+    /// when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` when the section is present but does not parse.
+    pub fn from_cascade() -> crate::transport::TransportResult<Self> {
         <Self as super::traits::FromCascade>::from_cascade_key("transport.pipe")
     }
 }
@@ -106,6 +110,9 @@ struct ReadState {
 /// Receive reads lines from stdin, each becoming a message.
 /// Commit is a no-op (stdin cannot be rewound).
 pub struct PipeTransport {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
     stdin: tokio::sync::Mutex<ReadState>,
     stdout: tokio::sync::Mutex<tokio::io::Stdout>,
     sequence: AtomicU64,
@@ -172,7 +179,7 @@ impl PipeTransport {
         super::filter::TransportFilterEngine::new(
             &config.filters_in,
             &config.filters_out,
-            &crate::transport::filter::TransportFilterTierConfig::from_cascade(),
+            &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )
     }
 
@@ -190,19 +197,21 @@ impl PipeTransport {
         let closed = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let h = Arc::clone(&closed);
             let filters_compiled = filter_engine.is_ok();
-            crate::health::HealthRegistry::register("transport:pipe", move || {
+            crate::health::HealthRegistry::register_scoped("transport:pipe", move || {
                 if filters_compiled && !h.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Healthy
                 } else {
                     crate::health::HealthStatus::Unhealthy
                 }
-            });
-        }
+            })
+        };
 
         Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
             stdin: tokio::sync::Mutex::new(ReadState {
                 reader: BufReader::new(input),
                 line: Vec::new(),
@@ -374,6 +383,7 @@ impl TransportReceiver for PipeTransport {
                         token: PipeToken { seq },
                         timestamp_ms: Some(timestamp_ms),
                         format,
+                        headers: Vec::new(),
                     });
                 }
                 Err(e) => {

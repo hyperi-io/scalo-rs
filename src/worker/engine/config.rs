@@ -32,7 +32,7 @@ pub enum ParseErrorAction {
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PreRouteFilterConfig {
-    /// Route to DLQ if a required field is absent.
+    /// Drop the record, committed with its block, if a required field is absent.
     DropFieldMissing {
         /// Name of the required field.
         field: String,
@@ -72,7 +72,8 @@ pub struct BatchProcessingConfig {
 
     /// Pre-route filters applied before routing decisions.
     ///
-    /// Evaluated in order -- first match wins.
+    /// Evaluated in order -- first match wins. Each reads the field it names,
+    /// whether or not `routing_field` is set.
     #[serde(default)]
     pub pre_route_filters: Vec<PreRouteFilterConfig>,
 
@@ -129,12 +130,16 @@ impl BatchProcessingConfig {
     ///
     /// # Errors
     ///
-    /// `ConfigError::InvalidValue` for a `max_chunk_size` of 0. Otherwise a
-    /// `ConfigError` only if the cascade is initialised and the key
-    /// contains data that cannot be deserialised into `BatchProcessingConfig`.
+    /// `ConfigError::InvalidValue` for a `max_chunk_size` of 0, and
+    /// `ConfigError::ExtractError` when the key is present but does not
+    /// deserialise into `BatchProcessingConfig`.
     pub fn from_cascade(key: &str) -> Result<Self, crate::config::ConfigError> {
         let config: Self = if let Some(cfg) = crate::config::try_get() {
-            cfg.unmarshal_key(key).unwrap_or_default()
+            if cfg.contains(key) {
+                cfg.unmarshal_key(key)?
+            } else {
+                Self::default()
+            }
         } else {
             tracing::debug!("Config cascade not initialised, using default BatchProcessingConfig");
             Self::default()
@@ -166,6 +171,32 @@ mod tests {
     fn from_cascade_falls_back_to_defaults() {
         let config = BatchProcessingConfig::from_cascade("batch_processing").unwrap();
         assert_eq!(config.max_chunk_size, 10_000);
+    }
+
+    /// An absent section takes the defaults, and one that does not parse is
+    /// an error rather than silently becoming the defaults.
+    #[test]
+    #[cfg(feature = "config")]
+    fn from_cascade_refuses_a_section_that_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "batch_processing:\n  routing_field: _table\n  pre_route_filters:\n    - type: no_such_filter\n",
+        )
+        .unwrap();
+        crate::config::setup(crate::config::ConfigOptions {
+            config_paths: vec![dir.path().to_path_buf()],
+            ..crate::config::ConfigOptions::default()
+        })
+        .unwrap();
+
+        let invalid = BatchProcessingConfig::from_cascade("batch_processing");
+        assert!(
+            matches!(invalid, Err(crate::config::ConfigError::ExtractError(_))),
+            "an unknown filter type must fail the load, got {invalid:?}"
+        );
+        let absent = BatchProcessingConfig::from_cascade("no_such_section").unwrap();
+        assert_eq!(absent.max_chunk_size, 10_000);
     }
 
     #[test]

@@ -421,8 +421,8 @@ pub(super) async fn settle_recv<T: crate::transport::CommitToken>(
 }
 
 /// Sink `batch`, holding it and retrying while the sink reports a transient
-/// failure, so no later block is fetched or committed past it. Retries stop
-/// when `retry` closes.
+/// failure, so no later block is fetched or committed past it. Retries, and an
+/// attempt still in flight, stop when `retry` closes.
 #[cfg(feature = "transport")]
 async fn sink_until_delivered<T, Sink, SinkFut>(
     sink: &mut Sink,
@@ -436,7 +436,14 @@ where
 {
     let mut failures = 0_u32;
     loop {
-        match sink(batch).await {
+        // An attempt still pending when the window closes is dropped too, so a
+        // hung sink cannot hold shutdown.
+        let result = tokio::select! {
+            biased;
+            result = sink(batch) => result,
+            () = retry.closed() => return Ok(Delivery::Abandoned),
+        };
+        match result {
             Ok(()) => {
                 note_recovered("sink", failures);
                 return Ok(Delivery::Sunk);

@@ -244,7 +244,8 @@ async fn resolve_file(spec: &str, path: &str) -> Result<String, CredentialError>
 /// spec ever resolved.
 #[cfg(all(feature = "secrets-vault", feature = "config"))]
 fn secrets_config_for_lookup() -> Result<super::SecretsConfig, CredentialError> {
-    let mut config = super::SecretsConfig::from_cascade();
+    let mut config =
+        super::SecretsConfig::from_cascade().map_err(|e| CredentialError::Vault(e.to_string()))?;
     if config.openbao.is_none() {
         config.openbao = super::OpenBaoConfig::from_env();
     }
@@ -319,8 +320,9 @@ async fn resolve_vault(_spec: &str, _path: &str, _key: &str) -> Result<String, C
 /// absent section is filled from the standard `AWS_*` variables rather than
 /// left to fail later as an unconfigured provider.
 #[cfg(feature = "secrets-aws")]
-fn secrets_config_for_aws_lookup() -> super::SecretsConfig {
-    let mut config = super::SecretsConfig::from_cascade();
+fn secrets_config_for_aws_lookup() -> Result<super::SecretsConfig, CredentialError> {
+    let mut config =
+        super::SecretsConfig::from_cascade().map_err(|e| CredentialError::Aws(e.to_string()))?;
     if config.aws.is_none() {
         #[cfg(feature = "config")]
         {
@@ -336,7 +338,7 @@ fn secrets_config_for_aws_lookup() -> super::SecretsConfig {
         config.openbao = None;
     }
     without_cache(&mut config);
-    config
+    Ok(config)
 }
 
 #[cfg(feature = "secrets-aws")]
@@ -348,7 +350,7 @@ async fn resolve_aws(
     use super::{SecretSource, SecretsManager};
 
     let name = one_off_source_name(spec);
-    let mut config = secrets_config_for_aws_lookup();
+    let mut config = secrets_config_for_aws_lookup()?;
     config.sources.insert(
         name.clone(),
         SecretSource::Aws {
@@ -709,7 +711,7 @@ mod tests {
     #[cfg(feature = "secrets-aws")]
     fn aws_lookup_config_turns_the_cache_off() {
         assert!(
-            !secrets_config_for_aws_lookup().cache.enabled,
+            !secrets_config_for_aws_lookup().unwrap().cache.enabled,
             "a one-off aws lookup must not cache"
         );
     }
@@ -725,7 +727,7 @@ mod tests {
                 ("AWS_DEFAULT_REGION", None),
                 ("AWS_ENDPOINT_URL", None),
             ],
-            || secrets_config_for_aws_lookup().aws.unwrap().region,
+            || secrets_config_for_aws_lookup().unwrap().aws.unwrap().region,
         );
 
         assert!(

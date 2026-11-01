@@ -1373,7 +1373,7 @@ pub struct KafkaConfig {
     // apply here. The mapping from the unified `TlsTrust` vocabulary is:
     //   TlsTrust.extra_roots (private CA, single bundle ok) -> ssl_ca_location
     //   client cert / key (mTLS)                             -> ssl_certificate_location / ssl_key_location
-    //   native/webpki roots                                  -> librdkafka uses the system store by default (omit ssl_ca_location)
+    //   native/webpki roots                                  -> omit ssl_ca_location: the client builders set ssl.ca.location=probe
     //   exclusive private-CA pin                             -> set ssl_ca_location to the private CA only
     /// SSL CA certificate file path (private-CA bundle; maps to
     /// `TlsTrust.extra_roots` -- a single combined root+intermediate PEM is

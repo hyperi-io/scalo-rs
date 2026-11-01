@@ -139,7 +139,7 @@ use self::pre_route::filters_from_config;
 // Pre-route + parse helpers are used only by the in-process process_* methods,
 // which take the canonical transport Record and so are transport-gated.
 #[cfg(feature = "transport")]
-use self::pre_route::{PreRouteOutcome, apply_filters, extract_routing_field};
+use self::pre_route::{PreRouteOutcome, apply_filters};
 #[cfg(feature = "transport")]
 use self::types::PayloadFormat;
 use super::config::WorkerPoolConfig;
@@ -364,7 +364,7 @@ impl BatchEngine {
             self.config.max_chunk_size
         };
 
-        let has_routing = self.config.routing_field.is_some();
+        let has_filters = !self.filters.is_empty();
         let mut all_results = Vec::with_capacity(messages.len());
 
         for chunk in messages.chunks(chunk_size) {
@@ -381,12 +381,8 @@ impl BatchEngine {
 
             for msg in chunk {
                 // Phase 1: Pre-route
-                if has_routing {
-                    let field_name = self.config.routing_field.as_ref().expect("checked above");
-                    let extraction = extract_routing_field(&msg.payload, field_name);
-                    let outcome = apply_filters(&extraction, &self.filters);
-
-                    match outcome {
+                if has_filters {
+                    match apply_filters(&msg.payload, &self.filters) {
                         PreRouteOutcome::Continue => {}
                         PreRouteOutcome::Filtered => {
                             self.stats.incr_filtered();
@@ -524,7 +520,7 @@ impl BatchEngine {
             self.config.max_chunk_size
         };
 
-        let has_routing = self.config.routing_field.is_some();
+        let has_filters = !self.filters.is_empty();
         let mut all_results = Vec::with_capacity(messages.len());
 
         for chunk in messages.chunks(chunk_size) {
@@ -534,13 +530,10 @@ impl BatchEngine {
             self.stats.add_bytes_received(chunk_bytes);
 
             // Phase 1: Pre-route filter
-            let to_process: Vec<&crate::transport::Record> = if has_routing {
-                let field_name = self.config.routing_field.as_ref().expect("checked above");
+            let to_process: Vec<&crate::transport::Record> = if has_filters {
                 let mut passed = Vec::with_capacity(chunk.len());
                 for msg in chunk {
-                    let extraction = extract_routing_field(&msg.payload, field_name);
-                    let outcome = apply_filters(&extraction, &self.filters);
-                    match outcome {
+                    match apply_filters(&msg.payload, &self.filters) {
                         PreRouteOutcome::Continue => passed.push(msg),
                         PreRouteOutcome::Filtered => {
                             self.stats.incr_filtered();
@@ -1038,6 +1031,105 @@ mod engine_tests {
         let snap = engine.stats().snapshot();
         assert_eq!(snap.filtered, 1);
         assert_eq!(snap.received, 3);
+    }
+
+    /// Each pre-route filter reads the field it names, whatever
+    /// `routing_field` is, in both the mid-tier and the raw path.
+    #[test]
+    fn a_pre_route_filter_reads_its_own_field() {
+        use config::PreRouteFilterConfig as F;
+        // name, routing_field, filters, payload, (results, filtered, dlq)
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            Vec<F>,
+            &'static str,
+            (usize, u64, u64),
+        );
+        let drop_no_host = || F::DropFieldMissing {
+            field: "host".to_string(),
+        };
+        let dlq_bad_status = || F::DlqFieldValue {
+            field: "status".to_string(),
+            value: "bad".to_string(),
+        };
+        let cases: Vec<Case> = vec![
+            (
+                "drop: filter field absent, routing field present",
+                Some("_table"),
+                vec![drop_no_host()],
+                r#"{"_table":"events"}"#,
+                (0, 1, 0),
+            ),
+            (
+                "drop: filter field present, routing field absent",
+                Some("_table"),
+                vec![drop_no_host()],
+                r#"{"host":"web1"}"#,
+                (1, 0, 0),
+            ),
+            (
+                "dlq: on the filter's field",
+                Some("_table"),
+                vec![dlq_bad_status()],
+                r#"{"_table":"events","status":"bad"}"#,
+                (1, 0, 1),
+            ),
+            (
+                "dlq: routing field holding the value is not the filter's field",
+                Some("status"),
+                vec![F::DlqFieldValue {
+                    field: "_table".to_string(),
+                    value: "bad".to_string(),
+                }],
+                r#"{"_table":"events","status":"bad"}"#,
+                (1, 0, 0),
+            ),
+            (
+                "a filter runs with no routing field",
+                None,
+                vec![drop_no_host()],
+                r#"{"_table":"events"}"#,
+                (0, 1, 0),
+            ),
+            (
+                "no filters, no routing field",
+                None,
+                vec![],
+                r#"{"_table":"events"}"#,
+                (1, 0, 0),
+            ),
+        ];
+        for (name, routing_field, filters, payload, (results, filtered, dlq)) in cases {
+            let config = BatchProcessingConfig {
+                routing_field: routing_field.map(str::to_string),
+                pre_route_filters: filters,
+                ..Default::default()
+            };
+            let msgs = vec![Record {
+                payload: Bytes::from(payload.to_string()),
+                key: None,
+                headers: vec![],
+                metadata: RecordMeta {
+                    timestamp_ms: None,
+                    format: TPayloadFormat::Json,
+                },
+            }];
+            for path in ["mid_tier", "raw"] {
+                let engine = BatchEngine::new(config.clone());
+                let got: Vec<Result<(), String>> = if path == "mid_tier" {
+                    engine.process_mid_tier(&msgs, |_pm| Ok(()))
+                } else {
+                    engine.process_raw(&msgs, |_r| Ok(()))
+                };
+                let snap = engine.stats().snapshot();
+                assert_eq!(
+                    (got.len(), snap.filtered, snap.dlq),
+                    (results, filtered, dlq),
+                    "{name} ({path}): results {got:?}"
+                );
+            }
+        }
     }
 
     #[test]

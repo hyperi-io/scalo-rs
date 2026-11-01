@@ -28,8 +28,8 @@ Both take a `&[Record]` slice, chunk it at `max_chunk_size` (default
 
 ```mermaid
 flowchart LR
-    R[Record slice] --> C{routing_field set?}
-    C -->|yes| F[Pre-route filter<br/>SIMD field extract<br/>~100 ns/msg]
+    R[Record slice] --> C{pre_route_filters listed?}
+    C -->|yes| F[Pre-route filter<br/>SIMD extract of each filter's field<br/>~100 ns/field]
     C -->|no| P
     F --> P[Parse<br/>sonic_rs::from_slice<br/>~1-5 us/msg]
     P --> I[Intern known fields<br/>extract into HashMap]
@@ -37,7 +37,7 @@ flowchart LR
     T --> O[Vec&lt;Result&lt;O, E&gt;&gt;]
 ```
 
-Filter-rejected messages are removed from the output. DLQ-routed and
+Each pre-route filter reads the field it names, and the first filter that matches decides. `routing_field` does not gate them. Filter-rejected messages are removed from the output. DLQ-routed and
 parse-error messages become `Err` entries; the action is configured
 via `parse_error_action: dlq | skip | fail_batch`.
 
@@ -108,7 +108,9 @@ stopped at the token lost what the source had acknowledged.
   shutdown, whether the sink began refusing before shutdown or during the
   drain. A sink busy for a moment at shutdown therefore loses nothing.
 - A block the sink still refuses when those 10 s are up stays uncommitted,
-  and the drain stops there, so nothing is committed past it. What the
+  and the drain stops there, so nothing is committed past it. A sink call
+  still in flight at that point is dropped the same way, so a hung sink
+  cannot hold shutdown, and a held push block is released `Errored`. What the
   source still holds is not delivered. If the sink was refusing it before
   the drain began, the source is closed without a drain.
 - A permanent sink error stops the drain at once and is returned as the
@@ -161,13 +163,13 @@ outside the runtime use `BatchEngine::new` or
 
 ## Configuration
 
-Loaded from the `batch_processing` cascade key:
+Loaded from the `batch_processing` cascade key. An absent section takes the defaults below, and a section that does not parse fails the load with `ConfigError::ExtractError`:
 
 ```yaml
 batch_processing:
   max_chunk_size: 10000          # at least 1
   format: auto                    # auto | json | msgpack
-  routing_field: _table           # null disables pre-route
+  routing_field: _table           # the field the app routes on
   pre_route_filters:
     - type: drop_field_missing
       field: _table

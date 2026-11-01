@@ -107,7 +107,14 @@ let kafka: KafkaConfig = config::get().unmarshal_key_registered::<KafkaConfig>("
 ```
 
 Modules with sensible defaults expose a `from_cascade` constructor wrapping this
-call: `TransportFilterEngine::from_cascade("filters")?`.
+call: `TransportFilterEngine::from_cascade("filters")?`. The transport configs
+(`HttpTransportConfig`, `FileTransportConfig`, `PipeTransportConfig`,
+`GrpcConfig`, `AcknowledgementsConfig`) and `SinkStackConfig` read through
+`transport::FromCascade`: an absent section takes the defaults, and a present one
+that does not parse is `TransportError::Config` naming its key. Every other
+module's `from_cascade()` reads through `scalo::cascade::section` the same way and
+returns a `CascadeError`, and `run_app` refuses to start, `config-check` included,
+when a section its own runtime reads does not parse (`check_runtime_sections`).
 
 ---
 
@@ -189,6 +196,8 @@ let _handle = reloader.start();        // -> JoinHandle<()>; spawns the watch ta
 // Reader path -- lock-free:
 let current = shared.get();            // clone; or shared.read() for a guard
 ```
+
+Reloads are at least `debounce` (500 ms) apart. A trigger inside that window reloads once it ends, so a file edited just after a reload is still applied.
 
 `with_registry_update(key)` makes the reloader call `registry::update(key)` after a
 successful reload, firing any `registry::on_change(key, cb)` subscribers:

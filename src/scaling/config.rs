@@ -51,17 +51,13 @@ impl ScalingPressureConfig {
     ///
     /// Falls back to [`ScalingPressureConfig::default()`] if config is not
     /// initialised or the key is absent.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(scaling) = cfg.unmarshal_key_registered::<Self>("scaling")
-            {
-                return scaling;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `scaling` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("scaling")
     }
 }
 

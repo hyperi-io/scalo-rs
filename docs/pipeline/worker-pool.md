@@ -149,7 +149,7 @@ just use `runtime.worker_pool`.
 | `AdaptiveWorkerPool::new(cfg)` | Build pool with explicit config |
 | `AdaptiveWorkerPool::from_cascade(key)` | Build pool from `worker_pool` cascade key |
 | `process_batch(items, f)` | Rayon `par_iter` with permit throttling, results in input order |
-| `fan_out_async(items, f)` | Tokio fan-out with `async_concurrency` cap, results in input order |
+| `fan_out_async(items, f)` | Tokio fan-out with `async_concurrency` cap, results in input order. Dropping the future aborts the tasks it spawned |
 | `install(f)` | Raw rayon pool access -- no permit throttling |
 | `register_metrics(mgr)` | Register operational gauges with `MetricsManager` |
 | `start_scaling_loop(cancel)` | Spawn the pressure-based scaling controller |

@@ -86,6 +86,10 @@ pub enum HttpClientError {
     /// Failed to build the underlying reqwest client.
     #[error("failed to build HTTP client: {0}")]
     BuildError(#[from] reqwest::Error),
+
+    /// The `http_client` config section does not parse.
+    #[error(transparent)]
+    Config(#[from] crate::cascade::CascadeError),
 }
 
 /// Error from an HTTP request.
@@ -293,7 +297,7 @@ impl HttpClient {
     /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
     /// client cannot be constructed.
     pub fn from_cascade() -> Result<Self, HttpClientError> {
-        Self::new(HttpClientConfig::from_cascade())
+        Self::new(HttpClientConfig::from_cascade()?)
     }
 
     /// Exponential backoff schedule from config (jittered to avoid sync'd
@@ -459,7 +463,8 @@ impl HttpClient {
         body: &T,
     ) -> Result<Response, HttpError> {
         let start = std::time::Instant::now();
-        let body_bytes = serde_json::to_vec(body)?;
+        // One buffer, shared by every attempt: a clone is a refcount bump.
+        let body_bytes = bytes::Bytes::from(serde_json::to_vec(body)?);
         let result = self
             .execute("POST", false, || {
                 self.inner
@@ -483,7 +488,8 @@ impl HttpClient {
         body: &T,
     ) -> Result<Response, HttpError> {
         let start = std::time::Instant::now();
-        let body_bytes = serde_json::to_vec(body)?;
+        // One buffer, shared by every attempt: a clone is a refcount bump.
+        let body_bytes = bytes::Bytes::from(serde_json::to_vec(body)?);
         let result = self
             .execute("PUT", true, || {
                 self.inner

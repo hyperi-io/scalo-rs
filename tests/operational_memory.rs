@@ -15,7 +15,7 @@
 //! - cap=off -> OOM-killed (the control proving the limit is real)
 //!
 //! `#[ignore]` by default: it needs docker and builds an image (~minutes), so
-//! it runs in a dedicated/nightly CI job, not the per-push gate. Run with:
+//! it runs in the full tier (nightly and before a release), not core. Run with:
 //!
 //! ```sh
 //! cargo nextest run --features memory --run-ignored all -E 'test(operational)'
@@ -34,7 +34,7 @@ fn docker_available() -> bool {
 }
 
 #[test]
-#[ignore = "operational: needs docker + builds an image; runs in the dedicated CI job"]
+#[ignore = "needs docker + builds an image -- run: cargo nextest run --all-features --run-ignored all --ignore-default-filter"]
 fn operational_memory_cap_bounds_under_cgroup_with_control() {
     if !docker_available() {
         eprintln!("SKIP: docker unavailable -- operational memory test not run");

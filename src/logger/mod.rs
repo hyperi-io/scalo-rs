@@ -69,6 +69,10 @@ pub enum LoggerError {
     #[error("logger already initialised")]
     AlreadyInitialised,
 
+    /// The `logger` or `otel_tracing` config section does not parse.
+    #[error(transparent)]
+    Config(#[from] crate::cascade::CascadeError),
+
     /// Failed to set global subscriber.
     #[error("failed to set global subscriber: {0}")]
     SetGlobalError(String),
@@ -253,17 +257,13 @@ impl LoggerSettings {
     ///
     /// Returns the default (nothing set) when config is not initialised, so
     /// a logger built before the cascade exists still works.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(settings) = cfg.unmarshal_key_registered::<Self>("logger")
-            {
-                return settings;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `logger` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("logger")
     }
 }
 
@@ -318,7 +318,7 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
     // exporter resolves to.
     #[cfg(feature = "otel-tracing")]
     let otel = {
-        let mut config = crate::otel_tracing::OtelTracingConfig::from_cascade();
+        let mut config = crate::otel_tracing::OtelTracingConfig::from_cascade()?;
         if config.service_name.is_empty() {
             config.service_name = opts
                 .service_name
@@ -369,7 +369,7 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
             let ansi = colour_enabled(
                 std::env::var("LOG_COLOR").ok().as_deref(),
                 is_no_color(),
-                LoggerSettings::from_cascade().color,
+                LoggerSettings::from_cascade()?.color,
                 ConsoleContext::detect().tty,
             );
             let formatter = format::ColouredFormatter::new(ansi)
@@ -452,7 +452,7 @@ pub fn setup_default() -> Result<(), LoggerError> {
 
     let format = first_concrete_format([
         std::env::var("LOG_FORMAT").ok(),
-        LoggerSettings::from_cascade().format,
+        LoggerSettings::from_cascade()?.format,
     ]);
 
     let throttle_enabled = std::env::var("LOG_THROTTLE_ENABLED")

@@ -14,6 +14,7 @@ use backon::ExponentialBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::governor::RateLimitConfig;
+use crate::transport::FromCascade;
 
 /// Configuration for a [`SinkStack`](super::SinkStack).
 ///
@@ -75,6 +76,8 @@ fn default_max_backoff_ms() -> u64 {
     30_000
 }
 
+impl FromCascade for SinkStackConfig {}
+
 impl Default for SinkStackConfig {
     fn default() -> Self {
         Self {
@@ -91,27 +94,15 @@ impl Default for SinkStackConfig {
 }
 
 impl SinkStackConfig {
-    /// Load from the config cascade under the `sink_stack` key (or defaults).
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        Self::from_cascade_key("sink_stack")
-    }
-
-    /// Load from the config cascade under an explicit `key` (or defaults). Lets a
-    /// runtime with multiple sinks give each its own `sink_stack`-shaped section.
-    #[must_use]
-    pub fn from_cascade_key(key: &str) -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(s) = cfg.unmarshal_key_registered::<Self>(key)
-            {
-                return s;
-            }
-        }
-        #[cfg(not(feature = "config"))]
-        let _ = key;
-        Self::default()
+    /// Load from the config cascade under the `sink_stack` key, or the defaults
+    /// when it is absent. A runtime with several sinks gives each its own
+    /// `sink_stack`-shaped section through [`FromCascade::from_cascade_key`].
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` when the section is present but does not parse.
+    pub fn from_cascade() -> crate::transport::TransportResult<Self> {
+        <Self as FromCascade>::from_cascade_key("sink_stack")
     }
 
     /// Per-attempt timeout as a `Duration`. A configured `0` is treated as a

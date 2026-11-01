@@ -915,6 +915,40 @@ impl DeploymentContract {
         dev
     }
 
+    /// Mount the file DLQ's directory writable, so the file backend still
+    /// starts on the read-only root filesystem.
+    ///
+    /// Adds a `dlq` [`WritablePath`] at `dlq.file.path` when `dlq` writes
+    /// files: the DLQ and its file backend on, in any mode but `kafka_only`.
+    /// A writable path already at that directory, or above it, leaves the
+    /// contract as it is. Pass the config the app spawns its DLQ with, so the
+    /// mount is the directory the backend opens.
+    ///
+    /// ```
+    /// use scalo::deployment::DeploymentContract;
+    /// use scalo::dlq::DlqConfig;
+    ///
+    /// let contract = DeploymentContract::default().with_dlq(&DlqConfig::default());
+    /// assert_eq!(contract.writable_paths[0].path, "/var/spool/scalo/dlq");
+    /// ```
+    #[cfg(feature = "dlq")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dlq")))]
+    #[must_use]
+    pub fn with_dlq(mut self, dlq: &crate::dlq::DlqConfig) -> Self {
+        let writes_files =
+            dlq.enabled && dlq.file.enabled && dlq.mode != crate::dlq::DlqMode::KafkaOnly;
+        let dir = dlq.file.path.as_path();
+        let covered = self
+            .writable_paths
+            .iter()
+            .any(|w| dir.starts_with(std::path::Path::new(&w.path)));
+        if writes_files && !covered {
+            self.writable_paths
+                .push(WritablePath::new("dlq", dir.to_string_lossy()));
+        }
+        self
+    }
+
     /// The KEDA contract when it turns KEDA on; `None` when absent or disabled.
     pub(crate) fn enabled_keda(&self) -> Option<&KedaContract> {
         self.keda.as_ref().filter(|keda| keda.enabled)

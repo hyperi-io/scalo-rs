@@ -8,6 +8,132 @@ release and the target before bumping.
 
 ## Unreleased
 
+### The spool's size cap counts queued bytes (BEHAVIOUR CHANGE)
+
+`Spool::push` checks `max_size_bytes` against the bytes of the records queued plus the record being written, counted once at open and then incrementally. It summed the directory on every push, which counted records already consumed and walked the directory on the async runtime. `Spool::queued_bytes()` returns the count.
+
+**Consumer adjustment** -- none. A spool drained after filling accepts pushes again.
+
+### The file transport caps a line it reads (BEHAVIOUR CHANGE)
+
+`FileTransportConfig` gains `max_line_bytes` (default 16 MiB). A longer line comes back from `recv` as a dead letter in `dlq_entries` carrying its first `max_line_bytes`, with its token in the commit tokens, where it was read into memory whole. `0` is refused.
+
+**Consumer adjustment** -- a struct literal of `FileTransportConfig` adds the field or `..Default::default()`. A reader of files with longer lines raises the cap.
+
+### Kafka TLS with no CA probes the system bundle (BEHAVIOUR CHANGE)
+
+With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`, `ssl.ca.location` or `ssl.ca.pem`, every Kafka client sets `ssl.ca.location: probe`. A static OpenSSL's built-in default reads `/etc/ssl/certs` hashed links, which a RHEL or UBI base lacks.
+
+**Consumer adjustment** -- none. A deploy that relied on `OPENSSLDIR` alone keeps working on Debian-family images.
+
+### A dropped transport leaves the health registry (additive)
+
+`HealthRegistry::register_scoped` returns a `HealthRegistration` that removes its check on drop. The HTTP, file, pipe, gRPC and Kafka transports and the tiered sink's circuit breaker register through it, so a closed and dropped one no longer holds `/readyz` at 503 for the rest of the process. `register` is unchanged.
+
+**Consumer adjustment** -- none. An app that registers a check for a component it replaces moves to `register_scoped` and holds the handle with the component.
+
+### The compose fragment's `command` no longer repeats the binary (BEHAVIOUR CHANGE)
+
+`generate_compose_fragment` wrote `command: ["<binary>", <args>]`, which compose appends to the image's `ENTRYPOINT ["<binary>"]`, so the process started as `<binary> <binary> --config ...`. It writes the args alone.
+
+**Consumer adjustment** -- regenerate a committed compose file (`<app> generate-artefacts`). dfe-fetcher's `docker-compose.yaml` carries `command: ["dfe-fetcher", "--config", "/etc/dfe/fetcher.yaml"]`.
+
+### Kafka test support generates its SCRAM password (API CHANGE)
+
+`transport::kafka::test_support::SCRAM_PASSWORD` is replaced by `scram_password()`, which returns a password generated once per test process, so the test broker carries no credential in source.
+
+**Consumer adjustment** -- `SCRAM_PASSWORD` becomes `scram_password()`. None of the seven DFE consumers uses it: dfe-loader keeps its own copy in `tests/common/tls_broker.rs`.
+
+### The spool drains in batches (BEHAVIOUR CHANGE)
+
+`TieredSink`'s drain sends up to `drain_batch_max_records` (default 500) spooled records, within `drain_batch_max_bytes` (default 4 MiB as stored), in one `send_batch`, where it sent one record per pass. A sink that answers once the batch is delivered, Kafka's delivery reports say, now costs one round trip per batch. The whole batch commits on `Ok` and rolls back on backpressure, a timeout or a sink-level `Fatal`. A record-level `Fatal` re-sends the batch one record at a time.
+
+**Consumer adjustment** -- none. A struct literal of `TieredSinkConfig` adds the two fields or uses `TieredSinkConfig::new`, and none of the seven consumers has one.
+
+### Every `from_cascade()` refuses a section that does not parse (API CHANGE)
+
+These return `Result<Self, scalo::cascade::CascadeError>`, where they answered a present section that does not deserialise with the defaults: `HttpClientConfig`, `OtelTracingConfig`, `SecretsConfig`, `GeoIpConfig`, `MetricsSettings`, `ScalingPressureConfig`, `TransportFilterTierConfig`, `LoggerSettings`, `MemoryGuardConfig`, `SelfRegulationConfig` and `rules::CompileOptions`. `WorkerPoolConfig::from_cascade` returns `ConfigError::ExtractError` for one. An absent section still takes the defaults. `scalo::cascade::section(key)` is the shared reader, and `FromCascade` uses it.
+
+`run_app` refuses to start on a bad `logger`, `metrics`, `memory`, `self_regulation`, `scaling`, `otel_tracing`, `transport.filter_tiers`, `expression` or `sink_stack` section (`cascade::check_runtime_sections`), `config-check` included. `ServiceRuntime::build`, `logger::setup`, `RuleSet::compile`, `HttpClient::from_cascade` and the transports' constructors return the error. `LoggerError`, `HttpClientError` and `RulesError` gain a `Config(CascadeError)` variant, and `TransportError`, `CliError` and `SecretsError` convert from it. `VersionCheckConfig::from_cascade_or` keeps its per-key leniency.
+
+**Consumer adjustment** -- at each consumer's `origin/main`:
+
+- dfe-loader (b54cae3):
+  - `src/pipeline/startup.rs:37` (`retry_until_shutdown`, no error path for it): `SinkStackConfig::from_cascade().unwrap_or_default()`. `run_app` has already refused a bad `sink_stack` section.
+  - `src/main.rs:353` (test `the_scaling_gate_reaches_the_cascade_through_the_env`): `scalo::ScalingPressureConfig::from_cascade().unwrap()`.
+- dfe-receiver (662e3d0):
+  - `src/routing/mod.rs:188` (`compile_rules`, returns `Result`): `CompileOptions::from_cascade().map_err(|e| Error::Config(format!("rules: {e}")))?`.
+- dfe-archiver (f2cc428):
+  - `crates/archiver/src/archiver.rs:1030` (inside `buffer_config`, no error path): `scalo::scaling::ScalingPressureConfig::from_cascade().unwrap_or_default()`. `run_app` has already refused a bad `scaling` section.
+- dfe-transform-elastic (05489a4):
+  - `src/config/loader.rs:304` and `:311` (test `a_config_file_is_a_layer_of_the_scalo_cascade`): add `.unwrap()` to `LoggerSettings::from_cascade()` and `ScalingPressureConfig::from_cascade()`.
+  - `src/service.rs:361` (`log_effective_scaling`, no error path): `ScalingPressureConfig::from_cascade().unwrap_or_default()`.
+- dfe-fetcher (795ae60), dfe-transform-vrl (adc9fd0), dfe-transform-vector (c9bf05d) and culvert (4310b91): none. They call only `VersionCheckConfig::from_cascade_or` and `base_image_from_cascade`, which are unchanged.
+
+### Transport config sections that do not parse fail the load (API CHANGE)
+
+`FromCascade::from_cascade_key` returns `TransportResult<Self>`, and so do `HttpTransportConfig::from_cascade`, `FileTransportConfig::from_cascade`, `PipeTransportConfig::from_cascade`, `GrpcConfig::from_cascade` and `SinkStackConfig::from_cascade`. A present section that does not deserialise is `TransportError::Config` naming its key, where it became the defaults. `SinkStackConfig` implements `FromCascade` in place of its own `from_cascade_key`, and `ServiceRuntime::outbound_sink_stack` returns the error. An absent section still takes the defaults.
+
+**Consumer adjustment** -- a caller of any of these adds `?`. The one DFE call site, dfe-loader `src/pipeline/startup.rs:37`, is listed in the entry above.
+
+### A batch_processing section that does not parse fails startup (BEHAVIOUR CHANGE)
+
+`BatchProcessingConfig::from_cascade` returns `ConfigError::ExtractError` for a present section that does not deserialise, where it replaced the whole section with defaults and dropped its filters, `routing_field` and parse policy. `ServiceRuntime::build` passes the error on. An absent section still takes the defaults.
+
+**Consumer adjustment** -- fix the section the error names. A deploy that ran on silently defaulted settings now stops at startup.
+
+### HTTP receive bounds the bytes it holds (BEHAVIOUR CHANGE)
+
+`HttpTransportConfig` gains `max_in_flight_bytes` (default 64 MiB). The receive server checks the governor and reserves a request's declared length from it before reading the body, and answers 503 when either refuses. Queued records hold their bytes until `recv` takes them. A config with `max_in_flight_bytes` below `max_body_bytes` fails `HttpTransport::new`.
+
+**Consumer adjustment** -- a struct literal of `HttpTransportConfig` adds the field or `..Default::default()`. A receiver whose senders post large bodies concurrently raises `max_in_flight_bytes` within its pod's memory limit.
+
+### Pre-route filters read the field they name (BEHAVIOUR CHANGE)
+
+Each `pre_route_filters` entry reads its own `field`. They read `routing_field` whatever they named, and ran only when `routing_field` was set, so a `drop_field_missing` on another field passed records missing it. They now run whenever any are listed. `pre_route::apply_filters` takes the payload in place of one extraction: `apply_filters(&payload, &filters)`.
+
+**Consumer adjustment** -- none for a config whose filters name `routing_field`. A direct caller of `apply_filters` passes the payload.
+
+### Received records keep their headers (API CHANGE)
+
+`Message<T>` gains `headers: Vec<(String, Vec<u8>)>`, and the `WorkBatch` conversions move it onto each `Record`. The gRPC receiver fills it from each `RouteBatch` record, so the dedup key a sender set reaches the receiving app, where it was dropped. The memory transport fills it too. Every other receiver leaves it empty.
+
+`TransportSender::send_record(&Record)` sends one whole record, and the default `send_batch` calls it. Its default calls `send` with the key and payload, so a transport with nowhere to put headers is unchanged. `MemoryTransport` overrides it to keep the headers, and `AnySender` forwards it.
+
+**Consumer adjustment** -- a struct literal of `Message` adds `headers: Vec::new()`, or builds through `Message::new`.
+
+### HTTP sends retry every 5xx (BEHAVIOUR CHANGE)
+
+`HttpTransport::send` answers `Backpressured` for every 5xx, where 500, 501 and 505 to 599 were `Fatal(Send)`. A wrong credential or endpoint (401, 403, 404, 405, 407, 410, 421) is `Fatal(Config)` and 413 is `Fatal(MessageTooLarge)`, so a tiered sink's drain keeps a spooled record through a server fault or a refused credential and drops it only for a 4xx about the payload.
+
+**Consumer adjustment** -- a caller that matched `Fatal(TransportError::Send(_))` for an auth or not-found answer from the HTTP sender matches `Fatal(TransportError::Config(_))`.
+
+### Test support shares one container per service per run (API CHANGE)
+
+`deployment-test-support` carries `test_support::shared_service`, and `transport-kafka-test-support` pulls it and adds `shared_kafka` and `kafka_spec` (see [feature-flags.md](feature-flags.md)). `TlsBroker::start` and `Pki::generate` take its `Suite`, so the broker and the openssl container are named under `HYPERI_TEST_CONTAINER_PREFIX`, else `<repo>-test`, and carry its owner labels.
+
+**Consumer adjustment** -- `TlsBroker::start("my-app", test)` becomes `TlsBroker::start(&SUITE, test)`, with a `const SUITE: Suite` naming the repo, `env!("CARGO_MANIFEST_DIR")` and `option_env!("CARGO_TARGET_TMPDIR")`. A suite with its own copy of the shared-service owner drops it for scalo's: `record` and `log_path` are `Suite` methods, and `spawn_watcher` takes the suite first.
+
+### The file DLQ's directory in the contract (additive)
+
+`DeploymentContract::with_dlq(&dlq_config)` adds a `dlq` writable path at `file.path` whenever the DLQ writes files, so the file backend starts on the chart's read-only root filesystem.
+
+**Consumer adjustment** -- an app with a file DLQ builds its contract with `.with_dlq(&dlq.to_scalo_config())`, or whatever builds the `DlqConfig` it spawns. It replaces a hand-written `dlq` writable path at the same directory.
+
+### Secrets refresh on a timer (additive)
+
+`SecretsManager::spawn_refresh(shutdown)` runs `refresh_all` every `cache.refresh_interval_secs` plus up to `cache.refresh_jitter_secs`, which nothing read before. The `secrets` feature now pulls `tokio-util`.
+
+**Consumer adjustment** -- none, until an app wants the refresh.
+
+### Generated images install no Kafka C libraries (API CHANGE)
+
+`NativeDepsContract` no longer maps any feature to `librdkafka1`, the Confluent repo, `libssl`, `zlib1g` or `libzstd1`, because a release build links them statically ([native-deps.md](deployment/native-deps.md)). `directory-config-git` still maps to libgit2. `BaseDistro::confluent_suite` and `BaseDistro::libssl_package` are gone. An `AptRepoContract` with an empty `codename` now takes the resolved release instead of writing an empty suite.
+
+**Consumer adjustment** -- regenerate the committed `Dockerfile` and `Dockerfile.runtime` (`<app> generate-artefacts`), and build releases with hyperi-ci's static prefix. A local build still links the system `librdkafka-dev`.
+
+## 2.14.23
+
 ### Startup refuses config it used to run past (BEHAVIOUR CHANGE)
 
 `config::setup` fails with `ConfigError::LoadError` on a `config_paths` entry that does not exist, or a file it cannot read or parse, so `--config` with a typo stops the service. `ServiceRuntime::build` fails on `batch_processing.max_chunk_size: 0`, which capped every receive at no records. `KafkaConfig::apply_provider` refuses `msk_iam`, whose IAM token nothing in scalo can produce. On Kubernetes `TieredSink::new` refuses `disk_aware` with no byte cap and no `SCALO_WRITABLE_PATH_LIMITS` entry for the spool.
@@ -37,6 +163,8 @@ release and the target before bumping.
 `CommonArgs::to_config_options` and `flat_env::load_config` set `load_dotenv` only when no file is named, as `load_typed` already did. Under `run_app` the first cascade set up wins, so since 2.14.22 every service started with `--config` read `./.env` into its environment.
 
 **Consumer adjustment** -- none for a deployed service. A local run that relied on a `.env` beside a named file exports those values in the shell instead.
+
+## 2.14.22
 
 ### Tests hold their memory to the contract (API CHANGE)
 
@@ -118,6 +246,8 @@ On a transport with no consumer, `recv`, `release`, `commit` and `commit_weak_as
 
 **Consumer adjustment** -- none for a `BatchEngine` app. Code that stopped on the `Fatal` should retry the record instead. librdkafka waits `topic.metadata.propagation.max.ms` (30 s by default) for a topic before reporting it missing.
 
+## 2.14.19
+
 ### The CEL profile reads literals and comments as cel does (BEHAVIOUR CHANGE)
 
 The profile scanner, and with it the transport filter classifier, now reads one-line, triple-quoted and raw string and bytes literals, `//` comments and backtick-quoted names as cel's lexer does, and takes any whitespace or comment before `(` as part of a call. An expression that hid a restricted call behind one of those forms now fails `validate`, `compile` and `RuleSet::compile`, and a transport filter with such a call classifies as Tier 3. `existsOne`, which cel expands as `exists_one`, is restricted iteration too: `allow_iteration` now allows it, where it was refused as an unknown function, and a filter with it classifies as Tier 3.
@@ -135,6 +265,8 @@ When librdkafka refuses a key, a value or a combination of them, `KafkaTransport
 `auto_download.max_database_bytes` (default 512 MiB) caps each download and the database decompressed from it, and a file that does not read as an MMDB never replaces the local copy. Both old provider URLs returned 404, so `ip_locate` now downloads IPLocate.io's IP to ASN database (CC BY-SA 4.0), and `sapics` downloads DB-IP Lite ASN from sapics' `latest` release (CC BY 4.0) to `sapics-dbip-asn.mmdb`.
 
 **Consumer adjustment** -- an `AutoDownloadConfig` struct literal names `max_database_bytes` or ends in `..Default::default()`. An exhaustive match on `GeoIpDownloadError` adds `TooLarge` and `NotMmdb`. A `sapics` deployment that reads `sapics-asn-country.mmdb` reads `sapics-dbip-asn.mmdb`.
+
+## 2.14.18
 
 ### The contract declares `hot_paths`, and the chart's checksum skips them (API CHANGE)
 
@@ -154,6 +286,8 @@ New `scalo::rules`: a rule set that, per target field in order, takes the first 
 
 **Consumer adjustment** -- none.
 
+## 2.14.14
+
 ### Credential names match in any spelling, and text masks `key: value` and URL passwords (BEHAVIOUR CHANGE)
 
 The logger decides every credential name through the new `logger::is_credential_name`: a name holding a default field anywhere in it, read as written and word by word. So `secretAccessKey`, `signingKey`, `api.key` and `ssl.key.pem`, which were logged in clear, are masked. `default_sensitive_fields()` adds `passphrase`, more token and secret spellings, the qualified keys (`signing_key`, `tls_key`, `ssh_key` and the rest), `jaas_config`, `header_value`, `session`, `cookie`, `csrf`, `cert`, `private`, `creds`, `connection_string`, `tfn`, `medicare`, `card_number`, `email` and `phone`. A bare `key` or `value` in a JSON line is judged with its parent's name.
@@ -161,6 +295,8 @@ The logger decides every credential name through the new `logger::is_credential_
 Text-format lines, and every string in a JSON line including the message, now mask `key: value` as well as `key=value`, the password of every URL up to the last `@` a host follows, and bearer tokens; the new `logger::mask_url_userinfo` applies the URL rule to any string. `mask_sensitive_string` uses the same rules, so the `{:#?}` config dump `config-check` prints masks its credential fields, where it wrote each value straight after the mask. See [core-pillars/logging.md](core-pillars/logging.md#sensitive-field-masking).
 
 **Consumer adjustment** -- expect more masking. A name that only contains a field is masked too: `token_count`, `tokenizer`, `mapping` (`pin`), `author` (`auth`), `session_timeout_ms` (`session`) and `email_count` (`email`), and so is a `key: value` pair inside a message. Log a value an operator must read under a name that holds no field. An `@` later in the path or query of a URL that carries a password is masked with it.
+
+## 2.14.13
 
 ### YAML parses through `scalo::yaml` (BEHAVIOUR CHANGE)
 
@@ -211,6 +347,8 @@ Both returned an empty string when serialisation failed. They now return `Result
 The scalo-service chart wrote the config file and each file set into its ConfigMap's `data`, and Helm deletes the text `<no value>` from everything it renders. A VRL program holding `.tag = "<no value>"` was mounted as `.tag = ""`, and a config value `tag: <no value>` as `tag:`, a null. So the pod ran different bytes from the ones the values carried. Each file is now base64-encoded under `binaryData`. Mount paths and file names are unchanged, and the pod reads the exact bytes sent. Base64 adds a third to each file's size, which counts against the ConfigMap's 1 MiB limit.
 
 **Consumer adjustment** -- regenerate every thin chart against this library release. A tool that reads the config file or a file set back out of its ConfigMap reads `binaryData` and decodes it.
+
+## 2.14.11
 
 ### `TieredSink::shutdown()` is not reported as a drop (BEHAVIOUR CHANGE)
 

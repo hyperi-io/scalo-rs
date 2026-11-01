@@ -1,16 +1,38 @@
-# Every test that starts a Kafka broker container runs in one group, so a
-# loaded runner never holds more than three JVM brokers at once. More than
-# that pushed the outage ride-out tests close to their windows.
+# Core is the default selection: unit tests, the integration tests that need
+# no server, and one shared-instance test per heavy service with its main
+# cases (Kafka: e2e::kafka::test_kafka_send_receive_batch, OpenBao:
+# secrets_vault_resolve). Every other test that needs a real broker, OpenBao or
+# a docker build is full, which runs with `--run-ignored all
+# --ignore-default-filter`. tests/TESTING.md lists both.
+[profile.default]
+default-filter = '''
+not (
+    binary(dlq_kafka_durable)
+    | binary(kafka_consumer_outage)
+    | binary(kafka_recv_runtime)
+    | binary(kafka_send_batch)
+    | binary(kafka_tls)
+    | (binary(secrets_refresh) & test(/^openbao::/))
+    | (binary(e2e_tests) & test(/^e2e::kafka::[a-z_]+::/))
+    | (binary(e2e_tests) & test(/^e2e::kafka::test_kafka_(admin_describe_topic|admin_list_topics|consumer_lag|transport_connection)$/))
+    | (binary(e2e_tests) & test(/^e2e::contract_artefacts::tier_a_/))
+)
+'''
+# No retries: a retry turns a real failure into a green run.
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Tests that start a broker of their own each wait on a cold JVM broker, so
+# no more than three run at once. Tests on the run's shared broker stay fully
+# parallel.
 [test-groups]
-kafka-broker = { max-threads = 3 }
+own-broker = { max-threads = 3 }
 
 [[profile.default.overrides]]
 filter = '''
-binary(dlq_kafka_durable)
-| binary(kafka_consumer_outage)
-| binary(kafka_recv_runtime)
-| binary(kafka_send_batch)
+binary(kafka_consumer_outage)
 | binary(kafka_tls)
-| (binary(e2e_tests) & test(/^e2e::kafka::/))
+| (binary(dlq_kafka_durable) & test(/^(a_flush_returns_only_after_the_broker_acks|a_flush_with_the_broker_down_fails_within_its_bound_and_counts_the_loss|the_runtime_keeps_running_while_a_flush_waits_on_kafka|shutdown_without_a_flush_counts_what_a_stopped_broker_never_acked|the_configured_send_timeout_bounds_the_flush)$/))
+| (binary(e2e_tests) & test(/^e2e::kafka::broker_down_at_start::/))
 '''
-test-group = 'kafka-broker'
+test-group = 'own-broker'

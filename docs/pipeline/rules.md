@@ -178,7 +178,7 @@ use scalo::config::reloader::ReloaderConfig;
 use scalo::config::shared::SharedConfig;
 use scalo::rules::{CompileOptions, RuleSet, reloader};
 
-let options = CompileOptions::from_cascade();
+let options = CompileOptions::from_cascade()?;
 let set = RuleSet::from_file_section(&path, "routing.rules", &options)?;
 let shared = SharedConfig::new(Arc::new(set));
 let _watch = reloader(

@@ -44,7 +44,7 @@ Neither check proves the bytes are the provider's, and no checksum is compared. 
 ```rust
 use scalo::geoip_download::{GeoIpConfig, ensure_databases};
 
-let paths = ensure_databases(&GeoIpConfig::from_cascade()).await?;
+let paths = ensure_databases(&GeoIpConfig::from_cascade()?).await?;
 
 if let Some(city) = paths.city {
     // hand the path to your reader

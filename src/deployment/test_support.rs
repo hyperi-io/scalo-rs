@@ -26,6 +26,10 @@
 //! * **Memory budget** -- [`assert_peak_memory`]: the test's peak resident
 //!   set fails over the contract's memory limit and warns over its request,
 //!   so no test carries a budget of its own.
+//! * **Shared backing services** -- [`shared_service`], on Unix: one
+//!   container per service per test run, shared by every nextest process and
+//!   removed by a single owner when the run ends, plus containers a test
+//!   holds alone.
 //!
 //! # Usage from a consumer's `tests/e2e/`
 //!
@@ -65,6 +69,9 @@ use std::time::Duration;
 #[cfg(all(feature = "transport", feature = "worker-batch"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "transport", feature = "worker-batch"))))]
 pub mod conformance;
+
+#[cfg(unix)]
+pub mod shared_service;
 
 // ============================================================================
 // Tool probes -- thin, cached, no panic.

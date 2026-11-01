@@ -184,6 +184,40 @@ impl TransportSender for AnySender {
         }
     }
 
+    /// Forward [`send_record`](TransportSender::send_record) to the active
+    /// backend, so one that carries headers keeps them.
+    #[cfg_attr(
+        not(any(
+            feature = "transport-kafka",
+            feature = "transport-grpc",
+            feature = "transport-memory",
+            feature = "transport-pipe",
+            feature = "transport-file",
+            feature = "transport-http"
+        )),
+        allow(unused_variables)
+    )]
+    async fn send_record(&self, record: &Record) -> SendResult {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => t.send_record(record).await,
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => t.send_record(record).await,
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => t.send_record(record).await,
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => t.send_record(record).await,
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => t.send_record(record).await,
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => t.send_record(record).await,
+            #[allow(unreachable_patterns)]
+            _ => SendResult::Fatal(TransportError::Config(
+                "no transport variant enabled".into(),
+            )),
+        }
+    }
+
     /// Forward [`send_batch`](TransportSender::send_batch) to the active
     /// backend. gRPC uses its native single-RPC `RouteBatch` override and Kafka
     /// queues the whole block before awaiting any delivery report; every other

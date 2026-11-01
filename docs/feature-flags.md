@@ -162,29 +162,17 @@ ship.
 
 ## Native dependencies
 
-Some features pull in `*-sys` crates that link against system C
-libraries. The build host needs `-dev` packages; the deployment host
-needs runtime libs.
+Some features pull in `*-sys` crates that link C libraries. A release build links them statically, so only libgit2 needs a runtime package.
 
 | Feature | `-sys` crate | Build package | Runtime package |
 | --------- | -------------- | --------------- | ----------------- |
-| `transport-kafka` | `rdkafka-sys` | `librdkafka-dev` (>= 2.12.1, Confluent APT repo) | `librdkafka1` |
+| `transport-kafka` | `rdkafka-sys` | release: hyperi-ci's static librdkafka and OpenSSL prefix. dev: `librdkafka-dev` (>= 2.12.1) | -- (statically linked) |
 | `transport-kafka-config` | -- | -- | -- |
-| `directory-config-git` | `libgit2-sys` | `libgit2-dev` | `libgit2-1.9` (release-specific) |
-| `spool` / `tiered-sink` | `zstd-sys` | `libzstd-dev` | `libzstd1` |
-| (transitive via several) | `openssl-sys` | `libssl-dev` | `libssl3t64` (release-specific) |
-| (transitive via several) | `libz-sys` | `zlib1g-dev` | `zlib1g` |
+| `directory-config-git` | `libgit2-sys`, `libz-sys` | `libgit2-dev`, `zlib1g-dev` | `libgit2-1.9` (release-specific) |
+| `spool` / `tiered-sink` | `zstd-sys` | -- (bundled source) | -- (statically linked) |
 | `secrets-aws` | `aws-lc-sys` | -- (compiled from source, ~20-30s, sccache-cached) | -- (statically linked) |
 
-The two rows marked release-specific bake a library version into the package name,
-so they differ per base release - the values above are for the default base.
-The full table is in [deployment/native-deps.md](deployment/native-deps.md).
-
-`hyperi-ci` auto-detects which `-sys` crates appear in `Cargo.lock` and
-installs the matching packages. The Confluent APT repo is added
-automatically when `rdkafka-sys` is present and the installed version is
-below the minimum. See [deployment/native-deps.md](deployment/native-deps.md)
-for the `NativeDepsContract` that wires this into generated artefacts.
+The libgit2 package name carries the library version, so it differs per base release - the value above is for the default base. The build variables, the full table and the `NativeDepsContract` that wires this into generated artefacts are in [deployment/native-deps.md](deployment/native-deps.md).
 
 ---
 
@@ -255,14 +243,14 @@ diagnostic, smoke-test, or specialty:
 
 - `deployment-smoke` -- runs `docker build` + `docker run` as part of
   tests. Requires a Docker daemon.
-- `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, `assert_peak_memory` (a test's peak resident set fails over the contract's memory limit and warns over its request, read from `ResourcesContract`, so no test hard-codes a budget). `assert_peak_memory_of` judges a peak the caller measured, for a child process. With `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)).
+- `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, `assert_peak_memory` (a test's peak resident set fails over the contract's memory limit and warns over its request, read from `ResourcesContract`, so no test hard-codes a budget). `assert_peak_memory_of` judges a peak the caller measured, for a child process. With `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)). On Unix, `test_support::shared_service`: one container per backing service per test run, which the first nextest process creates and every other joins by name, removed by a watcher once the run's nextest process exits. Ports bind the daemon host's loopback, an ssh daemon gets an `ssh -L` tunnel per port, and a remote `tcp://` daemon is refused without `HYPERI_TEST_DOCKER_BIND`. Containers are named under `HYPERI_TEST_CONTAINER_PREFIX` (else `<repo>-test`) and labelled with their owner's host, PID namespace, pid and start time, so a create sweeps a dead owner's containers, and another host's only once their 4 h lease lapses. `start_alone` starts one a test holds by itself, `container_name` and `test_name!` name it, and `lookup` and `pets_allowed` read the `HYPERI_TEST_*` settings from the environment, the project `.env` and the file `HYPERI_TEST_ENV_FILE` names. Pulls `dotenvy` and `tempfile`.
 - `config-postgres` -- PostgreSQL-backed config source. Built-for, not
   built-with -- the YAML cascade already handles centralised config.
 - `worker-msgpack` -- MsgPack batch serialisation for the worker pool.
   Specialty use.
-- `transport-kafka-test-support` -- Kafka fixtures for a consumer's tests, in `scalo::transport::kafka::test_support`: `KAFKA_IMAGE` (the one pinned `apache/kafka` image, as `image:tag@digest`), `kafka_tag()` for `testcontainers-modules`, `require_docker()` (skip without Docker locally, fail when `CI` is set), and `TlsBroker`, a single-node broker with TLS, mTLS and SASL_SSL SCRAM-SHA-512 listeners and the certificates for them, driven through the docker CLI. Enable it on a dev-dependency. It pulls `transport-kafka`, `tempfile` and tokio's `process`, and needs a Docker daemon when the tests run.
-- `testcontainers` -- builds scalo's own real-broker tests, which start Kafka
-  in a container and need a Docker daemon. Implies `transport-kafka-test-support`, which holds the image pin. nextest runs at most three of them at once, the `kafka-broker` test group in `.config/nextest.toml`; a new test binary that starts a broker joins its filter.
+- `transport-kafka-test-support` -- Kafka fixtures for a consumer's tests, in `scalo::transport::kafka::test_support` (Unix): `KAFKA_IMAGE` (the one pinned `apache/kafka` image, as `image:tag@digest`), `kafka_tag()` for `testcontainers-modules`, `require_docker()` (skip without Docker locally, fail when `CI` is set), `shared_kafka(suite)`, the run's one PLAINTEXT broker through `shared_service`, `kafka_spec(host_port)` for a broker a test holds alone, and `TlsBroker`, a single-node broker with TLS, mTLS and SASL_SSL SCRAM-SHA-512 listeners and the certificates for them, driven through the docker CLI and named for the suite. Enable it on a dev-dependency. It pulls `transport-kafka`, `deployment-test-support`, `tempfile` and tokio's `process`, and needs a Docker daemon when the tests run.
+- `testcontainers` -- builds scalo's own real-broker and OpenBao tests, which
+  need a Docker daemon. Implies `transport-kafka-test-support`, which holds the image pin. They run on the run's shared broker and shared OpenBao, except a test that stops or pauses its broker, which holds one alone. nextest runs at most three of those at once, the `own-broker` test group in `.config/nextest.toml`. [tests/TESTING.md](../tests/TESTING.md) says which tests are core and which full.
 
 Enable these explicitly when you need them.
 

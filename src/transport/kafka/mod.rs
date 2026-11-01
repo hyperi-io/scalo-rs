@@ -54,7 +54,7 @@ mod admin;
 mod classify;
 mod metrics;
 mod producer;
-#[cfg(feature = "transport-kafka-test-support")]
+#[cfg(all(feature = "transport-kafka-test-support", unix))]
 pub mod test_support;
 pub mod topic_resolver;
 mod types;
@@ -188,6 +188,12 @@ fn block_result(results: Vec<SendResult>) -> SendResult {
 /// - Drains internal queue with zero-timeout polls
 /// - Minimizes allocations in hot path
 pub struct KafkaTransport {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
+    /// Removes this component from the health registry when it drops.
+    #[cfg(all(feature = "governor", feature = "health"))]
+    _partition_limited_registration: crate::health::HealthRegistration,
     /// librdkafka consumer and the group protocol it joined with.
     ///
     /// Shared with the optional [`KafkaGateActuator`] (`governor` feature), so
@@ -473,6 +479,7 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
     }
 
     apply_group_protocol(&mut client_config, protocol);
+    probe_system_ca(&mut client_config);
     client_config
 }
 
@@ -534,7 +541,24 @@ pub fn producer_client_config(
     apply_layer(&mut client_config, profile_defaults);
     let settings = config.resolved_producer_settings();
     apply_layer(&mut client_config, &raw_layer(&settings));
+    probe_system_ca(&mut client_config);
     client_config
+}
+
+/// With TLS on and no CA named, have librdkafka probe the usual system bundle
+/// paths. A static OpenSSL's built-in default reads `/etc/ssl/certs` hashed
+/// links, which only Debian-family bases carry. A `ssl.ca.location` or
+/// `ssl.ca.pem` from any layer wins.
+pub(super) fn probe_system_ca(client_config: &mut ClientConfig) {
+    let tls = client_config
+        .get("security.protocol")
+        .is_some_and(|p| p.eq_ignore_ascii_case("ssl") || p.eq_ignore_ascii_case("sasl_ssl"));
+    if tls
+        && client_config.get("ssl.ca.location").is_none()
+        && client_config.get("ssl.ca.pem").is_none()
+    {
+        client_config.set("ssl.ca.location", "probe");
+    }
 }
 
 /// Set every key of `layer` over `client_config`, each replacing the other
@@ -1116,16 +1140,16 @@ impl KafkaTransport {
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
             &config.filters_out,
-            &crate::transport::filter::TransportFilterTierConfig::from_cascade(),
+            &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let h = Arc::clone(&healthy);
             let refused = Arc::clone(&auth);
             let missing = Arc::clone(&topic_missing);
             let destinations = Arc::clone(&missing_destinations);
-            crate::health::HealthRegistry::register("transport:kafka", move || {
+            crate::health::HealthRegistry::register_scoped("transport:kafka", move || {
                 if h.load(Ordering::Relaxed)
                     && !refused.is_refused()
                     && !missing.load(Ordering::Relaxed)
@@ -1135,8 +1159,8 @@ impl KafkaTransport {
                 } else {
                     crate::health::HealthStatus::Unhealthy
                 }
-            });
-        }
+            })
+        };
 
         #[cfg(all(feature = "governor", feature = "health"))]
         let partition_limited_flag = Arc::new(AtomicBool::new(false));
@@ -1145,18 +1169,22 @@ impl KafkaTransport {
         // flag, so it tracks the condition in both directions and never grows
         // the registry per tick.
         #[cfg(all(feature = "governor", feature = "health"))]
-        {
+        let partition_limited_registration = {
             let f = Arc::clone(&partition_limited_flag);
-            crate::health::HealthRegistry::register("kafka:partition_limited", move || {
+            crate::health::HealthRegistry::register_scoped("kafka:partition_limited", move || {
                 if f.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Degraded
                 } else {
                     crate::health::HealthStatus::Healthy
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
+            #[cfg(all(feature = "governor", feature = "health"))]
+            _partition_limited_registration: partition_limited_registration,
             consumer: consumer.map(|client| {
                 Arc::new(parking_lot::RwLock::new(ConsumerSlot {
                     client,
@@ -2645,6 +2673,7 @@ fn build_batch_from_spans(arena: bytes::Bytes, spans: Vec<Span>) -> Vec<Message<
             token: span.token,
             timestamp_ms: span.timestamp_ms,
             format: span.format,
+            headers: Vec::new(),
         })
         .collect()
 }
@@ -4269,6 +4298,65 @@ mod tests {
     // =========================================================================
     // Consumer config: one property under two librdkafka names
     // =========================================================================
+
+    /// With TLS on and no CA named, every client probes the system CA bundle
+    /// paths, and a CA named by the typed field or by a raw key wins.
+    #[test]
+    fn tls_with_no_ca_probes_the_system_bundle() {
+        let ssl = || KafkaConfig::default().with_tls(None);
+        let cases: Vec<(&str, KafkaConfig, Option<&str>)> = vec![
+            ("plaintext", KafkaConfig::default(), None),
+            ("ssl, no CA", ssl(), Some("probe")),
+            (
+                "sasl_ssl, no CA",
+                KafkaConfig {
+                    security_protocol: "sasl_ssl".to_string(),
+                    ..KafkaConfig::default()
+                },
+                Some("probe"),
+            ),
+            (
+                "upper-case SSL",
+                KafkaConfig {
+                    security_protocol: "SSL".to_string(),
+                    ..KafkaConfig::default()
+                },
+                Some("probe"),
+            ),
+            (
+                "typed CA",
+                KafkaConfig::default().with_tls(Some("/etc/ca.pem")),
+                Some("/etc/ca.pem"),
+            ),
+            (
+                "raw ssl.ca.location",
+                ssl().with_override("ssl.ca.location", "/raw/ca.pem"),
+                Some("/raw/ca.pem"),
+            ),
+            (
+                "raw ssl.ca.pem",
+                ssl().with_override("ssl.ca.pem", "-----BEGIN CERTIFICATE-----"),
+                None,
+            ),
+        ];
+        for (name, config, want) in cases {
+            let built = [
+                (
+                    "consumer",
+                    consumer_client_config(&config, ConsumerProtocol::Classic),
+                ),
+                ("producer", producer_client_config(&config, &[])),
+                ("admin", admin::admin_client_config(&config)),
+            ];
+            for (client, built) in built {
+                assert_eq!(
+                    built.get("ssl.ca.location"),
+                    want,
+                    "{name}, {client}: ssl.ca.location"
+                );
+            }
+        }
+    }
 
     /// The default partition fetch reaches librdkafka as the 1 MiB memory bound.
     #[test]

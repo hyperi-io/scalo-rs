@@ -134,17 +134,13 @@ impl OtelTracingConfig {
     ///
     /// Falls back to defaults when config is not initialised or the key is
     /// absent.
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(settings) = cfg.unmarshal_key_registered::<Self>("otel_tracing")
-            {
-                return settings;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `otel_tracing` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("otel_tracing")
     }
 
     /// Whether span export should be wired up, after env-var resolution.

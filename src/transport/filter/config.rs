@@ -145,18 +145,13 @@ impl TransportFilterTierConfig {
     /// the cascade is not initialised or the section is missing. This is
     /// the secure default -- operators must explicitly opt in to higher
     /// tiers per the [transport filter design](crate::transport::filter).
-    #[must_use]
-    pub fn from_cascade() -> Self {
-        #[cfg(feature = "config")]
-        {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(tier_config) =
-                    cfg.unmarshal_key_registered::<Self>("transport.filter_tiers")
-            {
-                return tier_config;
-            }
-        }
-        Self::default()
+    ///
+    /// # Errors
+    ///
+    /// [`CascadeError`](crate::cascade::CascadeError) when the `transport.filter_tiers` section
+    /// is present but does not parse.
+    pub fn from_cascade() -> Result<Self, crate::cascade::CascadeError> {
+        crate::cascade::section("transport.filter_tiers")
     }
 }
 

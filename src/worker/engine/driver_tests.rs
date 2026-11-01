@@ -3433,6 +3433,63 @@ async fn a_block_still_refused_when_the_retry_window_closes_is_abandoned() {
     );
 }
 
+/// A sink attempt that never answers is cut off when the retry window after
+/// shutdown closes, in the driver's run loop and in the pipeline: the run
+/// ends, its block stays uncommitted and the source is closed.
+#[tokio::test(start_paused = true)]
+async fn a_hung_sink_attempt_is_abandoned_when_the_retry_window_closes() {
+    for path in ["run_workbatch", "pipeline"] {
+        let source = AckedQueueSource::holding(ACKED);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let hung_sink = move |_out: &WorkBatch<crate::transport::memory::MemoryToken>| {
+            stop.cancel();
+            std::future::pending::<Result<(), EngineError>>()
+        };
+        let engine = default_engine();
+        let started = tokio::time::Instant::now();
+        let bound = SHUTDOWN_RETRY_LIMIT + Duration::from_secs(60);
+        let result = if path == "run_workbatch" {
+            tokio::time::timeout(
+                bound,
+                engine.run_workbatch(
+                    &source,
+                    shutdown.clone(),
+                    |batch| Ok(batch),
+                    hung_sink,
+                    CommitMode::Auto,
+                    no_ticker(),
+                ),
+            )
+            .await
+        } else {
+            tokio::time::timeout(
+                bound,
+                engine
+                    .pipeline(&source)
+                    .shutdown(shutdown.clone())
+                    .run(|batch| Ok(batch), hung_sink),
+            )
+            .await
+        };
+        let took = started.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "{path}: the run waited on a hung sink past the {SHUTDOWN_RETRY_LIMIT:?} retry window"
+        );
+        assert!(
+            took < SHUTDOWN_RETRY_LIMIT + Duration::from_secs(1),
+            "{path}: the hung attempt should end at the retry window, took {took:?}"
+        );
+        assert_eq!(
+            *source.committed.lock(),
+            Vec::<u64>::new(),
+            "{path}: nothing commits past the hung block"
+        );
+    }
+}
+
 /// A source that ignores `close()` and waits forever cannot hold shutdown:
 /// the drain gives up once nothing has arrived for `DRAIN_IDLE_LIMIT`.
 #[tokio::test(start_paused = true)]

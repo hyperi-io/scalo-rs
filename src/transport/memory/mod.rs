@@ -80,6 +80,7 @@ impl Default for MemoryConfig {
 struct InternalMessage {
     key: Option<Arc<str>>,
     payload: bytes::Bytes,
+    headers: Vec<(String, Vec<u8>)>,
     seq: u64,
     timestamp_ms: i64,
 }
@@ -110,7 +111,7 @@ impl MemoryTransport {
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
             &config.filters_out,
-            &crate::transport::filter::TransportFilterTierConfig::from_cascade(),
+            &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
         Ok(Self {
             sender,
@@ -151,6 +152,7 @@ impl MemoryTransport {
         let msg = InternalMessage {
             key: key.map(Arc::from),
             payload: payload.into(),
+            headers: Vec::new(),
             seq,
             timestamp_ms,
         };
@@ -187,6 +189,7 @@ impl MemorySender<'_> {
         let msg = InternalMessage {
             key: key.map(Arc::from),
             payload: payload.into(),
+            headers: Vec::new(),
             seq,
             timestamp_ms,
         };
@@ -219,6 +222,24 @@ impl TransportBase for MemoryTransport {
 
 impl TransportSender for MemoryTransport {
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
+        self.offer(destination, payload, Vec::new())
+    }
+
+    /// Queue `record` with its headers, so `recv` returns them on the record.
+    async fn send_record(&self, record: &super::work_batch::Record) -> SendResult {
+        let destination = record.key.as_deref().unwrap_or("");
+        self.offer(destination, record.payload.clone(), record.headers.clone())
+    }
+}
+
+impl MemoryTransport {
+    /// Filter and queue one record for `recv`.
+    fn offer(
+        &self,
+        destination: &str,
+        payload: bytes::Bytes,
+        headers: Vec<(String, Vec<u8>)>,
+    ) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
@@ -238,6 +259,7 @@ impl TransportSender for MemoryTransport {
         let msg = InternalMessage {
             key: Some(Arc::from(destination)),
             payload,
+            headers,
             seq,
             timestamp_ms,
         };
@@ -294,6 +316,7 @@ impl TransportReceiver for MemoryTransport {
                 token: MemoryToken { seq: internal.seq },
                 timestamp_ms: Some(internal.timestamp_ms),
                 format,
+                headers: internal.headers,
             });
         }
 
@@ -349,7 +372,8 @@ mod tests {
 
     /// MemoryTransport does NOT override `send_batch`, so this exercises the
     /// trait's per-record default fallback: every record is sent
-    /// individually via `send`, using its own key, and all arrive intact.
+    /// individually, using its own key, and all arrive intact, headers and
+    /// dedup key included.
     #[tokio::test]
     async fn send_batch_default_fallback_sends_each_record() {
         use super::super::work_batch::{Record, RecordMeta};
@@ -358,14 +382,17 @@ mod tests {
             .expect("memory transport with valid config must construct");
 
         let records: Vec<Record> = (0..3)
-            .map(|i| Record {
-                payload: bytes::Bytes::from(format!(r#"{{"id":{i}}}"#)),
-                key: Some(Arc::from(format!("k{i}").as_str())),
-                headers: Vec::new(),
-                metadata: RecordMeta {
-                    timestamp_ms: None,
-                    format: PayloadFormat::Json,
-                },
+            .map(|i| {
+                Record {
+                    payload: bytes::Bytes::from(format!(r#"{{"id":{i}}}"#)),
+                    key: Some(Arc::from(format!("k{i}").as_str())),
+                    headers: vec![("tenant".to_string(), format!("t{i}").into_bytes())],
+                    metadata: RecordMeta {
+                        timestamp_ms: None,
+                        format: PayloadFormat::Json,
+                    },
+                }
+                .with_dedup_key(format!("d{i}"))
             })
             .collect();
 
@@ -383,6 +410,12 @@ mod tests {
         assert_eq!(got[0].payload.as_ref(), br#"{"id":0}"#);
         assert_eq!(got[2].key.as_deref(), Some("k2"));
         assert_eq!(got[2].payload.as_ref(), br#"{"id":2}"#);
+        for (i, record) in got.iter().enumerate() {
+            assert_eq!(
+                record.headers, records[i].headers,
+                "record {i} kept its headers through send_batch and recv"
+            );
+        }
     }
 
     /// The default `send_batch` short-circuits on the first non-Ok result so the

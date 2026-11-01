@@ -15,8 +15,39 @@ use std::process::Command;
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
-#[cfg(feature = "secrets-vault")]
+#[cfg(all(feature = "secrets-vault", feature = "deployment-test-support", unix))]
 pub mod openbao;
+
+#[cfg(all(feature = "transport-kafka-test-support", unix))]
+pub mod kafka;
+
+/// This suite, for container names, labels, the run log and the
+/// `HYPERI_TEST_*` lookup.
+#[cfg(all(feature = "deployment-test-support", unix))]
+pub const SUITE: scalo::deployment::test_support::shared_service::Suite =
+    scalo::deployment::test_support::shared_service::Suite {
+        repo: "scalo-rs",
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
+        tmp_dir: option_env!("CARGO_TARGET_TMPDIR"),
+    };
+
+/// `name` made unique to this test process, for a topic, consumer group or
+/// secret path on a service other tests share.
+/// A password for test configs and refused-credential cases: random per test
+/// process, so no credential sits in the source.
+pub fn test_password() -> &'static str {
+    static PASSWORD: OnceLock<String> = OnceLock::new();
+    PASSWORD.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        format!("test-{:016x}", hasher.finish())
+    })
+}
+
+pub fn unique(name: &str) -> String {
+    format!("{name}-p{}", std::process::id())
+}
 
 /// Fail in CI rather than skip: a skipped container test reports green while
 /// exercising nothing, and CI does provide a container runtime.

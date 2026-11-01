@@ -98,8 +98,8 @@ pub struct ReloaderConfig {
     /// Default: disabled.
     pub periodic_interval: Duration,
 
-    /// Minimum time between reloads (debounce).
-    /// Default: 500ms.
+    /// Minimum time between reloads (debounce). A trigger inside the window
+    /// reloads once the window ends. Default: 500ms.
     pub debounce: Duration,
 
     /// Enable SIGHUP reload trigger (Unix only, ignored on other platforms).
@@ -253,10 +253,24 @@ impl<T: Clone + Send + Sync + 'static> ConfigReloader<T> {
                 return;
             };
 
-            // Debounce check
-            if last_reload.elapsed() < self.config.debounce {
+            // A trigger inside the debounce window waits for it to end rather
+            // than being dropped: a file trigger has already taken the new
+            // mtime, so it would not fire again.
+            let ready_at = last_reload + self.config.debounce;
+            if Instant::now() < ready_at {
                 debug!("Debouncing config reload");
-                continue;
+                #[cfg(feature = "shutdown")]
+                {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(ready_at.into()) => {}
+                        () = shutdown_token.cancelled() => {
+                            info!("Config reloader stopping (shutdown)");
+                            return;
+                        }
+                    }
+                }
+                #[cfg(not(feature = "shutdown"))]
+                tokio::time::sleep_until(ready_at.into()).await;
             }
 
             match trigger {
@@ -380,57 +394,61 @@ mod tests {
         handle.abort();
     }
 
+    /// A file change reloads, including one inside the debounce window, which
+    /// is applied once the window ends rather than dropped.
     #[tokio::test]
     async fn test_file_change_triggers_reload() {
-        let dir = TempDir::new().unwrap();
-        let config_path = dir.path().join("config.yaml");
-        fs::write(&config_path, "initial content").unwrap();
+        for debounce_ms in [10_u64, 1_000] {
+            let dir = TempDir::new().unwrap();
+            let config_path = dir.path().join("config.yaml");
+            fs::write(&config_path, "initial content").unwrap();
 
-        let shared = SharedConfig::new(TestConfig {
-            value: "initial".into(),
-        });
-        let mut rx = shared.subscribe();
+            let shared = SharedConfig::new(TestConfig {
+                value: "initial".into(),
+            });
+            let mut rx = shared.subscribe();
 
-        let path_for_reload = config_path.clone();
-        let reloader = ConfigReloader::new(
-            ReloaderConfig {
-                config_path: Some(config_path.clone()),
-                poll_interval: Duration::from_millis(50),
-                debounce: Duration::from_millis(10),
-                enable_sighup: false,
-                ..Default::default()
-            },
-            shared.clone(),
-            move || {
-                let content = fs::read_to_string(&path_for_reload).unwrap_or_default();
-                Ok(TestConfig { value: content })
-            },
-            |_| Ok(()),
-        );
+            let path_for_reload = config_path.clone();
+            let reloader = ConfigReloader::new(
+                ReloaderConfig {
+                    config_path: Some(config_path.clone()),
+                    poll_interval: Duration::from_millis(20),
+                    debounce: Duration::from_millis(debounce_ms),
+                    enable_sighup: false,
+                    ..Default::default()
+                },
+                shared.clone(),
+                move || {
+                    let content = fs::read_to_string(&path_for_reload).unwrap_or_default();
+                    Ok(TestConfig { value: content })
+                },
+                |_| Ok(()),
+            );
 
-        let handle = reloader.start();
+            let handle = reloader.start();
 
-        // Let the watcher start and record initial mtime
-        tokio::time::sleep(Duration::from_millis(150)).await;
+            // Past the watcher's priming read. Too short fails the test, never
+            // passes it: the change then reads as the baseline.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&config_path)
+                    .unwrap();
+                file.write_all(b"updated content").unwrap();
+                file.sync_all().unwrap();
+            }
 
-        // Modify the file
-        {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&config_path)
-                .unwrap();
-            file.write_all(b"updated content").unwrap();
-            file.sync_all().unwrap();
-        }
-
-        // Wait for the reload
-        let result = tokio::time::timeout(Duration::from_secs(2), rx.changed()).await;
-        if result.is_ok() {
+            let result = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+            assert!(
+                result.is_ok(),
+                "debounce {debounce_ms} ms: the change was never applied"
+            );
             assert_eq!(shared.read().value, "updated content");
-        }
 
-        handle.abort();
+            handle.abort();
+        }
     }
 
     #[tokio::test]

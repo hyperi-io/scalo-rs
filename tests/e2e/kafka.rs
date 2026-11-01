@@ -173,20 +173,25 @@ fn test_kafka_config_for_testing() {
 
 #[test]
 fn test_kafka_config_with_scram() {
-    let config = KafkaConfig::default().with_scram("SCRAM-SHA-256", "user", "pass");
+    let password = crate::common::test_password();
+    let config = KafkaConfig::default().with_scram("SCRAM-SHA-256", "user", password);
 
     assert_eq!(config.security_protocol, "sasl_plaintext");
     assert_eq!(config.sasl_mechanism, Some("SCRAM-SHA-256".to_string()));
     assert_eq!(config.sasl_username, Some("user".to_string()));
     assert_eq!(
         config.sasl_password.as_ref().map(|p| p.expose()),
-        Some("pass")
+        Some(password)
     );
 }
 
 #[test]
 fn test_kafka_config_with_scram_ssl() {
-    let config = KafkaConfig::default().with_scram_ssl("SCRAM-SHA-512", "user", "pass");
+    let config = KafkaConfig::default().with_scram_ssl(
+        "SCRAM-SHA-512",
+        "user",
+        crate::common::test_password(),
+    );
 
     assert_eq!(config.security_protocol, "sasl_ssl");
     assert_eq!(config.sasl_mechanism, Some("SCRAM-SHA-512".to_string()));
@@ -203,7 +208,7 @@ fn test_kafka_config_with_tls() {
 #[test]
 fn test_kafka_config_with_tls_upgrades_sasl() {
     let config = KafkaConfig::default()
-        .with_scram("PLAIN", "user", "pass")
+        .with_scram("PLAIN", "user", crate::common::test_password())
         .with_tls(None);
 
     assert_eq!(config.security_protocol, "sasl_ssl");
@@ -238,7 +243,7 @@ fn test_kafka_config_with_ssl_insecure() {
 #[test]
 fn test_kafka_config_with_ssl_insecure_upgrades_sasl() {
     let config = KafkaConfig::default()
-        .with_scram("PLAIN", "user", "pass")
+        .with_scram("PLAIN", "user", crate::common::test_password())
         .with_ssl_insecure();
 
     assert_eq!(config.security_protocol, "sasl_ssl");
@@ -364,7 +369,7 @@ fn test_kafka_config_with_cloud_connection_tuning() {
 fn test_kafka_config_chained_builders() {
     // Test that all builder methods can be chained together
     let config = KafkaConfig::production()
-        .with_scram_ssl("SCRAM-SHA-512", "user", "pass")
+        .with_scram_ssl("SCRAM-SHA-512", "user", crate::common::test_password())
         .with_statistics(1000)
         .with_cloud_connection_tuning()
         .with_override("fetch.min.bytes", "2097152");
@@ -405,7 +410,10 @@ fn test_kafka_config_from_env() {
             ("TESTAPP_SECURITY_PROTOCOL", Some("sasl_ssl")),
             ("TESTAPP_SASL_MECHANISM", Some("SCRAM-SHA-256")),
             ("TESTAPP_SASL_USERNAME", Some("testuser")),
-            ("TESTAPP_SASL_PASSWORD", Some("testpass")),
+            (
+                "TESTAPP_SASL_PASSWORD",
+                Some(crate::common::test_password()),
+            ),
             ("TESTAPP_SSL_SKIP_VERIFY", Some("true")),
             ("TESTAPP_TOPICS", Some("topic1,topic2,topic3")),
         ],
@@ -420,7 +428,7 @@ fn test_kafka_config_from_env() {
             assert_eq!(config.sasl_username, Some("testuser".to_string()));
             assert_eq!(
                 config.sasl_password.as_ref().map(|p| p.expose()),
-                Some("testpass")
+                Some(crate::common::test_password())
             );
             assert!(config.ssl_skip_verify);
             assert_eq!(config.topics, vec!["topic1", "topic2", "topic3"]);
@@ -723,10 +731,11 @@ async fn test_kafka_consumer_lag() {
     }
 }
 
-/// A real broker in a container, for the tests below.
+/// The run's shared broker, or one a test holds alone, for the tests below.
 ///
 /// Built with the `testcontainers` feature, which CI's Test job enables. A
-/// test skips when no Docker daemon answers, and fails instead in CI.
+/// test skips when no Docker daemon answers, and fails instead in CI. Each
+/// test keeps to topics and consumer groups of its own.
 #[cfg(feature = "testcontainers")]
 mod broker {
     use std::ops::Range;
@@ -744,34 +753,37 @@ mod broker {
         all(feature = "governor", feature = "metrics")
     ))]
     use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
-    use scalo::transport::kafka::test_support::kafka_tag;
+    use scalo::deployment::test_support::shared_service::{self, OwnedContainer};
+    use scalo::transport::kafka::test_support::{KAFKA_PORT, kafka_spec, shared_kafka};
     use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
-    use testcontainers_modules::kafka::apache::{self, Kafka};
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
-    /// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
-    const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+    use crate::common::SUITE;
 
-    /// Container starts to try: on a busy CI runner a broker started alongside
-    /// others can exit before it logs that it is ready.
-    const START_ATTEMPTS: u32 = 3;
-
-    /// Start a broker and return it with its bootstrap address, or `None` when
-    /// no Docker daemon answers outside CI. In CI that fails the test.
-    pub(super) async fn start_kafka() -> Option<(ContainerAsync<Kafka>, String)> {
-        let node = start_node(None).await?;
-        let port = node
-            .get_host_port_ipv4(apache::KAFKA_PORT)
-            .await
-            .expect("kafka host port");
-        Some((node, format!("127.0.0.1:{port}")))
+    /// The run's shared broker's bootstrap address, or `None` when no Docker
+    /// daemon answers outside CI. In CI that fails the test. The unit value
+    /// stands where a container guard stood: the run owns the broker.
+    pub(super) async fn start_kafka() -> Option<((), String)> {
+        if !crate::common::docker_answers() {
+            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
+            return None;
+        }
+        Some(((), shared_kafka(SUITE).await.addr(KAFKA_PORT)))
     }
 
-    /// Start a broker on host `port`, for a client given the address before
-    /// the broker existed. `None` as for [`start_kafka`].
-    pub(super) async fn start_kafka_on(port: u16) -> Option<ContainerAsync<Kafka>> {
-        start_node(Some(port)).await
+    /// Start a broker only `test` uses on host `port`, for a client given the
+    /// address before the broker existed. `None` as for [`start_kafka`].
+    pub(super) async fn start_kafka_on(test: &str, port: u16) -> Option<OwnedContainer> {
+        if !crate::common::docker_answers() {
+            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
+            return None;
+        }
+        let name = shared_service::container_name(&SUITE, Some(test), "kafka");
+        let node = tokio::task::spawn_blocking(move || {
+            shared_service::start_alone(&SUITE, &kafka_spec(Some(port)), &name)
+        })
+        .await
+        .expect("start a broker of the test's own");
+        Some(node)
     }
 
     /// A free loopback port, which refuses connections until a broker takes it.
@@ -780,32 +792,6 @@ mod broker {
             .and_then(|l| l.local_addr())
             .expect("bind an ephemeral port")
             .port()
-    }
-
-    async fn start_node(port: Option<u16>) -> Option<ContainerAsync<Kafka>> {
-        if !crate::common::docker_answers() {
-            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
-            return None;
-        }
-        let mut attempt = 1;
-        loop {
-            let request = Kafka::default()
-                .with_jvm_image()
-                .with_tag(kafka_tag())
-                .with_startup_timeout(KAFKA_STARTUP_TIMEOUT);
-            let request = match port {
-                Some(port) => request.with_mapped_port(port, apache::KAFKA_PORT),
-                None => request,
-            };
-            match request.start().await {
-                Ok(node) => return Some(node),
-                Err(e) if attempt < START_ATTEMPTS => {
-                    eprintln!("kafka container attempt {attempt} did not start: {e}");
-                    attempt += 1;
-                }
-                Err(e) => panic!("start kafka container: {e}"),
-            }
-        }
     }
 
     /// Create a one-partition `topic` and wait for its metadata.
@@ -2217,7 +2203,7 @@ mod broker_down_at_start {
         let batch = consumer.recv(100).await.expect("recv with no broker");
         assert!(batch.records.is_empty(), "no broker, so no records");
 
-        let Some(_node) = start_kafka_on(port).await else {
+        let Some(_node) = start_kafka_on(scalo::test_name!(), port).await else {
             return;
         };
         create_topic(&bootstrap, TOPIC).await;
@@ -2298,6 +2284,80 @@ mod broker_down_at_start {
         assert!(
             took < SHUTDOWN_AFTER + Duration::from_secs(1),
             "the shutdown was acted on {took:?} after construction began"
+        );
+    }
+}
+
+/// `close()` keeps the consumer's group membership, so the final commit a
+/// service makes after closing its source lands, and the next member resumes
+/// at that offset. Dropping the transport is what leaves the group.
+#[cfg(all(
+    feature = "testcontainers",
+    any(
+        feature = "worker-batch",
+        all(feature = "governor", feature = "metrics")
+    )
+))]
+mod commit_after_close {
+    use std::time::{Duration, Instant};
+
+    use scalo::transport::{TransportBase, TransportReceiver};
+
+    use super::broker::{committed, consumer, create_topic, produce, start_kafka};
+
+    /// Records written before the first member closes.
+    const BEFORE: usize = 5;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_after_close_lands_and_the_next_member_resumes_there() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let topic = "commit-after-close";
+        let group = "commit-after-close-group";
+        create_topic(&bootstrap, topic).await;
+        produce(&bootstrap, topic, 0..BEFORE).await;
+
+        let first = consumer(&bootstrap, topic, group).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut tokens = Vec::new();
+        while tokens.len() < BEFORE {
+            assert!(
+                Instant::now() < deadline,
+                "read {} of {BEFORE} records within 60 s",
+                tokens.len()
+            );
+            tokens.extend(first.recv(10).await.expect("recv").commit_tokens);
+        }
+        first.close().await.expect("close");
+        first
+            .commit(&tokens)
+            .await
+            .expect("a commit after close() must land: the member is still in its group");
+        assert_eq!(
+            committed(&bootstrap, group, topic).await,
+            Some(i64::try_from(BEFORE).expect("fits")),
+            "the group's committed offset after the post-close commit"
+        );
+        drop(first);
+
+        produce(&bootstrap, topic, BEFORE..BEFORE + 1).await;
+        let next = consumer(&bootstrap, topic, group).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let first_read = loop {
+            assert!(
+                Instant::now() < deadline,
+                "the next member read nothing within 60 s"
+            );
+            let batch = next.recv(10).await.expect("recv");
+            if let Some(record) = batch.records.first() {
+                break String::from_utf8_lossy(&record.payload).into_owned();
+            }
+        };
+        assert_eq!(
+            first_read,
+            format!("{{\"seq\":{BEFORE}}}"),
+            "the next member resumes at the committed offset, not before it"
         );
     }
 }

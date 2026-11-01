@@ -133,10 +133,13 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         // files can be GB-sized after a crash; walking them on the
         // async runtime pins a tokio worker.
         let spool_path_for_scan = config.spool_path.clone();
-        let (initial_count, initial_bytes) =
-            tokio::task::spawn_blocking(move || spool_item_count_and_bytes(&spool_path_for_scan))
-                .await
-                .unwrap_or((0, 0));
+        let (initial_count, initial_bytes) = tokio::task::spawn_blocking(move || {
+            crate::spool_codec::queued_items_and_bytes(&spool_path_for_scan)
+        })
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or((0, 0));
         let spool_count = Arc::new(AtomicU64::new(initial_count));
         let spool_bytes = Arc::new(AtomicU64::new(initial_bytes));
 
@@ -191,6 +194,10 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             config.drain_strategy,
             config.drain_interval(),
             config.send_timeout_duration(),
+            drainer::DrainBatch {
+                max_records: config.drain_batch_max_records,
+                max_bytes: config.drain_batch_max_bytes,
+            },
             shutdown.clone(),
             fifo_gate.as_ref().map(Arc::clone),
         ));
@@ -365,9 +372,9 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         }
     }
 
-    /// Reserve capacity (`try_update`) before enqueue; roll back
-    /// on failure. Atomic reservation prevents two concurrent
-    /// callers from both passing the cap check and overshooting.
+    /// Reserve capacity (`try_update`) before enqueue; a failure or a
+    /// cancelled future gives it back. Atomic reservation prevents two
+    /// concurrent callers from both passing the cap check and overshooting.
     async fn spool_message(&self, record: &Record) -> Result<()> {
         // Check disk availability first
         if !self.disk_available.load(AtomicOrdering::Relaxed) {
@@ -410,8 +417,16 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         } else {
             self.spool_count.fetch_add(1, AtomicOrdering::AcqRel);
         }
+        // From here every early return, and a cancel at either await below,
+        // gives the reservation back.
+        let mut reservation = SpoolReservation {
+            count: &self.spool_count,
+            bytes: &self.spool_bytes,
+            len: 0,
+            kept: false,
+        };
 
-        // Reserve byte budget; roll back item slot on failure.
+        // Reserve byte budget.
         if let Some(max_bytes) = self.config.max_spool_bytes {
             if let Err(current_bytes) = self.spool_bytes.try_update(
                 AtomicOrdering::AcqRel,
@@ -421,8 +436,6 @@ impl<S: TransportSender + 'static> TieredSink<S> {
                         .filter(|new| *new <= max_bytes)
                 },
             ) {
-                // Roll back the item-slot reservation taken above.
-                self.spool_count.fetch_sub(1, AtomicOrdering::AcqRel);
                 // Spool full on byte budget -> apply the WhenFull policy.
                 if self.drop_on_full() {
                     Self::record_overflow_drop();
@@ -437,17 +450,15 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             self.spool_bytes
                 .fetch_add(compressed_len, AtomicOrdering::AcqRel);
         }
+        reservation.len = compressed_len;
 
-        // Enqueue; roll back both reservations on failure.
         let mut sender = self.spool_sender.lock().await;
-        if let Err(e) = sender.send(compressed).await {
-            drop(sender);
-            self.spool_count.fetch_sub(1, AtomicOrdering::AcqRel);
-            self.spool_bytes
-                .fetch_sub(compressed_len, AtomicOrdering::AcqRel);
-            return Err(TieredSinkError::Spool(e.to_string()));
-        }
+        sender
+            .send(compressed)
+            .await
+            .map_err(|e| TieredSinkError::Spool(e.to_string()))?;
         drop(sender);
+        reservation.kept = true;
 
         #[cfg(feature = "metrics")]
         {
@@ -532,88 +543,21 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     }
 }
 
-/// Count existing items and sum payload bytes in a yaque queue directory.
-///
-/// yaque stores messages as `[4-byte Hamming header][payload]` in segment files
-/// named `<n>.q`. The receiver position is persisted in `recv-metadata`.
-///
-/// Returns `(item_count, payload_bytes)`.
-fn spool_item_count_and_bytes(path: &std::path::Path) -> (u64, u64) {
-    if !path.is_dir() {
-        return (0, 0);
-    }
+/// One spill's item slot and `len` bytes of spool capacity, given back on drop
+/// unless `kept` is set once the record is on the spool.
+struct SpoolReservation<'a> {
+    count: &'a AtomicU64,
+    bytes: &'a AtomicU64,
+    len: u64,
+    kept: bool,
+}
 
-    // Read receiver state from recv-metadata (two big-endian u64: segment, position)
-    let recv_metadata_path = path.join("recv-metadata");
-    let (recv_segment, recv_position) = if recv_metadata_path.exists() {
-        std::fs::read(&recv_metadata_path)
-            .ok()
-            .and_then(|data| {
-                if data.len() >= 16 {
-                    let segment = u64::from_be_bytes(data[0..8].try_into().ok()?);
-                    let position = u64::from_be_bytes(data[8..16].try_into().ok()?);
-                    Some((segment, position))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or((0, 0))
-    } else {
-        (0, 0)
-    };
-
-    // Collect segment files at or after the receiver position
-    let mut segments: Vec<u64> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let file_path = entry.path();
-            if file_path.extension().and_then(|e| e.to_str()) == Some("q")
-                && let Some(seg_num) = file_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-                && seg_num >= recv_segment
-            {
-                segments.push(seg_num);
-            }
+impl Drop for SpoolReservation<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            drainer::release(self.count, self.bytes, self.len);
         }
     }
-    segments.sort_unstable();
-
-    let header_eof: [u8; 4] = [255, 255, 255, 255];
-    let mut count = 0u64;
-    let mut bytes = 0u64;
-
-    for &seg_num in &segments {
-        let seg_path = path.join(format!("{seg_num}.q"));
-        let Ok(file_data) = std::fs::read(&seg_path) else {
-            continue;
-        };
-
-        #[allow(clippy::cast_possible_truncation)]
-        let start = if seg_num == recv_segment {
-            recv_position as usize
-        } else {
-            0
-        };
-
-        let mut pos = start;
-        while pos + 4 <= file_data.len() {
-            let header_bytes: [u8; 4] = file_data[pos..pos + 4].try_into().unwrap_or([0; 4]);
-            if header_bytes == header_eof {
-                break;
-            }
-            let encoded = u32::from_be_bytes(header_bytes);
-            let payload_len = (encoded & 0x03_FF_FF_FF) as usize;
-            pos += 4 + payload_len;
-            if pos <= file_data.len() {
-                count += 1;
-                bytes += payload_len as u64;
-            }
-        }
-    }
-
-    (count, bytes)
 }
 
 /// Check available disk space using `statvfs`.
@@ -773,6 +717,11 @@ mod tests {
         /// When set, every send answers `Fatal` with this error instead.
         fatal: std::sync::Mutex<Option<fn() -> TransportError>>,
         received: Mutex<Vec<Record>>,
+        /// `send_batch` calls that delivered, and the most records one carried.
+        delivering_calls: std::sync::atomic::AtomicUsize,
+        largest_call: std::sync::atomic::AtomicUsize,
+        /// A payload answered `Fatal(Send)`, and the whole call it is in.
+        refused: std::sync::Mutex<Option<&'static [u8]>>,
     }
 
     impl TestSink {
@@ -781,7 +730,14 @@ mod tests {
                 available: AtomicBool::new(true),
                 fatal: std::sync::Mutex::new(None),
                 received: Mutex::new(Vec::new()),
+                delivering_calls: std::sync::atomic::AtomicUsize::new(0),
+                largest_call: std::sync::atomic::AtomicUsize::new(0),
+                refused: std::sync::Mutex::new(None),
             }
+        }
+
+        fn refuse_payload(&self, payload: Option<&'static [u8]>) {
+            *self.refused.lock().unwrap() = payload;
         }
 
         fn answer_fatal(&self, error: Option<fn() -> TransportError>) {
@@ -843,7 +799,14 @@ mod tests {
             if let Some(fatal) = self.fatal_answer() {
                 return fatal;
             }
+            let refused = *self.refused.lock().unwrap();
+            if refused.is_some_and(|bad| records.iter().any(|r| r.payload.as_ref() == bad)) {
+                return SendResult::Fatal(TransportError::Send("refused".into()));
+            }
             if self.available.load(AtomicOrdering::SeqCst) {
+                self.delivering_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.largest_call
+                    .fetch_max(records.len(), AtomicOrdering::SeqCst);
                 let mut r = self.received.lock().await;
                 r.extend(records.iter().cloned());
                 SendResult::Ok
@@ -919,6 +882,68 @@ mod tests {
         tiered.send(&rec(b"3")).await.unwrap();
         assert_eq!(tiered.circuit_state().await, CircuitState::Open);
 
+        tiered.shutdown().await;
+    }
+
+    /// `shutdown()` does not wait out the drain's rate-limit pause. Paused
+    /// time makes the pause the only clock `shutdown` could be waiting on.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cuts_the_drain_rate_limit_pause_short() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::RateLimited { msgs_per_sec: 1 };
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        tiered.send(&rec(b"paced")).await.unwrap();
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+
+        // The drain has just taken a record, so it is in its 1 s pause.
+        let started = tokio::time::Instant::now();
+        tiered.shutdown().await;
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_millis(500),
+            "shutdown waited {waited:?} of the drain's 1 s pause"
+        );
+    }
+
+    /// A spill cancelled while it waits on the spool writer leaves no item or
+    /// byte reserved: a phantom would keep StrictFifo off the hot path and,
+    /// repeated, refuse every spill as full.
+    #[tokio::test]
+    async fn a_cancelled_spill_releases_its_reservation() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.max_spool_items = Some(1);
+        config.max_spool_bytes = Some(1 << 20);
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+
+        let writer = tiered.spool_sender.lock().await;
+        for i in 0..3 {
+            let cancelled = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                tiered.send(&rec(b"cancelled")),
+            )
+            .await;
+            assert!(
+                cancelled.is_err(),
+                "spill {i} returned {cancelled:?} instead of waiting on the writer"
+            );
+        }
+        drop(writer);
+        assert_eq!(
+            (tiered.spool_len().await, tiered.spool_bytes()),
+            (0, 0),
+            "cancelled spills left a reservation behind"
+        );
+        tiered
+            .send(&rec(b"next"))
+            .await
+            .expect("the cap of 1 item still has room after three cancelled spills");
         tiered.shutdown().await;
     }
 
@@ -1052,6 +1077,90 @@ mod tests {
             "drained records must match what was spilled"
         );
 
+        tiered.shutdown().await;
+    }
+
+    /// A backlog drains in batches: 1000 spooled records reach the sink in
+    /// two `send_batch` calls at the default 500-record batch, in order.
+    #[tokio::test]
+    async fn a_backlog_drains_in_batches() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        let payloads: Vec<Vec<u8>> = (0..1000)
+            .map(|i| format!("b-{i:04}").into_bytes())
+            .collect();
+        for payload in &payloads {
+            tiered.send(&rec(payload)).await.unwrap();
+        }
+
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+        let calls = tiered.inner().delivering_calls.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            calls, 2,
+            "1000 records took {calls} delivering send_batch calls"
+        );
+        assert_eq!(tiered.inner().received_payloads().await, payloads);
+        tiered.shutdown().await;
+    }
+
+    /// The byte cap bounds a pass by the bytes stored: records whose stored
+    /// size lets three fit go three to a `send_batch`, and every one arrives.
+    #[tokio::test]
+    async fn a_drain_pass_takes_no_more_than_the_byte_cap() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+        config.compression = CompressionCodec::None;
+        let payloads: Vec<Vec<u8>> = (0..10).map(|i| vec![b'0' + i; 1000]).collect();
+        let stored = crate::spool_codec::frame(config.crc, rec(&payloads[0]).encode()).len() as u64;
+        config.drain_batch_max_bytes = stored * 3 + stored / 2;
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        for payload in &payloads {
+            tiered.send(&rec(payload)).await.unwrap();
+        }
+
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+        let sink = tiered.inner();
+        assert_eq!(sink.largest_call.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(
+            sink.delivering_calls.load(AtomicOrdering::SeqCst),
+            4,
+            "3 + 3 + 3 + 1"
+        );
+        assert_eq!(sink.received_payloads().await, payloads);
+        tiered.shutdown().await;
+    }
+
+    /// A batch the sink refuses as the fault of a record it does not name is
+    /// kept, then sent one record at a time, so only the refused record is
+    /// dropped and the rest arrive in order.
+    #[tokio::test]
+    async fn a_refused_batch_drops_only_the_refused_record() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        for payload in [&b"good-1"[..], b"poison", b"good-2"] {
+            tiered.send(&rec(payload)).await.unwrap();
+        }
+
+        tiered.inner().refuse_payload(Some(b"poison"));
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+        assert_eq!(
+            tiered.inner().received_payloads().await,
+            vec![b"good-1".to_vec(), b"good-2".to_vec()]
+        );
         tiered.shutdown().await;
     }
 
@@ -1836,6 +1945,8 @@ mod tests {
         hang: AtomicBool,
         /// `send_batch` calls that started while `hang` was set.
         hung_sends: AtomicU64,
+        /// The most records one hung call carried.
+        largest_hung: std::sync::atomic::AtomicUsize,
     }
 
     impl HangingSink {
@@ -1844,6 +1955,7 @@ mod tests {
                 inner: TestSink::new(),
                 hang: AtomicBool::new(false),
                 hung_sends: AtomicU64::new(0),
+                largest_hung: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -1867,6 +1979,8 @@ mod tests {
 
         async fn send_batch(&self, records: &[Record]) -> SendResult {
             if self.hang.load(AtomicOrdering::SeqCst) {
+                self.largest_hung
+                    .fetch_max(records.len(), AtomicOrdering::SeqCst);
                 self.hung_sends.fetch_add(1, AtomicOrdering::SeqCst);
                 return std::future::pending().await;
             }
@@ -1935,9 +2049,14 @@ mod tests {
         // The second hung send is the first record offered again after its send was cut off.
         wait_for_hung_sends(&tiered, 2).await;
         assert_eq!(
+            tiered.inner().largest_hung.load(AtomicOrdering::SeqCst),
+            3,
+            "the hung send carried the whole batch"
+        );
+        assert_eq!(
             tiered.spool_len().await,
             3,
-            "a timed-out send commits nothing"
+            "a timed-out batch commits none of its records"
         );
 
         tiered.inner().hang.store(false, AtomicOrdering::SeqCst);

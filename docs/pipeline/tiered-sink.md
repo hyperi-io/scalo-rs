@@ -55,7 +55,7 @@ flowchart TB
 | `Fatal(e)` | `Err(TieredSinkError::Sink)` to the caller | None. Not spooled |
 | No answer within `send_timeout_ms` | Spool to disk | Failure recorded and counted in `spool_circuit_trips_total`, may open the circuit |
 
-The sink reads the `SendResult` every `TransportSender` already returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for is dropped and logged, unless the error is `TransportError::Config` or `Closed`. Those describe the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
+The sink reads the `SendResult` every `TransportSender` already returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for, sent on its own, is dropped and logged, unless the error is `TransportError::Config` or `Closed`. Those describe the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
 
 ---
 
@@ -108,7 +108,9 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
-A pass that takes a record off the spool starts the next at once, so the strategy sets the rate. `drain_interval_ms` (100 ms) is the wait after a pass that found the spool empty or the sink down.
+Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Every entry is committed only when the sink answers `Ok` or `FilteredDlq`. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal` names no record, so the batch is kept and its entries are sent one at a time, which drops only the record the sink refuses. An entry that fails its CRC or does not decode is dropped on its own, and the rest of its batch is sent.
+
+A pass that takes records starts the next after the strategy's pause for that many records, so the strategy sets the rate. `drain_interval_ms` (100 ms) is added after a pass that found the spool empty or the sink down. Shutdown cuts either wait short.
 
 The drain task is `tokio::spawn`'d at construction. It and the disk poller both stop when the sink's shutdown `CancellationToken` is cancelled, by `shutdown()` or by drop. With the `shutdown` feature the drain task also stops on the global token.
 
@@ -127,7 +129,7 @@ Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A 
 
 On a Kubernetes emptyDir `statvfs` reads the node's disk, not the volume's `sizeLimit`, so a spool past the limit gets the pod evicted and the spool lost. The scalo-service chart sets `SCALO_WRITABLE_PATH_LIMITS` to each emptyDir writable path with a `sizeLimit`. With `max_spool_bytes` unset, `TieredSink::new` caps a spool on such a path at nine tenths of its limit. On Kubernetes, `disk_aware` with no cap at all is refused with `SpoolOpen`.
 
-A spill past `max_spool_items` or `max_spool_bytes` applies `when_full`:
+A spill reserves its item slot and bytes before it writes, and gives them back if the write fails or the `send` future is dropped, so a cancelled spill leaves nothing counted. A spill past `max_spool_items` or `max_spool_bytes` applies `when_full`:
 
 | `when_full` | `send` returns |
 | --- | --- |
@@ -161,6 +163,8 @@ tiered_sink:
   circuit_failure_threshold: 5
   circuit_reset_timeout_ms: 30000
   drain_interval_ms: 100
+  drain_batch_max_records: 500
+  drain_batch_max_bytes: 4194304   # 4 MiB, as stored
   disk_aware:
     max_usage_percent: 0.8
     poll_interval_secs: 5

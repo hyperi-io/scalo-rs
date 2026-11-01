@@ -10,7 +10,9 @@
 //!
 //! NO mocks: the broker container is stopped under a live scalo consumer and
 //! started again. A raw rdkafka producer writes the records, so scalo's write
-//! path never feeds scalo's read path.
+//! path never feeds scalo's read path. A test that stops the broker holds one
+//! of its own, on a host port kept across the restart because the broker
+//! advertises it. The missing-topic test uses the run's shared broker.
 //!
 //! They need a Docker daemon: without one they skip on a developer's machine and
 //! fail when `CI` is set.
@@ -19,24 +21,23 @@
 //! cargo nextest run --features transport-kafka,transport-kafka-test-support --test kafka_consumer_outage --no-capture
 //! ```
 
-#![cfg(feature = "transport-kafka-test-support")]
+#![cfg(all(feature = "transport-kafka-test-support", unix))]
+
+mod common;
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use scalo::transport::kafka::test_support::{kafka_tag, require_docker};
+use scalo::test_name;
+use scalo::transport::kafka::test_support::require_docker;
 use scalo::transport::kafka::{
     ConsumerProtocol, KafkaAdmin, KafkaConfig, KafkaToken, KafkaTransport,
 };
 use scalo::transport::{TransportBase, TransportError, TransportReceiver};
-use testcontainers_modules::kafka::apache::{self, Kafka};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 
-/// A JVM broker takes 5-12 s to become ready, longer on a busy runner, so 60 s is too tight.
-const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
+use common::kafka::{broker_alone, restart, shared_bootstrap, stop};
 
 const TOPIC: &str = "outage";
 
@@ -45,32 +46,6 @@ const RECORDS: usize = 20;
 
 /// How long the broker stays down while the consumer keeps polling.
 const OUTAGE: Duration = Duration::from_secs(20);
-
-/// A free loopback port for the broker to keep across its restart.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("bind an ephemeral port")
-        .port()
-}
-
-/// Start a single-node KRaft broker on a fixed host port and return it plus
-/// its bootstrap address.
-///
-/// The port is fixed because Docker hands a restarted container a new
-/// ephemeral port, and the broker advertises the one it started with.
-async fn start_kafka() -> (ContainerAsync<Kafka>, String) {
-    let port = free_port();
-    let node = Kafka::default()
-        .with_jvm_image()
-        .with_tag(kafka_tag())
-        .with_mapped_port(port, apache::KAFKA_PORT)
-        .with_startup_timeout(KAFKA_STARTUP_TIMEOUT)
-        .start()
-        .await
-        .expect("start kafka container");
-    (node, format!("127.0.0.1:{port}"))
-}
 
 async fn create_topic(bootstrap: &str) {
     let admin = KafkaAdmin::new(&KafkaConfig {
@@ -168,8 +143,8 @@ async fn consume_all(
 }
 
 /// Consume, lose the broker for [`OUTAGE`], get it back, consume again.
-async fn ride_out_an_outage(protocol: ConsumerProtocol, group: &str) {
-    let (node, bootstrap) = start_kafka().await;
+async fn ride_out_an_outage(test: &str, protocol: ConsumerProtocol, group: &str) {
+    let (node, bootstrap) = broker_alone(test).await;
     create_topic(&bootstrap).await;
     let producer = raw_producer(&bootstrap);
 
@@ -184,9 +159,7 @@ async fn ride_out_an_outage(protocol: ConsumerProtocol, group: &str) {
         .await
         .expect("commit before the outage");
 
-    node.stop_with_timeout(Some(0))
-        .await
-        .expect("stop the broker");
+    stop(&node).await;
 
     let outage = Instant::now();
     let mut calls = 0_u32;
@@ -216,9 +189,7 @@ async fn ride_out_an_outage(protocol: ConsumerProtocol, group: &str) {
         "one recv held the caller for {slowest:?}, past the 2 s backoff ceiling"
     );
 
-    // A plain Docker start: the image's start hook would rewrite the broker's
-    // launch script while the restarted container is already running it.
-    (*node).start().await.expect("restart the broker");
+    restart(&node).await;
     let restarted = Instant::now();
 
     let after = produce(&producer, "after").await;
@@ -238,7 +209,7 @@ async fn a_consumer_rides_out_a_broker_outage() {
     if !require_docker() {
         return;
     }
-    ride_out_an_outage(ConsumerProtocol::Consumer, "outage-kip848").await;
+    ride_out_an_outage(test_name!(), ConsumerProtocol::Consumer, "outage-kip848").await;
 }
 
 #[tokio::test]
@@ -246,7 +217,7 @@ async fn a_classic_consumer_rides_out_a_broker_outage() {
     if !require_docker() {
         return;
     }
-    ride_out_an_outage(ConsumerProtocol::Classic, "outage-classic").await;
+    ride_out_an_outage(test_name!(), ConsumerProtocol::Classic, "outage-classic").await;
 }
 
 /// A commit caught by an outage retries for its window and then reports the
@@ -257,7 +228,7 @@ async fn a_commit_during_an_outage_reports_instead_of_hanging() {
     if !require_docker() {
         return;
     }
-    let (node, bootstrap) = start_kafka().await;
+    let (node, bootstrap) = broker_alone(test_name!()).await;
     create_topic(&bootstrap).await;
     let producer = raw_producer(&bootstrap);
     let consumer = KafkaTransport::new(&consumer_config(
@@ -271,9 +242,7 @@ async fn a_commit_during_an_outage_reports_instead_of_hanging() {
     let before = produce(&producer, "before").await;
     let tokens = consume_all(&consumer, &before, Duration::from_secs(60)).await;
 
-    node.stop_with_timeout(Some(0))
-        .await
-        .expect("stop the broker");
+    stop(&node).await;
     let started = Instant::now();
     let result = consumer.commit(&tokens).await;
     let took = started.elapsed();
@@ -288,7 +257,7 @@ async fn a_commit_during_an_outage_reports_instead_of_hanging() {
         "commit held the caller for {took:?}"
     );
 
-    (*node).start().await.expect("restart the broker");
+    restart(&node).await;
     let after = produce(&producer, "after").await;
     let tokens = consume_all(&consumer, &after, Duration::from_secs(120)).await;
     consumer
@@ -315,7 +284,7 @@ async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
     const RESUME_WITHIN: Duration = Duration::from_secs(30);
     const SESSION_TIMEOUT_MS: u32 = 240_000;
 
-    let (node, bootstrap) = start_kafka().await;
+    let (node, bootstrap) = broker_alone(test_name!()).await;
     create_topic(&bootstrap).await;
     let producer = raw_producer(&bootstrap);
     let consumer = KafkaTransport::new(
@@ -335,11 +304,9 @@ async fn a_consumer_left_unpolled_through_an_outage_resumes_promptly() {
         .await
         .expect("commit before the outage");
 
-    node.stop_with_timeout(Some(0))
-        .await
-        .expect("stop the broker");
+    stop(&node).await;
     tokio::time::sleep(UNPOLLED).await;
-    (*node).start().await.expect("restart the broker");
+    restart(&node).await;
 
     // Delivery is the broker's own readiness signal: the clock starts once it
     // is serving again, however long the restart took.
@@ -366,10 +333,14 @@ async fn a_missing_topic_fails_readiness_not_the_consumer() {
     if !require_docker() {
         return;
     }
-    let (_node, bootstrap) = start_kafka().await;
+    let bootstrap = shared_bootstrap().await;
     let config = KafkaConfig {
-        topics: vec!["no-such-topic".to_string()],
-        ..consumer_config(&bootstrap, "outage-missing", ConsumerProtocol::Classic)
+        topics: vec![common::unique("no-such-topic")],
+        ..consumer_config(
+            &bootstrap,
+            &common::unique("outage-missing"),
+            ConsumerProtocol::Classic,
+        )
     };
     let consumer = KafkaTransport::new(&config).await.expect("kafka consumer");
 

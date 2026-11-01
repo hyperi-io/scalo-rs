@@ -6,7 +6,7 @@ feature flag -- apps pull only what they ship.
 
 | Backend | Feature flag | Native dep | Use case | Holds its source acknowledgement |
 | --------- | -------------- | ------------ | ---------- | ---------- |
-| Kafka | `transport-kafka` | `librdkafka1` (runtime), `librdkafka-dev` (build) | Production default, persistence, replay | Yes |
+| Kafka | `transport-kafka` | none at runtime (static), `librdkafka-dev` for a dev build | Production default, persistence, replay | Yes |
 | gRPC | `transport-grpc` | None (pure Rust -- `tonic`) | Inter-service mesh, low latency | Yes |
 | Memory | `transport-memory` | None | Unit tests, same-process pipelines | No, none to hold |
 | File | `transport-file` | None | Debugging, audit trails, replay | Not yet |
@@ -62,6 +62,7 @@ transport:
       sasl_password: ${KAFKA_PASSWORD}
 ```
 
+- **CA trust**: with TLS on (`ssl` or `sasl_ssl`) and neither `ssl_ca_location` nor a raw `ssl.ca.location` or `ssl.ca.pem` set, the consumer, producer and admin clients set `ssl.ca.location: probe`, so the statically linked OpenSSL finds the system bundle on RHEL and UBI bases as well as Debian. A CA named anywhere wins.
 - **Security floor**: every constructor that builds a client from a `KafkaConfig` applies `provider`, then runs `KafkaConfig::validate`: `KafkaTransport::new`, `receiver` and `sender`, `KafkaProducer::new` and its profile shorthands, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend. In any environment it refuses an unknown `provider`, `msk_iam` (AWS IAM auth needs a SigV4-signed OAUTHBEARER token, which scalo cannot generate, so use `msk` with SCRAM), and a `PLAIN` SASL mechanism unless the transport is `sasl_ssl`. Where `APP_ENV` (else `ENVIRONMENT`, else `ENV`) is `production` or `prod`, it also refuses `ssl_skip_verify: true`, certificate verification turned off or `ssl.endpoint.identification.algorithm: none`, and `plaintext` or `sasl_plaintext` without `allow_insecure_transport: true`. In production it also refuses a raw map's `sasl.oauthbearer.token.endpoint.url` that is not an `https` URL (a URL with no scheme included), which would send the OAUTHBEARER client secret in cleartext, and a raw map's `ssl.cipher.suites` that names a suite with no encryption. That is a token, split on `:`, `,`, `;` or whitespace, with a `+`, `-` or `_` separated part that is `NULL`, `eNULL` or `COMPLEMENTOFALL` (`eNULL`, `NULL-SHA`, `ECDHE-RSA-NULL-SHA`), unless a leading `!` or `-` excludes it. The cipher rule reads suite names, not OpenSSL's full cipher-string semantics, and `COMPLEMENTOFALL` is the one alias it expands. Neither key has a typed field. Each rule judges the typed field and every value `librdkafka_overrides`, `sizing.producer_librdkafka`, `sizing.consumer_librdkafka` or `extra_config` gives `security.protocol`, `sasl.mechanism` (or `sasl.mechanisms`), `enable.ssl.certificate.verification` or `ssl.endpoint.identification.algorithm`, keys and values in any case, so no raw map takes a client below the floor. A refusal a raw map caused names the map and the key. The consumer runs the typed `security_protocol` and `sasl_mechanism` over those maps, and the producer and admin clients run the maps' values, so an override to `ssl` does not lift a typed `plaintext` either. The refusal is `TransportError::Config`. `Dlq::spawn` leaves a refused Kafka backend out with a WARN and runs the others (see [the DLQ page](../pipeline/dlq.md)). `producer_client_config` does neither step, so an app building its own client from it calls `apply_provider` and `validate` first.
 - **Client build errors**: when librdkafka refuses a key, a value or a combination of them, such as `enable.idempotence: true` with `acks: 1`, building a client fails with `TransportError::Config`, which `is_fatal()` reports, so the app stops rather than retrying. That holds for `KafkaTransport::new`, `receiver` and `sender`, `KafkaProducer::new`, `KafkaAdmin::new` and the admin's group consumers. The message names the client, the key and librdkafka's reason. librdkafka quotes some refused values in that reason, so the configured value, whole and every whitespace- or comma-separated token of it, is replaced by `<redacted>`. A failure to start librdkafka's threads is `TransportError::Connection`.
 - **Cancellation safety**: `recv` polls on tokio's blocking pool, so a loop on it never holds a runtime worker. It is safe to drop at any `.await`, including its outage backoff and the wait after a repeated consumer rebuild: a poll still running when `recv` is dropped is kept, and the next `recv` returns its records, or an empty batch when the client it polled has been rebuilt since and the poll failed.
@@ -72,6 +73,7 @@ transport:
   otherwise it is the first `Backpressured`/`Fatal` in record order and part
   of the block may be on the broker -- retry it whole (at-least-once).
   Records carry their `key` as the topic and no headers.
+- **`close()`**: stops receiving and keeps the consumer's group membership, so the final commit a service makes after closing its source lands. Dropping the transport leaves the group.
 - **`is_healthy()`**: `false` after `close()`; for a fenced static member; from a failed consumer rebuild, or a second one with no record between, until a record arrives; and while a broker refuses the transport's credentials or TLS setup and none has yet accepted them (see [Refused credentials](#refused-credentials)). A broker outage or a receive error does not flip it.
 - **Group protocol**: `classic` unless `consumer_protocol: consumer` opts in to KIP-848; `group_protocol()` reports the one in use. A consumer librdkafka flags fatal is rebuilt by the next `recv`, as `classic` when the broker refused KIP-848, except a fenced static member, which is not. See [../kafka-path.md](../kafka-path.md).
 - **`commit()`**: synchronous (`CommitMode::Sync`) on tokio's blocking pool, so a broker rejection reaches the caller. `commit_weak_async()` is the fire-and-forget form.
@@ -96,7 +98,7 @@ An auth or TLS failure is permanent only until the credentials first work (a bro
 
 #### Testing against a real broker
 
-`transport-kafka-test-support` ([feature-flags.md](../feature-flags.md)) gives an app's integration tests the broker scalo's own suite uses, so the image is pinned once and not copied per repo. `TlsBroker::start(test)` brings up Apache Kafka with TLS, mTLS and SASL_SSL listeners and generates the certificates (`broker.pki.file("ca.crt")`). `tests/kafka_tls.rs` is the worked example, with a refused row for each way a client can be turned away.
+`transport-kafka-test-support` ([feature-flags.md](../feature-flags.md)) gives an app's integration tests the broker scalo's own suite uses, so the image is pinned once and not copied per repo. `shared_kafka(SUITE)` is the run's one PLAINTEXT broker, shared by every test process, and `kafka_spec(host_port)` starts one a test holds alone, on a pinned port when it stops and starts the broker. `TlsBroker::start(&SUITE, test)` brings up Apache Kafka with TLS, mTLS and SASL_SSL listeners and generates the certificates (`broker.pki.file("ca.crt")`). Every container is named and labelled for the suite, as [`shared_service`](../../src/deployment/test_support/shared_service.rs) names them. `tests/kafka_tls.rs` is the worked example, with a refused row for each way a client can be turned away.
 
 #### Refused credentials
 
@@ -141,7 +143,7 @@ transport:
 - **Message-size ceiling**: `max_message_size` bounds the encoded request, measured uncompressed, as the receiver's decoder measures it. `send` returns `FilteredDlq` for a record over it without making the RPC, and for a record the receiver refuses with `OutOfRange` (its limit is lower, or gzip grew the frame past it). `send_batch` sends a block over it as several `RouteBatch` requests, in order, each within the limit. A failure after the first leaves the earlier ones accepted, and the retry of the whole block sends them again. A record over the limit on its own is left out and counted in `transport_message_too_large_total`. When every record is, the result is `FilteredDlq`, which callers take as handled. Otherwise the rest of the block is sent and the result is `Ok`. Either way the record left out is DROPPED: it is counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`, once the rest of the block is sent when there is a rest. To dead-letter it instead, take out every record `dead_letter_reason` names before the call, as the pipeline's `.sender(&sender)` does.
 - **Changed in 2.13.0, for `send_batch` callers**: 2.12 returned `Fatal` for a block over the limit and sent none of it. 2.13.0 splits the block, and a record over the limit on its own no longer fails the block: it is dropped and counted, as above.
 - **Acknowledgement**: unarmed, or with acknowledgements disabled, the server answers once the records are queued for `recv`, not once the consumer reads them. Armed, it answers once they are released: see [Held responses](#held-responses). A full queue (`recv_buffer_size`) answers `ResourceExhausted`.
-- **`RouteBatch`**: a batch is queued whole or not at all. One with more records than `recv_buffer_size` never fits the queue, so it is held whole in a slot of its own, one batch at a time: it lands in one step, or is answered `ResourceExhausted` with nothing queued while an earlier one is still waiting. `recv` hands that batch over before the queue, so the receiver holds at most `recv_buffer_size` records plus one such batch. Each request takes one contiguous range of token sequence numbers.
+- **`RouteBatch`**: each record's headers, the dedup key among them, reach `recv` on its `Record`. A batch is queued whole or not at all. One with more records than `recv_buffer_size` never fits the queue, so it is held whole in a slot of its own, one batch at a time: it lands in one step, or is answered `ResourceExhausted` with nothing queued while an earlier one is still waiting. `recv` hands that batch over before the queue, so the receiver holds at most `recv_buffer_size` records plus one such batch. Each request takes one contiguous range of token sequence numbers.
 - **`close()`**: refuses new pushes with `Unavailable`, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Held responses are answered as their records are released, and those still held at the drain deadline (`drain_deadline`, default 20 s, kept under the pod's termination grace period) are answered `Unavailable`. Open connections finish their in-flight RPCs on their own, the listener is free when `close()` returns, and a client that never finishes its RPC does not hold it open. Dropping the transport stops the server too, and answers every held response `Unavailable` at once.
 - **Shutdown order**: `close()`, then `recv` until `Closed`, releasing each block as it completes, then flush. A service that stops calling `recv` before it returns `Closed` loses the records still queued, whenever it closes.
 - **Counters**: receipts count in `transport_received_*`, never in `transport_sent_total`.
@@ -204,6 +206,8 @@ Source: [../../src/transport/vector_compat/](../../src/transport/vector_compat/)
 receiver are tied to the same `MemoryTransport` instance. **Not a
 deployable backend** -- for tests and in-process pipelines (e.g.
 unit tests against the `BatchEngine`).
+A record sent through `send_record` or `send_batch` comes back from `recv`
+with its headers, the dedup key among them. `send` carries none.
 
 ```yaml
 transport:
@@ -233,6 +237,10 @@ file so reads survive restarts. `FileToken` carries the byte offset;
 `commit()` writes the highest committed offset to a temporary file, syncs it
 and renames it over the sidecar. Only a line ending in `\n` becomes a record,
 so a reader racing an appender holds a half-written line until it is finished.
+A line over `max_line_bytes` (16 MiB, newline included) is read past without
+being held: `recv` returns it as a dead letter carrying its first
+`max_line_bytes`, counts it in `transport_message_too_large_total`, and its
+offset commits with the block.
 
 ```yaml
 transport:
@@ -241,6 +249,7 @@ transport:
     file:
       path: "/var/log/myapp/events.ndjson"
       append: true
+      max_line_bytes: 16777216
 ```
 
 - **Cancellation safety**: `recv` keeps a partly read line, and any
@@ -299,12 +308,16 @@ transport:
       listen: "0.0.0.0:8080"
       recv_path: "/ingest"
       recv_buffer_size: 10000
+      max_body_bytes: 16777216      # one request's body, 413 above it
+      max_in_flight_bytes: 67108864 # bodies read and queued at once
 ```
+
+- **Admission**: a POST is checked before its body is read. A held governor answers 503, then the request reserves its declared `Content-Length` (or `max_body_bytes` without one) from `max_in_flight_bytes`, and answers 503 with `Retry-After: 1` when that does not fit. The bytes stay reserved while the record is queued and come back as `recv` hands it over, so bodies read and queued never exceed `max_in_flight_bytes`. A declared length over `max_body_bytes` is 413 at once. `max_in_flight_bytes` below `max_body_bytes` is refused at construction.
 
 - **Cancellation safety**: send is `reqwest`'s async path -- drop
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
-- **Send failures**: a refused, reset or timed-out connection, and HTTP 408, 429, 502, 503 or 504, are `Backpressured`, so a down endpoint is waited out. Any other non-2xx status, and a request that cannot be built, is `Fatal`.
+- **Send failures**: a refused, reset or timed-out connection, HTTP 408 and 429, and every 5xx are `Backpressured`, so a down or failing endpoint is waited out. A wrong credential or endpoint (401, 403, 404, 405, 407, 410, 421, an unfollowed 3xx) is `Fatal(Config)`, which a tiered sink's drain keeps spooled until the sink is fixed. 413 is `Fatal(MessageTooLarge)`, and any other 4xx `Fatal(Send)`: both are the payload's fault, so the drain drops the record. A request that cannot be built is `Fatal(Send)`.
 - **Acknowledgement**: the server answers 200 once the record is queued for `recv`, not once the consumer reads it, so a crash loses what it answered but had not delivered. A full queue (`recv_buffer_size`), a held inbound gate, and a closed receiver answer 503 with `Retry-After: 1`. It does not hold its answer yet: `<key>.http.acknowledgements` has no effect, and the factory warns once. An endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#a-hand-rolled-loop)).
 - **`close()`**: answers new POSTs with 503, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Open connections finish their in-flight requests on their own, the listener is free when `close()` returns, and a client that never finishes its request does not hold it open. Dropping the transport stops the server too.
 - **Shutdown order**: `close()`, then `recv` until `Closed`, then flush. The `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). Flushing first loses the records still queued.
