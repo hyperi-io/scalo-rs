@@ -117,6 +117,12 @@ enum Security {
         cert: &'static str,
         key: &'static str,
     },
+    /// TLS naming no CA, so the trust comes from the environment, and
+    /// SCRAM-SHA-512 with `password`.
+    ScramSslEnvTrust {
+        /// Generated per run, so the table holds the function, not the value.
+        password: fn() -> &'static str,
+    },
     /// TLS trusting `ca`, and SCRAM-SHA-512 with `password`.
     ScramSsl {
         ca: &'static str,
@@ -235,6 +241,9 @@ fn client_config(
         Security::Mtls { ca, cert, key } => base
             .with_tls(Some(file(ca).as_str()))
             .with_client_cert(&file(cert), &file(key)),
+        Security::ScramSslEnvTrust { password } => base
+            .with_scram_ssl("SCRAM-SHA-512", SCRAM_USER, password())
+            .with_tls(None),
         Security::ScramSsl { ca, password } => base
             .with_scram_ssl("SCRAM-SHA-512", SCRAM_USER, password())
             .with_tls(Some(file(ca).as_str())),
@@ -479,4 +488,48 @@ async fn kafka_transport_against_a_tls_broker() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// A client that names no CA trusts the bundle `SSL_CERT_FILE` names, the
+/// way the scalo-service chart delivers a private CA, and is refused when that
+/// bundle holds another CA. Its own process, so the variable reaches only it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_ca_in_ssl_cert_file_is_trusted() {
+    if !require_docker() {
+        return;
+    }
+    let broker = match TlsBroker::start(&common::SUITE, scalo::test_name!()).await {
+        Ok(broker) => broker,
+        Err(e) => {
+            skip_or_fail(&format!("the TLS broker would not start ({e})"));
+            return;
+        }
+    };
+    let row = Accepted {
+        name: "sasl-ssl-scram-trust-from-ssl-cert-file",
+        listener: Listener::SaslSsl,
+        security: Security::ScramSslEnvTrust {
+            password: scram_password,
+        },
+    };
+    let mut failures = Vec::new();
+    for (bundle, trusted) in [("ca.crt", true), ("rogue-ca.crt", false)] {
+        let path = broker.pki.file(bundle);
+        let outcome = temp_env::async_with_vars(
+            [
+                ("SSL_CERT_FILE", Some(path.as_str())),
+                ("SSL_CERT_DIR", None),
+            ],
+            round_trip(&broker, &row),
+        )
+        .await;
+        match (trusted, outcome) {
+            (true, Ok(_)) | (false, Err(_)) => {}
+            (true, Err(why)) => failures.push(format!("SSL_CERT_FILE={bundle}: {why}")),
+            (false, Ok(_)) => failures.push(format!(
+                "SSL_CERT_FILE={bundle}: a bundle holding another CA was trusted"
+            )),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

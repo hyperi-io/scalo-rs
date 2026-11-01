@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### Kafka TLS with no CA trusts `SSL_CERT_FILE` before probing (BEHAVIOUR CHANGE)
+
+With TLS on and no CA set by `ssl_ca_location`, `ssl.ca.location` or `ssl.ca.pem`, every Kafka client sets `ssl.ca.location` to `SSL_CERT_FILE`, else `SSL_CERT_DIR`, else `probe`. 2.14.24 set `probe` alone, and librdkafka's probe ignores both variables, so a client trusting a private CA through `SSL_CERT_FILE` failed its TLS handshake.
+
+**Consumer adjustment** -- none. An app on 2.14.24 that trusts a private Kafka CA through `SSL_CERT_FILE` takes this release.
+
 ### The spool's size cap counts queued bytes (BEHAVIOUR CHANGE)
 
 `Spool::push` checks `max_size_bytes` against the bytes of the records queued plus the record being written, counted once at open and then incrementally. It summed the directory on every push, which counted records already consumed and walked the directory on the async runtime. `Spool::queued_bytes()` returns the count.

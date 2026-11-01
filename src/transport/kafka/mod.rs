@@ -479,7 +479,7 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
     }
 
     apply_group_protocol(&mut client_config, protocol);
-    probe_system_ca(&mut client_config);
+    set_default_ca(&mut client_config);
     client_config
 }
 
@@ -541,15 +541,13 @@ pub fn producer_client_config(
     apply_layer(&mut client_config, profile_defaults);
     let settings = config.resolved_producer_settings();
     apply_layer(&mut client_config, &raw_layer(&settings));
-    probe_system_ca(&mut client_config);
+    set_default_ca(&mut client_config);
     client_config
 }
 
-/// With TLS on and no CA named, have librdkafka probe the usual system bundle
-/// paths. A static OpenSSL's built-in default reads `/etc/ssl/certs` hashed
-/// links, which only Debian-family bases carry. A `ssl.ca.location` or
-/// `ssl.ca.pem` from any layer wins.
-pub(super) fn probe_system_ca(client_config: &mut ClientConfig) {
+/// With TLS on and no CA named, trust what [`default_ca_location`] picks. A
+/// `ssl.ca.location` or `ssl.ca.pem` from any layer wins.
+pub(super) fn set_default_ca(client_config: &mut ClientConfig) {
     let tls = client_config
         .get("security.protocol")
         .is_some_and(|p| p.eq_ignore_ascii_case("ssl") || p.eq_ignore_ascii_case("sasl_ssl"));
@@ -557,8 +555,27 @@ pub(super) fn probe_system_ca(client_config: &mut ClientConfig) {
         && client_config.get("ssl.ca.location").is_none()
         && client_config.get("ssl.ca.pem").is_none()
     {
-        client_config.set("ssl.ca.location", "probe");
+        let location = default_ca_location(env_path("SSL_CERT_FILE"), env_path("SSL_CERT_DIR"));
+        client_config.set("ssl.ca.location", location);
     }
+}
+
+/// The CA a TLS client trusts when its config names none: the bundle
+/// `SSL_CERT_FILE` names, else the directory `SSL_CERT_DIR` names, else
+/// librdkafka's `probe` of the usual system paths.
+///
+/// librdkafka's probe reads neither variable, and a static OpenSSL's own
+/// default reads `/etc/ssl/certs` hashed links, which only Debian-family bases
+/// carry, so a private CA delivered through either variable is passed on here.
+fn default_ca_location(cert_file: Option<String>, cert_dir: Option<String>) -> String {
+    cert_file
+        .or(cert_dir)
+        .unwrap_or_else(|| "probe".to_string())
+}
+
+/// A path variable from the environment, `None` when unset or blank.
+fn env_path(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
 /// Set every key of `layer` over `client_config`, each replacing the other
@@ -4299,21 +4316,30 @@ mod tests {
     // Consumer config: one property under two librdkafka names
     // =========================================================================
 
-    /// With TLS on and no CA named, every client probes the system CA bundle
-    /// paths, and a CA named by the typed field or by a raw key wins.
+    /// With TLS on and no CA named, every client trusts the bundle
+    /// `SSL_CERT_FILE` names, else the directory `SSL_CERT_DIR` names, else
+    /// probes the system paths. A CA named by the typed field or a raw key wins
+    /// whatever the environment holds.
     #[test]
-    fn tls_with_no_ca_probes_the_system_bundle() {
+    fn tls_with_no_ca_takes_the_environment_then_probes() {
+        // A row's expectation, where `Default` is what the environment picks.
+        #[derive(Clone, Copy)]
+        enum Want {
+            Unset,
+            Default,
+            Exactly(&'static str),
+        }
         let ssl = || KafkaConfig::default().with_tls(None);
-        let cases: Vec<(&str, KafkaConfig, Option<&str>)> = vec![
-            ("plaintext", KafkaConfig::default(), None),
-            ("ssl, no CA", ssl(), Some("probe")),
+        let rows: Vec<(&str, KafkaConfig, Want)> = vec![
+            ("plaintext", KafkaConfig::default(), Want::Unset),
+            ("ssl, no CA", ssl(), Want::Default),
             (
                 "sasl_ssl, no CA",
                 KafkaConfig {
                     security_protocol: "sasl_ssl".to_string(),
                     ..KafkaConfig::default()
                 },
-                Some("probe"),
+                Want::Default,
             ),
             (
                 "upper-case SSL",
@@ -4321,40 +4347,72 @@ mod tests {
                     security_protocol: "SSL".to_string(),
                     ..KafkaConfig::default()
                 },
-                Some("probe"),
+                Want::Default,
             ),
             (
                 "typed CA",
                 KafkaConfig::default().with_tls(Some("/etc/ca.pem")),
-                Some("/etc/ca.pem"),
+                Want::Exactly("/etc/ca.pem"),
             ),
             (
                 "raw ssl.ca.location",
                 ssl().with_override("ssl.ca.location", "/raw/ca.pem"),
-                Some("/raw/ca.pem"),
+                Want::Exactly("/raw/ca.pem"),
             ),
             (
                 "raw ssl.ca.pem",
                 ssl().with_override("ssl.ca.pem", "-----BEGIN CERTIFICATE-----"),
-                None,
+                Want::Unset,
             ),
         ];
-        for (name, config, want) in cases {
-            let built = [
-                (
-                    "consumer",
-                    consumer_client_config(&config, ConsumerProtocol::Classic),
-                ),
-                ("producer", producer_client_config(&config, &[])),
-                ("admin", admin::admin_client_config(&config)),
-            ];
-            for (client, built) in built {
-                assert_eq!(
-                    built.get("ssl.ca.location"),
-                    want,
-                    "{name}, {client}: ssl.ca.location"
-                );
-            }
+        // env name, SSL_CERT_FILE, SSL_CERT_DIR, the default it gives
+        let envs: [(&str, Option<&str>, Option<&str>, &str); 5] = [
+            ("neither set", None, None, "probe"),
+            (
+                "file",
+                Some("/run/ca/bundle.pem"),
+                None,
+                "/run/ca/bundle.pem",
+            ),
+            ("dir", None, Some("/run/ca/certs"), "/run/ca/certs"),
+            (
+                "both: the file wins",
+                Some("/run/ca/bundle.pem"),
+                Some("/run/ca/certs"),
+                "/run/ca/bundle.pem",
+            ),
+            (
+                "blank file: the dir",
+                Some("  "),
+                Some("/run/ca/certs"),
+                "/run/ca/certs",
+            ),
+        ];
+        for (env, file, dir, default) in envs {
+            temp_env::with_vars([("SSL_CERT_FILE", file), ("SSL_CERT_DIR", dir)], || {
+                for (name, config, want) in &rows {
+                    let want = match want {
+                        Want::Unset => None,
+                        Want::Default => Some(default),
+                        Want::Exactly(location) => Some(*location),
+                    };
+                    let built = [
+                        (
+                            "consumer",
+                            consumer_client_config(config, ConsumerProtocol::Classic),
+                        ),
+                        ("producer", producer_client_config(config, &[])),
+                        ("admin", admin::admin_client_config(config)),
+                    ];
+                    for (client, built) in built {
+                        assert_eq!(
+                            built.get("ssl.ca.location"),
+                            want,
+                            "{env}, {name}, {client}: ssl.ca.location"
+                        );
+                    }
+                }
+            });
         }
     }
 
