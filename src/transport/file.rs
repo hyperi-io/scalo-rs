@@ -110,9 +110,13 @@ impl Default for FileTransportConfig {
 }
 
 impl FileTransportConfig {
-    /// Load from the config cascade under the `transport.file` key.
-    #[must_use]
-    pub fn from_cascade() -> Self {
+    /// Load from the config cascade under the `transport.file` key, or the defaults
+    /// when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` when the section is present but does not parse.
+    pub fn from_cascade() -> crate::transport::TransportResult<Self> {
         <Self as super::traits::FromCascade>::from_cascade_key("transport.file")
     }
 }

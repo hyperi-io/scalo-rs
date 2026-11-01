@@ -38,6 +38,12 @@ With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`,
 
 **Consumer adjustment** -- regenerate a committed compose file (`<app> generate-artefacts`). dfe-fetcher's `docker-compose.yaml` carries `command: ["dfe-fetcher", "--config", "/etc/dfe/fetcher.yaml"]`.
 
+### Transport config sections that do not parse fail the load (API CHANGE)
+
+`FromCascade::from_cascade_key` returns `TransportResult<Self>`, and so do `HttpTransportConfig::from_cascade`, `FileTransportConfig::from_cascade`, `PipeTransportConfig::from_cascade`, `GrpcConfig::from_cascade` and `SinkStackConfig::from_cascade`. A present section that does not deserialise is `TransportError::Config` naming its key, where it became the defaults. `SinkStackConfig` implements `FromCascade` in place of its own `from_cascade_key`, and `ServiceRuntime::outbound_sink_stack` returns the error. An absent section still takes the defaults.
+
+**Consumer adjustment** -- a caller of any of these adds `?`. None of the seven DFE consumers calls them.
+
 ### A batch_processing section that does not parse fails startup (BEHAVIOUR CHANGE)
 
 `BatchProcessingConfig::from_cascade` returns `ConfigError::ExtractError` for a present section that does not deserialise, where it replaced the whole section with defaults and dropped its filters, `routing_field` and parse policy. `ServiceRuntime::build` passes the error on. An absent section still takes the defaults.

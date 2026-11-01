@@ -369,7 +369,7 @@ impl ServiceRuntime {
         use crate::sink_stack::{SinkStack, SinkStackConfig};
         use crate::transport::factory::AnySender;
         let sender = std::sync::Arc::new(AnySender::from_config(sender_key).await?);
-        let cfg = SinkStackConfig::from_cascade_key(cfg_key);
+        let cfg = <SinkStackConfig as crate::transport::FromCascade>::from_cascade_key(cfg_key)?;
         Ok(SinkStack::new(sender, &cfg))
     }
 }

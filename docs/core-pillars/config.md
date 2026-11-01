@@ -107,7 +107,11 @@ let kafka: KafkaConfig = config::get().unmarshal_key_registered::<KafkaConfig>("
 ```
 
 Modules with sensible defaults expose a `from_cascade` constructor wrapping this
-call: `TransportFilterEngine::from_cascade("filters")?`.
+call: `TransportFilterEngine::from_cascade("filters")?`. The transport configs
+(`HttpTransportConfig`, `FileTransportConfig`, `PipeTransportConfig`,
+`GrpcConfig`, `AcknowledgementsConfig`) and `SinkStackConfig` read through
+`transport::FromCascade`: an absent section takes the defaults, and a present one
+that does not parse is `TransportError::Config` naming its key.
 
 ---
 

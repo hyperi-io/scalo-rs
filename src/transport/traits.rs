@@ -448,29 +448,32 @@ pub trait Transport: TransportSender + TransportReceiver {}
 /// Blanket impl: anything that implements both traits is a Transport.
 impl<T: TransportSender + TransportReceiver> Transport for T {}
 
-/// Load a transport config from the cascade under a fixed key.
+/// Load a config from the cascade under a key.
 ///
-/// The shared body behind each transport config's `from_cascade()`.
-/// Implementors only name their key. Without the `config` feature the default
-/// method returns `Default::default()`.
+/// The shared body behind each transport config's `from_cascade()` and the
+/// sink stack's. Implementors only name their key. Without the `config`
+/// feature the default method returns `Default::default()`.
 pub trait FromCascade: Default + serde::Serialize + serde::de::DeserializeOwned + 'static {
     /// Load `Self` from the config cascade under `key`, registering the section
-    /// in the global registry; falls back to `Default` if the cascade is
-    /// unavailable or the key is absent/invalid.
-    #[must_use]
-    fn from_cascade_key(key: &str) -> Self {
+    /// in the global registry. Defaults when the cascade is not set up or the
+    /// key is absent.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Config`] naming `key` when the section is present
+    /// but does not deserialise into `Self`.
+    fn from_cascade_key(key: &str) -> TransportResult<Self> {
         #[cfg(feature = "config")]
+        if let Some(cfg) = crate::config::try_get()
+            && cfg.contains(key)
         {
-            if let Some(cfg) = crate::config::try_get()
-                && let Ok(value) = cfg.unmarshal_key_registered::<Self>(key)
-            {
-                return value;
-            }
+            return cfg
+                .unmarshal_key_registered::<Self>(key)
+                .map_err(|e| TransportError::Config(format!("config section {key}: {e}")));
         }
-        // Without `config`, or on any cascade miss, use defaults.
         #[cfg(not(feature = "config"))]
         let _ = key;
-        Self::default()
+        Ok(Self::default())
     }
 }
 
@@ -589,5 +592,87 @@ mod healthcheck_tests {
             boot_healthcheck(&t, cfg).await.is_err(),
             "a hanging probe must hit the boot timeout"
         );
+    }
+}
+
+/// Every config read through `FromCascade` takes its defaults when its
+/// section is absent, and refuses a present section that does not parse,
+/// naming it, rather than replacing it with defaults.
+#[cfg(all(
+    test,
+    feature = "config",
+    feature = "transport-http",
+    feature = "transport-file",
+    feature = "transport-pipe",
+    feature = "transport-grpc",
+    feature = "sink-stack"
+))]
+mod from_cascade_tests {
+    use super::FromCascade;
+    use crate::transport::TransportError;
+
+    /// `T` read from `present` (a section that does not parse) and from
+    /// `absent`: whether the first was refused naming the key, and whether the
+    /// second came back as the defaults.
+    fn reads<T: FromCascade>(present: &str, absent: &str) -> (bool, bool) {
+        let defaults = serde_json::to_value(T::default()).ok();
+        let refused = matches!(
+            T::from_cascade_key(present),
+            Err(TransportError::Config(m)) if m.contains(present)
+        );
+        let defaulted = matches!(
+            T::from_cascade_key(absent),
+            Ok(v) if serde_json::to_value(&v).ok() == defaults
+        );
+        (refused, defaulted)
+    }
+
+    #[test]
+    fn a_section_that_does_not_parse_is_refused_and_an_absent_one_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "bad:\n  http:\n    recv_buffer_size: lots\n  file:\n    append: maybe\n  pipe:\n    recv_timeout_ms: soon\n  grpc:\n    max_message_size: huge\n  acks:\n    enabled: perhaps\n  sink_stack:\n    attempt_timeout_ms: later\n",
+        )
+        .unwrap();
+        crate::config::setup(crate::config::ConfigOptions {
+            config_paths: vec![dir.path().to_path_buf()],
+            ..crate::config::ConfigOptions::default()
+        })
+        .unwrap();
+
+        let cases: [(&str, (bool, bool)); 6] = [
+            (
+                "http",
+                reads::<crate::transport::http::HttpTransportConfig>("bad.http", "none.http"),
+            ),
+            (
+                "file",
+                reads::<crate::transport::file::FileTransportConfig>("bad.file", "none.file"),
+            ),
+            (
+                "pipe",
+                reads::<crate::transport::pipe::PipeTransportConfig>("bad.pipe", "none.pipe"),
+            ),
+            (
+                "grpc",
+                reads::<crate::transport::grpc::GrpcConfig>("bad.grpc", "none.grpc"),
+            ),
+            (
+                "acknowledgements",
+                reads::<crate::transport::AcknowledgementsConfig>("bad.acks", "none.acks"),
+            ),
+            (
+                "sink_stack",
+                reads::<crate::sink_stack::SinkStackConfig>("bad.sink_stack", "none.sink_stack"),
+            ),
+        ];
+        for (name, got) in cases {
+            assert_eq!(
+                got,
+                (true, true),
+                "{name}: (refused bad section, defaulted absent one)"
+            );
+        }
     }
 }
