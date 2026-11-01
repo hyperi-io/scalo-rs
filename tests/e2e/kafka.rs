@@ -2279,3 +2279,77 @@ mod broker_down_at_start {
         );
     }
 }
+
+/// `close()` keeps the consumer's group membership, so the final commit a
+/// service makes after closing its source lands, and the next member resumes
+/// at that offset. Dropping the transport is what leaves the group.
+#[cfg(all(
+    feature = "testcontainers",
+    any(
+        feature = "worker-batch",
+        all(feature = "governor", feature = "metrics")
+    )
+))]
+mod commit_after_close {
+    use std::time::{Duration, Instant};
+
+    use scalo::transport::{TransportBase, TransportReceiver};
+
+    use super::broker::{committed, consumer, create_topic, produce, start_kafka};
+
+    /// Records written before the first member closes.
+    const BEFORE: usize = 5;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_after_close_lands_and_the_next_member_resumes_there() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let topic = "commit-after-close";
+        let group = "commit-after-close-group";
+        create_topic(&bootstrap, topic).await;
+        produce(&bootstrap, topic, 0..BEFORE).await;
+
+        let first = consumer(&bootstrap, topic, group).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut tokens = Vec::new();
+        while tokens.len() < BEFORE {
+            assert!(
+                Instant::now() < deadline,
+                "read {} of {BEFORE} records within 60 s",
+                tokens.len()
+            );
+            tokens.extend(first.recv(10).await.expect("recv").commit_tokens);
+        }
+        first.close().await.expect("close");
+        first
+            .commit(&tokens)
+            .await
+            .expect("a commit after close() must land: the member is still in its group");
+        assert_eq!(
+            committed(&bootstrap, group, topic).await,
+            Some(i64::try_from(BEFORE).expect("fits")),
+            "the group's committed offset after the post-close commit"
+        );
+        drop(first);
+
+        produce(&bootstrap, topic, BEFORE..BEFORE + 1).await;
+        let next = consumer(&bootstrap, topic, group).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let first_read = loop {
+            assert!(
+                Instant::now() < deadline,
+                "the next member read nothing within 60 s"
+            );
+            let batch = next.recv(10).await.expect("recv");
+            if let Some(record) = batch.records.first() {
+                break String::from_utf8_lossy(&record.payload).into_owned();
+            }
+        };
+        assert_eq!(
+            first_read,
+            format!("{{\"seq\":{BEFORE}}}"),
+            "the next member resumes at the committed offset, not before it"
+        );
+    }
+}

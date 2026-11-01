@@ -72,6 +72,7 @@ transport:
   otherwise it is the first `Backpressured`/`Fatal` in record order and part
   of the block may be on the broker -- retry it whole (at-least-once).
   Records carry their `key` as the topic and no headers.
+- **`close()`**: stops receiving and keeps the consumer's group membership, so the final commit a service makes after closing its source lands. Dropping the transport leaves the group.
 - **`is_healthy()`**: `false` after `close()`; for a fenced static member; from a failed consumer rebuild, or a second one with no record between, until a record arrives; and while a broker refuses the transport's credentials or TLS setup and none has yet accepted them (see [Refused credentials](#refused-credentials)). A broker outage or a receive error does not flip it.
 - **Group protocol**: `classic` unless `consumer_protocol: consumer` opts in to KIP-848; `group_protocol()` reports the one in use. A consumer librdkafka flags fatal is rebuilt by the next `recv`, as `classic` when the broker refused KIP-848, except a fenced static member, which is not. See [../kafka-path.md](../kafka-path.md).
 - **`commit()`**: synchronous (`CommitMode::Sync`) on tokio's blocking pool, so a broker rejection reaches the caller. `commit_weak_async()` is the fire-and-forget form.
