@@ -272,8 +272,10 @@ impl AdaptiveWorkerPool {
     /// - `Some(Err(e))` -- task returned `Err(e)`
     /// - `None` -- task panicked; the panic was logged at `error` level
     ///   with the input index. The wrapping `Option` exists so the
-    ///   panic doesn't silently shorten the result vector (which was
-    ///   the previous behaviour and violated the input-order contract).
+    ///   panic doesn't silently shorten the result vector.
+    ///
+    /// Cancel-safe: dropping the returned future aborts every task it spawned,
+    /// so a caller's timeout leaves no work running on.
     ///
     /// Use this for: enrichment lookups, external API calls, storage writes.
     pub async fn fan_out_async<T, R, E, F, Fut>(
@@ -288,13 +290,16 @@ impl AdaptiveWorkerPool {
         F: Fn(&T) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = Result<R, E>> + Send + 'static,
     {
-        let concurrency = self.config.read().async_concurrency;
+        let concurrency = self.config.read().async_concurrency.max(1);
         let mut results: Vec<Option<Result<R, E>>> = (0..items.len()).map(|_| None).collect();
 
-        // Process in chunks of `concurrency` to limit in-flight tasks
+        // Process in chunks of `concurrency` to limit in-flight tasks. The set
+        // owns them, so dropping this future (a caller's timeout) aborts them.
         for chunk_start in (0..items.len()).step_by(concurrency) {
             let chunk_end = (chunk_start + concurrency).min(items.len());
-            let mut handles = Vec::with_capacity(chunk_end - chunk_start);
+            let mut set: tokio::task::JoinSet<(usize, Result<R, E>)> = tokio::task::JoinSet::new();
+            // task Id -> input idx, so a panicked task still maps to its slot.
+            let mut id_to_idx = std::collections::HashMap::with_capacity(chunk_end - chunk_start);
 
             for (idx, item) in items
                 .iter()
@@ -303,16 +308,18 @@ impl AdaptiveWorkerPool {
                 .take(chunk_end - chunk_start)
             {
                 let fut = f(item);
-                handles.push((idx, tokio::spawn(fut)));
+                let handle = set.spawn(async move { (idx, fut.await) });
+                id_to_idx.insert(handle.id(), idx);
             }
 
-            for (idx, handle) in handles {
-                match handle.await {
-                    Ok(result) => results[idx] = Some(result),
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok((idx, result)) => results[idx] = Some(result),
                     Err(join_err) => {
                         // Leave results[idx] = None; caller can detect
                         // the panic without shrinking the output vec.
-                        tracing::error!(error = %join_err, idx, "fan_out_async task panicked");
+                        let idx = id_to_idx.get(&join_err.id()).copied();
+                        tracing::error!(error = %join_err, ?idx, "fan_out_async task panicked");
                     }
                 }
             }

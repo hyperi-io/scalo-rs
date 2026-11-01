@@ -263,6 +263,39 @@ async fn test_fan_out_async_respects_concurrency_limit() {
     assert!(observed <= 3, "Expected max 3 concurrent, got {observed}");
 }
 
+/// Dropping a `fan_out_async` call mid-flight, as a caller's timeout does,
+/// stops the work it started: none of it runs on after the call is gone.
+#[tokio::test(start_paused = true)]
+async fn test_fan_out_async_cancelled_stops_its_tasks() {
+    let pool = AdaptiveWorkerPool::new(WorkerPoolConfig {
+        async_concurrency: 4,
+        ..Default::default()
+    });
+    let finished = Arc::new(AtomicUsize::new(0));
+    let items: Vec<i32> = (0..8).collect();
+    let done = finished.clone();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        pool.fan_out_async(&items, |&item| {
+            let done = done.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                done.fetch_add(1, Ordering::SeqCst);
+                Ok::<i32, String>(item)
+            }
+        }),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the call outlived its timeout");
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        0,
+        "tasks of a cancelled fan-out ran to completion"
+    );
+}
+
 #[tokio::test]
 async fn test_fan_out_async_empty_input() {
     let pool = AdaptiveWorkerPool::new(WorkerPoolConfig::default());
