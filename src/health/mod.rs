@@ -26,4 +26,4 @@
 
 pub mod registry;
 
-pub use registry::{HealthRegistry, HealthStatus};
+pub use registry::{HealthRegistration, HealthRegistry, HealthStatus};

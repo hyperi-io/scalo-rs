@@ -128,6 +128,9 @@ struct ReadState {
 /// position tracking). Position is persisted to a `.pos` sidecar
 /// file so reads survive process restarts.
 pub struct FileTransport {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
     config: FileTransportConfig,
     writer: Mutex<Option<WriteState>>,
     reader: Mutex<Option<ReadState>>,
@@ -160,18 +163,20 @@ impl FileTransport {
         let closed = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let h = Arc::clone(&closed);
-            crate::health::HealthRegistry::register("transport:file", move || {
+            crate::health::HealthRegistry::register_scoped("transport:file", move || {
                 if h.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Unhealthy
                 } else {
                     crate::health::HealthStatus::Healthy
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
             config: config.clone(),
             writer: Mutex::new(None),
             reader: Mutex::new(None),
@@ -496,6 +501,28 @@ mod tests {
             ..Default::default()
         };
         FileTransport::new(&config).await.unwrap()
+    }
+
+    /// A closed and dropped transport leaves the health registry, so a
+    /// replacement is not held unready by the one it replaced.
+    #[cfg(feature = "health")]
+    #[tokio::test]
+    #[allow(
+        clippy::used_underscore_binding,
+        reason = "the field is held only for its Drop, and this test reads its id"
+    )]
+    async fn a_retired_transport_leaves_the_health_registry() {
+        let dir = TempDir::new().unwrap();
+        let transport = make_transport(&dir, "health.ndjson").await;
+        let id = transport._health_registration.id();
+        assert!(crate::health::HealthRegistry::is_registered(id));
+
+        transport.close().await.unwrap();
+        drop(transport);
+        assert!(
+            !crate::health::HealthRegistry::is_registered(id),
+            "the closed transport still reports to readiness"
+        );
     }
 
     #[tokio::test]

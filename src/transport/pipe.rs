@@ -106,6 +106,9 @@ struct ReadState {
 /// Receive reads lines from stdin, each becoming a message.
 /// Commit is a no-op (stdin cannot be rewound).
 pub struct PipeTransport {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
     stdin: tokio::sync::Mutex<ReadState>,
     stdout: tokio::sync::Mutex<tokio::io::Stdout>,
     sequence: AtomicU64,
@@ -190,19 +193,21 @@ impl PipeTransport {
         let closed = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let h = Arc::clone(&closed);
             let filters_compiled = filter_engine.is_ok();
-            crate::health::HealthRegistry::register("transport:pipe", move || {
+            crate::health::HealthRegistry::register_scoped("transport:pipe", move || {
                 if filters_compiled && !h.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Healthy
                 } else {
                     crate::health::HealthStatus::Unhealthy
                 }
-            });
-        }
+            })
+        };
 
         Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
             stdin: tokio::sync::Mutex::new(ReadState {
                 reader: BufReader::new(input),
                 line: Vec::new(),

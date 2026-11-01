@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### A dropped transport leaves the health registry (additive)
+
+`HealthRegistry::register_scoped` returns a `HealthRegistration` that removes its check on drop. The HTTP, file, pipe, gRPC and Kafka transports and the tiered sink's circuit breaker register through it, so a closed and dropped one no longer holds `/readyz` at 503 for the rest of the process. `register` is unchanged.
+
+**Consumer adjustment** -- none. An app that registers a check for a component it replaces moves to `register_scoped` and holds the handle with the component.
+
 ### The compose fragment's `command` no longer repeats the binary (BEHAVIOUR CHANGE)
 
 `generate_compose_fragment` wrote `command: ["<binary>", <args>]`, which compose appends to the image's `ENTRYPOINT ["<binary>"]`, so the process started as `<binary> <binary> --config ...`. It writes the args alone.

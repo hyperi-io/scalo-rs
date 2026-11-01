@@ -246,6 +246,9 @@ impl HttpTransportConfig {
 /// Supports send (POST to endpoint) and receive (embedded axum server).
 /// The receive side requires the `http-server` feature for axum.
 pub struct HttpTransport {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
     /// reqwest client for sending (always available when transport-http is enabled).
     client: reqwest::Client,
 
@@ -444,18 +447,20 @@ impl HttpTransport {
         let closed = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let h = Arc::clone(&closed);
-            crate::health::HealthRegistry::register("transport:http", move || {
+            crate::health::HealthRegistry::register_scoped("transport:http", move || {
                 if h.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Unhealthy
                 } else {
                     crate::health::HealthStatus::Healthy
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
             client,
             endpoint: config.endpoint.clone(),
             #[cfg(feature = "http-server")]

@@ -188,6 +188,12 @@ fn block_result(results: Vec<SendResult>) -> SendResult {
 /// - Drains internal queue with zero-timeout polls
 /// - Minimizes allocations in hot path
 pub struct KafkaTransport {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
+    /// Removes this component from the health registry when it drops.
+    #[cfg(all(feature = "governor", feature = "health"))]
+    _partition_limited_registration: crate::health::HealthRegistration,
     /// librdkafka consumer and the group protocol it joined with.
     ///
     /// Shared with the optional [`KafkaGateActuator`] (`governor` feature), so
@@ -1120,12 +1126,12 @@ impl KafkaTransport {
         )?;
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let h = Arc::clone(&healthy);
             let refused = Arc::clone(&auth);
             let missing = Arc::clone(&topic_missing);
             let destinations = Arc::clone(&missing_destinations);
-            crate::health::HealthRegistry::register("transport:kafka", move || {
+            crate::health::HealthRegistry::register_scoped("transport:kafka", move || {
                 if h.load(Ordering::Relaxed)
                     && !refused.is_refused()
                     && !missing.load(Ordering::Relaxed)
@@ -1135,8 +1141,8 @@ impl KafkaTransport {
                 } else {
                     crate::health::HealthStatus::Unhealthy
                 }
-            });
-        }
+            })
+        };
 
         #[cfg(all(feature = "governor", feature = "health"))]
         let partition_limited_flag = Arc::new(AtomicBool::new(false));
@@ -1145,18 +1151,22 @@ impl KafkaTransport {
         // flag, so it tracks the condition in both directions and never grows
         // the registry per tick.
         #[cfg(all(feature = "governor", feature = "health"))]
-        {
+        let partition_limited_registration = {
             let f = Arc::clone(&partition_limited_flag);
-            crate::health::HealthRegistry::register("kafka:partition_limited", move || {
+            crate::health::HealthRegistry::register_scoped("kafka:partition_limited", move || {
                 if f.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Degraded
                 } else {
                     crate::health::HealthStatus::Healthy
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
+            #[cfg(all(feature = "governor", feature = "health"))]
+            _partition_limited_registration: partition_limited_registration,
             consumer: consumer.map(|client| {
                 Arc::new(parking_lot::RwLock::new(ConsumerSlot {
                     client,

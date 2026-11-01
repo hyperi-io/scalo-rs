@@ -355,6 +355,9 @@ pub(crate) fn lazy_channel(
 /// Implements both `TransportSender` and `TransportReceiver`, so it also
 /// satisfies the unified `Transport` trait via blanket impl.
 pub struct GrpcTransport {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
     /// Client for sending (None if server-only mode).
     client: Option<proto::transport_client::TransportClient<tonic::transport::Channel>>,
 
@@ -828,18 +831,20 @@ impl GrpcTransport {
         )?;
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let h = Arc::clone(&healthy);
-            crate::health::HealthRegistry::register("transport:grpc", move || {
+            crate::health::HealthRegistry::register_scoped("transport:grpc", move || {
                 if h.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Healthy
                 } else {
                     crate::health::HealthStatus::Unhealthy
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
             client,
             receiver,
             oversize,

@@ -20,6 +20,7 @@
 //!   (degraded is acceptable for readiness)
 //! - Empty registry is considered healthy (vacuously true)
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Health status of a registered component.
@@ -51,8 +52,39 @@ type HealthCheck = Arc<dyn Fn() -> HealthStatus + Send + Sync>;
 
 /// A registered health check entry.
 struct HealthEntry {
+    id: u64,
     name: String,
     check: HealthCheck,
+}
+
+/// Source of [`HealthEntry::id`], unique for the process.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A component's place in the registry, removed when this is dropped.
+///
+/// Returned by [`HealthRegistry::register_scoped`] for a component that can be
+/// retired before the process ends, a transport say, so a closed and dropped
+/// one stops counting against readiness.
+#[must_use = "dropping the registration unregisters the component at once"]
+#[derive(Debug)]
+pub struct HealthRegistration {
+    id: u64,
+}
+
+impl HealthRegistration {
+    /// The registry entry this handle owns.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for HealthRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut components) = HealthRegistry::global().components.lock() {
+            components.retain(|c| c.id != self.id);
+        }
+    }
 }
 
 /// Global health registry singleton.
@@ -99,13 +131,41 @@ impl HealthRegistry {
         name: impl Into<String>,
         check: impl Fn() -> HealthStatus + Send + Sync + 'static,
     ) {
-        let registry = Self::global();
-        if let Ok(mut components) = registry.components.lock() {
-            components.push(HealthEntry {
-                name: name.into(),
-                check: Arc::new(check),
-            });
+        Self::insert(name.into(), Arc::new(check));
+    }
+
+    /// Register a health check that lasts as long as the returned handle.
+    ///
+    /// As [`register`](Self::register), but dropping the
+    /// [`HealthRegistration`] removes the check. A component that can be
+    /// closed and replaced holds the handle, so it leaves the registry with
+    /// the component rather than reporting unhealthy for the rest of the
+    /// process.
+    pub fn register_scoped(
+        name: impl Into<String>,
+        check: impl Fn() -> HealthStatus + Send + Sync + 'static,
+    ) -> HealthRegistration {
+        HealthRegistration {
+            id: Self::insert(name.into(), Arc::new(check)),
         }
+    }
+
+    /// Add `check` under `name` and return its entry id.
+    fn insert(name: String, check: HealthCheck) -> u64 {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut components) = Self::global().components.lock() {
+            components.push(HealthEntry { id, name, check });
+        }
+        id
+    }
+
+    /// Whether the entry `id` is still registered.
+    #[cfg(test)]
+    pub(crate) fn is_registered(id: u64) -> bool {
+        Self::global()
+            .components
+            .lock()
+            .is_ok_and(|components| components.iter().any(|c| c.id == id))
     }
 
     /// Snapshot every registered check, drop the registry lock, then run
@@ -312,6 +372,34 @@ mod tests {
         state.store(0, Ordering::Relaxed);
         assert!(HealthRegistry::is_healthy());
         assert!(HealthRegistry::is_ready());
+    }
+
+    /// A scoped registration counts while its handle lives and is gone once
+    /// the handle drops, leaving the components registered beside it.
+    #[test]
+    fn a_scoped_registration_ends_with_its_handle() {
+        let _guard = serial_test_guard();
+
+        HealthRegistry::register("permanent", || HealthStatus::Healthy);
+        let scoped = HealthRegistry::register_scoped("retired", || HealthStatus::Unhealthy);
+        let id = scoped.id();
+        assert!(HealthRegistry::is_registered(id));
+        assert!(
+            !HealthRegistry::is_ready(),
+            "the unhealthy component counts"
+        );
+
+        drop(scoped);
+        assert!(!HealthRegistry::is_registered(id));
+        assert!(
+            HealthRegistry::is_ready(),
+            "the dropped component no longer counts"
+        );
+        let names: Vec<String> = HealthRegistry::components()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["permanent"]);
     }
 
     #[test]

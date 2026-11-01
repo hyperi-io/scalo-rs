@@ -80,6 +80,9 @@ struct Inner {
 /// Tracks consecutive failures and opens when a threshold is reached. After
 /// the reset timeout it admits a single probe to test recovery.
 pub struct CircuitBreaker {
+    /// Removes this component from the health registry when it drops.
+    #[cfg(feature = "health")]
+    _health_registration: crate::health::HealthRegistration,
     inner: Mutex<Inner>,
     failure_threshold: u32,
     reset_timeout: Duration,
@@ -97,18 +100,20 @@ impl CircuitBreaker {
         let health_state = Arc::new(AtomicU8::new(CircuitState::Closed.code()));
 
         #[cfg(feature = "health")]
-        {
+        let health_registration = {
             let hs = Arc::clone(&health_state);
-            crate::health::HealthRegistry::register("circuit_breaker", move || {
+            crate::health::HealthRegistry::register_scoped("circuit_breaker", move || {
                 match hs.load(Ordering::Acquire) {
                     0 => crate::health::HealthStatus::Healthy,   // Closed
                     2 => crate::health::HealthStatus::Degraded,  // HalfOpen
                     _ => crate::health::HealthStatus::Unhealthy, // Open
                 }
-            });
-        }
+            })
+        };
 
         Self {
+            #[cfg(feature = "health")]
+            _health_registration: health_registration,
             inner: Mutex::new(Inner {
                 state: CircuitState::Closed,
                 consecutive_failures: 0,
