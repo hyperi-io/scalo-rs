@@ -108,7 +108,9 @@ stopped at the token lost what the source had acknowledged.
   shutdown, whether the sink began refusing before shutdown or during the
   drain. A sink busy for a moment at shutdown therefore loses nothing.
 - A block the sink still refuses when those 10 s are up stays uncommitted,
-  and the drain stops there, so nothing is committed past it. What the
+  and the drain stops there, so nothing is committed past it. A sink call
+  still in flight at that point is dropped the same way, so a hung sink
+  cannot hold shutdown, and a held push block is released `Errored`. What the
   source still holds is not delivered. If the sink was refusing it before
   the drain began, the source is closed without a drain.
 - A permanent sink error stops the drain at once and is returned as the

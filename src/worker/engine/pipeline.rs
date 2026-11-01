@@ -831,13 +831,11 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
 
         let mut failures = 0_u32;
         loop {
-            let attempt = dlq.write_confirmed(entries.clone());
-            let written = match give_up {
-                Some(at) => match tokio::time::timeout_at(at, attempt).await {
-                    Ok(written) => written,
-                    Err(_elapsed) => return (Some(DeliveryStatus::Errored), SinkEnd::Expired),
-                },
-                None => attempt.await,
+            let written = tokio::select! {
+                biased;
+                written = dlq.write_confirmed(entries.clone()) => written,
+                () = until(give_up) => return (Some(DeliveryStatus::Errored), SinkEnd::Expired),
+                () = self.retry.closed() => return (None, SinkEnd::Abandoned),
             };
             match written {
                 Ok(()) if enabled => {
@@ -869,7 +867,8 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
     }
 
     /// Sink `batch`, retrying a transient failure, until it is taken, the hold
-    /// deadline comes, or the retry window after shutdown closes.
+    /// deadline comes, or the retry window after shutdown closes. The last two
+    /// also cut short an attempt still in flight.
     async fn sink_held<Sink, SinkFut>(
         &self,
         sink: &mut Sink,
@@ -883,13 +882,13 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
     {
         let mut failures = 0_u32;
         loop {
-            let attempt = sink(batch, pieces);
-            let result = match give_up {
-                Some(at) => match tokio::time::timeout_at(at, attempt).await {
-                    Ok(result) => result,
-                    Err(_elapsed) => return Ok(SinkEnd::Expired),
-                },
-                None => attempt.await,
+            // An attempt still pending at the hold deadline or when the retry
+            // window closes is dropped, so a hung sink cannot hold shutdown.
+            let result = tokio::select! {
+                biased;
+                result = sink(batch, pieces) => result,
+                () = until(give_up) => return Ok(SinkEnd::Expired),
+                () = self.retry.closed() => return Ok(SinkEnd::Abandoned),
             };
             match result {
                 Ok(()) => {
