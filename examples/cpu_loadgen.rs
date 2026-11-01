@@ -102,7 +102,11 @@ fn cgroup_throttled_usec() -> Option<u64> {
 }
 
 fn run_capped(burst_tasks: usize, task_iters: u64, idle: Duration) -> u64 {
-    let pool = AdaptiveWorkerPool::new(WorkerPoolConfig::default());
+    // from_cascade, as a service builds it: under --cpus <= 1 it clamps the
+    // default min_threads to the one CPU, where new(default()) refuses 2 > 1.
+    let config = WorkerPoolConfig::from_cascade("worker_pool")
+        .unwrap_or_else(|e| panic!("worker pool config: {e}"));
+    let pool = AdaptiveWorkerPool::new(config);
     println!(
         "cpu_loadgen pool target_threads={} max_threads={}",
         pool.target_threads(),
