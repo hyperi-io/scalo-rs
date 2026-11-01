@@ -42,7 +42,7 @@ With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`,
 
 `generate_compose_fragment` wrote `command: ["<binary>", <args>]`, which compose appends to the image's `ENTRYPOINT ["<binary>"]`, so the process started as `<binary> <binary> --config ...`. It writes the args alone.
 
-**Consumer adjustment** -- regenerate a committed compose file (`<app> generate-artefacts`). dfe-fetcher's `docker-compose.yaml` carries `command: ["dfe-fetcher", "--config", "/etc/dfe/fetcher.yaml"]`.
+**Consumer adjustment** -- regenerate a committed compose file (`<app> generate-artefacts`).
 
 ### Kafka test support generates its SCRAM password (API CHANGE)
 
