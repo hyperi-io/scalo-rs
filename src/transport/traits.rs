@@ -200,11 +200,23 @@ pub trait TransportSender: TransportBase {
         payload: bytes::Bytes,
     ) -> impl Future<Output = SendResult> + Send;
 
+    /// Send one whole [`Record`]: key, payload and headers.
+    ///
+    /// The default calls [`send`](Self::send) with the record's `key` as the
+    /// destination (empty when `None`) and its payload, so the headers are
+    /// dropped. A transport that can carry headers overrides this, and the
+    /// default [`send_batch`](Self::send_batch) then carries them too.
+    fn send_record(&self, record: &Record) -> impl Future<Output = SendResult> + Send {
+        async move {
+            let destination = record.key.as_deref().unwrap_or("");
+            self.send(destination, record.payload.clone()).await
+        }
+    }
+
     /// Send a whole block of [`Record`]s in one shot.
     ///
-    /// The default sends each record individually via [`send`](Self::send),
-    /// using the record's own `key` as the destination (empty when `None`) and
-    /// payload (a refcount bump, not a copy), awaiting each before the next.
+    /// The default sends each record individually via
+    /// [`send_record`](Self::send_record), awaiting each before the next.
     /// Transports that can do better override this: gRPC sends the block as one
     /// `RouteBatch` RPC, and Kafka queues the whole block before awaiting any
     /// delivery report. Commit tokens and inline-DLQ entries are NOT
@@ -231,8 +243,7 @@ pub trait TransportSender: TransportBase {
     fn send_batch(&self, records: &[Record]) -> impl Future<Output = SendResult> + Send {
         async move {
             for record in records {
-                let destination = record.key.as_deref().unwrap_or("");
-                match self.send(destination, record.payload.clone()).await {
+                match self.send_record(record).await {
                     // Sent, dropped (Ok), or suppressed by an outbound dlq
                     // filter -- all handled; keep going, do NOT abort the block.
                     SendResult::Ok | SendResult::FilteredDlq => {}

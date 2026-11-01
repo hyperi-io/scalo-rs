@@ -64,7 +64,9 @@ Each `pre_route_filters` entry reads its own `field`. They read `routing_field` 
 
 ### Received records keep their headers (API CHANGE)
 
-`Message<T>` gains `headers: Vec<(String, Vec<u8>)>`, and the `WorkBatch` conversions move it onto each `Record`. The gRPC receiver fills it from each `RouteBatch` record, so the dedup key a sender set reaches the receiving app, where it was dropped. Every other receiver leaves it empty.
+`Message<T>` gains `headers: Vec<(String, Vec<u8>)>`, and the `WorkBatch` conversions move it onto each `Record`. The gRPC receiver fills it from each `RouteBatch` record, so the dedup key a sender set reaches the receiving app, where it was dropped. The memory transport fills it too. Every other receiver leaves it empty.
+
+`TransportSender::send_record(&Record)` sends one whole record, and the default `send_batch` calls it. Its default calls `send` with the key and payload, so a transport with nowhere to put headers is unchanged. `MemoryTransport` overrides it to keep the headers, and `AnySender` forwards it.
 
 **Consumer adjustment** -- a struct literal of `Message` adds `headers: Vec::new()`, or builds through `Message::new`.
 

@@ -206,6 +206,8 @@ Source: [../../src/transport/vector_compat/](../../src/transport/vector_compat/)
 receiver are tied to the same `MemoryTransport` instance. **Not a
 deployable backend** -- for tests and in-process pipelines (e.g.
 unit tests against the `BatchEngine`).
+A record sent through `send_record` or `send_batch` comes back from `recv`
+with its headers, the dedup key among them. `send` carries none.
 
 ```yaml
 transport:
