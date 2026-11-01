@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.25](https://github.com/hyperi-io/scalo-rs/compare/v2.14.24...v2.14.25) (2026-11-01)
+
+### Bug Fixes
+
+* **ci:** clear lint and doc-path warnings ([#434](https://github.com/hyperi-io/scalo-rs/issues/434)) ([65c2dff](https://github.com/hyperi-io/scalo-rs/commit/65c2dff4382107ddf5dc91a2cdd6e57b63a55b9a))
+* **kafka:** trust SSL_CERT_FILE before probing system CAs ([#429](https://github.com/hyperi-io/scalo-rs/issues/429)) ([4b7d574](https://github.com/hyperi-io/scalo-rs/commit/4b7d57445771aa9d6d487f702c67506364494019))
+
 ## [2.14.24](https://github.com/hyperi-io/scalo-rs/compare/v2.14.23...v2.14.24) (2026-11-01)
 
 ### Bug Fixes
