@@ -161,7 +161,7 @@ outside the runtime use `BatchEngine::new` or
 
 ## Configuration
 
-Loaded from the `batch_processing` cascade key:
+Loaded from the `batch_processing` cascade key. An absent section takes the defaults below, and a section that does not parse fails the load with `ConfigError::ExtractError`:
 
 ```yaml
 batch_processing:

@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### A batch_processing section that does not parse fails startup (BEHAVIOUR CHANGE)
+
+`BatchProcessingConfig::from_cascade` returns `ConfigError::ExtractError` for a present section that does not deserialise, where it replaced the whole section with defaults and dropped its filters, `routing_field` and parse policy. `ServiceRuntime::build` passes the error on. An absent section still takes the defaults.
+
+**Consumer adjustment** -- fix the section the error names. A deploy that ran on silently defaulted settings now stops at startup.
+
 ### HTTP receive bounds the bytes it holds (BEHAVIOUR CHANGE)
 
 `HttpTransportConfig` gains `max_in_flight_bytes` (default 64 MiB). The receive server checks the governor and reserves a request's declared length from it before reading the body, and answers 503 when either refuses. Queued records hold their bytes until `recv` takes them. A config with `max_in_flight_bytes` below `max_body_bytes` fails `HttpTransport::new`.
