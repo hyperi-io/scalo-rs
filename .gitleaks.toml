@@ -18,6 +18,11 @@ useDefault = true
 description = "Confluent APT signing-key fingerprint (public key id, not a credential)"
 regexes = ['''CBBB821E8FAF364F79835C438B1DA6120C2BF624''']
 
+# The made-up fingerprint the contract tests and the native-deps doc example use.
+[[allowlists]]
+description = "Placeholder APT key fingerprint in tests and docs (not a key)"
+regexes = ['''0123456789ABCDEF0123456789ABCDEF01234567''']
+
 # Uncomment and customise as needed:
 #
 # [[allowlists]]
