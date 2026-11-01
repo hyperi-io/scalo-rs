@@ -400,11 +400,8 @@ pub async fn drain_loop<S: TransportSender + 'static>(
         // Handle the result outside the lock
         settle(result, &mut drainer, &circuit, send_timeout).await;
 
-        // Apply rate limiting
-        let delay = drainer.delay();
-        if delay > Duration::ZERO {
-            tokio::time::sleep(delay).await;
-        }
+        // Rate limiting rides the shutdown-aware pause at the top of the loop.
+        pause += drainer.delay();
     }
 }
 

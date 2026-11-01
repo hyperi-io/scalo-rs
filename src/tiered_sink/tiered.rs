@@ -943,6 +943,30 @@ mod tests {
         tiered.shutdown().await;
     }
 
+    /// `shutdown()` does not wait out the drain's rate-limit pause. Paused
+    /// time makes the pause the only clock `shutdown` could be waiting on.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cuts_the_drain_rate_limit_pause_short() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::RateLimited { msgs_per_sec: 1 };
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        tiered.send(&rec(b"paced")).await.unwrap();
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+
+        // The drain has just taken a record, so it is in its 1 s pause.
+        let started = tokio::time::Instant::now();
+        tiered.shutdown().await;
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_millis(500),
+            "shutdown waited {waited:?} of the drain's 1 s pause"
+        );
+    }
+
     /// A spill cancelled while it waits on the spool writer leaves no item or
     /// byte reserved: a phantom would keep StrictFifo off the hot path and,
     /// repeated, refuse every spill as full.

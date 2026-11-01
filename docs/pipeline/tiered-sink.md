@@ -108,7 +108,7 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
-A pass that takes a record off the spool starts the next at once, so the strategy sets the rate. `drain_interval_ms` (100 ms) is the wait after a pass that found the spool empty or the sink down.
+A pass that takes a record off the spool starts the next after the strategy's pause, so the strategy sets the rate. `drain_interval_ms` (100 ms) is added after a pass that found the spool empty or the sink down. Shutdown cuts either wait short.
 
 The drain task is `tokio::spawn`'d at construction. It and the disk poller both stop when the sink's shutdown `CancellationToken` is cancelled, by `shutdown()` or by drop. With the `shutdown` feature the drain task also stops on the global token.
 
