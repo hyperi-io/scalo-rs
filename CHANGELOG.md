@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.24](https://github.com/hyperi-io/scalo-rs/compare/v2.14.23...v2.14.24) (2026-11-01)
+
+### Bug Fixes
+
+* share test services per run, refresh secrets, and install no C libraries in app images ([#426](https://github.com/hyperi-io/scalo-rs/issues/426)) ([ee176bf](https://github.com/hyperi-io/scalo-rs/commit/ee176bf521f78800ea60e79c21044a55d4db5b8c))
+
 ## [2.14.23](https://github.com/hyperi-io/scalo-rs/compare/v2.14.22...v2.14.23) (2026-10-31)
 
 ### Bug Fixes
