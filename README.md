@@ -60,7 +60,7 @@ carries the right names.
 
 ## What it is for
 
-The data plane -- the Rust hot path where every microsecond and byte counts.
+The at-scale data plane -- the Rust hot path where every microsecond and byte counts.
 Built as the foundation for PB/hr data services.
 
 [scalo-py](https://github.com/hyperi-io/scalo-py) is the control plane half:
@@ -77,7 +77,7 @@ course, no microservices.
 
 ## Wired together already
 
-Which is the part you would otherwise build:
+Which is the bit you would have to build:
 
 - config, logging and metrics are global singletons, so there is no init dance
 - the cascade feeds the CLI, so `run`, `version` and `config-check` work without
