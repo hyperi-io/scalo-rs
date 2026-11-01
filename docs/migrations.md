@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### The file transport caps a line it reads (BEHAVIOUR CHANGE)
+
+`FileTransportConfig` gains `max_line_bytes` (default 16 MiB). A longer line comes back from `recv` as a dead letter in `dlq_entries` carrying its first `max_line_bytes`, with its token in the commit tokens, where it was read into memory whole. `0` is refused.
+
+**Consumer adjustment** -- a struct literal of `FileTransportConfig` adds the field or `..Default::default()`. A reader of files with longer lines raises the cap.
+
 ### Kafka TLS with no CA probes the system bundle (BEHAVIOUR CHANGE)
 
 With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`, `ssl.ca.location` or `ssl.ca.pem`, every Kafka client sets `ssl.ca.location: probe`. A static OpenSSL's built-in default reads `/etc/ssl/certs` hashed links, which a RHEL or UBI base lacks.

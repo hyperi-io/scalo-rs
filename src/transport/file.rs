@@ -23,7 +23,8 @@
 //!
 //! Only a line that ends in `\n` becomes a record. A trailing line without
 //! one is held until the writer finishes it, so a file whose last line has no
-//! newline never yields that line.
+//! newline never yields that line. A line over `max_line_bytes` is never held
+//! whole: it comes back as a dead letter carrying its first `max_line_bytes`.
 //!
 //! ## Example
 //!
@@ -80,10 +81,20 @@ pub struct FileTransportConfig {
     /// Outbound message filters (applied on send before transport dispatches).
     #[serde(default)]
     pub filters_out: Vec<super::filter::FilterRule>,
+
+    /// Longest line read into memory, newline included. Default 16 MiB. A
+    /// longer line is read past without being held and returned as a dead
+    /// letter carrying its first `max_line_bytes`.
+    #[serde(default = "default_max_line_bytes")]
+    pub max_line_bytes: usize,
 }
 
 fn default_append() -> bool {
     true
+}
+
+fn default_max_line_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 impl Default for FileTransportConfig {
@@ -93,6 +104,7 @@ impl Default for FileTransportConfig {
             append: true,
             filters_in: Vec::new(),
             filters_out: Vec::new(),
+            max_line_bytes: default_max_line_bytes(),
         }
     }
 }
@@ -116,10 +128,49 @@ struct ReadState {
     reader: BufReader<tokio::fs::File>,
     /// Byte offset just past the last complete line read.
     offset: u64,
-    /// Bytes of a line still waiting for its newline.
+    /// Bytes of a line still waiting for its newline, at most `max_line_bytes`.
     line: Vec<u8>,
-    /// Records read but not yet returned.
-    pending: Vec<Message<FileToken>>,
+    /// Bytes of the current line read past the cap and not kept.
+    skipped: u64,
+    /// Lines read but not yet returned, in file order.
+    pending: Vec<ReadLine>,
+}
+
+/// A complete line the reader has taken off the file.
+enum ReadLine {
+    /// A line within `max_line_bytes`.
+    Record(Message<FileToken>),
+    /// A line over `max_line_bytes`, as a dead letter of its head.
+    TooLong(super::filter::FilteredDlqEntry, FileToken),
+}
+
+/// Read to the next `\n`, appending at most `cap` bytes of the line to `line`
+/// and counting the rest in `skipped`. `Ok(false)` at end of file with the line
+/// unfinished. Cancel-safe: the bytes consumed are in `line` or `skipped`.
+async fn read_line_capped(
+    reader: &mut BufReader<tokio::fs::File>,
+    line: &mut Vec<u8>,
+    skipped: &mut u64,
+    cap: usize,
+) -> std::io::Result<bool> {
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(false);
+        }
+        let (chunk, ended) = match memchr::memchr(b'\n', buf) {
+            Some(i) => (&buf[..=i], true),
+            None => (buf, false),
+        };
+        let keep = chunk.len().min(cap.saturating_sub(line.len()));
+        line.extend_from_slice(&chunk[..keep]);
+        *skipped += (chunk.len() - keep) as u64;
+        let used = chunk.len();
+        reader.consume(used);
+        if ended {
+            return Ok(true);
+        }
+    }
 }
 
 /// NDJSON file transport.
@@ -147,6 +198,11 @@ impl FileTransport {
     pub async fn new(config: &FileTransportConfig) -> TransportResult<Self> {
         if config.path.is_empty() {
             return Err(TransportError::Config("file path is empty".into()));
+        }
+        if config.max_line_bytes == 0 {
+            return Err(TransportError::Config(
+                "max_line_bytes is 0, which turns every line into a dead letter".into(),
+            ));
         }
 
         #[cfg(feature = "logger")]
@@ -284,6 +340,7 @@ impl FileTransport {
                 reader: BufReader::new(file),
                 offset,
                 line: Vec::with_capacity(4096),
+                skipped: 0,
                 pending: Vec::new(),
             });
         }
@@ -385,29 +442,58 @@ impl TransportReceiver for FileTransport {
             .as_mut()
             .ok_or_else(|| TransportError::Internal("reader not initialised".into()))?;
 
-        // `read_until` leaves a partial line in `line` when dropped, and
-        // `pending` holds finished records, so a dropped call resumes here.
+        // A dropped read leaves a partial line in `line` and `skipped`, and
+        // `pending` holds finished lines, so a dropped call resumes here.
         let ReadState {
             reader,
             offset,
             line,
+            skipped,
             pending,
         } = state;
+        let cap = self.config.max_line_bytes;
 
         for _ in pending.len()..max {
-            reader
-                .read_until(b'\n', line)
+            let ended = read_line_capped(reader, line, skipped, cap)
                 .await
                 .map_err(|e| TransportError::Recv(format!("read failed: {e}")))?;
 
             // EOF, or a line the writer has not finished: keep the partial
-            // bytes in `line` for the next call and leave `offset` before them.
-            if line.last() != Some(&b'\n') {
+            // bytes for the next call and leave `offset` before them.
+            if !ended {
                 break;
             }
 
-            // Every byte of the line, across dropped calls too, is in `line`.
-            *offset += line.len() as u64;
+            // Every byte of the line, across dropped calls too, is in `line`
+            // or `skipped`.
+            *offset += line.len() as u64 + *skipped;
+
+            if *skipped > 0 {
+                let total = line.len() as u64 + *skipped;
+                *skipped = 0;
+                #[cfg(feature = "logger")]
+                tracing::warn!(
+                    offset = *offset,
+                    line_bytes = total,
+                    max_line_bytes = cap,
+                    "File transport: a line over max_line_bytes is returned as a dead letter"
+                );
+                #[cfg(feature = "metrics")]
+                metrics::counter!("transport_message_too_large_total", "transport" => "file")
+                    .increment(1);
+                pending.push(ReadLine::TooLong(
+                    super::filter::FilteredDlqEntry {
+                        payload: std::mem::take(line),
+                        key: None,
+                        reason: format!(
+                            "line of {total} bytes exceeds max_line_bytes {cap}; the first {cap} \
+                             bytes are kept"
+                        ),
+                    },
+                    FileToken { offset: *offset },
+                ));
+                continue;
+            }
 
             // Strip the trailing newline and any carriage returns before it
             let end = line
@@ -423,19 +509,32 @@ impl TransportReceiver for FileTransport {
             let format = PayloadFormat::detect(&payload);
             let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
-            pending.push(Message {
+            pending.push(ReadLine::Record(Message {
                 key: None,
                 payload,
                 token: FileToken { offset: *offset },
                 timestamp_ms: Some(timestamp_ms),
                 format,
                 headers: Vec::new(),
-            });
+            }));
         }
         // A call with a smaller `max` than the dropped one leaves the rest queued.
         let rest = pending.split_off(pending.len().min(max));
-        let messages = std::mem::replace(pending, rest);
+        let lines = std::mem::replace(pending, rest);
         drop(guard);
+
+        let mut messages = Vec::with_capacity(lines.len());
+        let mut too_long = Vec::new();
+        let mut too_long_tokens = Vec::new();
+        for read in lines {
+            match read {
+                ReadLine::Record(message) => messages.push(message),
+                ReadLine::TooLong(entry, token) => {
+                    too_long.push(entry);
+                    too_long_tokens.push(token);
+                }
+            }
+        }
 
         // Apply inbound filters via the shared partition helper; DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
@@ -446,8 +545,10 @@ impl TransportReceiver for FileTransport {
             |m| m.token,
         );
         let messages = batch.messages;
-        let dlq_entries = batch.dlq_entries;
-        let filtered_tokens = batch.filtered_tokens;
+        let mut dlq_entries = batch.dlq_entries;
+        dlq_entries.extend(too_long);
+        let mut filtered_tokens = batch.filtered_tokens;
+        filtered_tokens.extend(too_long_tokens);
 
         #[cfg(feature = "logger")]
         if !messages.is_empty() {
@@ -522,6 +623,49 @@ mod tests {
         assert!(
             !crate::health::HealthRegistry::is_registered(id),
             "the closed transport still reports to readiness"
+        );
+    }
+
+    /// A line longer than the cap is not held in memory whole: it comes back
+    /// as a dead letter carrying the first `max_line_bytes`, its offset is
+    /// committed with the block, and the lines either side are records.
+    #[tokio::test]
+    async fn a_line_over_the_cap_is_dead_lettered_not_buffered() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("long.ndjson");
+        let cap = FileTransportConfig::default().max_line_bytes;
+        let long = vec![b'x'; cap + 4096];
+        let mut body = b"{\"before\":1}\n".to_vec();
+        body.extend_from_slice(&long);
+        body.extend_from_slice(b"\n{\"after\":1}\n");
+        std::fs::write(&path, &body).unwrap();
+
+        let transport = FileTransport::new(&FileTransportConfig {
+            path: path.to_str().unwrap().to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let batch = transport.recv(10).await.unwrap();
+
+        let lengths: Vec<usize> = batch.records.iter().map(|r| r.payload.len()).collect();
+        assert_eq!(
+            lengths,
+            [12, 11],
+            "record lengths: only the short lines are records"
+        );
+        assert_eq!(batch.records[0].payload.as_ref(), b"{\"before\":1}");
+        assert_eq!(batch.records[1].payload.as_ref(), b"{\"after\":1}");
+        assert_eq!(batch.dlq_entries.len(), 1, "the long line is a dead letter");
+        assert_eq!(
+            batch.dlq_entries[0].payload.len(),
+            cap,
+            "only its head is kept"
+        );
+        assert_eq!(
+            batch.commit_tokens.iter().map(|t| t.offset).max(),
+            Some(body.len() as u64),
+            "the block commits past every line it read"
         );
     }
 

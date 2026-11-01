@@ -235,6 +235,10 @@ file so reads survive restarts. `FileToken` carries the byte offset;
 `commit()` writes the highest committed offset to a temporary file, syncs it
 and renames it over the sidecar. Only a line ending in `\n` becomes a record,
 so a reader racing an appender holds a half-written line until it is finished.
+A line over `max_line_bytes` (16 MiB, newline included) is read past without
+being held: `recv` returns it as a dead letter carrying its first
+`max_line_bytes`, counts it in `transport_message_too_large_total`, and its
+offset commits with the block.
 
 ```yaml
 transport:
@@ -243,6 +247,7 @@ transport:
     file:
       path: "/var/log/myapp/events.ndjson"
       append: true
+      max_line_bytes: 16777216
 ```
 
 - **Cancellation safety**: `recv` keeps a partly read line, and any
