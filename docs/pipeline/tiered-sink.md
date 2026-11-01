@@ -55,7 +55,7 @@ flowchart TB
 | `Fatal(e)` | `Err(TieredSinkError::Sink)` to the caller | None. Not spooled |
 | No answer within `send_timeout_ms` | Spool to disk | Failure recorded and counted in `spool_circuit_trips_total`, may open the circuit |
 
-The sink reads the `SendResult` every `TransportSender` already returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for is dropped and logged, unless the error is `TransportError::Config` or `Closed`. Those describe the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
+The sink reads the `SendResult` every `TransportSender` already returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for, sent on its own, is dropped and logged, unless the error is `TransportError::Config` or `Closed`. Those describe the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
 
 ---
 
@@ -108,7 +108,9 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
-A pass that takes a record off the spool starts the next after the strategy's pause, so the strategy sets the rate. `drain_interval_ms` (100 ms) is added after a pass that found the spool empty or the sink down. Shutdown cuts either wait short.
+Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Every entry is committed only when the sink answers `Ok` or `FilteredDlq`. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal` names no record, so the batch is kept and its entries are sent one at a time, which drops only the record the sink refuses. An entry that fails its CRC or does not decode is dropped on its own, and the rest of its batch is sent.
+
+A pass that takes records starts the next after the strategy's pause for that many records, so the strategy sets the rate. `drain_interval_ms` (100 ms) is added after a pass that found the spool empty or the sink down. Shutdown cuts either wait short.
 
 The drain task is `tokio::spawn`'d at construction. It and the disk poller both stop when the sink's shutdown `CancellationToken` is cancelled, by `shutdown()` or by drop. With the `shutdown` feature the drain task also stops on the global token.
 
@@ -161,6 +163,8 @@ tiered_sink:
   circuit_failure_threshold: 5
   circuit_reset_timeout_ms: 30000
   drain_interval_ms: 100
+  drain_batch_max_records: 500
+  drain_batch_max_bytes: 4194304   # 4 MiB, as stored
   disk_aware:
     max_usage_percent: 0.8
     poll_interval_secs: 5

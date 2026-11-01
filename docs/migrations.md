@@ -38,6 +38,12 @@ With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`,
 
 **Consumer adjustment** -- regenerate a committed compose file (`<app> generate-artefacts`). dfe-fetcher's `docker-compose.yaml` carries `command: ["dfe-fetcher", "--config", "/etc/dfe/fetcher.yaml"]`.
 
+### The spool drains in batches (BEHAVIOUR CHANGE)
+
+`TieredSink`'s drain sends up to `drain_batch_max_records` (default 500) spooled records, within `drain_batch_max_bytes` (default 4 MiB as stored), in one `send_batch`, where it sent one record per pass. A sink that answers once the batch is delivered, Kafka's delivery reports say, now costs one round trip per batch. The whole batch commits on `Ok` and rolls back on backpressure, a timeout or a sink-level `Fatal`. A record-level `Fatal` re-sends the batch one record at a time.
+
+**Consumer adjustment** -- none. A struct literal of `TieredSinkConfig` adds the two fields or uses `TieredSinkConfig::new`, and none of the seven consumers has one.
+
 ### Every `from_cascade()` refuses a section that does not parse (API CHANGE)
 
 These return `Result<Self, scalo::cascade::CascadeError>`, where they answered a present section that does not deserialise with the defaults: `HttpClientConfig`, `OtelTracingConfig`, `SecretsConfig`, `GeoIpConfig`, `MetricsSettings`, `ScalingPressureConfig`, `TransportFilterTierConfig`, `LoggerSettings`, `MemoryGuardConfig`, `SelfRegulationConfig` and `rules::CompileOptions`. `WorkerPoolConfig::from_cascade` returns `ConfigError::ExtractError` for one. An absent section still takes the defaults. `scalo::cascade::section(key)` is the shared reader, and `FromCascade` uses it.

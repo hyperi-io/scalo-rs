@@ -119,8 +119,12 @@ impl Drainer {
 
 /// Result of a drain attempt.
 enum DrainResult {
-    /// Successfully sent and committed
-    Success,
+    /// This many records sent and committed
+    Success(usize),
+    /// The sink refused a batch of this many entries as `Fatal` for a record
+    /// it did not name. The batch is still spooled, and the next passes send
+    /// its entries one at a time.
+    Isolate(usize),
     /// Sink is unavailable / backpressured
     SinkUnavailable,
     /// The send outlived `send_timeout`. The entry is still on disk,
@@ -152,11 +156,26 @@ async fn settle(
     send_timeout: Duration,
 ) {
     match result {
-        DrainResult::Success => {
-            drainer.record_success();
+        DrainResult::Success(records) => {
+            for _ in 0..records {
+                drainer.record_success();
+            }
             circuit.record_success().await;
             #[cfg(feature = "tracing")]
-            tracing::debug!(rate = drainer.current_rate(), "Drained message to sink");
+            tracing::debug!(
+                records,
+                rate = drainer.current_rate(),
+                "Drained records to sink"
+            );
+        }
+        DrainResult::Isolate(entries) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                entries,
+                "Sink refused a drained batch; sending its entries one at a time"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = entries;
         }
         DrainResult::SinkUnavailable => {
             drainer.record_failure();
@@ -203,15 +222,162 @@ async fn settle(
 /// zero: a count already short of what is on disk must not wrap to
 /// `u64::MAX`, which keeps StrictFifo's hot path shut and refuses every spill.
 pub(crate) fn release(count: &AtomicU64, total: &AtomicU64, bytes: u64) {
+    release_many(count, total, 1, bytes);
+}
+
+/// [`release`] for `entries` committed together, holding `bytes` between them.
+fn release_many(count: &AtomicU64, total: &AtomicU64, entries: u64, bytes: u64) {
     let _ = count.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
-        Some(n.saturating_sub(1))
+        Some(n.saturating_sub(entries))
     });
     let _ = total.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
         Some(n.saturating_sub(bytes))
     });
 }
 
+/// How many spooled entries one drain pass takes and sends together.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainBatch {
+    /// Most entries a pass takes.
+    pub(crate) max_records: usize,
+    /// Most spooled (stored) bytes a pass takes. A first entry over it is
+    /// still taken on its own.
+    pub(crate) max_bytes: u64,
+}
+
+/// How many leading entries of `sizes` fit `max_bytes`, never fewer than one.
+fn fitting(sizes: &[u64], max_bytes: u64) -> usize {
+    let mut total = 0_u64;
+    let fit = sizes
+        .iter()
+        .take_while(|&&size| {
+            total = total.saturating_add(size);
+            total <= max_bytes
+        })
+        .count();
+    fit.max(1)
+}
+
+/// One spooled entry, decoded for the sink, or why it could not be.
+enum Entry {
+    Record(Record),
+    Unreadable(DrainResult),
+}
+
+/// Unframe, decompress and decode one spooled entry.
+fn decode_entry(raw: Vec<u8>, crc: bool, codec: crate::tiered_sink::CompressionCodec) -> Entry {
+    // Verify+strip the CRC header (when enabled), then decompress. Either
+    // failing means the spilled bytes are unreadable, so the entry is dropped,
+    // never replayed downstream.
+    let data = match crate::spool_codec::unframe(crc, raw)
+        .map_err(|c| c.0)
+        .and_then(|c| codec.decompress(&c).map_err(|e| e.to_string()))
+    {
+        Ok(data) => data,
+        Err(e) => return Entry::Unreadable(DrainResult::DecompressError(e)),
+    };
+    match Record::decode(&data) {
+        Ok(record) => Entry::Record(record),
+        Err(e) => Entry::Unreadable(DrainResult::DecodeError(e.to_string())),
+    }
+}
+
+/// Take up to `cap` entries within `batch.max_bytes`, send the readable ones in
+/// one `send_batch` under `send_timeout`, and commit every entry only when the
+/// sink takes them. Any other answer rolls the whole batch back.
+#[allow(clippy::too_many_arguments)]
+async fn drain_once<S: TransportSender>(
+    sink: &S,
+    receiver: &mut Receiver,
+    cap: usize,
+    batch: DrainBatch,
+    codec: crate::tiered_sink::CompressionCodec,
+    crc: bool,
+    send_timeout: Duration,
+    spool_count: &AtomicU64,
+    spool_bytes: &AtomicU64,
+) -> Vec<DrainResult> {
+    let first = match receiver.try_recv_batch_up_to(cap) {
+        Ok(guard) => guard,
+        Err(yaque::TryRecvError::QueueEmpty) => return vec![DrainResult::Empty],
+        Err(yaque::TryRecvError::Io(e)) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(error = %e, "I/O error reading from spool");
+            #[cfg(not(feature = "tracing"))]
+            let _ = e;
+            return vec![DrainResult::IoError];
+        }
+    };
+    let sizes: Vec<u64> = first.iter().map(|e| e.len() as u64).collect();
+    let take = fitting(&sizes, batch.max_bytes);
+    let stored: u64 = sizes.iter().take(take).sum();
+    // yaque commits a guard whole, so a batch over the byte cap is rolled
+    // back (on drop) and only what fits is taken again.
+    let guard = if take == first.len() {
+        first
+    } else {
+        drop(first);
+        match receiver.try_recv_batch_up_to(take) {
+            Ok(guard) => guard,
+            Err(yaque::TryRecvError::QueueEmpty) => return vec![DrainResult::Empty],
+            Err(yaque::TryRecvError::Io(_)) => return vec![DrainResult::IoError],
+        }
+    };
+    let taken = guard.len();
+    let mut records = Vec::with_capacity(taken);
+    let mut unreadable = Vec::new();
+    for raw in guard.iter() {
+        match decode_entry(raw.clone(), crc, codec) {
+            Entry::Record(record) => records.push(record),
+            Entry::Unreadable(why) => unreadable.push(why),
+        }
+    }
+
+    let sent = if records.is_empty() {
+        None
+    } else {
+        Some(timeout(send_timeout, sink.send_batch(&records)).await)
+    };
+    let delivered = match sent {
+        // Only unreadable entries: nothing to send, drop them.
+        None => 0,
+        Some(Ok(SendResult::Ok | SendResult::FilteredDlq)) => records.len(),
+        // Backpressure, a timeout (the batch may or may not have reached the
+        // sink) and a closed or misconfigured sink keep the whole batch spooled
+        // (at-least-once).
+        Some(Ok(SendResult::Backpressured)) => return vec![DrainResult::SinkUnavailable],
+        Some(Err(_elapsed)) => return vec![DrainResult::SendTimedOut],
+        Some(Ok(SendResult::Fatal(e))) if e.is_fatal() => {
+            return vec![DrainResult::SinkUnavailable];
+        }
+        // A refusal of one record in a batch cannot say which: keep them all
+        // and send them one at a time until the refused one is past.
+        Some(Ok(SendResult::Fatal(_))) if taken > 1 => {
+            return vec![DrainResult::Isolate(taken)];
+        }
+        // On its own, the refused record is its own fault: drop it.
+        Some(Ok(SendResult::Fatal(e))) => {
+            unreadable.push(DrainResult::Fatal(e.to_string()));
+            0
+        }
+    };
+    match guard.commit() {
+        Ok(()) => {
+            release_many(spool_count, spool_bytes, taken as u64, stored);
+            let mut results = unreadable;
+            if delivered > 0 {
+                results.push(DrainResult::Success(delivered));
+            }
+            results
+        }
+        Err(e) => vec![DrainResult::CommitFailed(e.to_string())],
+    }
+}
+
 /// Drain loop. Runs until shutdown signalled.
+///
+/// Each pass takes up to `batch` entries, at most one second's worth at the
+/// strategy's current rate, and sends them in one `send_batch`.
 ///
 /// `send_timeout`: bounds each downstream send, the hot path's limit, so a hung
 /// sink cannot pin the spool lock, the StrictFifo gate or `shutdown()`.
@@ -230,10 +396,13 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     strategy: DrainStrategy,
     interval: Duration,
     send_timeout: Duration,
+    batch: DrainBatch,
     shutdown: CancellationToken,
     fifo_gate: Option<Arc<Mutex<()>>>,
 ) {
     let mut drainer = Drainer::new(strategy);
+    // Entries still to send one at a time after a refused batch.
+    let mut isolate = 0_usize;
 
     #[cfg(feature = "shutdown")]
     let global_shutdown = crate::shutdown::token();
@@ -279,130 +448,65 @@ pub async fn drain_loop<S: TransportSender + 'static>(
             None => None,
         };
 
-        // Try to receive, decompress, send, and commit all within the lock
-        // This is necessary because RecvGuard borrows the Receiver
-        let result: DrainResult = {
+        // A second's worth at the current rate, so a rate-limited drain stays smooth.
+        let cap = if isolate > 0 {
+            isolate -= 1;
+            1
+        } else {
+            per_pass(batch.max_records, drainer.current_rate())
+        };
+        // RecvGuard borrows the Receiver, so take, send and commit under its lock.
+        let results = {
             let mut receiver = spool_receiver.lock().await;
-
-            let recv_result = receiver.try_recv();
-            match recv_result {
-                Ok(guard) => {
-                    let raw = guard.to_vec();
-                    let compressed_len = raw.len() as u64;
-
-                    // Verify+strip the CRC header (when enabled), then decompress.
-                    // Either failing means the spilled bytes are unreadable -- drop
-                    // (commit) the record below, never replay garbage downstream.
-                    let decompress_result: std::result::Result<Vec<u8>, String> =
-                        crate::spool_codec::unframe(crc, raw)
-                            .map_err(|c| c.0)
-                            .and_then(|c| codec.decompress(&c).map_err(|e| e.to_string()));
-                    match decompress_result {
-                        Ok(data) => {
-                            // Decode the spooled record and replay it to the
-                            // downstream. A record that no longer decodes cannot
-                            // be replayed -- drop it (commit) like a decode error,
-                            // never block the queue forever on a poison entry.
-                            match Record::decode(&data) {
-                                Ok(record) => {
-                                    match timeout(
-                                        send_timeout,
-                                        sink.send_batch(std::slice::from_ref(&record)),
-                                    )
-                                    .await
-                                    {
-                                        Ok(SendResult::Ok | SendResult::FilteredDlq) => {
-                                            // Commit FIRST; only decrement on commit
-                                            // success so counters never drift while
-                                            // the entry still sits in the queue.
-                                            match guard.commit() {
-                                                Ok(()) => {
-                                                    release(
-                                                        &spool_count,
-                                                        &spool_bytes,
-                                                        compressed_len,
-                                                    );
-                                                    DrainResult::Success
-                                                }
-                                                Err(e) => DrainResult::CommitFailed(e.to_string()),
-                                            }
-                                        }
-                                        Ok(SendResult::Backpressured) => {
-                                            // Don't commit - guard rolls back, retry later.
-                                            drop(guard);
-                                            DrainResult::SinkUnavailable
-                                        }
-                                        Err(_elapsed) => {
-                                            // The send future is dropped; the entry
-                                            // may or may not have reached the sink, so
-                                            // roll back and retry (at-least-once).
-                                            drop(guard);
-                                            DrainResult::SendTimedOut
-                                        }
-                                        Ok(SendResult::Fatal(e)) if e.is_fatal() => {
-                                            // The sink is closed or misconfigured (a
-                                            // refused credential, say), which says
-                                            // nothing about this record. Keep it
-                                            // spooled until the sink is fixed.
-                                            drop(guard);
-                                            DrainResult::SinkUnavailable
-                                        }
-                                        Ok(SendResult::Fatal(e)) => match guard.commit() {
-                                            Ok(()) => {
-                                                release(&spool_count, &spool_bytes, compressed_len);
-                                                DrainResult::Fatal(e.to_string())
-                                            }
-                                            Err(commit_err) => {
-                                                DrainResult::CommitFailed(commit_err.to_string())
-                                            }
-                                        },
-                                    }
-                                }
-                                Err(decode_err) => match guard.commit() {
-                                    Ok(()) => {
-                                        release(&spool_count, &spool_bytes, compressed_len);
-                                        DrainResult::DecodeError(decode_err.to_string())
-                                    }
-                                    Err(commit_err) => {
-                                        DrainResult::CommitFailed(commit_err.to_string())
-                                    }
-                                },
-                            }
-                        }
-                        Err(e) => match guard.commit() {
-                            Ok(()) => {
-                                release(&spool_count, &spool_bytes, compressed_len);
-                                DrainResult::DecompressError(e)
-                            }
-                            Err(commit_err) => DrainResult::CommitFailed(commit_err.to_string()),
-                        },
-                    }
-                }
-                Err(yaque::TryRecvError::QueueEmpty) => DrainResult::Empty,
-                Err(yaque::TryRecvError::Io(e)) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::warn!(error = %e, "I/O error reading from spool");
-                    DrainResult::IoError
-                }
-            }
+            drain_once(
+                sink.as_ref(),
+                &mut receiver,
+                cap,
+                batch,
+                codec,
+                crc,
+                send_timeout,
+                &spool_count,
+                &spool_bytes,
+            )
+            .await
         };
 
-        if matches!(
-            result,
-            DrainResult::Success
-                | DrainResult::Fatal(_)
+        let mut took = 0_usize;
+        for result in results {
+            match result {
+                DrainResult::Success(records) => {
+                    took += records;
+                    pause = Duration::ZERO;
+                }
+                DrainResult::Fatal(_)
                 | DrainResult::DecompressError(_)
-                | DrainResult::DecodeError(_)
-        ) {
-            pause = Duration::ZERO;
+                | DrainResult::DecodeError(_) => pause = Duration::ZERO,
+                DrainResult::Isolate(entries) => {
+                    isolate = entries;
+                    pause = Duration::ZERO;
+                }
+                _ => {}
+            }
+            settle(result, &mut drainer, &circuit, send_timeout).await;
         }
 
-        // Handle the result outside the lock
-        settle(result, &mut drainer, &circuit, send_timeout).await;
-
-        // Rate limiting rides the shutdown-aware pause at the top of the loop.
-        pause += drainer.delay();
+        // The strategy's delay is per record, so a batch waits for each one.
+        pause += drainer
+            .delay()
+            .saturating_mul(u32::try_from(took.max(1)).unwrap_or(u32::MAX));
     }
+}
+
+/// Records one pass takes: `max_records`, held to a second's worth at `rate`
+/// records per second, never fewer than one.
+fn per_pass(max_records: usize, rate: f64) -> usize {
+    if rate >= max_records as f64 {
+        return max_records.max(1);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let at_rate = rate.ceil() as usize;
+    at_rate.clamp(1, max_records.max(1))
 }
 
 #[cfg(test)]

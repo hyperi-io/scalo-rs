@@ -68,6 +68,18 @@ pub struct TieredSinkConfig {
     #[serde(default = "default_drain_interval_ms")]
     pub drain_interval_ms: u64,
 
+    /// Most spooled records one drain pass sends in a single `send_batch`.
+    /// Default 500. A pass also takes no more than a second's worth at the
+    /// drain strategy's current rate.
+    #[serde(default = "default_drain_batch_max_records")]
+    pub drain_batch_max_records: usize,
+
+    /// Most spooled bytes, as stored (after compression and framing), one
+    /// drain pass takes. Default 4 MiB. A single record over it is still sent
+    /// on its own.
+    #[serde(default = "default_drain_batch_max_bytes")]
+    pub drain_batch_max_bytes: u64,
+
     /// Disk-aware capacity management. When configured, a background poller
     /// checks available disk space and stops spooling if the filesystem
     /// exceeds the configured usage threshold.
@@ -108,6 +120,14 @@ fn default_drain_interval_ms() -> u64 {
     100 // 100ms
 }
 
+fn default_drain_batch_max_records() -> usize {
+    500
+}
+
+fn default_drain_batch_max_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+
 impl TieredSinkConfig {
     /// Create a new config with the given spool path.
     #[must_use]
@@ -124,6 +144,8 @@ impl TieredSinkConfig {
             circuit_failure_threshold: default_circuit_failure_threshold(),
             circuit_reset_timeout_ms: default_circuit_reset_timeout_ms(),
             drain_interval_ms: default_drain_interval_ms(),
+            drain_batch_max_records: default_drain_batch_max_records(),
+            drain_batch_max_bytes: default_drain_batch_max_bytes(),
             disk_aware: None,
             crc: false,
             on_corruption: CorruptionPolicy::Quarantine,

@@ -194,6 +194,10 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             config.drain_strategy,
             config.drain_interval(),
             config.send_timeout_duration(),
+            drainer::DrainBatch {
+                max_records: config.drain_batch_max_records,
+                max_bytes: config.drain_batch_max_bytes,
+            },
             shutdown.clone(),
             fifo_gate.as_ref().map(Arc::clone),
         ));
@@ -713,6 +717,11 @@ mod tests {
         /// When set, every send answers `Fatal` with this error instead.
         fatal: std::sync::Mutex<Option<fn() -> TransportError>>,
         received: Mutex<Vec<Record>>,
+        /// `send_batch` calls that delivered, and the most records one carried.
+        delivering_calls: std::sync::atomic::AtomicUsize,
+        largest_call: std::sync::atomic::AtomicUsize,
+        /// A payload answered `Fatal(Send)`, and the whole call it is in.
+        refused: std::sync::Mutex<Option<&'static [u8]>>,
     }
 
     impl TestSink {
@@ -721,7 +730,14 @@ mod tests {
                 available: AtomicBool::new(true),
                 fatal: std::sync::Mutex::new(None),
                 received: Mutex::new(Vec::new()),
+                delivering_calls: std::sync::atomic::AtomicUsize::new(0),
+                largest_call: std::sync::atomic::AtomicUsize::new(0),
+                refused: std::sync::Mutex::new(None),
             }
+        }
+
+        fn refuse_payload(&self, payload: Option<&'static [u8]>) {
+            *self.refused.lock().unwrap() = payload;
         }
 
         fn answer_fatal(&self, error: Option<fn() -> TransportError>) {
@@ -783,7 +799,14 @@ mod tests {
             if let Some(fatal) = self.fatal_answer() {
                 return fatal;
             }
+            let refused = *self.refused.lock().unwrap();
+            if refused.is_some_and(|bad| records.iter().any(|r| r.payload.as_ref() == bad)) {
+                return SendResult::Fatal(TransportError::Send("refused".into()));
+            }
             if self.available.load(AtomicOrdering::SeqCst) {
+                self.delivering_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.largest_call
+                    .fetch_max(records.len(), AtomicOrdering::SeqCst);
                 let mut r = self.received.lock().await;
                 r.extend(records.iter().cloned());
                 SendResult::Ok
@@ -1054,6 +1077,90 @@ mod tests {
             "drained records must match what was spilled"
         );
 
+        tiered.shutdown().await;
+    }
+
+    /// A backlog drains in batches: 1000 spooled records reach the sink in
+    /// two `send_batch` calls at the default 500-record batch, in order.
+    #[tokio::test]
+    async fn a_backlog_drains_in_batches() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        let payloads: Vec<Vec<u8>> = (0..1000)
+            .map(|i| format!("b-{i:04}").into_bytes())
+            .collect();
+        for payload in &payloads {
+            tiered.send(&rec(payload)).await.unwrap();
+        }
+
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+        let calls = tiered.inner().delivering_calls.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            calls, 2,
+            "1000 records took {calls} delivering send_batch calls"
+        );
+        assert_eq!(tiered.inner().received_payloads().await, payloads);
+        tiered.shutdown().await;
+    }
+
+    /// The byte cap bounds a pass by the bytes stored: records whose stored
+    /// size lets three fit go three to a `send_batch`, and every one arrives.
+    #[tokio::test]
+    async fn a_drain_pass_takes_no_more_than_the_byte_cap() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+        config.compression = CompressionCodec::None;
+        let payloads: Vec<Vec<u8>> = (0..10).map(|i| vec![b'0' + i; 1000]).collect();
+        let stored = crate::spool_codec::frame(config.crc, rec(&payloads[0]).encode()).len() as u64;
+        config.drain_batch_max_bytes = stored * 3 + stored / 2;
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        for payload in &payloads {
+            tiered.send(&rec(payload)).await.unwrap();
+        }
+
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+        let sink = tiered.inner();
+        assert_eq!(sink.largest_call.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(
+            sink.delivering_calls.load(AtomicOrdering::SeqCst),
+            4,
+            "3 + 3 + 3 + 1"
+        );
+        assert_eq!(sink.received_payloads().await, payloads);
+        tiered.shutdown().await;
+    }
+
+    /// A batch the sink refuses as the fault of a record it does not name is
+    /// kept, then sent one record at a time, so only the refused record is
+    /// dropped and the rest arrive in order.
+    #[tokio::test]
+    async fn a_refused_batch_drops_only_the_refused_record() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        for payload in [&b"good-1"[..], b"poison", b"good-2"] {
+            tiered.send(&rec(payload)).await.unwrap();
+        }
+
+        tiered.inner().refuse_payload(Some(b"poison"));
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+        assert_eq!(
+            tiered.inner().received_payloads().await,
+            vec![b"good-1".to_vec(), b"good-2".to_vec()]
+        );
         tiered.shutdown().await;
     }
 
@@ -1838,6 +1945,8 @@ mod tests {
         hang: AtomicBool,
         /// `send_batch` calls that started while `hang` was set.
         hung_sends: AtomicU64,
+        /// The most records one hung call carried.
+        largest_hung: std::sync::atomic::AtomicUsize,
     }
 
     impl HangingSink {
@@ -1846,6 +1955,7 @@ mod tests {
                 inner: TestSink::new(),
                 hang: AtomicBool::new(false),
                 hung_sends: AtomicU64::new(0),
+                largest_hung: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -1869,6 +1979,8 @@ mod tests {
 
         async fn send_batch(&self, records: &[Record]) -> SendResult {
             if self.hang.load(AtomicOrdering::SeqCst) {
+                self.largest_hung
+                    .fetch_max(records.len(), AtomicOrdering::SeqCst);
                 self.hung_sends.fetch_add(1, AtomicOrdering::SeqCst);
                 return std::future::pending().await;
             }
@@ -1937,9 +2049,14 @@ mod tests {
         // The second hung send is the first record offered again after its send was cut off.
         wait_for_hung_sends(&tiered, 2).await;
         assert_eq!(
+            tiered.inner().largest_hung.load(AtomicOrdering::SeqCst),
+            3,
+            "the hung send carried the whole batch"
+        );
+        assert_eq!(
             tiered.spool_len().await,
             3,
-            "a timed-out send commits nothing"
+            "a timed-out batch commits none of its records"
         );
 
         tiered.inner().hang.store(false, AtomicOrdering::SeqCst);
