@@ -38,6 +38,12 @@ With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`,
 
 **Consumer adjustment** -- regenerate a committed compose file (`<app> generate-artefacts`). dfe-fetcher's `docker-compose.yaml` carries `command: ["dfe-fetcher", "--config", "/etc/dfe/fetcher.yaml"]`.
 
+### Kafka test support generates its SCRAM password (API CHANGE)
+
+`transport::kafka::test_support::SCRAM_PASSWORD` is replaced by `scram_password()`, which returns a password generated once per test process, so the test broker carries no credential in source.
+
+**Consumer adjustment** -- `SCRAM_PASSWORD` becomes `scram_password()`. None of the seven DFE consumers uses it: dfe-loader keeps its own copy in `tests/common/tls_broker.rs`.
+
 ### The spool drains in batches (BEHAVIOUR CHANGE)
 
 `TieredSink`'s drain sends up to `drain_batch_max_records` (default 500) spooled records, within `drain_batch_max_bytes` (default 4 MiB as stored), in one `send_batch`, where it sent one record per pass. A sink that answers once the batch is delivered, Kafka's delivery reports say, now costs one round trip per batch. The whole batch commits on `Ok` and rolls back on backpressure, a timeout or a sink-level `Fatal`. A record-level `Fatal` re-sends the batch one record at a time.

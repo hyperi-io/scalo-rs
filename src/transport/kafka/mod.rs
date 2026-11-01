@@ -4309,7 +4309,10 @@ mod tests {
             ("ssl, no CA", ssl(), Some("probe")),
             (
                 "sasl_ssl, no CA",
-                KafkaConfig::default().with_scram_ssl("SCRAM-SHA-512", "u", "p"),
+                KafkaConfig {
+                    security_protocol: "sasl_ssl".to_string(),
+                    ..KafkaConfig::default()
+                },
                 Some("probe"),
             ),
             (

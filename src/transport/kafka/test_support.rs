@@ -238,8 +238,16 @@ const PULL_DEADLINE: Duration = Duration::from_secs(300);
 /// The SCRAM-SHA-512 user the broker is formatted with.
 pub const SCRAM_USER: &str = "dfe";
 
-/// Its password.
-pub const SCRAM_PASSWORD: &str = "dfe-secret";
+/// Its password: random per test process, so no credential sits in the source.
+pub fn scram_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        format!("scram-{:016x}", hasher.finish())
+    })
+}
 
 /// Fixed cluster id: KRaft storage must be formatted with one.
 const CLUSTER_ID: &str = "MkU3OEVBNTcwNTJENDM2Qk";
@@ -453,11 +461,12 @@ fn server_properties(controller: u16, tls: u16, sasl_ssl: u16, mtls: u16) -> Str
 
 /// Formats the KRaft storage with the SCRAM user, then runs the broker.
 fn start_script() -> String {
+    let scram_password = scram_password();
     format!(
         "set -e\n\
          cd /opt/kafka\n\
          bin/kafka-storage.sh format -t {CLUSTER_ID} -c {BROKER_DIR}/server.properties \
-         --add-scram 'SCRAM-SHA-512=[name={SCRAM_USER},password={SCRAM_PASSWORD}]' --ignore-formatted\n\
+         --add-scram 'SCRAM-SHA-512=[name={SCRAM_USER},password={scram_password}]' --ignore-formatted\n\
          exec bin/kafka-server-start.sh {BROKER_DIR}/server.properties\n"
     )
 }

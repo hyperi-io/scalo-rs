@@ -173,20 +173,25 @@ fn test_kafka_config_for_testing() {
 
 #[test]
 fn test_kafka_config_with_scram() {
-    let config = KafkaConfig::default().with_scram("SCRAM-SHA-256", "user", "pass");
+    let password = crate::common::test_password();
+    let config = KafkaConfig::default().with_scram("SCRAM-SHA-256", "user", password);
 
     assert_eq!(config.security_protocol, "sasl_plaintext");
     assert_eq!(config.sasl_mechanism, Some("SCRAM-SHA-256".to_string()));
     assert_eq!(config.sasl_username, Some("user".to_string()));
     assert_eq!(
         config.sasl_password.as_ref().map(|p| p.expose()),
-        Some("pass")
+        Some(password)
     );
 }
 
 #[test]
 fn test_kafka_config_with_scram_ssl() {
-    let config = KafkaConfig::default().with_scram_ssl("SCRAM-SHA-512", "user", "pass");
+    let config = KafkaConfig::default().with_scram_ssl(
+        "SCRAM-SHA-512",
+        "user",
+        crate::common::test_password(),
+    );
 
     assert_eq!(config.security_protocol, "sasl_ssl");
     assert_eq!(config.sasl_mechanism, Some("SCRAM-SHA-512".to_string()));
@@ -203,7 +208,7 @@ fn test_kafka_config_with_tls() {
 #[test]
 fn test_kafka_config_with_tls_upgrades_sasl() {
     let config = KafkaConfig::default()
-        .with_scram("PLAIN", "user", "pass")
+        .with_scram("PLAIN", "user", crate::common::test_password())
         .with_tls(None);
 
     assert_eq!(config.security_protocol, "sasl_ssl");
@@ -238,7 +243,7 @@ fn test_kafka_config_with_ssl_insecure() {
 #[test]
 fn test_kafka_config_with_ssl_insecure_upgrades_sasl() {
     let config = KafkaConfig::default()
-        .with_scram("PLAIN", "user", "pass")
+        .with_scram("PLAIN", "user", crate::common::test_password())
         .with_ssl_insecure();
 
     assert_eq!(config.security_protocol, "sasl_ssl");
@@ -364,7 +369,7 @@ fn test_kafka_config_with_cloud_connection_tuning() {
 fn test_kafka_config_chained_builders() {
     // Test that all builder methods can be chained together
     let config = KafkaConfig::production()
-        .with_scram_ssl("SCRAM-SHA-512", "user", "pass")
+        .with_scram_ssl("SCRAM-SHA-512", "user", crate::common::test_password())
         .with_statistics(1000)
         .with_cloud_connection_tuning()
         .with_override("fetch.min.bytes", "2097152");
@@ -405,7 +410,10 @@ fn test_kafka_config_from_env() {
             ("TESTAPP_SECURITY_PROTOCOL", Some("sasl_ssl")),
             ("TESTAPP_SASL_MECHANISM", Some("SCRAM-SHA-256")),
             ("TESTAPP_SASL_USERNAME", Some("testuser")),
-            ("TESTAPP_SASL_PASSWORD", Some("testpass")),
+            (
+                "TESTAPP_SASL_PASSWORD",
+                Some(crate::common::test_password()),
+            ),
             ("TESTAPP_SSL_SKIP_VERIFY", Some("true")),
             ("TESTAPP_TOPICS", Some("topic1,topic2,topic3")),
         ],
@@ -420,7 +428,7 @@ fn test_kafka_config_from_env() {
             assert_eq!(config.sasl_username, Some("testuser".to_string()));
             assert_eq!(
                 config.sasl_password.as_ref().map(|p| p.expose()),
-                Some("testpass")
+                Some(crate::common::test_password())
             );
             assert!(config.ssl_skip_verify);
             assert_eq!(config.topics, vec!["topic1", "topic2", "topic3"]);

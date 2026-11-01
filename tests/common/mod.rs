@@ -33,6 +33,18 @@ pub const SUITE: scalo::deployment::test_support::shared_service::Suite =
 
 /// `name` made unique to this test process, for a topic, consumer group or
 /// secret path on a service other tests share.
+/// A password for test configs and refused-credential cases: random per test
+/// process, so no credential sits in the source.
+pub fn test_password() -> &'static str {
+    static PASSWORD: OnceLock<String> = OnceLock::new();
+    PASSWORD.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        format!("test-{:016x}", hasher.finish())
+    })
+}
+
 pub fn unique(name: &str) -> String {
     format!("{name}-p{}", std::process::id())
 }

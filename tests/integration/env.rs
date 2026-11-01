@@ -28,7 +28,7 @@ mod kafka_env {
             [
                 ("KAFKA_BOOTSTRAP_SERVERS", Some("broker1:9092,broker2:9092")),
                 ("KAFKA_SASL_USERNAME", Some("testuser")),
-                ("KAFKA_SASL_PASSWORD", Some("testpass")),
+                ("KAFKA_SASL_PASSWORD", Some(crate::common::test_password())),
                 ("KAFKA_SECURITY_PROTOCOL", Some("SASL_SSL")),
                 ("KAFKA_SASL_MECHANISM", Some("SCRAM-SHA-512")),
                 ("KAFKA_GROUP_ID", Some("test-group")),
@@ -41,7 +41,7 @@ mod kafka_env {
                 assert_eq!(config.sasl_username, Some("testuser".to_string()));
                 assert_eq!(
                     config.sasl_password.as_ref().map(|p| p.expose()),
-                    Some("testpass")
+                    Some(crate::common::test_password())
                 );
                 assert_eq!(config.security_protocol, "SASL_SSL");
                 assert_eq!(config.sasl_mechanism, Some("SCRAM-SHA-512".to_string()));
