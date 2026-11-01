@@ -190,6 +190,8 @@ let _handle = reloader.start();        // -> JoinHandle<()>; spawns the watch ta
 let current = shared.get();            // clone; or shared.read() for a guard
 ```
 
+Reloads are at least `debounce` (500 ms) apart. A trigger inside that window reloads once it ends, so a file edited just after a reload is still applied.
+
 `with_registry_update(key)` makes the reloader call `registry::update(key)` after a
 successful reload, firing any `registry::on_change(key, cb)` subscribers:
 
