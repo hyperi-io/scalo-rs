@@ -79,7 +79,7 @@ feature is off.
 
 ## Caching
 
-`get()` serves a cached value until `ttl_secs` passes, then goes back to the backend. If the backend fails, `get()` serves the expired value for up to `stale_grace_secs` more before returning the error. The disk tier is written only with an `encryption_key`, or with `allow_plaintext_disk_cache` outside production. Without either the cache is memory-only.
+`get()` serves a cached value until `ttl_secs` passes, then goes back to the backend. If the backend fails, `get()` serves the expired value for up to `stale_grace_secs` more before returning the error. The disk tier is written only with an `encryption_key`, or with `allow_plaintext_disk_cache` outside production. Without either the cache is memory-only. `SecretsManager` reads and writes the disk tier on tokio's blocking pool with no cache lock held, so a slow cache volume stalls only the lookup waiting on it.
 
 `refresh_all()` re-fetches every source in `secrets.sources` from its backend, fresh entries included, and replaces the cached values, so the next `get()` returns them. A source that fails is named in the returned `SecretsError::RefreshFailed` and keeps its cached value, and the other sources still refresh. Unlike `get()`, `refresh_all()` never answers a failed source from the stale cache. Paths read with `get_file()` are not refreshed. Fetches of one source run one at a time across `get()` and `refresh_all()`, so the cache ends on the value read last, and a `get()` that waited returns what the fetch before it cached. `clear_cache()` drops the cache without re-fetching.
 

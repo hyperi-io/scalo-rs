@@ -264,7 +264,7 @@ impl SecretsManager {
         let cache_key = format!("file:{path}");
 
         // Check cache first
-        if let Some(cached) = self.cache.read().get(&cache_key) {
+        if let Some(cached) = self.cached(&cache_key).await {
             debug!(path = %path, "Secret loaded from cache");
             #[cfg(feature = "metrics")]
             metrics::counter!("secrets_cache_hits_total").increment(1);
@@ -276,7 +276,7 @@ impl SecretsManager {
 
         let _fetching = Fetching::acquire(&self.in_flight, &cache_key).await;
         // A concurrent read may have filled the cache while this one waited.
-        if let Some(cached) = self.cache.read().get(&cache_key) {
+        if let Some(cached) = self.cached(&cache_key).await {
             return Ok(cached);
         }
 
@@ -286,7 +286,7 @@ impl SecretsManager {
         metrics::counter!("secrets_fetch_total").increment(1);
 
         // Update cache
-        if let Err(e) = self.cache.write().set(&cache_key, &value) {
+        if let Err(e) = self.store(&cache_key, &value).await {
             warn!(error = %e, "Failed to cache secret");
         }
 
@@ -301,7 +301,7 @@ impl SecretsManager {
         source: &SecretSource,
     ) -> SecretsResult<SecretValue> {
         // Check cache first
-        if let Some(cached) = self.cache.read().get(cache_key) {
+        if let Some(cached) = self.cached(cache_key).await {
             debug!(key = %cache_key, "Secret loaded from cache");
             #[cfg(feature = "metrics")]
             metrics::counter!("secrets_cache_hits_total").increment(1);
@@ -314,7 +314,7 @@ impl SecretsManager {
         let _fetching = Fetching::acquire(&self.in_flight, cache_key).await;
         // A concurrent read or refresh may have filled the cache while this
         // one waited.
-        if let Some(cached) = self.cache.read().get(cache_key) {
+        if let Some(cached) = self.cached(cache_key).await {
             return Ok(cached);
         }
 
@@ -322,7 +322,7 @@ impl SecretsManager {
             Ok(value) => Ok(value),
             Err(e) => {
                 // Try stale cache on provider failure
-                if let Some(stale) = self.cache.read().get_stale(cache_key) {
+                if let Some(stale) = self.stale(cache_key).await {
                     warn!(
                         key = %cache_key,
                         error = %e,
@@ -339,7 +339,7 @@ impl SecretsManager {
     /// on success, and send a [`RotationEvent`] when its version differs from
     /// the one the cache last held for `cache_key`, expired or not.
     async fn fetch(&self, cache_key: &str, source: &SecretSource) -> SecretsResult<SecretValue> {
-        let old_version = self.cache.read().last_version(cache_key);
+        let old_version = self.last_version(cache_key).await;
         let result = match source {
             SecretSource::File { path } => self.file_provider.get(path).await,
 
@@ -380,7 +380,7 @@ impl SecretsManager {
         metrics::counter!("secrets_fetch_total").increment(1);
 
         let value = result?;
-        if let Err(e) = self.cache.write().set(cache_key, &value) {
+        if let Err(e) = self.store(cache_key, &value).await {
             warn!(key = %cache_key, error = %e, "Failed to cache secret");
         }
         if let (Some(old_version), Some(new_version)) = (old_version, &value.metadata.version)
@@ -402,6 +402,84 @@ impl SecretsManager {
             let _ = self.rotation_tx.send(event);
         }
         Ok(value)
+    }
+
+    /// A fresh cached value: memory under the lock, then disk on the blocking
+    /// pool with no lock held, so a slow cache volume stalls only this lookup.
+    async fn cached(&self, key: &str) -> Option<SecretValue> {
+        let disk = {
+            let cache = self.cache.read();
+            if let Some(value) = cache.fresh_in_memory(key) {
+                return Some(value);
+            }
+            cache.disk_tier()
+        };
+        let found = match disk {
+            Some(disk) => {
+                let key = key.to_string();
+                off_runtime(move || disk.load_fresh(&key)).await.flatten()
+            }
+            None => None,
+        };
+        self.cache.read().count_lookup(found.is_some());
+        found
+    }
+
+    /// A cached value within the grace period, read as [`cached`](Self::cached) reads.
+    async fn stale(&self, key: &str) -> Option<SecretValue> {
+        let disk = {
+            let cache = self.cache.read();
+            if let Some(value) = cache.stale_in_memory(key) {
+                return Some(value);
+            }
+            cache.disk_tier()?
+        };
+        let key = key.to_string();
+        let found = off_runtime(move || disk.load_within_grace(&key))
+            .await
+            .flatten();
+        if found.is_some() {
+            self.cache.read().count_stale_hit();
+        }
+        found
+    }
+
+    /// The version last cached for `key`, fresh or not: memory, then disk.
+    async fn last_version(&self, key: &str) -> Option<String> {
+        let disk = {
+            let cache = self.cache.read();
+            if let Some(version) = cache.memory_version(key) {
+                return version;
+            }
+            cache.disk_tier()?
+        };
+        let key = key.to_string();
+        off_runtime(move || disk.load(&key))
+            .await
+            .flatten()
+            .and_then(|value| value.metadata.version)
+    }
+
+    /// Cache `value`: memory under the lock, then disk on the blocking pool.
+    async fn store(&self, key: &str, value: &SecretValue) -> SecretsResult<()> {
+        let disk = {
+            let mut cache = self.cache.write();
+            cache.remember(key, value);
+            cache.disk_tier()
+        };
+        if let Some(disk) = disk {
+            let key = key.to_string();
+            let value = value.clone();
+            off_runtime(move || disk.save(&key, &value))
+                .await
+                .unwrap_or_else(|| {
+                    Err(SecretsError::CacheError(
+                        "disk cache write task failed".into(),
+                    ))
+                })?;
+        }
+        debug!(key = %key, "Secret cached");
+        Ok(())
     }
 
     /// Subscribe to rotation events.
@@ -610,6 +688,12 @@ pub struct CacheStats {
     pub stale_hits: u64,
 }
 
+/// Run blocking disk-cache I/O on the blocking pool. `None` if the task
+/// panicked.
+async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +805,82 @@ mod tests {
         for (case, interval, jitter, seed, want) in cases {
             assert_eq!(refresh_wait(interval, jitter, seed), want, "{case}");
         }
+    }
+
+    /// A disk-cache read that never returns stalls only its own lookup: the
+    /// cache lock is not held across it, so another secret is fetched and
+    /// cached meanwhile. The stalled read is a FIFO with no writer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_stalled_cache_read_does_not_stall_other_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut sources = std::collections::HashMap::new();
+        for name in ["a", "b"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            sources.insert(
+                name.to_string(),
+                SecretSource::File {
+                    path: path.to_str().unwrap().to_string(),
+                },
+            );
+        }
+        let config = SecretsConfig {
+            cache: CacheConfig {
+                directory: Some(cache_dir.clone()),
+                ttl_secs: 3600,
+                allow_plaintext_disk_cache: true,
+                ..Default::default()
+            },
+            sources,
+            ..Default::default()
+        };
+        // The disk-cache file for "a" (its key, base64url, `.json`).
+        let fifo = cache_dir.join("YQ.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+
+        let mgr = Arc::new(SecretsManager::new(config).unwrap());
+        let stalled = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move { mgr.get("a").await }
+        });
+        // Long enough for "a" to reach its cache read. Too short only lets "b"
+        // finish first, which passes the check below whatever the fix.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // On a task, so a lookup that blocks its thread fails the timeout
+        // instead of hanging the test.
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::spawn({
+                let mgr = Arc::clone(&mgr);
+                async move { mgr.get("b").await }
+            }),
+        )
+        .await;
+
+        // Open the FIFO's write end for the blocked read, unlink it so no later
+        // lookup finds it, then close: "a" reads EOF and fetches from source.
+        std::thread::spawn(move || {
+            let writer = std::fs::OpenOptions::new().write(true).open(&fifo);
+            let _ = std::fs::remove_file(&fifo);
+            drop(writer);
+        });
+        let unstalled = tokio::time::timeout(Duration::from_secs(5), stalled).await;
+
+        assert!(
+            matches!(&other, Ok(Ok(Ok(value))) if value.as_bytes() == b"b"),
+            "a stalled cache read for one secret held up another: {other:?}"
+        );
+        assert!(
+            matches!(&unstalled, Ok(Ok(Ok(value))) if value.as_bytes() == b"a"),
+            "the stalled lookup completes once its read returns: {unstalled:?}"
+        );
     }
 
     fn file_sources(
