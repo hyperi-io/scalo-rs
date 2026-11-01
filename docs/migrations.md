@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### The spool's size cap counts queued bytes (BEHAVIOUR CHANGE)
+
+`Spool::push` checks `max_size_bytes` against the bytes of the records queued plus the record being written, counted once at open and then incrementally. It summed the directory on every push, which counted records already consumed and walked the directory on the async runtime. `Spool::queued_bytes()` returns the count.
+
+**Consumer adjustment** -- none. A spool drained after filling accepts pushes again.
+
 ### The file transport caps a line it reads (BEHAVIOUR CHANGE)
 
 `FileTransportConfig` gains `max_line_bytes` (default 16 MiB). A longer line comes back from `recv` as a dead letter in `dlq_entries` carrying its first `max_line_bytes`, with its token in the commit tokens, where it was read into memory whole. `0` is refused.

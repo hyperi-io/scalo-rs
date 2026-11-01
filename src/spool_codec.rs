@@ -18,6 +18,8 @@
 //! - **Open** ([`open_queue`]): clears lock files a stopped process left behind,
 //!   refuses a queue a live process still holds, and quarantines a queue that
 //!   will not open under [`CorruptionPolicy::Quarantine`].
+//! - **Count** ([`queued_items_and_bytes`]): what a queue directory still
+//!   holds, read once at open so the counters after it move incrementally.
 //! - **Quarantine** ([`quarantine`]): move a corrupt queue's files into a
 //!   timestamped subdirectory of the spool path (forensics preserved, never
 //!   deleted). The spool path itself is never renamed, so it works when the
@@ -382,6 +384,75 @@ fn create_quarantine_dir(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Err(last)
+}
+
+/// Count the records a yaque queue directory still holds and sum their
+/// payload bytes, header excluded.
+///
+/// yaque stores messages as `[4-byte Hamming header][payload]` in `<n>.q`
+/// segments, and the receiver position lives in `recv-metadata` (two
+/// big-endian u64: segment, position). Counts from the receiver position to the
+/// end of the highest segment. Reads every segment, so it runs off the async
+/// runtime, once at open.
+pub(crate) fn queued_items_and_bytes(path: &Path) -> io::Result<(u64, u64)> {
+    if !path.is_dir() {
+        return Ok((0, 0));
+    }
+
+    let recv_metadata_path = path.join("recv-metadata");
+    let (recv_segment, recv_position) = if recv_metadata_path.exists() {
+        let data = std::fs::read(&recv_metadata_path)?;
+        match (data.get(0..8), data.get(8..16)) {
+            (Some(segment), Some(position)) => (
+                u64::from_be_bytes(segment.try_into().unwrap_or([0; 8])),
+                u64::from_be_bytes(position.try_into().unwrap_or([0; 8])),
+            ),
+            _ => (0, 0),
+        }
+    } else {
+        (0, 0)
+    };
+
+    let mut segments: Vec<u64> = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let file_path = entry?.path();
+        if file_path.extension().and_then(|e| e.to_str()) == Some("q")
+            && let Some(seg_num) = file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+            && seg_num >= recv_segment
+        {
+            segments.push(seg_num);
+        }
+    }
+    segments.sort_unstable();
+
+    let header_eof: [u8; 4] = [255, 255, 255, 255];
+    let mut count = 0_u64;
+    let mut bytes = 0_u64;
+    for &seg_num in &segments {
+        let file_data = std::fs::read(path.join(format!("{seg_num}.q")))?;
+        let mut pos = if seg_num == recv_segment {
+            usize::try_from(recv_position).unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        while let Some(header) = pos.checked_add(4).and_then(|end| file_data.get(pos..end)) {
+            let header: [u8; 4] = header.try_into().unwrap_or([0; 4]);
+            if header == header_eof {
+                break;
+            }
+            // Length in the low 26 bits of the Hamming-encoded header.
+            let payload_len = (u32::from_be_bytes(header) & 0x03_FF_FF_FF) as usize;
+            pos += 4 + payload_len;
+            if pos <= file_data.len() {
+                count += 1;
+                bytes += payload_len as u64;
+            }
+        }
+    }
+    Ok((count, bytes))
 }
 
 #[cfg(test)]

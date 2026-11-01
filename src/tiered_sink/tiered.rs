@@ -133,10 +133,13 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         // files can be GB-sized after a crash; walking them on the
         // async runtime pins a tokio worker.
         let spool_path_for_scan = config.spool_path.clone();
-        let (initial_count, initial_bytes) =
-            tokio::task::spawn_blocking(move || spool_item_count_and_bytes(&spool_path_for_scan))
-                .await
-                .unwrap_or((0, 0));
+        let (initial_count, initial_bytes) = tokio::task::spawn_blocking(move || {
+            crate::spool_codec::queued_items_and_bytes(&spool_path_for_scan)
+        })
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or((0, 0));
         let spool_count = Arc::new(AtomicU64::new(initial_count));
         let spool_bytes = Arc::new(AtomicU64::new(initial_bytes));
 
@@ -551,90 +554,6 @@ impl Drop for SpoolReservation<'_> {
             drainer::release(self.count, self.bytes, self.len);
         }
     }
-}
-
-/// Count existing items and sum payload bytes in a yaque queue directory.
-///
-/// yaque stores messages as `[4-byte Hamming header][payload]` in segment files
-/// named `<n>.q`. The receiver position is persisted in `recv-metadata`.
-///
-/// Returns `(item_count, payload_bytes)`.
-fn spool_item_count_and_bytes(path: &std::path::Path) -> (u64, u64) {
-    if !path.is_dir() {
-        return (0, 0);
-    }
-
-    // Read receiver state from recv-metadata (two big-endian u64: segment, position)
-    let recv_metadata_path = path.join("recv-metadata");
-    let (recv_segment, recv_position) = if recv_metadata_path.exists() {
-        std::fs::read(&recv_metadata_path)
-            .ok()
-            .and_then(|data| {
-                if data.len() >= 16 {
-                    let segment = u64::from_be_bytes(data[0..8].try_into().ok()?);
-                    let position = u64::from_be_bytes(data[8..16].try_into().ok()?);
-                    Some((segment, position))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or((0, 0))
-    } else {
-        (0, 0)
-    };
-
-    // Collect segment files at or after the receiver position
-    let mut segments: Vec<u64> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let file_path = entry.path();
-            if file_path.extension().and_then(|e| e.to_str()) == Some("q")
-                && let Some(seg_num) = file_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-                && seg_num >= recv_segment
-            {
-                segments.push(seg_num);
-            }
-        }
-    }
-    segments.sort_unstable();
-
-    let header_eof: [u8; 4] = [255, 255, 255, 255];
-    let mut count = 0u64;
-    let mut bytes = 0u64;
-
-    for &seg_num in &segments {
-        let seg_path = path.join(format!("{seg_num}.q"));
-        let Ok(file_data) = std::fs::read(&seg_path) else {
-            continue;
-        };
-
-        #[allow(clippy::cast_possible_truncation)]
-        let start = if seg_num == recv_segment {
-            recv_position as usize
-        } else {
-            0
-        };
-
-        let mut pos = start;
-        while pos + 4 <= file_data.len() {
-            let header_bytes: [u8; 4] = file_data[pos..pos + 4].try_into().unwrap_or([0; 4]);
-            if header_bytes == header_eof {
-                break;
-            }
-            let encoded = u32::from_be_bytes(header_bytes);
-            let payload_len = (encoded & 0x03_FF_FF_FF) as usize;
-            pos += 4 + payload_len;
-            if pos <= file_data.len() {
-                count += 1;
-                bytes += payload_len as u64;
-            }
-        }
-    }
-
-    (count, bytes)
 }
 
 /// Check available disk space using `statvfs`.
