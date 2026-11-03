@@ -355,11 +355,11 @@ owo-colors = { version = ">=4.4.0, <5", optional = true }
 tracing-throttle = { version = ">=0.4.4, <0.5", default-features = false, optional = true }
 
 # OpenTelemetry (modern observability - OTLP native)
-# Held at 0.31: metrics-exporter-opentelemetry 0.2.1, its newest crates.io
-# release as of 2026-10-06, requires opentelemetry ^0.31, and the otel crates do
-# not interoperate across a minor, so `otel-metrics` cannot build against a newer
-# SDK. The exporter's main branch already targets 0.33 but is unreleased. Bump the
-# whole stack together once that release ships (scalo-rs#281).
+# Held at 0.31: metrics-exporter-opentelemetry 0.2.1 requires opentelemetry
+# ^0.31, and the otel crates do not interoperate across a minor, so `otel-metrics`
+# cannot build against a newer SDK. The exporter's 0.2.2 (2026-11-02) moved to 0.33
+# in a patch release, so it is capped below 0.2.2 until the whole stack is bumped
+# together (scalo-rs#281).
 #
 # The hold keeps opentelemetry_sdk below 0.32.1, which fixes GHSA-w9wp-h8wv-79jx
 # (CVE-2026-48504, unbounded allocation in W3C Baggage propagation). Not reachable
@@ -376,7 +376,7 @@ metrics-exporter-prometheus = { version = ">=0.18.3, <0.19", default-features = 
 # Frees the histogram blocks the Prometheus upkeep drains (see metrics::run_upkeep).
 crossbeam-epoch = { version = ">=0.9.21, <0.10", optional = true }
 metrics-util = { version = ">=0.20.4, <0.21", optional = true }
-metrics-exporter-opentelemetry = { version = ">=0.2.1, <0.3", optional = true }
+metrics-exporter-opentelemetry = { version = ">=0.2.1, <0.2.2", optional = true }
 sysinfo = { version = ">=0.39.6, <0.40", optional = true }
 
 # Async runtime (for metrics server, http-server, shutdown)

@@ -2938,11 +2938,13 @@ impl PollJob {
     /// with the job's result when none arrives.
     ///
     /// librdkafka keeps queueing error events while nothing polls, ahead of
-    /// the rebalance events and records that follow. So a transient first
-    /// error starts a drain that clears them, serving each rebalance on the
-    /// way, until a record arrives, a failure no retry clears, or
-    /// `drain_deadline` passes. A drain that ends with no record returns its
-    /// last transient error, and the caller backs off once for the lot.
+    /// the rebalance events and records that follow. So a transient or
+    /// missing-topic first error starts a drain that clears them, serving each
+    /// rebalance on the way, until a record arrives, a failure no retry
+    /// clears, or `drain_deadline` passes. A drain that ends with no record
+    /// returns its last error, and the caller backs off once for the lot.
+    /// One error per backoff falls behind a deleted topic's partitions, and
+    /// the rebalance that revokes them is never served.
     fn first_record(
         &self,
         drain_deadline: std::time::Instant,
@@ -2954,7 +2956,7 @@ impl PollJob {
             None => return ControlFlow::Break(Polled::Empty),
             Some(Ok(msg)) => return ControlFlow::Continue(msg),
             Some(Err(e)) => match self.classify_before_a_record(&e) {
-                classify::RecvFailure::Transient => e,
+                class if drains(class) => (e, class),
                 class => return ControlFlow::Break(Polled::Failed(e, class)),
             },
         };
@@ -2965,7 +2967,8 @@ impl PollJob {
             let remaining = drain_deadline.saturating_duration_since(std::time::Instant::now());
             // librdkafka waits in whole milliseconds, so a shorter wait would spin.
             if remaining < Duration::from_millis(1) || polls == ERROR_DRAIN_MAX_POLLS {
-                break ControlFlow::Break(Polled::Failed(last, classify::RecvFailure::Transient));
+                let (err, class) = last;
+                break ControlFlow::Break(Polled::Failed(err, class));
             }
             polls += 1;
             // Not a zero-timeout poll: that returns None for a stats event it
@@ -2976,9 +2979,9 @@ impl PollJob {
                 Some(Ok(msg)) => break ControlFlow::Continue(msg),
                 Some(Err(e)) => match self.classify_before_a_record(&e) {
                     classify::RecvFailure::EndOfPartition => {}
-                    classify::RecvFailure::Transient => {
+                    class if drains(class) => {
                         errors = errors.saturating_add(1);
-                        last = e;
+                        last = (e, class);
                     }
                     class => break ControlFlow::Break(Polled::Failed(e, class)),
                 },
@@ -3000,6 +3003,15 @@ impl PollJob {
             },
         )
     }
+}
+
+/// Whether a poll error met before a record keeps [`PollJob::first_record`]
+/// draining the queue.
+fn drains(class: classify::RecvFailure) -> bool {
+    matches!(
+        class,
+        classify::RecvFailure::Transient | classify::RecvFailure::MissingTopic
+    )
 }
 
 // --- Inbound gate actuator (governor feature) -------------------------------
