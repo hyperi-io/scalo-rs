@@ -590,6 +590,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "install_env": {
+          "description": "Environment set for the `apt-get install` of this repo's packages only.\n\nEmitted as a prefix on that one command, never as an image `ENV`, so the\nvalue does not reach the running container. For a package whose\npreinst refuses to run until a licence is accepted, e.g.\n`ACCEPT_EULA=Y`. Values are single-quoted in the Dockerfile.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       },
       "required": [

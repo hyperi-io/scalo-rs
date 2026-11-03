@@ -88,6 +88,7 @@ fn parity_contract() -> DeploymentContract {
         codename: "trixie".into(),
         key_fingerprint: "0123456789ABCDEF0123456789ABCDEF01234567".into(),
         packages: vec!["vendor-runtime".into()],
+        install_env: Default::default(),
     });
     native_deps.unresolved_base_image = Some("registry.example.com/base@sha256:0123".into());
     native_deps.contradicted_base_image = Some("debian:bookworm-slim".into());

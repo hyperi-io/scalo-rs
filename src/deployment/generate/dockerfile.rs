@@ -317,6 +317,11 @@ const DEV_TOOLS: &[&str] = &[
     "jq",
 ];
 
+/// Single-quote a value for `sh`, escaping embedded single quotes.
+fn shell_quote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "'\\''"))
+}
+
 /// Build the apt-get RUN block from native deps contract and image profile.
 ///
 /// When custom APT repos are needed (e.g., Confluent for librdkafka), emits
@@ -361,7 +366,7 @@ fn build_apt_block(
 
     // Collect all runtime packages (repo-specific + default)
     let mut runtime_pkgs: Vec<&str> = Vec::new();
-    for repo in &deps.apt_repos {
+    for repo in deps.apt_repos.iter().filter(|r| r.install_env.is_empty()) {
         for pkg in &repo.packages {
             runtime_pkgs.push(pkg);
         }
@@ -446,8 +451,27 @@ fn build_apt_block(
     }
 
     // Second apt-get update + install runtime packages
-    out.push_str("    && apt-get update && apt-get install -y --no-install-recommends \\\n");
-    out.push_str(&format!("       {} \\\n", runtime_pkgs.join(" ")));
+    out.push_str("    && apt-get update");
+    if runtime_pkgs.is_empty() {
+        out.push_str(" \\\n");
+    } else {
+        out.push_str(" && apt-get install -y --no-install-recommends \\\n");
+        out.push_str(&format!("       {} \\\n", runtime_pkgs.join(" ")));
+    }
+    // A repo that declares install-time environment gets its own install, so
+    // the variables apply to its packages and no others.
+    for repo in deps.apt_repos.iter().filter(|r| !r.install_env.is_empty()) {
+        let env = repo
+            .install_env
+            .iter()
+            .map(|(k, v)| format!("{k}={}", shell_quote(v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!(
+            "    && {env} apt-get install -y --no-install-recommends \\\n       {} \\\n",
+            repo.packages.join(" ")
+        ));
+    }
     if !is_dev && !fetch_tools.is_empty() {
         out.push_str(&format!(
             "    && apt-get purge -y --auto-remove {} \\\n",
