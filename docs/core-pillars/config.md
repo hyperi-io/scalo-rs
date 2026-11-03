@@ -45,7 +45,9 @@ Every YAML file the cascade reads, every file `load_typed` reads, and every tabl
 | YAML | Reads as |
 | --- | --- |
 | `yes`, `no`, `on`, `off` | Text. Only `true` and `false` are booleans |
+| An empty, comment-only or `~` file | `None` for an `Option`, else what the type reads from `{}`: a `#[serde(default)]` struct takes its defaults |
 | `key:` or `key: ~` into a `String` field | An error at that line. `Option<String>` reads it as `None` and `SensitiveString` as empty. `#[serde(deserialize_with = "scalo::yaml::de::null_as_empty")]` opts a `String` field in |
+| `key:` or `key: ~` into a list, map or struct field | An error at that line. Write `[]` or `{}`, or make the field an `Option` |
 | A key repeated in one mapping | An error |
 | `<<: *anchor` | Merged into the mapping |
 | `.inf`, `.nan` in the cascade or an untyped value | An error. A typed `f64` field reads them |

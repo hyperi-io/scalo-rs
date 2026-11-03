@@ -162,15 +162,39 @@ fn empty_and_comment_only_documents_read_as_default() {
     struct Defaults {
         n: u8,
     }
-    assert_eq!(config::<Defaults>("").unwrap(), Defaults::default());
-    assert_eq!(
-        config::<Defaults>("# nothing\n").unwrap(),
-        Defaults::default()
-    );
+    for text in ["", "# nothing\n", "~\n"] {
+        assert_eq!(config::<Defaults>(text).unwrap(), Defaults::default());
+        let loaded = from_str_reporting::<Defaults>(text, "t", Profile::Config).unwrap();
+        assert_eq!(loaded.value, Defaults::default());
+        assert!(config::<BTreeMap<String, String>>(text).unwrap().is_empty());
+    }
     assert_eq!(
         config::<Option<BTreeMap<String, String>>>("").unwrap(),
         None
     );
+    assert!(
+        config::<Text>("").is_err(),
+        "a required field stays required"
+    );
+}
+
+/// A null into a list, map or struct field is a located error, not an empty one.
+#[test]
+fn null_into_a_collection_is_a_located_error() {
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(default)]
+    #[allow(dead_code)]
+    struct Collections {
+        a: u8,
+        list: Vec<u8>,
+        map: BTreeMap<String, u8>,
+        maybe: Option<Vec<u8>>,
+    }
+    for text in ["a: 1\nlist:\n", "a: 1\nmap: ~\n"] {
+        let err = config::<Collections>(text).unwrap_err();
+        assert_eq!(err.line, Some(2), "{text:?}: {err}");
+    }
+    assert!(config::<Collections>("maybe:\n").unwrap().maybe.is_none());
 }
 
 #[test]

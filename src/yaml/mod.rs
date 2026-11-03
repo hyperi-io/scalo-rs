@@ -17,7 +17,9 @@
 //! | Input | Result |
 //! | --- | --- |
 //! | `yes`, `no`, `on`, `off` | Text. Only `true` and `false` are booleans |
+//! | An empty, comment-only or `~` document | `None` for an `Option`, else what `T` reads from `{}`: a `#[serde(default)]` struct takes its defaults |
 //! | `key:` or `key: ~` into a `String` field | An error at that line. `Option<String>` and [`SensitiveString`](crate::SensitiveString) read it as empty. [`de::null_as_empty`] opts a `String` field in |
+//! | `key:` or `key: ~` into a list, map or struct field | An error at that line. Write `[]` or `{}`, or make the field an `Option` |
 //! | A key repeated in one mapping | An error |
 //! | `<<: *anchor` merge keys | Merged into the mapping |
 //! | `.inf`, `.nan` where any type is accepted | An error. A typed `f64` field still reads them |
@@ -59,7 +61,8 @@ mod lint;
 use std::path::Path;
 
 use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::de::value::{Error as ValueError, MapDeserializer};
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy, NonFiniteFloatPolicy};
 
 pub use error::YamlError;
@@ -160,8 +163,22 @@ pub fn from_str<T: DeserializeOwned>(
     profile: Profile,
 ) -> Result<T, YamlError> {
     check_size(text.len(), origin, profile)?;
-    serde_saphyr::from_str_with_options(text, options(profile))
-        .map_err(|e| YamlError::parse(origin, e))
+    serde_saphyr::from_str_with_options(text, options(profile)).or_else(|e| {
+        null_document_as_empty(text, profile).ok_or_else(|| YamlError::parse(origin, e))
+    })
+}
+
+/// `T` read from `{}` when the whole document is null, which serde-saphyr
+/// refuses for a struct or map. `None` keeps the parse error.
+fn null_document_as_empty<T: DeserializeOwned>(text: &str, profile: Profile) -> Option<T> {
+    let root: Option<IgnoredAny> =
+        serde_saphyr::from_str_with_options(text, options(profile)).ok()?;
+    if root.is_some() {
+        return None;
+    }
+    let empty: MapDeserializer<_, ValueError> =
+        MapDeserializer::new(std::iter::empty::<(&str, &str)>());
+    T::deserialize(empty).ok()
 }
 
 /// Read the file at `path` and parse it into `T`. The path names the file in
@@ -197,7 +214,9 @@ pub fn from_str_reporting<T: DeserializeOwned>(
         serde_saphyr::with_deserializer_from_str_with_options(text, options(profile), |de| {
             serde_ignored::deserialize(de, |path| unknown_keys.push(path.to_string()))
         })
-        .map_err(|e| YamlError::parse(origin, e))?;
+        .or_else(|e| {
+            null_document_as_empty(text, profile).ok_or_else(|| YamlError::parse(origin, e))
+        })?;
     Ok(Loaded {
         value,
         unknown_keys,
