@@ -49,6 +49,7 @@ mod tests {
             codename: String::new(),
             key_fingerprint: VENDOR_FINGERPRINT.into(),
             packages: vec!["vendor-runtime".into()],
+            install_env: Default::default(),
         });
         deps
     }
@@ -801,6 +802,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `install_env` reaches the install of its own repo's packages only: not
+    /// the base install, not another repo's, and never an image `ENV`. Without
+    /// it the repo's packages share the single runtime install, as before.
+    #[test]
+    fn install_env_scopes_to_its_repos_packages() {
+        let install = "    && apt-get update && apt-get install -y --no-install-recommends \\\n       \
+                       vendor-runtime libgit2-1.9 \\\n";
+        let mut plain = test_contract();
+        plain.native_deps = deps_with_repo("debian:trixie-slim");
+        let text = generate_dockerfile(&plain, None).unwrap();
+        assert!(text.contains(install), "{text}");
+        assert!(!text.contains("ACCEPT_EULA"), "{text}");
+
+        let mut gated = plain.clone();
+        gated.native_deps.apt_repos[0]
+            .install_env
+            .insert("ACCEPT_EULA".into(), "Y".into());
+        gated.native_deps.apt_repos[0]
+            .install_env
+            .insert("NOTE".into(), "it's".into());
+        let text = generate_dockerfile(&gated, None).unwrap();
+        let expected = "    && apt-get update && apt-get install -y --no-install-recommends \\\n       \
+                        libgit2-1.9 \\\n    \
+                        && ACCEPT_EULA='Y' NOTE='it'\\''s' apt-get install -y --no-install-recommends \\\n       \
+                        vendor-runtime \\\n";
+        assert!(text.contains(expected), "{text}");
+        assert!(
+            !text.lines().any(|l| l.starts_with("ENV ACCEPT_EULA")),
+            "{text}"
+        );
     }
 
     /// A production image keeps its repo's packages and drops every tool it

@@ -340,6 +340,7 @@ fn tier_a_dockerfile_with_native_deps_builds() {
             codename: "bookworm".into(),
             key_fingerprint: "CBBB821E8FAF364F79835C438B1DA6120C2BF624".into(),
             packages: vec!["librdkafka1".into()],
+            install_env: Default::default(),
         });
     // A failure here means a generated package name does not resolve on this
     // release -- the assertion inside `build` prints the apt output.
