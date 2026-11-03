@@ -2361,3 +2361,150 @@ mod commit_after_close {
         );
     }
 }
+
+/// A topic deleted while subscribed beside an idle one: the consumer drops it
+/// at the next discovery refresh and goes on to consume the topics discovered
+/// after it.
+#[cfg(feature = "testcontainers")]
+mod deleted_topic {
+    use std::time::{Duration, Instant};
+
+    use rdkafka::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+    use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaToken, KafkaTransport};
+    use scalo::transport::{AcknowledgementsConfig, TransportBase, TransportReceiver};
+
+    use super::broker::{create_topic_with_partitions, produce, start_kafka};
+
+    const IDLE: &str = "deleted-stall-idle";
+    const GONE: &str = "deleted-stall-gone";
+    const NEXT: &str = "deleted-stall-next";
+    const GROUP: &str = "deleted-stall-group";
+
+    /// Each partition of a deleted topic queues its own errors.
+    const PARTITIONS: i32 = 3;
+
+    /// The default refresh.
+    const REFRESH: Duration = Duration::from_secs(60);
+
+    /// Longer than a refresh, so the delete and the new topic land in
+    /// different refreshes.
+    const QUIET: Duration = Duration::from_secs(75);
+
+    /// Refresh, rebalance and first fetch, on a cold single-node broker.
+    const CONSUMED_WITHIN: Duration = Duration::from_secs(150);
+
+    const RECORDS: usize = 3;
+
+    /// Receive until `want` records of `topic` arrive or `within` passes.
+    async fn read(
+        transport: &KafkaTransport,
+        topic: &str,
+        want: usize,
+        within: Duration,
+    ) -> Vec<KafkaToken> {
+        let deadline = Instant::now() + within;
+        let mut tokens = Vec::new();
+        while tokens.len() < want && Instant::now() < deadline {
+            // A partition of the deleted topic fails one receive; a caller polls on.
+            let Ok(batch) = transport.recv(100).await else {
+                continue;
+            };
+            tokens.extend(
+                batch
+                    .commit_tokens
+                    .into_iter()
+                    .filter(|t| &*t.topic == topic),
+            );
+        }
+        tokens
+    }
+
+    /// The records `group` has committed past, summed over `topic`'s partitions.
+    async fn committed_total(bootstrap: &str, group: &str, topic: &str) -> i64 {
+        let (bootstrap, group, topic) =
+            (bootstrap.to_string(), group.to_string(), topic.to_string());
+        tokio::task::spawn_blocking(move || {
+            let client: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", &bootstrap)
+                .set("group.id", &group)
+                .set("enable.auto.commit", "false")
+                .create()
+                .expect("offset client");
+            let mut partitions = TopicPartitionList::new();
+            for partition in 0..PARTITIONS {
+                partitions.add_partition(&topic, partition);
+            }
+            let found = client
+                .committed_offsets(partitions, Duration::from_secs(10))
+                .expect("committed offsets");
+            found
+                .elements()
+                .iter()
+                .map(|p| match p.offset() {
+                    Offset::Offset(next) => next,
+                    _ => 0,
+                })
+                .sum()
+        })
+        .await
+        .expect("offset task")
+    }
+
+    #[tokio::test]
+    async fn a_topic_found_after_a_subscribed_one_is_deleted_is_consumed() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        create_topic_with_partitions(&bootstrap, IDLE, PARTITIONS).await;
+        create_topic_with_partitions(&bootstrap, GONE, PARTITIONS).await;
+        produce(&bootstrap, GONE, 0..RECORDS).await;
+
+        let config = KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: GROUP.to_string(),
+            auto_discover: true,
+            topic_include: vec!["^deleted-stall-".to_string()],
+            topic_refresh_secs: REFRESH.as_secs(),
+            ..Default::default()
+        };
+        let transport = KafkaTransport::receiver(&config)
+            .await
+            .expect("kafka consumer")
+            .with_acknowledgements(AcknowledgementsConfig::default());
+        let first = read(&transport, GONE, RECORDS, CONSUMED_WITHIN).await;
+        assert_eq!(first.len(), RECORDS, "the first topic is read");
+
+        let admin = KafkaAdmin::new(&KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: String::new(),
+            ..Default::default()
+        })
+        .expect("kafka admin");
+        admin.delete_topics(&[GONE]).await.expect("delete topic");
+        // The topic has gone, so this commit can fail; the consumer goes on.
+        let _ = transport.commit(&first).await;
+        let _ = read(&transport, GONE, usize::MAX, QUIET).await;
+
+        create_topic_with_partitions(&bootstrap, NEXT, PARTITIONS).await;
+        produce(&bootstrap, NEXT, 0..RECORDS).await;
+        let started = Instant::now();
+        let next = read(&transport, NEXT, RECORDS, CONSUMED_WITHIN).await;
+        assert_eq!(
+            next.len(),
+            RECORDS,
+            "read {} of {RECORDS} records of a topic created after a subscribed one was \
+             deleted, in {:?}",
+            next.len(),
+            started.elapsed()
+        );
+        transport.commit(&next).await.expect("commit the new topic");
+        assert_eq!(
+            committed_total(&bootstrap, GROUP, NEXT).await,
+            RECORDS as i64,
+            "the new topic's offsets are committed"
+        );
+        transport.close().await.expect("close");
+    }
+}

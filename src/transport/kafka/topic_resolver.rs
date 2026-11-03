@@ -243,8 +243,7 @@ impl TopicRefreshHandle {
     /// or `None` if there are no changes.
     pub fn check_changed(&mut self) -> Option<Vec<String>> {
         if self.rx.has_changed().unwrap_or(false) {
-            self.rx.mark_changed();
-            let current = self.rx.borrow().clone();
+            let current = self.rx.borrow_and_update().clone();
             if current == self.last_seen {
                 return None;
             }
