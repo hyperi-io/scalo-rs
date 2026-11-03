@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.26](https://github.com/hyperi-io/scalo-rs/compare/v2.14.25...v2.14.26) (2026-11-03)
+
+### Bug Fixes
+
+* **kafka:** consume past a deleted topic's errors ([#437](https://github.com/hyperi-io/scalo-rs/issues/437)) ([be1c14f](https://github.com/hyperi-io/scalo-rs/commit/be1c14f36a8ba787a92173a921e2c65887935fb5))
+
 ## [2.14.25](https://github.com/hyperi-io/scalo-rs/compare/v2.14.24...v2.14.25) (2026-11-01)
 
 ### Bug Fixes
