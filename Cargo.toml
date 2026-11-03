@@ -322,8 +322,9 @@ figment = { version = ">=0.10.19, <0.11", features = ["toml", "json", "env"], op
 dotenvy = { version = ">=0.15.7, <0.16", optional = true }
 
 # YAML (`yaml` feature). serde-saphyr is pure safe Rust over granit-parser,
-# MIT OR Apache-2.0. 2.0.0 released 2026-10-13 (crates.io API checked 2026-10-14).
-serde-saphyr = { version = ">=2.0.0, <3", optional = true }
+# MIT OR Apache-2.0. 2.1.0 released 2026-11-03 (crates.io API checked 2026-11-04). 2.1
+# refuses a null list, map or struct, a rule the `scalo::yaml` docs state.
+serde-saphyr = { version = ">=2.1.0, <3", optional = true }
 # Reports the keys a typed parse skipped. MIT OR Apache-2.0. 0.1.14 released
 # 2025-09-14, repository pushed 2026-06-24.
 serde_ignored = { version = ">=0.1.14, <0.2", optional = true }

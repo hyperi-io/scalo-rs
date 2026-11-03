@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### A null list, map or struct in YAML is an error (BEHAVIOUR CHANGE)
+
+The `serde-saphyr` floor is 2.1.0, which refuses YAML null for a list, map or struct. `items:`, `items: ~` and `items: null` into a `Vec`, map or struct field are now an error at that line, where they read as empty. An `Option` field still reads them as `None`. A whole document that is empty, comment-only or `~` still reads as `T` from `{}`, so `load_typed` on an empty file returns the struct's defaults.
+
+**Consumer adjustment** -- write `[]` or `{}` for an empty collection in config files, fixtures and generators, or make the field an `Option`.
+
 ### Kafka TLS with no CA trusts `SSL_CERT_FILE` before probing (BEHAVIOUR CHANGE)
 
 With TLS on and no CA set by `ssl_ca_location`, `ssl.ca.location` or `ssl.ca.pem`, every Kafka client sets `ssl.ca.location` to `SSL_CERT_FILE`, else `SSL_CERT_DIR`, else `probe`. 2.14.24 set `probe` alone, and librdkafka's probe ignores both variables, so a client trusting a private CA through `SSL_CERT_FILE` failed its TLS handshake.
