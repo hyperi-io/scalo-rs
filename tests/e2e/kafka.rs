@@ -2502,7 +2502,7 @@ mod deleted_topic {
         transport.commit(&next).await.expect("commit the new topic");
         assert_eq!(
             committed_total(&bootstrap, GROUP, NEXT).await,
-            RECORDS as i64,
+            i64::try_from(RECORDS).expect("RECORDS fits i64"),
             "the new topic's offsets are committed"
         );
         transport.close().await.expect("close");
