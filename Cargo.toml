@@ -544,7 +544,7 @@ vaultrs = { version = ">=0.8, <0.9", optional = true }
 aws-config = { version = ">=1.13.0, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
 # Floor is 1.117, the first release to require aws-smithy-json 0.63.1: 0.63.0 does
 # not compile against the aws-smithy-types 1.7 Document::Object reshape (E0308).
-aws-sdk-secretsmanager = { version = ">=1.123.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-secretsmanager = { version = ">=1.125.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
 # Kafka transport: one optional `rdkafka` per target, both behind `transport-kafka`.
 # `dynamic-linking` and `cmake-build` must never both reach rdkafka-sys, so neither
