@@ -96,9 +96,10 @@ fn test_resolve_max_threads_auto_detect() {
 
 #[test]
 fn test_process_batch_executes_on_multiple_threads() {
+    // max_threads is capped at the host's CPU count, so min stays at 2.
     let config = WorkerPoolConfig {
-        min_threads: 4,
-        max_threads: 4,
+        min_threads: 2,
+        max_threads: 2,
         ..Default::default()
     };
     let pool = AdaptiveWorkerPool::new(config);
@@ -403,7 +404,7 @@ async fn test_graceful_shutdown_drains_work() {
 
 #[test]
 fn test_map_owned_throttles_to_target_not_rayon_size() {
-    // Pool with 4 rayon threads but target=1 (min_threads=1). map_owned must
+    // Pool with up to 4 rayon threads but target=1 (min_threads=1). map_owned must
     // cap concurrent execution at the target (1), proving the parsed path is
     // throttled by the scaler -- not by the rayon pool size. Without the
     // semaphore (the old install() path) peak concurrency would reach 4.
@@ -442,17 +443,18 @@ fn test_map_owned_throttles_to_target_not_rayon_size() {
 #[test]
 fn test_thread_accounting_target_leased_available() {
     let config = WorkerPoolConfig {
-        min_threads: 3,
-        max_threads: 8,
+        min_threads: 1,
+        max_threads: 2,
         ..Default::default()
     };
     let pool = AdaptiveWorkerPool::new(config);
     // Idle pool: zero in-flight, regardless of the scaler target.
     assert_eq!(pool.active_threads(), 0, "idle pool reports zero active");
     // Target starts at min_threads; headroom equals the target when idle.
-    assert_eq!(pool.target_threads(), 3, "initial target is min_threads");
-    assert_eq!(pool.available_threads(), 3, "idle headroom equals target");
-    assert_eq!(pool.max_threads(), 8);
+    assert_eq!(pool.target_threads(), 1, "initial target is min_threads");
+    assert_eq!(pool.available_threads(), 1, "idle headroom equals target");
+    // max_threads is capped at the host's CPU count.
+    assert!((1..=2).contains(&pool.max_threads()));
 }
 
 // =============================================================================
@@ -509,9 +511,10 @@ fn test_process_batch_single_item() {
 
 #[test]
 fn test_process_batch_large_batch_stress() {
-    // 10,000 items should process without issues
+    // 10,000 items should process without issues.
+    // max_threads is capped at the host's CPU count, so min stays at 2.
     let config = WorkerPoolConfig {
-        min_threads: 4,
+        min_threads: 2,
         max_threads: 4,
         ..Default::default()
     };

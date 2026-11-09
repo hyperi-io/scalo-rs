@@ -166,7 +166,7 @@ Some features pull in `*-sys` crates that link C libraries. A release build link
 
 | Feature | `-sys` crate | Build package | Runtime package |
 | --------- | -------------- | --------------- | ----------------- |
-| `transport-kafka` | `rdkafka-sys` | release: hyperi-ci's static librdkafka and OpenSSL prefix. dev: `librdkafka-dev` (>= 2.12.1) | -- (statically linked) |
+| `transport-kafka` | `rdkafka-sys` | release: hyperi-ci's static librdkafka and OpenSSL prefix. dev: `librdkafka-dev` (>= 2.12.1). macOS: `cmake` (bundled source) | -- (statically linked) |
 | `transport-kafka-config` | -- | -- | -- |
 | `directory-config-git` | `libgit2-sys`, `libz-sys` | `libgit2-dev`, `zlib1g-dev` | `libgit2-1.9` (release-specific) |
 | `spool` / `tiered-sink` | `zstd-sys` | -- (bundled source) | -- (statically linked) |

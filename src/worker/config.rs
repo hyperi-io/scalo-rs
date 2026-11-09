@@ -95,6 +95,16 @@ impl Default for WorkerPoolConfig {
 }
 
 impl WorkerPoolConfig {
+    /// The defaults with `min_threads` clamped to this host's CPU count, so a
+    /// pool built without the cascade still starts on a 1-CPU host.
+    #[cfg(feature = "worker-batch")]
+    #[must_use]
+    pub(crate) fn host_default() -> Self {
+        let mut cfg = Self::default();
+        cfg.clamp_derived_min(detected_parallelism());
+        cfg
+    }
+
     /// Load config from the cascade under the given key (e.g. "worker_pool").
     ///
     /// Falls back to defaults if the config cascade is not initialised or the

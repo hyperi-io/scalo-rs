@@ -199,11 +199,12 @@ pub struct BatchEngine {
 impl BatchEngine {
     /// Create a standalone engine with its own worker pool.
     ///
-    /// Uses `WorkerPoolConfig::default()` for the pool. Prefer
-    /// [`with_pool`](Self::with_pool) when a `ServiceRuntime` pool exists.
+    /// Uses the default pool config, with `min_threads` clamped to the host's
+    /// CPU count. Prefer [`with_pool`](Self::with_pool) when a
+    /// `ServiceRuntime` pool exists.
     #[must_use]
     pub fn new(config: BatchProcessingConfig) -> Self {
-        let pool = Arc::new(AdaptiveWorkerPool::new(WorkerPoolConfig::default()));
+        let pool = Arc::new(AdaptiveWorkerPool::new(WorkerPoolConfig::host_default()));
         Self::with_pool(pool, config)
     }
 
