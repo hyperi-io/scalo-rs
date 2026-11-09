@@ -440,8 +440,8 @@ rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["
 # not by hand-written source — cargo-machete won't see it but it's required.
 # tls-aws-lc: client/server TLS on the aws-lc-rs backend (matches crate::tls's
 # explicit provider). tls-native-roots: ClientTlsConfig::with_native_roots().
-tonic = { version = ">=0.14.6, <0.15", features = ["gzip", "tls-aws-lc", "tls-native-roots"], optional = true }
-tonic-prost = { version = ">=0.14.6, <0.15", optional = true }
+tonic = { version = ">=0.14.9, <0.15", features = ["gzip", "tls-aws-lc", "tls-native-roots"], optional = true }
+tonic-prost = { version = ">=0.14.9, <0.15", optional = true }
 prost = { version = ">=0.14.4, <0.15", optional = true }
 prost-types = { version = ">=0.14.4, <0.15", optional = true }
 # TcpListenerStream — lets GrpcTransport::new bind the listener synchronously
@@ -552,7 +552,7 @@ aws-config = { version = ">=1.13.0, <2", default-features = false, features = ["
 aws-sdk-secretsmanager = { version = ">=1.123.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
 [build-dependencies]
-tonic-prost-build = { version = ">=0.14.6, <0.15", optional = true }
+tonic-prost-build = { version = ">=0.14.9, <0.15", optional = true }
 prost-build = { version = ">=0.14.4, <0.15", optional = true }
 
 [dev-dependencies]
