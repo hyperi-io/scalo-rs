@@ -59,4 +59,9 @@ jobs:
       from-head: ${{ inputs.from-head || '' }}
       bump: ${{ inputs.bump || 'auto' }}
       test-tier: ${{ inputs.test-tier || 'core' }}
+      optimize-tier: release
+      runner-mode: free
+      branch-build: "true"
+      build-timeout-minutes: 360
+      test-timeout-minutes: 360
     secrets: inherit
