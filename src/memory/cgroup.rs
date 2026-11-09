@@ -56,9 +56,11 @@ pub fn detect_memory_limit() -> u64 {
     }
 
     // Fallback to system memory
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let total = sys.total_memory();
+    // 0 on a platform sysinfo does not support, the value callers already read as unknown.
+    let total = sysinfo::System::new().map_or(0, |mut sys| {
+        sys.refresh_memory();
+        sys.total_memory()
+    });
     tracing::info!(
         limit_bytes = total,
         source = "system-memory",
