@@ -230,7 +230,7 @@ sinks:
   receiver:
     type: vector
     inputs: ["demo"]
-    address: "127.0.0.1:{port}"
+    address: "http://127.0.0.1:{port}"
     compression: none
     healthcheck:
       enabled: false
@@ -305,7 +305,7 @@ sinks:
   receiver:
     type: vector
     inputs: ["demo"]
-    address: "127.0.0.1:{port}"
+    address: "http://127.0.0.1:{port}"
     compression: none
     healthcheck:
       enabled: false
@@ -400,7 +400,7 @@ sinks:
   receiver:
     type: vector
     inputs: ["demo"]
-    address: "127.0.0.1:{port}"
+    address: "http://127.0.0.1:{port}"
     compression: none
     healthcheck:
       enabled: false
