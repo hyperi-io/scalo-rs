@@ -3,6 +3,17 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.27](https://github.com/hyperi-io/scalo-rs/compare/v2.14.26...v2.14.27) (2026-11-09)
+
+### Bug Fixes
+
+* **build:** fix macOS linking and 1-CPU panic, ignore RUSTSEC-2026-0440 ([f38de37](https://github.com/hyperi-io/scalo-rs/commit/f38de3702f8be302c6e311c943f0c8ac1bc62cb1)), closes [#440](https://github.com/hyperi-io/scalo-rs/issues/440)
+* **deps:** update dependency vectordotdev/vector to v0.61.0 ([#446](https://github.com/hyperi-io/scalo-rs/issues/446)) ([52a413a](https://github.com/hyperi-io/scalo-rs/commit/52a413a79066bc19f5e4bb72c7d3b81404f84360))
+* **deps:** update Rust crate aws-sdk-secretsmanager to >=1.125.0, <2 ([#447](https://github.com/hyperi-io/scalo-rs/issues/447)) ([a94eb17](https://github.com/hyperi-io/scalo-rs/commit/a94eb1764f737adab722c15c333c2fd3699bd6a7))
+* **deps:** update rust-dependencies ([#444](https://github.com/hyperi-io/scalo-rs/issues/444)) ([f55a14b](https://github.com/hyperi-io/scalo-rs/commit/f55a14bd9a41f2fdcdeeb015ae3bc2f0323d8619))
+* **deps:** update tonic-prost to >=0.14.9, <0.15 ([#445](https://github.com/hyperi-io/scalo-rs/issues/445)) ([f59ef15](https://github.com/hyperi-io/scalo-rs/commit/f59ef15943b04530b39349d0588f7216f552a442))
+* **yaml:** read an empty document as the type's defaults again ([#438](https://github.com/hyperi-io/scalo-rs/issues/438)) ([858f6b2](https://github.com/hyperi-io/scalo-rs/commit/858f6b2ef442aa66157904f91bd769bb61d1991f))
+
 ## [2.14.26](https://github.com/hyperi-io/scalo-rs/compare/v2.14.25...v2.14.26) (2026-11-03)
 
 ### Bug Fixes
