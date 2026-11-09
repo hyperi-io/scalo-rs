@@ -20,6 +20,8 @@ That OpenSSL is built with `--openssldir=/etc/ssl`, so it reads CA certificates 
 
 A local dev build with none of those set links the system `librdkafka-dev` dynamically.
 
+macOS has no prefix. There rdkafka-sys runs with `cmake-build` instead, building librdkafka (SSL, zstd, zlib), OpenSSL and zstd from source and linking them statically, so the build host needs `cmake` and the binary needs no Homebrew librdkafka. zlib is the system `libz`. The two features never meet on one target: `Cargo.toml` declares `rdkafka` once per target. That holds only under Cargo resolver 2 or later in the consuming workspace, which edition 2021 and 2024 packages get by default. A virtual workspace must set `resolver = "2"` or `"3"` itself, or resolver 1 merges the macOS features into the Linux build.
+
 librdkafka, OpenSSL, `rdkafka` and `rdkafka-sys` take each release with no 7-day cooldown: they are mature, very widely used libraries, and staying current outweighs the delay. The versions are still pinned with checksums.
 
 ---

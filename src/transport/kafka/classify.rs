@@ -25,9 +25,9 @@
 //! reads it back, rather than guessing from the timeout.
 //!
 //! The classification reads [`KafkaError::rdkafka_error_code`], never the
-//! rendered message. `Cargo.toml` pins `rdkafka` with `dynamic-linking`, so the
-//! error STRING comes from whichever system librdkafka the image ships and can
-//! change under a base-image bump; the error CODE is a stable protocol constant.
+//! rendered message. The error STRING comes from whichever librdkafka the build
+//! linked and can change with any librdkafka bump. The error CODE is a stable
+//! protocol constant.
 
 use rdkafka::error::KafkaError;
 use rdkafka::types::RDKafkaErrorCode;
