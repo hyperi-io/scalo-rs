@@ -62,6 +62,9 @@ build:
   - native
   rust:
     features: all
+    # The all-features test build peaks at 14.9 GiB with 3 jobs on a 15.6 GiB
+    # free runner, so plan 6 GiB a job: 2 jobs there.
+    memory_per_job_gib: 6
     targets: []
 release:
   enabled: true
