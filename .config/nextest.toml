@@ -27,6 +27,7 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # parallel.
 [test-groups]
 own-broker = { max-threads = 3 }
+docker-build = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '''
@@ -36,3 +37,10 @@ binary(kafka_consumer_outage)
 | (binary(e2e_tests) & test(/^e2e::kafka::broker_down_at_start::/))
 '''
 test-group = 'own-broker'
+
+# The operational tests build a docker image inside the test. On a 4-CPU
+# runner that takes over 5 minutes, and two at once compete for the CPUs.
+[[profile.default.overrides]]
+filter = 'binary(operational_cpu) | binary(operational_memory)'
+slow-timeout = { period = "120s", terminate-after = 10 }
+test-group = 'docker-build'
