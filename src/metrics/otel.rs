@@ -13,12 +13,68 @@
 //! (Prometheus) and `otel-metrics` features are enabled, a `Fanout` recorder
 //! sends each measurement to both backends.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 
 use super::MetricsError;
 use super::otel_types::{OtelMetricsConfig, OtelProtocol};
+
+/// Makes each metric export one steady OTel stream.
+///
+/// `metrics::gauge!` registers on every call, and the exporter answers each registration with a new instrument. It describes only the first registration of a name, and OTel treats a differing description as a separate instrument, so descriptions never reach it. It also starts each gauge handle at 0, so `increment` and `decrement` would record one step rather than the running value: one handle is kept per key.
+pub(crate) struct SteadyRecorder<R> {
+    counters: Mutex<HashMap<Key, Counter>>,
+    gauges: Mutex<HashMap<Key, Gauge>>,
+    histograms: Mutex<HashMap<Key, Histogram>>,
+    inner: R,
+}
+
+impl<R> SteadyRecorder<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self {
+            counters: Mutex::default(),
+            gauges: Mutex::default(),
+            histograms: Mutex::default(),
+            inner,
+        }
+    }
+}
+
+/// The handle `key` already has, registering one only on its first use.
+fn cached<H: Clone>(cache: &Mutex<HashMap<Key, H>>, key: &Key, register: impl FnOnce() -> H) -> H {
+    let mut handles = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    handles.entry(key.clone()).or_insert_with(register).clone()
+}
+
+impl<R: Recorder> Recorder for SteadyRecorder<R> {
+    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn register_counter(&self, key: &Key, metadata: &Metadata<'_>) -> Counter {
+        cached(&self.counters, key, || {
+            self.inner.register_counter(key, metadata)
+        })
+    }
+
+    fn register_gauge(&self, key: &Key, metadata: &Metadata<'_>) -> Gauge {
+        cached(&self.gauges, key, || {
+            self.inner.register_gauge(key, metadata)
+        })
+    }
+
+    fn register_histogram(&self, key: &Key, metadata: &Metadata<'_>) -> Histogram {
+        cached(&self.histograms, key, || {
+            self.inner.register_histogram(key, metadata)
+        })
+    }
+}
 
 /// Resolved OTLP configuration after applying env var overrides.
 struct ResolvedOtelConfig {
@@ -164,7 +220,7 @@ pub(crate) fn build_otel_recorder(
     config: &OtelMetricsConfig,
 ) -> Result<
     (
-        metrics_exporter_opentelemetry::Recorder,
+        SteadyRecorder<metrics_exporter_opentelemetry::Recorder>,
         opentelemetry_sdk::metrics::SdkMeterProvider,
     ),
     MetricsError,
@@ -203,12 +259,140 @@ pub(crate) fn build_otel_recorder(
         "OTLP metric push enabled"
     );
 
-    Ok((recorder, provider))
+    Ok((SteadyRecorder::new(recorder), provider))
 }
 
 #[cfg(test)]
 mod tests {
+    use metrics::{Level, Metadata};
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
+
     use super::*;
+
+    const GAUGE: &str = "a_gauge";
+    const COUNTER: &str = "a_counter";
+    const HISTOGRAM: &str = "a_histogram";
+
+    fn streams(data: &AggregatedMetrics) -> usize {
+        match data {
+            AggregatedMetrics::F64(MetricData::Gauge(gauge)) => gauge.data_points().count(),
+            AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                histogram.data_points().count()
+            }
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => sum.data_points().count(),
+            other => panic!("the exporter sent an unexpected shape: {other:?}"),
+        }
+    }
+
+    /// Describe each kind once, record through three registrations as `metrics::gauge!` does, and count the streams exported per name.
+    fn exported_streams(
+        wrap: impl FnOnce(metrics_exporter_opentelemetry::Recorder) -> Box<dyn Recorder>,
+    ) -> Vec<(String, usize)> {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let (provider, recorder) = metrics_exporter_opentelemetry::Recorder::builder("test")
+            .with_meter_provider(move |builder| builder.with_reader(reader))
+            .build();
+        let recorder = wrap(recorder);
+        let metadata = Metadata::new("test", Level::INFO, None);
+
+        recorder.describe_gauge(GAUGE.into(), None, "described".into());
+        recorder.describe_counter(COUNTER.into(), None, "described".into());
+        recorder.describe_histogram(HISTOGRAM.into(), None, "described".into());
+        for value in [1, 2, 3] {
+            recorder
+                .register_gauge(&Key::from_name(GAUGE), &metadata)
+                .set(f64::from(value));
+            recorder
+                .register_counter(&Key::from_name(COUNTER), &metadata)
+                .increment(1);
+            recorder
+                .register_histogram(&Key::from_name(HISTOGRAM), &metadata)
+                .record(f64::from(value));
+        }
+        provider
+            .force_flush()
+            .expect("the in-memory exporter takes the flush");
+
+        let finished = exporter.get_finished_metrics().expect("the flush exported");
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for resource in &finished {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    found.push((metric.name().to_string(), streams(metric.data())));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn each_metric_exports_one_stream_however_often_it_registers() {
+        let found = exported_streams(|recorder| Box::new(SteadyRecorder::new(recorder)));
+
+        assert_eq!(
+            found,
+            vec![
+                (COUNTER.to_string(), 1),
+                (GAUGE.to_string(), 1),
+                (HISTOGRAM.to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gauge_moved_up_and_down_reads_its_running_value() {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let (provider, bare) = metrics_exporter_opentelemetry::Recorder::builder("test")
+            .with_meter_provider(move |builder| builder.with_reader(reader))
+            .build();
+        let recorder = SteadyRecorder::new(bare);
+        let metadata = Metadata::new("test", Level::INFO, None);
+        let key = Key::from_name(GAUGE);
+
+        // A connection gauge: two opens and one close, each through its own registration
+        recorder.register_gauge(&key, &metadata).increment(1.0);
+        recorder.register_gauge(&key, &metadata).increment(1.0);
+        recorder.register_gauge(&key, &metadata).decrement(1.0);
+        provider
+            .force_flush()
+            .expect("the in-memory exporter takes the flush");
+
+        let finished = exporter.get_finished_metrics().expect("the flush exported");
+        let values: Vec<f64> = finished
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .filter_map(|metric| match metric.data() {
+                AggregatedMetrics::F64(MetricData::Gauge(gauge)) => Some(
+                    gauge
+                        .data_points()
+                        .map(|point| point.value())
+                        .collect::<Vec<f64>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(values, vec![1.0]);
+    }
+
+    /// When this fails the exporter no longer loses descriptions, and `SteadyRecorder` can stop dropping them.
+    #[test]
+    fn the_bare_exporter_splits_a_described_metric_into_two_instruments() {
+        let found = exported_streams(|recorder| Box::new(recorder));
+
+        for name in [COUNTER, GAUGE, HISTOGRAM] {
+            let count = found
+                .iter()
+                .filter(|(found_name, _)| found_name == name)
+                .count();
+            assert_eq!(count, 2, "{name} in {found:?}");
+        }
+    }
 
     // Deploy-env OTel: the deployment environment must be sourced from scalo's
     // env detection (APP_ENV) and configured resource_attributes must pass
