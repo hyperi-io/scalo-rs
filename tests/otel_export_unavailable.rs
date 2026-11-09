@@ -35,7 +35,7 @@ fn closed_port() -> u16 {
 fn resident_bytes() -> u64 {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
     let pid = sysinfo::get_current_pid().expect("current pid");
-    let mut sys = System::new();
+    let mut sys = System::new().expect("sysinfo supports the test host");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,

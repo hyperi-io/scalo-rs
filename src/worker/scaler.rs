@@ -117,14 +117,17 @@ impl ScalingDecision {
 /// algorithm, and adjusts the semaphore permits on the worker pool.
 pub(crate) struct ScalingController {
     pool: Arc<AdaptiveWorkerPool>,
-    system: System,
+    /// `None` on a platform sysinfo does not support, where the pool holds its size.
+    system: Option<System>,
 }
 
 impl ScalingController {
     pub fn new(pool: Arc<AdaptiveWorkerPool>) -> Self {
         Self {
             pool,
-            system: System::new(),
+            system: System::new()
+                .inspect_err(|e| tracing::warn!(error = %e, "worker pool scaling disabled"))
+                .ok(),
         }
     }
 
@@ -151,9 +154,12 @@ impl ScalingController {
     }
 
     fn tick(&mut self) {
+        let Some(system) = self.system.as_mut() else {
+            return;
+        };
         // Sample CPU
-        self.system.refresh_cpu_all();
-        let cpu_util = f64::from(self.system.global_cpu_usage()) / 100.0;
+        system.refresh_cpu_all();
+        let cpu_util = f64::from(system.global_cpu_usage()) / 100.0;
 
         // Memory signal, container-first. Priority:
         //   1. Attached MemoryGuard pressure (app-tracked bytes vs the cgroup
@@ -179,9 +185,9 @@ impl ScalingController {
         let cgroup_pressure: Option<f64> = None;
 
         let effective_memory_pressure = guard_pressure.or(cgroup_pressure).unwrap_or_else(|| {
-            self.system.refresh_memory();
-            if self.system.total_memory() > 0 {
-                self.system.used_memory() as f64 / self.system.total_memory() as f64
+            system.refresh_memory();
+            if system.total_memory() > 0 {
+                system.used_memory() as f64 / system.total_memory() as f64
             } else {
                 0.0
             }

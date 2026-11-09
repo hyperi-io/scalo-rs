@@ -20,7 +20,8 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 /// metrics get the same `{namespace}_` prefix as everything else.
 #[derive(Debug, Clone)]
 pub struct ProcessMetrics {
-    system: Arc<std::sync::Mutex<System>>,
+    /// `None` on a platform sysinfo does not support, where no process metric is set.
+    system: Arc<std::sync::Mutex<Option<System>>>,
     pid: sysinfo::Pid,
     start_time: f64,
 }
@@ -36,7 +37,9 @@ impl ProcessMetrics {
         let pid = sysinfo::Pid::from_u32(std::process::id());
         // Empty: loading every process would hold a /proc file open for each
         // one on the host. `update` refreshes this process alone.
-        let system = System::new();
+        let system = System::new()
+            .inspect_err(|e| tracing::warn!(error = %e, "process metrics unavailable"))
+            .ok();
 
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -79,7 +82,10 @@ impl ProcessMetrics {
         // Recover from a poisoned lock rather than panicking: a panic in a
         // prior update must not turn metrics collection into a repeat-panic.
         // Observability degrades, it does not crash.
-        let mut system = self.system.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.system.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(system) = guard.as_mut() else {
+            return;
+        };
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[self.pid]),
             true,
@@ -140,8 +146,11 @@ mod tests {
     fn only_this_process_is_loaded() {
         let pm = ProcessMetrics::new("test");
         pm.update();
-        let system = pm.system.lock().unwrap_or_else(|e| e.into_inner());
-        let pids: Vec<_> = system.processes().keys().copied().collect();
+        let guard = pm.system.lock().unwrap_or_else(|e| e.into_inner());
+        let pids: Vec<_> = guard
+            .iter()
+            .flat_map(|system| system.processes().keys().copied())
+            .collect();
         assert_eq!(pids, vec![pm.pid], "{pids:?}");
     }
 
@@ -151,9 +160,10 @@ mod tests {
         let pm = ProcessMetrics::new("test");
         pm.update();
         let first = {
-            let system = pm.system.lock().unwrap_or_else(|e| e.into_inner());
-            system
-                .process(pm.pid)
+            let guard = pm.system.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .as_ref()
+                .and_then(|system| system.process(pm.pid))
                 .map(sysinfo::Process::accumulated_cpu_time)
         };
         let mut spin = 0u64;
@@ -163,9 +173,10 @@ mod tests {
         std::hint::black_box(spin);
         pm.update();
         let second = {
-            let system = pm.system.lock().unwrap_or_else(|e| e.into_inner());
-            system
-                .process(pm.pid)
+            let guard = pm.system.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .as_ref()
+                .and_then(|system| system.process(pm.pid))
                 .map(sysinfo::Process::accumulated_cpu_time)
         };
         assert!(second >= first, "{first:?} then {second:?}");
