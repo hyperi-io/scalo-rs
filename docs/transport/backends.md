@@ -175,6 +175,8 @@ endpoint without recompile. Enable with `vector_compat: true` in the
 gRPC config -- the server then accepts both native and Vector RPCs on
 the same listener. Not a separate backend, not for any other app.
 
+From Vector 0.61 a `vector` sink address with no scheme means `https`, so a sink pointed at a plaintext listener needs an explicit `http://` address, or its TLS handshake fails and it retries without end.
+
 A `PushEvents` request is queued whole or not at all: every event is converted first, then room for all of them is reserved in the receive queue, waiting while it is full. A receiver closed under the request refuses it with `Unavailable` (`receiver closed`), which Vector retries, and none of its events were queued. A request with more events than `recv_buffer_size` cannot be reserved at once, so it is queued one event at a time; if the receiver closes part-way, the events already queued arrive again when Vector retries the request.
 
 A `PushEvents` goes through the same intake as a native push: refused with `Unavailable` while the pressure governor holds intake (`GrpcTransport::with_pressure`), and counted in `transport_received_events_total` and `transport_received_bytes_total` (the JSON queued for `recv`) once queued. A refusal because the receiver closed counts in `transport_refused_total`.
