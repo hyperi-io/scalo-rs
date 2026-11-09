@@ -378,7 +378,7 @@ metrics-exporter-prometheus = { version = ">=0.18.3, <0.19", default-features = 
 crossbeam-epoch = { version = ">=0.9.21, <0.10", optional = true }
 metrics-util = { version = ">=0.20.4, <0.21", optional = true }
 metrics-exporter-opentelemetry = { version = ">=0.2.1, <0.2.2", optional = true }
-sysinfo = { version = ">=0.39.6, <0.40", optional = true }
+sysinfo = { version = ">=0.40.1, <0.41", optional = true }
 
 # Async runtime (for metrics server, http-server, shutdown)
 tokio = { version = ">=1.54.1, <2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-std", "io-util"], optional = true }
@@ -594,7 +594,7 @@ axum = ">=0.8.9, <0.9"
 # Validates the emitted contract against the committed contract JSON Schema, the
 # check a chart assembler outside Rust runs. Local refs only, so no HTTP resolver.
 # MIT; 0.60.1 (2026-10-23) read from the crates.io API.
-jsonschema = { version = ">=0.60.1, <0.61", default-features = false }
+jsonschema = { version = ">=0.60.2, <0.61", default-features = false }
 
 [lints.rust]
 unsafe_code = "deny"
