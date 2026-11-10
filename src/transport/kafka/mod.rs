@@ -915,6 +915,20 @@ fn subscribe_consumer(
         .map_err(|e| TransportError::Connection(format!("Failed to subscribe: {e}")))
 }
 
+/// Move the consumer's subscription to `topics`. An empty list unsubscribes,
+/// because librdkafka refuses an empty subscription and would keep the old one.
+fn resubscribe_consumer(
+    consumer: &BaseConsumer<StatsContext>,
+    topics: &[String],
+) -> Result<(), KafkaError> {
+    if topics.is_empty() {
+        consumer.unsubscribe();
+        return Ok(());
+    }
+    let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
+    consumer.subscribe(&topics)
+}
+
 /// The consumer's fatal error, when librdkafka has set one.
 ///
 /// A fatal client can never poll again, so the transport never keeps one.
@@ -2349,8 +2363,7 @@ impl KafkaTransport {
         if let Some(ref refresh) = self.topic_refresh
             && let Some(new_topics) = refresh.lock().check_changed()
         {
-            let topics: Vec<&str> = new_topics.iter().map(String::as_str).collect();
-            match consumer.subscribe(&topics) {
+            match resubscribe_consumer(&consumer, &new_topics) {
                 Ok(()) => {
                     tracing::info!(?new_topics, "Re-subscribed after topic refresh");
                     *self.subscribed_topics.write() = new_topics;
@@ -4117,6 +4130,46 @@ mod tests {
             .map(|e| e.topic().to_string())
             .collect();
         assert_eq!(topics, vec!["events".to_string()]);
+    }
+
+    /// A refresh that lists none of the discovered topics leaves the consumer
+    /// subscribed to nothing, where librdkafka refuses an empty subscribe and
+    /// keeps the old one. Broker-free.
+    #[test]
+    fn an_empty_refresh_unsubscribes_the_consumer() {
+        let config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "scalo-emptied".to_string(),
+            ..Default::default()
+        };
+        let consumer = create_consumer(
+            &consumer_client_config(&config, ConsumerProtocol::Classic),
+            &Arc::default(),
+        )
+        .expect("a consumer builds broker-free");
+        let subscribed = |consumer: &BaseConsumer<StatsContext>| -> Vec<String> {
+            consumer
+                .subscription()
+                .expect("librdkafka reports the subscription")
+                .elements()
+                .iter()
+                .map(|e| e.topic().to_string())
+                .collect()
+        };
+        resubscribe_consumer(&consumer, &["events".to_string()]).expect("subscribe");
+        assert_eq!(subscribed(&consumer), vec!["events".to_string()]);
+
+        assert!(
+            consumer.subscribe(&[]).is_err(),
+            "librdkafka refuses an empty subscribe"
+        );
+        assert_eq!(subscribed(&consumer), vec!["events".to_string()]);
+
+        resubscribe_consumer(&consumer, &[]).expect("unsubscribe");
+        assert_eq!(subscribed(&consumer), Vec::<String>::new());
+
+        resubscribe_consumer(&consumer, &["next".to_string()]).expect("subscribe again");
+        assert_eq!(subscribed(&consumer), vec!["next".to_string()]);
     }
 
     /// One fatal rebuild keeps readiness; a second with no record between
