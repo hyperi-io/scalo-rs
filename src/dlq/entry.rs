@@ -58,7 +58,7 @@ pub struct DlqEntry {
     /// Where the message originated.
     pub source: Option<DlqSource>,
 
-    /// The original's common-header fields, read before `truncate_to` cut it.
+    /// The original's common-header fields as `truncate_to` budgeted them, which serialising prefers to the payload's own.
     header: Option<Header>,
 }
 
@@ -261,29 +261,39 @@ impl DlqEntry {
         self
     }
 
-    /// Keep the start of a payload longer than `max_bytes`, marking the entry
+    /// Hold the payload and its copied header values within `max_bytes`
+    /// together. A longer payload keeps its start and marks the entry
     /// `truncated` with the original length. A payload within it is kept
     /// whole.
     ///
-    /// The original's common-header fields are read first, so the entry still carries them. They share `max_bytes` with the kept payload: a value that would go over it is left out and named in `header_dropped`.
+    /// The original's common-header fields are read first, so the entry still carries them. A payload that fits keeps all its bytes, and the header takes what is left. A cut payload takes what the header leaves. A header value that does not fit is left out and named in `header_dropped`.
     #[must_use]
     pub fn truncate_to(mut self, max_bytes: usize) -> Self {
         let len = self.payload.len();
+        // Header values are part of the payload's text, so a payload at most half the cap fits with them.
+        if self.header.is_none() && len.saturating_mul(2) <= max_bytes {
+            return self;
+        }
+        if self.header.is_none() {
+            self.header = object_text(&self.payload).and_then(|text| Header::read(&text));
+        }
+        let budget = if len <= max_bytes {
+            max_bytes - len
+        } else {
+            max_bytes
+        };
+        let mut header_bytes = 0;
+        if let Some(header) = &mut self.header {
+            header.keep(|value| {
+                let value_bytes = value.get().len();
+                let fits = header_bytes + value_bytes <= budget;
+                if fits {
+                    header_bytes += value_bytes;
+                }
+                fits
+            });
+        }
         if len > max_bytes {
-            if self.header.is_none() {
-                self.header = object_text(&self.payload).and_then(|text| Header::read(&text));
-            }
-            let mut header_bytes = 0;
-            if let Some(header) = &mut self.header {
-                header.keep(|value| {
-                    let len = value.get().len();
-                    let fits = header_bytes + len <= max_bytes;
-                    if fits {
-                        header_bytes += len;
-                    }
-                    fits
-                });
-            }
             self.payload.truncate(max_bytes - header_bytes);
             self.payload.shrink_to_fit();
             self.truncated = true;
@@ -311,11 +321,12 @@ impl Serialize for DlqEntry {
         } else {
             file(&self.payload)
         };
-        let (header, json, raw_reason) = match &filed {
+        let (read, json, raw_reason) = match &filed {
             Filed::Json(header, json) => (Some(header), Some(json.as_ref()), None),
             Filed::TooDeep(header) => (Some(header), None, Some(RawReason::Depth)),
-            Filed::Raw => (self.header.as_ref(), None, None),
+            Filed::Raw => (None, None, None),
         };
+        let header = self.header.as_ref().or(read);
         let (raw, raw_encoding) = if json.is_some() {
             (None, None)
         } else {
@@ -652,28 +663,60 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_event_keeps_the_header_values_its_cap_holds() {
+    fn an_entry_keeps_the_header_values_its_cap_holds() {
         let small = br#"{"_org_id":"acme","_tags":{},"eventVersion":"1.11"}"#.to_vec();
         let big = format!(
             r#"{{"_org_id":"acme","_tags":{{"k":"{}"}},"eventVersion":"1.11"}}"#,
             "x".repeat(64)
         )
         .into_bytes();
-        // `"acme"` takes 6 bytes, `{}` 2 and the big `_tags` 72, out of the same cap as the kept payload.
-        // (case, event, cap, payload kept, header_dropped)
-        let cases: [(&str, &[u8], usize, usize, &[&str]); 4] = [
-            ("small header", &small, 16, 8, &[]),
-            ("oversized _tags", &big, 16, 10, &["_tags"]),
-            ("header fills the cap", &big, 78, 0, &[]),
-            ("cap under every value", &big, 4, 4, &["_org_id", "_tags"]),
+        // `small` is 51 bytes and `big` 121. `"acme"` takes 6 bytes, `{}` 2 and the big `_tags` 72, out of the same cap as the payload.
+        // (case, event, caps applied in turn, payload kept, header_dropped)
+        let cases: [(&str, &[u8], &[usize], usize, &[&str]); 8] = [
+            ("small header", &small, &[16], 8, &[]),
+            ("oversized _tags", &big, &[16], 10, &["_tags"]),
+            ("header fills the cap", &big, &[78], 0, &[]),
+            (
+                "cap under every value",
+                &big,
+                &[4],
+                4,
+                &["_org_id", "_tags"],
+            ),
+            ("object under half the cap", &small, &[200], 51, &[]),
+            (
+                "whole object with room for its header",
+                &big,
+                &[200],
+                121,
+                &[],
+            ),
+            (
+                "header-heavy object under the cap",
+                &big,
+                &[130],
+                121,
+                &["_tags"],
+            ),
+            ("smaller second cap", &big, &[90, 40], 12, &["_tags"]),
         ];
-        for (name, event, cap, kept, dropped) in cases {
-            let cut = DlqEntry::new("svc", "r", event.to_vec()).truncate_to(cap);
+        for (name, event, caps, kept, dropped) in cases {
+            let cut = caps
+                .iter()
+                .fold(DlqEntry::new("svc", "r", event.to_vec()), |entry, cap| {
+                    entry.truncate_to(*cap)
+                });
+            let cap = caps.iter().copied().min().expect("a cap");
 
             let json = serde_json::to_string(&cut).expect("serialise");
             let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-            assert_eq!(value["_raw_encoding"], "base64", "{name}");
-            assert!(value.get("_json").is_none(), "{name}");
+            if kept == event.len() {
+                assert!(value.get("_json").is_some(), "{name}: whole, under `_json`");
+                assert!(value.get("truncated").is_none(), "{name}");
+            } else {
+                assert_eq!(value["_raw_encoding"], "base64", "{name}");
+                assert!(value.get("_json").is_none(), "{name}");
+            }
             assert_eq!(
                 value.get("header_dropped"),
                 (!dropped.is_empty())

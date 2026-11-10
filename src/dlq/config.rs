@@ -87,10 +87,11 @@ pub struct DlqConfig {
     /// Default 100 ms.
     pub flush_interval_ms: u64,
 
-    /// Payload bytes an entry keeps: a longer payload is cut to this and the
-    /// entry marked `truncated` with its original length, so it lands where
-    /// the whole record could not. `None` keeps every payload whole. Default
-    /// [`DEFAULT_MAX_PAYLOAD_BYTES`].
+    /// Bytes an entry's payload and copied header values keep together: a
+    /// longer payload is cut and the entry marked `truncated` with its
+    /// original length, so it lands where the whole record could not, and a
+    /// header value that does not fit is left out. `None` keeps every
+    /// payload whole. Default [`DEFAULT_MAX_PAYLOAD_BYTES`].
     pub max_payload_bytes: Option<usize>,
 
     /// File backend configuration.
