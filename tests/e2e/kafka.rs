@@ -2362,9 +2362,9 @@ mod commit_after_close {
     }
 }
 
-/// A topic deleted while subscribed beside an idle one: the consumer drops it
-/// at the next discovery refresh and goes on to consume the topics discovered
-/// after it.
+/// A discovered topic deleted while subscribed: the consumer drops it at the
+/// next discovery refresh, alone or beside other topics, and goes on to
+/// consume the topics discovered after it.
 #[cfg(feature = "testcontainers")]
 mod deleted_topic {
     use std::time::{Duration, Instant};
@@ -2506,5 +2506,118 @@ mod deleted_topic {
             "the new topic's offsets are committed"
         );
         transport.close().await.expect("close");
+    }
+
+    /// A short refresh, so the test waits seconds rather than the 60 s default.
+    const FAST_REFRESH: Duration = Duration::from_secs(5);
+
+    /// Two refreshes: the one that lists the topic gone, and the slack of the
+    /// one in flight when it was deleted.
+    const DROPPED_WITHIN: Duration = Duration::from_secs(2 * FAST_REFRESH.as_secs());
+
+    /// The rebalance that revokes the dropped topic's partitions, on a shared broker.
+    const REVOKED_WITHIN: Duration = Duration::from_secs(10);
+
+    /// Delete `gone` under a consumer that discovered it, and assert the
+    /// subscription lets it go within two refreshes and the assignment one
+    /// rebalance later. `kept`, when given, is another discovered topic that stays.
+    async fn drops_a_deleted_topic(prefix: &str, gone: &'static str, kept: Option<&'static str>) {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        for topic in std::iter::once(gone).chain(kept) {
+            create_topic_with_partitions(&bootstrap, topic, PARTITIONS).await;
+            produce(&bootstrap, topic, 0..RECORDS).await;
+        }
+        let config = KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: format!("{prefix}group"),
+            auto_discover: true,
+            topic_include: vec![format!("^{prefix}")],
+            topic_refresh_secs: FAST_REFRESH.as_secs(),
+            ..Default::default()
+        };
+        let transport = KafkaTransport::receiver(&config)
+            .await
+            .expect("kafka consumer");
+        let first = read(&transport, gone, RECORDS, CONSUMED_WITHIN).await;
+        assert_eq!(first.len(), RECORDS, "the discovered topic is read");
+
+        let admin = KafkaAdmin::new(&KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: String::new(),
+            ..Default::default()
+        })
+        .expect("kafka admin");
+        admin.delete_topics(&[gone]).await.expect("delete topic");
+        let deleted = Instant::now();
+
+        let mut failed_receives = 0_u32;
+        loop {
+            let subscribed = format!("{transport:?}").contains(&format!("{gone:?}"));
+            let assigned: Vec<i32> = (0..PARTITIONS)
+                .filter(|&p| transport.lease(gone, p).is_some())
+                .collect();
+            if !subscribed && assigned.is_empty() {
+                break;
+            }
+            let limit = if subscribed {
+                DROPPED_WITHIN
+            } else {
+                DROPPED_WITHIN + REVOKED_WITHIN
+            };
+            assert!(
+                deleted.elapsed() < limit,
+                "{gone} was deleted {:?} ago and is still held: subscribed {subscribed}, \
+                 assigned partitions {assigned:?}, {failed_receives} failed receives, \
+                 transport {transport:?}",
+                deleted.elapsed()
+            );
+            if let Err(e) = transport.recv(100).await {
+                failed_receives += 1;
+                eprintln!("{:?} after the delete: recv failed: {e}", deleted.elapsed());
+            }
+        }
+        eprintln!(
+            "{gone} dropped {:?} after the delete, after {failed_receives} failed receives",
+            deleted.elapsed()
+        );
+
+        // Once dropped, the deleted topic fails no receive and readiness holds.
+        let settled = Instant::now();
+        while settled.elapsed() < FAST_REFRESH {
+            if let Err(e) = transport.recv(100).await {
+                panic!(
+                    "recv failed {:?} after {gone} was dropped: {e}",
+                    settled.elapsed()
+                );
+            }
+        }
+        assert!(
+            transport.is_healthy(),
+            "not ready {FAST_REFRESH:?} after {gone} was dropped: {transport:?}"
+        );
+        if let Some(kept) = kept {
+            assert!(
+                format!("{transport:?}").contains(&format!("{kept:?}")),
+                "the topic that was not deleted stays subscribed: {transport:?}"
+            );
+        }
+        transport.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn the_only_discovered_topic_is_dropped_once_deleted() {
+        drops_a_deleted_topic("vanish-alone-", "vanish-alone-gone", None).await;
+    }
+
+    #[tokio::test]
+    async fn a_deleted_topic_is_dropped_beside_one_that_stays() {
+        drops_a_deleted_topic(
+            "vanish-beside-",
+            "vanish-beside-gone",
+            Some("vanish-beside-kept"),
+        )
+        .await;
     }
 }
