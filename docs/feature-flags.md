@@ -102,7 +102,7 @@ production apps list only what you actually use.
 
 | Feature | Adds |
 | --------- | ------ |
-| `dlq` | File backend (always available) |
+| `dlq` | File backend (always available), and the `parse_guard` depth check (`wide`) that keeps a deep original out of `_json` |
 | `dlq-kafka` | Above + Kafka backend (pulls `transport-kafka`) |
 | `dlq-http` | Above + HTTP backend (pulls `reqwest`) |
 
@@ -120,7 +120,7 @@ production apps list only what you actually use.
 | Feature | Adds |
 | --------- | ------ |
 | `otel` | Umbrella -- SDK, OTLP exporter |
-| `otel-metrics` | Above + bridge `metrics` crate -> OTLP |
+| `otel-metrics` | Above + bridge `metrics` crate -> OTLP, with `dashmap` holding one handle per metric key |
 | `otel-tracing` | Above + bridge `tracing` crate -> OTLP (closes the W3C distributed-tracing chain when paired with `transport-trace`) |
 
 For full distributed tracing through Kafka/gRPC, enable
@@ -270,7 +270,7 @@ A handful of dependencies aren't visible from the feature name alone:
   `config-schema` does the same through schemars.
 - `worker-batch` pulls `worker-pool` and `metrics`. `BatchEngine` is
   metric-aware.
-- `parse_guard` -- `json_depth_within` and `MAX_PARSE_DEPTH`, the nesting-depth check to run before parsing untrusted JSON -- compiles with `transport`, `worker-batch` or `rules`, and each pulls `wide` for its SIMD byte compares. There is no feature for the guard alone.
+- `parse_guard` -- `json_depth_within` and `MAX_PARSE_DEPTH`, the nesting-depth check to run before parsing untrusted JSON -- compiles with `transport`, `worker-batch`, `rules` or `dlq`, and each pulls `wide` for its SIMD byte compares. There is no feature for the guard alone.
 - `rules` pulls `strmatch`, so its regex crates come along even when no row uses the `regex` test, and `expression`, so `cel` comes too.
 - `tiered-sink` pulls `tokio`, `tokio-util` (its shutdown token) and the spill cache's own crates (`yaque`, `zstd`), not the `spool` feature: `TieredSink` keeps its own cache, and the standalone `Spool` type needs `spool`.
 - `spool` pulls `tokio`: `Spool::open` opens the queue on tokio's blocking

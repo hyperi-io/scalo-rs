@@ -181,15 +181,18 @@ Each entry is one JSON object, a DFE event a loader can land in a DLQ table:
 }
 ```
 
-- A payload that is one whole JSON object goes under `_json` as itself, with raw newlines turned to spaces so a file line holds one entry. Its `_org_id`, `_source`, `_timestamp_received` and `_tags` are copied beside it.
-- Any other payload goes under `_raw`: valid UTF-8 as text, binary or truncated bytes as base64 with `"_raw_encoding": "base64"`. A truncated object keeps the header fields read before the cut.
-- `timestamp` is when the entry was made, in epoch milliseconds. `truncated`, `original_bytes`, `destination` and `source` appear only when set.
+- A payload that is one whole, valid JSON object, at most 63 levels deep, goes under `_json` trimmed, with the line breaks between its tokens turned to spaces so a file line holds one entry. Its `_org_id`, `_source`, `_timestamp_received` and `_tags` are copied beside it. The entry then nests at most 64 deep, which a loader parses.
+- Any other payload goes under `_raw`, byte for byte: valid UTF-8 as text, unless its JSON escapes would make it longer than base64, and binary or truncated bytes as base64 with `"_raw_encoding": "base64"`.
+- A deeper object keeps its header and adds `"_raw_reason": "depth"`. A truncated object keeps the header fields read before the cut. A header value nested past 63 levels, or one that would push a truncated entry past `max_payload_bytes`, is left out and named in `header_dropped`.
+- `timestamp` is when the entry was made, in epoch milliseconds. `truncated`, `original_bytes`, `header_dropped`, `destination` and `source` appear only when set.
 
 ---
 
 ## Payload cap
 
-A dead letter is often in the DLQ because it was too large, and a cut payload is written as base64, a third larger again, so a Kafka backend would refuse it the same way. So every send cuts a payload over `max_payload_bytes` (default 512 KiB, `DEFAULT_MAX_PAYLOAD_BYTES`) to that length, on every backend, and the entry carries `"truncated": true` and `"original_bytes"`, the length it had. Each cut counts in `dlq_payload_truncated_total`. 512 KiB base64'd is 699,052 bytes, under Kafka's and librdkafka's default `message.max.bytes`. Set `max_payload_bytes: null` to keep every payload whole, for a file DLQ that is replayed, say.
+A dead letter is often in the DLQ because it was too large, and a cut payload is written as base64, a third larger again, so a Kafka backend would refuse it the same way. So every send cuts a payload over `max_payload_bytes` (default 512 KiB, `DEFAULT_MAX_PAYLOAD_BYTES`) to that length, on every backend, and the entry carries `"truncated": true` and `"original_bytes"`, the length it had. Each cut counts in `dlq_payload_truncated_total`. Set `max_payload_bytes: null` to keep every payload whole, for a file DLQ that is replayed, say.
+
+512 KiB base64'd is 699,052 bytes, under Kafka's and librdkafka's default `message.max.bytes`, and `_raw` never takes more than the base64 of its payload. A truncated entry's copied header shares the cap with the kept payload. A whole object under `_json` is the exception: its header copies can add up to its own size again, so an object near the cap that is mostly header reaches about twice the cap, past the Kafka default. `refusal` names such an entry for a Kafka-only DLQ, and `Cascade` lands it in the next backend.
 
 ---
 

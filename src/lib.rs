@@ -103,12 +103,22 @@ pub mod kafka_config;
 pub mod sensitive;
 
 // Parse-path depth guard, shared by the transport codec (JSON/MsgPack), the
-// worker engine parse stage and any consumer that parses untrusted JSON itself.
-// Compiled whenever either scalo parse path is enabled.
-#[cfg(any(feature = "transport", feature = "worker-batch", feature = "rules"))]
+// worker engine parse stage, the DLQ entry and any consumer that parses
+// untrusted JSON itself.
+#[cfg(any(
+    feature = "transport",
+    feature = "worker-batch",
+    feature = "rules",
+    feature = "dlq"
+))]
 #[cfg_attr(
     docsrs,
-    doc(cfg(any(feature = "transport", feature = "worker-batch", feature = "rules")))
+    doc(cfg(any(
+        feature = "transport",
+        feature = "worker-batch",
+        feature = "rules",
+        feature = "dlq"
+    )))
 )]
 pub mod parse_guard;
 

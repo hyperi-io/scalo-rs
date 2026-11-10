@@ -243,6 +243,8 @@ endpoint configured the default follows the protocol: `http://localhost:4317`
 for `grpc`, `http://localhost:4318` for `http`, including when
 `OTEL_EXPORTER_OTLP_PROTOCOL` picks it.
 
+Each metric name exports as one OTel metric, with one stream per label set, however often a macro registers it. scalo keeps one handle per key and gives every instrument of a name the unit and description of its first `describe_*`, because OTel splits instruments that differ in either. A describe after the name's first use is ignored, so describe a metric before it records if it is to carry a unit. A gauge's increments, decrements and sets run one at a time, so the value it exports is its running value.
+
 The OTLP resource names the replica, so each pod of a service writes its own
 series. `service.instance.id` comes from the first of `OTEL_RESOURCE_ATTRIBUTES`,
 `POD_NAME`, `HOSTNAME` (the pod name in Kubernetes) and an id generated once per
