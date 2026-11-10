@@ -3,6 +3,14 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.29](https://github.com/hyperi-io/scalo-rs/compare/v2.14.28...v2.14.29) (2026-11-10)
+
+### Bug Fixes
+
+* **dlq:** use TLS for the test broker to pass the production check ([03e31a9](https://github.com/hyperi-io/scalo-rs/commit/03e31a966d005da4f06de1a4c471ad995c9a577f))
+* **kafka:** skip the Kafka ecosystem's internal topics in discovery ([a58ef61](https://github.com/hyperi-io/scalo-rs/commit/a58ef610a30e8ddfbd72f936354fc26180fb3778))
+* **kafka:** unsubscribe when discovery lists no topic ([8f84ad7](https://github.com/hyperi-io/scalo-rs/commit/8f84ad72e87f0e2d2fe5bf79d61c24a10b2f5905))
+
 ## [2.14.28](https://github.com/hyperi-io/scalo-rs/compare/v2.14.27...v2.14.28) (2026-11-10)
 
 ### Bug Fixes
