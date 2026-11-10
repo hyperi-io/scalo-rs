@@ -104,7 +104,7 @@ metrics = ["metrics-process", "metrics-exporter-prometheus", "dep:crossbeam-epoc
 # `metrics-process`, not `metrics`, because the other direction is a cargo
 # feature cycle. On its own it is the push-only build, no Prometheus exporter.
 otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing", "tracing-opentelemetry", "serde_json"]
-otel-metrics = ["otel", "metrics-process", "metrics-util", "metrics-exporter-opentelemetry", "opentelemetry_sdk/rt-tokio", "tokio"]
+otel-metrics = ["otel", "metrics-process", "metrics-util", "metrics-exporter-opentelemetry", "opentelemetry_sdk/rt-tokio", "tokio", "dashmap"]
 otel-tracing = ["otel", "opentelemetry_sdk/rt-tokio", "tokio", "tracing-subscriber"]
 
 # Standard pipeline metric groups (opt-in).
@@ -204,8 +204,9 @@ top = ["cli-service", "ratatui"]
 # Shared NDJSON file I/O (used by dlq + output-file)
 io = ["file-rotate", "parking_lot", "chrono", "tracing", "tokio"]
 
-# Dead letter queue (file backend always available)
-dlq = ["io", "concurrency", "base64", "serde_json", "serde_json/raw_value", "tokio", "tokio-util", "tracing"]
+# Dead letter queue (file backend always available). `wide` compiles parse_guard,
+# which caps the depth of an original filed under `_json`.
+dlq = ["io", "concurrency", "base64", "serde_json", "serde_json/raw_value", "tokio", "tokio-util", "tracing", "dep:wide"]
 dlq-kafka = ["dlq", "transport-kafka"]
 dlq-http = ["dlq", "reqwest"]
 

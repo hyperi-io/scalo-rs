@@ -90,7 +90,7 @@ pub struct Dlq {
         allow(dead_code, reason = "read by `refusal` only")
     )]
     ceiling: Option<usize>,
-    /// Payload bytes an entry keeps; see [`DlqConfig::max_payload_bytes`].
+    /// Bytes an entry's payload and copied header keep, see [`DlqConfig::max_payload_bytes`].
     max_payload_bytes: Option<usize>,
 }
 
@@ -418,27 +418,27 @@ impl Dlq {
         sink.write_confirmed(entries).await.map_err(map_sink_err)
     }
 
-    /// `entry` as this DLQ writes it: a payload over
-    /// [`DlqConfig::max_payload_bytes`] cut to it, the entry marked
-    /// `truncated`, and `dlq_payload_truncated_total` counted. Every send
-    /// applies it. Apply it before `refusal` (`transport` feature), which
-    /// judges the entry it is given.
+    /// `entry` as this DLQ writes it: its payload and copied header held
+    /// within [`DlqConfig::max_payload_bytes`] by
+    /// [`DlqEntry::truncate_to`], and `dlq_payload_truncated_total` counted
+    /// for a cut payload. Every send applies it. Apply it before `refusal`
+    /// (`transport` feature), which judges the entry it is given.
     #[must_use]
     pub fn cap(&self, entry: DlqEntry) -> DlqEntry {
-        match self.max_payload_bytes {
-            Some(max) if entry.payload.len() > max => {
-                #[cfg(feature = "metrics")]
-                ::metrics::counter!("dlq_payload_truncated_total").increment(1);
-                tracing::debug!(
-                    bytes = entry.payload.len(),
-                    max,
-                    reason = %entry.reason,
-                    "DLQ entry payload truncated"
-                );
-                entry.truncate_to(max)
-            }
-            _ => entry,
+        let Some(max) = self.max_payload_bytes else {
+            return entry;
+        };
+        if entry.payload.len() > max {
+            #[cfg(feature = "metrics")]
+            ::metrics::counter!("dlq_payload_truncated_total").increment(1);
+            tracing::debug!(
+                bytes = entry.payload.len(),
+                max,
+                reason = %entry.reason,
+                "DLQ entry payload truncated"
+            );
         }
+        entry.truncate_to(max)
     }
 
     /// Why no backend of this DLQ can ever hold `entry`, or `None` when one
@@ -1459,10 +1459,17 @@ mod tests {
         #[tokio::test]
         async fn an_entry_over_the_only_backends_ceiling_is_refused() {
             let mut kafka = unreachable_broker();
-            kafka.sizing.producer.message_max_bytes = Some(2_000_000);
+            // librdkafka's own default.
+            kafka.sizing.producer.message_max_bytes = Some(1_000_000);
             // Within the ceiling as bytes, over it once base64 grows the binary payload by a third.
-            let over = DlqEntry::new("svc", "err", vec![0xff; 1_600_000]);
+            let over = DlqEntry::new("svc", "err", vec![0xff; 800_000]);
             let under = DlqEntry::new("svc", "err", vec![b'x'; 100]);
+            // Under the default cap, over the ceiling once `_tags` is copied beside it.
+            let heavy = DlqEntry::new(
+                "svc",
+                "err",
+                format!(r#"{{"_org_id":"acme","_tags":"{}"}}"#, "x".repeat(520_000)).into_bytes(),
+            );
 
             let alone = Dlq::spawn(
                 &kafka_only(300),
@@ -1476,7 +1483,7 @@ mod tests {
                 matches!(
                     refused,
                     Some(crate::transport::DeadLetterReason::TooLarge { bytes, limit })
-                        if limit == 2_000_000 - 128 && bytes > limit
+                        if limit == 1_000_000 - 128 && bytes > limit
                 ),
                 "base64 grows the payload past the ceiling: {refused:?}"
             );
@@ -1499,6 +1506,19 @@ mod tests {
                 None,
                 "the default payload cap brings it under the ceiling"
             );
+            assert!(
+                alone.refusal(&heavy).is_some(),
+                "the copied header doubles it"
+            );
+            let capped = alone.cap(heavy);
+            assert_eq!(
+                alone.refusal(&capped),
+                None,
+                "the cap leaves the header copy out"
+            );
+            let written = serde_json::to_value(&capped).expect("json");
+            assert_eq!(written["header_dropped"], serde_json::json!(["_tags"]));
+            assert!(written.get("_json").is_some() && written.get("truncated").is_none());
         }
 
         #[tokio::test]

@@ -10,9 +10,15 @@ release and the target before bumping.
 
 ### A DLQ entry is written as a DFE event (BEHAVIOUR CHANGE)
 
-A `DlqEntry` no longer writes its payload as base64 under `payload`. A payload that is one whole JSON object goes under `_json` as itself, with the original's `_org_id`, `_source`, `_timestamp_received` and `_tags` copied beside it. Any other payload goes under `_raw`: text as it is, binary or truncated bytes as base64 with `"_raw_encoding": "base64"`. The other fields keep their names, and the Rust struct's public fields are unchanged. Reading an entry back accepts only this shape. See [dlq.md](pipeline/dlq.md#entry-format).
+A `DlqEntry` no longer writes base64 under `payload`. A whole JSON object, at most 63 levels deep, goes under `_json` with its header fields beside it. Anything else goes under `_raw`, as text or as base64 with `_raw_encoding`. See [dlq.md](pipeline/dlq.md#entry-format).
 
-**Consumer adjustment** -- none in code. Anything that reads DLQ files or topics itself reads `_json` or `_raw` in place of `payload`.
+**Consumer adjustment** -- `DlqEntry` gained a private field, so a struct literal outside scalo no longer compiles: use `DlqEntry::new` and the builders. A reader of DLQ files or topics reads `_json` or `_raw` in place of `payload`. An object comes back trimmed, its line breaks as spaces.
+
+### OTLP push exports a metric's unit (BEHAVIOUR CHANGE)
+
+See [metrics.md](core-pillars/metrics.md#otel-mode).
+
+**Consumer adjustment** -- describe a metric before its first use. A collector that suffixes units renames it.
 
 ### A null list, map or struct in YAML is an error (BEHAVIOUR CHANGE)
 
