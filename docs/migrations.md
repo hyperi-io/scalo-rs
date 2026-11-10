@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## Unreleased
 
+### A DLQ entry is written as a DFE event (BEHAVIOUR CHANGE)
+
+A `DlqEntry` no longer writes its payload as base64 under `payload`. A payload that is one whole JSON object goes under `_json` as itself, with the original's `_org_id`, `_source`, `_timestamp_received` and `_tags` copied beside it. Any other payload goes under `_raw`: text as it is, binary or truncated bytes as base64 with `"_raw_encoding": "base64"`. The other fields keep their names, and the Rust struct's public fields are unchanged. Reading an entry back accepts only this shape. See [dlq.md](pipeline/dlq.md#entry-format).
+
+**Consumer adjustment** -- none in code. Anything that reads DLQ files or topics itself reads `_json` or `_raw` in place of `payload`.
+
 ### A null list, map or struct in YAML is an error (BEHAVIOUR CHANGE)
 
 The `serde-saphyr` floor is 2.1.0, which refuses YAML null for a list, map or struct. `items:`, `items: ~` and `items: null` into a `Vec`, map or struct field are now an error at that line, where they read as empty. An `Option` field still reads them as `None`. A whole document that is empty, comment-only or `~` still reads as `T` from `{}`, so `load_typed` on an empty file returns the struct's defaults.

@@ -205,7 +205,7 @@ top = ["cli-service", "ratatui"]
 io = ["file-rotate", "parking_lot", "chrono", "tracing", "tokio"]
 
 # Dead letter queue (file backend always available)
-dlq = ["io", "concurrency", "base64", "serde_json", "tokio", "tokio-util", "tracing"]
+dlq = ["io", "concurrency", "base64", "serde_json", "serde_json/raw_value", "tokio", "tokio-util", "tracing"]
 dlq-kafka = ["dlq", "transport-kafka"]
 dlq-http = ["dlq", "reqwest"]
 
