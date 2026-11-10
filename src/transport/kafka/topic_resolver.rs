@@ -493,10 +493,30 @@ mod tests {
     fn default_excludes_drop_dlq_and_internal_topics() {
         let exclude =
             compile_patterns(&crate::transport::KafkaConfig::default().topic_exclude).unwrap();
-        assert!(passes_filters("default_land", &[], &exclude));
-        assert!(!passes_filters("dfe_loader_dlq", &[], &exclude));
-        assert!(!passes_filters("dfe_transform_dlq", &[], &exclude));
-        assert!(!passes_filters("__consumer_offsets", &[], &exclude));
+        for dropped in [
+            "dfe_loader_dlq",
+            "dfe_transform_dlq",
+            "__consumer_offsets",
+            "strimzi.cruisecontrol.metrics",
+            "strimzi.cruisecontrol.partitionmetricsamples",
+            "_confluent-metrics",
+            "_redpanda.audit_log",
+            "_schemas",
+            "connect-configs",
+            "connect-offsets",
+            "connect-status",
+        ] {
+            assert!(!passes_filters(dropped, &[], &exclude), "{dropped} passed");
+        }
+        for kept in [
+            "default_land",
+            "strimzi_land",
+            "my_schemas",
+            "connect-events_land",
+            "confluent_land",
+        ] {
+            assert!(passes_filters(kept, &[], &exclude), "{kept} was dropped");
+        }
     }
 
     #[test]

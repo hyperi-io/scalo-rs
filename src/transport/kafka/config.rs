@@ -1322,8 +1322,9 @@ pub struct KafkaConfig {
 
     /// Regex patterns for topic exclude filtering.
     /// Topics matching any pattern are excluded. Exclude wins over include.
-    /// Default: `["^__", "_dlq$"]` -- Kafka internal topics and a downstream
-    /// dead-letter-topic convention (a DLQ consumer sets its own include).
+    /// Default: Kafka internal topics (`^__`), the internal topics of Strimzi,
+    /// Confluent, Redpanda, Schema Registry and Kafka Connect, and a downstream
+    /// dead-letter-topic convention (`_dlq$`, a DLQ consumer sets its own include).
     #[serde(default = "default_topic_exclude")]
     pub topic_exclude: Vec<String>,
 
@@ -1501,7 +1502,18 @@ pub struct KafkaConfig {
 fn default_topic_exclude() -> Vec<String> {
     // `_dlq$`: a downstream DLQ convention pre-creates per-app dead-letter topics;
     // auto-discovery must never feed dead letters back into a data path.
-    vec!["^__".to_string(), "_dlq$".to_string()]
+    [
+        "^__",
+        r"^strimzi\.",
+        "^_confluent",
+        "^_redpanda",
+        "^_schemas$",
+        "^connect-(configs|offsets|status)$",
+        "_dlq$",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 fn default_topic_refresh_secs() -> u64 {
@@ -2892,10 +2904,12 @@ mod tests {
     fn kafka_config_topic_resolution_defaults() {
         let config = KafkaConfig::default();
         assert_eq!(config.topic_include, [] as [std::string::String; 0]);
-        assert_eq!(
-            config.topic_exclude,
-            vec!["^__".to_string(), "_dlq$".to_string()]
-        );
+        for pattern in ["^__", "_dlq$"] {
+            assert!(
+                config.topic_exclude.iter().any(|p| p == pattern),
+                "{pattern} missing from the default excludes"
+            );
+        }
         assert!(!config.auto_discover);
         assert_eq!(config.topic_refresh_secs, 60);
         assert_eq!(config.topic_suppression_rules.len(), 1);
