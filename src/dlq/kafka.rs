@@ -359,11 +359,15 @@ impl KafkaDlqInner {
 
 /// A producer config for a broker that refuses at once -- port 1 on
 /// loopback -- so nothing queued is ever acked.
+///
+/// It asks for TLS, which the production check accepts, because another test
+/// can hold `APP_ENV=production` while this one builds.
 #[cfg(test)]
 pub(super) fn unreachable_broker() -> KafkaConfig {
     let mut config = KafkaConfig {
         brokers: vec!["127.0.0.1:1".to_string()],
         group: String::new(),
+        security_protocol: "ssl".to_string(),
         ..KafkaConfig::default()
     };
     config.sizing.producer.idempotence = Some(false);
