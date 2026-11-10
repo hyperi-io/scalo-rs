@@ -445,7 +445,7 @@ impl Dlq {
     /// can, or the DLQ is disabled.
     ///
     /// Only a Kafka backend has a ceiling: `message.max.bytes`, measured
-    /// against the entry as it is written, base64 payload included. A file or
+    /// against the entry as it is written, payload included. A file or
     /// HTTP backend beside it takes what Kafka refuses, so the DLQ refuses an
     /// entry only when every backend does. A caller holding a source
     /// acknowledgement leaves such an entry out of
@@ -1460,8 +1460,8 @@ mod tests {
         async fn an_entry_over_the_only_backends_ceiling_is_refused() {
             let mut kafka = unreachable_broker();
             kafka.sizing.producer.message_max_bytes = Some(2_000_000);
-            // Within the ceiling as raw bytes, over it once base64 grows it by a third.
-            let over = DlqEntry::new("svc", "err", vec![b'x'; 1_600_000]);
+            // Within the ceiling as bytes, over it once base64 grows the binary payload by a third.
+            let over = DlqEntry::new("svc", "err", vec![0xff; 1_600_000]);
             let under = DlqEntry::new("svc", "err", vec![b'x'; 100]);
 
             let alone = Dlq::spawn(
@@ -1632,7 +1632,7 @@ mod tests {
             let dlq = spawn_cascade(dir.path(), &kafka);
 
             dlq.send(test_entry("queued")).await.expect("queued");
-            // Over the producer's ceiling once base64 grows it by a third.
+            // Over the producer's ceiling.
             dlq.send(DlqEntry::new("svc", "oversize", vec![b'x'; 300_000]))
                 .await
                 .expect("queued");

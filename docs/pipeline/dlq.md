@@ -113,7 +113,7 @@ for the next `flush()` as well. A Kafka backend that purged entries it has
 not heard back about yet fails the confirmed write. The pipeline's
 `with_dlq` writes each block's dead letters this way.
 
-An error from `write_confirmed` does not say whether a retry can land the entries, and a caller holding a source acknowledgement needs to know. `refusal(&entry)` answers it before the write, per entry: `Some(DeadLetterReason::TooLarge { bytes, limit })` when no backend can ever hold the entry, `None` otherwise. Only a Kafka backend has a ceiling, its producer's `message.max.bytes` less 128 bytes of framing, measured against the entry as written, so a payload grows by a third as base64. A file or HTTP backend beside Kafka takes what Kafka refuses, so such a DLQ refuses nothing.
+An error from `write_confirmed` does not say whether a retry can land the entries, and a caller holding a source acknowledgement needs to know. `refusal(&entry)` answers it before the write, per entry: `Some(DeadLetterReason::TooLarge { bytes, limit })` when no backend can ever hold the entry, `None` otherwise. Only a Kafka backend has a ceiling, its producer's `message.max.bytes` less 128 bytes of framing, measured against the entry as written, where a binary or truncated payload grows by a third as base64. A file or HTTP backend beside Kafka takes what Kafka refuses, so such a DLQ refuses nothing.
 
 So a caller holding a source acknowledgement:
 
@@ -163,9 +163,33 @@ The count lands only if the drain gets to finish. Await `shutdown()`, or keep th
 
 ---
 
+## Entry format
+
+Each entry is one JSON object, a DFE event a loader can land in a DLQ table:
+
+```json
+{
+  "timestamp": 1762740000000,
+  "service": "loader",
+  "reason": "invalid IP address 'lambda.amazonaws.com'",
+  "attempts": 0,
+  "destination": "acme.aws_cloudtrail",
+  "source": {"topic": "dfe.aws-cloudtrail_land", "partition": 0, "offset": 42},
+  "_org_id": "acme",
+  "_source": "aws-cloudtrail",
+  "_json": {"_org_id": "acme", "_source": "aws-cloudtrail", "sourceIPAddress": "lambda.amazonaws.com"}
+}
+```
+
+- A payload that is one whole JSON object goes under `_json` as itself, with raw newlines turned to spaces so a file line holds one entry. Its `_org_id`, `_source`, `_timestamp_received` and `_tags` are copied beside it.
+- Any other payload goes under `_raw`: valid UTF-8 as text, binary or truncated bytes as base64 with `"_raw_encoding": "base64"`. A truncated object keeps the header fields read before the cut.
+- `timestamp` is when the entry was made, in epoch milliseconds. `truncated`, `original_bytes`, `destination` and `source` appear only when set.
+
+---
+
 ## Payload cap
 
-A dead letter is often in the DLQ because it was too large, and its entry is a third larger again once the payload is base64'd, so a Kafka backend would refuse it the same way. So every send cuts a payload over `max_payload_bytes` (default 512 KiB, `DEFAULT_MAX_PAYLOAD_BYTES`) to that length, on every backend, and the entry carries `"truncated": true` and `"original_bytes"`, the length it had. Each cut counts in `dlq_payload_truncated_total`. 512 KiB base64'd is 699,052 bytes, under Kafka's and librdkafka's default `message.max.bytes`. Set `max_payload_bytes: null` to keep every payload whole, for a file DLQ that is replayed, say.
+A dead letter is often in the DLQ because it was too large, and a cut payload is written as base64, a third larger again, so a Kafka backend would refuse it the same way. So every send cuts a payload over `max_payload_bytes` (default 512 KiB, `DEFAULT_MAX_PAYLOAD_BYTES`) to that length, on every backend, and the entry carries `"truncated": true` and `"original_bytes"`, the length it had. Each cut counts in `dlq_payload_truncated_total`. 512 KiB base64'd is 699,052 bytes, under Kafka's and librdkafka's default `message.max.bytes`. Set `max_payload_bytes: null` to keep every payload whole, for a file DLQ that is replayed, say.
 
 ---
 
