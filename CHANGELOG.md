@@ -3,6 +3,15 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.28](https://github.com/hyperi-io/scalo-rs/compare/v2.14.27...v2.14.28) (2026-11-10)
+
+### Bug Fixes
+
+* **ci:** give the operational tests time to build their image ([81c6a08](https://github.com/hyperi-io/scalo-rs/commit/81c6a0896fc714e6dbefd37b5518329f2424bcc8))
+* **dlq,otel:** validate DLQ JSON, keep OTel units ([#452](https://github.com/hyperi-io/scalo-rs/issues/452)) ([655f468](https://github.com/hyperi-io/scalo-rs/commit/655f46869b4c399fae211039f07309573e3c3240))
+* **dlq:** write the entry as a DFE event, original under _json ([3b03671](https://github.com/hyperi-io/scalo-rs/commit/3b036717b774a6020651059cb0c38dc20698aeec)), closes [#442](https://github.com/hyperi-io/scalo-rs/issues/442)
+* **otel:** export one steady stream per metric ([7651f44](https://github.com/hyperi-io/scalo-rs/commit/7651f444a628eef62d75749cdbac92213719bbfc))
+
 ## [2.14.27](https://github.com/hyperi-io/scalo-rs/compare/v2.14.26...v2.14.27) (2026-11-09)
 
 ### Bug Fixes
