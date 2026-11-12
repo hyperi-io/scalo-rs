@@ -5,7 +5,7 @@ The one doctrine: **gate the SOURCE, never the SINK.**
 When a pipeline falls behind, pause the inbound source so the in-flight buffer
 drains. Do NOT slow the outbound drain. Gating the drain DEADLOCKS: the sink
 stops accepting, the buffer fills, the source keeps pulling (nothing told it to
-stop), the pipeline wedges. Backpressure propagates UPSTREAM to the intake.
+stop), the pipeline stops. Backpressure propagates UPSTREAM to the intake.
 
 So the inbound gate (`src/governor/gate.rs`) is INBOUND-only; `send` is never
 involved. See [self-regulation.md](self-regulation.md) for the governor that

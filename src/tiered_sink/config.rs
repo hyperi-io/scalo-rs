@@ -98,7 +98,7 @@ pub struct TieredSinkConfig {
     /// What to do when the spill cache cannot be opened (corrupt segments /
     /// metadata). Default [`CorruptionPolicy::Quarantine`]: move the corrupt
     /// queue's files into a timestamped `corrupt-*` subdirectory of
-    /// `spool_path` and start fresh, so a poisoned spill cache can never wedge
+    /// `spool_path` and start fresh, so a poisoned spill cache can never block
     /// startup. A cache another live sink holds is refused, never quarantined.
     #[serde(default)]
     pub on_corruption: CorruptionPolicy,

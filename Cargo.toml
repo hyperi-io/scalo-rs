@@ -154,7 +154,7 @@ sink-stack = ["transport", "tower", "dep:backon", "governor", "tokio", "tracing"
 # Cgroup-aware memory backpressure (OOM prevention)
 memory = ["sysinfo", "tracing"]
 
-# Unified self-regulation governor: a pressure seam that combines a HARD
+# Unified self-regulation governor: one pressure level that combines a HARD
 # memory signal (never masked) with weighted SOFT signals under a
 # hysteresis latch. Additive, default-off. Depends on MemoryGuard, so it
 # implies `memory`. Pulls `tokio` for async waits, `parking_lot` for locks, and

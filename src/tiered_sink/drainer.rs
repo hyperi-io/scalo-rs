@@ -135,7 +135,7 @@ enum DrainResult {
     /// Decompression error
     DecompressError(String),
     /// The spooled bytes could not be decoded back into a record (corrupt /
-    /// incompatible frame). Dropped (committed) so it cannot wedge the queue.
+    /// incompatible frame). Dropped (committed) so it cannot block the queue.
     DecodeError(String),
     /// Queue is empty
     Empty,

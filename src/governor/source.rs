@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Pressure seam: normalised readings, sources, and the unified latch.
+//! Pressure inputs: normalised readings, sources, and the unified latch.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,7 +52,7 @@ impl HoldClock {
 /// A normalised pressure reading, clamped to `[0.0, 1.0]` on construction.
 ///
 /// `NaN` collapses to `0.0` (treat an unreadable source as no pressure,
-/// never as max pressure -- a `NaN` masquerading as `1.0` would wedge the
+/// never as max pressure -- a `NaN` masquerading as `1.0` would latch the
 /// governor into a permanent hold).
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Pressure(f64);
@@ -349,7 +349,7 @@ impl UnifiedPressure {
 
     /// Add a source after construction.
     ///
-    /// Proves the seam accepts a new signal kind (e.g. a future CPU
+    /// Proves the governor accepts a new signal kind (e.g. a future CPU
     /// source) with zero change to the gate API -- existing callers of
     /// [`level`](Self::level) / [`should_hold`](Self::should_hold) are
     /// untouched.
@@ -372,7 +372,7 @@ impl UnifiedPressure {
     /// sources. `level = hard_max.max(soft_max)`.
     ///
     /// Soft `weight()` is clamped to `[0.0, 1.0]` (non-finite -> `1.0`) at the
-    /// combine: `add_source` is the advertised extension seam, so a future
+    /// combine: `add_source` is the advertised extension point, so a future
     /// soft source returning a stray weight cannot push `level()` outside its
     /// documented range or silently neutralise itself with a negative/NaN
     /// weight. One branch per soft source per `evaluate()` (not per record);
@@ -616,7 +616,7 @@ mod tests {
         assert!(approx(Pressure::new(2.0).get(), 1.0));
         assert!(approx(Pressure::new(0.5).get(), 0.5));
         // NaN must collapse to 0.0, NOT to 1.0 -- a NaN reading must never
-        // wedge the governor into a permanent hold.
+        // latch the governor into a permanent hold.
         assert!(approx(Pressure::new(f64::NAN).get(), 0.0));
         assert!(approx(Pressure::new(f64::INFINITY).get(), 1.0));
         assert!(approx(Pressure::new(f64::NEG_INFINITY).get(), 0.0));
@@ -647,7 +647,7 @@ mod tests {
 
     /// A future SOFT source returning a stray weight must not push `level()`
     /// outside `[0,1]` or silently neutralise itself. `add_source` is the
-    /// advertised extension seam, so the combine clamps each soft weight to
+    /// advertised extension point, so the combine clamps each soft weight to
     /// `[0,1]` (non-finite -> `1.0`).
     #[test]
     fn soft_weight_is_clamped_at_combine() {
@@ -761,7 +761,7 @@ mod tests {
             "latch must re-arm cleanly with no sticky state"
         );
 
-        // Step 6: add a THIRD soft source via add_source -- proves the seam
+        // Step 6: add a THIRD soft source via add_source -- proves the governor
         // accepts a new signal kind with zero gate-API change. Release first
         // so we can observe the new source's effect cleanly.
         mem.set(0.10);
@@ -925,7 +925,7 @@ mod tests {
         (latch, mem, now)
     }
 
-    /// The wedge: a burst arms the latch, the level settles in the band on
+    /// A hold the level never clears: a burst arms the latch, the level settles in the band on
     /// memory the paused intake cannot free, and the hold ends at 30 s. The
     /// band then keeps the latch released.
     #[test]

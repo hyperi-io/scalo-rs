@@ -245,7 +245,7 @@ self_regulation:
   them prevents flapping: the latch arms at `pause_above`, releases at
   `resume_below`, and holds its state in between. An inverted or non-finite
   band falls back to the defaults (`0.80` / `0.65`) with a warning rather
-  than wedging the governor.
+  than leaving the latch unable to release.
 - **`max_hold_secs`** -- the bound on one hold (see "How the loop works").
   `0` restores the unbounded latch, which holds until the level falls to
   `resume_below` however long that takes.

@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn format_derives_from_otel_presence() {
-        // The deployment seam: shipping telemetry -> json, not shipping -> lines.
+        // The deployment decides: shipping telemetry -> json, not shipping -> lines.
         assert_eq!(CommonArgs::derive_log_format(true), "json");
         assert_eq!(CommonArgs::derive_log_format(false), "text");
     }

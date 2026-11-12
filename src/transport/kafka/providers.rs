@@ -1,7 +1,7 @@
 // Project:   scalo
 // File:      src/transport/kafka/providers.rs
 // Purpose:   Generic, open Kafka provider abstraction - normalise per-provider
-//            auth + capabilities (transport + cluster lifecycle are trait seams).
+//            auth + capabilities (transport + cluster lifecycle are separate traits).
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -26,7 +26,7 @@
 //!   serverless tier? IAM vs user/pass?).
 //! - **transport tuning** -- [`KafkaProvider::transport_overrides`] (default: none).
 //! - **cluster control (lifecycle) + topic-admin quirks** hang off this same identity
-//!   at their own seams (the managed-cluster lifecycle + admin layers) -- added there.
+//!   in their own modules (the managed-cluster lifecycle + admin layers) -- added there.
 //!
 //! # Vanilla core, opinions on top
 //!
@@ -117,7 +117,7 @@ pub enum SchemaRegistry {
 /// The generic, open Kafka provider abstraction.
 ///
 /// Implement this for any provider -- built-in or your own -- to teach scalo its auth
-/// shape, capabilities, and (at their seams) transport tuning. Everything
+/// shape, capabilities, and transport tuning (`transport_overrides`). Everything
 /// provider-specific hangs off this one trait rather than being bolted on beside it.
 pub trait KafkaProvider {
     /// A stable identifier (e.g. `"confluent-cloud"`). Used in config + logs.

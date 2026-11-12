@@ -739,7 +739,7 @@ mod tests {
     async fn test_corruption_quarantines_and_starts_fresh() {
         // Default policy: a corrupt cache is renamed aside (timestamped, for
         // forensics) and a FRESH queue takes its place -- the service continues
-        // rather than wedging or serving bad data.
+        // rather than stopping or serving bad data.
         let dir = tempdir().unwrap();
         let path = dir.path().join("spill-cache");
         {

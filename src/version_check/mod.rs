@@ -153,8 +153,8 @@ impl VersionCheckConfig {
     ///
     /// Every `version_check` key the cascade sets wins -- an explicit
     /// `enabled: false` included -- and a key it leaves unset falls to
-    /// `defaults` instead of this type's own defaults. The seam a binary
-    /// uses to supply its endpoint default while any config layer (file
+    /// `defaults` instead of this type's own defaults. This is how a binary
+    /// supplies its endpoint default while any config layer (file
     /// or env) can still turn the check off:
     ///
     /// ```rust,no_run
