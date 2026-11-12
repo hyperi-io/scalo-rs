@@ -24,7 +24,7 @@
 //!   per partition, the shape of a Kafka source. A fresh [`PullSource`] starts
 //!   from the committed offsets, which is what a restart sees.
 //! - [`PushSource`]: the shape of a gRPC or HTTP source. A client pushes
-//!   requests and resends each until it is answered with success; the source
+//!   requests and resends each until it is answered with success. The source
 //!   answers from [`release`](TransportReceiver::release) once armed, and at
 //!   enqueue otherwise.
 //! - [`FaultSink`]: a [`TransportSender`] that records arrivals and can refuse
@@ -504,7 +504,7 @@ impl PushSource {
         self
     }
 
-    /// Queue one request; the receiver resolves to `true` for a success answer.
+    /// Queue one request. The receiver resolves to `true` for a success answer.
     pub fn push(&self, payloads: Vec<bytes::Bytes>) -> oneshot::Receiver<bool> {
         let (answer, answered) = oneshot::channel();
         if self.closed.load(Ordering::Acquire) {
@@ -650,7 +650,7 @@ impl AcknowledgingReceiver for PushSource {
     }
 }
 
-/// The live push instances a client sends to; the case swaps them on restart.
+/// The live push instances a client sends to. The case swaps them on restart.
 #[derive(Debug, Clone, Default)]
 struct Endpoints(Arc<Mutex<Vec<Arc<PushSource>>>>);
 
@@ -900,7 +900,7 @@ impl TransportSender for FaultSink {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Fault {
-    /// The shutdown token fires while that send is in flight; it then completes.
+    /// The shutdown token fires while that send is in flight. It then completes.
     GracefulStop,
     /// The pipeline task is aborted while that send is in flight.
     KillMidBatch,
@@ -910,7 +910,7 @@ pub enum Fault {
     /// The sink rejects that record permanently, after the records before it
     /// in the block landed, until the pipeline restarts.
     RejectMidStream,
-    /// Two instances share one source; the one holding that send is killed
+    /// Two instances share one source. The one holding that send is killed
     /// and the source's other consumers take over its share.
     TwoInstances,
 }
@@ -967,7 +967,7 @@ impl Instance {
     }
 }
 
-/// Poll `ready` every 5 ms until it holds or `within` passes; whether it held.
+/// Poll `ready` every 5 ms until it holds or `within` passes. Whether it held.
 async fn wait_for(within: Duration, mut ready: impl FnMut() -> bool) -> bool {
     let until = tokio::time::Instant::now() + within;
     loop {
@@ -1014,7 +1014,7 @@ pub struct Case {
     pub fault: Fault,
     /// Marked records driven through the pipeline.
     pub records: u64,
-    /// Partitions of the pull log; at least two for [`Fault::TwoInstances`].
+    /// Partitions of the pull log. At least two for [`Fault::TwoInstances`].
     pub partitions: usize,
     /// Records per pushed request.
     pub request_size: usize,
@@ -1107,7 +1107,7 @@ impl Case {
         };
 
         let landed = if self.fault == Fault::TwoInstances {
-            // Instance i reads partition i; the middle marker's partition decides the victim.
+            // Instance i reads partition i. The middle marker's partition decides the victim.
             let mut instances: Vec<Option<Instance>> =
                 all.iter().map(|&p| Some(start(p, &all[p..=p]))).collect();
             let landed = wait_for(self.drain_within, || sink.held_by().is_some()).await;

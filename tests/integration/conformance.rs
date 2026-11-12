@@ -53,7 +53,7 @@ async fn engine_pipeline<R>(
         .await;
 }
 
-/// Send one block until the sink takes it or refuses it for good; `None` on shutdown.
+/// Send one block until the sink takes it or refuses it for good. `None` on shutdown.
 async fn send_block(
     sink: &FaultSink,
     records: &[Record],

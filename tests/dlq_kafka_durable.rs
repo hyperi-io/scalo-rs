@@ -505,7 +505,7 @@ async fn an_oversize_payload_lands_truncated() {
 }
 
 /// A record the broker refuses fails the flush that covers it and is counted
-/// once; entries acked around it are not.
+/// once. Entries acked around it are not.
 #[tokio::test]
 async fn a_delivery_the_broker_refuses_fails_the_flush_and_is_counted_once() {
     if !require_docker() {

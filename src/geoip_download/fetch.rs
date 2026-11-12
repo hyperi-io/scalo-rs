@@ -170,7 +170,7 @@ impl Transfer {
         // fresh constructs no client at all.
         let mut config =
             HttpClientConfig::from_cascade().map_err(crate::http_client::HttpClientError::from)?;
-        // The cascade timeout is sized for API calls; an MMDB transfer needs
+        // The cascade timeout is sized for API calls. An MMDB transfer needs
         // minutes, so this one is not operator-tunable.
         config.timeout_secs = DOWNLOAD_TIMEOUT_SECS;
         config.user_agent = Some(format!("scalo/{}", crate::VERSION));

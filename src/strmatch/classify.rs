@@ -34,7 +34,7 @@ use super::plan::{Anchor, Plan, ShapeOp, SmallByteSet};
 use super::{BuildError, MatcherTier};
 
 /// Soft-cap on the size of a character class we'll attempt to reduce to
-/// a small byte set. `\w` is ~80 codepoints; `\p{L}` is tens of
+/// a small byte set. `\w` is ~80 codepoints. `\p{L}` is tens of
 /// thousands. Past this limit we fall through to Meta rather than
 /// produce a giant byte set that scans no faster than a regex.
 const CLASS_BYTE_CAP: usize = 16;
@@ -96,7 +96,7 @@ pub fn classify(pattern: &str, case_insensitive: bool) -> Result<Classified, Bui
     }
 
     // 2. Single-pattern simple shape (skipped when case-insensitive --
-    //    memchr/memmem can't fold case; we route those through a
+    //    memchr/memmem can't fold case. We route those through a
     //    one-element AC below instead).
     if !case_insensitive && let Some(shape) = try_simple_shape(&hir) {
         let descriptor = Descriptor {
@@ -236,7 +236,7 @@ fn hard_reject(hir: &Hir) -> Option<(&'static str, &'static str)> {
             // we just don't expose captures in our public API. But the
             // important case is back-references, which regex-syntax
             // forbids at parse time anyway (the default parser
-            // rejects `(\1)`). So traverse the sub-Hir; captures
+            // rejects `(\1)`). So traverse the sub-Hir. Captures
             // themselves aren't disqualifying.
             hard_reject(&c.sub)
         }

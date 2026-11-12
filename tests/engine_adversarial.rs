@@ -168,7 +168,7 @@ fn deeply_nested_json() {
     // Pathological nesting is REJECTED gracefully, never a stack overflow /
     // process abort. The iterative pre-scan rejects it before the recursive
     // parser runs, so this is stack-safe at any depth. Reaching this assertion
-    // at all proves there was no crash; the payload must not parse successfully
+    // at all proves there was no crash. The payload must not parse successfully
     // (asserted action-agnostically: Skip yields no result, Dlq/FailBatch an
     // Err -- in neither case an Ok).
     let bomb = vec![make_raw(&nested(5000))];

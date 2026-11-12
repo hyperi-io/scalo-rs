@@ -32,7 +32,7 @@
 //! into a plaintext value, so data-plane services share one syntax:
 //!
 //! - `vault:mount/path:key` -- fetch from OpenBao (needs the `secrets-vault`
-//!   feature); the first segment is the KV mount and the KV v2 `data` segment
+//!   feature). The first segment is the KV mount and the KV v2 `data` segment
 //!   is optional
 //! - `bao:mount/path:key` / `openbao:mount/path:key` -- the same lookup,
 //!   spelled as the OpenBao tooling spells it
@@ -285,7 +285,6 @@ impl SecretsManager {
         #[cfg(feature = "metrics")]
         metrics::counter!("secrets_fetch_total").increment(1);
 
-        // Update cache
         if let Err(e) = self.store(&cache_key, &value).await {
             warn!(error = %e, "Failed to cache secret");
         }

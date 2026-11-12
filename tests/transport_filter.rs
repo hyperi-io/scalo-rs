@@ -1085,7 +1085,7 @@ async fn dlq_entries_returned_once_per_recv() {
         .await
         .unwrap();
 
-    // recv() returns the DLQ entry inline; nothing is retained.
+    // recv() returns the DLQ entry inline. Nothing is retained.
     let first = transport.recv(10).await.unwrap();
     assert_eq!(first.dlq_entries.len(), 1);
 

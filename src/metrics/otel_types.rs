@@ -108,7 +108,7 @@ impl OtelMetricsConfig {
     /// Whether OTLP push should be wired up, after env-var resolution.
     ///
     /// False when [`enabled`](Self::enabled) is off, the effective endpoint is
-    /// blank, or there is no Tokio runtime to export on; callers install the
+    /// blank, or there is no Tokio runtime to export on. Callers install the
     /// Prometheus recorder alone.
     #[must_use]
     pub fn is_active(&self) -> bool {

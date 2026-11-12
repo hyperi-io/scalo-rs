@@ -72,7 +72,7 @@ pub struct Credential {
     pub secret: SensitiveString,
     /// Already margin-adjusted: renew when `now >= this`.
     pub renew_at: Instant,
-    /// What else the exchange returned that a consumer reads; `None` for a
+    /// What else the exchange returned that a consumer reads. `None` for a
     /// source that returns only a secret, so the common case costs nothing.
     pub extra: Option<Arc<Value>>,
 }
@@ -246,7 +246,7 @@ impl<E: Exchange> CredentialSource for Cached<E> {
         }
 
         // Read before queueing, so a failure that finishes while this caller
-        // waits is one it waited on; the lock orders the count against the
+        // waits is one it waited on. The lock orders the count against the
         // failure it describes.
         let entered = self.finished.load(Ordering::Relaxed);
         // The one await under a guard in this module, and the reason the mutex

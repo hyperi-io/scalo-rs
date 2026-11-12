@@ -45,7 +45,7 @@ impl ProcessMetrics {
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
 
-        // Register metric descriptions (bare names; namespace added by the
+        // Register metric descriptions (bare names -- namespace added by the
         // recorder's prefix layer).
         Self::register_metrics();
 

@@ -34,7 +34,7 @@ pub(crate) struct PrefixRecorder<R> {
 impl<R> PrefixRecorder<R> {
     /// Wrap `inner`, prepending `{prefix}_` to every metric name.
     ///
-    /// The caller is responsible for passing a non-empty `prefix`; an empty
+    /// The caller is responsible for passing a non-empty `prefix`. An empty
     /// prefix would emit a leading underscore. `install_recorders` only wraps
     /// when the namespace is non-empty.
     pub(crate) fn new(prefix: impl Into<String>, inner: R) -> Self {

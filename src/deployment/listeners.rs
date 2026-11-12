@@ -38,7 +38,7 @@ impl DeploymentContract {
     /// and any path a port's `bound_from` names. A port claims the path its
     /// `bound_from` names, `metrics_port` claims `metrics.address`, and a path
     /// in `unbound_listen_paths` needs no claim. A `host:port` value must
-    /// carry the claiming port's number; a null or host-only value is not
+    /// carry the claiming port's number. A null or host-only value is not
     /// compared. Paths are dotted and relative to `default_config`. An empty
     /// result means every listener the app binds is declared.
     #[must_use]
@@ -149,7 +149,7 @@ fn is_listen_value(value: &Value) -> bool {
 }
 
 /// The port a listen address binds, from `host:port`, `[v6]:port`, a URL or a
-/// bare number; `None` for null or a host with no port.
+/// bare number. `None` for null or a host with no port.
 fn bound_port(value: &Value) -> Option<u16> {
     match value {
         Value::String(address) => {
@@ -282,7 +282,7 @@ mod tests {
         );
     }
 
-    /// Syslog binds 514 on TCP and on UDP from two keys; declaring only the
+    /// Syslog binds 514 on TCP and on UDP from two keys. Declaring only the
     /// TCP port leaves the UDP listener undeclared.
     #[test]
     fn test_a_tcp_and_udp_listener_pair_needs_both_ports() {

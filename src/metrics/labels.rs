@@ -16,17 +16,17 @@
 //! Variant choice aligns with industry conventions:
 //!
 //! - [`TransportKind`] -- one variant per `transport-*` cargo
-//!   feature; label values match OTel `messaging.system`.
+//!   feature. Label values match OTel `messaging.system`.
 //! - [`FlushTrigger`] -- standard buffer-flush triggers seen across
 //!   Kafka producers and batch processors.
 //! - [`AuthFailureReason`] -- RFC 6749 OAuth 2.0 + JWT-specific
-//!   failure codes; label values are the RFC strings.
+//!   failure codes. Label values are the RFC strings.
 //! - [`ValidationFailureReason`] -- JSON Schema 2020-12 validator
 //!   error categories.
 //!
 //! No `Other` catch-all: every code path that names a failure must
 //! pick a variant. Add new variants here when a real new failure
-//! mode appears; never widen at the call site.
+//! mode appears. Never widen at the call site.
 
 /// Transport backend kind. One variant per `transport-*` cargo
 /// feature plus `routed`. Aligns with OTel `messaging.system`

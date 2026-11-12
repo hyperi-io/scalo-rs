@@ -450,7 +450,7 @@ fn test_thread_accounting_target_leased_available() {
     let pool = AdaptiveWorkerPool::new(config);
     // Idle pool: zero in-flight, regardless of the scaler target.
     assert_eq!(pool.active_threads(), 0, "idle pool reports zero active");
-    // Target starts at min_threads; headroom equals the target when idle.
+    // Target starts at min_threads. Headroom equals the target when idle.
     assert_eq!(pool.target_threads(), 1, "initial target is min_threads");
     assert_eq!(pool.available_threads(), 1, "idle headroom equals target");
     // max_threads is capped at the host's CPU count.

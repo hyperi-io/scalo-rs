@@ -16,7 +16,7 @@
 //!
 //! The hook is async because acquiring the credential can be I/O -- a token
 //! exchange, a metadata-server call, a secret read. The placements in the
-//! `auth` module (`auth` feature) are the implementations that come with scalo; a signing
+//! `auth` module (`auth` feature) are the implementations that come with scalo. A signing
 //! scheme with its own crypto dependencies (SigV4, a request HMAC) belongs in
 //! the consumer as one more implementation of this trait.
 

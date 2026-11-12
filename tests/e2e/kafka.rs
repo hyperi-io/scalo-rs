@@ -1570,7 +1570,7 @@ mod group_protocol {
         }
     }
 
-    /// One member holds both partitions of a two-partition topic; a second
+    /// One member holds both partitions of a two-partition topic. A second
     /// joins, and the incremental rebalance leaves each holding one. The lag
     /// each reports follows what it holds, so a partition revoked from the
     /// first leaves its lag, and neither reports the other's.
@@ -2407,7 +2407,7 @@ mod deleted_topic {
         let deadline = Instant::now() + within;
         let mut tokens = Vec::new();
         while tokens.len() < want && Instant::now() < deadline {
-            // A partition of the deleted topic fails one receive; a caller polls on.
+            // A partition of the deleted topic fails one receive. A caller polls on.
             let Ok(batch) = transport.recv(100).await else {
                 continue;
             };
@@ -2483,7 +2483,7 @@ mod deleted_topic {
         })
         .expect("kafka admin");
         admin.delete_topics(&[GONE]).await.expect("delete topic");
-        // The topic has gone, so this commit can fail; the consumer goes on.
+        // The topic has gone, so this commit can fail. The consumer goes on.
         let _ = transport.commit(&first).await;
         let _ = read(&transport, GONE, usize::MAX, QUIET).await;
 

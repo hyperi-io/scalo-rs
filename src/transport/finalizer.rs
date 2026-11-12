@@ -28,7 +28,7 @@
 //!
 //! The callback decides what the merged status means for the source via
 //! [`DeliveryStatus::should_commit`]: commit (advance) for
-//! Delivered/Dropped/Rejected; do NOT commit for Errored (the whole block is
+//! Delivered/Dropped/Rejected. Do NOT commit for Errored (the whole block is
 //! redelivered -- at-least-once). This is the second half of effectively-once:
 //! the idempotent producer removes producer-retry duplicates on the wire, the
 //! [`dedup_key`](super::Record::dedup_key) lets the sink remove the replay
@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 ///
 /// Ordered by ack-blocking severity (lowest -> highest): `Delivered` < `Dropped`
 /// < `Rejected` < `Errored`. The finalizer keeps the MAX. Only `Errored` blocks
-/// the source commit (it is the "retry the block" signal); the rest are terminal
+/// the source commit (it is the "retry the block" signal). The rest are terminal
 /// and let the source advance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeliveryStatus {
@@ -60,7 +60,7 @@ pub enum DeliveryStatus {
     /// Permanently rejected and routed to the DLQ -- will not be retried, so the
     /// source may advance (the record is accounted for, just not at the sink).
     Rejected = 2,
-    /// Transient failure -- the source must NOT advance; the block is redelivered.
+    /// Transient failure -- the source must NOT advance. The block is redelivered.
     Errored = 3,
 }
 
@@ -105,7 +105,7 @@ impl Shared {
         self.worst.fetch_max(status as u8, Ordering::AcqRel);
     }
 
-    /// Drop one outstanding handle; if it was the last, fire the callback.
+    /// Drop one outstanding handle. If it was the last, fire the callback.
     fn release(&self) {
         // fetch_sub returns the PREVIOUS value; 1 -> this was the last handle.
         if self.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -140,7 +140,7 @@ impl BatchFinalizer {
     {
         Self {
             shared: Arc::new(Shared {
-                // Start at the best status; pieces only ever raise it.
+                // Start at the best status. Pieces only ever raise it.
                 worst: AtomicU8::new(DeliveryStatus::Delivered as u8),
                 // The base seal is the first outstanding holder.
                 outstanding: AtomicUsize::new(1),
@@ -161,11 +161,11 @@ impl BatchFinalizer {
     }
 
     /// Seal the batch: signals that no further pieces will be created. Releases
-    /// the base holder; the ack fires now if all pieces have already resolved,
+    /// the base holder. The ack fires now if all pieces have already resolved,
     /// otherwise when the last one does.
     pub fn seal(self) {
         // The Arc refcount and the `outstanding` count are independent: release()
-        // decrements `outstanding` (the ack trigger); when `self` then drops, its
+        // decrements `outstanding` (the ack trigger). When `self` then drops, its
         // Arc clone is released normally (keeping `Shared` alive while any
         // PieceFinalizer still holds a clone). No double-decrement.
         self.shared.release();
@@ -173,7 +173,7 @@ impl BatchFinalizer {
 }
 
 /// Handle for a single fanned-out piece. Report the outcome with
-/// [`report`](Self::report); if dropped without a report it counts as
+/// [`report`](Self::report). If dropped without a report it counts as
 /// [`DeliveryStatus::Errored`] so a lost piece never acks as success.
 pub struct PieceFinalizer {
     shared: Arc<Shared>,
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn seal_before_pieces_resolve_defers_ack() {
-        // Sealing while a piece is still outstanding must NOT fire early; the ack
+        // Sealing while a piece is still outstanding must NOT fire early. The ack
         // waits for the last piece to resolve.
         let (fin, rx) = capturing();
         let p = fin.piece();

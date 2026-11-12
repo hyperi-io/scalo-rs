@@ -39,7 +39,7 @@ use super::manifest::{MetricDescriptor, MetricType};
 /// scalo's Kafka, gRPC, HTTP, file and pipe transports record their own
 /// `transport_*` series under their own `transport` label. The `transport_*`
 /// methods here are for a sink or source scalo does not provide, such as a
-/// database client; calling them after a scalo transport's send or receive
+/// database client. Calling them after a scalo transport's send or receive
 /// counts that traffic twice. `records_received_total` is counted here, not
 /// also through `AppMetrics`.
 pub struct ServiceMetrics {
@@ -965,7 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_populates_registry() {
-        // Bare-name contract: ServiceMetrics pushes BARE names; the registry
+        // Bare-name contract: ServiceMetrics pushes BARE names. The registry
         // (namespace "test_app") applies the `test_app_` prefix to the manifest.
         let mgr = super::super::MetricsManager::new_for_test("test_app");
         let _dfe = ServiceMetrics::register(&mgr);

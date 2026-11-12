@@ -81,7 +81,7 @@ pub trait BatchProcessor: Sync {
 ///
 /// Wraps the worker pool with common data-plane pipeline concerns: stats tracking,
 /// memory accounting, and metrics emission. Apps provide a [`BatchProcessor`]
-/// implementation; the pipeline handles the rest.
+/// implementation. The pipeline handles the rest.
 pub struct BatchPipeline {
     pool: Arc<AdaptiveWorkerPool>,
     stats: Arc<PipelineStats>,

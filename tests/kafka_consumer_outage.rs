@@ -221,7 +221,7 @@ async fn a_classic_consumer_rides_out_a_broker_outage() {
 }
 
 /// A commit caught by an outage retries for its window and then reports the
-/// failure, rather than holding the caller until the broker returns; the
+/// failure, rather than holding the caller until the broker returns. The
 /// consumer carries on once it does.
 #[tokio::test]
 async fn a_commit_during_an_outage_reports_instead_of_hanging() {

@@ -19,8 +19,8 @@
 # per test, so N tests invoke it at once. Two things make that safe:
 #
 #   - The cache directory is keyed by version, so no run ever deletes a binary
-#     another run is about to exec. The previous "rm -rf bin, then rebuild it in
-#     place" produced `ETXTBSY` ("Text file busy") when one test exec'd the
+#     another run is about to exec. Rebuilding one shared directory in place
+#     would produce `ETXTBSY` ("Text file busy") when one test exec'd the
 #     binary while another still held it open for writing.
 #   - Download and extraction happen in a private temp directory, promoted with
 #     one rename. A reader therefore sees either no directory or a complete one,
@@ -36,7 +36,7 @@ ARCH="$(uname -m)"
 
 # Pinned. A floating "latest" made the harness retarget on every upstream
 # release, so a break landed with nothing in the diff to explain it -- and it
-# needed network plus gh/jq on every single test run. Bump deliberately; Vector
+# needed network plus gh/jq on every single test run. Bump deliberately. Vector
 # minor releases change CLI flags and config schema.
 # renovate: datasource=github-releases depName=vectordotdev/vector
 DEFAULT_VECTOR_VERSION="0.61.0"
@@ -57,7 +57,7 @@ fi
 mkdir -p "${CACHE_DIR}"
 
 # mkdir is atomic on POSIX: exactly one concurrent run creates the lock and
-# downloads; the rest wait for the binary to appear.
+# downloads. The rest wait for the binary to appear.
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "Another run is fetching Vector ${WANT_VERSION}; waiting..." >&2
     for _ in $(seq 1 300); do

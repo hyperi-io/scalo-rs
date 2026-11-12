@@ -424,7 +424,7 @@ async fn scope_is_absent_when_unset() {
     );
 }
 
-/// Providers send `expires_in` as a JSON string as readily as a number; both
+/// Providers send `expires_in` as a JSON string as readily as a number. Both
 /// are read, and the exposed fields ride along in `extra`.
 #[tokio::test]
 async fn expires_in_as_a_string_is_accepted() {

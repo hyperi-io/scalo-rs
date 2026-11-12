@@ -10,14 +10,14 @@
 //!
 //! Resolves credential specs in these formats:
 //! - `vault:mount/path:key` -- fetch from OpenBao via [`super::SecretsManager`]
-//!   (requires the `secrets-vault` feature); the KV v2 `data` segment is
+//!   (requires the `secrets-vault` feature). The KV v2 `data` segment is
 //!   optional
 //! - `bao:mount/path:key` / `openbao:mount/path:key` -- the same lookup under
 //!   the names the OpenBao tooling uses
 //! - `file:path` -- read a local file, typically a mounted Kubernetes Secret
 //! - `aws:secret_id` or `aws:secret_id:key` -- fetch from AWS Secrets Manager
 //!   (requires the `secrets-aws` feature)
-//! - `env:VAR_NAME`   -- read from the environment; hard error if unset
+//! - `env:VAR_NAME`   -- read from the environment. Hard error if unset
 //! - any other string -- used as a literal value
 //!
 //! Folded in from the former `credential` module so data-plane services
@@ -434,9 +434,8 @@ mod tests {
     }
 
     /// A `vault:` spec with no address configured must say which variables to
-    /// set. It used to report `provider not configured: openbao`, which reads
-    /// as a scalo build problem rather than "you have not told me where OpenBao
-    /// is", and no amount of `VAULT_ADDR` changed it.
+    /// set. `provider not configured: openbao` would read as a scalo build
+    /// problem rather than "you have not told me where OpenBao is".
     #[tokio::test]
     #[cfg(all(feature = "secrets-vault", feature = "config"))]
     async fn vault_without_an_address_names_the_variables_to_set() {

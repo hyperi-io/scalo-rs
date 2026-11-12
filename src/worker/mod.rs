@@ -16,7 +16,7 @@
 //!
 //! - **Opinionated:** [`BatchProcessor`] trait + [`BatchPipeline`] provide a
 //!   structured parallel-then-sequential pipeline for consumer services. Apps implement
-//!   `BatchProcessor` for their domain; the pipeline handles stats, scaling,
+//!   `BatchProcessor` for their domain. The pipeline handles stats, scaling,
 //!   and batch orchestration. [`PipelineStats`] provides common atomic counters.
 //!
 //! ## Quick Start

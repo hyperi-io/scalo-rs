@@ -171,7 +171,7 @@ impl HealthRegistry {
     /// Snapshot every registered check, drop the registry lock, then run
     /// the checks. A check callback that re-enters
     /// [`HealthRegistry::register`] (or any other path that takes the
-    /// registry mutex) would otherwise deadlock against itself; this
+    /// registry mutex) would otherwise deadlock against itself. This
     /// keeps the lock critical-section to a clone of the `Arc<dyn Fn>`
     /// handles.
     fn snapshot_checks() -> Vec<HealthCheck> {
@@ -215,7 +215,7 @@ impl HealthRegistry {
     /// status. Useful for detailed health endpoints.
     #[must_use]
     pub fn components() -> Vec<(String, HealthStatus)> {
-        // Snapshot (name, check) pairs under the lock; run checks after
+        // Snapshot (name, check) pairs under the lock. Run checks after
         // releasing it. See `snapshot_checks` for the reentrancy rationale.
         let snapshot: Vec<(String, HealthCheck)> = {
             let registry = Self::global();

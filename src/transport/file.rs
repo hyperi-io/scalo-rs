@@ -540,7 +540,7 @@ impl TransportReceiver for FileTransport {
             }
         }
 
-        // Apply inbound filters via the shared partition helper; DLQ entries
+        // Apply inbound filters via the shared partition helper. DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
         let batch = self.filter_engine.partition_batch(
             messages,

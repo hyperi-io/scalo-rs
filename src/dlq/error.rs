@@ -43,7 +43,7 @@ pub enum DlqError {
     NotConfigured,
 
     /// In-memory queue is full. Caller submitted faster than the drain
-    /// can write; the entry was rejected.
+    /// can write. The entry was rejected.
     #[error("DLQ queue is full")]
     QueueFull,
 

@@ -8,8 +8,8 @@
 
 //! Static enum dispatch for DLQ backends.
 //!
-//! Replaces the previous `#[async_trait] trait DlqBackend` + `Box<dyn>`
-//! shape. Each backend is a concrete variant; the drain matches over
+//! Each backend is a concrete variant, not a `Box<dyn>` behind an
+//! `#[async_trait]` trait. The drain matches over
 //! variants. No vtable, no `async_trait` macro, no heap-boxed future.
 //!
 //! See [`super::orchestrator::Dlq`] for usage.
@@ -102,7 +102,7 @@ impl DlqBackend {
     }
 
     /// Entries the last failed `send_batch` handed on before it stopped.
-    /// Only Kafka queues entry by entry; the others fail a batch whole.
+    /// Only Kafka queues entry by entry. The others fail a batch whole.
     #[allow(clippy::match_same_arms, reason = "only Kafka can fail part-way")]
     pub(crate) fn queued_before_failure(&self) -> usize {
         match self {

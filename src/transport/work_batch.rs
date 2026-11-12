@@ -16,7 +16,7 @@
 //!   shrink the record count without disturbing the source acks).
 //! - [`RecordMeta`] -- lean per-record metadata (timestamp + payload format).
 //!   Deliberately leaner than the engine's `MessageMetadata`, which carries a
-//!   type-erased commit token; here tokens move to the batch.
+//!   type-erased commit token. Here tokens move to the batch.
 //! - [`WorkBatch`] -- the canonical zero-copy block of records, the source
 //!   commit tokens for the whole block, and any inline-DLQ entries carried
 //!   forward (the no-silent-drop contract preserved from the older
@@ -28,7 +28,7 @@
 //! (at-least-once delivery).
 //!
 //! The block flows `get -> process -> send -> commit` through the unified
-//! engine driver (`crate::worker::engine::driver`); fields are parsed on
+//! engine driver (`crate::worker::engine::driver`). Fields are parsed on
 //! demand via the [`codec`](super::codec). For the wider picture see
 //! `docs/backpressure.md` (commit-token + brake contract),
 //! `docs/self-regulation.md`, and `docs/migrations.md` (the
@@ -45,7 +45,7 @@ use thiserror::Error;
 ///
 /// These cover only the **framing** contract -- slicing a top-level JSON array
 /// into per-element byte views. Element values are NOT parsed, so a malformed
-/// element body (e.g. `[1,nul]`) is not detected here; that is the downstream
+/// element body (e.g. `[1,nul]`) is not detected here. That is the downstream
 /// parser's job. What IS detected: a missing opening `[`, an unterminated array
 /// or string, structural imbalance, empty elements (leading/trailing/double
 /// commas), and trailing garbage after the closing `]`.
@@ -222,8 +222,8 @@ impl Record {
             None
         };
         let n_headers = r.u32()? as usize;
-        // Cap the pre-allocation -- a corrupt count cannot force a huge alloc;
-        // the per-header reads are still bounds-checked and fail fast on EOF.
+        // Cap the pre-allocation -- a corrupt count cannot force a huge alloc.
+        // The per-header reads are still bounds-checked and fail fast on EOF.
         let mut headers = Vec::with_capacity(n_headers.min(64));
         for _ in 0..n_headers {
             let k = std::str::from_utf8(r.bytes()?)
@@ -425,7 +425,7 @@ impl<T: CommitToken> WorkBatch<T> {
     // batch shares ONE allocation: `record.payload = blob.slice(start..end)` is
     // a refcounted view, never a payload copy. They do NOT parse / deserialise
     // and do NOT re-serialise -- framing only. Commit tokens and DLQ entries are
-    // left EMPTY; the source attaches its acks afterwards.
+    // left EMPTY. The source attaches its acks afterwards.
 
     /// One record holding the WHOLE blob (no framing).
     ///
@@ -454,20 +454,20 @@ impl<T: CommitToken> WorkBatch<T> {
     /// Frame an NDJSON (newline-delimited JSON) blob into one record per line.
     ///
     /// Splits on `\n` using `memchr`. Each line is trimmed of a trailing `\r`
-    /// (so Windows CRLF endings work) and of surrounding ASCII whitespace; blank
+    /// (so Windows CRLF endings work) and of surrounding ASCII whitespace. Blank
     /// or whitespace-only lines are skipped. Each surviving line becomes a
     /// [`Record`] whose payload is a zero-copy `blob.slice(start..end)` view.
     /// `format` is set to [`PayloadFormat::Json`].
     ///
     /// This is framing, not parsing -- it never fails. A line that is not valid
-    /// JSON still becomes a record; the downstream parser surfaces that.
+    /// JSON still becomes a record. The downstream parser surfaces that.
     #[must_use]
     pub fn from_ndjson(blob: Bytes) -> Self {
         let mut records = Vec::new();
         let mut line_start = 0usize;
         let bytes = blob.as_ref();
 
-        // Walk newline boundaries; the tail after the last `\n` is its own line.
+        // Walk newline boundaries. The tail after the last `\n` is its own line.
         for nl in memchr::memchr_iter(b'\n', bytes) {
             Self::push_ndjson_line(&mut records, &blob, line_start, nl);
             line_start = nl + 1;
@@ -515,7 +515,7 @@ impl<T: CommitToken> WorkBatch<T> {
 
     /// Frame a top-level JSON array blob into one record per top-level element.
     ///
-    /// Each element becomes a zero-copy `blob.slice(start..end)` view; element
+    /// Each element becomes a zero-copy `blob.slice(start..end)` view. Element
     /// VALUES are not parsed. The byte-level scanner tracks string state (so
     /// `[`, `]`, `{`, `}` and `,` inside a string are literal), JSON escapes
     /// (`\"`, `\\`), and container depth, so nested objects/arrays frame
@@ -545,7 +545,7 @@ fn scan_json_array(blob: &Bytes) -> Result<Vec<Record>, FramingError> {
     let bytes = blob.as_ref();
     let len = bytes.len();
 
-    // Skip leading whitespace; the first significant byte must be '['.
+    // Skip leading whitespace. The first significant byte must be '['.
     let mut i = 0usize;
     while i < len && bytes[i].is_ascii_whitespace() {
         i += 1;
@@ -721,7 +721,7 @@ impl<T: CommitToken> From<crate::transport::traits::RecvBatch<T>> for WorkBatch<
     /// `WorkBatch`.
     ///
     /// Each `Message<T>` becomes a [`Record`]; its `token` is collected into
-    /// `commit_tokens` (preserving order); `dlq_entries` carry straight across.
+    /// `commit_tokens` (preserving order). `dlq_entries` carry straight across.
     /// `filtered_tokens` (acks of records removed by inbound drop/dlq filters)
     /// are appended to `commit_tokens` so the block commit advances the source
     /// past them -- the commit-token count is deliberately NOT tied to
@@ -1080,7 +1080,7 @@ mod tests {
         let payload_ptr = payload.as_ptr();
 
         let msg = Message::new(Some(Arc::from("topic")), payload, TestToken(1), None);
-        // Message.payload is Bytes built from the vec; same allocation.
+        // Message.payload is Bytes built from the vec. Same allocation.
         assert_eq!(msg.payload.as_ptr(), payload_ptr);
 
         let wb: WorkBatch<TestToken> = msg.into();
@@ -1356,7 +1356,7 @@ mod tests {
 
     #[test]
     fn json_array_string_with_escaped_backslash_then_closing_quote() {
-        // `\\` is an escaped backslash; the following `"` DOES close the string.
+        // `\\` is an escaped backslash. The following `"` DOES close the string.
         // Element 0 is the string "path\\" and element 1 is the number 1.
         let blob = Bytes::from_static(b"[\"path\\\\\", 1]");
         let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();

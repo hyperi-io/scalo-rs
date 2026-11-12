@@ -13,7 +13,7 @@
 //! - **CRC framing** ([`frame`] / [`unframe`]): an optional CRC32C header in
 //!   front of each record's on-disk bytes. The underlying queue (yaque) only
 //!   parity-checks the LENGTH header, so a torn write / bit-rot in the payload
-//!   would otherwise be returned silently; the checksum turns that into a
+//!   would otherwise be returned silently. The checksum turns that into a
 //!   detectable [`CorruptionError`].
 //! - **Open** ([`open_queue`]): clears lock files a stopped process left behind,
 //!   refuses a queue a live process still holds, and quarantines a queue that
@@ -130,7 +130,7 @@ const LOCK_WRITE_GRACE: Duration = Duration::from_millis(500);
 pub(crate) enum QuarantineTrigger {
     /// The queue would not open.
     OpenFailed,
-    /// A record failed its CRC check on read; only the standalone spool recovers on read.
+    /// A record failed its CRC check on read. Only the standalone spool recovers on read.
     #[cfg(feature = "spool")]
     CrcMismatch,
 }
@@ -148,7 +148,7 @@ impl QuarantineTrigger {
 /// Why [`open_queue`] could not open a spool directory.
 #[derive(Debug)]
 pub(crate) enum OpenError {
-    /// A live process holds the queue; a second handle would put two writers
+    /// A live process holds the queue. A second handle would put two writers
     /// and two readers on one queue.
     Locked(String),
     /// The queue would not open, and was not (or could not be) replaced.
@@ -170,7 +170,7 @@ impl std::fmt::Display for OpenError {
 /// Open the yaque queue at `path` for sending and receiving.
 ///
 /// Lock files left by a process that no longer exists are removed first, using
-/// yaque's pid+token check; an empty or unparseable lock counts as stale. A
+/// yaque's pid+token check. An empty or unparseable lock counts as stale. A
 /// lock a live process holds refuses the open and is never treated as
 /// corruption. When the queue still will not open, `policy` decides:
 /// [`CorruptionPolicy::Quarantine`] moves its files into a `corrupt-*`
@@ -208,7 +208,7 @@ pub(crate) fn open_queue(
         .map_err(|e| OpenError::Failed(format!("{open_err}; fresh open failed: {e}")))
 }
 
-/// Remove every lock file whose owner is gone; refuse when a live owner holds one.
+/// Remove every lock file whose owner is gone. Refuse when a live owner holds one.
 fn release_stale_locks(path: &Path) -> Result<(), OpenError> {
     for (label, segments) in LOCK_FILES {
         let lock = segments.iter().fold(path.to_path_buf(), |p, s| p.join(s));
@@ -256,7 +256,7 @@ fn release_one(lock: &Path) -> Result<Option<&'static str>, OpenError> {
     }
 }
 
-/// Read a lock file, `None` when it does not exist; non-UTF-8 reads as unparseable.
+/// Read a lock file, `None` when it does not exist. Non-UTF-8 reads as unparseable.
 fn read_lock(lock: &Path) -> Result<Option<String>, OpenError> {
     match std::fs::read(lock) {
         Ok(bytes) => Ok(Some(String::from_utf8(bytes).unwrap_or_default())),

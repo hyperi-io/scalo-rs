@@ -28,7 +28,7 @@
 //!
 //! - [`ParsedPayload::field_str`] -- the common case: a top-level string field.
 //! - [`ParsedPayload::field`] -- a [`FieldRef`] over the scalar routing cases
-//!   (string/int/float/bool/null); everything else collapses to
+//!   (string/int/float/bool/null). Everything else collapses to
 //!   [`FieldRef::Other`] because routers do not key off containers.
 //!
 //! **Scope:** top-level object-key lookup only. No deep JSON-path (YAGNI -- keys
@@ -96,10 +96,10 @@ pub enum ParsedPayload {
 ///
 /// This is the shared currency the unified accessor returns so a router need
 /// not know whether the record was JSON or MsgPack. It covers the scalar cases
-/// a router actually keys off; nested objects / arrays / binary / ext collapse
+/// a router actually keys off. Nested objects / arrays / binary / ext collapse
 /// to [`FieldRef::Other`] because routing never branches on a container.
 ///
-/// `Str` borrows from the parsed value (zero-copy); the numeric / bool variants
+/// `Str` borrows from the parsed value (zero-copy). The numeric / bool variants
 /// are `Copy` scalars.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -149,12 +149,12 @@ pub fn parse(payload: &Bytes, format: PayloadFormat) -> Result<ParsedPayload, Co
             Ok(ParsedPayload::Json(value))
         }
         PayloadFormat::MsgPack => {
-            // `&mut &[u8]` is the io::Read cursor; advances as it decodes. SINGLE
+            // `&mut &[u8]` is the io::Read cursor. Advances as it decodes. SINGLE
             // native decode -- no rmp_serde, no serde_json, no re-encode.
             //
             // Bound nesting depth: a malicious/corrupt payload can encode deep
             // nesting that drives recursive decode into worker-thread stack
-            // exhaustion. rmpv defaults to 1024; tighten to the shared parse-path
+            // exhaustion. rmpv defaults to 1024. Tighten to the shared parse-path
             // bound on this untrusted path.
             let mut cursor: &[u8] = payload.as_ref();
             let value = rmpv::decode::read_value_with_max_depth(
@@ -163,7 +163,7 @@ pub fn parse(payload: &Bytes, format: PayloadFormat) -> Result<ParsedPayload, Co
             )?;
             // One value per record. Leftover bytes mean corruption, framing
             // misalignment, or concatenated values -- reject. MsgPack-stream
-            // framing is a separate deferred feature; do NOT silently accept.
+            // framing is a separate deferred feature. Do NOT silently accept.
             let remaining = cursor.len();
             if remaining > 0 {
                 return Err(CodecError::TrailingBytes(remaining));
@@ -200,7 +200,7 @@ pub fn to_json_bytes(value: &sonic_rs::Value) -> Result<Bytes, CodecError> {
 /// an in-memory `Vec` writer this is effectively unreachable, but the encoder
 /// is fallible so the error is surfaced rather than unwrapped.
 pub fn to_msgpack_bytes(value: &rmpv::Value) -> Result<Bytes, CodecError> {
-    // write_value writes into any `io::Write`; a Vec<u8> is one and never
+    // write_value writes into any `io::Write`. A Vec<u8> is one and never
     // returns a short write, so the only failure path is the encoder's own.
     let mut buf: Vec<u8> = Vec::new();
     rmpv::encode::write_value(&mut buf, value)?;
@@ -318,7 +318,7 @@ fn msgpack_field<'a>(v: &'a rmpv::Value, name: &str) -> Option<&'a rmpv::Value> 
 
 /// Classify an rmpv MsgPack value into a [`FieldRef`].
 ///
-/// MsgPack integers split into signed/unsigned at the wire level; both fold to
+/// MsgPack integers split into signed/unsigned at the wire level. Both fold to
 /// `i64` here when they fit. An unsigned value above `i64::MAX` cannot fit `i64`
 /// and is surfaced as [`FieldRef::Float`] via `as_f64` (lossy but it keeps a
 /// numeric field numeric for routing) rather than dropped to `Other`.
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn parse_json_array_is_ok() {
-        // A top-level array is valid JSON; it simply has no named fields.
+        // A top-level array is valid JSON. It simply has no named fields.
         let parsed = parse(&Bytes::from_static(b"[1,2,3]"), PayloadFormat::Json).unwrap();
         assert!(parsed.is_json());
         assert_eq!(parsed.field_str("anything"), None);
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn empty_blob_auto_errors_as_json() {
-        // detect() maps empty -> Json; empty is not valid JSON.
+        // detect() maps empty -> Json. Empty is not valid JSON.
         let err = parse(&Bytes::new(), PayloadFormat::Auto).unwrap_err();
         assert!(matches!(err, CodecError::Json(_)), "got {err:?}");
     }
@@ -722,7 +722,7 @@ mod tests {
         let bytes = parsed.to_bytes().unwrap();
         let reparsed = parse(&bytes, PayloadFormat::Json).unwrap();
         assert!(reparsed.is_json());
-        // No named fields either way; the value re-parses without error.
+        // No named fields either way. The value re-parses without error.
         assert_eq!(reparsed.field_str("anything"), None);
     }
 
@@ -759,7 +759,7 @@ mod tests {
     fn msgpack_rejects_trailing_bytes() {
         // A valid fixmap {"k": "v"} followed by a stray nil byte (0xc0).
         // Without the trailing-bytes check the value parses Ok and the 0xc0 is
-        // silently ignored; it must return CodecError::TrailingBytes(1).
+        // silently ignored. It must return CodecError::TrailingBytes(1).
         let mut buf = vec![fixmap_header(1)];
         buf.extend(fixstr("k"));
         buf.extend(fixstr("v"));
@@ -775,7 +775,7 @@ mod tests {
     #[test]
     fn msgpack_rejects_concatenated_values() {
         // Two valid MsgPack values back-to-back: fixint 1 then fixint 2.
-        // parse() decodes ONE value; the second byte is trailing and must error.
+        // parse() decodes ONE value. The second byte is trailing and must error.
         let buf = vec![0x01u8, 0x02u8]; // positive fixint 1, positive fixint 2
         let err = parse(&Bytes::from(buf), PayloadFormat::MsgPack)
             .expect_err("concatenated values must be rejected");

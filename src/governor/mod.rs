@@ -34,14 +34,14 @@
 //!   A saturated SOFT signal can never lower the level below what the HARD
 //!   signal demands, nor can a missing HARD signal be hidden by a busy SOFT
 //!   one: the memory signal always reaches the latch. The latch stops new
-//!   intake; it cannot stop an allocation already under way, so it does not
+//!   intake. It cannot stop an allocation already under way, so it does not
 //!   by itself prevent an OOM kill.
 //! - **SOFT signals are weighted.** Each SOFT source's reading is scaled by
 //!   its [`weight`](PressureSource::weight) before competing for the level.
 //!   A low-weight SOFT source at full saturation cannot force a hold the
 //!   HARD signal would not.
 //! - **Hysteresis prevents flapping.** The latch arms at `pause_above` and
-//!   releases at `resume_below`; between the two it holds its current state,
+//!   releases at `resume_below`. Between the two it holds its current state,
 //!   so a reading oscillating around a single threshold cannot rapidly
 //!   toggle pause/resume.
 //! - **A hold is bounded in time.** Memory already resident can keep the
@@ -50,7 +50,7 @@
 //!   window and re-arms if the level is still at `pause_above`, so a source
 //!   is never paused for good. Each [`InboundGate`] on the latch resumes once
 //!   per expired hold and stays open until a receive returns records or 2 s
-//!   pass; the byte budget never takes that window.
+//!   pass. The byte budget never takes that window.
 //!
 //! New source kinds (e.g. a future CPU source) plug in via
 //! [`UnifiedPressure::add_source`] with zero change to the gate API.

@@ -509,7 +509,7 @@ pub fn init(env_prefix: &str) -> Result<(), Box<dyn std::error::Error + Send + S
 #[cfg(test)]
 mod runner {
     /// The suite shares process-global state, so plain `cargo test` fails
-    /// tests for that reason alone; this one says so by name.
+    /// tests for that reason alone. This one says so by name.
     #[test]
     fn the_suite_runs_one_test_per_process_under_cargo_nextest() {
         assert_eq!(

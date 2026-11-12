@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/governor/source.rs
-// Purpose:   Pressure seam + memory source for the self-regulation governor
+// Purpose:   Pressure source trait + memory source for the self-regulation governor
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -267,7 +267,7 @@ pub struct UnifiedPressure {
     /// transports it gates.
     sources: parking_lot::RwLock<Vec<Arc<dyn PressureSource>>>,
     hyst: Hysteresis,
-    /// `0` while released; while held, the clock reading the hold armed at,
+    /// `0` while released. While held, the clock reading the hold armed at,
     /// plus one, so one compare-exchange ends exactly the hold that was read.
     hold: AtomicU64,
     /// Longest a hold lasts with the level above `resume_below`, in clock
@@ -409,7 +409,7 @@ impl UnifiedPressure {
     /// - Otherwise -> return the current latch state (the band holds it).
     ///
     /// Beyond [`level`](Self::level) it loads the latch word and, with
-    /// `metrics`, the last published level; a held latch with a bound also
+    /// `metrics`, the last published level. A held latch with a bound also
     /// reads the monotonic clock.
     #[must_use]
     pub fn should_hold(&self) -> bool {
@@ -717,7 +717,7 @@ mod tests {
         );
 
         // Step 1: memory=0.50, cpu=1.0 (saturated SOFT).
-        // soft = 1.0 * 0.5 = 0.50; hard = 0.50; level = max(0.50, 0.50) = 0.50.
+        // soft = 1.0 * 0.5 = 0.50. Hard = 0.50. Level = max(0.50, 0.50) = 0.50.
         // A saturated SOFT signal at weight 0.5 CANNOT force a hold the HARD
         // signal would not. level < pause_above -> no hold.
         assert!(

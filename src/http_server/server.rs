@@ -338,7 +338,7 @@ async fn health_live() -> impl IntoResponse {
 ///
 /// Checks the local ready flag AND (when the `health` feature is enabled)
 /// the global [`HealthRegistry`](crate::health::HealthRegistry). Both must
-/// be true for a 200 response; otherwise 503.
+/// be true for a 200 response. Otherwise 503.
 async fn health_ready(ready: Arc<AtomicBool>) -> impl IntoResponse {
     let locally_ready = ready.load(Ordering::SeqCst);
 

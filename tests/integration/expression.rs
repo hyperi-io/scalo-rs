@@ -310,7 +310,7 @@ fn evaluate_size_list() {
     assert_eq!(result, true.into());
 }
 
-// cel 0.14 keeps `contains` for strings only; membership in a list or map is `in`.
+// cel 0.14 keeps `contains` for strings only. Membership in a list or map is `in`.
 
 #[test]
 fn evaluate_contains_on_a_list_is_an_error() {

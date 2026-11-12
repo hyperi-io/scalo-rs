@@ -46,7 +46,7 @@ pub fn generate_container_manifest(
         .collect();
 
     // A port with a `when` condition is not exposed, because an image cannot
-    // know whether that listener is on; it is listed with its condition instead.
+    // know whether that listener is on. It is listed with its condition instead.
     let mut expose_ports = vec![serde_json::Value::from(contract.metrics_port)];
     let mut conditional_ports = Vec::new();
     for p in &contract.extra_ports {

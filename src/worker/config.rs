@@ -110,7 +110,7 @@ impl WorkerPoolConfig {
     /// Falls back to defaults if the config cascade is not initialised or the
     /// key is absent. A DERIVED (defaulted, not user-set) `min_threads` that
     /// exceeds the CPU-derived thread ceiling is clamped down with an INFO log
-    /// so small-CPU containers resolve to a working pool; a user-explicit
+    /// so small-CPU containers resolve to a working pool. A user-explicit
     /// `min_threads` is never clamped. Validates after loading.
     ///
     /// # Errors
@@ -180,7 +180,7 @@ impl WorkerPoolConfig {
             });
         }
         // Zero CPU workers leaves the rayon semaphore
-        // spinning in `yield_now()` forever. Reject upfront; the
+        // spinning in `yield_now()` forever. Reject upfront. The
         // scaler's clamp uses min_threads as the floor, so this
         // also guarantees the scaler never drives permits below 1.
         if self.min_threads == 0 {
@@ -239,9 +239,8 @@ fn detected_parallelism() -> usize {
 mod tests {
     use super::*;
 
-    /// Regression: `async_concurrency: 0` previously
-    /// passed validation and panicked at `step_by(0)` in
-    /// `fan_out_async`.
+    /// `async_concurrency: 0` must fail validation, because `fan_out_async`
+    /// panics at `step_by(0)`.
     #[test]
     fn validate_rejects_zero_async_concurrency() {
         let cfg = WorkerPoolConfig {
@@ -265,7 +264,7 @@ mod tests {
     }
 
     /// Regression (#21): a 1-CPU cgroup derives max_threads = 1 while the
-    /// default min_threads is 2; the derived min clamps down to the ceiling
+    /// default min_threads is 2. The derived min clamps down to the ceiling
     /// instead of failing validation.
     #[test]
     fn one_cpu_derivation_clamps_default_min() {
@@ -301,8 +300,8 @@ mod tests {
         assert_eq!(cfg.min_threads, 2);
     }
 
-    /// Regression: `min_threads: 0` previously passed
-    /// validation and pinned the rayon semaphore in a yield loop.
+    /// `min_threads: 0` must fail validation, because it pins the rayon
+    /// semaphore in a yield loop.
     #[test]
     fn validate_rejects_zero_min_threads() {
         let cfg = WorkerPoolConfig {

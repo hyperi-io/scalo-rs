@@ -396,7 +396,7 @@ impl TransportReceiver for PipeTransport {
         let messages = std::mem::replace(pending, rest);
         drop(stdin);
 
-        // Apply inbound filters via the shared partition helper; DLQ entries
+        // Apply inbound filters via the shared partition helper. DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
         let batch = filter_engine.partition_batch(
             messages,
@@ -606,7 +606,7 @@ mod tests {
     }
 
     /// Drop `recv` after `ms` if it has not returned, as a losing `select!`
-    /// arm does; `None` means it was dropped.
+    /// arm does. `None` means it was dropped.
     #[cfg(unix)]
     async fn recv_within(
         transport: &PipeTransport,

@@ -8,9 +8,7 @@
 
 //! # Unified `WorkBatch` engine driver
 //!
-//! The single run loop that the four legacy loops (`run` / `run_raw` /
-//! `run_async` / `run_raw_async`) collapsed into when the spine flipped to
-//! `WorkBatch`. It drives the canonical currency -- [`WorkBatch`] --
+//! The single run loop for the engine. It drives the canonical currency -- [`WorkBatch`] --
 //! through one block at a time:
 //!
 //! ```text
@@ -28,7 +26,7 @@
 //! from `records.len()`, so a `process` that fans `N` records out to `2N` (or
 //! collapses them) does NOT disturb the source acks. The driver commits EXACTLY
 //! the input tokens after the whole out-batch is sent -- never `2N`, never per
-//! output record. That invariant is the data-plane core; the fan-out
+//! output record. That invariant is the data-plane core. The fan-out
 //! commit-correctness test proves it.
 //!
 //! ## Two parse modes (the hybrid)
@@ -47,8 +45,7 @@
 //!   opt in.
 //!
 //! `process_mid_tier`, `process_raw` and `ParsedMessage` remain for the
-//! in-process (non-run-loop) callers; only the four legacy run loops were
-//! removed by the 0.7b flip.
+//! in-process (non-run-loop) callers.
 //!
 //! ## Shutdown
 //!
@@ -77,7 +74,7 @@ use crate::transport::{
 pub enum CommitMode {
     /// At-least-once: after the sink returns `Ok` for the WHOLE out-batch, the
     /// engine calls `receiver.commit(&out_batch.commit_tokens)`. A transient
-    /// sink error holds the block and retries it; a permanent one skips the
+    /// sink error holds the block and retries it. A permanent one skips the
     /// commit so the block is re-delivered. This is the engine-commits
     /// behaviour of the former mid-tier / raw run loops, lifted onto the block.
     Auto,
@@ -101,11 +98,11 @@ pub enum CommitMode {
 /// `records` and `parsed` are aligned 1:1 and contain ONLY records that parsed
 /// successfully. A record whose payload fails [`codec::parse`] is handled per
 /// the engine's configured [`ParseErrorAction`](super::ParseErrorAction) -- the
-/// same contract the legacy `process_mid_tier` honoured:
+/// same contract `process_mid_tier` honours:
 ///
 /// - [`Dlq`](super::ParseErrorAction::Dlq) (default): its bytes are appended to
 ///   [`dlq_entries`](Self::dlq_entries) with a `parse error: ...` reason
-///   (no silent drop); the resulting [`WorkBatch`] inherits those entries and
+///   (no silent drop). The resulting [`WorkBatch`] inherits those entries and
 ///   the driver routes them through the DLQ policy before commit.
 /// - [`Skip`](super::ParseErrorAction::Skip): the record is dropped (counted in
 ///   errors) -- a deliberate, configured drop, not a silent vanish.
@@ -132,7 +129,7 @@ pub struct ParsedBatch<'a, T: crate::transport::CommitToken> {
     pub dlq_entries: Vec<crate::transport::filter::FilteredDlqEntry>,
 
     /// Shared interner for hot routing-field-name dedup. The first time a field
-    /// name is seen it allocates an `Arc<str>`; later lookups are a refcount
+    /// name is seen it allocates an `Arc<str>`. Later lookups are a refcount
     /// bump. Reused from the engine so dedup persists across blocks.
     pub interner: &'a super::FieldInterner,
 }
@@ -201,7 +198,7 @@ where
         }
     }
 
-    /// Run the ticker callback; a callback error is logged, not fatal.
+    /// Run the ticker callback. A callback error is logged, not fatal.
     pub(super) async fn fire(&mut self, label: &str) {
         if let Some(f) = self.callback.as_mut()
             && let Err(e) = f().await
@@ -217,7 +214,7 @@ pub(super) enum Delivery {
     /// The sink took it.
     Sunk,
     /// The sink was still refusing it when the retry window after shutdown
-    /// closed; it stays uncommitted.
+    /// closed. It stays uncommitted.
     Abandoned,
 }
 
@@ -295,7 +292,7 @@ pub(super) async fn recv_capped<R: TransportReceiver>(
     }
 }
 
-/// Close the source at shutdown; a failure is logged, since shutdown goes on.
+/// Close the source at shutdown. A failure is logged, since shutdown goes on.
 #[cfg(feature = "transport")]
 pub(super) async fn close_source<R: TransportReceiver>(receiver: &R) {
     if let Err(e) = receiver.close().await {
@@ -336,7 +333,7 @@ async fn wait_unless_shutdown(shutdown: &CancellationToken, wait: Duration) -> b
     }
 }
 
-/// Count and report one transient failure of a run-loop `stage`; warn on the
+/// Count and report one transient failure of a run-loop `stage`. Warn on the
 /// first of a run only.
 #[cfg(feature = "transport")]
 pub(super) fn note_transient(stage: &'static str, error: &dyn std::fmt::Display, failures: u32) {
@@ -465,7 +462,7 @@ where
 /// Commit `tokens`, logging and counting a failure instead of ending the loop.
 ///
 /// The block was already delivered and source commits are cumulative, so the
-/// next successful commit covers it; a lost commit costs re-delivery after a
+/// next successful commit covers it. A lost commit costs re-delivery after a
 /// restart, never data.
 #[cfg(feature = "transport")]
 async fn commit_or_report<R: TransportReceiver>(receiver: &R, tokens: &[R::Token]) {
@@ -490,7 +487,7 @@ impl BatchEngine {
     /// pay zero parse cost.
     ///
     /// - `process` runs on the loop task (cancellation-aware between awaits) and
-    ///   may fan records out or in; it MUST preserve `commit_tokens` (use
+    ///   may fan records out or in. It MUST preserve `commit_tokens` (use
     ///   [`WorkBatch::map_records`], which does so automatically).
     /// - `sink` is async and receives the WHOLE out-batch by reference.
     /// - `commit` selects [`CommitMode::Auto`] (engine commits after sink `Ok`)
@@ -536,7 +533,7 @@ impl BatchEngine {
     /// `recv` stops retrying when `shutdown` fires, a sink 10 s after it. A sink
     /// should map
     /// [`SendResult::Backpressured`](crate::transport::SendResult::Backpressured)
-    /// to `Err(TransportError::Backpressure.into())` to get this; an
+    /// to `Err(TransportError::Backpressure.into())` to get this. An
     /// [`EngineError::Sink`] is treated as permanent.
     ///
     /// While the sink refuses a block, that block is held and re-sunk: no later
@@ -637,7 +634,7 @@ impl BatchEngine {
     /// FINAL sub-block's sink returns `Ok` (under [`CommitMode::Auto`]) -- so
     /// at-least-once is preserved: a sink error on any sub-block stops the block
     /// and skips the commit, so the WHOLE block is re-delivered. The sub-block
-    /// views carry EMPTY `commit_tokens`; the batch's tokens are committed once at
+    /// views carry EMPTY `commit_tokens`. The batch's tokens are committed once at
     /// the end.
     ///
     /// `sub_block_bytes` is the target sum of `payload.len()` per sub-block (floor
@@ -649,7 +646,7 @@ impl BatchEngine {
         doc = "[`run_governed`](Self::run_governed) supplies it from the governor's byte budget."
     )]
     ///
-    /// Fan-out WITHIN a sub-block's `process` is fine (records grow); the source
+    /// Fan-out WITHIN a sub-block's `process` is fine (records grow). The source
     /// acks are still the batch's input tokens, committed once at the end.
     ///
     /// Shutdown drains the source as [`run_workbatch`](Self::run_workbatch)
@@ -773,7 +770,7 @@ impl BatchEngine {
     /// transport-side brake. The two share the same `UnifiedPressure`.
     ///
     /// Shutdown drains the source as [`run_workbatch`](Self::run_workbatch)
-    /// does; with the governor on, through the byte budget in force when
+    /// does. With the governor on, through the byte budget in force when
     /// shutdown lands.
     ///
     /// # Errors
@@ -890,7 +887,7 @@ impl BatchEngine {
                     };
 
                     // Re-read the budget for THIS block: no memory pressure -> big
-                    // budget -> one sub-block (no overhead); memory pressure ->
+                    // budget -> one sub-block (no overhead). Memory pressure ->
                     // shrunk budget -> peak in-flight bounded to one sub-block.
                     let sub_block_bytes = budget.byte_budget();
 
@@ -1147,7 +1144,7 @@ impl BatchEngine {
     /// Drive ONE block through `ingress lease -> process -> sink -> commit`.
     ///
     /// Shared by both [`run_workbatch`](Self::run_workbatch) and
-    /// [`run_workbatch_parsed`](Self::run_workbatch_parsed); the only difference
+    /// [`run_workbatch_parsed`](Self::run_workbatch_parsed). The only difference
     /// between the two is the `process` closure they pass. Returns
     /// [`Delivery::Abandoned`] when the sink still refused the block as `retry`
     /// closed, which leaves it uncommitted.
@@ -1167,13 +1164,13 @@ impl BatchEngine {
         Sink: FnMut(&WorkBatch<R::Token>) -> SinkFut,
         SinkFut: std::future::Future<Output = Result<(), EngineError>>,
     {
-        // Account the in-flight ingress bytes against the MemoryGuard; the lease
+        // Account the in-flight ingress bytes against the MemoryGuard. The lease
         // releases on every exit path of this block (sink-error early return,
         // commit, ?-return) via Drop.
         #[cfg(feature = "memory")]
         let _ingress_lease = self.lease_ingress_batch(&batch);
 
-        // process() may fan out / fan in; it preserves the input commit_tokens.
+        // process() may fan out / fan in. It preserves the input commit_tokens.
         // Capture the input ack count so a contract breach is LOGGED rather than
         // silently freezing the source offset: a closure that rebuilds its
         // output with WorkBatch::from_records (instead of map_records) drops the
@@ -1218,8 +1215,8 @@ impl BatchEngine {
         // CUMULATIVE (Kafka "commit up to offset N"), so no later block may be
         // fetched and committed while this one is undelivered -- its commit
         // would advance the watermark past this block's records. A transient
-        // sink failure therefore holds THIS block and re-sinks it with backoff;
-        // any other sink failure stops the run loop with the block uncommitted.
+        // sink failure therefore holds THIS block and re-sinks it with backoff.
+        // Any other sink failure stops the run loop with the block uncommitted.
         // Skip the sink when there is nothing to send (e.g. every record in the
         // block was filtered out): the sink has no work, but the block's
         // commit_tokens -- which include the filtered records' acks -- must still
@@ -1253,7 +1250,7 @@ impl BatchEngine {
     /// bounded to ONE sub-block, the source acks commit once after the final
     /// sub-block.
     ///
-    /// The whole batch's `commit_tokens` are carried ASIDE; each sub-block view is
+    /// The whole batch's `commit_tokens` are carried ASIDE. Each sub-block view is
     /// processed and sunk with EMPTY `commit_tokens` so a fan-out within a
     /// sub-block never multiplies the source acks. Each sub-block's ingress lease
     /// is dropped (releasing those bytes) BEFORE the next sub-block is leased, so
@@ -1266,7 +1263,7 @@ impl BatchEngine {
     /// block's ordered commit can advance past it (the ack barrier -- see
     /// [`drive_block`](Self::drive_block)). The commit (under
     /// [`CommitMode::Auto`]) fires EXACTLY ONCE after the final sub-block is
-    /// delivered, with ALL the batch's input source acks; a commit failure is
+    /// delivered, with ALL the batch's input source acks. A commit failure is
     /// logged and counted, and the loop carries on. Returns
     /// [`Delivery::Abandoned`] when the sink still refused a sub-block as
     /// `retry` closed, leaving the whole block uncommitted.
@@ -1288,7 +1285,7 @@ impl BatchEngine {
         Sink: FnMut(&WorkBatch<R::Token>) -> SinkFut,
         SinkFut: std::future::Future<Output = Result<(), EngineError>>,
     {
-        // Carry the WHOLE block's source acks aside; the sub-block views below
+        // Carry the WHOLE block's source acks aside. The sub-block views below
         // commit EMPTY tokens. The batch's tokens commit ONCE after the final
         // sub-block (at-least-once on the whole block). dlq_entries were already
         // routed by ingest_workbatch, so the block here carries none.
@@ -1315,7 +1312,7 @@ impl BatchEngine {
             #[cfg(feature = "memory")]
             let _sub_lease = self.lease_ingress_batch(&sub_block);
 
-            // process() may fan out / fan in within the sub-block; it preserves
+            // process() may fan out / fan in within the sub-block. It preserves
             // the (empty) commit_tokens of the sub-block view.
             let mut out_sub = process(sub_block)?;
 
@@ -1361,7 +1358,7 @@ impl BatchEngine {
     /// Collect a [`SubBlockDrain`] into a `Vec<Vec<Record>>` (test convenience).
     ///
     /// The driver itself uses [`SubBlockDrain`] LAZILY and never collects all
-    /// sub-blocks; this wrapper keeps the byte-split unit tests (which assert the
+    /// sub-blocks. This wrapper keeps the byte-split unit tests (which assert the
     /// sub-block shapes) ergonomic. Same splitting contract as
     /// [`SubBlockDrain::next_sub_block`].
     #[cfg(all(test, feature = "transport-memory"))]
@@ -1380,9 +1377,8 @@ impl BatchEngine {
     /// Parses each record's payload via [`codec::parse`] on the worker pool
     /// (SIMD JSON / native MsgPack), keeping the surviving records aligned 1:1
     /// with their [`ParsedPayload`]s. A record that FAILS to parse is handled per
-    /// the engine's `parse_error_action` -- the SAME contract the legacy
-    /// `process_mid_tier` honoured (previously the parsed path hardcoded
-    /// route-to-DLQ, ignoring the config):
+    /// the engine's `parse_error_action` -- the SAME contract
+    /// `process_mid_tier` honours:
     ///
     /// - [`Dlq`](super::ParseErrorAction::Dlq) (default): the record's bytes are
     ///   appended to the batch's `dlq_entries` (no silent drop) and counted in
@@ -1391,7 +1387,7 @@ impl BatchEngine {
     ///   in errors ONLY (a deliberate, configured drop -- not a silent vanish).
     /// - [`FailBatch`](super::ParseErrorAction::FailBatch): the whole block is
     ///   failed via [`EngineError::ParseBatchFailed`] -- terminal/no-commit,
-    ///   consistent with the P1 ack barrier, so the block is re-delivered rather
+    ///   consistent with the ack barrier, so the block is re-delivered rather
     ///   than partially committed.
     ///
     /// Input `commit_tokens` and any carried-in `dlq_entries` are preserved.
@@ -1416,7 +1412,7 @@ impl BatchEngine {
 
         // Parse each record on the pool. The pool's map_owned applies the scaler
         // semaphore per item, so the parse phase obeys the CPU cap exactly as the
-        // legacy parsed path does. map_owned preserves input order, so a record
+        // other parse paths do. map_owned preserves input order, so a record
         // and its parse result stay aligned without threading an explicit index.
         let parsed_each: Vec<(Record, Result<ParsedPayload, String>)> =
             self.pool.map_owned(records, |record| {
@@ -1495,7 +1491,7 @@ impl BatchEngine {
 ///
 /// Each call to [`next_sub_block`](Self::next_sub_block) pulls records (in
 /// order) from the source until the accumulated `payload.len()` would overshoot
-/// `target_bytes`, then returns that sub-block; the remaining records stay
+/// `target_bytes`, then returns that sub-block. The remaining records stay
 /// un-pulled in the source iterator. Splitting contract:
 ///
 /// - records are kept in order;
@@ -1507,7 +1503,7 @@ impl BatchEngine {
 /// The lazy shape matters: the previous `Vec<Vec<Record>>` allocated every
 /// sub-block vector before the loop processed the first one. Here, at most ONE
 /// sub-block vector is allocated at a time -- the one the loop is about to lease
-/// and sink -- so the SPLIT no longer defeats the streaming peak-memory bound.
+/// and sink -- so the SPLIT keeps the streaming peak-memory bound.
 #[cfg(feature = "transport")]
 pub(super) struct SubBlockDrain {
     /// Source records, drained in order. `peeked` holds a record we pulled but

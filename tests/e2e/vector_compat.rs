@@ -605,10 +605,8 @@ sinks:
         .spawn()
         .expect("Failed to spawn vector binary");
 
-    // Wait for Vector to bind the gRPC port. Polling instead of a fixed
-    // sleep -- Vector startup varies from ~50 ms to several seconds under
-    // CI contention, and the previous 2 s sleep was the source of the
-    // flake when the full test suite was running in parallel.
+    // Wait for Vector to bind the gRPC port. Startup takes from ~50 ms to
+    // several seconds under CI contention, so poll rather than sleep a fixed time.
     wait_for_port_bind(port, Duration::from_secs(15))
         .await
         .expect("vector failed to bind gRPC port within 15s");

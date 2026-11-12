@@ -114,7 +114,7 @@ pub struct DeploymentContract {
 
     /// `default_config` listen paths that need no port, e.g. the bind address
     /// of a client that only sends. Waives them from
-    /// [`undeclared_listeners`](Self::undeclared_listeners); no generated
+    /// [`undeclared_listeners`](Self::undeclared_listeners). No generated
     /// artefact changes with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unbound_listen_paths: Vec<String>,
@@ -165,7 +165,7 @@ pub struct DeploymentContract {
     /// derived via schemars (scalo-rs#6). `None` when the app does not provide
     /// one. Secret fields carry the `x-scalo-secret` marker, and operator dials
     /// carry `x-scalo-dial` (`big` or `small`, see [`DIAL_KEYWORD`](super::DIAL_KEYWORD)).
-    /// Carried inline so a single fetch of the contract gives the schema; also
+    /// Carried inline so a single fetch of the contract gives the schema. Also
     /// written to `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(
@@ -193,7 +193,7 @@ pub struct DeploymentContract {
     pub termination_grace_seconds: u32,
 
     /// The app's own CPU and memory requests and limits. Empty values leave
-    /// the chart's defaults in place; deployment values override both.
+    /// the chart's defaults in place. Deployment values override both.
     #[serde(default, skip_serializing_if = "ResourcesContract::is_empty")]
     pub resources: ResourcesContract,
 
@@ -307,7 +307,7 @@ fn default_termination_grace_seconds() -> u32 {
 /// A directory the app writes at run time.
 ///
 /// A chart mounts each one as a volume, so the container's root filesystem can
-/// stay read-only. An ephemeral path is an `emptyDir`; a persistent one is a
+/// stay read-only. An ephemeral path is an `emptyDir`. A persistent one is a
 /// claim that outlives the pod. Build one with [`new`](Self::new).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
@@ -332,7 +332,7 @@ pub struct WritablePath {
     /// Requested size of a persistent path's claim, as a Kubernetes quantity.
     #[serde(default = "default_volume_size")]
     pub size: String,
-    /// The values condition under which the app writes here; `None` means always.
+    /// The values condition under which the app writes here. `None` means always.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<PortCondition>,
 }
@@ -439,7 +439,7 @@ pub struct SecurityContract {
     /// Group that owns mounted volumes.
     #[serde(default = "default_id")]
     pub fs_group: u32,
-    /// Mount the root filesystem read-only; writes go to `writable_paths`.
+    /// Mount the root filesystem read-only. Writes go to `writable_paths`.
     #[serde(default = "default_true")]
     pub read_only_root_filesystem: bool,
     /// Linux capabilities added after every other one is dropped (e.g. "NET_ADMIN").
@@ -579,12 +579,12 @@ pub struct PortContract {
     pub when: Option<PortCondition>,
     /// Dotted `default_config` path of the listen address this port serves,
     /// e.g. `grpc.listen`. Read only by
-    /// [`undeclared_listeners`](DeploymentContract::undeclared_listeners); no
+    /// [`undeclared_listeners`](DeploymentContract::undeclared_listeners). No
     /// generated artefact changes with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_from: Option<String>,
     /// Clients outside the cluster connect here. A chart can put such ports on
-    /// a load balancer; whether it does is a deployment choice.
+    /// a load balancer. Whether it does is a deployment choice.
     #[serde(default, skip_serializing_if = "is_false")]
     pub public: bool,
     /// The application protocol a proxy speaks to this port, written to the
@@ -770,7 +770,7 @@ fn helm_truthy(value: &serde_json::Value) -> bool {
     }
 }
 
-/// What the chart's `toString` makes of a scalar; `None` for null, a list or a map.
+/// What the chart's `toString` makes of a scalar. `None` for null, a list or a map.
 fn helm_string(value: &serde_json::Value) -> Option<String> {
     use serde_json::Value;
     match value {
@@ -949,7 +949,7 @@ impl DeploymentContract {
         self
     }
 
-    /// The KEDA contract when it turns KEDA on; `None` when absent or disabled.
+    /// The KEDA contract when it turns KEDA on. `None` when absent or disabled.
     pub(crate) fn enabled_keda(&self) -> Option<&KedaContract> {
         self.keda.as_ref().filter(|keda| keda.enabled)
     }
@@ -1268,7 +1268,7 @@ mod tests {
                 "group_id": null,
             }
         })));
-        // brokers is set; group_id is null and topics is absent, and the chart
+        // brokers is set. group_id is null and topics is absent, and the chart
         // would render both empty.
         assert_eq!(
             contract.unresolved_values_paths(),
@@ -1506,7 +1506,7 @@ mod tests {
     }
 
     /// A gate the config cannot answer is reported like any other unresolved
-    /// values path; a gate whose key is null is off, not unresolved.
+    /// values path. A gate whose key is null is off, not unresolved.
     #[test]
     fn test_unresolved_values_paths_reports_a_gate_the_config_lacks() {
         let mut contract = keda_contract(Some(serde_json::json!({

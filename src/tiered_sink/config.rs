@@ -410,7 +410,7 @@ pub enum WhenFull {
     /// Meant to divert the overflowing record to the DLQ. Not wired yet:
     /// behaves as `Block`, with a warning.
     Dlq,
-    /// Drop the incoming (newest) record. Explicit opt-in loss; keeps the
+    /// Drop the incoming (newest) record. Explicit opt-in loss. Keeps the
     /// older, lower-latency records already spooled.
     DropNewest,
     /// Meant to drop the oldest spooled record to make room for the newest.

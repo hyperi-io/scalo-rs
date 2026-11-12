@@ -246,7 +246,6 @@ async fn test_04_metrics_endpoint() {
         .expect("failed to start server");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Fetch metrics
     let (status, body) = http_get(&addr, "/metrics").await;
 
     assert!(status.contains("200 OK"), "expected 200 OK, got: {status}");
@@ -483,7 +482,6 @@ async fn test_12_gauge_set() {
         "gauge should show 25.5, got: {output}"
     );
 
-    // Update gauge
     gauge.set(30.0);
     let output = manager.render();
 

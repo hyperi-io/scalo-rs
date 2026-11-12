@@ -9,8 +9,7 @@
 //! CPU oversubscription operational-test harness.
 //!
 //! The unit-under-test for the cgroup-confined CPU operational test (see
-//! `scripts/operational-cpu-test.sh` and the plan's "Operational testing"
-//! section). Like the memory harness it is a *black box*: drive it under a
+//! `scripts/operational-cpu-test.sh`). Like the memory harness it is a *black box*: drive it under a
 //! real cgroup `--cpus` cap and observe the KERNEL outcome (CPU-seconds the
 //! process actually burned, and cgroup throttling) -- not scalo internals.
 //!
@@ -21,7 +20,7 @@
 //!
 //! - `HARNESS_CAP=on`  (default): work runs on the real [`AdaptiveWorkerPool`].
 //!   During the idle window its workers PARK, so total CPU burned is roughly
-//!   just the burst; under a `--cpus` cap it is NOT throttled while idle.
+//!   just the burst. Under a `--cpus` cap it is NOT throttled while idle.
 //! - `HARNESS_CAP=off`: the control -- a naive hand-rolled pool of
 //!   over-subscribed OS threads that BUSY-SPIN on an empty queue instead of
 //!   parking. During the "idle" window they peg every core they're allowed,
@@ -69,7 +68,7 @@ fn cpu_work(seed: u64, iters: u64) -> u64 {
 
 /// CPU-seconds this process has consumed (utime + stime) from /proc/self/stat.
 ///
-/// USER_HZ is 100 on every supported Linux target; reading it via `sysconf`
+/// USER_HZ is 100 on every supported Linux target. Reading it via `sysconf`
 /// needs `unsafe`, which this crate forbids, so it is hard-coded with a note.
 #[allow(clippy::cast_precision_loss)] // tick counts are tiny; f64 is exact here
 fn process_cpu_seconds() -> f64 {

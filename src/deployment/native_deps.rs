@@ -166,7 +166,7 @@ impl BaseDistro {
     ///
     /// Returns `None` for anything not positively recognised -- a digest-only
     /// reference, a rolling alias (`stable`, `latest`), or an unknown release.
-    /// The caller decides what to do about that; guessing here is what breaks
+    /// The caller decides what to do about that. Guessing here is what breaks
     /// digest-pinned builds.
     #[must_use]
     pub fn from_base_image(base_image: &str) -> Option<Self> {
@@ -217,7 +217,7 @@ impl BaseDistro {
     /// `debian` and `ubuntu` images only.
     fn from_version(image_name: &str, part: &str) -> Option<Self> {
         match image_name {
-            // Debian publishes point-release tags (`13.2-slim`); the minor does
+            // Debian publishes point-release tags (`13.2-slim`). The minor does
             // not change the release, so compare on the major alone.
             "debian" => match part.split('.').next().unwrap_or(part) {
                 "13" => Some(Self::Trixie),
@@ -508,10 +508,10 @@ mod tests {
     // ------------------------------------------------------------------
     // BaseDistro derivation
     //
-    // The substring match this replaced only ever recognised a base image
-    // spelled with the word "trixie", and quietly served Ubuntu package names
-    // to everything else. Every reference below is a legitimate way to name a
-    // Debian 13 image.
+    // A substring match would only recognise a base image spelled with the
+    // word "trixie", and quietly serve Ubuntu package names to everything
+    // else. Every reference below is a legitimate way to name a Debian 13
+    // image.
     // ------------------------------------------------------------------
 
     #[test]
@@ -536,8 +536,8 @@ mod tests {
 
     #[test]
     fn distro_from_version_tags() {
-        // The tag most likely to be typed, and the one the old substring match
-        // silently sent to Ubuntu.
+        // The tag most likely to be typed, and the one a substring match
+        // would silently send to Ubuntu.
         assert_eq!(
             BaseDistro::from_base_image("debian:13-slim"),
             Some(BaseDistro::Trixie)
@@ -635,7 +635,7 @@ mod tests {
             Some("debian@sha256:abc123")
         );
         assert_eq!(deps.distro, Some(crate::deployment::DEFAULT_BASE_DISTRO));
-        // Trixie names, not the Ubuntu ones the old fallback would have served.
+        // Trixie names, not the Ubuntu ones.
         assert_eq!(deps.apt_packages, ["libgit2-1.9"]);
     }
 
@@ -644,8 +644,7 @@ mod tests {
         let _env = crate::deployment::env_test_lock::guard();
         // Config wins, but a Dockerfile whose FROM and whose package names are
         // for different releases is almost never intended -- so say so rather
-        // than quietly picking a side. This is the one case that used to have
-        // NO signal at all.
+        // than quietly picking a side.
         temp_env::with_var("DEPLOYMENT__BASE_DISTRO", Some("noble"), || {
             let deps =
                 NativeDepsContract::for_scalo_features(&["transport-kafka"], "debian:trixie-slim");

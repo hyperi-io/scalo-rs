@@ -42,7 +42,7 @@ use crate::io::{DEFAULT_SPOOL_ROOT, FileWriterConfig};
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DlqMode {
-    /// Try backends in order; stop on first success.
+    /// Try backends in order. Stop on first success.
     /// Default order: Kafka first, file fallback.
     #[default]
     Cascade,

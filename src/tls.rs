@@ -9,9 +9,9 @@
 //! # Unified TLS trust
 //!
 //! One place to build a rustls [`ClientConfig`] for every transport that
-//! speaks TLS (HTTP, gRPC, Vault; Kafka maps the same vocabulary onto
-//! librdkafka file paths). Collapses the previously ad-hoc per-transport TLS
-//! handling into a single trust model with first-class **private-CA** support
+//! speaks TLS (HTTP, gRPC, Vault -- Kafka maps the same vocabulary onto
+//! librdkafka file paths). One trust model replaces per-transport TLS
+//! handling, with first-class **private-CA** support
 //! -- the common deployment shape (an internal CA, not the public web
 //! PKI). Mirrors the design used in the clickhouse-rs fork.
 //!
@@ -90,7 +90,7 @@ pub enum TlsError {
 
 /// Where a transport's TLS roots come from.
 ///
-/// `native` + `webpki` are convenience root sources; `extra_*` are explicit
+/// `native` + `webpki` are convenience root sources. `extra_*` are explicit
 /// PEM files (the private CA). See the module docs for `exclusive`.
 #[derive(Debug, Clone)]
 pub struct TlsTrust {
@@ -253,7 +253,7 @@ pub fn build_client_config_with(
             let provider = posture_provider(profile.pqc());
             let builder = ClientConfig::builder_with_provider(provider);
             let versioned = match profile.tls_floor() {
-                // Commercial floor: TLS 1.2 + 1.3; peers negotiate up.
+                // Commercial floor: TLS 1.2 + 1.3. Peers negotiate up.
                 TlsFloor::V1_2 => builder.with_safe_default_protocol_versions(),
                 // National-security: TLS 1.3 only.
                 TlsFloor::V1_3 => builder.with_protocol_versions(&[&rustls::version::TLS13]),
@@ -295,7 +295,7 @@ pub fn install_default_provider() -> bool {
 /// Is `group` a hybrid post-quantum (ML-KEM) key-exchange group?
 ///
 /// Add `SecP384r1MLKEM1024` (the CNSA-pure P-384 + ML-KEM-1024 hybrid) here
-/// when rustls/aws-lc-rs expose it; today the widely-deployed
+/// when rustls/aws-lc-rs expose it. Today the widely-deployed
 /// `X25519MLKEM768` is the one available.
 fn is_hybrid_pqc(group: NamedGroup) -> bool {
     matches!(group, NamedGroup::X25519MLKEM768)
@@ -306,8 +306,8 @@ fn is_hybrid_pqc(group: NamedGroup) -> bool {
 ///
 /// aws-lc-rs offers the hybrid group by default but lists it LAST, so two
 /// default peers negotiate a classical group. `Prefer` reorders the hybrid to
-/// the front so it is actually used; `Require` keeps only the hybrid(s)
-/// (non-PQC peers are refused); `Off` drops them.
+/// the front so it is actually used. `Require` keeps only the hybrid(s)
+/// (non-PQC peers are refused). `Off` drops them.
 fn posture_provider(pqc: PqcMode) -> Arc<CryptoProvider> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     match pqc {
@@ -440,7 +440,7 @@ mod tests {
         )
     }
 
-    /// Drive an in-memory handshake to completion; propagate the first rustls
+    /// Drive an in-memory handshake to completion. Propagate the first rustls
     /// error (e.g. no common kx group under `Require` vs a classical peer).
     ///
     /// Running out of rounds is an error, not a success: `Ok(())` on

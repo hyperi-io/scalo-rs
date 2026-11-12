@@ -55,7 +55,7 @@ pub enum PreRouteFilterConfig {
 pub struct BatchProcessingConfig {
     /// Maximum number of messages per rayon chunk.
     ///
-    /// Smaller chunks reduce per-task overhead; larger chunks amortise
+    /// Smaller chunks reduce per-task overhead. Larger chunks amortise
     /// the rayon work-stealing cost. Default 10 000 matches data-plane batch sizes.
     #[serde(default = "default_max_chunk_size")]
     pub max_chunk_size: usize,

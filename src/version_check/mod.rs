@@ -78,7 +78,7 @@ pub struct VersionCheckConfig {
     #[serde(default = "default_timeout", with = "duration_secs")]
     pub timeout: Duration,
     /// Enable the startup version check. ON by default -- wiring the check
-    /// into a binary is the opt-in; it still does nothing until an
+    /// into a binary is the opt-in. It still does nothing until an
     /// `api_url` is configured. An explicit `version_check.enabled: false`
     /// in any config layer is the opt-out and always wins.
     #[serde(default = "default_true")]
@@ -346,7 +346,7 @@ impl VersionCheck {
 /// `arch` (x86_64/aarch64), plus `instance_id` unless
 /// `version_check.send_instance_id: false`. The id is derived from the
 /// platform (see [`resolve_instance_id`]) so one install reports as one
-/// install across restarts; it is a one-way UUIDv5, so nothing about the
+/// install across restarts. It is a one-way UUIDv5, so nothing about the
 /// host can be recovered from it. `deployment` is never sent: operators
 /// embed sensitive names in free-form deployment strings.
 #[derive(Debug, Serialize)]
@@ -609,10 +609,8 @@ fn format_age(published_at: &str) -> Option<String> {
     }
 }
 
-// Persistent-instance-id helpers removed in 2.7.5 -- the disk-stored
-// UUID was a tracking cookie in all but name (see CheckPayload above).
-// Friction for SOC2 / regulated consumers outweighed the fleet-
-// uniqueness signal.
+// No instance id is persisted to disk: a stored UUID would be a tracking
+// cookie in all but name (see CheckPayload above).
 
 /// Errors during version check (internal, never exposed to caller).
 #[derive(Debug)]

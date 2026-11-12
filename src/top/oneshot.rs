@@ -60,7 +60,7 @@ fn filter_samples<'a>(samples: &'a [MetricSample], filter: Option<&str>) -> Vec<
     }
 }
 
-/// Plain strings match by `contains`; patterns with metacharacters go
+/// Plain strings match by `contains`. Patterns with metacharacters go
 /// through the lightweight `.*`/anchor matcher (not the `regex` crate).
 fn match_filter(name: &str, pattern: &str) -> bool {
     // If pattern has no regex metacharacters, do simple contains match
@@ -84,7 +84,6 @@ fn has_regex_chars(s: &str) -> bool {
 /// Supports `.*` as a wildcard for any sequence of characters.
 /// Filters are unanchored (substring match) unless `^` or `$` are used.
 fn regex_match(name: &str, pattern: &str) -> bool {
-    // Handle anchors
     let anchored_start = pattern.starts_with('^');
     let anchored_end = pattern.ends_with('$');
     let pattern = pattern

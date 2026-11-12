@@ -589,7 +589,7 @@ impl Refused {
 pub enum TicketOutcome {
     /// Every piece was delivered.
     Delivered,
-    /// Dropped by policy; not a loss.
+    /// Dropped by policy. Not a loss.
     Dropped,
     /// Dead-lettered, and the DLQ confirmed the write.
     Rejected,
@@ -663,7 +663,7 @@ impl TicketsInner {
 /// would pass the ceiling is refused, except when nothing is held, so an
 /// oversized request is never refused forever.
 ///
-/// Clone is cheap; clones share the ceiling.
+/// Clone is cheap. Clones share the ceiling.
 #[derive(Clone)]
 pub struct Tickets {
     inner: Arc<TicketsInner>,

@@ -290,7 +290,7 @@ fn build_otlp_exporter(
 /// `deployment.environment.name`, the replica's identity, and the consumer's
 /// attributes, which win over all three.
 ///
-/// `deployment.environment.name` is the stable semconv key; the bare
+/// `deployment.environment.name` is the stable semconv key. The bare
 /// `deployment.environment` is deprecated.
 fn resource(resolved: &ResolvedOtelConfig) -> opentelemetry_sdk::Resource {
     let mut builder = opentelemetry_sdk::Resource::builder();
@@ -746,8 +746,7 @@ mod tests {
 
     // Deploy-env OTel: the deployment environment must be sourced from scalo's
     // env detection (APP_ENV) and configured resource_attributes must pass
-    // through to the resolved config (they were previously dropped). Mirrors
-    // the temp_env pattern used by env.rs tests.
+    // through to the resolved config.
     #[test]
     fn resolve_sets_deployment_environment_and_keeps_resource_attributes() {
         temp_env::with_vars(

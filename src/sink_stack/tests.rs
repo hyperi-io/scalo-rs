@@ -182,7 +182,7 @@ async fn fatal_is_not_retried() {
 
 #[tokio::test]
 async fn exhausted_transient_returns_backpressured() {
-    // Never recovers; with 2 retries the caller sees Backpressured (retryable),
+    // Never recovers. With 2 retries the caller sees Backpressured (retryable),
     // never silent success -- so its commit does NOT advance (no data loss).
     let sender = FakeSender::new(Script::FailThenOk(99));
     let cfg = SinkStackConfig {
@@ -226,7 +226,7 @@ async fn per_attempt_timeout_engages() {
 
 #[test]
 fn adaptive_config_builds_clamped_limiter() {
-    // min_limit 0 would deadlock -> clamped to 1; initial honoured.
+    // min_limit 0 would deadlock -> clamped to 1. Initial honoured.
     let ac = AdaptiveConfig {
         initial_limit: 7,
         min_limit: 0, // clamped to 1 (deadlock guard)
@@ -295,7 +295,7 @@ async fn adaptive_stack_preserves_at_least_once() {
 
 #[tokio::test]
 async fn adaptive_recovers_after_failures_no_deadlock() {
-    // Sustained transient failures drive the AIMD limit DOWN; the min-limit
+    // Sustained transient failures drive the AIMD limit DOWN. The min-limit
     // floor (>=1) must keep at least one slot so the sink recovers rather than
     // deadlocking at zero concurrency. Fail 3 times then succeed, 5 retries.
     let sender = FakeSender::new(Script::FailThenOk(3));

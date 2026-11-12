@@ -43,7 +43,7 @@ pub struct TieredSink<S: TransportSender> {
     circuit: Arc<CircuitBreaker>,
     codec: CompressionCodec,
     config: TieredSinkConfig,
-    /// Stops the drainer and the disk poller; every waiter sees the cancel, even one that waits after it.
+    /// Stops the drainer and the disk poller. Every waiter sees the cancel, even one that waits after it.
     shutdown: CancellationToken,
     drain_handle: Option<JoinHandle<()>>,
     disk_available: Arc<std::sync::atomic::AtomicBool>,
@@ -130,7 +130,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         let spool_receiver = Arc::new(Mutex::new(receiver));
 
         // Recover counters in spawn_blocking -- segment
-        // files can be GB-sized after a crash; walking them on the
+        // files can be GB-sized after a crash. Walking them on the
         // async runtime pins a tokio worker.
         let spool_path_for_scan = config.spool_path.clone();
         let (initial_count, initial_bytes) = tokio::task::spawn_blocking(move || {
@@ -342,7 +342,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     /// source -- scalo's lossless default).
     ///
     /// `Dlq` and `DropOldest` are not yet wired (they need a DLQ handle and
-    /// oldest-eviction access respectively); until then they degrade to the
+    /// oldest-eviction access respectively). Until then they degrade to the
     /// SAFE, lossless `Block` with a warning -- never silent loss.
     fn drop_on_full(&self) -> bool {
         use crate::tiered_sink::WhenFull;
@@ -372,7 +372,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         }
     }
 
-    /// Reserve capacity (`try_update`) before enqueue; a failure or a
+    /// Reserve capacity (`try_update`) before enqueue. A failure or a
     /// cancelled future gives it back. Atomic reservation prevents two
     /// concurrent callers from both passing the cap check and overshooting.
     async fn spool_message(&self, record: &Record) -> Result<()> {
@@ -589,7 +589,7 @@ fn check_disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
     // Portability: libc::statvfs field widths differ across platforms.
     // Linux: f_blocks/f_bavail/f_frsize are all u64. macOS (aarch64): f_frsize
     // is c_ulong (u64) but f_blocks/f_bavail are fsblkcnt_t (u32), so only those
-    // two need the widening cast here; f_frsize is already u64. Fixes #39.
+    // two need the widening cast here. f_frsize is already u64. Fixes #39.
     #[cfg(target_os = "macos")]
     {
         let block_size: u64 = stat.f_frsize;
@@ -696,7 +696,7 @@ mod tests {
         }
     }
 
-    /// Poll until the drainer has emptied the spool and released its byte count; a fixed sleep flakes on a loaded runner.
+    /// Poll until the drainer has emptied the spool and released its byte count. A fixed sleep flakes on a loaded runner.
     async fn wait_for_drain<S: TransportSender + 'static>(tiered: &TieredSink<S>) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !(tiered.spool_is_empty().await && tiered.spool_bytes() == 0) {
@@ -1373,7 +1373,7 @@ mod tests {
         bytes[8] ^= 0xFF;
         std::fs::write(&seg, &bytes).unwrap();
 
-        // Reopen with the sink available; the corrupt record must be dropped, not
+        // Reopen with the sink available. The corrupt record must be dropped, not
         // delivered, and the spool must end up empty.
         let sink = TestSink::new();
         let mut config = TieredSinkConfig::new(&spool_path).crc(true);
@@ -1623,7 +1623,7 @@ mod tests {
     }
 
     /// C15 regression: N concurrent senders against a small cap.
-    /// Pre-fix overshot; atomic reservation keeps total exact.
+    /// Pre-fix overshot. Atomic reservation keeps total exact.
     #[tokio::test]
     async fn test_max_spool_items_not_overshooting_under_concurrency() {
         let dir = tempdir().unwrap();
@@ -1719,7 +1719,7 @@ mod tests {
     /// How long a shutdown may take before the test calls it hung.
     const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// Spilling config with the disk poller on; its 5 s poll keeps it parked on the shutdown signal.
+    /// Spilling config with the disk poller on. Its 5 s poll keeps it parked on the shutdown signal.
     /// The byte cap keeps it valid when the tests run inside a Kubernetes pod, as CI runners do.
     fn disk_aware_config(path: &std::path::Path) -> TieredSinkConfig {
         spilling_config(path)
@@ -2010,7 +2010,7 @@ mod tests {
         tiered
     }
 
-    /// Poll until the drainer has started `at_least` hung sends; it runs on its own task.
+    /// Poll until the drainer has started `at_least` hung sends. It runs on its own task.
     async fn wait_for_hung_sends(tiered: &TieredSink<HangingSink>, at_least: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while tiered.inner().hung_sends.load(AtomicOrdering::SeqCst) < at_least {

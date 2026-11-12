@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/deployment/emit.rs
-// Purpose:   Emit + drift-check config artefacts; guard declared listeners
+// Purpose:   Emit + drift-check config artefacts. Guard declared listeners
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -151,7 +151,7 @@ pub fn emit_config_artifacts(
 /// # Errors
 ///
 /// Returns [`DeploymentError::Drift`] if a committed file is missing or its
-/// bytes differ; other [`DeploymentError`] variants on read/serialise failure.
+/// bytes differ. Other [`DeploymentError`] variants on read/serialise failure.
 pub fn check_config_artifact_drift(
     contract: &DeploymentContract,
     dir: impl AsRef<Path>,

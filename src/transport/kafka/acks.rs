@@ -64,7 +64,7 @@ impl Run {
         self.held.last().map_or(i64::MIN, |h| h.offset)
     }
 
-    /// Mark `offset` released; `true` when this run holds it.
+    /// Mark `offset` released. `true` when this run holds it.
     fn release(&mut self, offset: i64) -> bool {
         let Ok(at) = self.held.binary_search_by_key(&offset, |h| h.offset) else {
             return false;
@@ -118,7 +118,7 @@ struct PartitionHold {
     runs: VecDeque<Run>,
     /// Highest offset released, held here or not.
     highest_released: Option<i64>,
-    /// The next-to-read offset last committed; commits never go below it.
+    /// The next-to-read offset last committed. Commits never go below it.
     committed_next: Option<i64>,
     /// Revoked and not assigned again: nothing is held or committed for it.
     unowned: bool,
@@ -228,7 +228,7 @@ impl KafkaAcks {
         self.publish_held();
     }
 
-    /// Wait for any commit in progress; hold the guard across the next commit.
+    /// Wait for any commit in progress. Hold the guard across the next commit.
     pub(super) async fn serialise_commit(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.commit_serial.lock().await
     }

@@ -56,7 +56,7 @@ pub enum SelfRegulationProfile {
 
 impl SelfRegulationProfile {
     /// The byte-budget envelope for this profile. The hysteresis band is
-    /// profile-independent (set in [`SelfRegulationConfig`]); this only sizes
+    /// profile-independent (set in [`SelfRegulationConfig`]). This only sizes
     /// the AIMD lever.
     #[must_use]
     fn byte_budget_envelope(self) -> (u64, u64, u64, usize) {
@@ -114,7 +114,7 @@ pub struct SelfRegulationConfig {
     pub pause_above: f64,
 
     /// Hysteresis: release the inbound hold when pressure drops to this.
-    /// Must be strictly less than `pause_above` (validated; an invalid band
+    /// Must be strictly less than `pause_above` (validated -- an invalid band
     /// falls back to the defaults).
     pub resume_below: f64,
 

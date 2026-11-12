@@ -43,12 +43,12 @@ static HEAP_SOURCE: OnceLock<fn() -> usize> = OnceLock::new();
 /// wires it here in a few lines. This keeps scalo allocator-agnostic with no
 /// allocator dependency in its graph.
 ///
-/// The first call wins and returns `true`; later calls are a no-op and return
+/// The first call wins and returns `true`. Later calls are a no-op and return
 /// `false` (the existing source is kept). Call once at startup, before
 /// constructing guards.
 ///
 /// The application picks a tracking allocator -- prefer an actively-maintained
-/// one such as `tikv-jemalloc-ctl` (`stats.allocated`); the `cap` crate also
+/// one such as `tikv-jemalloc-ctl` (`stats.allocated`). The `cap` crate also
 /// works but is effectively unmaintained (last release 2023).
 ///
 /// `tikv_jemalloc_ctl::stats` sits behind that crate's `stats` feature, which
@@ -764,9 +764,9 @@ mod tests {
 
     #[test]
     fn pressure_ratio_follows_the_cgroup_current_file() {
-        // The bug this guards: with jemalloc installed and no heap source
-        // registered, the guard read a reservation counter that never moved
-        // while the process held 189 MiB. It now reads what the kernel charges.
+        // With jemalloc installed and no heap source registered, a reservation
+        // counter never moves while the process holds memory, so the guard
+        // must read what the kernel charges.
         let limit = 536_870_912u64; // matches memory.max in the fixture
         let dir = cgroup_fixture(&[("memory.current", "0\n"), ("memory.max", "536870912\n")]);
         let guard = MemoryGuard::with_usage_source(
@@ -1213,7 +1213,7 @@ mod tests {
 
     #[test]
     fn effective_auto_limit_caps_at_memory_high() {
-        // headroom 0.85 of 1000 = 850; high 600 is lower -> cap at the soft
+        // headroom 0.85 of 1000 = 850. High 600 is lower -> cap at the soft
         // throttle so we shed before the kernel does.
         assert_eq!(effective_auto_limit(1000, 0.85, Some(600)), 600);
         // high above the headroom limit -> headroom wins (no change).

@@ -105,7 +105,7 @@ impl<T: CommitToken> Message<T> {
     /// Create a new message with auto-detected format.
     ///
     /// `payload` accepts any `impl Into<Bytes>` -- pass a `Vec<u8>` and it is
-    /// moved (zero copy); pass a `Bytes` slice and the refcount is bumped.
+    /// moved (zero copy). Pass a `Bytes` slice and the refcount is bumped.
     #[must_use]
     pub fn new(
         key: Option<Arc<str>>,

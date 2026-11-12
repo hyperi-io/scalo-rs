@@ -46,7 +46,7 @@ fn no_ticker() -> Option<(
     None
 }
 
-// --- run_workbatch() tests (the WorkBatch driver replaced the legacy loops) ---
+// --- run_workbatch() tests ---
 
 #[tokio::test]
 async fn run_workbatch_processes_injected_records_then_shuts_down() {

@@ -15,7 +15,7 @@
 //! - Health endpoints (`/livez` and `/readyz` -- no aliases)
 //!
 //! In-process TLS and a `/metrics` endpoint are NOT wired here -- see
-//! [`HttpServerConfig`]. Terminate TLS at the ingress / mesh; metrics are
+//! [`HttpServerConfig`]. Terminate TLS at the ingress / mesh. Metrics are
 //! served by `MetricsManager` on its own listener.
 //!
 //! ## Example

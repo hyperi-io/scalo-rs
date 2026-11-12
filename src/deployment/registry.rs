@@ -8,7 +8,7 @@
 
 //! Container registry resolution for deployment contracts.
 //!
-//! [`BaseDistro`] lives in [`native_deps`](super::native_deps); this module
+//! [`BaseDistro`] lives in [`native_deps`](super::native_deps). This module
 //! only resolves WHICH one applies.
 //!
 //! The publish-target registry (where the built image is pushed) and the
@@ -43,9 +43,9 @@
 //! derives, or set `base_distro` alongside the pin and the generator has no
 //! guessing to do.
 //!
-//! When (eventually) a curated GHCR base image lands at
-//! `ghcr.io/org/base:trixie`, ops can override
-//! `deployment.base_image` in the cascade without rebuilding the apps.
+//! Ops can point at a curated image such as `ghcr.io/org/base:trixie` by
+//! overriding `deployment.base_image` in the cascade, without rebuilding the
+//! apps.
 
 use super::native_deps::BaseDistro;
 
@@ -55,7 +55,7 @@ use super::native_deps::BaseDistro;
 /// and fewer CVEs than a full ubuntu base, and its glibc matches the debian
 /// trixie CI builders so binaries built on CI run as-is. Override via
 /// `deployment.base_image` in the YAML cascade (keep glibc(runtime) >=
-/// glibc(build); musl/alpine unsupported -- see docs/deployment/native-deps.md).
+/// glibc(build). musl/alpine unsupported -- see docs/deployment/native-deps.md).
 ///
 /// Pinned to the multi-arch index digest so every build of one scalo release
 /// gets the same bytes on amd64 and arm64. Renovate refreshes the digest.
@@ -153,7 +153,7 @@ pub fn base_distro_from_cascade() -> Option<BaseDistro> {
 /// Explicit config wins, then the base image where it is positively
 /// recognisable. `None` means neither answered -- typically a digest-pinned
 /// base image with no `deployment.base_distro` set. Callers fall back to
-/// [`DEFAULT_BASE_DISTRO`] and record that they did; nothing here guesses at a
+/// [`DEFAULT_BASE_DISTRO`] and record that they did. Nothing here guesses at a
 /// different distro's package names.
 #[must_use]
 pub fn resolve_base_distro(base_image: &str) -> Option<BaseDistro> {

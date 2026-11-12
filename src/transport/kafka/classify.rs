@@ -16,7 +16,7 @@
 //!
 //! The consume path asks the matching question of a failed poll: keep polling
 //! or give up. librdkafka reconnects to brokers and rejoins the group by
-//! itself, so an unavailable broker is never a reason to end the consumer; only
+//! itself, so an unavailable broker is never a reason to end the consumer. Only
 //! a failure no retry can clear is surfaced.
 //!
 //! An authentication or TLS refusal reaches a client only through librdkafka's
@@ -125,7 +125,7 @@ pub(crate) enum RecvFailure {
 pub(crate) struct RecvContext {
     /// Whether this consumer has reached a broker with its credentials before.
     /// An authentication or TLS failure after that is most likely a restarting
-    /// broker; before it, a misconfiguration that should fail fast.
+    /// broker. Before it, a misconfiguration that should fail fast.
     pub(crate) credentials_proven: bool,
 }
 
@@ -244,7 +244,7 @@ pub(crate) fn commit_is_retryable(err: &KafkaError) -> bool {
 /// polls that follow them, and reports an outage once rather than per poll.
 #[derive(Debug, Default)]
 pub(crate) struct RecvState {
-    /// Transient failures since the last record arrived; drives the backoff.
+    /// Transient failures since the last record arrived. Drives the backoff.
     consecutive: AtomicU32,
     degraded: DegradedLatch,
     /// Latches the missing-topic warn to the first of a run.
@@ -254,7 +254,7 @@ pub(crate) struct RecvState {
 }
 
 impl RecvState {
-    /// Count a transient poll failure; warn on the first of a run only.
+    /// Count a transient poll failure. Warn on the first of a run only.
     pub(crate) fn record_transient(&self, err: &KafkaError) {
         let failures = self
             .consecutive
@@ -273,7 +273,7 @@ impl RecvState {
     }
 
     /// Count a poll that found a subscribed topic missing, in the backoff
-    /// with the transient failures; warn on the first of a run only.
+    /// with the transient failures. Warn on the first of a run only.
     pub(crate) fn record_missing_topic(&self, err: &KafkaError) {
         self.consecutive.fetch_add(1, Ordering::Relaxed);
         count_recv_error("missing_topic");
@@ -473,7 +473,7 @@ pub(crate) struct DeliveryState {
 }
 
 impl DeliveryState {
-    /// Count every failed delivery; report the first of a run.
+    /// Count every failed delivery. Report the first of a run.
     pub(crate) fn record_failure(&self, err: &KafkaError, topic: &str, partition: i32) {
         self.failures.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "metrics")]
@@ -651,8 +651,8 @@ mod tests {
 
     #[test]
     fn an_oversize_record_is_its_own_class() {
-        // Classing it fatal tears the transport down over one poison record;
-        // classing it retryable loops on a record no retry can deliver.
+        // Classing it fatal tears the transport down over one poison record.
+        // Classing it retryable loops on a record no retry can deliver.
         let err = KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge);
         assert_eq!(classify_send_failure(&err), SendFailure::TooLarge);
     }
@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn a_substring_match_on_the_rendered_text_cannot_reach_this_verdict() {
         // MessageTimedOut renders without any "queue full" text, so text
-        // matching can only call it fatal; by code it is retryable. Pins the
+        // matching can only call it fatal. By code it is retryable. Pins the
         // classifier to the code and blocks a return to string matching.
         let err = KafkaError::MessageProduction(RDKafkaErrorCode::MessageTimedOut);
         let rendered = err.to_string();
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn an_unavailable_broker_never_ends_the_consumer() {
         // Each of these ended a running pipeline when every poll error was
-        // fatal; librdkafka reconnects and rejoins on its own.
+        // fatal. librdkafka reconnects and rejoins on its own.
         for code in [
             RDKafkaErrorCode::BrokerTransportFailure,
             RDKafkaErrorCode::AllBrokersDown,
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn the_fatal_flag_wins_over_a_transient_code() {
-        // librdkafka can flag any code fatal; the client is unusable after it.
+        // librdkafka can flag any code fatal. The client is unusable after it.
         let err = KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::BrokerTransportFailure);
         assert_eq!(
             classify_recv_failure(&err, FIRST_CONTACT),

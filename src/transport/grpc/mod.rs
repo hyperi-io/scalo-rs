@@ -145,7 +145,7 @@ impl OversizeSlot {
         out.extend(state.records.drain(..n));
     }
 
-    /// Refuse batches from now on; one already admitted stays for `recv`.
+    /// Refuse batches from now on. One already admitted stays for `recv`.
     fn close(&self) {
         self.state.lock().closed = true;
     }
@@ -580,7 +580,7 @@ impl GrpcTransportBuilder<'_> {
 }
 
 impl GrpcTransportBuilder<'_> {
-    /// The registry a receive server holds responses in; `None` in client-only
+    /// The registry a receive server holds responses in. `None` in client-only
     /// mode.
     fn hold_registry(&self) -> Option<Arc<PendingRegistry>> {
         self.config.listen.as_ref()?;
@@ -1136,7 +1136,7 @@ impl TransportSender for GrpcTransport {
     /// as OPAQUE `bytes`, the JSON / MsgPack codec is NEVER invoked in transit.
     ///
     /// Commit tokens and inline-DLQ entries are NOT sent -- the SENDER's local
-    /// concern. Pass the records (e.g. `&workbatch.records`); the caller fires
+    /// concern. Pass the records (e.g. `&workbatch.records`). The caller fires
     /// its commit tokens locally after this returns `Ok`.
     ///
     /// ## Atomic (all-or-nothing) acceptance
@@ -1348,7 +1348,7 @@ impl GrpcTransport {
                 // Server is all-or-nothing today, but the proto permits partial
                 // acceptance. Treating ANY Ok as full success would fire every
                 // commit token while the receiver kept only a prefix -- silent
-                // loss. Require accepted == sent; a shortfall is retryable
+                // loss. Require accepted == sent. A shortfall is retryable
                 // (at-least-once).
                 let accepted = response.into_inner().accepted;
                 if accepted < sent_count as u64 {
@@ -1478,7 +1478,7 @@ impl TransportReceiver for GrpcTransport {
 
         let mut rx = receiver.lock().await;
         let mut messages = Vec::with_capacity(max.min(100));
-        // Only the first record is waited for, up to recv_timeout_ms; the rest
+        // Only the first record is waited for, up to recv_timeout_ms. The rest
         // only take what is already queued.
         let wait_until = (self.recv_timeout_ms > 0)
             .then(|| tokio::time::Instant::now() + Duration::from_millis(self.recv_timeout_ms));
@@ -1511,7 +1511,7 @@ impl TransportReceiver for GrpcTransport {
             let landed = self.oversize.landed.notified();
             tokio::select! {
                 msg = rx.recv() => {
-                    // None: closed and drained; the next pass says Closed.
+                    // None: closed and drained. The next pass says Closed.
                     if let Some(msg) = msg {
                         messages.push(msg);
                     }
@@ -1521,7 +1521,7 @@ impl TransportReceiver for GrpcTransport {
             }
         }
 
-        // Apply inbound filters via the shared partition helper; DLQ entries
+        // Apply inbound filters via the shared partition helper. DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
         let batch = self.filter_engine.partition_batch(
             messages,
@@ -1547,7 +1547,7 @@ impl TransportReceiver for GrpcTransport {
         Ok(())
     }
 
-    /// The held-response controls of the receive server; `None` in
+    /// The held-response controls of the receive server. `None` in
     /// client-only mode.
     fn ack_control(&self) -> Option<&dyn AckControl> {
         self.pending.as_deref().map(|p| p as &dyn AckControl)
@@ -1619,7 +1619,7 @@ impl TransportServiceImpl {
     /// Wrap one `RouteBatch` record for `recv` under sequence number `seq`.
     fn message(record: Record, seq: u64) -> Message<GrpcToken> {
         // Auto means the sender did not pin a format. Detect from the lead
-        // byte so the receiver gets a concrete hint; does NOT parse/decode.
+        // byte so the receiver gets a concrete hint. Does NOT parse/decode.
         let format = if record.metadata.format == PayloadFormat::Auto {
             PayloadFormat::detect(&record.payload)
         } else {
@@ -2178,7 +2178,7 @@ mod tests {
         }
     }
 
-    /// A status the server sent is its answer and keeps its code's meaning; a
+    /// A status the server sent is its answer and keeps its code's meaning. A
     /// status tonic raised for the client's own connection is an outage.
     #[test]
     fn only_transient_codes_and_connection_failures_are_backpressure() {
@@ -2268,7 +2268,7 @@ mod tests {
     }
 
     /// A server that cuts an RPC at its deadline answers `Cancelled` with
-    /// nothing queued; the sender retries it rather than stopping.
+    /// nothing queued. The sender retries it rather than stopping.
     #[tokio::test]
     async fn an_rpc_the_server_cuts_at_its_deadline_is_backpressure() {
         let addr = server_cutting_rpcs_at(Duration::from_millis(100)).await;
@@ -2800,7 +2800,7 @@ mod tests {
         assert_eq!(sender_deadline(&tonic::metadata::MetadataMap::new()), None);
     }
 
-    /// An outage stays backpressure at the limit; over it, the record is
+    /// An outage stays backpressure at the limit. Over it, the record is
     /// refused without reaching for the network.
     #[tokio::test]
     async fn a_down_receiver_is_backpressure_and_an_over_limit_record_is_still_dead_lettered() {

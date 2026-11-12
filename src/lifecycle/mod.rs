@@ -25,7 +25,7 @@
 //! | valid but EMPTY of work (no sources, no topics, no destination) | [`WorkState::Idle`] -- start, stay Ready, wait |
 //!
 //! The emptiness predicate belongs to the app (it is the only thing that knows
-//! what "no work" means); the behaviour belongs to scalo. An app names its
+//! what "no work" means). The behaviour belongs to scalo. An app names its
 //! predicate by implementing `ServiceApp::work_state` (`cli-service` feature).
 //!
 //! ## What idle looks like from outside
@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How often the gate re-reads the config file while parked. Matches the
 /// reloader's default poll so an idle app and a running one see a change at the
-/// same rate; SIGHUP short-circuits it either way.
+/// same rate. SIGHUP short-circuits it either way.
 pub const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Name of the health component the gate registers.
@@ -212,7 +212,7 @@ fn set_idle_gauge(idle: bool) {
 
 /// Park until the configuration changes or shutdown is requested.
 ///
-/// `config_path` is the file the service was started with; with no file the
+/// `config_path` is the file the service was started with. With no file the
 /// gate still waits on SIGHUP and shutdown, so an env-only deployment can be
 /// nudged rather than restarted.
 pub async fn wait_for_config_change(config_path: Option<&std::path::Path>) -> GateWake {

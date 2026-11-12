@@ -286,7 +286,7 @@ impl TransportReceiver for MemoryTransport {
         let mut messages = Vec::with_capacity(max.min(100));
 
         for _ in 0..max {
-            // The first record waits up to recv_timeout_ms; the rest only take
+            // The first record waits up to recv_timeout_ms. The rest only take
             // what is already queued.
             let internal = if self.recv_timeout_ms == 0 || !messages.is_empty() {
                 match receiver.try_recv() {
@@ -320,7 +320,7 @@ impl TransportReceiver for MemoryTransport {
             });
         }
 
-        // Apply inbound filters via the shared partition helper; DLQ entries
+        // Apply inbound filters via the shared partition helper. DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
         let batch = self.filter_engine.partition_batch(
             messages,

@@ -9,13 +9,13 @@
 
 //! Kafka provider abstraction: one open trait ([`KafkaProvider`]) behind which every
 //! provider-specific quirk is normalised. Each managed/self-hosted Kafka has its own
-//! weirdness across MANY axes -- this trait is the single seam that combines them.
+//! weirdness across MANY axes -- this trait is the one place that normalises them.
 //!
 //! # Generic and OPEN
 //!
 //! [`KafkaProvider`] is a trait, not a closed set. A provider with its own odd
 //! requirements is added by IMPLEMENTING the trait -- no change to this module. The
-//! built-in [`KnownProvider`] enum implements it for the common providers; a third
+//! built-in [`KnownProvider`] enum implements it for the common providers. A third
 //! party writes `impl KafkaProvider for MyProvider { .. }` for anything else.
 //!
 //! # Concerns
@@ -32,7 +32,7 @@
 //!
 //! This module is pure, generic FACT: what each provider's platform requires. It holds
 //! NO deployment POLICY. An app that wants an opinionated contract -- "SCRAM mandatory
-//! on brokers we own, never weakened; only this blessed set is allowed" (an
+//! on brokers we own, never weakened. Only this blessed set is allowed" (an
 //! opinionated credential contract) -- layers that ON TOP, opt-in, in the consumer.
 //! The vanilla core works irrespective of any such opinion.
 //!
@@ -40,7 +40,7 @@
 //! with a username+password pair. Only the `sasl.mechanism` differs, and it is a
 //! property of the PROVIDER: SCRAM-SHA-512 where the platform offers SCRAM
 //! (self-hosted Kafka/Strimzi, Redpanda self-hosted + Cloud, AWS MSK provisioned);
-//! PLAIN (API key) where it does not (Confluent Cloud); IAM/OAUTHBEARER as a separate,
+//! PLAIN (API key) where it does not (Confluent Cloud). IAM/OAUTHBEARER as a separate,
 //! quarantined credential shape (AWS MSK Serverless is IAM-only).
 //!
 //! The one hard floor: PLAIN must ride SASL_SSL. Enforced by [`validate`] and by
@@ -64,7 +64,7 @@ pub enum AuthKind {
 }
 
 /// Provider-specific behaviour flags -- the "weirdness" of each Kafka provider,
-/// combined behind one type. Static data (no I/O); the cluster-control lifecycle that
+/// combined behind one type. Static data (no I/O). The cluster-control lifecycle that
 /// ACTS on these (create/delete/status, teardown-to-empty) reads them from the opt-in
 /// lifecycle layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,11 +90,11 @@ pub struct ProviderCapabilities {
 
 /// The cluster metadata plane -- a version-implication FACT that shapes deployment
 /// and admin tooling. (Modern kafbat auto-senses topology via the AdminClient and the
-/// precise running version is runtime-detected; this is the deployment SHAPE, which
+/// precise running version is runtime-detected. This is the deployment SHAPE, which
 /// still governs which admin features light up and how the cluster is stood up.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataMode {
-    /// KRaft (KIP-500) -- no ZooKeeper. The modern default; Redpanda is KRaft-native.
+    /// KRaft (KIP-500) -- no ZooKeeper. The modern default. Redpanda is KRaft-native.
     KRaft,
     /// ZooKeeper-backed (legacy self-hosted).
     Zookeeper,
@@ -103,7 +103,7 @@ pub enum MetadataMode {
 }
 
 /// A schema registry bundled with the provider, if any. The endpoint is a runtime
-/// connection detail; this is just which KIND, so a config emitter knows to wire it.
+/// connection detail. This is just which KIND, so a config emitter knows to wire it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaRegistry {
     /// No bundled registry -- bring your own.
@@ -136,7 +136,7 @@ pub trait KafkaProvider {
     }
 
     /// The metadata plane (KRaft / ZooKeeper / managed-hidden). Default: KRaft, the
-    /// modern default. Self-hosted providers may run either; this is the recommended.
+    /// modern default. Self-hosted providers may run either. This is the recommended.
     fn metadata_mode(&self) -> MetadataMode {
         MetadataMode::KRaft
     }
@@ -284,8 +284,8 @@ impl KafkaProvider for KnownProvider {
 
     fn metadata_mode(&self) -> MetadataMode {
         match self {
-            // Redpanda is KRaft-native (no ZooKeeper); Strimzi + local dev default to
-            // KRaft on modern Kafka; provisioned MSK is KRaft-forward.
+            // Redpanda is KRaft-native (no ZooKeeper). Strimzi + local dev default to
+            // KRaft on modern Kafka. Provisioned MSK is KRaft-forward.
             Self::Redpanda | Self::Strimzi | Self::Plaintext | Self::Msk => MetadataMode::KRaft,
             // The clouds hide their metadata plane entirely.
             Self::RedpandaCloud | Self::ConfluentCloud | Self::MskIam => MetadataMode::Managed,
@@ -553,7 +553,7 @@ mod tests {
     // trait -- no change to this module. (Illustrative: NOT a blessed provider.)
     struct DemoProvider;
     impl KafkaProvider for DemoProvider {
-        // The trait returns &str (a provider may name itself dynamically); this test
+        // The trait returns &str (a provider may name itself dynamically). This test
         // double returns a literal, so silence the &'static str nudge here.
         #[allow(clippy::unnecessary_literal_bound)]
         fn name(&self) -> &str {

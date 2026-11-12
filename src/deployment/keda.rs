@@ -91,7 +91,7 @@ fn default_enabled() -> bool {
 impl KedaContract {
     /// Build a contract from a [`KedaConfig`].
     ///
-    /// The Kafka lag trigger reads the default `config.kafka` layout; use
+    /// The Kafka lag trigger reads the default `config.kafka` layout. Use
     /// [`with_kafka_trigger`](Self::with_kafka_trigger) for any other.
     #[must_use]
     pub fn from_config(config: &KedaConfig) -> Self {
@@ -123,7 +123,7 @@ impl KedaContract {
 /// This describes the chart's layout, not an operator setting, which is why it
 /// lives on the contract and not on [`KedaConfig`]. Each path is a dotted,
 /// `.Values`-relative chain of Go identifiers. The default suits an app whose
-/// config has a top-level `kafka` section; an app that keeps them elsewhere
+/// config has a top-level `kafka` section. An app that keeps them elsewhere
 /// names that section with [`under`](Self::under), then sets any path that
 /// sits elsewhere on the value it returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

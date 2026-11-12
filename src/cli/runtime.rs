@@ -133,7 +133,7 @@ impl ServiceRuntime {
         // Namespace is DECOUPLED from app_name: sourced from the `metrics`
         // config section (bare by default), NOT forced to the app name. Metric
         // names are bare unless the consumer opts into a `{namespace}_` prefix
-        // via `metrics.namespace`; services are differentiated by platform
+        // via `metrics.namespace`. Services are differentiated by platform
         // labels (Prometheus job/instance, OTel service.name), not the name.
         //
         // The whole `metrics` section is carried through, not just the
@@ -350,7 +350,7 @@ impl ServiceRuntime {
     /// opt-in via config, adaptive concurrency + rate-limit) on its outbound send
     /// for free, instead of hand-rolling them. The
     /// [`SinkStackConfig`](crate::sink_stack::SinkStackConfig) is read
-    /// from the cascade at `cfg_key` (e.g. `"sink_stack"`); the stack's defaults
+    /// from the cascade at `cfg_key` (e.g. `"sink_stack"`). The stack's defaults
     /// preserve at-least-once (whole-batch retry on a transient failure, never an
     /// ack before the sink confirms). Use the returned stack as the driver's sink
     /// via [`SinkStack::send_workbatch`](crate::sink_stack::SinkStack::send_workbatch).

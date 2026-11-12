@@ -58,7 +58,7 @@ pub enum StandardCommand {
     /// Writes `config-schema.{json,yaml}` + `capability-catalog.{json,yaml}`
     /// derived from the app's `Config` and capability catalog into the target
     /// directory (scalo-rs#6). Also produced by `generate-artefacts`. Use to
-    /// refresh the committed contract; a drift test then keeps it honest:
+    /// refresh the committed contract. A drift test then keeps it honest:
     /// `my-service config-schema --dir docs/`
     #[command(name = "config-schema")]
     ConfigSchema(ConfigSchemaArgs),

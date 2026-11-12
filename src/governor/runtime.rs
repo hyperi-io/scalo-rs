@@ -115,7 +115,7 @@ impl SelfRegulationConfig {
         }
 
         // ONE pressure governor over a single HARD memory source. New SOFT
-        // sources (CPU, queue depth) plug in later via `add_source` with zero
+        // sources (CPU, queue depth) plug in via `add_source` with zero
         // change to the gate / budget APIs.
         let sources: Vec<Arc<dyn PressureSource>> =
             vec![Arc::new(MemoryPressureSource::new(memory_guard)) as Arc<dyn PressureSource>];
@@ -182,7 +182,7 @@ mod tests {
         assert!(gov.budget().byte_budget() >= 1);
     }
 
-    /// The configured bound reaches the latch the gates share; `0` removes it.
+    /// The configured bound reaches the latch the gates share. `0` removes it.
     #[test]
     fn build_bounds_the_latch_with_max_hold_secs() {
         let default = SelfRegulationConfig::default()

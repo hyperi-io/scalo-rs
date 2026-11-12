@@ -109,7 +109,7 @@ async fn prometheus_scrapes_the_metrics_endpoint() {
         namespace: String::new(),
         enable_process_metrics: false,
         enable_container_metrics: false,
-        // Scrape is the subject here; push has its own test.
+        // Scrape is the subject here. Push has its own test.
         #[cfg(feature = "otel-metrics")]
         otel: scalo::metrics::OtelMetricsConfig {
             enabled: false,

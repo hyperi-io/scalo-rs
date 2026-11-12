@@ -54,7 +54,7 @@ mod kafka_env {
     #[test]
     fn test_kafka_from_env_provider() {
         temp_env::with_var("KAFKA_PROVIDER", Some("confluent-cloud"), || {
-            // from_env reads the provider NAME; the mechanism derivation happens later at
+            // from_env reads the provider NAME. The mechanism derivation happens later at
             // KafkaTransport::new (apply_provider), so here we assert the field is set.
             assert_eq!(
                 KafkaConfig::from_env_standard().provider,
@@ -65,7 +65,7 @@ mod kafka_env {
 
     #[test]
     fn test_kafka_from_env_group_instance_id() {
-        // Set; canonically the pod name.
+        // Set. Canonically the pod name.
         temp_env::with_var("KAFKA_GROUP_INSTANCE_ID", Some("pod-7"), || {
             assert_eq!(
                 KafkaConfig::from_env_standard().group_instance_id,
@@ -546,7 +546,6 @@ mod env_compat_tests {
         });
 
         temp_env::with_var("STANDARD_VAR_TEST", Some("value"), || {
-            // Set standard
             let var = EnvVar::new("STANDARD_VAR_TEST").with_legacy("LEGACY_VAR_TEST");
             assert_eq!(var.which_name_used(), Some("STANDARD_VAR_TEST"));
         });

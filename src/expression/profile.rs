@@ -41,7 +41,7 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "bool",
     "bytes",
     // Type introspection. Constant-time, and `dyn()` only relaxes static
-    // type-checking; neither iterates.
+    // type-checking. Neither iterates.
     "type",
     "dyn",
     // Timestamp and duration accessors: cheap field reads on a value that is

@@ -71,7 +71,7 @@ pub enum OpenBaoAuth {
         /// Role ID. An identifier (like a username), not a credential.
         role_id: String,
         /// Secret ID. The AppRole credential -- redacted in
-        /// `Debug`/serialised output; `.expose()` only at the auth call site.
+        /// `Debug`/serialised output. `.expose()` only at the auth call site.
         secret_id: SensitiveString,
         /// Mount path (default: "approle").
         #[serde(default = "default_approle_mount")]
@@ -253,12 +253,12 @@ impl OpenBaoConfig {
     /// Validate the Vault config against the deployment profile.
     ///
     /// `skip_verify` disables TLS certificate verification, which exposes the
-    /// connection to MITM. It is permitted only in dev/test; under a
+    /// connection to MITM. It is permitted only in dev/test. Under a
     /// production profile this returns an error. Call at startup with
     /// [`crate::env::is_production`].
     ///
-    /// NOTE: `skip_verify` is slated for removal at GA -- private-CA trust via
-    /// `ca_cert` (the unified TLS module) is the supported path.
+    /// Private-CA trust via `ca_cert` (the unified TLS module) is the
+    /// supported path.
     ///
     /// # Errors
     ///
@@ -315,8 +315,7 @@ impl OpenBaoProvider {
             settings.namespace(Some(ns.clone()));
         }
 
-        // Private-CA trust + verification (finding 9: these were previously
-        // ignored). vaultrs owns its reqwest client, so we route through its
+        // Private-CA trust + verification. vaultrs owns its reqwest client, so we route through its
         // native settings rather than the unified `tls` module: a PEM CA file
         // for private-CA deployments, and TLS verification on unless the
         // dev-only `skip_verify` is set (rejected in prod by `validate`).
@@ -415,7 +414,7 @@ impl OpenBaoProvider {
         let client = self.get_client().await?;
 
         // "<mount>/<path>", with an optional KV v2 "data" segment after the
-        // mount; a path with no "/" reads from the "secret" mount.
+        // mount. A path with no "/" reads from the "secret" mount.
         let (mount, secret_path) = Self::parse_path(path)?;
 
         let endpoint = ReadSecretRequest::builder()
@@ -459,7 +458,7 @@ impl OpenBaoProvider {
 
     /// Parse a Vault path into its mount and the secret path under that mount.
     ///
-    /// The first segment is the mount; a `data` segment after it is the KV v2
+    /// The first segment is the mount. A `data` segment after it is the KV v2
     /// API prefix the read request adds itself, not part of the secret path:
     /// - "secret/data/myapp/tls" -> ("secret", "myapp/tls")
     /// - "kv/myapp/tls" -> ("kv", "myapp/tls")

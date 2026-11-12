@@ -166,7 +166,7 @@ impl HttpServerConfig {
         self.tls_cert_path.is_some() && self.tls_key_path.is_some()
     }
 
-    /// Validate the server config (finding 10: `is_tls_enabled` must not lie).
+    /// Validate the server config (`is_tls_enabled` must not lie).
     ///
     /// In-process TLS termination is not supported -- the K8s pattern is to
     /// terminate TLS at the ingress / service mesh and run cleartext in-pod.

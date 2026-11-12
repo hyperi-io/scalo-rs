@@ -76,7 +76,7 @@ pub struct FilteredDlqEntry {
 
 /// Result of partitioning a batch of messages through inbound filters.
 ///
-/// Drop and DLQ messages are removed from `messages`; their commit tokens are
+/// Drop and DLQ messages are removed from `messages`. Their commit tokens are
 /// preserved in `filtered_tokens`. The engine does NOT send to DLQ directly
 /// (transports hold no DLQ handle) -- the caller routes `dlq_entries`.
 #[derive(Debug)]
@@ -260,7 +260,7 @@ impl TransportFilterEngine {
     ///
     /// The recommended transport API: returns a `FilteredBatch` with passing
     /// messages AND DLQ entries (the caller routes DLQ via its own handle).
-    /// Drop and DLQ messages are removed from `messages`; never silently lost.
+    /// Drop and DLQ messages are removed from `messages`. Never silently lost.
     ///
     /// `T` is the message type, `K` its commit token. The closures extract
     /// payload/key/token, avoiding coupling to a specific message struct.
@@ -334,7 +334,7 @@ impl TransportFilterEngine {
 
         // MsgPack bypasses filters (SIMD extraction is JSON-only).
         // Warn once per direction so operators don't silently pass
-        // every MsgPack message; emit a metric every time so the
+        // every MsgPack message. Emit a metric every time so the
         // bypass rate is visible.
         if is_likely_msgpack(payload) {
             #[cfg(feature = "metrics")]
@@ -407,7 +407,7 @@ impl TransportFilterEngine {
 }
 
 /// Log a one-shot warning per direction when filters skip MsgPack.
-/// Counter increments every call; the log fires once per process.
+/// Counter increments every call. The log fires once per process.
 fn warn_msgpack_bypass_once(direction: FilterDirection) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED_IN: AtomicBool = AtomicBool::new(false);

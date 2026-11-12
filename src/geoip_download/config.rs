@@ -82,7 +82,7 @@ pub enum GeoIpProvider {
     /// anonymous, ASN only, CC BY 4.0.
     Sapics,
 
-    /// Caller supplies the MMDB paths directly; nothing is downloaded.
+    /// Caller supplies the MMDB paths directly. Nothing is downloaded.
     Custom,
 }
 

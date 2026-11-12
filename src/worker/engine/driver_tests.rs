@@ -49,8 +49,8 @@ fn fan_out(records: Vec<Record>, factor: usize) -> Vec<Record> {
     out
 }
 
-/// THE proving test: N source records, each with a distinct ack; a process
-/// that fans 1->2; assert all 2N records hit the sink AND commit acked
+/// THE proving test: N source records, each with a distinct ack. A process
+/// that fans 1->2. Assert all 2N records hit the sink AND commit acked
 /// EXACTLY N source tokens (committed_sequence advanced by the source acks,
 /// not the doubled output count).
 #[tokio::test]
@@ -153,7 +153,7 @@ async fn sink_error_does_not_commit() {
     );
 
     // committed_sequence is a fetch_max seeded at 0 and the only injected
-    // message had seq 0; a commit would still leave it at 0, so to PROVE the
+    // message had seq 0. A commit would still leave it at 0, so to PROVE the
     // commit did not fire we inject a higher-seq message that, if committed,
     // would advance the sequence past 0. Re-run with seq 1..=2.
     let transport = mem_transport(50);
@@ -269,7 +269,7 @@ async fn sink_managed_does_not_commit_in_engine() {
     );
 }
 
-/// The ticker fires on its interval; shutdown stops the loop cleanly.
+/// The ticker fires on its interval. Shutdown stops the loop cleanly.
 #[tokio::test]
 async fn ticker_fires_and_shutdown_stops_loop() {
     let transport = mem_transport(50);
@@ -353,7 +353,7 @@ async fn on_demand_transform_reads_field_via_codec_parse() {
     assert_eq!(*seen_table.lock().unwrap(), "events");
 }
 
-/// Batch-parse path: the driver pre-parses; the process closure sees aligned
+/// Batch-parse path: the driver pre-parses. The process closure sees aligned
 /// parsed payloads, the interner dedups field names, and the logical result
 /// matches the on-demand path.
 #[tokio::test]
@@ -553,7 +553,7 @@ impl CommitToken for MemTok {}
 /// MemoryTransport's channel batching (which would coalesce all pending
 /// messages into a single block).
 struct OrderedReceiver {
-    /// Next seq to deliver; one record per recv until exhausted.
+    /// Next seq to deliver. One record per recv until exhausted.
     next_seq: Arc<AtomicU64>,
     /// How many records to deliver before recv blocks (pending) forever.
     total: u64,
@@ -567,7 +567,7 @@ struct OrderedReceiver {
     fail_commit_on_seq: Option<u64>,
     /// How many more `recv` calls report the source busy before records flow.
     recv_backpressure: Arc<AtomicU64>,
-    /// Set by `close()`; `recv` then reports `Closed`, as Kafka does.
+    /// Set by `close()`. `recv` then reports `Closed`, as Kafka does.
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -671,7 +671,7 @@ impl TransportReceiver for OrderedReceiver {
 }
 
 /// THE ack-barrier bug test (sink failure). Token 0's block fails at the
-/// sink; token 1's block would succeed. With an ORDERED/cumulative commit,
+/// sink. Token 1's block would succeed. With an ORDERED/cumulative commit,
 /// the engine must NEVER commit token 1 (which would advance the watermark
 /// past the never-sent token 0). Assert: the committed watermark never
 /// advances past the last successfully-sunk block -- i.e. NOTHING is
@@ -964,7 +964,7 @@ async fn a_backpressured_recv_is_waited_out() {
     );
 }
 
-/// Streaming variant: a backpressured sub-block is held and re-sunk; the
+/// Streaming variant: a backpressured sub-block is held and re-sunk. The
 /// block commits once, after its final sub-block is delivered.
 #[tokio::test(start_paused = true)]
 async fn streaming_backpressured_sub_block_is_held_and_retried() {
@@ -1093,7 +1093,7 @@ async fn streaming_sink_error_blocks_later_ordered_commits() {
 #[test]
 fn split_groups_by_byte_target() {
     // Five 10-byte records, target 25 -> sub-blocks of {2,2,1} records
-    // (20 <= 25; adding the 3rd would be 30 > 25 -> close at 2).
+    // (20 <= 25 -- adding the 3rd would be 30 > 25 -> close at 2).
     let records: Vec<Record> = (0..5)
         .map(|_| Record {
             payload: Bytes::from_static(b"0123456789"), // 10 bytes
@@ -1165,7 +1165,7 @@ fn split_smaller_than_target_is_one_sub_block() {
 /// THE peak-memory proving test: a batch of N records totalling B bytes,
 /// streamed with sub_block_bytes ~= B/4. The sink samples
 /// `guard.reserved_bytes()` on EACH call (the sub-block lease is held during
-/// the sink); the high-water must stay at ~one sub-block, NOT the whole batch
+/// the sink). The high-water must stay at ~one sub-block, NOT the whole batch
 /// B. The contrast: drive_block would peak at B.
 #[cfg(feature = "memory")]
 #[tokio::test]
@@ -1397,7 +1397,7 @@ async fn streaming_mid_sub_block_sink_error_skips_commit() {
     cancel_after(shutdown.clone(), 200);
 
     let sc = Arc::clone(&sink_calls);
-    // ~3 records per sub-block -> 3 sub-blocks; fail on the 2nd (middle).
+    // ~3 records per sub-block -> 3 sub-blocks. Fail on the 2nd (middle).
     let sub_block_bytes = (RECORD_BYTES * 3) as u64;
 
     let result = engine
@@ -1678,7 +1678,7 @@ async fn governed_off_is_whole_batch_passthrough() {
 }
 
 /// The shared pressure feeds an InboundGate: under high memory the gate
-/// holds (Admit::Hold) and the budget shrinks; low memory admits and the
+/// holds (Admit::Hold) and the budget shrinks. Low memory admits and the
 /// budget sits at start-big. Proves the gate + budget share one pressure.
 #[cfg(feature = "governor")]
 #[test]
@@ -1726,7 +1726,7 @@ fn governed_gate_and_budget_share_pressure() {
 /// `send` / `send_batch` still succeed. Gating the drain would deadlock the
 /// pipeline (in-flight work could never leave), so the governor must never
 /// touch it. MemoryTransport's send path consults no pressure governor by
-/// construction; this test proves that holds even when a governor that the
+/// construction. This test proves that holds even when a governor that the
 /// inbound side WOULD obey is wired and saturated.
 #[cfg(feature = "governor")]
 #[tokio::test]
@@ -1866,7 +1866,7 @@ async fn operational_never_oom_governed_pipeline_bounds_memory() {
     // load. This is the never-OOM shape: high pressure brakes inbound, but
     // memory stays bounded because only one sub-block is ever resident.
     const LIMIT: u64 = 18 * 1024; // 18 KiB
-    // Records far larger than the floor; many of them -> sustained load.
+    // Records far larger than the floor. Many of them -> sustained load.
     const RECORD_BYTES: usize = 1024; // 1 KiB each
     const N: usize = 256; // 256 KiB of payload total -- 14x the limit
     let payload = vec![b'q'; RECORD_BYTES];
@@ -1953,7 +1953,7 @@ async fn operational_never_oom_governed_pipeline_bounds_memory() {
     );
 
     // (3) Peak in-flight bytes stayed BOUNDED, NOT the whole payload. The
-    // streaming peak-lease bounds it to ~one shrunk sub-block; allow generous
+    // streaming peak-lease bounds it to ~one shrunk sub-block. Allow generous
     // headroom but it must be a small fraction of the whole-batch footprint.
     let peak = high_water.load(Ordering::Relaxed);
     assert!(
@@ -2006,7 +2006,7 @@ struct ByteAwareSource {
     /// High-water of the bytes handed out in any single recv/recv_limited.
     recv_high_water: Arc<AtomicU64>,
     committed: Arc<AtomicU64>,
-    /// Set by `close()`; `recv` then reports `Closed`, as Kafka does.
+    /// Set by `close()`. `recv` then reports `Closed`, as Kafka does.
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -2247,7 +2247,7 @@ async fn governed_recv_is_byte_bounded_not_record_bounded() {
 /// for later sub-blocks remain un-pulled in the drain.
 #[test]
 fn sub_block_drain_yields_incrementally() {
-    // 6 records of 10 bytes; target 25 -> sub-blocks {2, 2, 2}.
+    // 6 records of 10 bytes. Target 25 -> sub-blocks {2, 2, 2}.
     let records: Vec<Record> = (0..6)
         .map(|_| Record {
             payload: Bytes::from_static(b"0123456789"),
@@ -2261,7 +2261,7 @@ fn sub_block_drain_yields_incrementally() {
         .collect();
     let mut drain = SubBlockDrain::new(records, 25);
 
-    // First pull yields ONE sub-block (2 records); the remaining 4 are still
+    // First pull yields ONE sub-block (2 records). The remaining 4 are still
     // inside the drain, NOT pre-materialised into sub-block vectors.
     let first = drain.next_sub_block().expect("first sub-block");
     assert_eq!(first.len(), 2, "first sub-block is one budget's worth");
@@ -2580,7 +2580,7 @@ async fn parsed_parse_error_skip_drops_without_dlq_and_commits_survivors() {
         "Skip: nothing reaches the DLQ route point"
     );
     // All three source acks committed -- survivors and the dropped record's
-    // ack alike (at-least-once on the whole block; Skip is opt-in loss).
+    // ack alike (at-least-once on the whole block -- Skip is opt-in loss).
     assert_eq!(transport.committed_sequence(), 2);
 }
 
@@ -2699,7 +2699,7 @@ async fn parsed_parse_error_dlq_routes_before_commit() {
         "Dlq: the parse failure reached the DLQ route point"
     );
     // The route fired BEFORE the commit: MemoryTransport's committed_sequence
-    // starts at 0; the block's highest seq is 2, so a commit would set it to
+    // starts at 0. The block's highest seq is 2, so a commit would set it to
     // 2. At route time it must still be its pre-commit value (0).
     assert_eq!(
         committed_at_route.load(Ordering::Relaxed),
@@ -2743,7 +2743,7 @@ async fn standard_send_batch_sink_does_not_silently_drop_dlq_entries() {
 
     // The SINK ignores dlq_entries entirely (the realistic app shape). The
     // PROCESS closure emits a dlq_entry on the out-batch. Pre-fix this entry
-    // would vanish; post-fix the driver routes it before commit.
+    // would vanish. Post-fix the driver routes it before commit.
     engine
         .run_workbatch(
             &transport,
@@ -2800,7 +2800,7 @@ async fn dlq_route_failure_is_terminal_and_blocks_commit() {
             &receiver,
             shutdown,
             |batch| {
-                // process emits a dlq entry; routing it will fail.
+                // process emits a dlq entry. Routing it will fail.
                 let dlq = vec![crate::transport::filter::FilteredDlqEntry {
                     payload: b"bad".to_vec(),
                     key: None,
@@ -3581,7 +3581,7 @@ impl AckControl for TestControl {
 }
 
 /// A source that holds its acknowledgement: it hands out scripted blocks, one
-/// per `recv`, then waits; it records every release and commit, and gives each
+/// per `recv`, then waits. It records every release and commit, and gives each
 /// block a hold deadline when `hold_for` is set, as a push source does.
 struct HeldSource {
     blocks: parking_lot::Mutex<std::collections::VecDeque<Vec<u64>>>,
@@ -4147,7 +4147,7 @@ async fn guarantee_series(listener: Option<&str>) -> Vec<Vec<(String, String)>> 
 }
 
 /// A pipeline named with `.listener` publishes its guarantee under that
-/// label and no unlabelled series beside it; one not named publishes the
+/// label and no unlabelled series beside it. One not named publishes the
 /// unlabelled series as before.
 #[cfg(feature = "metrics")]
 #[tokio::test(flavor = "current_thread")]

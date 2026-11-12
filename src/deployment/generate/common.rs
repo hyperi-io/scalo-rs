@@ -11,7 +11,7 @@
 // ============================================================================
 
 /// The `/udp` suffix Docker and Compose need on a UDP port, since a bare port
-/// number means TCP to both; empty for any other protocol.
+/// number means TCP to both. Empty for any other protocol.
 pub(super) fn udp_port_suffix(protocol: &str) -> &'static str {
     if protocol.eq_ignore_ascii_case("udp") {
         "/udp"
