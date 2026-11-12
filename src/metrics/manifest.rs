@@ -73,7 +73,7 @@ pub struct ManifestResponse {
     /// The service the manifest describes. Holds the namespace until the
     /// service runtime or the CLI names the service.
     pub app: String,
-    /// The `{namespace}_` prefix every metric name carries; empty when names
+    /// The `{namespace}_` prefix every metric name carries. Empty when names
     /// are bare.
     #[serde(default)]
     pub namespace: String,
@@ -89,7 +89,7 @@ pub struct ManifestResponse {
 /// Inner state of the metric registry.
 struct MetricRegistryInner {
     descriptors: Vec<MetricDescriptor>,
-    /// The prefix `push` puts on every name; empty for bare names.
+    /// The prefix `push` puts on every name. Empty for bare names.
     namespace: String,
     app: String,
     version: String,
@@ -211,7 +211,7 @@ impl MetricRegistry {
 
     /// Set use cases for a metric by BARE name. No-op if not found.
     ///
-    /// Pass the bare metric name (no namespace prefix); `{namespace}_` is
+    /// Pass the bare metric name (no namespace prefix). `{namespace}_` is
     /// prepended here to match the stored descriptor name.
     pub(crate) fn set_use_cases(&self, metric_name: &str, use_cases: &[&str]) {
         if let Ok(mut inner) = self.inner.write() {
@@ -230,7 +230,7 @@ impl MetricRegistry {
 
     /// Set dashboard hint for a metric by BARE name. No-op if not found.
     ///
-    /// Pass the bare metric name (no namespace prefix); `{namespace}_` is
+    /// Pass the bare metric name (no namespace prefix). `{namespace}_` is
     /// prepended here to match the stored descriptor name.
     pub(crate) fn set_dashboard_hint(&self, metric_name: &str, hint: &str) {
         if let Ok(mut inner) = self.inner.write() {
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn test_registry_push_and_manifest() {
         let reg = MetricRegistry::new("test_app");
-        // Push a BARE name; the registry applies the `{app}_` prefix.
+        // Push a BARE name. The registry applies the `{app}_` prefix.
         reg.push(MetricDescriptor {
             name: "requests_total".into(),
             metric_type: MetricType::Counter,

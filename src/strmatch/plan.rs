@@ -11,7 +11,7 @@
 //!
 //! Three variants -- `LiteralOnly` / `Shape` / `Meta` -- map directly to
 //! the public [`super::MatcherTier`]. Match-time dispatch is a single
-//! `match` per call; each arm is one or two instructions for the
+//! `match` per call. Each arm is one or two instructions for the
 //! literal and shape tiers.
 
 use aho_corasick::AhoCorasick;
@@ -33,7 +33,7 @@ pub(crate) enum Anchor {
 }
 
 /// Up-to-3-byte set, used for `[xy]` and `[xyz]` shape patterns. The
-/// `n` field carries the live count; bytes beyond `n` are
+/// `n` field carries the live count. Bytes beyond `n` are
 /// uninitialised semantically (and zero-filled in practice).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SmallByteSet {
@@ -82,7 +82,7 @@ impl SmallByteSet {
 /// regex engine.
 ///
 /// `Contains(Finder)` is boxed because the `memmem::Finder` carries
-/// pre-computed search tables that can be hundreds of bytes; the other
+/// pre-computed search tables that can be hundreds of bytes. The other
 /// variants are small. Boxing keeps `ShapeOp` itself one cache line so
 /// dispatch doesn't pay for cold variant data.
 #[derive(Debug, Clone)]
@@ -156,7 +156,7 @@ impl Plan {
     /// Collect every non-overlapping match per this plan into `out`.
     /// Eager (vs lazy iterator) because the inner iterator types have
     /// incompatible lifetimes and dyn-dispatch would cost a vtable
-    /// call per element; eager collection costs one allocation per
+    /// call per element. Eager collection costs one allocation per
     /// `find_iter` call and amortises well over typical scrubber-style
     /// "redact all matches" workloads (0-3 matches per log line).
     pub(crate) fn collect_matches(&self, hay: &[u8], out: &mut Vec<Match>) {
@@ -313,7 +313,7 @@ fn match_shape_find(op: &ShapeOp, hay: &[u8]) -> Option<Match> {
 fn collect_set(ac: &AhoCorasick, anchor: Anchor, hay: &[u8], out: &mut Vec<Match>) {
     // AhoCorasick::find_iter yields non-overlapping leftmost-first
     // matches. For non-`Anywhere` anchors, filter by the position
-    // constraint; in practice an anchored set produces at most one
+    // constraint. In practice an anchored set produces at most one
     // valid match (since the position is fixed), but we let the
     // iterator yield naturally and filter.
     for m in ac.find_iter(hay) {
@@ -381,7 +381,7 @@ fn collect_shape(op: &ShapeOp, hay: &[u8], out: &mut Vec<Match>) {
                 });
             }
         }
-        // Anchored shapes have at most one match; reuse the single-find logic.
+        // Anchored shapes have at most one match. Reuse the single-find logic.
         ShapeOp::StartsWith(_) | ShapeOp::EndsWith(_) | ShapeOp::ExactMatch(_) => {
             if let Some(m) = match_shape_find(op, hay) {
                 out.push(m);

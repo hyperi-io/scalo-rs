@@ -9,7 +9,7 @@
 //! Field name interning for the batch processing engine.
 //!
 //! Deduplicates field name strings across an entire batch. The first occurrence
-//! of a field name allocates an `Arc<str>`; all subsequent occurrences get a
+//! of a field name allocates an `Arc<str>`. All subsequent occurrences get a
 //! cheap `Arc::clone` (~2 ns). Thread-safe via `DashMap` -- safe for concurrent
 //! access from rayon worker threads.
 
@@ -26,7 +26,7 @@ use sonic_rs::JsonContainerTrait as _;
 ///
 /// # Thread safety
 ///
-/// `DashMap` shards the hash map into multiple segments; concurrent
+/// `DashMap` shards the hash map into multiple segments. Concurrent
 /// reads and writes from rayon worker threads are safe without external locking.
 pub struct FieldInterner {
     table: DashMap<Arc<str>, ()>,
@@ -74,7 +74,7 @@ impl FieldInterner {
 
         // Re-read to handle the (rare) concurrent-insert race: two threads may
         // both miss the fast path and both try to insert. The one that wins
-        // the DashMap shard lock stores its key; the loser's key is dropped.
+        // the DashMap shard lock stores its key. The loser's key is dropped.
         // We always return the canonical key that is present in the map.
         if let Some(entry) = self.table.get(name) {
             Arc::clone(entry.key())

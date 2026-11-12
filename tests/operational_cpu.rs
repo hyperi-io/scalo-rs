@@ -6,8 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Operational CPU test (CRITICAL, see the plan's "Operational testing"
-//! section). Not a code-block test -- it drives the real harness
+//! Operational CPU test (CRITICAL). Not a code-block test -- it drives the real harness
 //! ([`examples/cpu_loadgen.rs`]) under a genuine cgroup `--cpus` cap via docker
 //! and asserts the KERNEL outcome with a with/without control:
 //!

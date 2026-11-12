@@ -130,7 +130,7 @@ pub fn dump_effective() -> JsonValue {
 }
 
 /// Dump effective config WITHOUT redaction. **Compile-time gated**
-/// behind the `dangerous-diagnostics` feature; not in `full`. Off
+/// behind the `dangerous-diagnostics` feature. Not in `full`. Off
 /// in every shipping build. One-off operator-driven diagnostics
 /// only -- never wire to a network endpoint.
 #[cfg(feature = "dangerous-diagnostics")]
@@ -205,7 +205,7 @@ pub fn get_section(key: &str) -> Option<ConfigSection> {
 /// Subscribe to changes for a specific config key (opt-in).
 ///
 /// The callback fires when [`update`] is called for the given key.
-/// Modules that need hot-reload subscribe at init; modules that don't
+/// Modules that need hot-reload subscribe at init. Modules that don't
 /// simply use the `OnceLock` pattern and ignore change events.
 ///
 /// The callback receives the new effective value as JSON.
@@ -245,7 +245,7 @@ where
 
     // Snapshot callbacks under the lock, drop the guard, then invoke. A
     // callback that re-registers a listener would deadlock the mutex
-    // otherwise; callback work (alloc, I/O) also shouldn't run under a
+    // otherwise. Callback work (alloc, I/O) also shouldn't run under a
     // global lock.
     let snapshot: Option<Vec<ListenerCallback>> = LISTENERS.lock().ok().and_then(|guard| {
         guard

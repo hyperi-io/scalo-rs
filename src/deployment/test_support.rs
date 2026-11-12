@@ -56,7 +56,7 @@
 //!
 //! # Why no `tempfile` dependency here?
 //!
-//! scalo `src/` stays std-only; `tempfile` is a dev-dep not pulled into the
+//! scalo `src/` stays std-only. `tempfile` is a dev-dep not pulled into the
 //! runtime crate. Callers needing a tempdir pass one in via
 //! [`ensure_kind_cluster_in`]. The shorthand [`ensure_kind_cluster`] uses
 //! `~/.cache/scalo/contract-test/<cluster>/` and cleans it on Drop.

@@ -94,7 +94,7 @@ fn scan_file(path: &Path) -> Vec<String> {
             None => trimmed,
         };
 
-        // `#[cfg(test)]` on its own line; the next `mod` opens a test block.
+        // `#[cfg(test)]` on its own line. The next `mod` opens a test block.
         let cfg_test_here = code.contains("#[cfg(test)]");
         if cfg_test_here {
             last_was_cfg_test = true;

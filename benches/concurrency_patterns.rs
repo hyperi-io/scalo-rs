@@ -20,7 +20,7 @@
 //!
 //! Run with `cargo bench --bench concurrency_patterns --features concurrency`.
 
-// Bench crates do not inherit lib.rs lint attrs; trait contracts stay async fn.
+// Bench crates do not inherit lib.rs lint attrs. Trait contracts stay async fn.
 #![allow(unknown_lints)]
 #![allow(clippy::unused_async_trait_impl)]
 

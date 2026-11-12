@@ -84,9 +84,8 @@ impl SecretCache {
                     .join("secrets")
             });
 
-            // Create if missing AND force the configured mode on
-            // every new(). F6: previously skipped chmod on existing
-            // dirs, leaving umask-default perms.
+            // Create if missing AND force the configured mode on every new(),
+            // so an existing dir does not keep its umask-default perms.
             ensure_dir_private(&dir, config.dir_mode)?;
 
             // Loud at startup when the disk tier would persist plaintext
@@ -243,8 +242,8 @@ impl SecretCache {
             if let Err(e) = std::fs::remove_dir_all(dir) {
                 warn!(error = %e, "Failed to clear disk cache");
             }
-            // F6: re-creating the dir without permissions falls back
-            // to umask. Force the configured mode on every recreate.
+            // Re-creating the dir without permissions falls back to umask,
+            // so force the configured mode on every recreate.
             if let Err(e) = ensure_dir_private(dir, self.config.dir_mode) {
                 warn!(error = %e, "Failed to restore cache directory perms");
             }
@@ -406,7 +405,7 @@ fn key_to_filename(key: &str) -> String {
     format!("{encoded}.json")
 }
 
-/// Ensure `dir` exists; chmod to `mode` on Unix when `mode` is
+/// Ensure `dir` exists. Chmod to `mode` on Unix when `mode` is
 /// `Some`. `None` skips chmod -- used by operators on S3-FUSE,
 /// root-squashed NFS, or other mounts that reject chmod.
 fn ensure_dir_private(dir: &std::path::Path, mode: Option<u32>) -> SecretsResult<()> {
@@ -429,7 +428,7 @@ fn ensure_dir_private(dir: &std::path::Path, mode: Option<u32>) -> SecretsResult
     Ok(())
 }
 
-/// Atomic-write `bytes` to `path`; chmod to `mode` on Unix when
+/// Atomic-write `bytes` to `path`. Chmod to `mode` on Unix when
 /// `mode` is `Some`. Sets perms BEFORE rename so the file is never
 /// visible at the umask default even briefly.
 fn write_private_file_atomic(
@@ -694,7 +693,7 @@ mod tests {
             ..Default::default()
         };
         // Pre-set the dir to a non-private mode that ensure_dir_private
-        // would normally clobber; with mode: None it must NOT change.
+        // would normally clobber. With mode: None it must NOT change.
         std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let _cache = SecretCache::new(&cfg).unwrap();
         let mode = std::fs::metadata(temp_dir.path())
@@ -705,8 +704,8 @@ mod tests {
         assert_eq!(mode, 0o755, "dir_mode: None must skip chmod");
     }
 
-    /// Regression (Unix): create -> set -> clear -> set;
-    /// directory stays 0700 and the cache file lands at 0600.
+    /// Unix: create -> set -> clear -> set.
+    /// The directory stays 0700 and the cache file lands at 0600.
     #[cfg(unix)]
     #[test]
     fn cache_directory_and_files_stay_private_after_clear() {

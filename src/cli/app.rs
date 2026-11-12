@@ -120,7 +120,7 @@ pub trait ServiceApp: Sized {
     /// with the operator-facing reason.
     ///
     /// [`run_app`] then keeps the service Ready with no transports open until a
-    /// config change gives it work; see [`crate::lifecycle`] for what idle looks
+    /// config change gives it work. See [`crate::lifecycle`] for what idle looks
     /// like from outside. The default is
     /// [`Active`](crate::lifecycle::WorkState::Active), so an app that does not
     /// override this behaves exactly as before.
@@ -193,7 +193,7 @@ pub trait ServiceApp: Sized {
     ///
     /// The runtime overlays the `version_check` config cascade on this, so
     /// any key a deployment sets -- an explicit `enabled: false` included
-    /// -- wins. Override to supply the service's releases endpoint; the
+    /// -- wins. Override to supply the service's releases endpoint. The
     /// default has none, which leaves the check inert.
     #[cfg(feature = "version-check")]
     fn version_check_defaults(&self) -> crate::VersionCheckConfig {
@@ -399,7 +399,7 @@ async fn hand_over<A: ServiceApp>(
 /// Returns the config to run with, or `None` when shutdown arrived while the
 /// service was still idle (exit cleanly -- never start work on the way out).
 /// Every wake re-reads the config through the app's own `load_config`, so the
-/// predicate sees exactly what a fresh start would see; a load that fails while
+/// predicate sees exactly what a fresh start would see. A load that fails while
 /// idle is logged and the previous config kept, matching the reloader.
 #[cfg(feature = "lifecycle")]
 async fn wait_for_work<A: ServiceApp>(

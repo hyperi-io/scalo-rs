@@ -82,7 +82,7 @@
 //!
 //! A routed send NEVER retries and NEVER routes to a DLQ: it returns the
 //! chosen backend's [`SendResult`] unchanged, so the caller applies its own
-//! policy (the fetcher holds the batch and stalls its scheduler; the receiver
+//! policy (the fetcher holds the batch and stalls its scheduler -- the receiver
 //! back-pressures its ingest). Bounded retry with backoff is the `sink-stack`
 //! feature's job and composes on top -- `RoutedSender` implements
 //! [`TransportSender`], so a stack wraps it.
@@ -94,7 +94,7 @@
 //! # Metrics
 //!
 //! A routed record is counted once, by the transport that sends it and only
-//! once it has landed; the routed layer adds no `transport_sent_*` series.
+//! once it has landed. The routed layer adds no `transport_sent_*` series.
 
 // With no backend feature on, `AnySender` is uninhabited and so zero-sized.
 #![cfg_attr(
@@ -222,7 +222,7 @@ impl RoutedSender {
     /// `destination` selects the route (falling back to the default);
     /// `key` is what the chosen backend receives as its destination -- the
     /// Kafka topic or the gRPC metadata routing key. Use this
-    /// wherever the destination NAME and the wire key differ; the bare
+    /// wherever the destination NAME and the wire key differ. The bare
     /// [`send`](TransportSender::send) is this call with the two equal.
     pub async fn send_to(&self, destination: &str, key: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
@@ -265,7 +265,7 @@ impl RoutedSender {
     /// receives the WHOLE block in ONE
     /// [`send_batch`](TransportSender::send_batch) call, with each record's own
     /// `key` as the wire destination. Acknowledged only when every destination
-    /// has accepted; the first `Backpressured`/`Fatal` short-circuits and is
+    /// has accepted. The first `Backpressured`/`Fatal` short-circuits and is
     /// returned, so the caller retries the whole fan-out (at-least-once --
     /// duplicates, never loss). An empty destination list or an empty block is
     /// `Ok`.
@@ -422,7 +422,7 @@ impl TransportSender for RoutedSender {
     /// groups, which is the failure belonging to the earliest record that could
     /// have produced one. Groups after it are NOT sent, so the caller retries
     /// the whole block (at-least-once -- duplicates, never loss). An empty block
-    /// is `Ok`; a block holding an unroutable record is `Fatal` with nothing
+    /// is `Ok`. A block holding an unroutable record is `Fatal` with nothing
     /// sent at all.
     async fn send_batch(&self, records: &[Record]) -> SendResult {
         if records.is_empty() {

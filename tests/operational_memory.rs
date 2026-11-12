@@ -6,8 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Operational memory test (CRITICAL, see the plan's "Operational testing"
-//! section). This is NOT a code-block test -- it drives the real harness
+//! Operational memory test (CRITICAL). This is NOT a code-block test -- it drives the real harness
 //! ([`examples/mem_loadgen.rs`]) under a genuine cgroup `--memory` limit via
 //! docker and asserts the KERNEL outcome with a with/without control:
 //!

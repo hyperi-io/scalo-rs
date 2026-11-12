@@ -8,7 +8,7 @@
 
 //! The thin charts under `charts/scalo-service/tests/fixtures/` stand for what
 //! an assembler writes. Each one's contract must load in scalo, pass
-//! `validate`, and pass the committed contract schema; and its
+//! `validate`, and pass the committed contract schema. And its
 //! `values.schema.json` must carry, under `config`, exactly the dials
 //! [`dials`] finds in that contract, nested by path. That last check is the
 //! README's assembly algorithm, run against the committed output.

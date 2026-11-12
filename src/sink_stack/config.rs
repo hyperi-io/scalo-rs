@@ -31,7 +31,7 @@ pub struct SinkStackConfig {
 
     /// Adaptive request concurrency (AIMD). When set, the sink discovers the
     /// downstream's safe concurrency from RTT/error feedback instead of using
-    /// the static `max_concurrency` cap. Opt-in; `None` keeps the fixed gate.
+    /// the static `max_concurrency` cap. Opt-in. `None` keeps the fixed gate.
     #[serde(default)]
     pub adaptive: Option<AdaptiveConfig>,
 
@@ -186,7 +186,7 @@ impl Default for AdaptiveConfig {
 
 impl AdaptiveConfig {
     /// Build the AIMD concurrency limiter from this config. Field clamping (min
-    /// floored at 1 -- the deadlock guard; initial into `[min, max]`;
+    /// floored at 1 -- the deadlock guard. Initial into `[min, max]`.
     /// decrease_factor into `[0.5, 1.0)`) happens in
     /// [`AdaptiveLimiter::new`](super::adaptive::AdaptiveLimiter::new).
     #[must_use]

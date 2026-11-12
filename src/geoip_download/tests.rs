@@ -8,7 +8,7 @@
 
 //! Every test here stays offline.
 //!
-//! The provider endpoints are real third-party services; hitting them from a
+//! The provider endpoints are real third-party services. Hitting them from a
 //! test suite would make it slow, flaky and rude. The paths exercised are the
 //! ones that decide an outcome before any socket is opened: explicit-path
 //! override, existing-file reuse, auto-download disabled, freshness, missing

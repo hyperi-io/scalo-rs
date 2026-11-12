@@ -27,9 +27,8 @@ use super::common::{on_one_line, udp_port_suffix};
 /// `identity`, when provided, stamps three `<namespace>.contract.*` LABEL
 /// lines on the image, under the contract's `oci_labels.label_namespace`
 /// (`io.scalo` by default), per the Contract Identity Annotation Scheme v1
-/// (see [`ContractIdentity`](crate::deployment::ContractIdentity)). Phase 1
-/// rollout: optional; callers SHOULD pass `Some(&identity)`. Phase 2 will
-/// flip this to a required parameter.
+/// (see [`ContractIdentity`](crate::deployment::ContractIdentity)). It is
+/// optional and callers SHOULD pass `Some(&identity)`.
 ///
 /// # Errors
 ///
@@ -52,7 +51,7 @@ pub fn generate_dockerfile(
     let namespace = &contract.oci_labels.label_namespace;
 
     // Contract Identity Annotation Scheme v1 -- three LABEL lines.
-    // Phase 1: silent on None for backwards compat (see module doc).
+    // Silent on None, so consumers not yet passing an identity keep working.
     let identity_block = identity
         .map(|id| format!("\n{labels}", labels = id.as_dockerfile_labels(namespace)))
         .unwrap_or_default();
@@ -266,7 +265,7 @@ fn shell_quoted(text: &str) -> String {
 /// listens, with UDP ports marked since a bare port number means TCP.
 ///
 /// A port with a `when` condition is left out, because an image cannot know
-/// whether that listener is on; a comment after the line lists each one and
+/// whether that listener is on. A comment after the line lists each one and
 /// its condition instead, with any control character escaped so the entry
 /// stays one comment line.
 fn expose_ports(contract: &DeploymentContract) -> String {

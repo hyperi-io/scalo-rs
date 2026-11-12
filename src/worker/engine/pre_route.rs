@@ -181,7 +181,7 @@ mod tests {
 
     // ---- filter tests -------------------------------------------------------
 
-    /// Each filter reads its own field; first match wins; a parse error or no
+    /// Each filter reads its own field. First match wins. A parse error or no
     /// filter continues.
     #[test]
     fn filters_read_their_own_field() {

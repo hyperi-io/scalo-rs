@@ -48,11 +48,10 @@
 //! assert_eq!(*rx.borrow(), 1);
 //! ```
 //!
-//! Drop-in replacement for the per-component `SharedConfig` structs data-plane
-//! components used to hard-code to their own `Config`. Same method names
-//! (`read`/`get`/`with`/`update`/`version`/`subscribe`); type is inferred
-//! from the argument. The old `clone_inner()` is gone -- clone the
-//! `SharedConfig` itself.
+//! Generic over the config type, so a component need not define its own
+//! `SharedConfig`. Methods are `read`/`get`/`with`/`update`/`version`/`subscribe`.
+//! The type is inferred from the argument. Clone the `SharedConfig` itself to
+//! share it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

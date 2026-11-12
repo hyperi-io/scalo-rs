@@ -484,7 +484,7 @@ mod tests {
     }
 
     /// Compose publishes a gated port only when `default_config` turns its
-    /// listener on; off, or not decidable from the config, leaves a comment.
+    /// listener on. Off, or not decidable from the config, leaves a comment.
     #[test]
     fn test_compose_publishes_a_gated_port_only_when_its_listener_is_on() {
         let mut contract = test_contract();
@@ -959,7 +959,7 @@ mod tests {
     // ============================================================================
     // Contract Identity Annotation Scheme v1 -- end-to-end wiring tests.
     // The unit tests for ContractIdentity itself live in
-    // src/deployment/contract_identity.rs; these verify the Dockerfile
+    // src/deployment/contract_identity.rs. These verify the Dockerfile
     // generator emits the three keys as image labels.
     // ============================================================================
 

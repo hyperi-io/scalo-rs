@@ -10,7 +10,7 @@
 //!
 //! A change is breaking when a document the old schema accepted, or a value an
 //! operator already stored, would be refused or ignored under the new one. The
-//! check reads the keywords schemars and a hand-written chart schema use; a
+//! check reads the keywords schemars and a hand-written chart schema use. A
 //! keyword it does not read is not compared.
 //!
 //! [`breaking_changes`] reports each one with its path:
@@ -77,7 +77,7 @@ impl fmt::Display for SchemaBreakKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaBreak {
     /// Dotted path of the node: `a.b` for properties, `a[]` for items, `a.*`
-    /// for additional properties; empty for the root.
+    /// for additional properties. Empty for the root.
     pub path: String,
     /// The kind of narrowing.
     pub kind: SchemaBreakKind,
@@ -119,7 +119,7 @@ pub fn breaking_changes(old: &Value, new: &Value) -> Vec<SchemaBreak> {
     walker.out
 }
 
-/// Keywords that bound a value from below; a higher new value narrows.
+/// Keywords that bound a value from below. A higher new value narrows.
 const LOWER_BOUNDS: [&str; 5] = [
     "minimum",
     "exclusiveMinimum",
@@ -128,7 +128,7 @@ const LOWER_BOUNDS: [&str; 5] = [
     "minProperties",
 ];
 
-/// Keywords that bound a value from above; a lower new value narrows.
+/// Keywords that bound a value from above. A lower new value narrows.
 const UPPER_BOUNDS: [&str; 5] = [
     "maximum",
     "exclusiveMaximum",
@@ -582,7 +582,7 @@ fn nullable(root: &Value, node: &Value) -> (Value, Option<String>) {
     (Value::Object(merged), inner_ref.or(outer_ref))
 }
 
-/// The node as a keyword map; `true` reads as the empty schema.
+/// The node as a keyword map. `true` reads as the empty schema.
 fn as_schema(node: &Value) -> Option<Map<String, Value>> {
     match node {
         Value::Bool(true) => Some(Map::new()),
@@ -606,7 +606,7 @@ fn is_dial(node: &Value) -> bool {
     node.get(DIAL_KEYWORD).is_some()
 }
 
-/// The JSON types a node allows; `None` when it names none, so allows all.
+/// The JSON types a node allows. `None` when it names none, so allows all.
 fn types(map: &Map<String, Value>) -> Option<BTreeSet<String>> {
     match map.get("type")? {
         Value::String(t) => Some(BTreeSet::from([t.clone()])),
@@ -620,7 +620,7 @@ fn types(map: &Map<String, Value>) -> Option<BTreeSet<String>> {
     }
 }
 
-/// The values an `enum` or `const` allows; `None` when neither is set.
+/// The values an `enum` or `const` allows. `None` when neither is set.
 fn allowed_values(map: &Map<String, Value>) -> Option<Vec<Value>> {
     if let Some(value) = map.get("const") {
         return Some(vec![value.clone()]);

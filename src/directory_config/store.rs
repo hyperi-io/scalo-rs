@@ -235,7 +235,6 @@ impl DirectoryConfigStore {
         // Write with advisory lock
         write_yaml_locked(&file_path, &doc)?;
 
-        // Update cache
         {
             let mut cache = self.cache.write().await;
             cache.insert(table.to_string(), doc);
@@ -291,7 +290,6 @@ impl DirectoryConfigStore {
 
         write_yaml_locked(&file_path, &doc)?;
 
-        // Update cache
         {
             let mut cache = self.cache.write().await;
             cache.insert(table.to_string(), doc);
@@ -646,12 +644,9 @@ fn load_yaml_file(path: &Path) -> DirectoryConfigResult<serde_json::Value> {
 /// Write YAML to file with advisory file lock.
 ///
 /// Acquires the advisory lock BEFORE truncating, then writes through the
-/// SAME handle the lock was acquired on. The previous implementation
-/// opened with `.truncate(true)` (which truncated immediately), then
-/// later called `std::fs::write(path, ...)` through a separate file
-/// handle -- meaning both the truncate AND the write happened outside
-/// the locked handle, defeating the advisory protection the function
-/// name promises.
+/// SAME handle the lock was acquired on. Truncating at open, or writing
+/// through a separate handle, would happen outside the lock and defeat the
+/// advisory protection the function name promises.
 fn write_yaml_locked(path: &Path, value: &serde_json::Value) -> DirectoryConfigResult<()> {
     use std::io::{Seek, SeekFrom, Write};
 

@@ -567,11 +567,10 @@ fn with_path_refs<R>(path: &[String], f: impl FnOnce(&[&str]) -> R) -> R {
 ///   - Per field: one `Vec<&str>` for the dotted path split, plus the
 ///     `serde_json::Value` tree produced by `from_str`.
 ///
-/// Crucially the field NAMES are not cloned -- they reference the
-/// `CompiledFilter::fields` storage, which lives as long as the filter.
-/// The previous implementation built a `HashMap<String, Value>` per call
-/// which cloned every field name; at PB/hr rates that allocator pressure
-/// shows up as GC-like tail-latency spikes.
+/// The field NAMES are not cloned -- they reference the
+/// `CompiledFilter::fields` storage, which lives as long as the filter. A
+/// `HashMap<String, Value>` per call would clone every field name, and at
+/// PB/hr rates that allocator pressure shows up as tail-latency spikes.
 #[cfg(feature = "expression")]
 fn evaluate_cel(
     payload: &[u8],
@@ -598,7 +597,7 @@ fn evaluate_cel(
         }
     }
 
-    // `build_context` takes `(&String, &JsonValue)`; `extracted.iter()` yields
+    // `build_context` takes `(&String, &JsonValue)`. `extracted.iter()` yields
     // `&(&String, JsonValue)`, so we re-borrow the value to match.
     let ctx = crate::expression::build_context(extracted.iter().map(|(k, v)| (*k, v))).ok()?;
     match program.execute(&ctx) {
@@ -672,7 +671,7 @@ mod tests {
             &TransportFilterTierConfig::default(),
         )
         .unwrap();
-        // Substring appears inside description; field is genuinely absent.
+        // Substring appears inside description. Field is genuinely absent.
         let payload = br#"{"description":"docs mention \"_table\":\"x\" only","id":1}"#;
         assert_eq!(filter.evaluate(payload), Some(FilterAction::Drop));
 

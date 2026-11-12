@@ -16,7 +16,7 @@
 //! # Non-fatal by contract
 //!
 //! [`ensure_databases`] returns `Ok` with `None` paths when a download fails.
-//! A GeoIP database going missing degrades enrichment; it must not stop a
+//! A GeoIP database going missing degrades enrichment. It must not stop a
 //! service from starting. Failures are logged at `warn` and a stale local file
 //! is preferred over no file at all.
 //!
@@ -274,7 +274,7 @@ fn is_fresh(path: &Path, max_age_secs: u64) -> bool {
     let Ok(modified) = metadata.modified() else {
         return false;
     };
-    // A future mtime makes duration_since fail; treat that as stale rather
+    // A future mtime makes duration_since fail. Treat that as stale rather
     // than trusting a clock that has gone backwards.
     let Ok(age) = SystemTime::now().duration_since(modified) else {
         return false;
@@ -302,7 +302,7 @@ fn plan(kind: Kind, config: &GeoIpConfig) -> Result<Transfer, GeoIpDownloadError
     };
 
     let transfer = match (config.provider, kind) {
-        // DB-IP publishes a fresh dated file each month; the current month is
+        // DB-IP publishes a fresh dated file each month. The current month is
         // the only URL that resolves.
         (GeoIpProvider::DbIpLite, _) => {
             let month = chrono::Utc::now().format("%Y-%m");

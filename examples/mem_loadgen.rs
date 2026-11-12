@@ -9,8 +9,7 @@
 //! Memory backpressure operational-test harness.
 //!
 //! This is the unit-under-test for the cgroup-confined memory operational
-//! test (see `scripts/operational-mem-test.sh` and the plan's "Operational
-//! testing" section). It is deliberately a *black box*: drive it under a real
+//! test (see `scripts/operational-mem-test.sh`). It is deliberately a *black box*: drive it under a real
 //! cgroup `--memory` limit and observe the KERNEL outcome (OOM-killed vs
 //! survives) and its stdout backpressure counters -- not scalo's internals.
 //!
@@ -79,7 +78,7 @@ fn main() {
 
     let start = Instant::now();
     let deadline = start + Duration::from_secs(duration_secs);
-    // Inter-arrival sleep target; we batch sleeps to keep overhead low.
+    // Inter-arrival sleep target. We batch sleeps to keep overhead low.
     #[allow(clippy::cast_precision_loss)] // rate_hz is small; exactness irrelevant
     let per_op = Duration::from_secs_f64(1.0 / rate_hz as f64);
     let mut last_report = start;

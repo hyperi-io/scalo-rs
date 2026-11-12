@@ -21,10 +21,10 @@
 //!   is never invoked.
 //! - **Regex** (engine-bounded) -- fall through to
 //!   `regex-automata::meta::Regex`. Has its own internal prefilter
-//!   pipeline; cost depends on pattern and haystack.
+//!   pipeline. Cost depends on pattern and haystack.
 //!
 //! Budgets are typical for a modern x86 server on a ~200-byte
-//! haystack; see [`MatcherTier::typical_budget_ns`] and
+//! haystack. See [`MatcherTier::typical_budget_ns`] and
 //! `benches/strmatch.rs`.
 //!
 //! ## Anti-spam discipline
@@ -95,7 +95,7 @@ use plan::Plan;
 /// means faster). Use [`Self::rank`] for `min_tier` comparisons.
 ///
 /// Budgets below are typical for a modern x86 server on a ~200-byte
-/// haystack. Hardware-dependent; cold caches and pathological inputs
+/// haystack. Hardware-dependent. Cold caches and pathological inputs
 /// move them around.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -655,7 +655,7 @@ impl StrMatcherBuilder {
     ///
     /// `min_tier` + `on_below_min` apply per pattern. First failure
     /// short-circuits the build. Unanchored literals fold into a
-    /// merged AC; anchored / regex patterns stay individual.
+    /// merged AC. Anchored / regex patterns stay individual.
     ///
     /// # Errors
     ///
@@ -708,7 +708,7 @@ impl StrMatcherBuilder {
     }
 }
 
-// The inherent single-pattern build method already exists above; the
+// The inherent single-pattern build method already exists above. The
 // trait-style impl below disambiguates against the iterator version.
 // Rust resolves single-pattern `&str` to the inherent method because
 // `IntoIterator<Item = S: AsRef<str>>` is not implemented for `&str`
@@ -754,7 +754,7 @@ mod warn {
         };
 
         if already_warned && !force {
-            // Already warned about this pattern; respect the dedup.
+            // Already warned about this pattern. Respect the dedup.
             return;
         }
 

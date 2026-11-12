@@ -12,7 +12,7 @@
 //! It is derived from [`DeploymentContract`] by schemars and committed as
 //! `charts/scalo-service/schema/deployment-contract.v<N>.schema.json`, where a
 //! chart assembler outside Rust reads it. A test fails when the committed file
-//! and the derivation differ as JSON values; object key order is not compared.
+//! and the derivation differ as JSON values. Object key order is not compared.
 
 use std::borrow::Cow;
 

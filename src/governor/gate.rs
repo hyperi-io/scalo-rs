@@ -8,13 +8,13 @@
 
 //! Inbound gate: drives an actuator on each pause/resume transition.
 //!
-//! The [`UnifiedPressure`] latch tells us *whether* to hold; the
+//! The [`UnifiedPressure`] latch tells us *whether* to hold. The
 //! [`InboundGate`] turns that latched boolean into EDGE events. Each
 //! [`evaluate`](InboundGate::evaluate) samples the latch and, on a
 //! transition only, calls the [`GateActuator`] exactly once -- `pause()`
 //! on the false->true (rising) edge, `resume()` on the true->false
 //! (falling) edge. While the latch stays held, repeated `evaluate()`
-//! calls return [`Admit::Hold`] but do NOT re-call `pause()`; likewise a
+//! calls return [`Admit::Hold`] but do NOT re-call `pause()`. Likewise a
 //! released latch returns [`Admit::Yes`] without re-calling `resume()`.
 //!
 //! INBOUND side only: the actuator pauses a source's recv/ingest (stops
@@ -22,7 +22,7 @@
 //! wired to the outbound drain (sink) -- gating the drain would deadlock the
 //! pipeline. `send` is never involved here.
 //!
-//! Gated behind the `governor` feature; wired into the receive transport by
+//! Gated behind the `governor` feature. Wired into the receive transport by
 //! [`SelfRegulationGovernor`](super::SelfRegulationGovernor) (default-on).
 
 use std::sync::Arc;
@@ -170,7 +170,7 @@ pub struct InboundGate {
     paused_edge: AtomicBool,
     /// The latch's expired-hold count this gate has already opened for.
     expired_seen: AtomicU64,
-    /// `0` while no release window is open; while one is, the latch clock
+    /// `0` while no release window is open. While one is, the latch clock
     /// reading it opened at, plus one.
     release_window: AtomicU64,
 }
@@ -178,7 +178,7 @@ pub struct InboundGate {
 impl InboundGate {
     /// Build a gate over a shared pressure latch and an actuator.
     ///
-    /// The gate starts in the released (open) state; the first
+    /// The gate starts in the released (open) state. The first
     /// [`evaluate`](Self::evaluate) under pressure will fire `pause()`.
     #[must_use]
     pub fn new(pressure: Arc<UnifiedPressure>, actuator: Box<dyn GateActuator>) -> Self {
@@ -225,7 +225,7 @@ impl InboundGate {
     /// out of order, stranding the source paused while the flag reads open. The
     /// in-tree wiring satisfies this -- each transport's recv loop calls
     /// `evaluate()` once per `recv`. Do NOT share one `InboundGate` across
-    /// concurrent evaluators; give each source its own gate.
+    /// concurrent evaluators. Give each source its own gate.
     pub fn evaluate(&self) -> Admit {
         let hold = self.pressure.should_hold();
         let expired = self.pressure.expired_holds();
@@ -481,7 +481,7 @@ mod tests {
     }
 
     /// A paused source whose level never clears resumes once at max_hold and
-    /// pauses again once a receive returns records; a level that settled in
+    /// pauses again once a receive returns records. A level that settled in
     /// the band stays resumed.
     #[test]
     fn a_hold_past_max_hold_resumes_the_source_once() {

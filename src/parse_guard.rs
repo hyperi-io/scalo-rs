@@ -8,7 +8,7 @@
 
 //! Parse-path depth guard against stack-exhaustion DoS.
 //!
-//! JSON (`sonic_rs`) and MsgPack (`rmpv`) recurse per nesting level; a
+//! JSON (`sonic_rs`) and MsgPack (`rmpv`) recurse per nesting level. A
 //! deeply-nested payload can blow the worker stack. We reject above
 //! [`MAX_PARSE_DEPTH`] -- JSON via the iterative [`json_depth_within`] (run
 //! before the recursive parser), MsgPack via `read_value_with_max_depth`.
@@ -31,7 +31,7 @@ const ODD_BITS: u64 = 0xAAAA_AAAA_AAAA_AAAA;
 
 /// `true` if the JSON payload nests no deeper than `max`.
 ///
-/// Counts `{` and `[` outside strings, honouring `\` escapes inside strings; a
+/// Counts `{` and `[` outside strings, honouring `\` escapes inside strings. A
 /// close with nothing open saturates at zero. Not a validator -- a pre-filter
 /// ahead of `sonic_rs`: malformed JSON, unbalanced brackets, unterminated
 /// strings and non-UTF-8 bytes all get an answer, and the parser that runs next
@@ -184,7 +184,7 @@ impl Scan {
         Step::Within
     }
 
-    /// Applies one block's brackets in order; `false` once the depth passes `max`.
+    /// Applies one block's brackets in order. `false` once the depth passes `max`.
     #[inline]
     fn walk(&mut self, opens: u64, closes: u64, max: usize) -> bool {
         let n_open = opens.count_ones() as usize;
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn exactly_at_bound_passes_one_over_fails() {
-        // depth 3 with max 3 is OK; depth 4 with max 3 is rejected.
+        // depth 3 with max 3 is OK. Depth 4 with max 3 is rejected.
         assert!(json_depth_within(br"[[[1]]]", 3));
         assert!(!json_depth_within(br"[[[[1]]]]", 3));
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Project:   scalo
 # File:      scripts/dep-dup-check.sh
-# Purpose:   Warning-only dependency-duplication report (finding P2 / task 4.3)
+# Purpose:   Warning-only dependency-duplication report
 # Language:  Bash
 #
 # License:   Apache-2.0

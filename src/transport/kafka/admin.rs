@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(base.get("group.id"), None);
     }
 
-    /// A raw `group.id` override is aimed at the app's own consumer; the
+    /// A raw `group.id` override is aimed at the app's own consumer. The
     /// admin's offset-query consumer keeps its derived id.
     #[test]
     fn offset_query_group_id_wins_over_a_raw_override() {

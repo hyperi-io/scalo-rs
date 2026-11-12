@@ -55,7 +55,7 @@ use super::entry::DlqEntry;
 use super::error::DlqError;
 use super::file::FileDlqInner;
 
-/// Unified DLQ. Caller queues entries from any task; the orchestrator
+/// Unified DLQ. Caller queues entries from any task. The orchestrator
 /// drains them off-runtime via the configured backends.
 ///
 /// Clone is cheap (`mpsc::Sender` clone). The single-owner shutdown
@@ -111,7 +111,7 @@ impl std::io::Write for ByteCount {
     }
 }
 
-/// Minimum interval between dead-letter-drop ERROR logs; the counters
+/// Minimum interval between dead-letter-drop ERROR logs. The counters
 /// still move for every dropped entry.
 const DROP_LOG_INTERVAL_MS: u64 = 5_000;
 
@@ -341,7 +341,7 @@ impl Dlq {
             .map_err(map_sink_err)
     }
 
-    /// Async batch submission. Each entry is queued individually; the
+    /// Async batch submission. Each entry is queued individually. The
     /// drain decides how to coalesce.
     ///
     /// # Errors
@@ -368,8 +368,8 @@ impl Dlq {
     /// the broker: the flush waits up to `kafka.send_timeout_ms` for that,
     /// off the runtime. In cascade mode an entry the broker refused or never
     /// acked goes on to the backend after Kafka and counts as accepted once
-    /// that backend takes it; otherwise it counts as refused. A refused batch
-    /// is reported by the first flush after it and not again; it is also
+    /// that backend takes it. Otherwise it counts as refused. A refused batch
+    /// is reported by the first flush after it and not again. It is also
     /// counted in [`Dlq::dropped`]. What "accepted" means per backend is in
     /// `docs/pipeline/dlq.md`.
     ///
@@ -474,10 +474,10 @@ impl Dlq {
     /// Before it exits the drain waits for the Kafka backend's acks, up to
     /// `kafka.send_timeout_ms` plus 5 s when it has to purge. In cascade mode
     /// the entries only Kafka held that were never acked go on to the backend
-    /// after Kafka; what no backend takes is counted in [`Dlq::dropped`]. A
+    /// after Kafka. What no backend takes is counted in [`Dlq::dropped`]. A
     /// caller that needs that loss as an `Err` calls [`Self::flush`] first.
     ///
-    /// Idempotent across clones: the join happens once; later calls see
+    /// Idempotent across clones: the join happens once. Later calls see
     /// an empty join slot and return Ok.
     ///
     /// # Errors
@@ -505,7 +505,7 @@ fn map_sink_err(e: SinkError) -> DlqError {
     }
 }
 
-/// A Kafka or HTTP backend's own loss keeps its variant; every other drain
+/// A Kafka or HTTP backend's own loss keeps its variant. Every other drain
 /// failure reads as `File`, as it always has.
 fn map_drain_err(d: DrainError) -> DlqError {
     let source = match d {
@@ -744,7 +744,7 @@ impl DlqDrain {
         first_err.map_or(Ok(()), Err)
     }
 
-    /// Every backend gets the whole batch; an entry is safe while any holds it.
+    /// Every backend gets the whole batch. An entry is safe while any holds it.
     async fn write_fan_out(&mut self, batch: &[DlqEntry]) -> Result<(), DrainError> {
         // Per backend: entries it holds, and whether it took the whole batch.
         let mut outcomes: Vec<(usize, bool)> = Vec::with_capacity(self.backends.len());
@@ -983,7 +983,7 @@ mod tests {
         assert!(written < 1_000_000, "{written} bytes");
     }
 
-    /// A write that rotates the file moves what it held aside; the readers
+    /// A write that rotates the file moves what it held aside. The readers
     /// above still return every entry, oldest first, in whichever file it landed.
     #[tokio::test]
     async fn the_file_readers_see_entries_a_rotation_moved_aside() {
@@ -1440,7 +1440,7 @@ mod tests {
             .expect("spawn")
         }
 
-        /// Shutdown drops the producer, which discards what it holds; what no
+        /// Shutdown drops the producer, which discards what it holds. What no
         /// broker acked by then must be counted, not lost silently.
         #[tokio::test]
         async fn shutdown_counts_the_entries_no_broker_acked() {

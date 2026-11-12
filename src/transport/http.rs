@@ -268,7 +268,7 @@ pub struct HttpTransport {
     #[cfg(feature = "http-server")]
     local_addr: Option<std::net::SocketAddr>,
 
-    /// One permit per body byte read or queued; `recv` returns a record's
+    /// One permit per body byte read or queued. `recv` returns a record's
     /// permits as it hands the record over.
     #[cfg(feature = "http-server")]
     in_flight: Option<Arc<tokio::sync::Semaphore>>,
@@ -338,7 +338,7 @@ impl HttpTransport {
         config: &HttpTransportConfig,
         #[cfg(feature = "governor")] pressure: Option<Arc<crate::governor::UnifiedPressure>>,
     ) -> TransportResult<Self> {
-        // `mut` is only used on the TLS path; harmless without the feature.
+        // `mut` is only used on the TLS path. Harmless without the feature.
         #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
         let mut client_builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(config.connect_timeout_ms))
@@ -428,7 +428,7 @@ impl HttpTransport {
         };
 
         // When the governor feature is on but http-server is off there is no
-        // receive server to attach the pressure governor to; consume it so the
+        // receive server to attach the pressure governor to. Consume it so the
         // signature stays uniform without an unused-variable warning.
         #[cfg(all(feature = "governor", not(feature = "http-server")))]
         let _ = pressure;
@@ -644,7 +644,7 @@ async fn ingest_handler(
     if body.is_empty() {
         return axum::http::StatusCode::BAD_REQUEST.into_response();
     }
-    // Keep exactly the bytes read; a short body returns the rest of its reservation.
+    // Keep exactly the bytes read. A short body returns the rest of its reservation.
     drop(permit.split(permit.num_permits().saturating_sub(body.len())));
 
     let seq = state.sequence.fetch_add(1, Ordering::Relaxed);
@@ -867,8 +867,8 @@ impl TransportSender for HttpTransport {
                 #[cfg(feature = "metrics")]
                 metrics::counter!("transport_send_errors_total", "transport" => "http")
                     .increment(1);
-                // Only a request that could never be built or followed is permanent;
-                // refused, reset and timed-out connections clear when the endpoint returns.
+                // Only a request that could never be built or followed is permanent.
+                // Refused, reset and timed-out connections clear when the endpoint returns.
                 if e.is_builder() || e.is_redirect() {
                     SendResult::Fatal(TransportError::Send(format!("HTTP request failed: {e}")))
                 } else {
@@ -910,7 +910,7 @@ impl TransportReceiver for HttpTransport {
             let mut messages = Vec::with_capacity(max.min(100));
 
             for _ in 0..max {
-                // The first record waits up to recv_timeout_ms; the rest only take
+                // The first record waits up to recv_timeout_ms. The rest only take
                 // what is already queued.
                 let msg = if self.recv_timeout_ms == 0 || !messages.is_empty() {
                     match rx.try_recv() {
@@ -938,7 +938,7 @@ impl TransportReceiver for HttpTransport {
                 messages.push(msg);
             }
 
-            // Apply inbound filters via the shared partition helper; DLQ
+            // Apply inbound filters via the shared partition helper. DLQ
             // entries are returned in the RecvBatch for the caller to route.
             let batch = self.filter_engine.partition_batch(
                 messages,
@@ -1282,7 +1282,7 @@ mod tests {
     #[cfg(feature = "http-server")]
     #[tokio::test]
     async fn send_and_receive_roundtrip() {
-        // Port 0 binds a free port atomically; a probe-then-rebind races
+        // Port 0 binds a free port atomically. A probe-then-rebind races
         // parallel tests for the same port.
         let recv_config = HttpTransportConfig {
             listen: Some("127.0.0.1:0".to_string()),

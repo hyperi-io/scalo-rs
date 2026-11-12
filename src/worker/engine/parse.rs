@@ -11,7 +11,7 @@
 //!
 //! - JSON: `sonic_rs::from_slice` (AVX2/NEON SIMD, 2-4x faster than serde_json)
 //! - MsgPack: `rmpv` native decode -> `sonic_rs::Value` via a direct value walker
-//!   (no `rmp_serde -> serde_json` bridge; MsgPack messages are a small minority
+//!   (no `rmp_serde -> serde_json` bridge -- MsgPack messages are a small minority
 //!   in practice)
 //! - Auto: byte-sniff via [`PayloadFormat::detect`], then dispatch
 
@@ -84,7 +84,7 @@ pub fn parse_payload(payload: &[u8], format: PayloadFormat) -> Result<sonic_rs::
     };
 
     match effective {
-        // Auto resolves to Json or MsgPack; treat residual Auto as Json.
+        // Auto resolves to Json or MsgPack. Treat residual Auto as Json.
         PayloadFormat::Json | PayloadFormat::Auto => {
             // Reject pathological nesting with a CHEAP ITERATIVE pre-scan before
             // the recursive SIMD parser runs -- a hostile deeply-nested payload
@@ -129,11 +129,11 @@ pub fn parse_payload(payload: &[u8], format: PayloadFormat) -> Result<sonic_rs::
 ///
 /// ## Mapping
 ///
-/// - Nil -> JSON null; Boolean -> bool; F32/F64 -> JSON number.
+/// - Nil -> JSON null. Boolean -> bool. F32/F64 -> JSON number.
 /// - Integers fold to `i64` / `u64` (a `u64 > i64::MAX` stays unsigned;
 ///   otherwise it is surfaced as `f64`, matching the codec's lossy-but-numeric
 ///   policy for the rare oversized case).
-/// - String: valid UTF-8 -> JSON string; otherwise the lossy form (a MsgPack
+/// - String: valid UTF-8 -> JSON string. Otherwise the lossy form (a MsgPack
 ///   `str` is meant to be UTF-8, so this only bites on malformed input).
 /// - Binary / Ext: base-relevant routing never keys off these, so a `bin` maps
 ///   to its lossy-UTF-8 string and `ext` to JSON null -- neither aborts the
@@ -191,7 +191,7 @@ fn rmpv_to_sonic(value: &rmpv::Value) -> sonic_rs::Value {
 }
 
 /// Stringify an `rmpv` map key so it can be a JSON object key (which must be a
-/// string). String keys pass through; everything else uses its `Display`-ish
+/// string). String keys pass through. Everything else uses its `Display`-ish
 /// form so the field stays addressable rather than being dropped.
 #[cfg(feature = "worker-msgpack")]
 fn msgpack_key_to_string(key: &rmpv::Value) -> String {
@@ -293,7 +293,7 @@ mod tests {
         }
         #[cfg(feature = "worker-msgpack")]
         {
-            // Feature is enabled; just verify the UnsupportedFormat variant
+            // Feature is enabled. Just verify the UnsupportedFormat variant
             // can still be constructed and displayed.
             let e = ParseError::UnsupportedFormat("test");
             assert!(e.to_string().contains("test"));

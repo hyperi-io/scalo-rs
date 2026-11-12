@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn docker_available_returns_bool() {
-        // Just exercises the function; result depends on environment.
+        // Just exercises the function. Result depends on environment.
         let _ = docker_available();
     }
 

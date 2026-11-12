@@ -48,7 +48,7 @@
 //!
 //! TieredSink wraps any [`TransportSender`](crate::transport::TransportSender) --
 //! the same senders the transport factory produces. Records go straight to the
-//! sender on the happy path (no encode); only when the downstream fails are they
+//! sender on the happy path (no encode). Only when the downstream fails are they
 //! serialised and spilled to disk, then drained back on recovery.
 //!
 //! ```rust,ignore

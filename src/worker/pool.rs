@@ -52,7 +52,7 @@ pub(crate) struct Semaphore {
     state: Mutex<SemState>,
     /// Signalled when a permit frees or the target grows.
     available: Condvar,
-    /// Architectural ceiling (rayon pool size); `target` never exceeds it.
+    /// Architectural ceiling (rayon pool size). `target` never exceeds it.
     max_permits: usize,
 }
 
@@ -88,7 +88,7 @@ impl Semaphore {
 
     /// Set the target concurrency (called by the scaler). Clamped to
     /// `[1, max_permits]`. Growing the target wakes parked acquirers so they
-    /// re-check; shrinking simply stops new leases until `leased` falls below
+    /// re-check. Shrinking simply stops new leases until `leased` falls below
     /// the new target -- in-flight work drains naturally.
     pub(crate) fn set_target(&self, target: usize) {
         let clamped = target.clamp(1, self.max_permits);
@@ -127,7 +127,7 @@ impl Drop for SemaphoreGuard<'_> {
         let mut st = self.semaphore.state.lock();
         st.leased = st.leased.saturating_sub(1);
         drop(st);
-        // Wake one parked acquirer; the freed permit is now leasable
+        // Wake one parked acquirer. The freed permit is now leasable
         // (subject to the current target, which it re-checks).
         self.semaphore.available.notify_one();
     }
@@ -143,7 +143,7 @@ impl Drop for SemaphoreGuard<'_> {
 pub struct FanOutPolicy {
     /// Per-item timeout. `None` = no timeout (caller must bound the future).
     pub per_item_timeout: Option<std::time::Duration>,
-    /// Cancellation token. When cancelled, no NEW items are spawned; in-flight
+    /// Cancellation token. When cancelled, no NEW items are spawned. In-flight
     /// items are still awaited. Remaining unspawned items report `Cancelled`.
     pub cancel: Option<tokio_util::sync::CancellationToken>,
 }
@@ -270,7 +270,7 @@ impl AdaptiveWorkerPool {
     ///
     /// - `Some(Ok(r))` -- task completed successfully with result `r`
     /// - `Some(Err(e))` -- task returned `Err(e)`
-    /// - `None` -- task panicked; the panic was logged at `error` level
+    /// - `None` -- task panicked. The panic was logged at `error` level
     ///   with the input index. The wrapping `Option` exists so the
     ///   panic doesn't silently shorten the result vector.
     ///
@@ -316,7 +316,7 @@ impl AdaptiveWorkerPool {
                 match joined {
                     Ok((idx, result)) => results[idx] = Some(result),
                     Err(join_err) => {
-                        // Leave results[idx] = None; caller can detect
+                        // Leave results[idx] = None. Caller can detect
                         // the panic without shrinking the output vec.
                         let idx = id_to_idx.get(&join_err.id()).copied();
                         tracing::error!(error = %join_err, ?idx, "fan_out_async task panicked");
@@ -333,7 +333,7 @@ impl AdaptiveWorkerPool {
     /// Unlike [`fan_out_async`](Self::fan_out_async), this streams completions
     /// (a `JoinSet`) so a slow item never blocks faster ones, applies an
     /// optional per-item timeout, and stops spawning new work when the policy's
-    /// cancellation token fires. Results are returned in input order; each is a
+    /// cancellation token fires. Results are returned in input order. Each is a
     /// [`FanOutResult`]. Emits `<namespace>_fanout_*` metrics (in-flight gauge, timeout/
     /// panic counters, batch-duration histogram) when the `metrics` feature is on.
     pub async fn fan_out_async_with_policy<T, R, E, F, Fut>(
@@ -434,7 +434,7 @@ impl AdaptiveWorkerPool {
     ///
     /// Like [`process_batch`](Self::process_batch) but takes OWNED items and a
     /// closure that consumes each (so the transform may mutate its own copy),
-    /// returning an arbitrary `R` per item. Crucially the semaphore IS applied
+    /// returning an arbitrary `R` per item. The semaphore IS applied
     /// per item, so this path obeys the scaler target -- unlike
     /// [`install`](Self::install). Results are collected in input order.
     ///
@@ -465,7 +465,7 @@ impl AdaptiveWorkerPool {
     /// `par_iter_mut` or other rayon primitives not covered by the throttled
     /// helpers. The semaphore is NOT applied -- callers manage their own
     /// concurrency. Prefer [`process_batch`](Self::process_batch) or
-    /// [`map_owned`](Self::map_owned), which respect the scaler target; reach
+    /// [`map_owned`](Self::map_owned), which respect the scaler target. Reach
     /// for `install` only for genuine rayon-primitive escape hatches.
     pub fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
         self.rayon_pool.install(f)
@@ -562,7 +562,7 @@ mod semaphore_tests {
     fn downscale_does_not_overshoot_on_drop() {
         // Lease the full target, shrink the target while leased, then drain.
         // The old model refilled `available` toward max_permits on drop,
-        // undoing the downscale; the new model derives available from the
+        // undoing the downscale. The new model derives available from the
         // target, so post-drain available == target, not max.
         let s = Semaphore::new(8, 8);
         let guards: Vec<_> = (0..8).map(|_| s.acquire()).collect();
@@ -594,7 +594,7 @@ mod semaphore_tests {
 
     #[test]
     fn contention_never_exceeds_target() {
-        // 8 threads hammer a target=2 limiter; leased must never exceed 2.
+        // 8 threads hammer a target=2 limiter. Leased must never exceed 2.
         let s = Arc::new(Semaphore::new(2, 2));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let handles: Vec<_> = (0..8)
@@ -622,7 +622,7 @@ mod semaphore_tests {
 
     #[test]
     fn grow_target_wakes_parked_acquirer() {
-        // target=1, one lease held; a second acquirer parks until the target
+        // target=1, one lease held. A second acquirer parks until the target
         // grows -- proving wakeup on set_target, not a spin.
         let s = Arc::new(Semaphore::new(1, 4));
         let held = s.acquire();

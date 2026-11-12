@@ -23,7 +23,7 @@ use std::fs;
 use std::path::Path;
 
 /// cgroup v2 mount root. The `*_at` helpers take a root so tests can point at
-/// a fixture directory; the public functions use this real path.
+/// a fixture directory. The public functions use this real path.
 const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
 
 /// Detect the memory limit for this process.
@@ -101,7 +101,7 @@ pub fn detect_memory_pressure() -> Option<f64> {
 ///
 /// This is the earliest memory-pressure signal -- it rises on reclaim/thrash
 /// before byte ratios cross a threshold. Exposed for observability (emit it as
-/// a gauge and alert on it); it is deliberately NOT folded into the scale/shed
+/// a gauge and alert on it). It is deliberately NOT folded into the scale/shed
 /// decision, because the stall-percent at which to act is workload-specific and
 /// wants per-service calibration, not a guessed constant.
 ///

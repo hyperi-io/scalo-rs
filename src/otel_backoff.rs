@@ -166,7 +166,7 @@ impl BackoffGate {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
         // A poisoned lock only means a previous holder panicked while
-        // adjusting counters; the numbers are advisory, so carry on with them.
+        // adjusting counters. The numbers are advisory, so carry on with them.
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }

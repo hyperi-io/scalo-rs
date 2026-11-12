@@ -157,7 +157,7 @@ impl ConfigWatch {
         }
     }
 
-    /// Select over every enabled trigger; a disabled one parks forever.
+    /// Select over every enabled trigger. A disabled one parks forever.
     async fn select_trigger(&mut self) -> ConfigTrigger {
         #[cfg(unix)]
         {
@@ -182,7 +182,7 @@ impl ConfigWatch {
     }
 }
 
-/// Await one tick of an optional timer; `None` parks forever.
+/// Await one tick of an optional timer. `None` parks forever.
 async fn tick(timer: Option<&mut tokio::time::Interval>) {
     match timer {
         Some(t) => {
@@ -243,7 +243,7 @@ mod tests {
         let mut watch = ConfigWatch::new(Some(path.clone()), Duration::from_millis(10));
         watch.prime().await;
 
-        // Rewrite with a later mtime; the poll must see it.
+        // Rewrite with a later mtime. The poll must see it.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let mut f = std::fs::File::create(&path).expect("recreate");
         f.write_all(b"value: 2").expect("write");

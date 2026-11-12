@@ -30,7 +30,7 @@
 //! Starts BIG (`start_bytes`) so a cold pipeline is not artificially
 //! throttled, and grows from there until memory pressure says otherwise.
 //!
-//! Gated behind the `governor` feature; folded per block by
+//! Gated behind the `governor` feature. Folded per block by
 //! [`run_governed`](crate::worker::BatchEngine::run_governed) (default-on).
 
 use std::sync::Arc;
@@ -60,7 +60,7 @@ pub struct ByteBudgetConfig {
     /// `floor_records * nominal_record_bytes` (and never below 1 byte).
     pub floor_records: u64,
     /// Nominal per-record size used to derive the byte floor from
-    /// `floor_records`. Record sizes vary at runtime; this is only the
+    /// `floor_records`. Record sizes vary at runtime. This is only the
     /// floor estimate, not a live measurement.
     pub nominal_record_bytes: u64,
     /// Has no effect on the budget, which moves on memory pressure alone.
@@ -83,8 +83,8 @@ pub struct ByteBudgetConfig {
 impl Default for ByteBudgetConfig {
     fn default() -> Self {
         Self {
-            // 8 MiB start, 64 MiB ceiling -- generous defaults; a real
-            // deployment tunes these via config in a later phase.
+            // 8 MiB start, 64 MiB ceiling -- generous defaults a deployment
+            // overrides via config.
             start_bytes: 8 * 1024 * 1024,
             max_bytes: 64 * 1024 * 1024,
             floor_records: 1,
@@ -134,7 +134,7 @@ fn publish_budget(bytes: u64) {
 /// Byte-budget lever: shrinks while the memory pressure latch holds, grows
 /// otherwise.
 ///
-/// [`observe`](Self::observe) is the control step; `byte_budget()` and
+/// [`observe`](Self::observe) is the control step. `byte_budget()` and
 /// `record_cap()` are the cheap reads the recv loop consults. All state is
 /// interior-mutable and `Sync`.
 pub struct ByteBudgetController {
@@ -147,7 +147,7 @@ pub struct ByteBudgetController {
 impl ByteBudgetController {
     /// Build a controller from config and a shared pressure latch.
     ///
-    /// The config is sanitised (ranges clamped, floors enforced); the
+    /// The config is sanitised (ranges clamped, floors enforced). The
     /// budget starts at the sanitised `start_bytes`.
     #[must_use]
     pub fn new(cfg: ByteBudgetConfig, pressure: Arc<UnifiedPressure>) -> Self {
@@ -163,7 +163,7 @@ impl ByteBudgetController {
     /// Fold one block into the budget.
     ///
     /// While the pressure latch holds, the budget shrinks by `md_factor`
-    /// toward the floor; otherwise it grows by `ai_step` toward `max_bytes`.
+    /// toward the floor. Otherwise it grows by `ai_step` toward `max_bytes`.
     /// The arguments describe the block (its payload bytes, how long it took
     /// to process, and the gap since the previous receive) and do not move
     /// the budget.
@@ -190,7 +190,7 @@ impl ByteBudgetController {
     /// and never `0`.
     fn multiplicative_decrease(&self) {
         let cur = self.budget.load(Ordering::Relaxed);
-        // f64 math then back to u64; budgets are well under 2^52 so this is
+        // f64 math then back to u64. Budgets are well under 2^52 so this is
         // lossless in the operating range. `floor()` then clamp.
         #[allow(
             clippy::cast_precision_loss,

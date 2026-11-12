@@ -8,10 +8,10 @@
 
 //! Span export aimed by a settings file, proven against a REAL collector.
 //!
-//! The logger used to initialise before the config cascade existed, which left
-//! `OTEL_EXPORTER_OTLP_ENDPOINT` as the only way to aim span export. This test
-//! deliberately sets NO environment variable: the endpoint comes from
-//! `settings.yaml` alone, so it fails if the ordering ever goes back.
+//! `OTEL_EXPORTER_OTLP_ENDPOINT` must not be the only way to aim span export.
+//! This test deliberately sets NO environment variable: the endpoint comes from
+//! `settings.yaml` alone, so it fails if the logger initialises before the
+//! config cascade.
 //!
 //! `#[ignore]` because it needs a running Docker daemon:
 //!

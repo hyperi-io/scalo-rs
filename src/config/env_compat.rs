@@ -11,7 +11,7 @@
 //! Reads env vars supporting legacy name aliases (PG*, KAFKA_*, VAULT_*,
 //! AWS_*) with deprecation warnings for graceful migration.
 //!
-//! Resolution: standard name first, then legacy names; a legacy hit logs a
+//! Resolution: standard name first, then legacy names. A legacy hit logs a
 //! deprecation warning. Standard always wins if both are set.
 //!
 //! ## Example

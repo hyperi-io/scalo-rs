@@ -100,7 +100,7 @@ impl Envelope {
 ///
 /// HKDF-SHA256 with a fixed library-domain salt + info. The user's
 /// `encryption_key` can be any length (passphrase or pre-existing
-/// 32-byte key encoded as text); HKDF normalises it.
+/// 32-byte key encoded as text). HKDF normalises it.
 fn derive_key(user_key: &str) -> [u8; 32] {
     // Output buffer, not a key: HKDF-Expand overwrites all 32 bytes or the expect below panics.
     let mut out = [0u8; 32];
@@ -113,7 +113,7 @@ fn derive_key(user_key: &str) -> [u8; 32] {
 }
 
 /// Seal `plaintext` under `user_key`. `aad` (cache-key name) is
-/// authenticated, not encrypted; mismatch on open fails auth.
+/// authenticated, not encrypted. Mismatch on open fails auth.
 ///
 /// # Errors
 ///

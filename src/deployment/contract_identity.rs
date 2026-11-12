@@ -31,12 +31,11 @@
 //! rendered after the push can carry the DIGEST form returned by the registry,
 //! for digest-pinned reproducibility.
 //!
-//! # Rollout phase
+//! # Optional identity
 //!
-//! Phase 1 (today): the Dockerfile generator accepts `Option<&ContractIdentity>` --
-//! `Some` emits the annotations, `None` is silent (backwards-compat for
-//! consumers not yet migrated). Phase 2 makes it required once all
-//! consumer services pass identity. Phase 3 drops the `Option` wrapper.
+//! The Dockerfile generator accepts `Option<&ContractIdentity>` -- `Some`
+//! emits the annotations, `None` is silent so consumers not yet passing an
+//! identity keep working.
 
 use std::env;
 use std::process::Command;
@@ -160,7 +159,7 @@ impl ContractIdentity {
 
     /// Render as three Dockerfile `LABEL` lines under `namespace` (the
     /// contract's `oci_labels.label_namespace`), in canonical order
-    /// (version, source-commit, image-ref). No trailing newline; the
+    /// (version, source-commit, image-ref). No trailing newline. The
     /// caller is responsible for any separator.
     #[must_use]
     pub fn as_dockerfile_labels(&self, namespace: &str) -> String {

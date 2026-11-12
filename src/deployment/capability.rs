@@ -12,10 +12,10 @@
 //! `Config`, but it cannot describe runtime DATA -- service names like
 //! "cloudtrail" are strings in a list, and their knobs are read ad-hoc deep in
 //! the fetch code. The capability catalog fills that gap: scalo defines the
-//! catalog TYPES here; each app fills the CONTENT (grounded in its own code).
+//! catalog TYPES here. Each app fills the CONTENT (grounded in its own code).
 //!
 //! The catalog is one flat list of [`Capability`], each discriminated by
-//! [`Capability::kind`] (`"source"`, `"service"`, `"transport"`, ...); nested
+//! [`Capability::kind`] (`"source"`, `"service"`, `"transport"`, ...). Nested
 //! capabilities (e.g. a source's services) live under [`Capability::children`].
 //!
 //! This shape is a cross-language SSoT shared with scalo-py -- see
@@ -178,7 +178,7 @@ pub struct FieldSpec {
 
     /// Whether the field holds a secret. When `true` the app schema also marks
     /// the field `x-scalo-secret` so the UI masks it and the engine routes it
-    /// through the secrets seam. Omitted when `false`.
+    /// through the secrets provider. Omitted when `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub secret: bool,
 
@@ -329,7 +329,7 @@ pub enum FieldType {
     Float,
     /// A boolean.
     Bool,
-    /// A secret string (masked; routed via the secrets seam).
+    /// A secret string (masked, read through the secrets provider).
     Secret,
     /// A closed set of string values (see [`FieldSpec::enum_values`]).
     Enum,
@@ -373,7 +373,7 @@ mod tests {
     fn empty_and_default_fields_are_omitted() {
         // A plain, non-secret, non-required string field with no default:
         // name/type/required/description are always present (core catalog
-        // fields); secret/default/example/enum_values are omitted for a clean,
+        // fields). secret/default/example/enum_values are omitted for a clean,
         // deterministic catalog.
         let f = FieldSpec::string("region");
         let v = serde_json::to_value(&f).unwrap();

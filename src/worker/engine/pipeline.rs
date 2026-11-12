@@ -74,7 +74,7 @@ pub struct Pipeline<'a, R, T = NoTicker> {
 
 /// Hands a sink more pieces of the block it is writing: one per destination it
 /// fans out to, or one for a write it confirms later. The block's source is
-/// released only once each has reported; one dropped without a report counts
+/// released only once each has reported. One dropped without a report counts
 /// as `Errored`.
 pub struct BlockPieces<'f> {
     finalizer: &'f BatchFinalizer,
@@ -120,7 +120,7 @@ impl BatchEngine {
 }
 
 impl<'a, R: TransportReceiver, T> Pipeline<'a, R, T> {
-    /// The token that stops the loop; it then drains the source as the other
+    /// The token that stops the loop. It then drains the source as the other
     /// run loops do.
     pub fn shutdown(mut self, shutdown: CancellationToken) -> Self {
         self.shutdown = shutdown;
@@ -370,7 +370,7 @@ enum AckMode {
     Hold,
     /// Released at receipt (`acknowledgements.enabled: false`).
     AtReceipt,
-    /// The source has none; released after the pieces, as a commit.
+    /// The source has none. Released after the pieces, as a commit.
     Unheld,
 }
 

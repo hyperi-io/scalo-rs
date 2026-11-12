@@ -51,7 +51,7 @@ impl RuntimePaths {
     /// Discover paths for a specific environment.
     ///
     /// On bare metal the directories are named for `APP_NAME`, else the
-    /// program name, else `app`; see [`discover_for_app`](Self::discover_for_app).
+    /// program name, else `app`. See [`discover_for_app`](Self::discover_for_app).
     #[must_use]
     pub fn discover_for(env: Environment) -> Self {
         Self::discover_for_app(env, None)
@@ -164,7 +164,7 @@ fn resolve_app_name(explicit: Option<&str>) -> String {
     )
 }
 
-/// [`resolve_app_name`] over given inputs; a blank name counts as unset.
+/// [`resolve_app_name`] over given inputs. A blank name counts as unset.
 fn app_name_from(
     explicit: Option<&str>,
     app_name_var: Option<&str>,
@@ -180,7 +180,7 @@ fn app_name_from(
         .unwrap_or_else(|| DEFAULT_APP_NAME.to_string())
 }
 
-/// The file stem of `argv0` with underscores as hyphens; `None` when it is empty, starts with `-` or has no UTF-8 stem.
+/// The file stem of `argv0` with underscores as hyphens. `None` when it is empty, starts with `-` or has no UTF-8 stem.
 fn program_name(argv0: &OsStr) -> Option<String> {
     if matches!(argv0.as_encoded_bytes().first(), None | Some(b'-')) {
         return None;

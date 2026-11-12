@@ -63,7 +63,7 @@ use tracing_subscriber::Layer as _;
 /// OTLP transport protocol (mirrors `metrics::OtelProtocol`, `otel-metrics` feature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OtelTracingProtocol {
-    /// gRPC with tonic (default; OTLP-native, lowest overhead).
+    /// gRPC with tonic (default -- OTLP-native, lowest overhead).
     #[default]
     Grpc,
     /// HTTP with protobuf body.
@@ -285,7 +285,7 @@ where
         .with_batch_config(batch_config)
         .build();
 
-    // Parent-based so an upstream sampling decision is honoured; the ratio
+    // Parent-based so an upstream sampling decision is honoured. The ratio
     // only governs traces that start here.
     let sampler = opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
         opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(resolved.sample_ratio),
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn resolve_picks_up_env_overrides() {
-        // SAFETY: temp_env handles cleanup; env mutations are scoped.
+        // SAFETY: temp_env handles cleanup. Env mutations are scoped.
         temp_env::with_vars(
             [
                 (

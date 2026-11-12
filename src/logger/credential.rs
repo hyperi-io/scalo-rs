@@ -115,7 +115,7 @@ pub(super) const SENSITIVE_FIELDS: &[&str] = &[
 /// Names that say nothing until their parent qualifies them, as `tls` does `key`.
 const BARE_NAMES: [&str; 4] = ["key", "keys", "value", "values"];
 
-/// The longest `Name(...)` value read as one value, in bytes; one that does not close within it is masked to the end of the text, and the bound keeps a line of unclosed parentheses linear.
+/// The longest `Name(...)` value read as one value, in bytes. One that does not close within it is masked to the end of the text, and the bound keeps a line of unclosed parentheses linear.
 const MAX_WRAPPER_LEN: usize = 4096;
 
 /// A key holding this, in any case, names an authorization header, whose value is a scheme followed by its credentials.
@@ -223,7 +223,7 @@ fn spellings(name: &str) -> (String, String) {
 /// The ASCII words of `name`, lower-cased and joined by `_`.
 ///
 /// A word is an acronym, a capitalised or lower-case run, or a run of digits, so
-/// `HTTPServer` is `http_server`; anything else separates words.
+/// `HTTPServer` is `http_server`. Anything else separates words.
 fn joined_words(name: &str) -> String {
     let bytes = name.as_bytes();
     let mut out = String::with_capacity(name.len());
@@ -902,12 +902,12 @@ impl<'a> Values<'a> {
     /// Where a pass ends the `Name(...)` value at `from`, and how far the value runs.
     ///
     /// The name is ASCII letters, digits and `_`. Parentheses nest, and a
-    /// string inside, single or double quoted, may span lines; it closes at its
+    /// string inside, single or double quoted, may span lines. It closes at its
     /// first quote no backslash escapes or, when the text holds no such quote
     /// after it, at its next quote. A pass ends the value at its close only when
     /// the name starts with a letter or `_`, every string in it closes at a
     /// quote no backslash escapes, and it closes within [`MAX_WRAPPER_LEN`]
-    /// bytes; otherwise the first is `None`. The value runs to its close, or to
+    /// bytes. Otherwise the first is `None`. The value runs to its close, or to
     /// the end of the text when it does not close within the window. Both are
     /// `None` when no `Name(` starts at `from`. The walk scans each byte of the
     /// window at most once, so a value costs at most the window.

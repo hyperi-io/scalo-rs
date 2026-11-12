@@ -47,7 +47,7 @@
 //!
 //! ## Delivery guarantee (at-least-once preserved)
 //!
-//! - Rate-limit and concurrency-limit only DELAY admission; they never drop.
+//! - Rate-limit and concurrency-limit only DELAY admission. They never drop.
 //! - Retry re-sends the WHOLE batch on a transient failure (records are held
 //!   behind an `Arc`, so a retry is a refcount bump, not a copy).
 //! - A fatal error stops immediately (no point retrying a permanent failure).
@@ -165,8 +165,8 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // The sender applies its own internal backpressure inside send_batch;
-        // readiness here is unconditional.
+        // The sender applies its own internal backpressure inside send_batch.
+        // Readiness here is unconditional.
         Poll::Ready(Ok(()))
     }
 
@@ -251,7 +251,7 @@ where
 // SinkStack -- the assembled, retried delivery pipeline.
 // ---------------------------------------------------------------------------
 
-/// 0 means "no concurrency limit"; mapped to this large permit count so a
+/// 0 means "no concurrency limit". Mapped to this large permit count so a
 /// single boxed service type covers both configured and unlimited cases.
 const UNLIMITED_CONCURRENCY: usize = 1 << 20;
 
@@ -276,7 +276,7 @@ impl SinkStack {
         //
         // - ADAPTIVE (ARC): rate-limit -> adaptive -> timeout -> sender. The
         //   adaptive layer wraps the TIMEOUT so a timed-out (or errored) attempt
-        //   feeds the AIMD decrease; a well-utilised success feeds the increase.
+        //   feeds the AIMD decrease. A well-utilised success feeds the increase.
         //   Both layers keep Error = BoxError, so no error mapping is needed.
         // - FIXED: rate-limit -> timeout -> static concurrency gate -> sender.
         let core: BoxCloneService<SinkBatch, (), BoxError> = if let Some(ac) = cfg.adaptive {
@@ -398,7 +398,7 @@ impl std::fmt::Debug for SinkStack {
 
 /// Tower layer applying adaptive request concurrency (ARC) via the AIMD
 /// [`AdaptiveLimiter`]. Gating happens in `call` via the limiter's async acquire
-/// (which parks on the semaphore queue -- no busy poll); a slot-wait that
+/// (which parks on the semaphore queue -- no busy poll). A slot-wait that
 /// exhausts `acquire_timeout` sheds as transient backpressure (retryable, no
 /// loss). Keeps `Error = BoxError`, so it composes with the rest of the stack
 /// without error mapping.
@@ -448,7 +448,7 @@ where
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // Gating happens in `call` via the limiter's async acquire (parks on a
-        // queue, no spin); readiness here is unconditional.
+        // queue, no spin). Readiness here is unconditional.
         Poll::Ready(Ok(()))
     }
 
@@ -466,7 +466,7 @@ where
             };
             let result = inner.call(req).await;
             // Feed the loss-based AIMD: a timeout / backpressure is overload (the
-            // limit should shrink); a permanent Fatal is NOT overload, so it must
+            // limit should shrink). A permanent Fatal is NOT overload, so it must
             // not shrink the limit for a non-congestion failure.
             let outcome = match &result {
                 Ok(_) => Outcome::Success,
@@ -486,14 +486,14 @@ where
 }
 
 /// Whether a boxed stack error is transient (retryable). A `SinkError::Fatal`
-/// is the only non-retryable case; timeout (`Elapsed`) and load-shed
+/// is the only non-retryable case. Timeout (`Elapsed`) and load-shed
 /// (`Overloaded`) are transient and worth another attempt.
 fn is_transient(e: &BoxError) -> bool {
     !matches!(e.downcast_ref::<SinkError>(), Some(SinkError::Fatal(_)))
 }
 
 /// Map a terminal boxed error back to a [`SendResult`] for the caller's commit
-/// decision. Only a fatal transport error is reported as `Fatal`; an exhausted
+/// decision. Only a fatal transport error is reported as `Fatal`. An exhausted
 /// transient (timeout / overload / backpressure) is `Backpressured` so the
 /// caller's outer loop can retry the whole block later without losing data.
 fn classify_final(e: BoxError) -> SendResult {

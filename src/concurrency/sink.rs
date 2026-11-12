@@ -16,7 +16,7 @@
 //! # The contract
 //!
 //! - [`BackgroundSink::try_push`] returns immediately. ~100 ns when the
-//!   queue has space; `Err(SinkError::Overflow)` if full (Drop mode).
+//!   queue has space. `Err(SinkError::Overflow)` if full (Drop mode).
 //! - [`BackgroundSink::push_blocking`] is `async` and awaits queue
 //!   space. Use when the caller can yield.
 //! - [`BackgroundSink::flush`] is `async` and resolves only after every
@@ -152,7 +152,7 @@ pub trait SinkDrain<T: Send>: Send + 'static {
     ///
     /// Takes `&mut self` -- drains typically own mutable I/O state
     /// (file handles, connection pools, write buffers). The actor
-    /// holds the only reference; this method is never called
+    /// holds the only reference. This method is never called
     /// concurrently for a given drain instance.
     fn write_batch(&mut self, batch: Vec<T>)
     -> impl Future<Output = Result<(), DrainError>> + Send;
@@ -164,7 +164,7 @@ pub trait SinkDrain<T: Send>: Send + 'static {
     /// -- so callers of `flush()` see real durability, not just "the
     /// bytes were handed to the kernel".
     ///
-    /// Default: no-op (the trait stays additive; non-durable drains
+    /// Default: no-op (the trait stays additive -- non-durable drains
     /// pay nothing). Implementers with durability semantics
     /// (fsync, Kafka producer flush, etc.) override.
     fn flush_durable(&mut self) -> impl Future<Output = Result<(), DrainError>> + Send {
@@ -204,7 +204,7 @@ pub struct BackgroundSink<T: Send + 'static> {
 /// Single-owner handle for awaiting actor shutdown.
 ///
 /// Held by the orchestrator that called [`BackgroundSink::spawn`]. The
-/// actor task is detached; the handle exists to let the owner join it
+/// actor task is detached. The handle exists to let the owner join it
 /// after cancelling the shutdown token.
 pub struct BackgroundSinkHandle {
     join: JoinHandle<()>,
@@ -329,7 +329,7 @@ impl<T: Send + 'static> BackgroundSink<T> {
     pub async fn push_blocking(&self, msg: T) -> Result<(), SinkError> {
         // Increment before send, same race avoidance as `try_push`. The
         // .await yield point makes the race window wider than the sync
-        // case; the same fix applies.
+        // case. The same fix applies.
         self.pending.fetch_add(1, Ordering::Relaxed);
         if self.tx.send(SinkMsg::Data(msg)).await.is_err() {
             self.pending.fetch_sub(1, Ordering::Relaxed);
@@ -439,11 +439,11 @@ async fn actor_loop<T, D>(
     D: SinkDrain<T>,
 {
     let mut batch: Vec<T> = Vec::with_capacity(config.batch_size);
-    // First write failure since the last barrier; the next barrier reports it.
+    // First write failure since the last barrier. The next barrier reports it.
     let mut unreported: Option<DrainError> = None;
     let mut tick = interval(config.flush_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // Consume the immediate first tick; otherwise interval fires at t=0.
+    // Consume the immediate first tick. Otherwise interval fires at t=0.
     tick.tick().await;
 
     loop {
@@ -492,7 +492,7 @@ async fn actor_loop<T, D>(
                         }
                     }
                 }
-                // No barrier can follow this write; its failure is logged and counted.
+                // No barrier can follow this write. Its failure is logged and counted.
                 if !batch.is_empty() {
                     let _ = write_batch_with_metrics(
                         &mut drain, std::mem::take(&mut batch),
@@ -532,7 +532,7 @@ async fn actor_loop<T, D>(
                     let _ = ack.send(result);
                 }
                 None => {
-                    // No barrier can follow this write; its failure is logged and counted.
+                    // No barrier can follow this write. Its failure is logged and counted.
                     if !batch.is_empty() {
                         let _ = write_batch_with_metrics(
                             &mut drain, std::mem::take(&mut batch),
@@ -559,7 +559,7 @@ async fn actor_loop<T, D>(
     }
 }
 
-/// Keep the first failure; later ones are already logged and counted by the write.
+/// Keep the first failure. Later ones are already logged and counted by the write.
 fn hold_first_failure(held: &mut Option<DrainError>, result: Result<(), DrainError>) {
     if let Err(e) = result
         && held.is_none()
@@ -568,7 +568,7 @@ fn hold_first_failure(held: &mut Option<DrainError>, result: Result<(), DrainErr
     }
 }
 
-/// Ack a barrier; a failure its caller stopped waiting for stays held for the next barrier.
+/// Ack a barrier. A failure its caller stopped waiting for stays held for the next barrier.
 fn ack_barrier(
     ack: oneshot::Sender<Result<(), DrainError>>,
     result: Result<(), DrainError>,
@@ -1206,7 +1206,7 @@ mod tests {
         handle.join().await.expect("clean exit");
     }
 
-    /// Refuses every batch; the first `flush_durable` waits for `gate`.
+    /// Refuses every batch. The first `flush_durable` waits for `gate`.
     struct RefusingSlowBarrierDrain {
         gate: Arc<Notify>,
         attempts: Arc<AtomicU64>,

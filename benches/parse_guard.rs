@@ -69,7 +69,7 @@ fn byte_guard(payload: &[u8], max: usize) -> bool {
     true
 }
 
-/// One audit-log record; `i` varies the identifiers, addresses and times.
+/// One audit-log record. `i` varies the identifiers, addresses and times.
 fn identity_event(i: usize) -> Vec<u8> {
     let ip = i % 254 + 1;
     let minute = i % 60;

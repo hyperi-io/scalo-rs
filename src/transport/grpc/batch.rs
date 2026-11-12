@@ -68,7 +68,7 @@ fn format_from_proto(format: i32) -> PayloadFormat {
 /// Map one scalo [`Record`] onto a proto [`Record`](proto::Record).
 ///
 /// The payload `Bytes` handle is MOVED onto the proto field (no copy). `key`
-/// `None` becomes the empty string; `Some(k)` carries the key text.
+/// `None` becomes the empty string. `Some(k)` carries the key text.
 pub(crate) fn record_to_proto(record: Record) -> proto::Record {
     let (timestamp_ms, has_timestamp_ms) = match record.metadata.timestamp_ms {
         Some(ts) => (ts, true),
@@ -292,7 +292,7 @@ mod tests {
     }
 
     /// The proto `Record.payload` field is `bytes::Bytes` (not `Vec<u8>`).
-    /// This is the build.rs `.bytes(".")` config taking effect; a regression to
+    /// This is the build.rs `.bytes(".")` config taking effect. A regression to
     /// the default `Vec<u8>` would fail to compile this assignment.
     #[test]
     fn proto_payload_field_is_bytes_type() {

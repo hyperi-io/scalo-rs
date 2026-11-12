@@ -117,7 +117,7 @@ impl Drop for ExposeGuard {
 /// # Scope and reentrancy
 ///
 /// The flag is thread-local. Calls from inside the closure on the same
-/// thread observe exposure; calls from other threads do not. Nested
+/// thread observe exposure. Calls from other threads do not. Nested
 /// calls compose correctly (inner guards restore the outer state on
 /// drop). Async callers should be aware that the flag does NOT cross
 /// `.await` boundaries to other threads -- keep the round-trip on one
@@ -227,7 +227,7 @@ impl<'de> serde::Deserialize<'de> for SensitiveString {
 }
 
 /// JSON Schema: a write-only string carrying the `x-scalo-secret` marker so the
-/// control plane masks the field and routes it through the secrets seam
+/// control plane masks the field and routes it through the secrets provider
 /// (scalo-rs#6). Gated on `config-schema`. This is why apps derive `JsonSchema`
 /// via scalo's re-exported schemars -- a `SensitiveString` field automatically
 /// gets the secret marker in the emitted `config-schema.*` with no per-field
@@ -425,7 +425,7 @@ mod tests {
 
     /// The motivating case from scalo#41: serialise to a serde
     /// `Value`, then deserialise back. Without `expose_during` the
-    /// inner string is destroyed (replaced by `***REDACTED***`); inside
+    /// inner string is destroyed (replaced by `***REDACTED***`). Inside
     /// the helper, the value survives.
     #[cfg(feature = "serde_json")]
     #[test]
@@ -444,9 +444,8 @@ mod tests {
         let v = serde_json::to_value(&s).unwrap();
         let round_tripped: SensitiveString = serde_json::from_value(v).unwrap();
         // The serialised form was the literal "***REDACTED***", so the
-        // deserialised value is that literal. This is the bug being
-        // fixed for the consumer who wraps their round-trip -- but the
-        // default behaviour is preserved verbatim.
+        // deserialised value is that literal. A consumer who wraps their
+        // round-trip in `expose_during` gets the real value instead.
         assert_eq!(round_tripped.expose(), REDACTED);
     }
 
@@ -539,7 +538,7 @@ mod tests {
             *observed2.lock().unwrap() = out;
         });
 
-        // Thread A: inside expose_during. Spawn happened above; let it
+        // Thread A: inside expose_during. Spawn happened above. Let it
         // race the closure.
         expose_during(|| {
             std::thread::yield_now();

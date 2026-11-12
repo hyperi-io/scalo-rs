@@ -228,7 +228,7 @@ impl SelfRegulationProfile {
                 fetch_min_bytes: Some(1_048_576),
                 // 50 ms -- gives broker time to fill the 1 MiB budget.
                 fetch_max_wait_ms: Some(50),
-                // Bounds what one fetch decompresses per partition; a larger record grows the fetch.
+                // Bounds what one fetch decompresses per partition. A larger record grows the fetch.
                 max_partition_fetch_bytes: Some(PARTITION_FETCH_BYTES),
                 // 50 MiB -- caps total network fetch per round-trip, and stays
                 // under the 55 MiB the broker holds read-only on MSK Express.
@@ -262,13 +262,13 @@ impl SelfRegulationProfile {
                 batch_size_bytes: Some(131_072),
                 // 20 ms -- enough time to fill the 128 KiB batch.
                 linger_ms: Some(20),
-                // The same codec on every profile; the level follows it.
+                // The same codec on every profile. The level follows it.
                 compression_type: Some(DEFAULT_PRODUCER_CODEC.to_string()),
                 // 64 MiB total producer queue (queue.buffering.max.kbytes in KiB).
                 buffer_memory_bytes: Some(67_108_864),
                 // 5 in-flight per connection -- matches exactly-once safe limit.
                 max_in_flight: Some(5),
-                // Profiles leave idempotence unset; the default (on) is applied
+                // Profiles leave idempotence unset. The default (on) is applied
                 // in resolved_producer_map, independent of profile.
                 idempotence: None,
                 // The pipeline-wide record ceiling -- identical on every
@@ -389,7 +389,7 @@ pub struct ProducerKnobs {
     ///
     /// librdkafka: `queue.buffering.max.kbytes` (in KiB, default 1 GiB).
     /// This is the TOTAL queue, not per-batch. Set lower to bound memory
-    /// usage in containers. Stored as bytes in this struct; divided by 1024
+    /// usage in containers. Stored as bytes in this struct. Divided by 1024
     /// when applied to librdkafka.
     #[serde(default)]
     pub buffer_memory_bytes: Option<u64>,
@@ -511,7 +511,7 @@ const GOVERNOR_PRODUCER_KEYS: &[&str] = &[
     "partitioner",
     "sticky.partitioning.linger.ms",
     // Effectively-once invariants (v2.10): the sizing surface sets these when
-    // idempotence is on; a raw override changes the delivery guarantee.
+    // idempotence is on. A raw override changes the delivery guarantee.
     "enable.idempotence",
     "acks",
     "retries",
@@ -896,7 +896,7 @@ impl<'a> SecuritySetting<'a> {
 
     /// Whether the value is a URL whose scheme, the text before the first
     /// `:`, is anything but `https` in any case. A URL with no scheme counts,
-    /// since the HTTP client reads it as `http`; an empty value is unset.
+    /// since the HTTP client reads it as `http`. An empty value is unset.
     fn is_not_https_url(&self) -> bool {
         !self.value.is_empty()
             && !self
@@ -912,7 +912,7 @@ impl<'a> SecuritySetting<'a> {
     /// a `+`, `-` or `_` separated part of it is `NULL` or `eNULL`, in any
     /// case: `eNULL`, `NULL-SHA`, `ECDHE-RSA-NULL-SHA`, `RSA+eNULL`.
     /// `COMPLEMENTOFALL`, the one alias whose suites are the eNULL ones, counts
-    /// too; other aliases are not expanded. A token led by `!` or `-` removes
+    /// too. Other aliases are not expanded. A token led by `!` or `-` removes
     /// suites, so it never counts.
     fn names_null_cipher(&self) -> bool {
         self.value
@@ -1132,7 +1132,7 @@ pub const PRODUCER_HIGH_THROUGHPUT: &[(&str, &str)] = &[
 /// after this constant, also sets `enable.idempotence` and
 /// `max.in.flight.requests.per.connection` on every path, and `acks` while
 /// idempotence is on. The table holds while `sizing.producer.idempotence` is
-/// unset or `true`, the default; with it `false` the producer is not
+/// unset or `true`, the default. With it `false` the producer is not
 /// idempotent whatever this profile says. Batching and codec come from the
 /// sizing surface.
 ///
@@ -1300,7 +1300,7 @@ pub struct KafkaConfig {
     /// No longer read: nothing waits on a KIP-848 join, because librdkafka
     /// reports no join for a member that holds no partitions.
     ///
-    /// Kept so configs that set it still parse; it has no effect.
+    /// Kept so configs that set it still parse. It has no effect.
     #[serde(default = "default_consumer_protocol_probe_ms")]
     pub consumer_protocol_probe_ms: u64,
 
@@ -1376,7 +1376,7 @@ pub struct KafkaConfig {
     //   client cert / key (mTLS)                             -> ssl_certificate_location / ssl_key_location
     //   native/webpki roots                                  -> omit ssl_ca_location: the client builders set ssl.ca.location=probe
     //   exclusive private-CA pin                             -> set ssl_ca_location to the private CA only
-    /// SSL CA certificate file path (private-CA bundle; maps to
+    /// SSL CA certificate file path (private-CA bundle -- maps to
     /// `TlsTrust.extra_roots` -- a single combined root+intermediate PEM is
     /// accepted).
     #[serde(default)]
@@ -1879,7 +1879,7 @@ impl KafkaConfig {
     ///
     /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
     /// and is set by the `devtest`/`for_testing` profiles by design. It is
-    /// permitted only in dev/test; under a production profile this returns an
+    /// permitted only in dev/test. Under a production profile this returns an
     /// error. Every constructor that builds an rdkafka client from a config
     /// runs this with [`crate::env::is_production`], after
     /// [`apply_provider`](Self::apply_provider). Call it directly to check a
@@ -2155,7 +2155,7 @@ impl KafkaConfig {
             config.client_rack = Some(val);
         }
 
-        // Static group membership id (KIP-345). Opt-in; canonically wired from
+        // Static group membership id (KIP-345). Opt-in. Canonically wired from
         // the pod name (e.g. `<PREFIX>_GROUP_INSTANCE_ID` set to the downward
         // API pod name). An empty value is treated as unset.
         if let Some(val) = prefixed("GROUP_INSTANCE_ID", &[]).get()
@@ -2177,7 +2177,7 @@ impl KafkaConfig {
         }
 
         // PROVIDER derives security_protocol + sasl_mechanism at construction (see
-        // apply_provider); read it here so KAFKA_PROVIDER wires the abstraction into
+        // apply_provider). Read it here so KAFKA_PROVIDER wires the abstraction into
         // the env-configured data-plane services.
         if let Some(val) = prefixed("PROVIDER", &[]).get() {
             config.provider = Some(val);
@@ -2398,7 +2398,7 @@ mod tests {
 
     #[test]
     fn validate_refuses_an_override_that_sends_plain_over_plaintext() {
-        // The typed fields pass; the producer and admin clients apply the
+        // The typed fields pass. The producer and admin clients apply the
         // override after them and would run PLAIN over sasl_plaintext.
         let protocol_override = KafkaConfig {
             security_protocol: "sasl_ssl".to_string(),
@@ -3576,7 +3576,7 @@ mod tests {
     /// The Kafka sizing profile must serialise as snake_case so the
     /// `self_regulation.profile` cascade key reads identically to the governor
     /// profile (scalo-rs<->scalo-py config-consistency rule). The doc table at the
-    /// enum definition uses `low_latency`; this asserts the wire form matches.
+    /// enum definition uses `low_latency`. This asserts the wire form matches.
     #[test]
     fn sizing_profile_serialises_snake_case() {
         let j = serde_json::to_string(&SelfRegulationProfile::LowLatency).unwrap();

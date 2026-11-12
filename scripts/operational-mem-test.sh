@@ -98,7 +98,7 @@ ceiling=$((limit + limit / 20))
 echo "PASS leg 1: survived, rejected=$final_rej (backpressure engaged), peak usage $peak <= $ceiling"
 
 echo "== leg 2/2: cap=OFF under --memory=$MEM (control: expect OOM-kill) =="
-# Cap on a short duration; it should OOM well before this.
+# Cap on a short duration. It should OOM well before this.
 off_rc=0
 docker run --rm --memory="$MEM" --memory-swap="$MEM" \
     "${COMMON_ENV[@]}" -e HARNESS_CAP=off -e HARNESS_DURATION_SECS=30 \

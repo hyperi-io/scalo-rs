@@ -30,11 +30,11 @@
 //! | CPU      | CFS throttle     | Yes -- graceful  | No -- the kernel already handles it |
 //!
 //! Exceeding the CPU quota is graceful and automatic (the scheduler throttles
-//! us); exceeding the memory limit is fatal. So the dynamic pressure signal
+//! us). Exceeding the memory limit is fatal. So the dynamic pressure signal
 //! that actually matters is **memory**, which is cgroup-aware here. There is
 //! deliberately no `cpu.stat` reader: feeding a bespoke cgroup-CPU signal into
 //! the scaler would prop up a scale-DOWN that the cgroup case does not want
-//! (under a hard quota you want to USE your whole budget; CFS bounds it).
+//! (under a hard quota you want to USE your whole budget -- CFS bounds it).
 //!
 //! ## What `ScalingInput::cpu_util` is for
 //!
@@ -236,7 +236,7 @@ impl ScalingController {
         self.pool.semaphore.set_target(decision.target);
 
         // Emit operational metrics -- active (leased, in-flight) and target
-        // (admission ceiling) are DISTINCT; do not conflate them.
+        // (admission ceiling) are DISTINCT. Do not conflate them.
         let leased = self.pool.active_threads();
         metrics::gauge!("worker_pool_active_threads").set(leased as f64);
         metrics::gauge!("worker_pool_target_threads").set(decision.target as f64);

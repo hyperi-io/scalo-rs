@@ -37,7 +37,7 @@ impl ContainerMetrics {
     pub fn new(_namespace: &str) -> Self {
         let cgroup_version = detect_cgroup_version();
 
-        // Register metric descriptions (bare names; namespace added by the
+        // Register metric descriptions (bare names -- namespace added by the
         // recorder's prefix layer).
         Self::register_metrics();
 
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn test_container_metrics_new() {
         let cm = ContainerMetrics::new("test");
-        // Names are bare now; just confirm construction succeeds.
+        // Names are bare now. Just confirm construction succeeds.
         let _ = cm;
     }
 

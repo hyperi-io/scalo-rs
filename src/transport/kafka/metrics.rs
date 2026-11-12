@@ -565,7 +565,7 @@ impl StatsContext {
 
     /// Messages the broker refused or never acknowledged.
     ///
-    /// Only moves when this context drives a producer directly; the
+    /// Only moves when this context drives a producer directly. The
     /// `FutureProducer` path reports delivery through its own send future.
     #[must_use]
     pub fn delivery_failures(&self) -> u64 {
@@ -941,7 +941,7 @@ impl rdkafka::producer::ProducerContext for StatsContext {
 
 /// Calculate total consumer lag across all partitions.
 ///
-/// Helper function to sum lag from a `KafkaMetrics` snapshot; see
+/// Helper function to sum lag from a `KafkaMetrics` snapshot. See
 /// [`KafkaMetrics::partition_lag`] for what each partition counts from, and
 /// [`StatsContext::total_position_lag`] for lag behind the read position
 /// throughout.

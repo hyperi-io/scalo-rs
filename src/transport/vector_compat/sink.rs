@@ -89,7 +89,7 @@ impl VectorCompatClient {
     ///
     /// Each JSON value is wrapped as a Vector `Log` event inside an `EventWrapper`.
     /// Waits as long as the source holds the RPC and still answers HTTP/2
-    /// PINGs; only the dial is limited.
+    /// PINGs. Only the dial is limited.
     ///
     /// # Errors
     ///
@@ -153,7 +153,7 @@ impl VectorCompatClient {
 
     /// Check if the remote Vector source is healthy.
     ///
-    /// A short probe, so it gives up at the send limit, dial included; a
+    /// A short probe, so it gives up at the send limit, dial included. A
     /// source that does not answer by then is not healthy.
     ///
     /// # Errors
@@ -215,7 +215,7 @@ mod tests {
 
     /// A listener whose accept queue is full, so the kernel drops every SYN and
     /// a dial to it stalls in the TCP connect. Sending on the returned channel
-    /// frees the queue; from then on it accepts silently, counting accepts
+    /// frees the queue. From then on it accepts silently, counting accepts
     /// (the connection that filled the queue included).
     async fn stalled_connect_listener() -> (
         std::net::SocketAddr,
@@ -226,7 +226,7 @@ mod tests {
         socket
             .bind("127.0.0.1:0".parse().expect("addr"))
             .expect("bind");
-        // Backlog 0 holds one completed connection; the filler takes that slot.
+        // Backlog 0 holds one completed connection. The filler takes that slot.
         let listener = socket.listen(0).expect("listen");
         let addr = listener.local_addr().expect("addr");
         let filler = tokio::net::TcpStream::connect(addr)
@@ -542,7 +542,7 @@ mod tests {
         );
 
         release.send(()).expect("listener task alive");
-        // The server never answers, so this send stays open; only its dial is
+        // The server never answers, so this send stays open. Only its dial is
         // under test.
         let second = tokio::spawn({
             let client = Arc::clone(&client);

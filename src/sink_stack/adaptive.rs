@@ -18,7 +18,7 @@
 //!
 //! It is built directly on a tokio [`Semaphore`], which already gives correct,
 //! cancellation-safe, NON-spinning FIFO queueing of waiters (acquire parks on
-//! the semaphore; a dropped/timed-out acquire removes itself). The only thing a
+//! the semaphore. A dropped/timed-out acquire removes itself). The only thing a
 //! plain semaphore lacks is a correct DYNAMIC limit, so this adds:
 //!
 //! - **grow**: [`Semaphore::add_permits`].
@@ -52,7 +52,7 @@ pub enum Outcome {
 #[derive(Debug)]
 pub struct AdaptiveLimiter {
     sem: Arc<Semaphore>,
-    /// Current concurrency limit (read lock-free; written only under `resize`).
+    /// Current concurrency limit (read lock-free -- written only under `resize`).
     limit: AtomicUsize,
     /// Permits whose capacity must be destroyed on return to complete a shrink
     /// the in-flight permits had not yet allowed (drain-don't-revoke).
@@ -73,7 +73,7 @@ const GROW_UTILISATION_PERCENT: usize = 80;
 
 impl AdaptiveLimiter {
     /// Build a limiter. `min_limit` is floored at 1; `initial`/`max` are clamped
-    /// into a sane range; `decrease_factor` into `[0.5, 1.0)`.
+    /// into a sane range. `decrease_factor` into `[0.5, 1.0)`.
     #[must_use]
     pub fn new(
         initial: usize,
@@ -113,7 +113,7 @@ impl AdaptiveLimiter {
 
     /// Acquire a concurrency slot, parking (without spinning) until one frees.
     pub async fn acquire(self: &Arc<Self>) -> Permit {
-        // `acquire_owned` parks on the semaphore queue; cancellation (drop) is
+        // `acquire_owned` parks on the semaphore queue. Cancellation (drop) is
         // handled by tokio. The semaphore is never closed, so this cannot error.
         let permit = Arc::clone(&self.sem)
             .acquire_owned()
@@ -173,7 +173,7 @@ impl AdaptiveLimiter {
     }
 
     /// Apply a new limit (caller holds `resize`). Grows via add_permits (cancel
-    /// any pending debt first); shrinks by forgetting available permits now and
+    /// any pending debt first). Shrinks by forgetting available permits now and
     /// deferring the in-flight remainder to `debt`.
     fn apply_limit(&self, current: usize, new: usize) {
         if new > current {
@@ -190,7 +190,7 @@ impl AdaptiveLimiter {
             }
         } else {
             let shrink = current - new;
-            // Remove what's available immediately; defer the rest to debt, to be
+            // Remove what's available immediately. Defer the rest to debt, to be
             // absorbed as in-flight permits are returned (no over-admit).
             let forgot = self.sem.forget_permits(shrink);
             if shrink > forgot {

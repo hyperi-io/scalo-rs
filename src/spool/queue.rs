@@ -27,7 +27,7 @@ pub struct Spool {
     bytes: u64,
 }
 
-/// The open yaque handles; each holds a lock file in the queue directory.
+/// The open yaque handles. Each holds a lock file in the queue directory.
 struct Queue {
     sender: Sender,
     receiver: Receiver,
@@ -400,7 +400,7 @@ impl Spool {
         }
     }
 
-    /// Verify+strip the CRC header (shared logic); a checksum failure becomes
+    /// Verify+strip the CRC header (shared logic). A checksum failure becomes
     /// [`SpoolError::Corrupted`].
     fn unframe(crc: bool, raw: Vec<u8>) -> Result<Vec<u8>> {
         crate::spool_codec::unframe(crc, raw).map_err(|e| SpoolError::Corrupted(e.0))
@@ -852,7 +852,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_crc_with_compression() {
-        // CRC frames the COMPRESSED bytes (what lands on disk); the two compose.
+        // CRC frames the COMPRESSED bytes (what lands on disk). The two compose.
         let dir = tempdir().unwrap();
         let path = dir.path().join("crc-zstd-queue");
         let data = b"compressible ".repeat(50);

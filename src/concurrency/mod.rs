@@ -17,7 +17,7 @@
 //!
 //! | Shape | Use |
 //! |---|---|
-//! | Consumer pushes; background batches + writes to a backend | [`BackgroundSink`] + [`SinkDrain`] |
+//! | Consumer pushes. Background batches + writes to a backend | [`BackgroundSink`] + [`SinkDrain`] |
 //! | Timer-driven loop, no inbound queue | [`PeriodicWorker`] + [`PeriodicTask`] |
 //! | Mutable state, command queue, optional oneshot replies | [`ActorHandle`] + [`Actor`] |
 //!
@@ -47,7 +47,7 @@
 //! - `xtra`, `actix`, `bastion` -- heavy actor frameworks. Don't fit
 //!   the sink shape. Rejected.
 //! - `tracing-appender::non_blocking` -- used elsewhere for the logger
-//!   subscriber; orthogonal to this module's tokio-runtime concerns.
+//!   subscriber. Orthogonal to this module's tokio-runtime concerns.
 //!
 //! Rationale per [Alice Ryhl's "Actors with Tokio"](https://ryhl.io/blog/actors-with-tokio/).
 

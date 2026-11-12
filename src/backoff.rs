@@ -19,7 +19,7 @@ use std::time::Duration;
 /// Jitter applied either side of the computed wait, as a percentage.
 const JITTER_PCT: u64 = 20;
 
-/// Consecutive failures after which the wait stops doubling; bounds the shift.
+/// Consecutive failures after which the wait stops doubling. Bounds the shift.
 const MAX_DOUBLINGS: u32 = 16;
 
 /// A doubling wait schedule between `base` and `max`.

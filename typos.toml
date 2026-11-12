@@ -16,7 +16,7 @@
 # and allowlist the American spellings that appear in code.
 
 [default]
-# Use Australian English — flags American spellings in prose
+# Use Australian English -- flags American spellings in prose
 locale = "en-au"
 
 [default.extend-words]

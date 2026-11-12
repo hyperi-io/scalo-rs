@@ -86,18 +86,14 @@ fn literal_tier_ends_with_multi_byte() {
     assert!(!m.is_match(b"server.log.gz"));
 }
 
-/// Regression: `ShapeOp::EndsWith` previously used
-/// `hay.ends_with(lit).then_some(Match { start: hay.len() - lit.len(), .. })`
-/// which eagerly evaluates the subtraction. When the haystack is shorter
-/// than the literal, `ends_with` returns false but the subtraction underflows
-/// -- panic in debug, garbage offset in release.
-///
-/// Lazy `then(|| ..)` defers the Match construction so the subtraction
-/// only happens when the literal actually fits.
+/// `ShapeOp::EndsWith` must build its `Match` lazily. An eager
+/// `then_some(Match { start: hay.len() - lit.len(), .. })` underflows when the
+/// haystack is shorter than the literal -- a panic in debug, a garbage offset
+/// in release.
 #[test]
 fn ends_with_does_not_panic_on_short_haystack() {
     let m = StrMatcher::new(r"\.log$").unwrap();
-    // Literal is `.log` (4 bytes). Haystacks shorter than 4 bytes used to
+    // Literal is `.log` (4 bytes). Haystacks shorter than 4 bytes would
     // underflow `hay.len() - lit.len()`.
     assert!(!m.is_match(b""));
     assert!(!m.is_match(b"a"));
@@ -152,7 +148,7 @@ fn literal_set_tier_alternation_anchored() {
 /// leftmost-only search reports a false negative.
 ///
 /// AtEnd requires walking find_iter to discover any match whose end ==
-/// hay.len(); Exact requires walking to find a match with both
+/// hay.len(). Exact requires walking to find a match with both
 /// start == 0 and end == hay.len().
 #[test]
 fn literal_set_at_end_finds_later_match() {
@@ -328,13 +324,13 @@ mod antispam {
 
     /// Capture WARN/INFO/DEBUG events emitted by strmatch and return
     /// them after running `f`. We use a thread-local mutex via
-    /// `tracing-subscriber::fmt` for the simplest correct capture; if
+    /// `tracing-subscriber::fmt` for the simplest correct capture. If
     /// tests are run with `--test-threads=1` this is deterministic.
     fn capture<F: FnOnce()>(_f: F) {
-        // The real tracing setup is global; we don't try to capture
+        // The real tracing setup is global. We don't try to capture
         // here. Tests assert on the counter and on tier classification
         // instead, which are deterministic. Behavioural docs say WARN
-        // fires once per pattern; that's checked via the descriptor
+        // fires once per pattern. That's checked via the descriptor
         // + the dedup state.
     }
 
@@ -348,7 +344,7 @@ mod antispam {
         let _m2 = StrMatcher::new(r"\bfoo\b").unwrap();
         // Both compiled. Hash set tracks one entry -- second compile
         // re-hashes the same pattern and finds it already inserted.
-        capture(|| {}); // no-op for now; real capture would assert exactly one WARN line
+        capture(|| {});
     }
 
     #[test]
@@ -592,14 +588,14 @@ fn haystack_equals_pattern_in_exact_match() {
 #[test]
 fn multi_byte_utf8_haystack_does_not_split_literals() {
     // "caf" + U+00E9 in UTF-8 = b"caf\xc3\xa9". A search for "f" should hit
-    // position 2; a search for U+00E9 (b"\xc3\xa9") should hit position 3.
+    // position 2. A search for U+00E9 (b"\xc3\xa9") should hit position 3.
     let m = StrMatcher::new("f").unwrap();
     let hit = m.find("café".as_bytes()).unwrap();
     assert_eq!(hit.start, 2);
 
     let m = StrMatcher::new("\u{e9}").unwrap(); // U+00E9
     assert!(m.tier() == MatcherTier::Byte || m.tier() == MatcherTier::Literal);
-    // The literal byte representation of U+00E9 is c3 a9; our pattern
+    // The literal byte representation of U+00E9 is c3 a9. Our pattern
     // becomes the regex bytes c3 a9 which is a 2-byte literal.
     assert!(m.is_match("café".as_bytes()));
     assert!(!m.is_match("cafe".as_bytes()));
@@ -796,7 +792,7 @@ fn set_find_iter_merges_across_patterns_sorted_by_position() {
     assert_eq!(hits[2].pattern_idx, 2);
 }
 
-/// 50 literals merge into one AC; pattern_idx maps to input order.
+/// 50 literals merge into one AC. pattern_idx maps to input order.
 #[test]
 fn set_merged_ac_pattern_indices_survive_across_merge_boundary() {
     let patterns: Vec<String> = (0..50).map(|i| format!("tok{i:03}")).collect();
@@ -821,7 +817,7 @@ fn set_merged_ac_alternation_patterns_map_to_one_input_index() {
     assert_eq!(hits[2].pattern_idx, 0); // baz
 }
 
-/// Anchored patterns stay individual; unanchored fold into merged.
+/// Anchored patterns stay individual. Unanchored fold into merged.
 #[test]
 fn set_merged_and_individual_partitions_both_yield_correct_matches() {
     let set = StrMatcherSet::new(["AKIA", "^/api/", "ghp_", "_END$"]).unwrap();

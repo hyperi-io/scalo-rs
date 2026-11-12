@@ -28,7 +28,7 @@
 //!
 //! The config cascade (figment) is the SSoT for app defaults. The contract
 //! captures the deployment-facing subset. Generation creates artifacts from
-//! scratch; validation asserts that existing artifacts match.
+//! scratch. Validation asserts that existing artifacts match.
 //!
 //! # Example
 //!
@@ -76,8 +76,8 @@
 //!     hot_paths: vec![],
 //! };
 //!
-//! // Generate production Dockerfile (without identity annotations -- Phase 1
-//! // backwards-compat. New callers should pass `Some(&identity)`; see
+//! // Generate production Dockerfile (without identity annotations. New
+//! // callers should pass `Some(&identity)`; see
 //! // `ContractIdentity::new` and `ContractIdentity::detect`.)
 //! let dockerfile = generate_dockerfile(&contract, None);
 //!

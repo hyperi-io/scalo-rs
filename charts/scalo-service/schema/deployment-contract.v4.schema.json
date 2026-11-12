@@ -65,7 +65,7 @@
       "default": []
     },
     "unbound_listen_paths": {
-      "description": "`default_config` listen paths that need no port, e.g. the bind address\nof a client that only sends. Waives them from\n[`undeclared_listeners`](Self::undeclared_listeners); no generated\nartefact changes with it.",
+      "description": "`default_config` listen paths that need no port, e.g. the bind address\nof a client that only sends. Waives them from\n[`undeclared_listeners`](Self::undeclared_listeners). No generated\nartefact changes with it.",
       "type": "array",
       "items": {
         "type": "string"
@@ -141,7 +141,7 @@
       }
     },
     "config_schema": {
-      "description": "Reflectable JSON Schema (draft 2020-12) of the app's full `Config`,\nderived via schemars (scalo-rs#6). `None` when the app does not provide\none. Secret fields carry the `x-scalo-secret` marker, and operator dials\ncarry `x-scalo-dial` (`big` or `small`, see [`DIAL_KEYWORD`](super::DIAL_KEYWORD)).\nCarried inline so a single fetch of the contract gives the schema; also\nwritten to `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).",
+      "description": "Reflectable JSON Schema (draft 2020-12) of the app's full `Config`,\nderived via schemars (scalo-rs#6). `None` when the app does not provide\none. Secret fields carry the `x-scalo-secret` marker, and operator dials\ncarry `x-scalo-dial` (`big` or `small`, see [`DIAL_KEYWORD`](super::DIAL_KEYWORD)).\nCarried inline so a single fetch of the contract gives the schema. Also\nwritten to `config-schema.{json,yaml}` by [`emit_config_artifacts`](super::emit_config_artifacts).",
       "anyOf": [
         {
           "$ref": "#/$defs/ConfigSchemaNode"
@@ -173,7 +173,7 @@
       "default": 45
     },
     "resources": {
-      "description": "The app's own CPU and memory requests and limits. Empty values leave\nthe chart's defaults in place; deployment values override both.",
+      "description": "The app's own CPU and memory requests and limits. Empty values leave\nthe chart's defaults in place. Deployment values override both.",
       "$ref": "#/$defs/ResourcesContract"
     },
     "security": {
@@ -276,14 +276,14 @@
           ]
         },
         "bound_from": {
-          "description": "Dotted `default_config` path of the listen address this port serves,\ne.g. `grpc.listen`. Read only by\n[`undeclared_listeners`](DeploymentContract::undeclared_listeners); no\ngenerated artefact changes with it.",
+          "description": "Dotted `default_config` path of the listen address this port serves,\ne.g. `grpc.listen`. Read only by\n[`undeclared_listeners`](DeploymentContract::undeclared_listeners). No\ngenerated artefact changes with it.",
           "type": [
             "string",
             "null"
           ]
         },
         "public": {
-          "description": "Clients outside the cluster connect here. A chart can put such ports on\na load balancer; whether it does is a deployment choice.",
+          "description": "Clients outside the cluster connect here. A chart can put such ports on\na load balancer. Whether it does is a deployment choice.",
           "type": "boolean"
         },
         "app_protocol": {
@@ -303,13 +303,13 @@
           "description": "The value counts as true: anything but false, null, zero or empty.",
           "type": "object",
           "properties": {
-            "path": {
-              "description": "Values path of the switch.",
-              "type": "string"
-            },
             "kind": {
               "type": "string",
               "const": "enabled"
+            },
+            "path": {
+              "description": "Values path of the switch.",
+              "type": "string"
             }
           },
           "required": [
@@ -321,6 +321,10 @@
           "description": "The value, as a string, equals `value`.",
           "type": "object",
           "properties": {
+            "kind": {
+              "type": "string",
+              "const": "equals"
+            },
             "path": {
               "description": "Values path of the setting.",
               "type": "string"
@@ -328,10 +332,6 @@
             "value": {
               "description": "The value that turns the listener on.",
               "type": "string"
-            },
-            "kind": {
-              "type": "string",
-              "const": "equals"
             }
           },
           "required": [
@@ -344,6 +344,10 @@
           "description": "The value, as a string, is one of `values`.",
           "type": "object",
           "properties": {
+            "kind": {
+              "type": "string",
+              "const": "one_of"
+            },
             "path": {
               "description": "Values path of the setting.",
               "type": "string"
@@ -354,10 +358,6 @@
               "items": {
                 "type": "string"
               }
-            },
-            "kind": {
-              "type": "string",
-              "const": "one_of"
             }
           },
           "required": [
@@ -486,7 +486,7 @@
       ]
     },
     "KafkaLagTrigger": {
-      "description": "Where the generated Kafka lag trigger reads the broker list, consumer group\nand topics in the chart's values.\n\nThis describes the chart's layout, not an operator setting, which is why it\nlives on the contract and not on [`KedaConfig`]. Each path is a dotted,\n`.Values`-relative chain of Go identifiers. The default suits an app whose\nconfig has a top-level `kafka` section; an app that keeps them elsewhere\nnames that section with [`under`](Self::under), then sets any path that\nsits elsewhere on the value it returns.",
+      "description": "Where the generated Kafka lag trigger reads the broker list, consumer group\nand topics in the chart's values.\n\nThis describes the chart's layout, not an operator setting, which is why it\nlives on the contract and not on [`KedaConfig`]. Each path is a dotted,\n`.Values`-relative chain of Go identifiers. The default suits an app whose\nconfig has a top-level `kafka` section. An app that keeps them elsewhere\nnames that section with [`under`](Self::under), then sets any path that\nsits elsewhere on the value it returns.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -770,7 +770,7 @@
           "default": ""
         },
         "secret": {
-          "description": "Whether the field holds a secret. When `true` the app schema also marks\nthe field `x-scalo-secret` so the UI masks it and the engine routes it\nthrough the secrets seam. Omitted when `false`.",
+          "description": "Whether the field holds a secret. When `true` the app schema also marks\nthe field `x-scalo-secret` so the UI masks it and the engine routes it\nthrough the secrets provider. Omitted when `false`.",
           "type": "boolean"
         },
         "enum_values": {
@@ -814,7 +814,7 @@
           "const": "bool"
         },
         {
-          "description": "A secret string (masked; routed via the secrets seam).",
+          "description": "A secret string (masked, read through the secrets provider).",
           "type": "string",
           "const": "secret"
         },
@@ -846,7 +846,7 @@
       ]
     },
     "WritablePath": {
-      "description": "A directory the app writes at run time.\n\nA chart mounts each one as a volume, so the container's root filesystem can\nstay read-only. An ephemeral path is an `emptyDir`; a persistent one is a\nclaim that outlives the pod. Build one with [`new`](Self::new).",
+      "description": "A directory the app writes at run time.\n\nA chart mounts each one as a volume, so the container's root filesystem can\nstay read-only. An ephemeral path is an `emptyDir`. A persistent one is a\nclaim that outlives the pod. Build one with [`new`](Self::new).",
       "type": "object",
       "properties": {
         "name": {
@@ -873,7 +873,7 @@
           "default": "1Gi"
         },
         "when": {
-          "description": "The values condition under which the app writes here; `None` means always.",
+          "description": "The values condition under which the app writes here. `None` means always.",
           "anyOf": [
             {
               "$ref": "#/$defs/PortCondition"
@@ -943,7 +943,7 @@
           "default": 1000
         },
         "read_only_root_filesystem": {
-          "description": "Mount the root filesystem read-only; writes go to `writable_paths`.",
+          "description": "Mount the root filesystem read-only. Writes go to `writable_paths`.",
           "type": "boolean",
           "default": true
         },

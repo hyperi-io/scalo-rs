@@ -198,7 +198,7 @@ pub struct KafkaTransport {
     ///
     /// Shared with the optional [`KafkaGateActuator`] (`governor` feature), so
     /// a client replaced after a fatal error is the one the actuator pauses.
-    /// Every `Consumer` method used takes `&self`; the lock guards only the
+    /// Every `Consumer` method used takes `&self`. The lock guards only the
     /// swap, and each caller works on an `Arc` clone of the current client.
     /// `None` on a transport that only sends.
     consumer: Option<SharedConsumer>,
@@ -229,7 +229,7 @@ pub struct KafkaTransport {
     closed: AtomicBool,
     /// Shared healthy flag, read by the health registry closure. `close()`, a
     /// fenced member, a failed rebuild and a second rebuild with no record
-    /// between clear it; a record sets it again, except after `close()`.
+    /// between clear it. A record sets it again, except after `close()`.
     healthy: Arc<AtomicBool>,
     /// Whether the broker refuses this transport's credentials or TLS setup,
     /// shared by its producer and every consumer it builds. A refusal fails
@@ -282,7 +282,7 @@ pub struct KafkaTransport {
     /// Diagnostic dedup latch for the `kafka_partition_limited` warning.
     /// Rate-limits the warning to once per cooldown window so a persistently
     /// partition-limited consumer does not spam the log. `None` until the
-    /// diagnostic is consulted; behaviour is unchanged when the diagnostic is
+    /// diagnostic is consulted. Behaviour is unchanged when the diagnostic is
     /// never invoked.
     #[cfg(feature = "governor")]
     partition_limited_warn: PartitionLimitedDiagnostic,
@@ -1261,7 +1261,7 @@ impl KafkaTransport {
     /// Set the `acknowledgements` config (default: enabled).
     ///
     /// A transport built from an explicit [`KafkaConfig`] takes its
-    /// `acknowledgements` section here; `AnyReceiver::from_config` reads it
+    /// `acknowledgements` section here. `AnyReceiver::from_config` reads it
     /// from `<key>.kafka.acknowledgements`.
     #[must_use]
     pub fn with_acknowledgements(mut self, config: AcknowledgementsConfig) -> Self {
@@ -1313,7 +1313,7 @@ impl KafkaTransport {
     /// The returned actuator holds an `Arc` clone of the shared consumer. On
     /// the rising edge it reads the current [`assignment`](rdkafka::consumer::Consumer::assignment)
     /// and [`pause`](rdkafka::consumer::Consumer::pause)s exactly those
-    /// partitions; on the falling edge it [`resume`](rdkafka::consumer::Consumer::resume)s
+    /// partitions. On the falling edge it [`resume`](rdkafka::consumer::Consumer::resume)s
     /// them. Pausing the ASSIGNED set (not unsubscribing) keeps the member in
     /// the consumer group, so no rebalance is triggered while we hold.
     ///
@@ -1595,7 +1595,7 @@ impl KafkaTransport {
     ///
     /// NO topology mutation -- it never calls `createPartitions`. Returns the
     /// decision so callers can act on it. This is a
-    /// metadata round-trip; call it periodically (e.g. once per refresh tick),
+    /// metadata round-trip. Call it periodically (e.g. once per refresh tick),
     /// NOT on the recv hot path.
     ///
     /// # Errors
@@ -1614,7 +1614,7 @@ impl KafkaTransport {
         // subscribed topics -- NOT this member's assigned slice. (Using the
         // assignment count made `members >= partitions` fire whenever m^2 >= P,
         // a false positive with headroom for many more consumers.) Read from
-        // broker metadata; a failed/empty fetch yields 0, which makes the
+        // broker metadata. A failed/empty fetch yields 0, which makes the
         // decision below false (never a false-positive "limited").
         let topics = self.subscribed_topics.read().clone();
         let mut partitions = 0usize;
@@ -1898,7 +1898,7 @@ impl KafkaTransport {
 enum Offered {
     /// Resolved without a delivery report: filtered, or refused at enqueue.
     Settled(SendResult),
-    /// Queued; the delivery report arrives on the future.
+    /// Queued. The delivery report arrives on the future.
     Queued(DeliveryFuture),
 }
 
@@ -2005,7 +2005,7 @@ impl TransportSender for KafkaTransport {
     /// others may already be confirmed (the default could only leave a prefix).
     /// The caller retries the whole block: duplicates, never loss. Per-partition
     /// order follows offer order while the idempotent producer is on (the
-    /// default); with `idempotence: false`, a broker retry can reorder records
+    /// default). With `idempotence: false`, a broker retry can reorder records
     /// within a partition.
     async fn send_batch(&self, records: &[Record]) -> SendResult {
         if records.is_empty() {
@@ -2039,7 +2039,7 @@ impl TransportSender for KafkaTransport {
                 Err(settled) => {
                     let stop = matches!(settled, SendResult::Backpressured | SendResult::Fatal(_));
                     offered.push(Offered::Settled(settled));
-                    // Records after a refusal are never offered; the refusal
+                    // Records after a refusal are never offered. The refusal
                     // pushed above already fails the block.
                     if stop {
                         break;
@@ -2169,7 +2169,7 @@ impl TransportReceiver for KafkaTransport {
     /// ## Observable (synchronous) commit
     ///
     /// [`CommitMode::Sync`] waits for the broker's answer, so a failed commit
-    /// is reported rather than swallowed; rdkafka's `CommitMode::Async` returns
+    /// is reported rather than swallowed. Rdkafka's `CommitMode::Async` returns
     /// `Ok` once the request is queued. The blocking call runs on tokio's
     /// blocking pool, never on a runtime worker. An app that wants the weaker
     /// fire-and-forget commit opts in with
@@ -2207,7 +2207,7 @@ impl TransportReceiver for KafkaTransport {
     }
 
     /// Commit per partition up to the lowest offset not yet released, once
-    /// armed; unarmed, the default: commit when the outcome allows it.
+    /// armed. Unarmed, the default: commit when the outcome allows it.
     ///
     /// An `Errored` release commits nothing, and once armed keeps its offsets
     /// held, so no later release commits past them.
@@ -2253,7 +2253,7 @@ impl KafkaTransport {
         Ok(())
     }
 
-    /// Commit `tpl` synchronously, retrying a transient failure; see
+    /// Commit `tpl` synchronously, retrying a transient failure. See
     /// [`commit`](TransportReceiver::commit).
     async fn commit_tpl(&self, mut tpl: TopicPartitionList) -> TransportResult<()> {
         let started = std::time::Instant::now();
@@ -2337,12 +2337,12 @@ impl KafkaTransport {
             let _ = gate.evaluate();
             // Level-triggered re-pause while held. The edge actuator pauses the
             // assignment captured at the rising edge and never re-pauses while
-            // latched; a cooperative rebalance during the hold (routine under
+            // latched. A cooperative rebalance during the hold (routine under
             // KEDA churn) then assigns NEW partitions UNPAUSED and ingest
             // silently reopens at full rate while pressure is still high,
             // defeating the brake. Re-applying pause to the CURRENT assignment
             // each recv while held is idempotent for already-paused partitions
-            // and catches the newly assigned ones; the falling-edge resume()
+            // and catches the newly assigned ones. The falling-edge resume()
             // resumes the current assignment, so nothing is stranded paused.
             // Off the per-record path -- once per recv, only while held.
             if gate.is_held()
@@ -2423,7 +2423,7 @@ impl KafkaTransport {
                 self.topic_missing.store(false, Ordering::Relaxed);
                 match stopped_by {
                     None => {}
-                    // Records are in hand; the next call backs off if it persists.
+                    // Records are in hand. The next call backs off if it persists.
                     Some(DrainStop::Transient(e)) => self.recv_state.record_transient(&e),
                     Some(DrainStop::MissingTopic(e)) => self.recv_state.record_missing_topic(&e),
                     // Returned by the next call, after these records.
@@ -2444,7 +2444,7 @@ impl KafkaTransport {
         let arena: bytes::Bytes = bytes::Bytes::from(arena);
         let messages = build_batch_from_spans(arena, spans);
 
-        // Apply inbound filters via the shared partition helper; DLQ entries
+        // Apply inbound filters via the shared partition helper. DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
         let batch = self.filter_engine.partition_batch(
             messages,
@@ -2492,7 +2492,7 @@ impl KafkaTransport {
     /// A call dropped while the job runs -- a `select!` arm that won -- leaves
     /// the job in `in_flight`, and the next call returns its records instead
     /// of starting another. librdkafka has already moved past them, so
-    /// dropping them would skip them for this session, and a later commit
+    /// dropping them would skip them for this consumer, and a later commit
     /// would skip them for good. A job picked up that way keeps the limits of
     /// the call that started it. One that polled a client replaced since is
     /// settled by [`settle_stale_poll`], never against the new client.
@@ -2661,7 +2661,7 @@ fn arena_byte_limit_reached(arena_len: usize, span_count: usize, max_bytes: Opti
 /// One record's worth of OWNED metadata collected during a poll, plus the
 /// byte range of its payload inside the recv-arena.
 ///
-/// Crucially this carries NO borrowed data: the `BorrowedMessage` and the
+/// This carries NO borrowed data: the `BorrowedMessage` and the
 /// `&[u8]` payload it lends are valid only until the next poll / until that
 /// message drops, so every field here is owned (`Arc<str>`, `i64`, indices).
 /// The payload itself has already been copied into the shared arena; `range`
@@ -2684,7 +2684,7 @@ struct Span {
 
 /// Rebuild a batch of `Message`s from a frozen recv-arena and its spans.
 ///
-/// The arena is ONE `Bytes` holding every record's payload back-to-back; each
+/// The arena is ONE `Bytes` holding every record's payload back-to-back. Each
 /// span's `range` indexes into it. We build each `Message::payload` via
 /// `arena.slice(range)` -- a refcount bump into the shared backing buffer, NOT
 /// a per-record copy. So the whole batch shares ONE allocation and frees once
@@ -2778,7 +2778,7 @@ enum Polled {
 
 /// A poll failure that ended the drain after at least one record.
 enum DrainStop {
-    /// A condition librdkafka recovers from; the next call backs off if it persists.
+    /// A condition librdkafka recovers from. The next call backs off if it persists.
     Transient(KafkaError),
     /// A subscribed topic is missing while another delivers records.
     MissingTopic(KafkaError),
@@ -2798,7 +2798,7 @@ struct PollJob {
     /// Whether a record reached this consumer before the job started, which
     /// proves its credentials.
     received_before: bool,
-    /// The caller's span; a pool thread has none of its own to record on.
+    /// The caller's span. A pool thread has none of its own to record on.
     #[cfg(feature = "transport-trace")]
     span: tracing::Span,
 }
@@ -2846,7 +2846,7 @@ impl PollJob {
         let mut spans: Vec<Span> = Vec::with_capacity(span_cap);
         // Arena byte estimate: when a byte cap is set, size the up-front alloc
         // to the cap (plus a one-record cushion) so the governed arena is right-
-        // sized; otherwise ~256 bytes/record (typical JSON event). It grows as
+        // sized. Otherwise ~256 bytes/record (typical JSON event). It grows as
         // needed either way. One up-front alloc beats N small ones.
         let arena_hint = match self.max_bytes {
             Some(cap) => usize::try_from(cap)
@@ -2882,12 +2882,12 @@ impl PollJob {
         let mut stopped_by = None;
 
         // Phase 2: drain the queue with zero-timeout polls. librdkafka has
-        // already fetched a batch from the network; we just drain it fast.
+        // already fetched a batch from the network. We just drain it fast.
         //
         // BYTE-AWARE STOP: when `max_bytes` is set, stop
         // draining once the arena has reached the cap. Phase 1 already took one
         // record (the floor), so a single oversized record is always returned
-        // and the loop never stalls; the arena is bounded to
+        // and the loop never stalls. The arena is bounded to
         // `max_bytes + one record`. Without a cap (`None`) this check is skipped
         // and the drain is record-bounded exactly as before.
         while spans.len() < self.max_msgs {
@@ -3034,7 +3034,7 @@ fn drains(class: classify::RecvFailure) -> bool {
 ///
 /// Holds the transport's consumer slot (see [`KafkaTransport::gate_actuator`]),
 /// so it acts on whichever client the transport runs now. On the rising edge it
-/// reads the live assignment and pauses exactly those partitions; on the
+/// reads the live assignment and pauses exactly those partitions. On the
 /// falling edge it resumes them. Pausing the assignment (not unsubscribing)
 /// keeps the member in the group, so no rebalance fires while held.
 /// Pause/resume failures are logged but never panic -- the gate's edge
@@ -3250,7 +3250,7 @@ impl Default for PartitionLimitedDiagnostic {
             last_warn: parking_lot::Mutex::new(None),
             // 5 minutes: long enough to avoid spam, short enough to re-surface
             // a persistent condition in logs/alerts. (from_secs over the
-            // unstable from_mins; allow the readability lint.)
+            // unstable from_mins. Allow the readability lint.)
             #[allow(clippy::duration_suboptimal_units)]
             cooldown: Duration::from_secs(300),
         }
@@ -4172,7 +4172,7 @@ mod tests {
         assert_eq!(subscribed(&consumer), vec!["next".to_string()]);
     }
 
-    /// One fatal rebuild keeps readiness; a second with no record between
+    /// One fatal rebuild keeps readiness. A second with no record between
     /// them fails it, so a consumer that keeps dying is not reported Ready,
     /// and spaces the next poll.
     #[tokio::test]
@@ -5203,7 +5203,7 @@ mod tests {
 
     /// The Kafka gate actuator drives pause/resume EXACTLY ONCE per edge
     /// through an `InboundGate`, broker-free. We prove the EDGE wiring (the
-    /// risky part) with a counting actuator; the live consumer pause/resume
+    /// risky part) with a counting actuator. The live consumer pause/resume
     /// path is left to a broker integration test. The `recv` gate
     /// hook is verified `None`-default no-op by every existing recv test.
     #[cfg(feature = "governor")]

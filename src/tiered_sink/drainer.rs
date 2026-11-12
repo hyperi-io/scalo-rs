@@ -143,7 +143,7 @@ enum DrainResult {
     IoError,
     /// `guard.commit()` failed after the sink/codec returned a result
     /// that would normally consume the entry. The entry is STILL on
-    /// disk; counters were NOT decremented. StrictFifo must stay
+    /// disk. Counters were NOT decremented. StrictFifo must stay
     /// gated until the next drain iteration retries.
     CommitFailed(String),
 }
@@ -209,7 +209,7 @@ async fn settle(
             // Nothing to do, just continue
         }
         DrainResult::CommitFailed(e) => {
-            // Counters intact; entry still on disk. Treat as
+            // Counters intact. Entry still on disk. Treat as
             // failure so StrictFifo stays gated until retry.
             drainer.record_failure();
             #[cfg(feature = "tracing")]

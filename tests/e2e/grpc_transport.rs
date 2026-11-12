@@ -46,7 +46,7 @@ async fn test_close_frees_port_and_is_idempotent() {
     server.close().await.expect("close is idempotent");
 
     // The serve task needs a moment to react to the shutdown signal and drop
-    // the listener; poll-retry the rebind rather than sleep a fixed budget.
+    // the listener. Poll-retry the rebind rather than sleep a fixed budget.
     let mut rebound = None;
     for _ in 0..40 {
         match GrpcTransport::new(&GrpcConfig::server(&addr)).await {
@@ -850,7 +850,7 @@ async fn stalled_push_stream(addr: &str) -> tokio::net::TcpStream {
     stream
 }
 
-/// Poll-rebind `addr` for up to 2 s; true once a new server can bind it.
+/// Poll-rebind `addr` for up to 2 s. true once a new server can bind it.
 async fn port_is_free(addr: &str) -> bool {
     for _ in 0..40 {
         if GrpcTransport::new(&GrpcConfig::server(addr)).await.is_ok() {
@@ -946,7 +946,7 @@ async fn tls_client(addr: std::net::SocketAddr, send_timeout_ms: u64) -> GrpcTra
 }
 
 /// A TLS client to a server that accepts and never answers waits in the TLS
-/// handshake, before the RPC starts; `send_timeout_ms` still ends the send.
+/// handshake, before the RPC starts. `send_timeout_ms` still ends the send.
 #[tokio::test]
 async fn a_send_to_a_server_that_never_answers_ends_at_send_timeout() {
     let (addr, _accepts) = silent_listener().await;

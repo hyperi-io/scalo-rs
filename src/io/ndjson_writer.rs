@@ -92,7 +92,7 @@ pub struct NdjsonWriter {
 /// The open rotating file plus the reopen schedule that follows a failed write.
 struct RotatingTarget {
     file: FileRotate<AppendTimestamp>,
-    /// When the next reopen may run; `None` while writes are landing.
+    /// When the next reopen may run. `None` while writes are landing.
     reopen_at: Option<Instant>,
     backoff: Duration,
 }
@@ -240,7 +240,7 @@ impl NdjsonWriter {
             return;
         }
         target.schedule_next_reopen(now);
-        // A missing directory may be an unmounted volume; recreating it would
+        // A missing directory may be an unmounted volume. Recreating it would
         // write the DLQ onto whatever filesystem sits underneath.
         if let Err(e) = ensure_dir_usable(&self.output_path) {
             warn!(
@@ -371,7 +371,7 @@ impl NdjsonWriter {
     /// `file-rotate` doesn't expose the inner `File`, so this flushes to
     /// the kernel page cache only -- NOT on-disk durability. Power loss
     /// before write-back can still lose data. Strongest the file backend
-    /// can express until `file-rotate` gains a sync hook; for real
+    /// can express until `file-rotate` gains a sync hook. For real
     /// durability pair with an `acks=all` Kafka backend.
     ///
     /// # Errors
@@ -439,7 +439,7 @@ impl AsyncNdjsonWriter {
     }
 
     /// Write a single line off-runtime. The closure runs on a blocking
-    /// thread; the tokio runtime is free to schedule other tasks.
+    /// thread. The tokio runtime is free to schedule other tasks.
     ///
     /// # Errors
     ///
@@ -581,7 +581,7 @@ mod tests {
     }
 
     /// Issue #22 (scalo-rs): `file-rotate` reports `Ok` while writing
-    /// nothing when its lazy reopen fails; the writer must surface that
+    /// nothing when its lazy reopen fails. The writer must surface that
     /// as an error instead of pretending the write happened.
     #[test]
     fn test_swallowed_write_surfaces_error() {

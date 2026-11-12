@@ -68,7 +68,7 @@ use std::time::Duration;
 
 /// Producer profile for different use cases.
 ///
-/// A profile sets only what the sizing surface leaves alone; batch size,
+/// A profile sets only what the sizing surface leaves alone. Batch size,
 /// linger, codec and queue size come from `KafkaConfig::sizing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProducerProfile {
@@ -348,14 +348,14 @@ impl KafkaProducer {
     ///
     /// * `Ok(())` - Message queued successfully
     /// * `Err(TransportError::Backpressure)` - Queue full or a retryable broker
-    ///   condition; the message is still deliverable, so retry it
+    ///   condition. The message is still deliverable, so retry it
     /// * `Err(TransportError::MessageTooLarge)` - Over the message-size
     ///   ceiling, so a retry can never succeed -- dead-letter it
     /// * `Err(TransportError::Send(_))` - Retrying cannot help
     ///
     /// # Errors
     ///
-    /// Returns the classified produce failure above; the caller decides
+    /// Returns the classified produce failure above. The caller decides
     /// between retry, dead-letter and abort.
     pub fn send(&self, topic: &str, key: Option<&[u8]>, payload: &[u8]) -> TransportResult<()> {
         let mut record = BaseRecord::to(topic).payload(payload);
@@ -383,7 +383,7 @@ impl KafkaProducer {
                     }),
                     SendFailure::Retryable | SendFailure::MissingTopic => {
                         // Backpressure is the recoverable outcome the caller
-                        // acts on; the cause only survives in this line.
+                        // acts on. The cause only survives in this line.
                         if self.enqueue_degraded.enter() {
                             tracing::warn!(
                                 topic,
@@ -720,7 +720,7 @@ mod tests {
             .send("unreachable.topic", None, b"payload")
             .expect("the message queues locally even with no broker");
 
-        // Flush waits for the delivery report; the timeout above bounds it.
+        // Flush waits for the delivery report. The timeout above bounds it.
         producer.flush(Duration::from_secs(5));
 
         assert_eq!(
@@ -821,7 +821,7 @@ mod tests {
 
     /// Run `test` in a child process of this test binary that runs nothing
     /// else, so a global subscriber another test installed cannot be in the
-    /// way. `name` is the test's own name; the parent fails unless the child
+    /// way. `name` is the test's own name. The parent fails unless the child
     /// ran exactly that one test and it passed.
     #[cfg(feature = "logger")]
     fn in_own_process(name: &str, test: impl FnOnce()) {

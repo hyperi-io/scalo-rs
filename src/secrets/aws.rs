@@ -99,8 +99,7 @@ impl AwsProvider {
     ///
     /// Returns an error if the AWS client cannot be initialized.
     pub fn new(config: &AwsConfig) -> SecretsResult<Self> {
-        // Build AWS config synchronously for now
-        // In production, this should be async
+        // The AWS config is loaded by blocking on the current runtime.
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|e| SecretsError::ConfigError(format!("tokio runtime required: {e}")))?;
 

@@ -86,7 +86,7 @@ pub struct CacheConfig {
     pub refresh_jitter_secs: u64,
 
     /// Disk-cache encryption key. When set, on-disk cache entries are sealed
-    /// with AES-256-GCM (see `secrets::crypto`); the value is redacted in
+    /// with AES-256-GCM (see `secrets::crypto`). The value is redacted in
     /// serialisation and debug output. When `None`, the disk cache is
     /// memory-only UNLESS `allow_plaintext_disk_cache` is explicitly enabled.
     pub encryption_key: Option<crate::SensitiveString>,

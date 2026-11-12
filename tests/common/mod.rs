@@ -70,7 +70,7 @@ pub fn docker_answers() -> bool {
     })
 }
 
-/// The file DLQ's current file name; a rotation appends a timestamp to it.
+/// The file DLQ's current file name. A rotation appends a timestamp to it.
 const DLQ_FILE: &str = "dlq.ndjson";
 
 /// Every line a file DLQ wrote under `path` for `service`, oldest first: the
@@ -112,7 +112,6 @@ pub fn create_test_config_dir() -> (TempDir, PathBuf) {
     let dir = TempDir::new().expect("failed to create temp dir");
     let path = dir.path().to_path_buf();
 
-    // Create defaults.yaml
     std::fs::write(
         path.join("defaults.yaml"),
         r#"
@@ -124,7 +123,6 @@ database:
     )
     .expect("failed to write defaults.yaml");
 
-    // Create settings.yaml
     std::fs::write(
         path.join("settings.yaml"),
         r#"
@@ -135,7 +133,6 @@ database:
     )
     .expect("failed to write settings.yaml");
 
-    // Create settings.development.yaml
     std::fs::write(
         path.join("settings.development.yaml"),
         r#"

@@ -1,5 +1,5 @@
 # The thin chart an assembler writes per app. It replaces name, version,
-# appVersion, description and dependencies; everything else is copied as is.
+# appVersion, description and dependencies. Everything else is copied as is.
 apiVersion: v2
 name: app-name
 description: A service rendered by the scalo-service library chart from files/contract.json.

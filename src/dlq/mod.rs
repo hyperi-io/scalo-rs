@@ -90,7 +90,7 @@ pub type Result<T> = std::result::Result<T, DlqError>;
 pub(crate) mod test_files {
     use std::path::{Path, PathBuf};
 
-    /// The file backend's current file name; a rotation appends a timestamp to it.
+    /// The file backend's current file name. A rotation appends a timestamp to it.
     const CURRENT: &str = "dlq.ndjson";
 
     /// Every line the file backend wrote under `path` for `service`, oldest

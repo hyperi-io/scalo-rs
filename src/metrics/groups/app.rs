@@ -27,7 +27,7 @@ use super::super::manifest::{MetricDescriptor, MetricType};
 pub struct AppMetrics {
     /// Handle on `records_received_total`, the series
     /// [`ServiceMetrics::records_received`](crate::metrics::ServiceMetrics::records_received)
-    /// counts. For an app that sets the total rather than incrementing it; an
+    /// counts. For an app that sets the total rather than incrementing it. An
     /// app that increments counts through `ServiceMetrics` alone.
     pub records_received: Counter,
     pub records_processed: Counter,
@@ -44,7 +44,7 @@ impl AppMetrics {
     /// Create and register app metrics.
     ///
     /// `version` and `commit` are emitted as labels on the `info` gauge by the
-    /// first set built on `manager`, which in a service is the runtime's; a
+    /// first set built on `manager`, which in a service is the runtime's. A
     /// later set leaves `info` and the manifest's build info as they are.
     #[must_use]
     pub fn new(manager: &MetricsManager, version: &str, commit: &str) -> Self {
@@ -85,7 +85,7 @@ impl AppMetrics {
         );
 
         // config_reloads_total -- label-based, register descriptor manually.
-        // BARE name; the recorder's prefix layer adds the namespace at emit time.
+        // BARE name. The recorder's prefix layer adds the namespace at emit time.
         let config_key = "config_reloads_total";
         metrics::describe_counter!(config_key, "Config reload attempts");
         manager.registry().push(MetricDescriptor {
@@ -311,7 +311,7 @@ mod tests {
         );
     }
 
-    /// The runtime builds the app set first; an app building it again adds no
+    /// The runtime builds the app set first. An app building it again adds no
     /// second `info` series and leaves the build info the runtime set.
     #[test]
     fn a_second_app_set_emits_no_second_info_series() {

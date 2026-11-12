@@ -238,16 +238,14 @@ impl Default for MetricsConfig {
 /// config section, mirroring the `from_cascade` pattern used by
 /// `ScalingPressureConfig` / `SelfRegulationConfig`.
 ///
-/// The whole point of this type is to DECOUPLE the metric namespace from the
-/// app name: the runtime used to force `namespace = app_name` (always
-/// prefixing every metric). Per the de-brand mandate, metric names are now
-/// BARE by default and a `{namespace}_` prefix is OPT-IN -- a consumer sets
+/// This type DECOUPLES the metric namespace from the app name: metric names
+/// are BARE by default and a `{namespace}_` prefix is OPT-IN -- a consumer sets
 /// `metrics.namespace` independently (commonly, but not necessarily, to their
 /// app name). Differentiation between services is done via platform LABELS
 /// (Prometheus job/instance, OTel `service.name`), not the metric name.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MetricsSettings {
-    /// Metric namespace prefix. Empty (the default) = bare metric names; set it
+    /// Metric namespace prefix. Empty (the default) = bare metric names. Set it
     /// to opt into a `{namespace}_` prefix.
     #[serde(default)]
     pub namespace: String,
@@ -255,7 +253,7 @@ pub struct MetricsSettings {
     /// Metrics server bind address, under `metrics.address`.
     ///
     /// Consumed by the CLI's `effective_metrics_addr()` fall-through when no
-    /// `--metrics-addr`/`METRICS_ADDR` is given; `None` falls to the
+    /// `--metrics-addr`/`METRICS_ADDR` is given. `None` falls to the
     /// hard-coded default.
     #[serde(default)]
     pub address: Option<String>,
@@ -317,7 +315,7 @@ static OTEL_METER_PROVIDER: std::sync::OnceLock<opentelemetry_sdk::metrics::SdkM
 /// Flush and stop OTLP metric push, if it was wired up.
 ///
 /// Bounded at two seconds so an unreachable collector cannot hold up a
-/// shutdown; pending measurements are dropped instead.
+/// shutdown. Pending measurements are dropped instead.
 #[cfg(feature = "otel-metrics")]
 pub fn shutdown_otel_export() {
     if let Some(provider) = OTEL_METER_PROVIDER.get()
@@ -394,7 +392,7 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
         }
         // `build_otel_recorder`'s first arg is the OTel instrumentation SCOPE
         // name (the meter name), NOT an instrument-name prefix. Pass the real
-        // namespace so scope identity is preserved; instrument-name prefixing
+        // namespace so scope identity is preserved. Instrument-name prefixing
         // is done uniformly by the prefix layer below, so there is no
         // double-prefix on instrument names.
         match otel::build_otel_recorder(&config.namespace, &config.otel) {
@@ -519,7 +517,7 @@ impl MetricsManager {
 
     /// Test constructor that skips the global recorder install.
     ///
-    /// The global recorder installs once per process; parallel `new()` calls
+    /// The global recorder installs once per process. Parallel `new()` calls
     /// race and all but the first panic with `SetRecorderError`. Skipping it
     /// makes `metrics!` macros no-ops (documented behaviour with no recorder)
     /// while registry tracking, descriptor push, and namespace logic -- what
@@ -602,7 +600,7 @@ impl MetricsManager {
     #[must_use]
     pub fn counter(&self, name: &str, description: &str) -> Counter {
         // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder; the registry applies
+        // once by the prefix layer on the global recorder. The registry applies
         // it to the manifest. So the manifest and the emitted names match.
         let key = name.to_string();
         let desc = description.to_string();
@@ -635,7 +633,7 @@ impl MetricsManager {
         group: &str,
     ) -> Counter {
         // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder; the registry applies
+        // once by the prefix layer on the global recorder. The registry applies
         // it to the manifest. So the manifest and the emitted names match.
         let key = name.to_string();
         let desc = description.to_string();
@@ -661,7 +659,7 @@ impl MetricsManager {
     #[must_use]
     pub fn gauge(&self, name: &str, description: &str) -> Gauge {
         // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder; the registry applies
+        // once by the prefix layer on the global recorder. The registry applies
         // it to the manifest. So the manifest and the emitted names match.
         let key = name.to_string();
         let desc = description.to_string();
@@ -690,7 +688,7 @@ impl MetricsManager {
         group: &str,
     ) -> Gauge {
         // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder; the registry applies
+        // once by the prefix layer on the global recorder. The registry applies
         // it to the manifest. So the manifest and the emitted names match.
         let key = name.to_string();
         let desc = description.to_string();
@@ -716,7 +714,7 @@ impl MetricsManager {
     #[must_use]
     pub fn histogram(&self, name: &str, description: &str) -> Histogram {
         // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder; the registry applies
+        // once by the prefix layer on the global recorder. The registry applies
         // it to the manifest. So the manifest and the emitted names match.
         let key = name.to_string();
         let desc = description.to_string();
@@ -746,7 +744,7 @@ impl MetricsManager {
         buckets: Option<&[f64]>,
     ) -> Histogram {
         // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder; the registry applies
+        // once by the prefix layer on the global recorder. The registry applies
         // it to the manifest. So the manifest and the emitted names match.
         let key = name.to_string();
         let desc = description.to_string();
@@ -778,7 +776,7 @@ impl MetricsManager {
         buckets: &[f64],
     ) -> Histogram {
         // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder; the registry applies
+        // once by the prefix layer on the global recorder. The registry applies
         // it to the manifest. So the manifest and the emitted names match.
         let key = name.to_string();
         let desc = description.to_string();
@@ -864,7 +862,7 @@ impl MetricsManager {
     /// Once set, `/scaling/pressure` on the metrics listener returns the
     /// current pressure value as plain text, whichever of
     /// [`start_server`](Self::start_server) or `start_server_with_routes`
-    /// started it; until then it returns 404.
+    /// started it. Until then it returns 404.
     ///
     /// Takes effect immediately whether or not the server is already running,
     /// because the route reads a slot rather than a value captured at start.
@@ -888,7 +886,7 @@ impl MetricsManager {
     /// Attach a `MemoryGuard` instance.
     ///
     /// When set and using `start_server_with_routes`, `/memory/pressure`
-    /// returns the current memory status; until then it returns 404.
+    /// returns the current memory status. Until then it returns 404.
     ///
     /// Late-binds the same way [`set_scaling_pressure`](Self::set_scaling_pressure)
     /// does.
@@ -1161,7 +1159,7 @@ impl MetricsManager {
     ///
     /// Uses interior mutability (writes through the registry's `Arc<RwLock>`),
     /// so only `&self` is needed. The first `groups::AppMetrics::new()` on this
-    /// manager records it too (`service-metrics` feature); this call overrides
+    /// manager records it too (`service-metrics` feature). This call overrides
     /// the manifest's copy only, not the `info` gauge.
     pub fn set_build_info(&self, version: &str, commit: &str) {
         self.registry.set_build_info(version, commit);
@@ -1169,7 +1167,7 @@ impl MetricsManager {
 
     /// Set operational use cases for a metric (by BARE name).
     ///
-    /// Pass the bare metric name (no namespace prefix); the registry applies
+    /// Pass the bare metric name (no namespace prefix). The registry applies
     /// the namespace internally. No-op if the metric is not found.
     pub fn set_use_cases(&self, metric_name: &str, use_cases: &[&str]) {
         self.registry.set_use_cases(metric_name, use_cases);
@@ -1177,7 +1175,7 @@ impl MetricsManager {
 
     /// Set the suggested Grafana panel type for a metric (by BARE name).
     ///
-    /// Pass the bare metric name (no namespace prefix); the registry applies
+    /// Pass the bare metric name (no namespace prefix). The registry applies
     /// the namespace internally. No-op if the metric is not found.
     pub fn set_dashboard_hint(&self, metric_name: &str, hint: &str) {
         self.registry.set_dashboard_hint(metric_name, hint);
@@ -1297,7 +1295,7 @@ fn run_upkeep(handle: &PrometheusHandle) {
 
 /// Longest request line we will read before giving up.
 ///
-/// A probe or a scrape sends a short line; anything past this is either broken
+/// A probe or a scrape sends a short line. Anything past this is either broken
 /// or hostile. Without the cap, `read_line` appends until it sees a newline, so
 /// a client that opens a socket and streams bytes without one grows the buffer
 /// until the process dies.
@@ -1596,7 +1594,7 @@ mod tests {
         for _ in 0..CAP {
             idle.push(tokio::net::TcpStream::connect(addr).await.unwrap());
         }
-        // A served connection is held open for the read timeout (5 s); one over
+        // A served connection is held open for the read timeout (5 s). One over
         // the cap is closed straight away, so the read below sees EOF.
         let mut over = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut buf = [0_u8; 16];

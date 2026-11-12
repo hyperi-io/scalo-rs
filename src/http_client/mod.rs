@@ -35,12 +35,12 @@
 //! on the built request, inside the retry loop, so a signature covers the final
 //! body and query and is regenerated on every attempt.
 //! [`Self::get_signed`](HttpClient::get_signed) and
-//! [`Self::send_signed`](HttpClient::send_signed) are the signed surface; the
+//! [`Self::send_signed`](HttpClient::send_signed) are the signed surface. The
 //! unsigned methods are the same loop with [`Unsigned`] in place of a signer.
 //!
 //! No error leaves the loop carrying the request URL: reqwest keeps a copy of
 //! it on a transport error and renders it, and a credential placed in the query
-//! is inside that URL. The error names what failed; the caller knows what it
+//! is inside that URL. The error names what failed. The caller knows what it
 //! called.
 //!
 //! ## Redirects
@@ -95,7 +95,7 @@ pub enum HttpClientError {
 /// Error from an HTTP request.
 ///
 /// `Status` carries the [`Response`] so the caller can still inspect a
-/// persistent server error after retries are exhausted; it is surfaced by the
+/// persistent server error after retries are exhausted. It is surfaced by the
 /// public methods as `Ok(response)` (not `Err`), matching the historical
 /// "caller checks the status code" contract.
 #[derive(Debug, thiserror::Error)]
@@ -105,7 +105,7 @@ pub enum HttpError {
     Transport(#[from] reqwest::Error),
 
     /// Server returned a retryable status (5xx / 429 / 408). Held internally
-    /// during the retry loop; never escapes a public method as an `Err`.
+    /// during the retry loop. Never escapes a public method as an `Err`.
     #[error("HTTP retryable status: {}", .0.status())]
     Status(Box<Response>),
 
@@ -127,7 +127,7 @@ impl HttpError {
     /// signer refused never left, so that decision does not apply to it.
     fn is_retryable(&self, replayable: bool) -> bool {
         match self {
-            // Connect/timeout are transient; decode/redirect/body are not.
+            // Connect/timeout are transient. decode/redirect/body are not.
             Self::Transport(e) => replayable && (e.is_timeout() || e.is_connect()),
             // A retryable status was only constructed for the retryable set.
             Self::Status(_) => replayable,
@@ -135,7 +135,7 @@ impl HttpError {
             // request again.
             Self::Serialize(_) => false,
             // A credential endpoint that could not be reached, or answered
-            // 408, 429 or 5xx, may answer the next attempt; any other refusal
+            // 408, 429 or 5xx, may answer the next attempt. Any other refusal
             // will not.
             Self::Sign(e) => e.is_retryable(),
         }
@@ -447,16 +447,14 @@ impl HttpClient {
 
     /// Send a POST request with a JSON body.
     ///
-    /// POST is **not** retried by default (not idempotent); enable
+    /// POST is **not** retried by default (not idempotent). Enable
     /// `retry_non_idempotent` only for dedupe-safe endpoints.
     ///
     /// # Errors
     ///
     /// Returns [`HttpError::Serialize`] if `body` cannot be encoded as JSON,
-    /// or [`HttpError::Transport`] on a persistent transport failure.
-    /// Previously a serialisation failure was silently substituted with an
-    /// empty body -- the request would dispatch with no payload, hiding the
-    /// bug at the caller.
+    /// or [`HttpError::Transport`] on a persistent transport failure. A
+    /// serialisation failure never dispatches an empty body.
     pub async fn post_json<T: serde::Serialize + ?Sized>(
         &self,
         url: &str,
@@ -544,7 +542,7 @@ impl HttpClient {
 
     /// Send a request of any method with `signer` putting the credential on it.
     ///
-    /// `body` is the raw request body, if any; `customise` decorates the builder
+    /// `body` is the raw request body, if any. `customise` decorates the builder
     /// (headers, query, a form) once per attempt, before signing. Retries follow
     /// the method: GET, HEAD, PUT, DELETE and OPTIONS are replayable, anything
     /// else needs the `retry_non_idempotent` opt-in, matching the typed methods.

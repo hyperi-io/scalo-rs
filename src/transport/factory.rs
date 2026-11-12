@@ -220,7 +220,7 @@ impl TransportSender for AnySender {
 
     /// Forward [`send_batch`](TransportSender::send_batch) to the active
     /// backend. gRPC uses its native single-RPC `RouteBatch` override and Kafka
-    /// queues the whole block before awaiting any delivery report; every other
+    /// queues the whole block before awaiting any delivery report. Every other
     /// backend uses the trait's per-record default (see the at-least-once
     /// partial-send caveat on the trait method).
     #[cfg_attr(
@@ -413,7 +413,7 @@ impl AnySender {
 /// `AnyReceiver::commit` routes tokens back to the correct backend with no heap
 /// allocation or trait objects. Variant set mirrors the enabled feature flags.
 /// `commit` skips tokens whose variant does not match the active backend
-/// (defensive; cannot occur in practice -- tokens come from the same receiver).
+/// (defensive -- cannot occur in practice -- tokens come from the same receiver).
 ///
 /// `#[non_exhaustive]`: adding a backend variant is not a breaking change.
 /// Downstream `match` on `AnyToken` must include a wildcard arm.
@@ -584,7 +584,7 @@ impl TransportBase for AnyReceiver {
 
 /// Map a backend's `WorkBatch<BackendToken>` into `WorkBatch<AnyToken>` using
 /// the provided variant constructor.  Each `commit_tokens` entry is wrapped in
-/// the matching [`AnyToken`] variant; `records` and `dlq_entries` move straight
+/// the matching [`AnyToken`] variant. `records` and `dlq_entries` move straight
 /// through (the record payload `Bytes` is a refcount bump, never a copy).
 #[cfg(any(
     feature = "transport-kafka",
@@ -727,7 +727,7 @@ impl TransportReceiver for AnyReceiver {
     async fn commit(&self, tokens: &[AnyToken]) -> TransportResult<()> {
         // `match tok { Variant(x) => Some(x), _ => None }` not `if let`: with a
         // single feature enabled AnyToken has one variant, making `if let`
-        // irrefutable (error under -D warnings); the wildcard arm is unreachable
+        // irrefutable (error under -D warnings). The wildcard arm is unreachable
         // but legal there. Tokens from a non-matching variant are a programming
         // error (cannot arise from this receiver's recv) -- filtered out
         // defensively, not panicked on.
@@ -1506,7 +1506,7 @@ mod tests {
 
         receiver.commit(&tokens).await.expect("commit must succeed");
 
-        // The memory transport tracks the max committed seq; it must have advanced.
+        // The memory transport tracks the max committed seq. It must have advanced.
         #[allow(irrefutable_let_patterns)]
         if let AnyReceiver::Memory(ref t) = receiver {
             let seq_after = t.committed_sequence();
@@ -1698,7 +1698,7 @@ mod governor_tests {
     }
 
     /// A factory-built HTTP receiver MUST shed with 503 under pressure (governor
-    /// pinned HIGH); the shed request never reaches the queue.
+    /// pinned HIGH). The shed request never reaches the queue.
     #[cfg(all(feature = "transport-http", feature = "http-server"))]
     #[tokio::test]
     async fn http_governed_receiver_sheds_under_pressure() {

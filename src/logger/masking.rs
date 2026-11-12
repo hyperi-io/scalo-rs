@@ -27,7 +27,7 @@ const TARGET_KEY: &str = "target";
 /// Default list of sensitive field names to mask.
 ///
 /// A field name holding any of these anywhere in it, in any case and with any
-/// separators, is masked; see [`is_credential_name`](super::is_credential_name).
+/// separators, is masked. See [`is_credential_name`](super::is_credential_name).
 #[must_use]
 pub fn default_sensitive_fields() -> Vec<String> {
     SENSITIVE_FIELDS.iter().map(ToString::to_string).collect()
@@ -320,7 +320,7 @@ fn inject_and_redact_json_line(
 /// A key naming a credential masks its whole value, and a string is masked
 /// with the text rules. `entry` is true for an item of an array, where a
 /// two-item array whose first item names a credential is a `(name, value)`
-/// pair; under a key a two-item array is a list.
+/// pair. Under a key a two-item array is a list.
 fn redact_json_value(
     value: &mut serde_json::Value,
     parent: &str,

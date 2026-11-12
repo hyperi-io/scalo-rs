@@ -102,7 +102,7 @@ pub trait TransportBase: Send + Sync {
     /// misconfigured or unreachable downstream fails fast instead of being
     /// discovered on the first `send`. The DEFAULT delegates to
     /// [`is_healthy`](Self::is_healthy) (passes unless the transport already
-    /// knows it is unhealthy); a transport SHOULD override with a real probe
+    /// knows it is unhealthy). A transport SHOULD override with a real probe
     /// (Kafka metadata fetch, HTTP GET, file-path writability, ...).
     ///
     /// Shape: a per-component async `Result<()>` probe, run in parallel at boot
@@ -155,7 +155,7 @@ impl Default for HealthcheckConfig {
 ///
 /// - `cfg.enabled == false` -> skip (always `Ok`).
 /// - otherwise probe [`TransportBase::healthcheck`] under a `cfg.timeout_ms`
-///   deadline; a probe error OR a timeout returns `Err` so the caller can abort
+///   deadline. A probe error OR a timeout returns `Err` so the caller can abort
 ///   startup before accepting traffic.
 ///
 /// # Errors
@@ -220,7 +220,7 @@ pub trait TransportSender: TransportBase {
     /// Transports that can do better override this: gRPC sends the block as one
     /// `RouteBatch` RPC, and Kafka queues the whole block before awaiting any
     /// delivery report. Commit tokens and inline-DLQ entries are NOT
-    /// sent -- they are the SENDER's local concern; fire the commit tokens
+    /// sent -- they are the SENDER's local concern. Fire the commit tokens
     /// locally after this returns [`SendResult::Ok`].
     ///
     /// ## At-least-once caveat -- per-record fallback can partially send
@@ -245,7 +245,7 @@ pub trait TransportSender: TransportBase {
             for record in records {
                 match self.send_record(record).await {
                     // Sent, dropped (Ok), or suppressed by an outbound dlq
-                    // filter -- all handled; keep going, do NOT abort the block.
+                    // filter -- all handled. Keep going, do NOT abort the block.
                     SendResult::Ok | SendResult::FilteredDlq => {}
                     // Transient/fatal transport failure: stop so the caller
                     // retries the unconfirmed remainder of the block.
@@ -340,7 +340,7 @@ pub trait TransportReceiver: TransportBase {
     /// internally. The in-tree Kafka (keeps an unfinished poll for the next
     /// call), memory (awaits only on an empty buffer), and pipe and file (keep
     /// a partial line and unreturned records for the next call) impls satisfy
-    /// this; a custom impl that holds records across an `.await` will drop data
+    /// this. A custom impl that holds records across an `.await` will drop data
     /// on cancellation.
     ///
     /// # Yielding (REQUIRED of implementors)
@@ -406,7 +406,7 @@ pub trait TransportReceiver: TransportBase {
     /// Release the source acknowledgement of `tokens` with the merged status of
     /// every piece built from them.
     ///
-    /// `Delivered`, `Dropped` and `Rejected` release it; `Errored` withholds it
+    /// `Delivered`, `Dropped` and `Rejected` release it. `Errored` withholds it
     /// so the records are delivered again. The default commits when
     /// [`DeliveryStatus::should_commit`] holds and does nothing otherwise. A
     /// push source answers its held senders here.

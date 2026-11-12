@@ -28,7 +28,7 @@ pub enum Environment {
     BareMetal,
 }
 
-/// cgroup path segments only a containerised process sits under; host daemons such as `docker.service` do not match.
+/// cgroup path segments only a containerised process sits under. Host daemons such as `docker.service` do not match.
 const CONTAINER_CGROUP_MARKERS: [&str; 4] = ["/docker/", "/kubepods", "/lxc/", "/containerd/"];
 
 /// Runtime names found in the mount options of a container's own root filesystem.
@@ -145,7 +145,7 @@ fn has_docker_scope(body: &str) -> bool {
     })
 }
 
-/// Whether the mount at `/` in a mountinfo body is an overlay a container runtime built; only the root mount counts, as a host that runs containers lists their overlays too.
+/// Whether the mount at `/` in a mountinfo body is an overlay a container runtime built. Only the root mount counts, as a host that runs containers lists their overlays too.
 fn rootfs_is_container_overlay(mountinfo: &str) -> bool {
     mountinfo.lines().any(|line| {
         if line.split(' ').nth(4) != Some("/") {
@@ -431,7 +431,7 @@ pub fn is_production() -> bool {
 
 /// What the default log format and colour are decided from.
 ///
-/// [`ConsoleContext::detect`] reads it from the process; tests build one directly.
+/// [`ConsoleContext::detect`] reads it from the process. Tests build one directly.
 #[cfg(any(feature = "logger", feature = "cli"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ConsoleContext {

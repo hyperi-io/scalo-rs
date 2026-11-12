@@ -100,7 +100,7 @@ pub enum LogFormat {
 }
 
 impl LogFormat {
-    /// Resolve `Auto` to `Json` or `Text`; other formats are returned unchanged.
+    /// Resolve `Auto` to `Json` or `Text`. Other formats are returned unchanged.
     ///
     /// `Auto` gives `Json` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, else
     /// `Text` under a CI runner or when stderr is a terminal, else `Json`.
@@ -433,7 +433,7 @@ pub(crate) fn parse_level(name: &str) -> Option<Level> {
 ///   unrecognised defers to `logger.format` in config, then to
 ///   [`LogFormat::Auto`]
 /// - `LOG_COLOR`: Colour in text mode (`true`, `1` or `yes` is on, anything
-///   else off); unset defers to `NO_COLOR`, then `logger.color`, then the
+///   else off). Unset defers to `NO_COLOR`, then `logger.color`, then the
 ///   terminal check
 /// - `NO_COLOR`: Disable coloured output when `LOG_COLOR` is unset
 /// - `LOG_THROTTLE_ENABLED`: Enable log deduplication (default: false)
@@ -512,7 +512,7 @@ fn build_throttle_filter(config: &ThrottleConfig) -> Option<TracingRateLimitLaye
     }
 }
 
-/// The first selector naming `json` or `text`, else `Auto`; blank, `auto` and unrecognised ones defer.
+/// The first selector naming `json` or `text`, else `Auto`. Blank, `auto` and unrecognised ones defer.
 fn first_concrete_format<const N: usize>(selectors: [Option<String>; N]) -> LogFormat {
     selectors
         .into_iter()

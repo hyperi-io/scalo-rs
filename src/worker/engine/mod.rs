@@ -87,7 +87,7 @@ impl EngineError {
 /// What a [`BatchEngine`] run loop does with inbound-filter DLQ entries
 /// ([`WorkBatch::dlq_entries`](crate::transport::WorkBatch::dlq_entries)).
 ///
-/// Inbound `action: dlq` filters remove messages from the normal batch; those
+/// Inbound `action: dlq` filters remove messages from the normal batch. Those
 /// entries must go somewhere. The default is [`Reject`](Self::Reject) so a
 /// data-loss-shaped config never passes silently.
 #[cfg(feature = "transport")]
@@ -161,9 +161,8 @@ use super::config::WorkerPoolConfig;
 /// `transport::WorkBatch` carries), chunk large batches, and track stats
 /// atomically.
 ///
-/// Inbound braking under memory pressure is no longer a blocking pause between
-/// chunks (the retired `check_memory_pressure` proto-actuator). It is now the
-/// self-regulation governor's job: the inbound GATE pauses the source transport
+/// Inbound braking under memory pressure is not a blocking pause between
+/// chunks. It is the self-regulation governor's job: the inbound GATE pauses the source transport
 /// and the streaming byte-budget lever bounds peak in-flight memory. With the
 /// governor OFF, there is no active brake -- that is the deliberate opt-out.
 #[cfg_attr(
@@ -485,7 +484,6 @@ impl BatchEngine {
             // Sort by original index to preserve order
             chunk_results.sort_by_key(|(idx, _)| *idx);
 
-            // Update stats
             let ok_count = chunk_results.iter().filter(|(_, r)| r.is_ok()).count();
             self.stats.add_processed(ok_count as u64);
 
@@ -630,7 +628,7 @@ impl BatchEngine {
 
 /// RAII lease over in-flight ingress bytes tracked by a [`MemoryGuard`].
 ///
-/// Created by the WorkBatch driver's `lease_ingress_batch`; releases the
+/// Created by the WorkBatch driver's `lease_ingress_batch`. Releases the
 /// accounted bytes back to the guard on drop so no block exit path can leak
 /// the reservation.
 ///
@@ -647,7 +645,7 @@ pub(crate) struct IngressLease<'a> {
 #[cfg(all(feature = "memory", feature = "transport"))]
 impl<'a> IngressLease<'a> {
     /// Construct a lease over already-accounted ingress bytes. The caller must
-    /// have already called `guard.add_bytes(bytes)`; `Drop` releases them. Used
+    /// have already called `guard.add_bytes(bytes)`. `Drop` releases them. Used
     /// by the WorkBatch driver's `lease_ingress_batch`.
     fn new(guard: &'a crate::memory::MemoryGuard, bytes: u64) -> Self {
         Self { guard, bytes }
@@ -745,7 +743,7 @@ mod engine_tests {
             .expect("no entries -> ok");
         assert!(passed.dlq_entries.is_empty());
 
-        // DiscardWithMetric -> ok (deliberately dropped); entries consumed.
+        // DiscardWithMetric -> ok (deliberately dropped). Entries consumed.
         let eng = default_engine().with_filter_dlq_policy(FilterDlqPolicy::DiscardWithMetric);
         let passed = eng
             .apply_workbatch_dlq_policy(batch_with(1))
@@ -1171,10 +1169,9 @@ mod engine_tests {
         assert!(debug.contains("config"));
     }
 
-    /// The driver run loops (`run_workbatch` / `run_workbatch_parsed`) replaced
-    /// the four legacy loops. These tests exercise the same
-    /// behaviours -- process+sink, ticker, on-demand (no-parse) pass-through, and
-    /// sink-error resilience -- through the surviving WorkBatch driver.
+    /// The driver run loops (`run_workbatch` / `run_workbatch_parsed`) tested
+    /// for process+sink, ticker, on-demand (no-parse) pass-through, and
+    /// sink-error resilience.
     #[cfg(feature = "transport-memory")]
     mod driver_engine_tests {
         use super::*;
@@ -1242,7 +1239,7 @@ mod engine_tests {
                             Ok(())
                         }
                     },
-                    // SinkManaged mirrors the legacy run_async sink-owns-commit shape.
+                    // SinkManaged: the sink owns the commit.
                     CommitMode::SinkManaged,
                     no_ticker(),
                 )

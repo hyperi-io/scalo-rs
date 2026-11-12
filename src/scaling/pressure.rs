@@ -181,7 +181,7 @@ impl ScalingPressure {
         self.components.iter().any(|entry| entry.name == name)
     }
 
-    /// Warn the first time `name` misses; returns whether this call warned.
+    /// Warn the first time `name` misses. Returns whether this call warned.
     fn warn_unregistered(&self, name: &str) -> bool {
         let mut warned = self.warned_unregistered.lock();
         if warned.iter().any(|seen| seen == name) {

@@ -1,7 +1,7 @@
 // Project:   scalo
 // File:      src/crypto.rs
 // Purpose:   CryptoProfile - the common, opinionated crypto posture the whole
-//            suite reads (tls today; secrets/jwt later)
+//            suite reads (tls, secrets, jwt)
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -13,8 +13,8 @@
 //! crate SELECTS a profile and inherits the algorithm floor, the
 //! commercial-grade fallback, and the downgrade warnings - it never
 //! hand-assembles a cipher/curve/version policy. The `tls` module (`tls`
-//! feature) is the first consumer; secrets-at-rest and JWT policy read the same
-//! profile later.
+//! feature) is its only consumer. The secrets disk cache uses its own
+//! `encryption_key` with a fixed AES-256-GCM, and no JWT policy reads the profile.
 //!
 //! ## Profiles - base is commercial-floor, high-security is opt-in
 //!
@@ -26,18 +26,18 @@
 //! - [`CryptoProfile::HighSec`]: national-security opt-in. TLS 1.3 only,
 //!   hybrid post-quantum key exchange **required** (peers that cannot do it are
 //!   refused).
-//! - [`CryptoProfile::DevTest`]: local/dev; same algorithms as prod, warnings
+//! - [`CryptoProfile::DevTest`]: local/dev. Same algorithms as prod, warnings
 //!   quietened.
 //!
 //! ## Honest naming
 //!
-//! The symmetric + hash choices (AES-256-GCM, SHA-384) meet **CNSA 2.0**; the
+//! The symmetric + hash choices (AES-256-GCM, SHA-384) meet **CNSA 2.0**. The
 //! asymmetric choices (ECDH/ECDSA P-384) are the **CNSA 1.0** classical suite.
 //! The hybrid ML-KEM key-exchange layer is the feasible-today step toward full
 //! CNSA 2.0 (ML-KEM-1024 / ML-DSA-87). We do not label a P-384 baseline
 //! "CNSA 2.0".
 
-/// Operating crypto profile. `Prod` is the drop-in default; `HighSec` is opt-in.
+/// Operating crypto profile. `Prod` is the drop-in default. `HighSec` is opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CryptoProfile {
     /// Commercial-floor best practice (the default). See the module docs.

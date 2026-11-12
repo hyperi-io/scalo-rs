@@ -28,7 +28,7 @@
 //!
 //! When the reset timeout elapses the breaker admits exactly ONE probe via
 //! [`allow_request`](CircuitBreaker::allow_request): the first caller takes the
-//! probe permit (Open -> HalfOpen) and proceeds; concurrent callers are
+//! probe permit (Open -> HalfOpen) and proceeds. Concurrent callers are
 //! refused until the probe resolves (success -> Closed, failure -> Open). This
 //! stops a recovery thundering-herd from hammering a still-fragile downstream.
 //! A probe that never reports, because its caller's future was dropped or its
@@ -202,7 +202,7 @@ impl CircuitBreaker {
     }
 
     /// Record a failed request. Opens the circuit once consecutive failures
-    /// reach the threshold; a failure while half-open re-opens immediately
+    /// reach the threshold. A failure while half-open re-opens immediately
     /// (the count is not reset until a success, so it is still >= threshold).
     pub async fn record_failure(&self) {
         let mut inner = self.lock();
@@ -344,11 +344,11 @@ mod tests {
         // Closed: always admitted.
         assert!(cb.allow_request().await);
 
-        // Trip it open; while open the timeout has not elapsed -> refused.
+        // Trip it open. While open the timeout has not elapsed -> refused.
         cb.record_failure().await;
         assert!(!cb.allow_request().await);
 
-        // After the timeout, exactly ONE probe is admitted; the next is refused
+        // After the timeout, exactly ONE probe is admitted. The next is refused
         // until the probe resolves.
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(cb.allow_request().await, "first caller takes the probe");

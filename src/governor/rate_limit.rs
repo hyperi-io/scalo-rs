@@ -12,7 +12,7 @@
 //! states explicitly ("this API allows 100 req/s"). Distinct from the adaptive
 //! sink concurrency controller (`sink_stack::AdaptiveLimiter`, feature
 //! `sink-stack`): that one *discovers* the downstream's safe concurrency from
-//! overload signals (backpressure, per-attempt timeouts); this one *enforces* a
+//! overload signals (backpressure, per-attempt timeouts). This one *enforces* a
 //! fixed ceiling the operator already knows.
 //!
 //! ## Built on the `governor` crate
@@ -48,7 +48,7 @@ use gcra::{DefaultDirectRateLimiter, Jitter, Quota};
 ///
 /// `rps == 0` (the default) means **disabled** -- the limiter is a no-op (the
 /// derived `Default` is `rps = 0, burst = 0`). A non-zero `rps` enforces that
-/// steady rate; `burst` is the bucket depth (the largest momentary spike
+/// steady rate. `burst` is the bucket depth (the largest momentary spike
 /// permitted), defaulting to one second of `rps`.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct RateLimitConfig {
@@ -240,7 +240,7 @@ mod tests {
         );
 
         // Drain any remaining initial token, then the next acquire must wait for
-        // a refill (at least the ~10ms GCRA delay; jitter may add more).
+        // a refill (at least the ~10ms GCRA delay -- jitter may add more).
         let _ = rl.try_acquire();
         let waited = rl.acquire().await;
         assert!(
@@ -258,7 +258,7 @@ mod tests {
         for _ in 0..5 {
             rl.acquire().await;
         }
-        // 5 tokens at 100rps ~= 50ms minimum (jitter only adds); floor at 40ms.
+        // 5 tokens at 100rps ~= 50ms minimum (jitter only adds). Floor at 40ms.
         assert!(
             start.elapsed() >= Duration::from_millis(40),
             "5 acquires at 100rps must take ~50ms+, took {:?}",
