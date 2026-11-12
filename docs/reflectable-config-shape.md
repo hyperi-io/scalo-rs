@@ -69,7 +69,7 @@ FieldSpec {
   required: bool
   default: any | null      # omitted when null
   description: string
-  secret: bool             # true => also x-scalo-secret in the schema; UI masks, engine routes via secrets seam
+  secret: bool             # true => also x-scalo-secret in the schema; UI masks, engine routes via the secrets store
   enum_values: string[]    # allowed values for type=enum; omitted when empty
   example: any | null      # omitted when null
 }
@@ -95,7 +95,7 @@ A secret field is flagged in TWO places:
 - catalog `FieldSpec.secret = true`
 - JSON Schema: the field's subschema carries `"x-scalo-secret": true` (plus `"writeOnly": true`).
 
-Rust: `SensitiveString` implements `JsonSchema` to emit `{"type": "string", "x-scalo-secret": true, "writeOnly": true}`. Python must emit the same keys, in the same order, through the secret field type's `json_schema_extra`. The control plane keys off the marker to route the value through the secrets seam and the UI masks the input.
+Rust: `SensitiveString` implements `JsonSchema` to emit `{"type": "string", "x-scalo-secret": true, "writeOnly": true}`. Python must emit the same keys, in the same order, through the secret field type's `json_schema_extra`. The control plane keys off the marker to route the value through the secrets store and the UI masks the input.
 
 ## ENV mapping for nested config (decision: C)
 

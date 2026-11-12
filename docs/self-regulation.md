@@ -99,7 +99,7 @@ They are NOT interchangeable; each answers a different question.
 - **UnifiedPressure** (`src/governor/source.rs`) combines the sources into
   ONE normalised level in `[0.0, 1.0]` under a hysteretic latch. It is what
   the inbound gate and the byte-budget controller both consult. It owns no
-  signal of its own -- it is the seam that turns the brains' readings into
+  signal of its own -- it turns the brains' readings into
   a single pause/resume decision.
 
 ### Why memory is HARD and CPU is deliberately dropped
@@ -117,7 +117,7 @@ CPU is deliberately NOT a pressure source:
   Horizontal scale is the right answer to "not enough CPU", not pausing
   intake on the one pod that is already maxed.
 
-The seam is built to accept a CPU source LATER with **zero API change**.
+`UnifiedPressure` can accept a CPU source LATER with **zero API change**.
 `UnifiedPressure::add_source` takes any `PressureSource`; a future CPU
 source would plug in as a SOFT, weighted source and every existing caller
 of `level()` / `should_hold()` is untouched. The decision to drop CPU is a
