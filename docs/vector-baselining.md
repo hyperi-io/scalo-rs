@@ -690,7 +690,7 @@ worth it for a hot-path runtime. Global cgroup memory + PSI is enough.
    independent).
 2. 9.1 ARC (the big one; land the AIMD sink controller, then fold in
    adaptive sink batching 9.x and the rate-limiter 9.5 on the same
-   sender seam).
+   sender layer).
 3. 9.4 verify/patch the within-app parse-once lane + CoW.
 4. Bake the before/after into the Section 7 benches so each is measured,
    not asserted.

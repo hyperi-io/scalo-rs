@@ -155,7 +155,7 @@ paths.ensure_dirs()?;              // mkdir -p all of them
 let cfg_path = paths.config_dir.join("settings.yaml");
 ```
 
-`discover_for(env)` is the test seam -- feed in a specific
+`discover_for(env)` is the entry point for tests -- feed in a specific
 `Environment` and bypass detection.
 
 ---
