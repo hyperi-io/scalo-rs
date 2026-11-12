@@ -77,7 +77,7 @@ impl Semaphore {
     }
 
     /// Lease a permit, parking until `leased < target`. Releases on drop.
-    fn acquire(&self) -> SemaphoreGuard<'_> {
+    pub(crate) fn acquire(&self) -> SemaphoreGuard<'_> {
         let mut st = self.state.lock();
         while st.leased >= st.target {
             self.available.wait(&mut st);
@@ -118,7 +118,7 @@ impl Semaphore {
     }
 }
 
-struct SemaphoreGuard<'a> {
+pub(crate) struct SemaphoreGuard<'a> {
     semaphore: &'a Semaphore,
 }
 
