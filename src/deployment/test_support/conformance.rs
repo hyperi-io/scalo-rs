@@ -379,8 +379,8 @@ impl TransportReceiver for PullSource {
                 continue;
             }
             // Cumulative: committing k acknowledges every offset below it in the partition.
-            for offset in from..=t.offset {
-                if let Some(m) = marker_of(&state.partitions[t.partition][offset]) {
+            for payload in &state.partitions[t.partition][from..=t.offset] {
+                if let Some(m) = marker_of(payload) {
                     self.log.ledger.acked(m);
                 }
             }
