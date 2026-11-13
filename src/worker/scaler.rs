@@ -111,6 +111,20 @@ impl ScalingDecision {
     }
 }
 
+/// Publishes leased workers over `max_threads` as the saturation gauge and, when
+/// the app registered the component, as the `worker_pool_saturation` pressure.
+fn publish_saturation(pool: &AdaptiveWorkerPool, max_threads: usize) {
+    let saturation = pool.active_threads() as f64 / max_threads.max(1) as f64;
+    metrics::gauge!("worker_pool_saturation").set(saturation);
+
+    #[cfg(feature = "scaling")]
+    if let Some(sp) = pool.scaling_pressure.lock().as_ref()
+        && sp.has_component("worker_pool_saturation")
+    {
+        sp.set_component("worker_pool_saturation", saturation);
+    }
+}
+
 /// Background scaling controller.
 ///
 /// Samples CPU and memory every `scale_interval_secs`, applies the watermark
@@ -251,16 +265,118 @@ impl ScalingController {
         if let Some(stall) = crate::memory::detect_memory_stall() {
             metrics::gauge!("worker_pool_memory_psi_some").set(stall);
         }
-        metrics::gauge!("worker_pool_saturation")
-            .set(decision.target as f64 / cfg.max_threads.max(1) as f64);
+        publish_saturation(&self.pool, cfg.max_threads);
+    }
+}
 
-        // Feed ScalingPressure only when the app registered the component.
-        #[cfg(feature = "scaling")]
-        if let Some(sp) = self.pool.scaling_pressure.lock().as_ref()
-            && sp.has_component("worker_pool_saturation")
-        {
-            let saturation = decision.target as f64 / cfg.max_threads.max(1) as f64;
-            sp.set_component("worker_pool_saturation", saturation);
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use metrics::{Key, KeyName, Metadata, Recorder, SharedString, Unit};
+
+    use super::*;
+    use crate::worker::WorkerPoolConfig;
+
+    #[derive(Default)]
+    struct GaugeCapture {
+        gauges: std::sync::Mutex<HashMap<Key, Arc<AtomicU64>>>,
+    }
+
+    impl GaugeCapture {
+        fn value(&self, name: &str) -> f64 {
+            let gauges = self.gauges.lock().unwrap();
+            let (_, cell) = gauges
+                .iter()
+                .find(|(key, _)| key.name() == name)
+                .unwrap_or_else(|| panic!("gauge {name:?} was never written"));
+            f64::from_bits(cell.load(Ordering::Acquire))
         }
+    }
+
+    impl Recorder for GaugeCapture {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> metrics::Gauge {
+            let cell = Arc::clone(self.gauges.lock().unwrap().entry(key.clone()).or_default());
+            metrics::Gauge::from_arc(cell)
+        }
+
+        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    fn pool_with_target_at_max() -> AdaptiveWorkerPool {
+        let pool = AdaptiveWorkerPool::new(WorkerPoolConfig {
+            max_threads: 4,
+            min_threads: 1,
+            ..WorkerPoolConfig::default()
+        });
+        pool.semaphore.set_target(4);
+        pool
+    }
+
+    #[test]
+    fn saturation_is_leased_over_max_not_target_over_max() {
+        let pool = pool_with_target_at_max();
+        let capture = GaugeCapture::default();
+
+        let idle = metrics::with_local_recorder(&capture, || {
+            publish_saturation(&pool, 4);
+            capture.value("worker_pool_saturation")
+        });
+        assert!(
+            idle.abs() < f64::EPSILON,
+            "idle pool at target 4/4 read {idle}"
+        );
+
+        let guards: Vec<_> = (0..3).map(|_| pool.semaphore.acquire()).collect();
+        let leased = metrics::with_local_recorder(&capture, || {
+            publish_saturation(&pool, 4);
+            capture.value("worker_pool_saturation")
+        });
+        assert!(
+            (leased - 0.75).abs() < f64::EPSILON,
+            "3 of 4 leased read {leased}"
+        );
+        drop(guards);
+    }
+
+    #[cfg(feature = "scaling")]
+    #[test]
+    fn pressure_component_is_leased_over_max_not_target_over_max() {
+        use crate::scaling::{ScalingComponent, ScalingPressure, ScalingPressureConfig};
+
+        let pool = pool_with_target_at_max();
+        let pressure = Arc::new(ScalingPressure::new(
+            ScalingPressureConfig::default(),
+            vec![ScalingComponent::new("worker_pool_saturation", 1.0, 1.0)],
+        ));
+        pool.set_scaling_pressure(Arc::clone(&pressure));
+        let component = || pressure.snapshot().components[0].raw_value;
+
+        publish_saturation(&pool, 4);
+        assert!(
+            component().abs() < f64::EPSILON,
+            "idle pool read {}",
+            component()
+        );
+
+        let guards: Vec<_> = (0..3).map(|_| pool.semaphore.acquire()).collect();
+        publish_saturation(&pool, 4);
+        assert!(
+            (component() - 0.75).abs() < f64::EPSILON,
+            "3 of 4 leased read {}",
+            component()
+        );
+        drop(guards);
     }
 }
