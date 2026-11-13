@@ -3,7 +3,7 @@
 <!-- BADGES:START -->
 [![Build Status](https://github.com/hyperi-io/scalo-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/scalo-rs/actions)
 [![Crates.io](https://img.shields.io/crates/v/scalo?logo=rust)](https://crates.io/crates/scalo)
-[![Rust Version](https://img.shields.io/badge/rust-1.95%2B-blue?logo=rust)](https://www.rust-lang.org/)
+[![Rust Version](https://img.shields.io/crates/msrv/scalo?logo=rust)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](https://www.apache.org/licenses/LICENSE-2.0)
 <!-- BADGES:END -->
 
