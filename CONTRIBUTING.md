@@ -156,7 +156,7 @@ hyperi-ci check
 it once with `uv tool install hyperi-ci` (or `pipx install hyperi-ci`), or run it
 ad hoc with `uvx hyperi-ci check`. It runs the project's full local validation --
 the same suite CI runs -- and reports what to fix. Run it before every push and before opening a
-pull request; it is the single best way to give your change the best chance of
+pull request. It is the single best way to give your change the best chance of
 surviving CI.
 
 To run the tests by hand, use `cargo nextest run --all-features`, not plain `cargo test`. The suite shares process-global state (the config cascade, the metrics recorder, the health registry), so it needs nextest's one process per test, and under `cargo test` tests fail for that reason alone.
@@ -176,3 +176,48 @@ This happens automatically - no manual intervention required.
 ## Questions
 
 If you have questions about contributing, please open an issue or contact us.
+
+## Context
+
+### What this is
+
+HyperI's shared Rust library -- config cascade, logging, metrics, health,
+self-regulation, transports, spool and DLQ, secrets and the deployment-contract
+generators -- published as `scalo` on crates.io under Apache-2.0.
+
+scalo-py is a separate Python library with the same conventions and a different
+API. Check its own docs for what it supports.
+
+### Where things live
+
+| Path | What it holds |
+| ------ | --------------- |
+| `src/<module>/` | One directory per module, gated by the feature of the same name |
+| `docs/core-pillars/` | config, logging, metrics, health, tracing, shutdown, lifecycle |
+| `docs/pipeline/` | spool, DLQ, tiered sink, worker pool, batch engine, scaling |
+| `benches/` | Criterion benches -- config, logger, engine, strmatch, auth, loadgen |
+| `docs/architecture.md` | Layering and the crate dependency graph |
+
+### Commands that prove a change
+
+```bash
+make quality   # fmt, clippy, audit
+make test      # the suite
+make bench     # criterion
+```
+
+Read the per-job CI result, never a local summary.
+
+### What tends to bite
+
+| Don't | Do | Why |
+| ------- | ---- | ----- |
+| Declare rustflags under `[build]` | Put them under `[target.<triple>]` | The ARC pod sets `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which counts as a target entry, and cargo reads `build.rustflags` ONLY when no target entry exists. A committed, correct-looking config.toml ships without its flags and nothing fails |
+| Negate a file inside an excluded directory in `.gitignore` | Exclude with `.cargo/*` so the negation can apply | `.cargo/` excludes the directory, so `!.cargo/config.toml` is inert and the file never commits |
+| Read an instruction count as proof a target-cpu applied | Compare VEX to legacy-SSE encodings within one binary | Crates with runtime dispatch compile AVX2 paths whatever `target-cpu` says, so a raw BMI2 or ymm count measures what the binary LINKS, not what the compiler was told |
+
+### Where this sits
+
+Generated from `dfe-infra/suite.yaml` via `dfe-stack suite`. Seven DFE Rust
+consumers declare this crate: receiver, loader, fetcher, archiver, transform-vrl,
+transform-vector and transform-elastic.
