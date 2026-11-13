@@ -68,8 +68,8 @@ Built as the foundation for PB/hr data services.
 orchestration, APIs and integration glue in Python. Same conventions, DIFFERENT
 API, separate repo. Never assume parity.
 
-Opinionated about correctness -- backpressure, memory safety and the health
-probes are on by default. Unopinionated about your domain -- no web framework, no
+Opinionated about correctness -- backpressure, the memory guard and the health
+probes are built in and come on with their features. Unopinionated about your domain -- no web framework, no
 ORM, no enforced transport.
 
 This module exists because of this --

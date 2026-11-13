@@ -196,7 +196,7 @@ API. Check its own docs for what it supports.
 | `docs/core-pillars/` | config, logging, metrics, health, tracing, shutdown, lifecycle |
 | `docs/pipeline/` | spool, DLQ, tiered sink, worker pool, batch engine, scaling |
 | `benches/` | Criterion benches -- config, logger, engine, strmatch, auth, loadgen |
-| `docs/architecture.md` | Layering, the crate dependency graph, and what scalo-py has that this does not |
+| `docs/architecture.md` | Layering and the crate dependency graph |
 
 ### Commands that prove a change
 
