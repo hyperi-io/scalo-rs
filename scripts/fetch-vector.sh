@@ -72,7 +72,7 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     exit 1
 fi
 
-# Release the lock however we leave, so a failed download does not wedge every
+# Release the lock however we leave, so a failed download does not block every
 # later run behind a lock nobody holds.
 cleanup() {
     rm -rf "$LOCK_DIR" "${WORK_DIR:-}"

@@ -26,7 +26,7 @@
 //!
 //! The mapping is isolated to this module: a future hand-rolled frame could
 //! replace [`records_to_proto`] / [`proto_batch_to_records`] without touching
-//! the `WorkBatch` types or the transport seam.
+//! the `WorkBatch` types or the transport traits.
 //!
 //! ## What does NOT cross the wire
 //!

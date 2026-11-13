@@ -44,7 +44,7 @@ pub struct SpoolConfig {
     /// What to do when a corrupt cache is detected (queue won't open, or a CRC
     /// check fails on read). Default [`CorruptionPolicy::Quarantine`]: move the
     /// corrupt queue's files into a timestamped `corrupt-*` subdirectory of
-    /// `path` and start fresh, so a poisoned spill cache can never wedge the
+    /// `path` and start fresh, so a poisoned spill cache can never stop the
     /// service or silently serve bad data. A cache another live process holds
     /// is refused, never quarantined.
     #[serde(default)]

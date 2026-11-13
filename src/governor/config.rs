@@ -165,8 +165,8 @@ impl SelfRegulationConfig {
     /// Build the [`Hysteresis`] band from the config.
     ///
     /// An inverted / non-finite band falls back to the defaults
-    /// (`0.80 / 0.65`) rather than failing -- a bad knob must not wedge the
-    /// governor.
+    /// (`0.80 / 0.65`) rather than failing -- a bad knob must not leave the
+    /// governor latched.
     #[must_use]
     pub fn hysteresis(&self) -> Hysteresis {
         Hysteresis::new(self.pause_above, self.resume_below).unwrap_or_else(|e| {
@@ -259,7 +259,7 @@ mod tests {
     }
 
     /// An out-of-`[0,1]` band (here a negative resume that could never release
-    /// the latch) must fall back to the safe defaults, not wedge the governor.
+    /// the latch) must fall back to the safe defaults, not leave the governor latched.
     #[test]
     fn out_of_range_band_falls_back_to_defaults() {
         let cfg = SelfRegulationConfig {

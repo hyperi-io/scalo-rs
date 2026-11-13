@@ -127,7 +127,7 @@ impl CircuitBreaker {
     }
 
     /// Lock the inner cell, tolerating poison (breaker state is just counters;
-    /// a panic elsewhere must not wedge the data plane).
+    /// a panic elsewhere must not stop the data plane).
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
             .lock()
