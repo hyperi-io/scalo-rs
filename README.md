@@ -112,62 +112,17 @@ Which is the bit you would have to build:
 Read [health.md](docs/core-pillars/health.md) before you point a probe at a port:
 two routers can serve the health paths and they do NOT carry the same set.
 
-## License
-
-[Apache-2.0](LICENSE). Third-party attributions are recorded in [NOTICE](NOTICE).
-
 ## Related
 
 - **[scalo-py](https://github.com/hyperi-io/scalo-py)** -- sister library for
   Python control-plane services. Same opinions, same patterns, Python idiom.
 
-## Context
+## Help and contributing
 
-### What this is
-
-HyperI's shared Rust library -- config cascade, logging, metrics, health,
-self-regulation, transports, spool and DLQ, secrets and the deployment-contract
-generators -- published as `scalo` on crates.io under Apache-2.0.
-
-It is scalo-py's SISTER, not its twin: same conventions, DIFFERENT API, separate
-repo. Never assume parity.
-
-### Where things live
-
-| Path | What it holds |
-| ------ | --------------- |
-| `src/<module>/` | One directory per module, gated by the feature of the same name |
-| `docs/core-pillars/` | config, logging, metrics, health, tracing, shutdown, lifecycle |
-| `docs/pipeline/` | spool, DLQ, tiered sink, worker pool, batch engine, scaling |
-| `benches/` | Criterion benches -- config, logger, engine, strmatch, auth, loadgen |
-| `docs/architecture.md` | Layering, the crate dependency graph, and what scalo-py has that this does not |
-
-### Commands that prove a change
-
-```bash
-make quality   # fmt, clippy, audit
-make test      # the suite
-make bench     # criterion
-```
-
-Rust builds on this host run under `nice -n 19` via the `~/.local/bin/cargo`
-shim. Never set `CARGO_BUILD_JOBS` -- it beats the shim. Read the per-job CI
-result, never a local summary.
-
-### What tends to bite
-
-| Don't | Do | Why |
-| ------- | ---- | ----- |
-| Declare rustflags under `[build]` | Put them under `[target.<triple>]` | The ARC pod sets `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which counts as a target entry, and cargo reads `build.rustflags` ONLY when no target entry exists. A committed, correct-looking config.toml ships without its flags and nothing fails |
-| Negate a file inside an excluded directory in `.gitignore` | Exclude with `.cargo/*` so the negation can apply | `.cargo/` excludes the directory, so `!.cargo/config.toml` is inert and the file never commits |
-| Read an instruction count as proof a target-cpu applied | Compare VEX to legacy-SSE encodings within one binary | Crates with runtime dispatch compile AVX2 paths whatever `target-cpu` says, so a raw BMI2 or ymm count measures what the binary LINKS, not what the compiler was told |
-
-### Where this sits
-
-Generated from `dfe-infra/suite.yaml` via `dfe-stack suite`. Seven DFE Rust
-consumers declare this crate: receiver, loader, fetcher, archiver, transform-vrl,
-transform-vector and transform-elastic.
-
-## Issues
+How to work in this repo, the commands that prove a change and what tends to bite are in [CONTRIBUTING.md](CONTRIBUTING.md). A question that is not a bug goes in a new issue.
 
 Open bugs: [this repo](https://github.com/hyperi-io/scalo-rs/issues?q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor) | [whole DFE suite](https://github.com/search?type=issues&q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor+repo%3Ahyperi-io%2Fdfe-infra+repo%3Ahyperi-io%2Fdfe-docker+repo%3Ahyperi-io%2Fdfe-deploy+repo%3Ahyperi-io%2Fdfe-engine+repo%3Ahyperi-io%2Fdfe-loader+repo%3Ahyperi-io%2Fdfe-receiver+repo%3Ahyperi-io%2Fdfe-fetcher+repo%3Ahyperi-io%2Fdfe-archiver+repo%3Ahyperi-io%2Fdfe-transform-vrl+repo%3Ahyperi-io%2Fdfe-transform-vector+repo%3Ahyperi-io%2Fdfe-transform-elastic+repo%3Ahyperi-io%2Fdfe-ui+repo%3Ahyperi-io%2Fdfe-hyperdx+repo%3Ahyperi-io%2Fscalo-rs+repo%3Ahyperi-io%2Fscalo-py+repo%3Ahyperi-io%2Flogreducer+repo%3Ahyperi-io%2Fdfe-schemas+repo%3Ahyperi-io%2Fvector-vrl+repo%3Ahyperi-io%2Fculvert+repo%3Ahyperi-io%2Fdfe-clickhouse-rs+repo%3Ahyperi-io%2Ffactbook-rs)
+
+## License
+
+[Apache-2.0](LICENSE). Third-party attributions are recorded in [NOTICE](NOTICE).
