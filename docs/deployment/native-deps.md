@@ -133,6 +133,8 @@ deps.apt_repos.push(AptRepoContract {
 });
 ```
 
+A repo's `install_env` sets environment for the `apt-get install` of that repo's packages only, as a prefix on that one command and never as an image `ENV`. A package that refuses to install until a licence is accepted takes `install_env: {"ACCEPT_EULA": "Y"}`, and the generator gives that repo its own install line, `&& ACCEPT_EULA='Y' apt-get install -y --no-install-recommends <packages>`.
+
 The build asserts the key's OpenPGP fingerprint before it dearmors the key into the keyring, so a compromised mirror cannot substitute its own key. A rotated key fails the build: re-derive the fingerprint rather than dropping the check. Pinning makes trust-on-first-use a one-time event. It does not prove the key was legitimate to begin with.
 
 The generated fragment, on trixie:
@@ -263,7 +265,7 @@ drift-detection pattern.
 | `BaseDistro` | The distro release the package names target |
 | `base_distro_from_cascade()` / `resolve_base_distro(base)` | Cascade reader / full resolution |
 | `DEFAULT_BASE_DISTRO` | The assumed release when nothing answers (`trixie`) |
-| `AptRepoContract` | One custom APT repo (`key_url`, `keyring`, `url`, `codename`, `key_fingerprint`, `packages`) |
+| `AptRepoContract` | One custom APT repo (`key_url`, `keyring`, `url`, `codename`, `key_fingerprint`, `packages`, `install_env`) |
 
 ---
 
