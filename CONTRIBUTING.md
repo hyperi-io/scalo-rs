@@ -185,8 +185,8 @@ HyperI's shared Rust library -- config cascade, logging, metrics, health,
 self-regulation, transports, spool and DLQ, secrets and the deployment-contract
 generators -- published as `scalo` on crates.io under Apache-2.0.
 
-It is scalo-py's SISTER, not its twin: same conventions, DIFFERENT API, separate
-repo. Never assume parity.
+scalo-py is a separate Python library with the same conventions and a different
+API. Check its own docs for what it supports.
 
 ### Where things live
 
