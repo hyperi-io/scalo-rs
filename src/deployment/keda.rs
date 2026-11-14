@@ -31,7 +31,8 @@ pub struct KedaConfig {
     pub max_replicas: u32,
     /// Seconds between KEDA polling the scaler.
     pub polling_interval: u32,
-    /// Seconds before scale-down after load drops.
+    /// Seconds after the last active trigger before KEDA scales to zero, so it
+    /// applies only when `min_replicas` is 0.
     pub cooldown_period: u32,
     /// Scale when consumer group lag exceeds this per partition.
     pub kafka_lag_threshold: u64,

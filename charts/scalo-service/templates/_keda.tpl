@@ -69,7 +69,8 @@ release namespace.
 {{/*
 scalo-service.scaledobject -- a KEDA ScaledObject named <fullname>-scaler while KEDA is
 on. A ScaledObject with no trigger is refused by KEDA, and KEDA's CPU scaler cannot wake
-a workload from zero, so either fails the render here.
+a workload from zero, so either fails the render here. Scale-down is paced by
+keda.scaleDown, and scale-up keeps the Kubernetes HPA default.
 */}}
 {{- define "scalo-service.scaledobject" -}}
 {{- if include "scalo-service.kedaEnabled" . -}}
@@ -97,7 +98,15 @@ a workload from zero, so either fails the render here.
 {{- if and $cpuOnly (eq $min 0) -}}
 {{- fail "scalo-service: CPU is the only KEDA trigger and minReplicaCount is 0, and KEDA's CPU scaler cannot wake a workload from zero" -}}
 {{- end -}}
-{{- $spec := dict "scaleTargetRef" (dict "name" (include "scalo-service.fullname" .)) "minReplicaCount" $min "maxReplicaCount" $max "pollingInterval" $polling "cooldownPeriod" $cooldown "triggers" $triggers -}}
+{{- $scaleDown := $keda.scaleDown | default dict -}}
+{{- $window := 300 -}}
+{{- if hasKey $scaleDown "stabilizationWindowSeconds" }}{{ $window = int $scaleDown.stabilizationWindowSeconds }}{{ end -}}
+{{- $percent := 25 -}}
+{{- if hasKey $scaleDown "percent" }}{{ $percent = int $scaleDown.percent }}{{ end -}}
+{{- $period := 60 -}}
+{{- if hasKey $scaleDown "periodSeconds" }}{{ $period = int $scaleDown.periodSeconds }}{{ end -}}
+{{- $behavior := dict "scaleDown" (dict "stabilizationWindowSeconds" $window "policies" (list (dict "type" "Percent" "value" $percent "periodSeconds" $period))) -}}
+{{- $spec := dict "scaleTargetRef" (dict "name" (include "scalo-service.fullname" .)) "minReplicaCount" $min "maxReplicaCount" $max "pollingInterval" $polling "cooldownPeriod" $cooldown "triggers" $triggers "advanced" (dict "horizontalPodAutoscalerConfig" (dict "behavior" $behavior)) -}}
 {{- if hasKey $keda "idleReplicaCount" }}{{ $_ := set $spec "idleReplicaCount" (int $keda.idleReplicaCount) }}{{ end -}}
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject

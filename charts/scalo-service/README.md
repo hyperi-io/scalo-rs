@@ -135,6 +135,9 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `strategy` | derived | Replaces the derived Recreate or surge-first strategy |
 | `keda.enabled` | contract | KEDA on or off |
 | `keda.minReplicaCount`, `maxReplicaCount`, `idleReplicaCount`, `pollingInterval`, `cooldownPeriod` | contract | ScaledObject bounds |
+| `keda.scaleDown.stabilizationWindowSeconds` | 300 | Seconds the HPA holds the highest recent recommendation before it removes pods. Read with `hasKey`, so 0 holds |
+| `keda.scaleDown.percent` | 25 | Most of the current pods removed in one period |
+| `keda.scaleDown.periodSeconds` | 60 | Length of that period |
 | `keda.cpu.enabled`, `keda.cpu.targetUtilization` | contract `cpu_enabled`, `cpu_threshold` | CPU trigger |
 | `keda.kafka.enabled`, `lagThreshold`, `activationLagThreshold` | contract | Kafka lag trigger |
 | `keda.triggers` | none | Replaces every derived trigger |

@@ -34,6 +34,47 @@ tests:
                 topic: events
                 lagThreshold: "1000"
                 activationLagThreshold: "0"
+      - equal:
+          path: spec.advanced.horizontalPodAutoscalerConfig.behavior
+          value:
+            scaleDown:
+              stabilizationWindowSeconds: 300
+              policies:
+                - type: Percent
+                  value: 25
+                  periodSeconds: 60
+      - notExists:
+          path: spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleUp
+
+  - it: takes the scale-down pacing from keda.scaleDown, and an explicit 0 window holds
+    template: scaledobject.yaml
+    set:
+      keda.scaleDown.stabilizationWindowSeconds: 0
+      keda.scaleDown.percent: 50
+      keda.scaleDown.periodSeconds: 30
+    asserts:
+      - equal:
+          path: spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown
+          value:
+            stabilizationWindowSeconds: 0
+            policies:
+              - type: Percent
+                value: 50
+                periodSeconds: 30
+
+  - it: keeps the default for each scale-down key values leave unset
+    template: scaledobject.yaml
+    set:
+      keda.scaleDown.percent: 10
+    asserts:
+      - equal:
+          path: spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown
+          value:
+            stabilizationWindowSeconds: 300
+            policies:
+              - type: Percent
+                value: 10
+                periodSeconds: 60
 
   - it: reads the trigger's brokers from values over default_config and takes values bounds
     template: scaledobject.yaml

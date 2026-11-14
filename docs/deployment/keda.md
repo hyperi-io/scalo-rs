@@ -17,7 +17,7 @@ pub struct KedaContract {
     pub min_replicas: u32,
     pub max_replicas: u32,
     pub polling_interval: u32,        // seconds between KEDA polls
-    pub cooldown_period: u32,         // seconds before scale-down after load drops
+    pub cooldown_period: u32,         // seconds idle before scaling to zero (min_replicas 0 only)
     pub kafka_lag_threshold: u64,     // scale when lag > N per partition
     pub activation_lag_threshold: u64,// wake from zero when lag > N
     pub cpu_enabled: bool,
@@ -116,6 +116,8 @@ still scale on CPU by setting `keda.enabled: false` and
 The Deployment sets `replicas: <replicaCount>` exactly when neither KEDA
 nor the HPA is on, because whichever is on owns the replica count and a
 GitOps sync must not revert a scale.
+
+KEDA's `cooldownPeriod` governs only the step to zero. Between 1 and N pods the HPA that KEDA creates decides, and the chart sets its scale-down behaviour from `keda.scaleDown`: `stabilizationWindowSeconds` (default 300), then at most `percent` (25) of the pods per `periodSeconds` (60). Scale-up keeps the Kubernetes default.
 
 ---
 

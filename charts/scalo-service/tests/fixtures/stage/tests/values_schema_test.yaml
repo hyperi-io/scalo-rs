@@ -27,6 +27,20 @@ tests:
       - failedTemplate:
           errorPattern: "extraEnv"
 
+  - it: refuses a scale-down percent of 0, which the HPA API rejects
+    set:
+      keda.scaleDown.percent: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "percent"
+
+  - it: refuses a scale-down period past the HPA API's 1800 s ceiling
+    set:
+      keda.scaleDown.periodSeconds: 1801
+    asserts:
+      - failedTemplate:
+          errorPattern: "periodSeconds"
+
   - it: refuses a dial below its minimum
     set:
       config.buffer.flush_rows: 0
