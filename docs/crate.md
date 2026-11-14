@@ -58,6 +58,6 @@ The default is `config` and `logger`. Everything else is opt-in, so you pay only
 | `deployment` | The deployment contract and its Dockerfile and manifest generators |
 | `full` | All of the above and more |
 
-There are 69 features in all. The full list, what each pulls in and which combinations matter are at <https://github.com/hyperi-io/scalo-rs/blob/main/docs/feature-flags.md>. `transport-kafka` links librdkafka, so the build host and the image need it: <https://github.com/hyperi-io/scalo-rs/blob/main/docs/deployment/native-deps.md>.
+The full list, what each pulls in and which combinations matter are at <https://github.com/hyperi-io/scalo-rs/blob/main/docs/feature-flags.md>. `transport-kafka` links librdkafka, so the build host and the image need it: <https://github.com/hyperi-io/scalo-rs/blob/main/docs/deployment/native-deps.md>.
 
-API docs are at <https://docs.rs/scalo>, the source and the guides at <https://github.com/hyperi-io/scalo-rs>. Requires Rust 1.95 or later. Licensed Apache-2.0: <https://github.com/hyperi-io/scalo-rs/blob/main/LICENSE>.
+API docs are at <https://docs.rs/scalo>, the source and the guides at <https://github.com/hyperi-io/scalo-rs>. Requires the Rust version `rust-version` names in `Cargo.toml`. Licensed Apache-2.0: <https://github.com/hyperi-io/scalo-rs/blob/main/LICENSE>.

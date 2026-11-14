@@ -1,8 +1,7 @@
 # Feature flags
 
-`scalo` ships ~60 cargo features. The trim in 2.6.0 dropped
-defaults to the minimum (`config`, `logger`) so the
-"I-just-want-config" use case avoids ~200 transitive deps. Every other
+The defaults are the minimum (`config`, `logger`), so the
+"I-just-want-config" use case avoids most transitive deps. Every other
 feature is opt-in.
 
 This doc covers:

@@ -80,7 +80,7 @@ pub(super) fn aad_for(cache_key: &str) -> Vec<u8> {
 /// Encrypted cache envelope. JSON-serialised to disk.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Envelope {
-    /// Format version. Currently always `1`.
+    /// Format version.
     pub v: u8,
     /// Base64-url-no-pad encoded 12-byte nonce.
     pub nonce: String,

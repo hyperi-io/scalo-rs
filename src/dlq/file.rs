@@ -108,7 +108,7 @@ impl FileDlqInner {
     /// Flush buffered bytes to the kernel page cache.
     ///
     /// See [`crate::io::NdjsonWriter::flush`] for the durability
-    /// caveat -- currently best-effort through the kernel page cache
+    /// caveat -- best-effort through the kernel page cache
     /// only.
     ///
     /// # Errors

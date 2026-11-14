@@ -172,8 +172,8 @@ Section landing: [api/README.md](api/README.md)
   [core-pillars/logging.md](core-pillars/logging.md) for what's
   shipped.
 - **`cache` module** (moka TinyLFU async cache). Documented in
-  [api/cache.md](api/cache.md) but not currently built into the crate;
-  there is no `cache` feature or `scalo::cache` module in this release.
+  [api/cache.md](api/cache.md) but not built into the crate: there is
+  no `cache` feature or `scalo::cache` module.
 
 ### Workflow artefacts (not user docs)
 

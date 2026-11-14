@@ -9,8 +9,8 @@
 //! The constructed governor bundle the runtime threads into transports + driver.
 //!
 //! [`SelfRegulationGovernor`] is what [`SelfRegulationConfig::build`] produces
-//! when `enabled = true`: ONE shared [`UnifiedPressure`] (memory-only HARD
-//! source today) plus ONE [`ByteBudgetController`] (the AIMD lever) over that
+//! when `enabled = true`: ONE shared [`UnifiedPressure`] (memory is the HARD
+//! source) plus ONE [`ByteBudgetController`] (the AIMD lever) over that
 //! same pressure. The runtime constructs it BEFORE the transports and the
 //! engine driver so the pressure can be threaded into:
 //!

@@ -766,7 +766,7 @@ impl MetricsManager {
     /// Create a histogram metric with custom buckets.
     ///
     /// **Note:** The `buckets` parameter is captured in the manifest registry
-    /// but currently ignored by the `metrics` crate at runtime (buckets are set
+    /// but ignored by the `metrics` crate at runtime (buckets are set
     /// globally at recorder installation time).
     #[must_use]
     pub fn histogram_with_buckets(

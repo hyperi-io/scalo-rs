@@ -295,7 +295,7 @@ pub fn install_default_provider() -> bool {
 /// Is `group` a hybrid post-quantum (ML-KEM) key-exchange group?
 ///
 /// Add `SecP384r1MLKEM1024` (the CNSA-pure P-384 + ML-KEM-1024 hybrid) here
-/// when rustls/aws-lc-rs expose it. Today the widely-deployed
+/// when rustls/aws-lc-rs expose it. Until then the widely-deployed
 /// `X25519MLKEM768` is the one available.
 fn is_hybrid_pqc(group: NamedGroup) -> bool {
     matches!(group, NamedGroup::X25519MLKEM768)

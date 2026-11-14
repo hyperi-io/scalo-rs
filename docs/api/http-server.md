@@ -40,7 +40,7 @@ NOT mounted here, whatever the feature set: `/metrics`, `/metrics/manifest`,
 `/scaling/pressure`, `/memory/pressure`. Those belong to the metrics server --
 see [../core-pillars/metrics.md](../core-pillars/metrics.md).
 
-`enable_metrics_endpoint` on `HttpServerConfig` is currently inert: the field
+`enable_metrics_endpoint` on `HttpServerConfig` is inert: the field
 exists and `build_router` does not read it. Setting it changes nothing.
 
 ---
