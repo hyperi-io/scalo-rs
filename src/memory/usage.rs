@@ -489,12 +489,16 @@ mod tests {
     #[test]
     fn reader_reuses_a_reading_within_the_cache_interval() {
         let dir = fixture(&[("memory.current", "1000\n")]);
-        let reader = UsageReader::new(UsageSource::CgroupV2(dir.path().to_path_buf()));
+        let source = || UsageSource::CgroupV2(dir.path().to_path_buf());
+        // An hour-long window, so a runner stalled between two reads cannot expire it.
+        let held = UsageReader::with_interval(source(), Duration::from_secs(3600));
+        let reader = UsageReader::new(source());
+        assert_eq!(held.read(), Some(1000));
         assert_eq!(reader.read(), Some(1000));
 
         std::fs::write(dir.path().join("memory.current"), "2000\n").expect("rewrite");
         assert_eq!(
-            reader.read(),
+            held.read(),
             Some(1000),
             "a fresh reading is served from the cache, not re-read"
         );
