@@ -103,7 +103,7 @@ const fn paused_health(paused: bool) -> crate::health::HealthStatus {
 impl GateActuator for ObservingActuator {
     fn pause(&self) {
         // `self_regulation_` domain prefix + a `source` label: a bare
-        // `inbound_paused` collides with nothing today but reads ambiguously
+        // `inbound_paused` collides with nothing but reads ambiguously
         // next to `MemoryGuard`/`ScalingPressure` gauges, and the label lets two
         // governed receivers (e.g. Kafka + HTTP) be told apart -- without it the
         // single global series shows "unpaused" while one source is still held.

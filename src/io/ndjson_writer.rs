@@ -81,8 +81,8 @@ pub struct NdjsonWriter {
     /// Current (non-rotated) output file, probed after each write because
     /// `file-rotate` swallows open failures -- its `write()` returns `Ok`
     /// with no file handle, silently dropping the bytes. The probe is
-    /// permanent while `file-rotate` is the backend: 0.8.0, its latest release
-    /// (2025-02-27), still keeps a failed open as `None` and reports the
+    /// permanent while `file-rotate` is the backend: 0.8.0 (2025-02-27)
+    /// still keeps a failed open as `None` and reports the
     /// dropped write as written.
     file_path: PathBuf,
     lines_written: AtomicU64,
@@ -466,7 +466,7 @@ impl AsyncNdjsonWriter {
 
     /// Flush buffered bytes through the rotating writer off-runtime.
     ///
-    /// See [`NdjsonWriter::flush`] for durability semantics -- currently
+    /// See [`NdjsonWriter::flush`] for durability semantics -- it
     /// flushes to kernel page cache only (the `file-rotate` crate
     /// doesn't expose the inner `File` for `fsync`).
     ///

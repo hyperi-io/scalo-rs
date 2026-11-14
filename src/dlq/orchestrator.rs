@@ -184,7 +184,7 @@ impl Dlq {
     ///
     /// # Errors
     ///
-    /// None today: the `Result` keeps room for a refusal that is not a
+    /// None: the `Result` keeps room for a refusal that is not a
     /// backend's.
     pub fn spawn(
         config: &DlqConfig,

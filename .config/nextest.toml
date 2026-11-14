@@ -38,8 +38,8 @@ binary(kafka_consumer_outage)
 '''
 test-group = 'own-broker'
 
-# The operational tests build a docker image inside the test. On a 4-CPU
-# runner that takes over 5 minutes, and two at once compete for the CPUs.
+# The operational tests build a docker image inside the test, and two at once
+# compete for the CPUs.
 [[profile.default.overrides]]
 filter = 'binary(operational_cpu) | binary(operational_memory)'
 slow-timeout = { period = "120s", terminate-after = 10 }

@@ -14,7 +14,7 @@ the bus, a gRPC endpoint on the direct transport. Sits on top of
 | ------- | --------- | ----- |
 | receiver | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
 | fetcher | **Yes** | Each source maps to its own destination, plus per-record routes |
-| VRL transform | **Yes** | Its sink list is config-driven -- one destination today, a list tomorrow |
+| VRL transform | **Yes** | Its sink list is config-driven, one destination or several |
 | Vector-compat transform | **Yes** | Same, though Vector owns the transform config itself |
 | loader | No | One ClickHouse sink -- 1:1 transport |
 | archiver | No | One object-storage sink -- 1:1 transport |

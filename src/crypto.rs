@@ -33,7 +33,7 @@
 //!
 //! The symmetric + hash choices (AES-256-GCM, SHA-384) meet **CNSA 2.0**. The
 //! asymmetric choices (ECDH/ECDSA P-384) are the **CNSA 1.0** classical suite.
-//! The hybrid ML-KEM key-exchange layer is the feasible-today step toward full
+//! The hybrid ML-KEM key-exchange layer is the available step toward full
 //! CNSA 2.0 (ML-KEM-1024 / ML-DSA-87). We do not label a P-384 baseline
 //! "CNSA 2.0".
 

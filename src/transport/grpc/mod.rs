@@ -1345,7 +1345,7 @@ impl GrpcTransport {
         let mut client = client.clone();
         let result = match self.within_send_timeout(client.route_batch(request)).await {
             Ok(response) => {
-                // Server is all-or-nothing today, but the proto permits partial
+                // Server is all-or-nothing, but the proto permits partial
                 // acceptance. Treating ANY Ok as full success would fire every
                 // commit token while the receiver kept only a prefix -- silent
                 // loss. Require accepted == sent. A shortfall is retryable

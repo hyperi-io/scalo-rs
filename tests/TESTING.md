@@ -25,8 +25,8 @@ Full adds the rest of the real-broker tests (`kafka_send_batch`, `kafka_recv_run
 
 | Service | Image | Container port |
 | --- | --- | --- |
-| Kafka | `apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837` | 9092 PLAINTEXT |
-| OpenBao | `openbao/openbao:2.6.1@sha256:5b2486ab0fb90bbc788cc345b0a08616dfb375873ee8be5df3a2fd4d378a67e0` | 8200, dev mode, root token `root` |
+| Kafka | `apache/kafka` | 9092 PLAINTEXT |
+| OpenBao | `openbao/openbao` | 8200, dev mode, root token `root` |
 
 The Kafka pin is `transport::kafka::test_support::KAFKA_IMAGE`, the line the DFE stack deploys. The OpenBao pin lives in `tests/common/openbao.rs`.
 

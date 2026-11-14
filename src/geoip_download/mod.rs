@@ -174,7 +174,7 @@ impl Kind {
 ///
 /// # Errors
 ///
-/// Returns no error today: download failures are absorbed and reported as
+/// Returns no error: download failures are absorbed and reported as
 /// `None` paths. The `Result` reserves room for a hard failure without a
 /// breaking signature change.
 pub async fn ensure_databases(config: &GeoIpConfig) -> Result<DatabasePaths, GeoIpDownloadError> {

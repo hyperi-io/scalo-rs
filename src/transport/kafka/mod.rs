@@ -270,7 +270,7 @@ pub struct KafkaTransport {
     /// Transport-level message filter engine.
     filter_engine: super::filter::TransportFilterEngine,
     /// Optional inbound gate (`governor` feature). `None` by default ->
-    /// `recv()` makes no gate calls and behaviour is byte-identical to today.
+    /// `recv()` makes no gate calls.
     /// When `Some`, each `recv()` calls `InboundGate::evaluate`, which drives
     /// the [`KafkaGateActuator`] on pause/resume edges, and reports the records
     /// its poll returned with `InboundGate::note_received`. The poll is ALWAYS

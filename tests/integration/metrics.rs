@@ -16,7 +16,7 @@
 //! recorder. The lock is held across `.await` points by design -- there is no
 //! second task that can contend (tests are serialised, the lock has no cross-
 //! task purpose). Switching to `tokio::sync::Mutex` would change nothing
-//! semantically and just churn 30 call sites.
+//! semantically and just churn every call site.
 #![allow(clippy::await_holding_lock)]
 
 #[cfg(feature = "scaling")]

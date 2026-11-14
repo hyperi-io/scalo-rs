@@ -4,13 +4,8 @@
 #
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
-#
-# Override defaults with HYPERCI_* env vars.
-# Reference: config/defaults.yaml in hyperi-ci.
 
-# Category 4 (OSS): public, Apache-2.0, publishes to crates.io, neutral
-# branding -- scalo carries no HyperI brand furniture. Declared rather than
-# inferred: the prefix is a hint, never authority.
+# Category 4 (OSS): public, Apache-2.0, publishes to crates.io, neutral branding.
 classification: oss
 
 language: rust
@@ -46,8 +41,7 @@ test:
   enabled: true
   coverage: false
   rust:
-    # Require process-per-test isolation rather than taking whatever the
-    # runner has installed.
+    # Process-per-test isolation.
     nextest: true
     # Every feature, `testcontainers` included, so the real-broker tests run on
     # the Test job's Docker-capable runner.

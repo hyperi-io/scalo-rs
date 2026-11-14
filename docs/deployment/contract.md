@@ -89,7 +89,7 @@ flowchart LR
 
 Tier 3 is aspirational. The contract is JSON-serialisable and
 language-neutral by design; the Rust (`scalo`) and Python (`scalo-py`)
-producers both exist today. Cross-language consumers read
+producers both exist. Cross-language consumers read
 `deployment-contract.json` (the serialised form), not this crate.
 
 ---

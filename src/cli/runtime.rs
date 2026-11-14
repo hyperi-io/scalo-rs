@@ -10,8 +10,7 @@
 //!
 //! [`ServiceRuntime`] is created by [`super::run_app`] before calling
 //! [`ServiceApp::run_service`](super::ServiceApp::run_service). Apps receive it
-//! fully wired -- eliminates ~50 lines of identical boilerplate per consumer
-//! service.
+//! fully wired, so no consumer service repeats that boilerplate.
 //!
 //! ## What's included (always)
 //!

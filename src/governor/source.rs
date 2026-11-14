@@ -376,7 +376,7 @@ impl UnifiedPressure {
     /// soft source returning a stray weight cannot push `level()` outside its
     /// documented range or silently neutralise itself with a negative/NaN
     /// weight. One branch per soft source per `evaluate()` (not per record);
-    /// with no soft source wired today the cost is nil.
+    /// with no soft source wired the cost is nil.
     #[must_use]
     pub fn level(&self) -> f64 {
         let mut hard_max = 0.0_f64;
