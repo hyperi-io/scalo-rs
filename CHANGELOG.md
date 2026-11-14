@@ -3,6 +3,14 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.30](https://github.com/hyperi-io/scalo-rs/compare/v2.14.29...v2.14.30) (2026-11-14)
+
+### Bug Fixes
+
+* **chart:** pace KEDA scale-down at 25 percent a minute ([f5a7b9f](https://github.com/hyperi-io/scalo-rs/commit/f5a7b9f12d587c0f9154dfc5ed2e81fdd5889e1b))
+* **deployment:** iterate the acknowledged payloads directly ([#463](https://github.com/hyperi-io/scalo-rs/issues/463)) ([140b4fe](https://github.com/hyperi-io/scalo-rs/commit/140b4fe97e383c7522f3efa685945f81ebc394f6))
+* **worker:** report saturation as leased over max ([#461](https://github.com/hyperi-io/scalo-rs/issues/461)) ([41edd9a](https://github.com/hyperi-io/scalo-rs/commit/41edd9a010005ef91b96107aa082a798f4841427))
+
 ## [2.14.29](https://github.com/hyperi-io/scalo-rs/compare/v2.14.28...v2.14.29) (2026-11-10)
 
 ### Bug Fixes
