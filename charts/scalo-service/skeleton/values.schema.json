@@ -111,6 +111,14 @@
         "idleReplicaCount": { "type": "integer", "minimum": 0 },
         "pollingInterval": { "type": "integer", "minimum": 1 },
         "cooldownPeriod": { "type": "integer", "minimum": 0 },
+        "scaleDown": {
+          "type": "object",
+          "properties": {
+            "stabilizationWindowSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+            "percent": { "type": "integer", "minimum": 1 },
+            "periodSeconds": { "type": "integer", "minimum": 1, "maximum": 1800 }
+          }
+        },
         "cpu": {
           "type": "object",
           "properties": {
