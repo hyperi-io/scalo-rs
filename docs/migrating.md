@@ -1,13 +1,13 @@
 # Migrating from hyperi-rustlib to scalo
 
-`hyperi-rustlib` has been renamed and relicensed as **`scalo`** -- a generic,
-Apache-2.0 runtime for self-regulating data-plane services. `hyperi-rustlib` is
-now **deprecated**; all future development happens in `scalo`. This guide covers
-everything you need to move across.
+`hyperi-rustlib` was renamed and relicensed as **`scalo`** -- a generic,
+Apache-2.0 runtime for self-regulating data-plane services. The
+`hyperi-rustlib` repo is archived, and development continues in `scalo`. This
+guide covers the move.
 
-> Most code keeps compiling after the dependency swap -- the renamed public
-> types ship as deprecated aliases for one release, so you get warnings, not
-> errors. Work through the sections below to clear them.
+> The renamed public types shipped as deprecated aliases for one release and
+> are gone, so code still on an old name no longer compiles. The sections
+> below give each rename.
 
 ## 1. Swap the dependency
 
@@ -34,7 +34,7 @@ now gone:
 
 ```diff
 - let metrics = DfeMetrics::register(&manager)?;
-+ let metrics = ServiceMetrics::register(&manager)?;
++ let metrics = ServiceMetrics::register(&manager);
 ```
 
 ## 3. Environment variables are now bare by default
@@ -48,8 +48,8 @@ Removed with no in-lib replacement:
 
 | Removed | Use instead |
 | --------- | ------------- |
-| `HYPERI_LIB_APP_NAME` | bare `APP_NAME` (or `<YOUR_PREFIX>_APP_NAME`) |
-| `HYPERI_E2E_CLUSTER` | bare `E2E_CLUSTER` |
+| `HYPERI_LIB_APP_NAME` | bare `APP_NAME` |
+| `HYPERI_E2E_CLUSTER` | removed -- scalo reads no cluster variable |
 | `HYPERI_TELEMETRY` | removed -- gate version checks via `version_check.enabled` |
 
 If you relied on the `HYPERI_` prefix, set your own prefix once at startup and
@@ -60,23 +60,23 @@ all keys follow it.
 | Removed | Replacement |
 | --------- | ------------- |
 | `database` | none in-lib -- bring your own client |
-| `config-postgres` (Postgres config source) | none -- config cascade is now **7-layer** (was 8); use YAML/env/CLI layers |
+| `config-postgres` (Postgres config source) | none -- the config cascade is **7-layer** (was 8). Use the YAML, env and CLI layers |
 | `cache` | use `spool` / `tiered-sink` for durable buffering |
 
 If your `Cargo.toml` enabled any of these features, drop them.
 
-## 5. Version check is opt-in
+## 5. Version check has no baked-in endpoint
 
 hyperi-rustlib ran a startup version check by default against a baked-in
-endpoint. scalo ships it **off**. To keep it, set both:
+endpoint. scalo bakes in no endpoint: `enabled` defaults to `true`, and the
+check stays inert until `api_url` is set. To run it:
 
 ```yaml
 version_check:
-  enabled: true
   api_url: "https://<your-version-endpoint>"
 ```
 
-With `enabled: false` (the default) it is a no-op. No endpoint is baked in.
+Set `enabled: false` to turn it off outright.
 
 ## 6. Metric and wire-protocol names
 
@@ -100,15 +100,15 @@ rule -- bare unless a prefix is supplied). The hardcoded `dfe_` prefix is gone:
 **Feature renamed:** `metrics-dfe` -> `service-metrics`.
 
 **Modules renamed** (only matters if you imported them directly):
-`scalo::metrics::dfe` -> `scalo::metrics::service`;
+`scalo::metrics::dfe` -> `scalo::metrics::service`, and
 `scalo::metrics::dfe_groups` -> `scalo::metrics::groups`.
 
-**Types:** `DfeMetrics` -> `ServiceMetrics` (deprecated alias kept one release).
+**Types:** `DfeMetrics` -> `ServiceMetrics` (the alias shipped for one release and is gone).
 
 **Wire protocol (BREAKING -- rebuild required):** the gRPC proto package
 `dfe.transport.v1` -> `scalo.transport.v1`, service `DfeTransport` -> `Transport`.
 Wire-incompatible: every gRPC producer and consumer must rebuild against the new
-package in lockstep. Message shapes (PushRequest, Batch, Record, ...) unchanged.
+package in lockstep. The messages (`PushRequest`, `Batch`, `Record`, ...) are unchanged.
 
 ## 7. Licence
 

@@ -5,7 +5,7 @@ A release build links every C library the Kafka transport and the spool use -- l
 `NativeDepsContract` is the bookkeeping. The Dockerfile generator reads
 it and emits the right `apt-get` block, with no per-app hand-coding.
 
-rdkafka-sys runs with `dynamic-linking`, which finds librdkafka through pkg-config. The release build points pkg-config at a static-only prefix that hyperi-ci builds once per library release (hyperi-io/hyperi-ci#742): `librdkafka.a` with SSL and zstd, OpenSSL on the 3.5 LTS line, zstd and zlib, each with its `.pc` file. The build sets:
+rdkafka-sys runs with `dynamic-linking`, which finds librdkafka through pkg-config. The release build points pkg-config at a static-only prefix that hyperi-ci builds once per library release (hyperi-io/hyperi-ci#742): `librdkafka.a` with SSL and zstd, OpenSSL on its LTS line (pinned in hyperi-ci's `versions.yaml`), zstd and zlib, each with its `.pc` file. The build sets:
 
 | Variable | Value |
 | --- | --- |
@@ -45,7 +45,7 @@ let deps = NativeDepsContract::for_scalo_features(
 
 Runtime package names are release-specific, so the mapping needs to know
 which distro release the base image is. `for_features()` takes that release
-as a `BaseDistro` directly; `for_scalo_features()` resolves it, in order:
+as a `BaseDistro` directly, and `for_scalo_features()` resolves it, in order:
 
 1. `deployment.base_distro` in the config cascade, if set and recognised.
 2. The env var `DEPLOYMENT__BASE_DISTRO` - the same key's ENV-layer spelling.
@@ -53,10 +53,9 @@ as a `BaseDistro` directly; `for_scalo_features()` resolves it, in order:
 4. Otherwise the default (`trixie`), recorded in
    `unresolved_base_image` so the generated Dockerfile carries a warning.
 
-Step 2 is not redundant. Artefact generation runs on a CLI path that never
-loads the config cascade, so the YAML lookup always misses there - use the env
-var when setting the release for a `generate-artefacts` run, or the YAML key
-when the app is running normally. Both spell the same thing.
+Step 2 sets the release where no config file does. `generate-artefacts` loads
+the app's config before it builds the contract, so the YAML key and the env var
+both work there.
 
 An unrecognised value at step 1 or 2 is treated as unset and falls through, so a
 typo cannot pin the release to something nobody asked for, and cannot suppress a
@@ -71,7 +70,7 @@ Fix one of the two rather than shipping it.
 
 Tag derivation strips any digest, ignores a registry port, and tests each
 hyphen-separated component - so `debian:trixie-slim`, `rust:1-trixie` and
-`ubuntu:24.04` all resolve. A codename wins wherever it appears; a bare version
+`ubuntu:24.04` all resolve. A codename wins wherever it appears, and a bare version
 number counts only on the `debian` and `ubuntu` images themselves, because
 `postgres:13-bookworm` is postgres 13 on bookworm, not Debian 13. A
 digest-pinned or rolling tag (`ghcr.io/org/base@sha256:...`, `:stable`), or a
@@ -88,7 +87,7 @@ deployment:
 ```
 
 ```bash
-# Equivalent, and the form that works for `<app> generate-artefacts`.
+# Equivalent, with no config file.
 DEPLOYMENT__BASE_DISTRO=trixie <app> generate-artefacts --output-dir ci-artefacts
 ```
 
@@ -210,7 +209,7 @@ host's (debian trixie):
 | --- | --- |
 | `debian:trixie-slim@sha256:...` (default) | yes -- same release |
 | a newer Debian release | yes -- newer glibc |
-| an OLDER Debian, or Ubuntu | no -- older glibc; build on that base too |
+| an OLDER Debian, or Ubuntu | no -- older glibc, so build on that base too |
 | distroless `cc-debian*` | no -- see below |
 
 Distroless is not a glibc problem: `cc-debian13` is trixie, so the glibc
@@ -272,5 +271,4 @@ drift-detection pattern.
 - [contract.md](contract.md) -- `native_deps` field on the contract
 - [artefacts.md](artefacts.md) -- the generated APT block in `Dockerfile.runtime`
 - [../feature-flags.md](../feature-flags.md) -- which features pull which deps
-- README -- full build-host vs runtime-host package tables
 - Source: [../../src/deployment/native_deps.rs](../../src/deployment/native_deps.rs)

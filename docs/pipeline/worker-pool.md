@@ -31,10 +31,11 @@ that need `par_iter_mut` or other rayon primitives not covered by
 
 Rayon pools cannot be resized after creation. The pool is built once
 at `max_threads` (default = `available_parallelism`, cgroup-aware) and
-a counting semaphore controls how many threads pick up work. Threads
-that fail to acquire a permit `std::thread::yield_now`.
+a counting semaphore controls how many threads pick up work. A thread
+that finds no permit parks on a condition variable until one frees or the
+target grows.
 
-The scaler updates `permits` -- never the underlying pool size.
+The scaler moves the permit target -- never the underlying pool size.
 
 ```mermaid
 flowchart TB
@@ -44,9 +45,7 @@ flowchart TB
     Pool --> Sem --> Batch
 ```
 
-This is the same permit-throttling pattern documented in the Rust
-standards section *Permit-Throttling a Non-Resizable Pool*. See
-[`../../src/worker/pool.rs`](../../src/worker/pool.rs).
+See [`../../src/worker/pool.rs`](../../src/worker/pool.rs).
 
 ---
 
@@ -54,8 +53,8 @@ standards section *Permit-Throttling a Non-Resizable Pool*. See
 
 A background controller (`ScalingController`, started by
 `start_scaling_loop`) samples CPU and memory every
-`scale_interval_secs` (default 5 s) and adjusts permits via
-`Semaphore::set_permits`.
+`scale_interval_secs` (default 5 s) and moves the permit target
+(`Semaphore::set_target`).
 
 | Signal | Direction | Step |
 | -------- | ----------- | ------ |
@@ -71,9 +70,10 @@ to the floor and stay there, regardless of CPU. The clamp is to
 (`worker_pool_scale_events_total{direction}`) and gauges for active
 threads, target threads, CPU, memory, and saturation.
 
-Memory pressure has two sources -- sysinfo process RSS and an optional
-`MemoryGuard` attached via `set_memory_guard`. The controller uses the
-max of the two so either source can trigger the cap.
+The memory signal is the first available of the `MemoryGuard`'s
+pressure (attached with `set_memory_guard`), the cgroup's current over
+its limit, and host memory used over total. CPU is the host-wide
+sample from `sysinfo`.
 
 ---
 
@@ -84,7 +84,7 @@ max of the two so either source can trigger the cap.
 - `set_scaling_pressure(Arc<ScalingPressure>)` -- feed pool saturation
   back into the KEDA signal as the `worker_pool_saturation`
   component. The pool feeds it only when the app registers a
-  `worker_pool_saturation` component; otherwise the composite never sees it.
+  `worker_pool_saturation` component, and otherwise the composite never sees it.
 
 Both are no-ops when the corresponding feature is off.
 `ServiceRuntime` wires both automatically.
@@ -155,7 +155,7 @@ just use `runtime.worker_pool`.
 | `start_scaling_loop(cancel)` | Spawn the pressure-based scaling controller |
 | `set_memory_guard(guard)` | Attach memory pressure source for the scaler |
 | `set_scaling_pressure(p)` | Feed pool saturation back into the KEDA pressure signal |
-| `active_threads() -> usize` | Permits currently in use |
+| `active_threads() -> usize` | Permits in use |
 | `max_threads() -> usize` | Pool size (fixed at construction) |
 
 ---

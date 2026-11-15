@@ -83,10 +83,10 @@ the exchange is built.
 | --- | --- |
 | `Static` | No I/O. A key the consumer already resolved, held for the life of the process |
 | `ClientCredentials` | OAuth2 client credentials (RFC 6749 s4.4) -- a form POST of `grant_type`, `client_id`, `client_secret`, optional `scope` |
-| `TokenPost` | A form POST of exactly the fields handed to it -- the generic shape |
+| `TokenPost` | A form POST of exactly the fields handed to it -- the generic form |
 | `MetadataServer` | A GET, optionally behind a header (`Metadata-Flavor: Google`) |
 
-`TokenPost` has two shapes. `TokenPost::new` takes a form rendered once
+`TokenPost` has two constructors. `TokenPost::new` takes a form rendered once
 and posts it unchanged on every exchange, renewals included, so it is for
 a form that is safe to resend: a session login, a client secret.
 `TokenPost::minted` takes a closure that renders the form for every
@@ -139,7 +139,7 @@ let source = Cached::new(TokenPost::minted(&http, token_url, move || {
 
 A render that cannot mint returns an `AuthError`, usually `Unavailable`,
 and the exchange hands it back without posting anything. Fields added
-with `with_form_field` ride along on both shapes, ahead of the minted
+with `with_form_field` ride along on both, ahead of the minted
 ones.
 
 ### The client an exchange uses
@@ -148,10 +148,10 @@ The `HttpClient` handed to an exchange is the settings it takes, not the
 client it calls on: it builds its own from them, with two deliberate
 differences.
 
-- **Redirects refused.** reqwest carries the form and any custom header
+- Redirects refused. reqwest carries the form and any custom header
   across a cross-origin hop, so a token endpoint that answers 307 would
   otherwise repost the client secret to whatever host it names.
-- **The POST retried only where it is safe to resend.** `ClientCredentials` ALWAYS retries its POST, whatever the shared client's `retry_non_idempotent` says: a client-secret POST mints a new credential, so replaying it duplicates nothing. `TokenPost::new` retries only when the shared client's `retry_non_idempotent` is on, because a retry resends the form it already posted. `TokenPost::minted` NEVER retries inside one exchange, whatever the flag says: a single-use assertion (an RFC 7523 `jti`) is refused on a second sight. A transient failure is left to the next acquisition instead, which mints a fresh assertion.
+- The POST retried only where it is safe to resend. `ClientCredentials` ALWAYS retries its POST, whatever the shared client's `retry_non_idempotent` says: a client-secret POST mints a new credential, so replaying it duplicates nothing. `TokenPost::new` retries only when the shared client's `retry_non_idempotent` is on, because a retry resends the form it already posted. `TokenPost::minted` NEVER retries inside one exchange, whatever the flag says: a single-use assertion (an RFC 7523 `jti`) is refused on a second sight. A transient failure is left to the next acquisition instead, which mints a fresh assertion.
 
 Everything else -- timeouts, schedule, user agent -- is the caller's.
 
@@ -165,7 +165,7 @@ link-local address.
 
 `TokenReading` is the response contract, shared by all three:
 
-- `access_token` is required; anything else is a malformed response,
+- `access_token` is required, and anything else is a malformed response,
   named as such rather than cached as an empty credential.
 - `expires_in` is read whether the provider sent it as a number or as a
   numeric string. Both are in the wild.
@@ -206,7 +206,7 @@ cross-origin hop and strips neither a custom header nor the query. Sign
 with a client built through `HttpClient::with_redirect_policy` and a
 policy that refuses the hop, or allows only the same origin.
 
-A consumer that reads the shape out of config rather than writing it
+A consumer that reads the exchange and placements out of config rather than writing them
 holds `AnyCredentialSource` and a `Vec<Placement<_>>`: one variant per
 exchange and per placement, dispatched by a match, so a registry keyed by
 provider name needs no vtable and no boxed future.
@@ -245,8 +245,7 @@ wait it guards is the exchange itself. A cold source hit by a hundred
 callers at once mints once.
 
 The held credential is an `ArcSwapOption`: read-mostly state swapped
-whole, which is what the memory rubric wants here and why it is not a
-`RwLock<Arc<_>>`.
+whole, so a read takes no lock.
 
 ### When the exchange fails
 
@@ -273,8 +272,8 @@ attempt.
 | --- | --- | --- |
 | `Unreachable` | The endpoint could not be reached, or the transport failed | yes |
 | `TimedOut` | The acquisition did not finish inside the exchange's own deadline | yes |
-| `Shared` | The acquisition this caller waited on failed; carries whether that failure was transient | as the failure it reports |
-| `Refused` | The endpoint answered with a non-2xx status | 408, 429 and 5xx yes; any other status no |
+| `Shared` | The acquisition this caller waited on failed, carrying whether that failure was transient | as the failure it reports |
+| `Refused` | The endpoint answered with a non-2xx status | 408, 429 and 5xx yes, any other status no |
 | `Malformed` | The endpoint answered 2xx with something that is not a credential | no |
 | `Endpoint` | The token URL cannot be used at all (not https, not loopback) | no |
 | `Client` | The exchange's own HTTP client could not be built | no |
@@ -295,14 +294,14 @@ the same way and nothing it will post.
 
 ## What stays with the consumer
 
-- **Templating and secret resolution.** An exchange takes rendered
+- Templating and secret resolution. An exchange takes rendered
   values. Where they came from -- config, a vault, an env var -- is the
   consumer's business.
-- **Signing schemes.** SigV4 and a request HMAC pull crypto crates in for
+- Signing schemes. SigV4 and a request HMAC pull crypto crates in for
   the one consumer that needs them, so they stay there as further
   implementations of `RequestSigner` rather than as a dependency for
   every consumer that does not.
-- **The Kafka `OAUTHBEARER` token refresh callback.** A credential source
+- The Kafka `OAUTHBEARER` token refresh callback. A credential source
   is the right input to it, but the callback itself belongs to the
   transport, not here.
 

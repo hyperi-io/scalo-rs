@@ -29,7 +29,7 @@ flowchart TD
 
 Without hard gates, a weighted composite smears over both cases --
 during a sink outage it would still call for scaling (wasteful and
-potentially harmful); during a memory event it would scale gradually
+potentially harmful), and during a memory event it would scale gradually
 based on whatever other signals are weighted high. The gates make the
 right thing happen unambiguously.
 
@@ -69,8 +69,8 @@ has a native CPU trigger that reads container-level CPU from the
 Kubernetes metrics-server. The right wiring is two independent KEDA
 triggers in the `ScaledObject`:
 
-- **`scaling_pressure` gauge** -> the deployment's own pressure trigger ([below](#how-keda-reads-it)) -> app-level signals
-- **CPU utilisation** -> CPU scaler -> container-level, via metrics-server
+- `scaling_pressure` gauge -> the deployment's own pressure trigger ([below](#how-keda-reads-it)) -> app-level signals
+- CPU use -> CPU scaler -> container-level, via metrics-server
 
 KEDA scales to the MAX of all triggers. Mixing CPU into the composite
 would double-count and obscure which signal is driving the scale.
@@ -81,12 +81,12 @@ would double-count and obscure which signal is driving the scale.
 
 scalo publishes the value two ways, and KEDA reads neither until the deployment adds a trigger for it:
 
-- **`/scaling/pressure`** on the metrics listener answers `format!("{:.2}", pressure.calculate())` as plain text once `MetricsManager::set_scaling_pressure` has attached a pressure, which `ServiceRuntime` does, and 404 until then.
-- **The `scaling_pressure` gauge**, `{namespace}_scaling_pressure` when `metrics.namespace` sets a prefix. With `service-metrics` on, `ServiceRuntime` writes the value `/scaling/pressure` serves into it once a second, from build until the shutdown token is cancelled, so the scrape and the OTLP push both carry it with no traffic and no app code. It reads the pressure attached to the metrics listener, so an app that attaches its own with `set_scaling_pressure` gets that value in the gauge. A service built without `ServiceRuntime`, or without `service-metrics`, calls `ServiceMetrics::scaling_pressure(pressure.calculate())` on its own tick.
+- `/scaling/pressure` on the metrics listener answers `format!("{:.2}", pressure.calculate())` as plain text once `MetricsManager::set_scaling_pressure` has attached a pressure, which `ServiceRuntime` does, and 404 until then.
+- The `scaling_pressure` gauge, `{namespace}_scaling_pressure` when `metrics.namespace` sets a prefix. With `service-metrics` on, `ServiceRuntime` writes the value `/scaling/pressure` serves into it once a second, from build until the shutdown token is cancelled, so the scrape and the OTLP push both carry it with no traffic and no app code. It reads the pressure attached to the metrics listener, so an app that attaches its own with `set_scaling_pressure` gets that value in the gauge. A service built without `ServiceRuntime`, or without `service-metrics`, calls `ServiceMetrics::scaling_pressure(pressure.calculate())` on its own tick.
 
 An app that still writes the gauge from `runtime.scaling` writes the same number the runtime does, because both read one pressure. Two writers of one gauge on two different pressures would flap between them, which is why the runtime reads what the listener serves.
 
-The [scalo-service](../../charts/scalo-service/README.md) chart reads neither. Its ScaledObject carries a Kafka consumer-group lag trigger unless the contract or `keda.kafka.enabled` turns it off, and a CPU utilisation trigger unless `cpu_enabled` or `keda.cpu.enabled` does. See [../deployment/keda.md](../deployment/keda.md).
+The [scalo-service](../../charts/scalo-service/README.md) chart reads neither. Its ScaledObject carries a Kafka consumer-group lag trigger unless the contract or `keda.kafka.enabled` turns it off, and a CPU trigger unless `cpu_enabled` or `keda.cpu.enabled` does. See [../deployment/keda.md](../deployment/keda.md).
 
 To scale on the composite, the deployment adds its own trigger, through the chart's `keda.extraTriggers` (appended to the derived ones) or `keda.triggers` (in their place). A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it, beside the CPU trigger:
 
@@ -132,8 +132,9 @@ impl ServiceApp for LoaderApp {
 
 `ServiceRuntime` constructs the `ScalingPressure`, registers the
 `/scaling/pressure` endpoint via `MetricsManager`, wires
-`worker_pool.set_scaling_pressure` so pool saturation also feeds into
-the signal, and with `service-metrics` keeps the `scaling_pressure`
+`worker_pool.set_scaling_pressure` so pool saturation feeds the signal
+once the app registers a `worker_pool_saturation` component, and with
+`service-metrics` keeps the `scaling_pressure`
 gauge current. Apps then update component values from their pipeline:
 
 ```rust
@@ -141,7 +142,7 @@ runtime.scaling.as_ref().unwrap().set_component("kafka_lag", lag as f64);
 runtime.scaling.as_ref().unwrap().set_memory(used, limit);
 ```
 
-The `scaling_pressure(value)` / `scaling_circuit_open(...)` / `scaling_memory_pressure(...)` helpers on `ServiceMetrics` write the companion gauges `scaling_pressure`, `scaling_circuit_open` and `scaling_memory_pressure`, prefixed when `metrics.namespace` is set, for the pressure trigger and dashboard overlay. Under `ServiceRuntime` with `service-metrics` the runtime writes `scaling_pressure`; the circuit and memory gauges stay with the app, which knows how it measures each.
+The `scaling_pressure(value)` / `scaling_circuit_open(...)` / `scaling_memory_pressure(...)` helpers on `ServiceMetrics` write the companion gauges `scaling_pressure`, `scaling_circuit_open` and `scaling_memory_pressure`, prefixed when `metrics.namespace` is set, for the pressure trigger and dashboard overlay. Under `ServiceRuntime` with `service-metrics` the runtime writes `scaling_pressure`, and the circuit and memory gauges stay with the app, which knows how it measures each.
 
 ---
 
@@ -175,7 +176,7 @@ falls back to defaults if absent.
 | `is_enabled() -> bool` | Reflects `config.enabled` |
 | `ScalingComponent::new(name, weight, saturation)` | Component constructor |
 | `ScalingPressureConfig::from_cascade()` | Load base config from `scaling` cascade key |
-| `GateType::CircuitBreaker / MemoryPressure` | Diagnostic -- which gate (if any) is currently active |
+| `GateType::CircuitBreaker / MemoryPressure` | Diagnostic -- which gate, if any, the snapshot's inputs trip |
 | `RateWindow` | Helper for converting per-event rates into windowed pressure inputs |
 | `ServiceApp::scaling_components(&self, &config) -> Vec<ScalingComponent>` | App registration hook (default empty) |
 
@@ -192,7 +193,7 @@ falls back to defaults if absent.
 
 ## Related
 
-- [worker-pool.md](worker-pool.md) -- pool saturation feeds into the composite as `worker_pool_saturation`
+- [worker-pool.md](worker-pool.md) -- pool saturation feeds the composite when the app registers `worker_pool_saturation`
 - [tiered-sink.md](tiered-sink.md) -- the circuit-breaker source that drives the gate
 - [../runtime/memory.md](../runtime/memory.md) -- the memory pressure source
 - [../runtime/service-runtime.md](../runtime/service-runtime.md) -- auto-wiring entry point

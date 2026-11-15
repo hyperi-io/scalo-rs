@@ -6,8 +6,8 @@ KEDA (Kubernetes Event-driven Autoscaling) scales pods on triggers the standard 
 
 ## `KedaContract`
 
-The contract subset the scalo-service chart renders into its `ScaledObject`;
-the chart's `keda.*` values override each field per deployment. Built from
+The contract subset the scalo-service chart renders into its `ScaledObject`,
+with the chart's `keda.*` values overriding each field per deployment. Built from
 `KedaConfig` (cascade-loaded runtime config) via
 `KedaContract::from_config(&cfg)`.
 
@@ -21,7 +21,7 @@ pub struct KedaContract {
     pub kafka_lag_threshold: u64,     // scale when lag > N per partition
     pub activation_lag_threshold: u64,// wake from zero when lag > N
     pub cpu_enabled: bool,
-    pub cpu_threshold: u32,           // % utilisation
+    pub cpu_threshold: u32,           // % CPU
     pub kafka_trigger: KafkaLagTrigger, // where the lag trigger reads brokers/group/topics
 }
 ```
@@ -64,7 +64,7 @@ the contract says. Each path is dotted and `.Values`-relative:
 | `enabled` | `true` | `false` drops the Kafka trigger, leaving CPU |
 | `brokers_path` | `config.kafka.brokers` | a list or a comma-separated string |
 | `group_path` | `config.kafka.group_id` | a string |
-| `topics_path` | `config.kafka.topics` | a list or a comma-separated string; KEDA watches the first |
+| `topics_path` | `config.kafka.topics` | a list or a comma-separated string. KEDA watches the first |
 
 An app whose config keeps Kafka under a `source` section points the
 trigger there:
@@ -124,7 +124,7 @@ KEDA's `cooldownPeriod` governs only the step to zero. Between 1 and N pods the 
 ## The triggers it derives
 
 1. **CPU** (unless `cpu_enabled` or `keda.cpu.enabled` turns it off) --
-   utilisation target `cpu_threshold`, `metricType: Utilization`;
+   target `cpu_threshold`, `metricType: Utilization`, and
    `keda.cpu.targetUtilization` overrides the target.
 2. **Kafka** (unless `kafka_trigger` or `keda.kafka.enabled` turns it
    off) -- `lagThreshold` per partition and `activationLagThreshold` for
@@ -153,7 +153,7 @@ triggers:
 ```
 
 KEDA scales to the **max** of all triggers -- high lag OR high CPU
-grows the pool; both must subside to shrink.
+grows the pool. Both must subside to shrink.
 
 The chart renders a TriggerAuthentication named `<fullname>-trigger-auth`
 only when `keda.triggerAuthentication.secretTargetRef` is set, and the
@@ -196,13 +196,13 @@ gate when both fire:
 | Circuit-breaker open | Downstream sink unreachable | `0.0` -- scaling won't help |
 | Memory >= threshold | Pod approaching OOM | `100.0` -- scale before kill |
 
-Outside the gates, components are weighted (sum to 1.0) and each saturates at its configured ceiling. The scalo-service chart does not read the score. It reaches the `scaling_pressure` gauge, with the `metrics.namespace` prefix when one is set: `ServiceRuntime` writes it once a second when `service-metrics` is on, and a service outside the runtime writes it through the `ServiceMetrics` helper. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it; [../pipeline/scaling.md](../pipeline/scaling.md#how-keda-reads-it) shows the trigger.
+Outside the gates, components are weighted (the weights meant to sum to 1.0, the total capped at 100) and each saturates at its configured ceiling. The scalo-service chart does not read the score. It reaches the `scaling_pressure` gauge, with the `metrics.namespace` prefix when one is set: `ServiceRuntime` writes it once a second when `service-metrics` is on, and a service outside the runtime writes it through the `ServiceMetrics` helper. A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it. [../pipeline/scaling.md](../pipeline/scaling.md#how-keda-reads-it) shows the trigger.
 
 ---
 
 ## `/scaling/pressure` endpoint
 
-Attach `ScalingPressure` to the metrics manager via `MetricsManager::set_scaling_pressure(...)`. The metrics HTTP server then answers `/scaling/pressure` with the current value as plain text, whether `start_server` or `start_server_with_routes` started it, and 404 until a pressure is attached. `ServiceRuntime` attaches its own, so every service built on it serves the route. Each pod answers with its own value; the deployment-side trigger above reads the gauge.
+Attach `ScalingPressure` to the metrics manager via `MetricsManager::set_scaling_pressure(...)`. The metrics HTTP server then answers `/scaling/pressure` with the current value as plain text, whether `start_server` or `start_server_with_routes` started it, and 404 until a pressure is attached. `ServiceRuntime` attaches its own, so every service built on it serves the route. Each pod answers with its own value. The deployment-side trigger above reads the gauge.
 
 See [../../src/metrics/mod.rs](../../src/metrics/mod.rs) for the attach
 API and [../../src/scaling/mod.rs](../../src/scaling/mod.rs) for the
@@ -218,9 +218,9 @@ the right source, since the app shouldn't measure its own CPU.
 Configure both triggers independently in the `ScaledObject`:
 
 - pressure gauge -> `metrics-api` scaler through an adapter (app-level signals, added by the deployment)
-- CPU utilisation -> CPU scaler (container-level, via metrics-server)
+- CPU use -> CPU scaler (container-level, via metrics-server)
 
-KEDA takes the max; either fires scale-out independently.
+KEDA takes the max. Either fires scale-out independently.
 
 ---
 
@@ -229,7 +229,7 @@ KEDA takes the max; either fires scale-out independently.
 | Item | Purpose |
 | ------ | --------- |
 | `KedaConfig` | Cascade-loaded runtime config (`enabled`, thresholds) |
-| `KedaContract` | Deployment-time subset; `enabled: false` renders what `keda: None` does |
+| `KedaContract` | Deployment-time subset, where `enabled: false` renders what `keda: None` does |
 | `KedaContract::from_config(&cfg)` | Build contract from config, `enabled` included |
 | `KedaContract::with_kafka_trigger(t)` | Point the Kafka lag trigger at another values layout, or turn it off |
 | `KedaContract::default()` | Defaults table above |

@@ -34,28 +34,28 @@ transfer, say).
 
 ## What the retry loop gives you
 
-- **Retry** with exponential backoff and jitter, on the transient set
+- Retry with exponential backoff and jitter, on the transient set
   only: 408, 429, 500, 502, 503, 504, plus connect and timeout failures.
   Any other 4xx returns immediately.
-- **Idempotent methods only** by default. GET, HEAD, PUT, DELETE and
-  OPTIONS are replayable; POST and PATCH need
+- Idempotent methods only by default. GET, HEAD, PUT, DELETE and
+  OPTIONS are replayable, and POST and PATCH need
   `retry_non_idempotent: true`, which is for endpoints that dedupe. A
   request the signer could not sign never left, so a transient signing
   failure is retried whatever the method.
-- **`Retry-After` honoured** in preference to the exponential schedule,
+- `Retry-After` honoured in preference to the exponential schedule,
   capped at `max_retry_interval_ms`. The cap matters: a throttled
   downstream can legally advertise hours, and taking that whole parks
   the request inside the retry loop. It paces the attempts `max_retries`
   already grants and never adds one, so a downstream answering 429 plus
   the header on every attempt still ends the loop.
-- **The last response returned** once retries are exhausted, even a 5xx,
+- The last response returned once retries are exhausted, even a 5xx,
   so the caller can read the status and body rather than getting a
   transport error.
-- **Request metrics** per method: `http_client_requests_total`,
+- Request metrics per method: `http_client_requests_total`,
   `http_client_duration_seconds`, `http_client_retries_total`. A request
   counts as `status="success"` only when the final answer is a 2xx, so a 5xx
   returned once the retries are spent counts as `status="error"`.
-- **No request URL on an error.** reqwest keeps a copy of the URL and
+- No request URL on an error. reqwest keeps a copy of the URL and
   renders it, and a credential placed in the query is inside that URL,
   so the loop drops it from every error it returns.
 
@@ -132,13 +132,13 @@ own default.
 Redirects are not in the config: they are a property of what the client
 is for, so they are set where it is built.
 `HttpClient::with_redirect_policy(config, policy)` takes any
-`reqwest::redirect::Policy`; `new(config)` is that with reqwest's
+`reqwest::redirect::Policy`, and `new(config)` is that with reqwest's
 default. reqwest strips `Authorization` on a cross-origin hop but carries
 the body, the query and any custom header across it, so a client whose
 calls are signed with a provider's own header -- or with a query
 parameter -- should refuse the hop (`Policy::none()`) or allow only the
 same origin. The token exchanges in [auth.md](auth.md) build themselves
-such a client; a client that only downloads keeps the default.
+such a client, and a client that only downloads keeps the default.
 
 ---
 
@@ -152,7 +152,7 @@ such a client; a client that only downloads keeps the default.
 | `.get(url)` | GET request |
 | `.get_with(url, f)` | GET with the builder decorated by `f` (headers, query) -- keeps retry and metrics, unlike `.client()` |
 | `.get_signed(url, signer)` | GET with `signer` putting the credential on each attempt |
-| `.send_signed(method, url, body, f, signer)` | Any method, raw body, decorated by `f`, signed per attempt; retries follow the method |
+| `.send_signed(method, url, body, f, signer)` | Any method, raw body, decorated by `f`, signed per attempt, retries following the method |
 | `.post_json(url, &body)` | POST with JSON body and content-type |
 | `.put_json(url, &body)` | PUT with JSON body |
 | `.delete(url)` | DELETE request |
@@ -167,7 +167,7 @@ such a client; a client that only downloads keeps the default.
 | ------ | ----- |
 | Outbound HTTP from a service | `HttpClient` -- always |
 | A credential on the request | `.get_signed` / `.send_signed` with a placement from [auth.md](auth.md) |
-| A signature over the body or query | A `RequestSigner`; the hook runs after the request is built |
+| A signature over the body or query | A `RequestSigner`, whose hook runs after the request is built |
 | Streaming download | `.get(...)` then `response.chunk()` in a loop -- the body streams, the retry still applies to the request |
 | Webhook receiver | Different concern -- that's [HTTP-SERVER](http-server.md) |
 | gRPC | Different concern -- see [../transport/backends.md](../transport/backends.md) |

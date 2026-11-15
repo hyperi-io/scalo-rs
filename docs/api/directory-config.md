@@ -19,7 +19,7 @@ written via tooling or git push).
 | App config (Kafka brokers, ports, log level) | [Config cascade](../core-pillars/config.md) |
 | Per-environment overrides of app config | Cascade -- `settings.{env}.yaml` |
 | One YAML per logical object, ops adds/removes them | This module |
-| File-system-shaped data store ops can edit by hand | This module |
+| A data store of plain files ops can edit by hand | This module |
 | Git as the audit trail for changes | This module with `directory-config-git` |
 
 If you find yourself growing the cascade into a "rules engine", you
@@ -80,7 +80,7 @@ refused with `KeyPathConflict`, and the file is left as it was.
 
 File-level locking via `std::fs::File::{lock,unlock}` (stable since
 Rust 1.89) -- no third-party lock crate. Concurrent writes from the
-same process serialise; cross-process writes are also safe.
+same process serialise, and cross-process writes are also safe.
 
 `ReadOnly` rejects writes at the API.
 

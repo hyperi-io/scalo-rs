@@ -1,6 +1,8 @@
 # scalo
 
-The runtime layer for Rust data-plane services: config, logging, metrics, health probes, memory backpressure, transports and secrets, already wired together. Pick the features you need, and each one plugs into the same config and the same metrics.
+The runtime layer for Rust data-plane services: config, logging, metrics, health, backpressure and transports.
+
+It all comes already wired together, secrets included. Pick the features you need, and each one plugs into the same config and the same metrics.
 
 It is built for the hot path. For APIs, orchestrators and integration glue there is a Python sister library, [scalo-py](https://github.com/hyperi-io/scalo-py), with the same conventions and a different API.
 
@@ -58,6 +60,6 @@ The default is `config` and `logger`. Everything else is opt-in, so you pay only
 | `deployment` | The deployment contract and its Dockerfile and manifest generators |
 | `full` | All of the above and more |
 
-The full list, what each pulls in and which combinations matter are at <https://github.com/hyperi-io/scalo-rs/blob/main/docs/feature-flags.md>. `transport-kafka` links librdkafka, so the build host and the image need it: <https://github.com/hyperi-io/scalo-rs/blob/main/docs/deployment/native-deps.md>.
+The full list, what each pulls in and which combinations matter are at <https://github.com/hyperi-io/scalo-rs/blob/main/docs/feature-flags.md>. `transport-kafka` links librdkafka, so the build host needs it, and so does the image unless the build links it statically: <https://github.com/hyperi-io/scalo-rs/blob/main/docs/deployment/native-deps.md>.
 
 API docs are at <https://docs.rs/scalo>, the source and the guides at <https://github.com/hyperi-io/scalo-rs>. Requires the Rust version `rust-version` names in `Cargo.toml`. Licensed Apache-2.0: <https://github.com/hyperi-io/scalo-rs/blob/main/LICENSE>.

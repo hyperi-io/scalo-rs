@@ -1,8 +1,8 @@
 # Health
 
 Two K8s probes with two distinct semantics, both mounted by the metrics HTTP
-server. Modules register a health-check callback into a global `HealthRegistry`;
-`/readyz` aggregates every registered check plus an optional caller callback to
+server. Modules register a health-check callback into a global `HealthRegistry`,
+and `/readyz` aggregates every registered check plus an optional caller callback to
 decide 200 vs 503.
 
 **Liveness must NEVER check downstream dependencies.** Mixing liveness with
@@ -32,15 +32,10 @@ answers 200, nothing can tell you which spelling a given service actually
 intends -- a chart probing a name the app no longer means keeps passing, so a
 half-finished migration is indistinguishable from a finished one.
 
-An earlier version of this library served six
-spellings: `/healthz`, `/readyz`, `/startupz` and `/health/{live,ready,startup}`.
-Across one fleet of six services on that version, the deployment contracts had
-drifted into three different answers for the same question -- some declaring
-`/healthz`, some `/health/live`, one `/livez` -- and every one of them worked,
-because the library answered all of them. The drift was invisible until a
-service that did NOT inherit these routes wired its chart to one spelling and
-its app to another. That probe 404'd, liveness killed the process, and the
-replacement crash-looped for six days before anyone noticed.
+Earlier versions also answered `/healthz`, `/startupz` and
+`/health/{live,ready,startup}`. A chart probing one spelling and an app meaning
+another kept passing, so the drift stayed invisible until a service that did not
+serve every alias went live with a probe that 404'd.
 
 Hence the second half of the contract: the canonical paths return 200 and the
 retired paths return **404**, and both directions are asserted in tests. The 404
@@ -182,7 +177,7 @@ does not serve `/metrics`.
    before init sets a callback that returns false until then.
 4. Start the server via `mgr.start_server` / `mgr.start_server_with_routes`.
 5. On SIGTERM the shutdown handler waits the pre-stop delay, then cancels the
-   global token; it does not touch readiness. See [shutdown.md](shutdown.md).
+   global token. It does not touch readiness. See [shutdown.md](shutdown.md).
 
 ---
 

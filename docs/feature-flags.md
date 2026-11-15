@@ -20,9 +20,8 @@ that costs.
 ## Defaults
 
 ```toml
-[dependencies.scalo]
-version = "2"
-# default = ["config", "logger"]
+[dependencies]
+scalo = "<version>"   # default features: config, logger
 ```
 
 That's it. The default set covers:
@@ -94,7 +93,7 @@ flowchart LR
 | `transport-grpc-vector-compat` | Vector.dev wire-compat for a transform consumer |
 | `transport-all` | All six backends |
 
-Pick backends explicitly. `transport-all` is a convenience for tests; in
+Pick backends explicitly. `transport-all` is a convenience for tests. In
 production apps list only what you actually use.
 
 ### DLQ
@@ -109,7 +108,7 @@ production apps list only what you actually use.
 
 | Feature | Adds |
 | --------- | ------ |
-| `secrets` | `SecretsManager` trait + file backend |
+| `secrets` | `SecretsManager`, the `SecretProvider` trait and the file backend |
 | `secrets-vault` | Above + OpenBao/Vault backend (`vaultrs`) |
 | `secrets-aws` | Above + AWS Secrets Manager backend (`aws-sdk-secretsmanager`) |
 | `secrets-all` | Vault + AWS |
@@ -123,8 +122,9 @@ production apps list only what you actually use.
 | `otel-tracing` | Above + bridge `tracing` crate -> OTLP (closes the W3C distributed-tracing chain when paired with `transport-trace`) |
 
 For full distributed tracing through Kafka/gRPC, enable
-`otel-tracing` + `transport-trace`. The latter alone propagates
-`traceparent` on the wire but doesn't export spans.
+`otel-tracing` + `transport-trace`. `transport-trace` alone writes a
+`traceparent` only while an OpenTelemetry span is active, which takes
+`otel-tracing` or the app's own tracer, and it exports no spans.
 
 ### Directory config
 
@@ -153,9 +153,9 @@ For full distributed tracing through Kafka/gRPC, enable
 features = ["full"]
 ```
 
-Pulls in everything except a handful of test/smoke features. Useful for
-poking around or for the `cargo doc --all-features` build. Not what you
-ship.
+Pulls in everything except the features listed under
+[What's not in `full`](#whats-not-in-full). Useful for poking around. Not
+what you ship.
 
 ---
 
@@ -165,11 +165,11 @@ Some features pull in `*-sys` crates that link C libraries. A release build link
 
 | Feature | `-sys` crate | Build package | Runtime package |
 | --------- | -------------- | --------------- | ----------------- |
-| `transport-kafka` | `rdkafka-sys` | release: hyperi-ci's static librdkafka and OpenSSL prefix. dev: `librdkafka-dev` (>= 2.12.1). macOS: `cmake` (bundled source) | -- (statically linked) |
+| `transport-kafka` | `rdkafka-sys` | release: hyperi-ci's static librdkafka and OpenSSL prefix. dev: `librdkafka-dev`, no older than the librdkafka in the resolved `rdkafka-sys` version's `+` suffix. macOS: `cmake` (bundled source) | -- (statically linked) |
 | `transport-kafka-config` | -- | -- | -- |
 | `directory-config-git` | `libgit2-sys`, `libz-sys` | `libgit2-dev`, `zlib1g-dev` | `libgit2-1.9` (release-specific) |
 | `spool` / `tiered-sink` | `zstd-sys` | -- (bundled source) | -- (statically linked) |
-| `secrets-aws` | `aws-lc-sys` | -- (compiled from source, ~20-30s, sccache-cached) | -- (statically linked) |
+| `secrets-aws` | `aws-lc-sys` | -- (compiled from source) | -- (statically linked) |
 
 The libgit2 package name carries the library version, so it differs per base release - the value above is for the default base. The build variables, the full table and the `NativeDepsContract` that wires this into generated artefacts are in [deployment/native-deps.md](deployment/native-deps.md).
 
@@ -219,7 +219,8 @@ features = [
 ]
 ```
 
-This is the loader / receiver shape. See
+This is a receiver-style service: Kafka and gRPC transports, a tiered sink
+that spills to disk, a Kafka DLQ and an HTTP server. See
 [integration.md](integration.md) for the rationale.
 
 ### Plus distributed tracing
@@ -230,28 +231,24 @@ Add to any of the above:
 features = ["otel-tracing", "transport-trace"]
 ```
 
-`otel-tracing` exports spans; `transport-trace` propagates
+`otel-tracing` exports spans and `transport-trace` propagates
 `traceparent` on the wire.
 
 ---
 
 ## What's *not* in `full`
 
-A few features are deliberately excluded from `full` because they're
-diagnostic, smoke-test, or specialty:
+These are left out of `full` because they are diagnostic, smoke-test or specialty features. Enable them explicitly when you need them.
 
-- `deployment-smoke` -- runs `docker build` + `docker run` as part of
-  tests. Requires a Docker daemon.
-- `deployment-test-support` -- test helpers for consumer suites: tool probes, kind clusters, `assert_peak_memory` (a test's peak resident set fails over the contract's memory limit and warns over its request, read from `ResourcesContract`, so no test hard-codes a budget). `assert_peak_memory_of` judges a peak the caller measured, for a child process. With `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)). On Unix, `test_support::shared_service`: one container per backing service per test run, which the first nextest process creates and every other joins by name, removed by a watcher once the run's nextest process exits. Ports bind the daemon host's loopback, an ssh daemon gets an `ssh -L` tunnel per port, and a remote `tcp://` daemon is refused without `HYPERI_TEST_DOCKER_BIND`. Containers are named under `HYPERI_TEST_CONTAINER_PREFIX` (else `<repo>-test`) and labelled with their owner's host, PID namespace, pid and start time, so a create sweeps a dead owner's containers, and another host's only once their 4 h lease lapses. `start_alone` starts one a test holds by itself, `container_name` and `test_name!` name it, and `lookup` and `pets_allowed` read the `HYPERI_TEST_*` settings from the environment, the project `.env` and the file `HYPERI_TEST_ENV_FILE` names. Pulls `dotenvy` and `tempfile`.
-- `config-postgres` -- PostgreSQL-backed config source. Built-for, not
-  built-with -- the YAML cascade already handles centralised config.
-- `worker-msgpack` -- MsgPack batch serialisation for the worker pool.
-  Specialty use.
-- `transport-kafka-test-support` -- Kafka fixtures for a consumer's tests, in `scalo::transport::kafka::test_support` (Unix): `KAFKA_IMAGE` (the one pinned `apache/kafka` image, as `image:tag@digest`), `kafka_tag()` for `testcontainers-modules`, `require_docker()` (skip without Docker locally, fail when `CI` is set), `shared_kafka(suite)`, the run's one PLAINTEXT broker through `shared_service`, `kafka_spec(host_port)` for a broker a test holds alone, and `TlsBroker`, a single-node broker with TLS, mTLS and SASL_SSL SCRAM-SHA-512 listeners and the certificates for them, driven through the docker CLI and named for the suite. Enable it on a dev-dependency. It pulls `transport-kafka`, `deployment-test-support`, `tempfile` and tokio's `process`, and needs a Docker daemon when the tests run.
-- `testcontainers` -- builds scalo's own real-broker and OpenBao tests, which
-  need a Docker daemon. Implies `transport-kafka-test-support`, which holds the image pin. They run on the run's shared broker and shared OpenBao, except a test that stops or pauses its broker, which holds one alone. nextest runs at most three of those at once, the `own-broker` test group in `.config/nextest.toml`. [tests/TESTING.md](../tests/TESTING.md) says which tests are core and which full.
-
-Enable these explicitly when you need them.
+| Feature | Adds |
+| --------- | ------ |
+| `deployment-smoke` | Runs `docker build` + `docker run` on the generated Dockerfile as part of tests. Requires a Docker daemon |
+| `deployment-test-support` | Test helpers for consumer suites: tool probes, kind clusters, `assert_peak_memory` (a test's peak resident set fails over the contract's memory limit and warns over its request, read from `ResourcesContract`, so no test hard-codes a budget). `assert_peak_memory_of` judges a peak the caller measured, for a child process. With `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)). On Unix, `test_support::shared_service`: one container per backing service per test run, which the first nextest process creates and every other joins by name, removed by a watcher once the run's nextest process exits. Ports bind the daemon host's loopback, an ssh daemon gets an `ssh -L` tunnel per port, and a remote `tcp://` daemon is refused without `HYPERI_TEST_DOCKER_BIND`. Containers are named under `HYPERI_TEST_CONTAINER_PREFIX` (else `<repo>-test`) and labelled with their owner's host, PID namespace, pid and start time, so a create sweeps a dead owner's containers, and another host's only once their 4 h lease lapses. `start_alone` starts one a test holds by itself, `container_name` and `test_name!` name it, and `lookup` and `pets_allowed` read the `HYPERI_TEST_*` settings from the environment, the project `.env` and the file `HYPERI_TEST_ENV_FILE` names. Pulls `dotenvy` and `tempfile` |
+| `worker-msgpack` | MsgPack payload decoding in the `BatchEngine` parse stage (`rmpv`) |
+| `top` | The `ratatui` TUI metrics dashboard. Pulls `cli-service` |
+| `dangerous-diagnostics` | `dump_effective_unredacted()`, the effective config with no redaction, for one-off operator debugging. Off in every shipping build |
+| `transport-kafka-test-support` | Kafka fixtures for a consumer's tests, Unix only, in `scalo::transport::kafka::test_support`. It holds `KAFKA_IMAGE` (the one pinned `apache/kafka` image, as `image:tag@digest`), `kafka_tag()` for `testcontainers-modules`, `require_docker()` (skip without Docker locally, fail when `CI` is set), `shared_kafka(suite)`, the run's one PLAINTEXT broker through `shared_service`, `kafka_spec(host_port)` for a broker a test holds alone, and `TlsBroker`, a single-node broker with TLS, mTLS and SASL_SSL SCRAM-SHA-512 listeners and the certificates for them, driven through the docker CLI and named for the suite. Enable it on a dev-dependency. It pulls `transport-kafka`, `deployment-test-support`, `tempfile` and tokio's `process`, and needs a Docker daemon when the tests run |
+| `testcontainers` | Builds scalo's own real-broker tests, and with `secrets-vault` its OpenBao tests, which need a Docker daemon. Implies `transport-kafka-test-support`, which holds the image pin. They run on the run's shared broker and shared OpenBao, except a test that stops or pauses its broker, which holds one alone. nextest runs at most three of those at once, the `own-broker` test group in `.config/nextest.toml`. [tests/TESTING.md](../tests/TESTING.md) says which tests are core and which full |
 
 ---
 
@@ -276,11 +273,15 @@ A handful of dependencies aren't visible from the feature name alone:
   pool, so it needs a tokio runtime.
 - `dlq` requires `concurrency` (for the `BackgroundSink` actor that
   drains queued entries).
+
+Across the service stack:
+
 - `cli-service` reaches across the stack -- `metrics + memory + scaling + shutdown + governor + lifecycle`. It pulls no transport, so a control or admin service built on it compiles none, and `ServiceRuntime::outbound_sink_stack` needs `sink-stack` declared. It does not pull `worker-pool` either, so rayon is compiled only by a service that asks for `worker-pool` or `worker-batch`.
 - `top` pulls `cli-service` (and through that, the full L2 runtime).
-- `expression` pulls the `cel` crate; needed only if any transport
-  filter uses Tier 2 or Tier 3 CEL (see
-  [transport/filter-engine.md](transport/filter-engine.md)).
+- `expression` pulls the `cel` crate. A transport filter needs it for
+  Tier 2 or Tier 3 CEL (see
+  [transport/filter-engine.md](transport/filter-engine.md)), and `rules`
+  pulls it for its CEL conditions.
 - `auth` pulls `http`, and turns on reqwest's `form` and `query`
   encoders. reqwest gates both behind features, so a build with `http`
   alone has neither -- `geoip-download` turns on `query` for the same

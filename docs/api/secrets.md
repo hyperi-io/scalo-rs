@@ -6,7 +6,7 @@ provider that's always available, OpenBao/Vault, and AWS Secrets
 Manager. The manager caches values with a TTL and broadcasts rotation
 events when a refresh finds that a source's version has changed.
 
-Where `SensitiveString` (from `config`) covers values that arrive
+Where `SensitiveString` (`scalo::SensitiveString`) covers values that arrive
 through the config cascade, `SecretsManager` covers values that need
 out-of-band fetching -- typically because they're rotated independently
 of deploys.
@@ -17,7 +17,7 @@ of deploys.
 
 | Backend | Feature | Backed by | Use when |
 | --------- | --------- | ----------- | ---------- |
-| File | `secrets` (default) | Plain files on disk | Local dev, K8s `Secret` volume mounts |
+| File | `secrets` | Plain files on disk | Local dev, K8s `Secret` volume mounts |
 | OpenBao / Vault | `secrets-vault` | [`vaultrs`](https://crates.io/crates/vaultrs) | Centralised secret store, rotation enabled |
 | AWS Secrets Manager | `secrets-aws` | [`aws-sdk-secretsmanager`](https://crates.io/crates/aws-sdk-secretsmanager) | AWS-native deployments |
 | `secrets-all` | -- | Vault + AWS | When you need both |
@@ -57,7 +57,7 @@ syntax instead of each hand-rolling its own env/vault lookup:
 | `vault:<mount>/<path>:<key>` | OpenBao lookup via `SecretsManager`: the first segment is the KV mount, the KV v2 `data` segment is optional (needs `secrets-vault`) |
 | `vault:<name>:<key>` | the same lookup on the default `secret` mount, for a path with no mount segment |
 | `bao:<mount>/<path>:<key>`, `openbao:<mount>/<path>:<key>` | the same lookup, spelled as the OpenBao tooling spells it |
-| `file:path` | the contents of a local file, read fresh every time so a rotated mount is seen; a zero-byte file is refused |
+| `file:path` | the contents of a local file, read fresh every time so a rotated mount is seen. A zero-byte file is refused |
 | `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`). An ARN is refused -- it carries colons of its own, so use the secret name or an `aws` source in `secrets.sources`. So is an empty key (`aws:name:`) |
 | `env:VAR` | the environment variable `VAR` (hard error if unset) |
 | anything else | the literal string |
@@ -230,7 +230,7 @@ A source whose backend's feature is off fails with `SecretsError::ProviderNotCon
 | `refresh_interval_secs` | `1800` | Seconds between the refreshes `spawn_refresh()` runs. `0` turns it off |
 | `refresh_jitter_secs` | `300` | Up to this many seconds added to each of those waits |
 
-`openbao` takes `address`, `auth`, and optionally `namespace`, `ca_cert` (a PEM CA file), `skip_verify` (default `false`, rejected under a production profile) and `timeout_secs`, the seconds one request may take, a login included (default 60, `VAULT_CLIENT_TIMEOUT` in the environment, `0` for none), so a server that never answers fails the lookup rather than hanging startup. `auth.method` picks the fields that go with it:
+`openbao` takes `address`, `auth`, and optionally `namespace`, `ca_cert` (a PEM CA file), `skip_verify` (default `false`, rejected under a production profile) and `timeout_secs`, the seconds one request may take, a login included (default 60, `0` for none, and `VAULT_CLIENT_TIMEOUT` where the config comes from the `VAULT_*` environment), so a server that never answers fails the lookup rather than hanging startup. `auth.method` picks the fields that go with it:
 
 | `method` | Fields |
 | -------- | ------ |
@@ -250,7 +250,7 @@ A source whose backend's feature is off fails with `SecretsError::ProviderNotCon
 | `SecretsConfig::from_cascade()` | Build config from the global cascade (pass to `SecretsManager::new`) |
 | `.get(name) -> SecretValue` | Fetch a secret by name through routed backend |
 | `.get_file(path) -> SecretValue` | Read a secret from a local file |
-| `.refresh_all()` | Re-fetch every configured source; a rotated version is reported, as on any `get()` that reaches the backend |
+| `.refresh_all()` | Re-fetch every configured source. A rotated version is reported, as on any `get()` that reaches the backend |
 | `.spawn_refresh(shutdown) -> Option<JoinHandle<()>>` | Run `refresh_all()` every `refresh_interval_secs` plus jitter until `shutdown` fires |
 | `.clear_cache()` | Drop the cache without re-fetching |
 | `.cache_stats() -> CacheStats` | Memory and disk entries, hits, misses, stale hits |

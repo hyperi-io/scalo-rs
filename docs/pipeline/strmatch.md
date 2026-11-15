@@ -1,8 +1,8 @@
 # Strmatch
 
 `strmatch` is the official answer to "don't use regex on the hot
-path". Operators write a regex (the pattern language everyone knows);
-the matcher classifies it into one of four tiers and dispatches via
+path". Operators write a regex (the pattern language everyone knows),
+and the matcher classifies it into one of four tiers and dispatches via
 the cheapest engine that's correct. Most hot-path patterns --
 field-presence checks, prefix tests, alternation over a fixed token
 list -- never invoke the regex engine at all.
@@ -36,22 +36,22 @@ call.
 `classify::classify` parses the pattern via `regex-syntax` and walks
 the HIR. Three outcomes:
 
-1. **Shape** -- single byte / byte-set / anchored or unanchored
+1. `Shape` -- single byte / byte-set / anchored or unanchored
    literal. Direct byte-op dispatch.
-2. **LiteralOnly** -- alternation of exact literals with no
-   lookaround. Single `aho-corasick` automaton; regex engine never
+2. `LiteralOnly` -- alternation of exact literals with no
+   lookaround. Single `aho-corasick` automaton, and the regex engine is never
    invoked at match time.
-3. **Meta** -- anything that contains a feature we can't safely
+3. `Meta` -- anything that contains a feature we can't safely
    reduce (word boundaries, multi-line anchors, lookarounds,
    unbounded quantifiers, non-ASCII unicode classes past a small
    byte-cap).
 
 The classifier never reports "this regex is invalid" -- that's the
-parser's job. It returns a `Plan` (the dispatch shape) and a
+parser's job. It returns a `Plan` (how to dispatch) and a
 `Descriptor` explaining which tier was chosen and (if Meta) why.
 
 A separate extractor fallback handles patterns that are
-literal-shaped after `regex-syntax::hir::literal::Extractor` strips
+pure literals after `regex-syntax::hir::literal::Extractor` strips
 prefixes/suffixes. So `Regex::new(r"^/api/(orders|users|carts)$")`
 ends up on `LiteralSet` despite the surface anchors.
 
@@ -76,8 +76,8 @@ let scrubber = StrMatcher::builder()
 
 | Policy | Effect |
 | -------- | -------- |
-| `Allow` (default) | Build succeeds; anti-spam protocol still emits up to 10 WARNs per process |
-| `Warn` | Build succeeds; always WARN (bypasses anti-spam cap) |
+| `Allow` (default) | Build succeeds, and the anti-spam protocol still emits up to 10 WARNs per process |
+| `Warn` | Build succeeds and always WARNs (bypasses the anti-spam cap) |
 | `Reject` | Build fails with `BuildError::TierTooLow { pattern, wanted, got, reason, hint }` |
 
 ---
@@ -122,10 +122,10 @@ operator quality checks.
 ## Case-insensitivity
 
 `StrMatcherBuilder::ascii_case_insensitive(true)` propagates to the
-AC builder. The Shape tier becomes unavailable (memchr/memmem can't
+AC builder. The `Shape` plan becomes unavailable (memchr/memmem can't
 fold case), so single literals route to a one-element AC. Pattern is
 **not** wrapped in `(?i:...)` before parsing -- that would expand
-literals into per-byte case classes and defeat simple-shape
+literals into per-byte case classes and defeat single-literal
 detection.
 
 ---

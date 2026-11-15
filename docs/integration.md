@@ -1,8 +1,8 @@
 # Integration
 
 This walks through wiring `scalo` into a new data-plane service from
-empty `Cargo.toml` to running binary. The goal is a self-contained recipe;
-the deep-dive details for each line live in the subsystem docs.
+empty `Cargo.toml` to running binary. The goal is a self-contained recipe,
+and the details for each line live in the subsystem docs.
 
 If you already know what a `ServiceApp` is and just want the trait signature,
 jump to [cli/app.rs](../src/cli/app.rs).
@@ -18,11 +18,11 @@ Two questions:
 - **What transports** does it touch -- Kafka, gRPC, file, none?
 
 For a typical data-plane service that talks to Kafka, ingests gRPC, scales under
-KEDA, and ships container artefacts, the `Cargo.toml` reads:
+KEDA, and ships container artefacts, the scalo dependency reads:
 
 ```toml
 [dependencies.scalo]
-version = "2"
+version = "<version>"
 features = [
     "cli-service",          # ServiceApp trait, run_app, ServiceRuntime
     "config-reload",        # Hot-reload of the config cascade
@@ -36,7 +36,7 @@ features = [
     "memory",               # Cgroup-aware OOM prevention
     "scaling",              # KEDA pressure signal
     "worker-batch",         # BatchEngine (SIMD parse + parallel transform)
-    "http-server",          # /livez, /readyz, /metrics, /config
+    "http-server",          # HttpServer: /livez, /readyz, /config
     "deployment",           # DeploymentContract + generators
     "version-check",        # Startup probe to version API
     "expression",           # CEL for transport filters
@@ -45,7 +45,9 @@ features = [
 
 `cli-service` is doing most of the work -- see
 [feature-flags.md](feature-flags.md#cli) for what it pulls in
-transitively.
+transitively. The code below also needs `clap` (derive), `serde` (derive)
+and `tokio` (macros and the multi-thread runtime) in the app's own
+dependencies.
 
 A tooling-style CLI that doesn't need a metrics server or worker pool
 takes `cli` instead, no `-service`:
@@ -61,7 +63,7 @@ For light apps that just need config + logs, the defaults (`config`,
 
 ## 2. Define your config
 
-The cascade does the heavy lifting; you write a plain `serde` struct.
+The cascade does the heavy lifting, and you write a plain `serde` struct.
 
 ```rust
 use scalo::config::flat_env::{ApplyFlatEnv, Normalize, flat_env_list};
@@ -116,9 +118,10 @@ repeated key is an error, a null into a `String` field is an error -- see
 
 ```rust
 use scalo::cli::{
-    CliError, CommonArgs, ServiceApp, ScalingComponent, ServiceRuntime,
-    StandardCommand, VersionInfo, run_app,
+    CliError, CommonArgs, ServiceApp, ServiceRuntime, StandardCommand,
+    VersionInfo, run_app,
 };
+use scalo::ScalingComponent;
 use scalo::metrics::MetricsManager;
 use scalo::deployment::DeploymentContract;
 
@@ -168,10 +171,11 @@ impl ServiceApp for LoaderCli {
 
     fn scaling_components(&self, config: &LoaderConfig) -> Vec<ScalingComponent> {
         // KEDA reads ScalingPressure; you register the signals.
+        // name, weight, and the value at which it contributes its full weight
         vec![
-            ScalingComponent::new("buffer_depth", 0.40),
-            ScalingComponent::new("consumer_lag", 0.40),
-            ScalingComponent::new("error_rate", 0.20),
+            ScalingComponent::new("buffer_depth", 0.40, 10_000.0),
+            ScalingComponent::new("consumer_lag", 0.40, 100_000.0),
+            ScalingComponent::new("error_rate", 0.20, 100.0),
         ]
     }
 
@@ -193,8 +197,8 @@ Notes on the trait surface:
   `config::load_typed`, which reads the `--config` file (or the cascade
   without one), logs the keys `LoaderConfig` does not take, and applies the
   env overrides. `run_app` has already set up the cascade from `--config`, so
-  `load_config` needs no `config::setup` of its own, and one that treats
-  `ConfigError::AlreadyInitialised` as an error now fails.
+  `load_config` needs no `config::setup` of its own. A `load_config` that
+  calls it and treats `ConfigError::AlreadyInitialised` as an error fails.
 - `run_service` is where the actual work lives. Everything else is
   scaffolding.
 - `scaling_components`, `register_metrics`, `deployment_contract` all
@@ -231,7 +235,7 @@ In your app repo:
 
 ```text
 config/
-|-- defaults.yaml          # Safe fallback baseline (always loaded last)
+|-- defaults.yaml          # Lowest-priority YAML baseline
 |-- settings.yaml          # Team defaults (committed)
 `-- settings.production.yaml   # Per-env overrides (committed)
 .env                       # Local-dev secrets (gitignored)
@@ -272,7 +276,7 @@ ends up there.
 
 ## 7. What you didn't have to write
 
-For the loader-shaped app above, the code you actually write is:
+For the loader app above, the code you actually write is:
 
 - a `Cargo.toml` dependency block
 - your config struct definitions
@@ -288,9 +292,9 @@ What you skipped:
 | `tracing-subscriber` setup, JSON/text autodetect | `logger::setup_default` |
 | `figment` cascade, env-var nesting, `.env` loading, sensitive masking | `config::load_typed` |
 | Prometheus exporter, `/metrics` endpoint, process metrics | `MetricsManager::new` |
-| axum HTTP server, probe routes, `/metrics`, `/config` | `http_server` (wired by `ServiceRuntime`) |
+| axum server with the probe routes and `/metrics` | the `MetricsManager` server `ServiceRuntime` starts. `/config` needs an `HttpServer` the app starts |
 | OTel SDK setup, OTLP exporter, traceparent propagation | `otel-tracing` + `transport-trace` |
-| `HealthRegistry`, `/livez` / `/readyz` | `health` + `http_server` |
+| `HealthRegistry`, `/livez` / `/readyz` | `health` + the metrics server |
 | SIGTERM/SIGINT, K8s pre-stop delay, cancellation propagation | `shutdown` (wired by `ServiceRuntime`) |
 | `MemoryGuard`, cgroup-aware OOM prevention | `memory` (wired by `ServiceRuntime`) |
 | Rayon pool sizing, pressure-based scaling | `worker_pool` (wired by `ServiceRuntime`) |
@@ -305,14 +309,15 @@ See [auto-wiring.md](auto-wiring.md) for the full
 
 ## Reference apps
 
-Each shape below matches a common consumer pattern. Read whichever is
+Each app below is a public DFE service built on scalo. Read whichever is
 closest to what you're building:
 
-| Shape | Best for |
+| App | Best for |
 | ----- | ---------- |
-| Loader | Kafka in, ClickHouse out -- the most complete `cli-service` integration |
-| Receiver | gRPC ingress + Kafka publish -- push-mode entry |
-| Fetcher | Pull-mode (cloud-provider) ingress |
-| Archiver | Long-term storage sink |
-| VRL transform | Embedded VRL transform engine |
-| Vector-compat transform | Thin wrapper around Vector.dev |
+| [dfe-loader](https://github.com/hyperi-io/dfe-loader) | Kafka or gRPC in, ClickHouse out -- the most complete `cli-service` integration |
+| [dfe-receiver](https://github.com/hyperi-io/dfe-receiver) | Multi-protocol push ingress, handing events on as JSON |
+| [dfe-fetcher](https://github.com/hyperi-io/dfe-fetcher) | Pull-mode ingress from cloud and SaaS APIs, databases and files |
+| [dfe-archiver](https://github.com/hyperi-io/dfe-archiver) | Compressed files in a local path or object store |
+| [dfe-transform-vrl](https://github.com/hyperi-io/dfe-transform-vrl) | VRL transforms run in-process |
+| [dfe-transform-vector](https://github.com/hyperi-io/dfe-transform-vector) | A Vector pipeline run as a supervised transform stage |
+| [dfe-transform-elastic](https://github.com/hyperi-io/dfe-transform-elastic) | Beats and Elastic Agent events turned into DFE-normalised events |

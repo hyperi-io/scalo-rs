@@ -29,8 +29,8 @@ fn work_state(&self, config: &Self::Config) -> WorkState {
 }
 ```
 
-That is the whole app-side change: about ten lines, and `load_config` keeps
-refusing a structurally invalid config exactly as before.
+That is the whole app-side change, and `load_config` keeps refusing a
+structurally invalid config exactly as before.
 
 ---
 
@@ -48,8 +48,8 @@ flowchart LR
     H --> R["ServiceRuntime::build<br/>probes serving"]
     R --> W{"work_state"}
     W -->|Active| S["run_service"]
-    W -->|"Idle(reason)"| P["park on config change"]
-    P -->|"file mtime / SIGHUP"| L2["load_config again"]
+    W -->|Idle| P["park on config change"]
+    P -->|file mtime or SIGHUP| L2["load_config again"]
     L2 --> H2["on_config_loaded"]
     H2 --> W
     P -->|shutdown| X["exit 0"]
@@ -81,7 +81,7 @@ re-evaluates the predicate. A load that fails while idle is logged and the
 previous config kept. Shutdown while idle exits 0 rather than starting work on
 the way out.
 
-The poll is 5 s (`lifecycle::IDLE_POLL_INTERVAL`); `kill -HUP` makes it
+The poll is 5 s (`lifecycle::IDLE_POLL_INTERVAL`), and `kill -HUP` makes it
 immediate.
 
 ---
@@ -90,12 +90,12 @@ immediate.
 
 | Item | Purpose |
 | --- | --- |
-| `ServiceApp::work_state(&config) -> WorkState` | The app's emptiness predicate; defaults to `Active` |
-| `ServiceApp::on_config_loaded(&config)` | Once per loaded config, logger up, before the gate: where startup config warnings go; defaults to nothing |
+| `ServiceApp::work_state(&config) -> WorkState` | The app's emptiness predicate, `Active` by default |
+| `ServiceApp::on_config_loaded(&config)` | Once per loaded config, logger up, before the gate: where startup config warnings go. Does nothing by default |
 | `WorkState::{Active, Idle(reason)}` | Whether the config names work |
-| `WorkState::idle_if(empty, reason)` | The shape almost every predicate takes |
+| `WorkState::idle_if(empty, reason)` | The form almost every predicate takes |
 | `IdleGate` | Gauge + health component + state, held by `run_app` |
-| `lifecycle::wait_for_config_change(path) -> GateWake` | The park; returns `ConfigChanged` or `ShuttingDown` |
+| `lifecycle::wait_for_config_change(path) -> GateWake` | The park. Returns `ConfigChanged` or `ShuttingDown` |
 | `lifecycle::WORK_COMPONENT` | `"work_config"` -- the registered health component |
 
 Feature `lifecycle`, folded into `cli-service`, so no consumer needs a Cargo

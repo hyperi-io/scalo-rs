@@ -40,9 +40,9 @@ kafka:
 
 The key sits beside the transport's own section: `AnyReceiver::from_config(key)` reads `<key>.kafka.acknowledgements` or `<key>.grpc.acknowledgements`, and a transport built from an explicit config takes it with `KafkaTransport::with_acknowledgements` or `GrpcTransport::builder(..).acknowledgements(..)`. Only those two sources hold their acknowledgement ([below](#which-sources-hold-it)). Under a memory, pipe, file or HTTP source the key has no effect, and the factory logs one WARN per backend saying so.
 
-- **On:** the loop arms the source (`AckControl::arm`) before the first `recv`. Kafka then commits each partition only up to its lowest offset not yet released, whatever order releases arrive in, and an `Errored` offset holds the commit below it. A push source answers its sender only on release, once armed. Before that it answers at enqueue, so a push that arrives between the server starting and the loop's `arm` is acknowledged with nothing to deliver it. Build a push source armed instead: `GrpcTransport::builder(..).armed(true)`, or `AnyReceiver::from_config_armed(key)` and `from_config_with_governor_armed(key, governor)`. The loop's own `arm` then changes nothing.
-- **Off:** the source is released at receipt, before the block is processed. A crash or a failed delivery loses what was released.
-- **A source with no acknowledgement:** released after the pieces, as the other run loops commit.
+- On: the loop arms the source (`AckControl::arm`) before the first `recv`. Kafka then commits each partition only up to its lowest offset not yet released, whatever order releases arrive in, and an `Errored` offset holds the commit below it. A push source answers its sender only on release, once armed. Before that it answers at enqueue, so a push that arrives between the server starting and the loop's `arm` is acknowledged with nothing to deliver it. Build a push source armed instead: `GrpcTransport::builder(..).armed(true)`, or `AnyReceiver::from_config_armed(key)` and `from_config_with_governor_armed(key, governor)`. The loop's own `arm` then changes nothing.
+- Off: the source is released at receipt, before the block is processed. A crash or a failed delivery loses what was released.
+- A source with no acknowledgement: released after the pieces, as the other run loops commit.
 
 ---
 
@@ -52,11 +52,11 @@ The key sits beside the transport's own section: `AnyReceiver::from_config(key)`
 | --- | --- | --- |
 | Kafka | Yes: the offset commit | Applied |
 | gRPC | Yes: the answer to a push | Applied |
-| HTTP | Not yet. The server answers 200 once a request is queued, so a crash loses what it answered but had not delivered | No effect, one WARN |
-| File, as a source | Not yet. It saves the highest read position released: a restart reads again what was not released, but a block released `Errored` is skipped once a later block is delivered | No effect, one WARN |
+| HTTP | No. The server answers 200 once a request is queued, so a crash loses what it answered but had not delivered | No effect, one WARN |
+| File, as a source | No. It saves the highest read position released: a restart reads again what was not released, but a block released `Errored` is skipped once a later block is delivered | No effect, one WARN |
 | Pipe, memory | No: there is no acknowledgement to hold | No effect, one WARN |
 
-HTTP and file sources are to hold it through `AcknowledgingReceiver`, as Kafka and gRPC do. Until then a pipeline over either reports `best_effort` / `source_cannot_ack`. An HTTP endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([below](#a-hand-rolled-loop)).
+A pipeline over an HTTP or file source reports `best_effort` / `source_cannot_ack`. An HTTP endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([below](#a-hand-rolled-loop)).
 
 ---
 

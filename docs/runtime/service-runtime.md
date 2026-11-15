@@ -75,7 +75,8 @@ Step by step inside `run_app` for the default `run` subcommand:
    - Construct `MetricsManager` under `metrics.namespace`, describe the
      scalo runtime set (`ServiceMetrics`, app info, worker pool and batch
      engine metrics when compiled in) -- the same set the manifest lists.
-   - Construct `MemoryGuard` from env prefix (cgroup auto-detect).
+   - Construct `MemoryGuard` from the `memory` config section with the
+     `{PREFIX}_MEMORY_*` env vars over it (cgroup auto-detect).
    - Construct the self-regulation governor from the same guard if
      `governor` is on and not opted out. Built before the worker pool,
      batch engine, and transports so its pressure and byte budget can
@@ -88,6 +89,9 @@ Step by step inside `run_app` for the default `run` subcommand:
    - Construct `BatchEngine` if `worker-batch` is on, auto-wire it
      to the metrics manager and memory guard, wire the governor's
      byte budget into its governed run path.
+
+   Then it starts what runs:
+
    - Install signal handler -- returns `CancellationToken`.
    - Start the worker pool scaling loop.
    - With `service-metrics`, start a task that writes the value
@@ -150,7 +154,9 @@ pub trait ServiceApp: Sized {
 
     // Optional -- defaults provided.
     fn command(&self) -> Option<&StandardCommand> { None }
+    fn on_config_loaded(&self, _: &Self::Config) {}
     fn work_state(&self, _: &Self::Config) -> WorkState { WorkState::Active }           // cfg: lifecycle
+    fn readiness_check(&self, _: &Self::Config) -> Option<ReadinessFn> { None }
     fn scaling_components(&self, _: &Self::Config) -> Vec<ScalingComponent> { vec![] }  // cfg: scaling
     fn register_metrics(&self, _: &MetricsManager) {}                                   // cfg: metrics | otel-metrics
     fn deployment_contract(&self) -> Option<DeploymentContract> { None }                // cfg: deployment
@@ -164,14 +170,16 @@ pub trait ServiceApp: Sized {
 | `env_prefix` | yes | Prefix for env-var config overrides (`DFE_LOADER_*`) |
 | `version_info` | yes | Version + commit + build timestamp |
 | `common_args` | yes | Returns the embedded `CommonArgs` clap struct |
-| `load_config` | yes | App-specific cascade load (typically `config::setup` + `unmarshal`) |
+| `load_config` | yes | App-specific config load (typically one `config::load_typed` call) |
 | `run_service` | yes | The actual service loop -- gets a fully wired runtime |
 | `command` | no | Override to expose app-specific subcommands |
+| `on_config_loaded` | no | Report on each loaded config before the idle gate: what it accepted but will not apply |
 | `work_state` | no (cfg `lifecycle`) | The emptiness predicate: a valid but workless config idles instead of refusing |
+| `readiness_check` | no | The app's readiness criterion, installed before `run_service` starts (see [Readiness check](#readiness-check)) |
 | `scaling_components` | no (cfg `scaling`) | Register app-specific KEDA signals (lag, queue depth) |
 | `register_metrics` | no (cfg `metrics`) | Describe the app's own metrics for `metrics-manifest` / `generate-artefacts`. The scalo runtime set is always in the manifest, so an override adds only what the app emits itself |
 | `deployment_contract` | no (cfg `deployment`) | Build the contract for `generate-artefacts` |
-| `version_check_defaults` | no (cfg `version-check`) | Supply the service's releases endpoint; the cascade overlays it, `version_check.enabled: false` always wins |
+| `version_check_defaults` | no (cfg `version-check`) | Supply the service's releases endpoint. The cascade overlays it, and `version_check.enabled: false` always wins |
 
 Apps that don't override the optional methods get sensible no-op
 defaults. The cfg-marked ones only exist when their feature is compiled
@@ -182,7 +190,7 @@ in.
 ## Standard subcommands
 
 `run_app` dispatches on `StandardCommand` before reaching the
-service loop. Every service gets the same six subcommands without
+service loop. Every service gets the same subcommands without
 writing any extra code:
 
 | Subcommand | Behaviour |
@@ -192,6 +200,7 @@ writing any extra code:
 | `config-check` | Load logger + config, print summary, exit non-zero on failure |
 | `metrics-manifest` | Load config (best-effort, for `metrics.namespace`), describe the scalo runtime set, call `register_metrics`, print manifest JSON to stdout, exit. Warnings go to stderr |
 | `generate-artefacts --output-dir <dir>` | Load config once (best-effort, a failure warned on stderr), then emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, and `config-schema.*` / `capability-catalog.*` when the contract carries them. Refuses, writing nothing, a contract whose `default_config` binds a listener no port declares |
+| `config-schema --dir <dir>` | Write `config-schema.{json,yaml}` and `capability-catalog.{json,yaml}` from the app's config and capability catalogue (needs `deployment`) |
 | `top` | Live metrics TUI (when `top` feature is on) |
 
 `config-check` exists so CI can validate config without booting the
@@ -233,11 +242,11 @@ metrics server's `/readyz` handler calls on every probe.
 ## What stays app-specific
 
 The runtime deliberately stops short of full automation. These
-remain in app code because they're genuinely domain-specific:
+remain in app code because they're domain-specific:
 
 - Readiness criteria -- each service has its own "I can serve traffic" definition.
 - Config hot-reload -- optional, and the reload semantics differ per app.
-- Pipeline construction -- the whole point of the service.
+- Pipeline construction -- what the service is for.
 - DLQ wiring -- varies by transport backend and policy.
 - App-specific metric groups (`ConsumerMetrics`, `BufferMetrics`).
 
@@ -248,14 +257,14 @@ remain in app code because they're genuinely domain-specific:
 | Item | Purpose |
 | ------ | --------- |
 | `ServiceApp` trait | Service contract -- implement to get the standard lifecycle |
-| `run_app::<A>(app)` | Drives the lifecycle; matches subcommand, builds runtime, calls `run_service` |
+| `run_app::<A>(app)` | Drives the lifecycle: matches subcommand, builds runtime, calls `run_service` |
 | `ServiceRuntime` | Pre-wired infrastructure bundle -- built by `run_app`, passed to `run_service` |
 | `ServiceApp::readiness_check(&config)` | The app's readiness criterion, installed before `run_service` starts |
 | `ServiceRuntime::set_readiness_check(fn)` | Replace the readiness criterion from inside `run_service` |
 | `ServiceRuntime::batch_engine()` | Borrow the batch engine if `worker-batch` is on |
-| `ServiceRuntime::governed_receiver(key)` | Build a receive transport with the governor's inbound brake wired in (cfg `governor` + `transport`); falls back to a plain receiver when the governor is off |
-| `StandardCommand` | Subcommand enum -- apps embed via `#[command(flatten)]` |
-| `CommonArgs` | Standard CLI flags (`--config`, `--log-level`, `--metrics-addr`, ...) |
+| `ServiceRuntime::governed_receiver(key)` | Build a receive transport with the governor's inbound brake wired in (cfg `governor` + `transport`). Falls back to a plain receiver when the governor is off |
+| `StandardCommand` | Subcommand enum -- apps embed it as `#[command(subcommand)]` |
+| `CommonArgs` | Standard CLI flags (`--config`, `--log-level`, `--metrics-addr`, ...) -- apps embed it via `#[command(flatten)]` |
 | `VersionInfo` | Service version + commit + build timestamp |
 | `CliError` | Lifecycle error type -- service errors wrap into `Service(String)` |
 
@@ -265,8 +274,8 @@ remain in app code because they're genuinely domain-specific:
 
 `ServiceRuntime::build` is `pub(crate)` -- tests don't construct it
 directly. For unit tests of `run_service`, build only the bits you
-need (`MetricsManager::new_for_test`, `CancellationToken::new`,
-explicit `MemoryGuard`) and skip the framework. Integration tests
+need (a `MetricsManager`, one per test process under `cargo nextest`, a
+`CancellationToken::new`, an explicit `MemoryGuard`) and skip the framework. Integration tests
 that boot the full runtime go through `run_app` with a fake config
 fixture.
 
@@ -276,8 +285,7 @@ fixture.
 
 - [../auto-wiring.md](../auto-wiring.md) -- singleton pattern across pillars
 - [../integration.md](../integration.md) -- service skeleton recipe
-- [runtime-context.md](runtime-context.md) -- `RuntimeContext` detection
-- [memory.md](memory.md) -- `MemoryGuard`
+- [runtime-context.md](runtime-context.md) -- `RuntimeContext` detection, and [memory.md](memory.md) -- `MemoryGuard`
 - [self-regulation.md](../self-regulation.md) -- governor, inbound brake, AIMD budget
 - [../core-pillars/shutdown.md](../core-pillars/shutdown.md) -- signal handler, K8s pre-stop
 - [../core-pillars/config.md](../core-pillars/config.md) -- cascade

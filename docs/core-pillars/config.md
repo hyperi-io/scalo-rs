@@ -1,6 +1,6 @@
 # Config
 
-Call `config::setup` once at startup; every module then reads one typed view of
+Call `config::setup` once at startup, and every module then reads one typed view of
 the whole cascade through the same API. A `ServiceApp` doesn't call it:
 `run_app` sets the cascade up from `--config` and `env_prefix()` before
 `load_config`, for every command but `version`.
@@ -109,7 +109,7 @@ let kafka: KafkaConfig = config::get().unmarshal_key_registered::<KafkaConfig>("
 ```
 
 Modules with sensible defaults expose a `from_cascade` constructor wrapping this
-call: `TransportFilterEngine::from_cascade("filters")?`. The transport configs
+call: `TransportFilterTierConfig::from_cascade()?` reads `transport.filter_tiers`. The transport configs
 (`HttpTransportConfig`, `FileTransportConfig`, `PipeTransportConfig`,
 `GrpcConfig`, `AcknowledgementsConfig`) and `SinkStackConfig` read through
 `transport::FromCascade`: an absent section takes the defaults, and a present one
@@ -128,7 +128,7 @@ concentric defences:
 1. `#[serde(skip_serializing)]` on secret fields -- explicit but easy to forget.
 2. Name-based redaction -- the registry dump masks a field whose name holds
    `password`, `secret`, `token`, `key`, `credential`, `auth`, `private`, `cert`,
-   `encryption`, `connection_string` or `dsn`; the logger, and the config dump
+   `encryption`, `connection_string` or `dsn`. The logger, and the config dump
    `config-check` prints, judge a name by `logger::is_credential_name` (see
    [logging.md](logging.md#sensitive-field-masking)).
 3. `SensitiveString` newtype -- always serialises as `"***REDACTED***"`, prints
@@ -195,7 +195,7 @@ let reloader = ConfigReloader::new(reloader_config, shared.clone(), reload_fn)
     .with_registry_update("kafka");   // fire registry::update("kafka") after reload
 let _handle = reloader.start();        // -> JoinHandle<()>; spawns the watch task
 
-// Reader path -- lock-free:
+// Reader path, behind a parking_lot read lock:
 let current = shared.get();            // clone; or shared.read() for a guard
 ```
 
@@ -217,9 +217,11 @@ See [reloader.rs](../../src/config/reloader.rs) and [shared.rs](../../src/config
 
 ## `/config` admin endpoint
 
-Set `enable_config_endpoint = true` (in the HTTP server options) and the runtime
-mounts `GET /config` on the metrics server, returning JSON with every registered
-section, secrets redacted via `SensitiveString`'s `Serialize` impl.
+Set `enable_config_endpoint = true` in `HttpServerConfig` and the app's
+`HttpServer` mounts `GET /config`, returning JSON with every registered section,
+its effective values and its defaults, secrets redacted by name and by
+`SensitiveString`'s `Serialize` impl. The metrics server does not serve it, and
+`ServiceRuntime` starts no `HttpServer`.
 
 Opt-in, **off by default** -- it would otherwise expose config on a port reachable
 inside the cluster. See [http_server/config.rs](../../src/http_server/config.rs).
@@ -233,7 +235,7 @@ inside the cluster. See [http_server/config.rs](../../src/http_server/config.rs)
 | `config::setup(opts)` | One-shot init -- builds the cascade into the global `OnceLock` |
 | `config::get() -> &Config` | Reader, panics if not initialised |
 | `config::try_get() -> Option<&Config>` | Reader, `None` if not initialised |
-| `Config::new(opts)` / `Config::new_async(opts)` | Build without installing globally (`_async` for `config-postgres`) |
+| `Config::new(opts)` | Build without installing globally |
 | `Config::merge_cli(args)` | Append CLI args as the highest-priority layer |
 | `Config::get_*(key)` | Typed primitive lookups (`String`, `i64`, `f64`, `bool`, `Duration`, `Vec<String>`) |
 | `Config::unmarshal::<T>()` | Deserialise the whole cascade into `T` |
@@ -247,9 +249,9 @@ inside the cluster. See [http_server/config.rs](../../src/http_server/config.rs)
 | `config::registry::on_change(key, cb)` | Subscribe to reloads of a section |
 | `config::registry::update(key, &value)` | Re-register a section + notify subscribers |
 | `config::registry::sections() -> Vec<...>` | Dump the registry (powers `/config`) |
-| `config::SensitiveString` | Redacted-on-serialise wrapper; `.expose()` to read |
+| `scalo::SensitiveString` | Redacted-on-serialise wrapper, `.expose()` to read |
 | `ConfigReloader::new(...).start() -> JoinHandle<()>` | Hot-reload driver (builder-style) |
-| `SharedConfig<T>::get()` / `read()` | Lock-free reader for the reloader's current value |
+| `SharedConfig<T>::get()` / `read()` | Reader for the reloader's current value, behind a `parking_lot` read lock |
 
 ---
 
@@ -267,8 +269,7 @@ let cfg = Config::new(ConfigOptions {
 ```
 
 For tests mutating env vars, use the `temp-env` crate -- `std::env::set_var` is
-`unsafe` in edition 2024 and this crate forbids unsafe. The `setup_test_env`
-helper is in [tests/common](../../tests/common/).
+`unsafe` in edition 2024 and this crate denies unsafe code (`#![deny(unsafe_code)]`).
 
 ---
 
@@ -277,5 +278,5 @@ helper is in [tests/common](../../tests/common/).
 - [auto-wiring.md](../auto-wiring.md) -- config in the singleton model
 - [integration.md](../integration.md) -- `ServiceApp::load_config` recipe
 - [core-pillars/logging.md](logging.md) -- sensitive-field masking in logs
-- [feature-flags.md](../feature-flags.md) -- `config`, `config-reload`, `config-postgres`
+- [feature-flags.md](../feature-flags.md) -- `config`, `config-reload`
 - Source: [`src/config/mod.rs`](../../src/config/mod.rs), [`src/config/registry.rs`](../../src/config/registry.rs), [`src/config/reloader.rs`](../../src/config/reloader.rs)

@@ -4,7 +4,7 @@
 NAMES -- `loader`, `archiver`, `transform-orders` -- so a routing decision
 picks a name and the config decides what that name is: a Kafka topic on
 the bus, a gRPC endpoint on the direct transport. Sits on top of
-[`AnySender`](README.md); no new backend, no new trait.
+[`AnySender`](README.md), with no new backend and no new trait.
 
 ---
 
@@ -12,12 +12,10 @@ the bus, a gRPC endpoint on the direct transport. Sits on top of
 
 | Stage | Routed? | Why |
 | ------- | --------- | ----- |
-| receiver | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
-| fetcher | **Yes** | Each source maps to its own destination, plus per-record routes |
-| VRL transform | **Yes** | Its sink list is config-driven, one destination or several |
-| Vector-compat transform | **Yes** | Same, though Vector owns the transform config itself |
-| loader | No | One ClickHouse sink -- 1:1 transport |
-| archiver | No | One object-storage sink -- 1:1 transport |
+| Ingress that matches records to destinations | **Yes** | A match rule sends a record to any named destination, or fans it out to several |
+| Source poller | **Yes** | Each source maps to its own destination, plus per-record routes |
+| Transform with a configured sink list | **Yes** | One destination or several |
+| Sink stage writing one store | No | One sink -- 1:1 transport |
 
 Push the routing decision as close to ingress as possible: a stage that
 sees one inbound stream and produces one outbound stream needs a name for
@@ -45,32 +43,32 @@ flowchart LR
 
 ## Config shape
 
+There is no `routed` transport type, so `AnySender::from_config` reads no route table. The app reads its own section into a `HashMap<String, TransportConfig>` and an optional default `TransportConfig`, and passes both to `RoutedSender::from_route_configs`:
+
 ```yaml
-transport:
-  output:
-    type: routed
-    default:
+routing:
+  default:
+    type: kafka
+    kafka:
+      brokers: ["kafka:9092"]
+  routes:
+    events.land:
       type: kafka
       kafka:
         brokers: ["kafka:9092"]
-    routes:
-      events.land:
-        type: kafka
-        kafka:
-          brokers: ["kafka:9092"]
-      events.load:
-        type: kafka
-        kafka:
-          brokers: ["kafka:9092"]
-      audit.land:
-        type: grpc
-        grpc:
-          endpoint: "http://archiver:6000"
+    events.load:
+      type: kafka
+      kafka:
+        brokers: ["kafka:9092"]
+    audit.land:
+      type: grpc
+      grpc:
+        endpoint: "http://archiver:6000"
 ```
 
 Each route value is a full `TransportConfig` -- any backend
 [backends.md](backends.md) supports is fair game. The `default` is
-optional; without it, an unknown key returns `SendResult::Fatal`.
+optional, and without it an unknown key returns `SendResult::Fatal`.
 
 ---
 
@@ -127,8 +125,8 @@ on the direct transport.
 
 A rule's destination may be a LIST. `send_fanout` delivers one payload to
 every named destination and is acknowledged only when every one has
-accepted -- this is how a matched record reaches the loader AND the
-archiver without a broker in the path:
+accepted -- this is how one record reaches two sinks without a broker
+in the path:
 
 ```rust
 sender.send_fanout(&["loader", "archiver"], "orders_land", payload).await;
@@ -169,8 +167,7 @@ sender.send_batch_fanout(&["loader", "archiver"], &workbatch.records).await;
 
 A routed send NEVER retries and NEVER routes to a DLQ. It returns the
 chosen backend's `SendResult` unchanged so the caller applies its own
-policy -- the fetcher holds the batch and stalls its scheduler, the
-receiver back-pressures its ingest. A DLQ that only exists on the bus is
+policy, such as holding the batch or back-pressuring its ingest. A DLQ that only exists on the bus is
 not a fallback a brokerless deployment can take.
 
 Bounded retry with backoff is [`SinkStack`](../pipeline/sink-stack.md)'s
@@ -182,7 +179,7 @@ so a stack wraps the whole set.
 ## Composition with `AnySender`
 
 `RoutedSender` **owns** N `AnySender`s -- one per route plus the
-default. Each `AnySender` is itself enum-dispatched over the seven
+default. Each `AnySender` is itself enum-dispatched over the six
 backends. So `RoutedSender::send`:
 
 1. `HashMap::get(destination)` to find the route (or fall back to default).
@@ -197,22 +194,7 @@ implements `TransportBase` too -- `close()` cascades to every route
 and the default, `is_healthy()` reports `false` if any constituent
 sender is unhealthy.
 
----
-
-## Performance
-
-Per `send()` call, on top of the chosen backend's own cost:
-
-| Step | Cost |
-| ------ | ------ |
-| `HashMap::get(&str)` lookup | ~20-40 ns (SipHash + compare) |
-| Match on `AnySender` variant | <5 ns (jump table) |
-| Backend `send` | us to ms -- dominates |
-
-The routing overhead is at most 1% of any real backend's send cost.
-No allocation, no `Arc::clone`, no async indirection. The metric
-`dfe_transport_sent_total{transport="routed", route=<key>}` records
-the route taken.
+`RoutedSender` records no metric of its own: the chosen backend counts the send in `transport_sent_total` under its own `transport` label.
 
 ---
 

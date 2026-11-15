@@ -38,7 +38,7 @@ library chart renders version 4 only.
 | 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `service_account`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, `hot_paths`, the `x-scalo-dial` keyword in `config_schema`, and `config_mount_path` may be empty |
 
 An app that writes `schema_version: 3` in its struct literal still emits 3, and
-a version-4 reader refuses it; write `CONTRACT_SCHEMA_VERSION` instead. Serde
+a version-4 reader refuses it. Write `CONTRACT_SCHEMA_VERSION` instead. Serde
 reads a v3 contract into the v4 types with every new field at its default, and
 a v3 reader ignores the v4 fields, because `DeploymentContract` does not set
 `deny_unknown_fields`.
@@ -50,7 +50,7 @@ Schema, draft 2020-12, from these types with schemars, `schema_version` pinned
 and required. It is committed as
 `charts/scalo-service/schema/deployment-contract.v4.schema.json`, where a chart
 assembler in any language validates a contract against it. A test fails when the
-committed file and the derivation differ as JSON values; key order does not count,
+committed file and the derivation differ as JSON values. Key order does not count,
 so a schemars release that only reorders properties leaves it passing. Regenerate
 with:
 
@@ -74,23 +74,20 @@ comparison is `breaking_changes(old, new)`, which an app can run on its own
 flowchart LR
     R[Rust service<br/>uses scalo] -->|generate-artefacts| C[deployment-contract.json]
     P[Python service<br/>uses scalo-py] -->|generate-artefacts| C
-    O[bash / TS / Go service<br/>via hyperi-ci templater] -.roadmap.-> C
     C --> D[Dockerfile]
     C --> H[thin chart on scalo-service]
     C --> CM[container-manifest.json]
     C --> CS[compose.yaml fragment]
 ```
 
-| Tier | Producer | Status |
-| ------ | ---------- | -------- |
-| 1 | scalo (this crate) -- Rust services emit the contract from their config struct | **Shipped** |
-| 2 | scalo-py -- Python services emit the same contract shape | **Shipped** |
-| 3 | hyperi-ci templater -- bash/TS/Go services emit the contract via templating | **Roadmap** |
+| Producer | Emits |
+| ---------- | -------- |
+| scalo (this crate) | Rust services, from their config struct |
+| scalo-py | Python services, the same contract |
 
-Tier 3 is aspirational. The contract is JSON-serialisable and
-language-neutral by design; the Rust (`scalo`) and Python (`scalo-py`)
-producers both exist. Cross-language consumers read
-`deployment-contract.json` (the serialised form), not this crate.
+The contract is JSON-serialisable and language-neutral by design, so
+cross-language consumers read `deployment-contract.json` (the serialised
+form), not this crate.
 
 ---
 
@@ -158,14 +155,14 @@ and `validate()` refuses it until they are set.
 | Field | Type | Default | Notes |
 | ------- | ------ | --------- | ------- |
 | `schema_version` | `u32` | `4` | A reader refuses an unsupported version |
-| `app_name` | `String` | required | Matches `Chart.yaml` `name`; image repo segment |
+| `app_name` | `String` | required | Matches `Chart.yaml` `name`. Image repo segment |
 | `binary_name` | `String` | `""` | Falls back to `app_name` via `.binary()` |
 | `description` | `String` | `""` | Chart description |
 | `metrics_port` | `u16` | `9090` (`DEFAULT_METRICS_PORT`) | Metrics + health listen port |
 | `health` | `HealthContract` | default | Probe paths -- see below |
-| `env_prefix` | `String` | required | Config env prefix; `__` is the nesting separator |
+| `env_prefix` | `String` | required | Config env prefix, with `__` as the nesting separator |
 | `metric_prefix` | `String` | required | Prometheus namespace |
-| `config_mount_path` | `String` | `""` | E.g. `/etc/event-loader/config.yaml`; empty means the app reads no config file (v4) |
+| `config_mount_path` | `String` | `""` | E.g. `/etc/event-loader/config.yaml`. Empty means the app reads no config file (v4) |
 | `image_registry` | `String` | required | Container registry base, and `validate()` refuses an empty one |
 | `extra_ports` | `Vec<PortContract>` | `[]` | HTTP / gRPC / data ports beyond metrics -- see [Ports](#ports) |
 | `unbound_listen_paths` | `Vec<String>` | `[]` | `default_config` listen paths no port serves -- see [Ports](#ports) |
@@ -178,11 +175,11 @@ and `validate()` refuses it until they are set.
 | `native_deps` | `NativeDepsContract` | default | See [native-deps.md](native-deps.md) |
 | `image_profile` | `ImageProfile` | `Production` | See below |
 | `oci_labels` | `OciLabels` | default | Static OCI labels and the namespace of scalo's own keys -- see [Labels](#labels) |
-| `config_schema` | `Option<Value>` | `None` | JSON Schema of the app's `Config` (v3); dials carry `x-scalo-dial` (v4) -- see [Dials](#dials) |
+| `config_schema` | `Option<Value>` | `None` | JSON Schema of the app's `Config` (v3). Dials carry `x-scalo-dial` (v4) -- see [Dials](#dials) |
 | `capabilities` | `Vec<Capability>` | `[]` | Runtime-surface catalogue (v3) |
 | `writable_paths` | `Vec<WritablePath>` | `[]` | Directories the app writes, so the root filesystem stays read-only (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
 | `termination_grace_seconds` | `u32` | `45` | Seconds between SIGTERM and SIGKILL (v4) |
-| `resources` | `ResourcesContract` | empty | The app's own requests and limits; empty leaves the chart default (v4) |
+| `resources` | `ResourcesContract` | empty | The app's own requests and limits. Empty leaves the chart default (v4) |
 | `security` | `SecurityContract` | uid/gid/fsGroup 1000, read-only root | Identity and capabilities the image runs with (v4) |
 | `singleton` | `bool` | `false` | Exactly one pod: no autoscaling, Recreate rollout (v4) |
 | `service_account` | `ServiceAccount` | `Own` | `none` for an app that calls no Kubernetes API: the chart creates no ServiceAccount and the pod names none. Omitted from the JSON while `own` (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
@@ -195,7 +192,7 @@ and `validate()` refuses it until they are set.
 | `liveness_path` | `/livez` | Dockerfile `HEALTHCHECK`, Helm `livenessProbe` AND `startupProbe` |
 | `readiness_path` | `/readyz` | Helm `readinessProbe` |
 | `metrics_path` | `/metrics` | Prometheus scrape annotation on the pod |
-| `startup_budget_seconds` | `150` | How long the scalo-service startup probe waits for the liveness path before a restart; at least 1 (v4) |
+| `startup_budget_seconds` | `150` | How long the scalo-service startup probe waits for the liveness path before a restart. At least 1 (v4) |
 
 Those three paths are the whole probe surface. There are no aliases -- a
 retired path returns 404, deliberately, because an alias that keeps answering
@@ -209,7 +206,7 @@ period without the two drifting apart.
 `config_schema` is the JSON Schema (draft 2020-12) of the app's own
 `Config`, derived by schemars - `None` when the app does not derive
 `JsonSchema`. `capabilities` is the hand-authored catalog of runtime-data
-surface schemars cannot see (service names and their knobs); empty when
+surface schemars cannot see (service names and their knobs). Empty when
 the app supplies none. Both are also written out as
 `config-schema.{json,yaml}` and `capability-catalog.{json,yaml}` by
 `emit_config_artifacts`.
@@ -221,11 +218,11 @@ token).
 
 | Field | Purpose |
 | ------- | --------- |
-| `group_name` | The chart's `secrets.<group>` values section; the Secret defaults to `<fullname>-<group>` |
+| `group_name` | The chart's `secrets.<group>` values section. The Secret defaults to `<fullname>-<group>` |
 | `env_vars[].env_var` | The full env var name injected into the pod (`EVENT_LOADER__KAFKA__PASSWORD`) |
 | `env_vars[].key_name` | The values key `secrets.<group>.keys.<key_name>` that overrides the data key |
 | `env_vars[].secret_key` | Default K8s Secret data key (`kafka-password`) |
-| `optional` | The app starts without the group, so a missing Secret or key leaves the variable unset (v4); build with `SecretGroupContract::new(..).optional()` |
+| `optional` | The app starts without the group, so a missing Secret or key leaves the variable unset (v4). Build with `SecretGroupContract::new(..).optional()` |
 
 ---
 
@@ -251,14 +248,14 @@ singleton: true,
 
 | Type | Field | Default | Notes |
 | --- | --- | --- | --- |
-| `WritablePath` | `name` | required | 1 to 50 lowercase letters, digits and inner hyphens; a persistent path's claim is `<chart name>-<name>` |
+| `WritablePath` | `name` | required | 1 to 50 lowercase letters, digits and inner hyphens. A persistent path's claim is `<chart name>-<name>` |
 | | `path` | required | Absolute mount path |
-| | `size_limit` | `""` | Cap on an ephemeral path, a Kubernetes quantity; empty is no cap |
+| | `size_limit` | `""` | Cap on an ephemeral path, a Kubernetes quantity. Empty is no cap |
 | | `persistent` | `false` | A claim that outlives the pod instead of an `emptyDir` |
 | | `size` | `"1Gi"` | The claim's requested size |
-| | `when` | `None` | A `PortCondition`, read as for ports; `None` is always |
-| `ResourcesContract` | `requests`, `limits` | empty | Each a `ResourceList` of `cpu` and `memory` quantities; empty is unset |
-| `SecurityContract` | `run_as_user`, `run_as_group`, `fs_group` | `1000` | Numeric; uid 0 lets the process run as root |
+| | `when` | `None` | A `PortCondition`, read as for ports, and `None` is always |
+| `ResourcesContract` | `requests`, `limits` | empty | Each a `ResourceList` of `cpu` and `memory` quantities. Empty is unset |
+| `SecurityContract` | `run_as_user`, `run_as_group`, `fs_group` | `1000` | Numeric. Uid 0 lets the process run as root |
 | | `read_only_root_filesystem` | `true` | Writes go to `writable_paths` |
 | | `capabilities_add` | `[]` | Upper-case Linux capability names, added after every other one is dropped |
 
@@ -330,7 +327,7 @@ extra_ports: vec![
 ],
 ```
 
-`public()` (v4) marks a port clients outside the cluster connect to; the
+`public()` (v4) marks a port clients outside the cluster connect to. The
 scalo-service chart puts such ports on a load balancer when the deployment asks
 for one. `app_protocol` (v4) is written to the Service port's `appProtocol`, so a
 proxy in front of a plain-text gRPC port speaks HTTP/2 to it.
@@ -354,14 +351,14 @@ Gate `equals` and `one_of` on a string or boolean setting. Both compare the char
 | scalo-service `Deployment` + `Service` | rendered only while the condition holds, so only when the listener is on |
 | Dockerfile + runtime stage | left out of `EXPOSE`, listed in a comment right under it with its condition |
 | `container-manifest.json` | left out of `expose_ports`, listed under `conditional_ports` (key present only when a port is gated) |
-| compose fragment | published when the condition holds for `default_config`; otherwise a commented-out line to uncomment |
+| compose fragment | published when the condition holds for `default_config`. Otherwise a commented-out line to uncomment |
 | `unresolved_values_paths()` | reports a gate whose path is absent from `default_config` (null is off, not missing) |
 
 A port without `when` is always on: in every `EXPOSE`, `expose_ports` and published compose port, and in the chart without a condition. A UDP port is written as UDP everywhere -- `514/udp` on `EXPOSE`, in `expose_ports` and on the compose port, since a bare number means TCP -- and the chart writes every protocol upper case (`tcp` renders `TCP`), because Kubernetes takes no other spelling.
 
 ### What every port must be
 
-`DeploymentContract::validate()` is the one check the generators that can refuse run first: `generate_container_manifest` and `generate-artefacts` return `InvalidContract` and write nothing when it fails. It requires, for each extra port:
+`DeploymentContract::validate()` runs first in every generator and in `generate-artefacts`, which return `InvalidContract` and write nothing when it fails. It requires, for each extra port:
 
 - a name Kubernetes takes -- 1 to 15 lowercase letters, digits and single inner hyphens, with at least one letter (`syslog-udp`, not `Syslog_UDP`)
 - a protocol of TCP, UDP or SCTP, in any case
@@ -375,17 +372,17 @@ Beyond the ports, `validate()` requires:
 - a `singleton` to leave KEDA off
 - every `x-scalo-dial` in `config_schema` to be `big` or `small`, with every `$ref` the dial search follows resolving
 
-`generate_dockerfile`, `generate_runtime_stage` and `generate_compose_fragment` return text rather than a `Result`, so they cannot refuse. They print a gated port's name and condition onto one comment line with any control character escaped, so a newline in a contract value cannot start a Dockerfile instruction or a YAML key. Run `validate()` in a test to catch the contract itself.
+The Dockerfile, runtime-stage and compose generators print a gated port's name and condition onto one comment line with any control character escaped, so a newline in a contract value cannot start a Dockerfile instruction or a YAML key. Run `validate()` in a test to catch the contract itself.
 
 ### `bound_from` -- listeners that no port declares
 
 The other direction. `bound_from` names the `default_config` listen address a port serves, as a dotted path relative to `default_config` (`grpc.listen`, not `config.grpc.listen`). `DeploymentContract::undeclared_listeners()` walks `default_config` for listen addresses -- a key named `listen`, `bind_address` or ending `_bind_address` holding a string or null, plus `metrics.address` -- and reports:
 
 - a listen address no port claims
-- a `host:port` whose port differs from the port claiming it (`metrics.address` is claimed by `metrics_port`); a null or host-only value is not compared
+- a `host:port` whose port differs from the port claiming it (`metrics.address` is claimed by `metrics_port`). A null or host-only value is not compared
 - a `bound_from` that names nothing in `default_config`
 
-Several ports can claim one address -- three UDP flow ports on one host-only `bind_address` is clean. A client that only sends still has a bind address; list it in `unbound_listen_paths` to waive it. Put the check in a test:
+Several ports can claim one address -- three UDP flow ports on one host-only `bind_address` is clean. A client that only sends still has a bind address. List it in `unbound_listen_paths` to waive it. Put the check in a test:
 
 ```rust
 #[test]
@@ -425,7 +422,7 @@ scalo stamps a few keys of its own beside the standard `org.opencontainers.image
 | `<namespace>.profile` | Dockerfile, runtime stage, container manifest | `production` or `development` |
 | `<namespace>.app` | container manifest | `app_name` |
 | `<namespace>.metrics_port` | container manifest | `metrics_port` |
-| `<namespace>.contract.version` / `.source-commit` / `.image-ref` | Dockerfile, when a `ContractIdentity` is passed; `ContractIdentity::as_yaml_annotations` renders the same keys for a chart or `Application` built elsewhere | see `ContractIdentity` |
+| `<namespace>.contract.version` / `.source-commit` / `.image-ref` | Dockerfile, when a `ContractIdentity` is passed, and `ContractIdentity::as_yaml_annotations` renders the same keys for a chart or `Application` built elsewhere | see `ContractIdentity` |
 
 An app that already ships its own namespace keeps it by setting `label_namespace`, and every key above moves with it.
 
@@ -472,7 +469,7 @@ reference carries no codename.
 | `DeploymentContract::config_filename()` / `config_dir()` | Split `config_mount_path` |
 | `ImageProfile::{Production, Development}` | Profile enum |
 | `HealthContract` | `/livez` / `/readyz` / `/metrics` paths |
-| `PortContract` | Extra container port beyond `metrics_port`; build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` and `expose_ports` as `514/udp`. `validate()` refuses a protocol other than TCP, UDP or SCTP (any case) |
+| `PortContract` | Extra container port beyond `metrics_port`. Build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` and `expose_ports` as `514/udp`. `validate()` refuses a protocol other than TCP, UDP or SCTP (any case) |
 | `PortCondition` | When a port's listener exists -- see [Ports](#ports) |
 | `DeploymentContract::undeclared_listeners()` / `assert_listeners_declared()` | Listener coverage -- see [Ports](#ports) |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |

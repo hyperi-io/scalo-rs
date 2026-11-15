@@ -22,7 +22,7 @@ flowchart TB
 
     subgraph L3["L3 - Transport and I/O"]
         T["transport<br/>Kafka / gRPC / Memory / File / Pipe / HTTP"]
-        TF["transport-filter<br/>3-tier filter engine"]
+        TF["transport::filter<br/>3-tier filter engine"]
         HS["http-server (axum)"]
         HC["http (reqwest)"]
         SEC["secrets (Vault / AWS)"]
@@ -31,7 +31,7 @@ flowchart TB
     end
 
     subgraph L2["L2 - Runtime and self-regulation"]
-        RC["runtime / env<br/>RuntimeContext (K8s/Docker/BareMetal)"]
+        RC["env / runtime<br/>RuntimeContext, RuntimePaths"]
         MEM["memory<br/>MemoryGuard"]
         SCA["scaling<br/>ScalingPressure"]
         GOV["governor<br/>UnifiedPressure gate (hard memory + soft signals)"]
@@ -64,7 +64,7 @@ flowchart TB
 ```
 
 Dashed lines mark embedded composition, not separate callers:
-`transport-filter` lives inside every transport backend, and `sink-stack`
+`transport::filter` lives inside every transport backend, and `sink-stack`
 wraps a transport sender. Solid arrows show layer dependencies.
 
 ---
@@ -77,8 +77,8 @@ wraps a transport sender. Solid arrows show layer dependencies.
 | -------- | --------- | --------- |
 | `config` | `config` (default) | 7-layer cascade (CLI -> env -> .env -> YAML -> defaults), hot-reload, section registry, `/config` admin endpoint |
 | `logger` | `logger` (default) | `tracing-subscriber` with JSON/text autodetect, RFC 3339 timestamps, sensitive-field masking, flood-control helpers |
-| `metrics` | `metrics-core`, `metrics-process`, `metrics` | Lock-free counters/gauges/histograms, Prometheus exporter, `/metrics` + `/metrics/manifest` |
-| `otel_metrics` / `otel_tracing` | `otel`, `otel-metrics`, `otel-tracing` | OTLP exporter, OTel SDK bridge for `tracing` spans |
+| `metrics` | `metrics` or `otel-metrics` (`metrics-core` and `metrics-process` are the parts they pull in) | Lock-free counters/gauges/histograms, Prometheus exporter, `/metrics` + `/metrics/manifest`, OTLP metrics push |
+| `otel_tracing` | `otel`, `otel-tracing` | OTLP exporter, OTel SDK bridge for `tracing` spans |
 | `health` | `health` | `HealthRegistry`, health probes (`/livez` / `/readyz`) |
 | `shutdown` | `shutdown` | `CancellationToken`, SIGTERM/SIGINT, K8s pre-stop delay |
 
@@ -90,8 +90,8 @@ Pillars are singletons. Modules in higher layers call into them via macros
 
 | Module | Feature | Purpose |
 | -------- | --------- | --------- |
-| `env` | always | Detect environment (Kubernetes, Docker, container, bare metal) |
-| `runtime` | `runtime` | XDG/container-aware paths, `RuntimeContext` singleton (pod, namespace, node, memory limit, CPU quota) |
+| `env` | always | Detect environment (Kubernetes, Docker, container, bare metal), `RuntimeContext` singleton (pod, namespace, node, container id, memory limit, CPU quota) |
+| `runtime` | `runtime` | XDG/container-aware paths (`RuntimePaths`) |
 | `memory` | `memory` | `MemoryGuard` - cgroup-aware OOM prevention with auto-detected limits |
 | `scaling` | `scaling` | `ScalingPressure` - KEDA external-scaler signal (0.0-100.0) |
 | `governor` | `governor` | `UnifiedPressure` self-regulation gate - latches a hard memory signal with weighted soft signals under hysteresis, driving inbound backpressure |
@@ -104,10 +104,10 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | Module | Feature | Purpose |
 | -------- | --------- | --------- |
 | `transport` | `transport`, `transport-{kafka,grpc,memory,file,pipe,http}` | Trait architecture (`TransportBase`, `TransportSender`, `TransportReceiver`, `Transport`), `AnySender` enum dispatch, factory |
-| `transport::filter` | `transport` | 3-tier engine (SIMD field ops / compiled CEL / complex CEL) embedded in every backend |
-| `http_server` | `http-server` | axum-based server, probe wiring, `/config` / `/metrics` / `/metrics/manifest` mount points |
+| `transport::filter` | `transport` (the two CEL tiers need `expression`) | 3-tier engine (SIMD field ops / compiled CEL / complex CEL) embedded in every backend |
+| `http_server` | `http-server` | axum-based server serving `/livez`, `/readyz`, `/health/detailed` and `/config`. `/metrics` and `/metrics/manifest` are on the `MetricsManager` listener |
 | `http_client` | `http` | `reqwest`, with retry and backoff from `backon` |
-| `secrets` | `secrets`, `secrets-vault`, `secrets-aws` | `SecretsManager` trait, OpenBao/Vault and AWS Secrets Manager backends |
+| `secrets` | `secrets`, `secrets-vault`, `secrets-aws` | `SecretsManager` over the `SecretProvider` trait, with file, OpenBao/Vault and AWS Secrets Manager providers |
 | `directory_config` | `directory-config`, `directory-config-git` | YAML directory store with optional `git2` |
 | `output` | `output-file` | NDJSON file output sink |
 
@@ -115,9 +115,9 @@ Pillars are singletons. Modules in higher layers call into them via macros
 
 | Module | Feature | Purpose |
 | -------- | --------- | --------- |
-| `spool` | `spool` | Disk-backed async FIFO queue (`yaque` + `zstd`), per-record CRC32C integrity |
+| `spool` | `spool` | Disk-backed async FIFO queue (`yaque` + `zstd`), with an opt-in per-record CRC32C check (`crc`, off by default) |
 | `tiered_sink` | `tiered-sink` | Transport + spool + circuit breaker + background drain |
-| `sink_stack` | `sink-stack` | Outbound control stack - composes timeout, load-shed, concurrency-limit, retry/backoff and rate-limit around a transport sender (tower `ServiceBuilder`); preserves at-least-once |
+| `sink_stack` | `sink-stack` | Outbound control stack - composes timeout, load-shed, concurrency-limit, retry/backoff and rate-limit around a transport sender (tower `ServiceBuilder`), and preserves at-least-once |
 | `worker::pool` | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio), pressure-based scaling |
 | `worker::engine` | `worker-batch` | `BatchEngine` - SIMD parse (`sonic-rs`), pre-route filter, field interning |
 | `dlq` | `dlq`, `dlq-kafka`, `dlq-http` | DLQ sink with file always available, Kafka/HTTP backends opt-in |
@@ -127,32 +127,21 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | Module | Feature | Purpose |
 | -------- | --------- | --------- |
 | `cli` | `cli` | `clap` types: `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
-| `cli::service` | `cli-service` | `ServiceApp` trait, `run_app`, `ServiceRuntime` - full data-plane app scaffolding |
+| `cli` (service items) | `cli-service` | `ServiceApp` trait, `run_app`, `ServiceRuntime` - full data-plane app scaffolding |
 | `top` | `top` | TUI metrics dashboard (`ratatui`) |
-| `deployment` | `deployment`, `deployment-smoke` | `DeploymentContract`, generators for Dockerfile / runtime stage / Compose fragment / container manifest; the scalo-service chart renders the Kubernetes objects |
+| `deployment` | `deployment`, `deployment-smoke` | `DeploymentContract`, generators for Dockerfile / runtime stage / Compose fragment / container manifest. The scalo-service chart renders the Kubernetes objects |
 | `version_check` | `version-check` | Startup HTTP probe to the version API |
 
 ---
 
 ## Layering rules
 
-1. **A module never depends upward.** `transport` cannot import from `cli`.
-   `config` cannot import from `worker`. Cargo's feature graph enforces
-   most of this; code review catches the rest.
-2. **Pillars don't depend on each other beyond what's structurally
-   required.** `metrics` uses `tracing` for its own logging, but does not
-   know `config` exists.
-3. **L2 modules can be used standalone.** `MemoryGuard`, `ScalingPressure`,
-   `cache`, `strmatch` all work without the L4 pipeline above them.
-4. **L3 transports always embed the filter engine.** Even when no filters
-   are configured the engine is present as a no-op (a single
-   `has_inbound_filters()` branch on every send/recv). Zero-cost when empty.
-5. **L4 pipeline modules compose L3 transports with L2 runtime concerns.**
-   `tiered_sink` is the canonical example: a transport plus a disk spool plus a circuit breaker that reports to the `HealthRegistry`.
-6. **L5 scaffolding glues the whole stack.** `ServiceRuntime::new` wires
-   the pillars, runtime, pipeline primitives, and shutdown into one
-   object the app holds. `DeploymentContract` does the same job for the
-   "ship it" side: one struct, generates every artefact CI/CD needs.
+1. Outside test support, a module never depends upward: `transport` cannot import from `cli`, and `config` cannot import from `worker`. A module compiled without the one above it cannot name it, so the feature graph enforces most of this.
+2. Pillars depend on each other only where they must. `metrics` uses `tracing` for its own logging, but does not know `config` exists.
+3. L2 modules work standalone. `MemoryGuard`, `ScalingPressure` and `strmatch` run without the L4 pipeline above them.
+4. L3 transports always embed the filter engine. With no filters configured it is a no-op: one `has_inbound_filters()` check per receive and one `has_outbound_filters()` check per send.
+5. L4 pipeline modules compose L3 transports with L2 runtime concerns. `tiered_sink` is the clearest case: a transport plus a disk spool plus a circuit breaker that reports to the `HealthRegistry`.
+6. L5 scaffolding glues the whole stack. `run_app` builds the `ServiceRuntime`, which wires the pillars, runtime, pipeline primitives and shutdown into the one object `run_service` receives. `DeploymentContract` does the same for shipping: from one struct the generators write the Dockerfile, runtime stage, Compose fragment and container manifest, and `to_json` writes the contract the scalo-service chart renders from.
 
 ---
 
@@ -175,10 +164,8 @@ A handful of dependencies aren't visible from layer naming alone:
 - `tiered-sink` does not enable `spool`. It runs its own `yaque` queue through the crate-private `spool_codec` it shares with `spool`, plus an L3 transport.
 - `dlq` requires `concurrency` (L2) for the `BackgroundSink` actor that
   drains queued entries.
-- `transport-trace` is the *only* feature that pulls in the OpenTelemetry
-  SDK on the transport side. Apps that send/receive without distributed
-  tracing avoid that dep entirely.
-- `cli-service` (L5) reaches across the whole stack - it pulls `cli + metrics + memory + scaling + shutdown + governor + lifecycle` because `ServiceRuntime::new` wires all of them. It pulls no transport, and neither `sink-stack` nor `worker-pool`: an app that moves data or runs a pool declares what it uses.
+- `transport-trace` is the *only* transport feature that pulls in OpenTelemetry, and it takes the `opentelemetry` API crate, not the SDK. Apps that send/receive without distributed tracing avoid that dep entirely.
+- `cli-service` (L5) reaches across the whole stack - it pulls `cli + metrics + memory + scaling + shutdown + governor + lifecycle` because the `ServiceRuntime` that `run_app` builds wires all of them. It pulls no transport, and neither `sink-stack` nor `worker-pool`: an app that moves data or runs a pool declares what it uses.
 
 Read [feature-flags.md](feature-flags.md) for the full feature-to-feature
 edges and [auto-wiring.md](auto-wiring.md) for which dependencies are
@@ -188,8 +175,6 @@ auto-wired vs explicit.
 
 ## Project facts
 
-- **Edition:** 2024
-- **MSRV:** see `rust-version` in `Cargo.toml`
-- **Sibling lib:** `scalo-py` (Python control-plane equivalent)
-- **Downstream:** the six core consumer services consume `scalo` in
-  lockstep (see [README.md Section Project facts](README.md#project-facts))
+- Edition 2024, MSRV as `rust-version` in `Cargo.toml`.
+- Sibling lib: `scalo-py`, the Python control-plane equivalent.
+- Downstream: the DFE Rust services consume `scalo` in lockstep. dfe-infra's `suite.yaml` lists them.
