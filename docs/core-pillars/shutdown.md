@@ -4,7 +4,7 @@
 `tokio_util::sync::CancellationToken` that every long-running task clones and
 awaits via `token.cancelled().await`. On SIGTERM/SIGINT the handler sleeps for a
 K8s pre-stop delay, then cancels the token. All tasks unblock together, drain
-in-flight work, and exit; the process exits when `main` returns.
+in-flight work and exit. The process exits when `main` returns.
 
 The pre-stop delay keeps traffic off a pod that has stopped accepting work.
 Kubernetes takes a terminating pod out of Service endpoints itself, and kube-proxy
@@ -44,8 +44,9 @@ callback and the health registry throughout. The one flag that does clear is
 `HttpServer`'s, when the cancelled token stops it -- see [health.md](health.md).
 An app that wants `/readyz` to fail while it drains wires that itself.
 
-When SIGTERM arrives in K8s, the handler increments `pod_eviction_received_total`
-(if `metrics` or `otel-metrics` is on) so eviction events are observable.
+In K8s, once the pre-stop delay has run, the handler increments
+`pod_eviction_received_total` (if `metrics` or `otel-metrics` is on), for
+SIGTERM and SIGINT alike, so eviction events are observable.
 
 ---
 
@@ -73,10 +74,10 @@ async fn consumer_loop(token: CancellationToken, mut rx: kafka::Consumer) {
 ```
 
 `biased` checks shutdown first on every poll -- without it a saturated channel can
-starve the cancellation branch. Enforced by code review and the audit script.
+starve the cancellation branch.
 
 For scoped cancellation (cancel a sub-task without shutting down the service), use
-`token.child_token()`. Cancelling the parent cancels every child; cancelling a
+`token.child_token()`. Cancelling the parent cancels every child, and cancelling a
 child leaves the parent running.
 
 ---
@@ -84,7 +85,7 @@ child leaves the parent running.
 ## Cancel-safety in `select!`
 
 A future polled by `select!` and dropped when another arm wins must be safe to
-drop at any await point. Most tokio primitives are; a few are not.
+drop at any await point. Most tokio primitives are, and a few are not.
 
 | Future | Cancel-safe? | Notes |
 | --- | --- | --- |
@@ -93,14 +94,11 @@ drop at any await point. Most tokio primitives are; a few are not.
 | `time::sleep` | Yes | |
 | `TcpListener::accept` | Yes | |
 | `CancellationToken::cancelled` | Yes | |
-| `broadcast::Receiver::recv` | **No** | Dropping drops messages -- hoist OUT, `pin!` once, drop only on shutdown |
-| `mpsc::Sender::send` after `reserve()` | **No** | Drop loses the permit slot |
+| `broadcast::Receiver::recv` | Yes | No message is received if another arm wins |
+| `mpsc::Sender::send` | **Partly** | The message is not sent, and it is dropped with the future -- `reserve()` first and send on the permit to keep it |
 | Any state machine you wrote yourself | Usually no | Default to "no" until proven otherwise |
 
-The Kafka offset-commit path in a loader was bitten by this: a
-`broadcast::recv` inside `select!` dropped messages on every shutdown event,
-corrupting committed offsets. The fix is the `pin!` hoist in
-`standards/languages/RUST.md`.
+Each tokio method states its cancel safety in its own docs under "Cancel safety".
 
 ---
 
@@ -119,7 +117,7 @@ scalo::shutdown::is_shutdown();    // check state without awaiting
 
 | Item | Purpose |
 | --- | --- |
-| `shutdown::install_signal_handler() -> CancellationToken` | Install SIGTERM/SIGINT handler; spawn the wait task; return the global token |
+| `shutdown::install_signal_handler() -> CancellationToken` | Installs the SIGTERM/SIGINT handler, spawns the wait task and returns the global token |
 | `shutdown::token() -> CancellationToken` | Clone the global token (created lazily if no handler installed) |
 | `shutdown::trigger()` | Cancel the global token |
 | `shutdown::is_shutdown() -> bool` | Check cancellation state without awaiting |
@@ -139,9 +137,9 @@ fresh `CancellationToken::new()` and drive it locally rather than touching the
 global -- see `trigger_cancels_token` and
 `cancelled_future_resolves_after_cancel` in [`src/shutdown.rs`](../../src/shutdown.rs).
 
-`install_signal_handler` spawns a tokio task; calling it twice is safe (the second
-clones the same token; the second listener is inert) but call it once at the top
-of `main`.
+`install_signal_handler` spawns a tokio task. A second call returns the same
+token but starts a second listener, which waits the pre-stop delay, counts the
+eviction and logs again, so call it once at the top of `main`.
 
 ---
 

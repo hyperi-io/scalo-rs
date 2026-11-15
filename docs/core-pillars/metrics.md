@@ -1,7 +1,7 @@
 # Metrics
 
-`MetricsManager::new("dfe_loader")` installs a global `metrics` recorder, builds a
-Prometheus exporter, and serves `/metrics`. Any module then calls
+`MetricsManager::new("dfe_loader")` installs a global `metrics` recorder and builds a
+Prometheus exporter, and its `start_server` serves `/metrics`. Any module then calls
 `metrics::counter!` / `gauge!` / `histogram!` -- the macros are no-ops with no
 recorder, so library code compiles without the metrics feature.
 
@@ -13,7 +13,7 @@ provisioning, alert validators, the data-plane docs site).
 
 Process and container metrics (RSS, CPU, FDs, cgroup limits) auto-collect on a
 fixed interval via [sysinfo](https://crates.io/crates/sysinfo) when the relevant
-features are on; container metrics read cgroup v1 and v2 transparently.
+features are on, and container metrics read cgroup v1 and v2 transparently.
 
 ---
 
@@ -54,7 +54,7 @@ mgr.start_server("0.0.0.0:9090").await?;
 
 Names are namespace-prefixed automatically -- `counter("foo")` records as
 `dfe_loader_foo`. The `metrics::counter!` / `gauge!` / `histogram!` macros take the bare name too: the recorder prefixes every key, so `counter!("dfe_loader_foo")` records as `dfe_loader_dfe_loader_foo`. Use `*_with_labels` so the label keys and group land in the
-manifest (i.e. nearly always; unlabeled metrics are rare in data-plane pipelines).
+manifest (nearly always: unlabelled metrics are rare in data-plane pipelines).
 
 Single-binary services use `ServiceRuntime` from `cli`, which constructs the manager, attaches its `ScalingPressure` so `/scaling/pressure` serves it, and starts the listener with `start_server`. The app sets its own readiness callback. `/memory/pressure` is served by `start_server_with_routes` only, so a service on `ServiceRuntime` does not answer it. See [../runtime/service-runtime.md](../runtime/service-runtime.md).
 
@@ -96,7 +96,7 @@ was created.
 
 The manifest lists what the registry holds, not everything `/metrics` serves:
 the process, container, HTTP client and memory guard gauges are served but not
-yet described (scalo-rs#137).
+described (scalo-rs#137).
 
 Two CLI subcommands produce the same JSON without running the service, reading
 `metrics.namespace` from the same config cascade the service loads.
@@ -151,7 +151,7 @@ A counter emitted both with and without labels is two series under one name, and
 
 ## Transport throughput
 
-The transport layer counts both events AND bytes, in both directions. All carry the `transport` label (backend kind: `kafka` / `grpc` / `http` / `file` / `pipe`). A record sent through a `RoutedSender` counts once, under the transport that sent it, and only once it has landed. Bytes are RAW wire bytes (summed `payload.len()` per `WorkBatch`), incremented once per batch send/recv -- not per event.
+The transport layer counts both events AND bytes, in both directions. All carry the `transport` label (backend kind: `kafka` / `grpc` / `http` / `file` / `pipe` / `memory`). A record sent through a `RoutedSender` counts once, under the transport that sent it, and only once it has landed. Bytes are RAW wire bytes (summed `payload.len()` per `WorkBatch`), incremented once per batch send/recv -- not per event.
 
 | Metric | Direction | Meaning |
 | --- | --- | --- |
@@ -176,11 +176,11 @@ A source or sink that goes away is waited out rather than ending the app, and th
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
-| `transport_recv_errors_total` | `transport`, `class` | receive failures; `class="transient"` were retried, `class="missing_topic"` waited for a subscribed topic to appear, `class="permanent"` were returned. Kafka emits it |
+| `transport_recv_errors_total` | `transport`, `class` | receive failures: `class="transient"` were retried, `class="missing_topic"` waited for a subscribed topic to appear, `class="permanent"` were returned. Kafka emits it |
 | `transport_send_missing_topic_total` | `transport` | sends that found the destination topic missing and returned `Backpressured`, so the caller retried them. Kafka emits it |
 | `transport_consumer_rebuilds_total` | `transport`, `protocol` | consumers replaced after librdkafka flagged them fatal, by the group protocol the new client joins with. Kafka emits it |
 | `transport_revoke_discarded_total` | `transport`, `stage` | records a revoke kept from a write, since the partition's next owner reads them again: `stage="receive"` for those `recv` left out, read before a revoke of their partition in the same poll, `stage="buffer"` for those a caller discarded from its own buffer and counted with `KafkaTransport::discarded_after_revoke`. Kafka emits it |
-| `transport_commit_errors_total` | `transport` | source commits that failed after the block was delivered; the `BatchEngine` driver counts them and carries on |
+| `transport_commit_errors_total` | `transport` | source commits that failed after the block was delivered. The `BatchEngine` driver counts them and carries on |
 | `pipeline_retries_total` | `stage` | `BatchEngine` run-loop steps retried after a transient failure, `stage` being `recv`, `sink`, or `dlq` for the pipeline's DLQ writes |
 | `transport_redelivered_total` | `transport`, `reason` | sends retried after an outcome the receiver may still deliver, so possible duplicates: `reason="hold_expired"` when a held response ran out of budget, `reason="deadline"` when the send's deadline passed. gRPC emits it |
 
@@ -222,7 +222,7 @@ don't reorder.
 
 The listener drains recorded histogram samples into their series every 5 s, scrape or no scrape, and frees the drained blocks, so a service nobody scrapes does not hold every sample it ever recorded.
 
-`start_server` serves at most 64 connections at once and closes one past that unanswered, counted in `metrics_server_connections_refused_total`. Each gets 5 s to send a request line of at most 8 KiB and 10 s for its response to be written, so a client that stops reading releases its socket and the rendered body.
+`start_server` serves at most 64 connections at once and closes one past that unanswered, counted in `metrics_server_connections_refused_total`. Each gets 5 s to send a request line of at most 8 KiB, and the server gives itself 10 s to write the response, so a client that stops reading releases its socket and the rendered body.
 
 ---
 
@@ -261,7 +261,7 @@ identity.
 | --- | --- |
 | `MetricsManager::new(namespace)` | Construct + install recorder |
 | `MetricsManager::with_config(MetricsConfig)` | Custom namespace, intervals, OTel config |
-| `MetricsManager::new_for_test(namespace)` *(test only)* | No global install -- safe for parallel tests |
+| `MetricsManager::new_for_test(namespace)` *(crate-private, scalo's own tests)* | No global install -- safe for parallel tests |
 | `counter` / `gauge` / `histogram` | Construct + auto-register |
 | `*_with_labels(name, desc, labels, group)` | Same, with manifest label keys + group |
 | `histogram_with_buckets` | Custom bucket spec (captured in manifest) |
@@ -280,11 +280,12 @@ identity.
 ## Testing
 
 Parallel tests panic if multiple call `MetricsManager::new()` -- the global
-Prometheus recorder installs once per process. Use `new_for_test()`: it skips the
-install but keeps the registry, descriptor push, and namespacing, and the macros
-become no-ops. Most tests verify descriptor registration and naming, not recorded
-values; end-to-end recording is verified in the integration suite where one
-fixture installs the recorder.
+Prometheus recorder installs once per process. scalo's own tests use the
+crate-private `new_for_test()`: it skips the install but keeps the registry,
+descriptor push, and namespacing, and the macros become no-ops. A consumer's
+tests get one process per test under `cargo nextest`. Most of scalo's tests verify
+descriptor registration and naming, not recorded values. Recording itself is
+verified in the integration suite, where one fixture installs the recorder.
 
 ---
 

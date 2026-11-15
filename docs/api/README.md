@@ -15,7 +15,6 @@ those are auto-wired and live in [../core-pillars/README.md](../core-pillars/REA
 | [directory-config.md](directory-config.md) | YAML directory store, optional git backing |
 | [concurrency.md](concurrency.md) | `BackgroundSink`, `PeriodicWorker`, `ActorHandle` |
 | [geoip-download.md](geoip-download.md) | GeoIP MMDB provisioning -- files onto disk, no lookup engine |
-| [cache.md](cache.md) | documented, NOT built into this release -- see the note in it |
 
 > **Note:** [http-server.md](http-server.md) is worth reading before you point a
 > probe or a scrape at a port. The `http-server` listener and the metrics

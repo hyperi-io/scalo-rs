@@ -6,9 +6,8 @@ interns known field names via `dashmap`, and runs the user transform
 across a rayon pool. Auto-wired by `ServiceRuntime` when the
 `worker-batch` feature is on.
 
-`BatchEngine` is the standard ingest-loop primitive for loader,
-archiver, and transform apps -- it sits between a `TransportReceiver`
-and an app-supplied sink.
+`BatchEngine` is the ingest-loop primitive for mid-tier and sink stages
+-- it sits between a `TransportReceiver` and an app-supplied sink.
 
 ---
 
@@ -16,8 +15,8 @@ and an app-supplied sink.
 
 | API | Parses? | Transform receives | Use case |
 | ----- | --------- | -------------------- | ---------- |
-| `process_mid_tier` | Yes (SIMD JSON) | `&mut ParsedMessage` | Loader, archiver, VRL -- needs field access |
-| `process_raw` | No | `&Record` | Receiver forwarding, binary protocols, opaque payloads |
+| `process_mid_tier` | Yes (SIMD JSON) | `&mut ParsedMessage` | Loaders and transforms that need field access |
+| `process_raw` | No | `&Record` | Forwarding, binary protocols, opaque payloads |
 
 Both take a `&[Record]` slice, chunk it at `max_chunk_size` (default
 10 000), and call the transform across a rayon pool.
@@ -29,17 +28,17 @@ Both take a `&[Record]` slice, chunk it at `max_chunk_size` (default
 ```mermaid
 flowchart LR
     R[Record slice] --> C{pre_route_filters listed?}
-    C -->|yes| F[Pre-route filter<br/>SIMD extract of each filter's field<br/>~100 ns/field]
+    C -->|yes| F["Pre-route filter<br/>SIMD extract of the field each filter names"]
     C -->|no| P
-    F --> P[Parse<br/>sonic_rs::from_slice<br/>~1-5 us/msg]
+    F --> P[Parse<br/>sonic_rs::from_slice]
     P --> I[Intern known fields<br/>extract into HashMap]
     I --> T[Parallel transform<br/>rayon par_iter_mut]
     T --> O[Vec&lt;Result&lt;O, E&gt;&gt;]
 ```
 
 Each pre-route filter reads the field it names, and the first filter that matches decides. `routing_field` does not gate them. Filter-rejected messages are removed from the output. DLQ-routed and
-parse-error messages become `Err` entries; the action is configured
-via `parse_error_action: dlq | skip | fail_batch`.
+parse-error messages become `Err` entries, and
+`parse_error_action: dlq | skip | fail_batch` sets the action.
 
 `process_raw` skips the parse and intern phases -- pre-route runs on
 raw bytes only.
@@ -51,12 +50,8 @@ raw bytes only.
 `FieldInterner` deduplicates field-name strings via
 `DashMap<Arc<str>, ()>`. Pre-populated at construction with the
 configured `known_fields` (`_table`, `_timestamp`, `_source`, `host`,
-`source_type`, `event_type` by default). Hot-path costs:
-
-| Path | Cost |
-| ------ | ------ |
-| Already interned (`Arc::clone`) | ~20 ns |
-| First occurrence (`Arc::from` + insert) | ~100 ns |
+`source_type`, `event_type` by default). An interned name costs an
+`Arc::clone`, and a first occurrence an `Arc::from` plus an insert.
 
 Once a field is interned, every subsequent batch reuses the same
 `Arc<str>` -- the slow path runs at most once per unique field per
@@ -82,7 +77,7 @@ sink, then the commit. They need the `transport` feature.
 
 `process` must keep the block's `commit_tokens` (`WorkBatch::map_records`
 does). `CommitMode::Auto` has the engine commit them once the sink takes
-the block; `CommitMode::SinkManaged` leaves the commit to the sink, which
+the block, and `CommitMode::SinkManaged` leaves the commit to the sink, which
 lets it defer until a downstream write lands. The sub-block paths take
 `Auto` only. The optional ticker fires inside the loop's `biased`
 `select!`, after the shutdown arm.
@@ -147,14 +142,11 @@ An app that runs several pipelines names each with `.listener(name)`, so each pu
 ## Auto-wiring
 
 `ServiceRuntime` builds the engine when the `worker-batch` feature is
-on, reusing the runtime's `AdaptiveWorkerPool` so no second rayon pool
-is created:
+on, with `BatchEngine::with_pool` over the runtime's `AdaptiveWorkerPool`
+so no second rayon pool is created, and hands it over as
+`runtime.batch_engine` (`Option<Arc<BatchEngine>>`).
 
-```rust
-let engine = BatchEngine::with_pool(runtime.worker_pool.clone(), cfg);
-```
-
-`auto_wire(&MetricsManager, Option<&MemoryGuard>)` registers metrics
+`auto_wire(&MetricsManager, Option<&Arc<MemoryGuard>>)` registers metrics
 and attaches the memory guard. Apps that want a standalone engine
 outside the runtime use `BatchEngine::new` or
 `BatchEngine::from_cascade("batch_processing")`.
@@ -202,8 +194,8 @@ pause inside the engine. See [self-regulation.md](../self-regulation.md).
 | `BatchEngine::with_pool(pool, cfg)` | Reuse an existing pool (preferred when `ServiceRuntime` is available) |
 | `BatchEngine::from_cascade(key)` | Load config from the cascade |
 | `process_mid_tier(messages, transform)` | Sync -- parse JSON, extract known fields, run transform on `&mut ParsedMessage` via rayon |
-| `process_raw(messages, transform)` | Sync -- no parse; run transform on `&Record` via rayon |
-| `run_governed(receiver, shutdown, process, sink, commit, ticker)` | Async loop; sub-blocks sized by the governor's byte budget, whole blocks with it off |
+| `process_raw(messages, transform)` | Sync -- no parse, run transform on `&Record` via rayon |
+| `run_governed(receiver, shutdown, process, sink, commit, ticker)` | Async loop, sub-blocks sized by the governor's byte budget, whole blocks with it off |
 | `run_workbatch(receiver, shutdown, process, sink, commit, ticker)` | Async loop, whole blocks, on-demand parse |
 | `run_workbatch_parsed(receiver, shutdown, process_parsed, sink, commit, ticker)` | Async loop, whole blocks, pre-parsed `ParsedBatch` |
 | `run_workbatch_streaming(receiver, shutdown, process, sink, commit, sub_block_bytes, ticker)` | Async loop, sub-blocks of `sub_block_bytes` |

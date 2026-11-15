@@ -4,11 +4,11 @@
 
 The subscriber wraps stderr in a `MaskingWriter` that redacts sensitive field
 values at the write boundary -- both `password=secret123` and
-`"password":"secret123"` come out `[REDACTED]`. Masking is on by default; disable
+`"password":"secret123"` come out `[REDACTED]`. Masking is on by default. Disable
 it explicitly if you must. JSON lines are also enriched with `service` /
 `version` (from `SERVICE_NAME` / `SERVICE_VERSION` or `ServiceApp`) and K8s context
 (`pod_name`, `namespace`, `node_name`) from
-[`env::runtime_context`](../../src/env.rs); those K8s fields are absent on bare
+[`env::runtime_context`](../../src/env.rs). Those K8s fields are absent on bare
 metal.
 
 ---
@@ -66,7 +66,7 @@ The format is the first selector that names `json` or `text` (`pretty` and `huma
 
 `LogFormat::Auto` resolves by the same derivation. `setup(opts)` takes `opts.format` as given and reads neither `LOG_FORMAT` nor `logger.format`: an explicit `Json` or `Text` is used as is, and `Auto` goes straight to the derivation.
 
-Colour applies to text output only; JSON is never coloured. First match wins:
+Colour applies to text output only, and JSON is never coloured. First match wins:
 
 1. `LOG_COLOR`: `true`, `1` or `yes` in any case is on, any other value (empty included) is off
 2. `NO_COLOR` present, with any value: off
@@ -83,7 +83,7 @@ Applied at the write boundary, so it is the catch-all regardless of how a value 
 
 The default list covers passwords, tokens, API keys, secrets, keys a qualifying word makes a credential (`signing_key`, `tls_key`, `ssh_key` and the rest, where `routing_key` is not one), auth and session values, certificates, connection strings, and personal data (`ssn`, `tfn`, `medicare`, `credit_card`, `card_number`, `cvv`, `pin`, `email`, `phone`). scalo-py's logger uses the same list and the same rule, and both are checked against one corpus, `tests/fixtures/credential_masking_parity.json`.
 
-JSON mode walks the object tree, and a key naming a credential masks its whole value at any depth. A bare `key` or `value` is judged with its parent's name, so `"tls": {"key": ...}` and `"accepted_headers": [{"values": [...]}]` mask while `"partitioner": {"key": ...}` does not. Inside an array, a two-item array whose first item names a credential, the shape a header list takes, masks its second item; a two-item array directly under a key is a list. Every string, the message included, is then masked as text, as below.
+JSON mode walks the object tree, and a key naming a credential masks its whole value at any depth. A bare `key` or `value` is judged with its parent's name, so `"tls": {"key": ...}` and `"accepted_headers": [{"values": [...]}]` mask while `"partitioner": {"key": ...}` does not. Inside an array, a two-item array whose first item names a credential, the form a header list takes, masks its second item. A two-item array directly under a key is a list. Every string, the message included, is then masked as text, as below.
 
 Extend rather than replace:
 
@@ -120,7 +120,7 @@ All of it writes `[REDACTED]` in place. A coloured text line holding a credentia
 | `token_count=5` | `token_count=[REDACTED]` (over-masked) |
 | `partition_key=order_id` | unchanged |
 
-Beyond URL passwords and bearer tokens, masking reads names, not values. An email address, literal or percent-encoded (`sentinel.user%40example.com` in a URL), or an opaque provider user id such as Okta's `00u1sentinel2abc3`, is written as-is unless the name carrying it holds a field: `email=...` masks, an address inside a sentence does not. scalo-py's logger also redacts email addresses by value; scalo-rs has no value scrubber yet (see [Planned](../README.md#planned-not-in-current-release)).
+Beyond URL passwords and bearer tokens, masking reads names, not values. An email address, literal or percent-encoded (`sentinel.user%40example.com` in a URL), or an opaque provider user id such as Okta's `00u1sentinel2abc3`, is written as-is unless the name carrying it holds a field: `email=...` masks, an address inside a sentence does not. scalo-py's logger also redacts email addresses by value. scalo-rs has no value scrubber.
 
 ---
 
@@ -149,8 +149,7 @@ The value of `sig`, `X-Amz-Signature`, `X-Amz-Security-Token` and `X-Goog-Signat
 ## Flood-control helpers
 
 Per-call-site rate limiting on lock-free atomics in
-[`logger/helpers.rs`](../../src/logger/helpers.rs); all three are ~5 ns when
-suppressed.
+[`logger/helpers.rs`](../../src/logger/helpers.rs).
 
 ```rust
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -176,7 +175,7 @@ emission, the metric carries the count.
 
 For service-wide dedup of identical events (different sites, same signature), set
 `LOG_THROTTLE_ENABLED=1`. The `tracing-throttle` layer dedups by event signature
-with a token bucket; high-cardinality fields (`request_id`, `trace_id`,
+with a token bucket, and high-cardinality fields (`request_id`, `trace_id`,
 `span_id`) are excluded from the signature by default so per-request lines don't
 collapse into one.
 
@@ -189,12 +188,12 @@ collapse into one.
 | `logger::setup_default()` | Env-driven install -- `ServiceApp` calls this |
 | `logger::setup(opts)` | Explicit install |
 | `LoggerOptions` | `level`, `format`, `add_source`, `enable_masking`, `sensitive_fields`, `span_events`, `throttle`, `service_name`, `service_version` |
-| `LogFormat::{Json, Text, Auto}` | Format; `Auto` resolves on `setup` |
-| `LoggerSettings` | `level`, `format`, `color` under the `logger` config key; `LoggerSettings::from_cascade()` |
+| `LogFormat::{Json, Text, Auto}` | Format. `Auto` resolves on `setup` |
+| `LoggerSettings` | `level`, `format`, `color` under the `logger` config key, read by `LoggerSettings::from_cascade()` |
 | `ThrottleConfig` | `enabled`, `burst`, `rate`, `max_signatures`, `excluded_fields` |
 | `logger::default_sensitive_fields() -> Vec<String>` | Baseline mask list -- extend, don't replace |
-| `logger::is_credential_name(name, parent) -> bool` | Whether a field name holds a credential, by the default list; `parent` qualifies a bare `key` or `value` |
-| `logger::mask_url_userinfo(text, mask, keep_user) -> Cow<str>` | Mask every URL password in a string; `keep_user: false` masks the whole `user:password` |
+| `logger::is_credential_name(name, parent) -> bool` | Whether a field name holds a credential, by the default list. `parent` qualifies a bare `key` or `value` |
+| `logger::mask_url_userinfo(text, mask, keep_user) -> Cow<str>` | Mask every URL password in a string. `keep_user: false` masks the whole `user:password` |
 | `logger::url_passwords(text) -> Vec<&str>` | Every non-empty URL password `mask_url_userinfo` masks, in order |
 | `logger::mask_sensitive_string(input, patterns) -> String` | Ad-hoc redaction outside the logger, by the text rules above and the fields in `patterns` |
 | `MaskingLayer` / `MaskingWriter<W>` | Detector + the writer wrapper `setup` installs |
@@ -211,7 +210,7 @@ The subscriber installs globally, once per process. Tests needing a fresh logger
 should not call `setup_default` -- capture a `tracing` `MakeWriter`, or skip
 logger init (the macros are no-ops with no subscriber). For env-var mutation use
 `temp-env` -- `std::env::set_var` is `unsafe` in edition 2024 and this crate
-forbids unsafe.
+denies unsafe code (`#![deny(unsafe_code)]`).
 
 ---
 

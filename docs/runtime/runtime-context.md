@@ -6,7 +6,7 @@ deployment environment. Pod name, namespace, node name, cgroup memory
 limit, CPU quota -- all behind one `runtime_context()` call.
 
 Stops modules each rolling their own env-var probes and cgroup file
-reads. Detection happens once; everything else is a `&'static` borrow.
+reads. Detection happens once, and everything else is a `&'static` borrow.
 
 ---
 
@@ -89,7 +89,7 @@ duplicated cgroup file reads.
 
 ---
 
-## App env and production posture
+## App env and production mode
 
 `get_app_env()` resolves the deployment environment name and is intentionally separate from `RuntimeContext`. It returns the first of these that holds a value, trimmed of surrounding whitespace, else `development`:
 
@@ -109,7 +109,7 @@ The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md
 | `OpenBaoProvider::new`, via `OpenBaoConfig::validate` | `skip_verify` |
 | `SecretCache::new` (and so `SecretsManager::new`), via `CacheConfig::validate` | a disk cache with no `encryption_key` and `allow_plaintext_disk_cache` set |
 
-Set `APP_ENV=production` on every production deployment. Left unset or blank, the posture is development and every refusal above is off. scalo logs one warning per process the first time it falls back to the default with a subscriber that records `WARN`, so a default resolved before the logger starts does not use it up:
+Set `APP_ENV=production` on every production deployment. Left unset or blank, the app environment is development and every refusal above is off. scalo logs one warning per process the first time it falls back to the default with a subscriber that records `WARN`, so a default resolved before the logger starts does not use it up:
 
 ```text
 WARN scalo::env: none of APP_ENV, ENVIRONMENT or ENV is set, so the app environment defaults to development and production-only safety checks are disabled -- set APP_ENV=production on a production deployment app_env="development"
@@ -172,7 +172,7 @@ let cfg_path = paths.config_dir.join("settings.yaml");
 | `RuntimeContext::is_kubernetes()` / `is_container()` / `is_bare_metal()` | Delegate to the embedded `Environment` |
 | `runtime_context() -> &'static RuntimeContext` | The pillar reader -- cached singleton |
 | `get_app_env()` | Deployment environment name for cascade resolution |
-| `is_production()` | True when app env resolves to `production` / `prod`; gates the production refusals |
+| `is_production()` | True when app env resolves to `production` / `prod`. Gates the production refusals |
 | `is_helm()` | Helm-deployment predicate |
 | `RuntimePaths` | Resolved config / data / cache / run paths |
 | `RuntimePaths::discover()` | Auto-detect environment and build paths |
@@ -192,8 +192,8 @@ For path tests, `RuntimePaths::discover_for(Environment::Docker)`
 sidesteps detection and lets you assert against a known
 environment.
 
-`std::env::set_var` is `unsafe` in edition 2024 and forbidden in
-this crate -- see the `temp-env` pattern in
+`std::env::set_var` is `unsafe` in edition 2024 and denied in
+this crate (`#![deny(unsafe_code)]`) -- see the `temp-env` pattern in
 [tests/integration/env_parity.rs](../../tests/integration/env_parity.rs).
 
 ---
@@ -204,6 +204,6 @@ this crate -- see the `temp-env` pattern in
 - [memory.md](memory.md) -- `MemoryGuard` reads the cgroup limit
 - [../core-pillars/config.md](../core-pillars/config.md) -- `get_app_env()` drives `settings.{env}.yaml` resolution
 - [../architecture.md](../architecture.md) -- pillar overview
-- [../feature-flags.md](../feature-flags.md) -- `env`, `runtime`
+- [../feature-flags.md](../feature-flags.md) -- `runtime` (`env` is always compiled)
 - Source: [../../src/env.rs](../../src/env.rs),
   [../../src/runtime.rs](../../src/runtime.rs)

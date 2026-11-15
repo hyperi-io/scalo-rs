@@ -1,9 +1,9 @@
-# Reflectable config shape (scalo contract, cross-language SSoT)
+# Reflectable config (scalo contract, cross-language SSoT)
 
-This is the single source of truth for the schema + capability-catalog shape that
+This is the single source of truth for the schema and capability-catalog format that
 BOTH scalo (Rust) and scalo-py (Python) emit. Consumers reflect on contracts
 produced by either language through ONE code path, so the two MUST emit identical
-JSON. Tracks scalo-rs#6 and scalo-py#3.
+JSON.
 
 ## The idea, plainly
 
@@ -12,7 +12,7 @@ the control plane so the engine and UI can build the right CRUD form for each
 endpoint without anyone hand-writing a form per source type. Two things get
 emitted:
 
-1. A CONFIG SCHEMA -- the typed shape of the whole `Config`, derived
+1. A CONFIG SCHEMA -- the typed structure of the whole `Config`, derived
    automatically (schemars in Rust, pydantic in Python). This gives field names,
    types, required-ness, defaults, and doc-string descriptions for free.
 
@@ -34,7 +34,7 @@ scalo's other emitted artefacts already live -- `metrics-manifest.json`,
 `deployment-contract.json`). Filenames follow scalo's existing kebab-case
 `<domain>-<kind>` artefact convention so they never collide with app source
 (NOT the generic `config.json` / `capabilities.json`). `docs/**` is CI
-paths-ignored, so committing regenerated artefacts is CI-free; the drift test
+paths-ignored, so committing regenerated artefacts is CI-free. The drift test
 still runs on any code change.
 
 | File | Content |
@@ -44,7 +44,7 @@ still runs on any code change.
 | `capability-catalog.json` | The capability catalog, JSON encoding |
 | `capability-catalog.yaml` | Same catalog, YAML encoding |
 
-`config-schema.*` comes from `config_schema` on the contract;
+`config-schema.*` comes from `config_schema` on the contract, and
 `capability-catalog.*` from `capabilities` on the contract.
 
 ## Catalog types
@@ -81,11 +81,11 @@ FieldType (lower_snake_case string):
 Serialisation rules (identical in both languages):
 
 - `type` is the JSON key for a `FieldSpec`'s field type (Rust `#[serde(rename =
-  "type")]`; Python field alias `type`).
+  "type")]`, Python field alias `type`).
 - Empty `fields`, `children`, `enum_values` are OMITTED (not `[]`).
-- `null` `maturity`, `default`, `example` are OMITTED.
+- `null` `maturity`, `default`, `example` are OMITTED, and so is `secret` when false.
 - Field order = declaration order. Rust uses schemars `preserve_order` +
-  serde_json preserve-order; Python relies on pydantic/dict insertion order. So
+  serde_json preserve-order, and Python relies on pydantic/dict insertion order. So
   running twice yields byte-identical output.
 
 ## Secret marker
@@ -97,7 +97,7 @@ A secret field is flagged in TWO places:
 
 Rust: `SensitiveString` implements `JsonSchema` to emit `{"type": "string", "x-scalo-secret": true, "writeOnly": true}`. Python must emit the same keys, in the same order, through the secret field type's `json_schema_extra`. The control plane keys off the marker to route the value through the secrets store and the UI masks the input.
 
-## ENV mapping for nested config (decision: C)
+## ENV mapping for nested config
 
 Multi-connection config (a source type with many `connections`) lives in the
 MOUNTED YAML config, not in ENV. Each connection carries a scalar
@@ -105,15 +105,15 @@ MOUNTED YAML config, not in ENV. Each connection carries a scalar
 opens with its KV mount and the KV v2 `data` segment is optional (e.g.
 `vault:secret/aws/prod:credentials` reads `aws/prod` on the `secret` mount).
 External Secrets materialises the real
-secret into the referenced backend; the app resolves it at fetch time via
+secret into the referenced backend, and the app resolves it at fetch time via
 `scalo::secrets::resolve`. Writing a REF is a TRUSTED role: `file:` resolves to
 the contents of any path the process can read, so whoever authors the config can
 hand any local file to the consumer that config names. ENV vars stay for
 singleton/scalar legacy config only
 -- there is NO array-index ENV encoding and NO JSON-in-ENV blob. This keeps K8s
-manifests sane at 50+ accounts and matches the per-connection secret-ref
+manifests readable with many accounts and matches the per-connection secret-ref
 contract. The schema/catalog therefore describe `credential_secret` as a normal
-(non-secret) string REF field; the actual secret value never appears in config.
+(non-secret) string REF field, and the actual secret value never appears in config.
 
 ## Worked example -- fetcher AWS source
 
@@ -197,15 +197,14 @@ they are authored here by reading that code.
 
 ## Contract carriage
 
-`DeploymentContract` grows two optional, defaulted, back-compat fields:
+`DeploymentContract` carries two optional, defaulted fields:
 
 ```text
 config_schema: object | null      # the JSON Schema; null/absent = not provided
 capabilities:  Capability[]       # the catalog; [] = not provided
 ```
 
-`schema_version` bumps (2 -> 3) so consumers can detect the new capability. Old
-consumers ignore the new fields; new consumers read them.
+A consumer that does not read them ignores them.
 
 ## Determinism + drift
 

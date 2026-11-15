@@ -1,7 +1,8 @@
 # Tracing
 
 `otel_tracing::build_tracer_layer(&cfg)?` builds an OpenTelemetry tracer with an
-OTLP batch exporter and returns a `tracing-subscriber` layer. Add it to your
+OTLP batch exporter and returns a `tracing-subscriber` layer with its
+`SdkTracerProvider`. Add the layer to your
 subscriber and `tracing::span!` / `#[instrument]` calls become OTel spans that
 ship to a collector (Tempo, Jaeger, Honeycomb, Grafana Cloud) with no further
 wiring.
@@ -13,7 +14,7 @@ provider. This matters: the transport propagation layer
 Without a global provider there is no current context to read, and the
 distributed trace breaks at every transport hop.
 
-Three features cover OTel; turning on `otel` alone does not give you W3C wire
+Three features cover OTel. Turning on `otel` alone does not give you W3C wire
 propagation, and the metrics bridge is a different module from the tracing bridge.
 
 ---
@@ -22,15 +23,15 @@ propagation, and the metrics bridge is a different module from the tracing bridg
 
 | Feature | Provides | Pair with |
 | --- | --- | --- |
-| `otel` | OTel SDK + OTLP exporter crates for other modules | umbrella; rarely useful alone |
+| `otel` | OTel SDK + OTLP exporter crates for other modules | umbrella, rarely useful alone |
 | `otel-metrics` | `metrics`-crate bridge to OTel meters | [metrics.md](metrics.md) |
 | `otel-tracing` | `tracing-opentelemetry` layer bridging spans to OTel spans | this doc |
 | `transport-trace` | `traceparent` formatting + injection at transport boundaries | [../transport/README.md](../transport/README.md) |
 
 Full distributed tracing needs `otel-tracing` **and** `transport-trace`: the first
 turns internal spans into exportable OTel spans, the second writes the current
-context as a `traceparent` header on outgoing Kafka / gRPC / HTTP and reads it on
-inbound.
+context as a `traceparent` header on outgoing Kafka / gRPC / HTTP. Inbound HTTP and
+gRPC record the header they receive as the span's `traceparent` field.
 
 ---
 
@@ -64,8 +65,8 @@ Env-var overrides resolve at build time, so one config covers dev and prod:
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `protocol` (`grpc` / `http/protobuf`) |
 | `OTEL_SERVICE_NAME` | `service_name` |
 
-`ServiceRuntime` wires all of this when `otel-tracing` is enabled -- apps don't
-build the layer manually.
+`run_app`'s logger setup wires all of this from the `otel_tracing` config section
+when `otel-tracing` is enabled -- apps don't build the layer manually.
 
 ---
 
@@ -100,8 +101,8 @@ fetch_data().await;
 let response = handle(req).instrument(span).await;
 ```
 
-Enforced by `clippy::await_holding_lock` and the audit script in
-`standards/languages/RUST.md`.
+No lint catches this: `clippy::await_holding_lock` covers lock guards, not span
+guards.
 
 ---
 
@@ -114,10 +115,11 @@ current OTel context as a W3C `traceparent` header:
 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 ```
 
-Transports inject it on outbound (Kafka headers, gRPC metadata, HTTP header) and
-extract it on inbound, restoring the OTel context so the inbound span attaches to
-the upstream trace. The plumbing lives in each transport backend -- no per-app
-wiring.
+Transports inject it on outbound (Kafka headers, gRPC metadata, HTTP header).
+Inbound HTTP and gRPC validate a received header and record it as the current
+span's `traceparent` field. They do not restore the OTel context from it, so an
+inbound span does not join the upstream trace. The injection lives in each
+transport backend -- no per-app wiring.
 
 `current_traceparent()` is gated behind `transport-trace`, **not** `otel`. Without
 `transport-trace` it does not compile and transports silently skip propagation.
@@ -133,16 +135,18 @@ picks `http`. On the `http` protocol `endpoint` is a base URL, the
 way the OTel spec defines `OTEL_EXPORTER_OTLP_ENDPOINT`, and `/v1/traces` is
 appended to it. An endpoint that already ends in `/v1/traces` is used as given.
 The batch processor coalesces spans every 5 seconds
-(`batch_scheduled_delay_ms`) with a 2 048-span queue (`batch_max_queue_size`);
-tune both for high-volume services.
+(`batch_scheduled_delay_ms`) with a 2 048-span queue (`batch_max_queue_size`).
+Tune both for high-volume services.
 
 The span resource carries the replica's identity, the same as the metrics
 resource: see [metrics.md](metrics.md#otel-mode).
 
-If the collector is unreachable the SDK batch processor drops spans on a full
-queue and the process keeps running -- there is no built-in retry, fallback metric,
-or per-export warning. Treat the OTLP path as best-effort and rely on collector-
-side monitoring for export loss.
+If the collector is unreachable a backoff gate around the exporter suppresses
+export attempts, doubling the wait after each failure with jitter, and warns once
+per outage. Batches it suppresses are dropped, and so is anything past the full
+queue, while the process keeps running. There is no retry of a failed batch and
+no fallback metric. Treat the OTLP path as best-effort and rely on collector-side
+monitoring for export loss.
 
 ---
 
@@ -150,9 +154,9 @@ side monitoring for export loss.
 
 | Item | Purpose |
 | --- | --- |
-| `OtelTracingConfig` | `endpoint`, `protocol`, `service_name`, `batch_scheduled_delay_ms`, `batch_max_queue_size` |
+| `OtelTracingConfig` | `enabled`, `endpoint`, `protocol`, `service_name`, `sample_ratio`, `batch_scheduled_delay_ms`, `batch_max_queue_size`, `batch_max_export_batch_size`, `export_timeout_ms` |
 | `OtelTracingProtocol::{Grpc, Http}` | OTLP transport choice |
-| `build_tracer_layer(&cfg)` | Returns `(layer, provider)`; installs the provider as global |
+| `build_tracer_layer(&cfg)` | Returns `(layer, provider)` and installs the provider as global |
 | `provider.shutdown()` | Flush + stop the batch exporter (call on graceful exit) |
 | `transport::propagation::current_traceparent()` *(feature `transport-trace`)* | Format current context for header injection |
 | `transport::propagation::format_traceparent_raw(trace_id, span_id, flags)` | Build a header from raw IDs (test / non-OTel use) |

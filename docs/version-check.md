@@ -14,8 +14,8 @@ feature in.
 
 ## Quick start
 
-`ServiceApp` binaries get the check for free from `ServiceRuntime::build`;
-the app supplies only its endpoint via the trait hook:
+`ServiceApp` binaries get the check for free from `ServiceRuntime::build`,
+and the app supplies only its endpoint via the trait hook:
 
 ```rust
 fn version_check_defaults(&self) -> scalo::version_check::VersionCheckConfig {
@@ -60,12 +60,12 @@ version_check:
 | Setting | Library default | Purpose |
 | --------- | ----------------- | --------- |
 | `enabled` | `true` | The kill switch. An explicit `false` wins over any app default. |
-| `api_url` | empty | Endpoint. No baked-in default -- the binary supplies its own; without one the check is inert. |
+| `api_url` | empty | Endpoint. No baked-in default -- the binary supplies its own, and without one the check is inert. |
 | `timeout` | `5` | HTTP timeout in seconds. |
 | `send_instance_id` | `true` | `false` strips the instance id from the payload. |
 | `instance_id` | empty | Explicit id, sent verbatim -- overrides the derived one. |
 
-A boolean reads `true`/`false`, `1`/`0` and `yes`/`no`/`on`/`off` in any case, `timeout` takes `5` or `"5s"`, and a number for a text key is read as its text. A value that is still unreadable is warned about and falls to the default, and the other keys still apply, so `VERSION_CHECK__ENABLED=0` holds beside a bad `timeout`.
+A boolean reads `true`/`false`, `1`/`0` and `yes`/`no`/`on`/`off` in any case, `timeout` takes `5` or `"5s"`, and a number for a text key is read as its text. A value that is still unreadable is warned about and falls to the default, and the other keys still apply, so `<PREFIX>_VERSION_CHECK__ENABLED=0` holds beside a bad `timeout`.
 
 `from_cascade_or` overlays the cascade on the caller's defaults: a key
 the cascade sets wins, an unset key falls to the given default. Plain
@@ -87,10 +87,10 @@ POST body, matching scalo-py field for field:
 
 `deployment` is never sent: the payload struct has no such field, so
 free-form deployment strings cannot leak. `instance_id` is derived from
-what the app runs on -- first hit wins: explicit config id; Kubernetes
-(UUIDv5 over the serviceaccount cluster CA + namespace); `/etc/machine-id`
-app-scoped outside containers; a UUID persisted under `~/.config/scalo/`;
-an ephemeral UUID. The UUIDv5 namespace is shared with scalo-py, so both
+what the app runs on -- first hit wins: explicit config id, Kubernetes
+(UUIDv5 over the serviceaccount cluster CA + namespace), `/etc/machine-id`
+app-scoped outside containers, a UUID persisted under `~/.config/scalo/`,
+then an ephemeral UUID. The UUIDv5 namespace is shared with scalo-py, so both
 chassis derive the same id on the same platform, and the derived forms are
 one-way -- nothing about the host is recoverable.
 
@@ -101,5 +101,5 @@ The Kubernetes rung needs both `ca.crt` and `namespace` under `/var/run/secrets/
 Everything inside the spawned check -- DNS failure, timeout, HTTP error,
 malformed JSON -- is caught and logged once at WARN as
 `version check failed (non-fatal)`. Air-gapped sites set
-`version_check.enabled: false`; without it the cost is one WARN line and
+`version_check.enabled: false`. Without it the cost is one WARN line and
 one connect timeout per boot, nothing more.

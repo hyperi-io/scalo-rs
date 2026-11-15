@@ -51,7 +51,7 @@ Delivery failures are read at every write, at the barrier and at [shutdown](#shu
 
 | Mode | Behaviour |
 | ------ | ----------- |
-| `Cascade` (default) | Try backends in order (Kafka -> File -> HTTP), stop on the first that takes the entry; an entry the broker never acks goes on to the next |
+| `Cascade` (default) | Try backends in order (Kafka -> File -> HTTP), stop on the first that takes the entry, and an entry the broker never acks goes on to the next |
 | `FanOut` | Write every batch to every enabled backend, succeed if at least one takes the whole batch |
 | `FileOnly` | File backend only -- no Kafka dependency |
 | `KafkaOnly` | Kafka backend only |
@@ -66,7 +66,7 @@ flowchart LR
     K -- no --> F[next backend]
     K -- yes --> A{broker acks it?}
     A -- yes --> D[held by Kafka]
-    A -- "refused, expired or purged" --> F
+    A -->|refused / expired / purged| F
     F -- takes it --> H[held]
     F -- refuses it --> L["dropped()"]
 ```
@@ -157,7 +157,7 @@ then exits. Triggered by either:
 Then `Dlq::shutdown().await` joins the drain task. Idempotent -- safe
 to call from any clone.
 
-Before it exits the drain waits for the Kafka backend's acks the way a `flush()` does: up to `kafka.send_timeout_ms`, plus up to 5 s when it has to purge. Dropping the producer afterwards discards whatever it still holds, so first the drain hands every entry only Kafka held that the broker refused or never acked to the backend after Kafka in `Cascade`, and counts what no backend took in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`. `shutdown()` returns `Ok` either way; a caller that needs the loss as an `Err` calls `flush()` before it.
+Before it exits the drain waits for the Kafka backend's acks the way a `flush()` does: up to `kafka.send_timeout_ms`, plus up to 5 s when it has to purge. Dropping the producer afterwards discards whatever it still holds, so first the drain hands every entry only Kafka held that the broker refused or never acked to the backend after Kafka in `Cascade`, and counts what no backend took in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`. `shutdown()` returns `Ok` either way, so a caller that needs the loss as an `Err` calls `flush()` before it.
 
 The count lands only if the drain gets to finish. Await `shutdown()`, or keep the runtime up until the drain exits: a drain dropped mid-wait counts nothing.
 
@@ -225,34 +225,20 @@ dlq:
 
 ---
 
-## Upgrading from the older DLQ API
-
-Earlier releases exposed `Dlq::file_only` / `Dlq::with_kafka` constructors
-and a `DlqBackend` trait object. Both are gone -- every backend mix now goes
-through `Dlq::spawn` with `DlqMode` selecting routing, and `DlqBackend` is an
-enum (static dispatch). The orchestrator gained `try_send` (non-blocking,
-`QueueFull` on overflow), `flush` (write barrier), and `shutdown`
-(drain + join). `send` semantics changed from "wait for durable write" to
-queue-admission -- see [Queue-admission semantics](#queue-admission-semantics).
-
-The version-keyed upgrade path lives in [migrations.md](../migrations.md).
-
----
-
 ## API surface
 
 | Item | Purpose |
 | ------ | --------- |
-| `Dlq::disabled()` | No-op handle -- `send` succeeds, nothing written; each routed entry is counted in `dropped()`, emitted as `dlq_dropped_total{reason="disabled"}`, and logged at ERROR (rate-limited) |
+| `Dlq::disabled()` | No-op handle -- `send` succeeds and nothing is written. Each routed entry is counted in `dropped()`, emitted as `dlq_dropped_total{reason="disabled"}`, and logged at ERROR (rate-limited) |
 | `Dlq::spawn(config, service_name, kafka_config, shutdown)` | Build backends, spawn drain, return cloneable handle |
-| `try_send(entry) -> Result<(), DlqError>` | Sync-shape queue submission; `QueueFull` on overflow |
+| `try_send(entry) -> Result<(), DlqError>` | Non-blocking queue submission, `QueueFull` on overflow |
 | `send(entry).await` | Async submission that awaits queue space |
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
-| `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka; `Err(File)` if any batch written since the previous flush was refused by every backend, `Err(Kafka)` if Kafka lost entries only it held (see [Queue-admission semantics](#queue-admission-semantics)) |
+| `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka. `Err(File)` if any batch written since the previous flush was refused by every backend, `Err(Kafka)` if Kafka lost entries only it held (see [Queue-admission semantics](#queue-admission-semantics)) |
 | `write_confirmed(entries).await` | Write these entries as a batch of their own and answer whether a backend holds them, to this caller alone (see [Queue-admission semantics](#queue-admission-semantics)) |
 | `cap(entry)` | The entry as the DLQ writes it: payload and copied header held within `max_payload_bytes`. Every send applies it, so call it only before `refusal` |
 | `refusal(&entry)` | Why no backend can ever hold this entry, or `None`: the permanent refusal a held source releases `Dropped` (needs `transport`). It judges the entry it is given, so pass it through `cap` first |
-| `shutdown().await` | Stop the drain and join it; the drain first waits for Kafka acks and counts what none confirmed in `dropped()` (see [Shutdown](#shutdown)) |
+| `shutdown().await` | Stop the drain and join it. The drain first waits for Kafka acks and counts what none confirmed in `dropped()` (see [Shutdown](#shutdown)) |
 | `is_enabled() / mode() / pending() / dropped()` | Introspection -- `dropped()` totals queue overflow (`dlq_dropped_total{reason="overflow"}`) + disabled-DLQ sends + batches every backend refused + Kafka entries a barrier or the shutdown found lost (`dlq_dropped_total{reason="backends_failed"}` + rate-limited ERROR) |
 | `DlqEntry::new(service, reason, payload)` + `.with_destination(...)`, `.with_source(...)`, `.with_attempts(...)`, `.truncate_to(max_bytes)` | Entry builder |
 | `DlqSource::kafka(topic, partition, offset)` | Provenance for the entry |

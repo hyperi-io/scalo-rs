@@ -1,6 +1,6 @@
 # Deployment
 
-Declare the contract once; scalo generates the Dockerfile, the Compose fragment
+Declare the contract once, and scalo generates the Dockerfile, the Compose fragment
 and the container manifest from it, and the scalo-service library chart renders
 the Kubernetes objects from the same contract. The app already knows its ports,
 health paths, secrets and native dependencies -- restating them by hand in

@@ -25,7 +25,7 @@ async fn every_acknowledged_record_arrives() {
 }
 ```
 
-`run_pull` feeds a `PullSource`: a partitioned log with cumulative per-partition commits, the shape of a Kafka topic. A restarted instance reads from the committed offsets. `run_push` feeds a `PushSource`, the shape of a gRPC or HTTP server. Its client resends each request until it is answered with success. The source holds each answer until `release` once armed, and answers at enqueue when it is not armed. `Case` builds it armed, as an app that releases every token must build its push transport (`GrpcTransport::builder(&cfg).armed(true)`, `AnyReceiver::from_config_armed(key)`): a source armed only when its pipeline starts answers whatever arrived before that at enqueue, and a kill loses those records. `Case::push_armed(false)` runs the unarmed default. An app whose dead-letter or filter path accounts for a record records it with `ledger.dead_lettered(marker)` or `ledger.dropped(marker, reason)`.
+`run_pull` feeds a `PullSource`: a partitioned log with cumulative per-partition commits, as a Kafka topic has. A restarted instance reads from the committed offsets. `run_push` feeds a `PushSource`, which behaves as a gRPC or HTTP server does. Its client resends each request until it is answered with success. The source holds each answer until `release` once armed, and answers at enqueue when it is not armed. `Case` builds it armed, as an app that releases every token must build its push transport (`GrpcTransport::builder(&cfg).armed(true)`, `AnyReceiver::from_config_armed(key)`): a source armed only when its pipeline starts answers whatever arrived before that at enqueue, and a kill loses those records. `Case::push_armed(false)` runs the unarmed default. An app whose dead-letter or filter path accounts for a record records it with `ledger.dead_lettered(marker)` or `ledger.dropped(marker, reason)`.
 
 ## Faults
 
@@ -33,11 +33,11 @@ Each fault is keyed on the middle marker, so it lands at the same point however 
 
 | `Fault` | What happens at the middle marker |
 | --- | --- |
-| `GracefulStop` | shutdown fires while that send is in flight; the send then completes |
+| `GracefulStop` | shutdown fires while that send is in flight, and the send then completes |
 | `KillMidBatch` | the pipeline task is aborted while that send is in flight |
 | `DownstreamRefusing` | the sink refuses that send and every send for 300 ms after it |
 | `RejectMidStream` | the sink rejects that record for good, after the records before it landed, until the restart |
-| `TwoInstances` | two instances share the source; the one holding that send is killed and the others take over |
+| `TwoInstances` | two instances share the source, and the one holding that send is killed while the others take over |
 
 After the fault the harness restarts one instance and waits until everything is acknowledged or 30 s pass (`Case::drain_within`). `Verdict::unacknowledged` counts what the source still holds at the end, which is not loss.
 

@@ -14,8 +14,8 @@ buffer, a checkpoint store, or a custom drainer.
 | Property | Notes |
 | ---------- | ------- |
 | FIFO order | Strict -- yaque is a single-producer / single-consumer log |
-| Persistent | Survives restarts; segment files in the queue directory |
-| Crash-safe | Receiver position persisted in `recv-metadata`; commit-then-advance semantics |
+| Persistent | Survives restarts, segment files in the queue directory |
+| Crash-safe | Receiver position persisted in `recv-metadata`, commit-then-advance semantics |
 | Async-native | Built on yaque's async receiver -- `recv()` awaits when empty |
 | Optional compression | zstd at construction-time level (1-22, clamped) |
 | Bounded | `max_items` (count) and `max_size_bytes` (bytes queued) |
@@ -24,21 +24,23 @@ buffer, a checkpoint store, or a custom drainer.
 
 ## Storage layout
 
-Inside the configured `path`:
+Directly in the configured `path`:
 
 ```text
-spool.queue/
+<path>/
 |-- 0.q                # segment file -- [4-byte Hamming header][payload] ...
 |-- 1.q
 |-- ...
 |-- recv-metadata      # 16 bytes: (segment u64 BE, position u64 BE)
-`-- send-metadata
+|-- send.lock
+|-- recv.lock
+`-- version/lock
 ```
 
 Segments roll over as they fill. The receiver position is two
 big-endian u64s pointing into the segment file at the next byte to
 read. On `recv` / `pop_front` the guard returned by yaque is
-explicitly `commit()`'d -- the position advances; on drop without
+explicitly `commit()`'d -- the position advances. On drop without
 commit, the read rolls back and the item stays in the queue (this is
 how `peek` works).
 
@@ -49,14 +51,13 @@ item count after a restart -- yaque doesn't expose a length API.
 
 ## Durability and recovery
 
-- yaque writes durable per-message -- a successful `push().await`
-  means the bytes are in the segment file. (Whether the OS has
-  fsync'd to disk depends on yaque's internal policy; for absolute
-  durability the caller should `fsync` the directory out-of-band or
-  use a journalled filesystem.)
+- A successful `push().await` means yaque has written and flushed the
+  bytes to the segment file, so they survive a process crash. yaque
+  never calls `fsync`, so a power loss before the kernel writes them
+  back can lose them, and `Spool` has no call that syncs them.
 - On restart, the receiver position is read from `recv-metadata` and
   scanning starts from there. Items consumed before the crash stay
-  consumed; items not yet committed reappear.
+  consumed, and items not yet committed reappear.
 - `clear()` walks the queue and commits every item -- empties without
   touching the filesystem directly.
 
@@ -90,9 +91,9 @@ Permission, full-disk, read-only and quota errors are returned under either poli
 ## Compression
 
 When `compress = true`, every payload is zstd-compressed before
-`sender.send` and decompressed inside `recv` / `pop_front` /
-`pop_front_async`. Compression level is config-controlled (default 3
--- fast). Use higher levels (10+) for archival queues; default for
+`sender.send` and decompressed inside `recv`, `pop_front` and
+`peek`. Compression level is config-controlled (default 3
+-- fast). Use higher levels (10+) for archival queues, and the default for a
 hot-path spool.
 
 The choice is a one-shot at construction -- there's no per-message
@@ -188,18 +189,18 @@ arrives). `pop_front` is the try-style alternative that returns
 
 | Item | Purpose |
 | ------ | --------- |
-| `Spool::open(config)` | Open or create the queue; recovers item count from disk |
+| `Spool::open(config)` | Open or create the queue, recovering the item count from disk |
 | `Spool::create(path)` | Convenience for `open(SpoolConfig::new(path))` |
 | `Spool::create_compressed(path)` | Convenience for `open(SpoolConfig::with_compression(path))` |
-| `push(data).await` | Append; checks `max_items` / `max_size_bytes` |
-| `recv().await` | Wait for next item; commits on success |
-| `pop_front().await` | Non-blocking pop; `Ok(None)` if empty |
+| `push(data).await` | Append, checking `max_items` / `max_size_bytes` |
+| `recv().await` | Wait for next item, committing on success |
+| `pop_front().await` | Non-blocking pop, `Ok(None)` if empty |
 | `peek().await` | Read without removing (guard rollback) |
 | `pop().await` | Remove front without returning value |
 | `len() / is_empty()` | Item count (tracked internally) |
 | `queued_bytes()` | Bytes of the records queued, the count `max_size_bytes` caps |
-| `file_size()` | Directory size in bytes, consumed records included; walks the directory |
-| `clear()` | Drain every item; resets count |
+| `file_size()` | Directory size in bytes, consumed records included. Walks the directory |
+| `clear()` | Drain every item and reset the count |
 | `config() -> &SpoolConfig` | Active config |
 | `SpoolError` | `Open / Queue / Compression / Decompression / Io / MaxItemsReached / MaxSizeReached / Corrupted` |
 

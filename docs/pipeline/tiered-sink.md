@@ -38,14 +38,14 @@ flowchart TB
     S["send(&record)"] --> CB{"Breaker admits, and<br/>StrictFifo spool empty?"}
     CB -->|yes| P["sender.send_batch"]
     CB -->|no| Sp[Spool to disk]
-    P -->|"Ok / FilteredDlq"| Done["Ok to caller"]
+    P -->|Ok / FilteredDlq| Done["Ok to caller"]
     P -->|Backpressured| Sp
-    P -->|"past send_timeout_ms"| Sp
+    P -->|past send_timeout_ms| Sp
     P -->|Fatal| Err["Err(Sink) to caller"]
     Sp -->|spooled| Done
-    Sp -->|"spool full, when_full: drop_newest"| Shed["Ok to caller, record dropped and counted"]
-    Sp -->|"spool full, any other when_full"| Full["Err(SpoolFull) to caller"]
-    Sp -->|"disk_aware threshold crossed"| Disk["Err(DiskUnavailable) to caller"]
+    Sp -->|spool full, when_full: drop_newest| Shed["Ok to caller, record dropped and counted"]
+    Sp -->|spool full, any other when_full| Full["Err(SpoolFull) to caller"]
+    Sp -->|disk_aware threshold crossed| Disk["Err(DiskUnavailable) to caller"]
 ```
 
 | `send_batch` result | Disposition | Circuit effect |
@@ -72,9 +72,9 @@ stateDiagram-v2
     HalfOpen --> Open : record_failure
 ```
 
-- **Closed** -- hot path active, failures counted.
-- **Open** -- hot path skipped, every message goes straight to spool.
-- **Half-open** -- one probe allowed, taken by whichever of a `send` or the drain asks first. Success -> Closed, failure -> Open. A probe that records neither, because its future was dropped or its outcome counts as neither, is lost once `reset_timeout` has passed since it went out, and the next caller probes again.
+- Closed -- hot path active, failures counted.
+- Open -- hot path skipped, every message goes straight to spool.
+- Half-open -- one probe allowed, taken by whichever of a `send` or the drain asks first. Success -> Closed, failure -> Open. A probe that records neither, because its future was dropped or its outcome counts as neither, is lost once `reset_timeout` has passed since it went out, and the next caller probes again.
 
 Hooks into the global `HealthRegistry` (when `health` feature is on)
 so `/readyz` reports the sink as Degraded (HalfOpen) or Unhealthy
@@ -88,8 +88,8 @@ See [`../../src/tiered_sink/circuit.rs`](../../src/tiered_sink/circuit.rs).
 
 | Mode | Hot path policy | Trade-off |
 | ------ | ----------------- | ----------- |
-| `Interleaved` (default) | Always try hot path when circuit allows | Max throughput; new messages may arrive before older spooled ones |
-| `StrictFifo` | Hot path only when spool is empty | Strict order; new traffic queues behind drain |
+| `Interleaved` (default) | Always try hot path when circuit allows | Max throughput, and new messages may arrive before older spooled ones |
+| `StrictFifo` | Hot path only when spool is empty | Strict order, and new traffic queues behind drain |
 
 `StrictFifo` is what you pick when downstream ordering matters
 (transaction log replication, append-only stores). Most pipelines
@@ -123,7 +123,7 @@ Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A 
 - `max_spool_items` -- record limit for the spool.
 - `max_spool_bytes` -- byte limit, as stored (post-compression).
 - `disk_aware: { max_usage_percent, poll_interval_secs }` -- background
-  `statvfs` poller; once filesystem use crosses the threshold,
+  `statvfs` poller. Once filesystem use crosses the threshold,
   `disk_available` flips false and spool writes return
   `DiskUnavailable`.
 
@@ -135,7 +135,7 @@ A spill reserves its item slot and bytes before it writes, and gives them back i
 | --- | --- |
 | `block` (default) | `Err(TieredSinkError::SpoolFull)` |
 | `drop_newest` | `Ok`. The record is dropped and counted in `tiered_sink_dropped_total{policy="drop_newest"}` |
-| `dlq`, `drop_oldest` | Not wired yet: behaves as `block`, with a warning logged on each spool-full event |
+| `dlq`, `drop_oldest` | Not wired: behaves as `block`, with a warning logged on each spool-full event |
 
 Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailable)` whatever `when_full` says. The caller decides what to do with either error -- the typical pattern is to route the record to the DLQ.
 
@@ -213,7 +213,7 @@ No metric counts a `SpoolFull` or `DiskUnavailable` error, which goes back to th
 
 | Item | Purpose |
 | ------ | --------- |
-| `TieredSink::new(sender, config)` | Construct, open spool, spawn drain task. `S` is any `TransportSender`; the sink calls its `send_batch` with one record and acts on the `SendResult` |
+| `TieredSink::new(sender, config)` | Construct, open spool, spawn drain task. `S` is any `TransportSender`, and the sink calls its `send_batch` with one record and acts on the `SendResult` |
 | `send(&Record) -> Result<()>` | Hot path, else spool. Errors go back to the caller, which routes the record (usually to the DLQ) |
 | `spool_len() / spool_is_empty() / spool_bytes()` | Spool depth introspection |
 | `circuit_state()` | Current `CircuitState` |
@@ -246,7 +246,7 @@ Drop cancels the same token, so both background tasks exit even if the consumer 
 
 ## Related
 
-- [spool.md](spool.md) -- the standalone yaque queue; this sink runs its own, with the same lock recovery and quarantine
+- [spool.md](spool.md) -- the standalone yaque queue. This sink runs its own, with the same lock recovery and quarantine
 - [dlq.md](dlq.md) -- where to send `SpoolFull` / `Fatal` errors
 - [batch-engine.md](batch-engine.md) -- the run loops this is a common sink for
 - [../transport/README.md](../transport/README.md)

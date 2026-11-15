@@ -32,7 +32,7 @@ What `build_router` actually mounts:
 | Path | Wired by | What it returns |
 | ------ | ---------- | ----------------- |
 | `/livez` | on by default (`enable_health_endpoints`) | 200 if process is alive (no dep checks -- never restart on dep down) |
-| `/readyz` | same | 200 if `ready_flag` is true AND all registered checks pass; 503 otherwise |
+| `/readyz` | same | 200 if `ready_flag` is true AND all registered checks pass, 503 otherwise |
 | `/health/detailed` | `health` + `serde_json` | per-check JSON breakdown |
 | `/config` | opt-in via `enable_config_endpoint` | JSON dump of every registered config section, with secrets redacted |
 
@@ -47,10 +47,8 @@ exists and `build_router` does not read it. Setting it changes nothing.
 
 ## Usage
 
-The common case is implicit -- `ServiceRuntime` calls `HttpServer::serve`
-on your behalf. Apps that need to mount extra routes do it through
-the runtime hook (or call `HttpServer` directly for tooling-style
-apps):
+`ServiceRuntime` never builds an `HttpServer`, so an app that wants one
+constructs and serves it itself:
 
 ```rust
 use scalo::http_server::{HttpServer, HttpServerConfig};
@@ -63,7 +61,7 @@ let app = Router::new()
 server.serve_with_shutdown(app, shutdown.cancelled()).await?;
 ```
 
-The probe, metrics, and (opt-in) `/config` routes are merged onto your
+The probe and (opt-in) `/config` routes are merged onto your
 router internally by `serve` / `serve_with_shutdown` / `serve_with_handle`
 -- you only supply your own extra routes.
 
@@ -71,20 +69,17 @@ router internally by `serve` / `serve_with_shutdown` / `serve_with_handle`
 
 ## Ready flag
 
-The ready flag is an `Arc<AtomicBool>` the server hands out via
-`ready_flag()`. The shutdown handler clears it before draining traffic,
+The ready flag is an `Arc<AtomicBool>`, true from construction, that the
+server hands out via `ready_flag()`. The shutdown handler clears it before draining traffic,
 so K8s sees `/readyz` flip to 503 BEFORE the cancellation token starts
 draining work. That is what avoids in-flight requests dying mid-flight
 during a rolling deploy.
 
 ```rust
 let flag = server.ready_flag();
-// Later, after init completes:
+flag.store(false, Ordering::Release); // not ready until init completes
+// ... init ...
 flag.store(true, Ordering::Release);
-// Pre-stop hook (auto-wired by ServiceRuntime):
-flag.store(false, Ordering::Release);    // K8s stops routing
-tokio::time::sleep(PRESTOP_DELAY).await; // give K8s time to notice
-shutdown_token.cancel();                  // now drain
 ```
 
 ---
@@ -104,7 +99,7 @@ serving cleartext. Front the service with a TLS sidecar or ingress instead.
 
 ## Graceful shutdown
 
-`serve_with_shutdown` takes any `Future<Output = ()>`; typical wiring
+`serve_with_shutdown` takes any `Future<Output = ()>`, and the typical wiring
 is `shutdown_token.cancelled()`. axum drains in-flight requests, then
 the future returns.
 
@@ -118,7 +113,7 @@ For test wiring or programmatic shutdown, `serve_with_handle` returns a
 
 ```yaml
 http_server:
-  bind_address: "0.0.0.0:9090"
+  bind_address: "0.0.0.0:8080"
   request_timeout_ms: 30000
   max_connections: 10000          # in-flight cap; excess requests queue
   max_body_bytes: 16777216        # 413 past this; 0 turns the cap off
@@ -137,7 +132,7 @@ http_server:
 | ------ | --------- |
 | `HttpServer::new(config)` | Build from explicit config |
 | `HttpServer::bind(addr)` | Build with just a bind address |
-| `.serve(app)` | Run until the future is dropped (merges probes/metrics/config routes) |
+| `.serve(app)` | Run until SIGTERM or Ctrl-C, merging the probe and config routes |
 | `.serve_with_shutdown(app, shutdown)` | Run until the shutdown future resolves |
 | `.serve_with_handle(app)` | Returns (`ShutdownHandle`, `ServerFuture`) |
 | `.set_ready(bool)` | Toggle the ready flag |

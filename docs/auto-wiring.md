@@ -15,12 +15,13 @@ This doc is the model -- what's wired, how, and what the consequences are.
 | Config | `OnceLock<Config>` | `config::setup(opts)` | `config::get`, `T::from_cascade()`, `Config::unmarshal_key_registered` |
 | Logger | Global `tracing` subscriber | `logger::setup_default()` | `tracing::info!`, `warn!`, `error!`, `debug!`, `trace!` macros |
 | Metrics | Global `metrics` recorder | `MetricsManager::new("app")` | `metrics::counter!`, `gauge!`, `histogram!` macros |
-| OTel | Global meter + tracer provider | `MetricsManager` sets the meter provider (`otel-metrics`); `logger::setup` adds the span layer (`otel-tracing`) | Propagated through `tracing::span!` and `#[instrument]` |
-| Health | `OnceLock<HealthRegistry>`, created on first use | `HealthRegistry::register("module", ...)` | `/readyz` aggregates; `HealthRegistry::is_ready()`, `is_healthy()` |
-| Shutdown | `CancellationToken` (from `tokio-util`) | `shutdown::install_signal_handler()`, which `ServiceRuntime::build` calls | `token.cancelled().await` in any task; `shutdown::token()` |
+| OTel | Global meter + tracer provider | `MetricsManager` sets the meter provider (`otel-metrics`), and `logger::setup` adds the span layer (`otel-tracing`) | Propagated through `tracing::span!` and `#[instrument]` |
+| Health | `OnceLock<HealthRegistry>`, created on first use | `HealthRegistry::register("module", ...)` | `/readyz` aggregates, `HealthRegistry::is_ready()`, `is_healthy()` |
+| Shutdown | `CancellationToken` (from `tokio-util`) | `shutdown::install_signal_handler()`, which `ServiceRuntime::build` calls | `token.cancelled().await` in any task, `shutdown::token()` |
 | Runtime context | `OnceLock<RuntimeContext>` | `RuntimeContext::detect()`, run once on first read | `env::runtime_context()` |
 
-These are the only globals. Everything else passes handles or
+These are the pillar singletons. The only other process-wide setting is the
+memory guard's `set_heap_source` hook. Everything else passes handles or
 borrows.
 
 ---
@@ -75,10 +76,10 @@ means a `Transport` impl ships with metrics-emission baked in, and the
 | Shutdown | `CancellationToken` created, SIGTERM/SIGINT handlers attached, K8s pre-stop delay configured |
 | Runtime context | `env::runtime_context()` detects once, results cached |
 | Memory guard | `MemoryGuard` constructed if `memory` feature on |
-| Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)`; with `service-metrics` on, the served value is written to the `scaling_pressure` gauge once a second |
+| Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)`. With `service-metrics` on, the served value is written to the `scaling_pressure` gauge once a second |
 | Worker pool | `AdaptiveWorkerPool` constructed if `worker-pool` feature on |
 | Metrics server | Started on `--metrics-addr` (default `0.0.0.0:9090`) if `metrics` feature on, serving `/metrics` `/metrics/manifest` `/livez` `/readyz` `/scaling/pressure` -- and nothing else |
-| Idle gate | `app.work_state(config)` evaluated after the runtime is up if `lifecycle` feature on; a workless config parks instead of entering `run_service` ([core-pillars/lifecycle.md](core-pillars/lifecycle.md)) |
+| Idle gate | `app.work_state(config)` evaluated after the runtime is up if `lifecycle` feature on. A workless config parks instead of entering `run_service` ([core-pillars/lifecycle.md](core-pillars/lifecycle.md)) |
 
 What's **not** auto-wired and still requires an explicit call from the app:
 
@@ -89,8 +90,8 @@ What's **not** auto-wired and still requires an explicit call from the app:
 
 - `TieredSink::new(...)` -- you choose which transport and which spool path, and where its errors go
 - `BatchEngine::process_*` -- you choose the parsing strategy and the transform closure
-- `Transport::from_config(...)` -- you name the config section (`transport.output`, `transport.input`)
-- Anything in `directory-config`, `secrets`, `cache`, `database` -- these are tools you reach for when needed
+- `AnySender::from_config(...)` / `AnyReceiver::from_config(...)` -- you name the config section (`transport.output`, `transport.input`)
+- Anything in `directory-config`, `secrets`, `auth` or `geoip-download` -- these are tools you reach for when needed
 
 Rule of thumb: the **pillars** auto-wire. The **L4 pipeline** modules
 are tools you compose into your `run_service`.
@@ -101,15 +102,15 @@ are tools you compose into your `run_service`.
 
 | You did this | You got this -- no extra wiring |
 | -------------- | ------------------------------- |
-| `config::setup(opts)` | 7-layer cascade, env-var nesting, `.env`, sensitive masking, hot-reload, `/config` admin endpoint, section registry |
+| `config::setup(opts)` | 7-layer cascade, env-var nesting, `.env`, sensitive masking, section registry. Hot reload comes with `config-reload`, the `/config` endpoint with `HttpServer` |
 | `logger::setup_default()` | Structured tracing, JSON/text autodetect, RFC 3339 timestamps, masking, flood control |
-| `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint, process metrics, cardinality cap, `/metrics/manifest` |
-| `run_app(app)` | All of the above + memory guard + scaling pressure + worker pool + shutdown token + K8s pre-stop + runtime context + metrics server |
+| `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint, process metrics, bounded label values, `/metrics/manifest` |
+| `run_app(app)` | All of the above + memory guard + scaling pressure + shutdown token + K8s pre-stop + runtime context + metrics server, and the worker pool with `worker-pool` |
 | Any `Transport` impl | 3-tier filter engine, DLQ routing, per-direction/action metrics, traceparent propagation |
 | `TieredSink::new(...)` | Transport + spool + circuit breaker + background drain + backpressure signal |
 | `BatchEngine::process_mid_tier()` | SIMD JSON parse, pre-route filter, field interning, parallel transform on the worker pool, commit-token plumbing |
-| `DeploymentContract { ... }` | Dockerfile, container manifest, metrics manifest, OCI labels, and the Kubernetes objects (with KEDA + secrets) the scalo-service chart renders from it |
-| `HealthRegistry::register("module", ...)` | Module appears in `/readyz` aggregate; reports go through the same JSON shape every app uses |
+| `DeploymentContract { ... }` | Dockerfile, container manifest, OCI labels, and the Kubernetes objects (with KEDA + secrets) the scalo-service chart renders from it |
+| `HealthRegistry::register("module", ...)` | Module appears in `/readyz` aggregate, in the same JSON format every app answers with |
 
 Read each subsystem doc for the implementation detail behind a given
 row.
@@ -121,27 +122,28 @@ row.
 The alternative is constructor injection -- pass a `Logger` to every
 module that logs, a `MetricsManager` to every module that emits
 counters, a `Config` to every module that reads config. That model
-works in small services. It rots in a 50-module crate that ships into
-six downstream apps because:
+works in small services. It rots in a crate this size that ships into
+several downstream apps, because:
 
-1. **Every new module forces a signature change** somewhere up the call
+1. Every new module forces a signature change somewhere up the call
    stack to thread the handle through.
-2. **Library code can't emit metrics without the consumer wiring it
-   through.** A `Transport` impl that wants to emit `kafka_messages_total`
+2. Library code can't emit metrics without the consumer wiring it
+   through. A `Transport` impl that wants to emit `transport_sent_total`
    needs the consumer to thread a `MetricsManager` through to it.
-3. **Tests duplicate the wiring.** Every integration test stands up
-   the same plumbing.
-4. **It blocks orthogonal features.** A new module that wants to call
-   `tracing::info!` requires a logger handle; with the singleton it's
+3. Tests duplicate the wiring. Every integration test stands up
+   the same handles.
+4. It blocks orthogonal features. A new module that wants to call
+   `tracing::info!` requires a logger handle. With the singleton it's
    automatic.
 
 The singleton model has the obvious failure mode: tests that run in
 parallel race on installing the global. The two mitigations:
 
-- **Test-only constructors**: `MetricsManager::new_for_test` skips
-  `set_global_recorder`. The macros become no-ops; everything else
-  (registry, descriptors, label validation) still runs.
-- **Process-per-test runners**: `cargo nextest` runs each test in its
+- Test-only constructors: scalo's own tests use the crate-private
+  `MetricsManager::new_for_test`, which skips `set_global_recorder`. The
+  macros become no-ops, and registry tracking, descriptors and namespace
+  logic still run.
+- Process-per-test runners: `cargo nextest` runs each test in its
   own process. The global is fresh per test.
 
 See [core-pillars/metrics.md Section Testing](core-pillars/metrics.md#testing)
@@ -154,16 +156,16 @@ for the test pattern.
 When you add a new module to `scalo` (or to a downstream app
 that has one), the auto-wiring contract is:
 
-1. **If the module has configurable behaviour**, load via the cascade --
+1. A module with configurable behaviour loads via the cascade --
    `T::from_cascade()` or `Config::unmarshal_key_registered::<T>(...)`.
    Don't read env vars directly.
-2. **If the module does I/O or processing**, add `#[cfg(feature = "metrics")]`
+2. A module that does I/O or processing adds `#[cfg(feature = "metrics")]`
    counters/gauges/histograms via the macros, the gate scalo's own emitters use. No handle passing.
-3. **If the module can fail or has interesting state**, add
+3. A module that can fail or has interesting state adds
    `tracing::` log calls at the right level. No handle passing.
-4. **If the module affects service readiness**, register into the
+4. A module that affects service readiness registers into the
    `HealthRegistry`. Aggregated automatically into `/readyz`.
-5. **If the module is long-lived**, take a `CancellationToken` argument
-   (or grab it off the runtime) and select on it in your main loop.
+5. A long-lived module takes a `CancellationToken` argument
+   (or grabs it off the runtime) and selects on it in its main loop.
 
 Follow that contract and your module ships with full observability the moment the consumer wires `MetricsManager::new` + `logger::setup_default` + `config::setup`. No extra plumbing.

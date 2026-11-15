@@ -6,8 +6,8 @@ without each sink re-deriving them. It is opt-in (`sink-stack` feature) and
 every knob defaults to behaviour-preserving values, so wrapping a sender with
 the default config changes nothing until you turn a control on.
 
-The controls are not independent: their **order** is load-bearing, and it
-differs between the two concurrency modes. Read the order off the diagrams
+The controls are not independent: their **order** decides what a timeout
+covers, and it differs between the two concurrency modes. Read the order off the diagrams
 rather than the prose.
 
 ## Layer order
@@ -58,11 +58,11 @@ flowchart LR
 
 ## Delivery guarantee (at-least-once preserved)
 
-- Rate-limit and concurrency-limit only DELAY admission; they never drop.
+- Rate-limit and concurrency-limit only DELAY admission. They never drop.
 - Retry re-sends the WHOLE batch on a transient failure. Records are held behind
   an `Arc`, so a retry is a refcount bump, not a copy.
 - A fatal error stops immediately -- no point retrying a permanent failure.
-- The call returns a `SendResult`; the caller fires its commit tokens only on
+- The call returns a `SendResult`, and the caller fires its commit tokens only on
   `SendResult::Ok`, exactly as for a bare `send_batch`. Retries may re-deliver
   records a failed attempt already sent -- a prefix for the per-record default,
   any subset for Kafka's pipelined override (at-least-once: duplicates, never
@@ -77,7 +77,7 @@ Defaults preserve behaviour: no concurrency cap, ARC off, queue-don't-shed.
 
 | Key | Default | Meaning |
 | ----- | --------- | --------- |
-| `max_concurrency` | `0` | Static in-flight cap; `0` = uncapped. Ignored when `adaptive` is set |
+| `max_concurrency` | `0` | Static in-flight cap, `0` = uncapped. Ignored when `adaptive` is set |
 | `adaptive` | unset | Enables ARC (AIMD limiter), replacing the static gate |
 | `attempt_timeout_ms` | `30000` | Per-attempt timeout |
 | `load_shed` | `false` | Shed (fail-fast) instead of queueing when the inner service is not ready |

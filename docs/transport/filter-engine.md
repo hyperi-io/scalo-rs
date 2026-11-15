@@ -4,8 +4,8 @@ The transport filter engine drops or DLQs messages on the way in or
 the way out of every transport -- Kafka, gRPC, Memory, File, Pipe,
 HTTP -- before they reach app code. It's embedded in every
 backend, zero-cost when no rules are configured, and tiered so the
-common case (field-presence or equality on a top-level field) runs at
-~50-100 ns per message without invoking the CEL engine at all.
+common case (field-presence or equality on a top-level field) runs
+without invoking the CEL engine at all.
 
 ---
 
@@ -13,13 +13,13 @@ common case (field-presence or equality on a top-level field) runs at
 
 Operators want to:
 
-- **Drop noise** at the wire (debug events, internal heartbeats) so it
+- Drop noise at the wire (debug events, internal heartbeats) so it
   doesn't burn budget downstream.
-- **Quarantine poison messages** to a DLQ for review without bringing
+- Quarantine poison messages to a DLQ for review without bringing
   down the pipeline.
-- **Express filters in operator-language** (CEL) rather than scattering
+- Express filters in operator-language (CEL) rather than scattering
   if-statements through transport code.
-- **Pay nothing** for the engine when no filters are configured.
+- Pay nothing for the engine when no filters are configured.
 
 The three-tier design makes that last point work: the fast tier runs
 without CEL, and tier classification happens at config-load -- startup
@@ -32,23 +32,24 @@ fails fast if a rule lands in a tier the operator hasn't allowed.
 ```mermaid
 flowchart LR
     R[Filter rule] --> C{Classify}
-    C -->|has, equality, startsWith| T1["Tier 1<br/>SIMD field ops<br/>~50-100 ns"]
-    C -->|compound CEL, numeric, size| T2["Tier 2<br/>compiled CEL<br/>~500 ns - 1 us"]
-    C -->|matches, filter, map, time fns| T3["Tier 3<br/>complex CEL<br/>~5-50 us"]
+    C -->|has, equality, startsWith| T1["Tier 1<br/>SIMD field ops"]
+    C -->|compound CEL, numeric, size| T2["Tier 2<br/>compiled CEL"]
+    C -->|matches, filter, map, time fns| T3["Tier 3<br/>complex CEL"]
     T2 -.->|gate| G2["transport.filter_tiers.allow_cel_filters_in/out"]
     T3 -.->|gate| G3["transport.filter_tiers.allow_complex_filters_in/out"]
 ```
 
-| Tier | Cost per message | Operations | Config gate |
-| ------ | ------------------ | ------------ | ------------- |
-| **1** | ~50-100 ns | `has(field)`, `!has(field)`, `field == "literal"`, `field != "literal"`, `field.startsWith(...)`, `field.endsWith(...)`, `field.contains(...)` -- `field` may be a dotted path such as `a.b` | Always on |
-| **2** | ~500 ns - 1 us | Compound CEL (`&&`, `\|\|`), numeric comparison, multi-field access, `size()` | `transport.filter_tiers.allow_cel_filters_in` / `_out` |
-| **3** | ~5-50 us | `matches()` (regex), `exists()`, `filter()`, `map()`, `all()`, `exists_one()` (or `existsOne()`), `timestamp()`, `duration()` | `transport.filter_tiers.allow_complex_filters_in` / `_out` (implies tier-2) |
+| Tier | Operations | Config gate |
+| ------ | ------------ | ------------- |
+| **1** | `has(field)`, `!has(field)`, `field == "literal"`, `field != "literal"`, `field.startsWith(...)`, `field.endsWith(...)`, `field.contains(...)` -- `field` may be a dotted path such as `a.b` | Always on |
+| **2** | Compound CEL (`&&`, `\|\|`), numeric comparison, multi-field access, `size()` | `transport.filter_tiers.allow_cel_filters_in` / `_out` |
+| **3** | `matches()` (regex), `exists()`, `filter()`, `map()`, `all()`, `exists_one()` (or `existsOne()`), `timestamp()`, `duration()` | `transport.filter_tiers.allow_complex_filters_in` / `_out` (implies tier-2) |
+
+Each tier costs more than the one before. `benches/filter_benchmark.rs` measures them.
 
 Tier 1 uses `sonic-rs::get_from_slice` for field extraction plus
 single-segment field-name lookups via pre-compiled
-`memchr::memmem::Finder` (~10-20 ns when the field name is the only
-needle). It never invokes the CEL interpreter.
+`memchr::memmem::Finder`. It never invokes the CEL interpreter.
 
 Tier 2 compiles the CEL expression once at startup, then evaluates
 against fields extracted via SIMD.
@@ -71,8 +72,8 @@ Otherwise tier 2.
 
 The scan reads literals, comments and backtick-quoted names with the same lexer as the expression profile, so a restricted call it finds is one the profile refuses, and a name inside a literal or comment is neither a call nor a field.
 
-This is conservative on purpose: only expressions that obviously fit a
-tier-1 pattern execute outside the CEL engine. Anything subtle drops
+This is conservative on purpose: only expressions that match a
+tier-1 pattern whole execute outside the CEL engine. Anything subtle drops
 to tier 2 or 3 where the actual CEL interpreter validates the
 expression.
 
@@ -82,23 +83,23 @@ See [src/transport/filter/classify.rs](../../src/transport/filter/classify.rs).
 
 ## Semantics
 
-- **First-match wins.** Filters are evaluated in declared order; the
+- First-match wins. Filters are evaluated in declared order, and the
   first match returns its action and stops the loop. No match -> message
   passes.
-- **`drop` action** silently discards. Every match, `drop` or `dlq`, counts
+- `drop` action silently discards. Every match, `drop` or `dlq`, counts
   in the `transport_filtered_total` counter, labelled `direction` and `action`.
-- **`dlq` action** produces a `FilteredDlqEntry` returned **inline** in
+- `dlq` action produces a `FilteredDlqEntry` returned **inline** in
   `recv()`'s `WorkBatch.dlq_entries` (alongside the passing
   `WorkBatch.records`) -- the transport does **not** route to a DLQ
   directly. The caller routes `batch.dlq_entries` to the DLQ of its
-  choice; they cannot be silently lost. (When the `BatchEngine` run
+  choice, and a hand-rolled loop that ignores them loses them. (When the `BatchEngine` run
   loops own the receive, a `FilterDlqPolicy` governs this -- `Reject` by
   default, or `Route`/`DiscardWithMetric`.) The commit token of a dropped
   or DLQ'd record stays in `WorkBatch.commit_tokens`, so the block commit
   moves the source past it.
-- **Inbound and outbound are independent.** Each transport has
+- Inbound and outbound are independent. Each transport has
   `filters_in` and `filters_out`, evaluated separately.
-- **Startup fails fast** on rules above the allowed tier, on invalid
+- Startup fails fast on rules above the allowed tier, on invalid
   CEL syntax, on empty expressions, and on Tier 2/3 rules over the AST
   budget (`transport.filter_tiers.budget`). A pipe built directly with
   `PipeTransport::new` starts but refuses traffic -- see
@@ -171,8 +172,8 @@ expression:
 
 Transport filters meet it in two ways:
 
-- **Tier 2** compiles under this profile.
-- **Tier 3** compiles with regex, iteration and time all unlocked, so these three flags do not apply to it. The tier gate is the only switch a Tier 3 filter needs.
+- Tier 2 compiles under this profile.
+- Tier 3 compiles with regex, iteration and time all unlocked, so these three flags do not apply to it. The tier gate is the only switch a Tier 3 filter needs.
 
 The profile's function allowlist applies to both tiers.
 
@@ -195,8 +196,8 @@ K8s, roll the pod). Rule lists load the same way, so a rule change
 needs a restart too.
 
 A first-time deployment should start with all gates off -- only Tier 1
-filters work. Flip a gate on once Tier 2 or Tier 3 is genuinely needed
-and the operator has reviewed the cost (Tier 3 is unbounded CPU; see
+filters work. Flip a gate on once Tier 2 or Tier 3 is needed
+and the operator has reviewed the cost (Tier 3 has no CPU bound, see
 [Known limitations](#known-limitations)).
 
 ---
@@ -286,31 +287,26 @@ converts it to JSON upstream.
 
 ## Known limitations
 
-Open gaps in the engine, by status:
+| Limitation | Effect |
+| ------ | ------- |
+| String comparison is not constant-time | A timing attack on a high-entropy field value is possible, at low risk |
+| Expressions are logged as written | Each rule's text is logged at INFO at startup, so treat expressions as non-secret |
+| `field == "value"` has no pre-quoted bytes fast path | `has` and `!has` use a pre-compiled `memmem::Finder`, and equality extracts the field and compares strings |
+| MsgPack payloads pass unfiltered | A one-shot warning per direction and `transport_filter_msgpack_bypass_total` make the bypass visible |
+| Tier 2/3 CEL has no time budget | `transport.filter_tiers.budget` caps AST size and iteration depth at startup and payload size at evaluation. `program.execute(&ctx)` runs with no time cap, so a costly filter within those caps can hold the ingest thread. A time cap needs support in the upstream `cel` crate |
 
-| # | Item | Status | Notes |
-| --- | ------ | -------- | ------- |
-| 7 | Constant-time string comparison for sensitive fields | Pending | Low risk; door open for timing attacks on high-entropy field values |
-| 8 | Log masking for filter expression content | Pending | Expression text logged as-is at startup; expression authors should treat expressions as non-secret |
-| 9 | Pre-quoted bytes fast path for `field == "value"` | Partial | `FieldExists` / `FieldNotExists` already use pre-compiled `memmem::Finder`; `FieldEquals` still uses SIMD extract + string compare |
-| 10 | MsgPack payloads pass unfiltered | Acknowledged | Design choice; a one-shot warning per direction plus `transport_filter_msgpack_bypass_total` make the bypass visible |
-| 12 | Tier 2/3 CEL has no time budget | Partial | `transport.filter_tiers.budget` caps AST size and iteration depth at startup and payload size at evaluation. `program.execute(&ctx)` still runs with no time cap, so a costly filter within those caps can hold the ingest thread. A time cap needs support in the upstream `cel` crate |
-
-The items aren't blockers. Operators should know about #10 if their
-pipeline mixes JSON and MsgPack.
+A pipeline that mixes JSON and MsgPack should read the MsgPack row.
 
 ---
 
 ## Tests and benchmarks
 
-- Unit tests: 70 across the module (budget, classify, compiled, config, metrics, mod).
-- Integration tests: 54 in `tests/transport_filter.rs` -- round-trip,
+- Unit tests in every file of the module (budget, classify, compiled, config, metrics, mod).
+- Integration tests in `tests/transport_filter.rs` -- round-trip,
   adversarial inputs, Unicode, 100-rule lists, MsgPack heuristic.
-- Benchmarks: `benches/filter_benchmark.rs` -- 8 criterion groups
+- Benchmarks: `benches/filter_benchmark.rs` -- criterion groups
   covering the no-filter baseline, tier-1 `has`, `==`, `startsWith` and a
   dotted path, first-match-at-N, tier-2 compound, tier-3 regex.
-
-Tier-1 latency confirmed at ~50-100 ns/message on the bench machine.
 
 ---
 

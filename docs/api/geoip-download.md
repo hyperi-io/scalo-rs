@@ -21,7 +21,7 @@ features = ["geoip-download"]
 
 `ensure_databases` returns `Ok` with `None` paths when a download fails.
 It never stops a service from starting. GeoIP going missing degrades
-enrichment; it is not a startup fault, and treating it as one turns a
+enrichment, and it is not a startup fault, and treating it as one turns a
 third-party outage into an outage of yours.
 
 The fallback ladder, per database:
@@ -144,7 +144,7 @@ An app that carried its own `geoip_download` maps across like this:
 | `GeoIpConfig.cache_capacity` | **stays in the app** -- a lookup-cache size, not a provisioning input |
 | `city_db_path` / `asn_db_path`: `Option<String>` | `Option<PathBuf>` (same YAML) |
 | `auto_download.data_dir`: `String` | `PathBuf` (same YAML) |
-| `auto_download.maxmind_account_id` / `_license_key`: `Option<String>` | `Option<SensitiveString>`; `.as_deref()` becomes `.map(SensitiveString::expose)` |
+| `auto_download.maxmind_account_id` / `_license_key`: `Option<String>` | `Option<SensitiveString>`, and `.as_deref()` becomes `.map(SensitiveString::expose)` |
 | `auto_download.ipinfo_token` | unchanged (`Option<SensitiveString>`) |
 | default `data_dir` | `/var/lib/geoip` -- set it explicitly if the old value matters |
 | `GeoIpDownloadError::Http(reqwest::Error)` | `Http(scalo::http_client::HttpError)`, plus `UnexpectedStatus` |
@@ -164,7 +164,7 @@ pub struct GeoIpConfig {
 }
 ```
 
-The YAML shape is unchanged; call sites become
+The YAML is unchanged, and call sites become
 `ensure_databases(&config.geoip.databases)`.
 
 ---

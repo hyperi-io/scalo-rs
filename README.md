@@ -7,7 +7,9 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](https://www.apache.org/licenses/LICENSE-2.0)
 <!-- BADGES:END -->
 
-The runtime layer for Rust data-plane services: config, logging, metrics, health probes, memory backpressure, transports and secrets, already wired together. In a DFE deployment every Rust service is built on it, so they all read config, log, report and shed load the same way.
+The runtime layer for Rust data-plane services: config, logging, metrics, health, backpressure and transports.
+
+It all comes already wired together, secrets included. In a DFE deployment every Rust service is built on it, so they all read config, log, report and shed load the same way.
 
 ## What it gives you
 
@@ -23,7 +25,7 @@ The runtime layer for Rust data-plane services: config, logging, metrics, health
 ## Quick Start
 
 ```sh
-cargo add scalo
+cargo add scalo anyhow tracing
 ```
 
 Default features are `config` and `logger`. Add the rest explicitly -- pick the
@@ -45,7 +47,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-All 40 feature flags, what each pulls in and which combinations matter are in
+Every feature flag, what each pulls in and which combinations matter are in
 [docs/feature-flags.md](docs/feature-flags.md). The ones most people reach for:
 `metrics`, `http-server` (health probes), `transport-kafka`, `worker` (adaptive
 pool plus SIMD batching), `memory` (the cgroup-aware guard), `secrets-vault`.

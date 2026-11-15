@@ -7,7 +7,7 @@ drains. Do NOT slow the outbound drain. Gating the drain DEADLOCKS: the sink
 stops accepting, the buffer fills, the source keeps pulling (nothing told it to
 stop), the pipeline stops. Backpressure propagates UPSTREAM to the intake.
 
-So the inbound gate (`src/governor/gate.rs`) is INBOUND-only; `send` is never
+So the inbound gate (`src/governor/gate.rs`) is INBOUND-only, and `send` is never
 involved. See [self-regulation.md](self-regulation.md) for the governor that
 decides WHEN to gate, [kafka-path.md](kafka-path.md) for the Kafka brake.
 
@@ -41,7 +41,7 @@ Kafka and fetcher sources are pull-based: pausing the pull leaves the data at
 rest in the broker / source, re-read once the gate reopens. Nothing is lost.
 
 The receiver is push-based. Its 503 / `UNAVAILABLE` is only lossless if the
-UPSTREAM caller retries. A well-behaved data-plane sender does; a fire-and-forget
+UPSTREAM caller retries. A well-behaved data-plane sender does. A fire-and-forget
 client does not, and its rejected payload is gone. The gate cannot make a push
 source lossless on its own -- that contract lives with the caller. Deliberate
 limit, not a bug.
@@ -61,7 +61,7 @@ Held bytes are also leased on the memory guard from admission to answer, so the 
 
 ## The brake / commit-token table
 
-The brake is one half of the at-least-once contract; the commit token is the
+The brake is one half of the at-least-once contract, and the commit token is the
 other. The driver commits source acks ONLY after the whole out-batch is sent
 (`src/worker/engine/driver.rs`). A brake without matching commit discipline
 would lose or double-count data. The two are designed together:
@@ -116,7 +116,7 @@ Commit discipline holds across the split:
 - A transient sink error (`TransportError::Backpressure` or `Timeout`) holds
   the sub-block and re-sends it with backoff, so nothing later is fetched or
   committed past it. A sink gets this by mapping `SendResult::Backpressured`
-  to `Err(TransportError::Backpressure.into())`; an `EngineError::Sink` counts
+  to `Err(TransportError::Backpressure.into())`. An `EngineError::Sink` counts
   as permanent. Any other sink error stops the block and skips the
   commit, so the WHOLE block is re-delivered. At-least-once holds even
   mid-stream.
@@ -135,10 +135,13 @@ Pausing intake is the LOCAL response on one pod. It buys time for the buffer to
 drain, but sustained pressure -- the pod just cannot keep up -- needs more pods,
 not a permanently-paused intake.
 
-A paused source grows consumer lag (Kafka) or queue depth (other sources). KEDA
-reads that lag via `ScalingPressure`'s external-scaler signal and adds replicas.
+A paused Kafka source grows consumer-group lag, which the scalo-service chart's
+KEDA Kafka trigger reads from the broker to add replicas. Any other signal, such
+as `ScalingPressure`, needs a trigger the deployment adds
+([pipeline/scaling.md](pipeline/scaling.md#how-keda-reads-it)).
 
-librdkafka learns a partition's log end only from a fetch reply, and fetches nothing it has paused, so on its own the lag it reports freezes the moment the gate pauses intake. While the gate holds, the Kafka transport asks the broker for the assignment's ends instead: one `ListOffsets` per leader, once per `statistics.interval.ms` and no more often than once a second. It does the same, gate or no gate, while the local queue is full: librdkafka also stops fetching a partition holding `queued.min.messages`, or once the consumer's queue holds `queued.max.messages.kbytes`, until the app reads it down. `total_consumer_lag`, `total_position_lag` and the `rdkafka_topic_partition_consumer_lag` gauge keep rising with what producers write, on every partition the consumer holds. A partition with nothing committed counts from where the consumer reads, so a group that has never committed shows its backlog from its first assignment.
+librdkafka learns a partition's log end only from a fetch reply, and fetches nothing it has paused, so on its own the lag it reports freezes the moment the gate pauses intake. While the gate holds, the Kafka transport asks the broker for the assignment's ends instead: one `ListOffsets` per leader, once per `statistics.interval.ms` and no more often than once a second. It does the same, gate or no gate, while the local queue is full: librdkafka also stops fetching a partition holding `queued.min.messages`, or once the consumer's queue holds `queued.max.messages.kbytes`, until the app reads it down. `total_consumer_lag`, `total_position_lag` and the `rdkafka_topic_partition_consumer_lag` gauge keep rising with what producers write, on every partition the consumer holds (the gauge for up to 256 partitions per client). A partition with nothing committed counts from where the consumer reads, so a group that has never committed shows its backlog from its first assignment.
+
 The two levers compose:
 
 - **InboundGate** is the fast, local, per-pod brake -- milliseconds, no new

@@ -2,7 +2,7 @@
 
 The transport layer is the boundary between an app and any
 message-shaped backend -- Kafka, gRPC, Memory, File, Pipe,
-HTTP. Apps depend on the traits; the concrete backend is selected
+HTTP. Apps depend on the traits, and the concrete backend is selected
 at runtime from config. Embedded filter engine, embedded metrics,
 embedded propagation -- see [filter-engine.md](filter-engine.md) and
 [backends.md](backends.md).
@@ -120,9 +120,9 @@ provenance.
 | HTTP | No-op -- the server answered when the record was queued |
 | Pipe | No-op -- stdin cannot be read again |
 
-**Releasing**: `release(&tokens, status)` is `commit` with the merged delivery status of every piece built from the tokens' records. `Delivered`, `Dropped` and `Rejected` release the source, and `Errored` withholds it so the records are delivered again. The default commits when the status allows it. A source that can hold its acknowledgement exposes `ack_control()` (`AckControl`: `enabled`, `arm`, `held`) and names a `hold_deadline` where a sender waits on it. Kafka armed commits each partition only up to its lowest offset not yet released, so releases may arrive in any order. The `BatchEngine` pipeline builder drives all of this ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md)), and a hand-rolled loop uses `SourceAck`. Each ack-capable backend reads `acknowledgements.enabled` (default `true`) from `<key>.<type>.acknowledgements`, beside its own section. Only Kafka and gRPC are ack-capable. HTTP and file sources are not yet, and pipe and memory have nothing to hold, so under those four the section has no effect and the factory warns once per backend ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#which-sources-hold-it)).
+**Releasing**: `release(&tokens, status)` is `commit` with the merged delivery status of every piece built from the tokens' records. `Delivered`, `Dropped` and `Rejected` release the source, and `Errored` withholds it so the records are delivered again. The default commits when the status allows it. A source that can hold its acknowledgement exposes `ack_control()` (`AckControl`: `enabled`, `arm`, `held`) and names a `hold_deadline` where a sender waits on it. Kafka armed commits each partition only up to its lowest offset not yet released, so releases may arrive in any order. The `BatchEngine` pipeline builder drives all of this ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md)), and a hand-rolled loop uses `SourceAck`. Each ack-capable backend reads `acknowledgements.enabled` (default `true`) from `<key>.<type>.acknowledgements`, beside its own section. Only Kafka and gRPC are ack-capable. HTTP and file sources are not, and pipe and memory have nothing to hold, so under those four the section has no effect and the factory warns once per backend ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#which-sources-hold-it)).
 
-**Closing a receiver**: after `close()`, `recv` returns the records the source had already acknowledged to their senders, then `TransportError::Closed`. A receiving service therefore shuts down with `close()`, then `recv` until `Closed`, then its final flush; the `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). The HTTP server, the memory transport, and a gRPC server that is unarmed or has acknowledgements off hold acknowledged records until `recv` takes them. An armed gRPC server has acknowledged nothing it still queues: `recv` returns those records too, and each push is answered once its records are released, or `Unavailable` at the drain deadline ([backends.md](backends.md#grpc)). Kafka and file report `Closed` at once and re-deliver what was not committed; pipe acknowledges nothing, and reports `Closed` at once too.
+**Closing a receiver**: after `close()`, `recv` returns the records the source had already acknowledged to their senders, then `TransportError::Closed`. A receiving service therefore shuts down with `close()`, then `recv` until `Closed`, then its final flush, and the `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). The HTTP server, the memory transport, and a gRPC server that is unarmed or has acknowledgements off hold acknowledged records until `recv` takes them. An armed gRPC server has acknowledged nothing it still queues: `recv` returns those records too, and each push is answered once its records are released, or `Unavailable` at the drain deadline ([backends.md](backends.md#grpc)). Kafka and file report `Closed` at once and re-deliver what was not committed. Pipe acknowledges nothing, and reports `Closed` at once too.
 
 ---
 
@@ -145,7 +145,7 @@ pub struct Record {
 
 Generic over `Token` -- pinned to the receiving transport. Payload is
 raw bytes, parsed by the app. Format auto-detected from the first
-byte (`{`/`[` -> JSON; `0x80..0x9f`/`0xdc..0xdf` -> MsgPack). See
+byte (`{`/`[` -> JSON, `0x80..0x9f`/`0xdc..0xdf` -> MsgPack). See
 [../pipeline/dlq.md](../pipeline/dlq.md) for how messages flow
 into the DLQ when downstream processing fails.
 
@@ -159,7 +159,7 @@ A backend collects `Message<Token>` values (`key`, `payload: Bytes`, `token`, `t
 
 Every backend wires the filter engine on construction. Inbound
 filters drop or DLQ-stage messages inside `recv()` before the caller
-ever sees them; outbound filters do the same on `send()`. Filters
+ever sees them, and outbound filters do the same on `send()`. Filters
 that match `action: dlq` don't route to a DLQ directly -- they come back
 **inline** in `recv()`'s `WorkBatch.dlq_entries`, which the caller routes:
 
@@ -179,9 +179,8 @@ With no inbound filter configured, `dlq_entries` is empty. Full design and tier 
 
 `RoutedSender` wraps N `AnySender`s in a `HashMap<String, AnySender>`
 plus an optional default. `send(destination, payload)` picks the
-backend by destination. Only the receiver and fetcher stages use
-this -- mid-tier and
-sink stages do 1:1. See [routing.md](routing.md).
+backend by destination. It suits a stage that originates data and
+routes per record, and a sink stage sends 1:1. See [routing.md](routing.md).
 
 ---
 
@@ -201,7 +200,7 @@ sink stages do 1:1. See [routing.md](routing.md).
 | `Transport` | Blanket impl for any `T: Sender + Receiver` |
 | `AnySender::from_config(key).await` | Cascade factory -- **async** |
 | `AnySender::from_transport_config(&cfg).await` | Direct factory for tests |
-| `AnyReceiver::from_config(key).await` | Receive-side cascade factory -- **async**; `from_transport_config` too |
+| `AnyReceiver::from_config(key).await` | Receive-side cascade factory -- **async**, and `from_transport_config` too |
 | `AnyToken` | Type-erased commit token from `AnyReceiver`, `#[non_exhaustive]` |
 | `RoutedSender::from_route_configs(routes, default).await` | Per-key routing factory |
 | `WorkBatch<Token>` / `Record` | What `recv` returns: records + source acks + inline DLQ entries |

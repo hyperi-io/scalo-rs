@@ -6,7 +6,7 @@ release and the target before bumping.
 
 ---
 
-## Unreleased
+## 2.14.28
 
 ### A DLQ entry is written as a DFE event (BEHAVIOUR CHANGE)
 
@@ -20,17 +20,23 @@ See [metrics.md](core-pillars/metrics.md#otel-mode).
 
 **Consumer adjustment** -- describe a metric before its first use. A collector that suffixes units renames it.
 
+## 2.14.27
+
 ### A null list, map or struct in YAML is an error (BEHAVIOUR CHANGE)
 
 The `serde-saphyr` floor is 2.1.0, which refuses YAML null for a list, map or struct. `items:`, `items: ~` and `items: null` into a `Vec`, map or struct field are now an error at that line, where they read as empty. An `Option` field still reads them as `None`. A whole document that is empty, comment-only or `~` still reads as `T` from `{}`, so `load_typed` on an empty file returns the struct's defaults.
 
 **Consumer adjustment** -- write `[]` or `{}` for an empty collection in config files, fixtures and generators, or make the field an `Option`.
 
+## 2.14.25
+
 ### Kafka TLS with no CA trusts `SSL_CERT_FILE` before probing (BEHAVIOUR CHANGE)
 
 With TLS on and no CA set by `ssl_ca_location`, `ssl.ca.location` or `ssl.ca.pem`, every Kafka client sets `ssl.ca.location` to `SSL_CERT_FILE`, else `SSL_CERT_DIR`, else `probe`. 2.14.24 set `probe` alone, and librdkafka's probe ignores both variables, so a client trusting a private CA through `SSL_CERT_FILE` failed its TLS handshake.
 
 **Consumer adjustment** -- none. An app on 2.14.24 that trusts a private Kafka CA through `SSL_CERT_FILE` takes this release.
+
+## 2.14.24
 
 ### The spool's size cap counts queued bytes (BEHAVIOUR CHANGE)
 
@@ -66,13 +72,13 @@ With `security_protocol` `ssl` or `sasl_ssl` and no CA set by `ssl_ca_location`,
 
 `transport::kafka::test_support::SCRAM_PASSWORD` is replaced by `scram_password()`, which returns a password generated once per test process, so the test broker carries no credential in source.
 
-**Consumer adjustment** -- `SCRAM_PASSWORD` becomes `scram_password()`. dfe-loader's Kafka TLS startup test uses it and moves with the release.
+**Consumer adjustment** -- `SCRAM_PASSWORD` becomes `scram_password()`.
 
 ### The spool drains in batches (BEHAVIOUR CHANGE)
 
 `TieredSink`'s drain sends up to `drain_batch_max_records` (default 500) spooled records, within `drain_batch_max_bytes` (default 4 MiB as stored), in one `send_batch`, where it sent one record per pass. A sink that answers once the batch is delivered, Kafka's delivery reports say, now costs one round trip per batch. The whole batch commits on `Ok` and rolls back on backpressure, a timeout or a sink-level `Fatal`. A record-level `Fatal` re-sends the batch one record at a time.
 
-**Consumer adjustment** -- none. A struct literal of `TieredSinkConfig` adds the two fields or uses `TieredSinkConfig::new`, and none of the seven consumers has one.
+**Consumer adjustment** -- a struct literal of `TieredSinkConfig` adds the two fields or uses `TieredSinkConfig::new`.
 
 ### Every `from_cascade()` refuses a section that does not parse (API CHANGE)
 
@@ -80,25 +86,13 @@ These return `Result<Self, scalo::cascade::CascadeError>`, where they answered a
 
 `run_app` refuses to start on a bad `logger`, `metrics`, `memory`, `self_regulation`, `scaling`, `otel_tracing`, `transport.filter_tiers`, `expression` or `sink_stack` section (`cascade::check_runtime_sections`), `config-check` included. `ServiceRuntime::build`, `logger::setup`, `RuleSet::compile`, `HttpClient::from_cascade` and the transports' constructors return the error. `LoggerError`, `HttpClientError` and `RulesError` gain a `Config(CascadeError)` variant, and `TransportError`, `CliError` and `SecretsError` convert from it. `VersionCheckConfig::from_cascade_or` keeps its per-key leniency.
 
-**Consumer adjustment** -- at each consumer's `origin/main`:
-
-- dfe-loader (b54cae3):
-  - `src/pipeline/startup.rs:37` (`retry_until_shutdown`, no error path for it): `SinkStackConfig::from_cascade().unwrap_or_default()`. `run_app` has already refused a bad `sink_stack` section.
-  - `src/main.rs:353` (test `the_scaling_gate_reaches_the_cascade_through_the_env`): `scalo::ScalingPressureConfig::from_cascade().unwrap()`.
-- dfe-receiver (662e3d0):
-  - `src/routing/mod.rs:188` (`compile_rules`, returns `Result`): `CompileOptions::from_cascade().map_err(|e| Error::Config(format!("rules: {e}")))?`.
-- dfe-archiver (f2cc428):
-  - `crates/archiver/src/archiver.rs:1030` (inside `buffer_config`, no error path): `scalo::scaling::ScalingPressureConfig::from_cascade().unwrap_or_default()`. `run_app` has already refused a bad `scaling` section.
-- dfe-transform-elastic (05489a4):
-  - `src/config/loader.rs:304` and `:311` (test `a_config_file_is_a_layer_of_the_scalo_cascade`): add `.unwrap()` to `LoggerSettings::from_cascade()` and `ScalingPressureConfig::from_cascade()`.
-  - `src/service.rs:361` (`log_effective_scaling`, no error path): `ScalingPressureConfig::from_cascade().unwrap_or_default()`.
-- dfe-fetcher (795ae60), dfe-transform-vrl (adc9fd0), dfe-transform-vector (c9bf05d) and culvert (4310b91): none. They call only `VersionCheckConfig::from_cascade_or` and `base_image_from_cascade`, which are unchanged.
+**Consumer adjustment** -- a caller with an error path adds `?`. A call with none, made after `run_app` has already refused a bad section, takes `.unwrap_or_default()`. A test that reads a section it set takes `.unwrap()`.
 
 ### Transport config sections that do not parse fail the load (API CHANGE)
 
 `FromCascade::from_cascade_key` returns `TransportResult<Self>`, and so do `HttpTransportConfig::from_cascade`, `FileTransportConfig::from_cascade`, `PipeTransportConfig::from_cascade`, `GrpcConfig::from_cascade` and `SinkStackConfig::from_cascade`. A present section that does not deserialise is `TransportError::Config` naming its key, where it became the defaults. `SinkStackConfig` implements `FromCascade` in place of its own `from_cascade_key`, and `ServiceRuntime::outbound_sink_stack` returns the error. An absent section still takes the defaults.
 
-**Consumer adjustment** -- a caller of any of these adds `?`. The one DFE call site, dfe-loader `src/pipeline/startup.rs:37`, is listed in the entry above.
+**Consumer adjustment** -- a caller of any of these adds `?`.
 
 ### A batch_processing section that does not parse fails startup (BEHAVIOUR CHANGE)
 
@@ -316,7 +310,7 @@ New `scalo::rules`: a rule set that, per target field in order, takes the first 
 
 The logger decides every credential name through the new `logger::is_credential_name`: a name holding a default field anywhere in it, read as written and word by word. So `secretAccessKey`, `signingKey`, `api.key` and `ssl.key.pem`, which were logged in clear, are masked. `default_sensitive_fields()` adds `passphrase`, more token and secret spellings, the qualified keys (`signing_key`, `tls_key`, `ssh_key` and the rest), `jaas_config`, `header_value`, `session`, `cookie`, `csrf`, `cert`, `private`, `creds`, `connection_string`, `tfn`, `medicare`, `card_number`, `email` and `phone`. A bare `key` or `value` in a JSON line is judged with its parent's name.
 
-Text-format lines, and every string in a JSON line including the message, now mask `key: value` as well as `key=value`, the password of every URL up to the last `@` a host follows, and bearer tokens; the new `logger::mask_url_userinfo` applies the URL rule to any string. `mask_sensitive_string` uses the same rules, so the `{:#?}` config dump `config-check` prints masks its credential fields, where it wrote each value straight after the mask. See [core-pillars/logging.md](core-pillars/logging.md#sensitive-field-masking).
+Text-format lines, and every string in a JSON line including the message, now mask `key: value` as well as `key=value`, the password of every URL up to the last `@` a host follows, and bearer tokens. The new `logger::mask_url_userinfo` applies the URL rule to any string. `mask_sensitive_string` uses the same rules, so the `{:#?}` config dump `config-check` prints masks its credential fields, where it wrote each value straight after the mask. See [core-pillars/logging.md](core-pillars/logging.md#sensitive-field-masking).
 
 **Consumer adjustment** -- expect more masking. A name that only contains a field is masked too: `token_count`, `tokenizer`, `mapping` (`pin`), `author` (`auth`), `session_timeout_ms` (`session`) and `email_count` (`email`), and so is a `key: value` pair inside a message. Log a value an operator must read under a name that holds no field. An `@` later in the path or query of a URL that carries a password is masked with it.
 
@@ -434,7 +428,7 @@ The scalo-service PodDisruptionBudget sets `unhealthyPodEvictionPolicy: AlwaysAl
 
 ### Deployment contract schema 4 (API CHANGE)
 
-`DeploymentContract` gains `writable_paths`, `termination_grace_seconds`, `resources`, `security` and `singleton`; `HealthContract` gains `startup_budget_seconds`; `PortContract` gains `public` and `app_protocol`; `SecretGroupContract` gains `optional`. `CONTRACT_SCHEMA_VERSION` is 4 and `schema_version` defaults to it. `config_mount_path` may be omitted or empty, meaning no config file. See [deployment/contract.md](deployment/contract.md#schema-versioning).
+`DeploymentContract` gains `writable_paths`, `termination_grace_seconds`, `resources`, `security` and `singleton`. `HealthContract` gains `startup_budget_seconds`. `PortContract` gains `public` and `app_protocol`. `SecretGroupContract` gains `optional`. `CONTRACT_SCHEMA_VERSION` is 4 and `schema_version` defaults to it. `config_mount_path` may be omitted or empty, meaning no config file. See [deployment/contract.md](deployment/contract.md#schema-versioning).
 
 **Consumer adjustment** -- a struct literal of any of those four types names the new fields: `writable_paths: vec![]`, `termination_grace_seconds: 45`, `resources: ResourcesContract::default()`, `security: SecurityContract::default()`, `singleton: false`, `startup_budget_seconds: 150`, `optional: false`, or builds through `HealthContract::default()`, `PortContract::tcp`/`udp` and `SecretGroupContract::new`. An app that writes `schema_version: 3` writes `CONTRACT_SCHEMA_VERSION` instead, because the scalo-service chart renders version 4 only. `validate()` now also refuses a malformed writable path, a capability that is not an upper-case name, a singleton with KEDA on, and an `x-scalo-dial` other than `big` or `small`. A committed `deployment-contract.json` changes on regeneration.
 
@@ -449,7 +443,7 @@ The `expression` module and the Tier 2/3 transport filters evaluate on cel 0.14,
 
 The `cel::Program`, `cel::Value` and `cel::Context` types the expression API returns are cel 0.14 types.
 
-**Consumer adjustment** -- an app that declares `cel` itself moves it to `>=0.14.5, <0.15` in the same change as the bump; otherwise it builds a second cel whose types do not match the ones the expression API returns. Check stored routing rules and computed fields for `.contains(` on a list or map field, and rewrite them with `in`.
+**Consumer adjustment** -- an app that declares `cel` itself moves it to `>=0.14.5, <0.15` in the same change as the bump. Otherwise it builds a second cel whose types do not match the ones the expression API returns. Check stored routing rules and computed fields for `.contains(` on a list or map field, and rewrite them with `in`.
 
 ## 2.14.0
 
@@ -467,18 +461,18 @@ The `cel::Program`, `cel::Value` and `cel::Context` types the expression API ret
 
 **Consumer adjustment** -- a config these paths used to accept unchecked can now fail construction with `TransportError::Config` (`DlqError::Kafka` for the DLQ):
 
-- in any environment, SASL `PLAIN` (any case) without `security_protocol=sasl_ssl`, or an unknown `provider`;
-- in production, `ssl_skip_verify`, or `plaintext` / `sasl_plaintext` without `allow_insecure_transport: true`;
-- a config that got past either check through a raw map, such as `librdkafka_overrides: { security.protocol: sasl_plaintext }` beside a typed `sasl_ssl` and `PLAIN`, or `{ enable.ssl.certificate.verification: "false" }` in production, on every constructor including `KafkaTransport::new`. Set the typed field instead, or `allow_insecure_transport: true` for an audited plaintext transport;
+- in any environment, SASL `PLAIN` (any case) without `security_protocol=sasl_ssl`, or an unknown `provider`
+- in production, `ssl_skip_verify`, or `plaintext` / `sasl_plaintext` without `allow_insecure_transport: true`
+- a config that got past either check through a raw map, such as `librdkafka_overrides: { security.protocol: sasl_plaintext }` beside a typed `sasl_ssl` and `PLAIN`, or `{ enable.ssl.certificate.verification: "false" }` in production, on every constructor including `KafkaTransport::new`. Set the typed field instead, or `allow_insecure_transport: true` for an audited plaintext transport
 - in production, a `sasl.oauthbearer.token.endpoint.url` that is not `https://` or a NULL suite in `ssl.cipher.suites`, from any raw map. Use an `https://` token endpoint, and drop the NULL suite or exclude it with `!eNULL`.
 
 A `provider` preset that these paths silently ignored now takes effect. `producer_client_config` still applies neither step: a caller that builds a producer from it runs `apply_provider` and `validate` itself.
 
 ### App environment reads past whitespace and skips blank values (BEHAVIOUR CHANGE)
 
-`get_app_env` trims `APP_ENV`, `ENVIRONMENT` and `ENV`, and treats one that is empty or only whitespace as unset. `APP_ENV=" production"` or `"production\n"` now resolves to `production`, so `is_production()` is true and every production refusal applies where it did not before. `APP_ENV=""` beside `ENVIRONMENT=production` now resolves to `production` rather than to an empty, non-production posture. With every variable blank or unset the posture is `development` and the one-shot warning fires.
+`get_app_env` trims `APP_ENV`, `ENVIRONMENT` and `ENV`, and treats one that is empty or only whitespace as unset. `APP_ENV=" production"` or `"production\n"` now resolves to `production`, so `is_production()` is true and every production refusal applies where it did not before. `APP_ENV=""` beside `ENVIRONMENT=production` now resolves to `production` rather than to an empty, non-production environment. With every variable blank or unset the environment is `development` and the one-shot warning fires.
 
-**Consumer adjustment** -- a deployment that set one of these to a padded production value was running in development posture and now runs in production posture; check its Kafka, secrets and cache config against the production refusals above before it rolls.
+**Consumer adjustment** -- a deployment that set one of these to a padded production value was running as development and now runs as production. Check its Kafka, secrets and cache config against the production refusals above before it rolls.
 
 ### Contract names and defaults carry no organisation or product name
 
@@ -636,7 +630,7 @@ The producer profile constants `PRODUCER_HIGH_THROUGHPUT`, `PRODUCER_EXACTLY_ONC
 
 The key was parsed and used nowhere. It is now how long a `flush()` or the shutdown waits for the broker's acks, replacing the fixed 30 s v2.12.10 shipped. The default stays 5000, so the default wait is 5 s. `0` skips the ack wait, but the purge after it still waits up to 5 s for the purged entries' delivery reports. See [pipeline/dlq.md](pipeline/dlq.md#the-kafka-barrier).
 
-**Consumer adjustment** -- a flush over the Kafka backend now takes up to `send_timeout_ms` plus 5 s while the broker is slow or down, 10 s at the default. A consumer that exposes `KafkaDlqConfig` to its operators can set `send_timeout_ms: 30000` to keep the 30 s wait; one that builds it from `KafkaDlqConfig::default()` gets 5 s until it exposes the field.
+**Consumer adjustment** -- a flush over the Kafka backend now takes up to `send_timeout_ms` plus 5 s while the broker is slow or down, 10 s at the default. A consumer that exposes `KafkaDlqConfig` to its operators can set `send_timeout_ms: 30000` to keep the 30 s wait. One that builds it from `KafkaDlqConfig::default()` gets 5 s until it exposes the field.
 
 ### A Kafka DLQ loss returns `DlqError::Kafka` (BEHAVIOUR CHANGE)
 
@@ -648,7 +642,7 @@ In v2.12.10 a Kafka loss found by `flush()` came back as `Err(DlqError::File("ba
 
 Dropping the Kafka producer discards what it still holds, queued or in flight. The drain used to exit without waiting, so every shutdown threw away the entries the broker had not acked yet, and counted none of them. It now waits for the acks the way a `flush()` does before it exits. Entries only Kafka held that the broker refused or never acked go to the next backend in `Cascade` with a backend after Kafka, and are counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}` otherwise. See [pipeline/dlq.md](pipeline/dlq.md#shutdown).
 
-**Consumer adjustment** -- none in code. `shutdown()`, or the drain's exit on the cancelled token, can take `kafka.send_timeout_ms` plus 5 s while the broker is down; fit that inside the pod's termination grace period. `shutdown()` still returns `Ok`; read `dropped()` after it, or call `flush()` first for the loss as an `Err`. The count lands only if the drain finishes: a runtime that shuts down under it drops it mid-wait. A caller that never calls `flush()` now sees Kafka delivery failures in `dropped()` once the DLQ has shut down.
+**Consumer adjustment** -- none in code. `shutdown()`, or the drain's exit on the cancelled token, can take `kafka.send_timeout_ms` plus 5 s while the broker is down. Fit that inside the pod's termination grace period. `shutdown()` still returns `Ok`. Read `dropped()` after it, or call `flush()` first for the loss as an `Err`. The count lands only if the drain finishes: a runtime that shuts down under it drops it mid-wait. A caller that never calls `flush()` now sees Kafka delivery failures in `dropped()` once the DLQ has shut down.
 
 ### `NdjsonWriter` refuses a write that reached no file (BEHAVIOUR CHANGE)
 
@@ -658,7 +652,7 @@ Dropping the Kafka producer discards what it still holds, queued or in flight. T
 
 ### `KafkaProducer::flush` counts messages only (BEHAVIOUR CHANGE)
 
-`flush` returned librdkafka's out-queue length, which also counts the statistics, error and log events the client has still to serve, so it could report messages outstanding after every message had its delivery report. It now returns the messages sent with no delivery report yet. A failed delivery has its report, so it is not counted; `delivery_failures()` counts those.
+`flush` returned librdkafka's out-queue length, which also counts the statistics, error and log events the client has still to serve, so it could report messages outstanding after every message had its delivery report. It now returns the messages sent with no delivery report yet. A failed delivery has its report, so it is not counted. `delivery_failures()` counts those.
 
 **Consumer adjustment** -- none in code. `in_flight_count()` and `ProducerMetrics::in_flight` still return the out-queue length.
 
@@ -668,7 +662,7 @@ Dropping the Kafka producer discards what it still holds, queued or in flight. T
 
 - The source is closed when the method returns. A second `close()` is harmless on every scalo transport.
 - A block the sink refuses transiently (`Backpressure`, `Timeout`) is retried for up to 10 s after the loop sees shutdown, whether it was refused before shutdown or during the drain. Before, retries stopped the moment the token fired, so one busy moment in the sink at shutdown lost everything the source still held.
-- A block the sink still refuses after those 10 s stops the drain, uncommitted; one refused since before the drain began closes the source without a drain. A permanent sink error stops it at once and is returned. A source that returns nothing for 5 s without reporting `Closed` stops it too.
+- A block the sink still refuses after those 10 s stops the drain, uncommitted. One refused since before the drain began closes the source without a drain. A permanent sink error stops it at once and is returned. A source that returns nothing for 5 s without reporting `Closed` stops it too.
 - A sink that stays busy therefore holds shutdown for up to 10 s longer than before.
 - A Kafka source reports `Closed` at once, so the drain reads nothing from it. A Kafka commit made after the method returns gets one attempt: the transport stops retrying commits once closed.
 
@@ -701,7 +695,7 @@ The Vector-compat source queued a request's events one at a time, so a request t
 
 The client had no connect timeout, so a dial to a peer that never completed the TCP connect held the caller until the operating system gave up, and every later call queued behind it. A dial whose DNS lookup or TCP connect is unfinished at nine tenths of the gRPC transport's default `send_timeout_ms` (30 s) is now abandoned: the call that started it returns its usual error (`TransportError::Send` from `send_events`, `TransportError::Connection` from `health_check`) and the next call dials afresh. `health_check` is a short probe, so it also gives up at the full 30 s once connected.
 
-`send_events` has no limit once connected. A Vector source with end-to-end acknowledgements holds `PushEvents` open until its own sink has delivered the events, and a sender that cut the RPC off and retried would push the same events again while the first push may still land. A send to a peer that stays connected but never answers waits for as long as the connection stays open.
+`send_events` has no limit once connected. A Vector source with acknowledgements on holds `PushEvents` open until its own sink has delivered the events, and a sender that cut the RPC off and retried would push the same events again while the first push may still land. A send to a peer that stays connected but never answers waits for as long as the connection stays open.
 
 **Consumer adjustment** -- none in code.
 
@@ -723,7 +717,7 @@ The gRPC server acknowledges a record once it is queued for `recv`. `close()` us
 
 - `close()` refuses every push from then on with `Unavailable`, which a sender retries. `recv` returns the records already queued, then `Closed`.
 - `close()` and dropping the transport both stop the server, so the listener is free when `close()` returns. The serve task used to outlive the transport for as long as a client held an RPC open. Open connections still finish their in-flight RPCs.
-- `send` and `send_batch` give up at `send_timeout_ms` end to end. The `grpc-timeout` header did not cover DNS, the TCP connect or the TLS handshake, so a send to a receiver that was down could outlive the limit. A dial whose DNS lookup, TCP connect or TLS handshake has not finished by nine tenths of the limit is now abandoned, so the next send dials afresh. Before, only the TCP connect was bounded, and every later send queued behind a TLS handshake the server never answered.
+- `send` and `send_batch` give up at `send_timeout_ms`, the whole send included. The `grpc-timeout` header did not cover DNS, the TCP connect or the TLS handshake, so a send to a receiver that was down could outlive the limit. A dial whose DNS lookup, TCP connect or TLS handshake has not finished by nine tenths of the limit is now abandoned, so the next send dials afresh. Before, only the TCP connect was bounded, and every later send queued behind a TLS handshake the server never answered.
 - The server no longer counts receipts in `transport_sent_total{transport="grpc"}`. They were counted as sends and as receipts both.
 
 **Consumer adjustment** -- a service that receives over gRPC shuts down with `close()`, then `recv` until `Closed`, then its final flush. One that stops calling `recv` and closes after its flush still loses what was queued. A dashboard that read the server's `transport_sent_total{transport="grpc"}` as its intake reads `transport_received_events_total{transport="grpc"}` instead.
@@ -764,7 +758,7 @@ The service runtime builds the app metric set, with the `info` gauge, and a serv
 
 `worker_pool_scale_events_total` is described with its `direction` label and no longer also emitted as an unlabelled series stuck at 0.
 
-**Consumer adjustment** -- a service that wants its commit in `info` names it in `ServiceApp::version_info` with `with_commit`, or builds with `GIT_COMMIT` set. Its own `AppMetrics::new` call can stay; it no longer changes `info`.
+**Consumer adjustment** -- a service that wants its commit in `info` names it in `ServiceApp::version_info` with `with_commit`, or builds with `GIT_COMMIT` set. Its own `AppMetrics::new` call can stay. It no longer changes `info`.
 
 ## 2.12.10
 
@@ -785,7 +779,7 @@ A refusal is reported once: the first flush after it returns the error and the n
 - `Cascade`: when Kafka queues part of a batch and refuses the rest, only the rest goes to the next backend. Before, the whole batch did, so the file held a second copy of the part Kafka took.
 - `FanOut`: a Kafka loss counts only for entries no other backend holds.
 
-**Consumer adjustment** -- none in code. A flush over the Kafka backend can now take up to 35 s while the broker is slow or down; a timeout around it shorter than that sees its own timeout, and the failure goes to the next flush. A caller that never calls `flush()` sees Kafka delivery failures in `transport_send_errors_total{transport="kafka"}` only, not in `dropped()`.
+**Consumer adjustment** -- none in code. A flush over the Kafka backend can now take up to 35 s while the broker is slow or down. A timeout around it shorter than that sees its own timeout, and the failure goes to the next flush. A caller that never calls `flush()` sees Kafka delivery failures in `transport_send_errors_total{transport="kafka"}` only, not in `dropped()`.
 
 The 30 s wait and the `File` variant changed after v2.12.10 -- see [`kafka.send_timeout_ms` is the Kafka ack wait](#kafkasend_timeout_ms-is-the-kafka-ack-wait-behaviour-change) and [A Kafka DLQ loss returns `DlqError::Kafka`](#a-kafka-dlq-loss-returns-dlqerrorkafka-behaviour-change).
 
@@ -796,7 +790,7 @@ The 30 s wait and the `File` variant changed after v2.12.10 -- see [`kafka.send_
 - A write while the current file is missing returns `Err` and schedules a reopen, which runs once the directory is usable again. It never recreates a missing directory, at a rotation boundary included.
 - `NdjsonWriter::new`, and a reopen, refuse a directory that is not a directory or cannot be listed.
 - `NdjsonWriter::new` refuses a filename with no final component (`..`) with `ErrorKind::InvalidInput`.
-- `max_age_days` is capped at 1,000,000 days; above about 95 million the rotation's age check panicked.
+- `max_age_days` is capped at 1,000,000 days. Above about 95 million the rotation's age check panicked.
 
 **Consumer adjustment** -- none in code. A write the writer would previously have lost silently or panicked on is now an `Err`.
 
@@ -806,7 +800,7 @@ The 30 s wait and the `File` variant changed after v2.12.10 -- see [`kafka.send_
 
 The `KafkaAdmin` offset-query consumer used the fixed group id `__hs_admin_internal`, and a producer-only `KafkaTransport` used `__scalo_producer_only`. A broker granting groups by prefix refused both, logging `GroupAuthorizationFailed` on every start. They are now `<group>-admin` (or `<client_id>-admin`) and `<client_id>-producer-only`. See [kafka-path.md](kafka-path.md), "Internal consumer groups and broker ACLs".
 
-Neither consumer ever joined its group or committed an offset, so no offsets are stranded under the old names. A transport with an empty `group` now subscribes to nothing even when `topics` is set; before, it joined `__scalo_producer_only` on those topics.
+Neither consumer ever joined its group or committed an offset, so no offsets are stranded under the old names. A transport with an empty `group` now subscribes to nothing even when `topics` is set. Before, it joined `__scalo_producer_only` on those topics.
 
 **Consumer adjustment** -- none in code. A deployment that granted the two literal ids by name, rather than by the app's group prefix, needs its grant to cover the new names.
 
@@ -830,7 +824,7 @@ yourself.
 **Consumer adjustment** -- ANY path whose second segment is not `data`
 changes meaning, at any length: its first segment used to be the first
 segment of a path under `secret` and is now the mount. `myapp/tls` was
-`secret`/`myapp/tls` and is now `myapp`/`tls`; `kv/dfe-test/runzero` was
+`secret`/`myapp/tls` and is now `myapp`/`tls`. `kv/dfe-test/runzero` was
 `secret`/`kv/dfe-test/runzero` and is now `kv`/`dfe-test/runzero`.
 Anything relying on the old reading now asks for a path that does not
 exist, so write the mount you mean (`secret/myapp/tls`).
@@ -850,7 +844,7 @@ chain -- the active profile and IMDS included -- so a pod with no
 `AWS_REGION` read secrets from the wrong region.
 
 **Consumer adjustment** -- code constructing `AwsConfig` literally now
-writes `region: Some("ap-southeast-2".into())`; `AwsConfig::with_region`
+writes `region: Some("ap-southeast-2".into())`. `AwsConfig::with_region`
 and `for_localstack` are unchanged. Anything that relied on the
 `us-east-1` default must name the region it means, in config
 (`secrets.aws.region`) or in `AWS_REGION` / `AWS_DEFAULT_REGION`.
@@ -877,7 +871,7 @@ No consumer code change is required to get the fix. Two things to know:
   counter, unchanged.
 - **`try_reserve(n)` is a projected-admission check** (`usage() + n <=
   limit`) and no longer mutates the reservation counter. Pair it with
-  `release` only if you also read `reserved_bytes()`; the kernel
+  `release` only if you also read `reserved_bytes()`. The kernel
   uncharges freed bytes on its own.
 
 New: `MemoryGuard::reserved_bytes()`, `MemoryGuard::usage_source()`,
@@ -921,7 +915,7 @@ engine driver, with self-regulation (memory guard + inbound/byte-budget
 backpressure) ON by default. See [self-regulation.md](self-regulation.md),
 [backpressure.md](backpressure.md), [kafka-path.md](kafka-path.md).
 
-The six core consumer services migrate in lockstep; items below are the
+Consumers migrate in lockstep with the release. Items below are the
 consumer-facing surface changes.
 
 ### `WorkBatch` / `Record` -- the canonical currency (BREAKING)
@@ -951,7 +945,7 @@ slices one inbound `Bytes` into per-record views -- no payload copy).
 
 `recv` now yields a `WorkBatch` natively -- no `RecvBatch` round-trip. The
 inbound-filter DLQ entries arrive on `WorkBatch.dlq_entries` alongside the
-passing `WorkBatch.records`; the source acks are on `WorkBatch.commit_tokens`.
+passing `WorkBatch.records`. The source acks are on `WorkBatch.commit_tokens`.
 
 Filter-dropped records still commit: a record an inbound `drop`/`dlq` filter
 removes produces no passing record but WAS handled, so its commit token is
@@ -982,8 +976,8 @@ The four legacy `BatchEngine` run loops (`run` / `run_raw` / `run_async` /
 
 | New method | Use |
 | --- | --- |
-| `run_governed` | The default for a self-regulating app. Streams in byte-budget sub-blocks when the governor is on; delegates to `run_workbatch` when off (byte-identical). |
-| `run_workbatch` | On-demand parse (default). The driver does not pre-parse; a transform calls `codec::parse` when it needs a field. Pass-through apps pay zero parse. |
+| `run_governed` | The default for a self-regulating app. Streams in byte-budget sub-blocks when the governor is on. Delegates to `run_workbatch` when off (byte-identical). |
+| `run_workbatch` | On-demand parse (default). The driver does not pre-parse. A transform calls `codec::parse` when it needs a field. Pass-through apps pay zero parse. |
 | `run_workbatch_parsed` | Opt-in hot path. The driver pre-parses the whole block (SIMD JSON / native MsgPack) on the pool and hands the closure a `ParsedBatch` (records + aligned `ParsedPayload`s + shared `FieldInterner`). Parse failures route to DLQ, no silent drop. |
 | `run_workbatch_streaming` | Explicit sub-block streaming with a caller-supplied byte size (peak memory bounded to one sub-block). |
 
@@ -995,17 +989,17 @@ the parsed path). It MUST preserve `commit_tokens` -- use
 commit) selects who fires the acks.
 
 Custom in-process callers: `process_mid_tier` / `process_raw` now take a
-`Record` (not a `Message`); only the four run LOOPS were removed.
+`Record` (not a `Message`). Only the four run LOOPS were removed.
 
 ### `TransportSender::send_batch` (additive, default provided)
 
 New trait method `send_batch(&self, records: &[Record]) -> SendResult`. The
 default loops `send` per record (using each record's own key + payload
-`Bytes`); transports with a native batch RPC (gRPC `RouteBatch`) override it
+`Bytes`). Transports with a native batch RPC (gRPC `RouteBatch`) override it
 to send the whole block in one serde-less call. Commit tokens + DLQ entries
-are NOT sent -- they are the sender's local concern; pass `&workbatch.records`
+are NOT sent -- they are the sender's local concern. Pass `&workbatch.records`
 and fire the commit tokens locally after `SendResult::Ok`. Existing `send`
-callers are unaffected; the default is non-atomic (a mid-block failure leaves
+callers are unaffected. The default is non-atomic (a mid-block failure leaves
 the already-sent prefix on the wire -- at-least-once, retried by the caller).
 
 ### Codec consolidation -- native rmpv, JSON bridge removed (BREAKING for codec users)
@@ -1015,8 +1009,8 @@ the already-sent prefix on the wire -- at-least-once, retried by the caller).
 (SIMD) and MsgPack via **native `rmpv`** -- NOT the old
 `rmp_serde -> serde_json::Value -> serde_json::to_vec -> sonic_rs` bridge
 (two parses + a re-serialise per MsgPack record). `ParsedPayload` keeps its
-native value (`sonic_rs::Value` / `rmpv::Value`); `field_str` / `field` are
-the format-agnostic routing-field accessors; `to_json_bytes` / `to_msgpack_bytes`
+native value (`sonic_rs::Value` / `rmpv::Value`). `field_str` / `field` are
+the format-agnostic routing-field accessors. `to_json_bytes` / `to_msgpack_bytes`
 / `ParsedPayload::to_bytes` serialise back to the OWN wire format (no
 cross-format bridge). Pass-through contract: an UNMODIFIED record must reuse
 its original `Record.payload` -- `to_bytes` is only for a record a transform
@@ -1043,7 +1037,7 @@ A new `self_regulation` config section turns the data-plane governor ON by
 default. When the `governor` feature is compiled in, the runtime builds the
 pressure governor (memory HARD source), the inbound gate, and the byte-budget
 controller, and threads them into the transports + driver. Memory pressure
-brakes inbound intake; the byte budget sizes streaming sub-blocks. To opt out
+brakes inbound intake. The byte budget sizes streaming sub-blocks. To opt out
 (byte-identical to pre-governor behaviour -- nothing is constructed):
 
 ```yaml
@@ -1052,7 +1046,7 @@ self_regulation:
 ```
 
 Full tuning surface (profile / pause_above / resume_below / max_hold_secs /
-md_factor) in [self-regulation.md](self-regulation.md). `target_rho` is still accepted and has no effect: the byte budget shrinks only under memory pressure, and utilisation and CPU saturation are the autoscaler's signal.
+md_factor) in [self-regulation.md](self-regulation.md). `target_rho` is still accepted and has no effect: the byte budget shrinks only under memory pressure, and how busy the pod is, CPU included, is the autoscaler's signal.
 Off-pressure cost is near zero: without memory pressure the budget stays at or above its big start value, so a block is one sub-block with no per-record overhead.
 
 ### Originator brake / token wiring (BEHAVIOUR CHANGE)
@@ -1061,14 +1055,14 @@ Data-originator stages get the inbound brake wired into the receive transport:
 Kafka pauses ASSIGNED partitions (member stays in group, no rebalance), HTTP/gRPC returns 503 / `UNAVAILABLE`, and the fetcher pauses its poll. Kafka pairs the brake with its offset and the fetcher with its cursor, so a paused intake never advances the source position. HTTP and gRPC have no source position: a refused request is the sender's to retry, and an accepted one is acknowledged once queued, with `commit` a no-op. `SelfRegulationGovernor::attach_kafka_gate` is the one-call form of the gate dance. See [backpressure.md](backpressure.md).
 
 **App adoption is TWO steps, not one.** The default-on governor only
-engages end-to-end if the app adopts BOTH the driver method AND the
+engages fully only if the app adopts BOTH the driver method AND the
 governed-receiver constructor. `run_governed` alone wires the byte-budget lever
-(streaming sub-blocks) but does NOT brake intake; the inbound brake lives on the
+(streaming sub-blocks) but does NOT brake intake. The inbound brake lives on the
 receive transport, which the plain factory constructors
-(`AnyReceiver::from_config` / `from_transport_config`) do NOT wire. Each of the
-six core consumer services MUST:
+(`AnyReceiver::from_config` / `from_transport_config`) do NOT wire. Each
+consumer service MUST:
 
-1. Drive the engine with `run_governed` (not the legacy run loops); AND
+1. Drive the engine with `run_governed` (not the legacy run loops). AND
 2. Build the receive transport through a governor-aware constructor so the
    inbound brake is actually attached.
 
@@ -1100,7 +1094,7 @@ receive side.
 
 - `Message` and `RecvBatch` remain as internal build helpers, with
   `From<Message>` and `From<RecvBatch>` conversions into `WorkBatch`.
-- The engine keeps `ParsedMessage` for its in-process callers; the codec's
+- The engine keeps `ParsedMessage` for its in-process callers. The codec's
   type is `ParsedPayload`.
 
 ### `BatchEngine` filter-DLQ policy (BEHAVIOUR CHANGE)
@@ -1173,7 +1167,7 @@ New `transport::FromCascade` trait with a default `from_cascade_key(key)`
 consolidates the byte-identical `from_cascade()` bodies the 5 transport configs
 (grpc/http/file/pipe/redis) each repeated. Each config's inherent
 `from_cascade()` is unchanged in signature -- it just delegates -- so this is
-**not** a consumer migration; it only removes internal duplication.
+**not** a consumer migration. It only removes internal duplication.
 
 ### `AdaptiveWorkerPool::fan_out_async` return type
 
@@ -1257,7 +1251,7 @@ auth fails.
 
 ### `SinkDrain::flush_durable` (additive, default no-op)
 
-New trait method; existing impls compile unchanged. A drain with a durability step overrides it. The DLQ drain does, running each backend's durable flush -- see [Kafka DLQ `flush()` waits for broker acks](#kafka-dlq-flush-waits-for-broker-acks-behaviour-change).
+New trait method. Existing impls compile unchanged. A drain with a durability step overrides it. The DLQ drain does, running each backend's durable flush -- see [Kafka DLQ `flush()` waits for broker acks](#kafka-dlq-flush-waits-for-broker-acks-behaviour-change).
 
 ### `Dlq` struct (internal layout)
 
@@ -1291,7 +1285,7 @@ unchanged (`is_match`, `find`, `find_iter`, `earliest_match`,
 
 Now actually wired (was silently inert). Default 10,000. Consumers
 that set `max_connections: 1` to "disable" filtering will now hit
-a hard cap; raise to a realistic number or document the throttling
+a hard cap. Raise to a realistic number or document the throttling
 intent.
 
 ### Version check
@@ -1351,7 +1345,7 @@ dotted path (`has(some.path.field)`) or to a Tier-2 CEL filter.
 ### Bounded metric labels
 
 `ServiceMetrics` methods that took free-form `&str` for metric labels
-now take typed enums. The labels are bounded; cardinality is
+now take typed enums. The labels are bounded. Cardinality is
 fixed at the enum variant count.
 
 | Method | Old | New |
@@ -1389,7 +1383,7 @@ Variant lists:
   `AdditionalProperties`, `NullValue`, `EncodingError`)
 
 No `Other` catch-all. New failure modes require a scalo release
-that adds a variant; consumers then bump and recompile. The compiler
+that adds a variant. Consumers then bump and recompile. The compiler
 flags every site needing the new variant.
 
 ### `RoutedSender` metric label

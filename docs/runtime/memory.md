@@ -6,8 +6,8 @@ fast atomic `under_pressure()` check that hot-path code reads to
 decide whether to accept more work or shed load.
 
 It is a *guard*, not a *limit*. scalo never OOM-kills its own
-process and takes no allocator dependency (`#![forbid(unsafe_code)]`).
-It surfaces pressure; the caller decides what to do with it.
+process and takes no allocator dependency (and `#![deny(unsafe_code)]`).
+It surfaces pressure, and the caller decides what to do with it.
 
 ---
 
@@ -20,16 +20,16 @@ process refuse new work *before* the kernel reaches for the axe.
 
 Memory pressure brakes INBOUND intake only -- never the outbound
 drain. Gating the drain deadlocks (you stop the thing that frees
-memory). See the backpressure doctrine in SELF-REGULATION.
+memory). See [../backpressure.md](../backpressure.md) and [../self-regulation.md](../self-regulation.md).
 
 | Consumer | Behaviour on `under_pressure()` |
 | ---------- | -------------------------------- |
 | HTTP server | 503 Service Unavailable |
-| Kafka receiver | Pause partition assignment |
+| Kafka receiver | Pause its assigned partitions |
 | `BatchEngine` | Smaller batches, more frequent flushes |
-| `ScalingPressure` | Bump KEDA signal toward 1.0 |
+| `ScalingPressure` | Jump the KEDA signal to 100 past its memory gate |
 
-The guard publishes the ratio; it owns none of these policies.
+The guard publishes the ratio, and it owns none of these policies.
 
 ---
 
@@ -49,7 +49,7 @@ room for code, stack, allocator fragmentation, and cgroup-attributed
 page cache. Rust has no GC, so no spike headroom is needed -- the 15%
 gap is just the cost of being a process.
 
-A 4 GiB cgroup with defaults -> ~3.4 GiB effective limit; backpressure
+A 4 GiB cgroup with defaults -> ~3.4 GiB effective limit, and backpressure
 at 80% of that (~2.72 GiB, ~68% of the real cgroup limit). Matches the
 OTel Collector's `limit_percentage: 80` philosophy.
 
@@ -68,7 +68,7 @@ is resolved once per guard, in this order:
 | 4 | reservations | -- | `reservations` |
 
 Rungs 1 and 2 read the working set kubelet evicts on: the usage less the inactive page cache, which the kernel reclaims before it OOM-kills. So file writes (a spool, staged uploads) do not trip the guard, whatever allocator the binary installed. Rung 3 covers a Linux host running no cgroup memory
-controller; it reads kB, so no page-size constant can be wrong on a 16K
+controller. It reads kB, so no page-size constant can be wrong on a 16K
 or 64K kernel. Rung 4 is the last resort where no kernel accounting is
 readable at all (non-Linux): the guard then sees only bytes callers
 reserved by hand, and says so with a warn at init.
@@ -120,11 +120,11 @@ scalo picks no allocator. The binary does, and jemalloc is the usual pick for a 
 
 The guard does not read the allocator. In a container it reads the kernel's `memory.current`, which counts every page the process holds, arenas the allocator keeps after a free included. An allocator figure such as jemalloc's `stats.allocated` is read only when the binary registers it with `set_heap_source`, and the guard then takes the larger of it and the kernel figure.
 
-Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project carries it on as `tikv-jemallocator`, from the same repo: <https://github.com/tikv/jemallocator>. As of 2026-09-26 `tikv-jemalloc-sys` is at 0.7.1, published 2026-05-25. So `tikv-` is the maintained line, not a side fork.
+Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project carries it on as `tikv-jemallocator`, from the same repo: <https://github.com/tikv/jemallocator>. So `tikv-` is the maintained line, not a side fork.
 
 Three crates, three jobs:
 
-- `tikv-jemalloc-sys` -- 'build jemalloc and link it in'. It compiles jemalloc's C source and statically links it into the binary. Nothing depends on it directly, it comes in under the other two. The version names the upstream build: `0.7.1+5.3.1-0-g81034ce1` is jemalloc 5.3.1 at that commit.
+- `tikv-jemalloc-sys` -- 'build jemalloc and link it in'. It compiles jemalloc's C source and statically links it into the binary. Nothing depends on it directly, it comes in under the other two. The version names the upstream build: `<crate version>+<jemalloc version>-<commit>`.
 - `tikv-jemallocator` -- the `#[global_allocator]` shim.
 - `tikv-jemalloc-ctl` -- 'ask jemalloc how much it holds'. Turn on its `stats` feature or there are no stats to read.
 
@@ -151,7 +151,7 @@ pub enum MemoryPressure {
 
 `pressure_threshold` is the only knob the hot path cares about. There
 is no separate warn/soft/hard tier: the hot-path API is binary
-(`under_pressure() -> bool`); `pressure()` is for log/metric labels.
+(`under_pressure() -> bool`), and `pressure()` is for log/metric labels.
 
 ---
 
@@ -182,14 +182,14 @@ if guard.under_pressure() {
 | `try_reserve(n)` | one cached usage read + a compare-exchange that judges and charges the ledger in one step (rollback on the reservation counter only on rung 4) |
 | `add_bytes(n)` | two `fetch_add` + threshold update |
 | `release(n)` | two `try_update` -- the reservation counter floors at zero, the ledger discharges oldest-first and never past what is outstanding |
-| `under_pressure()` | one cached usage read + compare; one file read per 50 ms |
-| `pressure_ratio()` | the same read + one float division; >1.0 means misconfigured limit |
+| `under_pressure()` | one cached usage read + compare, one file read per 50 ms |
+| `pressure_ratio()` | the same read + one float division. Over 1.0 means a misconfigured limit |
 
 ---
 
 ## Self-regulation
 
-Self-regulation (the `governor` feature) is ON by default; opt out via
+Self-regulation (the `governor` feature) is ON by default. Opt out via
 `self_regulation.enabled = false`, after which nothing is constructed
 and the data path is byte-identical to pre-governor. It consumes the
 guard's pressure to drive the inbound brake and an AIMD byte budget.
@@ -206,8 +206,8 @@ to force scale-up before OOM-kill, bypassing the weighted composite.
 
 ## ServiceRuntime wiring
 
-`ServiceRuntime::build` constructs the guard from the env prefix and
-hands the `Arc<MemoryGuard>` to:
+`ServiceRuntime::build` constructs the guard from the `memory` config section
+with the `{PREFIX}_MEMORY_*` env vars over it, and hands the `Arc<MemoryGuard>` to:
 
 - `AdaptiveWorkerPool` via `set_memory_guard(...)` -- scales down under
   pressure.
@@ -216,8 +216,8 @@ hands the `Arc<MemoryGuard>` to:
 - The self-regulation governor (built from the same guard).
 
 Apps read `runtime.memory_guard` directly. Env-var overrides
-(`MYAPP_MEMORY_LIMIT_BYTES`) work without bridging because
-`build` uses `from_env(env_prefix)`.
+(`MYAPP_MEMORY_LIMIT_BYTES`) work without bridging because `build` applies
+the flat `{PREFIX}_MEMORY_*` spellings over the config section.
 
 Env vars:
 
@@ -231,8 +231,8 @@ Env vars:
 
 | Item | Purpose |
 | ------ | --------- |
-| `memory::set_heap_source(fn() -> usize) -> bool` | Read an allocator figure beside the detected source, the larger winning (set-once; returns false if already set) |
-| `MemoryGuard::new(config)` | Construct; detects the usage source, and the limit if `limit_bytes == 0` |
+| `memory::set_heap_source(fn() -> usize) -> bool` | Read an allocator figure beside the detected source, the larger winning (set-once, returns false if already set) |
+| `MemoryGuard::new(config)` | Construct. Detects the usage source, and the limit if `limit_bytes == 0` |
 | `MemoryGuard::with_usage_source(config, source)` | Construct reading usage from a pinned `UsageSource` |
 | `MemoryGuard::try_reserve(n) -> bool` | Projected-admission check against current usage |
 | `MemoryGuard::add_bytes(n)` | Unchecked lease tracking -- data already accepted |
@@ -258,11 +258,12 @@ Env vars:
 
 | Layer | Default | Behaviour |
 | ------- | --------- | ----------- |
-| 1 -- cap allocator | opt-in | Hard cap; last-resort crash via `handle_alloc_error` instead of OOM-kill |
+| 1 -- cap allocator | opt-in | Hard cap, a last-resort crash via `handle_alloc_error` instead of OOM-kill |
 | 2 -- `MemoryGuard` | on | Cgroup-aware tracking + backpressure signal |
 
-Layer 2 is what 99% of services need. Layer 1 is a seatbelt for
-binaries that can't trust every dependency to honour backpressure.
+Layer 2 is what most services need, and scalo provides only that one. Layer 1
+is an allocator the binary picks, a seatbelt for binaries that can't trust every
+dependency to honour backpressure.
 
 ---
 

@@ -15,7 +15,7 @@ for the governor and brake over this path.
 
 ## The three batch sizes
 
-THREE distinct batch sizes on the Kafka path; conflating them is the usual
+THREE distinct batch sizes on the Kafka path, and conflating them is the usual
 tuning mistake. Each governs a different hop.
 
 | # | Batch | Governs | Sized by |
@@ -24,32 +24,32 @@ tuning mistake. Each governs a different hop.
 | 2 | **PROCESS** (WorkBatch) | How much in-flight data the stage holds while processing | The AIMD byte budget (`src/governor/budget.rs`) -- the self-regulation lever |
 | 3 | **SEND** (producer) | How many bytes the producer accumulates per MessageSet | `batch.size` + `linger.ms` |
 
-- **GET** is broker-side accumulation: the broker waits up to
+- GET is broker-side accumulation: the broker waits up to
   `fetch.wait.max.ms` to fill `fetch.min.bytes` before responding. Bigger
   GET batches mean fewer round-trips and higher throughput, at the cost of
   latency when traffic is thin.
-- **PROCESS** is the only one that self-regulates. It is the byte budget the
+- PROCESS is the only one that self-regulates. It is the byte budget the
   governed driver uses to size sub-blocks (see
   [backpressure.md](backpressure.md)). GET and SEND are static librdkafka
-  knobs; PROCESS moves with pressure.
-- **SEND** is producer-side accumulation, mirror of GET. `linger.ms` is the
-  time bound; `batch.size` is the byte bound. Accumulation only happens when
+  knobs, and PROCESS moves with pressure.
+- SEND is producer-side accumulation, mirror of GET. `linger.ms` is the
+  time bound and `batch.size` the byte bound. Accumulation only happens when
   records are queued together: `KafkaTransport::send_batch` queues the whole
   block before awaiting any delivery report, whereas a loop that awaits each
   `send` pays one `linger.ms` window per record.
 
 The poll-safety cap (`max_poll_records`) is a fourth, count-based limit. It
-is NOT a librdkafka property -- there is no broker knob for it. It is a
-client-side cap enforced by passing it as the `max` argument to
-`recv()`, bounding how many records the WorkBatch layer receives per poll so
-a tiny-record flood cannot blow the count even within the byte budget.
+is NOT a librdkafka property -- there is no broker knob for it. Nothing in
+scalo applies it: `KafkaSizingConfig::effective_poll_cap()` returns it, and an
+app that wants the cap passes that as `recv`'s `max`. The `BatchEngine` run
+loops pass their own `max_chunk_size`.
 
 ---
 
 ## Byte budget + time bound = one config, SME to hyperscale
 
 The sizing knobs default to GENEROUS ceilings with a TIME bound. The ceiling
-lets a busy topic fill large, efficient batches; the time bound
+lets a busy topic fill large, efficient batches, and the time bound
 (`fetch.wait.max.ms` on GET, `linger.ms` on SEND) stops a quiet topic stalling
 to fill it -- it returns whatever it has when the timer fires. The same
 `profile: throughput` config that batches a PB/day firehose into 1 MiB fetches
@@ -68,7 +68,7 @@ small-pod guidance in [self-regulation.md](self-regulation.md).
 
 `SelfRegulationProfile` (in `src/transport/kafka/config.rs`) sets opinionated
 defaults for the byte envelope and latency. An explicit per-knob value wins
-over the profile default; the raw sizing maps win over the named knobs; the
+over the profile default, the raw sizing maps win over the named knobs, and the
 transport-level `kafka.librdkafka_overrides` wins over all of it (see the full
 precedence below).
 
@@ -94,7 +94,7 @@ The profile defaults, with the ACTUAL librdkafka property each maps to:
 | `balanced` | 256 KiB | 25 ms | 1 MiB | 50 MiB | 1000 | 64 KiB | 5 ms | zstd, level 3 | 32 MiB | 16 MiB |
 | `low_latency` | 1 byte | 5 ms | 1 MiB | 16 MiB | 500 | 16 KiB | 0 ms | zstd, level 3 | 16 MiB | 16 MiB |
 
-Two columns do not vary by profile. `message.max.bytes` is the record-size chain rather than a tuning dial: the producer's own ceiling, which librdkafka defaults to 1,000,000 bytes and enforces LOCALLY, so raising the broker alone changes nothing.
+Three columns do not vary by profile: the codec, covered under [Wire compression](#wire-compression), and the two below. `message.max.bytes` is the record-size chain rather than a tuning dial: the producer's own ceiling, which librdkafka defaults to 1,000,000 bytes and enforces LOCALLY, so raising the broker alone changes nothing.
 
 `max.partition.fetch.bytes` bounds memory, not record size. librdkafka treats it as the INITIAL bytes per partition: a larger record grows the fetch until the whole record arrives, so a 16 MiB record still comes through a 1 MiB fetch. The value sets how much compressed data one fetch reply carries per partition, and librdkafka decompresses all of it before the application reads a record. That memory is outside the PROCESS byte budget, so on a compressed backlog this is the knob that bounds it.
 
@@ -111,8 +111,8 @@ leaves alone -- keeps the ceiling it has, and the broker's own
 ### librdkafka property names -- mind the differences
 
 librdkafka is NOT the Java Kafka client. Several property names differ, and
-the code uses the librdkafka ones. Getting these wrong silently no-ops
-(librdkafka ignores unknown keys).
+the code uses the librdkafka ones. librdkafka refuses an unknown key, so a Java
+name fails client creation with `TransportError::Config` naming the key.
 
 | Intent | librdkafka (used here) | NOT (Java client) |
 | --- | --- | --- |
@@ -128,7 +128,7 @@ null-key distribution is to keep the default `consistent_random` partitioner
 and set `sticky.partitioning.linger.ms` equal to the linger window, so
 null-key batches stick to one partition until the batch is full, then rotate.
 The sizing surface sets this to `linger_ms` automatically. It does NOT set
-`partitioner` (keyed `RoutedSender` paths set their own).
+`partitioner`, so a value a raw map gives it stands.
 
 ---
 
@@ -139,7 +139,7 @@ The PROCESS byte budget moves one step per block and shrinks only under memory p
 - memory HARD pressure (the latch holds) -> multiplicative-decrease by `md_factor`: pull smaller blocks.
 - otherwise -> additive-increase up to the profile ceiling: pull bigger blocks.
 
-How busy the consumer is does not move it. With a backlog, the gap between fetches is about as long as processing the last block, at any block size, so a budget that shrank on utilisation would fall to its floor and cap throughput at the sink's per-call cost. A consumer that cannot keep up grows lag, and lag is the autoscaler's signal.
+How busy the consumer is does not move it. With a backlog, the gap between fetches is about as long as processing the last block, at any block size, so a budget that shrank when the consumer is busy would fall to its floor and cap throughput at the sink's per-call cost. A consumer that cannot keep up grows lag, and lag is the autoscaler's signal.
 
 ---
 
@@ -149,9 +149,9 @@ Every profile produces with `zstd` at `compression.level` 3. The profiles differ
 
 Change it per stage:
 
-- **Codec** -- `kafka.sizing.producer.compression_type` (`lz4`, `gzip`, `snappy` or `none`). Another codec runs at librdkafka's own default level for it.
-- **zstd level** -- `compression.level` in `kafka.sizing.producer_librdkafka`. librdkafka takes -1 to 12.
-- **Either, over everything** -- `kafka.librdkafka_overrides`, applied after the whole sizing surface.
+- Codec -- `kafka.sizing.producer.compression_type` (`lz4`, `gzip`, `snappy` or `none`). Another codec runs at librdkafka's own default level for it.
+- zstd level -- `compression.level` in `kafka.sizing.producer_librdkafka`. librdkafka takes -1 to 12.
+- Either, over everything -- `kafka.librdkafka_overrides`, applied after the whole sizing surface.
 
 The level follows the codec. scalo sets 3 only while the resolved codec is zstd and no raw map names a level, because librdkafka reads the level against whichever codec is set, and lz4 switches to its slow high-compression mode from 3.
 
@@ -161,18 +161,18 @@ Every image that runs a scalo producer or consumer needs a librdkafka built with
 
 ## KIP / Kafka 4.0 notes
 
-- **KIP-429 (cooperative rebalancing)** -- the consumer profiles set
+- KIP-429 (cooperative rebalancing) -- the consumer profiles set
   `partition.assignment.strategy = cooperative-sticky` to avoid
   stop-the-world rebalances. Combined with partition-pause backpressure (see
   [backpressure.md](backpressure.md)), a paused consumer stays IN the group
   rather than triggering a rebalance. It applies to the `classic` protocol
   only -- see the section below.
-- **KIP-794 (uniform sticky partitioner)** -- handled via
+- KIP-794 (uniform sticky partitioner) -- handled via
   `sticky.partitioning.linger.ms` as above, since librdkafka lacks the Java
   `partitioner.ignore.keys`.
-- **KIP-392 (fetch from follower)** -- `kafka.client_rack` (env
+- KIP-392 (fetch from follower) -- `kafka.client_rack` (env
   `<PREFIX>_CLIENT_RACK`) sets `client.rack`, so a consumer reads from an
-  in-zone replica instead of the leader. Unset by default; wire it from the
+  in-zone replica instead of the leader. Unset by default. Wire it from the
   K8s `topology.kubernetes.io/zone` label or the EC2 availability zone.
 
 ---
@@ -190,9 +190,9 @@ so adding or removing a member costs no stop-the-world rebalance.
 KIP-848 needs a Kafka 4.0+ broker. An opted-in consumer reaches `classic` two
 ways:
 
-- **The provider gate.** A provider whose brokers do not implement it at all
+- The provider gate. A provider whose brokers do not implement it at all
   (`redpanda`, `redpanda-cloud`) resolves to `classic` at construction.
-- **A refusal.** The broker refuses the member with a FATAL error:
+- A refusal. The broker refuses the member with a FATAL error:
   `GROUP_ID_NOT_FOUND` from a group whose classic cooperative-sticky member has
   been through a rebalance, `UNKNOWN` from one whose other member has just moved
   to classic, or `UNSUPPORTED_VERSION`, `_UNSUPPORTED_FEATURE` or
@@ -211,7 +211,7 @@ to the same topics and returns an empty batch: `classic` after a refusal above,
 the same protocol after any other fatal. A rebuild that follows another with no
 record between them fails `/readyz` until a record arrives, and the poll after
 it waits a backoff (100 ms doubling to 2 s). The first rebuild of a run logs a
-warning and the first record after it logs the recovery;
+warning and the first record after it logs the recovery.
 `transport_consumer_rebuilds_total{protocol}` counts every one.
 
 A fenced static member (`FENCED_INSTANCE_ID`: another consumer holds its
@@ -282,7 +282,7 @@ WITHOUT a group-wide rebalance. That turns a rolling restart of a large
 consumer fleet from dozens of stop-the-world rebalances into zero.
 
 The value MUST be unique per replica -- two replicas sharing one
-`group.instance.id` get fenced. An empty value is treated as unset.
+`group.instance.id` get fenced. An empty `<PREFIX>_GROUP_INSTANCE_ID` is treated as unset.
 
 ---
 
@@ -313,8 +313,8 @@ Full resolution precedence (lowest to highest):
 When a sizing raw map touches a property the sizing governor depends on (the
 fetch byte sizes, `enable.auto.commit`, the producer batch/linger/compression
 keys), the code logs ONE warning per key so the operator knows the governor's
-assumptions changed. An invalid key silently no-ops in librdkafka -- check
-spelling.
+assumptions changed. librdkafka refuses an unknown key, so a misspelt one
+fails client creation.
 
 A raw key, producer or consumer, replaces the other librdkafka name for its
 property from the layers below it: `fetch.message.max.bytes` for
@@ -333,7 +333,7 @@ The producer is built from a SEPARATE `ClientConfig`, not the consumer's: consum
 
 A Kafka consumer group cannot have more ACTIVELY-consuming members than the
 topic has partitions -- extra members sit idle. So adding pods past the
-partition count does nothing for throughput; the lag just keeps growing while
+partition count does nothing for throughput, and the lag keeps growing while
 half the pods do nothing.
 
 scalo DETECTS this and tells you. It does NOT fix it by mutating topology.
@@ -343,15 +343,14 @@ scalo DETECTS this and tells you. It does NOT fix it by mutating topology.
 - the member count scoped to THIS group (`fetch_group_list(Some(group_id))` --
   not every group on a shared cluster), defaulting to 1 on a transient read,
 - the TOPIC's TOTAL partition count summed over subscribed topics (broker
-  metadata -- NOT this member's assigned slice; the assignment count made the
-  check fire whenever m^2 >= P, a false positive with headroom to spare),
+  metadata, NOT this member's assigned slice),
 - the current total lag,
 
 then evaluates the pure `partition_limited(members, partitions, lag)` decision.
 When limited it:
 
 - sets the `kafka_partition_limited` gauge to `1.0` (else `0.0`),
-- registers a `Degraded` entry on the health registry, and
+- sets the flag the `kafka:partition_limited` health check reads, which reports `Degraded` while limited and `Healthy` once not, and
 - emits ONE rate-limited warning per cooldown window (deduped so a
   persistently-limited consumer does not spam the log).
 
@@ -371,11 +370,11 @@ WARN  kafka consumer group is partition-limited: members >= partitions with
 Resolution is an operator / topology decision, not something scalo should
 do silently:
 
-- **More partitions per pod** -- raise per-pod parallelism so each consumer
+- More partitions per pod -- raise per-pod parallelism so each consumer
   drains its assigned partitions faster (the byte budget + worker pool
   already help here).
-- **Share groups (KIP-932, Kafka 4.0)** -- let more consumers than partitions
+- Share groups (KIP-932, Kafka 4.0) -- let more consumers than partitions
   share a partition's records, breaking the one-member-per-partition ceiling.
-- **Over-partition the topic** -- create the topic with more partitions than
+- Over-partition the topic -- create the topic with more partitions than
   you expect to need, so scale-out has headroom. The cleanest fix, but a
   create-time decision.
