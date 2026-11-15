@@ -49,6 +49,10 @@ room for code, stack, allocator fragmentation, and cgroup-attributed
 page cache. Rust has no GC, so no spike headroom is needed -- the 15%
 gap is just the cost of being a process.
 
+Where cgroup v2 sets `memory.high` below that figure, the limit is
+`memory.high` instead, because the kernel throttles allocations there
+before `memory.max` OOM-kills (`detect_memory_high`, `effective_auto_limit`).
+
 A 4 GiB cgroup with defaults -> ~3.4 GiB effective limit, and backpressure
 at 80% of that (~2.72 GiB, ~68% of the real cgroup limit). Matches the
 OTel Collector's `limit_percentage: 80` philosophy.
