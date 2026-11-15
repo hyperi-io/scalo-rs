@@ -161,7 +161,7 @@ what you ship.
 
 ## Native dependencies
 
-Some features pull in `*-sys` crates that link C libraries. A release build links them statically, so only libgit2 needs a runtime package.
+Some features pull in `*-sys` crates that link C libraries. The hyperi-ci release build links them statically, so only libgit2 needs a runtime package. A local `cargo build --release` links through pkg-config.
 
 | Feature | `-sys` crate | Build package | Runtime package |
 | --------- | -------------- | --------------- | ----------------- |

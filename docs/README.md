@@ -16,7 +16,7 @@ for how features cascade into one another.
 | ---------------------- | ---------------------- | ------------ |
 | `config::setup(opts)` | 7-layer cascade, env-var nesting, `.env`, sensitive masking, section registry. Hot reload comes with `config-reload`, the `/config` endpoint with `HttpServer` | Wire figment, write a settings loader, build a reload watcher |
 | `logger::setup_default()` | Structured tracing, JSON or text picked from the OTEL endpoint, CI and the terminal, colour only on a terminal, RFC 3339 timestamps, sensitive-field masking, flooding helpers | Install a tracing subscriber, format JSON, pick a logger crate |
-| `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint, process metrics, bounded label values, `/metrics/manifest` catalogue | Stand up an exporter, wire a process collector, hand-roll a manifest |
+| `MetricsManager::new("app")` | Prometheus exporter, `/metrics` endpoint once `start_server` runs, process metrics, bounded label values, `/metrics/manifest` catalogue | Stand up an exporter, wire a process collector, hand-roll a manifest |
 | `run_app(app)` | All of the above + memory guard + scaling pressure + shutdown token + K8s pre-stop delay + runtime context, and the worker pool and batch engine when `worker-pool` or `worker-batch` is on. It builds the `ServiceRuntime` and hands it to `run_service` | Glue them together manually |
 | Any `Transport` impl | 3-tier filter engine, DLQ routing, per-direction/action metrics, W3C traceparent propagation | Add filters, wire DLQ, instrument send/recv |
 | `TieredSink::new(...)` | Transport + disk-spillover spool + circuit breaker + background drain + backpressure signal (`SpoolFull` for the caller to route, usually to the DLQ) | Compose those primitives by hand |

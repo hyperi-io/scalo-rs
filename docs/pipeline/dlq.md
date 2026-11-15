@@ -231,7 +231,7 @@ dlq:
 | ------ | --------- |
 | `Dlq::disabled()` | No-op handle -- `send` succeeds and nothing is written. Each routed entry is counted in `dropped()`, emitted as `dlq_dropped_total{reason="disabled"}`, and logged at ERROR (rate-limited) |
 | `Dlq::spawn(config, service_name, kafka_config, shutdown)` | Build backends, spawn drain, return cloneable handle |
-| `try_send(entry) -> Result<(), DlqError>` | Sync-shape queue submission, `QueueFull` on overflow |
+| `try_send(entry) -> Result<(), DlqError>` | Non-blocking queue submission, `QueueFull` on overflow |
 | `send(entry).await` | Async submission that awaits queue space |
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
 | `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka. `Err(File)` if any batch written since the previous flush was refused by every backend, `Err(Kafka)` if Kafka lost entries only it held (see [Queue-admission semantics](#queue-admission-semantics)) |

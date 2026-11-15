@@ -37,7 +37,7 @@ Apps pick per stage, from config alone: a binary built with both features reads 
 
 ## Kafka
 
-`rdkafka`, linked statically in a release build and against the system
+`rdkafka`, linked statically in the hyperi-ci release build and against the system
 `librdkafka-dev` in a dev build -- see
 [../feature-flags.md](../feature-flags.md#native-dependencies) for the package matrix.
 Profile-based config (`production`, `devtest`) with
