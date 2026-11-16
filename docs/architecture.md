@@ -40,7 +40,7 @@ Two modules sit inside another rather than calling it: `transport::filter` lives
 | `config` | `config` (default) | 7-layer cascade (CLI -> env -> .env -> YAML -> defaults), section registry, hot reload with `config-reload`, the `/config` endpoint on `HttpServer` |
 | `logger` | `logger` (default) | `tracing-subscriber` with JSON/text autodetect, RFC 3339 timestamps, sensitive-field masking, flood-control helpers |
 | `metrics` | `metrics` or `otel-metrics` (`metrics-core` and `metrics-process` are the parts they pull in) | Lock-free counters/gauges/histograms, Prometheus exporter, `/metrics` + `/metrics/manifest`, OTLP metrics push |
-| `otel_tracing` | `otel`, `otel-tracing` | OTLP exporter, OTel SDK bridge for `tracing` spans |
+| `otel_tracing` | `otel`, `otel-tracing`, and `metrics`, which pulls `otel-metrics` and `otel-tracing` | OTLP exporter, OTel SDK bridge for `tracing` spans |
 | `health` | `health` | `HealthRegistry`, which `/readyz` consults |
 | `shutdown` | `shutdown` | `CancellationToken`, SIGTERM/SIGINT, K8s pre-stop delay |
 

@@ -54,7 +54,7 @@ rayon is not compiled.
 ```mermaid
 flowchart LR
     accTitle: L4 Detail -- Service lifecycle
-    accDescr: run_app sets up the config cascade and loads the app config, sets up the logger and calls on_config_loaded, builds the ServiceRuntime, passes the idle gate, then installs the readiness check and runs the service until the shutdown token is cancelled.
+    accDescr: run_app sets up the config cascade and loads the app config, sets up the logger and calls on_config_loaded, builds the ServiceRuntime, passes the idle gate, then installs the readiness check and calls run_service, which runs until the app's tasks see the shutdown token.
 
     load["Cascade,<br/>load_config"]
     logger["Logger,<br/>on_config_loaded"]

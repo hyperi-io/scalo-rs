@@ -2,16 +2,16 @@
 
 `scalo::rules` (feature `rules`) sets target fields on a record from an ordered rule set. For each target in the order the set lists them, the first row in declared order that matches the record and resolves a value sets it. A row tests the record with a native test or a CEL Fast condition, and takes its value as a literal, a copy of a field, or a field mapped through a bounded lookup table.
 
-Targets are set in their listed order, each by its first matching row, and a clamp then checks the clamped target's final value against an allowed set.
+Targets are set in their listed order, each by the first row that matches and resolves a value, and a clamp then checks the clamped target's final value against an allowed set.
 
 ```mermaid
 flowchart LR
     accTitle: L4 Detail -- Rule evaluation
-    accDescr: A record is evaluated target by target in the listed order, and the first matching row in declared order sets each target. With a clamp, the clamped target's final value is kept when it is in the allowed set and replaced by the default, and counted, when it is not.
+    accDescr: A record is evaluated target by target in the listed order, and the first row in declared order that matches and resolves a value sets each target. A matching row that resolves no value is skipped. With a clamp, the clamped target's final value is kept when it is in the allowed set and replaced by the default, and counted, when it is not.
 
     record(["Record"])
-    target_1["Target 1<br/>first match"]
-    target_2["Target 2<br/>first match"]
+    target_1["Target 1<br/>first resolved"]
+    target_2["Target 2<br/>first resolved"]
     clamp{"Value<br/>allowed?"}
     kept(["Value kept"])
     defaulted(["Default set,<br/>counted"])

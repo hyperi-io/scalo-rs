@@ -34,7 +34,7 @@ The handler sleeps the pre-stop delay before it cancels the token, so the pod se
 ```mermaid
 flowchart LR
     accTitle: L4 Detail -- Shutdown sequence
-    accDescr: On SIGTERM or SIGINT the handler sleeps for the pre-stop delay, counts the eviction on Kubernetes, then cancels the shared token. Application tasks watch the token, finish and return, and then main returns.
+    accDescr: On SIGTERM or SIGINT the handler sleeps for the pre-stop delay when it is above 0, counts the eviction on Kubernetes when metrics are on, then cancels the shared token. Application tasks watch the token, finish and return, and then main returns.
 
     signal(["SIGTERM<br/>or SIGINT"])
     sleep["Sleep<br/>pre-stop delay"]
@@ -50,7 +50,7 @@ flowchart LR
     classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
 
-*Figure 1. L4 Detail -- Shutdown sequence. The handler does the three steps after the signal, and the app's tasks end the process.* Up: [Core pillars](README.md).
+*Figure 1. L4 Detail -- Shutdown sequence. The sleep runs only for a delay above 0, and the count only on Kubernetes with metrics on.* Up: [Core pillars](README.md).
 
 The shutdown module does signal + delay + cancel and nothing else. Nothing in
 the shutdown path touches readiness, so `/readyz` answers from the readiness

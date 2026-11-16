@@ -31,30 +31,32 @@ how the pieces work".
 
 ## 10,000-foot view
 
-`run_app` builds a `ServiceRuntime` that wires the core pillars, self-regulation and the batch pipeline, and the deployment contract writes the artefacts the scalo-service chart renders.
+`run_app` builds a `ServiceRuntime` that wires the core pillars, self-regulation and the worker pool, the app builds its pipeline, and the deployment contract writes the artefacts the scalo-service chart renders.
 
 ```mermaid
 flowchart LR
     accTitle: L3 Components -- scalo
-    accDescr: An app hands itself to run_app, which builds the ServiceRuntime, and fills in a deployment contract. The runtime wires the core pillars, self-regulation and the pipeline, and the pipeline sends through the transports. The contract writes the Dockerfile and contract JSON that the scalo-service chart renders.
+    accDescr: An app hands itself to run_app, which builds the ServiceRuntime, builds its own pipeline, and fills in a deployment contract. The runtime wires the core pillars, self-regulation and the worker pool and batch engine. The pipeline sends through the transports. The contract writes the Dockerfile and contract JSON that the scalo-service chart renders.
 
     app["Your ServiceApp"]
     runtime[["ServiceRuntime"]]
+    pipeline[["Pipeline"]]
     contract[["Deployment<br/>contract"]]
     pillars["Core pillars"]
     regulation[["Self-regulation"]]
-    pipeline[["Pipeline"]]
-    artefacts[("Dockerfile and<br/>contract JSON")]
+    workers["Worker pool,<br/>batch engine"]
     transports[["Transports"]]
+    artefacts[("Dockerfile and<br/>contract JSON")]
     chart["scalo-service<br/>chart"]
 
     app --> runtime
+    app --> pipeline
     app --> contract
     runtime --> pillars
     runtime --> regulation
-    runtime --> pipeline
-    contract --> artefacts
+    runtime --> workers
     pipeline --> transports
+    contract --> artefacts
     artefacts --> chart
 
     classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A

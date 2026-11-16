@@ -48,7 +48,7 @@ flowchart LR
 | --------- | ------ |
 | `metrics-core` | scalo's dependency on the `metrics` crate. No exporter and no `scalo::metrics` API |
 | `metrics-process` | Above + `sysinfo`, which the cgroup-aware process gauges (RSS, CPU, FDs) use. Exposes no API on its own: the gauges come with `metrics` or `otel-metrics` |
-| `metrics` | Above + Prometheus exporter, `/metrics` HTTP endpoint, manifest dump, OTLP push |
+| `metrics` | Above + Prometheus exporter, `/metrics` HTTP endpoint, manifest dump, and `otel-metrics` and `otel-tracing` for OTLP metric push and span export |
 
 Pick `metrics` for service binaries. scalo's series, the tiered sink's and the transports' among them, are compiled only when `metrics` is on somewhere in the build. A library that emits series of its own depends on the `metrics` crate directly and leaves the exporter to the service. See [core-pillars/metrics.md](core-pillars/metrics.md#feature-tiers).
 
@@ -170,7 +170,7 @@ The libgit2 package name has the library version in it, so it differs per base r
 | Tooling-style CLI | `cli`, `config`, `logger` | `clap` types, no service scaffolding |
 | Light service (HTTP only) | `cli-service`, `http-server`, `transport-http` | `cli-service` brings `metrics`, `memory`, `scaling`, `shutdown`, `governor` and `lifecycle`. Add `sink-stack` if the sender sits in the outbound control stack, and `worker-pool` or `worker-batch` if the service processes batches on the pool the runtime builds |
 | Full data-plane service | `cli-service`, `config-reload`, `transport-kafka`, `transport-grpc`, `tiered-sink`, `dlq-kafka`, `spool`, `http-server`, `service-metrics`, `deployment`, `version-check`, `expression` | A receiver-style service: Kafka and gRPC transports, a tiered sink that spills to disk, a Kafka DLQ and an HTTP server. [integration.md](integration.md) walks through it |
-| Plus distributed tracing | add `otel-tracing`, `transport-trace` to any of the above | `otel-tracing` exports spans and `transport-trace` propagates `traceparent` on the wire |
+| Plus distributed tracing | add `transport-trace`, and `otel-tracing` where `metrics` is off | `otel-tracing`, which `metrics` and so `cli-service` pull, exports spans, and `transport-trace` propagates `traceparent` on the wire |
 
 ---
 

@@ -134,7 +134,7 @@ is for, so they are set where it is built.
 `HttpClient::with_redirect_policy(config, policy)` takes any
 `reqwest::redirect::Policy`, and `new(config)` is that with reqwest's
 default. reqwest strips `Authorization` on a cross-origin hop but can forward
-a custom credential header, so a client whose
+the body, the query and any custom header across it, so a client whose
 calls are signed with a provider's own header -- or with a query
 parameter -- should refuse the hop (`Policy::none()`) or allow only the
 same origin. The token exchanges in [auth.md](auth.md) build themselves

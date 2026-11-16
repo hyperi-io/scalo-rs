@@ -16,7 +16,7 @@ Composed with tower's `ServiceBuilder`, outer to inner: under the static cap the
 ```mermaid
 flowchart TB
     accTitle: L4 Detail -- Sink stack layer order
-    accDescr: Under the static concurrency cap an attempt passes load-shed, rate-limit, timeout and the concurrency limit before the sender. Under adaptive request concurrency it passes load-shed, rate-limit, the adaptive AIMD limiter and the timeout before the sender.
+    accDescr: Under the static concurrency cap an attempt passes load-shed when it is on, rate-limit, timeout and the concurrency limit before the sender. Under adaptive request concurrency it passes load-shed when on, rate-limit, the adaptive AIMD limiter and the timeout before the sender.
 
     subgraph fixed["Static concurrency cap, default"]
         direction LR
@@ -33,7 +33,7 @@ flowchart TB
     class fixed,arc group
 ```
 
-*Figure 1. L4 Detail -- Sink stack layer order. An attempt enters at the left and the bytes leave at the sender.* Up: [Pipeline](README.md).
+*Figure 1. L4 Detail -- Sink stack layer order. Load-shed is there only with `load_shed: true`, and the bytes leave at the sender.* Up: [Pipeline](README.md).
 
 The difference that bites: under the static cap the **timeout wraps the
 concurrency gate** (a request waiting for a slot can still time out). Under ARC

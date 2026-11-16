@@ -34,7 +34,7 @@ Each rule is classified once at config load, and the two CEL tiers start only wh
 ```mermaid
 flowchart LR
     accTitle: L4 Detail -- Filter tiers
-    accDescr: At config load each filter rule is classified. Field presence, equality and prefix tests run in tier 1 with SIMD field operations. Compound, numeric and size expressions run in tier 2 as compiled CEL, behind the allow_cel_filters gate. Regex, iteration and time functions run in tier 3 as complex CEL, behind the allow_complex_filters gate.
+    accDescr: At config load each filter rule is classified. Field presence and absence, equality, inequality, prefix, suffix and contains tests run in tier 1 with SIMD field operations. Compound, numeric and size expressions run in tier 2 as compiled CEL, behind the allow_cel_filters gate. Regex, iteration and time functions run in tier 3 as complex CEL, behind the allow_complex_filters gate.
 
     classify{"Classify<br/>the rule"}
     tier_1["Tier 1<br/>SIMD field ops"]
