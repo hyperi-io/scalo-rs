@@ -132,6 +132,7 @@ sub-components (filter engine lives inside every transport).
 | Other subsystems | [api/auth.md](api/auth.md) | Credential acquisition and placement |
 | Other subsystems | [api/secrets.md](api/secrets.md) | OpenBao/Vault, AWS Secrets Manager |
 | Other subsystems | [api/http-server.md](api/http-server.md) | axum server, probe wiring, route extensions |
+| Other subsystems | [api/tls.md](api/tls.md) | Server TLS, certificate reload from file or secret, handshake helper |
 | Other subsystems | [api/http-client.md](api/http-client.md) | `reqwest` + retry + request signing |
 | Other subsystems | [api/directory-config.md](api/directory-config.md) | YAML directory store with optional `git2` |
 | Other subsystems | [api/concurrency.md](api/concurrency.md) | `BackgroundSink`, `PeriodicWorker`, `ActorHandle` |

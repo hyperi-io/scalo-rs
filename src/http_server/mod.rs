@@ -13,10 +13,11 @@
 //! - Graceful shutdown
 //! - Configurable request timeout, in-flight cap, Tower middleware
 //! - Health endpoints (`/livez` and `/readyz` -- no aliases)
+//! - TLS with certificate reload, with the `tls` feature: `tls_cert_path` /
+//!   `tls_key_path`, or `HttpServer::with_tls` for any `ServerTls`
 //!
-//! In-process TLS and a `/metrics` endpoint are NOT wired here -- see
-//! [`HttpServerConfig`]. Terminate TLS at the ingress / mesh. Metrics are
-//! served by `MetricsManager` on its own listener.
+//! A `/metrics` endpoint is not wired here. Metrics are served by
+//! `MetricsManager` on its own listener.
 //!
 //! ## Example
 //!
@@ -42,10 +43,14 @@
 mod config;
 mod error;
 mod server;
+#[cfg(feature = "tls")]
+mod tls;
 
 pub use config::HttpServerConfig;
 pub use error::HttpServerError;
 pub use server::HttpServer;
+#[cfg(feature = "tls")]
+pub use tls::TlsListener;
 
 // Re-export axum types users commonly need
 pub use axum::{
