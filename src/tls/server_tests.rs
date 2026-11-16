@@ -279,7 +279,7 @@ async fn reload_swaps_the_certificate_and_keeps_it_through_bad_sources() {
             Change::Nothing => {}
             Change::Serve(leaf) => files.serve(leaf),
             Change::Cert(pem) => write(&files.cert(), pem),
-            Change::RemoveCert => std::fs::remove_file(files.cert()).unwrap(),
+            Change::RemoveCert => tokio::fs::remove_file(files.cert()).await.unwrap(),
         }
         let result = tls.reload().await.map_err(drop);
         assert_eq!(result, expected, "{name}");
@@ -342,15 +342,40 @@ async fn client_auth_modes_admit_the_clients_they_should() {
     let untrusted = stranger.client("untrusted");
 
     let cases = [
-        (ClientAuth::None, None, true),
-        (ClientAuth::Optional, None, true),
-        (ClientAuth::Optional, Some(&trusted), true),
-        (ClientAuth::Optional, Some(&untrusted), false),
-        (ClientAuth::Required, None, false),
-        (ClientAuth::Required, Some(&trusted), true),
-        (ClientAuth::Required, Some(&untrusted), false),
+        ("none, no certificate", ClientAuth::None, None, true),
+        ("optional, no certificate", ClientAuth::Optional, None, true),
+        (
+            "optional, trusted",
+            ClientAuth::Optional,
+            Some(&trusted),
+            true,
+        ),
+        (
+            "optional, untrusted",
+            ClientAuth::Optional,
+            Some(&untrusted),
+            false,
+        ),
+        (
+            "required, no certificate",
+            ClientAuth::Required,
+            None,
+            false,
+        ),
+        (
+            "required, trusted",
+            ClientAuth::Required,
+            Some(&trusted),
+            true,
+        ),
+        (
+            "required, untrusted",
+            ClientAuth::Required,
+            Some(&untrusted),
+            false,
+        ),
     ];
-    for (mode, identity, admitted) in cases {
+    for (name, mode, identity, admitted) in cases {
         let config = ServerTlsConfig {
             client_auth: mode,
             ca_file: (mode != ClientAuth::None).then(|| files.ca()),
@@ -359,15 +384,12 @@ async fn client_auth_modes_admit_the_clients_they_should() {
         let tls = ServerTls::load(&config).await.unwrap();
         let client = connector(&ca.pem(), identity, &[]);
         let outcome = handshake(&tls, &client).await;
-        let label = identity.map_or("no certificate", |_| "a certificate");
-        assert_eq!(
-            outcome.server.is_ok(),
-            admitted,
-            "{mode} with {label}: {:?}",
-            outcome.server
-        );
+        assert_eq!(outcome.server.is_ok(), admitted, "{name}");
         if !admitted {
-            assert!(matches!(outcome.server, Err(HandshakeError::Failed(_))));
+            assert!(
+                matches!(outcome.server, Err(HandshakeError::Failed(_))),
+                "{name}"
+            );
         }
     }
 }
