@@ -74,6 +74,63 @@ pub mod conformance;
 pub mod shared_service;
 
 // ============================================================================
+// Docker Hub images through the mirror.
+// ============================================================================
+
+/// Last-resort mirror for Docker Hub test images, used when neither the
+/// cascade nor `DEPLOYMENT__TEST_IMAGE_MIRROR` names one.
+pub const DEFAULT_TEST_IMAGE_MIRROR: &str = "ghcr.io/hyperi-io/mirror";
+
+/// The registry path Docker Hub test images are pulled through.
+///
+/// Reads `deployment.test_image_mirror` from the cascade, then its ENV-layer
+/// spelling `DEPLOYMENT__TEST_IMAGE_MIRROR`, then [`DEFAULT_TEST_IMAGE_MIRROR`].
+/// Tests often run without the app's config loaded, so the env layer is read
+/// directly. An empty value at either layer means Docker Hub itself.
+#[must_use]
+pub fn test_image_mirror() -> String {
+    #[cfg(feature = "config")]
+    {
+        if let Some(value) =
+            crate::config::try_get().and_then(|cfg| cfg.get_string("deployment.test_image_mirror"))
+        {
+            return value;
+        }
+    }
+    std::env::var("DEPLOYMENT__TEST_IMAGE_MIRROR")
+        .unwrap_or_else(|_| DEFAULT_TEST_IMAGE_MIRROR.to_string())
+}
+
+/// `reference` pulled through [`test_image_mirror`] when it names Docker Hub.
+///
+/// An official image (`alpine:3.24`) gains `library/`, a namespaced one
+/// (`apache/kafka:4.3.1@sha256:...`) keeps its namespace, and a reference that
+/// names another registry comes back unchanged. The mirror serves the same tag
+/// and digest, so a Renovate-pinned reference stays valid.
+#[must_use]
+pub fn mirror_image(reference: &str) -> String {
+    mirrored(&test_image_mirror(), reference)
+}
+
+fn mirrored(mirror: &str, reference: &str) -> String {
+    let reference = ["docker.io/", "index.docker.io/", "registry-1.docker.io/"]
+        .iter()
+        .find_map(|host| reference.strip_prefix(host))
+        .unwrap_or(reference);
+    let mirror = mirror.trim_end_matches('/');
+    let other_registry = reference
+        .split_once('/')
+        .is_some_and(|(first, _)| first.contains(['.', ':']) || first == "localhost");
+    if mirror.is_empty() || other_registry {
+        reference.to_string()
+    } else if reference.contains('/') {
+        format!("{mirror}/{reference}")
+    } else {
+        format!("{mirror}/library/{reference}")
+    }
+}
+
+// ============================================================================
 // Tool probes -- thin, cached, no panic.
 // ============================================================================
 
@@ -652,6 +709,43 @@ fn mib(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::deployment::{ResourceList, ResourcesContract};
+
+    #[test]
+    fn docker_hub_references_go_through_the_mirror_and_others_do_not() {
+        let digest = "sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837";
+        let kafka = format!("apache/kafka:4.3.1@{digest}");
+        let cases = [
+            ("m", "alpine:3.24.2", "m/library/alpine:3.24.2".to_string()),
+            (
+                "m/",
+                "docker.io/alpine:3.24.2",
+                "m/library/alpine:3.24.2".to_string(),
+            ),
+            (
+                "m",
+                "docker.io/library/busybox:1",
+                "m/library/busybox:1".to_string(),
+            ),
+            (
+                "m",
+                "index.docker.io/prom/prometheus:v3",
+                "m/prom/prometheus:v3".to_string(),
+            ),
+            ("m", kafka.as_str(), format!("m/{kafka}")),
+            (
+                "m",
+                "ghcr.io/kafbat/kafka-ui:v1.5.0",
+                "ghcr.io/kafbat/kafka-ui:v1.5.0".into(),
+            ),
+            ("m", "localhost:5000/app:1", "localhost:5000/app:1".into()),
+            ("m", "localhost/app:1", "localhost/app:1".into()),
+            ("", "alpine:3.24.2", "alpine:3.24.2".into()),
+            ("", "docker.io/alpine:3.24.2", "alpine:3.24.2".into()),
+        ];
+        for (mirror, reference, want) in cases {
+            assert_eq!(mirrored(mirror, reference), want, "{mirror} {reference}");
+        }
+    }
 
     #[test]
     fn memory_quantities_read_as_kubernetes_reads_them() {

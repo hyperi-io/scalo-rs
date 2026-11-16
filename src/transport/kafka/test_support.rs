@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use tokio::process::Command;
 
+use crate::deployment::test_support::mirror_image;
 use crate::deployment::test_support::shared_service::{
     self, Ready, ServiceSpec, SharedContainer, Suite,
 };
@@ -131,7 +132,7 @@ pub fn kafka_spec(host_port: Option<u16>) -> ServiceSpec {
         args: vec!["-c".into(), wait],
         after_start: write_kafka_start_script,
         ready: Ready::Log("Kafka Server started"),
-        ..ServiceSpec::new("kafka", KAFKA_IMAGE, SHARED_STARTUP_TIMEOUT)
+        ..ServiceSpec::new("kafka", mirror_image(KAFKA_IMAGE), SHARED_STARTUP_TIMEOUT)
     }
 }
 
@@ -372,9 +373,10 @@ impl Pki {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("temp dir: {e}"));
         let (name, owned) = owned_container_args(suite, test, "openssl");
         shared_service::spawn_watcher(suite, std::process::id(), Some(&name), None);
+        let image = mirror_image(OPENSSL_IMAGE);
         let mut run: Vec<&str> = vec!["run", "--rm"];
         run.extend(owned.iter().map(String::as_str));
-        run.extend(["--entrypoint", "sh", OPENSSL_IMAGE, "-c", PKI_SCRIPT]);
+        run.extend(["--entrypoint", "sh", image.as_str(), "-c", PKI_SCRIPT]);
         let out = docker(&run).await.unwrap_or_else(|e| panic!("{e}"));
         assert!(
             out.status.success(),
@@ -512,6 +514,7 @@ impl TlsBroker {
 
         let (name, owned) = owned_container_args(suite, test, "kafka");
         shared_service::spawn_watcher(suite, std::process::id(), Some(&name), None);
+        let image = mirror_image(KAFKA_IMAGE);
         let mut create: Vec<String> = vec!["create".into()];
         create.extend(owned);
         create.extend(
@@ -522,7 +525,7 @@ impl TlsBroker {
                 "KAFKA_HEAP_OPTS=-Xms256m -Xmx768m",
                 "--entrypoint",
                 "sh",
-                KAFKA_IMAGE,
+                image.as_str(),
             ]
             .map(String::from),
         );
@@ -530,10 +533,10 @@ impl TlsBroker {
         let refs: Vec<&str> = create.iter().map(String::as_str).collect();
         let created = tokio::time::timeout(PULL_DEADLINE, docker(&refs))
             .await
-            .map_err(|_| format!("{KAFKA_IMAGE} did not pull within {PULL_DEADLINE:?}"))??;
+            .map_err(|_| format!("{image} did not pull within {PULL_DEADLINE:?}"))??;
         if !created.status.success() {
             return Err(format!(
-                "docker create {KAFKA_IMAGE} failed: {}",
+                "docker create {image} failed: {}",
                 String::from_utf8_lossy(&created.stderr)
             ));
         }
