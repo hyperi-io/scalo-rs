@@ -33,24 +33,10 @@
       "enabled": false
     },
     {
-      "description": "OpenTelemetry SDK + exporters + the tracing bridge + the metrics bridge move in lockstep -- held at 0.31 while metrics-exporter-opentelemetry requires it. Bumping one alone breaks the build.",
+      "description": "OpenTelemetry SDK + exporters + the tracing bridge + the metrics bridge move in lockstep: they must agree on one opentelemetry_sdk line. Bumping one alone breaks the build.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["/^opentelemetry/", "tracing-opentelemetry", "metrics-exporter-opentelemetry"],
       "groupName": "opentelemetry",
-      "minimumReleaseAge": "7 days"
-    },
-    {
-      "description": "The same ceilings Cargo.toml declares, so Renovate stops proposing a minor the lockstep cannot take until metrics-exporter-opentelemetry moves past opentelemetry 0.31.",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["/^opentelemetry/"],
-      "allowedVersions": "<0.32",
-      "minimumReleaseAge": "7 days"
-    },
-    {
-      "description": "tracing-opentelemetry's line for opentelemetry 0.31.",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["tracing-opentelemetry"],
-      "allowedVersions": "<0.33",
       "minimumReleaseAge": "7 days"
     },
     {

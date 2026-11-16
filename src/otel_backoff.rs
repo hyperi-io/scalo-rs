@@ -270,14 +270,11 @@ where
         }
     }
 
-    fn shutdown_with_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> opentelemetry_sdk::error::OTelSdkResult {
+    fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
         self.inner.shutdown_with_timeout(timeout)
     }
 
-    fn force_flush(&mut self) -> opentelemetry_sdk::error::OTelSdkResult {
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
         self.inner.force_flush()
     }
 
