@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/tls.rs
-// Purpose:   Unified TLS trust + client-config construction (private-CA first)
+// Purpose:   Unified TLS trust, client-config construction and server TLS
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -41,6 +41,13 @@
 //! -- pin to your private CA and nothing else. An empty resulting store is an
 //! error, never a silent "trust nothing / trust everything".
 //!
+//! ## Server TLS
+//!
+//! [`ServerTls`] is the server side: a certificate, its key and an optional
+//! client CA from files or secret specs, a certificate that reloads when its
+//! source changes, and [`ServerTls::accept`], the handshake with a timeout that
+//! HTTP and non-HTTP listeners share. See `docs/api/tls.md`.
+//!
 //! ## No `InsecureSkipVerify`
 //!
 //! This module offers no certificate-verification bypass. Transports that still
@@ -56,6 +63,15 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 
 use crate::crypto::{CryptoProfile, PqcMode, TlsFloor};
+
+mod server;
+#[cfg(test)]
+pub(crate) mod test_pki;
+
+pub use server::{
+    CertResolver, ClientAuth, HandshakeError, Reloaded, ServerTls, ServerTlsConfig,
+    ServerTlsOptions,
+};
 
 /// Errors building a TLS trust store or client config.
 #[derive(Debug, thiserror::Error)]
@@ -83,9 +99,61 @@ pub enum TlsError {
     )]
     EmptyTrustStore,
 
-    /// rustls rejected the assembled client configuration.
-    #[error("TLS: failed to build client config: {0}")]
+    /// rustls rejected the assembled configuration, or a certificate does not
+    /// match its private key.
+    #[error("TLS: failed to build config: {0}")]
     Build(String),
+
+    /// A server certificate or key has no source configured.
+    #[error("TLS: set `{file}` or `{secret}`")]
+    MissingSource {
+        /// The file field.
+        file: &'static str,
+        /// The secret field.
+        secret: &'static str,
+    },
+
+    /// A server certificate, key or CA has both a file and a secret configured.
+    #[error("TLS: set `{file}` or `{secret}`, not both")]
+    ConflictingSource {
+        /// The file field.
+        file: &'static str,
+        /// The secret field.
+        secret: &'static str,
+    },
+
+    /// Client certificates are asked for with no CA to check them against.
+    #[error("TLS: client_auth `{mode}` needs `ca_file` or `ca_secret`")]
+    ClientCaRequired {
+        /// The configured mode.
+        mode: ClientAuth,
+    },
+
+    /// A secret spec did not resolve.
+    #[error("TLS: cannot read `{field}`: {reason}")]
+    SecretRead {
+        /// The config field holding the spec. The spec itself is never shown,
+        /// because a literal spec is the secret.
+        field: &'static str,
+        /// Why the lookup failed.
+        reason: String,
+    },
+
+    /// A secret spec is configured but the `secrets` feature is off.
+    #[error("TLS: `{field}` needs the `secrets` feature")]
+    SecretsUnsupported {
+        /// The config field holding the spec.
+        field: &'static str,
+    },
+
+    /// PEM data held no usable certificate or key.
+    #[error("TLS: {what}: {reason}")]
+    InvalidPem {
+        /// What was being parsed.
+        what: &'static str,
+        /// Why it was refused.
+        reason: String,
+    },
 }
 
 /// Where a transport's TLS roots come from.
@@ -251,19 +319,24 @@ pub fn build_client_config_with(
         TlsConfigSource::Trust(trust) => {
             let roots = build_root_store(&trust)?;
             let provider = posture_provider(profile.pqc());
-            let builder = ClientConfig::builder_with_provider(provider);
-            let versioned = match profile.tls_floor() {
-                // Commercial floor: TLS 1.2 + 1.3. Peers negotiate up.
-                TlsFloor::V1_2 => builder.with_safe_default_protocol_versions(),
-                // National-security: TLS 1.3 only.
-                TlsFloor::V1_3 => builder.with_protocol_versions(&[&rustls::version::TLS13]),
-            };
-            let cfg = versioned
+            let cfg = ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(protocol_versions(profile.tls_floor()))
                 .map_err(|e| TlsError::Build(e.to_string()))?
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             Ok(Arc::new(cfg))
         }
+    }
+}
+
+/// The protocol versions a [`TlsFloor`] allows.
+fn protocol_versions(floor: TlsFloor) -> &'static [&'static rustls::SupportedProtocolVersion] {
+    static TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
+    match floor {
+        // Commercial floor: TLS 1.2 + 1.3. Peers negotiate up.
+        TlsFloor::V1_2 => rustls::DEFAULT_VERSIONS,
+        // National-security: TLS 1.3 only.
+        TlsFloor::V1_3 => &TLS13_ONLY,
     }
 }
 

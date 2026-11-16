@@ -86,14 +86,16 @@ flag.store(true, Ordering::Release);
 
 ## TLS
 
-**In-process TLS termination is not supported.** The K8s pattern is to
-terminate TLS at the ingress / service mesh and run cleartext in-pod.
+With the `tls` feature the server terminates TLS itself. Set `tls_cert_path` and `tls_key_path` and it serves that certificate, offers ALPN `h2` and `http/1.1`, and re-reads both files every 30 s, so a rotated certificate is served from the next handshake with no restart. A bad new certificate keeps the old one in service.
 
-`HttpServerConfig` exposes `tls_cert_path` / `tls_key_path`, but they are
-**not wired** -- setting either is rejected by `HttpServerConfig::validate()`,
-which `serve` / `serve_with_shutdown` / `serve_with_handle` call before
-binding, so a config expecting in-pod TLS fails loudly rather than silently
-serving cleartext. Front the service with a TLS sidecar or ingress instead.
+For a certificate from a secret, client certificates, a crypto profile or one certificate shared with other listeners, load a `ServerTls` and pass it in:
+
+```rust
+let tls = ServerTls::load_with(&config.tls, ServerTlsOptions::http()).await?;
+HttpServer::new(config.http_server).with_tls(tls).serve(app).await?;
+```
+
+`validate()` runs before anything binds, so the server never serves cleartext while its config asks for TLS. It refuses one path set without the other, either path in a build without the `tls` feature, and `with_tls` together with the paths. [tls.md](tls.md) covers sources, reload and the handshake metrics.
 
 ---
 
@@ -122,7 +124,7 @@ http_server:
   shutdown_timeout_ms: 30000
 ```
 
-`max_body_bytes` applies to every route, so a handler that takes the body through a custom extractor or streams it is capped too. A declared `Content-Length` over the limit is answered 413 before the handler runs. `tls_cert_path` and `tls_key_path` exist only so `validate()` can refuse them.
+`max_body_bytes` applies to every route, so a handler that takes the body through a custom extractor or streams it is capped too. A declared `Content-Length` over the limit is answered 413 before the handler runs. `tls_cert_path` and `tls_key_path` turn on TLS, see [TLS](#tls).
 
 ---
 
@@ -132,6 +134,7 @@ http_server:
 | ------ | --------- |
 | `HttpServer::new(config)` | Build from explicit config |
 | `HttpServer::bind(addr)` | Build with just a bind address |
+| `.with_tls(ServerTls)` | Terminate TLS with a loaded `ServerTls` (`tls` feature) |
 | `.serve(app)` | Run until SIGTERM or Ctrl-C, merging the probe and config routes |
 | `.serve_with_shutdown(app, shutdown)` | Run until the shutdown future resolves |
 | `.serve_with_handle(app)` | Returns (`ShutdownHandle`, `ServerFuture`) |
@@ -148,6 +151,7 @@ http_server:
 - [../core-pillars/metrics.md](../core-pillars/metrics.md) -- `/metrics` + `/metrics/manifest`
 - [../core-pillars/config.md](../core-pillars/config.md) -- `/config` endpoint
 - [../core-pillars/shutdown.md](../core-pillars/shutdown.md) -- pre-stop, K8s drain flow
+- [tls.md](tls.md) -- server TLS, certificate reload, the shared handshake helper
 - [../runtime/service-runtime.md](../runtime/service-runtime.md) -- automatic wiring
 - [../pipeline/scaling.md](../pipeline/scaling.md) -- `/scaling/pressure` endpoint
 - Source: [../../src/http_server/](../../src/http_server/)

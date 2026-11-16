@@ -66,15 +66,15 @@ pub struct HttpServerConfig {
     #[serde(default = "default_true")]
     pub enable_http2: bool,
 
-    /// TLS cert path (PEM).
+    /// PEM certificate chain to serve TLS with. Set with `tls_key_path`.
     ///
-    /// **Not wired.** Needs `axum_server::tls_rustls` (not a dep).
-    /// K8s pattern: terminate TLS at Ingress / Service Mesh,
-    /// cleartext in-pod.
+    /// Needs the `tls` feature. The files are re-read every 30 s and a
+    /// changed certificate is served from the next handshake. For a secret,
+    /// client certificates or other settings use `HttpServer::with_tls`.
     #[serde(default)]
     pub tls_cert_path: Option<String>,
 
-    /// TLS key path (PEM). See `tls_cert_path` -- not wired.
+    /// PEM private key for `tls_cert_path`.
     #[serde(default)]
     pub tls_key_path: Option<String>,
 
@@ -155,38 +155,42 @@ impl HttpServerConfig {
         Duration::from_millis(self.shutdown_timeout_ms)
     }
 
-    /// Whether TLS cert+key paths are present in config.
-    ///
-    /// NOTE: this only reports that the fields are *set* -- in-process TLS is
-    /// NOT terminated by this server (see `tls_cert_path`). Use
-    /// [`validate`](Self::validate) at startup so a config that *expects*
-    /// in-pod TLS fails loudly instead of silently serving cleartext.
+    /// Whether both TLS paths are set.
     #[must_use]
     pub fn is_tls_enabled(&self) -> bool {
         self.tls_cert_path.is_some() && self.tls_key_path.is_some()
     }
 
-    /// Validate the server config (`is_tls_enabled` must not lie).
-    ///
-    /// In-process TLS termination is not supported -- the K8s pattern is to
-    /// terminate TLS at the ingress / service mesh and run cleartext in-pod.
-    /// If `tls_cert_path`/`tls_key_path` are set, the operator expects in-pod
-    /// TLS that will not happen, so this errors rather than letting the server
-    /// bind cleartext while the config claims TLS. Call at startup.
+    /// The server TLS config the two paths describe, when both are set.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn tls_files(&self) -> Option<crate::tls::ServerTlsConfig> {
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (Some(cert), Some(key)) => Some(crate::tls::ServerTlsConfig::from_files(cert, key)),
+            _ => None,
+        }
+    }
+
+    /// Refuse a TLS setting the server would not honour, so it never binds
+    /// cleartext while the config asks for TLS. `serve` calls this first.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if either TLS path is set.
+    /// One TLS path set without the other, or either set in a build without
+    /// the `tls` feature.
     pub fn validate(&self) -> Result<(), String> {
-        if self.tls_cert_path.is_some() || self.tls_key_path.is_some() {
-            return Err(
-                "http_server: in-process TLS is not supported (tls_cert_path / \
-                 tls_key_path set) -- terminate TLS at the ingress / service mesh \
-                 and leave these unset, or front the service with a TLS sidecar"
+        match (&self.tls_cert_path, &self.tls_key_path) {
+            (None, None) => Ok(()),
+            (Some(_), None) | (None, Some(_)) => {
+                Err("http_server: set both tls_cert_path and tls_key_path, or neither".to_string())
+            }
+            (Some(_), Some(_)) if cfg!(feature = "tls") => Ok(()),
+            (Some(_), Some(_)) => Err(
+                "http_server: tls_cert_path / tls_key_path need scalo's `tls` feature, \
+                 which this build does not enable"
                     .to_string(),
-            );
+            ),
         }
-        Ok(())
     }
 }
 
@@ -227,27 +231,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_unsupported_in_process_tls() {
-        // Default (no TLS paths) validates.
-        assert!(HttpServerConfig::default().validate().is_ok());
-
-        // Setting either TLS path is rejected -- the server can't terminate
-        // TLS, so a config expecting in-pod TLS must fail loudly, not serve
-        // cleartext while is_tls_enabled() reports true.
-        let mut config = HttpServerConfig::default();
-        config.tls_cert_path = Some("/path/to/cert.pem".to_string());
-        assert!(!config.is_tls_enabled()); // only one path set
-        assert!(
-            config.validate().is_err(),
-            "a set TLS path must be rejected"
-        );
-
-        config.tls_key_path = Some("/path/to/key.pem".to_string());
-        assert!(config.is_tls_enabled());
-        assert!(
-            config.validate().is_err(),
-            "is_tls_enabled() true but in-process TLS unsupported -> reject"
-        );
+    fn validate_refuses_tls_it_would_not_serve() {
+        let path = |p: &str| Some(p.to_string());
+        let cases = [
+            ("no TLS", None, None, true),
+            ("cert only", path("/c.pem"), None, false),
+            ("key only", None, path("/k.pem"), false),
+            // Without the tls feature the server cannot terminate TLS, so a
+            // config asking for it is refused rather than served cleartext.
+            (
+                "both",
+                path("/c.pem"),
+                path("/k.pem"),
+                cfg!(feature = "tls"),
+            ),
+        ];
+        for (name, cert, key, valid) in cases {
+            let config = HttpServerConfig {
+                tls_cert_path: cert,
+                tls_key_path: key,
+                ..HttpServerConfig::default()
+            };
+            assert_eq!(config.validate().is_ok(), valid, "{name}");
+        }
     }
 
     #[test]

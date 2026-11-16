@@ -8,12 +8,17 @@
 
 //! HTTP server implementation using axum.
 
+#[cfg(feature = "tls")]
+use crate::http_server::tls::TlsListener;
 use crate::http_server::{HttpServerConfig, HttpServerError, Result};
+#[cfg(feature = "tls")]
+use crate::tls::{ServerTls, ServerTlsOptions};
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
 #[cfg(not(feature = "shutdown"))]
 use tokio::signal;
@@ -29,6 +34,8 @@ use tower_http::trace::TraceLayer;
 pub struct HttpServer {
     config: HttpServerConfig,
     ready: Arc<AtomicBool>,
+    #[cfg(feature = "tls")]
+    tls: Option<ServerTls>,
 }
 
 impl HttpServer {
@@ -49,13 +56,29 @@ impl HttpServer {
             });
         }
 
-        Self { config, ready }
+        Self {
+            config,
+            ready,
+            #[cfg(feature = "tls")]
+            tls: None,
+        }
     }
 
     /// Create a new HTTP server bound to the specified address.
     #[must_use]
     pub fn bind(address: impl Into<String>) -> Self {
         Self::new(HttpServerConfig::new(address))
+    }
+
+    /// Terminate TLS with `tls`, for a certificate from a secret, client
+    /// certificates, or one `ServerTls` shared with other listeners. Load it
+    /// with [`ServerTlsOptions::http`] so clients can negotiate HTTP/2.
+    /// `tls_cert_path` / `tls_key_path` must then be unset.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn with_tls(mut self, tls: ServerTls) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
     /// Set the readiness state for the /readyz endpoint.
@@ -98,79 +121,14 @@ impl HttpServer {
     ///
     /// # Errors
     ///
-    /// Returns an error if binding fails or the server encounters an error.
+    /// Returns an error if the config is invalid, TLS fails to load, binding
+    /// fails, or the server encounters an error.
     pub async fn serve_with_shutdown<F>(self, app: Router, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        // Enforce config validity before binding: a
-        // config requesting unsupported in-process TLS must fail loudly here,
-        // not bind cleartext while is_tls_enabled() reports true.
-        self.config.validate().map_err(HttpServerError::TlsConfig)?;
-        let shutdown_timeout = self.config.shutdown_timeout();
-        let app = self.build_router(app);
-
-        let addr: SocketAddr =
-            self.config
-                .bind_address
-                .parse()
-                .map_err(|e| HttpServerError::Bind {
-                    address: self.config.bind_address.clone(),
-                    source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
-                })?;
-
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| HttpServerError::Bind {
-                address: self.config.bind_address.clone(),
-                source: e,
-            })?;
-
-        #[cfg(feature = "logger")]
-        tracing::info!(address = %addr, "HTTP server listening");
-
-        // Two-phase: unbounded wait for shutdown, then bounded drain.
-        // If drain exceeds shutdown_timeout, drop the serve future
-        // so K8s terminationGracePeriodSeconds isn't blown.
-        //
-        // Flip ready -> false BEFORE notifying drain start so
-        // /readyz returns 503 the moment shutdown is signalled.
-        // K8s endpoint controller catches the 503 and stops routing
-        // before in-flight requests finish draining.
-        let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
-        let drain_started_tx = std::sync::Mutex::new(Some(drain_started_tx));
-        let ready_for_signal = Arc::clone(&self.ready);
-        let signal = async move {
-            shutdown.await;
-            ready_for_signal.store(false, Ordering::SeqCst);
-            if let Some(tx) = drain_started_tx.lock().ok().and_then(|mut g| g.take()) {
-                let _ = tx.send(());
-            }
-        };
-        // WithGracefulShutdown is IntoFuture, not Future.
-        let serve = axum::serve(listener, app)
-            .with_graceful_shutdown(signal)
-            .into_future();
-        tokio::pin!(serve);
-
-        tokio::select! {
-            result = &mut serve => result.map_err(HttpServerError::Io)?,
-            () = async {
-                let _ = drain_started_rx.await;
-                tokio::time::sleep(shutdown_timeout).await;
-            } => {
-                #[cfg(feature = "logger")]
-                tracing::warn!(
-                    timeout_ms = u64::try_from(shutdown_timeout.as_millis()).unwrap_or(u64::MAX),
-                    "HTTP server graceful drain timed out -- forcing exit"
-                );
-            }
-        }
-
-        #[cfg(feature = "logger")]
-        tracing::info!("HTTP server shut down gracefully");
-
-        Ok(())
+        let listener = self.bind_listener().await?;
+        self.prepare(listener, app).await?.run(shutdown).await
     }
 
     /// Serve and return a handle for programmatic shutdown.
@@ -179,16 +137,27 @@ impl HttpServer {
     ///
     /// # Errors
     ///
-    /// Returns an error if binding fails.
+    /// Returns an error if the config is invalid, TLS fails to load, or
+    /// binding fails.
     pub async fn serve_with_handle(self, app: Router) -> Result<(ShutdownHandle, ServerFuture)> {
-        // Same validation gate as serve_with_shutdown.
-        self.config.validate().map_err(HttpServerError::TlsConfig)?;
+        let listener = self.bind_listener().await?;
+        let prepared = self.prepare(listener, app).await?;
         let (tx, rx) = watch::channel(());
         let handle = ShutdownHandle { sender: tx };
+        let signal = async move {
+            let _ = rx.clone().changed().await;
+        };
+        let future = ServerFuture {
+            inner: Box::pin(prepared.run(signal)),
+        };
+        Ok((handle, future))
+    }
 
-        let shutdown_timeout = self.config.shutdown_timeout();
-        let app = self.build_router(app);
-
+    /// Validate the config and bind its address.
+    async fn bind_listener(&self) -> Result<TcpListener> {
+        // A config asking for TLS this build cannot serve fails here, not by
+        // binding cleartext.
+        self.config.validate().map_err(HttpServerError::TlsConfig)?;
         let addr: SocketAddr =
             self.config
                 .bind_address
@@ -197,56 +166,40 @@ impl HttpServer {
                     address: self.config.bind_address.clone(),
                     source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
                 })?;
-
-        let listener = TcpListener::bind(addr)
+        TcpListener::bind(addr)
             .await
             .map_err(|e| HttpServerError::Bind {
                 address: self.config.bind_address.clone(),
                 source: e,
-            })?;
+            })
+    }
 
-        #[cfg(feature = "logger")]
-        tracing::info!(address = %addr, "HTTP server listening");
-
-        // Two-phase shutdown, matching `serve_with_shutdown`.
-        // Flip ready -> false before notifying drain start.
-        let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
-        let drain_started_tx = std::sync::Mutex::new(Some(drain_started_tx));
-        let ready_for_signal = Arc::clone(&self.ready);
-        let signal = async move {
-            let _ = rx.clone().changed().await;
-            ready_for_signal.store(false, Ordering::SeqCst);
-            if let Some(tx) = drain_started_tx.lock().ok().and_then(|mut g| g.take()) {
-                let _ = tx.send(());
+    /// Load TLS and build the router, so every startup error surfaces before
+    /// the first request.
+    async fn prepare(self, listener: TcpListener, app: Router) -> Result<Prepared> {
+        #[cfg(feature = "tls")]
+        let tls = match (self.tls.clone(), self.config.tls_files()) {
+            (Some(_), Some(_)) => {
+                return Err(HttpServerError::TlsConfig(
+                    "TLS is set both by with_tls and by tls_cert_path / tls_key_path".to_string(),
+                ));
             }
+            (Some(tls), None) => Some(tls),
+            (None, Some(config)) => Some(
+                ServerTls::load_with(&config, ServerTlsOptions::http())
+                    .await
+                    .map_err(|e| HttpServerError::TlsConfig(e.to_string()))?,
+            ),
+            (None, None) => None,
         };
-
-        let future = ServerFuture {
-            inner: Box::pin(async move {
-                let serve = axum::serve(listener, app)
-                    .with_graceful_shutdown(signal)
-                    .into_future();
-                tokio::pin!(serve);
-
-                tokio::select! {
-                    result = &mut serve => result.map_err(HttpServerError::Io)?,
-                    () = async {
-                        let _ = drain_started_rx.await;
-                        tokio::time::sleep(shutdown_timeout).await;
-                    } => {
-                        #[cfg(feature = "logger")]
-                        tracing::warn!(
-                            timeout_ms = u64::try_from(shutdown_timeout.as_millis()).unwrap_or(u64::MAX),
-                            "HTTP server graceful drain timed out -- forcing exit"
-                        );
-                    }
-                }
-
-                Ok(())
-            }),
-        };
-
-        Ok((handle, future))
+        Ok(Prepared {
+            app: self.build_router(app),
+            listener,
+            ready: Arc::clone(&self.ready),
+            shutdown_timeout: self.config.shutdown_timeout(),
+            #[cfg(feature = "tls")]
+            tls,
+        })
     }
 
     /// Build the final router with optional health endpoints + middleware.
@@ -298,6 +251,103 @@ impl HttpServer {
             // upstream should see backpressure via send-timeout.
             .layer(ConcurrencyLimitLayer::new(self.config.max_connections))
     }
+}
+
+/// A bound, configured server waiting for its shutdown signal.
+struct Prepared {
+    listener: TcpListener,
+    app: Router,
+    ready: Arc<AtomicBool>,
+    shutdown_timeout: Duration,
+    #[cfg(feature = "tls")]
+    tls: Option<ServerTls>,
+}
+
+impl Prepared {
+    async fn run<F>(self, shutdown: F) -> Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        #[cfg(feature = "logger")]
+        if let Ok(address) = self.listener.local_addr() {
+            #[cfg(feature = "tls")]
+            let tls = self.tls.is_some();
+            #[cfg(not(feature = "tls"))]
+            let tls = false;
+            tracing::info!(%address, tls, "HTTP server listening");
+        }
+        #[cfg(feature = "tls")]
+        if let Some(tls) = self.tls {
+            let listener = TlsListener::new(self.listener, tls)?;
+            return drive(
+                listener,
+                self.app,
+                self.ready,
+                self.shutdown_timeout,
+                shutdown,
+            )
+            .await;
+        }
+        drive(
+            self.listener,
+            self.app,
+            self.ready,
+            self.shutdown_timeout,
+            shutdown,
+        )
+        .await
+    }
+}
+
+/// Serve until `shutdown`, then drain for at most `shutdown_timeout`.
+///
+/// Two-phase: an unbounded wait for shutdown, then a bounded drain. A drain
+/// past `shutdown_timeout` drops the serve future, so Kubernetes'
+/// `terminationGracePeriodSeconds` is not blown. Ready flips to false before
+/// the drain starts, so /readyz answers 503 and the endpoint controller stops
+/// routing while in-flight requests finish.
+async fn drive<L, F>(
+    listener: L,
+    app: Router,
+    ready: Arc<AtomicBool>,
+    shutdown_timeout: Duration,
+    shutdown: F,
+) -> Result<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel();
+    let signal = async move {
+        shutdown.await;
+        ready.store(false, Ordering::SeqCst);
+        let _ = drain_started_tx.send(());
+    };
+    // WithGracefulShutdown is IntoFuture, not Future.
+    let serve = axum::serve(listener, app)
+        .with_graceful_shutdown(signal)
+        .into_future();
+    tokio::pin!(serve);
+
+    tokio::select! {
+        result = &mut serve => result.map_err(HttpServerError::Io)?,
+        () = async {
+            let _ = drain_started_rx.await;
+            tokio::time::sleep(shutdown_timeout).await;
+        } => {
+            #[cfg(feature = "logger")]
+            tracing::warn!(
+                timeout_ms = u64::try_from(shutdown_timeout.as_millis()).unwrap_or(u64::MAX),
+                "HTTP server graceful drain timed out -- forcing exit"
+            );
+        }
+    }
+
+    #[cfg(feature = "logger")]
+    tracing::info!("HTTP server shut down gracefully");
+
+    Ok(())
 }
 
 /// Handle for triggering server shutdown.
@@ -643,5 +693,93 @@ mod tests {
         assert!(!server.is_ready());
         server.set_ready(true);
         assert!(server.is_ready());
+    }
+
+    #[cfg(feature = "tls")]
+    mod tls {
+        use super::*;
+        use crate::tls::ServerTlsConfig;
+        use crate::tls::test_pki::{TestCa, connect, connector, write};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// A config serving `ca`'s certificate from files in `dir`.
+        fn tls_config(dir: &tempfile::TempDir, ca: &TestCa) -> HttpServerConfig {
+            let leaf = ca.server("http");
+            let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+            write(&cert, &leaf.cert_pem);
+            write(&key, &leaf.key_pem);
+            HttpServerConfig {
+                tls_cert_path: Some(cert.display().to_string()),
+                tls_key_path: Some(key.display().to_string()),
+                ..HttpServerConfig::new("127.0.0.1:0")
+            }
+        }
+
+        #[tokio::test]
+        async fn serves_https_from_the_config_paths() {
+            let ca = TestCa::new("http ca");
+            let dir = tempfile::TempDir::new().unwrap();
+            let server = HttpServer::new(tls_config(&dir, &ca));
+            let listener = server.bind_listener().await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let prepared = server.prepare(listener, Router::new()).await.unwrap();
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let running = tokio::spawn(prepared.run(async move {
+                let _ = stopped.await;
+            }));
+
+            let offers: [(&[&[u8]], &[u8]); 2] = [
+                (&[b"h2", b"http/1.1"], b"h2"),
+                (&[b"http/1.1"], b"http/1.1"),
+            ];
+            for (offered, chosen) in offers {
+                let stream = connect(&connector(&ca.pem(), None, offered), addr)
+                    .await
+                    .unwrap();
+                assert_eq!(stream.get_ref().1.alpn_protocol(), Some(chosen));
+            }
+
+            let mut stream = connect(&connector(&ca.pem(), None, &[b"http/1.1"]), addr)
+                .await
+                .unwrap();
+            stream
+                .write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut chunk = [0u8; 512];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "closed before the response headers");
+                response.extend_from_slice(&chunk[..read]);
+            }
+            let response = String::from_utf8_lossy(&response);
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+            stop.send(()).unwrap();
+            running.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn tls_from_both_with_tls_and_the_config_paths_is_refused() {
+            let ca = TestCa::new("both ca");
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = tls_config(&dir, &ca);
+            let files = config.tls_files().unwrap();
+            let tls = ServerTls::load(&ServerTlsConfig {
+                reload_interval_secs: 0,
+                ..files
+            })
+            .await
+            .unwrap();
+            let result = HttpServer::new(config)
+                .with_tls(tls)
+                .serve_with_handle(Router::new())
+                .await;
+            assert!(
+                matches!(result, Err(HttpServerError::TlsConfig(_))),
+                "TLS set twice was accepted"
+            );
+        }
     }
 }
