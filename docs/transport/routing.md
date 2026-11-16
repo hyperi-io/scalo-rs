@@ -21,23 +21,39 @@ Push the routing decision as close to ingress as possible: a stage that
 sees one inbound stream and produces one outbound stream needs a name for
 its sink, not a routing table.
 
----
-
-## Typical use case
-
 A receiver accepts gRPC pushes from many tenants on one listen
 socket, then fans messages out to per-tenant Kafka topics (durability)
 while a small set of audit events go to a dedicated gRPC archiver
 for low-latency capture.
 
+`RoutedSender` looks up the destination name a send has and hands the record to that route's sender, or to the default when the name has no route.
+
 ```mermaid
 flowchart LR
-    Ingress["gRPC ingress"] --> RS{"RoutedSender<br/>dispatch by destination"}
-    RS -->|&quot;events.land&quot;| K1["Kafka topic events.land"]
-    RS -->|&quot;events.load&quot;| K2["Kafka topic events.load"]
-    RS -->|&quot;audit.land&quot;| G["gRPC archiver:6000"]
-    RS -->|default| KC["Kafka catch-all"]
+    accTitle: L4 Detail -- Routed send
+    accDescr: A gRPC ingress sends each record with a destination name. RoutedSender looks the name up: events.land and events.load go to Kafka topics of those names, audit.land goes to a gRPC archiver, and any other name goes to the default Kafka catch-all.
+
+    ingress["gRPC ingress"]
+    routed{"RoutedSender<br/>route for name?"}
+    land[("events.land")]
+    load[("events.load")]
+    archiver["gRPC archiver"]
+    catch_all[("Kafka<br/>catch-all")]
+
+    ingress --> routed
+    routed -->|events.land| land
+    routed -->|events.load| load
+    routed -->|audit.land| archiver
+    routed -->|other| catch_all
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef async fill:#F6E6EF,stroke:#A8517F,stroke-width:1px,color:#3D1529
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    class routed decision
+    class land,load,catch_all async
 ```
+
+*Figure 1. L4 Detail -- Routed send. Cylinders are Kafka topics.* Up: [Transport](README.md).
 
 ---
 
@@ -70,9 +86,7 @@ Each route value is a full `TransportConfig` -- any backend
 [backends.md](backends.md) supports is fair game. The `default` is
 optional, and without it an unknown key returns `SendResult::Fatal`.
 
----
-
-## API
+In code:
 
 ```rust
 use std::collections::HashMap;
@@ -134,7 +148,7 @@ sender.send_fanout(&["loader", "archiver"], "orders_land", payload).await;
 
 The first `Backpressured`/`Fatal` short-circuits and is returned, so the
 caller retries the whole fan-out and re-delivers to whichever destinations
-already accepted: at-least-once, duplicates never loss -- the same contract
+accepted: at-least-once, duplicates never loss -- the same contract
 as `send_batch`'s per-record fallback. An empty list is `Ok`.
 
 ---
@@ -166,8 +180,8 @@ sender.send_batch_fanout(&["loader", "archiver"], &workbatch.records).await;
 ## Backpressure
 
 A routed send NEVER retries and NEVER routes to a DLQ. It returns the
-chosen backend's `SendResult` unchanged so the caller applies its own
-policy, such as holding the batch or back-pressuring its ingest. A DLQ that only exists on the bus is
+chosen backend's `SendResult` unchanged so the caller applies its
+policy, such as holding the batch or back-pressuring its ingest. A DLQ that exists only on the bus is
 not a fallback a brokerless deployment can take.
 
 Bounded retry with backoff is [`SinkStack`](../pipeline/sink-stack.md)'s
@@ -184,7 +198,7 @@ backends. So `RoutedSender::send`:
 
 1. `HashMap::get(destination)` to find the route (or fall back to default).
 2. `AnySender::send(destination, payload).await` on the chosen sender.
-3. Backend's own `send` runs -- Kafka, gRPC, etc.
+3. The backend's `send` runs -- Kafka, gRPC, etc.
 
 Two layers of dispatch, both monomorphised by the compiler. The route lookup is a `HashMap<String, AnySender>::get` -- single hash + equality compare, no allocation when the key is `&str`.
 
@@ -194,7 +208,7 @@ implements `TransportBase` too -- `close()` cascades to every route
 and the default, `is_healthy()` reports `false` if any constituent
 sender is unhealthy.
 
-`RoutedSender` records no metric of its own: the chosen backend counts the send in `transport_sent_total` under its own `transport` label.
+`RoutedSender` records no metric itself: the chosen backend counts the send in `transport_sent_total` under its `transport` label.
 
 ---
 

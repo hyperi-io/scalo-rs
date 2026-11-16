@@ -49,28 +49,39 @@ rayon is not compiled.
 
 ## Lifecycle
 
+`run_app` loads the config before the logger, builds the runtime so the probes serve, holds an idle service at the gate, then installs the readiness check and runs the service.
+
 ```mermaid
 flowchart LR
-    A[main] --> B["run_app::&lt;A: ServiceApp&gt;"]
-    B --> C[parse CommonArgs]
-    C --> E[app.load_config]
-    E --> D[init logger]
-    D --> F[ServiceRuntime::build]
-    F --> W{"app.work_state"}
-    W -->|Idle| P["park until config change"]
-    P --> E
-    W -->|Active| G["app.run_service(config, runtime)"]
-    G --> H[wait on shutdown token]
+    accTitle: L4 Detail -- Service lifecycle
+    accDescr: run_app sets up the config cascade and loads the app config, sets up the logger and calls on_config_loaded, builds the ServiceRuntime, passes the idle gate, then installs the readiness check and runs the service until the shutdown token is cancelled.
+
+    load["Cascade,<br/>load_config"]
+    logger["Logger,<br/>on_config_loaded"]
+    build["ServiceRuntime<br/>::build"]
+    gate[["Idle gate"]]
+    run["Readiness check,<br/>run_service"]
+
+    load --> logger
+    logger --> build
+    build --> gate
+    gate --> run
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
+
+*Figure 1. L4 Detail -- Service lifecycle. The double-bordered box has its own diagram.* Up: [L3 Components -- scalo](../README.md). Down: [L4 Detail -- Idle gate](../core-pillars/lifecycle.md).
 
 Step by step inside `run_app` for the default `run` subcommand:
 
-1. Resolve the subcommand from `app.command()` -- defaults to `Run`.
+1. Resolve the subcommand from `app.command()` -- defaults to `Run` --
+   and, for every command but `version`, set up the config cascade from
+   `--config` and `app.env_prefix()`. A cascade the app set up first is kept.
 2. Call `app.load_config(args.config.as_deref())` -- apps own this
-   step so they can deserialise into their own typed config.
+   step so they can deserialise into their typed config.
 3. Install the logger with the service name and version injected for
    JSON output. It comes after the config because the OTLP span exporter
-   reads its settings from the cascade.
+   reads its settings from the cascade. Then call `app.on_config_loaded`.
 4. Build `ServiceRuntime`:
    - Construct `MetricsManager` under `metrics.namespace`, describe the
      scalo runtime set (`ServiceMetrics`, app info, worker pool and batch
@@ -108,7 +119,8 @@ Step by step inside `run_app` for the default `run` subcommand:
 5. Evaluate `app.work_state(&config)`. Idle parks the service, Ready and
    with nothing open, until a config change gives it work -- see
    [../core-pillars/lifecycle.md](../core-pillars/lifecycle.md).
-6. Call `app.run_service(config, runtime)`.
+6. Install `app.readiness_check(&config)` if it returns one, mark the
+   service running, and call `app.run_service(config, runtime)`.
 
 Apart from `load_config` and `work_state`, the service author's code
 starts at step 6 -- everything before that is the framework.
@@ -117,8 +129,8 @@ starts at step 6 -- everything before that is the framework.
 
 `run_app` installs no rustls crypto provider, and nothing else in scalo does.
 A binary that links both aws-lc-rs and ring and has no process default panics
-in `rustls::ServerConfig::builder()`, which tonic's server TLS also calls.
-scalo itself enables aws-lc-rs only, so ring comes from the app's own
+in `rustls::ServerConfig::builder()`, which tonic's server TLS calls too.
+scalo itself enables aws-lc-rs only, so ring comes from the app's
 dependencies (tonic's `tls-ring` feature, for one).
 
 A service that builds any server TLS config, or calls
@@ -130,7 +142,7 @@ scalo::tls::install_default_provider(); // `tls` feature
 ```
 
 It installs aws-lc-rs, the provider scalo's client TLS uses, and keeps one
-already installed. Without the `tls` feature the equivalent line is
+installed before it. Without the `tls` feature the equivalent line is
 `let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();`.
 
 ---
@@ -177,7 +189,7 @@ pub trait ServiceApp: Sized {
 | `work_state` | no (cfg `lifecycle`) | The emptiness predicate: a valid but workless config idles instead of refusing |
 | `readiness_check` | no | The app's readiness criterion, installed before `run_service` starts (see [Readiness check](#readiness-check)) |
 | `scaling_components` | no (cfg `scaling`) | Register app-specific KEDA signals (lag, queue depth) |
-| `register_metrics` | no (cfg `metrics`) | Describe the app's own metrics for `metrics-manifest` / `generate-artefacts`. The scalo runtime set is always in the manifest, so an override adds only what the app emits itself |
+| `register_metrics` | no (cfg `metrics`) | Describe the app's metrics for `metrics-manifest` / `generate-artefacts`. The scalo runtime set is always in the manifest, so an override adds only what the app emits itself |
 | `deployment_contract` | no (cfg `deployment`) | Build the contract for `generate-artefacts` |
 | `version_check_defaults` | no (cfg `version-check`) | Supply the service's releases endpoint. The cascade overlays it, and `version_check.enabled: false` always wins |
 
@@ -199,7 +211,7 @@ writing any extra code:
 | `version` | Print `version_info()` and exit |
 | `config-check` | Load logger + config, print summary, exit non-zero on failure |
 | `metrics-manifest` | Load config (best-effort, for `metrics.namespace`), describe the scalo runtime set, call `register_metrics`, print manifest JSON to stdout, exit. Warnings go to stderr |
-| `generate-artefacts --output-dir <dir>` | Load config once (best-effort, a failure warned on stderr), then emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, and `config-schema.*` / `capability-catalog.*` when the contract carries them. Refuses, writing nothing, a contract whose `default_config` binds a listener no port declares |
+| `generate-artefacts --output-dir <dir>` | Load config once (best-effort, a failure warned on stderr), then emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, and `config-schema.*` / `capability-catalog.*` when the contract has them. Rejects, writing nothing, a contract whose `default_config` binds a listener no port declares |
 | `config-schema --dir <dir>` | Write `config-schema.{json,yaml}` and `capability-catalog.{json,yaml}` from the app's config and capability catalogue (needs `deployment`) |
 | `top` | Live metrics TUI (when `top` feature is on) |
 
@@ -244,7 +256,7 @@ metrics server's `/readyz` handler calls on every probe.
 The runtime deliberately stops short of full automation. These
 remain in app code because they're domain-specific:
 
-- Readiness criteria -- each service has its own "I can serve traffic" definition.
+- Readiness criteria -- each service defines "I can serve traffic" for itself.
 - Config hot-reload -- optional, and the reload semantics differ per app.
 - Pipeline construction -- what the service is for.
 - DLQ wiring -- varies by transport backend and policy.

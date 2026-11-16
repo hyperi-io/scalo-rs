@@ -22,12 +22,12 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 | Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic -- per-table (`acme.auth` -> `acme.auth.dlq`) or single common topic (`<service>.dlq` unless `common_topic` names one) |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
 
-After a refused write the file backend reopens its file on a later write, waiting 250 ms and doubling up to 30 s while writes keep failing. So a deleted file or a restored directory recovers without a restart. It never recreates a missing directory, because that could put the DLQ on the filesystem under an unmounted volume. While its file is missing it refuses writes before they reach `file-rotate`, whose rotation would otherwise panic -- an abort in a `panic = "abort"` service.
+After a refused write the file backend reopens its file on a later write, waiting 250 ms and doubling up to 30 s while writes keep failing. So a deleted file or a restored directory recovers without a restart. It never recreates a missing directory, because that could put the DLQ on the filesystem under an unmounted volume. While its file is missing it rejects writes before they reach `file-rotate`, whose rotation would otherwise panic -- an abort in a `panic = "abort"` service.
 
 External rotation of the DLQ file (logrotate, say) is unsupported: the backend rotates it itself. If something renames the file and puts a new one at the path, the writes until the next reopen report lost and count in `dropped()`, although their entries are in the renamed file.
 
 Backends are concrete variants of a `DlqBackend` enum (static
-dispatch, no `Box<dyn>`, no `async-trait` macro). Adding a new backend
+dispatch, no `Box<dyn>`, no `async-trait` macro). Adding a backend
 means extending the enum in scalo -- consumers never construct backend
 types directly.
 
@@ -37,10 +37,10 @@ The Kafka backend queues entries to the producer on every write and learns their
 
 - The wait runs on tokio's blocking pool, so a slow or absent broker holds no runtime worker. It lasts up to `kafka.send_timeout_ms` (default 5000 ms), plus up to 5 s to purge.
 - Entries still unacknowledged after `send_timeout_ms` are purged from the producer, which fails their delivery.
-- `Cascade` with a backend after Kafka: an entry whose delivery failed since the previous `flush()`, refused by the broker or purged, goes on to that backend before the barrier flushes it. It counts as accepted once that backend takes it, and is lost only if every backend after Kafka refuses it too.
+- `Cascade` with a backend after Kafka: an entry whose delivery failed since the previous `flush()`, refused by the broker or purged, goes on to that backend before the barrier flushes it. It counts as accepted once that backend takes it, and is lost only if every backend after Kafka rejects it too.
 - `KafkaOnly`, `FanOut`, or `Cascade` with nothing after Kafka: such an entry fails the `flush()` with `Err(DlqError::Kafka(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
-- The purge bounds the wait, but an entry already in flight to a stalled broker, not a dead one, can still be written after it. So under a stalled broker the DLQ topic can hold an entry the file backend also took, and `dropped()` can count one the topic holds: duplicates, never a gap.
-- `Cascade`: when Kafka queues part of a batch and refuses the rest (an entry over the producer's `message.max.bytes`, say), only the rest goes on to the next backend.
+- The purge bounds the wait, but an entry in flight to a stalled broker, not a dead one, can still be written after it. So under a stalled broker the DLQ topic can hold an entry the file backend took, and `dropped()` can count one the topic holds: duplicates, never a gap.
+- `Cascade`: when Kafka queues part of a batch and rejects the rest (an entry over the producer's `message.max.bytes`, say), only the rest goes on to the next backend.
 - `FanOut`: a Kafka loss counts only for entries no other backend took. When one barrier covers both kinds and Kafka lost some, the loss is charged to the entries Kafka held alone first, so the count can overstate the loss but never understate it.
 
 Delivery failures are read at every write, at the barrier and at [shutdown](#shutdown). Without a `flush()` an entry the broker never acks waits in the producer until librdkafka's `message.timeout.ms` (300000 ms unless set) fails it. It shows in `transport_send_errors_total{transport="kafka"}` and the producer's WARN log, then goes on to the next backend at the next write in `Cascade`, or counts in `dropped()` at the next `flush()` or shutdown otherwise.
@@ -56,20 +56,38 @@ Delivery failures are read at every write, at the barrier and at [shutdown](#shu
 | `FileOnly` | File backend only -- no Kafka dependency |
 | `KafkaOnly` | Kafka backend only |
 
-Cascade is the production default -- Kafka primary, file fallback. An entry falls through to the file when the producer refuses to queue it (a full producer queue, or an entry over its `message.max.bytes`), and when the producer queued it but the broker refused it or never acked it. So an unreachable broker loses no dead letters while the file backend takes them: they land in the file at the next `flush()` or shutdown, which purge what is unacked, or at the next write once librdkafka has failed the delivery (`message.timeout.ms`, 300 s unless set). See [The Kafka barrier](#the-kafka-barrier). FanOut is for compliance setups that need every entry mirrored to two destinations.
+Cascade is the production default -- Kafka primary, file fallback. An entry falls through to the file when the producer will not queue it (a full producer queue, or an entry over its `message.max.bytes`), and when the producer queued it but the broker refused it or never acked it. So an unreachable broker loses no dead letters while the file backend takes them: they land in the file at the next `flush()` or shutdown, which purge what is unacked, or at the next write once librdkafka has failed the delivery (`message.timeout.ms`, 300 s unless set). See [The Kafka barrier](#the-kafka-barrier). FanOut is for compliance setups that need every entry mirrored to two destinations.
 
 A backend that cannot start is left out, and the others run. On a read-only root filesystem the file backend's default `file.path` under `/var/spool` cannot be created, so a `Cascade` DLQ runs on Kafka alone, with a WARN and a count in `dlq_backend_start_failures_total{backend="file"}`. Mount a writable volume at `file.path` to keep the fallback: `DeploymentContract::with_dlq` adds it to the contract's writable paths. With no backend running the DLQ stays enabled and logs an ERROR at start. `write_confirmed` then returns `Err(DlqError::AllBackendsFailed(..))`, so a caller holding a source acknowledgement keeps it and nothing is lost, and the pipeline holds the block until a restart finds a backend. `send` and `try_send` hold no acknowledgement, so they count the entry in `dropped()` as a disabled DLQ does.
 
+In `Cascade` an entry Kafka does not hold, refused at the write or never acked by the broker, falls through to the next backend, and an entry no backend takes is counted as dropped.
+
 ```mermaid
 flowchart LR
-    E[entry] --> K{Kafka queues it?}
-    K -- no --> F[next backend]
-    K -- yes --> A{broker acks it?}
-    A -- yes --> D[held by Kafka]
-    A -->|refused / expired / purged| F
-    F -- takes it --> H[held]
-    F -- refuses it --> L["dropped()"]
+    accTitle: L4 Detail -- DLQ cascade
+    accDescr: An entry Kafka queues and the broker acks is held by Kafka. An entry Kafka refuses, or the broker refuses, expires or has purged, goes to the next backend. If that backend takes it, it is held there, otherwise it is counted in dropped.
+
+    kafka{"Kafka queues it,<br/>broker acks?"}
+    held_kafka(["Held by Kafka"])
+    next{"Next backend<br/>takes it?"}
+    held_next(["Held"])
+    dropped(["Counted in<br/>dropped()"])
+
+    kafka -->|yes| held_kafka
+    kafka -->|no| next
+    next -->|yes| held_next
+    next -->|no| dropped
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef store fill:#DDF3EC,stroke:#00785A,stroke-width:1px,color:#0B3327
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    classDef error fill:#FBE3D6,stroke:#C2410C,stroke-width:1px,color:#4A1A05
+    class kafka,next decision
+    class held_kafka,held_next store
+    class dropped error
 ```
+
+*Figure 1. L4 Detail -- DLQ cascade. Green ends are held, the orange end is the loss.* Up: [Pipeline](README.md).
 
 Each entry that falls through and lands counts once in `dlq_cascade_fallthrough_total{from, to, reason}`: `from` is the backend that gave it up, `to` the one that took it, and `reason` is `write_refused` (the backend refused the write itself), `delivery_failed` (the broker refused it) or `ack_timeout` (no ack came in time, so it expired or was purged). A rising `reason="ack_timeout"` with `to="file"` is a broker outage the file backend is covering.
 
@@ -113,7 +131,7 @@ for the next `flush()` as well. A Kafka backend that purged entries it has
 not heard back about yet fails the confirmed write. The pipeline's
 `with_dlq` writes each block's dead letters this way.
 
-An error from `write_confirmed` does not say whether a retry can land the entries, and a caller holding a source acknowledgement needs to know. `refusal(&entry)` answers it before the write, per entry: `Some(DeadLetterReason::TooLarge { bytes, limit })` when no backend can ever hold the entry, `None` otherwise. Only a Kafka backend has a ceiling, its producer's `message.max.bytes` less 128 bytes of framing, measured against the entry as written, where a binary or truncated payload grows by a third as base64. A file or HTTP backend beside Kafka takes what Kafka refuses, so such a DLQ refuses nothing.
+An error from `write_confirmed` does not say whether a retry can land the entries, and a caller holding a source acknowledgement needs to know. `refusal(&entry)` answers it before the write, per entry: `Some(DeadLetterReason::TooLarge { bytes, limit })` when no backend can ever hold the entry, `None` otherwise. Only a Kafka backend has a ceiling, its producer's `message.max.bytes` less 128 bytes of framing, measured against the entry as written, where a binary or truncated payload grows by a third as base64. A file or HTTP backend beside Kafka takes what Kafka rejects, so such a DLQ rejects nothing.
 
 So a caller holding a source acknowledgement:
 
@@ -121,7 +139,7 @@ So a caller holding a source acknowledgement:
 - holds the block and writes the rest again on any other error, since those can clear: a broker down, a timeout, a full disk
 - releases `Errored` only on `DlqError::Closed`, when the drain has exited
 
-A broker or topic ceiling below the producer's `message.max.bytes` is not seen by `refusal`: the broker refuses the entry after the write, and the confirmed write fails like any other loss. Keep the three ceilings in step ([../transport/backends.md](../transport/backends.md)).
+A broker or topic ceiling below the producer's `message.max.bytes` is not seen by `refusal`: the broker rejects the entry after the write, and the confirmed write fails like any other loss. Keep the three ceilings in step ([../transport/backends.md](../transport/backends.md)).
 
 What "accepted" means depends on the backend:
 
@@ -129,7 +147,7 @@ What "accepted" means depends on the backend:
 | --------- | ---------------- |
 | File | Written to the kernel page cache. No `fsync`, so power loss before write-back can still lose it |
 | Kafka | Acknowledged by the broker, under the producer's `acks` setting. The barrier waits up to `kafka.send_timeout_ms` -- see [The Kafka barrier](#the-kafka-barrier) |
-| HTTP | The endpoint returned a 2xx status. The barrier adds no wait: the write already waited for the response |
+| HTTP | The endpoint returned a 2xx status. The barrier adds no wait: the write waited for the response |
 
 An entry refused at admission (`try_send` returning `QueueFull`) never
 reached the queue, so `flush()` does not cover it -- `dropped()` does.
@@ -190,7 +208,7 @@ Each entry is one JSON object, a DFE event a loader can land in a DLQ table:
 
 ## Payload cap
 
-A dead letter is often in the DLQ because it was too large, and a cut payload is written as base64, a third larger again, so a Kafka backend would refuse it the same way. So every send cuts a payload over `max_payload_bytes` (default 512 KiB, `DEFAULT_MAX_PAYLOAD_BYTES`) to that length, on every backend, and the entry carries `"truncated": true` and `"original_bytes"`, the length it had. Each cut counts in `dlq_payload_truncated_total`. Set `max_payload_bytes: null` to keep every payload whole, for a file DLQ that is replayed, say.
+A dead letter is often in the DLQ because it was too large, and a cut payload is written as base64, a third larger again, so a Kafka backend would refuse it the same way. So every send cuts a payload over `max_payload_bytes` (default 512 KiB, `DEFAULT_MAX_PAYLOAD_BYTES`) to that length, on every backend, and the entry has `"truncated": true` and `"original_bytes"`, the length it had. Each cut counts in `dlq_payload_truncated_total`. Set `max_payload_bytes: null` to keep every payload whole, for a file DLQ that is replayed, say.
 
 The copied header shares the cap with the payload, whole or cut. A payload that fits keeps all its bytes and the header values take what is left, so a header copy is dropped before a payload that fits is cut. 512 KiB base64'd is 699,052 bytes, under Kafka's and librdkafka's default `message.max.bytes`, and `_raw` never takes more than the base64 of its payload, so an entry's payload and header stay within that, its other fields aside.
 

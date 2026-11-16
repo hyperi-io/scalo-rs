@@ -11,20 +11,38 @@ cadence.
 
 ## Hard gates first, composite second
 
+A disabled pressure reads 0, an open circuit reads 0 before memory is checked, memory at the gate reads 100, and only then does the weighted composite count.
+
 ```mermaid
-flowchart TD
-    C[calculate] --> E{enabled?}
-    E -->|no| Z0[0.0]
-    E -->|yes| G1{circuit_open?}
-    G1 -->|yes| Z1["0.0 - sink down, scaling will not help"]
-    G1 -->|no| G2{"memory_ratio >= memory_gate_threshold?"}
-    G2 -->|yes| Z2["100.0 - scale NOW, before OOM"]
-    G2 -->|no| W[Weighted composite<br/>sum score_i, capped at 100.0]
+flowchart LR
+    accTitle: L4 Detail -- Scaling pressure gates
+    accDescr: calculate returns 0 when scaling pressure is disabled. When enabled it returns 0 while the circuit is open, 100 when the memory ratio reaches the gate threshold, and otherwise the weighted composite capped at 100.
+
+    enabled{"Enabled?"}
+    circuit{"Circuit<br/>open?"}
+    off(["0.0, off"])
+    memory{"Memory at<br/>the gate?"}
+    sink_down(["0.0, sink down"])
+    composite(["Weighted<br/>composite"])
+    scale_now(["100.0, scale now"])
+
+    enabled -->|yes| circuit
+    enabled -->|no| off
+    circuit -->|no| memory
+    circuit -->|yes| sink_down
+    memory -->|no| composite
+    memory -->|yes| scale_now
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    class enabled,circuit,memory decision
 ```
+
+*Figure 1. L4 Detail -- Scaling pressure gates. Each gate overrides the composite.* Up: [Pipeline](README.md).
 
 | Gate | Trigger | Output | Why |
 | ------ | --------- | -------- | ----- |
-| **Circuit breaker** | `set_circuit_open(true)` | `0.0` | Downstream sink is unavailable. Adding replicas can't help -- they'd also fail. Don't scale. |
+| **Circuit breaker** | `set_circuit_open(true)` | `0.0` | Downstream sink is unavailable. Adding replicas can't help -- they'd fail. Don't scale. |
 | **Memory pressure** | `memory_used / memory_limit >= memory_gate_threshold` (default 0.8) | `100.0` | OOM is imminent. Bypass the composite and call for max scale immediately. |
 
 Without hard gates, a weighted composite smears over both cases --
@@ -47,7 +65,7 @@ pressure = min(sum score_i, 100.0)
 
 Each component contributes `weight_i * 100` when it reaches its
 saturation point, scales linearly below that, and is capped at its
-weight (no over-contribution). A negative reading scores 0, and so does one that is not a finite number (NaN or infinity), so a bad sample never reads as full pressure. Weights should sum to ~1.0 -- the cap
+weight (no over-contribution). A negative reading scores 0, and so does one that is not a finite number (NaN or infinity), so a bad sample never reads as full pressure. Weights should sum to about 1.0 -- the cap
 on the total keeps the output well-formed even if they don't.
 
 Example composition for a loader:
@@ -57,7 +75,7 @@ Example composition for a loader:
 | `kafka_lag` | 0.35 | 100 000 | Consumer lag from the Kafka client |
 | `buffer_depth` | 0.25 | 10 000 | In-memory batch buffer depth |
 | `insert_latency` | 0.15 | 5.0 s | ClickHouse insert latency p99 |
-| `memory` | 0.15 | 1.0 | Memory pressure ratio (also a gate) |
+| `memory` | 0.15 | 1.0 | Memory pressure ratio (a gate) |
 | `errors` | 0.10 | 100 | Recent error count |
 
 ---
@@ -86,7 +104,7 @@ scalo publishes the value two ways, and KEDA reads neither until the deployment 
 
 An app that still writes the gauge from `runtime.scaling` writes the same number the runtime does, because both read one pressure. Two writers of one gauge on two different pressures would flap between them, which is why the runtime reads what the listener serves.
 
-The [scalo-service](../../charts/scalo-service/README.md) chart reads neither. Its ScaledObject carries a Kafka consumer-group lag trigger unless the contract or `keda.kafka.enabled` turns it off, and a CPU trigger unless `cpu_enabled` or `keda.cpu.enabled` does. See [../deployment/keda.md](../deployment/keda.md).
+The [scalo-service](../../charts/scalo-service/README.md) chart reads neither. Its ScaledObject has a Kafka consumer-group lag trigger unless the contract or `keda.kafka.enabled` turns it off, and a CPU trigger unless `cpu_enabled` or `keda.cpu.enabled` does. See [../deployment/keda.md](../deployment/keda.md).
 
 To scale on the composite, the deployment adds its own trigger, through the chart's `keda.extraTriggers` (appended to the derived ones) or `keda.triggers` (in their place). A deployment can read the gauge with a KEDA `metrics-api` scaler through an adapter that serves it, beside the CPU trigger:
 
@@ -105,7 +123,7 @@ triggers:
       valueLocation: "value"
 ```
 
-Use `metricType: Value`. `AverageValue` treats the metric as a total to share across the replicas, which a 0-100 score is not. The adapter also decides what a failed lookup does, and holding the replica count is safer than scaling out on a missing value.
+Use `metricType: Value`. `AverageValue` treats the metric as a total to share across the replicas, which a 0-100 score is not. The adapter decides what a failed lookup does, and holding the replica count is safer than scaling out on a missing value.
 
 See [`../../src/metrics/mod.rs`](../../src/metrics/mod.rs) for the endpoint mount.
 

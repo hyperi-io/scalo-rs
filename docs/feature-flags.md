@@ -4,16 +4,7 @@ The defaults are the minimum (`config`, `logger`), so the
 "I-just-want-config" use case avoids most transitive deps. Every other
 feature is opt-in.
 
-This doc covers:
-
-- The default set and why it's minimal
-- The feature tree (which feature pulls in which)
-- Native-deps that come with certain features (apt packages on Linux)
-- Recommended bundles for common app shapes
-
-For the *what* -- what a feature actually does -- see the subsystem doc
-linked in each row. This page is about which features to enable and what
-that costs.
+What a feature does is in the subsystem doc each row links. This page says which features to enable and what each costs.
 
 ---
 
@@ -29,37 +20,39 @@ That's it. The default set covers:
 - 7-layer config cascade, with YAML parsed through `scalo::yaml`
 - Structured logging via `tracing-subscriber`
 
-If you only need those two, you can stop reading.
+If those two are all you need, stop here.
 
 ---
 
 ## Tier-split features (the not-so-obvious ones)
 
-Several features ship in tiers so callers pay only for what they use.
+Three features ship in tiers, and each tier includes the one before it, so a caller pays for the tier it picks.
+
+```mermaid
+flowchart LR
+    accTitle: L4 Detail -- Feature tiers
+    accDescr: metrics-core is included by metrics-process, which is included by metrics. worker-pool is included by worker-batch, which is included by worker. cli is included by cli-service, which is included by top.
+
+    metrics_core["metrics-core"] --> metrics_process["metrics-process"] --> metrics["metrics"]
+    worker_pool["worker-pool"] --> worker_batch["worker-batch"] --> worker["worker"]
+    cli["cli"] --> cli_service["cli-service"] --> top["top"]
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+```
+
+*Figure 1. L4 Detail -- Feature tiers. An arrow points at the feature that includes the one before it.* Up: [L3 Components -- scalo](README.md).
 
 ### Metrics
 
-```mermaid
-flowchart LR
-    M1[metrics-core] --> M2[metrics-process]
-    M2 --> M3[metrics]
-```
-
 | Feature | Adds |
 | --------- | ------ |
-| `metrics-core` | scalo's own dependency on the `metrics` crate. No exporter and no `scalo::metrics` API |
+| `metrics-core` | scalo's dependency on the `metrics` crate. No exporter and no `scalo::metrics` API |
 | `metrics-process` | Above + `sysinfo`, which the cgroup-aware process gauges (RSS, CPU, FDs) use. Exposes no API on its own: the gauges come with `metrics` or `otel-metrics` |
 | `metrics` | Above + Prometheus exporter, `/metrics` HTTP endpoint, manifest dump, OTLP push |
 
-Pick `metrics` for service binaries. scalo's own series, the tiered sink's and the transports' among them, are compiled only when `metrics` is on somewhere in the build. A library that emits its own series depends on the `metrics` crate directly and leaves the exporter to the service. See [core-pillars/metrics.md](core-pillars/metrics.md#feature-tiers).
+Pick `metrics` for service binaries. scalo's series, the tiered sink's and the transports' among them, are compiled only when `metrics` is on somewhere in the build. A library that emits series of its own depends on the `metrics` crate directly and leaves the exporter to the service. See [core-pillars/metrics.md](core-pillars/metrics.md#feature-tiers).
 
 ### Worker pool
-
-```mermaid
-flowchart LR
-    W1[worker-pool] --> W2[worker-batch]
-    W2 --> W3[worker]
-```
 
 | Feature | Adds |
 | --------- | ------ |
@@ -68,12 +61,6 @@ flowchart LR
 | `worker` | Alias for `worker-batch` -- back-compat |
 
 ### CLI
-
-```mermaid
-flowchart LR
-    C1[cli] --> C2[cli-service]
-    C2 --> C3[top]
-```
 
 | Feature | Adds |
 | --------- | ------ |
@@ -88,13 +75,13 @@ flowchart LR
 | --------- | ------ |
 | `transport` | Base trait architecture, factory, `AnySender`, and the `parse_guard` JSON depth pre-check (`wide`) |
 | `transport-trace` | Above + W3C traceparent propagation (pulls `opentelemetry`) |
-| `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends -- each pulls only its own deps |
+| `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends -- each pulls its deps and no others |
 | `transport-kafka-config` | `transport::kafka`'s config and token types with no client: `KafkaConfig` and `validate`, the provider presets, `KafkaToken`, `PartitionLease` and the profile constants. Builds and links no librdkafka. `transport-kafka` includes it |
 | `transport-grpc-vector-compat` | Vector.dev wire-compat for a transform consumer |
 | `transport-all` | All six backends |
 
 Pick backends explicitly. `transport-all` is a convenience for tests. In
-production apps list only what you actually use.
+production apps list what you use.
 
 ### DLQ
 
@@ -124,7 +111,7 @@ production apps list only what you actually use.
 For full distributed tracing through Kafka/gRPC, enable
 `otel-tracing` + `transport-trace`. `transport-trace` alone writes a
 `traceparent` only while an OpenTelemetry span is active, which takes
-`otel-tracing` or the app's own tracer, and it exports no spans.
+`otel-tracing` or a tracer the app installs, and it exports no spans.
 
 ### Directory config
 
@@ -171,68 +158,19 @@ Some features pull in `*-sys` crates that link C libraries. The hyperi-ci releas
 | `spool` / `tiered-sink` | `zstd-sys` | -- (bundled source) | -- (statically linked) |
 | `secrets-aws` | `aws-lc-sys` | -- (compiled from source) | -- (statically linked) |
 
-The libgit2 package name carries the library version, so it differs per base release - the value above is for the default base. The build variables, the full table and the `NativeDepsContract` that wires this into generated artefacts are in [deployment/native-deps.md](deployment/native-deps.md).
+The libgit2 package name has the library version in it, so it differs per base release - the value above is for the default base. The build variables, the full table and the `NativeDepsContract` that wires this into generated artefacts are in [deployment/native-deps.md](deployment/native-deps.md).
 
 ---
 
 ## Recommended bundles
 
-### Tiny library or CLI tool
-
-```toml
-features = ["config", "logger"]
-```
-
-Defaults. No metrics endpoint, no transport, no worker pool.
-
-### Tooling-style CLI
-
-```toml
-features = ["cli", "config", "logger"]
-```
-
-Adds `clap` types but no service scaffolding.
-
-### Light service (HTTP only)
-
-```toml
-features = ["cli-service", "http-server", "transport-http"]
-```
-
-`cli-service` brings `metrics`, `memory`, `scaling`, `shutdown`,
-`governor`, `lifecycle`. Add an HTTP transport, and `sink-stack` if the
-service wraps its sender in the outbound control stack. It does
-not bring the worker pool: add `worker-pool` (or `worker-batch`) only
-if the service processes batches on it, and the runtime builds it.
-
-### Full data-plane service
-
-```toml
-features = [
-    "cli-service", "config-reload",
-    "transport-kafka", "transport-grpc",
-    "tiered-sink", "dlq-kafka", "spool",
-    "http-server",
-    "service-metrics",
-    "deployment", "version-check",
-    "expression",
-]
-```
-
-This is a receiver-style service: Kafka and gRPC transports, a tiered sink
-that spills to disk, a Kafka DLQ and an HTTP server. See
-[integration.md](integration.md) for the rationale.
-
-### Plus distributed tracing
-
-Add to any of the above:
-
-```toml
-features = ["otel-tracing", "transport-trace"]
-```
-
-`otel-tracing` exports spans and `transport-trace` propagates
-`traceparent` on the wire.
+| App | Features | What it gets |
+| --- | --- | --- |
+| Tiny library or CLI tool | `config`, `logger` (the defaults) | No metrics endpoint, no transport, no worker pool |
+| Tooling-style CLI | `cli`, `config`, `logger` | `clap` types, no service scaffolding |
+| Light service (HTTP only) | `cli-service`, `http-server`, `transport-http` | `cli-service` brings `metrics`, `memory`, `scaling`, `shutdown`, `governor` and `lifecycle`. Add `sink-stack` if the sender sits in the outbound control stack, and `worker-pool` or `worker-batch` if the service processes batches on the pool the runtime builds |
+| Full data-plane service | `cli-service`, `config-reload`, `transport-kafka`, `transport-grpc`, `tiered-sink`, `dlq-kafka`, `spool`, `http-server`, `service-metrics`, `deployment`, `version-check`, `expression` | A receiver-style service: Kafka and gRPC transports, a tiered sink that spills to disk, a Kafka DLQ and an HTTP server. [integration.md](integration.md) walks through it |
+| Plus distributed tracing | add `otel-tracing`, `transport-trace` to any of the above | `otel-tracing` exports spans and `transport-trace` propagates `traceparent` on the wire |
 
 ---
 
@@ -242,13 +180,13 @@ These are left out of `full` because they are diagnostic, smoke-test or specialt
 
 | Feature | Adds |
 | --------- | ------ |
-| `deployment-smoke` | Runs `docker build` + `docker run` on the generated Dockerfile as part of tests. Requires a Docker daemon |
+| `deployment-smoke` | Runs `docker build` + `docker run` on the generated Dockerfile as part of tests. Needs a Docker daemon |
 | `deployment-test-support` | Test helpers for consumer suites: tool probes, kind clusters, `assert_peak_memory` (a test's peak resident set fails over the contract's memory limit and warns over its request, read from `ResourcesContract`, so no test hard-codes a budget). `assert_peak_memory_of` judges a peak the caller measured, for a child process. With `transport` + `worker-batch` the delivery conformance harness ([deployment/conformance.md](deployment/conformance.md)). On Unix, `test_support::shared_service`: one container per backing service per test run, which the first nextest process creates and every other joins by name, removed by a watcher once the run's nextest process exits. Ports bind the daemon host's loopback, an ssh daemon gets an `ssh -L` tunnel per port, and a remote `tcp://` daemon is refused without `HYPERI_TEST_DOCKER_BIND`. Containers are named under `HYPERI_TEST_CONTAINER_PREFIX` (else `<repo>-test`) and labelled with their owner's host, PID namespace, pid and start time, so a create sweeps a dead owner's containers, and another host's only once their 4 h lease lapses. `start_alone` starts one a test holds by itself, `container_name` and `test_name!` name it, and `lookup` and `pets_allowed` read the `HYPERI_TEST_*` settings from the environment, the project `.env` and the file `HYPERI_TEST_ENV_FILE` names. Pulls `dotenvy` and `tempfile` |
 | `worker-msgpack` | MsgPack payload decoding in the `BatchEngine` parse stage (`rmpv`) |
 | `top` | The `ratatui` TUI metrics dashboard. Pulls `cli-service` |
 | `dangerous-diagnostics` | `dump_effective_unredacted()`, the effective config with no redaction, for one-off operator debugging. Off in every shipping build |
 | `transport-kafka-test-support` | Kafka fixtures for a consumer's tests, Unix only, in `scalo::transport::kafka::test_support`. It holds `KAFKA_IMAGE` (the one pinned `apache/kafka` image, as `image:tag@digest`), `kafka_tag()` for `testcontainers-modules`, `require_docker()` (skip without Docker locally, fail when `CI` is set), `shared_kafka(suite)`, the run's one PLAINTEXT broker through `shared_service`, `kafka_spec(host_port)` for a broker a test holds alone, and `TlsBroker`, a single-node broker with TLS, mTLS and SASL_SSL SCRAM-SHA-512 listeners and the certificates for them, driven through the docker CLI and named for the suite. Enable it on a dev-dependency. It pulls `transport-kafka`, `deployment-test-support`, `tempfile` and tokio's `process`, and needs a Docker daemon when the tests run |
-| `testcontainers` | Builds scalo's own real-broker tests, and with `secrets-vault` its OpenBao tests, which need a Docker daemon. Implies `transport-kafka-test-support`, which holds the image pin. They run on the run's shared broker and shared OpenBao, except a test that stops or pauses its broker, which holds one alone. nextest runs at most three of those at once, the `own-broker` test group in `.config/nextest.toml`. [tests/TESTING.md](../tests/TESTING.md) says which tests are core and which full |
+| `testcontainers` | Builds scalo's real-broker tests, and with `secrets-vault` its OpenBao tests, which need a Docker daemon. Implies `transport-kafka-test-support`, which holds the image pin. They run on the run's shared broker and shared OpenBao, except a test that stops or pauses its broker, which holds one alone. nextest runs at most three of those at once, the `own-broker` test group in `.config/nextest.toml`. [tests/TESTING.md](../tests/TESTING.md) says which tests are core and which full |
 
 ---
 
@@ -259,7 +197,7 @@ A handful of dependencies aren't visible from the feature name alone:
 - `config`, `directory-config` and `deployment` each pull `yaml`, so every
   YAML scalo reads or writes goes through `scalo::yaml`. No feature pulls
   `serde_yaml`, `serde_yaml_ng` or `unsafe-libyaml`, and figment is built
-  without its own `yaml` feature.
+  without its `yaml` feature.
 - `directory-config` turns on serde_json's `preserve_order`, so a table
   written back keeps its key order. Cargo unifies features, so every
   `serde_json::Map` in a build with `directory-config` keeps insertion order.
@@ -268,10 +206,10 @@ A handful of dependencies aren't visible from the feature name alone:
   metric-aware.
 - `parse_guard` -- `json_depth_within` and `MAX_PARSE_DEPTH`, the nesting-depth check to run before parsing untrusted JSON -- compiles with `transport`, `worker-batch`, `rules` or `dlq`, and each pulls `wide` for its SIMD byte compares. There is no feature for the guard alone.
 - `rules` pulls `strmatch`, so its regex crates come along even when no row uses the `regex` test, and `expression`, so `cel` comes too.
-- `tiered-sink` pulls `tokio`, `tokio-util` (its shutdown token) and the spill cache's own crates (`yaque`, `zstd`), not the `spool` feature: `TieredSink` keeps its own cache, and the standalone `Spool` type needs `spool`.
+- `tiered-sink` pulls `tokio`, `tokio-util` (its shutdown token) and the spill cache's crates (`yaque`, `zstd`), not the `spool` feature: `TieredSink` keeps a separate cache, and the standalone `Spool` type needs `spool`.
 - `spool` pulls `tokio`: `Spool::open` opens the queue on tokio's blocking
   pool, so it needs a tokio runtime.
-- `dlq` requires `concurrency` (for the `BackgroundSink` actor that
+- `dlq` needs `concurrency` (for the `BackgroundSink` actor that
   drains queued entries).
 
 Across the service stack:
@@ -292,7 +230,7 @@ Across the service stack:
 ## Verifying your feature set
 
 ```bash
-# What does my feature set actually pull in?
+# What does my feature set pull in?
 cargo tree --features "cli-service,transport-kafka,deployment"
 
 # Which transitive crates does each feature add?

@@ -25,16 +25,28 @@ Both take a `&[Record]` slice, chunk it at `max_chunk_size` (default
 
 ## Pipeline phases (mid-tier)
 
+`process_mid_tier` filters, parses and interns each record in turn, then runs the transform across the rayon pool.
+
 ```mermaid
 flowchart LR
-    R[Record slice] --> C{pre_route_filters listed?}
-    C -->|yes| F["Pre-route filter<br/>SIMD extract of the field each filter names"]
-    C -->|no| P
-    F --> P[Parse<br/>sonic_rs::from_slice]
-    P --> I[Intern known fields<br/>extract into HashMap]
-    I --> T[Parallel transform<br/>rayon par_iter_mut]
-    T --> O[Vec&lt;Result&lt;O, E&gt;&gt;]
+    accTitle: L4 Detail -- Batch engine stages
+    accDescr: For each chunk of records the engine runs the pre-route filters when any are listed, parses each payload by its format, JSON with sonic_rs or MsgPack with rmpv under worker-msgpack, interns the known fields, then runs the transform in parallel. The parse-error policy can skip a record or stop the batch.
+
+    prefilter["Pre-route<br/>filter"]
+    parse["Parse<br/>JSON or MsgPack"]
+    intern["Intern known<br/>fields"]
+    transform["Parallel<br/>transform"]
+    results(["Results"])
+
+    prefilter --> parse
+    parse --> intern
+    intern --> transform
+    transform --> results
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
+
+*Figure 1. L4 Detail -- Batch engine stages. The pre-route filter runs only when `pre_route_filters` lists one.* Up: [Pipeline](README.md).
 
 Each pre-route filter reads the field it names, and the first filter that matches decides. `routing_field` does not gate them. Filter-rejected messages are removed from the output. DLQ-routed and
 parse-error messages become `Err` entries, and
@@ -98,11 +110,11 @@ stopped at the token lost what the source had acknowledged.
 - Kafka, file and pipe sources report `Closed` as soon as they are
   closed, so the drain reads nothing more. Kafka re-delivers what was not
   committed after a restart.
-- A block the sink refuses transiently (`Backpressure`, `Timeout`) is
+- A block the sink rejects transiently (`Backpressure`, `Timeout`) is
   retried with the usual backoff for up to 10 s after the loop sees
   shutdown, whether the sink began refusing before shutdown or during the
   drain. A sink busy for a moment at shutdown therefore loses nothing.
-- A block the sink still refuses when those 10 s are up stays uncommitted,
+- A block the sink still rejects when those 10 s are up stays uncommitted,
   and the drain stops there, so nothing is committed past it. A sink call
   still in flight at that point is dropped the same way, so a hung sink
   cannot hold shutdown, and a held push block is released `Errored`. What the
@@ -120,7 +132,7 @@ flush comes after it. Source: [`driver.rs`](../../src/worker/engine/driver.rs).
 
 ## Delivery guarantee: the pipeline builder
 
-The run loops above commit a block once its sink returns. A push source (the gRPC server) has already answered its sender by then, so what it held in memory is lost on a crash. `BatchEngine::pipeline` is the run loop that holds each block's source acknowledgement until every piece built from the block is delivered, whatever the source.
+The run loops above commit a block once its sink returns. A push source (the gRPC server) has answered its sender by then, so what it held in memory is lost on a crash. `BatchEngine::pipeline` is the run loop that holds each block's source acknowledgement until every piece built from the block is delivered, whatever the source.
 
 ```rust
 engine
@@ -178,7 +190,7 @@ batch_processing:
     - event_type
 ```
 
-`max_chunk_size` also caps the records one pipeline receive takes, so `0` is refused at load with `ConfigError::InvalidValue`, and a service fails to start on it.
+`max_chunk_size` caps the records one pipeline receive takes, so `0` is refused at load with `ConfigError::InvalidValue`, and a service fails to start on it.
 
 Inbound braking under memory pressure is the self-regulation governor's
 job (the inbound gate plus the AIMD byte-budget lever), not a per-chunk

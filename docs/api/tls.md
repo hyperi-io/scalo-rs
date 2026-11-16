@@ -24,7 +24,7 @@ let tls = ServerTls::load_with(&config.tls, ServerTlsOptions::http()).await?;
 
 `load` uses the default options: the `Prod` profile and no ALPN. `ServerTlsOptions::http()` offers `h2` then `http/1.1`. `with_profile(CryptoProfile::HighSec)` serves TLS 1.3 with hybrid post-quantum key exchange only.
 
-Startup refuses, and nothing binds, when:
+Startup rejects, and nothing binds, when:
 
 - the certificate or key has no source, or one has both a file and a secret
 - `client_auth` is `optional` or `required` with no CA
@@ -74,7 +74,7 @@ tokio::spawn(async move {
 | `tls_handshake_failures_total` | `reason` (`error`, `timeout`) |
 | `tls_certificate_reloads_total` | `result` (`success`, `failure`) |
 
-A failed handshake also logs at debug and emits a `tls.event` security event with the peer address.
+A failed handshake logs at debug and emits a `tls.event` security event with the peer address.
 
 For axum, `scalo::http_server::TlsListener` wraps a `TcpListener` and a `ServerTls`, runs each handshake in its own task, and hands axum the finished streams. `HttpServer` uses it, see [http-server.md](http-server.md#tls).
 

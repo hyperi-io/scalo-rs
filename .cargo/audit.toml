@@ -6,12 +6,7 @@
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 
-# Empty on purpose. An ignore here suppresses a real advisory, so an entry
-# stays only while the crate it names is still in the graph.
-#
-# deny.toml carries the same [advisories] ignore list. Suppressing anything in
-# both files is how a live CVE gets silenced by accident, so put new entries in
-# deny.toml and leave this one empty.
+# Empty on purpose: advisory ignores live in deny.toml alone, so one file silences nothing by accident.
 
 [advisories]
 ignore = []

@@ -24,12 +24,7 @@ categories = ["asynchronous", "config", "network-programming", "concurrency", "d
 exclude = [".claude/", ".github/", "ci/", "ai/", "docs/", "examples/", "benches/", "scripts/", "charts/"]
 
 [package.metadata.docs.rs]
-# `all-features = true` triggers transport-kafka (needs librdkafka-dev),
-# directory-config-git (libgit2-dev), secrets-aws (aws-lc-sys cmake),
-# deployment-smoke (Docker daemon).
-# None of these are installed in the docs.rs sandbox. Enumerate the set
-# of features that builds without system libraries instead. When a new
-# pure-Rust feature lands, add it here.
+# docs.rs has no librdkafka, libgit2, cmake or Docker, so list the features that build without them.
 features = [
     "config", "config-reload", "logger", "yaml",
     "metrics-core", "metrics-process", "metrics", "service-metrics",
@@ -55,82 +50,41 @@ features = [
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-# Only [config, logger] by default. Consumers needing more list features
-# explicitly, which keeps most transitive deps off the config-only use case.
+# Feature tree and costs: docs/feature-flags.md.
 default = ["config", "logger"]
 
-# Core features
 health = []
 shutdown = ["tokio", "tokio-util", "tracing"]
 runtime = ["dirs"]
 config = ["figment", "dotenvy", "yaml", "serde_json", "dirs", "tracing"]
 
-# YAML parse and emit (src/yaml): scalo's parse options, per-profile budgets,
-# located errors and unknown-key reports. serde-saphyr parses in safe Rust, and
-# serde_ignored collects the keys a typed parse skipped.
 yaml = ["dep:serde-saphyr", "dep:serde_ignored", "serde_json"]
 logger = ["tracing", "tracing-subscriber", "owo-colors", "serde_json", "tracing-throttle"]
 
-# Three generic async primitives (BackgroundSink, PeriodicWorker, ActorHandle).
-# Foundational helpers for any module that does fire-and-forget durable
-# writes, timer-driven loops, or stateful command-queue actors. See
-# `src/concurrency/mod.rs` for the decision matrix.
+# docs/api/concurrency.md
 concurrency = ["tokio", "tokio-util", "tracing", "metrics-core"]
 strmatch = ["regex", "regex-automata", "regex-syntax", "aho-corasick", "memchr", "tracing", "metrics-core"]
 
-# Metrics tiers. Consumers pay only for what they use:
-# - metrics-core: emit-only (counter!/gauge!/histogram! macros work)
-# - metrics-process: + cgroup-aware process gauges
-# - metrics: + Prometheus scrape endpoint, OTLP metric push, OTLP span export
-#
-# Serving /metrics sends nothing to a collector, so composing the exporters
-# into `metrics` keeps a service from silently having no telemetry path out.
-# Opt out through config (`metrics.otel.enabled`, `otel_tracing.enabled`), not
-# by omitting a feature. `metrics-process` is the tier below for a consumer
-# that wants gauges without any exporter.
+# Tiers, and why `metrics` pulls the OTLP exporters: docs/core-pillars/metrics.md#feature-tiers.
 metrics-core = ["dep:metrics", "tracing"]
 metrics-process = ["metrics-core", "sysinfo"]
 metrics = ["metrics-process", "metrics-exporter-prometheus", "dep:crossbeam-epoch", "tokio", "serde_json", "otel-metrics", "otel-tracing"]
 
-# OpenTelemetry support (modern observability)
-# `otel` is the umbrella enabling all OTel SDK deps. `otel-metrics` exports
-# Prometheus + custom metrics through OTLP. `otel-tracing` bridges the
-# `tracing` ecosystem (`tracing::span!`, `#[instrument]`) to OTel spans
-# exported via OTLP -- closes the W3C distributed-tracing chain that the
-# transport-layer traceparent propagation alone can't complete.
-#
-# `metrics` enables `otel-metrics`, never the reverse: `otel-metrics` pulls
-# `metrics-process`, not `metrics`, because the other direction is a cargo
-# feature cycle. On its own it is the push-only build, no Prometheus exporter.
+# `metrics` enables `otel-metrics`, never the reverse: the other direction is a cargo feature cycle.
 otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing", "tracing-opentelemetry", "serde_json"]
 otel-metrics = ["otel", "metrics-process", "metrics-util", "metrics-exporter-opentelemetry", "opentelemetry_sdk/rt-tokio", "tokio", "dashmap"]
 otel-tracing = ["otel", "opentelemetry_sdk/rt-tokio", "tokio", "tracing-subscriber"]
 
-# Standard pipeline metric groups (opt-in).
 service-metrics = ["metrics"]
 
-# Directory config store (YAML directory-backed)
-# File locking uses std::fs::File::{lock,unlock} (stable since Rust 1.89).
-# Tables are serde_json values written back to disk, so serde_json keeps key
-# order (`preserve_order`) or a write would sort an operator's file.
+# `preserve_order` keeps an operator's file in key order when a table is written back.
 directory-config = ["yaml", "serde_json/preserve_order", "tokio", "tracing"]
 directory-config-git = ["directory-config", "git2"]
 
-# Extended features
-# `base64` carries the Basic-auth credential encoder in http_client::signer:
-# reqwest's own encoder is private and only reachable from a RequestBuilder,
-# and a signer runs against a built Request. `bytes` holds the request body
-# across retries, so an attempt clones a handle rather than the payload.
+# `base64` encodes Basic auth for the signer, and `bytes` holds the body across retries.
 http = ["reqwest", "serde_json", "dep:backon", "tokio", "base64", "bytes"]
 
-# Credential acquisition + placement. Sources cache and
-# renew one credential under single-flight. Placements are RequestSigner impls
-# that put it on a request through the shared HttpClient retry loop.
-#
-# `reqwest/query` is the query placement's encoder and `reqwest/form` the token
-# exchange's. Both are feature-gated in reqwest 0.13 so only this feature pays
-# for `serde_urlencoded`. No signing scheme is pulled in -- SigV4 and HMAC stay
-# with their consumers as impls of the trait.
+# reqwest gates its `query` and `form` encoders, so this feature alone pays for them. docs/api/auth.md
 auth = [
     "http",
     "serde_json",
@@ -144,136 +98,72 @@ http-server = ["axum", "tower", "tower-http", "tokio", "tracing"]
 spool = ["yaque", "zstd", "dep:crc32c", "chrono", "tokio"]
 tiered-sink = ["transport", "yaque", "zstd", "lz4_flex", "snap", "tokio", "tokio-util", "libc", "tracing", "dep:crc32c", "chrono"]
 
-# Outbound sink-control stack: composes timeout + load-shed + concurrency-limit
-# + retry/backoff + rate-limit around any transport sender via tower's
-# ServiceBuilder. Opt-in. Preserves at-least-once (whole-batch retry on
-# transient failure, never acks before the sink confirms). Circuit-breaking is
-# applied separately by the TieredSink's own breaker (no double-regulation).
+# docs/pipeline/sink-stack.md
 sink-stack = ["transport", "tower", "dep:backon", "governor", "tokio", "tracing"]
 
-# Cgroup-aware memory backpressure (OOM prevention)
 memory = ["sysinfo", "tracing"]
 
-# Unified self-regulation governor: one pressure level that combines a HARD
-# memory signal (never masked) with weighted SOFT signals under a
-# hysteresis latch. Additive, default-off. Depends on MemoryGuard, so it
-# implies `memory`. Pulls `tokio` for async waits, `parking_lot` for locks, and
-# the `gcra` crate (the `governor` token-bucket lib, renamed to avoid the
-# feature/crate name clash) for the rate limiter.
+# `gcra` is the `governor` crate, renamed so it does not clash with this feature. docs/self-regulation.md
 governor = ["memory", "tokio", "parking_lot", "dep:gcra"]
 
-# Scaling pressure calculation (KEDA autoscaling)
 scaling = ["parking_lot", "tracing"]
 
-# Adaptive worker pool tiers:
-# - worker-pool: just AdaptiveWorkerPool (rayon + tokio + sysinfo)
-# - worker-batch: + BatchEngine (sonic-rs SIMD JSON, dashmap interning, bytes)
-#   and the parse_guard depth pre-check (wide)
-# - worker: alias for worker-batch
+# docs/feature-flags.md#worker-pool
 worker-pool = ["rayon", "config", "metrics", "tokio", "tokio-util", "sysinfo", "parking_lot", "tracing"]
 worker-batch = ["worker-pool", "sonic-rs", "dashmap", "bytes", "dep:wide"]
 worker = ["worker-batch"]
 
-# Worker pool with msgpack batch serialisation support.
-# Uses `rmpv` (native schema-less MsgPack value): the engine parse path decodes
-# MsgPack in a single native decode -- no rmp_serde -> serde_json bridge.
 worker-msgpack = ["worker", "rmpv"]
 
-# CLI tiers:
-# - cli: bare clap types -- CommonArgs, StandardCommand, VersionInfo, CliError,
-#   output helpers. Useful for tooling-style CLIs that don't need a metrics
-#   server, worker pool, or memory guard.
-# - cli-service: + ServiceApp trait, run_app, ServiceRuntime (full service app
-#   scaffolding). Enables metrics, memory, scaling, shutdown, governor and
-#   lifecycle. No transport is included: add the transport-* backends the
-#   service moves data with, and sink-stack for
-#   ServiceRuntime::outbound_sink_stack. The adaptive worker pool is not
-#   included either: add worker-pool for the pool, or worker-batch for the
-#   pool plus the batch engine, and the runtime builds and wires it.
+# `cli-service` pulls no transport and no worker pool: docs/feature-flags.md#cli
 cli = ["clap", "tracing"]
 cli-service = ["cli", "metrics", "memory", "scaling", "shutdown", "governor", "lifecycle"]
 
-# Idle-until-configured gate: an app deployed before it has work starts, stays
-# Ready, opens no connections, and picks up the first config that gives it work.
-# Folded into cli-service so no consumer needs a Cargo edit to get it.
+# Folded into cli-service: docs/core-pillars/lifecycle.md
 lifecycle = ["config", "tokio", "tracing"]
-# TUI metrics dashboard (ratatui + crossterm via ratatui re-export)
 top = ["cli-service", "ratatui"]
 
-# Shared NDJSON file I/O (used by dlq + output-file)
 io = ["file-rotate", "parking_lot", "chrono", "tracing", "tokio"]
 
-# Dead letter queue (file backend always available). `wide` compiles parse_guard,
-# which caps the depth of an original filed under `_json`.
+# `wide` compiles parse_guard, which caps the depth of an original filed under `_json`.
 dlq = ["io", "concurrency", "base64", "serde_json", "serde_json/raw_value", "tokio", "tokio-util", "tracing", "dep:wide"]
 dlq-kafka = ["dlq", "transport-kafka"]
 dlq-http = ["dlq", "reqwest"]
 
-# File output sink (local NDJSON file output)
 output-file = ["io", "serde_json", "tracing"]
 
-# CEL expression evaluation
 expression = ["dep:cel", "serde_json"]
 
-# Ordered first-match rules that set target fields (src/rules): native tests or
-# CEL Fast conditions, literal / copy / bounded-lookup values, a per-call clamp,
-# hit counters. sonic-rs reads a JSON payload lazily behind the parse_guard
-# depth check (wide), and strmatch compiles the regex test.
+# docs/pipeline/rules.md
 rules = ["expression", "strmatch", "sonic-rs", "memchr", "serde_json", "dep:wide", "tracing"]
 
-# Deployment contract, Dockerfile and Compose generation, Dockerfile validation
 deployment = ["yaml", "serde_json"]
-# Smoke-test helper that runs `docker build` + `docker run` against a
-# generated Dockerfile. Requires Docker daemon at test time. Opt-in.
+# Needs a Docker daemon at test time.
 deployment-smoke = ["deployment"]
 
-# Public reusable test helpers (probes, skip emitter, kind cluster guard, the
-# shared backing-service owner) used by scalo's own tests AND by downstream
-# consumers' suites. See src/deployment/test_support.rs.
+# Test helpers for scalo's suites and its consumers': src/deployment/test_support.rs
 deployment-test-support = ["deployment", "dotenvy", "dep:tempfile"]
 
-# Real-broker tests against testcontainers. Needs a Docker daemon at test time;
-# CI's Test job builds with every feature, so it runs them.
+# Needs a Docker daemon. CI's Test job builds every feature, so it runs them.
 testcontainers = ["transport-kafka-test-support"]
 
-# Reflectable config schema + capability catalog. Derives a JSON
-# Schema of the app `Config` via schemars and carries a hand-authored capability
-# catalog the control plane reflects on to build per-endpoint CRUD forms. Also
-# derives the deployment contract's own JSON Schema (`contract_json_schema`).
-# Pure-Rust, opt-in. Implies `deployment` (the contract carries + emits both).
+# docs/reflectable-config-shape.md
 config-schema = ["dep:schemars", "serde_json", "deployment"]
 
-# Startup version check (calls a configured version API)
 version-check = ["reqwest", "tokio", "serde_json", "tracing", "chrono", "dirs", "uuid"]
 
-# GeoIP MMDB provisioning: resolve, freshness-check and download the databases
-# an enrichment stage reads. Provisioning only -- no lookup engine, no MMDB
-# reader. Rides the shared `http` HttpClient rather than a second HTTP stack;
-# `flate2` and `tar` are the archive formats the providers publish in.
-#
-# `reqwest/query` is enabled here rather than on `http` so the token-auth
-# provider can attach its credential through the request builder instead of a
-# formatted URL. Only this feature pays for `serde_urlencoded`.
+# `reqwest/query` sits here, not on `http`, so only this feature pays for `serde_urlencoded`.
 geoip-download = ["http", "reqwest/query", "dep:flate2", "dep:tar", "tokio", "chrono", "tracing"]
 
-# Config hot-reload (SharedConfig<T> + ConfigReloader<T>)
 config-reload = ["config", "parking_lot", "tokio", "tracing"]
 
-# Transport features:
-# - transport: bare transport abstraction
-# - transport-trace: + W3C traceparent propagation via opentelemetry
-# Apps that send/receive but don't propagate distributed-trace context
-# avoid pulling in the OpenTelemetry SDK.
 transport = ["tokio", "serde_json", "rmpv", "chrono", "regex", "memchr", "sonic-rs", "parking_lot", "tracing", "metrics-core", "bytes", "dep:wide"]
 transport-trace = ["transport", "dep:opentelemetry"]
 transport-memory = ["transport"]
-# Kafka config, provider and token types with no librdkafka: for an app that
-# reads or checks Kafka config without a client.
+# Kafka config and token types with no librdkafka.
 transport-kafka-config = ["transport"]
 transport-kafka = ["transport-kafka-config", "rdkafka", "regex", "tokio-util"]
-# Kafka test fixtures for consumer suites (`scalo::transport::kafka::test_support`):
-# the pinned broker image and a TLS / mTLS / SASL_SSL broker driven through the
-# docker CLI. Needs a Docker daemon at test time. Opt-in, for dev-dependencies.
+# Kafka fixtures for consumer test suites. Needs a Docker daemon at test time.
 transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
 transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util"]
 transport-grpc-vector-compat = ["transport-grpc"]
@@ -282,94 +172,61 @@ transport-pipe = ["transport"]
 transport-http = ["transport", "http"]
 transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http"]
 
-# Secrets management
 secrets = ["tokio", "tokio-util", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2"]
 secrets-vault = ["secrets", "vaultrs"]
 secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager"]
 secrets-all = ["secrets-vault", "secrets-aws"]
 
-# TLS (src/tls.rs). Client trust: native + webpki + extra-PEM roots, explicit
-# aws-lc-rs crypto provider. Server TLS (src/tls/server.rs): an acceptor whose
-# certificate reloads from a file or, with `secrets`, a secret spec.
-# tokio-rustls runs the handshake and arc-swap holds the certificate in service.
+# docs/api/tls.md
 tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:webpki-roots", "dep:tokio-rustls", "dep:arc-swap", "tokio", "tracing"]
 
-# Diagnostics escape hatches that can leak secrets if mis-used.
-# Off in every shipping build. NOT included in `full`. Operators
-# opt-in deliberately for one-off debugging.
+# Can leak secrets: not in `full`, off in every shipping build.
 dangerous-diagnostics = []
 
-# Full feature set
 full = ["config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "output-file", "expression", "rules", "tls", "geoip-download", "auth"]
 
 [dependencies]
-# Serialisation (always needed)
 serde = { version = ">=1.0.229, <2", features = ["derive"] }
 
-# Error handling
 thiserror = ">=2.0.21, <3"
 
-# Environment detection
 dirs = { version = ">=7.0.0, <8", optional = true }
 
-# Opt-in version-check instance id
 uuid = { version = ">=1.29.2, <2", features = ["v4", "v5"], optional = true }
 
-# Configuration. figment's own `yaml` feature is off: it parses through
-# serde_yaml and unsafe-libyaml, so YAML files reach the cascade through the
-# provider in src/config/yaml_file.rs instead. figment's last release is
-# 0.10.19 (2024-05-17), though its master branch is active.
+# figment's `yaml` feature is off: it parses through unsafe-libyaml, so YAML reaches the cascade through src/config/yaml_file.rs.
 figment = { version = ">=0.10.19, <0.11", features = ["toml", "json", "env"], optional = true }
 dotenvy = { version = ">=0.15.7, <0.16", optional = true }
 
-# YAML (`yaml` feature). serde-saphyr is pure safe Rust over granit-parser.
-# 2.1 refuses a null list, map or struct, a rule the `scalo::yaml` docs state.
+# Floor 2.1: it rejects a null list, map or struct, as the `scalo::yaml` docs say.
 serde-saphyr = { version = ">=2.1.0, <3", optional = true }
-# Reports the keys a typed parse skipped. MIT OR Apache-2.0. 0.1.14 released
-# 2025-09-14, repository pushed 2026-06-24.
 serde_ignored = { version = ">=0.1.14, <0.2", optional = true }
 
-# Concurrent hash map (field interning)
 dashmap = { version = ">=6.2.1, <7", optional = true }
 serde_json = { version = ">=1.0.154, <2", optional = true }
 
-# JSON Schema derivation (`config-schema` feature). `preserve_order` keeps
-# schema property order = struct declaration order, so emitted `config.schema.*` is byte-deterministic.
+# `preserve_order` keeps schema properties in declaration order, so `config.schema.*` is byte-deterministic.
 schemars = { version = ">=1.2.3, <2", default-features = false, features = ["std", "derive", "preserve_order"], optional = true }
 
-# Git operations (for directory-config-git)
 git2 = { version = ">=0.21.0, <0.22", optional = true }
 
-# CEL expression evaluation
-# The `cel` crate (formerly published as cel-interpreter).
 cel = { version = ">=0.14.5, <0.15", features = ["json"], optional = true }
 
-# CLI framework
 clap = { version = ">=4.6.7, <5", features = ["derive", "env"], optional = true }
 
-# Logging
 tracing = { version = ">=0.1.44, <0.2", optional = true }
 tracing-subscriber = { version = ">=0.3.23, <0.4", features = ["json", "env-filter", "fmt", "time"], optional = true }
 owo-colors = { version = ">=4.4.0, <5", optional = true }
 tracing-throttle = { version = ">=0.4.4, <0.5", default-features = false, optional = true }
 
-# OpenTelemetry (modern observability - OTLP native)
-# Held at 0.31: metrics-exporter-opentelemetry 0.2.1 requires opentelemetry
-# ^0.31, and the otel crates do not interoperate across a minor, so `otel-metrics`
-# cannot build against a newer SDK. The exporter's 0.2.2 (2026-11-02) moved to 0.33
-# in a patch release, so it is capped below 0.2.2 until the whole stack is bumped
-# together (scalo-rs#281).
-#
-# The hold keeps opentelemetry_sdk below 0.32.1, which fixes GHSA-w9wp-h8wv-79jx
-# (CVE-2026-48504, unbounded allocation in W3C Baggage propagation). Not reachable
-# here: scalo registers no text-map propagator and never touches Baggage - trace
-# context is carried by hand in src/transport/propagation.rs.
+# Held at 0.31, with metrics-exporter-opentelemetry below 0.2.2, which moved to 0.33: the otel crates
+# do not interoperate across a minor (scalo-rs#281). The hold keeps opentelemetry_sdk below the
+# GHSA-w9wp-h8wv-79jx fix, which nothing here reaches: scalo registers no text-map propagator.
 opentelemetry = { version = ">=0.31.0, <0.32", optional = true }
 opentelemetry_sdk = { version = ">=0.31.0, <0.32", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = ">=0.31.1, <0.32", features = ["grpc-tonic", "http-proto", "metrics", "logs"], optional = true }
 tracing-opentelemetry = { version = ">=0.32.1, <0.33", optional = true }
 
-# Metrics (Prometheus-native)
 metrics = { version = ">=0.24.6, <0.25", optional = true }
 metrics-exporter-prometheus = { version = ">=0.18.3, <0.19", default-features = false, optional = true }
 # Frees the histogram blocks the Prometheus upkeep drains (see metrics::run_upkeep).
@@ -378,180 +235,104 @@ metrics-util = { version = ">=0.20.4, <0.21", optional = true }
 metrics-exporter-opentelemetry = { version = ">=0.2.1, <0.2.2", optional = true }
 sysinfo = { version = ">=0.40.1, <0.41", optional = true }
 
-# Async runtime (for metrics server, http-server, shutdown)
 tokio = { version = ">=1.54.1, <2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-std", "io-util"], optional = true }
 tokio-util = { version = ">=0.7.20, <0.8", optional = true }
 
-# HTTP client, reqwest + rustls. Retry/backoff is the `backon` crate, the one
-# backoff lib across the codebase.
-# `default-features = false` drops the `default-tls` feature (which pulls
-# native-tls + openssl). The standard here is rustls everywhere -- `rustls-tls`
-# is enabled explicitly so the resulting client still talks HTTPS.
+# `default-features = false` drops native-tls and OpenSSL, and `rustls-tls` keeps HTTPS.
 reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["json", "rustls"], optional = true }
-# Retry/backoff (GCRA-style exponential + jitter + dynamic Retry-After adjust).
 backon = { version = ">=1.6.0, <2", optional = true }
 
-# Lock-free atomic Arc swap, holding the one cached credential the `auth`
-# sources hand out. The tier list puts read-mostly state that is swapped whole
-# on ArcSwap and rules out RwLock<Arc<T>>: a cache hit is then one atomic load
-# and a pointer clone, and never parks.
+# Holds the cached `auth` credential: a hit is one atomic load and never parks.
 arc-swap = { version = ">=1.9.4, <2", optional = true }
 
-# Unified TLS trust module (src/tls.rs, `tls` feature). All already present
-# transitively (reqwest/aws-smithy pull rustls 0.23 + aws-lc-rs). These are
-# direct optional deps so the module can build a ClientConfig with an EXPLICIT
-# aws-lc-rs provider (the graph has both aws-lc-rs AND ring, so there is no
-# unambiguous process-default provider).
-# `default-features = false` on rustls avoids pulling the `ring` provider in
-# addition to `aws_lc_rs`. pki-types `std` enables CertificateDer PEM file IO.
-# Never below 0.23.45: RUSTSEC-2026-0285 is patched there, and 0.23.40-0.23.44
-# accept TLS 1.3 handshake messages across an encryption-level boundary.
+# An explicit aws-lc-rs provider: the graph has both aws-lc-rs and ring, so there is no single process
+# default. `default-features = false` keeps ring out. Never below 0.23.45: RUSTSEC-2026-0285.
 rustls = { version = ">=0.23.46, <0.24", default-features = false, features = ["aws_lc_rs", "tls12", "logging", "std"], optional = true }
 rustls-native-certs = { version = ">=0.8.5, <0.9", optional = true }
 rustls-pki-types = { version = ">=1.15.1, <2", features = ["std"], optional = true }
 webpki-roots = { version = ">=1.0.11, <2", optional = true }
-# Server TLS handshakes on tokio streams. aws-lc-rs and tls12 come from the
-# rustls entry above, so no provider feature is enabled here.
+# The provider comes from the rustls entry above.
 tokio-rustls = { version = ">=0.26.6, <0.27", default-features = false, features = ["logging", "tls12"], optional = true }
 
-# HTTP server (axum)
 axum = { version = ">=0.8.9, <0.9", optional = true }
 tower = { version = ">=0.5.3, <0.6", features = ["limit", "timeout", "load-shed", "retry", "util"], optional = true }
 tower-http = { version = ">=0.7.1, <0.8", features = ["timeout", "trace", "limit"], optional = true }
 
-# Async (for transport)
 chrono = { version = ">=0.4.45, <0.5", optional = true }
 
-# Native schema-less MsgPack Value decode (transport codec + engine parse fast
-# path). The single decode the parse path uses -- no rmp_serde -> serde_json ->
-# sonic_rs bridge.
+# The one MsgPack decode the parse path uses, with no serde_json bridge.
 rmpv = { version = ">=1.3.1, <2", optional = true }
 
-# gRPC transport (tonic + prost)
-# tonic-prost is used by the generated code in build.rs (vector.rs ProstCodec),
-# not by hand-written source -- cargo-machete won't see it but it's required.
-# tls-aws-lc: client/server TLS on the aws-lc-rs backend (matches crate::tls's
-# explicit provider). tls-native-roots: ClientTlsConfig::with_native_roots().
+# tonic-prost is used by the code build.rs generates, which cargo-machete does not see.
+# `tls-aws-lc` matches crate::tls's explicit provider.
 tonic = { version = ">=0.14.9, <0.15", features = ["gzip", "tls-aws-lc", "tls-native-roots"], optional = true }
 tonic-prost = { version = ">=0.14.9, <0.15", optional = true }
 prost = { version = ">=0.14.4, <0.15", optional = true }
 prost-types = { version = ">=0.14.4, <0.15", optional = true }
-# TcpListenerStream -- lets GrpcTransport::new bind the listener synchronously
-# and serve_with_incoming_shutdown, so server readiness is guaranteed on return.
-# The `net` feature does not exist before 0.1.1, and tonic pins the real floor
-# higher again, so this must stay a three-component floor.
+# A three-component floor: `net` does not exist before 0.1.1.
 tokio-stream = { version = ">=0.1.19, <0.2", features = ["net"], optional = true }
-# The TCP connector tonic's channel is built on, handed to
-# Endpoint::connect_with_connector_lazy so the connect timeout covers the TLS
-# handshake too. Same crate and features tonic's `channel` feature already pulls.
+# Endpoint::connect_with_connector_lazy takes it, so the connect timeout covers the TLS handshake.
 hyper-util = { version = ">=0.1.21, <0.2", features = ["client-legacy", "tokio"], optional = true }
 
-# TUI dashboard (ratatui re-exports crossterm)
 ratatui = { version = ">=0.30.2, <0.32", optional = true }
 
-# File rotation (for DLQ file backend)
 file-rotate = { version = ">=0.8.0, <0.9", optional = true }
 
-# Filesystem stats (disk-aware capacity management for tiered-sink)
 libc = { version = ">=0.2.191, <0.3", optional = true }
 
-# Gzip + tar decode for the GeoIP database archives the providers publish
-# (`geoip-download`). flate2 is already in the graph via file-rotate. tar is
-# pure Rust over the already-present filetime/libc/xattr.
 flate2 = { version = ">=1.1.11, <2", optional = true }
 tar = { version = ">=0.4.46, <0.5", optional = true }
 
-# Spool (disk-backed async queue). yaque's last release is 0.6.6 (2023-11-04,
-# crates.io API checked 2026-09-25). `recovery` clears locks a killed process left.
+# `recovery` clears locks a killed process left.
 yaque = { version = ">=0.6.6, <0.7", optional = true, features = ["recovery"] }
 zstd = { version = ">=0.14.3, <0.15", optional = true }
-# Per-record spool integrity (hardware-accelerated CRC32C). Closes the
-# payload-integrity gap the queue's length-only header leaves open.
 crc32c = { version = ">=0.6.9, <0.7", optional = true }
 
-# TieredSink compression codecs
-# Never below 0.12.1: RUSTSEC-2026-0041 leaks uninitialised memory out of the
-# block decompressor up to 0.11.5 and in 0.12.0, and 0.12.1 is the lowest release
-# that no vulnerable range covers.
+# Never below 0.12.1: RUSTSEC-2026-0041.
 lz4_flex = { version = ">=0.14.0, <0.15", optional = true }
 snap = { version = ">=1.1.2, <2", optional = true }
 
-# SIMD JSON (BatchEngine -- 2-4x faster than serde_json)
 sonic-rs = { version = ">=0.5.10, <1", optional = true }
 
-# Safe SIMD byte compares for the parse_guard depth pre-check. The unsafe lives in
-# wide/safe_arch, since this crate denies unsafe_code.
+# The unsafe lives in wide/safe_arch, since this crate denies unsafe_code.
 wide = { version = ">=1.7.1, <2", optional = true }
 
-# Regex (topic resolver include/exclude filters, strmatch)
 regex = { version = ">=1.13.1, <2", optional = true }
 regex-automata = { version = ">=0.4.18, <0.5", optional = true }
 regex-syntax = { version = ">=0.8.11, <0.9", optional = true }
 aho-corasick = { version = ">=1.1.5, <2", optional = true }
 memchr = { version = ">=2.8.3, <3", optional = true }
 
-# Secrets management
 parking_lot = { version = ">=0.13.0, <0.14", optional = true }
 tempfile = { version = ">=3.27.0, <4", optional = true }
 
-# Token-bucket / GCRA rate limiter (governor crate). Imported as `gcra` to
-# avoid a name clash with scalo's own `governor` module/feature (the crate and
-# the feature would otherwise both be `governor`). Used by governor::rate_limit.
+# The `governor` crate, renamed so it does not clash with scalo's `governor` feature.
 gcra = { package = "governor", version = ">=0.10.4, <0.11", optional = true }
 
-# Data parallelism (CPU-bound work distribution for worker pool)
 rayon = { version = ">=1.12.0, <2", optional = true }
 base64 = { version = ">=0.23.1, <0.24", optional = true }
 
-# AEAD for at-rest encryption of the secrets disk cache. Gated by
-# the `secrets` feature. Consumers without it pay nothing. AES-256-
-# GCM picked because AES-NI gives sub-microsecond seal/open on
-# modern x86, and the RustCrypto AEAD traits are well-vetted +
-# FIPS-friendly. aes-gcm's default `getrandom` feature draws each nonce from
-# the OS. src/secrets/crypto.rs holds an envelope sealed by the 0.10 line, so
-# an upgrade that cannot open the caches on disk fails its tests.
+# src/secrets/crypto.rs holds an envelope sealed by the 0.10 line, so an upgrade that cannot open the disk caches fails its tests.
 aes-gcm = { version = ">=0.11.1, <0.12", optional = true }
 hkdf = { version = ">=0.13.0, <0.14", optional = true }
 sha2 = { version = ">=0.11.1, <0.12", optional = true }
 
-# Zero-copy byte buffers (BatchEngine)
-# Never below 1.11.1: RUSTSEC-2026-0007 patched there, and BytesMut::reserve
-# overflows below it, setting a capacity past the allocation.
+# Never below 1.11.1: RUSTSEC-2026-0007.
 bytes = { version = ">=1.12.1, <2", optional = true }
 
-# Vault/OpenBao (for secrets-vault)
 vaultrs = { version = ">=0.8, <0.9", optional = true }
 
-# AWS (for secrets-aws)
-# NOTE: aws-config and aws-sdk-* transitively pull in aws-lc-sys, which compiles
-# C/C++ and assembly. Amazon hardcode their own crypto lib into the SDK and offer
-# no way to opt out at compile time. Every other C dependency in this crate is
-# dynamically linked against system libs, but aws-lc-sys gets a free pass because
-# apparently the AWS SDK team think we all enjoy watching cmake run. ~20-30s on
-# first build, cached by sccache after that. Revisit when they offer a ring-only
-# build -- or when we find a reason to drop the AWS secrets backend entirely.
-# Default features disabled to skip the aws-sdk `rustls` feature, which is
-# confusingly named -- it actually enables `aws-smithy-runtime/tls-rustls` and
-# pulls in rustls 0.21 + rustls-webpki 0.101 (RUSTSEC-2026-0098, -0099, -0104).
-# `default-https-client` uses the modern aws-smithy-http-client/rustls-aws-lc
-# path with rustls 0.23 + rustls-webpki 0.103 -- that's what we want.
+# Default features off: the aws-sdk `rustls` feature pulls rustls 0.21 (RUSTSEC-2026-0098, -0099, -0104),
+# and `default-https-client` takes rustls 0.23.
 aws-config = { version = ">=1.13.0, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
-# Floor is 1.117, the first release to require aws-smithy-json 0.63.1: 0.63.0 does
-# not compile against the aws-smithy-types 1.7 Document::Object reshape (E0308).
+# Floor 1.117: the first release to need aws-smithy-json 0.63.1.
 aws-sdk-secretsmanager = { version = ">=1.125.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
-# Kafka transport: one optional `rdkafka` per target, both behind `transport-kafka`.
-# `dynamic-linking` and `cmake-build` must never both reach rdkafka-sys, so neither
-# entry moves into [dependencies].
-#
-# Not macOS: `dynamic-linking` finds librdkafka through pkg-config, which the release
-# build points at a static-only prefix (docs/deployment/native-deps.md) and a dev build
-# at the system librdkafka-dev. librdkafka's .pc brings zlib, so no libz-sys.
+# One `rdkafka` per target: `dynamic-linking` and `cmake-build` must never both reach rdkafka-sys.
+# docs/deployment/native-deps.md
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["dynamic-linking", "tokio"], optional = true }
 
-# macOS has no prefix: librdkafka, OpenSSL and zstd build from source and link
-# statically, with the prefix's SSL and zstd support. zlib is the system libz.
 [target.'cfg(target_os = "macos")'.dependencies]
 rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["cmake-build", "ssl-vendored", "zstd", "libz", "tokio"], optional = true }
 
@@ -572,32 +353,18 @@ pretty_assertions = ">=1.4.1, <2"
 temp-env = { version = ">=0.3.6, <0.4", features = ["async_closure"] }
 async-trait = ">=0.1.92, <0.2"
 git2 = ">=0.21.0, <0.22"
-# Generate self-signed certs in-process for the `tls` module's unit tests
-# (no checked-in PEM fixtures to rot).
 rcgen = ">=0.14.10, <0.15"
-# Typed MsgPack encode -- only used by tests to build msgpack fixtures. The
-# library parse path uses rmpv natively, so this is dev-only.
+# Builds msgpack test fixtures. The library decodes with rmpv.
 rmp-serde = ">=1.3.1, <2"
-# Property-based testing (concurrency-control invariants: finalizer worst-status
-# merge, etc.).
 proptest = ">=1.12.0, <2"
-# Real-broker fault-injection (NO mocks): spin a Kafka container and
-# stop/start it to drive the spill/circuit/drain + at-least-once paths. The
-# `#[ignore]`d integration tests need a Docker daemon (run on a Docker host).
+# The real-broker tests need a Docker daemon.
 testcontainers = ">=0.27.0, <0.28"
 testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["kafka"] }
-# Query Prometheus's own HTTP API in the scrape test, so the assertion is what
-# Prometheus stored rather than what scalo rendered. Declaration must match the
-# optional `http` dependency exactly -- two different reqwest builds in one
-# graph is an E0464 on the lib test target.
+# Must match the optional `http` reqwest exactly: two reqwest builds in one graph is E0464 on the lib test target.
 reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["json", "rustls"] }
-# Serves the signer and credential-exchange integration tests from a real
-# listener on an ephemeral port, so the assertions are what went over the wire.
-# Same declaration as the optional `http-server` dependency for the reason the
-# reqwest note above gives.
+# Same declaration as the optional `http-server` dependency, for the reason above.
 axum = ">=0.8.9, <0.9"
-# Validates the emitted contract against the committed contract JSON Schema, the
-# check a chart assembler outside Rust runs. Local refs only, so no HTTP resolver.
+# Local refs only, so no HTTP resolver.
 jsonschema = { version = ">=0.61.0, <0.62", default-features = false }
 
 [lints.rust]
@@ -634,7 +401,7 @@ name = "engine_benchmark"
 harness = false
 required-features = ["worker", "transport"]
 
-# scalo-side numbers for Vector baselining (docs/vector-baselining.md).
+# docs/vector-baselining.md
 [[bench]]
 name = "baseline"
 harness = false

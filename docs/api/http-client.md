@@ -46,7 +46,7 @@ transfer, say).
   capped at `max_retry_interval_ms`. The cap matters: a throttled
   downstream can legally advertise hours, and taking that whole parks
   the request inside the retry loop. It paces the attempts `max_retries`
-  already grants and never adds one, so a downstream answering 429 plus
+  grants and never adds one, so a downstream answering 429 plus
   the header on every attempt still ends the loop.
 - The last response returned once retries are exhausted, even a 5xx,
   so the caller can read the status and body rather than getting a
@@ -133,8 +133,8 @@ Redirects are not in the config: they are a property of what the client
 is for, so they are set where it is built.
 `HttpClient::with_redirect_policy(config, policy)` takes any
 `reqwest::redirect::Policy`, and `new(config)` is that with reqwest's
-default. reqwest strips `Authorization` on a cross-origin hop but carries
-the body, the query and any custom header across it, so a client whose
+default. reqwest strips `Authorization` on a cross-origin hop but can forward
+a custom credential header, so a client whose
 calls are signed with a provider's own header -- or with a query
 parameter -- should refuse the hop (`Policy::none()`) or allow only the
 same origin. The token exchanges in [auth.md](auth.md) build themselves

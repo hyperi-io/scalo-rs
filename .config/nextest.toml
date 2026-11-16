@@ -1,9 +1,4 @@
-# Core is the default selection: unit tests, the integration tests that need
-# no server, and one shared-instance test per heavy service with its main
-# cases (Kafka: e2e::kafka::test_kafka_send_receive_batch, OpenBao:
-# secrets_vault_resolve). Every other test that needs a real broker, OpenBao or
-# a docker build is full, which runs with `--run-ignored all
-# --ignore-default-filter`. tests/TESTING.md lists both.
+# Core and full test tiers: tests/TESTING.md
 [profile.default]
 default-filter = '''
 not (
@@ -22,9 +17,7 @@ not (
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-# Tests that start a broker of their own each wait on a cold JVM broker, so
-# no more than three run at once. Tests on the run's shared broker stay fully
-# parallel.
+# Tests that start their own broker wait on a cold JVM, so at most three run at once.
 [test-groups]
 own-broker = { max-threads = 3 }
 docker-build = { max-threads = 1 }

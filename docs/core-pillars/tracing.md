@@ -7,7 +7,7 @@ subscriber and `tracing::span!` / `#[instrument]` calls become OTel spans that
 ship to a collector (Tempo, Jaeger, Honeycomb, Grafana Cloud) with no further
 wiring.
 
-It also installs the resulting `SdkTracerProvider` as the **global** OTel tracer
+It installs the resulting `SdkTracerProvider` as the **global** OTel tracer
 provider. This matters: the transport propagation layer
 ([`transport::propagation`](../../src/transport/propagation.rs)) reads
 `opentelemetry::Context::current()` to format outgoing `traceparent` headers.
@@ -133,12 +133,12 @@ HTTP/protobuf optional. With no endpoint configured the default follows the
 protocol: `http://localhost:4318` once `protocol` or `OTEL_EXPORTER_OTLP_PROTOCOL`
 picks `http`. On the `http` protocol `endpoint` is a base URL, the
 way the OTel spec defines `OTEL_EXPORTER_OTLP_ENDPOINT`, and `/v1/traces` is
-appended to it. An endpoint that already ends in `/v1/traces` is used as given.
+appended to it. An endpoint that ends in `/v1/traces` is used as given.
 The batch processor coalesces spans every 5 seconds
 (`batch_scheduled_delay_ms`) with a 2 048-span queue (`batch_max_queue_size`).
 Tune both for high-volume services.
 
-The span resource carries the replica's identity, the same as the metrics
+The span resource has the replica's identity, the same as the metrics
 resource: see [metrics.md](metrics.md#otel-mode).
 
 If the collector is unreachable a backoff gate around the exporter suppresses

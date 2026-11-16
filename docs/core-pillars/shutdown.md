@@ -7,10 +7,10 @@ K8s pre-stop delay, then cancels the token. All tasks unblock together, drain
 in-flight work and exit. The process exits when `main` returns.
 
 The pre-stop delay keeps traffic off a pod that has stopped accepting work.
-Kubernetes takes a terminating pod out of Service endpoints itself, and kube-proxy
+Kubernetes takes a terminating pod out of Service endpoints, and kube-proxy
 picks that up some seconds later. Without the delay the pod drains while traffic
 still arrives. With it, the app keeps serving through that window, and only then
-does cancellation propagate. Nothing in the shutdown path changes `/readyz` --
+does cancellation reach the tasks. Nothing in the shutdown path changes `/readyz` --
 see [health.md](health.md).
 
 `ServiceRuntime` from `cli` calls `install_signal_handler` and hands the token to
@@ -29,14 +29,28 @@ on `token.cancelled()` in every loop.
 Tune `PRESTOP_DELAY_SECS` via a K8s `Deployment` env entry to match the cluster's
 kube-proxy endpoint-sync latency. 5 seconds is the safe default.
 
-The delay runs *before* token cancellation:
+The handler sleeps the pre-stop delay before it cancels the token, so the pod serves through the endpoint-removal window and drains after it.
 
 ```mermaid
-flowchart TB
-    A["SIGTERM received"] --> B["Sleep PRESTOP_DELAY_SECS<br/>K8s removes the terminating pod from endpoints; in-flight requests drain"]
-    B --> C["Cancel CancellationToken<br/>every select! arm fires; modules drain"]
-    C --> D["main returns<br/>process exits"]
+flowchart LR
+    accTitle: L4 Detail -- Shutdown sequence
+    accDescr: On SIGTERM or SIGINT the handler sleeps for the pre-stop delay, counts the eviction on Kubernetes, then cancels the shared token. Application tasks watch the token, finish and return, and then main returns.
+
+    signal(["SIGTERM<br/>or SIGINT"])
+    sleep["Sleep<br/>pre-stop delay"]
+    count["Count the<br/>eviction"]
+    cancel["Cancel the<br/>token"]
+    exit(["main<br/>returns"])
+
+    signal --> sleep
+    sleep --> count
+    count --> cancel
+    cancel --> exit
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
+
+*Figure 1. L4 Detail -- Shutdown sequence. The handler does the three steps after the signal, and the app's tasks end the process.* Up: [Core pillars](README.md).
 
 The shutdown module does signal + delay + cancel and nothing else. Nothing in
 the shutdown path touches readiness, so `/readyz` answers from the readiness
@@ -102,24 +116,13 @@ Each tokio method states its cancel safety in its own docs under "Cancel safety"
 
 ---
 
-## Triggering shutdown programmatically
-
-For tests, integration drivers, or an internal watchdog:
-
-```rust
-scalo::shutdown::trigger();        // cancel global token; idempotent
-scalo::shutdown::is_shutdown();    // check state without awaiting
-```
-
----
-
 ## API surface
 
 | Item | Purpose |
 | --- | --- |
 | `shutdown::install_signal_handler() -> CancellationToken` | Installs the SIGTERM/SIGINT handler, spawns the wait task and returns the global token |
 | `shutdown::token() -> CancellationToken` | Clone the global token (created lazily if no handler installed) |
-| `shutdown::trigger()` | Cancel the global token |
+| `shutdown::trigger()` | Cancel the global token, idempotent: for tests, integration drivers or an internal watchdog |
 | `shutdown::is_shutdown() -> bool` | Check cancellation state without awaiting |
 | `CancellationToken::cancelled().await` | The await point every module loop uses |
 | `CancellationToken::child_token()` | Scoped cancellation not affecting the parent |

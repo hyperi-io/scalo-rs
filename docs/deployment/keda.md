@@ -47,7 +47,7 @@ when there's nothing to do, KEDA spins them back up when lag exceeds
 scaler cannot wake a workload from zero on its own, so a contract with
 the Kafka trigger off and `min_replicas: 0` is refused with
 `InvalidContract` on `keda.min_replicas` by `validate()`, and the chart
-refuses to render the same combination when values set it.
+will not render the same combination when values set it.
 
 `enabled` comes across from `KedaConfig::enabled`. Off renders exactly
 what `keda: None` does -- no ScaledObject -- so either way of saying it
@@ -77,14 +77,14 @@ let keda = KedaContract::from_config(&cfg)
 `KafkaLagTrigger::under(base)` reads `base.brokers`, `base.group_id` and
 `base.topics`. The chart reads each path against the config the app ends
 up running -- the contract's `default_config`, then `config`, then
-`configOverrides` -- and refuses to render when one has no value. Set it,
+`configOverrides` -- and will not render when one has no value. Set it,
 or turn the trigger off for that deployment with `keda.kafka.enabled: false`.
 
 `KafkaLagTrigger::disabled()` is for an app that does not consume from
-Kafka. The ScaledObject then carries only the CPU trigger. Turning off
+Kafka. The ScaledObject then has only the CPU trigger. Turning off
 the Kafka trigger AND `cpu_enabled` is an error -- KEDA would have
-nothing to scale on, so `validate()` refuses the contract and the chart
-refuses a ScaledObject with no trigger. Use `keda: None` for that. So is
+nothing to scale on, so `validate()` rejects the contract and the chart
+rejects a ScaledObject with no trigger. Use `keda: None` for that. So is
 the Kafka trigger off with `min_replicas: 0`, since CPU alone cannot
 scale from zero.
 
@@ -94,7 +94,7 @@ return.
 
 `DeploymentContract::unresolved_values_paths()` lists every trigger path
 that `default_config` does not set (or sets to null). Each one is a path
-every deployment has to set in values, or the chart refuses to render, so
+every deployment has to set in values, or the chart will not render, so
 assert the list is empty in a test.
 
 ---
@@ -157,7 +157,7 @@ grows the pool. Both must subside to shrink.
 
 The chart renders a TriggerAuthentication named `<fullname>-trigger-auth`
 only when `keda.triggerAuthentication.secretTargetRef` is set, and the
-Kafka trigger then references it. The trigger carries no `sasl` or `tls`:
+Kafka trigger then references it. The trigger has no `sasl` or `tls`:
 KEDA's Kafka scaler takes both as authentication parameters, so the
 operator sets them in that `secretTargetRef` beside the credentials, to
 match the listener. With neither set KEDA uses no SASL and no TLS.

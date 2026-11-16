@@ -2,15 +2,32 @@
 
 `scalo::rules` (feature `rules`) sets target fields on a record from an ordered rule set. For each target in the order the set lists them, the first row in declared order that matches the record and resolves a value sets it. A row tests the record with a native test or a CEL Fast condition, and takes its value as a literal, a copy of a field, or a field mapped through a bounded lookup table.
 
+Targets are set in their listed order, each by its first matching row, and a clamp then checks the clamped target's final value against an allowed set.
+
 ```mermaid
 flowchart LR
-    R[record] --> T1["target 1 rows, in order"]
-    T1 -->|first match sets target 1| T2["target 2 rows, in order"]
-    T2 -->|first match sets target 2| C{clamp?}
-    C -->|value outside the allowed set| D[default, counted]
-    C -->|inside| O[outcome]
-    D --> O
+    accTitle: L4 Detail -- Rule evaluation
+    accDescr: A record is evaluated target by target in the listed order, and the first matching row in declared order sets each target. With a clamp, the clamped target's final value is kept when it is in the allowed set and replaced by the default, and counted, when it is not.
+
+    record(["Record"])
+    target_1["Target 1<br/>first match"]
+    target_2["Target 2<br/>first match"]
+    clamp{"Value<br/>allowed?"}
+    kept(["Value kept"])
+    defaulted(["Default set,<br/>counted"])
+
+    record --> target_1
+    target_1 --> target_2
+    target_2 --> clamp
+    clamp -->|yes| kept
+    clamp -->|no| defaulted
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    class clamp decision
 ```
+
+*Figure 1. L4 Detail -- Rule evaluation. The clamp step runs only for `evaluate_clamped`.* Up: [Pipeline](README.md).
 
 ---
 
@@ -106,7 +123,7 @@ let set = RuleSet::compile_with(&config, &options)?;  // explicit
 let findings = RuleSet::check(&config, &options);     // never fails
 ```
 
-One pass reports every finding, so an editor shows them all at once. A `RuleDiagnostic` carries:
+One pass reports every finding, so an editor shows them all at once. A `RuleDiagnostic` has:
 
 | Field | Holds |
 | --- | --- |
@@ -116,7 +133,7 @@ One pass reports every finding, so an editor shows them all at once. A `RuleDiag
 | `message` | What is wrong |
 | `span` | For `when`, the byte range in the condition: the function name the profile scanner refused, or the character the parser stopped at |
 
-Warnings are reported once the set has no errors. Errors: a duplicate or malformed id, a row setting zero or several targets or one the set does not list, `match` beside `when`, a missing or stray operand, `regex` with the profile off, a pattern that does not compile, a lookup naming no table, an empty literal, a table over its bound, a CEL condition the profile refuses or that does not parse. Warnings: a row an earlier row of the same target always fires before, because the earlier row sets a literal and is unconditional, has the same test, or is a plain `exists` on the field the later row needs. `RuleSet::warnings()` keeps the warnings of a compiled set.
+Warnings are reported once the set has no errors. Errors: a duplicate or malformed id, a row setting zero or several targets or one the set does not list, `match` beside `when`, a missing or stray operand, `regex` with the profile off, a pattern that does not compile, a lookup naming no table, an empty literal, a table over its bound, a CEL condition the profile rejects or that does not parse. Warnings: a row an earlier row of the same target always fires before, because the earlier row sets a literal and is unconditional, has the same test, or is a plain `exists` on the field the later row needs. `RuleSet::warnings()` keeps the warnings of a compiled set.
 
 `tests/fixtures/rules_corpus.json` pins findings, spans and outcomes, and is the parity fixture a scalo-py implementation is tested against.
 
@@ -139,7 +156,7 @@ for (field, assignment) in outcome.iter() {
 }
 ```
 
-A record is anything that implements `FieldSource`. `JsonPayload` reads raw JSON bytes lazily with sonic-rs and builds no DOM, after the `parse_guard` depth check (`JsonPayload::trusted` skips it for bytes already checked). `serde_json::Value` implements it for a parsed record. An outcome borrows from the set and the record and holds at most `MAX_TARGETS` assignments inline. Native rows over `JsonPayload` allocate only to copy a string that holds escapes. A `serde_json::Value` number is formatted to text, and a CEL condition allocates the values it reads.
+A record is anything that implements `FieldSource`. `JsonPayload` reads raw JSON bytes lazily with sonic-rs and builds no DOM, after the `parse_guard` depth check (`JsonPayload::trusted` skips it for bytes checked). `serde_json::Value` implements it for a parsed record. An outcome borrows from the set and the record and holds at most `MAX_TARGETS` assignments inline. Native rows over `JsonPayload` allocate only to copy a string that holds escapes. A `serde_json::Value` number is formatted to text, and a CEL condition allocates the values it reads.
 
 | Outcome | Holds |
 | --- | --- |

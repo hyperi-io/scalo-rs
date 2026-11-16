@@ -4,7 +4,7 @@ This walks through wiring `scalo` into a new data-plane service from
 empty `Cargo.toml` to running binary. The goal is a self-contained recipe,
 and the details for each line live in the subsystem docs.
 
-If you already know what a `ServiceApp` is and just want the trait signature,
+If you know what a `ServiceApp` is and just want the trait signature,
 jump to [cli/app.rs](../src/cli/app.rs).
 
 ---
@@ -45,7 +45,7 @@ features = [
 
 `cli-service` is doing most of the work -- see
 [feature-flags.md](feature-flags.md#cli) for what it pulls in
-transitively. The code below also needs `clap` (derive), `serde` (derive)
+transitively. The code below needs `clap` (derive), `serde` (derive)
 and `tokio` (macros and the multi-thread runtime) in the app's own
 dependencies.
 
@@ -196,7 +196,7 @@ Notes on the trait surface:
 - `load_config` is yours to define -- typically one call into
   `config::load_typed`, which reads the `--config` file (or the cascade
   without one), logs the keys `LoaderConfig` does not take, and applies the
-  env overrides. `run_app` has already set up the cascade from `--config`, so
+  env overrides. `run_app` has set up the cascade from `--config`, so
   `load_config` needs no `config::setup` of its own. A `load_config` that
   calls it and treats `ConfigError::AlreadyInitialised` as an error fails.
 - `run_service` is where the actual work lives. Everything else is

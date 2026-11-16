@@ -32,7 +32,7 @@ answers 200, nothing can tell you which spelling a given service actually
 intends -- a chart probing a name the app no longer means keeps passing, so a
 half-finished migration is indistinguishable from a finished one.
 
-Earlier versions also answered `/healthz`, `/startupz` and
+Earlier versions answered `/healthz`, `/startupz` and
 `/health/{live,ready,startup}`. A chart probing one spelling and an app meaning
 another kept passing, so the drift stayed invisible until a service that did not
 serve every alias went live with a probe that 404'd.
@@ -46,7 +46,7 @@ in later.
 Readiness is the registry AND the callback set with
 `mgr.set_readiness_check`. No callback counts as ready, and without the
 `health` feature there is no registry half, so a bare `MetricsManager`
-answers 200. A service built by `run_app` also answers 503 `starting`
+answers 200. A service built by `run_app` answers 503 `starting`
 until it hands control to the app, see
 [service-runtime.md](../runtime/service-runtime.md#readiness-check).
 

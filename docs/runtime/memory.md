@@ -85,7 +85,7 @@ a reading is approximate below that interval anyway.
 
 Bytes admitted since that reading and not yet released are added to it, so a burst inside one window is charged against the limit instead of against a reading that predates it. A fresh sample restarts the ledger, marked before the file is read, so an admission racing the sample is double-counted rather than dropped.
 
-A release names no lease, so it discharges the oldest charges first. A lease taken before a sample and released after it spends bytes the fresh reading already counts, never a charge made since. While an older lease is outstanding, a newer one's release is spent on it: the ledger over-counts by at most what was outstanding at the sample, until that lease ends or the next sample. A release never discharges more than is outstanding, so a double release leaves no credit behind.
+A release names no lease, so it discharges the oldest charges first. A lease taken before a sample and released after it spends bytes the fresh reading counts, never a charge made since. While an older lease is outstanding, a newer one's release is spent on it: the ledger over-counts by at most what was outstanding at the sample, until that lease ends or the next sample. A release never discharges more than is outstanding, so a double release leaves no credit behind.
 
 `current_bytes()` is that estimate -- what the kernel charges, plus what
 has been admitted against the current reading. `reserved_bytes()` is the
@@ -124,7 +124,7 @@ scalo picks no allocator. The binary does, and jemalloc is the usual pick for a 
 
 The guard does not read the allocator. In a container it reads the kernel's `memory.current`, which counts every page the process holds, arenas the allocator keeps after a free included. An allocator figure such as jemalloc's `stats.allocated` is read only when the binary registers it with `set_heap_source`, and the guard then takes the larger of it and the kernel figure.
 
-Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project carries it on as `tikv-jemallocator`, from the same repo: <https://github.com/tikv/jemallocator>. So `tikv-` is the maintained line, not a side fork.
+Why the `tikv-` names? The original `jemallocator` crate stopped at 0.5.4 on 2023-07-27. The TiKV project maintains it as `tikv-jemallocator`, from the same repo: <https://github.com/tikv/jemallocator>. So `tikv-` is the maintained line, not a side fork.
 
 Three crates, three jobs:
 
@@ -197,7 +197,7 @@ Self-regulation (the `governor` feature) is ON by default. Opt out via
 `self_regulation.enabled = false`, after which nothing is constructed
 and the data path is byte-identical to pre-governor. It consumes the
 guard's pressure to drive the inbound brake and an AIMD byte budget.
-Memory the process already holds can keep the ratio above the brake's
+Memory the process holds can keep the ratio above the brake's
 release point with nothing coming in, so one hold lasts at most
 `self_regulation.max_hold_secs` (default 30). Its metrics are namespaced
 `self_regulation_*`. See SELF-REGULATION.
@@ -235,11 +235,11 @@ Env vars:
 
 | Item | Purpose |
 | ------ | --------- |
-| `memory::set_heap_source(fn() -> usize) -> bool` | Read an allocator figure beside the detected source, the larger winning (set-once, returns false if already set) |
+| `memory::set_heap_source(fn() -> usize) -> bool` | Read an allocator figure beside the detected source, the larger winning (set-once, returns false if set) |
 | `MemoryGuard::new(config)` | Construct. Detects the usage source, and the limit if `limit_bytes == 0` |
 | `MemoryGuard::with_usage_source(config, source)` | Construct reading usage from a pinned `UsageSource` |
 | `MemoryGuard::try_reserve(n) -> bool` | Projected-admission check against current usage |
-| `MemoryGuard::add_bytes(n)` | Unchecked lease tracking -- data already accepted |
+| `MemoryGuard::add_bytes(n)` | Unchecked lease tracking -- data accepted |
 | `MemoryGuard::release(n)` | Saturating subtract on the reservation counter, oldest-first discharge of the ledger, so a release across a re-sample never erases a later charge |
 | `MemoryGuard::under_pressure() -> bool` | Hot-path probe |
 | `MemoryGuard::pressure() -> MemoryPressure` | Three-level enum for logs/labels |

@@ -33,7 +33,7 @@ The fallback ladder, per database:
 
 Each download is held to `auto_download.max_database_bytes` (default 512 MiB) twice: the transferred body, and the database decompressed from it. A transfer past it is abandoned, so a decompression bomb cannot fill the disk.
 
-The database is then read as an MMDB before it replaces the local copy: the metadata marker in its last 128 KiB, `binary_format_major_version` 2, a `record_size` of 24, 28 or 32, an `ip_version` of 4 or 6, a `database_type`, and a search tree that fits in front of the metadata. That refuses an error page served with a 200, a truncated transfer and a file in another format. A refused file is deleted and the local copy kept.
+The database is then read as an MMDB before it replaces the local copy: the metadata marker in its last 128 KiB, `binary_format_major_version` 2, a `record_size` of 24, 28 or 32, an `ip_version` of 4 or 6, a `database_type`, and a search tree that fits in front of the metadata. That rejects an error page served with a 200, a truncated transfer and a file in another format. A refused file is deleted and the local copy kept.
 
 Neither check proves the bytes are the provider's, and no checksum is compared. DB-IP publishes an MD5 and a SHA-1 of the decompressed file on its download page only, with no SHA-256. TLS to the provider is the authenticity check.
 

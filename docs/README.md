@@ -5,7 +5,7 @@ Shared Rust library for data-plane services. A service built on `run_app` gets t
 This is the index. Read [architecture.md](architecture.md) for the
 10,000-foot view of how the modules fit together, [integration.md](integration.md)
 for a recipe walkthrough on building a data-plane service, [auto-wiring.md](auto-wiring.md)
-for the "you-get-this-for-free" model, and [feature-flags.md](feature-flags.md)
+for what is wired in for you, and [feature-flags.md](feature-flags.md)
 for how features cascade into one another.
 
 ---
@@ -20,6 +20,9 @@ for how features cascade into one another.
 | `run_app(app)` | All of the above + memory guard + scaling pressure + shutdown token + K8s pre-stop delay + runtime context, and the worker pool and batch engine when `worker-pool` or `worker-batch` is on. It builds the `ServiceRuntime` and hands it to `run_service` | Glue them together manually |
 | Any `Transport` impl | 3-tier filter engine, DLQ routing, per-direction/action metrics, W3C traceparent propagation | Add filters, wire DLQ, instrument send/recv |
 | `TieredSink::new(...)` | Transport + disk-spillover spool + circuit breaker + background drain + backpressure signal (`SpoolFull` for the caller to route, usually to the DLQ) | Compose those primitives by hand |
+| `BatchEngine::process_mid_tier()` | SIMD JSON parse, pre-route filter, field interning, parallel transform on the worker pool | Write a parse loop and a thread pool |
+| `DeploymentContract { ... }` | Dockerfile, container manifest, OCI labels, and the contract JSON the scalo-service chart renders the Kubernetes objects from | Hand-write a Dockerfile and chart values |
+| `HealthRegistry::register("module", ...)` | The module's status in the aggregate `/readyz` decision. The answer body is status only | Aggregate readiness by hand |
 
 That's the value proposition. Everything else in these docs is "and here's
 how the pieces work".
@@ -28,58 +31,42 @@ how the pieces work".
 
 ## 10,000-foot view
 
+`run_app` builds a `ServiceRuntime` that wires the core pillars, self-regulation and the batch pipeline, and the deployment contract writes the artefacts the scalo-service chart renders.
+
 ```mermaid
-flowchart TB
-    subgraph App["data-plane app"]
-        Cfg["ServiceApp"] --> SR["run_app() builds ServiceRuntime"]
-    end
+flowchart LR
+    accTitle: L3 Components -- scalo
+    accDescr: An app hands itself to run_app, which builds the ServiceRuntime, and fills in a deployment contract. The runtime wires the core pillars, self-regulation and the pipeline, and the pipeline sends through the transports. The contract writes the Dockerfile and contract JSON that the scalo-service chart renders.
 
-    subgraph Pillars["Core pillars (auto-wired)"]
-        Config
-        Logger
-        Metrics
-        OTel
-        Health
-        Shutdown
-    end
+    app["Your ServiceApp"]
+    runtime[["ServiceRuntime"]]
+    contract[["Deployment<br/>contract"]]
+    pillars["Core pillars"]
+    regulation[["Self-regulation"]]
+    pipeline[["Pipeline"]]
+    artefacts[("Dockerfile and<br/>contract JSON")]
+    transports[["Transports"]]
+    chart["scalo-service<br/>chart"]
 
-    subgraph Runtime["Runtime"]
-        RC["RuntimeContext (K8s/Docker/container/bare metal)"]
-        MG["MemoryGuard"]
-        SP["ScalingPressure"]
-        WP["AdaptiveWorkerPool"]
-        BE["BatchEngine"]
-    end
+    app --> runtime
+    app --> contract
+    runtime --> pillars
+    runtime --> regulation
+    runtime --> pipeline
+    contract --> artefacts
+    pipeline --> transports
+    artefacts --> chart
 
-    subgraph Pipeline["Pipeline"]
-        T["Transport (Kafka/gRPC/HTTP/...)"]
-        TF["TransportFilterEngine"]
-        TS["TieredSink"]
-        SPL["Spool"]
-        DLQ
-    end
-
-    subgraph Deploy["Deployment artefacts"]
-        DC["DeploymentContract"]
-        DF["Dockerfile"]
-        CJ["deployment-contract.json"]
-        CH["scalo-service chart"]
-    end
-
-    SR --> Pillars
-    SR --> Runtime
-    Pipeline --> Pillars
-    TF -.-> T
-    TS --> T
-    TS --> SPL
-    TS --> DLQ
-    DC --> DF
-    DC --> CJ
-    CJ --> CH
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef store fill:#DDF3EC,stroke:#00785A,stroke-width:1px,color:#0B3327
+    classDef ext fill:#EEF0F2,stroke:#6B7280,stroke-width:1px,stroke-dasharray:4 3,color:#1F2937
+    class app ext
+    class artefacts store
 ```
 
-Solid arrows are runtime data/control flow. Dashed arrows mark embedded
-sub-components (filter engine lives inside every transport).
+*Figure 1. L3 Components -- scalo. The dashed box is the app built on scalo.* Up: top of scalo-rs. Down: [L4 Detail -- Module layers](architecture.md), [L4 Detail -- Service lifecycle](runtime/service-runtime.md), [L4 Detail -- Self-regulation loop](self-regulation.md), [L4 Detail -- Pipeline stages](pipeline/README.md), [L4 Detail -- Transport traits](transport/README.md), [L4 Detail -- Contract to chart](deployment/contract.md).
+
+The runtime builds the worker pool and batch engine only when `worker-pool` or `worker-batch` is on. Transports, the tiered sink and the DLQ are built by the app in `run_service`.
 
 ---
 

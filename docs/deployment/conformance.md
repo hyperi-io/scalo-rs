@@ -35,7 +35,7 @@ Each fault is keyed on the middle marker, so it lands at the same point however 
 | --- | --- |
 | `GracefulStop` | shutdown fires while that send is in flight, and the send then completes |
 | `KillMidBatch` | the pipeline task is aborted while that send is in flight |
-| `DownstreamRefusing` | the sink refuses that send and every send for 300 ms after it |
+| `DownstreamRefusing` | the sink rejects that send and every send for 300 ms after it |
 | `RejectMidStream` | the sink rejects that record for good, after the records before it landed, until the restart |
 | `TwoInstances` | two instances share the source, and the one holding that send is killed while the others take over |
 

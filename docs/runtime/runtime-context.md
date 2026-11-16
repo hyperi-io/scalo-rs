@@ -35,7 +35,7 @@ isn't K8s, Docker, or a generic container is bare metal.
 | `BareMetal` | none of the above |
 
 Detection priority runs highest-confidence first -- a K8s pod is
-also a container, but you want to know it's K8s.
+a container, but you want to know it's K8s.
 
 Only evidence from inside the container counts. A docker host is `BareMetal`: its mountinfo lists the containers' overlay and netns mounts on non-root paths, and its own daemon cgroup (`docker.service`) names no container. Host directories such as `/cache` or `/data` count for nothing either. An env var set to an empty value counts as unset.
 
@@ -99,13 +99,13 @@ duplicated cgroup file reads.
 
 A variable that is empty or only whitespace counts as unset, so `APP_ENV=""` beside `ENVIRONMENT=production` resolves to `production`. A padded value resolves to the name inside it: `" production"` and `"production\n"` are `production`.
 
-The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md](../core-pillars/config.md). It is also the `deployment.environment.name` attribute on OTel metrics (`otel-metrics`).
+The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md](../core-pillars/config.md). It is the `deployment.environment.name` attribute on OTel metrics (`otel-metrics`).
 
 `is_production()` is true when that name is `production` or `prod`, in any letter case. Every other value, `staging` and `production-eu` included, is not production. It gates these refusals, each of which fails the constructor in production and passes in any other environment:
 
 | Constructor | Refused in production |
 | --- | --- |
-| `KafkaTransport::new`, `receiver` and `sender`, `KafkaProducer::new`, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend (`Dlq::spawn`), via `KafkaConfig::validate` | `ssl_skip_verify`, `enable.ssl.certificate.verification: "false"` or `ssl.endpoint.identification.algorithm: none`, and a `plaintext` or `sasl_plaintext` transport without `allow_insecure_transport`, whether a typed field sets it or `librdkafka_overrides` or another raw librdkafka map does. From a raw map, also a `sasl.oauthbearer.token.endpoint.url` that is not `https://`, and an `ssl.cipher.suites` that names a `NULL`, `eNULL` or `COMPLEMENTOFALL` suite without a leading `!` or `-` |
+| `KafkaTransport::new`, `receiver` and `sender`, `KafkaProducer::new`, `KafkaAdmin::new`, `TopicResolver::new` and the Kafka DLQ backend (`Dlq::spawn`), via `KafkaConfig::validate` | `ssl_skip_verify`, `enable.ssl.certificate.verification: "false"` or `ssl.endpoint.identification.algorithm: none`, and a `plaintext` or `sasl_plaintext` transport without `allow_insecure_transport`, whether a typed field sets it or `librdkafka_overrides` or another raw librdkafka map does. From a raw map, a `sasl.oauthbearer.token.endpoint.url` that is not `https://`, and an `ssl.cipher.suites` that names a `NULL`, `eNULL` or `COMPLEMENTOFALL` suite without a leading `!` or `-` |
 | `OpenBaoProvider::new`, via `OpenBaoConfig::validate` | `skip_verify` |
 | `SecretCache::new` (and so `SecretsManager::new`), via `CacheConfig::validate` | a disk cache with no `encryption_key` and `allow_plaintext_disk_cache` set |
 

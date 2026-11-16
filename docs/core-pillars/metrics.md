@@ -5,7 +5,7 @@ Prometheus exporter, and its `start_server` serves `/metrics`. Any module then c
 `metrics::counter!` / `gauge!` / `histogram!` -- the macros are no-ops with no
 recorder, so library code compiles without the metrics feature.
 
-Every counter / gauge / histogram built through `MetricsManager` also pushes a
+Every counter / gauge / histogram built through `MetricsManager` pushes a
 `MetricDescriptor` into a `MetricRegistry`, rendered as JSON at `/metrics/manifest`
 and to `docs/metrics-manifest.json` via the `metrics-manifest` CLI subcommand.
 That manifest is the only source of metric metadata for downstream tools (Grafana
@@ -88,7 +88,7 @@ spec, use cases, dashboard hint, app version, git commit, registration timestamp
 ```
 
 `app` is the service name. `namespace` is the `metrics.namespace` prefix every
-name carries, empty (bare names) by default. A name is listed once, and the first
+name has, empty (bare names) by default. A name is listed once, and the first
 descriptor stands: the runtime describes its own metrics before the app does, so
 an app describing a platform metric again cannot strip its labels, group, use
 cases or dashboard hint. `registered_at` is when the running service's registry
@@ -129,14 +129,14 @@ and both manifest subcommands describe it for you, with app info (feature
 `service-metrics`) and the worker pool and batch engine sets when those features are
 compiled in, so a service's `register_metrics` override describes only its own.
 
-`ServiceMetrics::register` also describes the tiered sink's series when `tiered-sink` is compiled in, and the standalone spool's when `spool` is. The tiered sink's are listed in [../pipeline/tiered-sink.md](../pipeline/tiered-sink.md#metrics).
+`ServiceMetrics::register` describes the tiered sink's series when `tiered-sink` is compiled in, and the standalone spool's when `spool` is. The tiered sink's are listed in [../pipeline/tiered-sink.md](../pipeline/tiered-sink.md#metrics).
 
 ### Count each thing once
 
 A name with no labels is one series, whichever handle writes it, so two call sites
 for one event double the count:
 
-| Series | Counted by | Not also by |
+| Series | Counted by | Not by |
 | --- | --- | --- |
 | `records_received_total` | `ServiceMetrics::records_received`, once per record | `AppMetrics::record_received`, or an `increment` on `AppMetrics::records_received`. That field is the same series, for an app that sets the total with `absolute` |
 | `transport_*` for a scalo transport | the transport itself, under its own `transport` label | the matching `ServiceMetrics::transport_*` method |
@@ -194,13 +194,13 @@ What a source holds until delivery, and the guarantee the pipeline gives ([../pi
 | --- | --- | --- |
 | `pipeline_delivery_guarantee` | `guarantee`, `reason`, optional `listener` | 1 for the guarantee the pipeline gives: `at_least_once`, `at_least_once_local` or `best_effort`, and why. `listener` names the listener when an app publishes one series per listener: a pipeline built with `.listener(name)`, or `EffectiveGuarantee::publish_for` |
 | `pipeline_dead_letters_dropped_total` | `reason` | dead letters dropped with nowhere to go: the pipeline has no DLQ or a disabled one, a gRPC `send_batch` left a record over its size ceiling out of a block, or an app dropped a record a downstream peer refused for good. `reason` is `too_large`, `outbound_filter`, `dead_letter` for one an inbound filter or `process` produced, or `rejected` (`transport::DEAD_LETTER_REJECTED`) for one a downstream peer refused for good, such as a Vector-compat source answering `DataLoss`, `InvalidArgument` or `OutOfRange` |
-| `transport_message_too_large_total` | `transport` | records over a sender's size ceiling. gRPC counts a record over `max_message_size` that `send` refuses before sending or the receiver refuses with `OutOfRange`, and one `send_batch` leaves out of a block, which also counts in `pipeline_dead_letters_dropped_total{reason="too_large"}`. Kafka counts a record librdkafka refuses as over `message.max.bytes`. A `send` of such a record answers `FilteredDlq` |
+| `transport_message_too_large_total` | `transport` | records over a sender's size ceiling. gRPC counts a record over `max_message_size` that `send` rejects before sending or the receiver rejects with `OutOfRange`, and one `send_batch` leaves out of a block, which counts in `pipeline_dead_letters_dropped_total{reason="too_large"}`. Kafka counts a record librdkafka rejects as over `message.max.bytes`. A `send` of such a record answers `FilteredDlq` |
 | `transport_ack_held` / `transport_ack_held_bytes` | `transport` | records and payload bytes whose acknowledgement is held |
 | `transport_ack_withheld` | `transport` | Kafka offsets released `Errored` and still held. Each pins its partition's commit until a restart or a revoke, so alert on it staying above 0 |
 | `transport_ack_released_total` | `transport`, `outcome` | releases, by merged status: records for Kafka, requests for gRPC and `Tickets` |
 | `transport_ack_latency_seconds` | `transport`, `outcome` | receipt to release |
 | `transport_ack_refused_total` | `transport`, `reason` | requests refused before their acknowledgement was held |
-| `transport_redelivered_total` | `transport`, `reason` | sends retried after the receiver may already have taken them |
+| `transport_redelivered_total` | `transport`, `reason` | sends retried after the receiver may have taken them |
 
 Kafka emits the `transport_ack_*` series once armed. An armed gRPC server emits them with `transport="grpc"`, one count per request, from admission to answer. Its outcomes and refusal reasons are in [../transport/backends.md](../transport/backends.md#held-responses). `Tickets` emits them for an app's own listener, under the name it was given.
 
@@ -238,7 +238,7 @@ batching config.
 
 On the `http` protocol the endpoint is a base URL and `/v1/metrics` is appended
 to it, because the exporter POSTs to whatever endpoint it is handed, unchanged.
-An endpoint that already ends in `/v1/metrics` is used as it is. With no
+An endpoint that ends in `/v1/metrics` is used as it is. With no
 endpoint configured the default follows the protocol: `http://localhost:4317`
 for `grpc`, `http://localhost:4318` for `http`, including when
 `OTEL_EXPORTER_OTLP_PROTOCOL` picks it.

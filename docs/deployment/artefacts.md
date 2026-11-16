@@ -135,11 +135,11 @@ CMD ["--config", "/etc/my-app/config.yaml"]
 
 `FROM` is the contract's `base_image`. The default, `DEFAULT_BASE_IMAGE`, is `debian:trixie-slim` pinned to its multi-arch index digest, and Renovate moves the digest. Override it with `deployment.base_image`.
 
-The sample contract names no vendor or licence, so the fragment carries no `org.opencontainers.image.vendor` or `org.opencontainers.image.licenses` label. Set `oci_labels.vendor` and `oci_labels.licenses` and the two lines appear after `description`, vendor first. `io.scalo.profile` is under the contract's `oci_labels.label_namespace` -- see [contract.md](contract.md#labels).
+The sample contract sets neither `oci_labels.vendor` nor `oci_labels.licenses`, so the fragment has no `org.opencontainers.image.vendor` or `org.opencontainers.image.licenses` label. Set `oci_labels.vendor` and `oci_labels.licenses` and the two lines appear after `description`, `vendor` first. `io.scalo.profile` is under the contract's `oci_labels.label_namespace` -- see [contract.md](contract.md#labels).
 
 The `userdel -r ubuntu` before `useradd --uid 1000 appuser` is guarded by
 `id ubuntu` because it is only needed on an Ubuntu 24.04 base, which ships
-a `ubuntu` user already squatting UID 1000 - `useradd --uid 1000` fails
+a `ubuntu` user squatting UID 1000 - `useradd --uid 1000` fails
 unless it is removed first. Debian trixie slim has no such account, so the
 guard makes the line a no-op there rather than a build failure.
 
@@ -151,7 +151,7 @@ The process starts in `/home/appuser`, which `useradd --create-home` gives to ap
 RUN mkdir -p '/var/spool/my-app' '/var/data/my-app' && chown 1000:1000 '/var/spool/my-app' '/var/data/my-app'
 ```
 
-A production image carries `ca-certificates`, any runtime packages the contract lists and the binary. The Kafka transport and the spool link their C libraries statically, so the sample installs nothing else ([native-deps.md](native-deps.md)). `curl` and `gnupg` are there only to import a custom repo's signing key, and the same `RUN` purges them once the repo's packages are in. The healthcheck speaks HTTP with bash builtins, so it needs no client. A development image (`with_dev_profile`) keeps `curl`, `netcat-openbsd` and `iputils-ping` beside the diagnostic tools.
+A production image has `ca-certificates`, any runtime packages the contract lists and the binary. The Kafka transport and the spool link their C libraries statically, so the sample installs nothing else ([native-deps.md](native-deps.md)). `curl` and `gnupg` are there only to import a custom repo's signing key, and the same `RUN` purges them once the repo's packages are in. The healthcheck speaks HTTP with bash builtins, so it needs no client. A development image (`with_dev_profile`) keeps `curl`, `netcat-openbsd` and `iputils-ping` beside the diagnostic tools.
 
 All four generators run [`DeploymentContract::validate`](contract.md) first and return its error, so a contract the chart would refuse renders no Dockerfile, runtime stage, compose fragment or container manifest either.
 
@@ -218,7 +218,7 @@ Any diff fails the build, forcing regenerate-and-commit so deployment
 artefacts always match the binary that ships.
 
 `validate_dockerfile()` is the programmatic alternative when a committed
-Dockerfile carries intentional deviations (e.g. CI's prepended builder
+Dockerfile has intentional deviations (e.g. CI's prepended builder
 stages). It returns the list of `ContractMismatch`es rather than a hard diff.
 
 ---
@@ -235,7 +235,7 @@ contract's base image and registry, and the metrics namespace. So a dev
 box and CI with different settings files or env
 vars can generate different artefacts from one commit. A config that
 does not load is reported on stderr and the defaults are taken. The
-manifest's `version` and `commit` also change with each build.
+manifest's `version` and `commit` change with each build.
 
 A contract with a `default_config` listener no port declares is refused
 before anything is written -- see [contract.md](contract.md#ports).

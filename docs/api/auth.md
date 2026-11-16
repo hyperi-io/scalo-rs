@@ -3,7 +3,7 @@
 `auth` gets a credential and puts it on a request. It is the shared half
 of provider authentication -- the caching, the renewal, the single-flight
 gate, the token-response reading, and putting the credential in a header,
-a query parameter or basic auth. It carries no signing scheme and no
+a query parameter or basic auth. It has no signing scheme and no
 crypto dependency.
 
 Feature: `auth`. Off by default. Pulls `http`, because an exchange is an
@@ -11,7 +11,7 @@ Feature: `auth`. Off by default. Pulls `http`, because an exchange is an
 
 ```toml
 [dependencies.scalo]
-version = "2"
+version = "<version>"
 features = ["auth"]
 ```
 
@@ -19,14 +19,28 @@ features = ["auth"]
 
 ## The two halves
 
-They compose, and neither knows about the other.
+An exchange gets the credential and a placement puts it on the request, with `Cached` between them, and neither half knows about the other.
 
 ```mermaid
 flowchart LR
-    E[Exchange<br/>one protocol, one credential] --> C[Cached<br/>hold, renew, single-flight]
-    C --> P[Placement<br/>RequestSigner]
-    P --> R[HttpClient<br/>retry loop]
+    accTitle: L4 Detail -- Credential acquisition and placement
+    accDescr: An exchange obtains a credential once over one protocol. Cached holds and renews it under a single-flight lock. A placement puts the held credential on each request attempt, and the HttpClient retry loop sends it.
+
+    exchange["Exchange"]
+    cached["Cached"]
+    placement["Placement"]
+    client["HttpClient<br/>retry loop"]
+
+    exchange -->|credential| cached
+    cached -->|credential| placement
+    placement --> client
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef core fill:#DCEBF7,stroke:#0072B2,stroke-width:2px,color:#0B2A3F
+    class cached core
 ```
+
+*Figure 1. L4 Detail -- Credential acquisition and placement. The blue box holds, renews and single-flights the credential.* Up: [Other subsystems](README.md).
 
 **Acquisition.** An `Exchange` obtains one credential, once, over one
 protocol. It holds no state and does no caching. `Cached` wraps any
@@ -36,10 +50,6 @@ exchange and owns all of that.
 [`RequestSigner`](http-client.md#signing-a-request) over a credential
 source. It runs per attempt on the built request, so the credential on a
 retry is the current one.
-
----
-
-## Usage
 
 ```rust
 use std::sync::Arc;
@@ -75,13 +85,13 @@ allocation, and it never parks.
 
 ## Exchanges
 
-Every value an exchange holds is already rendered. Templating, secret
+Every value an exchange holds arrives rendered. Templating, secret
 resolution and per-deployment substitution happen in the consumer before
 the exchange is built.
 
 | Exchange | Protocol |
 | --- | --- |
-| `Static` | No I/O. A key the consumer already resolved, held for the life of the process |
+| `Static` | No I/O. A key the consumer resolved, held for the life of the process |
 | `ClientCredentials` | OAuth2 client credentials (RFC 6749 s4.4) -- a form POST of `grant_type`, `client_id`, `client_secret`, optional `scope` |
 | `TokenPost` | A form POST of exactly the fields handed to it -- the generic form |
 | `MetadataServer` | A GET, optionally behind a header (`Metadata-Flavor: Google`) |
@@ -90,12 +100,12 @@ the exchange is built.
 and posts it unchanged on every exchange, renewals included, so it is for
 a form that is safe to resend: a session login, a client secret.
 `TokenPost::minted` takes a closure that renders the form for every
-exchange, and it is the RFC 7523 path: a signed client assertion carries
+exchange, and it is the RFC 7523 path: a signed client assertion has
 a single-use `jti` and a short `exp`, so each renewal needs a freshly
 minted one. The consumer mints and signs it in the closure, so no JWT
 library and no key parsing enters scalo.
 
-The closure returns a future, awaited inside the exchange's own
+The closure returns a future, awaited inside the exchange's
 deadline, so a signer that calls a KMS or fetches its key over the
 network holds no runtime thread while it waits:
 
@@ -142,16 +152,16 @@ and the exchange hands it back without posting anything. Fields added
 with `with_form_field` ride along on both, ahead of the minted
 ones.
 
-### The client an exchange uses
+## The client an exchange uses
 
 The `HttpClient` handed to an exchange is the settings it takes, not the
-client it calls on: it builds its own from them, with two deliberate
+client it calls on: it builds a second client from them, with two deliberate
 differences.
 
-- Redirects refused. reqwest carries the form and any custom header
+- Redirects refused. reqwest resends the form and any custom header
   across a cross-origin hop, so a token endpoint that answers 307 would
   otherwise repost the client secret to whatever host it names.
-- The POST retried only where it is safe to resend. `ClientCredentials` ALWAYS retries its POST, whatever the shared client's `retry_non_idempotent` says: a client-secret POST mints a new credential, so replaying it duplicates nothing. `TokenPost::new` retries only when the shared client's `retry_non_idempotent` is on, because a retry resends the form it already posted. `TokenPost::minted` NEVER retries inside one exchange, whatever the flag says: a single-use assertion (an RFC 7523 `jti`) is refused on a second sight. A transient failure is left to the next acquisition instead, which mints a fresh assertion.
+- The POST retried only where it is safe to resend. `ClientCredentials` ALWAYS retries its POST, whatever the shared client's `retry_non_idempotent` says: a client-secret POST mints a new credential, so replaying it duplicates nothing. `TokenPost::new` retries only when the shared client's `retry_non_idempotent` is on, because a retry resends the form it posted. `TokenPost::minted` NEVER retries inside one exchange, whatever the flag says: a single-use assertion (an RFC 7523 `jti`) is refused on a second sight. A transient failure is left to the next acquisition instead, which mints a fresh assertion.
 
 Everything else -- timeouts, schedule, user agent -- is the caller's.
 
@@ -161,7 +171,7 @@ else rather than post a client secret in the clear. `MetadataServer` is
 exempt, because every cloud serves its metadata over plaintext on a
 link-local address.
 
-### Reading a token response
+## Reading a token response
 
 `TokenReading` is the response contract, shared by all three:
 
@@ -179,7 +189,7 @@ link-local address.
   overflows the arithmetic outright, and a remote value that panics the
   process under the renewal lock is a remote kill.
 - Named top-level fields ride along in `Credential::extra` -- a Salesforce
-  `instance_url`, a provider's own `resource` -- and nothing else does.
+  `instance_url`, a provider's `resource` -- and nothing else does.
   The fields that are themselves credentials (`access_token`,
   `refresh_token`, `id_token`, `client_secret`) are refused: `extra` is
   read and rendered by consumers, and a second copy is a second leak.
@@ -192,10 +202,10 @@ link-local address.
 | --- | --- |
 | `HeaderPlacement::bearer(source)` | `Authorization: Bearer <secret>` |
 | `HeaderPlacement::new(name, prefix, source)` | `<name>: <prefix><secret>`, prefix empty for the providers wanting a bare key |
-| `QueryPlacement::new(name, source)` | `?<name>=<secret>`, appended to the built URL and encoded, so the URL a caller holds never carries it |
+| `QueryPlacement::new(name, source)` | `?<name>=<secret>`, appended to the built URL and encoded, so the URL a caller holds never has it |
 | `BasicPlacement::new(username, source)` | HTTP basic auth, credential as the password |
 
-A header placement marks its value sensitive, so the `http` crate's own
+A header placement marks its value sensitive, so the `http` crate's
 `Debug` renders it as `Sensitive` wherever a request is formatted. A
 query placement puts the credential on the request URL, which reqwest
 keeps a copy of and renders on a transport error -- the retry loop
@@ -204,7 +214,7 @@ therefore strips that URL out of every error it returns.
 Both follow a redirect: reqwest strips `Authorization` across a
 cross-origin hop and strips neither a custom header nor the query. Sign
 with a client built through `HttpClient::with_redirect_policy` and a
-policy that refuses the hop, or allows only the same origin.
+policy that rejects the hop, or allows only the same origin.
 
 A consumer that reads the exchange and placements out of config rather than writing them
 holds `AnyCredentialSource` and a `Vec<Placement<_>>`: one variant per
@@ -256,8 +266,8 @@ default, `with_failure_backoff` to change it), so a credential the
 endpoint has just rejected is not posted again by every caller in turn.
 A transient failure is not held -- an endpoint that was unreachable, out
 of time, or answered 408, 429 or 5xx -- so the next caller tries again,
-because that is what a retry is for. One acquisition is also bounded by
-the exchange's own timeout, so an endpoint that accepts the connection
+because that is what a retry is for. One acquisition is bounded by
+the exchange's timeout, so an endpoint that accepts the connection
 and then says nothing cannot park each caller in turn for the full
 timeout.
 
@@ -271,19 +281,19 @@ attempt.
 | `AuthError` | Meaning | Transient |
 | --- | --- | --- |
 | `Unreachable` | The endpoint could not be reached, or the transport failed | yes |
-| `TimedOut` | The acquisition did not finish inside the exchange's own deadline | yes |
+| `TimedOut` | The acquisition did not finish inside the exchange's deadline | yes |
 | `Shared` | The acquisition this caller waited on failed, carrying whether that failure was transient | as the failure it reports |
 | `Refused` | The endpoint answered with a non-2xx status | 408, 429 and 5xx yes, any other status no |
 | `Malformed` | The endpoint answered 2xx with something that is not a credential | no |
 | `Endpoint` | The token URL cannot be used at all (not https, not loopback) | no |
-| `Client` | The exchange's own HTTP client could not be built | no |
+| `Client` | The exchange's HTTP client could not be built | no |
 | `Unavailable` | The consumer could not supply the credential at all (a secret spec that did not resolve) | no |
 
 `invalidate()` drops the held credential for the consumer that learns
 from a 401 that the provider revoked it early.
 
 An error names the endpoint as scheme, host and path -- never its query
-or userinfo -- and a refusal carries the status plus the `error` and
+or userinfo -- and a refusal holds the status plus the `error` and
 `error_description` fields of a JSON body, never the body itself. A
 token endpoint that echoes the form it was posted would otherwise put
 the client secret in the error text, and an error text is the one thing

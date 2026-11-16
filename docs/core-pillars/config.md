@@ -51,12 +51,12 @@ Every YAML file the cascade reads, every file `load_typed` reads, and every tabl
 | A key repeated in one mapping | An error |
 | `<<: *anchor` | Merged into the mapping |
 | `.inf`, `.nan` in the cascade or an untyped value | An error. A typed `f64` field reads them |
-| `0123`, `1_000` in the cascade or an untyped value | The numbers `123` and `1000`, which a `String` field read through the cascade refuses. A file parsed straight into a struct keeps the text in a `String` field. Quote values that must stay text |
+| `0123`, `1_000` in the cascade or an untyped value | The numbers `123` and `1000`, which a `String` field read through the cascade rejects. A file parsed straight into a struct keeps the text in a `String` field. Quote values that must stay text |
 | More than one document (`---`) | An error |
 
 A config file may be up to 16 MiB, 100,000 nodes and 32 levels deep. An error names the file, line and column and quotes nothing, so it is safe to log. `YamlError::render_snippet` shows the failing line with a secret-looking value masked, for a person at a terminal.
 
-`scalo::yaml::from_str_reporting` also returns the keys the target type did not take and lints: indentation that is not a multiple of two, and plain leading-zero or `_`-separated numbers.
+`scalo::yaml::from_str_reporting` returns the keys the target type did not take and lints: indentation that is not a multiple of two, and plain leading-zero or `_`-separated numbers.
 
 ---
 
@@ -86,7 +86,7 @@ let kafka: KafkaConfig = config::get().unmarshal_key("kafka")?;  // one section
 
 ### An app's whole config
 
-`config::load_typed(path, prefix)` is the loader a `ServiceApp::load_config` calls. With `--config <file>` it parses that file into the app's struct and logs every key the struct does not take: a misspelt nested key at WARN, a top-level key at INFO, since it may be a runtime section. With no file it reads the cascade. Either way it then merges `{PREFIX}_` env vars with `__` nesting (empty values count as unset), applies the flat spellings through `ApplyFlatEnv`, and runs `Normalize`. It also sets up the global cascade with the file as its settings layer, so runtime sections (`metrics`, `version_check`) resolve from the same file.
+`config::load_typed(path, prefix)` is the loader a `ServiceApp::load_config` calls. With `--config <file>` it parses that file into the app's struct and logs every key the struct does not take: a misspelt nested key at WARN, a top-level key at INFO, since it may be a runtime section. With no file it reads the cascade. Either way it then merges `{PREFIX}_` env vars with `__` nesting (empty values count as unset), applies the flat spellings through `ApplyFlatEnv`, and runs `Normalize`. It sets up the global cascade with the file as its settings layer, so runtime sections (`metrics`, `version_check`) resolve from the same file.
 
 ```rust
 fn load_config(&self, path: Option<&str>) -> Result<LoaderConfig, CliError> {
@@ -96,7 +96,7 @@ fn load_config(&self, path: Option<&str>) -> Result<LoaderConfig, CliError> {
 
 The config type derives `Serialize` as well as `Deserialize`, because the env merge round-trips it. A `#[serde(skip)]` field comes back at its default, so set it after the call.
 
-`run_app` loads the config before it sets up logging, because the logger reads its own settings from that config. So `load_typed` holds the lines it would log until a subscriber exists, and `logger::setup` emits them. An app that installs its own subscriber calls `config::log_deferred()` after doing so.
+`run_app` loads the config before it sets up logging, because the logger reads its settings from that config. So `load_typed` holds the lines it would log until a subscriber exists, and `logger::setup` emits them. An app that installs its own subscriber calls `config::log_deferred()` after doing so.
 
 ### Registered sections
 
@@ -115,8 +115,8 @@ call: `TransportFilterTierConfig::from_cascade()?` reads `transport.filter_tiers
 `transport::FromCascade`: an absent section takes the defaults, and a present one
 that does not parse is `TransportError::Config` naming its key. Every other
 module's `from_cascade()` reads through `scalo::cascade::section` the same way and
-returns a `CascadeError`, and `run_app` refuses to start, `config-check` included,
-when a section its own runtime reads does not parse (`check_runtime_sections`).
+returns a `CascadeError`, and `run_app` will not start, `config-check` included,
+when a section its runtime reads does not parse (`check_runtime_sections`).
 
 ---
 

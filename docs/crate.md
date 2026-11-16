@@ -2,7 +2,7 @@
 
 The runtime layer for Rust data-plane services: config, logging, metrics, health, backpressure and transports.
 
-It all comes already wired together, secrets included. Pick the features you need, and each one plugs into the same config and the same metrics.
+It all comes wired together, secrets included. Pick the features you need, and each one plugs into the same config and the same metrics.
 
 It is built for the hot path. For APIs, orchestrators and integration glue there is a Python sister library, [scalo-py](https://github.com/hyperi-io/scalo-py), with the same conventions and a different API.
 
@@ -13,7 +13,7 @@ It is built for the hot path. For APIs, orchestrators and integration glue there
 - Prometheus and OpenTelemetry metrics with the `metrics` feature, with `/livez` and `/readyz` served on the same listener as `/metrics`.
 - `MemoryGuard`, which reads the cgroup memory limit and tells the hot path when to stop taking work, so a service sheds load before the kernel OOM-kills it.
 - Transports for Kafka, gRPC, HTTP, files, pipes and in-memory, behind one sender and receiver interface.
-- `TieredSink`, which wraps any sender with a timeout and a circuit breaker and spills to a disk spool when the downstream is slow or gone, then drains it. A dead letter queue takes the records a downstream refuses for good, to a file, Kafka or HTTP.
+- `TieredSink`, which wraps any sender with a timeout and a circuit breaker and spills to a disk spool when the downstream is slow or gone, then drains it. A dead letter queue takes the records a downstream rejects for good, to a file, Kafka or HTTP.
 - Secrets from files, OpenBao or Vault, and AWS Secrets Manager, cached with a TTL. Call `refresh_all` on your own schedule and it re-reads them, announcing any that rotated.
 - A deployment contract: fill in one struct and scalo writes your Dockerfile and the JSON the scalo-service Helm chart renders from.
 
@@ -62,4 +62,4 @@ The default is `config` and `logger`. Everything else is opt-in, so you pay only
 
 The full list, what each pulls in and which combinations matter are at <https://github.com/hyperi-io/scalo-rs/blob/main/docs/feature-flags.md>. `transport-kafka` links librdkafka, so the build host needs it, and so does the image unless the build links it statically: <https://github.com/hyperi-io/scalo-rs/blob/main/docs/deployment/native-deps.md>.
 
-API docs are at <https://docs.rs/scalo>, the source and the guides at <https://github.com/hyperi-io/scalo-rs>. Requires the Rust version `rust-version` names in `Cargo.toml`. Licensed Apache-2.0: <https://github.com/hyperi-io/scalo-rs/blob/main/LICENSE>.
+API docs are at <https://docs.rs/scalo>, the source and the guides at <https://github.com/hyperi-io/scalo-rs>. It needs the Rust version `rust-version` names in `Cargo.toml`. Licensed Apache-2.0: <https://github.com/hyperi-io/scalo-rs/blob/main/LICENSE>.
