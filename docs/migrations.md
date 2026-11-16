@@ -6,6 +6,14 @@ release and the target before bumping.
 
 ---
 
+## 2.14.31
+
+### OpenTelemetry moves to the 0.33 line (API CHANGE)
+
+`opentelemetry`, `opentelemetry_sdk` and `opentelemetry-otlp` move from 0.31 to 0.33, `tracing-opentelemetry` from 0.32 to 0.34 and `metrics-exporter-opentelemetry` to 0.2.2. The OTel types in scalo's signatures, such as the `SdkTracerProvider` that `otel_tracing::build_tracer_layer` returns and the `SdkMeterProvider` behind `metrics`, are now the 0.33 types.
+
+**Consumer adjustment** -- a consumer that depends on any `opentelemetry*` crate itself moves it to 0.33 too, or the graph holds two OTel stacks and those types no longer match. One with no OTel dependency of its own changes nothing.
+
 ## 2.14.28
 
 ### A DLQ entry is written as a DFE event (BEHAVIOUR CHANGE)
