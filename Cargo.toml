@@ -624,10 +624,12 @@ unwrap_used = "allow"                     # Allowed in tests for cleaner asserti
 [[bench]]
 name = "config_benchmark"
 harness = false
+required-features = ["config"]
 
 [[bench]]
 name = "logger_benchmark"
 harness = false
+required-features = ["logger"]
 
 [[bench]]
 name = "engine_benchmark"
