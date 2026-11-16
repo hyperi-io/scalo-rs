@@ -374,7 +374,7 @@ metrics-exporter-prometheus = { version = ">=0.18.3, <0.19", default-features = 
 # Frees the histogram blocks the Prometheus upkeep drains (see metrics::run_upkeep).
 crossbeam-epoch = { version = ">=0.9.21, <0.10", optional = true }
 metrics-util = { version = ">=0.20.4, <0.21", optional = true }
-metrics-exporter-opentelemetry = { version = ">=0.2.1, <0.2.2", optional = true }
+metrics-exporter-opentelemetry = { version = ">=0.2.2, <0.2.3", optional = true }
 sysinfo = { version = ">=0.40.1, <0.41", optional = true }
 
 # Async runtime (for metrics server, http-server, shutdown)
