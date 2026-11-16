@@ -2,51 +2,55 @@
 
 `TieredSink<S>` wraps any `TransportSender` (Kafka, gRPC, HTTP, file, pipe, or the factory's `AnySender`) with the resilience primitives every production data-plane pipeline needs -- timeout, circuit breaker, disk spillover, background drain. Apps call `sink.send(&record).await?` and the sink picks the right failure response.
 
-This is the canonical "resilient delivery" primitive. Every downstream
-write in the data plane should sit behind one.
+It is the resilient-delivery primitive: put every downstream write in the data plane behind one.
 
 ---
 
 ## What it composes
 
+A send goes to the sender when the breaker admits it, spills to the spool when the sender cannot take it, and reaches the caller as an `Err` for a fatal send or a spool write that fails.
+
 ```mermaid
-flowchart TB
-    Send["send(&record)"] --> Hot
-    subgraph TS["TieredSink wraps sender S"]
-        Hot["Hot path<br/>breaker admits? one send_batch, bounded by send_timeout_ms"]
-        Cold["Cold path<br/>encode, compress (Zstd/LZ4/Snappy), append to the yaque spool"]
-        Drain["Background drain, always running<br/>spool -> send_batch once the breaker admits"]
-        Hot -->|&quot;Backpressured / timeout / breaker refuses&quot;| Cold
-    end
-    Hot -->|&quot;Ok / FilteredDlq&quot;| Caller["caller (Ok)"]
-    Cold -->|spooled| Caller
-    Hot -->|Fatal| CallerErr["caller (Err)"]
-    Cold -->|&quot;SpoolFull / DiskUnavailable&quot;| CallerErr
+flowchart LR
+    accTitle: L4 Detail -- Tiered sink delivery
+    accDescr: A send is one send_batch the breaker admits. Delivered returns Ok. Refused by the breaker, backpressured or timed out spills to the spool. Fatal returns Err Sink. A spool write returns Ok when written, Ok with the record dropped under drop_newest, Err SpoolFull when full, or Err DiskUnavailable past the disk threshold.
+
+    hot{"Hot send<br/>result?"}
+    delivered(["Ok, delivered"])
+    spool{"Spool<br/>write?"}
+    fatal(["Err Sink"])
+    spooled(["Ok, spooled"])
+    shed(["Ok, dropped<br/>and counted"])
+    full(["Err SpoolFull"])
+    disk(["Err Disk-<br/>Unavailable"])
+
+    hot -->|delivered| delivered
+    hot -->|not delivered| spool
+    hot -->|Fatal| fatal
+    spool -->|written| spooled
+    spool -->|drop newest| shed
+    spool -->|full| full
+    spool -->|disk threshold| disk
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef store fill:#DDF3EC,stroke:#00785A,stroke-width:1px,color:#0B3327
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    classDef error fill:#FBE3D6,stroke:#C2410C,stroke-width:1px,color:#4A1A05
+    class hot,spool decision
+    class delivered,spooled store
+    class fatal,full,disk error
 ```
+
+*Figure 1. L4 Detail -- Tiered sink delivery. Green ends return `Ok`, orange ends `Err`, and the plain end `Ok` for a record it dropped.* Up: [Pipeline](README.md).
+
+The hot send is one `send_batch`, bounded by `send_timeout_ms`, made when the breaker admits it and, under `StrictFifo`, the spool is empty. Not delivered covers a breaker refusal, `Backpressured` and a timeout. Spool writes encode and compress (Zstd, LZ4 or Snappy) and append to the yaque spool, and a background drain sends the spool on once the breaker admits.
 
 A `disk_capacity_poller` watches the spool filesystem when
 `disk_aware` is configured -- if usage crosses the threshold the
 `disk_available` flag flips and new spool writes return
-`DiskUnavailable` instead of silently filling the disk.
+`DiskUnavailable` instead of filling the disk.
 
----
-
-## Failure modes
-
-```mermaid
-flowchart TB
-    S["send(&record)"] --> CB{"Breaker admits, and<br/>StrictFifo spool empty?"}
-    CB -->|yes| P["sender.send_batch"]
-    CB -->|no| Sp[Spool to disk]
-    P -->|Ok / FilteredDlq| Done["Ok to caller"]
-    P -->|Backpressured| Sp
-    P -->|past send_timeout_ms| Sp
-    P -->|Fatal| Err["Err(Sink) to caller"]
-    Sp -->|spooled| Done
-    Sp -->|spool full, when_full: drop_newest| Shed["Ok to caller, record dropped and counted"]
-    Sp -->|spool full, any other when_full| Full["Err(SpoolFull) to caller"]
-    Sp -->|disk_aware threshold crossed| Disk["Err(DiskUnavailable) to caller"]
-```
+Each `send_batch` answer and what the sink does with it:
 
 | `send_batch` result | Disposition | Circuit effect |
 | ------------- | ------------- | ---------------- |
@@ -55,22 +59,27 @@ flowchart TB
 | `Fatal(e)` | `Err(TieredSinkError::Sink)` to the caller | None. Not spooled |
 | No answer within `send_timeout_ms` | Spool to disk | Failure recorded and counted in `spool_circuit_trips_total`, may open the circuit |
 
-The sink reads the `SendResult` every `TransportSender` already returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for, sent on its own, is dropped and logged, unless the error is `TransportError::Config` or `Closed`. Those describe the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
+The sink reads the `SendResult` every `TransportSender` returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for, sent on its own, is dropped and logged, unless the error is `TransportError::Config` or `Closed`. Those describe the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
 
 ---
 
 ## Circuit breaker
 
-Three states, evaluated per `send` and per drain pass:
+The breaker opens on consecutive failures and probes once from half-open, evaluated per `send` and per drain pass.
 
 ```mermaid
 stateDiagram-v2
+    direction LR
+    accTitle: L4 Detail -- Circuit breaker states
+    accDescr: The breaker starts Closed, opens after the threshold of consecutive failures, goes half-open once reset_timeout has elapsed, and from half-open closes on a success or reopens on a failure.
     [*] --> Closed
-    Closed --> Open : consecutive_failures >= threshold
-    Open --> HalfOpen : reset_timeout elapsed
-    HalfOpen --> Closed : record_success
-    HalfOpen --> Open : record_failure
+    Closed --> Open: threshold failures
+    Open --> HalfOpen: reset_timeout
+    HalfOpen --> Closed: success
+    HalfOpen --> Open: failure
 ```
+
+*Figure 2. L4 Detail -- Circuit breaker states. A label names what moves the breaker.* Up: [Pipeline](README.md).
 
 - Closed -- hot path active, failures counted.
 - Open -- hot path skipped, every message goes straight to spool.
@@ -108,11 +117,11 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
-Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Every entry is committed only when the sink answers `Ok` or `FilteredDlq`. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal` names no record, so the batch is kept and its entries are sent one at a time, which drops only the record the sink refuses. An entry that fails its CRC or does not decode is dropped on its own, and the rest of its batch is sent.
+Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Every entry is committed only when the sink answers `Ok` or `FilteredDlq`. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal` names no record, so the batch is kept and its entries are sent one at a time, which drops only the record the sink rejects. An entry that fails its CRC or does not decode is dropped on its own, and the rest of its batch is sent.
 
 A pass that takes records starts the next after the strategy's pause for that many records, so the strategy sets the rate. `drain_interval_ms` (100 ms) is added after a pass that found the spool empty or the sink down. Shutdown cuts either wait short.
 
-The drain task is `tokio::spawn`'d at construction. It and the disk poller both stop when the sink's shutdown `CancellationToken` is cancelled, by `shutdown()` or by drop. With the `shutdown` feature the drain task also stops on the global token.
+The drain task is spawned at construction. It and the disk poller both stop when the sink's shutdown `CancellationToken` is cancelled, by `shutdown()` or by drop. With the `shutdown` feature the drain task stops on the global token.
 
 Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A send that runs past it counts as a circuit failure. The record stays at the head of the spool, uncommitted, and is offered again on the next drain pass. The downstream may have taken the record before the timeout, so the retry can duplicate it (at-least-once).
 
@@ -139,7 +148,7 @@ A spill reserves its item slot and bytes before it writes, and gives them back i
 
 Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailable)` whatever `when_full` says. The caller decides what to do with either error -- the typical pattern is to route the record to the DLQ.
 
-`TieredSink::new` clears spool locks a killed process left behind and refuses a `spool_path` another live sink holds, so each sink needs its own path. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. See [spool.md](spool.md#locks-after-a-hard-kill).
+`TieredSink::new` clears spool locks a killed process left behind and rejects a `spool_path` another live sink holds, so each sink needs a path of its own. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. See [spool.md](spool.md#locks-after-a-hard-kill).
 
 ---
 
@@ -226,14 +235,21 @@ No metric counts a `SpoolFull` or `DiskUnavailable` error, which goes back to th
 | `TieredSinkConfig` / `WhenFull` / `OrderingMode` / `DrainStrategy` / `DiskAwareConfig` / `CompressionCodec` / `CorruptionPolicy` | Configuration, see [Configuration](#configuration) |
 | `CircuitBreaker` / `CircuitState` | Exposed for tests and custom integrations |
 
-`shutdown()` lets a drain already in flight finish its send and commit, then returns. A drain send to a downstream that never answers is cut off at `send_timeout_ms`, so `shutdown()` waits at most that long. It does not drain the spill cache to the sink: records still spooled stay on disk and replay on the next open, so shutdown loses nothing `send` accepted.
+`shutdown()` lets a drain in flight finish its send and commit, then returns. A drain send to a downstream that never answers is cut off at `send_timeout_ms`, so `shutdown()` waits at most that long. It does not drain the spill cache to the sink: records still spooled stay on disk and replay on the next open, so shutdown loses nothing `send` accepted.
 
 Drop cancels the same token, so both background tasks exit even if the consumer forgets to call `shutdown().await`, but drop cannot wait for them.
 
 ---
 
-## Source
+## Related
 
+- [spool.md](spool.md) -- the standalone yaque queue. This sink runs a separate one, with the same lock recovery and quarantine
+- [dlq.md](dlq.md) -- where to send `SpoolFull` / `Fatal` errors
+- [batch-engine.md](batch-engine.md) -- the run loops this is a common sink for
+- [../transport/README.md](../transport/README.md)
+- [../feature-flags.md](../feature-flags.md) -- `tiered-sink`
+- [../auto-wiring.md](../auto-wiring.md)
+- [../architecture.md](../architecture.md)
 - [`../../src/tiered_sink/mod.rs`](../../src/tiered_sink/mod.rs)
 - [`../../src/tiered_sink/tiered.rs`](../../src/tiered_sink/tiered.rs)
 - [`../../src/tiered_sink/circuit.rs`](../../src/tiered_sink/circuit.rs)
@@ -241,15 +257,3 @@ Drop cancels the same token, so both background tasks exit even if the consumer 
 - [`../../src/tiered_sink/drainer.rs`](../../src/tiered_sink/drainer.rs)
 - [`../../src/tiered_sink/codec.rs`](../../src/tiered_sink/codec.rs) -- compression
 - [`../../src/tiered_sink/config.rs`](../../src/tiered_sink/config.rs)
-
----
-
-## Related
-
-- [spool.md](spool.md) -- the standalone yaque queue. This sink runs its own, with the same lock recovery and quarantine
-- [dlq.md](dlq.md) -- where to send `SpoolFull` / `Fatal` errors
-- [batch-engine.md](batch-engine.md) -- the run loops this is a common sink for
-- [../transport/README.md](../transport/README.md)
-- [../feature-flags.md](../feature-flags.md) -- `tiered-sink`
-- [../auto-wiring.md](../auto-wiring.md)
-- [../architecture.md](../architecture.md)

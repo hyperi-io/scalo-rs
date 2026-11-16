@@ -11,10 +11,13 @@ embedded propagation -- see [filter-engine.md](filter-engine.md) and
 
 ## Trait architecture
 
-Four traits stacked, split sender/receiver:
+Four traits stack: sender and receiver each extend `TransportBase`, and `Transport` is the blanket impl for a type that is both.
 
 ```mermaid
 classDiagram
+    direction LR
+    accTitle: L4 Detail -- Transport traits
+    accDescr: TransportSender and TransportReceiver each extend TransportBase, which carries close, is_healthy, name and healthcheck. Transport extends both through a blanket impl.
     class TransportBase {
         <<trait>>
         +close()
@@ -25,6 +28,7 @@ classDiagram
     class TransportSender {
         <<trait>>
         +send(destination, payload)
+        +send_batch(records)
     }
     class TransportReceiver {
         <<trait>>
@@ -34,16 +38,18 @@ classDiagram
     class Transport {
         <<trait>>
     }
-    TransportBase <|-- TransportSender : "not object safe"
-    TransportBase <|-- TransportReceiver : "per-backend Token, not object safe"
-    TransportSender <|-- Transport : "blanket impl"
-    TransportReceiver <|-- Transport : "blanket impl"
+    TransportBase <|-- TransportSender
+    TransportBase <|-- TransportReceiver
+    TransportSender <|-- Transport : blanket impl
+    TransportReceiver <|-- Transport : blanket impl
 ```
+
+*Figure 1. L4 Detail -- Transport traits. An arrow points at the trait a trait extends.* Up: [L3 Components -- scalo](../README.md).
 
 | Trait | Purpose | Object-safe? |
 | ------- | --------- | -------------- |
 | `TransportBase` | Lifecycle + introspection -- `close()`, `is_healthy()`, `name()`, `healthcheck()` | No -- `close()` and `healthcheck()` return `impl Future` |
-| `TransportSender` | Add `send(destination, payload)` -- async fn in trait | Not via `dyn` -- see below |
+| `TransportSender` | Add `send(destination, payload)` and `send_batch` -- async fn in trait | Not via `dyn` -- see below |
 | `TransportReceiver` | Add `recv` + `commit`, associated `type Token: CommitToken` | No -- `impl Future` returns, and `Token` differs per backend |
 | `Transport` | Marker -- blanket impl for `T: Sender + Receiver` | N/A |
 
@@ -88,7 +94,7 @@ receiver.commit(&batch.commit_tokens).await?;
 
 `AnyReceiver` is the receive-side mirror, with the same `from_config` and `from_transport_config` constructors. `recv` wraps each backend token in the matching `AnyToken` variant, and `commit` routes those tokens back to the backend that issued them. `AnyToken` is `#[non_exhaustive]`, so a `match` on it needs a wildcard arm.
 
-With the `governor` feature, `AnyReceiver::from_config_with_governor(key, &governor)` and `from_transport_config_with_governor(&cfg, &governor)` also wire the inbound brake: Kafka pauses assigned partitions, HTTP sheds with 503 and gRPC with `unavailable`.
+With the `governor` feature, `AnyReceiver::from_config_with_governor(key, &governor)` and `from_transport_config_with_governor(&cfg, &governor)` wire the inbound brake: Kafka pauses assigned partitions, HTTP sheds with 503 and gRPC with `unavailable`.
 
 An input stage that needs the backend's own token type takes a concrete `KafkaTransport` / `GrpcTransport` / etc. directly.
 
@@ -103,7 +109,7 @@ pub trait CommitToken: Clone + Send + Sync + Debug + Display + 'static {
 ```
 
 Every backend defines its own token (`KafkaToken`, `GrpcToken`,
-`FileToken`, etc.). The token carries whatever the backend needs to
+`FileToken`, etc.). The token has whatever the backend needs to
 ack the message -- Kafka offsets, file byte positions, in-memory
 sequence numbers. The `Display` impl prints a human-readable form
 (e.g. `kafka:events.land:0:12345`, `file:8192`) for logs and DLQ
@@ -122,7 +128,7 @@ provenance.
 
 **Releasing**: `release(&tokens, status)` is `commit` with the merged delivery status of every piece built from the tokens' records. `Delivered`, `Dropped` and `Rejected` release the source, and `Errored` withholds it so the records are delivered again. The default commits when the status allows it. A source that can hold its acknowledgement exposes `ack_control()` (`AckControl`: `enabled`, `arm`, `held`) and names a `hold_deadline` where a sender waits on it. Kafka armed commits each partition only up to its lowest offset not yet released, so releases may arrive in any order. The `BatchEngine` pipeline builder drives all of this ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md)), and a hand-rolled loop uses `SourceAck`. Each ack-capable backend reads `acknowledgements.enabled` (default `true`) from `<key>.<type>.acknowledgements`, beside its own section. Only Kafka and gRPC are ack-capable. HTTP and file sources are not, and pipe and memory have nothing to hold, so under those four the section has no effect and the factory warns once per backend ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#which-sources-hold-it)).
 
-**Closing a receiver**: after `close()`, `recv` returns the records the source had already acknowledged to their senders, then `TransportError::Closed`. A receiving service therefore shuts down with `close()`, then `recv` until `Closed`, then its final flush, and the `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). The HTTP server, the memory transport, and a gRPC server that is unarmed or has acknowledgements off hold acknowledged records until `recv` takes them. An armed gRPC server has acknowledged nothing it still queues: `recv` returns those records too, and each push is answered once its records are released, or `Unavailable` at the drain deadline ([backends.md](backends.md#grpc)). Kafka and file report `Closed` at once and re-deliver what was not committed. Pipe acknowledges nothing, and reports `Closed` at once too.
+**Closing a receiver**: after `close()`, `recv` returns the records the source had acknowledged to their senders, then `TransportError::Closed`. A receiving service therefore shuts down with `close()`, then `recv` until `Closed`, then its final flush, and the `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). The HTTP server, the memory transport, and a gRPC server that is unarmed or has acknowledgements off hold acknowledged records until `recv` takes them. An armed gRPC server has acknowledged nothing it still queues: `recv` returns those records too, and each push is answered once its records are released, or `Unavailable` at the drain deadline ([backends.md](backends.md#grpc)). Kafka and file report `Closed` at once and re-deliver what was not committed. Pipe acknowledges nothing, and reports `Closed` at once too.
 
 ---
 

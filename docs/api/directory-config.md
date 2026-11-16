@@ -79,8 +79,7 @@ the file are not kept. A key path through a value that is not a mapping is
 refused with `KeyPathConflict`, and the file is left as it was.
 
 File-level locking via `std::fs::File::{lock,unlock}` (stable since
-Rust 1.89) -- no third-party lock crate. Concurrent writes from the
-same process serialise, and cross-process writes are also safe.
+Rust 1.89) -- no third-party lock crate. A write holds an exclusive advisory lock while it writes the file, but `set` and `delete_key` read and modify the table before they take the lock, so two concurrent updates of one table can overwrite each other. Serialise updates outside the store.
 
 `ReadOnly` rejects writes at the API.
 

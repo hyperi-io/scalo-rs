@@ -53,7 +53,7 @@ lets a busy topic fill large, efficient batches, and the time bound
 (`fetch.wait.max.ms` on GET, `linger.ms` on SEND) stops a quiet topic stalling
 to fill it -- it returns whatever it has when the timer fires. The same
 `profile: throughput` config that batches a PB/day firehose into 1 MiB fetches
-also serves a trickle at low latency, because the time bound caps the wait
+serves a trickle at low latency, because the time bound caps the wait
 either way. One config, no re-tuning as volume grows.
 
 On a small or memory-tight pod the generous `throughput` start budget can
@@ -96,14 +96,14 @@ The profile defaults, with the ACTUAL librdkafka property each maps to:
 
 Three columns do not vary by profile: the codec, covered under [Wire compression](#wire-compression), and the two below. `message.max.bytes` is the record-size chain rather than a tuning dial: the producer's own ceiling, which librdkafka defaults to 1,000,000 bytes and enforces LOCALLY, so raising the broker alone changes nothing.
 
-`max.partition.fetch.bytes` bounds memory, not record size. librdkafka treats it as the INITIAL bytes per partition: a larger record grows the fetch until the whole record arrives, so a 16 MiB record still comes through a 1 MiB fetch. The value sets how much compressed data one fetch reply carries per partition, and librdkafka decompresses all of it before the application reads a record. That memory is outside the PROCESS byte budget, so on a compressed backlog this is the knob that bounds it.
+`max.partition.fetch.bytes` bounds memory, not record size. librdkafka treats it as the INITIAL bytes per partition: a larger record grows the fetch until the whole record arrives, so a 16 MiB record still comes through a 1 MiB fetch. The value sets how much compressed data one fetch reply has per partition, and librdkafka decompresses all of it before the application reads a record. That memory is outside the PROCESS byte budget, so on a compressed backlog this is the knob that bounds it.
 
 `fetch.max.bytes` stays at or under 50 MiB: MSK Express holds the broker's 55 MiB fetch ceiling read-only, so a larger ask can never be honoured. A first batch larger than it is still returned whole.
 
 The topic layer of that chain is set where scalo creates the topic:
 `KafkaAdmin::create_topics` gives every topic it creates
 `max.message.bytes = 16 MiB`, since a topic left on the broker's default
-refuses the very records the producer is configured to send. A topic created
+rejects the very records the producer is configured to send. A topic created
 by anything else -- and an already-existing topic, which the idempotent create
 leaves alone -- keeps the ceiling it has, and the broker's own
 `message.max.bytes` still has to be raised to match.
@@ -111,7 +111,7 @@ leaves alone -- keeps the ceiling it has, and the broker's own
 ### librdkafka property names -- mind the differences
 
 librdkafka is NOT the Java Kafka client. Several property names differ, and
-the code uses the librdkafka ones. librdkafka refuses an unknown key, so a Java
+the code uses the librdkafka ones. librdkafka rejects an unknown key, so a Java
 name fails client creation with `TransportError::Config` naming the key.
 
 | Intent | librdkafka (used here) | NOT (Java client) |
@@ -145,7 +145,7 @@ How busy the consumer is does not move it. With a backlog, the gap between fetch
 
 ## Wire compression
 
-Every profile produces with `zstd` at `compression.level` 3. The profiles differ in batching and latency, never in codec. Level 3 is also the level librdkafka picks for zstd when none is set.
+Every profile produces with `zstd` at `compression.level` 3. The profiles differ in batching and latency, never in codec. Level 3 is the level librdkafka picks for zstd when none is set.
 
 Change it per stage:
 
@@ -192,7 +192,7 @@ ways:
 
 - The provider gate. A provider whose brokers do not implement it at all
   (`redpanda`, `redpanda-cloud`) resolves to `classic` at construction.
-- A refusal. The broker refuses the member with a FATAL error:
+- A refusal. The broker rejects the member with a FATAL error:
   `GROUP_ID_NOT_FOUND` from a group whose classic cooperative-sticky member has
   been through a rebalance, `UNKNOWN` from one whose other member has just moved
   to classic, or `UNSUPPORTED_VERSION`, `_UNSUPPORTED_FEATURE` or
@@ -219,8 +219,8 @@ A fenced static member (`FENCED_INSTANCE_ID`: another consumer holds its
 consumer back. Every `recv` returns `TransportError::Recv` and `/readyz` fails:
 this instance has to stop.
 
-A broker that refuses the client's credentials or TLS setup, with no broker
-having accepted them yet, also fails `/readyz` until one does. That covers the
+A broker that rejects the client's credentials or TLS setup, with no broker
+having accepted them yet, fails `/readyz` until one does. That covers the
 consumer and the producer alike: see
 [Refused credentials](transport/backends.md#refused-credentials).
 
@@ -228,7 +228,7 @@ Any other error `recv` returns leaves `/readyz` alone. A caller that treats an
 error plus an unhealthy transport as closed would otherwise stop over a topic
 that is only briefly gone, as a removed source's is.
 
-Under `consumer`, librdkafka refuses the whole client if
+Under `consumer`, librdkafka rejects the whole client if
 `partition.assignment.strategy`, `session.timeout.ms`,
 `heartbeat.interval.ms` or `group.protocol.type` was set at all -- their
 replacements are broker-side. The config builder therefore strips them after
@@ -240,11 +240,11 @@ applies its own default, `uniform`.
 
 ## Internal consumer groups and broker ACLs
 
-librdkafka will not build a consumer without a `group.id`, and a consumer asks the broker for its group's coordinator as soon as it connects, whether or not it ever subscribes. A broker that grants groups by prefix refuses that lookup for any group outside the prefix, and logs it as `GroupAuthorizationFailed`. So the consumer scalo builds for its own use takes a group id derived from the app's config, never a fixed literal:
+librdkafka will not build a consumer without a `group.id`, and a consumer asks the broker for its group's coordinator as soon as it connects, whether or not it ever subscribes. A broker that grants groups by prefix rejects that lookup for any group outside the prefix, and logs it as `GroupAuthorizationFailed`. So the consumer scalo builds for its own use takes a group id derived from the app's config, never a fixed literal:
 
 | Client | Group id | Joins or commits |
 | --- | --- | --- |
-| `KafkaAdmin` offset-query consumer (also behind topic auto-discovery) | `<group>-admin`, or `<client_id>-admin` when `group` is empty | Never |
+| `KafkaAdmin` offset-query consumer (behind topic auto-discovery) | `<group>-admin`, or `<client_id>-admin` when `group` is empty | Never |
 
 An app granted `myapp-*` with `group: myapp-consumer` gets `myapp-consumer-admin`, inside the grant. With `group` and `client_id` both empty the anchor is the default client id, `scalo`.
 
@@ -264,7 +264,7 @@ A transport with no consumer subscribes to nothing even when `topics` is set. It
 
 ## Topic auto-discovery
 
-With `topics` empty and `auto_discover: true`, the transport subscribes to the broker's topics that pass `topic_include`, `topic_exclude` and the suppression rules. It lists them once at construction and again every `topic_refresh_secs` (60 s by default), and the next `recv` after a change re-subscribes. A discovered topic that is deleted leaves the subscription at the next refresh, and a refresh that lists no matching topic at all unsubscribes the consumer until one appears. Each listing is a metadata fetch of up to 10 s, run on tokio's blocking pool so it never holds a runtime worker. The listing builds a `KafkaAdmin`, fetches and drops it, so no client sits unpolled between refreshes. `TopicResolver::new` builds one and drops it too, so a config librdkafka refuses fails construction rather than every refresh. A `KafkaAdmin`'s two handles never emit librdkafka statistics, whatever the profile or `librdkafka_overrides` set, because nothing polls them for it.
+With `topics` empty and `auto_discover: true`, the transport subscribes to the broker's topics that pass `topic_include`, `topic_exclude` and the suppression rules. It lists them once at construction and again every `topic_refresh_secs` (60 s by default), and the next `recv` after a change re-subscribes. A discovered topic that is deleted leaves the subscription at the next refresh, and a refresh that lists no matching topic at all unsubscribes the consumer until one appears. Each listing is a metadata fetch of up to 10 s, run on tokio's blocking pool so it never holds a runtime worker. The listing builds a `KafkaAdmin`, fetches and drops it, so no client sits unpolled between refreshes. `TopicResolver::new` builds one and drops it too, so a config librdkafka rejects fails construction rather than every refresh. A `KafkaAdmin`'s two handles never emit librdkafka statistics, whatever the profile or `librdkafka_overrides` set, because nothing polls them for it.
 
 A broker that does not answer at construction is not fatal. The transport logs a warning with the error, builds subscribed to nothing, and the first refresh that lists the matching topics subscribes it. With `topic_refresh_secs: 0` nothing would recover, so construction fails with `TransportError::Admin`. Explicit `topics` never contact the broker at construction: librdkafka connects later.
 
@@ -313,7 +313,7 @@ Full resolution precedence (lowest to highest):
 When a sizing raw map touches a property the sizing governor depends on (the
 fetch byte sizes, `enable.auto.commit`, the producer batch/linger/compression
 keys), the code logs ONE warning per key so the operator knows the governor's
-assumptions changed. librdkafka refuses an unknown key, so a misspelt one
+assumptions changed. librdkafka rejects an unknown key, so a misspelt one
 fails client creation.
 
 A raw key, producer or consumer, replaces the other librdkafka name for its
@@ -372,7 +372,7 @@ do silently:
 
 - More partitions per pod -- raise per-pod parallelism so each consumer
   drains its assigned partitions faster (the byte budget + worker pool
-  already help here).
+  help here).
 - Share groups (KIP-932, Kafka 4.0) -- let more consumers than partitions
   share a partition's records, breaking the one-member-per-partition ceiling.
 - Over-partition the topic -- create the topic with more partitions than

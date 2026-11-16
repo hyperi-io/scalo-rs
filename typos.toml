@@ -5,29 +5,12 @@
 #
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
-#
-# Reference: https://github.com/crate-ci/typos
-#
-# Spelling policy (from ai/standards):
-#   Code:          American English (serialize, color, initialize)
-#   Docs/comments: Australian English (serialise, colour, initialise)
-#
-# typos cannot distinguish code from docs, so we use en-au locale
-# and allowlist the American spellings that appear in code.
 
 [default]
-# Use Australian English -- flags American spellings in prose
 locale = "en-au"
 
 [default.extend-words]
-# ---------------------------------------------------------------------------
-# American spellings allowed in code (programming convention)
-# ---------------------------------------------------------------------------
-# typos uses case-insensitive matching for extend-words, so "serialize"
-# covers Serialize, SERIALIZE, serialize, etc.
-#
-# Format: american_spelling = "american_spelling"  (identity = don't flag)
-# ---------------------------------------------------------------------------
+# American spellings code uses. extend-words matches case-insensitively.
 
 # -ize/-ise variants (most common in code)
 serialize = "serialize"
@@ -268,9 +251,7 @@ gray = "gray"
 artifact = "artifact"
 artifacts = "artifacts"
 
-# ---------------------------------------------------------------------------
-# Project-specific: proper nouns and external terms
-# ---------------------------------------------------------------------------
+# Proper nouns and external terms
 # HashiCorp (typos splits this and flags "Hashi" -> "Hash")
 Hashi = "Hashi"
 

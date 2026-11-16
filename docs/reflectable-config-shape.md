@@ -7,7 +7,7 @@ JSON.
 
 ## The idea, plainly
 
-An app already knows its own config surface. We want it to hand that knowledge to
+An app knows its own config surface. We want it to hand that knowledge to
 the control plane so the engine and UI can build the right CRUD form for each
 endpoint without anyone hand-writing a form per source type. Two things get
 emitted:
@@ -30,7 +30,7 @@ diffable in the repo.
 ## The four files
 
 Emitted into `docs/` in each app repo (safer than the repo root, and where
-scalo's other emitted artefacts already live -- `metrics-manifest.json`,
+scalo's other emitted artefacts live -- `metrics-manifest.json`,
 `deployment-contract.json`). Filenames follow scalo's existing kebab-case
 `<domain>-<kind>` artefact convention so they never collide with app source
 (NOT the generic `config.json` / `capabilities.json`). `docs/**` is CI
@@ -93,14 +93,14 @@ Serialisation rules (identical in both languages):
 A secret field is flagged in TWO places:
 
 - catalog `FieldSpec.secret = true`
-- JSON Schema: the field's subschema carries `"x-scalo-secret": true` (plus `"writeOnly": true`).
+- JSON Schema: the field's subschema has `"x-scalo-secret": true` (plus `"writeOnly": true`).
 
 Rust: `SensitiveString` implements `JsonSchema` to emit `{"type": "string", "x-scalo-secret": true, "writeOnly": true}`. Python must emit the same keys, in the same order, through the secret field type's `json_schema_extra`. The control plane keys off the marker to route the value through the secrets store and the UI masks the input.
 
 ## ENV mapping for nested config
 
 Multi-connection config (a source type with many `connections`) lives in the
-MOUNTED YAML config, not in ENV. Each connection carries a scalar
+MOUNTED YAML config, not in ENV. Each connection has a scalar
 `credential_secret` REF of the form `provider:path:key`, where a vault path
 opens with its KV mount and the KV v2 `data` segment is optional (e.g.
 `vault:secret/aws/prod:credentials` reads `aws/prod` on the `secret` mount).
@@ -197,7 +197,7 @@ they are authored here by reading that code.
 
 ## Contract carriage
 
-`DeploymentContract` carries two optional, defaulted fields:
+`DeploymentContract` has two optional, defaulted fields:
 
 ```text
 config_schema: object | null      # the JSON Schema; null/absent = not provided
@@ -211,5 +211,5 @@ A consumer that does not read them ignores them.
 Emission is deterministic (stable field order, no timestamps). Each app commits
 the four files and a `#[test]` (Rust) / test (Python) regenerates them and asserts
 byte-equality with the committed copies -- drift fails the normal test job. The
-schema must also round-trip the app's own `Config::default()` (the emitted schema
+schema must round-trip the app's own `Config::default()` (the emitted schema
 validates the struct it claims to describe).

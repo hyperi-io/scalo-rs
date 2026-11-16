@@ -52,10 +52,10 @@ limit, not a bug.
 
 An armed gRPC receive server answers a push only once its records are released, so a sender told `OK` is never relying on a copy that lives only in this process. What the server holds meanwhile has two brakes, and both are this gate:
 
-- The held-byte ceiling refuses a push with `ResourceExhausted` and a retry pushback once held responses carry `max_held_bytes` of payload. One push is always admitted while nothing is held.
+- The held-byte ceiling rejects a push with `ResourceExhausted` and a retry pushback once held responses carry `max_held_bytes` of payload. One push is always admitted while nothing is held.
 - An `AckHeldSource` reports held bytes, as a fraction of that ceiling, into the same `UnifiedPressure` latch as memory, as a HARD source. Near the ceiling the latch holds: Kafka partitions pause and pushes are refused `Unavailable`.
 
-Held bytes are also leased on the memory guard from admission to answer, so the memory source sees records waiting in the receive queue, not only those the engine has taken. Detail: [transport/backends.md](transport/backends.md#held-responses).
+Held bytes are leased on the memory guard from admission to answer, so the memory source sees records waiting in the receive queue, not only those the engine has taken. Detail: [transport/backends.md](transport/backends.md#held-responses).
 
 ---
 
@@ -67,7 +67,7 @@ other. The driver commits source acks ONLY after the whole out-batch is sent
 would lose or double-count data. The two are designed together:
 
 - **Brake** decides whether to pull the next unit of work.
-- **Commit token** decides when the source ack fires -- always after a successful send, never before. A block the sink refuses transiently is held and sent again. One it refuses permanently, or still refuses 10 s after shutdown, is left uncommitted: a source that re-delivers what was not committed (Kafka, file) sends it again after a restart, duplicates never loss. A push source (gRPC, HTTP) run by `run_governed` or the other run loops answered each sender when it queued the record and its commit is a no-op, so nothing re-delivers a block left uncommitted there, and it is lost. The `BatchEngine` pipeline builder holds the answer of a push source that can hold it until the block is delivered, and answers `Errored` so the sender retries ([pipeline/acknowledgements.md](pipeline/acknowledgements.md)).
+- **Commit token** decides when the source ack fires -- always after a successful send, never before. A block the sink rejects transiently is held and sent again. One it rejects permanently, or still rejects 10 s after shutdown, is left uncommitted: a source that re-delivers what was not committed (Kafka, file) sends it again after a restart, duplicates never loss. A push source (gRPC, HTTP) run by `run_governed` or the other run loops answered each sender when it queued the record and its commit is a no-op, so nothing re-delivers a block left uncommitted there, and it is lost. The `BatchEngine` pipeline builder holds the answer of a push source that can hold it until the block is delivered, and answers `Errored` so the sender retries ([pipeline/acknowledgements.md](pipeline/acknowledgements.md)).
 
 Commit tokens live on the `WorkBatch`, not on the record, and their count is
 decoupled from the record count. A transform that fans `N` records out to
@@ -79,7 +79,7 @@ contract.
 ### Filter-dropped records still commit
 
 A record an inbound filter DROPS or routes to DLQ produces no passing record,
-but it WAS handled -- so its commit token must still fire. The filter carries
+but it WAS handled -- so its commit token must still fire. The filter has
 those tokens (`FilteredBatch.filtered_tokens`, flowed into
 `WorkBatch.commit_tokens`) so the block commit advances the source past them.
 Drop the token instead and an all-filtered stretch FREEZES the Kafka offset
@@ -94,13 +94,31 @@ The governed driver need not hold a whole received block in memory at once.
 `BatchEngine::run_workbatch_streaming` (and `run_governed` when the byte budget
 is wired) processes each block in consecutive byte-budget-sized SUB-BLOCKS:
 
-```text
-  recv(block of N records)
-    -> split into sub-blocks of ~budget bytes (floor: one record)
-    -> for each sub-block:
-         lease its bytes -> process -> send -> RELEASE lease
-    -> commit ALL the block's source acks ONCE, after the final sub-block
+Each sub-block is leased, processed, sent and released before the next is leased, and the block's source acks commit once after the last.
+
+```mermaid
+flowchart LR
+    accTitle: L4 Detail -- Streaming sub-blocks
+    accDescr: A received block of N records is split into sub-blocks of about the byte budget, at least one record each. Each sub-block leases its bytes, is processed and sent, then releases its lease. After the last sub-block the block's source acks commit once.
+
+    split["Split block<br/>into sub-blocks"]
+    lease["Lease the<br/>sub-block bytes"]
+    send["Process, send,<br/>release lease"]
+    last{"Last<br/>sub-block?"}
+    commit(["Commit the<br/>block acks once"])
+
+    split --> lease
+    lease --> send
+    send --> last
+    last -->|yes| commit
+    last -.->|no| lease
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    class last decision
 ```
+
+*Figure 1. L4 Detail -- Streaming sub-blocks. The dotted arrow takes the next sub-block.* Up: [L3 Components -- scalo](README.md).
 
 Each sub-block's ingress lease is released BEFORE the next is leased, so peak
 in-flight ingress memory is bounded to ONE sub-block (`~sub_block_bytes`), not
@@ -109,7 +127,7 @@ sub-block, so the loop never stalls.
 
 Commit discipline holds across the split:
 
-- Each sub-block view carries EMPTY commit tokens, so a fan-out within a
+- Each sub-block view has EMPTY commit tokens, so a fan-out within a
   sub-block never multiplies the source acks.
 - The whole block's source acks commit EXACTLY ONCE, after the FINAL
   sub-block's sink returns `Ok` (under `CommitMode::Auto`).
@@ -140,7 +158,7 @@ KEDA Kafka trigger reads from the broker to add replicas. Any other signal, such
 as `ScalingPressure`, needs a trigger the deployment adds
 ([pipeline/scaling.md](pipeline/scaling.md#how-keda-reads-it)).
 
-librdkafka learns a partition's log end only from a fetch reply, and fetches nothing it has paused, so on its own the lag it reports freezes the moment the gate pauses intake. While the gate holds, the Kafka transport asks the broker for the assignment's ends instead: one `ListOffsets` per leader, once per `statistics.interval.ms` and no more often than once a second. It does the same, gate or no gate, while the local queue is full: librdkafka also stops fetching a partition holding `queued.min.messages`, or once the consumer's queue holds `queued.max.messages.kbytes`, until the app reads it down. `total_consumer_lag`, `total_position_lag` and the `rdkafka_topic_partition_consumer_lag` gauge keep rising with what producers write, on every partition the consumer holds (the gauge for up to 256 partitions per client). A partition with nothing committed counts from where the consumer reads, so a group that has never committed shows its backlog from its first assignment.
+librdkafka learns a partition's log end only from a fetch reply, and fetches nothing it has paused, so on its own the lag it reports freezes the moment the gate pauses intake. While the gate holds, the Kafka transport asks the broker for the assignment's ends instead: one `ListOffsets` per leader, once per `statistics.interval.ms` and no more often than once a second. It does the same, gate or no gate, while the local queue is full: librdkafka stops fetching a partition holding `queued.min.messages`, or once the consumer's queue holds `queued.max.messages.kbytes`, until the app reads it down. `total_consumer_lag`, `total_position_lag` and the `rdkafka_topic_partition_consumer_lag` gauge keep rising with what producers write, on every partition the consumer holds (the gauge for up to 256 partitions per client). A partition with nothing committed counts from where the consumer reads, so a group that has never committed shows its backlog from its first assignment.
 
 The two levers compose:
 

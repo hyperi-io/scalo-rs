@@ -4,7 +4,7 @@ A data-plane app is often deployed before anything has given it work: an
 archiver with no archived source, a fetcher with no sources, a transform whose
 source has not been written yet. Refusing to boot is the wrong answer -- the pod
 crash-loops, and because config is validated before the probe surface exists,
-there is not even a `/livez` to explain why.
+there is no `/livez` to explain why.
 
 The idle gate is the other answer: start, stay Ready, open nothing, and pick up
 the first config that gives the service work.
@@ -18,7 +18,7 @@ the first config that gives the service work.
 | structurally invalid -- bad address, unparseable, contradictory | refuse loudly, exit non-zero |
 | valid but EMPTY of work -- no sources, no topics, no destination | idle: start, stay Ready, wait |
 
-The emptiness predicate belongs to the app, because only the app knows what "no
+The emptiness predicate belongs to the app, because the app is what knows what "no
 work" means. The behaviour belongs to scalo, so every app idles the same way.
 
 ```rust
@@ -30,30 +30,45 @@ fn work_state(&self, config: &Self::Config) -> WorkState {
 ```
 
 That is the whole app-side change, and `load_config` keeps refusing a
-structurally invalid config exactly as before.
+structurally invalid config.
 
 ---
 
 ## Where the gate sits
 
 `run_app` evaluates `work_state` AFTER `ServiceRuntime::build`, so the metrics
-server, `/livez` and `/readyz` are already serving before anything can park.
+server, `/livez` and `/readyz` are serving before anything can park.
 `run_service` is never entered while idle, so the app constructs no transports.
 `on_config_loaded` runs on each config before the gate judges it, so an idle
-app has already logged what it accepted but will not apply.
+app has logged what it accepted but will not apply.
+
+The gate asks `work_state` once the probes are up, runs the service on `Active`, and on `Idle` parks until a config change or shutdown.
 
 ```mermaid
 flowchart LR
-    L["load_config"] --> H["on_config_loaded"]
-    H --> R["ServiceRuntime::build<br/>probes serving"]
-    R --> W{"work_state"}
-    W -->|Active| S["run_service"]
-    W -->|Idle| P["park on config change"]
-    P -->|file mtime or SIGHUP| L2["load_config again"]
-    L2 --> H2["on_config_loaded"]
-    H2 --> W
-    P -->|shutdown| X["exit 0"]
+    accTitle: L4 Detail -- Idle gate
+    accDescr: run_app loads the config and calls on_config_loaded, builds the ServiceRuntime so the probes serve, then asks work_state. Active runs the service. Idle parks until the config changes, which reloads it and asks again, or until shutdown, which exits 0.
+
+    load["load_config,<br/>on_config_loaded"]
+    build["ServiceRuntime::build<br/>probes serving"]
+    state{"work_state?"}
+    run["run_service"]
+    park["Park on<br/>config change"]
+    exit(["Exit 0"])
+
+    load --> build
+    build --> state
+    state -->|Active| run
+    state -->|Idle| park
+    park -->|shutdown| exit
+    park -.->|reload| state
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    class state decision
 ```
+
+*Figure 1. L4 Detail -- Idle gate. The dotted arrow is the wake, which re-reads the config through `load_config` and `on_config_loaded` first.* Up: [Core pillars](README.md).
 
 ---
 
@@ -71,12 +86,8 @@ Ready is deliberate: a deploy's readiness gate fails any pod that is not
 `n/n Ready`, so an idle app that reported not-ready would fail the deploy it was
 meant to survive.
 
----
-
-## Waking up
-
 The gate parks on [`ConfigWatch`](config.md) -- the same file-mtime poll and
-SIGHUP the reloader uses -- re-reads through the app's own `load_config`, and
+SIGHUP the reloader uses -- re-reads through the app's `load_config`, and
 re-evaluates the predicate. A load that fails while idle is logged and the
 previous config kept. Shutdown while idle exits 0 rather than starting work on
 the way out.

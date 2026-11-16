@@ -58,7 +58,7 @@ syntax instead of each hand-rolling its own env/vault lookup:
 | `vault:<name>:<key>` | the same lookup on the default `secret` mount, for a path with no mount segment |
 | `bao:<mount>/<path>:<key>`, `openbao:<mount>/<path>:<key>` | the same lookup, spelled as the OpenBao tooling spells it |
 | `file:path` | the contents of a local file, read fresh every time so a rotated mount is seen. A zero-byte file is refused |
-| `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`). An ARN is refused -- it carries colons of its own, so use the secret name or an `aws` source in `secrets.sources`. So is an empty key (`aws:name:`) |
+| `aws:secret_id`, `aws:secret_id:key` | AWS Secrets Manager lookup, optionally one key out of a JSON secret (needs `secrets-aws`). An ARN is refused -- it has colons of its own, so use the secret name or an `aws` source in `secrets.sources`. So is an empty key (`aws:name:`) |
 | `env:VAR` | the environment variable `VAR` (hard error if unset) |
 | anything else | the literal string |
 
@@ -106,7 +106,7 @@ The TTL, grace period, directory, encryption and file-mode settings have no effe
 
 ## Rotation events
 
-A `RotationEvent` is sent whenever a fetch from the backend returns a version that differs from the one the cache last held for that source, expired or not. `refresh_all()` fetches every source, and `get()` fetches on a cache miss or an expired entry, so both report a rotation, once. A fresh cache hit never reaches the backend and reports nothing. The event carries both versions.
+A `RotationEvent` is sent whenever a fetch from the backend returns a version that differs from the one the cache last held for that source, expired or not. `refresh_all()` fetches every source, and `get()` fetches on a cache miss or an expired entry, so both report a rotation, once. A fresh cache hit never reaches the backend and reports nothing. The event has both versions.
 
 Only backends that report a version can rotate: OpenBao (the KV v2 version number) and AWS Secrets Manager (the version id). A file source reports none, and with caching off there is no previous version, so neither produces an event.
 

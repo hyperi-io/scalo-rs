@@ -26,7 +26,7 @@ boundary.
 
 `DeploymentContract::schema_version` is the handshake between whatever writes a
 contract and whatever reads it. Current version is **4**,
-`CONTRACT_SCHEMA_VERSION`, and the field defaults to it. A reader refuses a
+`CONTRACT_SCHEMA_VERSION`, and the field defaults to it. A reader rejects a
 version it does not support: the [scalo-service](../../charts/scalo-service/README.md)
 library chart renders version 4 only.
 
@@ -38,7 +38,7 @@ library chart renders version 4 only.
 | 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `service_account`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, `hot_paths`, the `x-scalo-dial` keyword in `config_schema`, and `config_mount_path` may be empty |
 
 An app that writes `schema_version: 3` in its struct literal still emits 3, and
-a version-4 reader refuses it. Write `CONTRACT_SCHEMA_VERSION` instead. Serde
+a version-4 reader rejects it. Write `CONTRACT_SCHEMA_VERSION` instead. Serde
 reads a v3 contract into the v4 types with every new field at its default, and
 a v3 reader ignores the v4 fields, because `DeploymentContract` does not set
 `deny_unknown_fields`.
@@ -70,15 +70,39 @@ comparison is `breaking_changes(old, new)`, which an app can run on its own
 
 ## Producer tiers
 
+A Rust service on scalo and a Python service on scalo-py write the same contract, and every deployment artefact derives from it.
+
 ```mermaid
 flowchart LR
-    R[Rust service<br/>uses scalo] -->|generate-artefacts| C[deployment-contract.json]
-    P[Python service<br/>uses scalo-py] -->|generate-artefacts| C
-    C --> D[Dockerfile]
-    C --> H[thin chart on scalo-service]
-    C --> CM[container-manifest.json]
-    C --> CS[compose.yaml fragment]
+    accTitle: L4 Detail -- Contract to chart
+    accDescr: A Rust service on scalo and a Python service on scalo-py each write a deployment contract with generate-artefacts. The Dockerfile, container manifest and Compose fragment are generated from it, and the scalo-service chart renders the Kubernetes objects from its JSON.
+
+    subgraph producers["Producers"]
+        rust["Rust service<br/>on scalo"]
+        python["Python service<br/>on scalo-py"]
+    end
+    contract[("Deployment<br/>contract")]
+    dockerfile["Dockerfile"]
+    manifest["Container<br/>manifest"]
+    compose["Compose<br/>fragment"]
+    chart["scalo-service<br/>chart"]
+
+    producers --> contract
+    contract --> dockerfile
+    contract --> manifest
+    contract --> compose
+    contract --> chart
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef store fill:#DDF3EC,stroke:#00785A,stroke-width:1px,color:#0B3327
+    classDef ext fill:#EEF0F2,stroke:#6B7280,stroke-width:1px,stroke-dasharray:4 3,color:#1F2937
+    classDef group fill:none,stroke:#64748B,stroke-width:1px,stroke-dasharray:2 4
+    class rust,python ext
+    class contract store
+    class producers group
 ```
+
+*Figure 1. L4 Detail -- Contract to chart. Dashed boxes are the services that write the contract.* Up: [L3 Components -- scalo](../README.md).
 
 | Producer | Emits |
 | ---------- | -------- |
@@ -148,13 +172,13 @@ Name what the app sets and end with `..DeploymentContract::default()`. Every
 other field takes the default in the table below, so a field a later scalo
 release adds does not break the build. `DeploymentContract::default()` alone
 leaves `app_name`, `env_prefix`, `metric_prefix` and `image_registry` empty,
-and `validate()` refuses it until they are set.
+and `validate()` rejects it until they are set.
 
 ### Fields
 
 | Field | Type | Default | Notes |
 | ------- | ------ | --------- | ------- |
-| `schema_version` | `u32` | `4` | A reader refuses an unsupported version |
+| `schema_version` | `u32` | `4` | A reader rejects an unsupported version |
 | `app_name` | `String` | required | Matches `Chart.yaml` `name`. Image repo segment |
 | `binary_name` | `String` | `""` | Falls back to `app_name` via `.binary()` |
 | `description` | `String` | `""` | Chart description |
@@ -163,7 +187,7 @@ and `validate()` refuses it until they are set.
 | `env_prefix` | `String` | required | Config env prefix, with `__` as the nesting separator |
 | `metric_prefix` | `String` | required | Prometheus namespace |
 | `config_mount_path` | `String` | `""` | E.g. `/etc/event-loader/config.yaml`. Empty means the app reads no config file (v4) |
-| `image_registry` | `String` | required | Container registry base, and `validate()` refuses an empty one |
+| `image_registry` | `String` | required | Container registry base, and `validate()` rejects an empty one |
 | `extra_ports` | `Vec<PortContract>` | `[]` | HTTP / gRPC / data ports beyond metrics -- see [Ports](#ports) |
 | `unbound_listen_paths` | `Vec<String>` | `[]` | `default_config` listen paths no port serves -- see [Ports](#ports) |
 | `entrypoint_args` | `Vec<String>` | `[]` | Default `CMD` args, and the compose fragment's `command`. Both follow the image's `ENTRYPOINT [binary]`, so neither names the binary |
@@ -174,12 +198,12 @@ and `validate()` refuses it until they are set.
 | `base_image` | `String` | cascade | Runtime base for the Dockerfile |
 | `native_deps` | `NativeDepsContract` | default | See [native-deps.md](native-deps.md) |
 | `image_profile` | `ImageProfile` | `Production` | See below |
-| `oci_labels` | `OciLabels` | default | Static OCI labels and the namespace of scalo's own keys -- see [Labels](#labels) |
-| `config_schema` | `Option<Value>` | `None` | JSON Schema of the app's `Config` (v3). Dials carry `x-scalo-dial` (v4) -- see [Dials](#dials) |
+| `oci_labels` | `OciLabels` | default | Static OCI labels and the namespace of scalo's keys -- see [Labels](#labels) |
+| `config_schema` | `Option<Value>` | `None` | JSON Schema of the app's `Config` (v3). Dials have `x-scalo-dial` (v4) -- see [Dials](#dials) |
 | `capabilities` | `Vec<Capability>` | `[]` | Runtime-surface catalogue (v3) |
 | `writable_paths` | `Vec<WritablePath>` | `[]` | Directories the app writes, so the root filesystem stays read-only (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
 | `termination_grace_seconds` | `u32` | `45` | Seconds between SIGTERM and SIGKILL (v4) |
-| `resources` | `ResourcesContract` | empty | The app's own requests and limits. Empty leaves the chart default (v4) |
+| `resources` | `ResourcesContract` | empty | The app's requests and limits. Empty leaves the chart default (v4) |
 | `security` | `SecurityContract` | uid/gid/fsGroup 1000, read-only root | Identity and capabilities the image runs with (v4) |
 | `singleton` | `bool` | `false` | Exactly one pod: no autoscaling, Recreate rollout (v4) |
 | `service_account` | `ServiceAccount` | `Own` | `none` for an app that calls no Kubernetes API: the chart creates no ServiceAccount and the pod names none. Omitted from the JSON while `own` (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
@@ -203,11 +227,11 @@ There is no startup field and no `/startupz`: the `startupProbe` targets
 passes, so one path gives both a generous boot budget and a tight liveness
 period without the two drifting apart.
 
-`config_schema` is the JSON Schema (draft 2020-12) of the app's own
+`config_schema` is the JSON Schema (draft 2020-12) of the app's
 `Config`, derived by schemars - `None` when the app does not derive
 `JsonSchema`. `capabilities` is the hand-authored catalog of runtime-data
 surface schemars cannot see (service names and their knobs). Empty when
-the app supplies none. Both are also written out as
+the app supplies none. Both are written out as
 `config-schema.{json,yaml}` and `capability-catalog.{json,yaml}` by
 `emit_config_artifacts`.
 
@@ -261,7 +285,7 @@ singleton: true,
 
 A chart always adds a scratch `/tmp` beside the declared paths.
 
-An app with a file DLQ builds its contract with `.with_dlq(&dlq_config)` (feature `dlq`), passing the `DlqConfig` it spawns the DLQ with. That adds a `dlq` path at `file.path` whenever the DLQ writes files, so the file backend starts on the read-only root filesystem. A `kafka_only` DLQ, a DLQ or file backend that is off, or a directory already under a declared path adds nothing.
+An app with a file DLQ builds its contract with `.with_dlq(&dlq_config)` (feature `dlq`), passing the `DlqConfig` it spawns the DLQ with. That adds a `dlq` path at `file.path` whenever the DLQ writes files, so the file backend starts on the read-only root filesystem. A `kafka_only` DLQ, a DLQ or file backend that is off, or a directory under a declared path adds nothing.
 
 `service_account: ServiceAccount::None` (`"none"` in the JSON) is for an app with no Kubernetes client and no use for a token. The scalo-service chart then creates no ServiceAccount and leaves `serviceAccountName` off the pod, so it runs as the namespace's `default` account with the token still unmounted. Values can still set `serviceAccount.create` either way, or `serviceAccount.name` to run as an account the operator supplies.
 
@@ -281,7 +305,7 @@ hot_paths: vec!["rules".into(), "routing.source_rules".into()],
 | Unique | Listed once |
 | Needs `config_mount_path` | No config file, nothing to reload |
 
-A parent the removal leaves empty is dropped from the hash too, so adding the first entry under a hot path rolls nothing. The ConfigMap itself keeps every key. With `configMount.subPath` the kubelet never refreshes the file, so the chart hashes every path and an edit rolls the pods. `validate()` refuses a path that breaks the rules above.
+A parent the removal leaves empty is dropped from the hash too, so adding the first entry under a hot path rolls nothing. The ConfigMap itself keeps every key. With `configMount.subPath` the kubelet never refreshes the file, so the chart hashes every path and an edit rolls the pods. `validate()` rejects a path that breaks the rules above.
 
 ---
 
@@ -306,7 +330,7 @@ struct Buffer {
 `values.schema.json` under `config`, so an operator gets a typed, bounded value
 for each dial and every other config key passes through unvalidated. Narrowing a
 dial's constraint or removing a dial is a breaking change: a value an operator
-already stored fails every later render.
+stored fails every later render.
 
 ---
 
@@ -334,7 +358,7 @@ proxy in front of a plain-text gRPC port speaks HTTP/2 to it.
 
 ### `when` -- ports that only sometimes listen
 
-A service with two transports binds its push listener on one of them only. Without a gate the port lands in every artefact anyway, so the Service publishes a port that refuses connections.
+A service with two transports binds its push listener on one of them only. Without a gate the port lands in every artefact anyway, so the Service publishes a port that rejects connections.
 
 | Condition | Builder | Holds when the value |
 | --- | --- | --- |
@@ -358,13 +382,13 @@ A port without `when` is always on: in every `EXPOSE`, `expose_ports` and publis
 
 ### What every port must be
 
-`DeploymentContract::validate()` runs first in every generator and in `generate-artefacts`, which return `InvalidContract` and write nothing when it fails. It requires, for each extra port:
+`DeploymentContract::validate()` runs first in every generator and in `generate-artefacts`, which return `InvalidContract` and write nothing when it fails. It needs, for each extra port:
 
 - a name Kubernetes takes -- 1 to 15 lowercase letters, digits and single inner hyphens, with at least one letter (`syslog-udp`, not `Syslog_UDP`)
 - a protocol of TCP, UDP or SCTP, in any case
 - no control character in a `when` path or value, in `bound_from`, or in `app_protocol`
 
-Beyond the ports, `validate()` requires:
+Beyond the ports, `validate()` needs:
 
 - each writable path to have a unique name of 1 to 50 lowercase letters, digits and inner hyphens, a unique absolute path, and a size when it is persistent
 - each hot path to be a unique dotted path beside a config file ([Hot paths](#hot-paths))
@@ -424,9 +448,9 @@ scalo stamps a few keys of its own beside the standard `org.opencontainers.image
 | `<namespace>.metrics_port` | container manifest | `metrics_port` |
 | `<namespace>.contract.version` / `.source-commit` / `.image-ref` | Dockerfile, when a `ContractIdentity` is passed, and `ContractIdentity::as_yaml_annotations` renders the same keys for a chart or `Application` built elsewhere | see `ContractIdentity` |
 
-An app that already ships its own namespace keeps it by setting `label_namespace`, and every key above moves with it.
+An app that ships a namespace of its own keeps it by setting `label_namespace`, and every key above moves with it.
 
-`oci_labels.vendor`, `oci_labels.licenses` and `oci_labels.copyright` are empty by default, and an empty one writes nothing: no vendor or licence label, no `# License` or `# Copyright` header line. Set them to name the app's vendor, licence and copyright holder.
+`oci_labels.vendor`, `oci_labels.licenses` and `oci_labels.copyright` are empty by default, and an empty one writes nothing: no label and no `# License` or `# Copyright` header line. Set them to name the app's publisher, licence and copyright holder.
 
 ---
 
@@ -453,7 +477,7 @@ stay off musl (alpine) -- see [native-deps.md](native-deps.md#glibc-keep-runtime
 Pin it by digest too, as anything shipped must be. Keep the tag beside the
 digest (`image:tag@sha256:...`) so the release still derives, or set
 `base_distro` - runtime package names are release-specific and a digest-only
-reference carries no codename.
+reference has no codename.
 
 ---
 
@@ -469,7 +493,7 @@ reference carries no codename.
 | `DeploymentContract::config_filename()` / `config_dir()` | Split `config_mount_path` |
 | `ImageProfile::{Production, Development}` | Profile enum |
 | `HealthContract` | `/livez` / `/readyz` / `/metrics` paths |
-| `PortContract` | Extra container port beyond `metrics_port`. Build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` and `expose_ports` as `514/udp`. `validate()` refuses a protocol other than TCP, UDP or SCTP (any case) |
+| `PortContract` | Extra container port beyond `metrics_port`. Build with `tcp` / `udp`, gate with `when_*`, link with `bound_from`. A `UDP` protocol (any case) is carried into compose as `"514:514/udp"` and into `EXPOSE` and `expose_ports` as `514/udp`. `validate()` rejects a protocol other than TCP, UDP or SCTP (any case) |
 | `PortCondition` | When a port's listener exists -- see [Ports](#ports) |
 | `DeploymentContract::undeclared_listeners()` / `assert_listeners_declared()` | Listener coverage -- see [Ports](#ports) |
 | `SecretGroupContract` | One K8s Secret's worth of env vars |
@@ -485,9 +509,9 @@ reference carries no codename.
 | `WritablePath` / `ResourcesContract` / `ResourceList` / `SecurityContract` / `ServiceAccount` | v4 pod needs -- see [Writable paths](#writable-paths-resources-and-security) |
 | `contract_json_schema()` / `contract_schema_file_name(version)` | The contract's JSON Schema and its committed file name (feature `config-schema`) |
 | `DIAL_KEYWORD` / `DIAL_TIERS` / `dials(config_schema)` | The dial marker, its two values, and every marked node by path -- see [Dials](#dials) |
-| `breaking_changes(old, new)` / `SchemaBreak` / `SchemaBreakKind` | Every change between two JSON Schemas that refuses what the old one accepted |
+| `breaking_changes(old, new)` / `SchemaBreak` / `SchemaBreakKind` | Every change between two JSON Schemas that rejects what the old one accepted |
 
-`oci_labels.licenses` and `oci_labels.copyright` name the app's own licence and copyright holder. `licenses` sets the `org.opencontainers.image.licenses` label and the generated Dockerfile's `# License` header line, and `copyright` sets its `# Copyright` line. Both are empty by default, and an empty one writes no label and no line, so an app's artefacts carry only the terms the app states.
+`oci_labels.licenses` and `oci_labels.copyright` name the app's licence and copyright holder. `licenses` sets the `org.opencontainers.image.licenses` label and the generated Dockerfile's `# License` header line, and `copyright` sets its `# Copyright` line. Both are empty by default, and an empty one writes no label and no line, so an app's artefacts carry only the terms the app states.
 
 ---
 

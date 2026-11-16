@@ -5,7 +5,7 @@
 The subscriber wraps stderr in a `MaskingWriter` that redacts sensitive field
 values at the write boundary -- both `password=secret123` and
 `"password":"secret123"` come out `[REDACTED]`. Masking is on by default. Disable
-it explicitly if you must. JSON lines are also enriched with `service` /
+it explicitly if you must. JSON lines are enriched with `service` /
 `version` (from `SERVICE_NAME` / `SERVICE_VERSION` or `ServiceApp`) and K8s context
 (`pod_name`, `namespace`, `node_name`) from
 [`env::runtime_context`](../../src/env.rs). Those K8s fields are absent on bare
@@ -33,7 +33,7 @@ setup(LoggerOptions {
 
 | Var | Effect |
 | --- | --- |
-| `LOG_LEVEL` | The level: `trace`, `debug`, `info`, `warn` or `warning`, `error`, `critical` or `fatal`, any case. Blank is unset. A `CommonArgs` service refuses an unknown name at start, and `setup_default()` reads it as `info` |
+| `LOG_LEVEL` | The level: `trace`, `debug`, `info`, `warn` or `warning`, `error`, `critical` or `fatal`, any case. Blank is unset. A `CommonArgs` service rejects an unknown name at start, and `setup_default()` reads it as `info` |
 | `RUST_LOG` | `EnvFilter` directives layered over the level, for per-module filters (`hyper=warn,my_app=debug`). Read as the level when `LOG_LEVEL` is unset and it names a bare level |
 | `LOG_FORMAT` | `json` / `text` / `auto` (default). Unset, blank, `auto` or unrecognised defers to `logger.format`, then to the derived default |
 | `LOG_COLOR` | Text-mode colour: `true` / `1` / `yes` (any case) is on, any other value off. Outranks `NO_COLOR` and `logger.color` |
@@ -73,13 +73,13 @@ Colour applies to text output only, and JSON is never coloured. First match wins
 3. `logger.color` in config: a bool, a number (non-zero is on), or the strings `LOG_COLOR` accepts
 4. Whether stderr is a terminal
 
-So text piped to a file or another process carries no ANSI escapes unless one of the first three turns colour on.
+So text piped to a file or another process has no ANSI escapes unless one of the first three turns colour on.
 
 ---
 
 ## Sensitive-field masking
 
-Applied at the write boundary, so it is the catch-all regardless of how a value reaches a log line. One rule decides whether a name holds a credential, `logger::is_credential_name`: a name does when one of the [`default_sensitive_fields()`](../../src/logger/credential.rs) sits anywhere in it, case-insensitively. The name is also read word by word, so separators and camelCase do not hide a field: `db_password`, `PGPASSWORD`, `x-api-key`, `api.key` and `secretAccessKey` all match. The rule over-masks, and that is accepted: `token_count`, `tokenizer`, `mapping` (on `pin`), `author` (on `auth`) and `email_count` are masked too.
+Applied at the write boundary, so it is the catch-all regardless of how a value reaches a log line. One rule decides whether a name holds a credential, `logger::is_credential_name`: a name does when one of the [`default_sensitive_fields()`](../../src/logger/credential.rs) sits anywhere in it, case-insensitively. The name is read word by word, so separators and camelCase do not hide a field: `db_password`, `PGPASSWORD`, `x-api-key`, `api.key` and `secretAccessKey` all match. The rule over-masks, and that is accepted: `token_count`, `tokenizer`, `mapping` (on `pin`), `author` (on `auth`) and `email_count` are masked too.
 
 The default list covers passwords, tokens, API keys, secrets, keys a qualifying word makes a credential (`signing_key`, `tls_key`, `ssh_key` and the rest, where `routing_key` is not one), auth and session values, certificates, connection strings, and personal data (`ssn`, `tfn`, `medicare`, `credit_card`, `card_number`, `cvv`, `pin`, `email`, `phone`). scalo-py's logger uses the same list and the same rule, and both are checked against one corpus, `tests/fixtures/credential_masking_parity.json`.
 
@@ -120,13 +120,13 @@ All of it writes `[REDACTED]` in place. A coloured text line holding a credentia
 | `token_count=5` | `token_count=[REDACTED]` (over-masked) |
 | `partition_key=order_id` | unchanged |
 
-Beyond URL passwords and bearer tokens, masking reads names, not values. An email address, literal or percent-encoded (`sentinel.user%40example.com` in a URL), or an opaque provider user id such as Okta's `00u1sentinel2abc3`, is written as-is unless the name carrying it holds a field: `email=...` masks, an address inside a sentence does not. scalo-py's logger also redacts email addresses by value. scalo-rs has no value scrubber.
+Beyond URL passwords and bearer tokens, masking reads names, not values. An email address, literal or percent-encoded (`sentinel.user%40example.com` in a URL), or an opaque provider user id such as Okta's `00u1sentinel2abc3`, is written as-is unless the name carrying it holds a field: `email=...` masks, an address inside a sentence does not. scalo-py's logger redacts email addresses by value. scalo-rs has no value scrubber.
 
 ---
 
 ## Authorization and schemes
 
-After a key holding `authorization`, such as `Proxy-Authorization` or `HTTP_AUTHORIZATION`, an unquoted value is the scheme and the credentials after it, masked together. The credentials are comma-separated items, so a `Digest username="u", response="r"` list goes whole. An item runs to white space, `,`, `}` or `"`, takes a quoted string after `=` whole, and never crosses a line, so `Authorization: Basic abc status=401` keeps `status=401`. After `=` an item also ends at `&`, which separates form fields there, so `Authorization: SharedAccessSignature sr=x&sig=y` masks whole while `authorization=Basic abc&page=2` keeps `&page=2`. A key such as `authorization_url` loses its next item too.
+After a key holding `authorization`, such as `Proxy-Authorization` or `HTTP_AUTHORIZATION`, an unquoted value is the scheme and the credentials after it, masked together. The credentials are comma-separated items, so a `Digest username="u", response="r"` list goes whole. An item runs to white space, `,`, `}` or `"`, takes a quoted string after `=` whole, and never crosses a line, so `Authorization: Basic abc status=401` keeps `status=401`. After `=` an item ends at `&`, which separates form fields there, so `Authorization: SharedAccessSignature sr=x&sig=y` masks whole while `authorization=Basic abc&page=2` keeps `&page=2`. A key such as `authorization_url` loses its next item too.
 
 After any other credential key, a value whose first word is an authentication scheme is read the same way, so `x-api-key: Token abc` and `header_value=Basic abc` mask whole. The schemes are the IANA registry's (`Basic`, `Bearer`, `Concealed`, `Digest`, `DPoP`, `GNAP`, `HOBA`, `Mutual`, `Negotiate`, `OAuth`, `PrivateToken`, `SCRAM-SHA-1`, `SCRAM-SHA-256`, `vapid`) and `ApiKey`, `AWS4-HMAC-SHA256`, `NTLM`, `SharedAccessSignature`, `SharedKey`, `SharedKeyLite`, `Splunk`, `SSWS` and `Token`, in any case. Any other first word keeps the word after it, so `password: abc later` keeps `later`, while `auth=basic user=bob` loses `user=bob`.
 
@@ -171,7 +171,7 @@ if log_debounced(&LAST_WARN, 5_000) { tracing::warn!("udp recv backlog"); }
 ```
 
 Pair sampled / debounced calls with a metric counter -- the helper gates
-emission, the metric carries the count.
+emission, the metric has the count.
 
 For service-wide dedup of identical events (different sites, same signature), set
 `LOG_THROTTLE_ENABLED=1`. The `tracing-throttle` layer dedups by event signature

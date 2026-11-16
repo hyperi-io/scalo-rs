@@ -492,7 +492,7 @@ The names scalo writes into artefacts, and the defaults it falls back on, named 
 | Label and annotation keys `io.hyperi.profile`, `io.hyperi.app`, `io.hyperi.metrics_port`, `io.hyperi.contract.*` | `io.scalo.*`, under the new `OciLabels::label_namespace` | `oci_labels.label_namespace: "io.hyperi".into()` |
 | `pub const KEY_PREFIX` (`io.hyperi.contract`) | `pub const KEY_SEGMENT` (`contract`), under the label namespace | -- |
 | `ContractIdentity::as_dockerfile_labels()`, `as_yaml_annotations(indent)` | take the namespace: `as_dockerfile_labels(ns)`, `as_yaml_annotations(ns, indent)` | pass `"io.hyperi"` |
-| Vendor label default `HYPERI PTY LIMITED` | empty, and an empty vendor writes no label | `oci_labels.vendor: "HYPERI PTY LIMITED".into()` |
+| `oci_labels.vendor` default `HYPERI PTY LIMITED` | empty, and an empty value writes no label | `oci_labels.vendor: "HYPERI PTY LIMITED".into()` |
 | Copyright default `(c) 2026 HYPERI PTY LIMITED`, written to the generated Dockerfile's `# Copyright:` header line | empty, and an empty copyright writes no `# Copyright:` line | `oci_labels.copyright: "(c) 2026 HYPERI PTY LIMITED".into()`, which writes the header exactly as before |
 | Licence default `Apache-2.0` (scalo's own), written to the `# License:` header line and the `org.opencontainers.image.licenses` label | empty, and an empty licence writes neither | `oci_labels.licenses: "Apache-2.0".into()`, or the app's own licence. With neither licence nor copyright set, the header drops both lines and the `#` after them |
 | `DEFAULT_IMAGE_REGISTRY` (`ghcr.io/hyperi-io`) | removed. `image_registry` is required and `validate()` refuses an empty one | `image_registry: "ghcr.io/hyperi-io".into()`, or `deployment.image_registry` in the cascade |

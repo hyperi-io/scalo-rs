@@ -9,7 +9,7 @@
 
 The runtime layer for Rust data-plane services: config, logging, metrics, health, backpressure and transports.
 
-It all comes already wired together, secrets included. In a DFE deployment every Rust service is built on it, so they all read config, log, report and shed load the same way.
+It all comes wired together, secrets included. In a DFE deployment every Rust service is built on it, so they all read config, log, report and shed load the same way.
 
 ## What it gives you
 
@@ -29,7 +29,7 @@ cargo add scalo anyhow tracing
 ```
 
 Default features are `config` and `logger`. Add the rest explicitly -- pick the
-slice you need and pay only for what you use.
+slice you need and pay for what you use.
 
 ```rust
 use scalo::{config, logger, env};
@@ -49,8 +49,9 @@ fn main() -> anyhow::Result<()> {
 
 Every feature flag, what each pulls in and which combinations matter are in
 [docs/feature-flags.md](docs/feature-flags.md). The ones most people reach for:
-`metrics`, `http-server` (health probes), `transport-kafka`, `worker` (adaptive
-pool plus SIMD batching), `memory` (the cgroup-aware guard), `secrets-vault`.
+`metrics` (Prometheus, OTLP and the health probes), `transport-kafka`, `worker`
+(adaptive pool plus SIMD batching), `memory` (the cgroup-aware guard),
+`secrets-vault`.
 
 **A release build links librdkafka and OpenSSL statically**, from a static-only
 prefix hyperi-ci builds once per library release, so the image needs no C
@@ -59,7 +60,7 @@ links the system `librdkafka-dev` instead. The prefix, the build variables and
 a worked Dockerfile are in
 [docs/deployment/native-deps.md](docs/deployment/native-deps.md). The `deployment`
 feature derives the image's packages from the contract, so a generated
-Dockerfile already carries the right names.
+Dockerfile has the right names.
 
 ## What it is for
 
@@ -78,7 +79,7 @@ This module exists because of this --
 <https://www.youtube.com/watch?v=xE9W9Ghe4Jk> -- but for the backend. And of
 course, no microservices.
 
-## Wired together already
+## Wired together
 
 Which is the bit you would have to build:
 
@@ -86,7 +87,7 @@ Which is the bit you would have to build:
 - the cascade feeds the CLI, so `run`, `version` and `config-check` work without
   you parsing an argument
 - metrics and health feed the Kubernetes probes
-- the deployment contract, built from the config the app already declares, writes
+- the deployment contract, built from the config the app declares, writes
   your Dockerfile and drives the scalo-service chart that renders your Kubernetes objects
 
 ## Documentation
@@ -112,7 +113,7 @@ Which is the bit you would have to build:
 | Rust memory tier list | [dts-rust-memory-tier-list.md](docs/dts-rust-memory-tier-list.md) |
 
 Read [health.md](docs/core-pillars/health.md) before you point a probe at a port:
-two routers can serve the health paths and they do NOT carry the same set.
+two routers can serve the health paths and they do NOT serve the same set.
 
 ## Related
 

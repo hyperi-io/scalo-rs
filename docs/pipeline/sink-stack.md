@@ -7,26 +7,33 @@ every knob defaults to behaviour-preserving values, so wrapping a sender with
 the default config changes nothing until you turn a control on.
 
 The controls are not independent: their **order** decides what a timeout
-covers, and it differs between the two concurrency modes. Read the order off the diagrams
-rather than the prose.
+covers, and it differs between the two concurrency modes.
 
 ## Layer order
 
-Composed with tower's `ServiceBuilder` (outer -> inner). An attempt enters at
-the left and the bytes leave at `sender`.
+Composed with tower's `ServiceBuilder`, outer to inner: under the static cap the timeout wraps the concurrency gate, and under ARC the adaptive limiter wraps the timeout.
 
 ```mermaid
 flowchart TB
-    subgraph S["Static concurrency cap (default)"]
-        direction LR
-        sb["batch"] --> sls["load-shed"] --> srl["rate-limit"] --> sto["timeout"] --> scl["concurrency-limit"] --> ssnd["sender"]
-    end
+    accTitle: L4 Detail -- Sink stack layer order
+    accDescr: Under the static concurrency cap an attempt passes load-shed when it is on, rate-limit, timeout and the concurrency limit before the sender. Under adaptive request concurrency it passes load-shed when on, rate-limit, the adaptive AIMD limiter and the timeout before the sender.
 
-    subgraph A["Adaptive request concurrency -- ARC (opt-in)"]
+    subgraph fixed["Static concurrency cap, default"]
         direction LR
-        ab["batch"] --> als["load-shed"] --> arl["rate-limit"] --> aad["adaptive AIMD"] --> ato["timeout"] --> asnd["sender"]
+        f_shed["load-shed"] --> f_rate["rate-limit"] --> f_timeout["timeout"] --> f_limit["concurrency<br/>limit"] --> f_sender["sender"]
     end
+    subgraph arc["Adaptive request concurrency, opt-in"]
+        direction LR
+        a_shed["load-shed"] --> a_rate["rate-limit"] --> a_aimd["adaptive<br/>AIMD"] --> a_timeout["timeout"] --> a_sender["sender"]
+    end
+    fixed ~~~ arc
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef group fill:none,stroke:#64748B,stroke-width:1px,stroke-dasharray:2 4
+    class fixed,arc group
 ```
+
+*Figure 1. L4 Detail -- Sink stack layer order. Load-shed is there only with `load_shed: true`, and the bytes leave at the sender.* Up: [Pipeline](README.md).
 
 The difference that bites: under the static cap the **timeout wraps the
 concurrency gate** (a request waiting for a slot can still time out). Under ARC
@@ -46,15 +53,28 @@ overload should shed requests rather than queue them.
 Retry/backoff wraps the whole composed service as the OUTERMOST control (driven
 by `backon`), so each retry re-enters at `load-shed` and every attempt is
 independently timeout-bounded. Circuit-breaking is deliberately NOT a layer
-here: the `TieredSink` already wraps its sink in its own breaker, and a second
+here: the `TieredSink` wraps its sink in a breaker of its own, and a second
 one would double-regulate.
 
 ```mermaid
 flowchart LR
-    RT["retry / backoff<br/>(backon, outermost)"] --> STK["sink-stack layers"]
-    STK --> SND["TransportSender"]
-    TS["TieredSink"] -.->|owns the circuit breaker| SND
+    accTitle: L4 Detail -- Retry and the breaker around a sender
+    accDescr: Retry and backoff wrap the stack layers, which wrap the transport sender. A TieredSink wraps a sender with its own circuit breaker and is not a stack layer.
+
+    retry["Retry and<br/>backoff"]
+    layers["Stack layers"]
+    tiered["TieredSink<br/>with breaker"]
+    sender["TransportSender"]
+
+    retry --> layers
+    layers --> sender
+    tiered --> sender
+    retry ~~~ tiered
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
+
+*Figure 2. L4 Detail -- Retry and the breaker around a sender. The tiered sink is a separate wrapper, not a layer of the stack.* Up: [Pipeline](README.md).
 
 ## Delivery guarantee (at-least-once preserved)
 
@@ -64,7 +84,7 @@ flowchart LR
 - A fatal error stops immediately -- no point retrying a permanent failure.
 - The call returns a `SendResult`, and the caller fires its commit tokens only on
   `SendResult::Ok`, exactly as for a bare `send_batch`. Retries may re-deliver
-  records a failed attempt already sent -- a prefix for the per-record default,
+  records a failed attempt sent -- a prefix for the per-record default,
   any subset for Kafka's pipelined override (at-least-once: duplicates, never
   loss) -- identical to the transport's own `send_batch` contract.
 
@@ -89,6 +109,6 @@ Defaults preserve behaviour: no concurrency cap, ARC off, queue-don't-shed.
 ARC sub-knobs (`adaptive`): `initial_limit` (`10`), `min_limit` (`1`),
 `max_limit` (`100`), `increase_by` (`1`), `decrease_factor` (`0.5`).
 
-See also [tiered-sink.md](tiered-sink.md) for the breaker and spool delivery
+See [tiered-sink.md](tiered-sink.md) for the breaker and spool delivery
 path that sits around the sender, and [../self-regulation.md](../self-regulation.md)
 for the inbound side that the outbound ARC is kept separate from.

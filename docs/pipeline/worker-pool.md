@@ -37,13 +37,31 @@ target grows.
 
 The scaler moves the permit target -- never the underlying pool size.
 
+A pool thread takes a permit before it calls the processing closure for an item, and the scaling controller moves only the number of permits, never the pool size.
+
 ```mermaid
-flowchart TB
-    Pool["rayon::ThreadPool<br/>fixed at max_threads"]
-    Sem["Semaphore<br/>permits -- scaler controls"]
-    Batch["process_batch<br/>each item acquires a permit, releases on drop"]
-    Pool --> Sem --> Batch
+flowchart LR
+    accTitle: L4 Detail -- Worker pool permits
+    accDescr: process_batch hands its items to the rayon pool, fixed at max_threads. Each pool thread acquires a permit from the semaphore, whose target the scaling controller sets, before it calls the processing closure, and releases the permit when the closure returns.
+
+    items["process_batch<br/>items"]
+    pool["rayon pool<br/>max_threads"]
+    controller["Scaling<br/>controller"]
+    semaphore["Permit<br/>semaphore"]
+    closure["Processing<br/>closure"]
+
+    items --> pool
+    pool -->|acquire| semaphore
+    controller -->|target| semaphore
+    semaphore -->|permit| closure
+    items ~~~ controller
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef core fill:#DCEBF7,stroke:#0072B2,stroke-width:2px,color:#0B2A3F
+    class semaphore core
 ```
+
+*Figure 1. L4 Detail -- Worker pool permits. A thread releases its permit when the closure returns.* Up: [Pipeline](README.md).
 
 See [`../../src/worker/pool.rs`](../../src/worker/pool.rs).
 

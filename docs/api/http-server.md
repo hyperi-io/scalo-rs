@@ -27,7 +27,7 @@ SIGTERM drains in-flight requests before exit.
 
 ## Mounted endpoints
 
-What `build_router` actually mounts:
+What `build_router` mounts:
 
 | Path | Wired by | What it returns |
 | ------ | ---------- | ----------------- |
@@ -40,8 +40,7 @@ NOT mounted here, whatever the feature set: `/metrics`, `/metrics/manifest`,
 `/scaling/pressure`, `/memory/pressure`. Those belong to the metrics server --
 see [../core-pillars/metrics.md](../core-pillars/metrics.md).
 
-`enable_metrics_endpoint` on `HttpServerConfig` is inert: the field
-exists and `build_router` does not read it. Setting it changes nothing.
+Three `HttpServerConfig` fields parse and do nothing. `enable_metrics_endpoint` is never read by `build_router`. `keep_alive_timeout_ms` (75 s) and `enable_http2` (`true`) are not wired: axum's `serve()` sets no keep-alive and always negotiates HTTP/1 and HTTP/2 on cleartext, so `false` does not turn HTTP/2 off.
 
 ---
 
@@ -95,7 +94,7 @@ let tls = ServerTls::load_with(&config.tls, ServerTlsOptions::http()).await?;
 HttpServer::new(config.http_server).with_tls(tls).serve(app).await?;
 ```
 
-`validate()` runs before anything binds, so the server never serves cleartext while its config asks for TLS. It refuses one path set without the other, either path in a build without the `tls` feature, and `with_tls` together with the paths. [tls.md](tls.md) covers sources, reload and the handshake metrics.
+`validate()` runs before anything binds, so the server never serves cleartext while its config asks for TLS. It rejects one path set without the other, either path in a build without the `tls` feature, and `with_tls` together with the paths. [tls.md](tls.md) covers sources, reload and the handshake metrics.
 
 ---
 

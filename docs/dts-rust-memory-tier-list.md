@@ -37,73 +37,123 @@ What do you need?
 - A lock -> first ask if `ArcSwap` or atomics do the job. If you must ->
   `parking_lot`, never std.
 
-The three trees and the table answer most picks. Want the *why* -> the tiers.
+The three tables below and the quick-reference table answer most picks. Want the *why* -> the tiers.
 
 ### Pick an allocator (all three are S. Choose by the job)
 
-```text
-Need jeprof / MALLOC_CONF heap profiling, or org-policy compliance?  -> jemalloc (tikv-jemallocator)
-Target Windows/MSVC, or max portability (wasm/BSD/musl/macOS)?       -> mimalloc
-Heavy CROSS-THREAD free (stage A allocs Bytes, stage B frees post-send)? -> snmalloc-rs
-Default for a long-running HyperI Linux data-plane binary            -> jemalloc
-```
+| Situation | Pick |
+| --- | --- |
+| jeprof / `MALLOC_CONF` heap profiling, or org-policy compliance | jemalloc (`tikv-jemallocator`) |
+| Windows/MSVC, or max portability (wasm/BSD/musl/macOS) | mimalloc |
+| Heavy CROSS-THREAD free (stage A allocs `Bytes`, stage B frees post-send) | `snmalloc-rs` |
+| Default for a long-running HyperI Linux data-plane binary | jemalloc |
 
 ### Pick a concurrent map
 
-```text
-Read-heavy, lock-free reads, tail-latency-sensitive?         -> papaya  (or scc::HashIndex)
-Write-heavy, concurrent inserts, non-blocking resize?        -> scc2::HashMap
-Whole table swapped between batches, read-mostly?            -> ArcSwap<HashMap>  (ArcSwap<rpds map> for cheap snapshots)
-Want wait-free reads with no reclamation guard?             -> ArcSwap<rpds map>  (left-right family is unmaintained -> F)
-Config / cold path, want a drop-in RwLock<HashMap>?          -> DashMap
-Genuine in-place mutation, snapshot too costly?              -> shard a parking_lot::RwLock
-```
+| Situation | Pick |
+| --- | --- |
+| Read-heavy, lock-free reads, tail-latency-sensitive | `papaya` (or `scc::HashIndex`) |
+| Write-heavy, concurrent inserts, non-blocking resize | `scc2::HashMap` |
+| Whole table swapped between batches, read-mostly | `ArcSwap<HashMap>` (`ArcSwap<rpds map>` for cheap snapshots) |
+| Wait-free reads with no reclamation guard | `ArcSwap<rpds map>` (the left-right family is unmaintained, F) |
+| Config / cold path, a drop-in `RwLock<HashMap>` | `DashMap` |
+| In-place mutation, snapshot too costly | shard a `parking_lot::RwLock` |
 
 ### Pick a SIMD path (stable toolchain)
 
-```text
-Need runtime CPU dispatch (AVX2 vs AVX-512 vs NEON)?  -> pulp (native width)  or  #[multiversion]
-Fixed-width portable, build-time target?             -> wide  (set RUSTFLAGS target-cpu, or build per-target)
-Just reinterpreting bytes <-> POD lanes?             -> bytemuck / zerocopy + &[T]
-Columnar batch kernels?                              -> arrow-rs compute (verify target-cpu=native for AVX-512 codegen)
-On nightly and want std?                             -> std::simd   (NOT available on HyperI stable)
-```
+| Situation | Pick |
+| --- | --- |
+| Runtime CPU dispatch (AVX2 vs AVX-512 vs NEON) | `pulp` (native width) or `#[multiversion]` |
+| Fixed-width portable, build-time target | `wide` (set `RUSTFLAGS` target-cpu, or build per target) |
+| Reinterpreting bytes as POD lanes and back | `bytemuck` / `zerocopy` + `&[T]` |
+| Columnar batch kernels | `arrow-rs` compute (verify `target-cpu=native` for AVX-512 codegen) |
+| On nightly and want std | `std::simd` (NOT available on HyperI stable) |
 
 ### How it flows (where each structure lives on the hot path)
 
+The recommended hot-path layout, not scalo's implementation: bytes come in zero-copy and queue for the worker pool, the pool reads views and fans results out as an immutable `Arc<[T]>`, and a second queue feeds the sink.
+
 ```mermaid
 flowchart LR
-    SRC["Source<br/>socket / file / Kafka"] -->|&quot;mmap / read&quot;| BY["Bytes<br/>refcounted, zero-copy"]
-    BY -->|push| Q1["ArrayQueue<br/>bounded, lock-free"]
-    Q1 --> WP["Worker pool<br/>rayon + bumpalo arena"]
-    WP -->|&quot;parse: bytemuck/zerocopy + SIMD&quot;| VW["&amp;[u8] views"]
-    WP -->|batch| AR["Arc&lt;[T]&gt;<br/>immutable fan-out"]
-    AR --> Q2["ArrayQueue"]
-    Q2 --> SK["Sink<br/>Kafka / gRPC"]
-    CFG["ArcSwap<br/>config / routing"] -.->|read| WP
-    AT["atomics<br/>counters / watermarks"] -.->|update| WP
+    accTitle: L4 Detail -- Memory structures on the hot path
+    accDescr: A source fills refcounted Bytes, which queue in a bounded ArrayQueue. The rayon worker pool with a bumpalo arena reads byte-slice views and batches results into an immutable Arc slice, reading ArcSwap config and updating atomics as it goes. A second ArrayQueue feeds the Kafka or gRPC sink.
+
+    bytes["Bytes from<br/>the source"]
+    queue_in["ArrayQueue<br/>bounded"]
+    config["ArcSwap<br/>config"]
+    atomics["Atomics<br/>counters"]
+    pool["Worker pool<br/>rayon, bumpalo"]
+    views["Byte-slice<br/>views"]
+    fanout["Arc slice<br/>fan-out"]
+    sink["ArrayQueue<br/>to the sink"]
+
+    bytes --> queue_in
+    queue_in --> pool
+    config -.-> pool
+    atomics -.-> pool
+    pool --> views
+    pool --> fanout
+    fanout --> sink
+    bytes ~~~ config
+    bytes ~~~ atomics
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
+
+*Figure 1. L4 Detail -- Memory structures on the hot path. Dotted arrows are reads and updates of shared state.* Up: [L3 Components -- scalo](README.md).
 
 All of it sits on the jemalloc global allocator -- that's the one structure that
 touches every box.
 
 ### Which structure? (the short version)
 
+Moving bytes between threads or stages takes an `ArrayQueue`, or a channel to block on empty. State many threads read takes `ArcSwap`, a map or an atomic, by how it changes.
+
 ```mermaid
-flowchart TD
-    Q{"What are you doing?"}
-    Q --> M{"Moving bytes between<br/>threads / stages?"}
-    Q --> S{"Shared state read<br/>by many threads?"}
-    Q --> H{"Holding / building<br/>the bytes?"}
-    M -->|handoff| AQ["ArrayQueue<br/>block on empty? -&gt; channel"]
-    S -->|&quot;swap whole value&quot;| AS["ArcSwap"]
-    S -->|&quot;key-value map&quot;| MAP["see: pick a map"]
-    S -->|&quot;counter / flag&quot;| ATM["atomic"]
-    H -->|&quot;share / slice&quot;| BYT["Bytes"]
-    H -->|&quot;fan out immutable&quot;| ARC["Arc&lt;[T]&gt; / triomphe"]
-    H -->|&quot;build then freeze&quot;| VEC["Vec -&gt; freeze()"]
-    H -->|&quot;small / bounded&quot;| SMV["smallvec / arrayvec"]
+flowchart LR
+    accTitle: L4 Detail -- Structure for shared state
+    accDescr: State many threads read takes ArcSwap when the whole value is swapped, the map table for a key-value map, or an atomic for a counter or flag.
+
+    shared{"State many<br/>threads read?"}
+    arc_swap(["ArcSwap"])
+    map(["The map table"])
+    atomic(["Atomic"])
+
+    shared -->|swap whole| arc_swap
+    shared -->|key-value| map
+    shared -->|counter| atomic
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    class shared decision
 ```
+
+*Figure 2. L4 Detail -- Structure for shared state. Each end is the structure to reach for.* Up: [L3 Components -- scalo](README.md).
+
+Bytes you hold or build take `Bytes`, an `Arc` slice, a `Vec` you freeze, or an inline vector, by what happens to them next.
+
+```mermaid
+flowchart LR
+    accTitle: L4 Detail -- Structure for holding bytes
+    accDescr: Bytes to share or slice take Bytes, an immutable batch to fan out takes an Arc slice or triomphe, bytes still being built take a Vec then freeze, and a small bounded collection takes smallvec or arrayvec.
+
+    holding{"Holding or<br/>building bytes?"}
+    bytes_end(["Bytes"])
+    arc_slice(["Arc slice,<br/>triomphe"])
+    vec_freeze(["Vec, then<br/>freeze"])
+    small_vec(["smallvec,<br/>arrayvec"])
+
+    holding -->|slice| bytes_end
+    holding -->|fan out| arc_slice
+    holding -->|build| vec_freeze
+    holding -->|bounded| small_vec
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    class holding decision
+```
+
+*Figure 3. L4 Detail -- Structure for holding bytes. Each end is the structure to reach for.* Up: [L3 Components -- scalo](README.md).
 
 ### Quick-reference table
 
@@ -387,7 +437,7 @@ flowchart TD
   - *Situational:* `memmap2`, not `memmap` (that one's dead). Nasty for random
     small reads (page-fault storms) and lethal if the file's truncated or
     rotated under you -- mapping past EOF is UB, which is the log-tailing trap
-    exactly. Tailing wants buffered reads with rotation checks, not mmap.
+    exactly. Tail a file with buffered reads and rotation checks, not mmap.
 
 - `OnceLock` / `LazyLock` -- `[sync]` -- init shared immutable state once,
   read with no lock after. In std now.

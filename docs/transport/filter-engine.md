@@ -3,7 +3,7 @@
 The transport filter engine drops or DLQs messages on the way in or
 the way out of every transport -- Kafka, gRPC, Memory, File, Pipe,
 HTTP -- before they reach app code. It's embedded in every
-backend, zero-cost when no rules are configured, and tiered so the
+backend, a no-op check when no rules are configured, and tiered so the
 common case (field-presence or equality on a top-level field) runs
 without invoking the CEL engine at all.
 
@@ -29,15 +29,32 @@ fails fast if a rule lands in a tier the operator hasn't allowed.
 
 ## Three tiers
 
+Each rule is classified once at config load, and the two CEL tiers start only when their config gate allows them.
+
 ```mermaid
 flowchart LR
-    R[Filter rule] --> C{Classify}
-    C -->|has, equality, startsWith| T1["Tier 1<br/>SIMD field ops"]
-    C -->|compound CEL, numeric, size| T2["Tier 2<br/>compiled CEL"]
-    C -->|matches, filter, map, time fns| T3["Tier 3<br/>complex CEL"]
-    T2 -.->|gate| G2["transport.filter_tiers.allow_cel_filters_in/out"]
-    T3 -.->|gate| G3["transport.filter_tiers.allow_complex_filters_in/out"]
+    accTitle: L4 Detail -- Filter tiers
+    accDescr: At config load each filter rule is classified. Field presence and absence, equality, inequality, prefix, suffix and contains tests run in tier 1 with SIMD field operations. Compound, numeric and size expressions run in tier 2 as compiled CEL, behind the allow_cel_filters gate. Regex, iteration and time functions run in tier 3 as complex CEL, behind the allow_complex_filters gate.
+
+    classify{"Classify<br/>the rule"}
+    tier_1["Tier 1<br/>SIMD field ops"]
+    tier_2["Tier 2<br/>compiled CEL"]
+    tier_3["Tier 3<br/>complex CEL"]
+    gate_2["allow_cel<br/>_filters gate"]
+    gate_3["allow_complex<br/>_filters gate"]
+
+    classify -->|field tests| tier_1
+    classify -->|compound| tier_2
+    classify -->|regex, iteration| tier_3
+    tier_2 -.-> gate_2
+    tier_3 -.-> gate_3
+
+    classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
+    classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
+    class classify decision
 ```
+
+*Figure 1. L4 Detail -- Filter tiers. A dotted arrow is the gate a tier needs, under `transport.filter_tiers`.* Up: [Transport](README.md).
 
 | Tier | Operations | Config gate |
 | ------ | ------------ | ------------- |
@@ -70,7 +87,7 @@ tier-1 operation are tried in order of expected frequency
 none match, scan for restricted function names -- match means tier 3.
 Otherwise tier 2.
 
-The scan reads literals, comments and backtick-quoted names with the same lexer as the expression profile, so a restricted call it finds is one the profile refuses, and a name inside a literal or comment is neither a call nor a field.
+The scan reads literals, comments and backtick-quoted names with the same lexer as the expression profile, so a restricted call it finds is one the profile rejects, and a name inside a literal or comment is neither a call nor a field.
 
 This is conservative on purpose: only expressions that match a
 tier-1 pattern whole execute outside the CEL engine. Anything subtle drops
@@ -102,7 +119,7 @@ See [src/transport/filter/classify.rs](../../src/transport/filter/classify.rs).
 - Startup fails fast on rules above the allowed tier, on invalid
   CEL syntax, on empty expressions, and on Tier 2/3 rules over the AST
   budget (`transport.filter_tiers.budget`). A pipe built directly with
-  `PipeTransport::new` starts but refuses traffic -- see
+  `PipeTransport::new` starts but rejects traffic -- see
   [Where it's embedded](#where-its-embedded).
 
 ---
@@ -154,7 +171,7 @@ If a configured filter rule classifies above the allowed tier, the
 transport's constructor returns `TransportError::Config(...)` and the
 transport fails to start. **Fail-loud, not fail-silently** -- a
 misconfigured drop/dlq rule never runs as an empty filter engine that
-lets every message through. `PipeTransport::new` refuses traffic
+lets every message through. `PipeTransport::new` rejects traffic
 instead -- see [Where it's embedded](#where-its-embedded).
 
 `transport.filter_tiers.budget` bounds Tier 2/3 cost: `max_ast_nodes` (default 200) and `max_iteration_depth` (default 2) are checked at startup, and `max_payload_bytes` (default 1 MiB) at evaluation. A payload over `max_payload_bytes` skips the CEL rule, which then does not match, and counts in `transport_filter_cel_payload_skip_total` (with the `metrics` feature).

@@ -51,7 +51,7 @@ as a `BaseDistro` directly, and `for_scalo_features()` resolves it, in order:
 2. The env var `DEPLOYMENT__BASE_DISTRO` - the same key's ENV-layer spelling.
 3. The base image tag, if it positively names a release.
 4. Otherwise the default (`trixie`), recorded in
-   `unresolved_base_image` so the generated Dockerfile carries a warning.
+   `unresolved_base_image` so the generated Dockerfile has a warning.
 
 Step 2 sets the release where no config file does. `generate-artefacts` loads
 the app's config before it builds the contract, so the YAML key and the env var
@@ -119,16 +119,16 @@ Only librdkafka brings OpenSSL: `cargo tree --all-features -i openssl-sys` finds
 
 ## Custom APT repos
 
-An app that needs a vendor's package adds an `AptRepoContract` to `apt_repos`. An empty `codename` takes the release resolved above, and a set one is used as written, for a vendor whose suites do not follow the distro's:
+An app that needs a third-party package adds an `AptRepoContract` to `apt_repos`. An empty `codename` takes the release resolved above, and a set one is used as written, for a repository whose suites do not follow the distro's:
 
 ```rust
 deps.apt_repos.push(AptRepoContract {
-    key_url: "https://apt.vendor.example/archive.key".into(),
-    keyring: "/usr/share/keyrings/vendor.gpg".into(),
-    url: "https://apt.vendor.example/deb".into(),
+    key_url: "https://apt.example.com/archive.key".into(),
+    keyring: "/usr/share/keyrings/example.gpg".into(),
+    url: "https://apt.example.com/deb".into(),
     codename: String::new(),
     key_fingerprint: "0123456789ABCDEF0123456789ABCDEF01234567".into(),
-    packages: vec!["vendor-runtime".into()],
+    packages: vec!["example-runtime".into()],
 });
 ```
 
@@ -142,18 +142,18 @@ The generated fragment, on trixie:
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg \
-    && curl -fsSL https://apt.vendor.example/archive.key -o /tmp/repo-key.asc \
+    && curl -fsSL https://apt.example.com/archive.key -o /tmp/repo-key.asc \
     && gpg --show-keys --with-colons --with-fingerprint /tmp/repo-key.asc \
        > /tmp/repo-key.info \
     && grep -q "^fpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:" /tmp/repo-key.info \
     && rm -f /tmp/repo-key.info \
-    && gpg --dearmor -o /usr/share/keyrings/vendor.gpg /tmp/repo-key.asc \
+    && gpg --dearmor -o /usr/share/keyrings/example.gpg /tmp/repo-key.asc \
     && rm -f /tmp/repo-key.asc \
-    && echo "deb [signed-by=/usr/share/keyrings/vendor.gpg] \
-       https://apt.vendor.example/deb trixie main" \
-       > /etc/apt/sources.list.d/vendor.list \
+    && echo "deb [signed-by=/usr/share/keyrings/example.gpg] \
+       https://apt.example.com/deb trixie main" \
+       > /etc/apt/sources.list.d/example.list \
     && apt-get update && apt-get install -y --no-install-recommends \
-       vendor-runtime libgit2-1.9 \
+       example-runtime libgit2-1.9 \
     && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 ```
@@ -196,7 +196,7 @@ debian trixie too, so build and runtime glibc are identical -- it just works.
 
 That mapping is not taken on trust. `tier_a_dockerfile_with_native_deps_builds`
 (`tests/e2e/contract_artefacts.rs`) generates a Dockerfile for the default base
-with the kafka, spool, secrets and git features plus a real signed vendor repo,
+with the kafka, spool, secrets and git features plus a signed third-party repo,
 BUILDS it, and then asserts inside the image that the repo's package and
 `libgit2.so` are present. A package search would not prove this either way -
 Debian's package pages do not surface `Provides:`, so a package that resolves

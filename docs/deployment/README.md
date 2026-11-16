@@ -2,7 +2,7 @@
 
 Declare the contract once, and scalo generates the Dockerfile, the Compose fragment
 and the container manifest from it, and the scalo-service library chart renders
-the Kubernetes objects from the same contract. The app already knows its ports,
+the Kubernetes objects from the same contract. The app knows its ports,
 health paths, secrets and native dependencies -- restating them by hand in
 several YAML dialects is where drift comes from.
 
@@ -20,4 +20,4 @@ so a reviewer sees the diff when the contract changes.
 
 Two things bite people, both covered in [native-deps.md](native-deps.md):
 runtime package names are release-specific, and a digest-pinned base image
-carries no codename -- so set `deployment.base_distro` when you pin one.
+has no codename -- so set `deployment.base_distro` when you pin one.
