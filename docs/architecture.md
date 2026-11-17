@@ -25,7 +25,7 @@ flowchart LR
     classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
 
-*Figure 2. L4 Detail -- Module layers. An arrow points at the layer a layer builds on, and every layer may use any layer to its right.* Up: [L3 Components -- scalo](README.md).
+*Figure 1. L4 Detail -- Module layers. An arrow points at the layer a layer builds on, and every layer may use any layer to its right.* Up: [L3 Components -- scalo](README.md).
 
 Two modules sit inside another rather than calling it: `transport::filter` lives inside every transport backend, and `sink-stack` wraps a transport sender.
 
