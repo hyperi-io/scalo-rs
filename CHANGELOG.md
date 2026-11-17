@@ -3,6 +3,16 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.31](https://github.com/hyperi-io/scalo-rs/compare/v2.14.30...v2.14.31) (2026-11-17)
+
+### Bug Fixes
+
+* **build:** gate the config and logger benches on their features ([e03958d](https://github.com/hyperi-io/scalo-rs/commit/e03958d6e74eb04fe25f6177b770f4c3c5631c31))
+* **deps:** move the OpenTelemetry stack to 0.33 ([fdb2b50](https://github.com/hyperi-io/scalo-rs/commit/fdb2b50a473d822044a4079046360d0c80d0f624)), closes [#473](https://github.com/hyperi-io/scalo-rs/issues/473)
+* **deps:** update rust-dependencies ([773bf38](https://github.com/hyperi-io/scalo-rs/commit/773bf3886602c965005e2cfe91cddd49774a774d))
+* **test-support:** pull Docker Hub test images via GHCR mirror ([#479](https://github.com/hyperi-io/scalo-rs/issues/479)) ([24535a0](https://github.com/hyperi-io/scalo-rs/commit/24535a02359ce8303564d70e4df08484abfc3137))
+* **tls:** reload server certificates from file or secret ([#472](https://github.com/hyperi-io/scalo-rs/issues/472)) ([77f9039](https://github.com/hyperi-io/scalo-rs/commit/77f9039972f606275d1451cd9370b719d91649ff))
+
 ## [2.14.30](https://github.com/hyperi-io/scalo-rs/compare/v2.14.29...v2.14.30) (2026-11-14)
 
 ### Bug Fixes
