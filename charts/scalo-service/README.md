@@ -2,15 +2,22 @@
 
 A Helm library chart that renders a Kubernetes service from its deployment contract. The service's own chart is thin: the contract, one-line includes, and values. Every object comes from here.
 
+An assembler builds the thin chart from the service's contract and the scalo-service skeleton, and the thin chart renders its manifests through the library.
+
 ```mermaid
 flowchart LR
+  accTitle: L4 Detail -- scalo-service thin chart
+  accDescr: The app writes its deployment contract. An assembler combines it with the scalo-service skeleton and schema into a thin chart. The thin chart depends on the scalo-service library and renders the Kubernetes manifests.
   A[app generate-artefacts] --> C[deployment-contract.json]
   C --> S[assembler]
   K[scalo-service skeleton + schema] --> S
   S --> T[thin chart]
   T -->|depends on| L[scalo-service library]
   T --> M[Kubernetes manifests]
+  classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
+
+*Figure 1. L4 Detail -- scalo-service thin chart.* Up: [scalo-rs architecture](../../docs/architecture.md).
 
 The contract is the JSON `scalo::deployment::DeploymentContract` serialises, at `schema_version` 4. Its JSON Schema ships here as `schema/deployment-contract.v4.schema.json`, derived from the Rust types. scalo-py emits the same shape, and a service in any other language writes the file by hand.
 

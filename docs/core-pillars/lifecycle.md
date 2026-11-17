@@ -54,6 +54,7 @@ flowchart LR
     state{"work_state?"}
     run["run_service"]
     park["Park on<br/>config change"]
+    reload["Reload: load_config,<br/>on_config_loaded"]
     exit(["Exit 0"])
 
     load --> build
@@ -61,14 +62,15 @@ flowchart LR
     state -->|Active| run
     state -->|Idle| park
     park -->|shutdown| exit
-    park -.->|reload| state
+    park -.->|config change| reload
+    reload -.-> state
 
     classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
     classDef decision fill:#FCF1D6,stroke:#9A6700,stroke-width:1px,color:#3D2A00
     class state decision
 ```
 
-*Figure 1. L4 Detail -- Idle gate. The dotted arrow is the wake, which re-reads the config through `load_config` and `on_config_loaded` first.* Up: [Core pillars](README.md).
+*Figure 1. L4 Detail -- Idle gate. The dotted arrows are the wake, which re-reads the config before asking again.* Up: [Core pillars](README.md).
 
 ---
 
