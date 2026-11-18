@@ -33,12 +33,19 @@ enum Script {
     Fatal,
     /// Sleep this many ms on every call, then succeed (drives the timeout).
     Slow(u64),
+    /// Answer `FilteredDlq` for any call carrying this payload, `Ok` otherwise.
+    DeadLetters(&'static [u8]),
 }
+
+/// The payload every `FakeSender` names in `dead_letter_reason`.
+const SCREENED: &[u8] = b"{\"screened\":1}";
 
 /// A real `TransportSender` with a scripted outcome and a call counter.
 struct FakeSender {
     script: Script,
     calls: AtomicUsize,
+    /// Every payload a `send_batch` call carried, in order.
+    seen: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl FakeSender {
@@ -46,6 +53,7 @@ impl FakeSender {
         Arc::new(Self {
             script,
             calls: AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
         })
     }
     fn call_count(&self) -> usize {
@@ -70,9 +78,24 @@ impl TransportSender for FakeSender {
         SendResult::Ok
     }
 
-    async fn send_batch(&self, _records: &[Record]) -> SendResult {
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        (record.payload.as_ref() == SCREENED).then_some(DeadLetterReason::OutboundFilter)
+    }
+
+    async fn send_batch(&self, records: &[Record]) -> SendResult {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen
+            .lock()
+            .unwrap()
+            .extend(records.iter().map(|r| r.payload.to_vec()));
         match self.script {
+            Script::DeadLetters(bad) => {
+                if records.iter().any(|r| r.payload.as_ref() == bad) {
+                    SendResult::FilteredDlq
+                } else {
+                    SendResult::Ok
+                }
+            }
             Script::Ok => SendResult::Ok,
             Script::FailThenOk(fail_count) => {
                 if n < fail_count {
@@ -130,9 +153,51 @@ async fn delivers_ok_in_a_single_call() {
     let sender = FakeSender::new(Script::Ok);
     let stack = SinkStack::new(Arc::clone(&sender), &fast_cfg());
 
-    let result = stack.send_batch(batch()).await;
+    let result = stack.send_batch(batch()).await.result;
     assert!(result.is_ok());
     assert_eq!(sender.call_count(), 1, "no retries on first-try success");
+}
+
+/// A record the sender screens out and one it refuses only when sent both come
+/// back as dead letters, never counted as sent: the screened one never reaches
+/// the sender, and the refused block is resent one record at a time.
+#[tokio::test]
+async fn dead_letters_come_back_rather_than_counting_as_sent() {
+    const REFUSED: &[u8] = b"{\"refused\":1}";
+    let sender = FakeSender::new(Script::DeadLetters(REFUSED));
+    let stack = SinkStack::new(Arc::clone(&sender), &fast_cfg());
+
+    let sent = stack
+        .send_batch(vec![
+            rec(b"{\"a\":1}"),
+            rec(SCREENED),
+            rec(REFUSED),
+            rec(b"{\"b\":2}"),
+        ])
+        .await;
+
+    assert!(sent.result.is_ok(), "{:?}", sent.result);
+    let dead: Vec<(Vec<u8>, DeadLetterReason)> = sent
+        .dead_letters
+        .into_iter()
+        .map(|d| (d.record.payload.to_vec(), d.reason))
+        .collect();
+    assert_eq!(
+        dead,
+        vec![
+            (SCREENED.to_vec(), DeadLetterReason::OutboundFilter),
+            (REFUSED.to_vec(), DeadLetterReason::Rejected),
+        ]
+    );
+    assert_eq!(
+        sender.call_count(),
+        4,
+        "the block, then its 3 records singly"
+    );
+    assert!(
+        !sender.seen.lock().unwrap().iter().any(|p| p == SCREENED),
+        "a screened record never reaches the sender"
+    );
 }
 
 #[tokio::test]
@@ -140,7 +205,7 @@ async fn empty_batch_is_ok_without_calling_sender() {
     let sender = FakeSender::new(Script::Ok);
     let stack = SinkStack::new(Arc::clone(&sender), &fast_cfg());
 
-    assert!(stack.send_batch(Vec::new()).await.is_ok());
+    assert!(stack.send_batch(Vec::new()).await.result.is_ok());
     assert_eq!(
         sender.call_count(),
         0,
@@ -158,7 +223,7 @@ async fn retries_transient_then_succeeds() {
     };
     let stack = SinkStack::new(Arc::clone(&sender), &cfg);
 
-    let result = stack.send_batch(batch()).await;
+    let result = stack.send_batch(batch()).await.result;
     assert!(result.is_ok(), "should succeed once the sink recovers");
     assert_eq!(sender.call_count(), 3, "initial + 2 retries");
 }
@@ -172,7 +237,7 @@ async fn fatal_is_not_retried() {
     };
     let stack = SinkStack::new(Arc::clone(&sender), &cfg);
 
-    let result = stack.send_batch(batch()).await;
+    let result = stack.send_batch(batch()).await.result;
     assert!(
         result.is_fatal(),
         "fatal must surface as Fatal, got {result:?}"
@@ -191,7 +256,7 @@ async fn exhausted_transient_returns_backpressured() {
     };
     let stack = SinkStack::new(Arc::clone(&sender), &cfg);
 
-    let result = stack.send_batch(batch()).await;
+    let result = stack.send_batch(batch()).await.result;
     assert!(
         result.is_backpressured(),
         "exhausted retries must report Backpressured, got {result:?}"
@@ -213,7 +278,7 @@ async fn per_attempt_timeout_engages() {
     let stack = SinkStack::new(Arc::clone(&sender), &cfg);
 
     let start = Instant::now();
-    let result = stack.send_batch(batch()).await;
+    let result = stack.send_batch(batch()).await.result;
     assert!(
         result.is_backpressured(),
         "timed-out attempts must report Backpressured, got {result:?}"
@@ -263,7 +328,7 @@ async fn send_workbatch_delivers_records_and_ignores_commit_tokens() {
     let stack = SinkStack::new(Arc::clone(&sender), &fast_cfg());
 
     let wb = WorkBatch::new(batch(), vec![TestToken(1), TestToken(2)]);
-    let result = stack.send_workbatch(&wb).await;
+    let result = stack.send_workbatch(&wb).await.result;
     assert!(result.is_ok());
     assert_eq!(sender.call_count(), 1);
     // commit_tokens are the driver's concern, never sent by the stack.
@@ -278,7 +343,7 @@ async fn send_workbatch_delivers_records_and_ignores_commit_tokens() {
 async fn adaptive_stack_delivers_ok() {
     let sender = FakeSender::new(Script::Ok);
     let stack = SinkStack::new(Arc::clone(&sender), &adaptive_cfg());
-    assert!(stack.send_batch(batch()).await.is_ok());
+    assert!(stack.send_batch(batch()).await.result.is_ok());
     assert_eq!(sender.call_count(), 1);
 }
 
@@ -289,7 +354,7 @@ async fn adaptive_stack_preserves_at_least_once() {
     // only DELAYS, it never drops or false-acks.
     let fatal = FakeSender::new(Script::Fatal);
     let stack = SinkStack::new(Arc::clone(&fatal), &adaptive_cfg());
-    assert!(stack.send_batch(batch()).await.is_fatal());
+    assert!(stack.send_batch(batch()).await.result.is_fatal());
     assert_eq!(fatal.call_count(), 1, "fatal not retried under ARC");
 }
 
@@ -306,7 +371,7 @@ async fn adaptive_recovers_after_failures_no_deadlock() {
     let stack = SinkStack::new(Arc::clone(&sender), &cfg);
 
     let start = Instant::now();
-    let result = stack.send_batch(batch()).await;
+    let result = stack.send_batch(batch()).await.result;
     assert!(
         result.is_ok(),
         "must recover, not deadlock at zero concurrency"
@@ -327,10 +392,10 @@ async fn rate_limit_paces_sequential_sends() {
     let stack = SinkStack::new(Arc::clone(&sender), &cfg);
 
     // Drain the initial token, then time five paced sends.
-    let _ = stack.send_batch(batch()).await;
+    let _ = stack.send_batch(batch()).await.result;
     let start = Instant::now();
     for _ in 0..5 {
-        assert!(stack.send_batch(batch()).await.is_ok());
+        assert!(stack.send_batch(batch()).await.result.is_ok());
     }
     assert!(
         start.elapsed() >= Duration::from_millis(40),

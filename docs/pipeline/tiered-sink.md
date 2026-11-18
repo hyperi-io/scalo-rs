@@ -13,12 +13,13 @@ A send goes to the sender when the breaker admits it, spills to the spool when t
 ```mermaid
 flowchart LR
     accTitle: L4 Detail -- Tiered sink delivery
-    accDescr: A send is one send_batch the breaker admits. Delivered returns Ok. Refused by the breaker, backpressured or timed out spills to the spool. Fatal returns Err Sink. A spool write returns Ok when written, Ok with the record dropped under drop_newest, Err SpoolFull when full, or Err DiskUnavailable past the disk threshold.
+    accDescr: A send is one send_batch the breaker admits. Delivered returns Ok. Refused by the breaker, backpressured or timed out spills to the spool. Fatal returns Err Sink, and a record the sender dead-letters returns Err DeadLetter. A spool write returns Ok when written, Ok with the record dropped under drop_newest, Err SpoolFull when full, or Err DiskUnavailable past the disk threshold.
 
     hot{"Hot send<br/>result?"}
     delivered(["Ok, delivered"])
     spool{"Spool<br/>write?"}
     fatal(["Err Sink"])
+    dead(["Err Dead-<br/>Letter"])
     spooled(["Ok, spooled"])
     shed(["Ok, dropped<br/>and counted"])
     full(["Err SpoolFull"])
@@ -27,6 +28,7 @@ flowchart LR
     hot -->|delivered| delivered
     hot -->|not delivered| spool
     hot -->|Fatal| fatal
+    hot -->|FilteredDlq| dead
     spool -->|written| spooled
     spool -->|drop newest| shed
     spool -->|full| full
@@ -38,7 +40,7 @@ flowchart LR
     classDef error fill:#FBE3D6,stroke:#C2410C,stroke-width:1px,color:#4A1A05
     class hot,spool decision
     class delivered,spooled store
-    class fatal,full,disk error
+    class fatal,dead,full,disk error
 ```
 
 *Figure 1. L4 Detail -- Tiered sink delivery. Green ends return `Ok`, orange ends `Err`, and the plain end `Ok` for a record it dropped.* Up: [Pipeline](README.md).
@@ -54,12 +56,15 @@ Each `send_batch` answer and what the sink does with it:
 
 | `send_batch` result | Disposition | Circuit effect |
 | ------------- | ------------- | ---------------- |
-| `Ok` / `FilteredDlq` | `Ok` to the caller | Success recorded: failure count reset, circuit closes |
+| `Ok` | `Ok` to the caller | Success recorded: failure count reset, circuit closes |
+| `FilteredDlq` | `Err(TieredSinkError::DeadLetter)` to the caller. Not spooled | Success recorded |
 | `Backpressured` | Spool to disk | Failure recorded and counted in `spool_circuit_trips_total`, may open the circuit |
-| `Fatal(e)` | `Err(TieredSinkError::Sink)` to the caller | None. Not spooled |
+| `Fatal(e)` | `Err(TieredSinkError::Sink)` to the caller, with `e` as the cause | None. Not spooled |
 | No answer within `send_timeout_ms` | Spool to disk | Failure recorded and counted in `spool_circuit_trips_total`, may open the circuit |
 
-The sink reads the `SendResult` every `TransportSender` returns, so any sender plugs in unchanged. `FilteredDlq` counts as delivered and `send` returns `Ok`, so a record the sender filtered for the DLQ is not handed back to the caller. A spooled record the drain later gets `Fatal` for, sent on its own, is dropped and logged, unless the error is `TransportError::Config` or `Closed`. Those describe the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
+Before any of that, `send` asks the sender's `dead_letter_reason`, and a record it names comes back as `Err(TieredSinkError::DeadLetter)` without being sent or spooled. The caller holds that record, so it writes it to its DLQ, as it does for `Sink` and `SpoolFull`.
+
+The drain has no caller to hand a record back to. A spooled record the sender names, answers `FilteredDlq` for, or refuses with `Fatal` when sent on its own goes to the DLQ set with `TieredSink::with_dlq(Arc<Dlq>)`, with the cause as its reason, and its spool entry is committed only once the DLQ confirms it. A DLQ that does not confirm within `send_timeout_ms` leaves the batch spooled for the next pass. With no DLQ such a record is dropped, logged at ERROR and counted in `tiered_sink_dead_letters_total{outcome="dropped"}`. A `Fatal` of `TransportError::Config` or `Closed` describes the sink and not the record (a Kafka sink whose credentials are refused, say), so the record stays spooled and the circuit counts a failure until the sink is fixed.
 
 ---
 
@@ -117,7 +122,7 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
-Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Every entry is committed only when the sink answers `Ok` or `FilteredDlq`. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal` names no record, so the batch is kept and its entries are sent one at a time, which drops only the record the sink rejects. An entry that fails its CRC or does not decode is dropped on its own, and the rest of its batch is sent.
+Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Records the sender names in `dead_letter_reason` are taken out first. Every entry is committed only when the sink answers `Ok` and the DLQ holds the dead letters. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal`, and a `FilteredDlq`, names no record, so the batch is kept and its entries are sent one at a time, which dead-letters only the record the sink rejects. An entry that fails its CRC or does not decode is dropped on its own, and the rest of its batch is sent.
 
 A pass that takes records starts the next after the strategy's pause for that many records, so the strategy sets the rate. `drain_interval_ms` (100 ms) is added after a pass that found the spool empty or the sink down. Shutdown cuts either wait short.
 
@@ -144,7 +149,8 @@ A spill reserves its item slot and bytes before it writes, and gives them back i
 | --- | --- |
 | `block` (default) | `Err(TieredSinkError::SpoolFull)` |
 | `drop_newest` | `Ok`. The record is dropped and counted in `tiered_sink_dropped_total{policy="drop_newest"}` |
-| `dlq`, `drop_oldest` | Not wired: behaves as `block`, with a warning logged on each spool-full event |
+| `dlq` | `Ok` once the DLQ set with `with_dlq` confirms the record, counted in `tiered_sink_overflow_total{policy="dlq"}`. With no DLQ, or no confirmation within `send_timeout_ms`, behaves as `block` |
+| `drop_oldest` | Not wired: behaves as `block`, with a warning logged on each spool-full event |
 
 Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailable)` whatever `when_full` says. The caller decides what to do with either error -- the typical pattern is to route the record to the DLQ.
 
@@ -192,11 +198,12 @@ Emitted through the `metrics` crate, and only when scalo is built with the `metr
 
 | Metric | Type | Labels | What it reports |
 | --- | --- | --- | --- |
-| `spool_hot_path_total` | counter | none | Records the sink took directly, answering `Ok` or `FilteredDlq` within `send_timeout_ms` |
+| `spool_hot_path_total` | counter | none | Records the sink took directly, answering `Ok` within `send_timeout_ms` |
 | `spool_cold_path_total` | counter | none | `send` calls that ended on the spool path without error. Includes records shed by `drop_newest`, since `send` returns `Ok` for them |
 | `spool_circuit_trips_total` | counter | none | Hot-path sends that failed against the breaker (`Backpressured`, or past `send_timeout_ms`). One per failed send, not per Closed-to-Open change. Drain failures are not counted |
 | `spool_circuit_state` | gauge | none | Breaker state at the last `send`: `0` closed, `1` half-open, `2` open. Half-open shows once the reset timeout has passed, before a probe goes out. An idle sink keeps its last value |
-| `tiered_sink_overflow_total` | counter | `policy` | Records shed because the spool was full. Only `drop_newest` emits it. `block` returns `SpoolFull`, and `dlq` and `drop_oldest` fall back to `block`, so none of them count |
+| `tiered_sink_overflow_total` | counter | `policy` | Records a full spool did not take: `drop_newest` sheds them, `dlq` writes them to the DLQ. `block` returns `SpoolFull`, and `drop_oldest` falls back to `block`, so neither counts |
+| `tiered_sink_dead_letters_total` | counter | `reason`, `outcome` | Records the drain or `when_full: dlq` could not deliver. `outcome` is `dlq` when the DLQ confirmed it, `dropped` with no DLQ or one no backend can hold it. `reason` is `too_large`, `outbound_filter`, `rejected` (refused when sent) or `spool_full` |
 | `tiered_sink_dropped_total` | counter | `policy` | Records dropped on overflow. Moves with `tiered_sink_overflow_total` |
 | `spool_messages` | gauge | none | Records in the spool after the last spill. The drainer never updates it, so it goes stale once draining starts. `spool_len()` is the live count. `ServiceMetrics::spool_messages` writes the same series |
 | `spool_bytes` | gauge | none | Bytes in the spool as stored (compressed, plus the CRC header when `crc` is on). Stale the same way. `spool_bytes()` is the live figure. `ServiceMetrics::spool_bytes` writes the same series |
@@ -214,7 +221,7 @@ Alert on:
 - `1 - spool_disk_available_bytes / spool_disk_total_bytes` nearing `max_usage_percent`. Spool writes then return `DiskUnavailable`.
 - `spool_quarantined_total` above 0. A spill cache was set aside and its records are not replayed.
 
-No metric counts a `SpoolFull` or `DiskUnavailable` error, which goes back to the caller, or a record the drainer discards (a CRC, decompression or decode failure, or a `Fatal` answer about the record itself), which is logged at error level.
+No metric counts a `SpoolFull`, `DiskUnavailable` or `DeadLetter` error, which goes back to the caller, or an entry the drainer discards because it fails its CRC, decompression or decode, which is logged at error level.
 
 ---
 
@@ -224,6 +231,7 @@ No metric counts a `SpoolFull` or `DiskUnavailable` error, which goes back to th
 | ------ | --------- |
 | `TieredSink::new(sender, config)` | Construct, open spool, spawn drain task. `S` is any `TransportSender`, and the sink calls its `send_batch` with one record and acts on the `SendResult` |
 | `send(&Record) -> Result<()>` | Hot path, else spool. Errors go back to the caller, which routes the record (usually to the DLQ) |
+| `with_dlq(Arc<Dlq>)` | The DLQ the drain writes records it cannot deliver to, and `when_full: dlq` the records a full spool cannot take (`dlq` feature) |
 | `spool_len() / spool_is_empty() / spool_bytes()` | Spool depth introspection |
 | `circuit_state()` | Current `CircuitState` |
 | `reset_circuit()` | Manual reset (admin / test) |
@@ -231,7 +239,7 @@ No metric counts a `SpoolFull` or `DiskUnavailable` error, which goes back to th
 | `is_disk_available()` | Disk-aware poller flag |
 | `inner() -> &S` | Borrow the wrapped backend |
 | `shutdown()` | Stop the drain task and the disk poller, and wait for both to exit |
-| `TieredSinkError` | `SpoolOpen` from `new`. From `send`: `Sink` (a `Fatal` answer), `SpoolFull`, `DiskUnavailable`, `Spool` (the spool write failed), `Codec` (compression failed) |
+| `TieredSinkError` | `SpoolOpen` from `new`. From `send`: `DeadLetter` (the sender named it or answered `FilteredDlq`), `Sink` (a `Fatal` answer, with its cause), `SpoolFull`, `DiskUnavailable`, `Spool` (the spool write failed), `Codec` (compression failed) |
 | `TieredSinkConfig` / `WhenFull` / `OrderingMode` / `DrainStrategy` / `DiskAwareConfig` / `CompressionCodec` / `CorruptionPolicy` | Configuration, see [Configuration](#configuration) |
 | `CircuitBreaker` / `CircuitState` | Exposed for tests and custom integrations |
 

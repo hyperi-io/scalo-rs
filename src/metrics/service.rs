@@ -554,7 +554,7 @@ impl ServiceMetrics {
             &[
                 (
                     "spool_hot_path_total",
-                    "Records the tiered sink's sender took on the hot path (Ok or FilteredDlq)",
+                    "Records the tiered sink's sender took on the hot path",
                     MetricType::Counter,
                     "",
                     &[],
@@ -593,6 +593,13 @@ impl ServiceMetrics {
                     MetricType::Counter,
                     "",
                     &["policy"],
+                ),
+                (
+                    "tiered_sink_dead_letters_total",
+                    "Records the tiered sink's drain or full spool could not deliver, by reason and whether the DLQ took them",
+                    MetricType::Counter,
+                    "",
+                    &["reason", "outcome"],
                 ),
                 (
                     "spool_disk_available_bytes",
@@ -1073,6 +1080,11 @@ mod tests {
                 "test_app_tiered_sink_dropped_total",
                 MetricType::Counter,
                 vec!["policy"],
+            ),
+            (
+                "test_app_tiered_sink_dead_letters_total",
+                MetricType::Counter,
+                vec!["reason", "outcome"],
             ),
             ("test_app_spool_messages", MetricType::Gauge, vec![]),
             ("test_app_spool_bytes", MetricType::Gauge, vec![]),

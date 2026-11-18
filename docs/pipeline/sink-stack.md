@@ -82,11 +82,20 @@ flowchart LR
 - Retry re-sends the WHOLE batch on a transient failure. Records are held behind
   an `Arc`, so a retry is a refcount bump, not a copy.
 - A fatal error stops immediately -- no point retrying a permanent failure.
-- The call returns a `SendResult`, and the caller fires its commit tokens only on
-  `SendResult::Ok`, exactly as for a bare `send_batch`. Retries may re-deliver
-  records a failed attempt sent -- a prefix for the per-record default,
-  any subset for Kafka's pipelined override (at-least-once: duplicates, never
-  loss) -- identical to the transport's own `send_batch` contract.
+- The call returns a `SinkOutcome`: the `SendResult` for the records sent, and
+  `dead_letters`, the records the sender would or did dead-letter. The caller
+  writes the dead letters to its DLQ and fires its commit tokens only on
+  `SendResult::Ok`. Retries may re-deliver records a failed attempt sent -- a
+  prefix for the per-record default, any subset for Kafka's pipelined override
+  (at-least-once: duplicates, never loss).
+- Records the sender names in `dead_letter_reason` are taken out before the
+  send. A send it answers `FilteredDlq` names no record, so the stack sends
+  that batch's records again one at a time, and each one refused joins the dead
+  letters as `DeadLetterReason::Rejected`. The resend repeats the records already
+  sent. A `FilteredDlq` is never retried as a whole and never counts as sent.
+- In a `BatchEngine` pipeline, the sink hands the dead letters back through
+  `pieces.refusals()`, and the loop writes them to the DLQ before it releases
+  the source ([acknowledgements.md](acknowledgements.md#pieces-and-release)).
 
 ## Configuration
 

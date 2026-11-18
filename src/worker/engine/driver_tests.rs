@@ -4636,13 +4636,12 @@ async fn an_oversize_record_through_a_routed_sender_is_screened_by_its_route() {
 }
 
 /// A gRPC `send_batch` outside the pipeline leaves a record over its ceiling
-/// out of a block it otherwise sends: that record is dropped, so it counts
-/// with the dropped dead letters. A block of nothing but such records is
-/// answered `FilteredDlq`, which every caller takes as handled, so those
-/// count too.
+/// out of a block it otherwise sends: the block is answered `FilteredDlq`,
+/// never `Ok`, and the record counts with the dropped dead letters. A block of
+/// nothing but such records is answered the same way.
 #[cfg(all(feature = "metrics", feature = "transport-grpc"))]
 #[tokio::test(flavor = "current_thread")]
-async fn a_record_grpc_send_batch_leaves_out_counts_as_a_dropped_dead_letter() {
+async fn a_grpc_block_with_a_record_left_out_answers_filtered_dlq_and_counts_it_dropped() {
     use crate::transport::grpc::{GrpcConfig, GrpcTransport};
     use crate::transport::{SendResult, TransportSender};
 
@@ -4676,7 +4675,7 @@ async fn a_record_grpc_send_batch_leaves_out_counts_as_a_dropped_dead_letter() {
     let sent = client
         .send_batch(&[record(10), record(LIMIT), record(10)])
         .await;
-    assert!(matches!(sent, SendResult::Ok), "{sent:?}");
+    assert!(matches!(sent, SendResult::FilteredDlq), "{sent:?}");
     let received = server.recv(10).await.expect("recv").records.len();
     assert_eq!(received, 2, "the two records within the ceiling arrive");
     assert_eq!(dropped(), 1, "the one left out is counted dropped");

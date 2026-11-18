@@ -285,7 +285,8 @@ clone can call `shutdown()`.
 
 ## Related
 
-- [tiered-sink.md](tiered-sink.md) -- common upstream: its caller routes the sink's `SpoolFull` and `Sink` (fatal) errors here
+- [tiered-sink.md](tiered-sink.md) -- common upstream: its caller routes the sink's `SpoolFull`, `Sink` (fatal) and `DeadLetter` errors here, and its drain writes here with `with_dlq`
+- [sink-stack.md](sink-stack.md) -- hands back the records its sender dead-letters, for the caller to write here
 - [batch-engine.md](batch-engine.md) -- parse errors and pre-route DLQ outcomes flow here
 - [../transport/README.md](../transport/README.md) -- Kafka backend reuses `KafkaConfig`
 - [../transport/filter-engine.md](../transport/filter-engine.md) -- wire-level filter drains DLQ entries here

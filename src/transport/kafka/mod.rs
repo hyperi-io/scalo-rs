@@ -172,12 +172,23 @@ fn produce_record<'a>(
 ///
 /// `Ok` (sent or dropped by a filter) and `FilteredDlq` are handled records, so
 /// they never fail the block. Any other result means at least one record is
-/// unconfirmed, and the caller must retry the block rather than commit it.
+/// unconfirmed, and the caller must retry the block rather than commit it. A
+/// handled block with a `FilteredDlq` in it answers `FilteredDlq`, as the
+/// trait's `send_batch` does.
 fn block_result(results: Vec<SendResult>) -> SendResult {
-    results
-        .into_iter()
-        .find(|r| matches!(r, SendResult::Backpressured | SendResult::Fatal(_)))
-        .unwrap_or(SendResult::Ok)
+    let mut dead_lettered = false;
+    for result in results {
+        match result {
+            SendResult::Ok => {}
+            SendResult::FilteredDlq => dead_lettered = true,
+            failed @ (SendResult::Backpressured | SendResult::Fatal(_)) => return failed,
+        }
+    }
+    if dead_lettered {
+        SendResult::FilteredDlq
+    } else {
+        SendResult::Ok
+    }
 }
 
 /// What the `transport:kafka` health check reports.
@@ -2011,8 +2022,8 @@ impl TransportSender for KafkaTransport {
     /// - Every queued record's report is awaited, even after a failure, so the
     ///   result describes the whole block and a caller retry never overlaps it.
     /// - The result is the first `Backpressured` or `Fatal` in record order,
-    ///   else `Ok`. `Ok` means every record was confirmed by the broker or
-    ///   handled by a filter.
+    ///   else `FilteredDlq` when a record was dead-lettered, else `Ok`. `Ok`
+    ///   means every record was confirmed by the broker or dropped by a filter.
     ///
     /// ## At-least-once caveat -- a failed block can be partly delivered
     ///
@@ -4779,7 +4790,7 @@ mod tests {
     }
 
     #[test]
-    fn block_result_is_ok_only_when_every_record_is_handled() {
+    fn block_result_is_ok_only_when_every_record_is_sent_or_dropped() {
         assert!(block_result(Vec::new()).is_ok(), "an empty block is Ok");
         assert!(
             block_result(vec![
@@ -4787,8 +4798,8 @@ mod tests {
                 SendResult::FilteredDlq,
                 SendResult::Ok
             ])
-            .is_ok(),
-            "sent, dropped and dead-lettered records are all handled"
+            .is_filtered_dlq(),
+            "a dead-lettered record is handled but never answered as sent"
         );
         // One unconfirmed record among a thousand confirmed ones fails the
         // block, so the caller retries it rather than committing past it.
@@ -4829,9 +4840,9 @@ mod tests {
         );
     }
 
-    /// Filtered records never reach the producer. With no broker, a queued
-    /// record could not resolve inside the deadline, so an `Ok` in time proves
-    /// every record was filtered before it was offered.
+    /// Filtered records never reach the producer: with no broker, a
+    /// `FilteredDlq` answer inside the deadline means no record was queued, and
+    /// the block's `dlq` record makes that answer `FilteredDlq`, not `Ok`.
     #[tokio::test]
     async fn send_batch_filters_every_record_before_queueing_it() {
         let config = KafkaConfig {
@@ -4857,7 +4868,7 @@ mod tests {
             .await
             .expect("a filtered record was queued and waited on a broker that does not exist");
         assert!(
-            result.is_ok(),
+            result.is_filtered_dlq(),
             "filtered records are handled, got {result:?}"
         );
     }

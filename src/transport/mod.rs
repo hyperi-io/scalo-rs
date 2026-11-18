@@ -114,7 +114,7 @@ pub mod routed;
 // Re-exports -- traits and factory
 pub use ack::{
     AckControl, AckKind, AcknowledgementsConfig, AcknowledgingReceiver, DEAD_LETTER_REJECTED,
-    DeadLetterReason, HeldAcks, SinkConfirmation, SourceAck,
+    DeadLetter, DeadLetterReason, HeldAcks, SinkConfirmation, SourceAck, screen,
 };
 pub use codec::{CodecError, FieldRef, ParsedPayload, parse};
 pub use error::{TransportError, TransportResult};

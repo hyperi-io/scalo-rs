@@ -397,8 +397,8 @@ impl DrainStrategy {
 /// each record it sheds counts in `tiered_sink_overflow_total{policy}` and
 /// `tiered_sink_dropped_total{policy}` so the loss is alertable.
 ///
-/// `Dlq` and `DropOldest` are not wired yet: both behave as `Block`, log a
-/// warning on every spool-full event, and count in neither metric.
+/// `DropOldest` is not wired yet: it behaves as `Block`, logs a warning on
+/// every spool-full event, and counts in neither metric.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -407,8 +407,9 @@ pub enum WhenFull {
     /// source. Lossless. Default (matches pre-2.10 behaviour).
     #[default]
     Block,
-    /// Meant to divert the overflowing record to the DLQ. Not wired yet:
-    /// behaves as `Block`, with a warning.
+    /// Write the overflowing record to the DLQ set with `TieredSink::with_dlq`,
+    /// counted in `tiered_sink_overflow_total{policy="dlq"}`. With no DLQ, or
+    /// a write the DLQ does not confirm, behaves as `Block`.
     Dlq,
     /// Drop the incoming (newest) record. Explicit opt-in loss. Keeps the
     /// older, lower-latency records already spooled.
