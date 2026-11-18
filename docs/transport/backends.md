@@ -182,6 +182,26 @@ A server armed by a caller that releases every token it takes answers a push onl
 - Tokens: each request takes one contiguous range of sequence numbers, and a token is found by its number alone, so a `GrpcToken` rebuilt from a stored `seq` releases the same record. Releasing a token twice counts once.
 - Counters: `transport_ack_held` and `transport_ack_held_bytes` are gauges, and `transport_ack_latency_seconds{outcome}` runs from admission to answer. `transport_ack_released_total{outcome}` takes outcome `delivered`, `dropped`, `rejected`, `errored`, `expired`, `shutdown`, or `orphaned` for one freed after its sender went away unanswered. `transport_ack_refused_total{reason}` takes reason `ceiling`, `pressure`, `closed` or `full` (a receive queue with no room), counted while the server holds its responses.
 
+### Hold ladder
+
+In a chain of hops that each hold their sender's answer until the next hop has the records, every hop has to answer before its sender gives up. `transport::hold::HoldLadder` gives each hop its hold and its next-hop deadline by depth, so no hop copies its neighbour's number. It needs only the `transport` feature, so a Kafka-only build has it, and `transport::grpc` re-exports it beside `hold_budget`.
+
+`HoldLadder::DEFAULT` has a 25 s top, the gRPC server's default `max_hold`, and a 5 s step:
+
+| Depth | `hold` | `next_hop_deadline` |
+| --- | --- | --- |
+| 0 | 25 s | 20 s |
+| 1 | 18 s | 15 s |
+| 2 | 13.5 s | 10 s |
+| 3 | 9 s | 5 s |
+
+- Depth 0 holds for `top`. Depth `k` gives the next hop `top - step * (k + 1)` and holds for the `hold_budget` of the deadline depth `k - 1` gives. Every hop holds for less than its sender waits, and waits on the next hop for less than it holds.
+- `rung(depth)` is `None` past the last depth whose next-hop deadline is above zero. `rungs()` lists every rung, for a check that a chain shrinks at each hop.
+- `HoldLadder::new(top, step)` refuses a step no longer than a tenth of `top` or 1 s, whichever is longer, because a hop would then hold past its own next-hop deadline. It refuses a `top` no longer than `step` too.
+- Take the depth of your role in the longest flow you serve, and use it for every flow. Behind a shorter flow the hop holds for less than its nearer sender waits, which still answers that sender in time.
+- A hop that reads from Kafka holds no push, but it still takes its depth, so the hop it sends to holds for less than its next-hop deadline.
+- `next_hop_deadline` is the bound for a gRPC `send_timeout_ms`, or for a producer's `message.timeout.ms` while the hop holds its sender's answer.
+
 ### `transport-grpc-vector-compat`
 
 Wire-compat shim for `vector.Vector/PushEvents`. Only used by
