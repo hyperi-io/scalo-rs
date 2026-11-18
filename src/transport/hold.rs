@@ -245,8 +245,8 @@ mod tests {
         }
     }
 
-    /// The default ladder gives a three-depth flow the hold times and
-    /// deadlines its hops held before the ladder existed.
+    /// The default ladder's first three depths hold 25 s with a 20 s next-hop
+    /// deadline, 18 s with 15 s, then 13.5 s.
     #[test]
     fn the_default_ladder_keeps_the_three_depth_values() {
         assert_eq!(HoldLadder::default(), HoldLadder::DEFAULT);

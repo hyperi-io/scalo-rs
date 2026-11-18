@@ -93,7 +93,7 @@ A route filter table written with separate match types maps onto these:
 
 ### CEL Fast conditions
 
-`when` compiles under the CEL Fast profile ([../../src/expression/profile.rs](../../src/expression/profile.rs)): the options' `profile`, or `expression.*` from the config cascade for `RuleSet::compile`. Each top-level name the condition reads resolves lazily, from an earlier top-level target's new value or from the record. A condition that is not `true`, or fails to evaluate, does not match.
+`when` compiles under the CEL Fast profile ([../../src/expression/profile.rs](../../src/expression/profile.rs)): the options' `profile`, or `expression.*` from the config cascade for `RuleSet::compile`. Each top-level name the condition reads resolves lazily, from another top-level target's new value or from the record, as [Targets in order](#targets-in-order) says. A condition that is not `true`, or fails to evaluate, does not match.
 
 The profile scanner reads the condition as cel's lexer does. A function name inside a string or bytes literal (quoted, triple-quoted or raw, with the `r`, `R`, `b`, `B`, `br`, `bR`, `Br` or `BR` prefix), a `//` comment or a backtick-quoted name is not a call, and whitespace or a comment between a name and its `(` still makes it one.
 
@@ -110,6 +110,8 @@ Empty text reads as no value everywhere: `from` an empty field does not match, a
 ### Targets in order
 
 A row for a later target that reads an earlier target's field reads the value this pass set, when a row set one, else the record's. An earlier target reads the record's value of a later one. So with `targets: [_source, _org_id]` an org row can test the source the same pass chose.
+
+"The record's" value of another target, one no row has set, is what `FieldSource::unassigned_target` returns, and `unassigned_target_cel` for a CEL condition. Both default to the record's own lookup, so `JsonPayload`, `serde_json::Value` and any record that does not override them read the field as it stands. A record that overrides them returns `Lookup::Missing` (or `None`) for a value other targets' rows must not act on. With `targets: [kind, owner]`, a record carrying `kind: web` that no `kind` row matched then fires no owner row guarded on `kind equals web`. A target's own rows still read the record through `lookup`, so a `kind` row can confirm the `kind` the record carries.
 
 ---
 
