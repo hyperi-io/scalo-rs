@@ -4955,6 +4955,154 @@ async fn dlq_routed_record_releases_after_the_dlq_confirms() {
     dlq_shutdown.cancel();
 }
 
+/// An engine already behind an `Arc`, as `ServiceRuntime` hands it out, takes
+/// a filter DLQ policy and a DLQ, and its pipeline writes to that DLQ.
+#[cfg(feature = "dlq")]
+#[tokio::test]
+async fn a_shared_engine_takes_its_dlq_and_policy_after_it_is_built() {
+    use crate::worker::engine::FilterDlqPolicy;
+
+    let engine = Arc::new(default_engine());
+    let routed = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&routed);
+    engine.set_filter_dlq_policy(FilterDlqPolicy::Route(Arc::new(
+        move |entries: Vec<crate::transport::filter::FilteredDlqEntry>| {
+            seen.fetch_add(entries.len(), Ordering::SeqCst);
+            Ok(())
+        },
+    )));
+    engine
+        .route_dlq_entries(vec![crate::transport::filter::FilteredDlqEntry {
+            payload: b"x".to_vec(),
+            key: None,
+            reason: "filtered".into(),
+        }])
+        .expect("the policy set through the Arc routes it");
+    assert_eq!(routed.load(Ordering::SeqCst), 1);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dlq_shutdown = CancellationToken::new();
+    engine.set_dlq(file_dlq(dir.path(), &dlq_shutdown));
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    engine
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .run(dead_letter_seq_one, move |_out: &WorkBatch<_>| {
+            stop.cancel();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("clean shutdown");
+
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Rejected)]
+    );
+    assert_eq!(
+        dlq_lines(dir.path()).await,
+        1,
+        "written to the DLQ set later"
+    );
+    assert_eq!(
+        routed.load(Ordering::SeqCst),
+        1,
+        "the DLQ took it, not the policy"
+    );
+    dlq_shutdown.cancel();
+}
+
+/// A record the downstream refuses for good, handed back through
+/// `BlockPieces::refusals`, lands in the DLQ file with the refusal as its
+/// reason, and the block is released once the DLQ holds it. The gRPC receiver
+/// here has a lower ceiling than its sender, so the sender's screen passes the
+/// record and only the receiver's `OutOfRange` refuses it.
+#[cfg(all(feature = "dlq", feature = "transport-grpc"))]
+#[tokio::test]
+async fn a_record_the_sink_refuses_reaches_the_dlq_with_its_reason() {
+    use crate::transport::grpc::{GrpcConfig, GrpcTransport};
+    use crate::transport::{SendResult, TransportSender};
+    use crate::worker::engine::BlockPieces;
+
+    const RECEIVER_LIMIT: usize = 1024;
+    const REFUSAL: &str = "the receiver refused it as over its size limit";
+    let server = GrpcTransport::new(
+        &GrpcConfig::server("127.0.0.1:0").with_max_message_size(RECEIVER_LIMIT),
+    )
+    .await
+    .expect("server");
+    let uri = format!("http://{}", server.local_addr().expect("bound"));
+    let client = Arc::new(
+        GrpcTransport::new(&GrpcConfig::client(&uri))
+            .await
+            .expect("client"),
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dlq_shutdown = CancellationToken::new();
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1, 2]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+    let sink_client = Arc::clone(&client);
+
+    default_engine()
+        .with_dlq(file_dlq(dir.path(), &dlq_shutdown))
+        .pipeline(&source)
+        .shutdown(shutdown)
+        .sender(&*client)
+        .run_with_pieces(
+            |batch: WorkBatch<crate::transport::memory::MemoryToken>| {
+                Ok(batch.map_records(|records| {
+                    records
+                        .into_iter()
+                        .map(|mut record| {
+                            if record.payload.as_ref() == br#"{"seq":1}"# {
+                                record.payload = Bytes::from(vec![b'x'; RECEIVER_LIMIT * 4]);
+                            }
+                            record
+                        })
+                        .collect()
+                }))
+            },
+            move |out: &WorkBatch<_>, pieces: &BlockPieces<'_>| {
+                let refusals = pieces.refusals();
+                let records = out.records.clone();
+                let client = Arc::clone(&sink_client);
+                let stop = stop.clone();
+                async move {
+                    for record in &records {
+                        match client.send("main", record.payload.clone()).await {
+                            SendResult::Ok => {}
+                            SendResult::FilteredDlq => refusals.dead_letter(record, REFUSAL),
+                            other => return Err(EngineError::Sink(format!("{other:?}"))),
+                        }
+                    }
+                    stop.cancel();
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("clean shutdown");
+
+    assert_eq!(
+        source.released(),
+        vec![(vec![0, 1, 2], DeliveryStatus::Rejected)],
+        "released once the DLQ holds the refused record, never Delivered"
+    );
+    let delivered = server.recv(10).await.expect("recv").records.len();
+    assert_eq!(delivered, 2, "the two records within its ceiling arrive");
+    let path = dir.path().to_path_buf();
+    let lines =
+        tokio::task::spawn_blocking(move || crate::dlq::test_files::written_lines(&path, "svc"))
+            .await
+            .expect("read the DLQ files");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let entry: serde_json::Value = serde_json::from_str(&lines[0]).expect("a JSON line");
+    assert_eq!(entry["reason"], REFUSAL, "{entry}");
+    dlq_shutdown.cancel();
+}
+
 /// A disabled DLQ drops every dead letter: the block releases `Dropped`, and
 /// each counts in the pipeline's dropped counter as well as the DLQ's own.
 #[cfg(all(feature = "dlq", feature = "metrics"))]

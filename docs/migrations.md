@@ -6,6 +6,20 @@ release and the target before bumping.
 
 ---
 
+## 2.14.32
+
+### A pipeline sink hands refused records back to the DLQ (additive)
+
+`BlockPieces::refusals()` gives a `run_with_pieces` sink an owned `Refusals` handle. A record the downstream refuses for good goes back through `refusals.dead_letter(&record, reason)`, and the loop writes it to the DLQ before the source is released. `BatchEngine::set_dlq` and `set_filter_dlq_policy` set the DLQ and the policy on an engine already behind an `Arc`, as `ServiceRuntime` hands it out. See [acknowledgements.md](pipeline/acknowledgements.md#dead-letters).
+
+**Consumer adjustment** -- a sink that dropped and counted refused records hands them back instead. An app on `ServiceRuntime` that wants the DLQ calls `set_dlq` before its first run.
+
+### The engine's DLQ metric is the one it emits (BEHAVIOUR CHANGE)
+
+The batch engine registered `batch_engine_messages_dlq_total`, which nothing emitted. It now registers `engine_filter_dlq_discarded_total`, the counter `FilterDlqPolicy::DiscardWithMetric` emits.
+
+**Consumer adjustment** -- a metrics manifest or dashboard naming `batch_engine_messages_dlq_total` names `engine_filter_dlq_discarded_total` instead.
+
 ## 2.14.31
 
 ### OpenTelemetry moves to the 0.33 line (API CHANGE)
