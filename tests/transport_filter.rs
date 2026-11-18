@@ -185,6 +185,56 @@ async fn outbound_filter_dlq_returns_filtered_dlq() {
         )
         .await;
     assert!(result.is_ok(), "Non-matching message should send normally");
+
+    // The screen names before the send exactly the record the send dead-letters.
+    let record = |payload: &'static [u8]| scalo::transport::Record {
+        payload: bytes::Bytes::from_static(payload),
+        key: None,
+        headers: Vec::new(),
+        metadata: scalo::transport::RecordMeta {
+            timestamp_ms: None,
+            format: scalo::transport::PayloadFormat::Json,
+        },
+    };
+    assert_eq!(
+        transport.dead_letter_reason(&record(br#"{"status":"bad","data":"x"}"#)),
+        Some(scalo::transport::DeadLetterReason::OutboundFilter)
+    );
+    assert_eq!(
+        transport.dead_letter_reason(&record(br#"{"status":"good","data":"x"}"#)),
+        None
+    );
+
+    // A block holding a dead-lettered record sends the rest and never answers Ok.
+    let block = [
+        record(br#"{"status":"bad","data":"x"}"#),
+        record(br#"{"status":"good","data":"y"}"#),
+    ];
+    let result = transport.send_batch(&block).await;
+    assert!(result.is_filtered_dlq(), "{result:?}");
+
+    // gRPC's native batch answers the same, and still sends the rest.
+    #[cfg(feature = "transport-grpc")]
+    {
+        use scalo::transport::grpc::{GrpcConfig, GrpcTransport};
+        let server = GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0"))
+            .await
+            .expect("server");
+        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        let client = GrpcTransport::new(&GrpcConfig {
+            filters_out: vec![FilterRule {
+                expression: r#"status == "bad""#.into(),
+                action: FilterAction::Dlq,
+            }],
+            ..GrpcConfig::client(&uri)
+        })
+        .await
+        .expect("client");
+        let result = client.send_batch(&block).await;
+        assert!(result.is_filtered_dlq(), "grpc: {result:?}");
+        let arrived = server.recv(10).await.expect("recv").records;
+        assert_eq!(arrived.len(), 1, "the record that passed is sent");
+    }
 }
 
 #[tokio::test]

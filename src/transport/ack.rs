@@ -214,6 +214,37 @@ pub enum DeadLetterReason {
     /// An outbound `dlq` filter matched it.
     #[error("an outbound filter routed it to the DLQ")]
     OutboundFilter,
+    /// The sender answered `FilteredDlq` for it on its own, for a cause it could
+    /// not name before the send: a broker or receiver ceiling below its own.
+    #[error("the sender dead-lettered it when sent")]
+    Rejected,
+}
+
+/// A record taken out of a send because the sender would, or did, dead-letter
+/// it, with why. The caller writes it to its DLQ.
+#[derive(Debug, Clone)]
+pub struct DeadLetter {
+    /// The record, whole.
+    pub record: super::work_batch::Record,
+    /// Why it is a dead letter.
+    pub reason: DeadLetterReason,
+}
+
+/// Split `records` into those `sender` would send and those it names in
+/// [`dead_letter_reason`](super::TransportSender::dead_letter_reason).
+pub fn screen<S: super::TransportSender + ?Sized>(
+    sender: &S,
+    records: Vec<super::work_batch::Record>,
+) -> (Vec<super::work_batch::Record>, Vec<DeadLetter>) {
+    let mut kept = Vec::with_capacity(records.len());
+    let mut dead = Vec::new();
+    for record in records {
+        match sender.dead_letter_reason(&record) {
+            None => kept.push(record),
+            Some(reason) => dead.push(DeadLetter { record, reason }),
+        }
+    }
+    (kept, dead)
 }
 
 /// The `reason` label of a record over a sender's size ceiling.
@@ -233,6 +264,7 @@ impl DeadLetterReason {
         match self {
             Self::TooLarge { .. } => TOO_LARGE,
             Self::OutboundFilter => "outbound_filter",
+            Self::Rejected => DEAD_LETTER_REJECTED,
         }
     }
 }
@@ -912,6 +944,7 @@ mod tests {
             "too_large"
         );
         assert_eq!(DeadLetterReason::OutboundFilter.as_str(), "outbound_filter");
+        assert_eq!(DeadLetterReason::Rejected.as_str(), DEAD_LETTER_REJECTED);
     }
 
     struct Control {

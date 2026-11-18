@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 /// Hand a block to the fault sink, mapping its answer onto the engine's retry rules.
 async fn deliver(sink: &FaultSink, records: &[Record]) -> Result<(), EngineError> {
     match sink.send_batch(records).await {
-        SendResult::Ok | SendResult::FilteredDlq => Ok(()),
+        SendResult::Ok => Ok(()),
+        // Names no record, so the block is never released as delivered.
+        SendResult::FilteredDlq => Err(EngineError::Sink("the sink dead-lettered a record".into())),
         SendResult::Backpressured => Err(TransportError::Backpressure.into()),
         SendResult::Fatal(e) => Err(EngineError::Sink(e.to_string())),
     }

@@ -232,27 +232,36 @@ pub trait TransportSender: TransportBase {
     /// A native batch override (gRPC) sends the whole block as one RPC, avoiding
     /// the partial-send window.
     ///
-    /// ## Outbound-filter dispositions do NOT abort the batch
+    /// ## A dead-lettered record does NOT abort the batch
     ///
-    /// A per-record `FilteredDlq` is the record being HANDLED, not a send
-    /// failure: skip it and continue. Returning it would make the caller retry
-    /// the whole block forever -- the deterministic filter re-matches the same
-    /// record every time (a livelock that stalls the source). `Drop` records
-    /// likewise never reach the wire. Only `Backpressured`/`Fatal`
+    /// A per-record `FilteredDlq` is not a send failure: the rest of the block
+    /// is still sent. Stopping there would make the caller retry the whole
+    /// block forever, since the same bytes are refused every time. `Drop`
+    /// records never reach the wire. Only `Backpressured`/`Fatal`
     /// short-circuit.
+    ///
+    /// The result is then `FilteredDlq`, never `Ok`: every other record was
+    /// sent, and at least one was dead-lettered and written nowhere. The answer
+    /// names no record. A caller that holds the records takes out the ones
+    /// [`dead_letter_reason`](Self::dead_letter_reason) names before the call,
+    /// and on a `FilteredDlq` sends the block again one record at a time to
+    /// find the one refused, or holds the block. It never releases it as
+    /// delivered.
     fn send_batch(&self, records: &[Record]) -> impl Future<Output = SendResult> + Send {
         async move {
+            let mut dead_lettered = false;
             for record in records {
                 match self.send_record(record).await {
-                    // Sent, dropped (Ok), or suppressed by an outbound dlq
-                    // filter -- all handled. Keep going, do NOT abort the block.
-                    SendResult::Ok | SendResult::FilteredDlq => {}
-                    // Transient/fatal transport failure: stop so the caller
-                    // retries the unconfirmed remainder of the block.
+                    SendResult::Ok => {}
+                    SendResult::FilteredDlq => dead_lettered = true,
                     other @ (SendResult::Backpressured | SendResult::Fatal(_)) => return other,
                 }
             }
-            SendResult::Ok
+            if dead_lettered {
+                SendResult::FilteredDlq
+            } else {
+                SendResult::Ok
+            }
         }
     }
 
@@ -270,10 +279,10 @@ pub trait TransportSender: TransportBase {
     /// `None` when it would send it or drop it by policy.
     ///
     /// A sender answers such a record `FilteredDlq` without writing it
-    /// anywhere, and `send_batch` counts it handled, so a caller that holds a
-    /// source acknowledgement screens the block first and routes these to its
-    /// DLQ. Kafka names a record over `message.max.bytes` and an outbound `dlq`
-    /// filter match. The default names none.
+    /// anywhere, so a caller that holds a source acknowledgement screens the
+    /// block first and routes these to its DLQ. Every in-tree sender names an
+    /// outbound `dlq` filter match, and Kafka and gRPC a record over their
+    /// size ceiling. The default names none.
     fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
         let _ = record;
         None

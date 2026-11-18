@@ -34,6 +34,12 @@ pub enum TieredSinkError {
     #[error("sink error: {0}")]
     Sink(String),
 
+    /// The sink will never take this record: it names it in
+    /// `dead_letter_reason`, or answered `FilteredDlq` for it. Not spooled.
+    /// The caller writes it to its DLQ.
+    #[error("dead letter: {0}")]
+    DeadLetter(String),
+
     /// Disk is unavailable (full or inaccessible).
     #[error("disk unavailable for spooling")]
     DiskUnavailable,

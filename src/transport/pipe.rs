@@ -257,6 +257,18 @@ impl TransportBase for PipeTransport {
 }
 
 impl TransportSender for PipeTransport {
+    /// A record an outbound `dlq` filter matches. Filters that did not compile
+    /// refuse every send as `Fatal`, so they name none.
+    fn dead_letter_reason(
+        &self,
+        record: &super::work_batch::Record,
+    ) -> Option<super::ack::DeadLetterReason> {
+        self.filter_engine
+            .as_ref()
+            .is_ok_and(|engine| engine.outbound_dead_letter(&record.payload))
+            .then_some(super::ack::DeadLetterReason::OutboundFilter)
+    }
+
     async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);

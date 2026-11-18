@@ -68,11 +68,23 @@ With `BatchEngine::with_dlq(Arc<Dlq>)`, a block's dead letters -- inbound filter
 
 An entry no DLQ backend can ever hold -- over a Kafka-only DLQ's `message.max.bytes` as written -- is left out of the write (`Dlq::refusal`), dropped, and counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`, and its piece reports `Dropped`. No retry could land it, and holding it would pin a Kafka partition's commit for good. A disabled DLQ reports `Dropped` and counts each in `pipeline_dead_letters_dropped_total{reason}`, where `reason` is `dead_letter` for one an inbound filter or `process` produced, `rejected` for one the sink handed back.
 
-A sender names the records it would dead-letter rather than send (`TransportSender::dead_letter_reason`): Kafka names a record over `message.max.bytes` less 128 bytes of framing, gRPC one over `max_message_size` on its own, and both an outbound `dlq` filter match. The sender answers such a record `FilteredDlq`, or leaves it out of a gRPC block, without writing it anywhere, and `send_batch` counts it handled, so `.sender(&sender)` has the loop take them out of the block before the sink is called. Without a DLQ they go through `FilterDlqPolicy::Route` when one is set. Otherwise they are dropped, counted in `pipeline_dead_letters_dropped_total{reason}`, and the block releases `Dropped`, never `Delivered`.
+A sender names the records it would dead-letter rather than send (`TransportSender::dead_letter_reason`): Kafka names a record over `message.max.bytes` less 128 bytes of framing, gRPC one over `max_message_size` on its own, and every in-tree sender an outbound `dlq` filter match. The sender answers such a record `FilteredDlq` without writing it anywhere, and a gRPC block leaves it out and answers `FilteredDlq` for the block, so `.sender(&sender)` has the loop take them out of the block before the sink is called. Without a DLQ they go through `FilterDlqPolicy::Route` when one is set. Otherwise they are dropped, counted in `pipeline_dead_letters_dropped_total{reason}`, and the block releases `Dropped`, never `Delivered`.
 
-An app whose sink writes to a scalo transport passes that transport with `.sender(&sender)`. Without it nothing screens the block: `send_batch` drops such a record and the block releases `Delivered`. A sink that is not a transport -- a database writer that rejects a record itself -- has no transport screen to miss, and declares what its `Ok` proves with `.sink_confirms(..)` instead. A pipeline with neither logs one WARN at start and reports `best_effort` / `sink_cannot_confirm` (below).
+An app whose sink writes to a scalo transport passes that transport with `.sender(&sender)`. Without it nothing screens the block, and `send_batch` answers `FilteredDlq` for a block it dead-lettered a record from ([below](#a-block-answered-filtereddlq)). A sink that is not a transport -- a database writer that rejects a record itself -- has no transport screen to miss, and declares what its `Ok` proves with `.sink_confirms(..)` instead. A pipeline with neither logs one WARN at start and reports `best_effort` / `sink_cannot_confirm` (below).
 
 Without a DLQ, entries from filters and `process` go through the `FilterDlqPolicy` as in the other run loops. `Route` reports `Rejected` once its closure returns `Ok`, which does not prove the entry is durable. `with_dlq` does. An engine already behind an `Arc`, as `ServiceRuntime` hands it out, takes both through `set_dlq` and `set_filter_dlq_policy` before its first run.
+
+---
+
+## A block answered FilteredDlq
+
+`send_batch` answers `FilteredDlq` when it sent every record it could and dead-lettered at least one, written nowhere. Kafka does this for a record a broker or topic ceiling refuses below the producer's own, gRPC for a record over `max_message_size` or an outbound `dlq` filter match, and the trait's per-record default for any record its `send` refuses. The answer says the block holds a dead letter. It does not say which record, so the caller cannot write that record to a DLQ from the answer alone, and the block is never released `Delivered`.
+
+To keep the record:
+
+- Screen first. Every record `dead_letter_reason` names is taken out before the send, which is what `.sender(&sender)` does. That covers the size ceilings a sender knows and every outbound `dlq` filter.
+- Send per record when the block comes back `FilteredDlq`. The single record answered `FilteredDlq` is the dead letter: hand it back through `pieces.refusals()`. Resending repeats the records already sent: duplicates, never loss. `SinkStack` and the tiered sink's drain do this themselves.
+- Otherwise hold the block and fail the sink call, so the source is not released.
 
 ---
 

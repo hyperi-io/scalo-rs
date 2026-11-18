@@ -315,6 +315,13 @@ impl TransportFilterEngine {
         }
     }
 
+    /// Whether an outbound `dlq` filter takes `payload`: the answer a sender's
+    /// `dead_letter_reason` gives for a filter match.
+    #[must_use]
+    pub fn outbound_dead_letter(&self, payload: &[u8]) -> bool {
+        self.has_dlq_filters_out() && matches!(self.apply_outbound(payload), FilterDisposition::Dlq)
+    }
+
     /// Evaluate outbound filters against a raw payload. First-match-wins.
     #[inline]
     #[must_use]

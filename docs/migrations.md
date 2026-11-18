@@ -32,6 +32,16 @@ The `transport:kafka` health check is unhealthy from construction until a broker
 
 **Consumer adjustment** -- a pod whose Kafka is unreachable at start stays out of its Service until a broker answers. A client with `statistics.interval.ms: 0` is ready only after its first delivery or received record.
 
+### A dead-lettered record is never counted as sent (API CHANGE)
+
+`send_batch` on the trait's default, Kafka and gRPC answers `FilteredDlq`, not `Ok`, when it dead-lettered a record and sent the rest. For gRPC that covers a record left out of a block for size and an outbound `dlq` filter match. The answer names no record. See [acknowledgements.md](pipeline/acknowledgements.md#a-block-answered-filtereddlq).
+
+`SinkStack::send_batch` and `send_workbatch` return a `SinkOutcome`: the `SendResult` for the records sent, and `dead_letters`, the records the sender names in `dead_letter_reason` or refuses when sent. A `FilteredDlq` answer is no longer `Ok`, so the stack resends that batch one record at a time to find the record.
+
+`TieredSink::send` returns `TieredSinkError::DeadLetter` for a record the sender names or answers `FilteredDlq` for, and never spools it. `TieredSink::with_dlq` gives the drain a DLQ for the spooled records it cannot deliver, and `when_full: dlq` now writes there. `TieredSinkError::Sink` keeps the `Fatal` cause. `RoutedSender` passes a `FilteredDlq` answer through. The memory, pipe, file and HTTP senders name an outbound `dlq` filter match in `dead_letter_reason`.
+
+**Consumer adjustment** -- read `.result` from a `SinkOutcome` and write its `dead_letters` to the DLQ before committing. A `TieredSink` caller routes `DeadLetter` as it routes `SpoolFull`, and calls `with_dlq`. A caller of `send_batch` that took `FilteredDlq` as `Ok` screens the block with `dead_letter_reason` first, and on a block-level `FilteredDlq` resends its records one at a time, or holds the block. Neither commits it as delivered.
+
 ## 2.14.31
 
 ### OpenTelemetry moves to the 0.33 line (API CHANGE)

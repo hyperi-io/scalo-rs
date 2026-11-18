@@ -1155,9 +1155,9 @@ impl TransportSender for GrpcTransport {
     /// ones accepted, and the caller's retry of the whole block sends them
     /// again (at-least-once). A record over the limit on its own is left out
     /// and counted in `transport_message_too_large_total`, as
-    /// [`send`](TransportSender::send) refuses it, and when every record is,
-    /// the result is `FilteredDlq`. Either way it is dropped, and counted in
-    /// `pipeline_dead_letters_dropped_total`. [`dead_letter_reason`] names such a record
+    /// [`send`](TransportSender::send) refuses it. The rest of the block is
+    /// sent and the result is `FilteredDlq`, never `Ok`. The record left out is
+    /// dropped, and counted in `pipeline_dead_letters_dropped_total`. [`dead_letter_reason`] names such a record
     /// before the send, so a caller holding a source acknowledgement
     /// dead-letters it instead.
     ///
@@ -1181,30 +1181,34 @@ impl TransportSender for GrpcTransport {
         // Apply outbound filters BEFORE the wire: a record matched by a `drop`
         // or `dlq` filter must NOT be transmitted. This path once bypassed the
         // filter entirely -- a record told to drop sailed through.
+        let mut filtered_to_dlq = false;
         let to_send: Vec<Record> = if self.filter_engine.has_outbound_filters() {
             let mut keep = Vec::with_capacity(records.len());
             for r in records {
                 match self.filter_engine.apply_outbound(&r.payload) {
                     super::filter::FilterDisposition::Pass => keep.push(r.clone()),
-                    super::filter::FilterDisposition::Drop
-                    | super::filter::FilterDisposition::Dlq => {}
+                    super::filter::FilterDisposition::Drop => {}
+                    super::filter::FilterDisposition::Dlq => filtered_to_dlq = true,
                 }
             }
             keep
         } else {
             records.to_vec()
         };
+        let handled = if filtered_to_dlq {
+            SendResult::FilteredDlq
+        } else {
+            SendResult::Ok
+        };
 
-        // Everything was filtered out -- nothing to send, batch is "done".
         if to_send.is_empty() {
-            return SendResult::Ok;
+            return handled;
         }
 
         // A block over the ceiling goes as several requests in order, so none
         // is one the receiver's decoder refuses.
         let (batches, left_out) = batches_within(to_send, self.max_message_size);
         if batches.is_empty() {
-            // Callers take `FilteredDlq` as handled, so these are dropped too.
             count_left_out(left_out);
             return SendResult::FilteredDlq;
         }
@@ -1216,7 +1220,11 @@ impl TransportSender for GrpcTransport {
         }
         // Counted once the block is sent, so a retried block counts its drops once.
         count_left_out(left_out);
-        SendResult::Ok
+        if left_out > 0 {
+            SendResult::FilteredDlq
+        } else {
+            handled
+        }
     }
 
     /// The receive server answers only once the records are queued, or, armed,

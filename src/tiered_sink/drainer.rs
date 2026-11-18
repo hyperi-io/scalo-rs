@@ -130,8 +130,12 @@ enum DrainResult {
     /// The send outlived `send_timeout`. The entry is still on disk,
     /// uncommitted, and is offered again on the next pass.
     SendTimedOut,
-    /// Fatal error sending
-    Fatal(String),
+    /// The DLQ did not confirm the batch's dead letters. The batch is still
+    /// spooled, and is offered again on the next pass.
+    DeadLetterUnwritten,
+    /// This many records the sink would not take were written to the DLQ, or
+    /// dropped and counted when there is none, and committed.
+    DeadLettered(usize),
     /// Decompression error
     DecompressError(String),
     /// The spooled bytes could not be decoded back into a record (corrupt /
@@ -193,9 +197,21 @@ async fn settle(
                 "Sink send timed out during drain; record stays spooled, will retry"
             );
         }
-        DrainResult::Fatal(e) => {
+        DrainResult::DeadLettered(records) => {
             #[cfg(feature = "tracing")]
-            tracing::error!(error = %e, "Fatal error during drain, dropping message");
+            tracing::debug!(
+                records,
+                "Drained records the sink would not take as dead letters"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = records;
+        }
+        DrainResult::DeadLetterUnwritten => {
+            drainer.record_failure();
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "The DLQ did not confirm a drained batch's dead letters; it stays spooled"
+            );
         }
         DrainResult::DecompressError(e) => {
             #[cfg(feature = "tracing")]
@@ -233,6 +249,127 @@ fn release_many(count: &AtomicU64, total: &AtomicU64, entries: u64, bytes: u64) 
     let _ = total.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
         Some(n.saturating_sub(bytes))
     });
+}
+
+/// The `service` field of the dead letters the tiered sink writes.
+#[cfg(feature = "dlq")]
+const DLQ_SERVICE: &str = "tiered_sink";
+
+/// A record the sink will never take, and why.
+pub(crate) struct Undeliverable {
+    pub(crate) record: Record,
+    /// The `reason` label it counts under.
+    pub(crate) label: &'static str,
+    /// The DLQ entry's reason.
+    pub(crate) reason: String,
+}
+
+/// Where the tiered sink writes the records it cannot deliver: the DLQ set
+/// with `TieredSink::with_dlq`, or nowhere, dropping and counting them.
+#[derive(Clone, Default)]
+pub(crate) struct DeadLetters {
+    #[cfg(feature = "dlq")]
+    dlq: Arc<parking_lot::RwLock<Option<Arc<crate::dlq::Dlq>>>>,
+}
+
+impl DeadLetters {
+    #[cfg(feature = "dlq")]
+    pub(crate) fn set(&self, dlq: Arc<crate::dlq::Dlq>) {
+        *self.dlq.write() = Some(dlq);
+    }
+
+    #[cfg(feature = "dlq")]
+    pub(crate) fn dlq(&self) -> Option<Arc<crate::dlq::Dlq>> {
+        self.dlq.read().clone()
+    }
+
+    /// Write `dead` to the DLQ and wait up to `wait` for it to confirm, or
+    /// drop and count them when there is no DLQ. `false` when the DLQ did not
+    /// confirm, so the caller keeps the records.
+    pub(crate) async fn write(&self, dead: Vec<Undeliverable>, wait: Duration) -> bool {
+        #[cfg(feature = "dlq")]
+        if let Some(dlq) = self.dlq() {
+            return write_to(&dlq, dead, wait).await;
+        }
+        #[cfg(not(feature = "dlq"))]
+        let _ = wait;
+        for Undeliverable {
+            record,
+            label,
+            reason,
+        } in dead
+        {
+            count_dead_letter(label, "dropped");
+            #[cfg(feature = "tracing")]
+            tracing::error!(
+                destination = record.key.as_deref().unwrap_or(""),
+                reason = %reason,
+                "The tiered sink has no DLQ: a record its sink will not take is dropped"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = (record, reason);
+        }
+        true
+    }
+}
+
+/// The DLQ half of [`DeadLetters::write`].
+#[cfg(feature = "dlq")]
+async fn write_to(dlq: &crate::dlq::Dlq, dead: Vec<Undeliverable>, wait: Duration) -> bool {
+    let mut labels = Vec::with_capacity(dead.len());
+    let mut entries = Vec::with_capacity(dead.len());
+    for d in dead {
+        let entry = crate::dlq::DlqEntry::new(DLQ_SERVICE, d.reason, d.record.payload.to_vec());
+        let entry = dlq.cap(match &d.record.key {
+            Some(key) => entry.with_destination(key.as_ref()),
+            None => entry,
+        });
+        if let Some(refused) = dlq.refusal(&entry) {
+            count_dead_letter(d.label, "dropped");
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                reason = refused.as_str(),
+                "No DLQ backend can hold this dead letter; it is dropped"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = refused;
+            continue;
+        }
+        labels.push(d.label);
+        entries.push(entry);
+    }
+    if entries.is_empty() {
+        return true;
+    }
+    match timeout(wait, dlq.write_confirmed(entries)).await {
+        Ok(Ok(())) => {
+            for label in labels {
+                count_dead_letter(label, "dlq");
+            }
+            true
+        }
+        Ok(Err(e)) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(error = %e, "The DLQ refused the tiered sink's dead letters");
+            #[cfg(not(feature = "tracing"))]
+            let _ = e;
+            false
+        }
+        Err(_elapsed) => false,
+    }
+}
+
+/// Count one dead letter by its reason and where it went.
+fn count_dead_letter(reason: &'static str, outcome: &'static str) {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!(
+        "tiered_sink_dead_letters_total",
+        "reason" => reason,
+        "outcome" => outcome
+    )
+    .increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (reason, outcome);
 }
 
 /// How many spooled entries one drain pass takes and sends together.
@@ -296,6 +433,7 @@ async fn drain_once<S: TransportSender>(
     send_timeout: Duration,
     spool_count: &AtomicU64,
     spool_bytes: &AtomicU64,
+    dead_letters: &DeadLetters,
 ) -> Vec<DrainResult> {
     let first = match receiver.try_recv_batch_up_to(cap) {
         Ok(guard) => guard,
@@ -326,9 +464,17 @@ async fn drain_once<S: TransportSender>(
     let taken = guard.len();
     let mut records = Vec::with_capacity(taken);
     let mut unreadable = Vec::new();
+    let mut dead = Vec::new();
     for raw in guard.iter() {
         match decode_entry(raw.clone(), crc, codec) {
-            Entry::Record(record) => records.push(record),
+            Entry::Record(record) => match sink.dead_letter_reason(&record) {
+                None => records.push(record),
+                Some(reason) => dead.push(Undeliverable {
+                    label: reason.as_str(),
+                    reason: reason.to_string(),
+                    record,
+                }),
+            },
             Entry::Unreadable(why) => unreadable.push(why),
         }
     }
@@ -339,9 +485,9 @@ async fn drain_once<S: TransportSender>(
         Some(timeout(send_timeout, sink.send_batch(&records)).await)
     };
     let delivered = match sent {
-        // Only unreadable entries: nothing to send, drop them.
+        // Only unreadable entries and dead letters: nothing to send.
         None => 0,
-        Some(Ok(SendResult::Ok | SendResult::FilteredDlq)) => records.len(),
+        Some(Ok(SendResult::Ok)) => records.len(),
         // Backpressure, a timeout (the batch may or may not have reached the
         // sink) and a closed or misconfigured sink keep the whole batch spooled
         // (at-least-once).
@@ -350,21 +496,40 @@ async fn drain_once<S: TransportSender>(
         Some(Ok(SendResult::Fatal(e))) if e.is_fatal() => {
             return vec![DrainResult::SinkUnavailable];
         }
-        // A refusal of one record in a batch cannot say which: keep them all
-        // and send them one at a time until the refused one is past.
-        Some(Ok(SendResult::Fatal(_))) if taken > 1 => {
+        // A refusal or dead letter in a batch cannot say which record: keep
+        // them all and send them one at a time until that one is past.
+        Some(Ok(SendResult::Fatal(_) | SendResult::FilteredDlq)) if records.len() > 1 => {
             return vec![DrainResult::Isolate(taken)];
         }
-        // On its own, the refused record is its own fault: drop it.
+        // On its own, the refused record is its own fault: dead-letter it.
         Some(Ok(SendResult::Fatal(e))) => {
-            unreadable.push(DrainResult::Fatal(e.to_string()));
+            dead.extend(records.drain(..).map(|record| Undeliverable {
+                label: crate::transport::DEAD_LETTER_REJECTED,
+                reason: e.to_string(),
+                record,
+            }));
+            0
+        }
+        Some(Ok(SendResult::FilteredDlq)) => {
+            dead.extend(records.drain(..).map(|record| Undeliverable {
+                label: crate::transport::DEAD_LETTER_REJECTED,
+                reason: crate::transport::DeadLetterReason::Rejected.to_string(),
+                record,
+            }));
             0
         }
     };
+    let dead_lettered = dead.len();
+    if dead_lettered > 0 && !dead_letters.write(dead, send_timeout).await {
+        return vec![DrainResult::DeadLetterUnwritten];
+    }
     match guard.commit() {
         Ok(()) => {
             release_many(spool_count, spool_bytes, taken as u64, stored);
             let mut results = unreadable;
+            if dead_lettered > 0 {
+                results.push(DrainResult::DeadLettered(dead_lettered));
+            }
             if delivered > 0 {
                 results.push(DrainResult::Success(delivered));
             }
@@ -399,6 +564,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     batch: DrainBatch,
     shutdown: CancellationToken,
     fifo_gate: Option<Arc<Mutex<()>>>,
+    dead_letters: DeadLetters,
 ) {
     let mut drainer = Drainer::new(strategy);
     // Entries still to send one at a time after a refused batch.
@@ -468,6 +634,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                 send_timeout,
                 &spool_count,
                 &spool_bytes,
+                &dead_letters,
             )
             .await
         };
@@ -479,7 +646,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                     took += records;
                     pause = Duration::ZERO;
                 }
-                DrainResult::Fatal(_)
+                DrainResult::DeadLettered(_)
                 | DrainResult::DecompressError(_)
                 | DrainResult::DecodeError(_) => pause = Duration::ZERO,
                 DrainResult::Isolate(entries) => {

@@ -54,6 +54,10 @@ pub struct TieredSink<S: TransportSender> {
     /// Serialises send + drain in `StrictFifo`. `None` otherwise.
     fifo_gate: Option<Arc<Mutex<()>>>,
 
+    /// Where the drain and `when_full: dlq` write records the sink will not take.
+    #[cfg(feature = "dlq")]
+    dead_letters: drainer::DeadLetters,
+
     // Metrics
     hot_path_count: AtomicU64,
     cold_path_count: AtomicU64,
@@ -182,7 +186,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             ))
         });
 
-        // Start drain task
+        let dead_letters = drainer::DeadLetters::default();
         let drain_handle = tokio::spawn(drainer::drain_loop(
             Arc::clone(&sink),
             Arc::clone(&spool_receiver),
@@ -200,6 +204,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             },
             shutdown.clone(),
             fifo_gate.as_ref().map(Arc::clone),
+            dead_letters.clone(),
         ));
 
         Ok(Self {
@@ -217,6 +222,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             disk_poller_handle,
             shut_down: false,
             fifo_gate,
+            #[cfg(feature = "dlq")]
+            dead_letters,
             hot_path_count: AtomicU64::new(0),
             cold_path_count: AtomicU64::new(0),
         })
@@ -232,12 +239,19 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The sink names the record in `dead_letter_reason`, or answers
+    ///   `FilteredDlq` for it ([`TieredSinkError::DeadLetter`])
     /// - The sink answers `Fatal` ([`TieredSinkError::Sink`])
-    /// - The spool is full and `when_full` is `block`, `dlq` or `drop_oldest`
-    ///   ([`TieredSinkError::SpoolFull`])
+    /// - The spool is full and `when_full` is `block` or `drop_oldest`, or
+    ///   `dlq` with no DLQ set ([`TieredSinkError::SpoolFull`])
     /// - The `disk_aware` threshold is crossed ([`TieredSinkError::DiskUnavailable`])
     /// - Compression or the spool write fails
     pub async fn send(&self, record: &Record) -> Result<()> {
+        // Never spooled: the drain would only meet it again.
+        if let Some(reason) = self.sink.dead_letter_reason(record) {
+            return Err(TieredSinkError::DeadLetter(reason.to_string()));
+        }
+
         // StrictFifo: serialise decision + send + enqueue against
         // other senders and the drainer. Interleaved: no gate.
         let _gate = match &self.fifo_gate {
@@ -255,9 +269,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
                     ::metrics::counter!("spool_hot_path_total").increment(1);
                     return Ok(());
                 }
-                Err(TieredSinkError::Sink(_)) => {
-                    // Fatal error, don't spool
-                    return Err(TieredSinkError::Sink("fatal sink error".into()));
+                Err(e @ (TieredSinkError::Sink(_) | TieredSinkError::DeadLetter(_))) => {
+                    return Err(e);
                 }
                 Err(_) => {
                     // Retryable error, fall through to spool
@@ -271,6 +284,16 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         #[cfg(feature = "metrics")]
         ::metrics::counter!("spool_cold_path_total").increment(1);
         Ok(())
+    }
+
+    /// Write to `dlq` the records the drain cannot deliver, and with
+    /// `when_full: dlq` the record a full spool cannot take. Without one the
+    /// drain drops and counts them, and a full spool blocks.
+    #[cfg(feature = "dlq")]
+    #[must_use]
+    pub fn with_dlq(self, dlq: Arc<crate::dlq::Dlq>) -> Self {
+        self.dead_letters.set(dlq);
+        self
     }
 
     /// Determine if we should attempt the hot path.
@@ -309,9 +332,16 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         )
         .await
         {
-            Ok(SendResult::Ok | SendResult::FilteredDlq) => {
+            Ok(SendResult::Ok) => {
                 self.circuit.record_success().await;
                 Ok(())
+            }
+            Ok(SendResult::FilteredDlq) => {
+                // The sink answered, so the breaker counts a success.
+                self.circuit.record_success().await;
+                Err(TieredSinkError::DeadLetter(
+                    crate::transport::DeadLetterReason::Rejected.to_string(),
+                ))
             }
             Ok(SendResult::Backpressured) => {
                 // Downstream backpressured/unavailable: spool and count toward
@@ -334,31 +364,54 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         }
     }
 
-    /// Decide the action for a spool-full event per the configured
-    /// [`WhenFull`](crate::tiered_sink::WhenFull) policy.
+    /// Apply the [`WhenFull`](crate::tiered_sink::WhenFull) policy to a record
+    /// the full spool cannot take: `Some(Ok)` once it is shed or the DLQ holds
+    /// it, `None` to block with `SpoolFull`, scalo's lossless default.
     ///
-    /// Returns `true` to DROP the incoming record (shed and continue), `false`
-    /// to BLOCK (return `SpoolFull` so the caller backpressures the inbound
-    /// source -- scalo's lossless default).
-    ///
-    /// `Dlq` and `DropOldest` are not yet wired (they need a DLQ handle and
-    /// oldest-eviction access respectively). Until then they degrade to the
-    /// SAFE, lossless `Block` with a warning -- never silent loss.
-    fn drop_on_full(&self) -> bool {
+    /// `DropOldest` is not wired and blocks with a warning, as does `Dlq` with
+    /// no DLQ set or a DLQ write that is not confirmed.
+    async fn on_full(&self, record: &Record) -> Option<Result<()>> {
         use crate::tiered_sink::WhenFull;
         match self.config.when_full {
-            WhenFull::DropNewest => true,
-            WhenFull::Block => false,
-            WhenFull::Dlq | WhenFull::DropOldest => {
+            WhenFull::DropNewest => {
+                Self::record_overflow_drop();
+                Some(Ok(()))
+            }
+            WhenFull::Block => None,
+            WhenFull::Dlq => self.full_to_dlq(record).await,
+            WhenFull::DropOldest => {
                 #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    policy = ?self.config.when_full,
-                    "spool full: policy not yet wired (needs DLQ handle / oldest-eviction); \
-                     applying Block (lossless backpressure)"
-                );
-                false
+                tracing::warn!("spool full: drop_oldest is not wired; applying block");
+                None
             }
         }
+    }
+
+    /// `when_full: dlq`: write the record to the DLQ, or block without one.
+    async fn full_to_dlq(&self, record: &Record) -> Option<Result<()>> {
+        #[cfg(feature = "dlq")]
+        if self.dead_letters.dlq().is_some() {
+            let dead = vec![drainer::Undeliverable {
+                record: record.clone(),
+                label: "spool_full",
+                reason: "the tiered sink's spool is full".to_string(),
+            }];
+            if !self
+                .dead_letters
+                .write(dead, self.config.send_timeout_duration())
+                .await
+            {
+                return None;
+            }
+            #[cfg(feature = "metrics")]
+            ::metrics::counter!("tiered_sink_overflow_total", "policy" => "dlq").increment(1);
+            return Some(Ok(()));
+        }
+        #[cfg(not(feature = "dlq"))]
+        let _ = record;
+        #[cfg(feature = "tracing")]
+        tracing::warn!("spool full: when_full is dlq but no DLQ is set; applying block");
+        None
     }
 
     /// Record a shed (dropped) record so overflow loss is never silent.
@@ -406,9 +459,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
                 .is_err()
             {
                 // Spool full on item count -> apply the WhenFull policy.
-                if self.drop_on_full() {
-                    Self::record_overflow_drop();
-                    return Ok(());
+                if let Some(handled) = self.on_full(record).await {
+                    return handled;
                 }
                 return Err(TieredSinkError::SpoolFull(format!(
                     "max items {max_items} reached"
@@ -437,9 +489,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
                 },
             ) {
                 // Spool full on byte budget -> apply the WhenFull policy.
-                if self.drop_on_full() {
-                    Self::record_overflow_drop();
-                    return Ok(());
+                if let Some(handled) = self.on_full(record).await {
+                    return handled;
                 }
                 return Err(TieredSinkError::SpoolFull(format!(
                     "max spool bytes {max_bytes} reached (current: {current_bytes}, \
@@ -722,6 +773,10 @@ mod tests {
         largest_call: std::sync::atomic::AtomicUsize,
         /// A payload answered `Fatal(Send)`, and the whole call it is in.
         refused: std::sync::Mutex<Option<&'static [u8]>>,
+        /// A payload answered `FilteredDlq`, and the whole call it is in.
+        dead_lettered: std::sync::Mutex<Option<&'static [u8]>>,
+        /// A payload named in `dead_letter_reason`.
+        screened: std::sync::Mutex<Option<&'static [u8]>>,
     }
 
     impl TestSink {
@@ -733,7 +788,17 @@ mod tests {
                 delivering_calls: std::sync::atomic::AtomicUsize::new(0),
                 largest_call: std::sync::atomic::AtomicUsize::new(0),
                 refused: std::sync::Mutex::new(None),
+                dead_lettered: std::sync::Mutex::new(None),
+                screened: std::sync::Mutex::new(None),
             }
+        }
+
+        fn dead_letter_payload(&self, payload: Option<&'static [u8]>) {
+            *self.dead_lettered.lock().unwrap() = payload;
+        }
+
+        fn screen_payload(&self, payload: Option<&'static [u8]>) {
+            *self.screened.lock().unwrap() = payload;
         }
 
         fn refuse_payload(&self, payload: Option<&'static [u8]>) {
@@ -783,6 +848,15 @@ mod tests {
     }
 
     impl TransportSender for TestSink {
+        fn dead_letter_reason(
+            &self,
+            record: &Record,
+        ) -> Option<crate::transport::DeadLetterReason> {
+            let screened = *self.screened.lock().unwrap();
+            (screened == Some(record.payload.as_ref()))
+                .then_some(crate::transport::DeadLetterReason::OutboundFilter)
+        }
+
         async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
             if let Some(fatal) = self.fatal_answer() {
                 return fatal;
@@ -802,6 +876,19 @@ mod tests {
             let refused = *self.refused.lock().unwrap();
             if refused.is_some_and(|bad| records.iter().any(|r| r.payload.as_ref() == bad)) {
                 return SendResult::Fatal(TransportError::Send("refused".into()));
+            }
+            let dead = *self.dead_lettered.lock().unwrap();
+            if self.available.load(AtomicOrdering::SeqCst)
+                && dead.is_some_and(|bad| records.iter().any(|r| r.payload.as_ref() == bad))
+            {
+                let mut r = self.received.lock().await;
+                r.extend(
+                    records
+                        .iter()
+                        .filter(|r| Some(r.payload.as_ref()) != dead)
+                        .cloned(),
+                );
+                return SendResult::FilteredDlq;
             }
             if self.available.load(AtomicOrdering::SeqCst) {
                 self.delivering_calls.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1665,6 +1752,156 @@ mod tests {
             .map_err(|_| "outstanding Arc refs")
             .unwrap();
         tiered.shutdown().await;
+    }
+
+    /// A record the sink will never take comes back to the caller as
+    /// `DeadLetter`, never spooled: one it screens out, and one it answers
+    /// `FilteredDlq` for. A `Fatal` keeps its cause.
+    #[tokio::test]
+    async fn a_record_the_sink_will_not_take_comes_back_as_a_dead_letter() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.screen_payload(Some(b"screened"));
+        sink.dead_letter_payload(Some(b"refused"));
+        let tiered = TieredSink::new(sink, TieredSinkConfig::new(dir.path().join("q")))
+            .await
+            .unwrap();
+
+        for payload in [&b"screened"[..], b"refused"] {
+            let sent = tiered.send(&rec(payload)).await;
+            assert!(
+                matches!(sent, Err(TieredSinkError::DeadLetter(_))),
+                "{payload:?}: {sent:?}"
+            );
+        }
+        assert_eq!(
+            tiered.spool_len().await,
+            0,
+            "a dead letter is never spooled"
+        );
+        assert_eq!(tiered.inner().received_count().await, 0);
+
+        tiered
+            .inner()
+            .answer_fatal(Some(|| TransportError::Send("poison".into())));
+        let fatal = tiered.send(&rec(b"other")).await;
+        assert!(
+            matches!(&fatal, Err(TieredSinkError::Sink(cause)) if cause.contains("poison")),
+            "{fatal:?}"
+        );
+        tiered.shutdown().await;
+    }
+
+    /// A file DLQ under `dir`, and the token that stops it.
+    #[cfg(feature = "dlq")]
+    fn file_dlq(dir: &std::path::Path) -> (Arc<crate::dlq::Dlq>, CancellationToken) {
+        let config = crate::dlq::DlqConfig {
+            file: crate::dlq::FileDlqConfig {
+                enabled: true,
+                path: dir.to_path_buf(),
+                rotation: crate::dlq::RotationPeriod::Daily,
+                max_age_days: 1,
+                compress_rotated: false,
+            },
+            mode: crate::dlq::DlqMode::FileOnly,
+            flush_interval_ms: 20,
+            ..crate::dlq::DlqConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let dlq = crate::dlq::Dlq::spawn(&config, "svc", None, shutdown.clone()).unwrap();
+        (Arc::new(dlq), shutdown)
+    }
+
+    /// The `reason` of every entry the file DLQ under `dir` holds.
+    #[cfg(feature = "dlq")]
+    async fn dlq_reasons(dir: &std::path::Path) -> Vec<String> {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::dlq::test_files::written_lines(&dir, "svc")
+                .iter()
+                .map(|line| {
+                    let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                    entry["reason"].as_str().unwrap_or_default().to_string()
+                })
+                .collect()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The drain writes a spooled record the sink answers `FilteredDlq` for,
+    /// and one it refuses with `Fatal`, to the DLQ with the cause, and
+    /// delivers the rest.
+    #[cfg(feature = "dlq")]
+    #[tokio::test]
+    async fn the_drain_writes_records_the_sink_will_not_take_to_the_dlq() {
+        let dir = tempdir().unwrap();
+        let (dlq, dlq_shutdown) = file_dlq(&dir.path().join("dlq"));
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.path().join("q"));
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+        let tiered = TieredSink::new(sink, config).await.unwrap().with_dlq(dlq);
+        for payload in [&b"good"[..], b"dead", b"poison"] {
+            tiered.send(&rec(payload)).await.unwrap();
+        }
+
+        tiered.inner().dead_letter_payload(Some(b"dead"));
+        tiered.inner().refuse_payload(Some(b"poison"));
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+
+        assert_eq!(
+            tiered.inner().received_payloads().await,
+            vec![b"good".to_vec()]
+        );
+        let mut reasons = dlq_reasons(&dir.path().join("dlq")).await;
+        reasons.sort();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons.iter().any(|r| r.contains("refused")), "{reasons:?}");
+        assert!(
+            reasons.contains(&crate::transport::DeadLetterReason::Rejected.to_string()),
+            "{reasons:?}"
+        );
+        tiered.shutdown().await;
+        dlq_shutdown.cancel();
+    }
+
+    /// `when_full: dlq` writes the record a full spool cannot take to the DLQ,
+    /// and blocks with `SpoolFull` when no DLQ is set.
+    #[cfg(feature = "dlq")]
+    #[tokio::test]
+    async fn a_full_spool_writes_to_the_dlq_under_when_full_dlq() {
+        for with_dlq in [true, false] {
+            let dir = tempdir().unwrap();
+            let (dlq, dlq_shutdown) = file_dlq(&dir.path().join("dlq"));
+            let sink = TestSink::new();
+            sink.set_available(false);
+            let mut config = spilling_config(&dir.path().join("q"));
+            config.max_spool_items = Some(1);
+            config.when_full = crate::tiered_sink::WhenFull::Dlq;
+            let tiered = TieredSink::new(sink, config).await.unwrap();
+            let tiered = if with_dlq {
+                tiered.with_dlq(dlq)
+            } else {
+                tiered
+            };
+
+            tiered.send(&rec(b"spooled")).await.unwrap();
+            let overflow = tiered.send(&rec(b"overflow")).await;
+            if with_dlq {
+                assert!(overflow.is_ok(), "{overflow:?}");
+                assert_eq!(dlq_reasons(&dir.path().join("dlq")).await.len(), 1);
+            } else {
+                assert!(
+                    matches!(overflow, Err(TieredSinkError::SpoolFull(_))),
+                    "{overflow:?}"
+                );
+            }
+            assert_eq!(tiered.spool_len().await, 1);
+            tiered.shutdown().await;
+            dlq_shutdown.cancel();
+        }
     }
 
     /// The yaque lock files a spool directory can hold.

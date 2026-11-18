@@ -242,21 +242,24 @@ impl RoutedSender {
     /// retries the whole fan-out. That re-delivers to the destinations that
     /// already accepted -- at-least-once, duplicates never loss, the same
     /// contract as [`TransportSender::send_batch`]'s per-record fallback. An
-    /// empty destination list is `Ok` (nothing to deliver).
+    /// empty destination list is `Ok` (nothing to deliver). A destination that
+    /// answers `FilteredDlq` does not stop the others, and the result is then
+    /// `FilteredDlq`.
     pub async fn send_fanout(
         &self,
         destinations: &[&str],
         key: &str,
         payload: bytes::Bytes,
     ) -> SendResult {
+        let mut handled = Handled::default();
         for destination in destinations {
             // Bytes clone is a refcount bump, not a payload copy.
-            match self.send_to(destination, key, payload.clone()).await {
-                SendResult::Ok | SendResult::FilteredDlq => {}
-                other => return other,
+            if let Some(failed) = handled.add(self.send_to(destination, key, payload.clone()).await)
+            {
+                return failed;
             }
         }
-        SendResult::Ok
+        handled.result()
     }
 
     /// Fan a whole BLOCK out to every named destination in `destinations`.
@@ -268,7 +271,8 @@ impl RoutedSender {
     /// has accepted. The first `Backpressured`/`Fatal` short-circuits and is
     /// returned, so the caller retries the whole fan-out (at-least-once --
     /// duplicates, never loss). An empty destination list or an empty block is
-    /// `Ok`.
+    /// `Ok`. A destination that answers `FilteredDlq` does not stop the others,
+    /// and the result is then `FilteredDlq`.
     pub async fn send_batch_fanout(&self, destinations: &[&str], records: &[Record]) -> SendResult {
         if destinations.is_empty() || records.is_empty() {
             return SendResult::Ok;
@@ -277,16 +281,16 @@ impl RoutedSender {
             return SendResult::Fatal(TransportError::Closed);
         }
 
+        let mut handled = Handled::default();
         for destination in destinations {
             let Some(sender) = self.resolve(destination) else {
                 return unroutable(destination);
             };
-            match sender.send_batch(records).await {
-                SendResult::Ok | SendResult::FilteredDlq => {}
-                other => return other,
+            if let Some(failed) = handled.add(sender.send_batch(records).await) {
+                return failed;
             }
         }
-        SendResult::Ok
+        handled.result()
     }
 
     /// The sender a key routes to: its route, else the default.
@@ -370,12 +374,7 @@ where
         return SendResult::Ok; // empty block
     };
     if !mixed {
-        // A whole block the sink filtered to DLQ is HANDLED, not failed --
-        // the same normalisation the multi-group loop below performs.
-        return match first_sender.send_batch(records).await {
-            SendResult::FilteredDlq => SendResult::Ok,
-            other => other,
-        };
+        return first_sender.send_batch(records).await;
     }
 
     // Mixed block: one Vec per sink, input order preserved within each group.
@@ -393,13 +392,42 @@ where
         }
     }
 
+    let mut handled = Handled::default();
     for (sender, group) in groups {
-        match sender.send_batch(&group).await {
-            SendResult::Ok | SendResult::FilteredDlq => {}
-            other => return other,
+        if let Some(failed) = handled.add(sender.send_batch(&group).await) {
+            return failed;
         }
     }
-    SendResult::Ok
+    handled.result()
+}
+
+/// The answers of a set of sends that each took its whole input: `FilteredDlq`
+/// when one was, else `Ok`, so a dead-letter answer reaches the caller as itself.
+#[derive(Default)]
+struct Handled {
+    dead_lettered: bool,
+}
+
+impl Handled {
+    /// Take one answer. A `Backpressured` or `Fatal` comes back to return.
+    fn add(&mut self, result: SendResult) -> Option<SendResult> {
+        match result {
+            SendResult::Ok => None,
+            SendResult::FilteredDlq => {
+                self.dead_lettered = true;
+                None
+            }
+            failed @ (SendResult::Backpressured | SendResult::Fatal(_)) => Some(failed),
+        }
+    }
+
+    fn result(self) -> SendResult {
+        if self.dead_lettered {
+            SendResult::FilteredDlq
+        } else {
+            SendResult::Ok
+        }
+    }
 }
 
 impl TransportSender for RoutedSender {
@@ -417,9 +445,9 @@ impl TransportSender for RoutedSender {
     /// [`send`](TransportSender::send) uses -- and each group is handed to its
     /// sender in ONE call, keeping input order within the group.
     ///
-    /// The result is the trait's: `Ok` once every group is accepted, otherwise
-    /// the first `Backpressured`/`Fatal` in first-appearance order of the
-    /// groups, which is the failure belonging to the earliest record that could
+    /// The result is `Ok` once every group is accepted, `FilteredDlq` once
+    /// every group is handled and one answered `FilteredDlq`, otherwise the
+    /// first `Backpressured`/`Fatal` in first-appearance order of the groups, which is the failure belonging to the earliest record that could
     /// have produced one. Groups after it are NOT sent, so the caller retries
     /// the whole block (at-least-once -- duplicates, never loss). An empty block
     /// is `Ok`. A block holding an unroutable record is `Fatal` with nothing
@@ -693,12 +721,20 @@ mod tests {
         batches: Mutex<Vec<Vec<Vec<u8>>>>,
         sends: AtomicUsize,
         backpressure: bool,
+        dead_letter: bool,
     }
 
     impl CountingSender {
         fn backpressured() -> Self {
             Self {
                 backpressure: true,
+                ..Self::default()
+            }
+        }
+
+        fn dead_lettering() -> Self {
+            Self {
+                dead_letter: true,
                 ..Self::default()
             }
         }
@@ -744,6 +780,8 @@ mod tests {
                 .push(records.iter().map(|r| r.payload.to_vec()).collect());
             if self.backpressure {
                 SendResult::Backpressured
+            } else if self.dead_letter {
+                SendResult::FilteredDlq
             } else {
                 SendResult::Ok
             }
@@ -820,6 +858,24 @@ mod tests {
             routes["loader"].calls(),
             vec![vec!["one".to_string(), "two".to_string()]]
         );
+    }
+
+    /// A `FilteredDlq` answer reaches the caller as itself, from one route or
+    /// from one group of several, once every group has been sent.
+    #[tokio::test]
+    async fn send_batch_passes_a_dead_letter_answer_through() {
+        let mut routes = HashMap::new();
+        routes.insert("loader".to_string(), CountingSender::dead_lettering());
+        routes.insert("archiver".to_string(), CountingSender::default());
+
+        let one = vec![rec(Some("loader"), b"one")];
+        let single = send_grouped(&one, |k| resolve_fake(&routes, None, k)).await;
+        assert!(single.is_filtered_dlq(), "{single:?}");
+
+        let mixed = vec![rec(Some("loader"), b"two"), rec(Some("archiver"), b"three")];
+        let both = send_grouped(&mixed, |k| resolve_fake(&routes, None, k)).await;
+        assert!(both.is_filtered_dlq(), "{both:?}");
+        assert_eq!(routes["archiver"].calls(), vec![vec!["three".to_string()]]);
     }
 
     #[tokio::test]

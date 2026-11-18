@@ -231,7 +231,7 @@ chosen backend's `SendResult` unchanged -- backpressure, fatal, and
 filter-DLQ propagate up. Caller distinguishes by matching on the
 result.
 
-That holds for `send` and `send_to`. The block and fan-out forms (`send_batch`, `send_fanout`, `send_batch_fanout`) count a `FilteredDlq` answer as handled and return `Ok`, as the `TransportSender::send_batch` contract says, so the caller never sees it. To dead-letter those records instead, screen the block first: `dead_letter_reason` answers for the route each record's key selects, and `BatchEngine::pipeline(..).sender(&routed)` does that screening and routes the records to its DLQ. `confirms_delivery` is the weakest across every route and the default.
+That holds for `send` and `send_to`. The block and fan-out forms (`send_batch`, `send_fanout`, `send_batch_fanout`) take a `FilteredDlq` answer from one route or destination as handled and send the rest, then return `FilteredDlq`, so the caller sees it. That answer names no record. To dead-letter those records instead, screen the block first: `dead_letter_reason` answers for the route each record's key selects, and `BatchEngine::pipeline(..).sender(&routed)` does that screening and routes the records to its DLQ. `confirms_delivery` is the weakest across every route and the default.
 
 ---
 

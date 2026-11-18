@@ -51,8 +51,9 @@
 //! - Retry re-sends the WHOLE batch on a transient failure (records are held
 //!   behind an `Arc`, so a retry is a refcount bump, not a copy).
 //! - A fatal error stops immediately (no point retrying a permanent failure).
-//! - The method returns a [`SendResult`]; the caller fires its commit tokens
-//!   only on [`SendResult::Ok`], exactly as for a bare `send_batch`. Retries
+//! - Records the sender would or did dead-letter come back in
+//!   [`SinkOutcome::dead_letters`], never counted as sent. The caller writes
+//!   them to its DLQ and fires its commit tokens only on [`SendResult::Ok`]. Retries
 //!   may re-deliver records a failed attempt already sent -- a prefix for the
 //!   per-record default, any subset for Kafka's pipelined override
 //!   (at-least-once: duplicates, never loss) -- identical to the transport's
@@ -76,8 +77,12 @@ use tower::{BoxError, Layer, Service, ServiceBuilder, ServiceExt};
 
 use crate::governor::RateLimiter;
 use crate::transport::{
-    CommitToken, Record, SendResult, TransportError, TransportSender, WorkBatch,
+    CommitToken, DeadLetter, DeadLetterReason, Record, SendResult, TransportError, TransportSender,
+    WorkBatch,
 };
+
+/// The sender's screen: why it would dead-letter a record, or `None`.
+type Screen = Arc<dyn Fn(&Record) -> Option<DeadLetterReason> + Send + Sync>;
 
 /// A batch of records to deliver, shared cheaply across retry attempts.
 ///
@@ -115,6 +120,31 @@ pub enum SinkError {
     /// Permanent failure -- retrying will not help.
     #[error("sink fatal error: {0}")]
     Fatal(TransportError),
+    /// The sender answered `FilteredDlq`: it dead-lettered a record of the
+    /// batch. Retrying refuses the same record again.
+    #[error("sink dead-lettered a record of the batch")]
+    DeadLetter,
+}
+
+/// What a send through the stack did with a block.
+#[derive(Debug)]
+#[must_use = "route the dead letters to a DLQ before committing"]
+pub struct SinkOutcome {
+    /// The result for the records sent: `Ok`, `Backpressured` or `Fatal`.
+    pub result: SendResult,
+    /// Records the sender would or did dead-letter, never sent. On `Ok` the
+    /// caller writes them to its DLQ before it commits. On any other result
+    /// it retries the block, which finds them again.
+    pub dead_letters: Vec<DeadLetter>,
+}
+
+impl SinkOutcome {
+    fn ok(dead_letters: Vec<DeadLetter>) -> Self {
+        Self {
+            result: SendResult::Ok,
+            dead_letters,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,8 +204,8 @@ where
         let sender = Arc::clone(&self.sender);
         Box::pin(async move {
             match sender.send_batch(&req.0).await {
-                // Sent, or handled by an outbound dlq/drop filter -- both Ok.
-                SendResult::Ok | SendResult::FilteredDlq => Ok(()),
+                SendResult::Ok => Ok(()),
+                SendResult::FilteredDlq => Err(SinkError::DeadLetter),
                 SendResult::Backpressured => Err(SinkError::Transient),
                 SendResult::Fatal(e) => Err(SinkError::Fatal(e)),
             }
@@ -259,6 +289,7 @@ const UNLIMITED_CONCURRENCY: usize = 1 << 20;
 #[derive(Clone)]
 pub struct SinkStack {
     svc: BoxCloneService<SinkBatch, (), BoxError>,
+    screen: Screen,
     backoff: ExponentialBuilder,
     max_retries: usize,
 }
@@ -271,6 +302,8 @@ impl SinkStack {
         S: TransportSender + 'static,
     {
         let limiter = RateLimiter::new(cfg.rate_limit, "sink");
+        let screened = Arc::clone(&sender);
+        let screen: Screen = Arc::new(move |record| screened.dead_letter_reason(record));
 
         // In-attempt control core (Error = BoxError), one of two shapes:
         //
@@ -318,19 +351,62 @@ impl SinkStack {
 
         Self {
             svc,
+            screen,
             backoff: cfg.backoff(),
             max_retries: cfg.max_retries,
         }
     }
 
     /// Deliver a batch through the full stack, retrying transient failures with
-    /// backoff. Returns a [`SendResult`] with the same commit contract as a
-    /// bare `send_batch`: fire commit tokens only on [`SendResult::Ok`].
-    pub async fn send_batch(&self, records: Vec<Record>) -> SendResult {
-        if records.is_empty() {
-            return SendResult::Ok;
+    /// backoff.
+    ///
+    /// Records the sender names in `dead_letter_reason` are taken out before
+    /// the send and returned in [`SinkOutcome::dead_letters`]. A send the
+    /// sender answers `FilteredDlq` names no record, so its records are sent
+    /// again one at a time, and each it refuses joins the dead letters as
+    /// [`DeadLetterReason::Rejected`]. Fire commit tokens only on
+    /// [`SendResult::Ok`], once the dead letters are in the DLQ.
+    pub async fn send_batch(&self, records: Vec<Record>) -> SinkOutcome {
+        let mut dead_letters = Vec::new();
+        let mut kept = Vec::with_capacity(records.len());
+        for record in records {
+            match (self.screen)(&record) {
+                None => kept.push(record),
+                Some(reason) => dead_letters.push(DeadLetter { record, reason }),
+            }
         }
-        let batch = SinkBatch::new(records);
+        if kept.is_empty() {
+            return SinkOutcome::ok(dead_letters);
+        }
+        let batch = SinkBatch::new(kept);
+        let result = self.deliver(batch.clone()).await;
+        if !result.is_filtered_dlq() {
+            return SinkOutcome {
+                result,
+                dead_letters,
+            };
+        }
+        // Resending repeats the records already sent: duplicates, never loss.
+        for record in batch.0.iter().cloned() {
+            match self.deliver(SinkBatch::new(vec![record.clone()])).await {
+                SendResult::Ok => {}
+                SendResult::FilteredDlq => dead_letters.push(DeadLetter {
+                    record,
+                    reason: DeadLetterReason::Rejected,
+                }),
+                failed @ (SendResult::Backpressured | SendResult::Fatal(_)) => {
+                    return SinkOutcome {
+                        result: failed,
+                        dead_letters,
+                    };
+                }
+            }
+        }
+        SinkOutcome::ok(dead_letters)
+    }
+
+    /// One batch through the stack and its retries.
+    async fn deliver(&self, batch: SinkBatch) -> SendResult {
         let svc = self.svc.clone();
 
         let attempt = || {
@@ -357,33 +433,33 @@ impl SinkStack {
     /// Deliver a [`WorkBatch`]'s records through the stack -- the driver-path
     /// entry point.
     ///
-    /// The `worker` driver runs `get -> process -> sink -> commit` over a
-    /// caller-supplied sink closure of shape
-    /// `FnMut(&WorkBatch<T>) -> Future<Output = Result<(), EngineError>>`, and
-    /// commits the source acks only when the sink returns `Ok`. Wrap a stack as
-    /// that closure so every app gets retry/ARC/timeout/rate-limit on the
-    /// outbound send while at-least-once is preserved (a non-`Ok` here skips the
-    /// commit, so the block is redelivered):
+    /// As the sink of a `BatchEngine` pipeline, hand the dead letters back
+    /// through the block's `Refusals`, so the loop writes them to its DLQ
+    /// before it releases the source:
     ///
     /// ```rust,ignore
     /// let stack = SinkStack::new(sender, &cfg);
-    /// engine.run_workbatch(&receiver, shutdown, process, |batch| {
+    /// engine.pipeline(&receiver).run_with_pieces(process, |batch, pieces| {
     ///     let stack = stack.clone();
-    ///     let batch_records = batch; // borrowed for the call
+    ///     let refusals = pieces.refusals();
+    ///     let records = batch.records.clone();
     ///     async move {
-    ///         match stack.send_workbatch(batch_records).await {
-    ///             SendResult::Ok | SendResult::FilteredDlq => Ok(()),
-    ///             _ => Err(EngineError::sink("sink stack could not deliver")),
+    ///         let sent = stack.send_batch(records).await;
+    ///         for dead in &sent.dead_letters {
+    ///             refusals.dead_letter(&dead.record, dead.reason.to_string());
+    ///         }
+    ///         match sent.result {
+    ///             SendResult::Ok => Ok(()),
+    ///             _ => Err(EngineError::Sink("sink stack could not deliver".into())),
     ///         }
     ///     }
-    /// }, CommitMode::Auto, None).await?;
+    /// }).await?;
     /// ```
     ///
-    /// `commit_tokens` are NOT sent -- they are the source's local ack concern,
-    /// fired by the driver after this returns `Ok` (mirrors the bare
-    /// `send_batch` contract). The records are cloned once into the retry-shared
-    /// `Arc` (a `Bytes` refcount bump per record, not a payload copy).
-    pub async fn send_workbatch<T: CommitToken>(&self, batch: &WorkBatch<T>) -> SendResult {
+    /// `commit_tokens` are NOT sent -- they are the source's local ack concern.
+    /// The records are cloned once into the retry-shared `Arc` (a `Bytes`
+    /// refcount bump per record, not a payload copy).
+    pub async fn send_workbatch<T: CommitToken>(&self, batch: &WorkBatch<T>) -> SinkOutcome {
         self.send_batch(batch.records.clone()).await
     }
 }
@@ -466,15 +542,15 @@ where
             };
             let result = inner.call(req).await;
             // Feed the loss-based AIMD: a timeout / backpressure is overload (the
-            // limit should shrink). A permanent Fatal is NOT overload, so it must
-            // not shrink the limit for a non-congestion failure.
+            // limit should shrink). A permanent Fatal or a dead letter is NOT
+            // overload, so it must not shrink the limit.
             let outcome = match &result {
                 Ok(_) => Outcome::Success,
                 Err(e) => {
-                    if matches!(e.downcast_ref::<SinkError>(), Some(SinkError::Fatal(_))) {
-                        Outcome::Success
-                    } else {
+                    if is_transient(e) {
                         Outcome::Overload
+                    } else {
+                        Outcome::Success
                     }
                 }
             };
@@ -485,21 +561,26 @@ where
     }
 }
 
-/// Whether a boxed stack error is transient (retryable). A `SinkError::Fatal`
-/// is the only non-retryable case. Timeout (`Elapsed`) and load-shed
+/// Whether a boxed stack error is transient (retryable). `SinkError::Fatal` and
+/// `SinkError::DeadLetter` are not. Timeout (`Elapsed`) and load-shed
 /// (`Overloaded`) are transient and worth another attempt.
 fn is_transient(e: &BoxError) -> bool {
-    !matches!(e.downcast_ref::<SinkError>(), Some(SinkError::Fatal(_)))
+    !matches!(
+        e.downcast_ref::<SinkError>(),
+        Some(SinkError::Fatal(_) | SinkError::DeadLetter)
+    )
 }
 
 /// Map a terminal boxed error back to a [`SendResult`] for the caller's commit
-/// decision. Only a fatal transport error is reported as `Fatal`. An exhausted
-/// transient (timeout / overload / backpressure) is `Backpressured` so the
-/// caller's outer loop can retry the whole block later without losing data.
+/// decision. A fatal transport error is `Fatal` and a dead letter
+/// `FilteredDlq`. An exhausted transient (timeout / overload / backpressure) is
+/// `Backpressured` so the caller's outer loop can retry the whole block later
+/// without losing data.
 fn classify_final(e: BoxError) -> SendResult {
     match e.downcast::<SinkError>() {
         Ok(boxed) => match *boxed {
             SinkError::Fatal(te) => SendResult::Fatal(te),
+            SinkError::DeadLetter => SendResult::FilteredDlq,
             SinkError::Transient => SendResult::Backpressured,
         },
         Err(_) => SendResult::Backpressured,

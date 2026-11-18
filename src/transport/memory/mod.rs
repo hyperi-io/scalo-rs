@@ -221,6 +221,16 @@ impl TransportBase for MemoryTransport {
 }
 
 impl TransportSender for MemoryTransport {
+    /// A record an outbound `dlq` filter matches.
+    fn dead_letter_reason(
+        &self,
+        record: &super::work_batch::Record,
+    ) -> Option<super::ack::DeadLetterReason> {
+        self.filter_engine
+            .outbound_dead_letter(&record.payload)
+            .then_some(super::ack::DeadLetterReason::OutboundFilter)
+    }
+
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         self.offer(destination, payload, Vec::new())
     }
