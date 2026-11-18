@@ -61,6 +61,24 @@ transport:
 
 The cascade does not expand `${...}` in a file, so set `sasl_password` in the environment ([../core-pillars/config.md](../core-pillars/config.md)).
 
+### Providers
+
+`provider` sets `security_protocol` and `sasl_mechanism` for a known platform, so neither is set by hand. The table matches scalo-py's ([providers.rs](../../src/transport/kafka/providers.rs)).
+
+| `provider` | `security_protocol` | `sasl_mechanism` | In `contract::DEFAULT_ALLOWED` |
+| --- | --- | --- | --- |
+| `strimzi` | `SASL_SSL` | `SCRAM-SHA-512` | yes |
+| `redpanda` | `SASL_SSL` | `SCRAM-SHA-512` | yes |
+| `strimzi-no-tls` | `SASL_PLAINTEXT` | `SCRAM-SHA-512` | no |
+| `redpanda-no-tls` | `SASL_PLAINTEXT` | `SCRAM-SHA-512` | no |
+| `msk` | `SASL_SSL` | `SCRAM-SHA-512` | yes |
+| `redpanda-cloud` | `SASL_SSL` | `SCRAM-SHA-512` | yes |
+| `confluent-cloud` | `SASL_SSL` | `PLAIN` | yes |
+| `plaintext` | `PLAINTEXT` | none | yes |
+| `msk_iam` | `SASL_SSL` | `OAUTHBEARER` | no, and `apply_provider` refuses it |
+
+The `-no-tls` keys are the same self-hosted brokers on a TLS-off listener. Only SCRAM has one, because its challenge-response never sends the password. A strict allow-list built on `DEFAULT_ALLOWED` refuses both, and in production the security floor below refuses `sasl_plaintext` unless `allow_insecure_transport` is set.
+
 ### Connection and security
 
 - CA trust: with TLS on (`ssl` or `sasl_ssl`) and neither `ssl_ca_location` nor a raw `ssl.ca.location` or `ssl.ca.pem` set, the consumer, producer and admin clients set `ssl.ca.location` to the bundle `SSL_CERT_FILE` names, else the directory `SSL_CERT_DIR` names, else `probe`. librdkafka's probe reads neither variable, so a private CA a deployment delivers through `SSL_CERT_FILE` is passed on, and with neither set the statically linked OpenSSL still finds the system bundle on RHEL and UBI bases as well as Debian. A blank variable counts as unset. A CA named anywhere wins.

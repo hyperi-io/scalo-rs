@@ -2761,6 +2761,29 @@ mod tests {
         assert_eq!(cfg.sasl_mechanism.as_deref(), Some("PLAIN"));
     }
 
+    /// A TLS-off provider runs SCRAM over `sasl_plaintext`: allowed in dev, and
+    /// in production only with `allow_insecure_transport`.
+    #[test]
+    fn a_tls_off_provider_runs_scram_without_tls() {
+        for key in ["strimzi-no-tls", "redpanda-no-tls"] {
+            let mut cfg = KafkaConfig {
+                provider: Some(key.to_string()),
+                ..Default::default()
+            };
+            cfg.apply_provider().unwrap();
+            assert_eq!(cfg.security_protocol, "sasl_plaintext", "{key}");
+            assert_eq!(
+                cfg.sasl_mechanism.as_deref(),
+                Some("SCRAM-SHA-512"),
+                "{key}"
+            );
+            assert!(cfg.validate(false).is_ok(), "{key} in dev");
+            assert!(cfg.validate(true).is_err(), "{key} in production");
+            cfg.allow_insecure_transport = true;
+            assert!(cfg.validate(true).is_ok(), "{key} opted in");
+        }
+    }
+
     /// librdkafka cannot sign the AWS IAM token MSK IAM auth needs and scalo
     /// installs no token source, so `msk_iam` is refused rather than building
     /// a client that can never authenticate.
