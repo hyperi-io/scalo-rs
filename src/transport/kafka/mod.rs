@@ -206,11 +206,7 @@ fn registry_status(
     missing_destinations: &parking_lot::Mutex<std::collections::HashSet<String>>,
     waits_for_contact: bool,
 ) -> crate::health::HealthStatus {
-    let reached = if waits_for_contact {
-        auth.is_proven()
-    } else {
-        !auth.is_refused()
-    };
+    let reached = !auth.is_refused() && (auth.is_proven() || !waits_for_contact);
     if healthy.load(Ordering::Relaxed)
         && reached
         && !topic_missing.load(Ordering::Relaxed)
@@ -380,40 +376,54 @@ struct ProducerEntry {
 /// The transport's producer, shared with its refusal watch.
 type ProducerSlot = Arc<parking_lot::RwLock<ProducerEntry>>;
 
-/// How often the refusal watch checks for a refusal.
-const REFUSAL_CHECK: Duration = Duration::from_secs(1);
-
 /// The wait before each client rebuild while a broker refuses the client.
 const REFUSAL_REBUILD: Backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
 
 /// Rebuild the producer, and ask for a consumer rebuild, on [`REFUSAL_REBUILD`]
-/// while a broker refuses the client and none has accepted it.
+/// while a broker refuses the client, and declare a proven client refused
+/// again once a run of failures has lasted `grace`.
 ///
 /// librdkafka reads the CA bundle, certificate and credentials once, when it
-/// builds a client, so only a new client picks up a fixed setup. Ends once a
-/// broker accepts the client or `stop` is cancelled.
+/// builds a client, so only a new client picks up a fixed or rotated setup.
+/// With nothing refused and no run open it waits on the auth state's notify,
+/// so a healthy transport wakes it never. Ends when `stop` is cancelled.
 async fn refusal_watch(
     auth: Arc<classify::AuthState>,
     producer: Option<(ProducerSlot, ClientConfig)>,
+    grace: Duration,
     stop: tokio_util::sync::CancellationToken,
 ) {
     let mut rounds = 0_u32;
     loop {
-        let wait = if auth.is_refused() {
-            rounds = rounds.saturating_add(1);
-            REFUSAL_REBUILD.delay(rounds)
-        } else {
-            REFUSAL_CHECK
-        };
+        if !auth.is_refused() {
+            rounds = 0;
+            let open_for = auth
+                .run_started_ms()
+                .map(|started| classify::monotonic_ms().saturating_sub(started));
+            let Some(open_ms) = open_for else {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => return,
+                    () = auth.changed.notified() => {}
+                }
+                continue;
+            };
+            let left = grace.saturating_sub(Duration::from_millis(open_ms));
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(left) => {}
+            }
+            auth.refuse_if_overdue(grace, classify::monotonic_ms());
+            continue;
+        }
+        rounds = rounds.saturating_add(1);
         tokio::select! {
             biased;
             () = stop.cancelled() => return,
-            () = tokio::time::sleep(wait) => {}
+            () = tokio::time::sleep(REFUSAL_REBUILD.delay(rounds)) => {}
         }
-        if auth.is_proven() {
-            return;
-        }
-        if !auth.is_refused() || rounds == 0 {
+        if !auth.is_refused() {
             continue;
         }
         let generation = auth.advance_generation();
@@ -1306,6 +1316,7 @@ impl KafkaTransport {
             producer
                 .as_ref()
                 .map(|slot| (Arc::clone(slot), producer_config.clone())),
+            Duration::from_secs(config.auth_refusal_grace_secs),
             watch_stop.clone(),
         ));
 
@@ -3225,8 +3236,9 @@ impl PollJob {
         classify::classify_recv_failure(
             err,
             classify::RecvContext {
-                credentials_proven: self.received_before
-                    || self.consumer.context().auth().is_proven(),
+                credentials_proven: (self.received_before
+                    || self.consumer.context().auth().is_proven())
+                    && !self.consumer.context().auth().is_refused(),
             },
         )
     }
@@ -5024,6 +5036,83 @@ mod tests {
         assert!(slot.epoch > epoch, "the consumer was replaced");
         drop(slot);
         assert!(!transport.is_healthy(), "still refused, so not ready");
+    }
+
+    /// A proven client refused for longer than the grace, as after a rotated
+    /// CA, goes not ready, has both clients rebuilt, and is ready again once a
+    /// rebuilt client is accepted, with no restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proven_client_refused_past_the_grace_is_rebuilt_and_ready_again() {
+        let transport = KafkaTransport::new(&KafkaConfig {
+            topics: vec!["rotated".to_string()],
+            group: "rotated-group".to_string(),
+            auth_refusal_grace_secs: 1,
+            ..unreachable_config()
+        })
+        .await
+        .expect("a transport constructs broker-free");
+        transport.auth.mark_proven();
+        assert!(transport.is_healthy());
+
+        transport.auth.on_error(
+            &KafkaError::Global(RDKafkaErrorCode::SSL),
+            "certificate verify failed",
+        );
+        assert!(
+            transport.is_healthy(),
+            "inside the grace: a restarting broker"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while transport.auth.generation() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no rebuild after the grace and one backoff"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(transport.auth.is_refused(), "refused again past the grace");
+        assert!(!transport.is_healthy(), "refused, so not ready");
+        let producer = transport.current_producer().expect("a producer");
+        assert_eq!(
+            producer.generation,
+            transport.auth.generation(),
+            "the producer was rebuilt"
+        );
+        transport.recv(10).await.expect("a refused receive runs on");
+        assert_eq!(
+            transport
+                .consumer
+                .as_ref()
+                .expect("a consumer")
+                .read()
+                .generation,
+            transport.auth.generation(),
+            "the consumer was rebuilt"
+        );
+
+        #[cfg(feature = "health")]
+        let readiness = |t: &KafkaTransport| {
+            registry_status(
+                &t.healthy,
+                &t.auth,
+                &t.topic_missing,
+                &t.missing_destinations,
+                t.waits_for_contact,
+            )
+        };
+        #[cfg(feature = "health")]
+        assert_eq!(
+            readiness(&transport),
+            crate::health::HealthStatus::Unhealthy
+        );
+
+        // A rebuilt client accepted: a broker `UP`, a delivery or a record.
+        transport.auth.mark_proven();
+        assert!(transport.is_healthy(), "ready again with no restart");
+        assert!(transport.healthcheck().await.is_ok());
+        #[cfg(feature = "health")]
+        assert_eq!(readiness(&transport), crate::health::HealthStatus::Healthy);
     }
 
     /// A record in flight on a producer the refusal watch replaced answers

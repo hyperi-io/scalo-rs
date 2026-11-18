@@ -1404,6 +1404,18 @@ pub struct KafkaConfig {
     #[serde(default)]
     pub allow_insecure_transport: bool,
 
+    /// Seconds a client a broker has accepted may go on failing authentication
+    /// or TLS, with no success between, before it counts as refused again
+    /// (default 120).
+    ///
+    /// Inside it a failure is a restarting broker and changes nothing. Past it
+    /// readiness fails and the clients are rebuilt to read a rotated CA bundle,
+    /// certificate or password. Raising it rides out a longer broker restart
+    /// at the cost of that many seconds of a ready pod delivering nothing after
+    /// a rotation. No record is lost either way: a refused client backpressures.
+    #[serde(default = "default_auth_refusal_grace_secs")]
+    pub auth_refusal_grace_secs: u64,
+
     // --- Consumer Settings (explicit fields for common options) ---
     /// Enable auto-commit (default: false for manual commit).
     #[serde(default)]
@@ -1579,6 +1591,10 @@ fn default_consumer_protocol_probe_ms() -> u64 {
     5000
 }
 
+fn default_auth_refusal_grace_secs() -> u64 {
+    120
+}
+
 impl Default for KafkaConfig {
     fn default() -> Self {
         #[allow(deprecated)]
@@ -1607,6 +1623,7 @@ impl Default for KafkaConfig {
             ssl_key_location: None,
             ssl_skip_verify: false,
             allow_insecure_transport: false,
+            auth_refusal_grace_secs: default_auth_refusal_grace_secs(),
             enable_auto_commit: false,
             auto_commit_interval_ms: default_auto_commit_interval(),
             session_timeout_ms: default_session_timeout(),

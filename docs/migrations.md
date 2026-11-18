@@ -60,6 +60,12 @@ A bad CA, client certificate or SASL password no longer turns a Kafka send into 
 
 **Consumer adjustment** -- a dashboard or manifest naming one of the six drops it.
 
+### A Kafka client refused after it had worked goes not ready (BEHAVIOUR CHANGE)
+
+A client a broker accepted, then refuses for `auth_refusal_grace_secs` (default 120) with no success between, is refused again: readiness fails and the clients are rebuilt until one is accepted. Before, it stayed ready and delivered nothing until a restart. See [backends.md](transport/backends.md#refused-credentials).
+
+**Consumer adjustment** -- a pod goes not ready about two minutes into a CA, certificate or password rotation the broker refuses. Raise `auth_refusal_grace_secs` where a broker restart takes longer.
+
 ## 2.14.31
 
 ### OpenTelemetry moves to the 0.33 line (API CHANGE)

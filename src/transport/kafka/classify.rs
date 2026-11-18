@@ -386,9 +386,10 @@ impl DegradedLatch {
 /// Whether a client's credentials and TLS setup are being refused, kept from
 /// librdkafka's error callback so the send path and readiness can say why.
 ///
-/// A refusal counts only until a broker first accepts the client. After that an
-/// authentication or TLS failure is most likely a broker restarting, which
-/// librdkafka rides out, so it is logged once and changes nothing else. One
+/// Before a broker first accepts the client, any authentication or TLS failure
+/// is a refusal. After that one is most likely a broker restarting, which
+/// librdkafka rides out, so it opens a run that any success ends, and only a
+/// run lasting the grace (a rotated CA or password) is a refusal again. One
 /// state serves a transport's producer and every consumer it builds, because
 /// they present the same credentials: a broker accepting either proves both.
 #[derive(Debug, Default)]
@@ -404,28 +405,64 @@ pub(crate) struct AuthState {
     /// Client rebuilds asked for while refused. A client built at an earlier
     /// generation holds the setup that was refused and is replaced.
     generation: AtomicU64,
+    /// When the current run of failures after proof began, on
+    /// [`monotonic_ms`], or 0 with no run open. Any success ends the run.
+    run_started_ms: AtomicU64,
+    /// Woken by a refusal or a run opening, so the refusal watch sleeps
+    /// otherwise.
+    pub(crate) changed: tokio::sync::Notify,
+}
+
+/// Milliseconds since this process first asked, never 0, so 0 can mean unset.
+pub(crate) fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    u64::try_from(elapsed.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
 }
 
 impl AuthState {
     /// Take an error from librdkafka's error callback. Returns whether it was an
     /// authentication or TLS failure, which this state has then handled.
     pub(crate) fn on_error(&self, err: &KafkaError, detail: &str) -> bool {
+        self.on_error_at(err, detail, monotonic_ms())
+    }
+
+    /// [`on_error`](Self::on_error) at `now_ms` on [`monotonic_ms`].
+    pub(crate) fn on_error_at(&self, err: &KafkaError, detail: &str, now_ms: u64) -> bool {
         let Some(code) = err.rdkafka_error_code().filter(|c| is_auth_failure(*c)) else {
             return false;
         };
         if self.proven.load(Ordering::Relaxed) {
+            *self.reason.lock() = Some(format!("{code:?}: {detail}"));
+            if self.refused.load(Ordering::Relaxed) {
+                #[cfg(feature = "metrics")]
+                ::metrics::counter!("transport_auth_refused_total", "transport" => "kafka")
+                    .increment(1);
+                return true;
+            }
+            if self
+                .run_started_ms
+                .compare_exchange(0, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.changed.notify_one();
+            }
             if self.latch.enter() {
                 tracing::warn!(
                     code = ?code,
                     detail,
                     "kafka authentication or TLS failed after the credentials had worked; \
-                     treating it as a restarting broker"
+                     treating it as a restarting broker until auth_refusal_grace_secs passes \
+                     with no success"
                 );
             }
             return true;
         }
         *self.reason.lock() = Some(format!("{code:?}: {detail}"));
         self.refused.store(true, Ordering::Relaxed);
+        self.changed.notify_one();
         #[cfg(feature = "metrics")]
         ::metrics::counter!("transport_auth_refused_total", "transport" => "kafka").increment(1);
         if self.latch.enter() {
@@ -441,10 +478,20 @@ impl AuthState {
         true
     }
 
-    /// Record that a broker accepted this client: ends a refusal, and re-arms the
-    /// log line for a later one.
+    /// Record that a broker accepted this client: ends a refusal and any run of
+    /// failures, and re-arms the log line for a later one.
+    ///
+    /// Runs per delivery and per received batch, so it only loads unless a run
+    /// or a refusal is open.
     pub(crate) fn mark_proven(&self) {
         if self.proven.load(Ordering::Relaxed) {
+            if self.run_started_ms.load(Ordering::Relaxed) != 0 {
+                self.run_started_ms.store(0, Ordering::Relaxed);
+            }
+            if self.refused.load(Ordering::Relaxed) && self.refused.swap(false, Ordering::Relaxed) {
+                *self.reason.lock() = None;
+                tracing::info!("kafka: a broker accepted this client's credentials again");
+            }
             self.latch.clear();
             return;
         }
@@ -461,9 +508,44 @@ impl AuthState {
         self.proven.load(Ordering::Relaxed)
     }
 
-    /// Whether the client is being refused and has never been accepted.
+    /// Whether the client is being refused: never accepted yet, or accepted
+    /// once and refused for longer than the grace since.
     pub(crate) fn is_refused(&self) -> bool {
         self.refused.load(Ordering::Relaxed)
+    }
+
+    /// Whether a success would end something open: no proof yet, a run of
+    /// failures, or a refusal.
+    pub(crate) fn awaits_success(&self) -> bool {
+        !self.proven.load(Ordering::Relaxed) || self.run_started_ms.load(Ordering::Relaxed) != 0
+    }
+
+    /// When the open run of failures after proof began, if one is open.
+    pub(crate) fn run_started_ms(&self) -> Option<u64> {
+        Some(self.run_started_ms.load(Ordering::Acquire)).filter(|&ms| ms != 0)
+    }
+
+    /// Declare the client refused again once its run of failures after proof
+    /// has lasted `grace` at `now_ms`, with no success between. Returns
+    /// whether this call did so.
+    pub(crate) fn refuse_if_overdue(&self, grace: std::time::Duration, now_ms: u64) -> bool {
+        let Some(started) = self.run_started_ms() else {
+            return false;
+        };
+        let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+        if now_ms.saturating_sub(started) < grace_ms || self.refused.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        #[cfg(feature = "metrics")]
+        ::metrics::counter!("transport_auth_refused_total", "transport" => "kafka").increment(1);
+        tracing::error!(
+            grace_secs = grace.as_secs(),
+            reason = self.reason.lock().as_deref().unwrap_or(""),
+            "kafka refused this client's credentials or TLS setup for the whole grace after \
+             they had worked. Readiness reports not-ready and the client is rebuilt on a \
+             backoff to read a rotated CA bundle, certificate or password"
+        );
+        true
     }
 
     /// The last refusal, while the client is refused.
@@ -612,19 +694,47 @@ mod tests {
         }
     }
 
+    /// After the credentials worked, a run of failures is a restarting broker
+    /// until it has lasted the grace with no success between, then a refusal
+    /// again, which the next success ends.
     #[test]
-    fn a_refusal_ends_once_a_broker_accepts_the_client_and_does_not_return() {
+    fn a_proven_client_is_refused_again_only_past_the_grace() {
+        let grace = std::time::Duration::from_secs(120);
         let auth = AuthState::default();
         let refusal = KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed);
-        assert!(auth.on_error(&refusal, "bad password"));
+        assert!(auth.on_error_at(&refusal, "bad password", 1_000));
         assert!(auth.refusal().is_some_and(|r| r.contains("bad password")));
 
         auth.mark_proven();
         assert!(auth.is_proven() && !auth.is_refused() && auth.refusal().is_none());
 
-        // The same code after the credentials worked is a restarting broker.
-        assert!(auth.on_error(&refusal, "broker restarting"));
-        assert!(!auth.is_refused(), "a proven client is never refused again");
+        // A run that a success ends never becomes a refusal.
+        assert!(auth.on_error_at(&refusal, "broker restarting", 10_000));
+        assert!(!auth.refuse_if_overdue(grace, 129_999), "inside the grace");
+        auth.mark_proven();
+        assert!(auth.run_started_ms().is_none(), "a success ends the run");
+        assert!(!auth.refuse_if_overdue(grace, 1_000_000), "no run is open");
+
+        // A run that lasts the grace is a refusal again.
+        assert!(auth.on_error_at(&refusal, "rotated password", 200_000));
+        assert!(auth.on_error_at(&refusal, "rotated password", 250_000));
+        assert_eq!(
+            auth.run_started_ms(),
+            Some(200_000),
+            "the run keeps its start"
+        );
+        assert!(!auth.refuse_if_overdue(grace, 319_999));
+        assert!(!auth.is_refused());
+        assert!(auth.refuse_if_overdue(grace, 320_000));
+        assert!(auth.is_refused());
+        assert!(
+            auth.refusal()
+                .is_some_and(|r| r.contains("rotated password"))
+        );
+        assert!(!auth.refuse_if_overdue(grace, 400_000), "declared once");
+
+        auth.mark_proven();
+        assert!(!auth.is_refused() && auth.refusal().is_none() && auth.run_started_ms().is_none());
     }
 
     #[cfg(feature = "logger")]
