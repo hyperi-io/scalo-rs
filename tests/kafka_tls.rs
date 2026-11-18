@@ -27,12 +27,16 @@
 //!    The broker's log then names each refusal.
 //!
 //!    librdkafka reports a rejected certificate or SASL login to the client as
-//!    `SSL` or `Authentication`, and the transport turns those into a `Fatal`
-//!    send and a failed readiness check that names the cause. A broker that
-//!    drops the connection before the client learns why (a missing client
-//!    certificate under TLS 1.3, a plaintext client on a TLS port) reaches the
-//!    client as a plain transport failure, so those rows stay `Backpressured`
-//!    and ready. Each row says which it expects.
+//!    `SSL` or `Authentication`, and the transport turns those into a
+//!    `Backpressured` send, so the service runs on, and a failed readiness
+//!    check that names the cause. A broker that drops the connection before
+//!    the client learns why (a missing client certificate under TLS 1.3, a
+//!    plaintext client on a TLS port) reaches the client as a plain transport
+//!    failure, so those rows stay `Backpressured` and ready. Each row says
+//!    which it expects.
+//!
+//! A third test starts a client on an untrusted CA, then fixes the CA file it
+//! names, and expects the transport to connect without a restart.
 //!
 //! The test sets no environment and installs no process-global state, so the
 //! transport starts the way an app's `main` leaves it.
@@ -51,9 +55,7 @@ use scalo::transport::kafka::test_support::{
     SCRAM_USER, TlsBroker, require_docker, scram_password, skip_or_fail,
 };
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
-use scalo::transport::{
-    SendResult, TransportBase, TransportError, TransportReceiver, TransportSender,
-};
+use scalo::transport::{SendResult, TransportBase, TransportReceiver, TransportSender};
 
 /// Group join plus the first fetch, on a single-node broker busy with a JVM start.
 const ROUND_TRIP_WITHIN: Duration = Duration::from_secs(90);
@@ -86,8 +88,8 @@ struct Refused {
 /// How a refusal reaches the client.
 #[derive(Clone, Copy)]
 enum ClientSees {
-    /// librdkafka names the cause, with this error code, so the send is `Fatal`
-    /// and readiness fails.
+    /// librdkafka names the cause, with this error code, so the send is
+    /// `Backpressured` and readiness fails naming it.
     Cause(&'static str),
     /// The broker drops the connection and librdkafka reports a transport
     /// failure, so the send is `Backpressured` and readiness is unchanged.
@@ -341,20 +343,19 @@ async fn refusal(broker: &TlsBroker, row: &Refused) -> Result<String, String> {
                     "the producer delivered a record the broker should have refused".to_string(),
                 );
             }
-            (ClientSees::Cause(code), SendResult::Fatal(TransportError::Config(why))) => {
-                if !why.contains(code) {
-                    return Err(format!("the Fatal send does not name {code}: {why}"));
-                }
+            (ClientSees::Cause(code), SendResult::Backpressured) => {
                 if transport.is_healthy() {
                     return Err("readiness stayed ready after the broker refused the client".into());
                 }
                 match &healthcheck {
-                    Err(e) if e.is_fatal() && e.to_string().contains(code) => {}
+                    Err(e) if !e.is_fatal() && e.to_string().contains(code) => {}
                     other => {
-                        return Err(format!("the health check does not name {code}: {other:?}"));
+                        return Err(format!(
+                            "the health check does not name {code}, or is fatal: {other:?}"
+                        ));
                     }
                 }
-                format!("Fatal naming {code}, not ready")
+                format!("Backpressured, not ready, the health check naming {code}")
             }
             (ClientSees::DroppedConnection, SendResult::Backpressured) => {
                 if !transport.is_healthy() || healthcheck.is_err() {
@@ -368,7 +369,8 @@ async fn refusal(broker: &TlsBroker, row: &Refused) -> Result<String, String> {
                 return Err(format!(
                     "expected {}, the send returned {got:?}",
                     match expected {
-                        ClientSees::Cause(code) => format!("Fatal naming {code}"),
+                        ClientSees::Cause(code) =>
+                            format!("Backpressured, not ready naming {code}"),
                         ClientSees::DroppedConnection => "Backpressured".to_string(),
                     }
                 ));
@@ -488,6 +490,107 @@ async fn kafka_transport_against_a_tls_broker() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// The longest the refusal watch waits between rebuilds, plus a broker round trip.
+const RECOVERED_WITHIN: Duration = Duration::from_secs(150);
+
+/// A transport built on an untrusted CA runs on, backpressured and not ready,
+/// and connects once the CA file it names holds the right CA: librdkafka reads
+/// that file only when it builds a client, so this needs the rebuild.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transport_refused_for_its_ca_connects_once_the_ca_is_fixed() {
+    if !require_docker() {
+        return;
+    }
+    let broker = match TlsBroker::start(&common::SUITE, scalo::test_name!()).await {
+        Ok(broker) => broker,
+        Err(e) => {
+            skip_or_fail(&format!("the TLS broker would not start ({e})"));
+            return;
+        }
+    };
+    let topic = "tls-ca-fixed";
+    let trusted = KafkaConfig {
+        brokers: vec![broker.tls.clone()],
+        group: String::new(),
+        ..KafkaConfig::default()
+    }
+    .with_tls(Some(broker.pki.file("ca.crt").as_str()));
+    KafkaAdmin::new(&trusted)
+        .expect("admin")
+        .create_topics(&[(topic, 1, 1)])
+        .await
+        .expect("create topic");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ca = dir.path().join("trust.crt");
+    std::fs::copy(broker.pki.file("rogue-ca.crt"), &ca).expect("stage the wrong CA");
+    let config = KafkaConfig {
+        brokers: vec![broker.tls.clone()],
+        group: "tls-ca-fixed-group".to_string(),
+        topics: vec![topic.to_string()],
+        ..KafkaConfig::default()
+    }
+    .with_tls(Some(ca.to_string_lossy().as_ref()))
+    .with_override("message.timeout.ms", MESSAGE_TIMEOUT_MS);
+    let transport = KafkaTransport::new(&config)
+        .await
+        .expect("a refused setup still builds");
+
+    let refused = tokio::time::timeout(
+        REFUSED_WITHIN,
+        transport.send(topic, bytes::Bytes::from_static(b"{\"refused\":true}")),
+    )
+    .await
+    .expect("the refused send settles");
+    assert!(
+        refused.is_backpressured(),
+        "a refused send is kept for a retry: {refused:?}"
+    );
+    assert!(!transport.is_healthy(), "refused, so not ready");
+    let health = transport.healthcheck().await.expect_err("refused");
+    assert!(
+        !health.is_fatal(),
+        "a refusal never ends the service: {health}"
+    );
+
+    std::fs::copy(broker.pki.file("ca.crt"), &ca).expect("fix the CA");
+    let fixed = Instant::now();
+    let payload = b"{\"fixed\":true}";
+    loop {
+        assert!(
+            fixed.elapsed() < RECOVERED_WITHIN,
+            "never delivered within {RECOVERED_WITHIN:?} of the CA being fixed"
+        );
+        let sent = transport
+            .send(topic, bytes::Bytes::from_static(payload))
+            .await;
+        if sent.is_ok() {
+            break;
+        }
+        // Receives run the consumer's own rebuild.
+        let _ = transport.recv(10).await;
+    }
+    eprintln!("delivered {:?} after the CA was fixed", fixed.elapsed());
+    assert!(transport.is_healthy(), "accepted, so ready");
+
+    let deadline = Instant::now() + ROUND_TRIP_WITHIN;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the rebuilt consumer never read the record back"
+        );
+        let batch = transport.recv(10).await.expect("recv");
+        if batch
+            .records
+            .iter()
+            .any(|record| record.payload.as_ref() == payload)
+        {
+            break;
+        }
+    }
+    let _ = transport.close().await;
 }
 
 /// A client that names no CA trusts the bundle `SSL_CERT_FILE` names, the

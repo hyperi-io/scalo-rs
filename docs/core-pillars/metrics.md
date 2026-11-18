@@ -176,9 +176,11 @@ A source or sink that goes away is waited out rather than ending the app, and th
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
-| `transport_recv_errors_total` | `transport`, `class` | receive failures: `class="transient"` were retried, `class="missing_topic"` waited for a subscribed topic to appear, `class="permanent"` were returned. Kafka emits it |
+| `transport_recv_errors_total` | `transport`, `class` | receive failures: `class="transient"` were retried, `class="missing_topic"` waited for a subscribed topic to appear, `class="refused"` waited while a broker refused the client's credentials or TLS setup, `class="permanent"` were returned. Kafka emits it |
+| `transport_auth_refused_total` | `transport` | refusals of the client's credentials or TLS setup before any broker accepted them, one per reconnect librdkafka reports. Kafka emits it |
+| `transport_refusal_rebuilds_total` | `transport` | rounds in which a refused transport rebuilt its clients to read a fixed CA bundle, certificate or password. Kafka emits it |
 | `transport_send_missing_topic_total` | `transport` | sends that found the destination topic missing and returned `Backpressured`, so the caller retried them. Kafka emits it |
-| `transport_consumer_rebuilds_total` | `transport`, `protocol` | consumers replaced after librdkafka flagged them fatal, by the group protocol the new client joins with. Kafka emits it |
+| `transport_consumer_rebuilds_total` | `transport`, `protocol` | consumers replaced after librdkafka flagged them fatal or a broker refused them, by the group protocol the new client joins with. Kafka emits it |
 | `transport_revoke_discarded_total` | `transport`, `stage` | records a revoke kept from a write, since the partition's next owner reads them again: `stage="receive"` for those `recv` left out, read before a revoke of their partition in the same poll, `stage="buffer"` for those a caller discarded from its own buffer and counted with `KafkaTransport::discarded_after_revoke`. Kafka emits it |
 | `transport_commit_errors_total` | `transport` | source commits that failed after the block was delivered. The `BatchEngine` driver counts them and carries on |
 | `pipeline_retries_total` | `stage` | `BatchEngine` run-loop steps retried after a transient failure, `stage` being `recv`, `sink`, or `dlq` for the pipeline's DLQ writes |

@@ -30,7 +30,13 @@ A service built on `cli-service` now compiles the health registry, so every tran
 
 The `transport:kafka` health check is unhealthy from construction until a broker first accepts the client: a broker `UP` in the client's statistics, a delivered record or a received one. `is_healthy()` and `healthcheck()` are unchanged, so a boot probe does not fail on a broker that is slow to answer. See [backends.md](transport/backends.md#broker-outages).
 
-**Consumer adjustment** -- a pod whose Kafka is unreachable at start stays out of its Service until a broker answers. A client with `statistics.interval.ms: 0` is ready only after its first delivery or received record.
+**Consumer adjustment** -- a pod whose Kafka is unreachable at start stays out of its Service until a broker answers. With `statistics.interval.ms: 0` on every client of a transport, nothing reports a broker `UP`, so the check does not wait for first contact and follows `is_healthy()`.
+
+### A refused Kafka client runs on, not ready, and rebuilds (BEHAVIOUR CHANGE)
+
+A bad CA, client certificate or SASL password no longer turns a Kafka send into `Fatal(Config)` or a receive into an error. Sends come back `Backpressured`, receives return empty batches, `healthcheck()` returns a non-fatal `Connection` error and readiness fails. The transport rebuilds its clients on a backoff, so fixing the CA file or password recovers without a restart. See [backends.md](transport/backends.md#refused-credentials).
+
+**Consumer adjustment** -- an app that exited on a `Fatal` send or a receive error to surface a bad setup now runs on: alert on `/readyz` or `transport_auth_refused_total` instead.
 
 ### A dead-lettered record is never counted as sent (API CHANGE)
 

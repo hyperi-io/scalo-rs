@@ -112,8 +112,12 @@ pub(crate) enum RecvFailure {
     /// A subscribed topic does not exist yet: one not deployed yet, a topic
     /// ensure that failed, a broker rebuilt. The consumer waits for it.
     MissingTopic,
-    /// Retrying cannot help -- authentication on first contact, authorisation,
-    /// invalid configuration, or an error flagged fatal.
+    /// The broker refuses the client's credentials or TLS setup and none has
+    /// accepted them yet. The consumer polls on, not ready, and is rebuilt on
+    /// a backoff so a fixed CA bundle or password is read again.
+    Refused,
+    /// Retrying cannot help -- authorisation, invalid configuration, or an
+    /// error flagged fatal.
     Permanent,
     /// A code this module does not classify. Treated as permanent, and logged
     /// by name so it can be classified.
@@ -125,7 +129,7 @@ pub(crate) enum RecvFailure {
 pub(crate) struct RecvContext {
     /// Whether this consumer has reached a broker with its credentials before.
     /// An authentication or TLS failure after that is most likely a restarting
-    /// broker. Before it, a misconfiguration that should fail fast.
+    /// broker. Before it, a refusal the operator has to fix.
     pub(crate) credentials_proven: bool,
 }
 
@@ -143,9 +147,8 @@ pub(crate) fn classify_recv_failure(err: &KafkaError, ctx: RecvContext) -> RecvF
                 RecvFailure::MissingTopic
             }
             Some(code) if is_auth_failure(code) && ctx.credentials_proven => RecvFailure::Transient,
-            Some(code) if is_auth_failure(code) || is_recv_permanent(code) => {
-                RecvFailure::Permanent
-            }
+            Some(code) if is_auth_failure(code) => RecvFailure::Refused,
+            Some(code) if is_recv_permanent(code) => RecvFailure::Permanent,
             _ => RecvFailure::Unclassified,
         },
     }
@@ -179,7 +182,7 @@ fn is_consumer_retryable(code: RDKafkaErrorCode) -> bool {
     )
 }
 
-/// Authentication and TLS handshake failures: permanent on first contact,
+/// Authentication and TLS handshake failures: a refusal on first contact,
 /// transient once the same credentials have worked.
 pub(crate) fn is_auth_failure(code: RDKafkaErrorCode) -> bool {
     matches!(
@@ -288,6 +291,14 @@ impl RecvState {
         }
     }
 
+    /// Count a poll refused for the client's credentials or TLS setup, in the
+    /// backoff with the transient failures. [`AuthState`] logs the refusal.
+    pub(crate) fn record_refused(&self, err: &KafkaError) {
+        self.consecutive.fetch_add(1, Ordering::Relaxed);
+        count_recv_error("refused");
+        tracing::debug!(error = %err, "kafka consume refused; polling on");
+    }
+
     /// Note a received record: report the first after a run of transient
     /// failures or a missing topic, and remember that the credentials work.
     pub(crate) fn record_success(&self) {
@@ -390,6 +401,9 @@ pub(crate) struct AuthState {
     latch: DegradedLatch,
     /// The last refusal, for the message a caller sees.
     reason: parking_lot::Mutex<Option<String>>,
+    /// Client rebuilds asked for while refused. A client built at an earlier
+    /// generation holds the setup that was refused and is replaced.
+    generation: AtomicU64,
 }
 
 impl AuthState {
@@ -412,13 +426,16 @@ impl AuthState {
         }
         *self.reason.lock() = Some(format!("{code:?}: {detail}"));
         self.refused.store(true, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        ::metrics::counter!("transport_auth_refused_total", "transport" => "kafka").increment(1);
         if self.latch.enter() {
             tracing::error!(
                 code = ?code,
                 detail,
-                "kafka refused this client's credentials or TLS setup. Sends fail and \
-                 readiness reports not-ready until a broker accepts it. Check the broker \
-                 CA, the client certificate and the SASL user and password"
+                "kafka refused this client's credentials or TLS setup. Sends backpressure \
+                 and readiness reports not-ready until a broker accepts it, and the client \
+                 is rebuilt on a backoff to read a fixed setup. Check the broker CA, the \
+                 client certificate and the SASL user and password"
             );
         }
         true
@@ -456,6 +473,18 @@ impl AuthState {
         } else {
             None
         }
+    }
+
+    /// The current rebuild generation.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Ask every client built before now to be rebuilt, and return the new generation.
+    pub(crate) fn advance_generation(&self) -> u64 {
+        self.generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
     }
 }
 
@@ -791,15 +820,12 @@ mod tests {
     #[test]
     fn a_failure_no_retry_can_clear_still_surfaces() {
         for code in [
-            RDKafkaErrorCode::Authentication,
-            RDKafkaErrorCode::SaslAuthenticationFailed,
             RDKafkaErrorCode::TopicAuthorizationFailed,
             RDKafkaErrorCode::GroupAuthorizationFailed,
             RDKafkaErrorCode::ClusterAuthorizationFailed,
             RDKafkaErrorCode::UnknownPartition,
             RDKafkaErrorCode::InvalidArgument,
             RDKafkaErrorCode::InvalidConfig,
-            RDKafkaErrorCode::SSL,
             RDKafkaErrorCode::Fatal,
             RDKafkaErrorCode::AutoOffsetReset,
         ] {
@@ -812,9 +838,10 @@ mod tests {
         }
     }
 
+    /// Nothing has accepted these credentials yet: a refusal the operator fixes
+    /// while the consumer polls on, never an error that ends it.
     #[test]
-    fn an_auth_failure_fails_fast_on_first_contact() {
-        // Nothing has accepted these credentials yet: a misconfiguration.
+    fn an_auth_failure_on_first_contact_is_a_refusal() {
         for code in [
             RDKafkaErrorCode::Authentication,
             RDKafkaErrorCode::SSL,
@@ -825,10 +852,30 @@ mod tests {
             let err = KafkaError::MessageConsumption(code);
             assert_eq!(
                 classify_recv_failure(&err, FIRST_CONTACT),
-                RecvFailure::Permanent,
-                "{code:?} on first contact should end the consumer"
+                RecvFailure::Refused,
+                "{code:?} on first contact keeps the consumer polling, not ready"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_poll_backs_off_and_counts_toward_the_run() {
+        let state = RecvState::default();
+        let err = KafkaError::MessageConsumption(RDKafkaErrorCode::SSL);
+        state.record_refused(&err);
+        state.record_refused(&err);
+        assert_eq!(state.failures(), 2);
+        state.record_success();
+        assert_eq!(state.failures(), 0);
+    }
+
+    #[test]
+    fn each_advance_asks_for_a_newer_generation() {
+        let auth = AuthState::default();
+        assert_eq!(auth.generation(), 0);
+        assert_eq!(auth.advance_generation(), 1);
+        assert_eq!(auth.advance_generation(), 2);
+        assert_eq!(auth.generation(), 2);
     }
 
     #[test]

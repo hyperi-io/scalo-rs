@@ -196,15 +196,23 @@ fn block_result(results: Vec<SendResult>) -> SendResult {
 /// Unhealthy until a broker has accepted the client (a broker `UP` in its
 /// statistics, a delivered record or a received one), so a pod that cannot
 /// reach Kafka is not ready from the start. Then as [`TransportBase::is_healthy`].
+/// With `waits_for_contact` false (statistics off on every client, so no
+/// broker `UP` can prove an idle client) it is [`TransportBase::is_healthy`] throughout.
 #[cfg(feature = "health")]
 fn registry_status(
     healthy: &AtomicBool,
     auth: &classify::AuthState,
     topic_missing: &AtomicBool,
     missing_destinations: &parking_lot::Mutex<std::collections::HashSet<String>>,
+    waits_for_contact: bool,
 ) -> crate::health::HealthStatus {
+    let reached = if waits_for_contact {
+        auth.is_proven()
+    } else {
+        !auth.is_refused()
+    };
     if healthy.load(Ordering::Relaxed)
-        && auth.is_proven()
+        && reached
         && !topic_missing.load(Ordering::Relaxed)
         && missing_destinations.lock().is_empty()
     {
@@ -225,6 +233,9 @@ pub struct KafkaTransport {
     /// Removes this component from the health registry when it drops.
     #[cfg(feature = "health")]
     _health_registration: crate::health::HealthRegistration,
+    /// Whether the registry check waits for a broker to accept the client.
+    #[cfg(all(feature = "health", test))]
+    waits_for_contact: bool,
     /// Removes this component from the health registry when it drops.
     #[cfg(all(feature = "governor", feature = "health"))]
     _partition_limited_registration: crate::health::HealthRegistration,
@@ -249,8 +260,11 @@ pub struct KafkaTransport {
     rebuild_latch: classify::DegradedLatch,
     /// Latches the fenced-member error to one line.
     fenced_latch: classify::DegradedLatch,
-    /// `None` on a transport that only receives.
-    producer: Option<FutureProducer<StatsContext>>,
+    /// `None` on a transport that only receives. Replaced whole while a broker
+    /// refuses the client, so a send works on a clone of the current one.
+    producer: Option<ProducerSlot>,
+    /// Stops the refusal watch when the transport drops.
+    _refusal_watch: tokio_util::sync::DropGuard,
     /// Persistent topic-string interner. Shared across `recv()` calls so a
     /// newly-discovered topic is interned once (not re-`Arc`'d every batch) --
     /// the previous per-recv clone discarded new entries. RwLock: reads
@@ -267,7 +281,8 @@ pub struct KafkaTransport {
     healthy: Arc<AtomicBool>,
     /// Whether the broker refuses this transport's credentials or TLS setup,
     /// shared by its producer and every consumer it builds. A refusal fails
-    /// readiness, and turns a send that would only time out into `Fatal`.
+    /// readiness, keeps every undelivered send `Backpressured` and drives the
+    /// refusal watch's rebuilds.
     auth: Arc<classify::AuthState>,
     /// Latches a sustained retryable send failure so the warn fires on the edge,
     /// not once per record.
@@ -347,10 +362,97 @@ struct ConsumerSlot {
     /// Clients this transport built before this one, which keeps a lease from
     /// an earlier client from matching one of this client's.
     epoch: u64,
+    /// The refusal generation this client was built at: an older one holds a
+    /// setup a broker refused, and the next receive rebuilds it.
+    generation: u64,
 }
 
 /// The transport's consumer slot, shared with the gate actuator.
 type SharedConsumer = Arc<parking_lot::RwLock<ConsumerSlot>>;
+
+/// A producer client and the refusal generation it was built at.
+#[derive(Clone)]
+struct ProducerEntry {
+    client: FutureProducer<StatsContext>,
+    generation: u64,
+}
+
+/// The transport's producer, shared with its refusal watch.
+type ProducerSlot = Arc<parking_lot::RwLock<ProducerEntry>>;
+
+/// How often the refusal watch checks for a refusal.
+const REFUSAL_CHECK: Duration = Duration::from_secs(1);
+
+/// The wait before each client rebuild while a broker refuses the client.
+const REFUSAL_REBUILD: Backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
+
+/// Rebuild the producer, and ask for a consumer rebuild, on [`REFUSAL_REBUILD`]
+/// while a broker refuses the client and none has accepted it.
+///
+/// librdkafka reads the CA bundle, certificate and credentials once, when it
+/// builds a client, so only a new client picks up a fixed setup. Ends once a
+/// broker accepts the client or `stop` is cancelled.
+async fn refusal_watch(
+    auth: Arc<classify::AuthState>,
+    producer: Option<(ProducerSlot, ClientConfig)>,
+    stop: tokio_util::sync::CancellationToken,
+) {
+    let mut rounds = 0_u32;
+    loop {
+        let wait = if auth.is_refused() {
+            rounds = rounds.saturating_add(1);
+            REFUSAL_REBUILD.delay(rounds)
+        } else {
+            REFUSAL_CHECK
+        };
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => return,
+            () = tokio::time::sleep(wait) => {}
+        }
+        if auth.is_proven() {
+            return;
+        }
+        if !auth.is_refused() || rounds == 0 {
+            continue;
+        }
+        let generation = auth.advance_generation();
+        if let Some((slot, config)) = &producer {
+            rebuild_producer(slot, config, &auth, generation).await;
+        }
+        #[cfg(feature = "metrics")]
+        ::metrics::counter!("transport_refusal_rebuilds_total", "transport" => "kafka")
+            .increment(1);
+        tracing::debug!(generation, "kafka: rebuilding the refused clients");
+    }
+}
+
+/// Replace the producer in `slot` with one built from `config` at
+/// `generation`, off the runtime.
+async fn rebuild_producer(
+    slot: &ProducerSlot,
+    config: &ClientConfig,
+    auth: &Arc<classify::AuthState>,
+    generation: u64,
+) {
+    let (config, context_auth) = (config.clone(), Arc::clone(auth));
+    let built = tokio::task::spawn_blocking(move || {
+        config.create_with_context::<_, FutureProducer<StatsContext>>(
+            StatsContext::new().sharing(context_auth),
+        )
+    })
+    .await;
+    match built {
+        Ok(Ok(client)) => {
+            let fresh = ProducerEntry { client, generation };
+            let old = std::mem::replace(&mut *slot.write(), fresh);
+            // Dropping a producer joins its poll thread.
+            drop(tokio::task::spawn_blocking(move || drop(old)));
+        }
+        Ok(Err(e)) => tracing::debug!(error = %e, "kafka: the producer rebuild failed"),
+        Err(e) => tracing::debug!(error = %e, "kafka: the producer rebuild task failed"),
+    }
+}
 
 /// Fatal codes that mean the broker will not take this member on KIP-848.
 ///
@@ -1187,15 +1289,25 @@ impl KafkaTransport {
             .unwrap_or(LIBRDKAFKA_MESSAGE_MAX_BYTES);
 
         // Create producer with StatsContext for metrics collection.
-        let producer: Option<FutureProducer<StatsContext>> = if role == Role::Receive {
+        let producer: Option<ProducerSlot> = if role == Role::Receive {
             None
         } else {
-            Some(
-                producer_config
-                    .create_with_context(StatsContext::new().sharing(Arc::clone(&auth)))
-                    .map_err(|e| client_build_error("producer", &e))?,
-            )
+            let client: FutureProducer<StatsContext> = producer_config
+                .create_with_context(StatsContext::new().sharing(Arc::clone(&auth)))
+                .map_err(|e| client_build_error("producer", &e))?;
+            Some(Arc::new(parking_lot::RwLock::new(ProducerEntry {
+                client,
+                generation: 0,
+            })))
         };
+        let watch_stop = shutdown_token.child_token();
+        tokio::spawn(refusal_watch(
+            Arc::clone(&auth),
+            producer
+                .as_ref()
+                .map(|slot| (Arc::clone(slot), producer_config.clone())),
+            watch_stop.clone(),
+        ));
 
         let healthy = Arc::new(AtomicBool::new(true));
         let topic_missing = Arc::new(AtomicBool::new(false));
@@ -1208,6 +1320,21 @@ impl KafkaTransport {
             &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
 
+        // Only a client that emits statistics can be proven while idle.
+        #[cfg(feature = "health")]
+        let waits_for_contact = [
+            producer.is_some().then_some(&producer_config),
+            consumer_config.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|client| {
+            client
+                .get("statistics.interval.ms")
+                .and_then(|ms| ms.trim().parse::<u64>().ok())
+                .is_some_and(|ms| ms > 0)
+        });
+
         #[cfg(feature = "health")]
         let health_registration = {
             let h = Arc::clone(&healthy);
@@ -1215,7 +1342,7 @@ impl KafkaTransport {
             let missing = Arc::clone(&topic_missing);
             let destinations = Arc::clone(&missing_destinations);
             crate::health::HealthRegistry::register_scoped("transport:kafka", move || {
-                registry_status(&h, &reached, &missing, &destinations)
+                registry_status(&h, &reached, &missing, &destinations, waits_for_contact)
             })
         };
 
@@ -1240,6 +1367,8 @@ impl KafkaTransport {
         Ok(Self {
             #[cfg(feature = "health")]
             _health_registration: health_registration,
+            #[cfg(all(feature = "health", test))]
+            waits_for_contact,
             #[cfg(all(feature = "governor", feature = "health"))]
             _partition_limited_registration: partition_limited_registration,
             consumer: consumer.map(|client| {
@@ -1247,6 +1376,7 @@ impl KafkaTransport {
                     client,
                     protocol,
                     epoch: 0,
+                    generation: 0,
                 }))
             }),
             config: Box::new(owned.clone()),
@@ -1255,6 +1385,7 @@ impl KafkaTransport {
             rebuild_latch: classify::DegradedLatch::default(),
             fenced_latch: classify::DegradedLatch::default(),
             producer,
+            _refusal_watch: watch_stop.drop_guard(),
             topic_cache: Arc::new(parking_lot::RwLock::new(topic_cache)),
             in_flight: tokio::sync::Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -1376,6 +1507,28 @@ impl KafkaTransport {
         self.client().expect("the transport has a consumer")
     }
 
+    /// The current producer, `None` on a transport that only receives.
+    fn current_producer(&self) -> Option<ProducerEntry> {
+        self.producer.as_ref().map(|slot| slot.read().clone())
+    }
+
+    /// Whether the producer built at `generation` has since been replaced.
+    fn producer_replaced_since(&self, generation: u64) -> bool {
+        self.producer
+            .as_ref()
+            .is_some_and(|slot| slot.read().generation != generation)
+    }
+
+    /// A `Fatal` from a producer since replaced is a record dropped with it,
+    /// which the caller keeps and retries.
+    fn settle_on_replaced(&self, result: SendResult, sent_on: u64) -> SendResult {
+        if matches!(result, SendResult::Fatal(_)) && self.producer_replaced_since(sent_on) {
+            SendResult::Backpressured
+        } else {
+            result
+        }
+    }
+
     /// The consumer-group protocol the consumer is joined with now: the one
     /// requested, or `classic` once the transport has fallen back to it.
     #[must_use]
@@ -1493,6 +1646,7 @@ impl KafkaTransport {
                 "this kafka transport only sends: it has no consumer to rebuild".into(),
             ));
         };
+        let generation = self.auth.generation();
         let client = create_consumer(&consumer_client_config(&self.config, protocol), &self.auth)?;
         subscribe_consumer(&client, &self.subscribed_topics.read())?;
         let old = {
@@ -1504,6 +1658,7 @@ impl KafkaTransport {
                     client,
                     protocol,
                     epoch,
+                    generation,
                 },
             )
         };
@@ -1514,6 +1669,27 @@ impl KafkaTransport {
             Err(_) => drop(old),
         }
         Ok(())
+    }
+
+    /// Replace a consumer built before the refusal watch's latest generation,
+    /// so it reads the setup again.
+    ///
+    /// Generations advance only while the client is refused, so an older one
+    /// holds a refused setup even after the rebuilt producer is accepted. A
+    /// failed rebuild keeps the old client, and the next receive tries again.
+    fn rebuild_refused_consumer(&self) {
+        let Some(shared) = &self.consumer else {
+            return;
+        };
+        if shared.read().generation >= self.auth.generation() {
+            return;
+        }
+        let protocol = self.group_protocol();
+        if let Err(e) =
+            self.rebuild_consumer(protocol, "a broker refused its credentials or TLS setup")
+        {
+            tracing::debug!(error = %e, "kafka: the refused consumer was not rebuilt");
+        }
     }
 
     /// Replace a consumer librdkafka has flagged fatal, and answer the receive
@@ -1753,20 +1929,18 @@ impl KafkaTransport {
         }
     }
 
-    /// Offer one record to the producer queue without waiting for delivery.
+    /// Offer one record to `producer`'s queue without waiting for delivery.
     ///
     /// A full queue is re-offered every [`QUEUE_FULL_RETRY`] for up to
     /// [`QUEUE_FULL_TIMEOUT`], the same policy `send` gets from rdkafka. `Err`
     /// carries the settled result of a record the producer refused.
     async fn enqueue(
         &self,
+        producer: &FutureProducer<StatsContext>,
         destination: &str,
         payload: &[u8],
         headers: Option<&OwnedHeaders>,
     ) -> Result<DeliveryFuture, SendResult> {
-        let Some(producer) = &self.producer else {
-            return Err(SendResult::Fatal(receive_only()));
-        };
         let mut queue_full_since: Option<std::time::Instant> = None;
         loop {
             match producer.send_result(produce_record(destination, payload, headers)) {
@@ -1815,20 +1989,19 @@ impl KafkaTransport {
     /// Classify a failed produce, at enqueue or in the delivery report.
     fn failure_result(&self, destination: &str, bytes: usize, err: &KafkaError) -> SendResult {
         let class = classify::classify_send_failure(err);
-        // A full queue or a timed-out record is what a refused client looks like
-        // from the producer: nothing is delivered, whatever the cause. The
-        // error callback has named the cause, and no retry clears it.
+        // A refused client's record times out, queues up, or is purged with a
+        // replaced producer. The caller keeps it and retries until a rebuilt
+        // client is accepted.
         if matches!(
             class,
-            classify::SendFailure::QueueFull | classify::SendFailure::Retryable
-        ) && let Some(refusal) = self.auth.refusal()
+            classify::SendFailure::QueueFull
+                | classify::SendFailure::Retryable
+                | classify::SendFailure::Fatal
+        ) && self.auth.is_refused()
         {
             #[cfg(feature = "metrics")]
             ::metrics::counter!("transport_send_errors_total", "transport" => "kafka").increment(1);
-            return SendResult::Fatal(TransportError::Config(format!(
-                "kafka refused this client's credentials or TLS setup ({refusal}): \
-                 the record was not delivered"
-            )));
+            return SendResult::Backpressured;
         }
         match class {
             classify::SendFailure::QueueFull => {
@@ -1945,8 +2118,9 @@ impl TransportBase for KafkaTransport {
     }
 
     async fn healthcheck(&self) -> TransportResult<()> {
+        // Not `Config`: the transport rebuilds the client, so a fixed setup recovers without a restart.
         if let Some(refusal) = self.auth.refusal() {
-            return Err(TransportError::Config(format!(
+            return Err(TransportError::Connection(format!(
                 "kafka refused this client's credentials or TLS setup ({refusal})"
             )));
         }
@@ -1969,7 +2143,7 @@ impl TransportSender for KafkaTransport {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
-        let Some(producer) = &self.producer else {
+        let Some(producer) = self.current_producer() else {
             return SendResult::Fatal(receive_only());
         };
 
@@ -1987,9 +2161,11 @@ impl TransportSender for KafkaTransport {
             destination,
             payload.len(),
             producer
+                .client
                 .send(record, Timeout::After(QUEUE_FULL_TIMEOUT))
                 .await,
         );
+        let result = self.settle_on_replaced(result, producer.generation);
 
         #[cfg(feature = "metrics")]
         ::metrics::histogram!(
@@ -2040,9 +2216,10 @@ impl TransportSender for KafkaTransport {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
-        if self.producer.is_none() {
+        // One producer for the whole block, so a replacement mid-block leaves it alive until every report settles.
+        let Some(producer) = self.current_producer() else {
             return SendResult::Fatal(receive_only());
-        }
+        };
 
         let headers = trace_headers();
         #[cfg(feature = "metrics")]
@@ -2058,7 +2235,12 @@ impl TransportSender for KafkaTransport {
             }
             let destination = record.key.as_deref().unwrap_or("");
             match self
-                .enqueue(destination, &record.payload, headers.as_ref())
+                .enqueue(
+                    &producer.client,
+                    destination,
+                    &record.payload,
+                    headers.as_ref(),
+                )
                 .await
             {
                 Ok(delivery) => offered.push(Offered::Queued(delivery)),
@@ -2102,7 +2284,7 @@ impl TransportSender for KafkaTransport {
             };
             results.push(result);
         }
-        block_result(results)
+        self.settle_on_replaced(block_result(results), producer.generation)
     }
 
     /// The broker acknowledged the record under the producer's `acks`.
@@ -2343,6 +2525,7 @@ impl KafkaTransport {
         }
 
         self.wait_rebuild_backoff().await?;
+        self.rebuild_refused_consumer();
         let consumer = self.receiving_client()?;
         if let Some((code, detail)) = fatal_error(&consumer) {
             return self.replace_fatal_consumer(code, &detail);
@@ -2585,6 +2768,10 @@ impl KafkaTransport {
                 if consumer.assignment().map_or(true, |held| held.count() == 0) {
                     self.topic_missing.store(true, Ordering::Relaxed);
                 }
+                tokio::time::sleep(self.recv_state.backoff()).await;
+            }
+            classify::RecvFailure::Refused => {
+                self.recv_state.record_refused(&err);
                 tokio::time::sleep(self.recv_state.backoff()).await;
             }
             classify::RecvFailure::Permanent | classify::RecvFailure::Unclassified => {
@@ -2948,7 +3135,8 @@ impl PollJob {
                 Some(Err(e)) => match classify::classify_recv_failure(&e, ctx) {
                     // Another assigned partition may still hold records.
                     classify::RecvFailure::EndOfPartition => {}
-                    classify::RecvFailure::Transient => {
+                    // A record proved the credentials, so no refusal is classified here.
+                    classify::RecvFailure::Transient | classify::RecvFailure::Refused => {
                         stopped_by = Some(DrainStop::Transient(e));
                         break;
                     }
@@ -3049,7 +3237,9 @@ impl PollJob {
 fn drains(class: classify::RecvFailure) -> bool {
     matches!(
         class,
-        classify::RecvFailure::Transient | classify::RecvFailure::MissingTopic
+        classify::RecvFailure::Transient
+            | classify::RecvFailure::MissingTopic
+            | classify::RecvFailure::Refused
     )
 }
 
@@ -4664,12 +4854,13 @@ mod tests {
         }
     }
 
-    /// A refused client sees every record time out or queue up. Once the error
-    /// callback has named the refusal, those become `Fatal` so the caller stops
-    /// retrying, and readiness fails with the reason. A broker that accepts the
-    /// client ends the refusal. Other failures keep their class.
+    /// A refused client sees every record time out, queue up or go with a
+    /// replaced producer. Each comes back `Backpressured`, so the caller keeps
+    /// it and the service runs on, and readiness fails with the reason. A
+    /// broker that accepts the client ends the refusal. Other failures keep
+    /// their class.
     #[tokio::test]
-    async fn a_refused_client_fails_sends_and_readiness_until_a_broker_accepts_it() {
+    async fn a_refused_client_backpressures_sends_and_fails_readiness_until_a_broker_accepts_it() {
         let transport = KafkaTransport::new(&unreachable_config())
             .await
             .expect("a producer-only transport constructs broker-free");
@@ -4678,6 +4869,7 @@ mod tests {
             [
                 RDKafkaErrorCode::MessageTimedOut,
                 RDKafkaErrorCode::QueueFull,
+                RDKafkaErrorCode::PurgeQueue,
                 RDKafkaErrorCode::MessageSizeTooLarge,
             ]
             .map(|code| transport.failure_result("t", 10, &produce(code)))
@@ -4685,6 +4877,10 @@ mod tests {
 
         let before = classes(&transport);
         assert!(before[0].is_backpressured() && before[1].is_backpressured());
+        assert!(
+            matches!(before[2], SendResult::Fatal(_)),
+            "an unclassified failure of an accepted client stays Fatal"
+        );
         assert!(transport.is_healthy());
         assert!(transport.healthcheck().await.is_ok());
 
@@ -4692,11 +4888,11 @@ mod tests {
             &KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed),
             "invalid credentials",
         );
-        let [timed_out, queue_full, too_large] = classes(&transport);
-        for refused in [&timed_out, &queue_full] {
+        let [timed_out, queue_full, purged, too_large] = classes(&transport);
+        for refused in [&timed_out, &queue_full, &purged] {
             assert!(
-                matches!(refused, SendResult::Fatal(TransportError::Config(m)) if m.contains("invalid credentials")),
-                "a refused client's undelivered record is Fatal, got {refused:?}"
+                refused.is_backpressured(),
+                "a refused client's undelivered record is kept for a retry, got {refused:?}"
             );
         }
         assert!(
@@ -4705,7 +4901,10 @@ mod tests {
         );
         assert!(!transport.is_healthy());
         let health = transport.healthcheck().await.expect_err("not ready");
-        assert!(health.is_fatal() && health.to_string().contains("invalid credentials"));
+        assert!(
+            !health.is_fatal() && health.to_string().contains("invalid credentials"),
+            "a refusal is reported, never fatal: {health}"
+        );
 
         transport.auth.mark_proven();
         assert!(classes(&transport)[0].is_backpressured());
@@ -4714,22 +4913,43 @@ mod tests {
 
     /// The registry check of a transport no broker has answered yet is
     /// unhealthy, while `is_healthy` reports no known fault, and a broker
-    /// accepting the client makes the two agree.
+    /// accepting the client makes the two agree. With statistics off nothing
+    /// reports a broker `UP`, so the check does not wait for first contact.
     #[cfg(feature = "health")]
     #[tokio::test]
     async fn the_registry_check_waits_for_a_broker_to_accept_the_client() {
-        let transport = KafkaTransport::new(&unreachable_config())
-            .await
-            .expect("a producer-only transport constructs broker-free");
         let status = |t: &KafkaTransport| {
             registry_status(
                 &t.healthy,
                 &t.auth,
                 &t.topic_missing,
                 &t.missing_destinations,
+                t.waits_for_contact,
             )
         };
 
+        let quiet =
+            KafkaTransport::new(&unreachable_config().with_override("statistics.interval.ms", "0"))
+                .await
+                .expect("a producer-only transport constructs broker-free");
+        assert_eq!(
+            status(&quiet),
+            crate::health::HealthStatus::Healthy,
+            "with statistics off no proof can arrive, so readiness follows is_healthy"
+        );
+        quiet.auth.on_error(
+            &KafkaError::Global(RDKafkaErrorCode::SSL),
+            "certificate verify failed",
+        );
+        assert_eq!(
+            status(&quiet),
+            crate::health::HealthStatus::Unhealthy,
+            "a refusal still fails it"
+        );
+
+        let transport = KafkaTransport::new(&unreachable_config())
+            .await
+            .expect("a producer-only transport constructs broker-free");
         assert_eq!(
             status(&transport),
             crate::health::HealthStatus::Unhealthy,
@@ -4748,6 +4968,130 @@ mod tests {
             status(&transport),
             crate::health::HealthStatus::Unhealthy,
             "a reached broker does not mask a later fault"
+        );
+    }
+
+    /// While a broker refuses the client, the watch replaces the producer and
+    /// asks for a consumer rebuild on a backoff, and the next receive rebuilds
+    /// the consumer, so each client reads the setup again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_client_is_rebuilt_on_a_backoff() {
+        use rdkafka::producer::Producer as _;
+
+        let transport = KafkaTransport::new(&KafkaConfig {
+            topics: vec!["refused".to_string()],
+            group: "refused-group".to_string(),
+            ..unreachable_config()
+        })
+        .await
+        .expect("a transport constructs broker-free");
+        let first = transport
+            .current_producer()
+            .expect("a producer")
+            .client
+            .client()
+            .native_ptr() as usize;
+        let epoch = transport
+            .consumer
+            .as_ref()
+            .expect("a consumer")
+            .read()
+            .epoch;
+
+        transport.auth.on_error(
+            &KafkaError::Global(RDKafkaErrorCode::SSL),
+            "certificate verify failed",
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while transport.auth.generation() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no rebuild within the first backoff"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let rebuilt = transport
+            .current_producer()
+            .expect("a producer")
+            .client
+            .client()
+            .native_ptr() as usize;
+        assert_ne!(rebuilt, first, "the producer was replaced");
+
+        transport.recv(10).await.expect("a refused receive runs on");
+        let slot = transport.consumer.as_ref().expect("a consumer").read();
+        assert_eq!(slot.generation, transport.auth.generation());
+        assert!(slot.epoch > epoch, "the consumer was replaced");
+        drop(slot);
+        assert!(!transport.is_healthy(), "still refused, so not ready");
+    }
+
+    /// A record in flight on a producer the refusal watch replaced answers
+    /// `Backpressured`, even once the rebuilt client has been accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_record_on_a_replaced_producer_is_kept_after_the_client_is_proven() {
+        use rdkafka::producer::{Producer as _, PurgeConfig};
+
+        let transport = KafkaTransport::sender(&unreachable_config())
+            .await
+            .expect("a sender constructs broker-free");
+        let old = transport.current_producer().expect("a producer");
+        let records = [batch_record(b"{\"a\":1}")];
+        let replace = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            transport.auth.on_error(
+                &KafkaError::Global(RDKafkaErrorCode::SSL),
+                "certificate verify failed",
+            );
+            let generation = transport.auth.advance_generation();
+            rebuild_producer(
+                transport.producer.as_ref().expect("a producer slot"),
+                &transport_producer_config(&transport.config),
+                &transport.auth,
+                generation,
+            )
+            .await;
+            transport.auth.mark_proven();
+            // Fails the record still queued on the old producer.
+            old.client.purge(PurgeConfig::default().queue().inflight());
+        };
+        let (sent, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(30), transport.send_batch(&records)),
+            replace
+        );
+        let sent = sent.expect("the purged record settles");
+        assert!(
+            transport.producer_replaced_since(old.generation),
+            "the producer was replaced"
+        );
+        assert!(
+            sent.is_backpressured(),
+            "a record dropped with a replaced producer is kept, got {sent:?}"
+        );
+
+        // Only a `Fatal` is settled again. A handled block answer passes untouched.
+        let sent_on = old.generation;
+        assert!(
+            transport
+                .settle_on_replaced(SendResult::FilteredDlq, sent_on)
+                .is_filtered_dlq()
+        );
+        assert!(
+            transport
+                .settle_on_replaced(SendResult::Ok, sent_on)
+                .is_ok()
+        );
+        assert!(
+            transport
+                .settle_on_replaced(SendResult::Fatal(TransportError::Closed), sent_on)
+                .is_backpressured()
+        );
+        let current = transport.current_producer().expect("a producer").generation;
+        assert!(
+            transport
+                .settle_on_replaced(SendResult::Fatal(TransportError::Closed), current)
+                .is_fatal(),
+            "a Fatal from the producer still in place stays Fatal"
         );
     }
 
@@ -5700,15 +6044,15 @@ mod tests {
         transport.consumer().context().emit_prometheus_metrics();
         // Each statistics callback ends in an emit, the producers' included.
         transport
-            .producer
-            .as_ref()
+            .current_producer()
             .expect("a producer")
+            .client
             .context()
             .stats(Statistics::default());
         producer_only
-            .producer
-            .as_ref()
+            .current_producer()
             .expect("a producer")
+            .client
             .context()
             .stats(Statistics::default());
 
@@ -5845,9 +6189,9 @@ mod tests {
         // Contexts that have served no rebalance, each reporting partition 1 with lag 0.
         let unheld = events_committed_at_5(&[(1, 0)]);
         for t in [&transport, &producer_only] {
-            t.producer
-                .as_ref()
+            t.current_producer()
                 .expect("a producer")
+                .client
                 .context()
                 .stats(unheld.clone());
         }
