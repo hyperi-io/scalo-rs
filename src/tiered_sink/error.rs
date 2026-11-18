@@ -43,8 +43,4 @@ pub enum TieredSinkError {
     /// Disk is unavailable (full or inaccessible).
     #[error("disk unavailable for spooling")]
     DiskUnavailable,
-
-    /// Operation was cancelled.
-    #[error("operation cancelled")]
-    Cancelled,
 }

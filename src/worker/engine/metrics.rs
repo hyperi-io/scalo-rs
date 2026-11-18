@@ -41,27 +41,9 @@ pub fn describe(manager: &MetricsManager) {
         "engine_filter_dlq_discarded_total",
         "DLQ entries discarded under FilterDlqPolicy::DiscardWithMetric",
     );
-    let _ = manager.counter("batch_engine_parse_errors_total", "Parse failures");
-
-    // Histograms
-    let _ = manager.histogram(
-        "batch_engine_parse_duration_seconds",
-        "SIMD parse time per chunk",
-    );
-    let _ = manager.histogram(
-        "batch_engine_transform_duration_seconds",
-        "App transform time per chunk",
-    );
-    let _ = manager.histogram("batch_engine_chunk_size", "Actual items per chunk");
-    let _ = manager.histogram(
-        "batch_engine_pre_route_duration_seconds",
-        "Pre-route extraction time per chunk",
-    );
-
-    // Gauges
     let _ = manager.gauge(
-        "batch_engine_intern_table_size",
-        "Interned field name count",
+        "batch_engine_max_chunk_size",
+        "Configured batch_processing.max_chunk_size",
     );
 
     // Self-regulation governor observability (governor feature). Registered so
@@ -101,6 +83,17 @@ pub fn describe(manager: &MetricsManager) {
             "Inbound holds ended by max_hold with pressure above resume_below (per signal)",
         );
     }
+}
+
+/// Count one chunk the engine processed, once per chunk. `parsed` is `None`
+/// on the raw path, which parses nothing.
+#[cfg(feature = "transport")]
+pub(crate) fn count_chunk(received: usize, parsed: Option<u64>, filtered: u64) {
+    metrics::counter!("batch_engine_messages_received_total").increment(received as u64);
+    if let Some(parsed) = parsed {
+        metrics::counter!("batch_engine_messages_parsed_total").increment(parsed);
+    }
+    metrics::counter!("batch_engine_messages_filtered_total").increment(filtered);
 }
 
 /// Emit config threshold values as gauge metrics.
@@ -154,12 +147,7 @@ mod tests {
             "batch_engine_messages_parsed_total",
             "batch_engine_messages_filtered_total",
             "engine_filter_dlq_discarded_total",
-            "batch_engine_parse_errors_total",
-            "batch_engine_parse_duration_seconds",
-            "batch_engine_transform_duration_seconds",
-            "batch_engine_chunk_size",
-            "batch_engine_pre_route_duration_seconds",
-            "batch_engine_intern_table_size",
+            "batch_engine_max_chunk_size",
         ];
         #[cfg(feature = "governor")]
         expected.extend([

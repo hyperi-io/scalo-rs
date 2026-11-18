@@ -28,10 +28,6 @@ quality:
     - name: contract schema breaking-change check
       command: ["scripts/schema-breaking-check.sh"]
   ignore:
-    # Not reachable: the flaw is in W3C Baggage propagation, and scalo registers no text-map propagator.
-    - tool: osv-scanner
-      id: GHSA-w9wp-h8wv-79jx
-      reason: "CVE-2026-48504, opentelemetry_sdk 0.31.x: BaggagePropagator::extract_with_context is unreachable, as scalo registers no text-map propagator and never touches Baggage. The fix (0.32.1) waits on metrics-exporter-opentelemetry, whose newest release (0.2.1) requires opentelemetry ^0.31 (renovate.json holds the 0.31 line). Drop on that bump, tracked in scalo-rs#281."
     # Not a vulnerability: the advisory marks chrono unmaintained, and deny.toml ignores it for the same reason.
     - tool: osv-scanner
       id: RUSTSEC-2026-0543

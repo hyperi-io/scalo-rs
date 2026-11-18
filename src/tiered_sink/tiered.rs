@@ -242,7 +242,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     /// - The sink names the record in `dead_letter_reason`, or answers
     ///   `FilteredDlq` for it ([`TieredSinkError::DeadLetter`])
     /// - The sink answers `Fatal` ([`TieredSinkError::Sink`])
-    /// - The spool is full and `when_full` is `block` or `drop_oldest`, or
+    /// - The spool is full and `when_full` is `block`, or
     ///   `dlq` with no DLQ set ([`TieredSinkError::SpoolFull`])
     /// - The `disk_aware` threshold is crossed ([`TieredSinkError::DiskUnavailable`])
     /// - Compression or the spool write fails
@@ -366,10 +366,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
     /// Apply the [`WhenFull`](crate::tiered_sink::WhenFull) policy to a record
     /// the full spool cannot take: `Some(Ok)` once it is shed or the DLQ holds
-    /// it, `None` to block with `SpoolFull`, scalo's lossless default.
-    ///
-    /// `DropOldest` is not wired and blocks with a warning, as does `Dlq` with
-    /// no DLQ set or a DLQ write that is not confirmed.
+    /// it, `None` to block with `SpoolFull`, scalo's lossless default. `Dlq`
+    /// with no DLQ set, or a DLQ write that is not confirmed, blocks too.
     async fn on_full(&self, record: &Record) -> Option<Result<()>> {
         use crate::tiered_sink::WhenFull;
         match self.config.when_full {
@@ -379,11 +377,6 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             }
             WhenFull::Block => None,
             WhenFull::Dlq => self.full_to_dlq(record).await,
-            WhenFull::DropOldest => {
-                #[cfg(feature = "tracing")]
-                tracing::warn!("spool full: drop_oldest is not wired; applying block");
-                None
-            }
         }
     }
 
