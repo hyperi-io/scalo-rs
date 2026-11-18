@@ -69,6 +69,7 @@ mod error;
 pub mod factory;
 pub mod filter;
 pub mod finalizer;
+pub mod hold;
 pub mod propagation;
 mod traits;
 mod types;

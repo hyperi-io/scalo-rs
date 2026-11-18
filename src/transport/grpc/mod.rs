@@ -68,8 +68,8 @@ pub(crate) mod pending;
 pub mod proto;
 pub mod token;
 
+pub use super::hold::{HoldLadder, HoldLadderError, Rung, hold_budget};
 pub use config::GrpcConfig;
-pub use pending::hold_budget;
 pub use token::GrpcToken;
 
 use super::ack::{

@@ -28,16 +28,14 @@ use tokio::time::Instant;
 
 use crate::transport::ack::{AckControl, AckKind, HeldAcks};
 use crate::transport::finalizer::DeliveryStatus;
+use crate::transport::hold::{HoldLadder, hold_budget};
 
 /// The held-byte ceiling when no memory guard sizes it.
 pub(crate) const DEFAULT_MAX_HELD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The longest a response is held, and the whole budget for a sender that sets
-/// no deadline of its own.
-pub(crate) const DEFAULT_MAX_HOLD: Duration = Duration::from_secs(25);
-
-/// The least headroom kept below a sender's deadline.
-const MIN_MARGIN: Duration = Duration::from_secs(1);
+/// no deadline of its own: the top of the default hold ladder.
+pub(crate) const DEFAULT_MAX_HOLD: Duration = HoldLadder::DEFAULT.top();
 
 /// How a held request ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,33 +46,6 @@ pub(crate) enum Outcome {
     Expired,
     /// The transport shut down before every record was released.
     Shutdown,
-}
-
-/// The longest a response is held: `max_hold`, or the sender's deadline less a
-/// margin of a tenth of it, at least 1 s and at most half the deadline.
-///
-/// The budget an armed server gives each push, for an app's own listener to
-/// give the same: read the deadline with
-/// [`sender_deadline`](super::sender_deadline), and answer before the budget
-/// runs out, since tonic cuts a handler at the sender's deadline with
-/// `Cancelled`, which a sender cannot tell from a crash.
-///
-/// ```
-/// use std::time::Duration;
-/// use scalo::transport::grpc::hold_budget;
-///
-/// let max_hold = Duration::from_secs(25);
-/// assert_eq!(hold_budget(max_hold, None), max_hold);
-/// // A 10 s deadline keeps a 1 s margin.
-/// assert_eq!(hold_budget(max_hold, Some(Duration::from_secs(10))), Duration::from_secs(9));
-/// ```
-#[must_use]
-pub fn hold_budget(max_hold: Duration, sender_deadline: Option<Duration>) -> Duration {
-    let Some(deadline) = sender_deadline else {
-        return max_hold;
-    };
-    let margin = (deadline / 10).max(MIN_MARGIN).min(deadline / 2);
-    max_hold.min(deadline.saturating_sub(margin))
 }
 
 /// How a registry is set up.
