@@ -86,6 +86,23 @@ pub trait FieldSource: Sync {
 
     /// The top-level field `name` as a CEL value, for a condition that names it.
     fn cel_value(&self, name: &str) -> Option<cel::Value>;
+
+    /// What another target's rows read at target field `path` while no row has
+    /// assigned that target: one evaluated earlier that no row set, or one not
+    /// evaluated yet.
+    ///
+    /// The target's own rows read [`lookup`](Self::lookup) instead, so a row can
+    /// still confirm the value the record carries. Return [`Lookup::Missing`]
+    /// for a value in the record that other targets' rows must not act on.
+    fn unassigned_target(&self, path: &FieldPath) -> Lookup<'_> {
+        self.lookup(path)
+    }
+
+    /// The CEL twin of [`unassigned_target`](Self::unassigned_target), for a
+    /// condition that names the top-level target field `name`.
+    fn unassigned_target_cel(&self, name: &str) -> Option<cel::Value> {
+        self.cel_value(name)
+    }
 }
 
 /// A JSON object payload, read lazily: each lookup walks the bytes to the path

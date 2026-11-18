@@ -408,20 +408,42 @@ impl RuleSet {
     }
 }
 
+/// Which [`FieldSource`] method a read went through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Via {
+    /// [`FieldSource::lookup`].
+    Record,
+    /// [`FieldSource::unassigned_target`].
+    UnassignedTarget,
+}
+
 /// Recent record reads, so rows testing the same field read it once.
+///
+/// Keyed by the method as well as the field, because a target's own rows and
+/// other targets' rows read the same field through different methods.
 #[derive(Default)]
 struct Cache<'a> {
-    entries: [Option<(FieldId, Lookup<'a>)>; 4],
+    entries: [Option<(FieldId, Via, Lookup<'a>)>; 4],
     next: usize,
 }
 
 impl<'a> Cache<'a> {
-    fn get_or(&mut self, field: FieldId, read: impl FnOnce() -> Lookup<'a>) -> Lookup<'a> {
-        if let Some((_, found)) = self.entries.iter().flatten().find(|(id, _)| *id == field) {
+    fn get_or(
+        &mut self,
+        field: FieldId,
+        via: Via,
+        read: impl FnOnce() -> Lookup<'a>,
+    ) -> Lookup<'a> {
+        if let Some((_, _, found)) = self
+            .entries
+            .iter()
+            .flatten()
+            .find(|(id, by, _)| *id == field && *by == via)
+        {
             return found.clone();
         }
         let found = read();
-        self.entries[self.next] = Some((field, found.clone()));
+        self.entries[self.next] = Some((field, via, found.clone()));
         self.next = (self.next + 1) % self.entries.len();
         found
     }
@@ -435,7 +457,9 @@ struct Pass<'a, R: ?Sized> {
 }
 
 impl<'a, R: FieldSource + ?Sized> Pass<'a, R> {
-    /// The value at `field`: an earlier target's new value, else the record's.
+    /// The value at `field`: another target's new value, else
+    /// [`FieldSource::unassigned_target`] for another target no row has set,
+    /// else the record's.
     fn read(
         &self,
         field: FieldId,
@@ -443,13 +467,16 @@ impl<'a, R: FieldSource + ?Sized> Pass<'a, R> {
         cache: &mut Cache<'a>,
     ) -> Lookup<'a> {
         let slot = &self.set.fields[field];
-        if let Some(earlier) = slot.target.filter(|&i| i < self.target)
-            && let Some(assigned) = &slots[earlier]
-        {
-            return Lookup::Text(assigned.value.clone());
-        }
         let record: &'a R = self.record;
-        cache.get_or(field, || record.lookup(&slot.path))
+        if let Some(other) = slot.target.filter(|&i| i != self.target) {
+            if let Some(assigned) = &slots[other] {
+                return Lookup::Text(assigned.value.clone());
+            }
+            return cache.get_or(field, Via::UnassignedTarget, || {
+                record.unassigned_target(&slot.path)
+            });
+        }
+        cache.get_or(field, Via::Record, || record.lookup(&slot.path))
     }
 
     fn holds(
@@ -512,7 +539,8 @@ impl<'a, R: FieldSource + ?Sized> Pass<'a, R> {
     }
 }
 
-/// Feeds a CEL condition the record's fields and earlier targets' new values.
+/// Feeds a CEL condition the record's fields and other targets' values, read
+/// as [`Pass::read`] reads them.
 struct Resolver<'p, 'a, R: ?Sized> {
     pass: &'p Pass<'a, R>,
     slots: &'p [Option<Assignment<'a>>],
@@ -520,13 +548,20 @@ struct Resolver<'p, 'a, R: ?Sized> {
 
 impl<R: FieldSource + ?Sized> cel::context::VariableResolver for Resolver<'_, '_, R> {
     fn resolve(&self, name: &str) -> Option<cel::Value> {
-        let earlier = self.pass.set.targets[..self.pass.target]
+        let other = self
+            .pass
+            .set
+            .targets
             .iter()
-            .position(|t| t.field.as_str() == name);
-        if let Some(assigned) = earlier.and_then(|i| self.slots[i].as_ref()) {
-            return Some(cel::Value::String(Arc::new(assigned.value.to_string())));
+            .position(|t| t.field.as_str() == name)
+            .filter(|&i| i != self.pass.target);
+        let Some(other) = other else {
+            return self.pass.record.cel_value(name);
+        };
+        match &self.slots[other] {
+            Some(assigned) => Some(cel::Value::String(Arc::new(assigned.value.to_string()))),
+            None => self.pass.record.unassigned_target_cel(name),
         }
-        self.pass.record.cel_value(name)
     }
 }
 

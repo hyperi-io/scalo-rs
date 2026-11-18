@@ -17,7 +17,9 @@
 //! match, so the next row is tried.
 //!
 //! Targets are evaluated in the order the set lists them, so a row for a later
-//! target can test an earlier target's new value. A [`Clamp`] then holds one
+//! target can test an earlier target's new value. A row reading another target
+//! that no row has set reads [`FieldSource::unassigned_target`], the record's
+//! own value unless the record says otherwise. A [`Clamp`] then holds one
 //! target to a per-call allowed set, replacing anything outside it with a
 //! default and counting the replacement.
 //!

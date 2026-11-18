@@ -119,6 +119,153 @@ fn a_cel_condition_reads_an_earlier_targets_new_value() {
     assert_eq!(set.evaluate(&json("{}")).value(org), None);
 }
 
+/// A record whose values at the `hidden` target fields answer its own lookups,
+/// but which no other target's rows may act on while no row has set them.
+struct Hiding {
+    record: serde_json::Value,
+    hidden: &'static [&'static str],
+}
+
+impl FieldSource for Hiding {
+    fn lookup(&self, path: &FieldPath) -> Lookup<'_> {
+        self.record.lookup(path)
+    }
+
+    fn cel_value(&self, name: &str) -> Option<cel::Value> {
+        self.record.cel_value(name)
+    }
+
+    fn unassigned_target(&self, path: &FieldPath) -> Lookup<'_> {
+        if self.hidden.contains(&path.as_str()) {
+            Lookup::Missing
+        } else {
+            self.record.lookup(path)
+        }
+    }
+
+    fn unassigned_target_cel(&self, name: &str) -> Option<cel::Value> {
+        if self.hidden.contains(&name) {
+            None
+        } else {
+            self.record.cel_value(name)
+        }
+    }
+}
+
+/// Each case: rows over targets `kind` then `owner`, a record, the target to
+/// read, its value with `kind` and `owner` hidden from other targets' rows, and
+/// its value through the record's own lookups, which the default methods give.
+#[test]
+fn a_record_can_hide_an_unassigned_target_from_other_targets_rows() {
+    let web_kind = || {
+        RuleConfig::new("web", "kind", SetAction::value("web"))
+            .matching(MatchConfig::starts_with("host", "web-"))
+    };
+    let owner_if_web = || {
+        RuleConfig::new("owner", "owner", SetAction::value("acme"))
+            .matching(MatchConfig::equals("kind", "web"))
+    };
+    let targets = || RuleSetConfig::new("t", ["kind", "owner"]);
+    let cases = [
+        (
+            "an earlier target no row set",
+            targets().rule(web_kind()).rule(owner_if_web()),
+            r#"{"kind":"web","host":"db-1"}"#,
+            "owner",
+            None,
+            Some("acme"),
+        ),
+        (
+            "an earlier target a row set",
+            targets().rule(web_kind()).rule(owner_if_web()),
+            r#"{"kind":"db","host":"web-1"}"#,
+            "owner",
+            Some("acme"),
+            Some("acme"),
+        ),
+        (
+            "an earlier target no row set, in CEL",
+            targets().rule(web_kind()).rule(
+                RuleConfig::new("owner", "owner", SetAction::value("acme"))
+                    .when(r#"kind == "web""#),
+            ),
+            r#"{"kind":"web","host":"db-1"}"#,
+            "owner",
+            None,
+            Some("acme"),
+        ),
+        (
+            "a later target not evaluated yet",
+            targets().rule(
+                RuleConfig::new("copy", "kind", SetAction::from("owner"))
+                    .matching(MatchConfig::exists("owner")),
+            ),
+            r#"{"owner":"beta"}"#,
+            "kind",
+            None,
+            Some("beta"),
+        ),
+        (
+            "a later target not evaluated yet, in CEL",
+            targets().rule(
+                RuleConfig::new("beta", "kind", SetAction::value("secret"))
+                    .when(r#"owner == "beta""#),
+            ),
+            r#"{"owner":"beta"}"#,
+            "kind",
+            None,
+            Some("secret"),
+        ),
+        (
+            "a target's own rows confirming the record's value",
+            targets()
+                .rule(
+                    RuleConfig::new("confirm", "kind", SetAction::value("web"))
+                        .matching(MatchConfig::equals("kind", "web")),
+                )
+                .rule(owner_if_web()),
+            r#"{"kind":"web"}"#,
+            "owner",
+            Some("acme"),
+            Some("acme"),
+        ),
+        (
+            "the same field read by its own rows, then another target's",
+            targets()
+                .rule(
+                    RuleConfig::new("never", "kind", SetAction::value("x"))
+                        .matching(MatchConfig::equals("kind", "nope")),
+                )
+                .rule(
+                    RuleConfig::new("owner", "owner", SetAction::value("acme"))
+                        .matching(MatchConfig::exists("kind")),
+                ),
+            r#"{"kind":"web"}"#,
+            "owner",
+            None,
+            Some("acme"),
+        ),
+    ];
+    for (case, config, text, target, hidden, plain) in cases {
+        let set = compile(&config);
+        let target = set.target(target).unwrap();
+        let hiding = Hiding {
+            record: json(text),
+            hidden: &["kind", "owner"],
+        };
+        assert_eq!(
+            set.evaluate(&hiding).value(target),
+            hidden,
+            "hidden: {case}"
+        );
+        assert_eq!(
+            set.evaluate(&json(text)).value(target),
+            plain,
+            "default: {case}"
+        );
+    }
+}
+
 #[test]
 fn a_from_row_that_finds_nothing_falls_through_to_the_next() {
     let set = compile(
