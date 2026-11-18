@@ -9,7 +9,6 @@
 classification: oss
 
 language: rust
-license: Apache-2.0
 quality:
   enabled: true
   # The thin-chart skeleton renders only once an assembler adds files/contract.json.
