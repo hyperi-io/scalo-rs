@@ -66,6 +66,12 @@ A client a broker accepted, then refuses for `auth_refusal_grace_secs` (default 
 
 **Consumer adjustment** -- a pod goes not ready about two minutes into a CA, certificate or password rotation the broker refuses. Raise `auth_refusal_grace_secs` where a broker restart takes longer.
 
+### Kafka producers no longer create topics (BEHAVIOUR CHANGE)
+
+Every producer scalo builds (the transport's, `KafkaProducer` and the Kafka DLQ's) now sets `allow.auto.create.topics: false`. A transport send to a missing topic backpressures, and fails readiness, until the topic exists, even on a broker that creates topics on demand. A `KafkaProducer` or DLQ record for a missing topic fails undelivered. A topic deleted under a producer that had written to it stays deleted. See [backends.md](transport/backends.md#sending-to-kafka).
+
+**Consumer adjustment** -- a stack that relied on a producer creating its own topic, a DLQ topic included, now fails to send until the topic exists. Create its topics before the producer writes, or set `allow_auto_create_topics: true` on that producer's Kafka config.
+
 ## 2.14.31
 
 ### OpenTelemetry moves to the 0.33 line (API CHANGE)

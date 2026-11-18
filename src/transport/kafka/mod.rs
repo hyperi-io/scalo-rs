@@ -762,6 +762,11 @@ pub fn producer_client_config(
     if config.ssl_skip_verify {
         client_config.set("enable.ssl.certificate.verification", "false");
     }
+    // librdkafka's producer default is `true`. Set before the layers, so a raw override wins.
+    client_config.set(
+        "allow.auto.create.topics",
+        config.allow_auto_create_topics.to_string(),
+    );
     apply_layer(&mut client_config, profile_defaults);
     let settings = config.resolved_producer_settings();
     apply_layer(&mut client_config, &raw_layer(&settings));
@@ -4655,6 +4660,48 @@ mod tests {
         assert_eq!(built.get("compression.level"), Some("3"));
         assert_eq!(librdkafka_resolves(&built, "compression.codec"), "zstd");
         assert_eq!(librdkafka_resolves(&built, "compression.level"), "3");
+    }
+
+    /// Every scalo producer asks for no topic creation unless the config says
+    /// so, a raw override wins, and the consumer and admin clients are left at
+    /// librdkafka's own default.
+    #[test]
+    fn producers_create_no_topic_unless_the_config_allows_it() {
+        let allowed = KafkaConfig {
+            allow_auto_create_topics: true,
+            ..KafkaConfig::default()
+        };
+        let overridden = KafkaConfig::default().with_override("allow.auto.create.topics", "true");
+        let cases = [
+            ("default", KafkaConfig::default(), "false"),
+            ("allowed", allowed.clone(), "true"),
+            ("raw override", overridden, "true"),
+        ];
+        for (name, config, want) in cases {
+            for (client, built) in [
+                ("transport", transport_producer_config(&config)),
+                (
+                    "KafkaProducer and the DLQ",
+                    producer_client_config(&config, PRODUCER_LOW_LATENCY),
+                ),
+            ] {
+                // Set, not left unset: rd_kafka_new turns an unset key on for a producer.
+                assert_eq!(
+                    built.get("allow.auto.create.topics"),
+                    Some(want),
+                    "{name}: {client}"
+                );
+                assert_eq!(
+                    librdkafka_resolves(&built, "allow.auto.create.topics"),
+                    want,
+                    "{name}: {client}"
+                );
+            }
+        }
+        let consumer = consumer_client_config(&allowed, ConsumerProtocol::Classic);
+        assert_eq!(consumer.get("allow.auto.create.topics"), None, "consumer");
+        let admin = admin::admin_client_config(&allowed);
+        assert_eq!(admin.get("allow.auto.create.topics"), None, "admin");
     }
 
     /// `librdkafka_overrides` is the last layer: its codec wins over the zstd
