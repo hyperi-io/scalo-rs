@@ -37,7 +37,10 @@ pub fn describe(manager: &MetricsManager) {
         "batch_engine_messages_filtered_total",
         "Messages filtered at pre-route",
     );
-    let _ = manager.counter("batch_engine_messages_dlq_total", "Messages routed to DLQ");
+    let _ = manager.counter(
+        "engine_filter_dlq_discarded_total",
+        "DLQ entries discarded under FilterDlqPolicy::DiscardWithMetric",
+    );
     let _ = manager.counter("batch_engine_parse_errors_total", "Parse failures");
 
     // Histograms
@@ -150,7 +153,7 @@ mod tests {
             "batch_engine_messages_received_total",
             "batch_engine_messages_parsed_total",
             "batch_engine_messages_filtered_total",
-            "batch_engine_messages_dlq_total",
+            "engine_filter_dlq_discarded_total",
             "batch_engine_parse_errors_total",
             "batch_engine_parse_duration_seconds",
             "batch_engine_transform_duration_seconds",

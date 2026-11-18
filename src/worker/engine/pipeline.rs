@@ -76,8 +76,13 @@ pub struct Pipeline<'a, R, T = NoTicker> {
 /// fans out to, or one for a write it confirms later. The block's source is
 /// released only once each has reported. One dropped without a report counts
 /// as `Errored`.
+///
+/// It also takes back the records the sink's downstream refused for good
+/// ([`refusals`](Self::refusals)), which the loop writes to the DLQ.
 pub struct BlockPieces<'f> {
     finalizer: &'f BatchFinalizer,
+    /// The refusals of the sink call in progress. Each call gets a fresh list.
+    refused: &'f parking_lot::Mutex<Refusals>,
 }
 
 impl BlockPieces<'_> {
@@ -85,6 +90,67 @@ impl BlockPieces<'_> {
     #[must_use]
     pub fn piece(&self) -> PieceFinalizer {
         self.finalizer.piece()
+    }
+
+    /// Where the sink call in progress hands back the records the downstream
+    /// refused for good. The handle is owned, so the sink's future can keep it
+    /// across its sends.
+    #[must_use]
+    pub fn refusals(&self) -> Refusals {
+        self.refused.lock().clone()
+    }
+
+    /// Start the list for a new sink call. A handle kept from an earlier call
+    /// writes to the old list, which nothing reads.
+    fn start_call(&self) {
+        *self.refused.lock() = Refusals::default();
+    }
+
+    /// Take the records the sink call handed back, as dead letters it refused.
+    fn take_refused(&self) -> Vec<DeadLetter> {
+        let current = self.refused.lock().clone();
+        std::mem::take(&mut *current.0.lock())
+            .into_iter()
+            .map(|entry| DeadLetter {
+                entry,
+                screened: Some(crate::transport::DEAD_LETTER_REJECTED),
+            })
+            .collect()
+    }
+}
+
+/// Records a sink's downstream refused for good, handed back to the pipeline
+/// loop through [`BlockPieces::refusals`].
+///
+/// Once the sink call returns `Ok`, the loop writes them to the DLQ as a piece
+/// of the block, the way it writes a record the sender screens out, so the
+/// source is released only once the DLQ holds them. Without a DLQ they go
+/// through [`FilterDlqPolicy::Route`] when one is set, and are otherwise
+/// dropped and counted in `pipeline_dead_letters_dropped_total{reason="rejected"}`.
+///
+/// A sink call that fails discards its refusals, because the retry sends the
+/// block again, and one handed back after the call returned is not written.
+/// Under [`CommitMode::SinkManaged`] the write follows the sink's own release,
+/// so a sink that releases its source writes its refusals to the DLQ first.
+#[derive(Clone, Default)]
+pub struct Refusals(std::sync::Arc<parking_lot::Mutex<Vec<FilteredDlqEntry>>>);
+
+impl Refusals {
+    /// Hand back `record`, refused for good, with the refusal as `reason`.
+    pub fn dead_letter(&self, record: &Record, reason: impl Into<String>) {
+        self.0.lock().push(FilteredDlqEntry {
+            payload: record.payload.to_vec(),
+            key: record.key.clone(),
+            reason: reason.into(),
+        });
+    }
+}
+
+impl std::fmt::Debug for Refusals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Refusals")
+            .field("records", &self.0.lock().len())
+            .finish()
     }
 }
 
@@ -532,8 +598,10 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         };
 
         let (finalizer, merged) = merged_channel();
+        let refused = parking_lot::Mutex::new(Refusals::default());
         let pieces = BlockPieces {
             finalizer: &finalizer,
+            refused: &refused,
         };
         let inbound: Vec<DeadLetter> = std::mem::take(&mut batch.dlq_entries)
             .into_iter()
@@ -629,7 +697,8 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         match self.sink_held(sink, &out, pieces, give_up).await {
             Ok(SinkEnd::Sunk) => {
                 piece.report(DeliveryStatus::Delivered);
-                Ok(SinkEnd::Sunk)
+                self.dead_letter(pieces.take_refused(), pieces, give_up)
+                    .await
             }
             Ok(SinkEnd::Expired) => {
                 piece.report(DeliveryStatus::Errored);
@@ -688,7 +757,16 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
             }
             let piece = pieces.piece();
             match self.sink_held(sink, &out, pieces, give_up).await {
-                Ok(SinkEnd::Sunk) => piece.report(DeliveryStatus::Delivered),
+                Ok(SinkEnd::Sunk) => {
+                    piece.report(DeliveryStatus::Delivered);
+                    match self
+                        .dead_letter(pieces.take_refused(), pieces, give_up)
+                        .await?
+                    {
+                        SinkEnd::Sunk => {}
+                        end => return Ok(end),
+                    }
+                }
                 Ok(SinkEnd::Expired) => {
                     piece.report(DeliveryStatus::Errored);
                     return Ok(SinkEnd::Expired);
@@ -750,8 +828,8 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         let piece = pieces.piece();
 
         #[cfg(feature = "dlq")]
-        if let Some(dlq) = &self.engine.dlq {
-            let (status, end) = self.dead_letter_to(dlq, dead, give_up).await;
+        if let Some(dlq) = self.engine.dlq() {
+            let (status, end) = self.dead_letter_to(&dlq, dead, give_up).await;
             if let Some(status) = status {
                 piece.report(status);
             }
@@ -762,7 +840,7 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
 
         let (screened, routed): (Vec<DeadLetter>, Vec<DeadLetter>) =
             dead.into_iter().partition(|d| d.screened.is_some());
-        let route_policy = matches!(self.engine.filter_dlq_policy, FilterDlqPolicy::Route(_));
+        let route_policy = matches!(self.engine.filter_dlq_policy(), FilterDlqPolicy::Route(_));
         let mut status = DeliveryStatus::Delivered;
         if !routed.is_empty() {
             self.engine
@@ -884,6 +962,7 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         loop {
             // An attempt still pending at the hold deadline or when the retry
             // window closes is dropped, so a hung sink cannot hold shutdown.
+            pieces.start_call();
             let result = tokio::select! {
                 biased;
                 result = sink(batch, pieces) => result,

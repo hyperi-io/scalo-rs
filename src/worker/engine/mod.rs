@@ -22,7 +22,7 @@ pub use config::{BatchProcessingConfig, ParseErrorAction, PreRouteFilterConfig};
 pub use driver::{CommitMode, ParsedBatch};
 pub use intern::FieldInterner;
 #[cfg(feature = "transport")]
-pub use pipeline::{BlockPieces, NoTicker, Pipeline};
+pub use pipeline::{BlockPieces, NoTicker, Pipeline, Refusals};
 pub use types::{MessageMetadata, ParsedMessage, PreRouteResult};
 
 /// Errors returned by the [`BatchEngine`] `WorkBatch` drivers
@@ -47,8 +47,9 @@ pub enum EngineError {
     /// the engine fails fast rather than silently dropping dead-letters.
     #[error(
         "{0} inbound-filter DLQ entries were produced but no FilterDlqPolicy is \
-         configured -- set a policy via BatchEngine::with_filter_dlq_policy \
-         (Route to forward, or DiscardWithMetric to deliberately drop)"
+         configured -- set a policy via BatchEngine::set_filter_dlq_policy or \
+         with_filter_dlq_policy (Route to forward, or DiscardWithMetric to \
+         deliberately drop)"
     )]
     FilterDlqUnrouted(usize),
     /// A [`FilterDlqPolicy::Route`] sink failed to deliver DLQ entries. This is
@@ -180,7 +181,7 @@ pub struct BatchEngine {
     /// What the run loops do with inbound-filter DLQ entries. Default
     /// [`FilterDlqPolicy::Reject`] (no silent data loss).
     #[cfg(feature = "transport")]
-    filter_dlq_policy: FilterDlqPolicy,
+    filter_dlq_policy: parking_lot::RwLock<FilterDlqPolicy>,
     /// Self-regulation byte-budget lever (`governor` feature). `None` (the
     /// default, and whenever self-regulation is OFF) keeps the engine on the
     /// whole-batch [`run_workbatch`](Self::run_workbatch) loop -- byte-identical
@@ -192,7 +193,7 @@ pub struct BatchEngine {
     /// Where the pipeline loop writes dead letters, confirming each before the
     /// source is released. `None` routes them through `filter_dlq_policy`.
     #[cfg(all(feature = "transport", feature = "dlq"))]
-    dlq: Option<Arc<crate::dlq::Dlq>>,
+    dlq: parking_lot::RwLock<Option<Arc<crate::dlq::Dlq>>>,
 }
 
 impl BatchEngine {
@@ -225,11 +226,11 @@ impl BatchEngine {
             #[cfg(feature = "memory")]
             memory_guard: None,
             #[cfg(feature = "transport")]
-            filter_dlq_policy: FilterDlqPolicy::default(),
+            filter_dlq_policy: parking_lot::RwLock::new(FilterDlqPolicy::default()),
             #[cfg(feature = "governor")]
             byte_budget: None,
             #[cfg(all(feature = "transport", feature = "dlq"))]
-            dlq: None,
+            dlq: parking_lot::RwLock::new(None),
         }
     }
 
@@ -245,9 +246,23 @@ impl BatchEngine {
     /// [`FilterDlqPolicy`].
     #[cfg(all(feature = "transport", feature = "dlq"))]
     #[must_use]
-    pub fn with_dlq(mut self, dlq: Arc<crate::dlq::Dlq>) -> Self {
-        self.dlq = Some(dlq);
+    pub fn with_dlq(self, dlq: Arc<crate::dlq::Dlq>) -> Self {
+        self.set_dlq(dlq);
         self
+    }
+
+    /// [`with_dlq`](Self::with_dlq) on an engine already shared, such as the
+    /// `Arc<BatchEngine>` `ServiceRuntime` builds. It applies from the next
+    /// dead-letter write.
+    #[cfg(all(feature = "transport", feature = "dlq"))]
+    pub fn set_dlq(&self, dlq: Arc<crate::dlq::Dlq>) {
+        *self.dlq.write() = Some(dlq);
+    }
+
+    /// The DLQ the pipeline loop writes dead letters to, if one is set.
+    #[cfg(all(feature = "transport", feature = "dlq"))]
+    pub(crate) fn dlq(&self) -> Option<Arc<crate::dlq::Dlq>> {
+        self.dlq.read().clone()
     }
 
     /// Wire the self-regulation byte-budget lever (`governor` feature).
@@ -277,9 +292,23 @@ impl BatchEngine {
     /// dead-letters are never silently dropped.
     #[cfg(feature = "transport")]
     #[must_use]
-    pub fn with_filter_dlq_policy(mut self, policy: FilterDlqPolicy) -> Self {
-        self.filter_dlq_policy = policy;
+    pub fn with_filter_dlq_policy(self, policy: FilterDlqPolicy) -> Self {
+        self.set_filter_dlq_policy(policy);
         self
+    }
+
+    /// [`with_filter_dlq_policy`](Self::with_filter_dlq_policy) on an engine
+    /// already shared, such as the `Arc<BatchEngine>` `ServiceRuntime` builds.
+    /// It applies from the next set of entries routed.
+    #[cfg(feature = "transport")]
+    pub fn set_filter_dlq_policy(&self, policy: FilterDlqPolicy) {
+        *self.filter_dlq_policy.write() = policy;
+    }
+
+    /// The current policy, cloned so a `Route` sink runs without the lock held.
+    #[cfg(feature = "transport")]
+    pub(crate) fn filter_dlq_policy(&self) -> FilterDlqPolicy {
+        self.filter_dlq_policy.read().clone()
     }
 
     /// Load configuration from the cascade and create a standalone engine.
@@ -613,7 +642,7 @@ impl BatchEngine {
         if entries.is_empty() {
             return Ok(());
         }
-        match &self.filter_dlq_policy {
+        match self.filter_dlq_policy() {
             FilterDlqPolicy::Reject => Err(EngineError::FilterDlqUnrouted(entries.len())),
             FilterDlqPolicy::DiscardWithMetric => {
                 #[cfg(feature = "metrics")]
@@ -670,11 +699,11 @@ impl std::fmt::Debug for BatchEngine {
         #[cfg(feature = "memory")]
         s.field("memory_guard", &self.memory_guard.is_some());
         #[cfg(feature = "transport")]
-        s.field("filter_dlq_policy", &self.filter_dlq_policy);
+        s.field("filter_dlq_policy", &*self.filter_dlq_policy.read());
         #[cfg(feature = "governor")]
         s.field("self_regulated", &self.byte_budget.is_some());
         #[cfg(all(feature = "transport", feature = "dlq"))]
-        s.field("dlq", &self.dlq.is_some());
+        s.field("dlq", &self.dlq.read().is_some());
         s.finish()
     }
 }

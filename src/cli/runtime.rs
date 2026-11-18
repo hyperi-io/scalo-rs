@@ -87,7 +87,8 @@ pub struct ServiceRuntime {
 
     /// Batch processing engine with SIMD parsing and pre-route filtering
     /// (`worker-batch` feature). `None` if `worker-batch` is not enabled
-    /// or worker pool creation failed.
+    /// or worker pool creation failed. Install its dead-letter routing with
+    /// `set_dlq` and `set_filter_dlq_policy` before the first run.
     #[cfg(feature = "worker-batch")]
     pub batch_engine: Option<Arc<crate::worker::BatchEngine>>,
 

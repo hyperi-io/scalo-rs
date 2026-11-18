@@ -17,6 +17,8 @@ engine
 
 A **piece** is one downstream delivery covering part of a block: each sink call (the whole block, or a sub-block while the governor streams), the block's dead letters, and any piece the sink takes itself. `run_with_pieces` hands the sink a `BlockPieces` for that: a sink that fans out to several destinations, or confirms a write later, takes a piece per destination and reports it when the write lands. A piece dropped without a report counts as `Errored`.
 
+A record the downstream refuses for good only once it is sent goes back through `pieces.refusals()`, an owned handle the sink's future keeps: `refusals.dead_letter(&record, reason)`. When the sink call returns `Ok`, the loop writes them as a dead-letter piece ([below](#dead-letters)). A failed call discards its refusals, since the retry resends the block, and under `CommitMode::SinkManaged` the sink writes them to the DLQ itself before it releases.
+
 Once every piece has reported, the loop calls `TransportReceiver::release` once with the merged status:
 
 | Merged status | Source |
@@ -64,13 +66,13 @@ A pipeline over an HTTP or file source reports `best_effort` / `source_cannot_ac
 
 With `BatchEngine::with_dlq(Arc<Dlq>)`, a block's dead letters -- inbound filter matches, entries `process` adds, and records the sink would refuse -- are one piece, written with `Dlq::write_confirmed`. It reports `Rejected` once a DLQ backend holds them, so the source is never released for a dead letter the DLQ does not hold. A write that fails is retried with backoff (`pipeline_retries_total{stage="dlq"}`) while the block stays held, until it lands, the hold deadline comes, or the retry window after shutdown closes. It reports `Errored` at once only when the DLQ's drain has exited. The answer covers this block's own write, so a refusal of another writer's entries never reaches it ([dlq.md](dlq.md#queue-admission-semantics)).
 
-An entry no DLQ backend can ever hold -- over a Kafka-only DLQ's `message.max.bytes` as written -- is left out of the write (`Dlq::refusal`), dropped, and counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`, and its piece reports `Dropped`. No retry could land it, and holding it would pin a Kafka partition's commit for good. A disabled DLQ reports `Dropped` and counts each in `pipeline_dead_letters_dropped_total{reason}`, where `reason` is `dead_letter` for one an inbound filter or `process` produced.
+An entry no DLQ backend can ever hold -- over a Kafka-only DLQ's `message.max.bytes` as written -- is left out of the write (`Dlq::refusal`), dropped, and counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`, and its piece reports `Dropped`. No retry could land it, and holding it would pin a Kafka partition's commit for good. A disabled DLQ reports `Dropped` and counts each in `pipeline_dead_letters_dropped_total{reason}`, where `reason` is `dead_letter` for one an inbound filter or `process` produced, `rejected` for one the sink handed back.
 
 A sender names the records it would dead-letter rather than send (`TransportSender::dead_letter_reason`): Kafka names a record over `message.max.bytes` less 128 bytes of framing, gRPC one over `max_message_size` on its own, and both an outbound `dlq` filter match. The sender answers such a record `FilteredDlq`, or leaves it out of a gRPC block, without writing it anywhere, and `send_batch` counts it handled, so `.sender(&sender)` has the loop take them out of the block before the sink is called. Without a DLQ they go through `FilterDlqPolicy::Route` when one is set. Otherwise they are dropped, counted in `pipeline_dead_letters_dropped_total{reason}`, and the block releases `Dropped`, never `Delivered`.
 
 An app whose sink writes to a scalo transport passes that transport with `.sender(&sender)`. Without it nothing screens the block: `send_batch` drops such a record and the block releases `Delivered`. A sink that is not a transport -- a database writer that rejects a record itself -- has no transport screen to miss, and declares what its `Ok` proves with `.sink_confirms(..)` instead. A pipeline with neither logs one WARN at start and reports `best_effort` / `sink_cannot_confirm` (below).
 
-Without a DLQ, entries from filters and `process` go through the `FilterDlqPolicy` as in the other run loops. `Route` reports `Rejected` once its closure returns `Ok`, which does not prove the entry is durable. `with_dlq` does.
+Without a DLQ, entries from filters and `process` go through the `FilterDlqPolicy` as in the other run loops. `Route` reports `Rejected` once its closure returns `Ok`, which does not prove the entry is durable. `with_dlq` does. An engine already behind an `Arc`, as `ServiceRuntime` hands it out, takes both through `set_dlq` and `set_filter_dlq_policy` before its first run.
 
 ---
 

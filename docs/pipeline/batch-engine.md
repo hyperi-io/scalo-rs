@@ -212,7 +212,9 @@ pause inside the engine. See [self-regulation.md](../self-regulation.md).
 | `run_workbatch_parsed(receiver, shutdown, process_parsed, sink, commit, ticker)` | Async loop, whole blocks, pre-parsed `ParsedBatch` |
 | `run_workbatch_streaming(receiver, shutdown, process, sink, commit, sub_block_bytes, ticker)` | Async loop, sub-blocks of `sub_block_bytes` |
 | `pipeline(&receiver)` ... `.run(process, sink)` / `.run_with_pieces(process, sink)` | Governed loop that holds each block's source acknowledgement until every piece is delivered ([acknowledgements.md](acknowledgements.md)) |
-| `with_dlq(Arc<Dlq>)` | Dead letters of the `pipeline` loop, confirmed by the DLQ before the source is released |
+| `with_dlq(Arc<Dlq>)` / `set_dlq(Arc<Dlq>)` | Dead letters of the `pipeline` loop, confirmed by the DLQ before the source is released. `set_dlq` takes `&self`, for an engine already behind an `Arc` |
+| `with_filter_dlq_policy(policy)` / `set_filter_dlq_policy(policy)` | What the run loops do with dead letters when there is no DLQ (`FilterDlqPolicy`). `set_filter_dlq_policy` takes `&self` |
+| `BlockPieces::refusals()` | An owned `Refusals` handle a `run_with_pieces` sink hands records back through when the downstream refuses them for good. The loop writes them to the DLQ ([acknowledgements.md](acknowledgements.md#pieces-and-release)) |
 | `set_byte_budget(budget)` | Wire the governor's byte budget -- `ServiceRuntime` does this when self-regulation is on |
 | `auto_wire(metrics, memory_guard)` | Called by `ServiceRuntime` -- apps never call directly |
 | `stats() -> &Arc<PipelineStats>` | Atomic counters (received, processed, errors, filtered, dlq, bytes) |
