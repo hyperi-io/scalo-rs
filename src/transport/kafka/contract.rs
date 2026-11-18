@@ -100,6 +100,15 @@ mod tests {
         assert!(require_blessed("kinesis").is_err());
     }
 
+    /// The TLS-off keys are known providers a strict deployment still refuses.
+    #[test]
+    fn require_refuses_the_tls_off_providers() {
+        for key in ["strimzi-no-tls", "redpanda-no-tls"] {
+            assert!(KnownProvider::parse(key).is_ok(), "{key} is known");
+            assert!(require_blessed(key).is_err(), "{key} is not blessed");
+        }
+    }
+
     #[test]
     fn require_honours_a_custom_allow_list() {
         assert!(require("redpanda", &["redpanda"]).is_ok());

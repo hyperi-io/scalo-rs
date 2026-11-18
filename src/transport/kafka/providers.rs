@@ -175,6 +175,10 @@ pub enum KnownProvider {
     Strimzi,
     /// Self-hosted Redpanda -- SCRAM-SHA-512.
     Redpanda,
+    /// Strimzi's TLS-off listener -- SASL_PLAINTEXT + SCRAM-SHA-512.
+    StrimziNoTls,
+    /// Redpanda's TLS-off listener -- SASL_PLAINTEXT + SCRAM-SHA-512.
+    RedpandaNoTls,
     /// AWS MSK provisioned -- SCRAM-SHA-512 (serverless is IAM-only: use `MskIam`).
     Msk,
     /// Redpanda Cloud -- SASL_SSL + SCRAM-SHA-256/512.
@@ -196,6 +200,8 @@ impl KnownProvider {
         Ok(match s {
             "strimzi" => Self::Strimzi,
             "redpanda" => Self::Redpanda,
+            "strimzi-no-tls" => Self::StrimziNoTls,
+            "redpanda-no-tls" => Self::RedpandaNoTls,
             "msk" => Self::Msk,
             "redpanda-cloud" => Self::RedpandaCloud,
             "confluent-cloud" => Self::ConfluentCloud,
@@ -204,7 +210,8 @@ impl KnownProvider {
             other => {
                 return Err(format!(
                     "unknown kafka provider {other:?}; expected one of: strimzi, redpanda, \
-                     msk, redpanda-cloud, confluent-cloud, plaintext, msk_iam"
+                     strimzi-no-tls, redpanda-no-tls, msk, redpanda-cloud, confluent-cloud, \
+                     plaintext, msk_iam"
                 ));
             }
         })
@@ -216,6 +223,8 @@ impl KafkaProvider for KnownProvider {
         match self {
             Self::Strimzi => "strimzi",
             Self::Redpanda => "redpanda",
+            Self::StrimziNoTls => "strimzi-no-tls",
+            Self::RedpandaNoTls => "redpanda-no-tls",
             Self::Msk => "msk",
             Self::RedpandaCloud => "redpanda-cloud",
             Self::ConfluentCloud => "confluent-cloud",
@@ -229,6 +238,8 @@ impl KafkaProvider for KnownProvider {
             Self::Strimzi | Self::Redpanda | Self::Msk | Self::RedpandaCloud => {
                 ("SASL_SSL", "SCRAM-SHA-512")
             }
+            // SCRAM is challenge-response, so the password never crosses the TLS-off listener.
+            Self::StrimziNoTls | Self::RedpandaNoTls => ("SASL_PLAINTEXT", "SCRAM-SHA-512"),
             Self::ConfluentCloud => ("SASL_SSL", "PLAIN"),
             Self::Plaintext => ("PLAINTEXT", ""),
             Self::MskIam => ("SASL_SSL", "OAUTHBEARER"),
@@ -256,7 +267,9 @@ impl KafkaProvider for KnownProvider {
             auth_kind: AuthKind::UserPassword,
         };
         match self {
-            Self::Strimzi | Self::Redpanda => self_hosted,
+            Self::Strimzi | Self::Redpanda | Self::StrimziNoTls | Self::RedpandaNoTls => {
+                self_hosted
+            }
             // Provisioned MSK: fixed broker-hour capacity (MSK Serverless is the
             // separate `MskIam` identity).
             Self::Msk => ProviderCapabilities {
@@ -286,7 +299,12 @@ impl KafkaProvider for KnownProvider {
         match self {
             // Redpanda is KRaft-native (no ZooKeeper). Strimzi + local dev default to
             // KRaft on modern Kafka. Provisioned MSK is KRaft-forward.
-            Self::Redpanda | Self::Strimzi | Self::Plaintext | Self::Msk => MetadataMode::KRaft,
+            Self::Redpanda
+            | Self::Strimzi
+            | Self::RedpandaNoTls
+            | Self::StrimziNoTls
+            | Self::Plaintext
+            | Self::Msk => MetadataMode::KRaft,
             // The clouds hide their metadata plane entirely.
             Self::RedpandaCloud | Self::ConfluentCloud | Self::MskIam => MetadataMode::Managed,
         }
@@ -295,20 +313,25 @@ impl KafkaProvider for KnownProvider {
     fn schema_registry(&self) -> SchemaRegistry {
         match self {
             Self::ConfluentCloud => SchemaRegistry::Confluent,
-            Self::Redpanda | Self::RedpandaCloud => SchemaRegistry::Redpanda,
-            Self::Strimzi | Self::Msk | Self::Plaintext | Self::MskIam => SchemaRegistry::None,
+            Self::Redpanda | Self::RedpandaNoTls | Self::RedpandaCloud => SchemaRegistry::Redpanda,
+            Self::Strimzi | Self::StrimziNoTls | Self::Msk | Self::Plaintext | Self::MskIam => {
+                SchemaRegistry::None
+            }
         }
     }
 
     fn supports_consumer_group_protocol(&self) -> bool {
         match self {
             // Redpanda 26.2 answers no ConsumerGroupHeartbeat at all.
-            Self::Redpanda | Self::RedpandaCloud => false,
+            Self::Redpanda | Self::RedpandaNoTls | Self::RedpandaCloud => false,
             // Kafka-protocol platforms, gated on the broker being 4.0+; an
             // older broker's refusal rebuilds the consumer as classic.
-            Self::Strimzi | Self::Msk | Self::ConfluentCloud | Self::Plaintext | Self::MskIam => {
-                true
-            }
+            Self::Strimzi
+            | Self::StrimziNoTls
+            | Self::Msk
+            | Self::ConfluentCloud
+            | Self::Plaintext
+            | Self::MskIam => true,
         }
     }
 }
@@ -347,6 +370,8 @@ mod tests {
     const CANONICAL_TABLE: &[(&str, &str, &str)] = &[
         ("strimzi", "SASL_SSL", "SCRAM-SHA-512"),
         ("redpanda", "SASL_SSL", "SCRAM-SHA-512"),
+        ("strimzi-no-tls", "SASL_PLAINTEXT", "SCRAM-SHA-512"),
+        ("redpanda-no-tls", "SASL_PLAINTEXT", "SCRAM-SHA-512"),
         ("msk", "SASL_SSL", "SCRAM-SHA-512"),
         ("redpanda-cloud", "SASL_SSL", "SCRAM-SHA-512"),
         ("confluent-cloud", "SASL_SSL", "PLAIN"),
@@ -371,6 +396,24 @@ mod tests {
             .map(|(k, _, _)| *k)
             .collect();
         assert_eq!(plain, vec!["confluent-cloud"]);
+    }
+
+    /// Only SCRAM, whose challenge-response never sends the password, has a
+    /// TLS-off key, and every key without TLS other than `plaintext` is one.
+    #[test]
+    fn only_scram_rides_a_tls_off_listener() {
+        let without_tls: Vec<_> = CANONICAL_TABLE
+            .iter()
+            .filter(|(_, proto, _)| *proto == "SASL_PLAINTEXT")
+            .map(|(key, _, mech)| (*key, *mech))
+            .collect();
+        assert_eq!(
+            without_tls,
+            vec![
+                ("strimzi-no-tls", "SCRAM-SHA-512"),
+                ("redpanda-no-tls", "SCRAM-SHA-512")
+            ]
+        );
     }
 
     #[test]
@@ -453,7 +496,13 @@ mod tests {
 
     #[test]
     fn self_hosted_is_not_managed() {
-        for key in ["strimzi", "redpanda", "plaintext"] {
+        for key in [
+            "strimzi",
+            "redpanda",
+            "strimzi-no-tls",
+            "redpanda-no-tls",
+            "plaintext",
+        ] {
             let caps = KnownProvider::parse(key).unwrap().capabilities();
             assert!(!caps.managed, "{key} is self-hosted");
             assert!(!caps.always_on);
@@ -539,7 +588,10 @@ mod tests {
                     .supports_consumer_group_protocol()
             })
             .collect();
-        assert_eq!(without, vec!["redpanda", "redpanda-cloud"]);
+        assert_eq!(
+            without,
+            vec!["redpanda", "redpanda-no-tls", "redpanda-cloud"]
+        );
     }
 
     /// A provider that says nothing about the protocol is assumed to speak it,
