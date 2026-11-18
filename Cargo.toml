@@ -115,9 +115,9 @@ worker = ["worker-batch"]
 
 worker-msgpack = ["worker", "rmpv"]
 
-# `cli-service` pulls no transport and no worker pool: docs/feature-flags.md#cli
+# `cli-service` pulls no transport and no worker pool, and `health` so /readyz reads the registry: docs/feature-flags.md#cli
 cli = ["clap", "tracing"]
-cli-service = ["cli", "metrics", "memory", "scaling", "shutdown", "governor", "lifecycle"]
+cli-service = ["cli", "health", "metrics", "memory", "scaling", "shutdown", "governor", "lifecycle"]
 
 # Folded into cli-service: docs/core-pillars/lifecycle.md
 lifecycle = ["config", "tokio", "tracing"]

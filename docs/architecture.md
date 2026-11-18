@@ -127,7 +127,7 @@ A handful of dependencies aren't visible from layer naming alone:
 - `dlq` needs `concurrency` (L2) for the `BackgroundSink` actor that
   drains queued entries.
 - `transport-trace` is the *only* transport feature that pulls in OpenTelemetry, and it takes the `opentelemetry` API crate, not the SDK. Apps that send/receive without distributed tracing avoid that dep entirely.
-- `cli-service` (L5) reaches across the whole stack - it pulls `cli + metrics + memory + scaling + shutdown + governor + lifecycle` because the `ServiceRuntime` that `run_app` builds wires all of them. It pulls no transport, and neither `sink-stack` nor `worker-pool`: an app that moves data or runs a pool declares what it uses.
+- `cli-service` (L5) reaches across the whole stack - it pulls `cli + health + metrics + memory + scaling + shutdown + governor + lifecycle` because the `ServiceRuntime` that `run_app` builds wires all of them. It pulls no transport, and neither `sink-stack` nor `worker-pool`: an app that moves data or runs a pool declares what it uses.
 
 Read [feature-flags.md](feature-flags.md) for the full feature-to-feature
 edges and [auto-wiring.md](auto-wiring.md) for which dependencies are

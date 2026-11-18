@@ -2286,6 +2286,69 @@ mod broker_down_at_start {
             "the shutdown was acted on {took:?} after construction began"
         );
     }
+
+    /// Longer than the statistics interval, so a broker `UP` would have shown.
+    #[cfg(feature = "health")]
+    const UNREACHED_FOR: Duration = Duration::from_secs(4);
+
+    /// A cold single-node broker start plus the client's next reconnect.
+    #[cfg(feature = "health")]
+    const REACHED_WITHIN: Duration = Duration::from_secs(90);
+
+    /// The `transport:kafka` component's status, the only one this process registers.
+    #[cfg(feature = "health")]
+    fn kafka_status() -> Option<scalo::HealthStatus> {
+        scalo::HealthRegistry::components()
+            .into_iter()
+            .find(|(name, _)| name == "transport:kafka")
+            .map(|(_, status)| status)
+    }
+
+    #[cfg(feature = "health")]
+    #[tokio::test]
+    async fn readiness_fails_from_startup_until_a_broker_answers() {
+        if !crate::common::docker_answers() {
+            crate::common::skip_or_fail("no Docker daemon answers `docker info`");
+            return;
+        }
+        let port = free_port();
+        let config = KafkaConfig {
+            brokers: vec![format!("127.0.0.1:{port}")],
+            group: String::new(),
+            ..Default::default()
+        }
+        .with_override("statistics.interval.ms", "1000")
+        .with_override("reconnect.backoff.max.ms", "500");
+        let sender = KafkaTransport::sender(&config)
+            .await
+            .expect("a sender builds with no broker");
+
+        let unreached = Instant::now();
+        while unreached.elapsed() < UNREACHED_FOR {
+            assert_eq!(
+                kafka_status(),
+                Some(scalo::HealthStatus::Unhealthy),
+                "ready {:?} after startup with nothing listening on {port}",
+                unreached.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let Some(_node) = start_kafka_on(scalo::test_name!(), port).await else {
+            return;
+        };
+        let up = Instant::now();
+        while kafka_status() != Some(scalo::HealthStatus::Healthy) {
+            assert!(
+                up.elapsed() < REACHED_WITHIN,
+                "still not ready {:?} after the broker came up",
+                up.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        eprintln!("ready {:?} after the broker came up", up.elapsed());
+        sender.close().await.expect("close");
+    }
 }
 
 /// `close()` keeps the consumer's group membership, so the final commit a

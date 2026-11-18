@@ -20,6 +20,18 @@ The batch engine registered `batch_engine_messages_dlq_total`, which nothing emi
 
 **Consumer adjustment** -- a metrics manifest or dashboard naming `batch_engine_messages_dlq_total` names `engine_filter_dlq_discarded_total` instead.
 
+### `cli-service` pulls `health`, so a transport fault fails /readyz (BEHAVIOUR CHANGE)
+
+A service built on `cli-service` now compiles the health registry, so every transport, tiered sink circuit and self-regulation gate it builds counts toward `/readyz`. Before, only an app that declared `health` itself had that.
+
+**Consumer adjustment** -- none to build. Expect a pod to leave its Service while a transport is unhealthy, an open circuit or a paused gate included.
+
+### A Kafka transport is not ready until a broker accepts it (BEHAVIOUR CHANGE)
+
+The `transport:kafka` health check is unhealthy from construction until a broker first accepts the client: a broker `UP` in the client's statistics, a delivered record or a received one. `is_healthy()` and `healthcheck()` are unchanged, so a boot probe does not fail on a broker that is slow to answer. See [backends.md](transport/backends.md#broker-outages).
+
+**Consumer adjustment** -- a pod whose Kafka is unreachable at start stays out of its Service until a broker answers. A client with `statistics.interval.ms: 0` is ready only after its first delivery or received record.
+
 ## 2.14.31
 
 ### OpenTelemetry moves to the 0.33 line (API CHANGE)
