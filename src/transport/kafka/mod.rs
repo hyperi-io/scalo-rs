@@ -180,6 +180,29 @@ fn block_result(results: Vec<SendResult>) -> SendResult {
         .unwrap_or(SendResult::Ok)
 }
 
+/// What the `transport:kafka` health check reports.
+///
+/// Unhealthy until a broker has accepted the client (a broker `UP` in its
+/// statistics, a delivered record or a received one), so a pod that cannot
+/// reach Kafka is not ready from the start. Then as [`TransportBase::is_healthy`].
+#[cfg(feature = "health")]
+fn registry_status(
+    healthy: &AtomicBool,
+    auth: &classify::AuthState,
+    topic_missing: &AtomicBool,
+    missing_destinations: &parking_lot::Mutex<std::collections::HashSet<String>>,
+) -> crate::health::HealthStatus {
+    if healthy.load(Ordering::Relaxed)
+        && auth.is_proven()
+        && !topic_missing.load(Ordering::Relaxed)
+        && missing_destinations.lock().is_empty()
+    {
+        crate::health::HealthStatus::Healthy
+    } else {
+        crate::health::HealthStatus::Unhealthy
+    }
+}
+
 /// High-throughput Kafka transport using rdkafka.
 ///
 /// Optimized for batch-oriented consumption at PB/day scale:
@@ -1177,19 +1200,11 @@ impl KafkaTransport {
         #[cfg(feature = "health")]
         let health_registration = {
             let h = Arc::clone(&healthy);
-            let refused = Arc::clone(&auth);
+            let reached = Arc::clone(&auth);
             let missing = Arc::clone(&topic_missing);
             let destinations = Arc::clone(&missing_destinations);
             crate::health::HealthRegistry::register_scoped("transport:kafka", move || {
-                if h.load(Ordering::Relaxed)
-                    && !refused.is_refused()
-                    && !missing.load(Ordering::Relaxed)
-                    && destinations.lock().is_empty()
-                {
-                    crate::health::HealthStatus::Healthy
-                } else {
-                    crate::health::HealthStatus::Unhealthy
-                }
+                registry_status(&h, &reached, &missing, &destinations)
             })
         };
 
@@ -4684,6 +4699,45 @@ mod tests {
         transport.auth.mark_proven();
         assert!(classes(&transport)[0].is_backpressured());
         assert!(transport.is_healthy());
+    }
+
+    /// The registry check of a transport no broker has answered yet is
+    /// unhealthy, while `is_healthy` reports no known fault, and a broker
+    /// accepting the client makes the two agree.
+    #[cfg(feature = "health")]
+    #[tokio::test]
+    async fn the_registry_check_waits_for_a_broker_to_accept_the_client() {
+        let transport = KafkaTransport::new(&unreachable_config())
+            .await
+            .expect("a producer-only transport constructs broker-free");
+        let status = |t: &KafkaTransport| {
+            registry_status(
+                &t.healthy,
+                &t.auth,
+                &t.topic_missing,
+                &t.missing_destinations,
+            )
+        };
+
+        assert_eq!(
+            status(&transport),
+            crate::health::HealthStatus::Unhealthy,
+            "no broker has answered, so the pod is not ready"
+        );
+        assert!(transport.is_healthy(), "no fault is known yet");
+
+        transport.auth.mark_proven();
+        assert_eq!(status(&transport), crate::health::HealthStatus::Healthy);
+
+        transport
+            .missing_destinations
+            .lock()
+            .insert("absent".to_string());
+        assert_eq!(
+            status(&transport),
+            crate::health::HealthStatus::Unhealthy,
+            "a reached broker does not mask a later fault"
+        );
     }
 
     /// A missing destination backpressures and fails readiness until a send

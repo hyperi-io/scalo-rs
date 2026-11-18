@@ -20,7 +20,8 @@
 //! - the app's readiness check, once the service is running. An idle service
 //!   has no work to be ready for, so its check is not consulted.
 //! - the [`HealthRegistry`](crate::health::HealthRegistry), with the `health`
-//!   feature: no registered component may be `Unhealthy`.
+//!   feature, which `cli-service` pulls: no registered component may be
+//!   `Unhealthy`.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
@@ -174,6 +175,20 @@ mod tests {
     fn a_fresh_state_is_running_so_a_standalone_manager_is_unchanged() {
         assert_eq!(Readiness::default().phase(), ServicePhase::Running);
         assert_eq!(Readiness::default().answer(), ReadyAnswer::Ready);
+    }
+
+    /// A `cli-service` build reads the registry, so an unhealthy transport
+    /// fails `/readyz` without the app enabling `health` itself.
+    #[cfg(feature = "cli-service")]
+    #[test]
+    fn a_cli_service_build_answers_from_the_health_registry() {
+        let readiness = state(ServicePhase::Running, Some(true));
+        let failing = crate::health::HealthRegistry::register_scoped("readiness-test", || {
+            crate::health::HealthStatus::Unhealthy
+        });
+        assert_eq!(readiness.answer(), ReadyAnswer::NotReady);
+        drop(failing);
+        assert_eq!(readiness.answer(), ReadyAnswer::Ready);
     }
 
     #[test]

@@ -65,7 +65,7 @@ Pick `metrics` for service binaries. scalo's series, the tiered sink's and the t
 | Feature | Adds |
 | --------- | ------ |
 | `cli` | `clap`-based `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
-| `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `metrics + memory + scaling + shutdown + governor + lifecycle`). No transport comes with it: add the `transport-*` backends, and `sink-stack` for `outbound_sink_stack`. The worker pool is opt-in: add `worker-pool`, or `worker-batch` for the pool plus `BatchEngine` |
+| `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `health + metrics + memory + scaling + shutdown + governor + lifecycle`). `health` is what lets a transport, a circuit or a paused gate fail `/readyz`. No transport comes with it: add the `transport-*` backends, and `sink-stack` for `outbound_sink_stack`. The worker pool is opt-in: add `worker-pool`, or `worker-batch` for the pool plus `BatchEngine` |
 | `lifecycle` | Idle-until-configured gate (`WorkState`, `IdleGate`, `pipeline_idle`) -- folded into `cli-service` |
 | `top` | Above + `ratatui` TUI metrics dashboard |
 
@@ -168,7 +168,7 @@ The libgit2 package name has the library version in it, so it differs per base r
 | --- | --- | --- |
 | Tiny library or CLI tool | `config`, `logger` (the defaults) | No metrics endpoint, no transport, no worker pool |
 | Tooling-style CLI | `cli`, `config`, `logger` | `clap` types, no service scaffolding |
-| Light service (HTTP only) | `cli-service`, `http-server`, `transport-http` | `cli-service` brings `metrics`, `memory`, `scaling`, `shutdown`, `governor` and `lifecycle`. Add `sink-stack` if the sender sits in the outbound control stack, and `worker-pool` or `worker-batch` if the service processes batches on the pool the runtime builds |
+| Light service (HTTP only) | `cli-service`, `http-server`, `transport-http` | `cli-service` brings `health`, `metrics`, `memory`, `scaling`, `shutdown`, `governor` and `lifecycle`. Add `sink-stack` if the sender sits in the outbound control stack, and `worker-pool` or `worker-batch` if the service processes batches on the pool the runtime builds |
 | Full data-plane service | `cli-service`, `config-reload`, `transport-kafka`, `transport-grpc`, `tiered-sink`, `dlq-kafka`, `spool`, `http-server`, `service-metrics`, `deployment`, `version-check`, `expression` | A receiver-style service: Kafka and gRPC transports, a tiered sink that spills to disk, a Kafka DLQ and an HTTP server. [integration.md](integration.md) walks through it |
 | Plus distributed tracing | add `transport-trace`, and `otel-tracing` where `metrics` is off | `otel-tracing`, which `metrics` and so `cli-service` pull, exports spans, and `transport-trace` propagates `traceparent` on the wire |
 
@@ -214,7 +214,7 @@ A handful of dependencies aren't visible from the feature name alone:
 
 Across the service stack:
 
-- `cli-service` reaches across the stack -- `metrics + memory + scaling + shutdown + governor + lifecycle`. It pulls no transport, so a control or admin service built on it compiles none, and `ServiceRuntime::outbound_sink_stack` needs `sink-stack` declared. It does not pull `worker-pool` either, so rayon is compiled only by a service that asks for `worker-pool` or `worker-batch`.
+- `cli-service` reaches across the stack -- `health + metrics + memory + scaling + shutdown + governor + lifecycle`. It pulls no transport, so a control or admin service built on it compiles none, and `ServiceRuntime::outbound_sink_stack` needs `sink-stack` declared. It does not pull `worker-pool` either, so rayon is compiled only by a service that asks for `worker-pool` or `worker-batch`.
 - `top` pulls `cli-service` (and through that, the full L2 runtime).
 - `expression` pulls the `cel` crate. A transport filter needs it for
   Tier 2 or Tier 3 CEL (see

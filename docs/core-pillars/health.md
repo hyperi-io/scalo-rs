@@ -46,7 +46,8 @@ in later.
 Readiness is the registry AND the callback set with
 `mgr.set_readiness_check`. No callback counts as ready, and without the
 `health` feature there is no registry half, so a bare `MetricsManager`
-answers 200. A service built by `run_app` answers 503 `starting`
+answers 200. `cli-service` pulls `health`, so every service built on it has
+both halves. A service built by `run_app` answers 503 `starting`
 until it hands control to the app, see
 [service-runtime.md](../runtime/service-runtime.md#readiness-check).
 
