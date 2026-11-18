@@ -407,6 +407,8 @@ impl BatchEngine {
             // Track which messages are included (not filtered).
             let mut parsed_msgs: Vec<Result<ParsedMessage, String>> =
                 Vec::with_capacity(chunk.len());
+            let mut filtered = 0_u64;
+            let mut parsed = 0_u64;
 
             for msg in chunk {
                 // Phase 1: Pre-route
@@ -414,7 +416,7 @@ impl BatchEngine {
                     match apply_filters(&msg.payload, &self.filters) {
                         PreRouteOutcome::Continue => {}
                         PreRouteOutcome::Filtered => {
-                            self.stats.incr_filtered();
+                            filtered += 1;
                             continue; // skip this message entirely
                         }
                         PreRouteOutcome::Dlq(reason) => {
@@ -435,6 +437,7 @@ impl BatchEngine {
 
                 match parse::parse_payload(&msg.payload, format) {
                     Ok(value) => {
+                        parsed += 1;
                         let extracted = self.interner.extract_known(&value);
                         // Rebuild a MessageMetadata for ParsedMessage. Commit
                         // tokens live on the WorkBatch, not on individual records.
@@ -466,6 +469,8 @@ impl BatchEngine {
                                 // Return all accumulated results + this error,
                                 // then stop processing the chunk.
                                 parsed_msgs.push(Err(format!("parse error (fail_batch): {e}")));
+                                self.stats.add_filtered(filtered);
+                                metrics::count_chunk(chunk.len(), Some(parsed), filtered);
                                 let results: Vec<Result<O, E>> = parsed_msgs
                                     .into_iter()
                                     .map(|r| match r {
@@ -482,6 +487,9 @@ impl BatchEngine {
                     }
                 }
             }
+
+            self.stats.add_filtered(filtered);
+            metrics::count_chunk(chunk.len(), Some(parsed), filtered);
 
             // Phase 3: Parallel transform via rayon.
             // Split into ok/err: transform only the Ok entries.
@@ -558,14 +566,13 @@ impl BatchEngine {
             self.stats.add_bytes_received(chunk_bytes);
 
             // Phase 1: Pre-route filter
+            let mut filtered = 0_u64;
             let to_process: Vec<&crate::transport::Record> = if has_filters {
                 let mut passed = Vec::with_capacity(chunk.len());
                 for msg in chunk {
                     match apply_filters(&msg.payload, &self.filters) {
                         PreRouteOutcome::Continue => passed.push(msg),
-                        PreRouteOutcome::Filtered => {
-                            self.stats.incr_filtered();
-                        }
+                        PreRouteOutcome::Filtered => filtered += 1,
                         PreRouteOutcome::Dlq(reason) => {
                             self.stats.incr_dlq();
                             self.stats.incr_errors();
@@ -577,6 +584,8 @@ impl BatchEngine {
             } else {
                 chunk.iter().collect()
             };
+            self.stats.add_filtered(filtered);
+            metrics::count_chunk(chunk.len(), None, filtered);
 
             // Phase 2: Parallel transform via process_batch
             let results = self.pool.process_batch(&to_process, |msg| transform(msg));

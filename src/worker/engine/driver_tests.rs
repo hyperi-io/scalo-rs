@@ -4243,12 +4243,76 @@ async fn acknowledgements_disabled_releases_at_receipt() {
     );
 }
 
+/// The engine's received, parsed and filtered counters move with the records
+/// it handles, and the raw path, which parses nothing, leaves parsed alone.
+#[cfg(feature = "metrics")]
+#[test]
+fn the_engine_counts_what_it_receives_parses_and_filters() {
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let engine = BatchEngine::new(BatchProcessingConfig {
+        max_chunk_size: 2,
+        pre_route_filters: vec![
+            crate::worker::engine::PreRouteFilterConfig::DropFieldMissing {
+                field: "_table".to_string(),
+            },
+        ],
+        ..Default::default()
+    });
+    let record = |payload: &'static str| Record {
+        payload: Bytes::from_static(payload.as_bytes()),
+        key: None,
+        headers: vec![],
+        metadata: RecordMeta {
+            timestamp_ms: None,
+            format: PayloadFormat::Json,
+        },
+    };
+    let records = [
+        record(r#"{"_table":"a"}"#),
+        record(r#"{"host":"web1"}"#),
+        record(r#"{"_table":"b"}"#),
+    ];
+    let count = |name: &str| capture.counter(name, &[]);
+
+    let _: Vec<Result<(), String>> = engine.process_mid_tier(&records, |_| Ok(()));
+    assert_eq!(
+        (
+            count("batch_engine_messages_received_total"),
+            count("batch_engine_messages_parsed_total"),
+            count("batch_engine_messages_filtered_total"),
+        ),
+        (3, 2, 1)
+    );
+    // Three records in chunks of two: one call per chunk, never one per record.
+    for name in [
+        "batch_engine_messages_received_total",
+        "batch_engine_messages_parsed_total",
+        "batch_engine_messages_filtered_total",
+    ] {
+        assert_eq!(capture.counter_calls(name), 2, "{name}");
+    }
+
+    let _: Vec<Result<(), String>> = engine.process_raw(&records, |_| Ok(()));
+    assert_eq!(
+        (
+            count("batch_engine_messages_received_total"),
+            count("batch_engine_messages_parsed_total"),
+            count("batch_engine_messages_filtered_total"),
+        ),
+        (6, 2, 2)
+    );
+    assert_eq!(engine.stats().snapshot().filtered, 2);
+}
+
 /// A gauge value captured by a local recorder, keyed by name and labels.
 #[cfg(feature = "metrics")]
 #[derive(Default)]
 struct GaugeCapture {
     gauges: std::sync::Mutex<std::collections::HashMap<metrics::Key, Arc<AtomicU64>>>,
     counters: std::sync::Mutex<std::collections::HashMap<metrics::Key, Arc<AtomicU64>>>,
+    /// How many times each counter name was reached by a `counter!` call.
+    counter_calls: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 #[cfg(feature = "metrics")]
@@ -4278,6 +4342,15 @@ impl GaugeCapture {
                 labels
             })
             .collect()
+    }
+
+    fn counter_calls(&self, name: &str) -> usize {
+        self.counter_calls
+            .lock()
+            .expect("capture lock")
+            .get(name)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
@@ -4323,6 +4396,12 @@ impl metrics::Recorder for GaugeCapture {
     }
 
     fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        *self
+            .counter_calls
+            .lock()
+            .expect("capture lock")
+            .entry(key.name().to_string())
+            .or_default() += 1;
         let cell = Arc::clone(
             self.counters
                 .lock()

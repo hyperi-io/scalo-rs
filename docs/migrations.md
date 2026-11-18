@@ -42,6 +42,18 @@ The `transport:kafka` health check is unhealthy from construction until a broker
 
 **Consumer adjustment** -- read `.result` from a `SinkOutcome` and write its `dead_letters` to the DLQ before committing. A `TieredSink` caller routes `DeadLetter` as it routes `SpoolFull`, and calls `with_dlq`. A caller of `send_batch` that took `FilteredDlq` as `Ok` screens the block with `dead_letter_reason` first, and on a block-level `FilteredDlq` resends its records one at a time, or holds the block. Neither commits it as delivered.
 
+### `when_full: drop_oldest` and `TieredSinkError::Cancelled` are gone (API CHANGE)
+
+`drop_oldest` behaved as `block` and was never wired, and nothing constructed `Cancelled`. A config that sets `when_full: drop_oldest` now fails to load, naming `block`, `dlq` and `drop_newest`.
+
+**Consumer adjustment** -- set `when_full: block` where the config said `drop_oldest`. A match on `TieredSinkError` drops its `Cancelled` arm.
+
+### The batch engine's manifest lists what it emits (BEHAVIOUR CHANGE)
+
+`batch_engine_messages_received_total`, `_parsed_total` and `_filtered_total` are now emitted, once per chunk. `batch_engine_max_chunk_size` is described. These six left the manifest because nothing emitted them: `batch_engine_parse_errors_total`, `batch_engine_parse_duration_seconds`, `batch_engine_transform_duration_seconds`, `batch_engine_chunk_size`, `batch_engine_pre_route_duration_seconds` and `batch_engine_intern_table_size`.
+
+**Consumer adjustment** -- a dashboard or manifest naming one of the six drops it.
+
 ## 2.14.31
 
 ### OpenTelemetry moves to the 0.33 line (API CHANGE)

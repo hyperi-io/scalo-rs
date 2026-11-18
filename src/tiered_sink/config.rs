@@ -396,9 +396,6 @@ impl DrainStrategy {
 /// never silently drop the drain). `DropNewest` is explicit opt-in loss, and
 /// each record it sheds counts in `tiered_sink_overflow_total{policy}` and
 /// `tiered_sink_dropped_total{policy}` so the loss is alertable.
-///
-/// `DropOldest` is not wired yet: it behaves as `Block`, logs a warning on
-/// every spool-full event, and counts in neither metric.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -414,9 +411,6 @@ pub enum WhenFull {
     /// Drop the incoming (newest) record. Explicit opt-in loss. Keeps the
     /// older, lower-latency records already spooled.
     DropNewest,
-    /// Meant to drop the oldest spooled record to make room for the newest.
-    /// Not wired yet: behaves as `Block`, with a warning.
-    DropOldest,
 }
 
 /// Ordering mode for message delivery during drain.
@@ -455,6 +449,30 @@ mod tests {
         ];
         for (quantity, want) in cases {
             assert_eq!(parse_quantity(quantity), want, "{quantity:?}");
+        }
+    }
+
+    /// Every `when_full` value parses, and one that does not exist fails the
+    /// load naming the values that do.
+    #[test]
+    fn when_full_refuses_a_policy_that_does_not_exist() {
+        let read = |policy: &str| {
+            serde_json::from_value::<TieredSinkConfig>(serde_json::json!({
+                "spool_path": "/var/spool/test",
+                "when_full": policy,
+            }))
+        };
+        for (policy, want) in [
+            ("block", WhenFull::Block),
+            ("dlq", WhenFull::Dlq),
+            ("drop_newest", WhenFull::DropNewest),
+        ] {
+            assert_eq!(read(policy).expect(policy).when_full, want);
+        }
+        let refused = read("drop_oldest").expect_err("drop_oldest is not a policy");
+        let message = refused.to_string();
+        for named in ["block", "dlq", "drop_newest"] {
+            assert!(message.contains(named), "{message}");
         }
     }
 
