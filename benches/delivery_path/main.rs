@@ -26,6 +26,10 @@
 //! host noise lands on every approach. Each cell prints one JSON line, and each
 //! load a table of medians with their spread. `--compare` exits 1 when an
 //! approach is slower than the saved file by more than `--max-regression`.
+//! `--warmup SECONDS` runs one discarded cell first, 20 s on tier 2 by
+//! default, so a broker that has just started is not measured cold.
+//! `--stop-file FILE` stops the run before the next cell once FILE exists, so
+//! a detached run can be ended without a signal.
 //! `--allocs` counts heap allocations on every thread while the callers run,
 //! which slows the run, so its timings are not for comparison.
 //!
@@ -139,61 +143,70 @@ async fn parent(mut args: Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Run every cell in a child process of this binary, interleaving approaches.
+/// Run every cell in a child process of this binary, interleaving approaches,
+/// after `--warmup` seconds of a cell whose result is discarded.
 async fn cells(args: &Args) -> Option<Vec<CellResult>> {
     let exe = std::env::current_exe().ok()?;
+    if args.warmup > 0.0
+        && let (Some(load), Some(approach)) = (args.loads.first(), args.approaches.first())
+    {
+        let mut warm = args.clone();
+        warm.seconds = args.warmup;
+        let line = warm.cell_command_line(approach, *load, 0);
+        let result = run_cell(&exe, line).await?;
+        println!(
+            "# warmup {approach} {} {} s: {:.0} rec/s, discarded",
+            load.id(),
+            args.warmup,
+            result.records_per_sec
+        );
+    }
     let mut results = Vec::new();
     for load in &args.loads {
         for run in 0..args.runs {
             for approach in &args.approaches {
+                if let Some(stop) = &args.stop_file
+                    && stop.exists()
+                {
+                    println!("# stopped: {} exists", stop.display());
+                    return Some(results);
+                }
                 let line = args.cell_command_line(approach, *load, run);
-                let child = tokio::task::spawn_blocking({
-                    let exe = exe.clone();
-                    move || {
-                        Command::new(exe)
-                            .args(line)
-                            .stdin(Stdio::null())
-                            .stderr(Stdio::inherit())
-                            .output()
-                    }
-                })
-                .await
-                .ok()?;
-                let output = match child {
-                    Ok(output) if output.status.success() => output,
-                    Ok(output) => {
-                        eprintln!(
-                            "delivery_path: cell {approach} {} run {run} exited {}",
-                            load.id(),
-                            output.status
-                        );
-                        return None;
-                    }
-                    Err(e) => {
-                        eprintln!("delivery_path: start cell: {e}");
-                        return None;
-                    }
-                };
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let Some(json) = stdout.lines().find(|l| l.starts_with('{')) else {
+                let Some(result) = run_cell(&exe, line).await else {
                     eprintln!(
-                        "delivery_path: cell {approach} {} printed no result",
+                        "delivery_path: cell {approach} {} run {run} failed",
                         load.id()
                     );
                     return None;
                 };
-                println!("{json}");
-                match serde_json::from_str::<CellResult>(json) {
-                    Ok(result) => results.push(result),
-                    Err(e) => {
-                        eprintln!("delivery_path: cell result: {e}");
-                        return None;
-                    }
-                }
+                println!("{}", result.json_line());
+                results.push(result);
             }
         }
     }
     Some(results)
+}
+
+/// Run one cell in a child process and read back its result.
+async fn run_cell(exe: &std::path::Path, line: Vec<String>) -> Option<CellResult> {
+    let exe = exe.to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(exe)
+            .args(line)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+    })
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        eprintln!("delivery_path: cell exited {}", output.status);
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = stdout.lines().find(|l| l.starts_with('{'))?;
+    serde_json::from_str::<CellResult>(json).ok()
 }
 
 #[cfg(all(feature = "testcontainers", feature = "transport-grpc", unix))]

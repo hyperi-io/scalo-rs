@@ -17,7 +17,8 @@ pub const USAGE: &str = "\
 usage: delivery_path [--approaches a,b] [--loads W1,W2] [--tier 1|2] [--seconds N]
                      [--runs N] [--workers N] [--seed N] [--allocs] [--save FILE]
                      [--compare FILE] [--max-regression F]
-                     [--cpus LIST] [--broker-cpus LIST] [--calibrate] [--order-check]";
+                     [--cpus LIST] [--broker-cpus LIST] [--stop-file FILE] [--warmup SECONDS]
+                     [--calibrate] [--order-check]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -49,6 +50,10 @@ pub struct Args {
     pub max_regression: f64,
     pub calibrate: bool,
     pub order_check: bool,
+    /// The runner stops before the next cell once this file exists.
+    pub stop_file: Option<PathBuf>,
+    /// Seconds of a discarded cell before the measured ones.
+    pub warmup: f64,
     /// CPUs the runner and its cells are pinned to, as `taskset -c` writes them.
     pub cpus: Option<String>,
     /// The tier 2 broker container's cpuset, as `docker update --cpuset-cpus` takes it.
@@ -75,6 +80,8 @@ impl Args {
             max_regression: 0.05,
             calibrate: false,
             order_check: false,
+            stop_file: None,
+            warmup: -1.0,
             cpus: None,
             broker_cpus: None,
             cell_run: None,
@@ -118,12 +125,20 @@ impl Args {
                 "--max-regression" => args.max_regression = number(&value()?)?,
                 "--calibrate" => args.calibrate = true,
                 "--order-check" => args.order_check = true,
+                "--warmup" => args.warmup = number(&value()?)?,
+                "--stop-file" => args.stop_file = Some(PathBuf::from(value()?)),
                 "--cpus" => args.cpus = Some(value()?),
                 "--broker-cpus" => args.broker_cpus = Some(value()?),
                 "--cell-run" => args.cell_run = Some(number(&value()?)?),
                 "--bootstrap" => args.bootstrap = Some(value()?),
                 other => return Err(format!("unknown argument {other}")),
             }
+        }
+        if args.warmup < 0.0 {
+            args.warmup = match args.tier {
+                Tier::One => 0.0,
+                Tier::Two => 20.0,
+            };
         }
         if args.runs < 2 {
             return Err("--runs is at least 2, so every approach has a same-code spread".into());
