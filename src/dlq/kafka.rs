@@ -363,7 +363,7 @@ impl KafkaDlqInner {
 /// It asks for TLS, which the production check accepts, because another test
 /// can hold `APP_ENV=production` while this one builds.
 #[cfg(test)]
-pub(super) fn unreachable_broker() -> KafkaConfig {
+pub(crate) fn unreachable_broker() -> KafkaConfig {
     let mut config = KafkaConfig {
         brokers: vec!["127.0.0.1:1".to_string()],
         group: String::new(),

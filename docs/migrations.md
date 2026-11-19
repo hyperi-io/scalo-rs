@@ -34,7 +34,7 @@ The `transport:kafka` health check is unhealthy from construction until a broker
 
 ### A refused Kafka client runs on, not ready, and rebuilds (BEHAVIOUR CHANGE)
 
-A bad CA, client certificate or SASL password no longer turns a Kafka send into `Fatal(Config)` or a receive into an error. Sends come back `Backpressured`, receives return empty batches, `healthcheck()` returns a non-fatal `Connection` error and readiness fails. The transport rebuilds its clients on a backoff, so fixing the CA file or password recovers without a restart. See [backends.md](transport/backends.md#refused-credentials).
+A bad CA, client certificate or SASL password no longer turns a Kafka send into `Fatal(Config)` or a receive into an error. Sends come back `Backpressured`, receives return empty batches, `healthcheck()` returns a non-fatal `Connection` error and readiness fails. The transport rebuilds its clients on a backoff and each rebuild re-reads the CA bundle and certificate files, so fixing a file, or fixing the broker side, recovers without a restart. The SASL password is read once at construction, so a client-side password change needs a restart. See [backends.md](transport/backends.md#refused-credentials).
 
 **Consumer adjustment** -- an app that exited on a `Fatal` send or a receive error to surface a bad setup now runs on: alert on `/readyz` or `transport_auth_refused_total` instead.
 

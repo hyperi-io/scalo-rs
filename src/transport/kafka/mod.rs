@@ -2154,13 +2154,12 @@ impl TransportSender for KafkaTransport {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
-        let Some(producer) = self.current_producer() else {
-            return SendResult::Fatal(receive_only());
-        };
-
         if let Some(settled) = self.outbound_disposition(&payload) {
             return settled;
         }
+        let Some(producer) = self.current_producer() else {
+            return SendResult::Fatal(receive_only());
+        };
 
         let headers = trace_headers();
         let record = produce_record(destination, &payload, headers.as_ref());

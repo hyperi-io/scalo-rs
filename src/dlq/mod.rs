@@ -77,6 +77,8 @@ pub use orchestrator::Dlq;
 // Kafka types (only with `dlq-kafka` feature)
 #[cfg(feature = "dlq-kafka")]
 pub use config::{DlqRouting, KafkaDlqConfig};
+#[cfg(all(test, feature = "dlq-kafka", feature = "tiered-sink"))]
+pub(crate) use kafka::unreachable_broker;
 
 // HTTP types (only with `dlq-http` feature)
 #[cfg(feature = "dlq-http")]

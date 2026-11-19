@@ -283,6 +283,14 @@ impl DeadLetters {
         self.dlq.read().clone()
     }
 
+    /// Whether writing `dead` would store it: a DLQ is set, enabled, and has a
+    /// backend that can hold it. [`write`](Self::write) drops it otherwise.
+    #[cfg(feature = "dlq")]
+    pub(crate) fn holds(&self, dead: &Undeliverable) -> bool {
+        self.dlq()
+            .is_some_and(|dlq| dlq.is_enabled() && dlq.refusal(&dlq_entry(&dlq, dead)).is_none())
+    }
+
     /// Write `dead` to the DLQ and wait up to `wait` for it to confirm, or
     /// drop and count them when there is no DLQ. `false` when the DLQ did not
     /// confirm, so the caller keeps the records.
@@ -313,17 +321,27 @@ impl DeadLetters {
     }
 }
 
+/// `dead` as `dlq` writes it, capped.
+#[cfg(feature = "dlq")]
+fn dlq_entry(dlq: &crate::dlq::Dlq, dead: &Undeliverable) -> crate::dlq::DlqEntry {
+    let entry = crate::dlq::DlqEntry::new(
+        DLQ_SERVICE,
+        dead.reason.clone(),
+        dead.record.payload.to_vec(),
+    );
+    dlq.cap(match &dead.record.key {
+        Some(key) => entry.with_destination(key.as_ref()),
+        None => entry,
+    })
+}
+
 /// The DLQ half of [`DeadLetters::write`].
 #[cfg(feature = "dlq")]
 async fn write_to(dlq: &crate::dlq::Dlq, dead: Vec<Undeliverable>, wait: Duration) -> bool {
     let mut labels = Vec::with_capacity(dead.len());
     let mut entries = Vec::with_capacity(dead.len());
     for d in dead {
-        let entry = crate::dlq::DlqEntry::new(DLQ_SERVICE, d.reason, d.record.payload.to_vec());
-        let entry = dlq.cap(match &d.record.key {
-            Some(key) => entry.with_destination(key.as_ref()),
-            None => entry,
-        });
+        let entry = dlq_entry(dlq, &d);
         if let Some(refused) = dlq.refusal(&entry) {
             count_dead_letter(d.label, "dropped");
             #[cfg(feature = "tracing")]
