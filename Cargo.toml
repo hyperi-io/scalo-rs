@@ -165,6 +165,8 @@ transport-kafka-config = ["transport"]
 transport-kafka = ["transport-kafka-config", "rdkafka", "regex", "tokio-util"]
 # Kafka fixtures for consumer test suites. Needs a Docker daemon at test time.
 transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
+# Shaped senders and delivery approaches for tests and benches: src/transport/test_support/mod.rs
+transport-test-support = ["transport", "memory", "tokio", "dep:futures-util"]
 transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util"]
 transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
@@ -316,6 +318,9 @@ aes-gcm = { version = ">=0.11.1, <0.12", optional = true }
 hkdf = { version = ">=0.13.0, <0.14", optional = true }
 sha2 = { version = ">=0.11.1, <0.12", optional = true }
 
+# FuturesUnordered for the per-record delivery approach. Already in the graph through tonic and tower.
+futures-util = { version = ">=0.3.34, <0.4", default-features = false, features = ["std"], optional = true }
+
 # Never below 1.11.1: RUSTSEC-2026-0007.
 bytes = { version = ">=1.12.1, <2", optional = true }
 
@@ -363,6 +368,8 @@ testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["kafka"] }
 reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["json", "rustls"] }
 # Same declaration as the optional `http-server` dependency, for the reason above.
 axum = ">=0.8.9, <0.9"
+# Mergeable latency quantiles for the delivery_path bench. Already in the graph through metrics-util.
+sketches-ddsketch = ">=0.3.2, <0.4"
 # Local refs only, so no HTTP resolver.
 jsonschema = { version = ">=0.61.0, <0.62", default-features = false }
 
@@ -439,6 +446,13 @@ required-features = ["rules"]
 name = "auth_hit"
 harness = false
 required-features = ["auth"]
+
+# Delivery approaches on shaped senders, and with `testcontainers` + `transport-grpc` on real ones.
+[[bench]]
+name = "delivery_path"
+path = "benches/delivery_path/main.rs"
+harness = false
+required-features = ["transport-test-support"]
 
 # Memory backpressure operational-test harness (not a product binary).
 # Driven under a cgroup --memory limit by scripts/operational-mem-test.sh.

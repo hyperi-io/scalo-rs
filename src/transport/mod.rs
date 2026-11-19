@@ -111,6 +111,9 @@ pub mod http;
 
 pub mod routed;
 
+#[cfg(feature = "transport-test-support")]
+pub mod test_support;
+
 // Re-exports -- traits and factory
 pub use ack::{
     AckControl, AckKind, AcknowledgementsConfig, AcknowledgingReceiver, DEAD_LETTER_REJECTED,
