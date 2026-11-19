@@ -12,7 +12,9 @@
 //! 1. No record is released as delivered before its destination confirms.
 //! 2. A held answer never says taken before every destination it was routed to
 //!    confirms.
-//! 3. A record not routed to a sick destination is not delayed or refused by it.
+//! 3. A held batch with a record for a sick destination is refused whole, and
+//!    another caller's batch that touches no sick destination is neither
+//!    refused nor delayed by it.
 //! 4. A cancelled request releases its memory lease.
 //! 5. A refused record maps to the right caller and the right record.
 //! 6. Kafka per-key order survives.
@@ -207,48 +209,11 @@ async fn per_record_futures_holds_its_answer_until_every_destination_confirms() 
     check_held_answer_waits_for_every_destination(PER_RECORD).await;
 }
 
-// 3. A record not routed to a sick destination is not delayed or refused by it.
+// 3. A sick destination refuses a held batch whole, and no other caller.
 
-async fn check_sick_destination_isolated_across_callers(name: &str) {
-    let well = ShapedSender::new("well", grpc(5));
-    let sick = ShapedSender::new(
-        "sick",
-        ShapedConfig {
-            faults: Faults {
-                extra_latency: Duration::from_secs(1),
-                ..Faults::default()
-            },
-            ..grpc(5)
-        },
-    );
-    let set = destinations(&[("sick", &sick), ("well", &well)]);
-    let to_sick = spawn(
-        named(name),
-        &set,
-        vec![record("s", &[DestinationId(0)])],
-        Answer::Held,
-    );
-    tokio::time::sleep(Duration::from_millis(1)).await;
-    let start = Instant::now();
-    let outcomes = named(name)
-        .deliver(
-            &set,
-            CallerBatch {
-                records: vec![record("w", &[DestinationId(1)])],
-                answer: Answer::Held,
-            },
-        )
-        .await;
-    assert_eq!(outcomes, [Outcome::Sent], "{name}");
-    assert!(
-        start.elapsed() <= Duration::from_millis(5),
-        "{name}: a caller of the well destination waited {:?}",
-        start.elapsed()
-    );
-    to_sick.abort();
-}
-
-async fn check_sick_destination_isolated_within_a_batch(name: &str) {
+/// A caller can only be told to send the whole request again, so a held batch
+/// with one record for a sick destination is refused whole.
+async fn check_held_batch_refused_whole(name: &str) {
     let well = ShapedSender::new("well", grpc(5));
     let sick = ShapedSender::new("sick", down());
     let set = destinations(&[("sick", &sick), ("well", &well)]);
@@ -260,36 +225,81 @@ async fn check_sick_destination_isolated_within_a_batch(name: &str) {
                     record("s", &[DestinationId(0)]),
                     record("w", &[DestinationId(1)]),
                 ],
-                answer: Answer::PerRecord,
+                answer: Answer::Held,
             },
         )
         .await;
-    assert_eq!(
-        outcomes[1],
-        Outcome::Sent,
-        "{name}: the record for the well destination was refused: {outcomes:?}"
+    assert!(
+        outcomes.iter().all(|o| o.is_undelivered()),
+        "{name}: a held batch with a record for a down destination answered {outcomes:?}"
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn inline_sequential_does_not_delay_another_callers_records_for_a_sick_destination() {
-    check_sick_destination_isolated_across_callers(INLINE).await;
+/// Another caller's batch that touches no sick destination is answered in its
+/// own time, whether the sick one is slow or down.
+async fn check_other_caller_untouched(name: &str) {
+    let slow = ShapedConfig {
+        faults: Faults {
+            extra_latency: Duration::from_secs(1),
+            ..Faults::default()
+        },
+        ..grpc(5)
+    };
+    for (label, sick_config) in [("slow", slow), ("down", down())] {
+        let well = ShapedSender::new("well", grpc(5));
+        let sick = ShapedSender::new("sick", sick_config);
+        let set = destinations(&[("sick", &sick), ("well", &well)]);
+        let to_sick = spawn(
+            named(name),
+            &set,
+            vec![
+                record("s", &[DestinationId(0)]),
+                record("sw", &[DestinationId(0), DestinationId(1)]),
+            ],
+            Answer::Held,
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let start = Instant::now();
+        let outcomes = named(name)
+            .deliver(
+                &set,
+                CallerBatch {
+                    records: vec![
+                        record("w1", &[DestinationId(1)]),
+                        record("w2", &[DestinationId(1)]),
+                    ],
+                    answer: Answer::Held,
+                },
+            )
+            .await;
+        assert_eq!(outcomes, [Outcome::Sent; 2], "{name}, sick {label}");
+        assert!(
+            start.elapsed() <= Duration::from_millis(5),
+            "{name}, sick {label}: the other caller waited {:?}",
+            start.elapsed()
+        );
+        to_sick.abort();
+    }
 }
 
 #[tokio::test(start_paused = true)]
-async fn per_record_futures_does_not_delay_another_callers_records_for_a_sick_destination() {
-    check_sick_destination_isolated_across_callers(PER_RECORD).await;
+async fn inline_sequential_refuses_a_held_batch_with_a_sick_destination_whole() {
+    check_held_batch_refused_whole(INLINE).await;
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "inline_sequential stops at the first destination that fails, so a record in the same batch routed only to a later destination gets the sick destination's outcome"]
-async fn inline_sequential_does_not_refuse_a_batch_record_for_a_sick_destination() {
-    check_sick_destination_isolated_within_a_batch(INLINE).await;
+async fn per_record_futures_refuses_a_held_batch_with_a_sick_destination_whole() {
+    check_held_batch_refused_whole(PER_RECORD).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn per_record_futures_does_not_refuse_a_batch_record_for_a_sick_destination() {
-    check_sick_destination_isolated_within_a_batch(PER_RECORD).await;
+async fn inline_sequential_leaves_another_callers_batch_untouched_by_a_sick_destination() {
+    check_other_caller_untouched(INLINE).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_record_futures_leaves_another_callers_batch_untouched_by_a_sick_destination() {
+    check_other_caller_untouched(PER_RECORD).await;
 }
 
 // 4. A cancelled request releases its memory lease.
@@ -439,7 +449,7 @@ async fn inline_sequential_keeps_kafka_order() {
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "per_record_futures offers every record on its own, so a later record that fits the queue goes ahead of an earlier one that did not, and the resend lands after it"]
+#[ignore = "per_record_futures offers every record on its own, so a later record that fits the producer queue goes ahead of an earlier one that did not. The real Kafka sender reorders the same way: delivery_path --tier 2 --order-check"]
 async fn per_record_futures_keeps_kafka_order() {
     check_kafka_order(PER_RECORD).await;
 }

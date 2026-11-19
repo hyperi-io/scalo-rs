@@ -22,10 +22,22 @@ pub const GRPC_A: &str = "grpc-a";
 pub const GRPC_B: &str = "grpc-b";
 
 /// The wire key every record carries.
-const TOPIC: &str = "bench-events";
+pub const TOPIC: &str = "bench-events";
 
 /// First payload byte of a record the refusing destination dead-letters.
 const REFUSED_MARK: u8 = b'!';
+
+/// Size of W7's refused record: over [`REFUSING_LIMIT`], so the real gRPC
+/// sender dead-letters it for size.
+pub const REFUSED_BYTES: usize = 1_258_291;
+
+/// `max_message_size` of the refusing gRPC destination on tier 2: above a
+/// 999-record bulk batch, below [`REFUSED_BYTES`].
+#[cfg_attr(
+    not(all(feature = "testcontainers", feature = "transport-grpc", unix)),
+    allow(dead_code)
+)]
+pub const REFUSING_LIMIT: usize = 1_153_434;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Load {
@@ -72,18 +84,9 @@ impl Load {
             Self::W3 => "W1 and W2 together",
             Self::W4 => "W3 with grpc-b 100 ms slow",
             Self::W5 => "W3 with grpc-b down",
-            Self::W6 => "W3 with kafka confirmations stalling 500 ms every 2 s",
-            Self::W7 => "W2 with one record per batch refused by grpc-a",
+            Self::W6 => "W3 with the kafka queue filling in bursts",
+            Self::W7 => "W2 with one 1.2 MiB record per batch refused by grpc-a",
         }
-    }
-
-    /// Whether the load injects a fault, which only tier 1 can.
-    #[cfg_attr(
-        not(all(feature = "testcontainers", feature = "transport-grpc", unix)),
-        allow(dead_code)
-    )]
-    pub fn has_fault(self) -> bool {
-        matches!(self, Self::W4 | Self::W5 | Self::W6 | Self::W7)
     }
 
     /// The destination a fault makes sick, whose isolation is measured.
@@ -201,7 +204,11 @@ fn group<S: TransportSender>(
             (0..records)
                 .map(|i| RoutedRecord {
                     record: Record {
-                        payload: payload(size, caller, i, i < refused_per_batch),
+                        payload: if i < refused_per_batch {
+                            payload(REFUSED_BYTES, caller, i, true)
+                        } else {
+                            payload(size, caller, i, false)
+                        },
                         key: Some(Arc::clone(&topic)),
                         headers: Vec::new(),
                         metadata: RecordMeta {

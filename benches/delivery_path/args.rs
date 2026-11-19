@@ -15,8 +15,9 @@ use crate::loads::Load;
 
 pub const USAGE: &str = "\
 usage: delivery_path [--approaches a,b] [--loads W1,W2] [--tier 1|2] [--seconds N]
-                     [--runs N] [--seed N] [--save FILE]
-                     [--compare FILE] [--max-regression F] [--calibrate]";
+                     [--runs N] [--workers N] [--seed N] [--allocs] [--save FILE]
+                     [--compare FILE] [--max-regression F]
+                     [--calibrate] [--order-check]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -33,18 +34,25 @@ impl Tier {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Args {
     pub approaches: Vec<String>,
     pub loads: Vec<Load>,
     pub tier: Tier,
     pub seconds: f64,
     pub runs: usize,
+    pub workers: usize,
     pub seed: u64,
+    pub allocs: bool,
     pub save: Option<PathBuf>,
     pub compare: Option<PathBuf>,
     pub max_regression: f64,
     pub calibrate: bool,
+    pub order_check: bool,
+    /// Set in a child process: run this one cell and print its JSON line.
+    pub cell_run: Option<usize>,
+    /// Set in a tier 2 child: the broker the parent started.
+    pub bootstrap: Option<String>,
 }
 
 impl Args {
@@ -54,12 +62,17 @@ impl Args {
             loads: Load::ALL.to_vec(),
             tier: Tier::One,
             seconds: 5.0,
-            runs: 2,
+            runs: 5,
+            workers: 8,
             seed: 1,
+            allocs: false,
             save: None,
             compare: None,
             max_regression: 0.05,
             calibrate: false,
+            order_check: false,
+            cell_run: None,
+            bootstrap: None,
         };
         let mut words = command_line.peekable();
         while let Some(flag) = words.next() {
@@ -91,16 +104,24 @@ impl Args {
                 }
                 "--seconds" => args.seconds = number(&value()?)?,
                 "--runs" => args.runs = number(&value()?)?,
+                "--workers" => args.workers = number(&value()?)?,
                 "--seed" => args.seed = number(&value()?)?,
+                "--allocs" => args.allocs = true,
                 "--save" => args.save = Some(PathBuf::from(value()?)),
                 "--compare" => args.compare = Some(PathBuf::from(value()?)),
                 "--max-regression" => args.max_regression = number(&value()?)?,
                 "--calibrate" => args.calibrate = true,
+                "--order-check" => args.order_check = true,
+                "--cell-run" => args.cell_run = Some(number(&value()?)?),
+                "--bootstrap" => args.bootstrap = Some(value()?),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
         if args.runs < 2 {
             return Err("--runs is at least 2, so every approach has a same-code spread".into());
+        }
+        if args.workers == 0 {
+            return Err("--workers is at least 1".into());
         }
         if !(args.seconds > 0.0 && args.seconds.is_finite()) {
             return Err("--seconds must be positive".into());
@@ -110,6 +131,34 @@ impl Args {
 
     pub fn duration(&self) -> Duration {
         Duration::from_secs_f64(self.seconds)
+    }
+
+    /// The command line of a child that runs one cell of this invocation.
+    pub fn cell_command_line(&self, approach: &str, load: Load, run: usize) -> Vec<String> {
+        let mut line = vec![
+            "--approaches".to_string(),
+            approach.to_string(),
+            "--loads".to_string(),
+            load.id().to_string(),
+            "--tier".to_string(),
+            self.tier.number().to_string(),
+            "--seconds".to_string(),
+            self.seconds.to_string(),
+            "--workers".to_string(),
+            self.workers.to_string(),
+            "--seed".to_string(),
+            self.seed.to_string(),
+            "--cell-run".to_string(),
+            run.to_string(),
+        ];
+        if self.allocs {
+            line.push("--allocs".to_string());
+        }
+        if let Some(bootstrap) = &self.bootstrap {
+            line.push("--bootstrap".to_string());
+            line.push(bootstrap.clone());
+        }
+        line
     }
 }
 

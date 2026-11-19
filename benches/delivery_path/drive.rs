@@ -17,8 +17,8 @@ use scalo::transport::test_support::delivery::{
     AnyApproach, CallerBatch, DeliveryApproach, Destinations, Outcome,
 };
 
-use crate::host;
 use crate::loads::Group;
+use crate::{alloc, host};
 
 /// Slack past the deadline for the last round of every caller to answer.
 const DRAIN_BOUND: Duration = Duration::from_secs(60);
@@ -64,8 +64,9 @@ pub struct RawRun {
     pub elapsed: Duration,
     pub groups: Vec<GroupTally>,
     pub peak_held_bytes: u64,
-    pub peak_rss_bytes: Option<u64>,
     pub cpu_ns: Option<u64>,
+    /// (allocations, bytes) while the callers ran, with `--allocs`.
+    pub allocs: Option<(u64, u64)>,
 }
 
 /// Run every group's callers against `approach` for `duration`, then wait for
@@ -75,10 +76,13 @@ pub async fn run<S: TransportSender + 'static>(
     destinations: &Arc<Destinations<S>>,
     groups: &[Group],
     duration: Duration,
+    count_allocs: bool,
 ) -> Option<RawRun> {
     destinations.ledger().reset_peak();
-    host::reset_peak_rss();
     let cpu_start = host::cpu_ns();
+    if count_allocs {
+        alloc::start();
+    }
     let start = Instant::now();
     let deadline = start + duration;
 
@@ -108,6 +112,7 @@ pub async fn run<S: TransportSender + 'static>(
         Ok(())
     })
     .await;
+    let allocs = count_allocs.then(alloc::stop);
     match drain {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -130,8 +135,8 @@ pub async fn run<S: TransportSender + 'static>(
         elapsed,
         groups: tallies,
         peak_held_bytes: destinations.ledger().peak_bytes(),
-        peak_rss_bytes: host::peak_rss_bytes(),
         cpu_ns,
+        allocs,
     })
 }
 

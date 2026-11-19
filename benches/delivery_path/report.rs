@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      benches/delivery_path/report.rs
-// Purpose:   Per-run JSON lines, per-load tables, and the saved-baseline gate
+// Purpose:   Per-cell JSON lines, per-load tables, and the saved-baseline gate
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -9,6 +9,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sketches_ddsketch::{Config, DDSketch};
 
@@ -19,23 +20,30 @@ use crate::args::Args;
 use crate::drive::RawRun;
 use crate::loads::{Group, Load};
 
-/// One group's figures in one run.
+/// One group's figures in one cell.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GroupResult {
-    pub label: &'static str,
+    pub group: String,
     pub touches_sick: bool,
     pub batches: u64,
     pub p50_us: f64,
     pub p99_us: f64,
     pub p999_us: f64,
-    pub records: [u64; 4],
+    pub sent: u64,
+    pub dead_lettered: u64,
+    pub backpressured: u64,
+    pub failed: u64,
 }
 
-/// One (approach, load, run).
-pub struct RunResult {
-    pub approach: &'static str,
-    pub load: Load,
+/// One (approach, load, run), measured in a process of its own.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CellResult {
+    pub approach: String,
+    pub load: String,
     pub run: usize,
     pub tier: u8,
+    pub workers: usize,
+    pub presets_calibrated: bool,
     pub elapsed_s: f64,
     pub records_sent: u64,
     pub records_per_sec: f64,
@@ -44,16 +52,27 @@ pub struct RunResult {
     pub p999_us: f64,
     /// p99 of the callers whose records do not touch the sick destination.
     pub isolated_p99_us: Option<f64>,
-    pub groups: Vec<GroupResult>,
     pub peak_held_bytes: u64,
+    /// The cell process's `VmHWM`.
     pub peak_rss_bytes: Option<u64>,
+    /// The cell process's user plus system CPU while its callers ran.
     pub cpu_us_per_record: Option<f64>,
+    pub allocs_per_record: Option<f64>,
+    pub alloc_bytes_per_record: Option<f64>,
     /// Confirmations at the destinations beyond what the callers were told
     /// was delivered: copies a caller's retry would send again.
     pub excess_deliveries: Option<i64>,
+    pub groups: Vec<GroupResult>,
 }
 
-impl RunResult {
+fn per_record(total: Option<u64>, records: u64) -> Option<f64> {
+    total
+        .filter(|_| records > 0)
+        .map(|t| t as f64 / records as f64)
+}
+
+impl CellResult {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         args: &Args,
         load: Load,
@@ -62,6 +81,7 @@ impl RunResult {
         groups: &[Group],
         raw: &RawRun,
         confirmed: Option<u64>,
+        peak_rss_bytes: Option<u64>,
     ) -> Self {
         let sick = load.sick();
         let mut all = DDSketch::new(Config::defaults());
@@ -78,83 +98,50 @@ impl RunResult {
             expected += tally.count(Outcome::Sent) * routes
                 + tally.count(Outcome::DeadLettered) * routes.saturating_sub(1);
             results.push(GroupResult {
-                label: group.label,
+                group: group.label.to_string(),
                 touches_sick,
                 batches: tally.batches,
-                p50_us: tally.quantile_us(0.50).unwrap_or(0.0),
-                p99_us: tally.quantile_us(0.99).unwrap_or(0.0),
-                p999_us: tally.quantile_us(0.999).unwrap_or(0.0),
-                records: tally.records,
+                p50_us: round(tally.quantile_us(0.50).unwrap_or(0.0)),
+                p99_us: round(tally.quantile_us(0.99).unwrap_or(0.0)),
+                p999_us: round(tally.quantile_us(0.999).unwrap_or(0.0)),
+                sent: tally.count(Outcome::Sent),
+                dead_lettered: tally.count(Outcome::DeadLettered),
+                backpressured: tally.count(Outcome::Backpressured),
+                failed: tally.count(Outcome::Failed),
             });
         }
         let records_sent: u64 = raw.groups.iter().map(|g| g.count(Outcome::Sent)).sum();
         let elapsed_s = raw.elapsed.as_secs_f64();
-        let quantile = |s: &DDSketch, q| s.quantile(q).ok().flatten().unwrap_or(0.0);
+        let quantile = |s: &DDSketch, q| round(s.quantile(q).ok().flatten().unwrap_or(0.0));
         Self {
-            approach: approach.name(),
-            load,
+            approach: approach.name().to_string(),
+            load: load.id().to_string(),
             run,
             tier: args.tier.number(),
-            elapsed_s,
+            workers: args.workers,
+            presets_calibrated: PRESETS_CALIBRATED,
+            elapsed_s: round(elapsed_s),
             records_sent,
-            records_per_sec: records_sent as f64 / elapsed_s.max(f64::EPSILON),
+            records_per_sec: round(records_sent as f64 / elapsed_s.max(f64::EPSILON)),
             p50_us: quantile(&all, 0.50),
             p99_us: quantile(&all, 0.99),
             p999_us: quantile(&all, 0.999),
             isolated_p99_us: (sick.is_some() && isolated.count() > 0)
                 .then(|| quantile(&isolated, 0.99)),
-            groups: results,
             peak_held_bytes: raw.peak_held_bytes,
-            peak_rss_bytes: raw.peak_rss_bytes,
-            cpu_us_per_record: raw
-                .cpu_ns
-                .filter(|_| records_sent > 0)
-                .map(|ns| ns as f64 / 1000.0 / records_sent as f64),
+            peak_rss_bytes,
+            cpu_us_per_record: per_record(raw.cpu_ns, records_sent).map(|ns| round(ns / 1000.0)),
+            allocs_per_record: per_record(raw.allocs.map(|a| a.0), records_sent).map(round),
+            alloc_bytes_per_record: per_record(raw.allocs.map(|a| a.1), records_sent).map(round),
             excess_deliveries: confirmed.map(|c| {
                 i64::try_from(c).unwrap_or(i64::MAX) - i64::try_from(expected).unwrap_or(i64::MAX)
             }),
+            groups: results,
         }
     }
 
     pub fn json_line(&self) -> String {
-        let groups: Vec<Value> = self
-            .groups
-            .iter()
-            .map(|g| {
-                json!({
-                    "group": g.label,
-                    "touches_sick": g.touches_sick,
-                    "batches": g.batches,
-                    "p50_us": round(g.p50_us),
-                    "p99_us": round(g.p99_us),
-                    "p999_us": round(g.p999_us),
-                    "sent": g.records[Outcome::Sent as usize],
-                    "dead_lettered": g.records[Outcome::DeadLettered as usize],
-                    "backpressured": g.records[Outcome::Backpressured as usize],
-                    "failed": g.records[Outcome::Failed as usize],
-                })
-            })
-            .collect();
-        json!({
-            "approach": self.approach,
-            "load": self.load.id(),
-            "run": self.run,
-            "tier": self.tier,
-            "presets_calibrated": PRESETS_CALIBRATED,
-            "elapsed_s": round(self.elapsed_s),
-            "records_sent": self.records_sent,
-            "records_per_sec": round(self.records_per_sec),
-            "p50_us": round(self.p50_us),
-            "p99_us": round(self.p99_us),
-            "p999_us": round(self.p999_us),
-            "isolated_p99_us": self.isolated_p99_us.map(round),
-            "peak_held_bytes": self.peak_held_bytes,
-            "peak_rss_bytes": self.peak_rss_bytes,
-            "cpu_us_per_record": self.cpu_us_per_record.map(round),
-            "excess_deliveries": self.excess_deliveries,
-            "groups": groups,
-        })
-        .to_string()
+        serde_json::to_string(self).unwrap_or_default()
     }
 }
 
@@ -162,21 +149,27 @@ fn round(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
-/// Medians of one approach's runs under one load.
-struct Summary {
-    approach: &'static str,
-    runs: usize,
-    records_per_sec: f64,
-    p50_us: f64,
-    p99_us: f64,
-    p999_us: f64,
-    isolated_p99_us: Option<f64>,
-    peak_held_bytes: f64,
-    peak_rss_bytes: Option<f64>,
-    cpu_us_per_record: Option<f64>,
-    excess_deliveries: Option<f64>,
-    spread_records_per_sec: f64,
-    spread_p99: f64,
+/// Median and spread of one metric over an approach's runs under one load.
+#[derive(Clone, Copy)]
+struct Stat {
+    median: f64,
+    /// (max - min) / median: how far the same code moved between its runs.
+    spread: f64,
+}
+
+impl Stat {
+    fn of(values: &[f64]) -> Option<Self> {
+        if values.is_empty() {
+            return None;
+        }
+        let mid = median(values.to_vec());
+        let max = values.iter().copied().fold(f64::MIN, f64::max);
+        let min = values.iter().copied().fold(f64::MAX, f64::min);
+        Some(Self {
+            median: mid,
+            spread: if mid == 0.0 { 0.0 } else { (max - min) / mid },
+        })
+    }
 }
 
 fn median(mut values: Vec<f64>) -> f64 {
@@ -192,71 +185,90 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
 }
 
-/// (max - min) / median: how far the same code moved between its runs.
-fn spread(values: &[f64]) -> f64 {
-    let max = values.iter().copied().fold(f64::MIN, f64::max);
-    let min = values.iter().copied().fold(f64::MAX, f64::min);
-    let mid = median(values.to_vec());
-    if mid == 0.0 { 0.0 } else { (max - min) / mid }
+struct Summary {
+    approach: String,
+    runs: usize,
+    records_per_sec: Stat,
+    p50_us: Stat,
+    p99_us: Stat,
+    p999_us: Stat,
+    isolated_p99_us: Option<Stat>,
+    peak_held_bytes: Stat,
+    peak_rss_bytes: Option<Stat>,
+    cpu_us_per_record: Option<Stat>,
+    allocs_per_record: Option<Stat>,
+    alloc_bytes_per_record: Option<Stat>,
+    excess_deliveries: Option<Stat>,
 }
 
-fn summarise(approach: &'static str, runs: &[&RunResult]) -> Summary {
-    let pick = |f: &dyn Fn(&RunResult) -> f64| median(runs.iter().map(|r| f(r)).collect());
-    let pick_opt = |f: &dyn Fn(&RunResult) -> Option<f64>| {
-        let values: Vec<f64> = runs.iter().filter_map(|r| f(r)).collect();
-        (!values.is_empty()).then(|| median(values))
+fn summarise(runs: &[&CellResult]) -> Option<Summary> {
+    let first = runs.first()?;
+    let stat =
+        |f: &dyn Fn(&CellResult) -> f64| Stat::of(&runs.iter().map(|r| f(r)).collect::<Vec<f64>>());
+    let stat_opt = |f: &dyn Fn(&CellResult) -> Option<f64>| {
+        Stat::of(&runs.iter().filter_map(|r| f(r)).collect::<Vec<f64>>())
     };
-    let rps: Vec<f64> = runs.iter().map(|r| r.records_per_sec).collect();
-    let p99: Vec<f64> = runs.iter().map(|r| r.p99_us).collect();
-    Summary {
-        approach,
+    Some(Summary {
+        approach: first.approach.clone(),
         runs: runs.len(),
-        records_per_sec: pick(&|r| r.records_per_sec),
-        p50_us: pick(&|r| r.p50_us),
-        p99_us: pick(&|r| r.p99_us),
-        p999_us: pick(&|r| r.p999_us),
-        isolated_p99_us: pick_opt(&|r| r.isolated_p99_us),
-        peak_held_bytes: pick(&|r| r.peak_held_bytes as f64),
-        peak_rss_bytes: pick_opt(&|r| r.peak_rss_bytes.map(|b| b as f64)),
-        cpu_us_per_record: pick_opt(&|r| r.cpu_us_per_record),
-        excess_deliveries: pick_opt(&|r| r.excess_deliveries.map(|e| e as f64)),
-        spread_records_per_sec: spread(&rps),
-        spread_p99: spread(&p99),
-    }
+        records_per_sec: stat(&|r| r.records_per_sec)?,
+        p50_us: stat(&|r| r.p50_us)?,
+        p99_us: stat(&|r| r.p99_us)?,
+        p999_us: stat(&|r| r.p999_us)?,
+        isolated_p99_us: stat_opt(&|r| r.isolated_p99_us),
+        peak_held_bytes: stat(&|r| r.peak_held_bytes as f64)?,
+        peak_rss_bytes: stat_opt(&|r| r.peak_rss_bytes.map(|b| b as f64)),
+        cpu_us_per_record: stat_opt(&|r| r.cpu_us_per_record),
+        allocs_per_record: stat_opt(&|r| r.allocs_per_record),
+        alloc_bytes_per_record: stat_opt(&|r| r.alloc_bytes_per_record),
+        excess_deliveries: stat_opt(&|r| r.excess_deliveries.map(|e| e as f64)),
+    })
 }
 
-fn summaries(args: &Args, results: &[RunResult], load: Load) -> Vec<Summary> {
-    let mut out = Vec::new();
-    for name in &args.approaches {
-        let runs: Vec<&RunResult> = results
-            .iter()
-            .filter(|r| r.load == load && r.approach == name.as_str())
-            .collect();
-        if let Some(first) = runs.first() {
-            out.push(summarise(first.approach, &runs));
-        }
-    }
-    out
+fn summaries(args: &Args, results: &[CellResult], load: Load) -> Vec<Summary> {
+    args.approaches
+        .iter()
+        .filter_map(|name| {
+            let runs: Vec<&CellResult> = results
+                .iter()
+                .filter(|r| r.load == load.id() && &r.approach == name)
+                .collect();
+            summarise(&runs)
+        })
+        .collect()
 }
 
-fn percent(value: f64, base: f64) -> String {
-    if base == 0.0 {
-        "-".to_string()
+/// The difference from the first approach, marked `ns` when it is smaller than
+/// either side's spread and so decides nothing.
+fn versus(value: Stat, base: Stat) -> String {
+    if base.median == 0.0 {
+        return "-".to_string();
+    }
+    let change = (value.median - base.median) / base.median;
+    let noise = value.spread.max(base.spread);
+    if change.abs() <= noise {
+        format!("{:+.1}% ns", change * 100.0)
     } else {
-        format!("{:+.1}%", (value - base) / base * 100.0)
+        format!("{:+.1}%", change * 100.0)
     }
 }
 
-fn ms(us: f64) -> String {
-    format!("{:.2}", us / 1000.0)
+fn cell(stat: Option<Stat>, scale: f64, precision: usize) -> String {
+    stat.map_or_else(
+        || "-".to_string(),
+        |s| {
+            format!(
+                "{:.precision$} ({:.0}%)",
+                s.median / scale,
+                s.spread * 100.0
+            )
+        },
+    )
 }
 
-fn mib(bytes: f64) -> String {
-    format!("{:.1}", bytes / (1024.0 * 1024.0))
-}
-
-/// One table per load, a row per approach, medians over its runs.
-pub fn tables(args: &Args, results: &[RunResult]) {
+/// One table per load, a row per approach: medians over its runs, each with
+/// its spread in brackets.
+pub fn tables(args: &Args, results: &[CellResult]) {
     for load in &args.loads {
         let rows = summaries(args, results, *load);
         let Some(base) = rows.first() else {
@@ -266,7 +278,7 @@ pub fn tables(args: &Args, results: &[RunResult]) {
         let _ = writeln!(out, "\n## {} -- {}", load.id(), load.describe());
         let _ = writeln!(
             out,
-            "| approach | runs | rec/s | vs first | p50 ms | p99 ms | p999 ms | p99 vs first | iso p99 ms | held MiB | rss MiB | cpu us/rec | excess | spread rec/s | spread p99 |"
+            "| approach | runs | rec/s | vs first | p50 ms | p99 ms | p99 vs first | p999 ms | iso p99 ms | held MiB | rss MiB | cpu us/rec | allocs/rec | alloc B/rec | excess |"
         );
         let _ = writeln!(
             out,
@@ -275,47 +287,49 @@ pub fn tables(args: &Args, results: &[RunResult]) {
         for row in &rows {
             let _ = writeln!(
                 out,
-                "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1}% | {:.1}% |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 row.approach,
                 row.runs,
-                row.records_per_sec,
-                percent(row.records_per_sec, base.records_per_sec),
-                ms(row.p50_us),
-                ms(row.p99_us),
-                ms(row.p999_us),
-                percent(row.p99_us, base.p99_us),
-                row.isolated_p99_us.map_or_else(|| "-".to_string(), ms),
-                mib(row.peak_held_bytes),
-                row.peak_rss_bytes.map_or_else(|| "-".to_string(), mib),
-                row.cpu_us_per_record
-                    .map_or_else(|| "-".to_string(), |c| format!("{c:.2}")),
-                row.excess_deliveries
-                    .map_or_else(|| "-".to_string(), |e| format!("{e:.0}")),
-                row.spread_records_per_sec * 100.0,
-                row.spread_p99 * 100.0,
+                cell(Some(row.records_per_sec), 1.0, 0),
+                versus(row.records_per_sec, base.records_per_sec),
+                cell(Some(row.p50_us), 1000.0, 2),
+                cell(Some(row.p99_us), 1000.0, 2),
+                versus(row.p99_us, base.p99_us),
+                cell(Some(row.p999_us), 1000.0, 2),
+                cell(row.isolated_p99_us, 1000.0, 2),
+                cell(Some(row.peak_held_bytes), 1_048_576.0, 1),
+                cell(row.peak_rss_bytes, 1_048_576.0, 1),
+                cell(row.cpu_us_per_record, 1.0, 2),
+                cell(row.allocs_per_record, 1.0, 2),
+                cell(row.alloc_bytes_per_record, 1.0, 0),
+                cell(row.excess_deliveries, 1.0, 0),
             );
         }
         print!("{out}");
     }
+    println!(
+        "\nEach cell is the median over runs, (spread) is (max - min) / median, and ns marks a difference within the spread."
+    );
 }
 
 /// Write each (approach, load) median to `path` for a later `--compare`.
-pub fn save(path: &Path, args: &Args, results: &[RunResult]) -> std::io::Result<()> {
+pub fn save(path: &Path, args: &Args, results: &[CellResult]) -> std::io::Result<()> {
     let mut rows = Vec::new();
     for load in &args.loads {
         for s in summaries(args, results, *load) {
             rows.push(json!({
                 "approach": s.approach,
                 "load": load.id(),
-                "records_per_sec": s.records_per_sec,
-                "p99_us": s.p99_us,
-                "spread_records_per_sec": s.spread_records_per_sec,
-                "spread_p99": s.spread_p99,
+                "records_per_sec": s.records_per_sec.median,
+                "p99_us": s.p99_us.median,
+                "spread_records_per_sec": s.records_per_sec.spread,
+                "spread_p99": s.p99_us.spread,
             }));
         }
     }
     let saved = json!({
         "tier": args.tier.number(),
+        "workers": args.workers,
         "presets_calibrated": PRESETS_CALIBRATED,
         "results": rows,
     });
@@ -324,53 +338,45 @@ pub fn save(path: &Path, args: &Args, results: &[RunResult]) -> std::io::Result<
 
 /// Compare medians with a saved file. False when any (approach, load) lost more
 /// than `max` of its records per second or grew its p99 by more than `max`.
-pub fn compare(path: &Path, results: &[RunResult], max: f64) -> Result<bool, String> {
+pub fn compare(path: &Path, args: &Args, results: &[CellResult]) -> Result<bool, String> {
+    let max = args.max_regression;
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let saved: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let rows = saved["results"]
         .as_array()
         .ok_or("no results array in the saved file")?;
-    let mut loads: Vec<Load> = results.iter().map(|r| r.load).collect();
-    loads.sort();
-    loads.dedup();
     let mut passed = true;
-    for load in loads {
-        let mut names: Vec<&'static str> = Vec::new();
-        for result in results.iter().filter(|r| r.load == load) {
-            if !names.contains(&result.approach) {
-                names.push(result.approach);
-            }
-        }
-        for name in names {
-            let runs: Vec<&RunResult> = results
-                .iter()
-                .filter(|r| r.load == load && r.approach == name)
-                .collect();
-            let now = summarise(name, &runs);
+    for load in &args.loads {
+        for now in summaries(args, results, *load) {
             let Some(before) = rows
                 .iter()
-                .find(|r| r["approach"] == name && r["load"] == load.id())
+                .find(|r| r["approach"] == now.approach.as_str() && r["load"] == load.id())
             else {
-                println!("compare: {name} {}: not in the saved file", load.id());
+                println!(
+                    "compare: {} {}: not in the saved file",
+                    now.approach,
+                    load.id()
+                );
                 continue;
             };
             let rps = before["records_per_sec"].as_f64().unwrap_or(0.0);
             let p99 = before["p99_us"].as_f64().unwrap_or(0.0);
             let lost = if rps > 0.0 {
-                (rps - now.records_per_sec) / rps
+                (rps - now.records_per_sec.median) / rps
             } else {
                 0.0
             };
             let grew = if p99 > 0.0 {
-                (now.p99_us - p99) / p99
+                (now.p99_us.median - p99) / p99
             } else {
                 0.0
             };
             let ok = lost <= max && grew <= max;
             passed &= ok;
             println!(
-                "compare: {} {name} {}: rec/s {:+.1}%, p99 {:+.1}% (bound {:.1}%)",
+                "compare: {} {} {}: rec/s {:+.1}%, p99 {:+.1}% (bound {:.1}%)",
                 if ok { "ok" } else { "FAIL" },
+                now.approach,
                 load.id(),
                 -lost * 100.0,
                 grew * 100.0,

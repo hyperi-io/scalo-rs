@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      benches/delivery_path/main.rs
-// Purpose:   Delivery-path bench: approaches by name, loads by name, interleaved runs
+// Purpose:   Delivery-path bench: approaches by name, loads by name, one process per cell
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -11,44 +11,50 @@
 //! ```text
 //! cargo bench --bench delivery_path --features transport-test-support -- \
 //!     --approaches inline_sequential,per_record_futures --loads W1,W4 \
-//!     --tier 1 --seconds 5 [--runs 2] [--save FILE] \
+//!     --tier 1 --seconds 5 [--runs 5] [--workers 8] [--allocs] [--save FILE] \
 //!     [--compare FILE --max-regression 0.05]
 //! cargo bench --bench delivery_path \
 //!     --features transport-test-support,testcontainers,transport-grpc -- \
-//!     --tier 2 --calibrate
+//!     --tier 2 [--calibrate | --order-check]
 //! ```
 //!
-//! Tier 1 runs on shaped senders in process. Tier 2 runs on a Kafka broker in a
-//! container this binary starts and removes, and on gRPC listeners in process.
+//! Tier 1 runs on shaped senders. Tier 2 runs on a Kafka broker in a container
+//! this process starts and removes, and on gRPC listeners in each cell.
 //!
-//! Runs are interleaved (a, b, a, b) so host noise lands on every approach.
-//! Each run prints one JSON line, and each load a table with the difference
-//! from the first approach and the spread of the same code across its runs.
-//! `--compare` exits 1 when an approach is slower than the saved file by more
-//! than `--max-regression`.
+//! Every (approach, load, run) cell runs in a child process of this binary, so
+//! its peak RSS and CPU time are its own. Runs are interleaved (a, b, a, b) so
+//! host noise lands on every approach. Each cell prints one JSON line, and each
+//! load a table of medians with their spread. `--compare` exits 1 when an
+//! approach is slower than the saved file by more than `--max-regression`.
+//! `--allocs` counts heap allocations on every thread while the callers run,
+//! which slows the run, so its timings are not for comparison.
 //!
 //! criterion is not used: it times one closure, so it cannot report per-caller
 //! latency percentiles across concurrent callers or interleave approaches.
 
 #![allow(clippy::cast_precision_loss)]
 
+mod alloc;
 mod args;
+mod cell;
 mod drive;
 mod host;
+#[cfg(all(feature = "testcontainers", feature = "transport-grpc", unix))]
+mod listener;
 mod loads;
 mod report;
 #[cfg(all(feature = "testcontainers", feature = "transport-grpc", unix))]
 mod tier2;
 
-use std::process::ExitCode;
-use std::sync::Arc;
+use std::process::{Command, ExitCode, Stdio};
 
-use scalo::memory::{MemoryGuard, MemoryGuardConfig};
-use scalo::transport::test_support::delivery::{Destinations, approach};
-use scalo::transport::test_support::shaped::{PRESETS_CALIBRATED, ShapedSender};
+use scalo::transport::test_support::shaped::PRESETS_CALIBRATED;
 
 use args::{Args, Tier};
-use report::RunResult;
+use report::CellResult;
+
+#[global_allocator]
+static GLOBAL: alloc::Counting = alloc::Counting;
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
@@ -58,7 +64,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    if args.cell_run.is_some() {
+        return cell::main(&args);
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
@@ -68,28 +77,35 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    runtime.block_on(run(args))
+    runtime.block_on(parent(args))
 }
 
-async fn run(args: Args) -> ExitCode {
+async fn parent(mut args: Args) -> ExitCode {
     println!(
-        "# delivery_path tier {} presets {} load_avg_start {}",
+        "# delivery_path tier {} presets {} workers {} runs {} seconds {} allocs {} load_avg_start {}",
         args.tier.number(),
         if PRESETS_CALIBRATED {
             "calibrated"
         } else {
             "UNCALIBRATED"
         },
+        args.workers,
+        args.runs,
+        args.seconds,
+        args.allocs,
         host::load_average()
     );
 
-    let results = match args.tier {
-        Tier::One => tier_one(&args).await,
-        Tier::Two => tier_two(&args).await,
+    let outcome = match args.tier {
+        Tier::One => cells(&args).await,
+        Tier::Two => tier_two(&mut args).await,
     };
-    let Some(results) = results else {
+    let Some(results) = outcome else {
         return ExitCode::from(2);
     };
+    if results.is_empty() {
+        return ExitCode::SUCCESS;
+    }
 
     report::tables(&args, &results);
     println!("# load_avg_end {}", host::load_average());
@@ -101,7 +117,7 @@ async fn run(args: Args) -> ExitCode {
         return ExitCode::from(2);
     }
     if let Some(path) = &args.compare {
-        return match report::compare(path, &results, args.max_regression) {
+        return match report::compare(path, &args, &results) {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => ExitCode::from(1),
             Err(e) => {
@@ -113,27 +129,57 @@ async fn run(args: Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn tier_one(args: &Args) -> Option<Vec<RunResult>> {
+/// Run every cell in a child process of this binary, interleaving approaches.
+async fn cells(args: &Args) -> Option<Vec<CellResult>> {
+    let exe = std::env::current_exe().ok()?;
     let mut results = Vec::new();
     for load in &args.loads {
         for run in 0..args.runs {
-            for name in &args.approaches {
-                let approach = approach(name)?;
-                let mut destinations = Destinations::new(guard());
-                let mut senders = Vec::new();
-                for (dest, config) in loads::topology(*load, args.seed) {
-                    let sender = ShapedSender::new(dest, config);
-                    senders.push(sender.clone());
-                    destinations.add(dest, sender);
+            for approach in &args.approaches {
+                let line = args.cell_command_line(approach, *load, run);
+                let child = tokio::task::spawn_blocking({
+                    let exe = exe.clone();
+                    move || {
+                        Command::new(exe)
+                            .args(line)
+                            .stdin(Stdio::null())
+                            .stderr(Stdio::inherit())
+                            .output()
+                    }
+                })
+                .await
+                .ok()?;
+                let output = match child {
+                    Ok(output) if output.status.success() => output,
+                    Ok(output) => {
+                        eprintln!(
+                            "delivery_path: cell {approach} {} run {run} exited {}",
+                            load.id(),
+                            output.status
+                        );
+                        return None;
+                    }
+                    Err(e) => {
+                        eprintln!("delivery_path: start cell: {e}");
+                        return None;
+                    }
+                };
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let Some(json) = stdout.lines().find(|l| l.starts_with('{')) else {
+                    eprintln!(
+                        "delivery_path: cell {approach} {} printed no result",
+                        load.id()
+                    );
+                    return None;
+                };
+                println!("{json}");
+                match serde_json::from_str::<CellResult>(json) {
+                    Ok(result) => results.push(result),
+                    Err(e) => {
+                        eprintln!("delivery_path: cell result: {e}");
+                        return None;
+                    }
                 }
-                let destinations = Arc::new(destinations);
-                let groups = loads::groups(*load, destinations.as_ref());
-                let raw = drive::run(approach, &destinations, &groups, args.duration()).await?;
-                let confirmed: u64 = senders.iter().map(|s| s.stats().records_confirmed).sum();
-                let result =
-                    RunResult::new(args, *load, run, approach, &groups, &raw, Some(confirmed));
-                println!("{}", result.json_line());
-                results.push(result);
             }
         }
     }
@@ -141,23 +187,27 @@ async fn tier_one(args: &Args) -> Option<Vec<RunResult>> {
 }
 
 #[cfg(all(feature = "testcontainers", feature = "transport-grpc", unix))]
-async fn tier_two(args: &Args) -> Option<Vec<RunResult>> {
-    tier2::run(args).await
+async fn tier_two(args: &mut Args) -> Option<Vec<CellResult>> {
+    let stack = tier2::Stack::start().await?;
+    let outcome = if args.calibrate {
+        tier2::calibrate(&stack).await;
+        Some(Vec::new())
+    } else if args.order_check {
+        tier2::order_check(&stack).await;
+        Some(Vec::new())
+    } else {
+        args.bootstrap = Some(stack.bootstrap.clone());
+        cells(args).await
+    };
+    drop(stack);
+    outcome
 }
 
 #[cfg(not(all(feature = "testcontainers", feature = "transport-grpc", unix)))]
 #[allow(clippy::unused_async)]
-async fn tier_two(_args: &Args) -> Option<Vec<RunResult>> {
+async fn tier_two(_args: &mut Args) -> Option<Vec<CellResult>> {
     eprintln!(
         "delivery_path: tier 2 needs --features transport-test-support,testcontainers,transport-grpc on Unix"
     );
     None
-}
-
-/// A guard with a fixed limit, so leases are counted and never refused.
-fn guard() -> Arc<MemoryGuard> {
-    Arc::new(MemoryGuard::new(MemoryGuardConfig {
-        limit_bytes: 1 << 40,
-        ..MemoryGuardConfig::default()
-    }))
 }

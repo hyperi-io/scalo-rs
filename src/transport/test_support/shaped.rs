@@ -24,9 +24,16 @@
 //! Every wait is on tokio's clock, so a test under `start_paused` runs the
 //! shape in virtual time. Jitter comes from a seeded generator, so a run
 //! repeats.
+//!
+//! tokio's timer fires on whole milliseconds, so each sender sleeps whole
+//! milliseconds and carries the rest, and the timer's overshoot, into its next
+//! wait. A single call can be up to a millisecond off, while the mean across
+//! calls holds. Below 1 ms the shaped senders model mean latency only, and a
+//! result that turns on latency under 1 ms is for tier 2, the real transports,
+//! to decide.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore};
@@ -107,9 +114,11 @@ pub struct ShapedConfig {
     pub confirm_window: Option<Duration>,
     /// How a call's records are answered.
     pub outcome: OutcomeMode,
-    /// Bytes that may wait for confirmation at once. Zero is no cap. A record
-    /// larger than the cap is let in when the queue is empty.
+    /// Bytes that may wait for confirmation at once. Zero is no cap. A call
+    /// larger than a cap is let in when the queue is empty.
     pub queue_cap_bytes: u64,
+    /// Records that may wait for confirmation at once. Zero is no cap.
+    pub queue_cap_records: u64,
     /// How long an offer waits for room in a full queue before it answers
     /// [`SendResult::Backpressured`].
     pub queue_full_wait: Duration,
@@ -136,6 +145,7 @@ impl Default for ShapedConfig {
             confirm_window: None,
             outcome: OutcomeMode::AllOrNothing,
             queue_cap_bytes: 0,
+            queue_cap_records: 0,
             queue_full_wait: Duration::ZERO,
             max_calls_in_flight: 0,
             latency_jitter: Duration::ZERO,
@@ -160,8 +170,10 @@ pub fn kafka_like() -> ShapedConfig {
         // profile, less `call_latency`.
         confirm_window: Some(Duration::from_micros(21_184)),
         outcome: OutcomeMode::PerRecord,
-        // The throughput profile's producer queue.
+        // `ProducerKnobs::buffer_memory_bytes` of the throughput profile.
         queue_cap_bytes: 64 * 1024 * 1024,
+        // librdkafka's default `queue.buffering.max.messages`, which scalo leaves unset.
+        queue_cap_records: 100_000,
         // Time from a `send` to `Backpressured` at a full producer queue.
         queue_full_wait: Duration::from_millis(5_028),
         max_calls_in_flight: 0,
@@ -185,11 +197,13 @@ pub fn grpc_like() -> ShapedConfig {
         kib_cost: Duration::from_nanos(4_919),
         confirm_window: None,
         outcome: OutcomeMode::AllOrNothing,
-        // The receive side's channel, in bytes.
-        queue_cap_bytes: 64 * 1024 * 1024,
+        queue_cap_bytes: 0,
+        // `GrpcConfig::recv_buffer_size`: the receive channel, in records.
+        queue_cap_records: 10_000,
         queue_full_wait: Duration::ZERO,
-        // HTTP/2 concurrent streams per connection.
-        max_calls_in_flight: 100,
+        // hyper's HTTP/2 server default for `max_concurrent_streams`, which
+        // scalo's gRPC server leaves unset.
+        max_calls_in_flight: 200,
         latency_jitter: Duration::ZERO,
         seed: 0,
         log_order: false,
@@ -251,9 +265,12 @@ struct Inner {
     config: ShapedConfig,
     epoch: Instant,
     queue_bytes: AtomicU64,
+    queue_records: AtomicU64,
     room: Notify,
     slots: Option<Semaphore>,
     rng: AtomicU64,
+    /// Nanoseconds slept short of what was asked, carried into the next wait.
+    debt_ns: AtomicI64,
     /// When the open confirmation window closes, in nanoseconds from `epoch`.
     window_end: AtomicU64,
     counters: Counters,
@@ -282,9 +299,11 @@ impl ShapedSender {
                 config,
                 epoch: Instant::now(),
                 queue_bytes: AtomicU64::new(0),
+                queue_records: AtomicU64::new(0),
                 room: Notify::new(),
                 slots,
                 rng: AtomicU64::new(config.seed),
+                debt_ns: AtomicI64::new(0),
                 window_end: AtomicU64::new(0),
                 counters: Counters::default(),
                 closed: AtomicBool::new(false),
@@ -362,7 +381,7 @@ impl ShapedSender {
         c.batch_sizes[bucket(offered)].fetch_add(1, Ordering::Relaxed);
 
         if let Some(down) = inner.config.faults.down {
-            tokio::time::sleep(down.after).await;
+            self.wait_until(Instant::now() + down.after).await;
             c.backpressured_calls.fetch_add(1, Ordering::Relaxed);
             return SendResult::Backpressured;
         }
@@ -406,7 +425,7 @@ impl ShapedSender {
                 continue;
             }
             if !held
-                .take(len_u64(&record.payload), cfg.queue_full_wait)
+                .take(len_u64(&record.payload), 1, cfg.queue_full_wait)
                 .await
             {
                 refused = true;
@@ -418,7 +437,7 @@ impl ShapedSender {
             let confirmed = self.confirm_time(offered_at) + cfg.call_latency + self.extra();
             confirm_at = confirm_at.max(self.after_stall(confirmed));
         }
-        tokio::time::sleep_until(confirm_at).await;
+        self.wait_until(confirm_at).await;
         inner
             .counters
             .records_confirmed
@@ -454,7 +473,7 @@ impl ShapedSender {
         }
         if sent > 0 {
             let mut held = QueueHold::new(inner);
-            if !held.take(bytes, cfg.queue_full_wait).await {
+            if !held.take(bytes, sent, cfg.queue_full_wait).await {
                 return SendResult::Backpressured;
             }
             self.log(records.iter().filter(|r| !self.refuses(&r.payload)));
@@ -463,7 +482,7 @@ impl ShapedSender {
                 + scale(cfg.kib_cost, bytes.div_ceil(1024))
                 + self.extra();
             let done = self.after_stall(self.confirm_time(start + cost));
-            tokio::time::sleep_until(done).await;
+            self.wait_until(done).await;
             inner
                 .counters
                 .records_confirmed
@@ -474,6 +493,26 @@ impl ShapedSender {
         } else {
             SendResult::Ok
         }
+    }
+
+    /// Sleep whole milliseconds toward `deadline`, carrying the part the timer
+    /// cannot hit, and any overshoot, into the next wait.
+    async fn wait_until(&self, deadline: Instant) {
+        const TICK_NS: i64 = 1_000_000;
+        let start = Instant::now();
+        let asked = signed_nanos(deadline.saturating_duration_since(start));
+        let owed = self.inner.debt_ns.swap(0, Ordering::AcqRel);
+        let wanted = asked.saturating_add(owed);
+        let whole = wanted.div_euclid(TICK_NS) * TICK_NS;
+        if whole <= 0 {
+            self.inner.debt_ns.fetch_add(wanted, Ordering::AcqRel);
+            return;
+        }
+        tokio::time::sleep(Duration::from_nanos(whole.unsigned_abs())).await;
+        let slept = signed_nanos(start.elapsed());
+        self.inner
+            .debt_ns
+            .fetch_add(wanted - slept, Ordering::AcqRel);
     }
 
     /// When the window a record offered at `at` joins closes, opening one if
@@ -558,22 +597,27 @@ impl Drop for CallInFlight<'_> {
 struct QueueHold<'a> {
     inner: &'a Inner,
     bytes: u64,
+    records: u64,
 }
 
 impl<'a> QueueHold<'a> {
     fn new(inner: &'a Inner) -> Self {
-        Self { inner, bytes: 0 }
+        Self {
+            inner,
+            bytes: 0,
+            records: 0,
+        }
     }
 
-    /// Take `bytes` of queue room, waiting up to `wait` for it. False when
-    /// the room did not come.
-    async fn take(&mut self, bytes: u64, wait: Duration) -> bool {
+    /// Take room for `records` records of `bytes` bytes, waiting up to `wait`
+    /// for it. False when the room did not come.
+    async fn take(&mut self, bytes: u64, records: u64, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
         loop {
             let notified = self.inner.room.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.try_take(bytes) {
+            if self.try_take(bytes, records) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -586,18 +630,26 @@ impl<'a> QueueHold<'a> {
         }
     }
 
-    fn try_take(&mut self, bytes: u64) -> bool {
-        let cap = self.inner.config.queue_cap_bytes;
-        let taken =
-            self.inner
-                .queue_bytes
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    (cap == 0 || current == 0 || current + bytes <= cap).then_some(current + bytes)
-                });
-        let Ok(previous) = taken else {
+    fn try_take(&mut self, bytes: u64, records: u64) -> bool {
+        let Some(previous) = take_room(
+            &self.inner.queue_bytes,
+            bytes,
+            self.inner.config.queue_cap_bytes,
+        ) else {
             return false;
         };
+        if take_room(
+            &self.inner.queue_records,
+            records,
+            self.inner.config.queue_cap_records,
+        )
+        .is_none()
+        {
+            self.inner.queue_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        }
         self.bytes += bytes;
+        self.records += records;
         self.inner
             .counters
             .peak_bytes_in_flight
@@ -606,12 +658,25 @@ impl<'a> QueueHold<'a> {
     }
 }
 
+/// Add `amount` to `level` unless that passes `cap`, letting anything into an
+/// empty queue. Returns the level before, or `None` when it did not fit.
+fn take_room(level: &AtomicU64, amount: u64, cap: u64) -> Option<u64> {
+    level
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (cap == 0 || current == 0 || current + amount <= cap).then_some(current + amount)
+        })
+        .ok()
+}
+
 impl Drop for QueueHold<'_> {
     fn drop(&mut self) {
-        if self.bytes > 0 {
+        if self.bytes > 0 || self.records > 0 {
             self.inner
                 .queue_bytes
                 .fetch_sub(self.bytes, Ordering::AcqRel);
+            self.inner
+                .queue_records
+                .fetch_sub(self.records, Ordering::AcqRel);
             self.inner.room.notify_waiters();
         }
     }
@@ -677,6 +742,10 @@ fn len_u64(payload: &[u8]) -> u64 {
 /// `cost * n`, saturating.
 fn scale(cost: Duration, n: u64) -> Duration {
     nanos(cost.as_nanos().saturating_mul(u128::from(n)))
+}
+
+fn signed_nanos(d: Duration) -> i64 {
+    i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
 }
 
 fn as_u64_nanos(d: Duration) -> u64 {
@@ -838,6 +907,44 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(start.elapsed(), Duration::from_millis(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn latency_under_a_millisecond_keeps_its_mean_across_calls() {
+        let sender = ShapedSender::new(
+            "g",
+            ShapedConfig {
+                call_latency: Duration::from_micros(400),
+                ..ShapedConfig::default()
+            },
+        );
+        let start = Instant::now();
+        for _ in 0..10 {
+            assert!(sender.send_batch(&[record(b"a")]).await.is_ok());
+        }
+        assert_eq!(start.elapsed(), Duration::from_millis(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_record_cap_refuses_a_call_that_does_not_fit() {
+        let sender = ShapedSender::new(
+            "g",
+            ShapedConfig {
+                call_latency: Duration::from_millis(10),
+                queue_cap_records: 3,
+                ..ShapedConfig::default()
+            },
+        );
+        let two = [record(b"a"), record(b"b")];
+        let first = tokio::spawn({
+            let sender = sender.clone();
+            let two = two.clone();
+            async move { sender.send_batch(&two).await }
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(sender.send_batch(&two).await.is_backpressured());
+        assert!(first.await.is_ok_and(|r| r.is_ok()));
+        assert!(sender.send_batch(&two).await.is_ok());
     }
 
     #[test]
