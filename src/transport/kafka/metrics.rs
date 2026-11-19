@@ -131,6 +131,9 @@ pub struct StatsContext {
     /// broker `UP` in the statistics proves them, because librdkafka reaches it
     /// only after the TLS and SASL handshakes succeed.
     auth: Arc<super::classify::AuthState>,
+    /// The refusal generation this client was built at, which its evidence is
+    /// checked against.
+    generation: u64,
     /// Records past this consumer's read position, summed over its partitions.
     position_lag: AtomicI64,
     /// Ownership changes since the transport last looked, each numbered as
@@ -356,6 +359,7 @@ impl StatsContext {
             latest_metrics: RwLock::new(KafkaMetrics::default()),
             delivery: super::classify::DeliveryState::default(),
             auth: Arc::default(),
+            generation: 0,
             position_lag: AtomicI64::new(0),
             rebalanced: Mutex::new(Vec::new()),
             rebalances: AtomicU64::new(0),
@@ -373,11 +377,22 @@ impl StatsContext {
         }
     }
 
-    /// This context, sharing `auth` with the other clients of one transport.
+    /// This context, reporting to `auth`, the state of its client's role, as a
+    /// client built at `generation`.
     #[must_use]
-    pub(crate) fn sharing(mut self, auth: Arc<super::classify::AuthState>) -> Self {
+    pub(crate) fn sharing(
+        mut self,
+        auth: Arc<super::classify::AuthState>,
+        generation: u64,
+    ) -> Self {
         self.auth = auth;
+        self.generation = generation;
         self
+    }
+
+    /// Record that a broker accepted this client.
+    pub(crate) fn prove(&self) {
+        self.auth.mark_proven_by(self.generation);
     }
 
     /// This context, counting lag to where a consumer at `isolation` may read.
@@ -686,7 +701,7 @@ impl StatsContext {
 impl ClientContext for StatsContext {
     fn stats(&self, statistics: Statistics) {
         if self.auth.awaits_success() && statistics.brokers.values().any(|b| b.state == "UP") {
-            self.auth.mark_proven();
+            self.prove();
         }
         #[cfg(feature = "metrics")]
         self.client.get_or_init(|| Client::of(&statistics));
@@ -761,7 +776,7 @@ impl ClientContext for StatsContext {
 
     fn error(&self, error: KafkaError, reason: &str) {
         // librdkafka repeats a refusal on every reconnect, so it is logged once.
-        if self.auth.on_error(&error, reason) {
+        if self.auth.on_error_from(&error, reason, self.generation) {
             return;
         }
         #[cfg(feature = "logger")]

@@ -389,9 +389,13 @@ impl DegradedLatch {
 /// Before a broker first accepts the client, any authentication or TLS failure
 /// is a refusal. After that one is most likely a broker restarting, which
 /// librdkafka rides out, so it opens a run that any success ends, and only a
-/// run lasting the grace (a rotated CA or password) is a refusal again. One
-/// state serves a transport's producer and every consumer it builds, because
-/// they present the same credentials: a broker accepting either proves both.
+/// run lasting the grace (a rotated CA or password) is a refusal again.
+///
+/// A transport keeps one state per client role, the producer and the consumer,
+/// across that role's rebuilds. A broker checks credentials per connection, so
+/// one role's connection opened before a rotation can keep succeeding while
+/// the other's new ones are refused. Evidence from a client built at an
+/// earlier generation is ignored, as it comes from a setup since replaced.
 #[derive(Debug, Default)]
 pub(crate) struct AuthState {
     /// A broker has accepted this client, by reaching `UP` or confirming a record.
@@ -427,6 +431,28 @@ impl AuthState {
     /// authentication or TLS failure, which this state has then handled.
     pub(crate) fn on_error(&self, err: &KafkaError, detail: &str) -> bool {
         self.on_error_at(err, detail, monotonic_ms())
+    }
+
+    /// [`on_error`](Self::on_error) from a client built at `generation`. A
+    /// replaced client's authentication or TLS failure is handled and ignored.
+    pub(crate) fn on_error_from(&self, err: &KafkaError, detail: &str, generation: u64) -> bool {
+        if self.is_replaced(generation) {
+            return err.rdkafka_error_code().is_some_and(is_auth_failure);
+        }
+        self.on_error(err, detail)
+    }
+
+    /// [`mark_proven`](Self::mark_proven) by a client built at `generation`,
+    /// ignored for a replaced client.
+    pub(crate) fn mark_proven_by(&self, generation: u64) {
+        if !self.is_replaced(generation) {
+            self.mark_proven();
+        }
+    }
+
+    /// Whether a client built at `generation` has been asked to be rebuilt.
+    fn is_replaced(&self, generation: u64) -> bool {
+        generation < self.generation.load(Ordering::Acquire)
     }
 
     /// [`on_error`](Self::on_error) at `now_ms` on [`monotonic_ms`].
@@ -747,6 +773,39 @@ mod tests {
 
         auth.mark_proven();
         assert!(!auth.is_refused() && auth.refusal().is_none() && auth.run_started_ms().is_none());
+    }
+
+    /// Evidence from a client built before the latest rebuild comes from a
+    /// replaced setup: its success neither ends a refusal nor a run, and its
+    /// failure opens no run. The rebuilt client's evidence counts.
+    #[test]
+    fn a_replaced_clients_evidence_is_ignored() {
+        let grace = std::time::Duration::from_secs(120);
+        let refusal = KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed);
+        let auth = AuthState::default();
+        auth.mark_proven_by(0);
+        assert!(auth.on_error_from(&refusal, "rotated", 0));
+        assert!(auth.refuse_if_overdue(grace, monotonic_ms() + 200_000));
+        let current = auth.advance_generation();
+
+        auth.mark_proven_by(current - 1);
+        assert!(
+            auth.is_refused(),
+            "a replaced client's success ends no refusal"
+        );
+
+        auth.mark_proven_by(current);
+        assert!(!auth.is_refused(), "the rebuilt client's success does");
+        assert!(
+            auth.on_error_from(&refusal, "old connection", current - 1),
+            "a replaced client's refusal is still handled"
+        );
+        assert_eq!(auth.run_started_ms(), None, "and opens no run");
+        assert!(auth.on_error_from(&refusal, "rebuilt client", current));
+        assert!(
+            auth.run_started_ms().is_some(),
+            "the rebuilt client's opens one"
+        );
     }
 
     /// A success between reading the run and promoting it ends the run, so the

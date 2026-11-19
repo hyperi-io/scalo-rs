@@ -191,22 +191,93 @@ fn block_result(results: Vec<SendResult>) -> SendResult {
     }
 }
 
+/// One client role's acceptance state, and whether readiness waits for it.
+#[derive(Clone)]
+struct RoleAuth {
+    auth: Arc<classify::AuthState>,
+    /// Whether this role's client emits statistics, so a broker `UP` can prove
+    /// it while idle. Readiness never waits on a role that cannot be proven so.
+    #[cfg(feature = "health")]
+    waits_for_contact: bool,
+}
+
+impl RoleAuth {
+    fn new(client: &ClientConfig) -> Self {
+        #[cfg(not(feature = "health"))]
+        let _ = client;
+        Self {
+            auth: Arc::default(),
+            #[cfg(feature = "health")]
+            waits_for_contact: client
+                .get("statistics.interval.ms")
+                .and_then(|ms| ms.trim().parse::<u64>().ok())
+                .is_some_and(|ms| ms > 0),
+        }
+    }
+
+    /// Accepted, or never waited on, and not refused.
+    #[cfg(feature = "health")]
+    fn reached(&self) -> bool {
+        !self.auth.is_refused() && (self.auth.is_proven() || !self.waits_for_contact)
+    }
+}
+
+/// The acceptance state of each client role a transport has.
+#[derive(Clone)]
+struct Roles {
+    producer: Option<RoleAuth>,
+    consumer: Option<RoleAuth>,
+}
+
+impl Roles {
+    fn each(&self) -> impl Iterator<Item = &RoleAuth> {
+        self.producer.iter().chain(self.consumer.iter())
+    }
+
+    /// Whether any role is refused.
+    fn is_refused(&self) -> bool {
+        self.each().any(|role| role.auth.is_refused())
+    }
+
+    /// The refusal of the first refused role.
+    fn refusal(&self) -> Option<String> {
+        self.each().find_map(|role| role.auth.refusal())
+    }
+
+    /// Whether the producer role is refused.
+    fn producer_refused(&self) -> bool {
+        self.producer
+            .as_ref()
+            .is_some_and(|role| role.auth.is_refused())
+    }
+}
+
+#[cfg(test)]
+impl Roles {
+    fn producer_auth(&self) -> &classify::AuthState {
+        &self.producer.as_ref().expect("a producer role").auth
+    }
+
+    fn consumer_auth(&self) -> &classify::AuthState {
+        &self.consumer.as_ref().expect("a consumer role").auth
+    }
+}
+
 /// What the `transport:kafka` health check reports.
 ///
-/// Unhealthy until a broker has accepted the client (a broker `UP` in its
-/// statistics, a delivered record or a received one), so a pod that cannot
+/// Unhealthy until a broker has accepted every client role (a broker `UP` in
+/// its statistics, a delivered record or a received one), so a pod that cannot
 /// reach Kafka is not ready from the start. Then as [`TransportBase::is_healthy`].
-/// With `waits_for_contact` false (statistics off on every client, so no
-/// broker `UP` can prove an idle client) it is [`TransportBase::is_healthy`] throughout.
+/// A role with statistics off is not waited on, since no broker `UP` can prove
+/// it while idle.
 #[cfg(feature = "health")]
 fn registry_status(
     healthy: &AtomicBool,
-    auth: &classify::AuthState,
+    roles: &Roles,
     topic_missing: &AtomicBool,
     missing_destinations: &parking_lot::Mutex<std::collections::HashSet<String>>,
-    waits_for_contact: bool,
 ) -> crate::health::HealthStatus {
-    let reached = !auth.is_refused() && (auth.is_proven() || !waits_for_contact);
+    let reached = roles.each().all(RoleAuth::reached);
     if healthy.load(Ordering::Relaxed)
         && reached
         && !topic_missing.load(Ordering::Relaxed)
@@ -229,9 +300,6 @@ pub struct KafkaTransport {
     /// Removes this component from the health registry when it drops.
     #[cfg(feature = "health")]
     _health_registration: crate::health::HealthRegistration,
-    /// Whether the registry check waits for a broker to accept the client.
-    #[cfg(all(feature = "health", test))]
-    waits_for_contact: bool,
     /// Removes this component from the health registry when it drops.
     #[cfg(all(feature = "governor", feature = "health"))]
     _partition_limited_registration: crate::health::HealthRegistration,
@@ -275,11 +343,11 @@ pub struct KafkaTransport {
     /// fenced member, a failed rebuild and a second rebuild with no record
     /// between clear it. A record sets it again, except after `close()`.
     healthy: Arc<AtomicBool>,
-    /// Whether the broker refuses this transport's credentials or TLS setup,
-    /// shared by its producer and every consumer it builds. A refusal fails
-    /// readiness, keeps every undelivered send `Backpressured` and drives the
-    /// refusal watch's rebuilds.
-    auth: Arc<classify::AuthState>,
+    /// Whether a broker refuses each client role's credentials or TLS setup,
+    /// kept per role across its rebuilds. Any role refused fails readiness. A
+    /// refused producer keeps every undelivered send `Backpressured`, and each
+    /// role's refusal watch rebuilds that role only.
+    auth: Roles,
     /// Latches a sustained retryable send failure so the warn fires on the edge,
     /// not once per record.
     send_degraded: classify::DegradedLatch,
@@ -379,9 +447,11 @@ type ProducerSlot = Arc<parking_lot::RwLock<ProducerEntry>>;
 /// The wait before each client rebuild while a broker refuses the client.
 const REFUSAL_REBUILD: Backoff = Backoff::new(Duration::from_secs(5), Duration::from_secs(60));
 
-/// Rebuild the producer, and ask for a consumer rebuild, on [`REFUSAL_REBUILD`]
-/// while a broker refuses the client, and declare a proven client refused
-/// again once a run of failures has lasted `grace`.
+/// For one client role: rebuild it on [`REFUSAL_REBUILD`] while a broker
+/// refuses it, and declare it refused again once a run of failures after proof
+/// has lasted `grace`. The producer role passes its slot and config and is
+/// rebuilt here. The consumer role passes `None`, and its next receive rebuilds
+/// it from the advanced generation.
 ///
 /// librdkafka reads the CA bundle, certificate and credentials once, when it
 /// builds a client, so only a new client picks up a fixed or rotated setup.
@@ -433,7 +503,15 @@ async fn refusal_watch(
         #[cfg(feature = "metrics")]
         ::metrics::counter!("transport_refusal_rebuilds_total", "transport" => "kafka")
             .increment(1);
-        tracing::debug!(generation, "kafka: rebuilding the refused clients");
+        tracing::debug!(
+            generation,
+            role = if producer.is_some() {
+                "producer"
+            } else {
+                "consumer"
+            },
+            "kafka: rebuilding the refused client"
+        );
     }
 }
 
@@ -448,7 +526,7 @@ async fn rebuild_producer(
     let (config, context_auth) = (config.clone(), Arc::clone(auth));
     let built = tokio::task::spawn_blocking(move || {
         config.create_with_context::<_, FutureProducer<StatsContext>>(
-            StatsContext::new().sharing(context_auth),
+            StatsContext::new().sharing(context_auth, generation),
         )
     })
     .await;
@@ -955,9 +1033,10 @@ fn apply_group_protocol(client_config: &mut ClientConfig, protocol: ConsumerProt
 fn create_consumer(
     client_config: &ClientConfig,
     auth: &Arc<classify::AuthState>,
+    generation: u64,
 ) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
     let context = StatsContext::new()
-        .sharing(Arc::clone(auth))
+        .sharing(Arc::clone(auth), generation)
         .reading(metrics::Isolation::of(client_config))
         .queueing(metrics::QueueCap::of(client_config));
     #[cfg(feature = "metrics")]
@@ -1215,10 +1294,11 @@ impl KafkaTransport {
         // Consumer and producer each get their own context instance.
         let protocol = config.effective_consumer_protocol();
         let consumer_config = reads.then(|| consumer_client_config(config, protocol));
-        let auth = Arc::new(classify::AuthState::default());
+        let consumer_auth = consumer_config.as_ref().map(RoleAuth::new);
         let consumer = consumer_config
             .as_ref()
-            .map(|c| create_consumer(c, &auth))
+            .zip(consumer_auth.as_ref())
+            .map(|(c, role)| create_consumer(c, &role.auth, 0))
             .transpose()?;
 
         // Resolve effective topics:
@@ -1299,26 +1379,41 @@ impl KafkaTransport {
             .unwrap_or(LIBRDKAFKA_MESSAGE_MAX_BYTES);
 
         // Create producer with StatsContext for metrics collection.
-        let producer: Option<ProducerSlot> = if role == Role::Receive {
-            None
-        } else {
-            let client: FutureProducer<StatsContext> = producer_config
-                .create_with_context(StatsContext::new().sharing(Arc::clone(&auth)))
-                .map_err(|e| client_build_error("producer", &e))?;
-            Some(Arc::new(parking_lot::RwLock::new(ProducerEntry {
-                client,
-                generation: 0,
-            })))
+        let producer_auth = (role != Role::Receive).then(|| RoleAuth::new(&producer_config));
+        let producer: Option<ProducerSlot> = match &producer_auth {
+            None => None,
+            Some(role) => {
+                let client: FutureProducer<StatsContext> = producer_config
+                    .create_with_context(StatsContext::new().sharing(Arc::clone(&role.auth), 0))
+                    .map_err(|e| client_build_error("producer", &e))?;
+                Some(Arc::new(parking_lot::RwLock::new(ProducerEntry {
+                    client,
+                    generation: 0,
+                })))
+            }
+        };
+        let auth = Roles {
+            producer: producer_auth,
+            consumer: consumer_auth,
         };
         let watch_stop = shutdown_token.child_token();
-        tokio::spawn(refusal_watch(
-            Arc::clone(&auth),
-            producer
-                .as_ref()
-                .map(|slot| (Arc::clone(slot), producer_config.clone())),
-            Duration::from_secs(config.auth_refusal_grace_secs),
-            watch_stop.clone(),
-        ));
+        let grace = Duration::from_secs(config.auth_refusal_grace_secs);
+        if let (Some(role), Some(slot)) = (&auth.producer, &producer) {
+            tokio::spawn(refusal_watch(
+                Arc::clone(&role.auth),
+                Some((Arc::clone(slot), producer_config.clone())),
+                grace,
+                watch_stop.clone(),
+            ));
+        }
+        if let Some(role) = &auth.consumer {
+            tokio::spawn(refusal_watch(
+                Arc::clone(&role.auth),
+                None,
+                grace,
+                watch_stop.clone(),
+            ));
+        }
 
         let healthy = Arc::new(AtomicBool::new(true));
         let topic_missing = Arc::new(AtomicBool::new(false));
@@ -1331,29 +1426,14 @@ impl KafkaTransport {
             &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
 
-        // Only a client that emits statistics can be proven while idle.
-        #[cfg(feature = "health")]
-        let waits_for_contact = [
-            producer.is_some().then_some(&producer_config),
-            consumer_config.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|client| {
-            client
-                .get("statistics.interval.ms")
-                .and_then(|ms| ms.trim().parse::<u64>().ok())
-                .is_some_and(|ms| ms > 0)
-        });
-
         #[cfg(feature = "health")]
         let health_registration = {
             let h = Arc::clone(&healthy);
-            let reached = Arc::clone(&auth);
+            let roles = auth.clone();
             let missing = Arc::clone(&topic_missing);
             let destinations = Arc::clone(&missing_destinations);
             crate::health::HealthRegistry::register_scoped("transport:kafka", move || {
-                registry_status(&h, &reached, &missing, &destinations, waits_for_contact)
+                registry_status(&h, &roles, &missing, &destinations)
             })
         };
 
@@ -1378,8 +1458,6 @@ impl KafkaTransport {
         Ok(Self {
             #[cfg(feature = "health")]
             _health_registration: health_registration,
-            #[cfg(all(feature = "health", test))]
-            waits_for_contact,
             #[cfg(all(feature = "governor", feature = "health"))]
             _partition_limited_registration: partition_limited_registration,
             consumer: consumer.map(|client| {
@@ -1652,13 +1730,17 @@ impl KafkaTransport {
         } else {
             tracing::debug!(protocol = %protocol, reason, "kafka: rebuilding the consumer again");
         }
-        let Some(shared) = &self.consumer else {
+        let (Some(shared), Some(role)) = (&self.consumer, &self.auth.consumer) else {
             return Err(TransportError::Config(
                 "this kafka transport only sends: it has no consumer to rebuild".into(),
             ));
         };
-        let generation = self.auth.generation();
-        let client = create_consumer(&consumer_client_config(&self.config, protocol), &self.auth)?;
+        let generation = role.auth.generation();
+        let client = create_consumer(
+            &consumer_client_config(&self.config, protocol),
+            &role.auth,
+            generation,
+        )?;
         subscribe_consumer(&client, &self.subscribed_topics.read())?;
         let old = {
             let mut slot = shared.write();
@@ -1685,14 +1767,14 @@ impl KafkaTransport {
     /// Replace a consumer built before the refusal watch's latest generation,
     /// so it reads the setup again.
     ///
-    /// Generations advance only while the client is refused, so an older one
-    /// holds a refused setup even after the rebuilt producer is accepted. A
-    /// failed rebuild keeps the old client, and the next receive tries again.
+    /// The consumer role's generation advances only while it is refused, so an
+    /// older one holds a refused setup. A failed rebuild keeps the old client,
+    /// and the next receive tries again.
     fn rebuild_refused_consumer(&self) {
-        let Some(shared) = &self.consumer else {
+        let (Some(shared), Some(role)) = (&self.consumer, &self.auth.consumer) else {
             return;
         };
-        if shared.read().generation >= self.auth.generation() {
+        if shared.read().generation >= role.auth.generation() {
             return;
         }
         let protocol = self.group_protocol();
@@ -1970,12 +2052,14 @@ impl KafkaTransport {
         }
     }
 
-    /// Turn one delivery report into the caller's result.
+    /// Turn one delivery report from the producer built at `generation` into
+    /// the caller's result.
     fn delivery_result(
         &self,
         destination: &str,
         bytes: usize,
         report: OwnedDeliveryResult,
+        generation: u64,
     ) -> SendResult {
         match report {
             Ok(_) => {
@@ -1986,7 +2070,9 @@ impl KafkaTransport {
                     ::metrics::counter!("transport_sent_bytes_total", "transport" => "kafka")
                         .increment(bytes as u64);
                 }
-                self.auth.mark_proven();
+                if let Some(role) = &self.auth.producer {
+                    role.auth.mark_proven_by(generation);
+                }
                 if self.send_degraded.clear() {
                     tracing::info!(destination, "kafka send recovered");
                 }
@@ -2008,7 +2094,7 @@ impl KafkaTransport {
             classify::SendFailure::QueueFull
                 | classify::SendFailure::Retryable
                 | classify::SendFailure::Fatal
-        ) && self.auth.is_refused()
+        ) && self.auth.producer_refused()
         {
             #[cfg(feature = "metrics")]
             ::metrics::counter!("transport_send_errors_total", "transport" => "kafka").increment(1);
@@ -2174,6 +2260,7 @@ impl TransportSender for KafkaTransport {
                 .client
                 .send(record, Timeout::After(QUEUE_FULL_TIMEOUT))
                 .await,
+            producer.generation,
         );
         let result = self.settle_on_replaced(result, producer.generation);
 
@@ -2275,9 +2362,12 @@ impl TransportSender for KafkaTransport {
                 Offered::Queued(delivery) => {
                     let destination = record.key.as_deref().unwrap_or("");
                     let result = match delivery.await {
-                        Ok(report) => {
-                            self.delivery_result(destination, record.payload.len(), report)
-                        }
+                        Ok(report) => self.delivery_result(
+                            destination,
+                            record.payload.len(),
+                            report,
+                            producer.generation,
+                        ),
                         // A report lost with the producer is an unknown outcome, never a delivery.
                         Err(_) => SendResult::Fatal(TransportError::Send(
                             "kafka delivery report lost: producer dropped".into(),
@@ -2631,7 +2721,7 @@ impl KafkaTransport {
                     gate.note_received(spans.len());
                 }
                 self.recv_state.record_success();
-                self.auth.mark_proven();
+                consumer.context().prove();
                 self.rebuilds.store(0, Ordering::Relaxed);
                 if self.rebuild_latch.clear() {
                     tracing::info!("kafka: the rebuilt consumer is reading");
@@ -3977,7 +4067,7 @@ mod tests {
         let lag_under = |config: &KafkaConfig| {
             let built = consumer_client_config(config, ConsumerProtocol::Classic);
             let consumer =
-                create_consumer(&built, &Arc::default()).expect("a consumer builds broker-free");
+                create_consumer(&built, &Arc::default(), 0).expect("a consumer builds broker-free");
             consumer.context().stats(stats.clone());
             consumer.context().total_position_lag()
         };
@@ -4372,6 +4462,7 @@ mod tests {
         let consumer = create_consumer(
             &consumer_client_config(&config, ConsumerProtocol::Classic),
             &Arc::default(),
+            0,
         )
         .expect("a consumer builds broker-free");
         let subscribed = |consumer: &BaseConsumer<StatsContext>| -> Vec<String> {
@@ -4865,6 +4956,17 @@ mod tests {
         }
     }
 
+    /// What `t`'s `transport:kafka` health check reports.
+    #[cfg(feature = "health")]
+    fn readiness(t: &KafkaTransport) -> crate::health::HealthStatus {
+        registry_status(
+            &t.healthy,
+            &t.auth,
+            &t.topic_missing,
+            &t.missing_destinations,
+        )
+    }
+
     /// A refused client sees every record time out, queue up or go with a
     /// replaced producer. Each comes back `Backpressured`, so the caller keeps
     /// it and the service runs on, and readiness fails with the reason. A
@@ -4895,7 +4997,7 @@ mod tests {
         assert!(transport.is_healthy());
         assert!(transport.healthcheck().await.is_ok());
 
-        transport.auth.on_error(
+        transport.auth.producer_auth().on_error(
             &KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed),
             "invalid credentials",
         );
@@ -4917,7 +5019,7 @@ mod tests {
             "a refusal is reported, never fatal: {health}"
         );
 
-        transport.auth.mark_proven();
+        transport.auth.producer_auth().mark_proven();
         assert!(classes(&transport)[0].is_backpressured());
         assert!(transport.is_healthy());
     }
@@ -4929,15 +5031,7 @@ mod tests {
     #[cfg(feature = "health")]
     #[tokio::test]
     async fn the_registry_check_waits_for_a_broker_to_accept_the_client() {
-        let status = |t: &KafkaTransport| {
-            registry_status(
-                &t.healthy,
-                &t.auth,
-                &t.topic_missing,
-                &t.missing_destinations,
-                t.waits_for_contact,
-            )
-        };
+        let status = |t: &KafkaTransport| readiness(t);
 
         let quiet =
             KafkaTransport::new(&unreachable_config().with_override("statistics.interval.ms", "0"))
@@ -4948,7 +5042,7 @@ mod tests {
             crate::health::HealthStatus::Healthy,
             "with statistics off no proof can arrive, so readiness follows is_healthy"
         );
-        quiet.auth.on_error(
+        quiet.auth.producer_auth().on_error(
             &KafkaError::Global(RDKafkaErrorCode::SSL),
             "certificate verify failed",
         );
@@ -4968,7 +5062,7 @@ mod tests {
         );
         assert!(transport.is_healthy(), "no fault is known yet");
 
-        transport.auth.mark_proven();
+        transport.auth.producer_auth().mark_proven();
         assert_eq!(status(&transport), crate::health::HealthStatus::Healthy);
 
         transport
@@ -5009,12 +5103,19 @@ mod tests {
             .read()
             .epoch;
 
-        transport.auth.on_error(
-            &KafkaError::Global(RDKafkaErrorCode::SSL),
-            "certificate verify failed",
-        );
+        for role in [
+            transport.auth.producer_auth(),
+            transport.auth.consumer_auth(),
+        ] {
+            role.on_error(
+                &KafkaError::Global(RDKafkaErrorCode::SSL),
+                "certificate verify failed",
+            );
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while transport.auth.generation() == 0 {
+        while transport.auth.producer_auth().generation() == 0
+            || transport.auth.consumer_auth().generation() == 0
+        {
             assert!(
                 std::time::Instant::now() < deadline,
                 "no rebuild within the first backoff"
@@ -5031,7 +5132,7 @@ mod tests {
 
         transport.recv(10).await.expect("a refused receive runs on");
         let slot = transport.consumer.as_ref().expect("a consumer").read();
-        assert_eq!(slot.generation, transport.auth.generation());
+        assert_eq!(slot.generation, transport.auth.consumer_auth().generation());
         assert!(slot.epoch > epoch, "the consumer was replaced");
         drop(slot);
         assert!(!transport.is_healthy(), "still refused, so not ready");
@@ -5050,32 +5151,45 @@ mod tests {
         })
         .await
         .expect("a transport constructs broker-free");
-        transport.auth.mark_proven();
+        let roles = || {
+            [
+                transport.auth.producer_auth(),
+                transport.auth.consumer_auth(),
+            ]
+        };
+        for role in roles() {
+            role.mark_proven();
+        }
         assert!(transport.is_healthy());
 
-        transport.auth.on_error(
-            &KafkaError::Global(RDKafkaErrorCode::SSL),
-            "certificate verify failed",
-        );
+        for role in roles() {
+            role.on_error(
+                &KafkaError::Global(RDKafkaErrorCode::SSL),
+                "certificate verify failed",
+            );
+        }
         assert!(
             transport.is_healthy(),
             "inside the grace: a restarting broker"
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while transport.auth.generation() == 0 {
+        while roles().iter().any(|role| role.generation() == 0) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "no rebuild after the grace and one backoff"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(transport.auth.is_refused(), "refused again past the grace");
+        assert!(
+            roles().iter().all(|role| role.is_refused()),
+            "refused again past the grace"
+        );
         assert!(!transport.is_healthy(), "refused, so not ready");
         let producer = transport.current_producer().expect("a producer");
         assert_eq!(
             producer.generation,
-            transport.auth.generation(),
+            transport.auth.producer_auth().generation(),
             "the producer was rebuilt"
         );
         transport.recv(10).await.expect("a refused receive runs on");
@@ -5086,32 +5200,118 @@ mod tests {
                 .expect("a consumer")
                 .read()
                 .generation,
-            transport.auth.generation(),
+            transport.auth.consumer_auth().generation(),
             "the consumer was rebuilt"
         );
-
-        #[cfg(feature = "health")]
-        let readiness = |t: &KafkaTransport| {
-            registry_status(
-                &t.healthy,
-                &t.auth,
-                &t.topic_missing,
-                &t.missing_destinations,
-                t.waits_for_contact,
-            )
-        };
         #[cfg(feature = "health")]
         assert_eq!(
             readiness(&transport),
             crate::health::HealthStatus::Unhealthy
         );
 
-        // A rebuilt client accepted: a broker `UP`, a delivery or a record.
-        transport.auth.mark_proven();
+        // Each rebuilt client accepted: a broker `UP`, a delivery or a record.
+        transport.auth.producer_auth().mark_proven();
+        assert!(!transport.is_healthy(), "the consumer is still refused");
+        transport.auth.consumer_auth().mark_proven();
         assert!(transport.is_healthy(), "ready again with no restart");
         assert!(transport.healthcheck().await.is_ok());
         #[cfg(feature = "health")]
         assert_eq!(readiness(&transport), crate::health::HealthStatus::Healthy);
+    }
+
+    /// Per role: one role keeps succeeding on a connection it opened before a
+    /// rotation while the other's new connections are refused past the grace.
+    /// The refused role fails readiness and is the only one rebuilt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_role_refused_past_the_grace_is_rebuilt_while_the_other_succeeds() {
+        for refused_role in ["producer", "consumer"] {
+            let transport = KafkaTransport::new(&KafkaConfig {
+                topics: vec!["rotated".to_string()],
+                group: "rotated-group".to_string(),
+                auth_refusal_grace_secs: 1,
+                ..unreachable_config()
+            })
+            .await
+            .expect("a transport constructs broker-free");
+            let producer = transport.current_producer().expect("a producer");
+            let consumer = transport.consumer();
+            transport.auth.producer_auth().mark_proven();
+            transport.auth.consumer_auth().mark_proven();
+            let (refused, succeeding, refused_ctx_error): (_, _, Box<dyn Fn() + Send + Sync>) =
+                if refused_role == "producer" {
+                    let client = producer.client.clone();
+                    (
+                        transport.auth.producer_auth(),
+                        transport.auth.consumer_auth(),
+                        Box::new(move || {
+                            rdkafka::ClientContext::error(
+                                &**rdkafka::producer::Producer::context(&client),
+                                KafkaError::Global(RDKafkaErrorCode::SSL),
+                                "certificate verify failed",
+                            );
+                        }),
+                    )
+                } else {
+                    let client = Arc::clone(&consumer);
+                    (
+                        transport.auth.consumer_auth(),
+                        transport.auth.producer_auth(),
+                        Box::new(move || {
+                            rdkafka::ClientContext::error(
+                                &**client.context(),
+                                KafkaError::Global(RDKafkaErrorCode::SSL),
+                                "certificate verify failed",
+                            );
+                        }),
+                    )
+                };
+
+            refused_ctx_error();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while refused.generation() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{refused_role}: not rebuilt while the other role kept succeeding"
+                );
+                // The other role's old connection keeps delivering or fetching.
+                succeeding.mark_proven_by(0);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(refused.is_refused(), "{refused_role}: refused");
+            assert!(
+                !succeeding.is_refused(),
+                "{refused_role}: the other role is not"
+            );
+            assert!(!transport.is_healthy(), "{refused_role}: not ready");
+            #[cfg(feature = "health")]
+            assert_eq!(
+                readiness(&transport),
+                crate::health::HealthStatus::Unhealthy,
+                "{refused_role}"
+            );
+            assert_eq!(
+                succeeding.generation(),
+                0,
+                "{refused_role}: the other role is not rebuilt"
+            );
+            let current = transport.current_producer().expect("a producer").generation;
+            if refused_role == "producer" {
+                assert_eq!(current, refused.generation(), "the producer was rebuilt");
+            } else {
+                assert_eq!(current, 0, "the producer was left alone");
+                transport.recv(10).await.expect("a refused receive runs on");
+                assert_eq!(
+                    transport
+                        .consumer
+                        .as_ref()
+                        .expect("a consumer")
+                        .read()
+                        .generation,
+                    refused.generation(),
+                    "the consumer was rebuilt"
+                );
+            }
+        }
     }
 
     /// A record in flight on a producer the refusal watch replaced answers
@@ -5127,19 +5327,25 @@ mod tests {
         let records = [batch_record(b"{\"a\":1}")];
         let replace = async {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            transport.auth.on_error(
+            let role = &transport
+                .auth
+                .producer
+                .as_ref()
+                .expect("a producer role")
+                .auth;
+            role.on_error(
                 &KafkaError::Global(RDKafkaErrorCode::SSL),
                 "certificate verify failed",
             );
-            let generation = transport.auth.advance_generation();
+            let generation = role.advance_generation();
             rebuild_producer(
                 transport.producer.as_ref().expect("a producer slot"),
                 &transport_producer_config(&transport.config),
-                &transport.auth,
+                role,
                 generation,
             )
             .await;
-            transport.auth.mark_proven();
+            role.mark_proven();
             // Fails the record still queued on the old producer.
             old.client.purge(PurgeConfig::default().queue().inflight());
         };
@@ -5200,6 +5406,7 @@ mod tests {
                     offset: 0,
                     timestamp: rdkafka::Timestamp::NotAvailable,
                 }),
+                0,
             )
         };
 
