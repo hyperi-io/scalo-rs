@@ -17,7 +17,7 @@ pub const USAGE: &str = "\
 usage: delivery_path [--approaches a,b] [--loads W1,W2] [--tier 1|2] [--seconds N]
                      [--runs N] [--workers N] [--seed N] [--allocs] [--save FILE]
                      [--compare FILE] [--max-regression F]
-                     [--calibrate] [--order-check]";
+                     [--cpus LIST] [--broker-cpus LIST] [--calibrate] [--order-check]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -49,6 +49,10 @@ pub struct Args {
     pub max_regression: f64,
     pub calibrate: bool,
     pub order_check: bool,
+    /// CPUs the runner and its cells are pinned to, as `taskset -c` writes them.
+    pub cpus: Option<String>,
+    /// The tier 2 broker container's cpuset, as `docker update --cpuset-cpus` takes it.
+    pub broker_cpus: Option<String>,
     /// Set in a child process: run this one cell and print its JSON line.
     pub cell_run: Option<usize>,
     /// Set in a tier 2 child: the broker the parent started.
@@ -71,6 +75,8 @@ impl Args {
             max_regression: 0.05,
             calibrate: false,
             order_check: false,
+            cpus: None,
+            broker_cpus: None,
             cell_run: None,
             bootstrap: None,
         };
@@ -112,6 +118,8 @@ impl Args {
                 "--max-regression" => args.max_regression = number(&value()?)?,
                 "--calibrate" => args.calibrate = true,
                 "--order-check" => args.order_check = true,
+                "--cpus" => args.cpus = Some(value()?),
+                "--broker-cpus" => args.broker_cpus = Some(value()?),
                 "--cell-run" => args.cell_run = Some(number(&value()?)?),
                 "--bootstrap" => args.bootstrap = Some(value()?),
                 other => return Err(format!("unknown argument {other}")),
@@ -122,6 +130,19 @@ impl Args {
         }
         if args.workers == 0 {
             return Err("--workers is at least 1".into());
+        }
+        if let Some(list) = &args.cpus {
+            let cpus = cpu_list(list)?;
+            if args.workers > cpus.len() {
+                return Err(format!(
+                    "--workers {} is more than the {} CPUs in --cpus {list}",
+                    args.workers,
+                    cpus.len()
+                ));
+            }
+        }
+        if let Some(list) = &args.broker_cpus {
+            cpu_list(list)?;
         }
         if !(args.seconds > 0.0 && args.seconds.is_finite()) {
             return Err("--seconds must be positive".into());
@@ -160,6 +181,23 @@ impl Args {
         }
         line
     }
+}
+
+/// The CPUs a list like `16-23` or `0,2,4-7` names.
+pub fn cpu_list(list: &str) -> Result<Vec<usize>, String> {
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        let (low, high) = part.split_once('-').unwrap_or((part, part));
+        let low: usize = number(low.trim())?;
+        let high: usize = number(high.trim())?;
+        if low > high {
+            return Err(format!("CPU range {part} runs backwards"));
+        }
+        cpus.extend(low..=high);
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    Ok(cpus)
 }
 
 fn number<T: std::str::FromStr>(text: &str) -> Result<T, String> {

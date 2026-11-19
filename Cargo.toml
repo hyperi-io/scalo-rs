@@ -373,6 +373,10 @@ sketches-ddsketch = ">=0.3.2, <0.4"
 # Local refs only, so no HTTP resolver.
 jsonschema = { version = ">=0.61.0, <0.62", default-features = false }
 
+# Pins the delivery_path bench to a CPU set. Already in the graph through tempfile.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = ">=1.1.6, <2", features = ["thread"] }
+
 [lints.rust]
 unsafe_code = "deny"
 

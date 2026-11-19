@@ -64,6 +64,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(list) = &args.cpus {
+        // Before any thread starts, so the runtime, its workers and every cell inherit it.
+        if let Err(e) = args::cpu_list(list).and_then(|cpus| host::pin(&cpus)) {
+            eprintln!("delivery_path: pin to CPUs {list}: {e}");
+            return ExitCode::from(2);
+        }
+    }
     if args.cell_run.is_some() {
         return cell::main(&args);
     }
@@ -82,7 +89,7 @@ fn main() -> ExitCode {
 
 async fn parent(mut args: Args) -> ExitCode {
     println!(
-        "# delivery_path tier {} presets {} workers {} runs {} seconds {} allocs {} load_avg_start {}",
+        "# delivery_path tier {} presets {} workers {} runs {} seconds {} allocs {} cpus {} allowed_cpus {} broker_cpus {} load_avg_start {}",
         args.tier.number(),
         if PRESETS_CALIBRATED {
             "calibrated"
@@ -93,6 +100,9 @@ async fn parent(mut args: Args) -> ExitCode {
         args.runs,
         args.seconds,
         args.allocs,
+        args.cpus.as_deref().unwrap_or("all"),
+        host::allowed_cpus().map_or_else(|| "unknown".to_string(), |n| n.to_string()),
+        args.broker_cpus.as_deref().unwrap_or("all"),
         host::load_average()
     );
 
@@ -188,7 +198,7 @@ async fn cells(args: &Args) -> Option<Vec<CellResult>> {
 
 #[cfg(all(feature = "testcontainers", feature = "transport-grpc", unix))]
 async fn tier_two(args: &mut Args) -> Option<Vec<CellResult>> {
-    let stack = tier2::Stack::start().await?;
+    let stack = tier2::Stack::start(args.broker_cpus.as_deref()).await?;
     let outcome = if args.calibrate {
         tier2::calibrate(&stack).await;
         Some(Vec::new())

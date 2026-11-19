@@ -43,6 +43,8 @@ pub struct CellResult {
     pub run: usize,
     pub tier: u8,
     pub workers: usize,
+    /// CPUs the cell process was allowed to run on.
+    pub allowed_cpus: Option<u32>,
     pub presets_calibrated: bool,
     pub elapsed_s: f64,
     pub records_sent: u64,
@@ -119,6 +121,7 @@ impl CellResult {
             run,
             tier: args.tier.number(),
             workers: args.workers,
+            allowed_cpus: crate::host::allowed_cpus(),
             presets_calibrated: PRESETS_CALIBRATED,
             elapsed_s: round(elapsed_s),
             records_sent,

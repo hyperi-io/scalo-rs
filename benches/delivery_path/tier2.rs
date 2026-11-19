@@ -67,7 +67,8 @@ pub struct Stack {
 }
 
 impl Stack {
-    pub async fn start() -> Option<Self> {
+    /// Start the broker, on `cpus` when given.
+    pub async fn start(cpus: Option<&str>) -> Option<Self> {
         if !require_docker() {
             eprintln!("delivery_path: tier 2 needs a Docker daemon");
             return None;
@@ -84,6 +85,19 @@ impl Stack {
             .ok()?;
         let bootstrap = broker.container.addr(KAFKA_PORT);
         println!("# tier2 broker {} at {bootstrap}", broker.container.name);
+        if let Some(cpus) = cpus {
+            let updated = std::process::Command::new("docker")
+                .args(["update", "--cpuset-cpus", cpus, &broker.container.name])
+                .output()
+                .ok()?;
+            if !updated.status.success() {
+                eprintln!(
+                    "delivery_path: set the broker's cpuset to {cpus}: {}",
+                    String::from_utf8_lossy(&updated.stderr)
+                );
+                return None;
+            }
+        }
         create_topic(&bootstrap, TOPIC, PARTITIONS).await?;
         Some(Self {
             bootstrap,

@@ -59,3 +59,32 @@ fn ticks_per_second() -> Option<u64> {
             .filter(|t| *t > 0)
     })
 }
+
+/// Pin this thread, and every thread and child process it starts after, to
+/// `cpus`.
+#[cfg(target_os = "linux")]
+pub fn pin(cpus: &[usize]) -> Result<(), String> {
+    let mut set = rustix::thread::CpuSet::new();
+    for cpu in cpus {
+        set.set(*cpu);
+    }
+    rustix::thread::sched_setaffinity(None, &set).map_err(|e| e.to_string())
+}
+
+/// How many CPUs this thread may run on.
+#[cfg(target_os = "linux")]
+pub fn allowed_cpus() -> Option<u32> {
+    rustix::thread::sched_getaffinity(None)
+        .ok()
+        .map(|set| set.count())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn allowed_cpus() -> Option<u32> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pin(_cpus: &[usize]) -> Result<(), String> {
+    Err("CPU pinning is Linux only".to_string())
+}
