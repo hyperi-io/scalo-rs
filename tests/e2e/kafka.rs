@@ -2349,6 +2349,50 @@ mod broker_down_at_start {
         eprintln!("ready {:?} after the broker came up", up.elapsed());
         sender.close().await.expect("close");
     }
+
+    /// Readiness needs both of a transport's roles accepted, and each proves
+    /// itself by its own statistics: an idle producer that sends nothing and
+    /// an idle consumer whose receives return nothing.
+    #[cfg(feature = "health")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_producer_and_consumer_each_prove_themselves() {
+        let port = free_port();
+        let Some(_node) = start_kafka_on(scalo::test_name!(), port).await else {
+            return;
+        };
+        let bootstrap = format!("127.0.0.1:{port}");
+        create_topic(&bootstrap, "idle-roles").await;
+        let config = KafkaConfig {
+            brokers: vec![bootstrap],
+            group: "idle-roles".to_string(),
+            topics: vec!["idle-roles".to_string()],
+            ..Default::default()
+        }
+        .with_override("statistics.interval.ms", "1000");
+        let transport = KafkaTransport::new(&config)
+            .await
+            .expect("a transport with both roles builds");
+
+        let built = Instant::now();
+        while kafka_status() != Some(scalo::HealthStatus::Healthy) {
+            assert!(
+                built.elapsed() < REACHED_WITHIN,
+                "still not ready {:?} after the transport was built",
+                built.elapsed()
+            );
+            // An idle consumer in a running service keeps calling recv.
+            let batch = transport.recv(10).await.expect("an idle receive");
+            assert!(
+                batch.records.is_empty(),
+                "nothing was produced to the topic"
+            );
+        }
+        eprintln!(
+            "both roles ready {:?} after the transport was built",
+            built.elapsed()
+        );
+        transport.close().await.expect("close");
+    }
 }
 
 /// `close()` keeps the consumer's group membership, so the final commit a

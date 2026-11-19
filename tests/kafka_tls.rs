@@ -495,6 +495,10 @@ async fn kafka_transport_against_a_tls_broker() {
 /// The longest the refusal watch waits between rebuilds, plus a broker round trip.
 const RECOVERED_WITHIN: Duration = Duration::from_secs(150);
 
+/// Readiness after the read-back: the delivery and the read-back each prove
+/// their role at once, so this covers only the readiness check's own reads.
+const READY_AFTER_READ_BACK: Duration = Duration::from_secs(5);
+
 /// A transport built on an untrusted CA runs on, backpressured and not ready,
 /// and connects once the CA file it names holds the right CA: librdkafka reads
 /// that file only when it builds a client, so this needs the rebuild.
@@ -573,7 +577,6 @@ async fn a_transport_refused_for_its_ca_connects_once_the_ca_is_fixed() {
         let _ = transport.recv(10).await;
     }
     eprintln!("delivered {:?} after the CA was fixed", fixed.elapsed());
-    assert!(transport.is_healthy(), "accepted, so ready");
 
     let deadline = Instant::now() + ROUND_TRIP_WITHIN;
     loop {
@@ -589,6 +592,15 @@ async fn a_transport_refused_for_its_ca_connects_once_the_ca_is_fixed() {
         {
             break;
         }
+    }
+    // Ready only once both roles are accepted: the producer by its delivery, the consumer by the read-back.
+    let read_back = Instant::now();
+    while !transport.is_healthy() {
+        assert!(
+            read_back.elapsed() < READY_AFTER_READ_BACK,
+            "accepted, so ready within {READY_AFTER_READ_BACK:?} of the read-back"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let _ = transport.close().await;
 }
