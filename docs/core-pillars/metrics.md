@@ -177,7 +177,7 @@ A source or sink that goes away is waited out rather than ending the app, and th
 | Metric | Labels | Meaning |
 | --- | --- | --- |
 | `transport_recv_errors_total` | `transport`, `class` | receive failures: `class="transient"` were retried, `class="missing_topic"` waited for a subscribed topic to appear, `class="refused"` waited while a broker refused the client's credentials or TLS setup, `class="permanent"` were returned. Kafka emits it |
-| `transport_auth_refused_total` | `transport` | refusals of the client's credentials or TLS setup before any broker accepted them, one per reconnect librdkafka reports. Kafka emits it |
+| `transport_auth_refused_total` | `transport` | refusals of the client's credentials or TLS setup, one per reconnect librdkafka reports while refused: before any broker accepted them, or after a run of failures outlasted `auth_refusal_grace_secs`. Kafka emits it |
 | `transport_refusal_rebuilds_total` | `transport` | rounds in which a refused transport rebuilt its clients to read a fixed CA bundle, certificate or password. Kafka emits it |
 | `transport_send_missing_topic_total` | `transport` | sends that found the destination topic missing and returned `Backpressured`, so the caller retried them. Kafka emits it |
 | `transport_consumer_rebuilds_total` | `transport`, `protocol` | consumers replaced after librdkafka flagged them fatal or a broker refused them, by the group protocol the new client joins with. Kafka emits it |

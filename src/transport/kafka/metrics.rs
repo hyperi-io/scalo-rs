@@ -685,7 +685,7 @@ impl StatsContext {
 
 impl ClientContext for StatsContext {
     fn stats(&self, statistics: Statistics) {
-        if !self.auth.is_proven() && statistics.brokers.values().any(|b| b.state == "UP") {
+        if self.auth.awaits_success() && statistics.brokers.values().any(|b| b.state == "UP") {
             self.auth.mark_proven();
         }
         #[cfg(feature = "metrics")]
