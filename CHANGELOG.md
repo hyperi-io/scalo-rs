@@ -3,6 +3,23 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.32](https://github.com/hyperi-io/scalo-rs/compare/v2.14.31...v2.14.32) (2026-11-19)
+
+### Bug Fixes
+
+* **health:** check transports and first Kafka connection ([#487](https://github.com/hyperi-io/scalo-rs/issues/487)) ([99e1af3](https://github.com/hyperi-io/scalo-rs/commit/99e1af367487b3f68407c4710cca7ea4391263ec)), closes [#8](https://github.com/hyperi-io/scalo-rs/issues/8) [#430](https://github.com/hyperi-io/scalo-rs/issues/430)
+* **kafka:** add strimzi-no-tls and redpanda-no-tls providers ([#489](https://github.com/hyperi-io/scalo-rs/issues/489)) ([00d7dfb](https://github.com/hyperi-io/scalo-rs/commit/00d7dfb4b85bbc96320def3a7009cca9721a9b32)), closes [#456](https://github.com/hyperi-io/scalo-rs/issues/456)
+* **kafka:** mark clients refused after the auth grace ([#495](https://github.com/hyperi-io/scalo-rs/issues/495)) ([bc0ce91](https://github.com/hyperi-io/scalo-rs/commit/bc0ce916ca93fb9dc778634aa4e11f7065dee48b)), closes [#436](https://github.com/hyperi-io/scalo-rs/issues/436)
+* **kafka:** stay up on broker rejection ([#493](https://github.com/hyperi-io/scalo-rs/issues/493)) ([448b6c0](https://github.com/hyperi-io/scalo-rs/commit/448b6c042fa5db9c98c10740a72318aa73b93c6c)), closes [#436](https://github.com/hyperi-io/scalo-rs/issues/436)
+* **kafka:** stop false spool success and stale refusals ([#496](https://github.com/hyperi-io/scalo-rs/issues/496)) ([b5358fa](https://github.com/hyperi-io/scalo-rs/commit/b5358fa782bae7c00a0b8ec77216e06892830061)), closes [#436](https://github.com/hyperi-io/scalo-rs/issues/436) [#481](https://github.com/hyperi-io/scalo-rs/issues/481)
+* **kafka:** stop producers re-creating deleted topics by default ([#490](https://github.com/hyperi-io/scalo-rs/issues/490)) ([af7d802](https://github.com/hyperi-io/scalo-rs/commit/af7d80295cb08a2a0b6028846fd85612243bfa8c)), closes [#458](https://github.com/hyperi-io/scalo-rs/issues/458)
+* **kafka:** track acceptance per client role ([#497](https://github.com/hyperi-io/scalo-rs/issues/497)) ([be88d69](https://github.com/hyperi-io/scalo-rs/commit/be88d69a3ce1e02c9485e91a8db49fccc36215a1)), closes [#436](https://github.com/hyperi-io/scalo-rs/issues/436)
+* **pipeline:** send sink rejections to the DLQ ([#488](https://github.com/hyperi-io/scalo-rs/issues/488)) ([5d7df5e](https://github.com/hyperi-io/scalo-rs/commit/5d7df5e06c38b0126818c9dbdba360d1ad703664))
+* **rules:** let records hide unassigned targets from other rows ([#492](https://github.com/hyperi-io/scalo-rs/issues/492)) ([5c51478](https://github.com/hyperi-io/scalo-rs/commit/5c51478619231c48688b55f423fb4cfee10ce360)), closes [#379](https://github.com/hyperi-io/scalo-rs/issues/379)
+* **tiered-sink:** remove drop_oldest ([#494](https://github.com/hyperi-io/scalo-rs/issues/494)) ([34b1b94](https://github.com/hyperi-io/scalo-rs/commit/34b1b945ea4e5c0c9183b65204bb7b80e4a8bd7c)), closes [#481](https://github.com/hyperi-io/scalo-rs/issues/481)
+* **transport:** derive hop holds from depth ([#486](https://github.com/hyperi-io/scalo-rs/issues/486)) ([882e241](https://github.com/hyperi-io/scalo-rs/commit/882e2416134a7f25182b9358e2746455fed84582)), closes [#457](https://github.com/hyperi-io/scalo-rs/issues/457)
+* **transport:** return FilteredDlq for blocks with dead letters ([#491](https://github.com/hyperi-io/scalo-rs/issues/491)) ([bc52de3](https://github.com/hyperi-io/scalo-rs/commit/bc52de323b59feb6254d20791ffc23656579b813))
+
 ## [2.14.31](https://github.com/hyperi-io/scalo-rs/compare/v2.14.30...v2.14.31) (2026-11-17)
 
 ### Bug Fixes
