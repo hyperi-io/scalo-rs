@@ -1404,6 +1404,18 @@ pub struct KafkaConfig {
     #[serde(default)]
     pub allow_insecure_transport: bool,
 
+    /// Let scalo's producers ask the broker to create a topic they write to
+    /// (librdkafka `allow.auto.create.topics`, default `false`).
+    ///
+    /// Applies to every producer scalo builds: the transport's, `KafkaProducer`
+    /// and the Kafka DLQ's. Never to a consumer or an admin client. Off, a send
+    /// to a missing topic backpressures until the topic exists, and a producer
+    /// that once wrote to a topic does not bring it back after a delete. On,
+    /// a broker with `auto.create.topics.enable` creates it. A raw
+    /// `librdkafka_overrides` or `sizing.producer_librdkafka` value wins.
+    #[serde(default)]
+    pub allow_auto_create_topics: bool,
+
     /// Seconds a client a broker has accepted may go on failing authentication
     /// or TLS, with no success between, before it counts as refused again
     /// (default 120).
@@ -1623,6 +1635,7 @@ impl Default for KafkaConfig {
             ssl_key_location: None,
             ssl_skip_verify: false,
             allow_insecure_transport: false,
+            allow_auto_create_topics: false,
             auth_refusal_grace_secs: default_auth_refusal_grace_secs(),
             enable_auto_commit: false,
             auto_commit_interval_ms: default_auto_commit_interval(),

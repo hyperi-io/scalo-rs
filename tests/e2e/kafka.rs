@@ -2727,4 +2727,178 @@ mod deleted_topic {
         )
         .await;
     }
+
+    /// One scalo client that touches a topic after it is deleted.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Toucher {
+        /// A discovering receiver that read the topic, commits what it read and polls on.
+        Consumer,
+        /// A transport sender that wrote to the topic before the delete and is idle after.
+        IdleSender,
+        /// As `IdleSender`, with `allow_auto_create_topics: true`.
+        IdleSenderAllowed,
+        /// A transport sender that sends to the topic after the delete.
+        Sender,
+        /// A `KafkaProducer` that wrote to the topic before the delete and is idle after.
+        IdleProducer,
+        /// `KafkaAdmin::describe_topic` on the deleted topic.
+        Admin,
+    }
+
+    /// How long each client gets to touch the deleted topic.
+    const TOUCHED_FOR: Duration = Duration::from_secs(15);
+
+    /// librdkafka's metadata refresh, cut from 5 min so the window above covers several.
+    const METADATA_REFRESH_MS: &str = "1000";
+
+    fn config_for(bootstrap: &str) -> KafkaConfig {
+        KafkaConfig {
+            brokers: vec![bootstrap.to_string()],
+            group: String::new(),
+            ..Default::default()
+        }
+        .with_override("topic.metadata.refresh.interval.ms", METADATA_REFRESH_MS)
+    }
+
+    async fn topic_listed(admin: &std::sync::Arc<KafkaAdmin>, topic: &str) -> bool {
+        let admin = std::sync::Arc::clone(admin);
+        let topic = topic.to_string();
+        tokio::task::spawn_blocking(move || {
+            admin.list_topics().expect("list topics").contains(&topic)
+        })
+        .await
+        .expect("list task")
+    }
+
+    /// Whether the topic `toucher` touches after its delete exists again afterwards,
+    /// on a broker that creates topics on demand.
+    async fn recreated(bootstrap: &str, toucher: Toucher) -> bool {
+        use scalo::transport::TransportSender;
+        use scalo::transport::kafka::{KafkaProducer, ProducerProfile};
+
+        let topic = format!("recreate-{toucher:?}").to_lowercase();
+        let admin = std::sync::Arc::new(KafkaAdmin::new(&config_for(bootstrap)).expect("admin"));
+        admin
+            .create_topics(&[(topic.as_str(), 1, 1)])
+            .await
+            .expect("create topic");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !topic_listed(&admin, &topic).await {
+            assert!(Instant::now() < deadline, "{topic} never appeared");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        produce(bootstrap, &topic, 0..1).await;
+        let record = || bytes::Bytes::from_static(br#"{"seq":1}"#);
+
+        let receiver = if toucher == Toucher::Consumer {
+            let config = KafkaConfig {
+                group: format!("{topic}-group"),
+                auto_discover: true,
+                topic_include: vec![format!("^{topic}$")],
+                topic_refresh_secs: FAST_REFRESH.as_secs(),
+                ..config_for(bootstrap)
+            };
+            let receiver = KafkaTransport::receiver(&config).await.expect("receiver");
+            let read = read(&receiver, &topic, 1, CONSUMED_WITHIN).await;
+            assert_eq!(read.len(), 1, "{toucher:?}: the topic is read");
+            Some((receiver, read))
+        } else {
+            None
+        };
+        let sender = if matches!(
+            toucher,
+            Toucher::IdleSender | Toucher::IdleSenderAllowed | Toucher::Sender
+        ) {
+            let config = KafkaConfig {
+                allow_auto_create_topics: toucher == Toucher::IdleSenderAllowed,
+                ..config_for(bootstrap)
+            };
+            let sender = KafkaTransport::sender(&config).await.expect("sender");
+            assert!(
+                sender.send(&topic, record()).await.is_ok(),
+                "{toucher:?}: first send"
+            );
+            Some(sender)
+        } else {
+            None
+        };
+        let producer = if toucher == Toucher::IdleProducer {
+            let producer = KafkaProducer::new(&config_for(bootstrap), ProducerProfile::default())
+                .expect("producer");
+            producer
+                .send(&topic, None, br#"{"seq":1}"#)
+                .expect("enqueue");
+            assert_eq!(
+                producer.flush(Duration::from_secs(10)),
+                0,
+                "{toucher:?}: delivered"
+            );
+            Some(producer)
+        } else {
+            None
+        };
+
+        admin
+            .delete_topics(&[topic.as_str()])
+            .await
+            .expect("delete topic");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while topic_listed(&admin, &topic).await {
+            assert!(Instant::now() < deadline, "{topic} never left the metadata");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let touching = Instant::now();
+        while touching.elapsed() < TOUCHED_FOR {
+            match (toucher, &receiver, &sender) {
+                (Toucher::Consumer, Some((receiver, read)), _) => {
+                    // The commit can fail on a deleted topic. The consumer goes on.
+                    let _ = receiver.commit(read).await;
+                    let _ = receiver.recv(100).await;
+                }
+                (Toucher::Sender, _, Some(sender)) => {
+                    let _ = sender.send(&topic, record()).await;
+                }
+                (Toucher::Admin, _, _) => {
+                    let admin = std::sync::Arc::clone(&admin);
+                    let topic = topic.clone();
+                    let _ = tokio::task::spawn_blocking(move || admin.describe_topic(&topic)).await;
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let back = topic_listed(&admin, &topic).await;
+        drop((receiver, sender, producer));
+        if back {
+            let _ = admin.delete_topics(&[topic.as_str()]).await;
+        }
+        back
+    }
+
+    /// A deleted topic stays deleted under every scalo client, on a broker with
+    /// `auto.create.topics.enable` on. A producer that has written to a topic
+    /// keeps refreshing its metadata, and only `allow_auto_create_topics` lets
+    /// that refresh, idle or sending, create the topic again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_topic_stays_deleted_unless_producers_may_create_it() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let expected = [
+            (Toucher::Consumer, false),
+            (Toucher::IdleSender, false),
+            (Toucher::IdleSenderAllowed, true),
+            (Toucher::Sender, false),
+            (Toucher::IdleProducer, false),
+            (Toucher::Admin, false),
+        ];
+        let mut seen = Vec::new();
+        for (toucher, _) in expected {
+            let back = recreated(&bootstrap, toucher).await;
+            eprintln!("{toucher:?}: recreated {back}");
+            seen.push((toucher, back));
+        }
+        assert_eq!(seen, expected);
+    }
 }
