@@ -485,10 +485,11 @@ impl AuthState {
     /// or a refusal is open.
     pub(crate) fn mark_proven(&self) {
         if self.proven.load(Ordering::Relaxed) {
+            // SeqCst pairs with refuse_if_overdue, so a success and a promotion never both miss the other.
             if self.run_started_ms.load(Ordering::Relaxed) != 0 {
-                self.run_started_ms.store(0, Ordering::Relaxed);
+                self.run_started_ms.store(0, Ordering::SeqCst);
             }
-            if self.refused.load(Ordering::Relaxed) && self.refused.swap(false, Ordering::Relaxed) {
+            if self.refused.load(Ordering::SeqCst) && self.refused.swap(false, Ordering::SeqCst) {
                 *self.reason.lock() = None;
                 tracing::info!("kafka: a broker accepted this client's credentials again");
             }
@@ -532,8 +533,19 @@ impl AuthState {
         let Some(started) = self.run_started_ms() else {
             return false;
         };
+        self.promote(started, grace, now_ms)
+    }
+
+    /// [`refuse_if_overdue`](Self::refuse_if_overdue) for the run read as
+    /// starting at `started`, which a success may have ended since.
+    fn promote(&self, started: u64, grace: std::time::Duration, now_ms: u64) -> bool {
         let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
-        if now_ms.saturating_sub(started) < grace_ms || self.refused.swap(true, Ordering::AcqRel) {
+        if now_ms.saturating_sub(started) < grace_ms || self.refused.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        // A success that ended the run since it was read saw `refused` unset, so undo it here.
+        if self.run_started_ms.load(Ordering::SeqCst) != started {
+            self.refused.store(false, Ordering::SeqCst);
             return false;
         }
         #[cfg(feature = "metrics")]
@@ -735,6 +747,46 @@ mod tests {
 
         auth.mark_proven();
         assert!(!auth.is_refused() && auth.refusal().is_none() && auth.run_started_ms().is_none());
+    }
+
+    /// A success between reading the run and promoting it ends the run, so the
+    /// promotion leaves the client accepted, where nothing but a record could
+    /// clear it: broker statistics prove a client only while a run is open.
+    #[test]
+    fn a_success_racing_the_promotion_leaves_the_client_accepted() {
+        let grace = std::time::Duration::from_secs(120);
+        let refusal = KafkaError::Global(RDKafkaErrorCode::SaslAuthenticationFailed);
+        let auth = AuthState::default();
+        auth.mark_proven();
+        assert!(auth.on_error_at(&refusal, "rotated", 1_000));
+        let started = auth.run_started_ms().expect("a run is open");
+        auth.mark_proven();
+        assert!(!auth.promote(started, grace, 200_000));
+        assert!(!auth.is_refused(), "refused with no run open");
+
+        // The same race on two threads, through the public calls.
+        let grace = std::time::Duration::from_millis(1);
+        for round in 0..5_000 {
+            let auth = std::sync::Arc::new(AuthState::default());
+            auth.mark_proven();
+            auth.on_error_at(&refusal, "rotated", 1);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let (promoter_auth, promoter_barrier) = (
+                std::sync::Arc::clone(&auth),
+                std::sync::Arc::clone(&barrier),
+            );
+            let promoter = std::thread::spawn(move || {
+                promoter_barrier.wait();
+                promoter_auth.refuse_if_overdue(grace, 10_000)
+            });
+            barrier.wait();
+            auth.mark_proven();
+            promoter.join().unwrap();
+            assert!(
+                !auth.is_refused() || auth.awaits_success(),
+                "round {round}: refused with no run open"
+            );
+        }
     }
 
     #[cfg(feature = "logger")]

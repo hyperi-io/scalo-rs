@@ -381,17 +381,29 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     }
 
     /// `when_full: dlq`: write the record to the DLQ, or block without one.
+    ///
+    /// A disabled DLQ, or one with no backend that can hold the record, blocks
+    /// too: the record only overflowed, so dropping it would lose a record the
+    /// sink could still take.
     async fn full_to_dlq(&self, record: &Record) -> Option<Result<()>> {
         #[cfg(feature = "dlq")]
         if self.dead_letters.dlq().is_some() {
-            let dead = vec![drainer::Undeliverable {
+            let dead = drainer::Undeliverable {
                 record: record.clone(),
                 label: "spool_full",
                 reason: "the tiered sink's spool is full".to_string(),
-            }];
+            };
+            if !self.dead_letters.holds(&dead) {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    "spool full: when_full is dlq but the DLQ is disabled or cannot hold the \
+                     record; applying block"
+                );
+                return None;
+            }
             if !self
                 .dead_letters
-                .write(dead, self.config.send_timeout_duration())
+                .write(vec![dead], self.config.send_timeout_duration())
                 .await
             {
                 return None;
@@ -1860,41 +1872,92 @@ mod tests {
         dlq_shutdown.cancel();
     }
 
+    /// A full spool under `when_full: dlq`, with the record that overflows it.
+    #[cfg(feature = "dlq")]
+    async fn overflow_into(
+        dir: &std::path::Path,
+        dlq: Option<Arc<crate::dlq::Dlq>>,
+        overflow: &[u8],
+    ) -> (TieredSink<TestSink>, Result<()>) {
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = spilling_config(&dir.join("q"));
+        config.max_spool_items = Some(1);
+        config.when_full = crate::tiered_sink::WhenFull::Dlq;
+        let tiered = TieredSink::new(sink, config).await.unwrap();
+        let tiered = match dlq {
+            Some(dlq) => tiered.with_dlq(dlq),
+            None => tiered,
+        };
+        tiered.send(&rec(b"spooled")).await.unwrap();
+        let result = tiered.send(&rec(overflow)).await;
+        (tiered, result)
+    }
+
     /// `when_full: dlq` writes the record a full spool cannot take to the DLQ,
-    /// and blocks with `SpoolFull` when no DLQ is set.
+    /// and blocks with `SpoolFull` when no DLQ is set or the DLQ is disabled,
+    /// since nothing would store it.
     #[cfg(feature = "dlq")]
     #[tokio::test]
     async fn a_full_spool_writes_to_the_dlq_under_when_full_dlq() {
-        for with_dlq in [true, false] {
+        for case in ["file", "none", "disabled"] {
             let dir = tempdir().unwrap();
-            let (dlq, dlq_shutdown) = file_dlq(&dir.path().join("dlq"));
-            let sink = TestSink::new();
-            sink.set_available(false);
-            let mut config = spilling_config(&dir.path().join("q"));
-            config.max_spool_items = Some(1);
-            config.when_full = crate::tiered_sink::WhenFull::Dlq;
-            let tiered = TieredSink::new(sink, config).await.unwrap();
-            let tiered = if with_dlq {
-                tiered.with_dlq(dlq)
-            } else {
-                tiered
+            let (file, dlq_shutdown) = file_dlq(&dir.path().join("dlq"));
+            let dlq = match case {
+                "file" => Some(file),
+                "disabled" => Some(Arc::new(crate::dlq::Dlq::disabled())),
+                _ => None,
             };
-
-            tiered.send(&rec(b"spooled")).await.unwrap();
-            let overflow = tiered.send(&rec(b"overflow")).await;
-            if with_dlq {
-                assert!(overflow.is_ok(), "{overflow:?}");
+            let (tiered, overflow) = overflow_into(dir.path(), dlq, b"overflow").await;
+            if case == "file" {
+                assert!(overflow.is_ok(), "{case}: {overflow:?}");
                 assert_eq!(dlq_reasons(&dir.path().join("dlq")).await.len(), 1);
             } else {
                 assert!(
                     matches!(overflow, Err(TieredSinkError::SpoolFull(_))),
-                    "{overflow:?}"
+                    "{case}: {overflow:?}"
                 );
             }
-            assert_eq!(tiered.spool_len().await, 1);
+            assert_eq!(tiered.spool_len().await, 1, "{case}");
             tiered.shutdown().await;
             dlq_shutdown.cancel();
         }
+    }
+
+    /// A record over the ceiling of every DLQ backend blocks rather than being
+    /// dropped. No broker is needed: the ceiling check runs before any write.
+    #[cfg(feature = "dlq-kafka")]
+    #[tokio::test]
+    async fn a_full_spool_blocks_a_record_no_dlq_backend_can_hold() {
+        let mut kafka = crate::dlq::unreachable_broker();
+        kafka.sizing.producer.message_max_bytes = Some(4_096);
+        let config = crate::dlq::DlqConfig {
+            mode: crate::dlq::DlqMode::KafkaOnly,
+            file: crate::dlq::FileDlqConfig {
+                enabled: false,
+                ..crate::dlq::FileDlqConfig::default()
+            },
+            kafka: crate::dlq::KafkaDlqConfig {
+                enabled: true,
+                common_topic: Some("dlq.unreachable".to_string()),
+                ..crate::dlq::KafkaDlqConfig::default()
+            },
+            ..crate::dlq::DlqConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let dlq = Arc::new(
+            crate::dlq::Dlq::spawn(&config, "svc", Some(&kafka), shutdown.clone()).unwrap(),
+        );
+        let dir = tempdir().unwrap();
+        let (tiered, overflow) =
+            overflow_into(dir.path(), Some(Arc::clone(&dlq)), &[b'x'; 8_192]).await;
+        assert!(
+            matches!(overflow, Err(TieredSinkError::SpoolFull(_))),
+            "{overflow:?}"
+        );
+        assert_eq!(tiered.spool_len().await, 1);
+        tiered.shutdown().await;
+        shutdown.cancel();
     }
 
     /// The yaque lock files a spool directory can hold.
