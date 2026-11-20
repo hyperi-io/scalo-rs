@@ -101,6 +101,9 @@ pub struct CellResult {
     /// was delivered: copies a caller's retry sends, or would send, again.
     pub excess_deliveries: Option<i64>,
     pub kafka_queue: KafkaQueue,
+    /// Records offered to each destination, a resend counted each time, so
+    /// approaches that stop at a failure and ones that do not can be told apart.
+    pub attempted_records: Vec<(String, u64)>,
     /// Why the cell decides nothing, when it does not.
     pub invalid: Option<String>,
     pub groups: Vec<GroupResult>,
@@ -198,6 +201,7 @@ impl CellResult {
             alloc_bytes_per_record: per_record(raw.allocs.map(|a| a.1), records_sent).map(round),
             excess_deliveries: None,
             kafka_queue: KafkaQueue::default(),
+            attempted_records: Vec::new(),
             invalid: None,
             groups: results,
             expected_deliveries: expected,
@@ -224,6 +228,15 @@ impl CellResult {
             }
         }
         self.kafka_queue = queue;
+        self
+    }
+
+    /// Add the records each destination was offered.
+    pub fn attempted(mut self, counts: &[(&str, std::sync::Arc<crate::observe::Counts>)]) -> Self {
+        self.attempted_records = counts
+            .iter()
+            .map(|(name, c)| ((*name).to_string(), c.attempted_records()))
+            .collect();
         self
     }
 

@@ -44,6 +44,7 @@ use scalo::transport::{PayloadFormat, Record, RecordMeta};
 
 const INLINE: &str = "inline_sequential";
 const PER_RECORD: &str = "per_record_futures";
+const INLINE_CONTINUE: &str = "inline_sequential_continue";
 const PARALLEL: &str = "parallel_fanout";
 const PER_DESTINATION: &str = "batch_per_destination";
 const MERGE_CHANNEL: &str = "merge_channel";
@@ -51,7 +52,13 @@ const MERGE_SWAP: &str = "merge_swap";
 
 /// The approaches that send each destination one block per caller batch, or
 /// merge those blocks: each keeps every invariant.
-const BLOCK_APPROACHES: [&str; 4] = [PARALLEL, PER_DESTINATION, MERGE_CHANNEL, MERGE_SWAP];
+const BLOCK_APPROACHES: [&str; 5] = [
+    INLINE_CONTINUE,
+    PARALLEL,
+    PER_DESTINATION,
+    MERGE_CHANNEL,
+    MERGE_SWAP,
+];
 
 fn named(name: &str) -> AnyApproach {
     approach(name).unwrap_or_else(|| panic!("{name} is registered"))
@@ -528,6 +535,7 @@ fn every_registered_approach_has_its_invariant_tests() {
         names,
         [
             INLINE,
+            INLINE_CONTINUE,
             PER_RECORD,
             PARALLEL,
             PER_DESTINATION,
@@ -687,5 +695,30 @@ async fn merge_approaches_answer_every_caller() {
             "{name}: {answers:?}"
         );
         assert_eq!(g.stats().records_confirmed, 320, "{name}");
+    }
+}
+
+/// A block larger than the whole merge buffer is sent directly, never queued.
+#[tokio::test(start_paused = true)]
+async fn merge_approaches_send_a_block_larger_than_the_buffer_directly() {
+    for name in [MERGE_CHANNEL, MERGE_SWAP] {
+        let g = ShapedSender::new("g", grpc(5));
+        let set = destinations(&[("g", &g)]);
+        let merge = approach(&format!("{name}/w1/b8")).expect("a merge spec parses");
+        let outcomes = merge
+            .deliver(
+                &set,
+                CallerBatch {
+                    records: vec![record(vec![b'x'; 16], &[DestinationId(0)])],
+                    answer: Answer::Held,
+                },
+            )
+            .await;
+        assert_eq!(outcomes, [Outcome::Sent], "{name}");
+        assert_eq!(
+            merge.peak_queued_bytes(),
+            Some(0),
+            "{name}: nothing was queued"
+        );
     }
 }

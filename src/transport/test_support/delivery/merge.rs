@@ -16,7 +16,8 @@
 //!
 //! The buffer is a bounded channel drained with `recv_many`
 //! ([`MergeStore::Channel`]) or a mutex-guarded vector swapped out whole
-//! ([`MergeStore::Swap`]). It is bounded in payload bytes by a semaphore. The
+//! ([`MergeStore::Swap`]). It is bounded in payload bytes by a semaphore, and
+//! a block larger than the whole buffer is sent directly. The
 //! bytes are the callers' own, leased by each caller until it is answered, so
 //! a longer wait in the buffer shows as held bytes and the buffer takes no
 //! lease of its own. A buffer of 0 bytes sends directly, as the fan-out does.
@@ -118,7 +119,11 @@ impl Merge {
     ) -> Vec<Outcome> {
         let count = records.len();
         let bytes: u64 = records.iter().map(|r| r.payload.len() as u64).sum();
-        let permits = u32::try_from(bytes.min(stage.cap)).unwrap_or(u32::MAX);
+        if bytes > stage.cap {
+            // A block larger than the whole buffer is never queued.
+            return send_block(sender, &records).await;
+        }
+        let permits = u32::try_from(bytes).unwrap_or(u32::MAX);
         let Ok(permit) = Arc::clone(&stage.room).acquire_many_owned(permits).await else {
             return vec![Outcome::Failed; count];
         };

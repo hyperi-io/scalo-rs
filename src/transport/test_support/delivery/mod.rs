@@ -423,7 +423,12 @@ impl DeliveryApproach for AnyApproach {
 /// default.
 pub const REGISTRY: &[(&str, fn() -> AnyApproach)] = &[
     (InlineSequential::NAME, || {
-        AnyApproach::InlineSequential(InlineSequential)
+        AnyApproach::InlineSequential(InlineSequential::default())
+    }),
+    (InlineSequential::CONTINUE, || {
+        AnyApproach::InlineSequential(InlineSequential {
+            stop_at_failure: false,
+        })
     }),
     (PerRecordFutures::NAME, || {
         AnyApproach::PerRecordFutures(PerRecordFutures::default())

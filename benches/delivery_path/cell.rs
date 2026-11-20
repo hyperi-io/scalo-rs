@@ -54,10 +54,12 @@ async fn run(args: &Args) -> Option<String> {
             let mut destinations = Destinations::new(guard());
             let mut senders = Vec::new();
             let mut kafka_counts = None;
+            let mut all_counts = Vec::new();
             for (name, config) in loads::topology(load, args.seed) {
                 let sender = ShapedSender::new(name, config);
                 senders.push(sender.clone());
                 let (observed, counts) = Observed::new(sender);
+                all_counts.push((name, Arc::clone(&counts)));
                 if name == loads::KAFKA {
                     kafka_counts = Some(counts);
                 }
@@ -84,7 +86,12 @@ async fn run(args: &Args) -> Option<String> {
                 caller_side_peak_bytes: kafka_counts.as_deref().map(Counts::peak_bytes),
             };
             let confirmed = senders.iter().map(|s| s.stats().records_confirmed).sum();
-            Some(result.finish(Some(confirmed), queue).json_line())
+            Some(
+                result
+                    .finish(Some(confirmed), queue)
+                    .attempted(&all_counts)
+                    .json_line(),
+            )
         }
         Tier::Two => tier_two(args, load, spec, approach).await,
     }
@@ -111,7 +118,7 @@ async fn tier_two(args: &Args, load: Load, spec: &Spec, approach: AnyApproach) -
             backpressured_answers: Some(real.kafka.backpressured()),
             caller_side_peak_bytes: Some(real.kafka.peak_bytes()),
         };
-        result.map(|r| r.finish(None, queue).json_line())
+        result.map(|r| r.finish(None, queue).attempted(&real.counts).json_line())
     };
     real.close().await;
     line
