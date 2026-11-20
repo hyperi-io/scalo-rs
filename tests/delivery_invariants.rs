@@ -664,6 +664,8 @@ async fn merge_approaches_answer_every_caller() {
             callers.spawn(async move {
                 let mut answers = Vec::new();
                 for round in 0..5u8 {
+                    // Staggered arrivals, so blocks are queued while an earlier drain is in flight.
+                    tokio::time::sleep(Duration::from_millis(u64::from(caller % 7))).await;
                     let outcomes = merge
                         .deliver(
                             &set,
