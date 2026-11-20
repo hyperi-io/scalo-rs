@@ -241,6 +241,11 @@ pub async fn order_check(stack: &Stack) {
             first.map_or_else(|| "none".to_string(), |(a, b)| format!("{a}_after_{b}")),
             took.as_millis()
         );
+        let shown: Vec<String> = seqs.iter().take(60).map(ToString::to_string).collect();
+        println!(
+            "order-check approach={name} partition_order_first_60={}",
+            shown.join(",")
+        );
     }
 }
 

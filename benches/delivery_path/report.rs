@@ -67,6 +67,9 @@ pub struct CellResult {
     pub rate: Option<f64>,
     pub run: usize,
     pub tier: u8,
+    /// When the cell's callers started and finished, milliseconds since the Unix epoch.
+    pub started_unix_ms: u64,
+    pub ended_unix_ms: u64,
     pub workers: usize,
     /// CPUs the cell process was allowed to run on.
     pub allowed_cpus: Option<u32>,
@@ -167,6 +170,8 @@ impl CellResult {
             rate: args.rate,
             run: args.cell_run.unwrap_or(0),
             tier: args.tier.number(),
+            started_unix_ms: raw.started_unix_ms,
+            ended_unix_ms: raw.ended_unix_ms,
             workers: args.workers,
             allowed_cpus: crate::host::allowed_cpus(),
             presets_calibrated: PRESETS_CALIBRATED,

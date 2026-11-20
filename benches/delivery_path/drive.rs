@@ -155,6 +155,10 @@ impl GroupTally {
 
 /// One run's raw measurements.
 pub struct RawRun {
+    /// When the callers started and when the last one finished, in
+    /// milliseconds since the Unix epoch, to match a cell against host events.
+    pub started_unix_ms: u64,
+    pub ended_unix_ms: u64,
     pub elapsed: Duration,
     pub groups: Vec<GroupTally>,
     pub peak_held_bytes: u64,
@@ -190,6 +194,7 @@ pub async fn run<S: TransportSender + 'static>(
     if count_allocs {
         alloc::start();
     }
+    let started_unix_ms = unix_ms();
     let start = Instant::now();
     let deadline = start + duration;
     let callers: usize = groups.iter().map(|g| g.batches.len()).sum();
@@ -257,6 +262,8 @@ pub async fn run<S: TransportSender + 'static>(
         .zip(host::cpu_ns())
         .map(|(a, b)| b.saturating_sub(a));
     Some(RawRun {
+        started_unix_ms,
+        ended_unix_ms: unix_ms(),
         elapsed,
         groups: tallies,
         peak_held_bytes: destinations.ledger().peak_bytes(),
@@ -402,6 +409,12 @@ impl<S: TransportSender + 'static> Caller<S> {
             resent,
         }
     }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn micros(d: Duration) -> f64 {
