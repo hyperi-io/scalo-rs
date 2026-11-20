@@ -802,7 +802,10 @@ impl GrpcTransport {
             local_addr = Some(listener.local_addr().map_err(|e| {
                 TransportError::Config(format!("cannot read the address bound for {addr}: {e}"))
             })?);
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            // TCP_NODELAY on every accepted socket, as the client sets it, so a
+            // small HTTP/2 frame is not held back waiting for a delayed ACK.
+            let incoming =
+                tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
 
             let handle = tokio::spawn(async move {
                 router
