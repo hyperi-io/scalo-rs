@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scalo::transport::test_support::delivery::{Answer, DestinationId, Destinations, RoutedRecord};
-use scalo::transport::test_support::shaped::{Down, ShapedConfig, Stall, grpc_like, kafka_like};
+use scalo::transport::test_support::shaped::{Down, ShapedConfig, grpc_like, kafka_like};
 use scalo::transport::{PayloadFormat, Record, RecordMeta, TransportSender};
 
 /// The Kafka-shaped destination every load routes to.
@@ -20,6 +20,9 @@ pub const GRPC_A: &str = "grpc-a";
 /// The gRPC-shaped destination only the bulk group routes to, and the one a
 /// fault makes sick.
 pub const GRPC_B: &str = "grpc-b";
+
+/// W6's Kafka producer queue on both tiers, below what a W3 load offers at once.
+pub const W6_QUEUE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The wire key every record carries.
 pub const TOPIC: &str = "bench-events";
@@ -84,7 +87,7 @@ impl Load {
             Self::W3 => "W1 and W2 together",
             Self::W4 => "W3 with grpc-b 100 ms slow",
             Self::W5 => "W3 with grpc-b down",
-            Self::W6 => "W3 with the kafka queue filling in bursts",
+            Self::W6 => "W3 with a 4 MiB kafka producer queue",
             Self::W7 => "W2 with one 1.2 MiB record per batch refused by grpc-a",
         }
     }
@@ -128,12 +131,7 @@ pub fn topology(load: Load, seed: u64) -> [(&'static str, ShapedConfig); 3] {
                 after: grpc_b.call_latency,
             });
         }
-        Load::W6 => {
-            kafka.faults.stall = Some(Stall {
-                period: Duration::from_secs(2),
-                duration: Duration::from_millis(500),
-            });
-        }
+        Load::W6 => kafka.queue_cap_bytes = W6_QUEUE_BYTES,
         Load::W7 => grpc_a.faults.refuse = Some(|p| p.first() == Some(&REFUSED_MARK)),
         Load::W1 | Load::W2 | Load::W3 => {}
     }

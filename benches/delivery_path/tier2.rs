@@ -12,7 +12,7 @@
 //!
 //! Faults on the real transports: a gRPC listener that answers after 100 ms
 //! (W4), an endpoint nothing listens on (W5), a Kafka producer queue of
-//! [`W6_QUEUE_BYTES`] (W6), and a gRPC sender whose `max_message_size` is below
+//! `W6_QUEUE_BYTES` (W6), and a gRPC sender whose `max_message_size` is below
 //! W7's refused record.
 //!
 //! `--calibrate` measures the real senders and prints the preset values to set
@@ -43,7 +43,8 @@ use scalo::transport::{
 };
 
 use crate::listener::Listener;
-use crate::loads::{GRPC_A, GRPC_B, KAFKA, Load, REFUSING_LIMIT, TOPIC};
+use crate::loads::{GRPC_A, GRPC_B, KAFKA, Load, REFUSING_LIMIT, TOPIC, W6_QUEUE_BYTES};
+use crate::observe::{Counts, Observed};
 
 const SUITE: Suite = Suite {
     repo: "scalo",
@@ -53,9 +54,6 @@ const SUITE: Suite = Suite {
 
 /// Spreads the bench topic over more than one partition.
 const PARTITIONS: i32 = 3;
-
-/// W6's Kafka producer queue on tier 2, so a W3 load fills it in bursts.
-pub const W6_QUEUE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// W4's slow gRPC destination answers each call after this.
 const W4_DELAY: Duration = Duration::from_millis(100);
@@ -132,7 +130,9 @@ fn guard() -> Arc<MemoryGuard> {
 
 /// One cell's real senders and the listeners behind them.
 pub struct RealDestinations {
-    pub destinations: Arc<Destinations<AnySender>>,
+    pub destinations: Arc<Destinations<Observed<AnySender>>>,
+    /// What the Kafka destination held and refused.
+    pub kafka: Arc<Counts>,
     listeners: Vec<Listener>,
 }
 
@@ -144,8 +144,9 @@ impl RealDestinations {
         if load == Load::W6 {
             kafka.sizing.producer.buffer_memory_bytes = Some(W6_QUEUE_BYTES);
         }
-        let kafka = KafkaTransport::new(&kafka).await.ok()?;
-        destinations.add(KAFKA, AnySender::Kafka(kafka));
+        let (kafka, kafka_counts) =
+            Observed::new(AnySender::Kafka(KafkaTransport::new(&kafka).await.ok()?));
+        destinations.add(KAFKA, kafka);
 
         let mut listeners = Vec::new();
         let (a_endpoint, a_listener) = Listener::scalo().await?;
@@ -155,7 +156,7 @@ impl RealDestinations {
         }
         listeners.push(a_listener);
         let a_client = GrpcTransport::new(&a_config).await.ok()?;
-        destinations.add(GRPC_A, AnySender::Grpc(a_client));
+        destinations.add(GRPC_A, Observed::new(AnySender::Grpc(a_client)).0);
 
         let (b_endpoint, b_listener) = match load {
             Load::W4 => Listener::slow(W4_DELAY).await?,
@@ -166,9 +167,10 @@ impl RealDestinations {
         let b_client = GrpcTransport::new(&GrpcConfig::client(&b_endpoint))
             .await
             .ok()?;
-        destinations.add(GRPC_B, AnySender::Grpc(b_client));
+        destinations.add(GRPC_B, Observed::new(AnySender::Grpc(b_client)).0);
         Some(Self {
             destinations: Arc::new(destinations),
+            kafka: kafka_counts,
             listeners,
         })
     }

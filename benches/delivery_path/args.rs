@@ -11,14 +11,19 @@ use std::time::Duration;
 
 use scalo::transport::test_support::delivery::REGISTRY;
 
+use crate::drive::Retry;
 use crate::loads::Load;
 
 pub const USAGE: &str = "\
-usage: delivery_path [--approaches a,b] [--loads W1,W2] [--tier 1|2] [--seconds N]
-                     [--runs N] [--workers N] [--seed N] [--allocs] [--save FILE]
+usage: delivery_path [--approaches a[+retry][@control],b] [--retry none|bounded|hold]
+                     [--control] [--loads W1,W2] [--tier 1|2] [--seconds N] [--runs N]
+                     [--open-loop F,F] [--workers N] [--seed N] [--allocs] [--save FILE]
                      [--compare FILE] [--max-regression F]
                      [--cpus LIST] [--broker-cpus LIST] [--stop-file FILE] [--warmup SECONDS]
                      [--calibrate] [--order-check]";
+
+/// Exit code of `--compare` when the run cannot be compared.
+pub const INCONCLUSIVE: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -35,9 +40,47 @@ impl Tier {
     }
 }
 
+/// An approach under a retry policy, and the label its cells carry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spec {
+    pub name: String,
+    pub retry: Retry,
+    /// `name+retry`, with `@control` on a same-code control.
+    pub label: String,
+}
+
+impl Spec {
+    /// `name`, `name+retry` or either with `@control`, with `retry` when the
+    /// text names none.
+    pub fn parse(text: &str, retry: Retry) -> Result<Self, String> {
+        let (body, control) = text
+            .strip_suffix("@control")
+            .map_or((text, false), |b| (b, true));
+        let (name, retry) = match body.split_once('+') {
+            Some((name, policy)) => (
+                name,
+                Retry::parse(policy).ok_or_else(|| format!("no retry policy {policy}"))?,
+            ),
+            None => (body, retry),
+        };
+        if !REGISTRY.iter().any(|(n, _)| *n == name) {
+            let known: Vec<&str> = REGISTRY.iter().map(|(n, _)| *n).collect();
+            return Err(format!("no approach {name}: known {}", known.join(",")));
+        }
+        let suffix = if control { "@control" } else { "" };
+        Ok(Self {
+            name: name.to_string(),
+            retry,
+            label: format!("{name}+{}{suffix}", retry.name()),
+        })
+    }
+}
+
+// Each bool is one command-line switch.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Args {
-    pub approaches: Vec<String>,
+    pub approaches: Vec<Spec>,
     pub loads: Vec<Load>,
     pub tier: Tier,
     pub seconds: f64,
@@ -45,6 +88,9 @@ pub struct Args {
     pub workers: usize,
     pub seed: u64,
     pub allocs: bool,
+    /// Offered rates for open-loop cells, as fractions of the slowest
+    /// approach's closed-loop records per second under the same load.
+    pub open_loop: Vec<f64>,
     pub save: Option<PathBuf>,
     pub compare: Option<PathBuf>,
     pub max_regression: f64,
@@ -60,6 +106,12 @@ pub struct Args {
     pub broker_cpus: Option<String>,
     /// Set in a child process: run this one cell and print its JSON line.
     pub cell_run: Option<usize>,
+    /// Set in a child: the offered rate of an open-loop cell, records per second.
+    pub rate: Option<f64>,
+    /// Set in a child: the cell's drive, `closed` or `open@F`.
+    pub mode: String,
+    /// Set in a child: build the destinations, run no callers, report RSS.
+    pub idle: bool,
     /// Set in a tier 2 child: the broker the parent started.
     pub bootstrap: Option<String>,
 }
@@ -67,7 +119,7 @@ pub struct Args {
 impl Args {
     pub fn parse(command_line: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut args = Self {
-            approaches: REGISTRY.iter().map(|(n, _)| (*n).to_string()).collect(),
+            approaches: Vec::new(),
             loads: Load::ALL.to_vec(),
             tier: Tier::One,
             seconds: 5.0,
@@ -75,6 +127,7 @@ impl Args {
             workers: 8,
             seed: 1,
             allocs: false,
+            open_loop: Vec::new(),
             save: None,
             compare: None,
             max_regression: 0.05,
@@ -85,23 +138,27 @@ impl Args {
             cpus: None,
             broker_cpus: None,
             cell_run: None,
+            rate: None,
+            mode: "closed".to_string(),
+            idle: false,
             bootstrap: None,
         };
+        let mut approaches: Option<String> = None;
+        let mut retry = Retry::None;
+        let mut control = false;
         let mut words = command_line.peekable();
         while let Some(flag) = words.next() {
             let mut value = || words.next().ok_or_else(|| format!("{flag} needs a value"));
             match flag.as_str() {
                 // cargo bench passes --bench to a harness = false target.
                 "--bench" => {}
-                "--approaches" => {
-                    args.approaches = value()?.split(',').map(str::to_string).collect();
-                    for name in &args.approaches {
-                        if !REGISTRY.iter().any(|(n, _)| n == name) {
-                            let known: Vec<&str> = REGISTRY.iter().map(|(n, _)| *n).collect();
-                            return Err(format!("no approach {name}: known {}", known.join(",")));
-                        }
-                    }
+                "--approaches" => approaches = Some(value()?),
+                "--retry" => {
+                    let policy = value()?;
+                    retry =
+                        Retry::parse(&policy).ok_or_else(|| format!("no retry policy {policy}"))?;
                 }
+                "--control" => control = true,
                 "--loads" => {
                     args.loads = value()?
                         .split(',')
@@ -120,6 +177,13 @@ impl Args {
                 "--workers" => args.workers = number(&value()?)?,
                 "--seed" => args.seed = number(&value()?)?,
                 "--allocs" => args.allocs = true,
+                "--open-loop" => {
+                    args.open_loop = value()?.split(',').map(number::<f64>).collect::<Result<
+                        Vec<f64>,
+                        String,
+                    >>(
+                    )?;
+                }
                 "--save" => args.save = Some(PathBuf::from(value()?)),
                 "--compare" => args.compare = Some(PathBuf::from(value()?)),
                 "--max-regression" => args.max_regression = number(&value()?)?,
@@ -130,9 +194,27 @@ impl Args {
                 "--cpus" => args.cpus = Some(value()?),
                 "--broker-cpus" => args.broker_cpus = Some(value()?),
                 "--cell-run" => args.cell_run = Some(number(&value()?)?),
+                "--rate" => args.rate = Some(number(&value()?)?),
+                "--mode" => args.mode = value()?,
+                "--idle" => args.idle = true,
                 "--bootstrap" => args.bootstrap = Some(value()?),
                 other => return Err(format!("unknown argument {other}")),
             }
+        }
+        args.approaches = match approaches {
+            Some(list) => list
+                .split(',')
+                .map(|text| Spec::parse(text, retry))
+                .collect::<Result<Vec<Spec>, String>>()?,
+            None => REGISTRY
+                .iter()
+                .map(|(name, _)| Spec::parse(name, retry))
+                .collect::<Result<Vec<Spec>, String>>()?,
+        };
+        if control && let Some(first) = args.approaches.first() {
+            let mut twin = first.clone();
+            twin.label.push_str("@control");
+            args.approaches.push(twin);
         }
         if args.warmup < 0.0 {
             args.warmup = match args.tier {
@@ -162,6 +244,9 @@ impl Args {
         if !(args.seconds > 0.0 && args.seconds.is_finite()) {
             return Err("--seconds must be positive".into());
         }
+        if args.open_loop.iter().any(|f| !(*f > 0.0 && f.is_finite())) {
+            return Err("--open-loop fractions must be positive".into());
+        }
         Ok(args)
     }
 
@@ -169,11 +254,25 @@ impl Args {
         Duration::from_secs_f64(self.seconds)
     }
 
+    /// The modes every load runs: closed-loop, then each open-loop fraction.
+    pub fn modes(&self) -> Vec<String> {
+        let mut modes = vec!["closed".to_string()];
+        modes.extend(self.open_loop.iter().map(|f| format!("open@{f}")));
+        modes
+    }
+
     /// The command line of a child that runs one cell of this invocation.
-    pub fn cell_command_line(&self, approach: &str, load: Load, run: usize) -> Vec<String> {
+    pub fn cell_command_line(
+        &self,
+        spec: &Spec,
+        load: Load,
+        run: usize,
+        mode: &str,
+        rate: Option<f64>,
+    ) -> Vec<String> {
         let mut line = vec![
             "--approaches".to_string(),
-            approach.to_string(),
+            spec.label.clone(),
             "--loads".to_string(),
             load.id().to_string(),
             "--tier".to_string(),
@@ -186,7 +285,13 @@ impl Args {
             self.seed.to_string(),
             "--cell-run".to_string(),
             run.to_string(),
+            "--mode".to_string(),
+            mode.to_string(),
         ];
+        if let Some(rate) = rate {
+            line.push("--rate".to_string());
+            line.push(rate.to_string());
+        }
         if self.allocs {
             line.push("--allocs".to_string());
         }

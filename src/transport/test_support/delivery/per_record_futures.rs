@@ -7,17 +7,13 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! [`PerRecordFutures`]: one future per record, at most
-//! [`in_flight`](PerRecordFutures::in_flight) at once. Each sends its record to
-//! every destination it is routed to in turn with
+//! [`in_flight`](PerRecordFutures::in_flight) at once for each caller batch.
+//! Each sends its record to every destination it is routed to in turn with
 //! [`send`](TransportSender::send), awaiting each: a `Backpressured` or `Fatal`
 //! stops that record, and a `FilteredDlq` marks it dead-lettered and goes on.
 //!
-//! The backpressured records are sent again, to every destination, after a
-//! wait that starts at [`backoff`](PerRecordFutures::backoff) and doubles, up
-//! to [`retries`](PerRecordFutures::retries) times. Records still refused after
-//! that are answered backpressured.
-
-use std::time::Duration;
+//! The approach does not send a refused record again. Retry is the caller's
+//! policy, applied the same way to every approach.
 
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -25,15 +21,11 @@ use futures_util::stream::FuturesUnordered;
 use super::{CallerBatch, DeliveryApproach, Destinations, Outcome, RoutedRecord, answer};
 use crate::transport::{SendResult, TransportSender};
 
-/// One future per record, bounded, with a bounded resend of the backpressured.
+/// One future per record, bounded per caller batch.
 #[derive(Debug, Clone, Copy)]
 pub struct PerRecordFutures {
-    /// Record futures in flight at once.
+    /// Record futures in flight at once for one caller batch.
     pub in_flight: usize,
-    /// Times the backpressured records are sent again.
-    pub retries: u32,
-    /// Wait before the first resend. Each later wait doubles.
-    pub backoff: Duration,
 }
 
 impl PerRecordFutures {
@@ -43,11 +35,7 @@ impl PerRecordFutures {
 
 impl Default for PerRecordFutures {
     fn default() -> Self {
-        Self {
-            in_flight: 1000,
-            retries: 5,
-            backoff: Duration::from_millis(200),
-        }
+        Self { in_flight: 1000 }
     }
 }
 
@@ -63,41 +51,20 @@ impl DeliveryApproach for PerRecordFutures {
     ) -> Vec<Outcome> {
         let _lease = destinations.ledger().lease(batch.payload_bytes());
         let mut outcomes = vec![Outcome::Sent; batch.records.len()];
-        let mut pending: Vec<usize> = (0..batch.records.len()).collect();
-        let mut backoff = self.backoff;
-
-        for attempt in 0..=self.retries {
-            if pending.is_empty() {
+        let mut running = FuturesUnordered::new();
+        let mut next = batch.records.iter().enumerate();
+        loop {
+            while running.len() < self.in_flight.max(1)
+                && let Some((i, routed)) = next.next()
+            {
+                running.push(async move { (i, fan_out(destinations, routed).await) });
+            }
+            let Some((i, outcome)) = running.next().await else {
                 break;
-            }
-            if attempt > 0 {
-                tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2);
-            }
-            let mut held = Vec::new();
-            let mut running = FuturesUnordered::new();
-            let mut next = pending.into_iter();
-            loop {
-                while running.len() < self.in_flight.max(1)
-                    && let Some(i) = next.next()
-                {
-                    let routed = &batch.records[i];
-                    running.push(async move { (i, fan_out(destinations, routed).await) });
-                }
-                let Some((i, outcome)) = running.next().await else {
-                    break;
-                };
-                if outcome == Outcome::Backpressured {
-                    held.push(i);
-                } else {
-                    outcomes[i] = outcome;
-                }
-            }
-            pending = held;
+            };
+            outcomes[i] = outcome;
         }
-        for i in pending {
-            outcomes[i] = Outcome::Backpressured;
-        }
+        drop(running);
         answer(outcomes, batch.answer)
     }
 }

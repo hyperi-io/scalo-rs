@@ -27,10 +27,17 @@
 //!
 //! tokio's timer fires on whole milliseconds, so each sender sleeps whole
 //! milliseconds and carries the rest, and the timer's overshoot, into its next
-//! wait. A single call can be up to a millisecond off, while the mean across
-//! calls holds. Below 1 ms the shaped senders model mean latency only, and a
-//! result that turns on latency under 1 ms is for tier 2, the real transports,
-//! to decide.
+//! wait. A call holds its slot and its queue room until its own wait returns,
+//! but that wait can be up to a millisecond short or long, so below 1 ms the
+//! shaped senders get mean latency right, not each call's.
+//!
+//! The Kafka-like confirmation window closes on time or on size, whichever
+//! comes first, and is one window per sender: a producer's per-partition
+//! batches are not modelled.
+//!
+//! Shaped senders are the fast loop and the regression gate, where an approach
+//! is compared with its own saved baseline. A choice between approaches is made
+//! on tier 2, the real transports.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -112,6 +119,10 @@ pub struct ShapedConfig {
     /// batch. Every record offered while it is open confirms when it closes,
     /// plus `call_latency`.
     pub confirm_window: Option<Duration>,
+    /// Payload bytes that close a confirmation window early, as a full
+    /// producer batch is sent without waiting out its linger. Zero is no limit.
+    /// The record that fills the window confirms at once, plus `call_latency`.
+    pub confirm_batch_bytes: u64,
     /// How a call's records are answered.
     pub outcome: OutcomeMode,
     /// Bytes that may wait for confirmation at once. Zero is no cap. A call
@@ -143,6 +154,7 @@ impl Default for ShapedConfig {
             record_cost: Duration::ZERO,
             kib_cost: Duration::ZERO,
             confirm_window: None,
+            confirm_batch_bytes: 0,
             outcome: OutcomeMode::AllOrNothing,
             queue_cap_bytes: 0,
             queue_cap_records: 0,
@@ -169,6 +181,8 @@ pub fn kafka_like() -> ShapedConfig {
         // A lone record's time to its delivery report under the throughput
         // profile, less `call_latency`.
         confirm_window: Some(Duration::from_micros(21_184)),
+        // `ProducerKnobs::batch_size_bytes` of the throughput profile.
+        confirm_batch_bytes: 131_072,
         outcome: OutcomeMode::PerRecord,
         // `ProducerKnobs::buffer_memory_bytes` of the throughput profile.
         queue_cap_bytes: 64 * 1024 * 1024,
@@ -196,6 +210,7 @@ pub fn grpc_like() -> ShapedConfig {
         // The same fit's cost per KiB.
         kib_cost: Duration::from_nanos(4_919),
         confirm_window: None,
+        confirm_batch_bytes: 0,
         outcome: OutcomeMode::AllOrNothing,
         queue_cap_bytes: 0,
         // `GrpcConfig::recv_buffer_size`: the receive channel, in records.
@@ -234,6 +249,10 @@ pub struct ShapedStats {
     pub batch_sizes: [u64; BATCH_BUCKETS],
     /// Most payload bytes waiting for confirmation at once.
     pub peak_bytes_in_flight: u64,
+    /// Offers that found the queue full and waited for room.
+    pub queue_full_waits: u64,
+    /// Offers refused because room did not come within `queue_full_wait`.
+    pub queue_full_refusals: u64,
     /// Most calls in flight at once.
     pub peak_calls_in_flight: u64,
 }
@@ -248,6 +267,8 @@ struct Counters {
     max_batch: AtomicU64,
     batch_sizes: [AtomicU64; BATCH_BUCKETS],
     peak_bytes_in_flight: AtomicU64,
+    queue_full_waits: AtomicU64,
+    queue_full_refusals: AtomicU64,
     calls_in_flight: AtomicU64,
     peak_calls_in_flight: AtomicU64,
 }
@@ -271,8 +292,8 @@ struct Inner {
     rng: AtomicU64,
     /// Nanoseconds slept short of what was asked, carried into the next wait.
     debt_ns: AtomicI64,
-    /// When the open confirmation window closes, in nanoseconds from `epoch`.
-    window_end: AtomicU64,
+    /// The open confirmation window.
+    window: std::sync::Mutex<Window>,
     counters: Counters,
     closed: AtomicBool,
     order: std::sync::Mutex<Vec<bytes::Bytes>>,
@@ -304,7 +325,7 @@ impl ShapedSender {
                 slots,
                 rng: AtomicU64::new(config.seed),
                 debt_ns: AtomicI64::new(0),
-                window_end: AtomicU64::new(0),
+                window: std::sync::Mutex::new(Window::default()),
                 counters: Counters::default(),
                 closed: AtomicBool::new(false),
                 order: std::sync::Mutex::new(Vec::new()),
@@ -335,6 +356,8 @@ impl ShapedSender {
             max_batch: c.max_batch.load(Ordering::Relaxed),
             batch_sizes,
             peak_bytes_in_flight: c.peak_bytes_in_flight.load(Ordering::Relaxed),
+            queue_full_waits: c.queue_full_waits.load(Ordering::Relaxed),
+            queue_full_refusals: c.queue_full_refusals.load(Ordering::Relaxed),
             peak_calls_in_flight: c.peak_calls_in_flight.load(Ordering::Relaxed),
         }
     }
@@ -406,13 +429,17 @@ impl ShapedSender {
         result
     }
 
+    /// Offer each record to the queue in turn, and release each one's room
+    /// when its own confirmation is due, as a producer frees queue space on
+    /// each delivery report, so a call larger than the queue drains through it.
     async fn per_record(&self, records: &[Record]) -> SendResult {
         let inner = &self.inner;
         let cfg = &inner.config;
-        let start = Instant::now();
         let mut held = QueueHold::new(inner);
-        let mut confirm_at = start;
-        let mut queued: u64 = 0;
+        // Queued records not yet confirmed: (confirmation time, bytes).
+        let mut pending: std::collections::VecDeque<(Instant, u64)> =
+            std::collections::VecDeque::new();
+        let mut cursor = Instant::now();
         let mut dead_lettered = false;
         let mut refused = false;
         for record in records {
@@ -424,25 +451,23 @@ impl ShapedSender {
                 dead_lettered = true;
                 continue;
             }
+            let bytes = len_u64(&record.payload);
             if !held
-                .take(len_u64(&record.payload), 1, cfg.queue_full_wait)
+                .take_draining(bytes, cfg.queue_full_wait, &mut pending)
                 .await
             {
                 refused = true;
                 break;
             }
             self.log(std::iter::once(record));
-            queued += 1;
-            let offered_at = start + scale(cfg.record_cost, queued);
-            let confirmed = self.confirm_time(offered_at) + cfg.call_latency + self.extra();
-            confirm_at = confirm_at.max(self.after_stall(confirmed));
+            cursor = cursor.max(Instant::now()) + cfg.record_cost;
+            let confirmed = self.confirm_time(cursor, bytes) + cfg.call_latency + self.extra();
+            pending.push_back((self.after_stall(confirmed), bytes));
         }
-        self.wait_until(confirm_at).await;
-        inner
-            .counters
-            .records_confirmed
-            .fetch_add(queued, Ordering::Relaxed);
-        drop(held);
+        while let Some(&(due, _)) = pending.front() {
+            self.wait_until(due).await;
+            held.release_due(&mut pending, Instant::now().max(due));
+        }
         if refused {
             SendResult::Backpressured
         } else if dead_lettered {
@@ -481,7 +506,7 @@ impl ShapedSender {
                 + scale(cfg.record_cost, sent)
                 + scale(cfg.kib_cost, bytes.div_ceil(1024))
                 + self.extra();
-            let done = self.after_stall(self.confirm_time(start + cost));
+            let done = self.after_stall(self.confirm_time(start + cost, bytes));
             self.wait_until(done).await;
             inner
                 .counters
@@ -515,26 +540,29 @@ impl ShapedSender {
             .fetch_add(wanted - slept, Ordering::AcqRel);
     }
 
-    /// When the window a record offered at `at` joins closes, opening one if
-    /// none is open, or `at` with no window configured.
-    fn confirm_time(&self, at: Instant) -> Instant {
-        let Some(window) = self.inner.config.confirm_window else {
+    /// When the window a record of `bytes` offered at `at` joins closes,
+    /// opening one if none is open, or `at` with no window configured. The
+    /// record that fills the window to `confirm_batch_bytes` closes it at `at`.
+    fn confirm_time(&self, at: Instant, bytes: u64) -> Instant {
+        let cfg = &self.inner.config;
+        let Some(window) = cfg.confirm_window else {
             return at;
         };
         let at_ns = as_u64_nanos(at.saturating_duration_since(self.inner.epoch));
-        let window_ns = as_u64_nanos(window);
-        let end = &self.inner.window_end;
-        let mut current = end.load(Ordering::Acquire);
-        loop {
-            if at_ns < current {
-                return self.inner.epoch + Duration::from_nanos(current);
-            }
-            let opened = at_ns.saturating_add(window_ns);
-            match end.compare_exchange_weak(current, opened, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return self.inner.epoch + Duration::from_nanos(opened),
-                Err(seen) => current = seen,
-            }
+        let Ok(mut open) = self.inner.window.lock() else {
+            return at + window;
+        };
+        if at_ns >= open.end_ns {
+            open.end_ns = at_ns.saturating_add(as_u64_nanos(window));
+            open.bytes = 0;
         }
+        open.bytes = open.bytes.saturating_add(bytes);
+        if cfg.confirm_batch_bytes > 0 && open.bytes >= cfg.confirm_batch_bytes {
+            open.end_ns = at_ns;
+            open.bytes = 0;
+            return at;
+        }
+        self.inner.epoch + Duration::from_nanos(open.end_ns)
     }
 
     /// `at`, or the end of the stall it falls in.
@@ -567,6 +595,13 @@ impl ShapedSender {
         };
         cfg.faults.extra_latency + jitter
     }
+}
+
+/// The confirmation window records join, in nanoseconds from the sender's epoch.
+#[derive(Default)]
+struct Window {
+    end_ns: u64,
+    bytes: u64,
 }
 
 /// One call counted in flight until dropped.
@@ -612,22 +647,93 @@ impl<'a> QueueHold<'a> {
     /// Take room for `records` records of `bytes` bytes, waiting up to `wait`
     /// for it. False when the room did not come.
     async fn take(&mut self, bytes: u64, records: u64, wait: Duration) -> bool {
-        let deadline = Instant::now() + wait;
+        let mut nothing_pending = std::collections::VecDeque::new();
+        self.take_until(bytes, records, Instant::now() + wait, &mut nothing_pending)
+            .await
+    }
+
+    /// Take room for one record of `bytes` bytes, waiting up to `wait`, and
+    /// release this call's `pending` records as their confirmations fall due
+    /// meanwhile.
+    async fn take_draining(
+        &mut self,
+        bytes: u64,
+        wait: Duration,
+        pending: &mut std::collections::VecDeque<(Instant, u64)>,
+    ) -> bool {
+        self.take_until(bytes, 1, Instant::now() + wait, pending)
+            .await
+    }
+
+    async fn take_until(
+        &mut self,
+        bytes: u64,
+        records: u64,
+        deadline: Instant,
+        pending: &mut std::collections::VecDeque<(Instant, u64)>,
+    ) -> bool {
+        let mut waited = false;
         loop {
+            self.release_due(pending, Instant::now());
             let notified = self.inner.room.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if self.try_take(bytes, records) {
                 return true;
             }
+            let counters = &self.inner.counters;
+            if !waited {
+                waited = true;
+                counters.queue_full_waits.fetch_add(1, Ordering::Relaxed);
+            }
             if Instant::now() >= deadline {
+                counters.queue_full_refusals.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
+            let wake = pending
+                .front()
+                .map_or(deadline, |&(due, _)| due.min(deadline));
             tokio::select! {
                 () = notified => {}
-                () = tokio::time::sleep_until(deadline) => {}
+                () = tokio::time::sleep_until(wake) => {}
             }
         }
+    }
+
+    /// Give back the room of every `pending` record confirmed by `now`.
+    fn release_due(
+        &mut self,
+        pending: &mut std::collections::VecDeque<(Instant, u64)>,
+        now: Instant,
+    ) {
+        let mut bytes = 0;
+        let mut records = 0;
+        while let Some(&(due, size)) = pending.front() {
+            if due > now {
+                break;
+            }
+            pending.pop_front();
+            bytes += size;
+            records += 1;
+        }
+        if records > 0 {
+            self.release(bytes, records);
+        }
+    }
+
+    /// Give back `bytes` and `records` of this call's room.
+    fn release(&mut self, bytes: u64, records: u64) {
+        self.bytes -= bytes;
+        self.records -= records;
+        self.inner.queue_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.inner
+            .queue_records
+            .fetch_sub(records, Ordering::AcqRel);
+        self.inner
+            .counters
+            .records_confirmed
+            .fetch_add(records, Ordering::Relaxed);
+        self.inner.room.notify_waiters();
     }
 
     fn try_take(&mut self, bytes: u64, records: u64) -> bool {

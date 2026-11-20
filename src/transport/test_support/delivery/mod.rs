@@ -14,9 +14,14 @@
 //! and the tests pick approaches by name. Adding one is a file holding its
 //! type, a variant and a match arm on [`AnyApproach`], and a registry line.
 //!
-//! Every approach takes a [`Lease`] on the [`Destinations`]' memory guard for
+//! Every approach takes a [`Lease`] from the [`Destinations`]' [`Ledger`] for
 //! the batch's payload bytes when the batch is offered, and drops it when the
-//! last outcome is known, so a cancelled delivery releases its bytes.
+//! last outcome is known, so a cancelled delivery releases its bytes. The ledger
+//! is the only way an approach reaches the memory guard: every byte an approach
+//! buffers is leased through it, so its peak is the approach's held memory.
+//!
+//! Retry is not an approach's concern. An approach answers each record once,
+//! and the caller decides whether to offer the refused ones again.
 //!
 //! A held batch ([`Answer::Held`]) is answered all or nothing: when any record
 //! is not delivered, every record not dead-lettered gets the worst outcome.
@@ -164,10 +169,10 @@ impl Ledger {
         self.peak.store(self.held_bytes(), Ordering::Release);
     }
 
-    /// The guard leases are taken on.
+    /// Bytes reserved on the guard now, by this ledger's leases and any other.
     #[must_use]
-    pub fn guard(&self) -> &MemoryGuard {
-        &self.guard
+    pub fn guard_reserved_bytes(&self) -> u64 {
+        self.guard.reserved_bytes()
     }
 }
 
@@ -279,7 +284,8 @@ pub trait DeliveryApproach: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Deliver `batch` to its routes in `destinations` and return one outcome
-    /// per record, in the batch's order.
+    /// per record, in the batch's order. Every byte held meanwhile is leased
+    /// from [`Destinations::ledger`].
     fn deliver<'a, S: TransportSender>(
         &'a self,
         destinations: &'a Destinations<S>,

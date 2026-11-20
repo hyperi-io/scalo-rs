@@ -17,10 +17,12 @@
 //!    refused nor delayed by it.
 //! 4. A cancelled request releases its memory lease.
 //! 5. A refused record maps to the right caller and the right record.
-//! 6. Kafka per-key order survives.
+//! 6. Kafka per-key order survives a full producer queue, and a batch larger
+//!    than the queue drains through it.
 //!
-//! Each invariant is a `check_*` function and one test per approach. A test an
-//! approach fails is ignored with the reason, so the gap stays visible.
+//! Each invariant is a `check_*` function and one test per approach. Where an
+//! approach does not keep an invariant, its test asserts what it does instead
+//! and is named for it.
 
 #![cfg(feature = "transport-test-support")]
 
@@ -326,7 +328,7 @@ async fn check_cancel_releases_lease(name: &str) {
         "{name}: lease kept after cancel"
     );
     assert_eq!(
-        set.ledger().guard().reserved_bytes(),
+        set.ledger().guard_reserved_bytes(),
         0,
         "{name}: guard kept the bytes"
     );
@@ -398,60 +400,108 @@ async fn per_record_futures_maps_a_refusal_to_its_caller_and_record() {
     check_refusal_maps_to_its_record(PER_RECORD).await;
 }
 
-// 6. Kafka per-key order survives.
+// 6. Kafka per-key order survives, and a batch larger than the queue drains
+//    through it.
 
-/// Within one delivery, the queue never sees a record after a later one.
-///
-/// Records 0 to 3 fill 4 of the queue's 6 bytes. Record 4 is 3 bytes and does
-/// not fit, record 5 is 1 byte and does, which is the case a producer queue
-/// meets when record sizes vary.
-async fn check_kafka_order(name: &str) {
-    let k = ShapedSender::new(
+/// A Kafka-shaped queue of 6 bytes that waits up to 100 ms for room and logs
+/// the order records enter it.
+fn small_kafka_queue() -> ShapedSender {
+    ShapedSender::new(
         "k",
         ShapedConfig {
             queue_cap_bytes: 6,
-            queue_full_wait: Duration::ZERO,
+            queue_full_wait: Duration::from_millis(100),
             log_order: true,
             ..kafka(20)
         },
-    );
-    let set = destinations(&[("k", &k)]);
-    let records: Vec<RoutedRecord> = (0..10u8)
+    )
+}
+
+/// Ten records, each one byte holding its index, except record 4, which is
+/// three bytes: it does not fit beside records 0 to 3, and record 5 does.
+fn mixed_sizes(route: DestinationId) -> Vec<RoutedRecord> {
+    (0..10u8)
         .map(|i| {
             let payload = if i == 4 { vec![i; 3] } else { vec![i] };
-            record(payload, &[DestinationId(0)])
+            record(payload, &[route])
         })
-        .collect();
-    let _ = named(name)
+        .collect()
+}
+
+/// Deliver the mixed batch through a small queue and return the outcomes and
+/// the order the records entered the queue.
+async fn through_a_full_queue(name: &str) -> (Vec<Outcome>, Vec<u8>) {
+    let k = small_kafka_queue();
+    let set = destinations(&[("k", &k)]);
+    let outcomes = named(name)
         .deliver(
             &set,
             CallerBatch {
-                records,
+                records: mixed_sizes(DestinationId(0)),
                 answer: Answer::PerRecord,
             },
         )
         .await;
     let order: Vec<u8> = k.queued_payloads().iter().map(|p| p[0]).collect();
-    assert!(!order.is_empty(), "{name}: nothing reached the queue");
-    let mut highest = 0u8;
-    for (at, seq) in order.iter().enumerate() {
-        assert!(
-            *seq >= highest,
-            "{name}: record {seq} queued after record {highest} (queue order {order:?}, position {at})"
-        );
-        highest = *seq;
-    }
+    assert_eq!(k.bytes_in_flight(), 0, "{name}: the queue drained");
+    (outcomes, order)
 }
 
 #[tokio::test(start_paused = true)]
-async fn inline_sequential_keeps_kafka_order() {
-    check_kafka_order(INLINE).await;
+async fn inline_sequential_keeps_kafka_order_through_a_full_queue() {
+    let (outcomes, order) = through_a_full_queue(INLINE).await;
+    assert_eq!(outcomes, [Outcome::Sent; 10]);
+    assert_eq!(order, (0..10).collect::<Vec<u8>>());
+}
+
+/// The real Kafka sender does the same: `delivery_path --tier 2 --order-check`.
+#[tokio::test(start_paused = true)]
+async fn per_record_futures_lets_a_later_record_pass_an_earlier_one_at_a_full_kafka_queue() {
+    let (outcomes, order) = through_a_full_queue(PER_RECORD).await;
+    assert_eq!(outcomes, [Outcome::Sent; 10]);
+    assert_eq!(order, ORDER_PER_RECORD);
+}
+
+/// The order `per_record_futures` puts the mixed batch into the small queue.
+const ORDER_PER_RECORD: [u8; 10] = [0, 1, 2, 3, 5, 6, 4, 7, 8, 9];
+
+async fn check_batch_larger_than_queue_completes(name: &str) {
+    let k = ShapedSender::new(
+        "k",
+        ShapedConfig {
+            queue_cap_bytes: 4,
+            queue_full_wait: Duration::from_millis(100),
+            ..kafka(20)
+        },
+    );
+    let set = destinations(&[("k", &k)]);
+    let records: Vec<RoutedRecord> = (0..20u8)
+        .map(|i| record(vec![i], &[DestinationId(0)]))
+        .collect();
+    let outcomes = named(name)
+        .deliver(
+            &set,
+            CallerBatch {
+                records,
+                answer: Answer::Held,
+            },
+        )
+        .await;
+    assert_eq!(outcomes, [Outcome::Sent; 20], "{name}");
+    let stats = k.stats();
+    assert_eq!(stats.records_confirmed, 20, "{name}");
+    assert_eq!(stats.queue_full_refusals, 0, "{name}");
+    assert!(stats.queue_full_waits > 0, "{name}: the queue never filled");
 }
 
 #[tokio::test(start_paused = true)]
-#[ignore = "per_record_futures offers every record on its own, so a later record that fits the producer queue goes ahead of an earlier one that did not. The real Kafka sender reorders the same way: delivery_path --tier 2 --order-check"]
-async fn per_record_futures_keeps_kafka_order() {
-    check_kafka_order(PER_RECORD).await;
+async fn inline_sequential_drains_a_batch_larger_than_the_queue() {
+    check_batch_larger_than_queue_completes(INLINE).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_record_futures_drains_a_batch_larger_than_the_queue() {
+    check_batch_larger_than_queue_completes(PER_RECORD).await;
 }
 
 #[test]
