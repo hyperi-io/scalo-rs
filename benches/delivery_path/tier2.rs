@@ -36,7 +36,7 @@ use scalo::transport::kafka::test_support::{KAFKA_IMAGE, KAFKA_PORT, kafka_spec,
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::test_support::delivery::{
     Answer, CallerBatch, DeliveryApproach, DestinationId, Destinations, Outcome, RoutedRecord,
-    approach,
+    Shape, approach,
 };
 use scalo::transport::{
     AnySender, PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportSender,
@@ -146,7 +146,7 @@ impl RealDestinations {
         }
         let (kafka, kafka_counts) =
             Observed::new(AnySender::Kafka(KafkaTransport::new(&kafka).await.ok()?));
-        destinations.add(KAFKA, kafka);
+        destinations.add_shaped(KAFKA, kafka, Shape::PerRecord);
 
         let mut listeners = Vec::new();
         let (a_endpoint, a_listener) = Listener::scalo().await?;

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use scalo::memory::{MemoryGuard, MemoryGuardConfig};
 use scalo::transport::TransportSender;
-use scalo::transport::test_support::delivery::{AnyApproach, Destinations, approach};
+use scalo::transport::test_support::delivery::{AnyApproach, Destinations, Shape, approach};
 use scalo::transport::test_support::shaped::ShapedSender;
 
 use crate::args::{Args, Spec, Tier};
@@ -61,7 +61,12 @@ async fn run(args: &Args) -> Option<String> {
                 if name == loads::KAFKA {
                     kafka_counts = Some(counts);
                 }
-                destinations.add(name, observed);
+                let shape = if name == loads::KAFKA {
+                    Shape::PerRecord
+                } else {
+                    Shape::Batch
+                };
+                destinations.add_shaped(name, observed, shape);
             }
             let destinations = Arc::new(destinations);
             if args.idle {
@@ -139,7 +144,7 @@ async fn measure<S: TransportSender + 'static>(
     let groups = loads::groups(load, destinations.as_ref());
     let drive = args.rate.map_or(Drive::Closed, |rate| Drive::Open { rate });
     let raw = drive::run(
-        approach,
+        approach.clone(),
         spec.retry,
         drive,
         destinations,
@@ -148,14 +153,9 @@ async fn measure<S: TransportSender + 'static>(
         args.allocs,
     )
     .await?;
-    Some(CellResult::new(
-        args,
-        load,
-        spec,
-        &groups,
-        &raw,
-        host::peak_rss_bytes(),
-    ))
+    let mut result = CellResult::new(args, load, spec, &groups, &raw, host::peak_rss_bytes());
+    result.peak_queued_bytes = approach.peak_queued_bytes();
+    Some(result)
 }
 
 /// A guard with a fixed limit, so leases are counted and never refused.

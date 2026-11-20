@@ -87,6 +87,9 @@ pub struct CellResult {
     /// p99 of the callers whose records do not touch the sick destination.
     pub isolated_p99_us: Option<f64>,
     pub peak_held_bytes: u64,
+    /// Most payload bytes waiting in a merge buffer at once, for a merge
+    /// approach. Those bytes are inside `peak_held_bytes` already.
+    pub peak_queued_bytes: Option<u64>,
     /// The cell process's `VmHWM`: its senders, the approach, the callers and,
     /// on tier 2, the in-process gRPC listeners. The broker is not in it.
     pub peak_rss_bytes: Option<u64>,
@@ -188,6 +191,7 @@ impl CellResult {
             isolated_p99_us: (sick.is_some() && isolated.count() > 0)
                 .then(|| quantile(&isolated, 0.99)),
             peak_held_bytes: raw.peak_held_bytes,
+            peak_queued_bytes: None,
             peak_rss_bytes,
             cpu_us_per_record: per_record(raw.cpu_ns, records_sent).map(|ns| round(ns / 1000.0)),
             allocs_per_record: per_record(raw.allocs.map(|a| a.0), records_sent).map(round),
@@ -386,9 +390,9 @@ pub fn tables(args: &Args, collected: &Collected) {
             let _ = writeln!(out, "\n## {} {mode} -- {}", load.id(), load.describe());
             let _ = writeln!(
                 out,
-                "| approach | runs | offered rec/s | rec/s | vs first | paired rec/s | p50 ms | p99 ms | vs first | paired p99 | first-answer p99 ms | p999 ms | iso p99 ms | late | resent | held MiB | rss over idle MiB | cpu us/rec | allocs/rec | excess | invalid |"
+                "| approach | runs | offered rec/s | rec/s | vs first | paired rec/s | p50 ms | p99 ms | vs first | paired p99 | first-answer p99 ms | p999 ms | iso p99 ms | late | resent | held MiB | queued MiB | rss over idle MiB | cpu us/rec | allocs/rec | excess | invalid |"
             );
-            let _ = writeln!(out, "|{}", "---|".repeat(21));
+            let _ = writeln!(out, "|{}", "---|".repeat(22));
             for spec in &args.approaches {
                 let cells = cells_of(results, *load, &mode, &spec.label);
                 if cells.is_empty() {
@@ -404,7 +408,7 @@ pub fn tables(args: &Args, collected: &Collected) {
                 });
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     spec.label,
                     cells.len(),
                     show(stat(&cells, |c| Some(c.offered_records_per_sec)), 1.0, 0),
@@ -439,6 +443,11 @@ pub fn tables(args: &Args, collected: &Collected) {
                         1_048_576.0,
                         1
                     ),
+                    show(
+                        stat(&cells, |c| c.peak_queued_bytes.map(|b| b as f64)),
+                        1_048_576.0,
+                        1
+                    ),
                     show(rss_over_idle, 1_048_576.0, 1),
                     show(stat(&cells, |c| c.cpu_us_per_record), 1.0, 2),
                     show(stat(&cells, |c| c.allocs_per_record), 1.0, 2),
@@ -462,7 +471,7 @@ pub fn tables(args: &Args, collected: &Collected) {
         }
     }
     println!(
-        "\nEach figure is the median over runs with (max - min) / median in brackets. ns marks a difference within the spread. Paired figures are the per-round differences from the first approach: median [min, max]. Approach order rotates each round. An open-loop cell offers at a fixed rate and times each offer from its scheduled start. per_record_futures holds at most 1000 record futures per caller batch, as the fetcher does. RSS is the cell process's peak over an idle cell's on the same load."
+        "\nEach figure is the median over runs with (max - min) / median in brackets. ns marks a difference within the spread. Paired figures are the per-round differences from the first approach: median [min, max]. Approach order rotates each round. An open-loop cell offers at a fixed rate and times each offer from its scheduled start. per_record_futures holds at most 1000 record futures per caller batch, as the fetcher does. batch_per_destination sends destinations in turn and never stops at the first failure, since each record carries its own outcome. Queued MiB is the merge buffer's peak, already inside held MiB. A merge window of 0.5 ms waits as long as 1 ms on tokio's millisecond timer. RSS is the cell process's peak over an idle cell's on the same load."
     );
     if args.tier == Tier::One {
         println!(

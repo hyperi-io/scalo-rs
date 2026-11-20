@@ -208,7 +208,7 @@ pub async fn run<S: TransportSender + 'static>(
     for (index, group) in groups.iter().enumerate() {
         for batch in &group.batches {
             let caller = Caller {
-                approach,
+                approach: approach.clone(),
                 retry,
                 destinations: Arc::clone(destinations),
                 records: Arc::clone(batch),
@@ -285,7 +285,7 @@ struct Caller<S> {
 impl<S> Clone for Caller<S> {
     fn clone(&self) -> Self {
         Self {
-            approach: self.approach,
+            approach: self.approach.clone(),
             retry: self.retry,
             destinations: Arc::clone(&self.destinations),
             records: Arc::clone(&self.records),
