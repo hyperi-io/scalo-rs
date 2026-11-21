@@ -305,8 +305,14 @@ mod tests {
             let Some(TransportError::Config(message)) = error else {
                 panic!("{name}: built a client, or failed another way: {error:?}");
             };
-            assert!(message.contains(expected), "{name}: {message}");
-            assert!(message.starts_with("Vector TLS: "), "{name}: {message}");
+            assert!(
+                message.contains(expected),
+                "{name}: the error lacks `{expected}`"
+            );
+            assert!(
+                message.starts_with("Vector TLS: "),
+                "{name}: the error is not a Vector TLS error"
+            );
         }
 
         let good = VectorCompatTls::private_ca(&ca)
