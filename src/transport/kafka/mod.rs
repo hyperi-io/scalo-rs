@@ -416,6 +416,9 @@ pub struct KafkaTransport {
     acks: acks::KafkaAcks,
     /// The producer's `message.max.bytes`, for screening records before a send.
     message_max_bytes: usize,
+    /// Most records one receive returns, whatever the caller asks for.
+    /// `sizing.consumer.max_poll_records`, or its profile's default.
+    poll_cap: usize,
 }
 
 /// The consumer client and the group protocol it joined with, replaced whole
@@ -1287,6 +1290,13 @@ impl KafkaTransport {
             ));
         }
         let reads = role != Role::Send && !config.group.is_empty();
+        if reads && config.sizing.effective_poll_cap() == 0 {
+            return Err(TransportError::Config(
+                "kafka: sizing.consumer.max_poll_records must be at least 1, because a receive \
+                 always takes its first record, so a cap of 0 would act as 1"
+                    .into(),
+            ));
+        }
         if !reads && (!config.topics.is_empty() || config.auto_discover) {
             tracing::debug!(
                 topics = ?config.topics,
@@ -1506,6 +1516,7 @@ impl KafkaTransport {
             asked_ends: AskedEnds::new(consumer_config.as_ref()),
             acks: acks::KafkaAcks::default(),
             message_max_bytes,
+            poll_cap: config.sizing.effective_poll_cap(),
         })
     }
 
@@ -2427,10 +2438,12 @@ impl TransportReceiver for KafkaTransport {
     ///
     /// This is optimized for high-throughput batch processing:
     /// - Uses zero-timeout polls to drain librdkafka's internal queue
-    /// - Returns up to `max` messages per call
+    /// - Returns up to `max` messages per call, and never more than the poll
+    ///   cap, `sizing.consumer.max_poll_records` (2000 on the default
+    ///   `throughput` profile)
     /// - Pre-populates topic cache to avoid allocations
     ///
-    /// For PB/day workloads, call with `max = 10_000` or higher.
+    /// A larger batch needs a larger poll cap: `max` above it changes nothing.
     ///
     /// ## Broker outages
     ///
@@ -2604,7 +2617,7 @@ impl KafkaTransport {
     /// Shared poll + recv-arena body for [`recv`](TransportReceiver::recv) and
     /// [`recv_limited`](TransportReceiver::recv_limited).
     ///
-    /// `max_msgs` bounds the poll by record count (as before). `max_bytes`, when
+    /// `max_msgs`, held to the poll cap, bounds the poll by record count. `max_bytes`, when
     /// `Some`, ADDITIONALLY stops the drain once the recv-arena has accumulated
     /// at least that many payload bytes -- with a FLOOR of one record so an
     /// oversized record is still returned (the loop never stalls). `None`
@@ -2628,6 +2641,7 @@ impl KafkaTransport {
         if self.closed.load(Ordering::Relaxed) {
             return Err(TransportError::Closed);
         }
+        let max_msgs = max_msgs.min(self.poll_cap);
 
         self.wait_rebuild_backoff().await?;
         self.rebuild_refused_consumer();
@@ -3669,6 +3683,37 @@ mod tests {
                 "{name}: subscription"
             );
         }
+    }
+
+    /// A receive always takes its first record, so a poll cap of 0 would act as
+    /// 1. A transport that reads refuses it, and one that only sends has no
+    /// receive for it to cap and builds.
+    #[tokio::test]
+    async fn a_poll_cap_of_zero_fails_a_receiver_and_spares_a_sender() {
+        let mut config = KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            group: "consumer-a".to_string(),
+            topics: vec!["syslog_load".to_string()],
+            ..Default::default()
+        };
+        config.sizing.consumer.max_poll_records = Some(0);
+
+        for (name, built) in [
+            ("receiver", KafkaTransport::receiver(&config).await),
+            ("new with a group", KafkaTransport::new(&config).await),
+        ] {
+            assert!(
+                matches!(built, Err(TransportError::Config(ref m)) if m.contains("max_poll_records")),
+                "{name}: {:?}",
+                built.err()
+            );
+        }
+        let sender = KafkaTransport::sender(&config).await;
+        assert!(sender.is_ok(), "sender: {:?}", sender.err());
+
+        config.sizing.consumer.max_poll_records = Some(1);
+        let receiver = KafkaTransport::receiver(&config).await;
+        assert!(receiver.is_ok(), "a cap of 1: {:?}", receiver.err());
     }
 
     /// Each direction a transport was built without refuses its calls as a
