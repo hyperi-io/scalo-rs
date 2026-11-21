@@ -183,8 +183,9 @@ pub struct EnvVarDoc {
 ///
 /// It orchestrates:
 /// 1. `.env` loading (via dotenvy), only when no `config_path` is given
-/// 2. YAML file discovery and loading, with `config_path` as the settings
-///    layer when given
+/// 2. YAML file discovery and loading. With `config_path` that file is the
+///    settings layer and the standard locations (the working directory,
+///    `/config/` and the user's `~/.config/`) are not searched
 /// 3. Figment env var merging (double-underscore nesting)
 /// 4. Flat env overrides (single-underscore, K8s-friendly)
 /// 5. Normalisation (infer implied settings)
@@ -202,6 +203,7 @@ where
 {
     let mut opts = super::ConfigOptions {
         env_prefix: env_prefix.to_string(),
+        search_standard_paths: config_path.is_none(),
         load_dotenv: config_path.is_none(),
         ..Default::default()
     };
