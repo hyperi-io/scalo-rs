@@ -5370,7 +5370,13 @@ mod tests {
 
             refused_ctx_error();
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            while refused.generation() == 0 {
+            // The generation advances before the rebuilt producer is swapped in.
+            let swapped = || {
+                refused_role != "producer"
+                    || transport.current_producer().expect("a producer").generation
+                        == refused.generation()
+            };
+            while refused.generation() == 0 || !swapped() {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "{refused_role}: not rebuilt while the other role kept succeeding"
