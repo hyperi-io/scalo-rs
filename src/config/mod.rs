@@ -127,15 +127,32 @@ pub struct ConfigOptions {
 
     /// Application name for user-scoped config discovery.
     ///
-    /// When set, enables searching `~/.config/{app_name}/` for config files.
+    /// When set, enables searching `~/.config/{app_name}/` for config files,
+    /// unless `search_standard_paths` is off.
     /// Falls back to the bare `APP_NAME` environment variable if not
     /// explicitly provided.
     ///
     /// Default: None (user config directory not searched)
     pub app_name: Option<String>,
 
-    /// Additional paths to search for config files.
+    /// Additional paths to search for config files: a directory searched for
+    /// `defaults.yaml`, `settings.yaml` and `settings.{env}.yaml`, or a file
+    /// that is the `settings` layer outright.
     pub config_paths: Vec<PathBuf>,
+
+    /// Whether to search the standard locations for config files: the current
+    /// directory, `./config/`, `/config/` and `~/.config/{app_name}/`.
+    ///
+    /// Turn it off for a service that must read only the files it was pointed
+    /// at, such as one running with privileges, so nothing in the working
+    /// directory or a user's home reaches its config. `config_paths` is
+    /// searched either way. [`CommonArgs::to_config_options`] and
+    /// [`load_typed`] turn it off when a file is named, as they do `.env`.
+    ///
+    /// Default: true
+    ///
+    /// [`CommonArgs::to_config_options`]: crate::cli::CommonArgs::to_config_options
+    pub search_standard_paths: bool,
 
     /// Whether to load `.env` files.
     ///
@@ -161,10 +178,21 @@ impl Default for ConfigOptions {
             app_env: None,
             app_name: None,
             config_paths: Vec::new(),
+            search_standard_paths: true,
             load_dotenv: true,
             load_home_dotenv: false,
         }
     }
+}
+
+/// Where [`Config::find_config_files`] looks.
+struct SearchPaths<'a> {
+    /// `ConfigOptions::config_paths`.
+    extra: &'a [PathBuf],
+    /// Whether to search the standard locations.
+    standard: bool,
+    /// The name `~/.config/` is searched under, when there is one.
+    app_name: Option<&'a str>,
 }
 
 /// Configuration manager wrapping Figment.
@@ -211,19 +239,25 @@ impl Config {
         // 7. Hard-coded defaults (lowest priority)
         figment = figment.merge(Serialized::defaults(HardcodedDefaults::default()));
 
+        let search = SearchPaths {
+            extra: &opts.config_paths,
+            standard: opts.search_standard_paths,
+            app_name: app_name_ref,
+        };
+
         // 6. defaults.yaml
-        for path in Self::find_config_files("defaults", &opts.config_paths, app_name_ref) {
+        for path in Self::find_config_files("defaults", &search) {
             figment = figment.merge(YamlFile::new(path));
         }
 
         // 5. settings.yaml
-        for path in Self::find_config_files("settings", &opts.config_paths, app_name_ref) {
+        for path in Self::find_config_files("settings", &search) {
             figment = figment.merge(YamlFile::new(path));
         }
 
         // 4. settings.{env}.yaml
         let env_settings = format!("settings.{app_env}");
-        for path in Self::find_config_files(&env_settings, &opts.config_paths, app_name_ref) {
+        for path in Self::find_config_files(&env_settings, &search) {
             figment = figment.merge(YamlFile::new(path));
         }
 
@@ -316,55 +350,56 @@ impl Config {
     /// 3. Container mount: `/config/{name}.yaml` (always checked)
     /// 4. User config: `~/.config/{app_name}/{name}.yaml` (when app_name set)
     /// 5. Extra paths from `ConfigOptions::config_paths`
-    fn find_config_files(
-        base_name: &str,
-        extra_paths: &[PathBuf],
-        app_name: Option<&str>,
-    ) -> Vec<PathBuf> {
+    ///
+    /// Locations 1 to 4 are the standard ones, searched only when
+    /// `search.standard` is set.
+    fn find_config_files(base_name: &str, search: &SearchPaths<'_>) -> Vec<PathBuf> {
         let mut files = Vec::new();
         let extensions = ["yaml", "yml"];
 
-        // 1. Current directory
-        for ext in &extensions {
-            let path = PathBuf::from(format!("{base_name}.{ext}"));
-            if path.exists() {
-                files.push(path);
-                break;
-            }
-        }
-
-        // 2. Project config subdirectory
-        for ext in &extensions {
-            let path = PathBuf::from(format!("config/{base_name}.{ext}"));
-            if path.exists() {
-                files.push(path);
-                break;
-            }
-        }
-
-        // 3. Container config mount (/config/)
-        let container_config = PathBuf::from("/config");
-        if container_config.is_dir() {
+        if search.standard {
+            // 1. Current directory
             for ext in &extensions {
-                let path = container_config.join(format!("{base_name}.{ext}"));
+                let path = PathBuf::from(format!("{base_name}.{ext}"));
                 if path.exists() {
                     files.push(path);
                     break;
                 }
             }
-        }
 
-        // 4. User config directory (~/.config/{app_name}/)
-        if let Some(name) = app_name
-            && let Some(config_dir) = dirs::config_dir()
-        {
-            let user_config = config_dir.join(name);
-            if user_config.is_dir() {
+            // 2. Project config subdirectory
+            for ext in &extensions {
+                let path = PathBuf::from(format!("config/{base_name}.{ext}"));
+                if path.exists() {
+                    files.push(path);
+                    break;
+                }
+            }
+
+            // 3. Container config mount (/config/)
+            let container_config = PathBuf::from("/config");
+            if container_config.is_dir() {
                 for ext in &extensions {
-                    let path = user_config.join(format!("{base_name}.{ext}"));
+                    let path = container_config.join(format!("{base_name}.{ext}"));
                     if path.exists() {
                         files.push(path);
                         break;
+                    }
+                }
+            }
+
+            // 4. User config directory (~/.config/{app_name}/)
+            if let Some(name) = search.app_name
+                && let Some(config_dir) = dirs::config_dir()
+            {
+                let user_config = config_dir.join(name);
+                if user_config.is_dir() {
+                    for ext in &extensions {
+                        let path = user_config.join(format!("{base_name}.{ext}"));
+                        if path.exists() {
+                            files.push(path);
+                            break;
+                        }
                     }
                 }
             }
@@ -374,7 +409,7 @@ impl Config {
         // (`--config` passes a file, which no base name can be joined onto).
         // A named file belongs to the settings layer only -- it is one document,
         // and it outranks defaults.yaml because the operator chose it.
-        for base in extra_paths {
+        for base in search.extra {
             if base.is_file() {
                 if base_name == "settings" {
                     files.push(base.clone());
@@ -616,6 +651,7 @@ mod tests {
         assert!(opts.app_env.is_none());
         assert!(opts.app_name.is_none());
         assert_eq!(opts.config_paths, [] as [std::path::PathBuf; 0]);
+        assert!(opts.search_standard_paths);
         assert!(opts.load_dotenv);
         assert!(!opts.load_home_dotenv);
     }

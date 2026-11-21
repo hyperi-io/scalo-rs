@@ -20,6 +20,12 @@ yaque saves the receive position by truncating `recv-metadata` and then writing 
 
 **Consumer adjustment** -- call `sync` after a batch of pushes, or set `sync_on_push`, where a power loss must not lose an acknowledged record. A literal `SpoolConfig { .. }` with no `..Default::default()` adds `sync_on_push: false`.
 
+### A named config file is the only config file read (BEHAVIOUR CHANGE)
+
+`ConfigOptions` has a new field, `search_standard_paths`, default true, which turns off the search of the working directory, `./config/`, `/config/` and `~/.config/<app_name>/`. `CommonArgs::to_config_options`, `config::load_typed` and `flat_env::load_config` set it false when a file is named, as they do `load_dotenv`, so a service started with `--config` no longer merges a `settings.yaml`, `defaults.yaml` or `settings.{env}.yaml` found in those places under its file. Under `run_app` the first cascade set up wins, so this holds for every service that names its file.
+
+**Consumer adjustment** -- none for a deployed service whose files sit only at the path it names. A local run that relied on a `settings.yaml` beside a named file moves those keys into the file. A literal `ConfigOptions { .. }` with no `..Default::default()` adds `search_standard_paths: true` to keep its behaviour.
+
 ### `sizing.consumer.max_poll_records` caps every Kafka receive (BEHAVIOUR CHANGE)
 
 The cap was read by nothing, so a Kafka receive took whatever `recv(max)` or `batch_processing.max_chunk_size` asked for. `KafkaTransport` now holds `recv` and `recv_limited` to it: 2000 on `throughput`, 1000 on `balanced`, 500 on `low_latency`, or the value you set. A receiving transport refuses a cap of 0 when it is built, because a receive always takes its first record.

@@ -32,9 +32,11 @@ Each YAML layer reads every location below that holds the file and merges them i
 <config_paths dir>/<name>.yaml        <config_paths dir>/<name>.yml
 ```
 
+The first four locations are the standard ones, and `ConfigOptions::search_standard_paths` (default true) turns them all off, so only `config_paths` is read. `CommonArgs::to_config_options`, `config::load_typed` and `flat_env::load_config` turn it off, and `.env` with it, when a file is named: the named file is the whole config, and nothing in the working directory, `/config/` or a user's home reaches a service that names it. A service that must never read those, as a privileged one must not, names its file, and nothing sets the global cascade up before it does: the first cascade set up wins, so one built earlier with the search on keeps reading the standard locations. `run_app` sets it up first, from `--config`.
+
 A `ConfigOptions::config_paths` entry that is a directory is searched like the locations above. An entry that is a file, which is what `--config` passes, joins the `settings` layer only and merges after every other `settings.yaml`, so it outranks those and `defaults.yaml`. `settings.{env}.yaml` and env vars still outrank it. An entry that does not exist, or a file that cannot be read or parsed, fails `config::setup` with `ConfigError::LoadError`, so `--config` with a typo stops the service at start.
 
-`<app_name>` resolves from `ConfigOptions::app_name`, then `APP_NAME`, with no other fallback. No name -> the home-config path is skipped.
+`<app_name>` resolves from `ConfigOptions::app_name`, then `APP_NAME`, with no other fallback. No name -> the home-config path is skipped. With `search_standard_paths` off it is never searched.
 
 ---
 
@@ -86,7 +88,7 @@ let kafka: KafkaConfig = config::get().unmarshal_key("kafka")?;  // one section
 
 ### An app's whole config
 
-`config::load_typed(path, prefix)` is the loader a `ServiceApp::load_config` calls. With `--config <file>` it parses that file into the app's struct and logs every key the struct does not take: a misspelt nested key at WARN, a top-level key at INFO, since it may be a runtime section. With no file it reads the cascade. Either way it then merges `{PREFIX}_` env vars with `__` nesting (empty values count as unset), applies the flat spellings through `ApplyFlatEnv`, and runs `Normalize`. It sets up the global cascade with the file as its settings layer, so runtime sections (`metrics`, `version_check`) resolve from the same file.
+`config::load_typed(path, prefix)` is the loader a `ServiceApp::load_config` calls. With `--config <file>` it parses that file into the app's struct and logs every key the struct does not take: a misspelt nested key at WARN, a top-level key at INFO, since it may be a runtime section. With no file it reads the cascade. Either way it then merges `{PREFIX}_` env vars with `__` nesting (empty values count as unset), applies the flat spellings through `ApplyFlatEnv`, and runs `Normalize`. It sets up the global cascade with the file as its settings layer and no standard locations, so runtime sections (`metrics`, `version_check`) resolve from the same file and nothing else on disk.
 
 ```rust
 fn load_config(&self, path: Option<&str>) -> Result<LoaderConfig, CliError> {
@@ -263,6 +265,7 @@ Build a `Config` directly to avoid touching the global:
 let cfg = Config::new(ConfigOptions {
     env_prefix: "TEST".into(),
     config_paths: vec!["tests/fixtures/config".into()],
+    search_standard_paths: false,
     load_dotenv: false,
     ..Default::default()
 })?;
