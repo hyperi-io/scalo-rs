@@ -2646,8 +2646,8 @@ mod tests {
         let parent = dir.path().join("mnt");
         let spool = parent.join("spool");
         spill(&spool, &payloads(2)).await;
-        // A truncated receiver position makes the queue refuse to open: real corruption.
-        std::fs::write(spool.join("recv-metadata"), [0u8; 3]).unwrap();
+        // A segment that is a directory makes the sender refuse to open: real corruption.
+        std::fs::create_dir(spool.join("99.q")).unwrap();
         let inode = std::fs::metadata(&spool).unwrap().ino();
 
         // A read-only parent makes rename(2) of the spool path fail, as it does on a mount point.
