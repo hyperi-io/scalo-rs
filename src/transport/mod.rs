@@ -140,7 +140,7 @@ pub use kafka::{KafkaConfig, KafkaToken};
 pub use grpc::{GrpcConfig, GrpcToken, GrpcTransport, GrpcTransportBuilder};
 
 #[cfg(feature = "transport-grpc-vector-compat")]
-pub use vector_compat::{VectorCompatClient, VectorCompatService};
+pub use vector_compat::{VectorCompatClient, VectorCompatService, VectorCompatTls};
 
 #[cfg(feature = "transport-memory")]
 pub use memory::{MemoryConfig, MemoryToken, MemoryTransport};

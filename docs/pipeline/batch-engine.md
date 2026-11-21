@@ -190,7 +190,7 @@ batch_processing:
     - event_type
 ```
 
-`max_chunk_size` caps the records one pipeline receive takes, so `0` is refused at load with `ConfigError::InvalidValue`, and a service fails to start on it.
+`max_chunk_size` caps the records one pipeline receive takes, so `0` is refused at load with `ConfigError::InvalidValue`, and a service fails to start on it. A Kafka source also holds each receive to its `sizing.consumer.max_poll_records` (2000 on the default profile), so a `max_chunk_size` above that takes the poll cap.
 
 Inbound braking under memory pressure is the self-regulation governor's
 job (the inbound gate plus the AIMD byte-budget lever), not a per-chunk
