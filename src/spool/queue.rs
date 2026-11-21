@@ -25,9 +25,8 @@ pub struct Spool {
     /// moved by each push and take, so `max_size_bytes` never walks the
     /// directory.
     bytes: u64,
-    /// The oldest segment [`sync`](Self::sync) still has to flush: older ones
-    /// are full and were flushed by an earlier call.
-    synced_from: u64,
+    /// What [`sync`](Self::sync) has flushed, so a call does only what is left.
+    synced: crate::spool_codec::Synced,
 }
 
 /// The open yaque handles. Each holds a lock file in the queue directory.
@@ -79,7 +78,7 @@ impl Spool {
             config,
             len,
             bytes,
-            synced_from: 0,
+            synced: crate::spool_codec::Synced::default(),
         })
     }
 
@@ -94,7 +93,7 @@ impl Spool {
         self.queue = None;
         self.len = 0;
         self.bytes = 0;
-        self.synced_from = 0;
+        self.synced = crate::spool_codec::Synced::default();
         let moved = crate::spool_codec::quarantine(
             &self.config.path,
             crate::spool_codec::QuarantineTrigger::CrcMismatch,
@@ -189,9 +188,9 @@ impl Spool {
     pub async fn sync(&mut self) -> Result<()> {
         live(&mut self.queue)?;
         let path = self.config.path.clone();
-        let from = self.synced_from;
-        self.synced_from =
-            tokio::task::spawn_blocking(move || crate::spool_codec::sync_segments(&path, from))
+        let done = self.synced;
+        self.synced =
+            tokio::task::spawn_blocking(move || crate::spool_codec::sync_segments(&path, done))
                 .await
                 .map_err(|e| SpoolError::Queue(format!("spool sync task failed: {e}")))?
                 .map_err(SpoolError::Io)?;
