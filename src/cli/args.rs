@@ -30,6 +30,9 @@
 #[derive(Debug, Clone, clap::Args)]
 pub struct CommonArgs {
     /// Path to configuration file.
+    ///
+    /// Unset, the file `<PREFIX>_CONFIG` names is read, `<PREFIX>` being the
+    /// service's environment variable prefix.
     #[arg(short = 'c', long = "config")]
     pub config: Option<String>,
 
@@ -207,21 +210,33 @@ impl CommonArgs {
         })
     }
 
+    /// The config file a service with `env_prefix` reads: `--config`, else
+    /// the path `{env_prefix}_CONFIG` holds when it is set and not blank.
+    #[must_use]
+    pub fn config_path(&self, env_prefix: &str) -> Option<String> {
+        self.config.clone().or_else(|| {
+            let named = std::env::var(format!("{env_prefix}_CONFIG")).ok();
+            non_blank(named.as_deref())
+        })
+    }
+
     /// Convert to `ConfigOptions` for use with `config::setup()`.
     ///
-    /// `.env` and the standard config locations (the working directory,
-    /// `/config/` and the user's `~/.config/`) are read only when `--config`
-    /// is absent, so nothing outside the file reaches a service that names it.
+    /// The file is [`config_path`](Self::config_path)'s. `.env` and the
+    /// standard config locations (the working directory, `/config/` and the
+    /// user's `~/.config/`) are read only when there is none, so nothing
+    /// outside the file reaches a service that names it.
     #[cfg(feature = "config")]
     #[must_use]
     pub fn to_config_options(&self, env_prefix: &str) -> crate::config::ConfigOptions {
+        let path = self.config_path(env_prefix);
         let mut opts = crate::config::ConfigOptions {
             env_prefix: env_prefix.to_string(),
-            search_standard_paths: self.config.is_none(),
-            load_dotenv: self.config.is_none(),
+            search_standard_paths: path.is_none(),
+            load_dotenv: path.is_none(),
             ..Default::default()
         };
-        if let Some(ref path) = self.config {
+        if let Some(path) = path {
             opts.config_paths.push(path.into());
         }
         opts
@@ -256,37 +271,58 @@ mod tests {
         }
     }
 
-    /// A named file is the whole config, so `.env` and the standard config
-    /// locations are read only without one.
+    /// The file is `--config`, else the one `APP_CONFIG` names. It is the
+    /// whole config, so `.env` and the standard config locations are read
+    /// only without one.
     #[cfg(feature = "config")]
     #[test]
     fn to_config_options_reads_dotenv_and_standard_paths_only_without_a_named_file() {
+        // (case, --config, APP_CONFIG, the file read)
         let cases = [
             (
-                Some("/etc/app/app.yaml"),
-                false,
-                vec!["/etc/app/app.yaml".into()],
+                "flag only",
+                Some("/etc/app/flag.yaml"),
+                None,
+                Some("/etc/app/flag.yaml"),
             ),
-            (None, true, Vec::<std::path::PathBuf>::new()),
+            (
+                "env only",
+                None,
+                Some("/etc/app/env.yaml"),
+                Some("/etc/app/env.yaml"),
+            ),
+            (
+                "both, the flag wins",
+                Some("/etc/app/flag.yaml"),
+                Some("/etc/app/env.yaml"),
+                Some("/etc/app/flag.yaml"),
+            ),
+            ("neither", None, None, None),
+            ("a blank env value", None, Some(" "), None),
         ];
-        for (config, want_dotenv, want_paths) in cases {
+        for (case, flag, env, want) in cases {
             let args = CommonArgs {
-                config: config.map(String::from),
+                config: flag.map(String::from),
                 ..bare_args()
             };
-            let opts = args.to_config_options("APP");
+            let (path, opts) = temp_env::with_var("APP_CONFIG", env, || {
+                (args.config_path("APP"), args.to_config_options("APP"))
+            });
+            assert_eq!(path.as_deref(), want, "{case}");
             assert_eq!(opts.env_prefix, "APP");
             assert_eq!(
-                opts.load_dotenv, want_dotenv,
-                "--config {config:?} gave load_dotenv {}",
-                opts.load_dotenv
+                opts.config_paths,
+                want.map(std::path::PathBuf::from)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{case}"
             );
+            assert_eq!(opts.load_dotenv, want.is_none(), "{case}: load_dotenv");
             assert_eq!(
-                opts.search_standard_paths, want_dotenv,
-                "--config {config:?} gave search_standard_paths {}",
-                opts.search_standard_paths
+                opts.search_standard_paths,
+                want.is_none(),
+                "{case}: search_standard_paths"
             );
-            assert_eq!(opts.config_paths, want_paths, "--config {config:?}");
         }
     }
 
