@@ -379,6 +379,8 @@ impl Dlq {
     /// flush, whether the write was size-, tick- or barrier-triggered, or
     /// refused the entries Kafka handed on. `Kafka` if the Kafka backend lost
     /// entries no other backend holds and none after it could take.
+    /// `Refused` instead when Kafka is the only backend and each of those
+    /// entries is one the broker refused for its size.
     /// `Closed` if the drain has exited before this barrier was processed.
     pub async fn flush(&self) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
@@ -402,8 +404,12 @@ impl Dlq {
     ///
     /// `File` or `Kafka` when no backend holds the entries, the durable flush
     /// after them found a loss, or the Kafka backend purged entries it has
-    /// not yet heard back about. `AllBackendsFailed` when the DLQ is enabled
-    /// but no backend started. `Closed` if the drain has exited.
+    /// not yet heard back about. `Refused` when the only loss the durable
+    /// flush found is entries the broker of a Kafka-only DLQ refused for their
+    /// size: [`RefusedEntries::contains`](super::RefusedEntries::contains)
+    /// names which of these entries they are, and a backend holds the rest.
+    /// `AllBackendsFailed` when the DLQ is enabled but no backend started.
+    /// `Closed` if the drain has exited.
     pub async fn write_confirmed(&self, entries: Vec<DlqEntry>) -> Result<(), DlqError> {
         let Some(sink) = self.sink.as_ref() else {
             if self.unavailable {
@@ -450,10 +456,12 @@ impl Dlq {
     /// entry only when every backend does. A caller holding a source
     /// acknowledgement leaves such an entry out of
     /// [`write_confirmed`](Self::write_confirmed) and releases it `Dropped`:
-    /// no retry can land it. Every other `write_confirmed` error can clear, so
-    /// that caller holds the block and writes again. A broker or topic ceiling
-    /// below the producer's is not seen here, and fails the write instead.
-    /// Pass the entry through [`cap`](Self::cap) first.
+    /// no retry can land it. A broker or topic ceiling below the producer's is
+    /// not seen here: `write_confirmed` answers `DlqError::Refused` for an
+    /// entry the broker refuses for it, which that caller releases `Dropped`
+    /// the same way. Every other `write_confirmed` error can clear, so that
+    /// caller holds the block and writes again. Pass the entry through
+    /// [`cap`](Self::cap) first.
     #[cfg(feature = "transport")]
     #[must_use]
     pub fn refusal(&self, entry: &DlqEntry) -> Option<crate::transport::DeadLetterReason> {
@@ -505,8 +513,8 @@ fn map_sink_err(e: SinkError) -> DlqError {
     }
 }
 
-/// A Kafka or HTTP backend's own loss keeps its variant. Every other drain
-/// failure reads as `File`, as it always has.
+/// A Kafka or HTTP backend's own loss, and a refusal for good, keep their
+/// variant. Every other drain failure reads as `File`, as it always has.
 fn map_drain_err(d: DrainError) -> DlqError {
     let source = match d {
         DrainError::Backend(source) => source,
@@ -517,6 +525,7 @@ fn map_drain_err(d: DrainError) -> DlqError {
             #[cfg(feature = "dlq-kafka")]
             DlqError::Kafka(msg) => DlqError::Kafka(msg),
             DlqError::BackendError(msg) => DlqError::BackendError(msg),
+            DlqError::Refused(entries) => DlqError::Refused(entries),
             other @ (DlqError::Io(_)
             | DlqError::Serialization(_)
             | DlqError::File(_)
@@ -594,6 +603,12 @@ fn build_backends(
         && let Some(DlqBackend::Kafka(kafka)) = backends.first_mut()
     {
         kafka.hand_on_unacked();
+    }
+
+    // With no backend beside it, nothing takes what the broker refuses for its size.
+    #[cfg(feature = "dlq-kafka")]
+    if let [DlqBackend::Kafka(kafka)] = backends.as_mut_slice() {
+        kafka.mark_alone();
     }
 
     backends

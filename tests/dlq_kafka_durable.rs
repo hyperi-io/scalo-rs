@@ -505,7 +505,8 @@ async fn an_oversize_payload_lands_truncated() {
 }
 
 /// A record the broker refuses fails the flush that covers it and is counted
-/// once. Entries acked around it are not.
+/// once. Entries acked around it are not. Kafka is the only backend, so a
+/// refusal for its size is one for good.
 #[tokio::test]
 async fn a_delivery_the_broker_refuses_fails_the_flush_and_is_counted_once() {
     if !require_docker() {
@@ -535,8 +536,8 @@ async fn a_delivery_the_broker_refuses_fails_the_flush_and_is_counted_once() {
         started.elapsed()
     );
     assert!(
-        matches!(result, Err(DlqError::Kafka(_))),
-        "a refused delivery must fail the flush, got {result:?}"
+        matches!(&result, Err(DlqError::Refused(refused)) if refused.len() == 2),
+        "a refused delivery must fail the flush as refused for good, got {result:?}"
     );
     assert_eq!(dlq.dropped(), 2, "each refused record counted");
 
@@ -592,6 +593,240 @@ async fn fan_out_counts_a_kafka_loss_only_where_no_other_backend_holds_the_entry
         "Kafka was the only backend to take these, and lost them: {result:?}"
     );
     assert_eq!(dlq.dropped(), 2);
+}
+
+/// Kafka-only: a confirmed write the broker refuses part of for its size is
+/// `Refused`, naming exactly the entries refused since the last barrier, this
+/// write's and the queued one before it, and the rest lands once.
+#[tokio::test]
+async fn a_confirmed_write_names_the_entries_the_broker_refused_for_good() {
+    if !require_docker() {
+        return;
+    }
+    let topic = common::unique("dlq.refused.confirmed");
+    let topic = topic.as_str();
+    let bootstrap = shared_broker().await;
+    create_small_topic(&bootstrap, topic).await;
+    // A first produce to the new topic can outlast the default ack wait, and a timeout is no refusal.
+    let dlq = spawn_dlq(
+        &long_ack_wait(dlq_config(DlqMode::KafkaOnly, topic, None)),
+        &kafka_config(&bootstrap),
+    );
+
+    // Capped as the pipeline caps them, so they name what the DLQ wrote.
+    let queued = dlq.cap(oversize_entry("queued"));
+    let refused = dlq.cap(oversize_entry("refused"));
+    let held = dlq.cap(entry("held"));
+    dlq.send(queued.clone()).await.expect("queued");
+    let result = dlq
+        .write_confirmed(vec![held.clone(), refused.clone()])
+        .await;
+
+    let Err(DlqError::Refused(named)) = &result else {
+        panic!("the only backend refused them for their size, got {result:?}");
+    };
+    assert_eq!(named.len(), 2, "{named:?}");
+    assert!(named.contains(&refused) && named.contains(&queued));
+    assert!(
+        !named.contains(&held),
+        "the entry the broker took is not named"
+    );
+    assert_eq!(dlq.dropped(), 2);
+    assert_eq!(read_reasons_async(&bootstrap, topic).await, ["held"]);
+}
+
+/// Cascade: what the broker refuses for its size goes on to the file backend,
+/// so the confirmed write that carried it holds and nothing is dropped.
+#[tokio::test]
+async fn cascade_lands_what_the_broker_refuses_for_its_size_in_the_file() {
+    if !require_docker() {
+        return;
+    }
+    let topic = common::unique("dlq.refused.cascade");
+    let topic = topic.as_str();
+    let bootstrap = shared_broker().await;
+    create_small_topic(&bootstrap, topic).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A timed-out first produce would fall through to the file as well.
+    let dlq = spawn_dlq(
+        &long_ack_wait(dlq_config(DlqMode::Cascade, topic, Some(dir.path()))),
+        &kafka_config(&bootstrap),
+    );
+
+    dlq.write_confirmed(vec![entry("kafka"), oversize_entry("file")])
+        .await
+        .expect("the file backend holds what the broker refused");
+
+    assert_eq!(dlq.dropped(), 0);
+    assert_eq!(file_reasons(dir.path()), ["file"]);
+    assert_eq!(read_reasons_async(&bootstrap, topic).await, ["kafka"]);
+}
+
+/// The offset `group` last committed on partition 0 of `topic`.
+#[cfg(all(feature = "worker-batch", feature = "metrics"))]
+async fn committed(bootstrap: &str, group: &str, topic: &str) -> Option<i64> {
+    let (bootstrap, group, topic) = (bootstrap.to_string(), group.to_string(), topic.to_string());
+    tokio::task::spawn_blocking(move || {
+        let client: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap)
+            .set("group.id", &group)
+            .set("enable.auto.commit", "false")
+            .create()
+            .expect("offset client");
+        let mut partitions = TopicPartitionList::new();
+        partitions.add_partition(&topic, 0);
+        let found = client
+            .committed_offsets(partitions, Duration::from_secs(10))
+            .expect("committed offsets");
+        match found.find_partition(&topic, 0)?.offset() {
+            Offset::Offset(offset) => Some(offset),
+            _ => None,
+        }
+    })
+    .await
+    .expect("offset task")
+}
+
+/// Dead-letter every record of a block: `{"seq":0}` as an entry past the DLQ
+/// topic's ceiling, the others as themselves.
+#[cfg(all(feature = "worker-batch", feature = "metrics"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the run loop's process returns a Result"
+)]
+fn dead_letter_every_record(
+    batch: scalo::transport::WorkBatch<scalo::transport::kafka::KafkaToken>,
+) -> Result<
+    scalo::transport::WorkBatch<scalo::transport::kafka::KafkaToken>,
+    scalo::worker::EngineError,
+> {
+    let mut dead = Vec::new();
+    let batch = batch.map_records(|records| {
+        for record in records {
+            let entry = if record.payload.as_ref() == br#"{"seq":0}"# {
+                oversize_entry("oversize")
+            } else {
+                entry("held")
+            };
+            dead.push(scalo::transport::filter::FilteredDlqEntry {
+                payload: entry.payload,
+                key: None,
+                reason: entry.reason,
+            });
+        }
+        Vec::new()
+    });
+    Ok(batch.with_dlq_entries(dead))
+}
+
+/// A Kafka-sourced pipeline whose dead letters go to a DLQ topic that refuses
+/// one of them, which the producer's own ceiling passes. Kafka-only, the
+/// refused one is dropped and counted in
+/// `pipeline_dead_letters_dropped_total{reason="too_large"}`, the other
+/// lands once, and the block is released and committed rather than written
+/// again. Cascade, the file backend holds the refused one and nothing drops.
+#[cfg(all(feature = "worker-batch", feature = "metrics"))]
+#[tokio::test]
+async fn a_pipeline_releases_a_block_whose_dead_letter_the_broker_refuses() {
+    use scalo::worker::{BatchEngine, BatchProcessingConfig};
+
+    /// How long the block may take to be released and committed.
+    const RELEASED_WITHIN: Duration = Duration::from_secs(60);
+
+    if !require_docker() {
+        return;
+    }
+    let bootstrap = shared_broker().await;
+    // (mode, the file backend's entries, dropped as too large)
+    let cases: [(DlqMode, &[&str], u64); 2] = [
+        (DlqMode::KafkaOnly, &[], 1),
+        (DlqMode::Cascade, &["oversize"], 0),
+    ];
+    for (mode, in_file, too_large) in cases {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let rendered = recorder.handle();
+        // Current-thread runtime: the pipeline and the DLQ drain run on this thread.
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let source_topic = common::unique(&format!("dlq.pipeline.{mode:?}.source"));
+        let dlq_topic = common::unique(&format!("dlq.pipeline.{mode:?}"));
+        let group = common::unique(&format!("dlq.pipeline.{mode:?}.group"));
+        create_topic(&bootstrap, &source_topic).await;
+        create_small_topic(&bootstrap, &dlq_topic).await;
+        let producer: rdkafka::producer::FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap)
+            .create()
+            .expect("source producer");
+        for seq in 0..2 {
+            let payload = format!(r#"{{"seq":{seq}}}"#);
+            producer
+                .send(
+                    rdkafka::producer::FutureRecord::<(), str>::to(&source_topic).payload(&payload),
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap_or_else(|(e, _)| panic!("deliver source record {seq}: {e}"));
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = (mode == DlqMode::Cascade).then(|| dir.path());
+        // A timed-out first produce is retried, which would write the held entry twice.
+        let dlq = Arc::new(spawn_dlq(
+            &long_ack_wait(dlq_config(mode, &dlq_topic, file)),
+            &kafka_config(&bootstrap),
+        ));
+        let source = scalo::transport::kafka::KafkaTransport::new(&KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: group.clone(),
+            topics: vec![source_topic.clone()],
+            ..Default::default()
+        })
+        .await
+        .expect("source consumer");
+        let engine = BatchEngine::new(BatchProcessingConfig::default()).with_dlq(Arc::clone(&dlq));
+        let shutdown = CancellationToken::new();
+        let run = engine.pipeline(&source).shutdown(shutdown.clone()).run(
+            dead_letter_every_record,
+            |_out: &scalo::transport::WorkBatch<_>| std::future::ready(Ok(())),
+        );
+        tokio::pin!(run);
+
+        let deadline = Instant::now() + RELEASED_WITHIN;
+        let released = loop {
+            tokio::select! {
+                out = &mut run => panic!("{mode:?}: the pipeline ended early: {out:?}"),
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+            if committed(&bootstrap, &group, &source_topic).await == Some(2) {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+        };
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(30), run).await;
+
+        assert!(
+            released,
+            "{mode:?}: the block was still held {RELEASED_WITHIN:?} after its dead letters were written"
+        );
+        assert_eq!(
+            read_reasons_async(&bootstrap, &dlq_topic).await,
+            ["held"],
+            "{mode:?}"
+        );
+        assert_eq!(file_reasons(dir.path()), in_file, "{mode:?}");
+        assert_eq!(dlq.dropped(), too_large, "{mode:?}");
+        let counted = rendered
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with(r#"pipeline_dead_letters_dropped_total{reason="too_large"}"#)
+            })
+            .and_then(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert_eq!(counted, too_large, "{mode:?}");
+        dlq.shutdown().await.expect("DLQ shutdown");
+    }
 }
 
 /// Cascade: when Kafka queues part of a batch and refuses the rest, the next

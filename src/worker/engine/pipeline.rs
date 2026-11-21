@@ -804,7 +804,9 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
     }
 
     /// Write `dead` as one piece of the block: `Rejected` once the DLQ holds it,
-    /// `Dropped` for an entry no DLQ backend can ever hold.
+    /// `Dropped` for an entry no DLQ backend can ever hold, whether
+    /// `Dlq::refusal` names it before the write or the broker refuses it for
+    /// its size after.
     ///
     /// A DLQ write that fails is retried with backoff, holding the block, until
     /// it lands, the hold deadline comes (`Expired`, the piece `Errored`), or
@@ -929,6 +931,24 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
                 Err(e @ crate::dlq::DlqError::Closed) => {
                     tracing::warn!(error = %e, "The DLQ has shut down; the block is not released");
                     return (Some(DeliveryStatus::Errored), SinkEnd::Sunk);
+                }
+                Err(crate::dlq::DlqError::Refused(refused)) => {
+                    note_recovered("dlq", failures);
+                    let dropped = entries.iter().filter(|e| refused.contains(e)).count();
+                    for _ in 0..dropped {
+                        count_dropped_dead_letter(crate::transport::ack::TOO_LARGE);
+                    }
+                    if dropped > 0 {
+                        tracing::warn!(
+                            dropped,
+                            "The DLQ's broker refused a dead letter for its size; it is dropped"
+                        );
+                        status = status.max(DeliveryStatus::Dropped);
+                    }
+                    if dropped < entries.len() {
+                        status = status.max(DeliveryStatus::Rejected);
+                    }
+                    return (Some(status), SinkEnd::Sunk);
                 }
                 Err(e) => {
                     failures = failures.saturating_add(1);

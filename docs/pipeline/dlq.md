@@ -39,6 +39,7 @@ The Kafka backend queues entries to the producer on every write and learns their
 - Entries still unacknowledged after `send_timeout_ms` are purged from the producer, which fails their delivery.
 - `Cascade` with a backend after Kafka: an entry whose delivery failed since the previous `flush()`, refused by the broker or purged, goes on to that backend before the barrier flushes it. It counts as accepted once that backend takes it, and is lost only if every backend after Kafka rejects it too.
 - `KafkaOnly`, `FanOut`, or `Cascade` with nothing after Kafka: such an entry fails the `flush()` with `Err(DlqError::Kafka(..))` and is counted in `dropped()` and `dlq_dropped_total{reason="backends_failed"}`, like a refused write.
+- Kafka as the only backend: when the barrier has every delivery report and every entry lost since the previous `flush()` is one the broker refused for its size (`MSG_SIZE_TOO_LARGE`, a topic `max.message.bytes` below the producer's) and larger than the producer's `batch.size`, so it travelled alone, the `flush()` fails with `Err(DlqError::Refused(..))` instead. It is counted the same way. A smaller entry can be refused for the batch it shared, so it fails as `Kafka` and a retry can land it.
 - The purge bounds the wait, but an entry in flight to a stalled broker, not a dead one, can still be written after it. So under a stalled broker the DLQ topic can hold an entry the file backend took, and `dropped()` can count one the topic holds: duplicates, never a gap.
 - `Cascade`: when Kafka queues part of a batch and rejects the rest (an entry over the producer's `message.max.bytes`, say), only the rest goes on to the next backend.
 - `FanOut`: a Kafka loss counts only for entries no other backend took. When one barrier covers both kinds and Kafka lost some, the loss is charged to the entries Kafka held alone first, so the count can overstate the loss but never understate it.
@@ -111,7 +112,7 @@ previous `flush()` was accepted by a backend. That covers all three
 write triggers: a full batch (`batch_size`), the `flush_interval_ms`
 tick, and the batch the barrier itself writes.
 
-If every backend refused a batch, the next `flush()` returns `Err(DlqError::File(..))`, and so does an entry the broker never acked that every backend after Kafka refused. Entries only the Kafka backend held that the broker refused or never acked, with no backend after Kafka to take them, return `Err(DlqError::Kafka(..))`. The drain does not retry refused entries. They are counted in `dropped()` and in `dlq_dropped_total{reason="backends_failed"}`.
+If every backend refused a batch, the next `flush()` returns `Err(DlqError::File(..))`, and so does an entry the broker never acked that every backend after Kafka refused. Entries only the Kafka backend held that the broker refused or never acked, with no backend after Kafka to take them, return `Err(DlqError::Kafka(..))`, or `Err(DlqError::Refused(..))` when Kafka is the only backend and each was refused for its size ([The Kafka barrier](#the-kafka-barrier)). The drain does not retry refused entries. They are counted in `dropped()` and in `dlq_dropped_total{reason="backends_failed"}`.
 
 A refusal is reported once. The first barrier the drain processes after
 it returns the error, and the `flush()` after that starts clean. With
@@ -133,13 +134,14 @@ not heard back about yet fails the confirmed write. The pipeline's
 
 An error from `write_confirmed` does not say whether a retry can land the entries, and a caller holding a source acknowledgement needs to know. `refusal(&entry)` answers it before the write, per entry: `Some(DeadLetterReason::TooLarge { bytes, limit })` when no backend can ever hold the entry, `None` otherwise. Only a Kafka backend has a ceiling, its producer's `message.max.bytes` less 128 bytes of framing, measured against the entry as written, where a binary or truncated payload grows by a third as base64. A file or HTTP backend beside Kafka takes what Kafka rejects, so such a DLQ rejects nothing.
 
+A broker or topic ceiling below the producer's `message.max.bytes` is not seen by `refusal`: the broker rejects the entry after the write. Where Kafka is the only backend, `write_confirmed` then returns `Err(DlqError::Refused(refused))` when that is the only loss the barrier found ([The Kafka barrier](#the-kafka-barrier)). `refused.contains(&entry)` names the caller's entries among them, given each as it was written, so passed through `cap`. A backend holds every other entry of the write. Keep the three ceilings in step all the same ([../transport/backends.md](../transport/backends.md)).
+
 So a caller holding a source acknowledgement:
 
 - leaves a refused entry out of the write, releases it `Dropped`, and counts it, since no retry can land it
+- does the same for each of its entries a `Refused` answer names, and releases the rest `Rejected`
 - holds the block and writes the rest again on any other error, since those can clear: a broker down, a timeout, a full disk
 - releases `Errored` only on `DlqError::Closed`, when the drain has exited
-
-A broker or topic ceiling below the producer's `message.max.bytes` is not seen by `refusal`: the broker rejects the entry after the write, and the confirmed write fails like any other loss. Keep the three ceilings in step ([../transport/backends.md](../transport/backends.md)).
 
 What "accepted" means depends on the backend:
 
@@ -252,8 +254,8 @@ dlq:
 | `try_send(entry) -> Result<(), DlqError>` | Non-blocking queue submission, `QueueFull` on overflow |
 | `send(entry).await` | Async submission that awaits queue space |
 | `send_batch(entries).await` | Queue many entries (drain coalesces) |
-| `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka. `Err(File)` if any batch written since the previous flush was refused by every backend, `Err(Kafka)` if Kafka lost entries only it held (see [Queue-admission semantics](#queue-admission-semantics)) |
-| `write_confirmed(entries).await` | Write these entries as a batch of their own and answer whether a backend holds them, to this caller alone (see [Queue-admission semantics](#queue-admission-semantics)) |
+| `flush().await` | Barrier -- wait until every entry queued before this call is written, and acked where the backend is Kafka. `Err(File)` if any batch written since the previous flush was refused by every backend, `Err(Kafka)` if Kafka lost entries only it held, `Err(Refused)` if Kafka is the only backend and refused each of those for its size (see [Queue-admission semantics](#queue-admission-semantics)) |
+| `write_confirmed(entries).await` | Write these entries as a batch of their own and answer whether a backend holds them, to this caller alone. `Err(Refused(refused))` names the entries no backend will ever hold (see [Queue-admission semantics](#queue-admission-semantics)) |
 | `cap(entry)` | The entry as the DLQ writes it: payload and copied header held within `max_payload_bytes`. Every send applies it, so call it only before `refusal` |
 | `refusal(&entry)` | Why no backend can ever hold this entry, or `None`: the permanent refusal a held source releases `Dropped` (needs `transport`). It judges the entry it is given, so pass it through `cap` first |
 | `shutdown().await` | Stop the drain and join it. The drain first waits for Kafka acks and counts what none confirmed in `dropped()` (see [Shutdown](#shutdown)) |
@@ -262,7 +264,8 @@ dlq:
 | `DlqSource::kafka(topic, partition, offset)` | Provenance for the entry |
 | `DlqBackend` (enum) | `File / Kafka / Http` -- feature-gated variants |
 | `DlqMode` | `Cascade / FanOut / FileOnly / KafkaOnly` |
-| `DlqError` | `Io / Serialization / File / Kafka / BackendError / AllBackendsFailed / NotConfigured / QueueFull / Closed` |
+| `DlqError` | `Io / Serialization / File / Kafka / BackendError / AllBackendsFailed / NotConfigured / QueueFull / Closed / Refused` |
+| `RefusedEntries` | What `DlqError::Refused` carries: `len()`, and `contains(&entry)` for an entry as the DLQ wrote it |
 
 `Dlq` is `Clone` -- clones share the same drain. The single-owner
 shutdown handle lives inside `Arc<AsyncMutex<Option<...>>>` so any

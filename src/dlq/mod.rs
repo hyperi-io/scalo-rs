@@ -71,7 +71,7 @@ mod http;
 pub use backend::DlqBackend;
 pub use config::{DEFAULT_MAX_PAYLOAD_BYTES, DlqConfig, DlqMode, FileDlqConfig, RotationPeriod};
 pub use entry::{DlqEntry, DlqSource};
-pub use error::DlqError;
+pub use error::{DlqError, RefusedEntries};
 pub use orchestrator::Dlq;
 
 // Kafka types (only with `dlq-kafka` feature)
