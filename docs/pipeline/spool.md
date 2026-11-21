@@ -98,7 +98,7 @@ The liveness check reads the process table of the current pid namespace. Two pod
 
 ### Quarantine
 
-When a queue still will not open after the lock check, or a CRC check fails on read, `on_corruption` decides (default `quarantine`):
+When a queue still will not open after the lock check, or a CRC check fails on read, `on_corruption` decides (default `quarantine`). A queue also will not open when its `version/contents` does not hold a version, names a release other than yaque 0.6, or the directory holds a `.q` file that is not a segment number. yaque panics on each of those, which ends a service built with `panic = "abort"`, so `Spool::open` and `TieredSink::new` read the files first and treat them as an open failure that names the file:
 
 - `quarantine` moves the queue's files into a new `corrupt-YYYYMMDD-HHMMSS-<nanos>-<n>/` subdirectory of the spool path and opens a fresh queue in place. The path itself is never renamed, so this works when the path is a mount point (an `emptyDir` or PVC mounted exactly at `spool_path`). Counted in `spool_quarantined_total{trigger="open_failed|crc_mismatch"}`, one warn with the path.
 - `fail` returns the error.

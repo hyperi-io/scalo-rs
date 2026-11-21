@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use super::convert::json_to_event_wrapper;
 use super::proto::vector;
+use super::tls::VectorCompatTls;
 use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::grpc::{GrpcConfig, lazy_channel};
 
@@ -34,6 +35,9 @@ use crate::transport::grpc::{GrpcConfig, lazy_channel};
 /// sent an HTTP/2 PING and closed if the PING goes unanswered for 30 s more,
 /// so a send to a peer that stops answering ends with an error and the next
 /// dials afresh.
+///
+/// Plaintext by default. [`connect_lazy_tls`](Self::connect_lazy_tls) connects
+/// over TLS with the trust and client identity the caller gives it.
 pub struct VectorCompatClient {
     client: vector::vector_client::VectorClient<tonic::transport::Channel>,
 
@@ -64,14 +68,49 @@ impl VectorCompatClient {
     ///
     /// Returns error if the endpoint URI is invalid.
     pub fn connect_lazy_within(endpoint: &str, send_timeout_ms: u64) -> TransportResult<Self> {
+        Self::connect_lazy_inner(endpoint, send_timeout_ms, None)
+    }
+
+    /// [`connect_lazy_within`](Self::connect_lazy_within) over TLS, with the
+    /// trust, server name and client identity in `tls`.
+    ///
+    /// The endpoint must be `https://`. Every file `tls` names is read here, so
+    /// a missing or wrong one fails the call and not the first RPC. A server
+    /// whose certificate does not verify, or that asks for a client certificate
+    /// `tls` lacks, fails each send with the handshake error.
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` when the endpoint is invalid or not `https://`,
+    /// `tls` trusts no root, a certificate has no key or a key no certificate,
+    /// or a file cannot be read or is not the PEM it should be.
+    pub fn connect_lazy_tls(
+        endpoint: &str,
+        send_timeout_ms: u64,
+        tls: &VectorCompatTls,
+    ) -> TransportResult<Self> {
+        super::tls::require_https(endpoint)?;
+        Self::connect_lazy_inner(endpoint, send_timeout_ms, Some(tls))
+    }
+
+    fn connect_lazy_inner(
+        endpoint: &str,
+        send_timeout_ms: u64,
+        tls: Option<&VectorCompatTls>,
+    ) -> TransportResult<Self> {
         // Bound the response decode size. `usize::MAX` contradicts the never-OOM
         // doctrine -- even a (trusted) Vector server response should not be able
         // to drive an unbounded allocation. 64 MiB is far above any real ack
         // response and matches the generous end of the transport size envelope.
         const MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 
-        let ep = tonic::transport::Channel::from_shared(endpoint.to_string())
+        let mut ep = tonic::transport::Channel::from_shared(endpoint.to_string())
             .map_err(|e| TransportError::Config(format!("invalid Vector endpoint: {e}")))?;
+        if let Some(tls) = tls {
+            ep = ep
+                .tls_config(tls.client_config()?)
+                .map_err(|e| super::tls::tonic_error(&e))?;
+        }
         let channel = lazy_channel(ep, send_timeout_ms);
 
         let client = vector::vector_client::VectorClient::new(channel)

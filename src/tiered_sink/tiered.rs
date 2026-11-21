@@ -2699,6 +2699,48 @@ mod tests {
         }
     }
 
+    /// yaque panics on a version file that is not a version or names another
+    /// release, and on a `.q` file that is not a segment number, which ends a
+    /// service built with `panic = "abort"`. `TieredSink::new` refuses each
+    /// under `fail` and sets the queue aside under `quarantine`.
+    #[tokio::test]
+    async fn a_spill_queue_yaque_would_panic_on_is_an_open_failure() {
+        let version = std::path::Path::new("version").join("contents");
+        for (name, corruption) in [
+            ("not a version", Some("not a version")),
+            ("another release", Some("0.5.2")),
+            ("only whitespace", Some("\n")),
+            ("not a segment", None),
+        ] {
+            let dir = tempdir().unwrap();
+            let spool = dir.path().join("spool");
+            spill(&spool, &payloads(2)).await;
+            match corruption {
+                Some(text) => std::fs::write(spool.join(&version), text).unwrap(),
+                None => std::fs::write(spool.join("foo.q"), b"x").unwrap(),
+            }
+
+            let mut failing = spilling_config(&spool);
+            failing.on_corruption = crate::spool_codec::CorruptionPolicy::Fail;
+            let refused = TieredSink::new(TestSink::new(), failing).await;
+            assert!(
+                matches!(refused, Err(TieredSinkError::SpoolOpen { .. })),
+                "{name}: fail refuses"
+            );
+
+            let tiered = TieredSink::new(TestSink::new(), spilling_config(&spool))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: quarantine opens a fresh queue: {e}"));
+            assert_eq!(tiered.spool_len().await, 0, "{name}: a fresh queue");
+            assert_eq!(
+                entries_with_prefix(&spool, "corrupt-").len(),
+                1,
+                "{name}: the corrupt queue is kept"
+            );
+            tiered.shutdown().await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn quarantine_works_when_the_spool_path_is_a_mount_point() {
