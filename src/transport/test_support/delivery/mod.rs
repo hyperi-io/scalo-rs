@@ -26,7 +26,10 @@
 //! A held batch ([`Answer::Held`]) is answered all or nothing: when any record
 //! is not delivered, every record not dead-lettered gets the worst outcome.
 
+mod batch_per_destination;
 mod inline_sequential;
+mod merge;
+mod parallel_fanout;
 mod per_record_futures;
 
 use std::future::Future;
@@ -36,17 +39,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::memory::MemoryGuard;
 use crate::transport::{Record, SendResult, TransportSender};
 
+pub use batch_per_destination::BatchPerDestination;
 pub use inline_sequential::InlineSequential;
+pub use merge::{Merge, MergeStore};
+pub use parallel_fanout::ParallelFanout;
 pub use per_record_futures::PerRecordFutures;
 
 /// Index of a destination in a [`Destinations`] set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DestinationId(pub usize);
 
+/// How a destination takes records, which an approach that treats the two
+/// kinds apart reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// One call carries a batch, as a gRPC `RouteBatch` does.
+    Batch,
+    /// Records are queued one by one and confirmed on their own, as a Kafka
+    /// producer does.
+    PerRecord,
+}
+
 /// The named destinations a batch can be routed to, and the memory guard every
 /// delivery leases its bytes from.
 pub struct Destinations<S> {
-    entries: Vec<(Arc<str>, S)>,
+    entries: Vec<(Arc<str>, S, Shape)>,
     ledger: Ledger,
 }
 
@@ -64,8 +81,23 @@ impl<S: TransportSender> Destinations<S> {
     /// adding, which is the order an approach that sends one destination after
     /// another uses.
     pub fn add(&mut self, name: &str, sender: S) -> DestinationId {
-        self.entries.push((Arc::from(name), sender));
+        self.add_shaped(name, sender, Shape::Batch)
+    }
+
+    /// Add `sender` under `name` with the shape it takes records in.
+    pub fn add_shaped(&mut self, name: &str, sender: S, shape: Shape) -> DestinationId {
+        self.entries.push((Arc::from(name), sender, shape));
         DestinationId(self.entries.len() - 1)
+    }
+
+    /// The destination's shape.
+    ///
+    /// # Panics
+    ///
+    /// When `id` is not from this set.
+    #[must_use]
+    pub fn shape(&self, id: DestinationId) -> Shape {
+        self.entries[id.0].2
     }
 
     /// The id of the destination called `name`.
@@ -73,7 +105,7 @@ impl<S: TransportSender> Destinations<S> {
     pub fn id(&self, name: &str) -> Option<DestinationId> {
         self.entries
             .iter()
-            .position(|(n, _)| &**n == name)
+            .position(|(n, _, _)| &**n == name)
             .map(DestinationId)
     }
 
@@ -102,7 +134,7 @@ impl<S: TransportSender> Destinations<S> {
         self.entries
             .iter()
             .enumerate()
-            .map(|(i, (name, sender))| (DestinationId(i), &**name, sender))
+            .map(|(i, (name, sender, _))| (DestinationId(i), &**name, sender))
     }
 
     /// Number of destinations.
@@ -261,6 +293,47 @@ impl Outcome {
     }
 }
 
+/// The records of `batch` routed to `id` that `sender` would take, with their
+/// places in the batch. Those it would dead-letter are marked in `outcomes`.
+fn block_for<S: TransportSender>(
+    batch: &CallerBatch,
+    id: DestinationId,
+    sender: &S,
+    outcomes: &mut [Outcome],
+) -> (Vec<Record>, Vec<usize>) {
+    let mut block = Vec::new();
+    let mut places = Vec::new();
+    for (i, routed) in batch.records.iter().enumerate() {
+        if !routed.routes.contains(&id) {
+            continue;
+        }
+        if sender.dead_letter_reason(&routed.record).is_some() {
+            outcomes[i] = outcomes[i].max(Outcome::DeadLettered);
+        } else {
+            block.push(routed.record.clone());
+            places.push(i);
+        }
+    }
+    (block, places)
+}
+
+/// Send `records` in one `send_batch` and return each record's outcome. A
+/// `FilteredDlq` answer names no record, so each is then sent on its own.
+async fn send_block<S: TransportSender>(sender: &S, records: &[Record]) -> Vec<Outcome> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    let result = sender.send_batch(records).await;
+    if matches!(result, SendResult::FilteredDlq) {
+        let mut outcomes = Vec::with_capacity(records.len());
+        for record in records {
+            outcomes.push(Outcome::from_send(&sender.send_record(record).await));
+        }
+        return outcomes;
+    }
+    vec![Outcome::from_send(&result); records.len()]
+}
+
 /// Apply the caller's answer rule to per-record outcomes: a held batch with any
 /// undelivered record gives every record not dead-lettered the worst outcome.
 #[must_use]
@@ -294,12 +367,30 @@ pub trait DeliveryApproach: Send + Sync {
 }
 
 /// Every approach, dispatched by enum.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum AnyApproach {
     /// [`InlineSequential`].
     InlineSequential(InlineSequential),
     /// [`PerRecordFutures`].
     PerRecordFutures(PerRecordFutures),
+    /// [`ParallelFanout`].
+    ParallelFanout(ParallelFanout),
+    /// [`BatchPerDestination`].
+    BatchPerDestination(BatchPerDestination),
+    /// [`Merge`], with a channel or a swapped buffer.
+    Merge(Merge),
+}
+
+impl AnyApproach {
+    /// Most payload bytes waiting in a merge buffer at once, for an approach
+    /// that has one.
+    #[must_use]
+    pub fn peak_queued_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Merge(a) => Some(a.peak_queued_bytes()),
+            _ => None,
+        }
+    }
 }
 
 impl DeliveryApproach for AnyApproach {
@@ -307,6 +398,9 @@ impl DeliveryApproach for AnyApproach {
         match self {
             Self::InlineSequential(a) => a.name(),
             Self::PerRecordFutures(a) => a.name(),
+            Self::ParallelFanout(a) => a.name(),
+            Self::BatchPerDestination(a) => a.name(),
+            Self::Merge(a) => a.name(),
         }
     }
 
@@ -318,6 +412,9 @@ impl DeliveryApproach for AnyApproach {
         match self {
             Self::InlineSequential(a) => a.deliver(destinations, batch).await,
             Self::PerRecordFutures(a) => a.deliver(destinations, batch).await,
+            Self::ParallelFanout(a) => a.deliver(destinations, batch).await,
+            Self::BatchPerDestination(a) => a.deliver(destinations, batch).await,
+            Self::Merge(a) => a.deliver(destinations, batch).await,
         }
     }
 }
@@ -326,20 +423,56 @@ impl DeliveryApproach for AnyApproach {
 /// default.
 pub const REGISTRY: &[(&str, fn() -> AnyApproach)] = &[
     (InlineSequential::NAME, || {
-        AnyApproach::InlineSequential(InlineSequential)
+        AnyApproach::InlineSequential(InlineSequential::default())
+    }),
+    (InlineSequential::CONTINUE, || {
+        AnyApproach::InlineSequential(InlineSequential {
+            stop_at_failure: false,
+        })
     }),
     (PerRecordFutures::NAME, || {
         AnyApproach::PerRecordFutures(PerRecordFutures::default())
     }),
+    (ParallelFanout::NAME, || {
+        AnyApproach::ParallelFanout(ParallelFanout)
+    }),
+    (BatchPerDestination::NAME, || {
+        AnyApproach::BatchPerDestination(BatchPerDestination)
+    }),
+    (Merge::CHANNEL, || {
+        AnyApproach::Merge(Merge::new(MergeStore::Channel))
+    }),
+    (Merge::SWAP, || {
+        AnyApproach::Merge(Merge::new(MergeStore::Swap))
+    }),
 ];
 
-/// The approach registered as `name`.
+/// The approach a spec names: a registry name, then for a merge approach
+/// `/w<milliseconds>` for its merge window and `/b<bytes>` for its buffer, as
+/// in `merge_channel/w1/b262144`.
 #[must_use]
-pub fn approach(name: &str) -> Option<AnyApproach> {
-    REGISTRY
+pub fn approach(spec: &str) -> Option<AnyApproach> {
+    let mut parts = spec.split('/');
+    let name = parts.next()?;
+    let mut found = REGISTRY
         .iter()
         .find(|(n, _)| *n == name)
-        .map(|(_, make)| make())
+        .map(|(_, make)| make())?;
+    for part in parts {
+        let AnyApproach::Merge(merge) = &mut found else {
+            return None;
+        };
+        if let Some(ms) = part.strip_prefix('w') {
+            let ms: f64 = ms.parse().ok()?;
+            if !(ms >= 0.0 && ms.is_finite()) {
+                return None;
+            }
+            merge.window = std::time::Duration::from_secs_f64(ms / 1000.0);
+        } else {
+            merge.buffer_bytes = part.strip_prefix('b')?.parse().ok()?;
+        }
+    }
+    Some(found)
 }
 
 #[cfg(test)]

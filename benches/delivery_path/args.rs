@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use scalo::transport::test_support::delivery::REGISTRY;
+use scalo::transport::test_support::delivery::{REGISTRY, approach};
 
 use crate::drive::Retry;
 use crate::loads::Load;
@@ -63,7 +63,7 @@ impl Spec {
             ),
             None => (body, retry),
         };
-        if !REGISTRY.iter().any(|(n, _)| *n == name) {
+        if approach(name).is_none() {
             let known: Vec<&str> = REGISTRY.iter().map(|(n, _)| *n).collect();
             return Err(format!("no approach {name}: known {}", known.join(",")));
         }

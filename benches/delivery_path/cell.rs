@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use scalo::memory::{MemoryGuard, MemoryGuardConfig};
 use scalo::transport::TransportSender;
-use scalo::transport::test_support::delivery::{AnyApproach, Destinations, approach};
+use scalo::transport::test_support::delivery::{AnyApproach, Destinations, Shape, approach};
 use scalo::transport::test_support::shaped::ShapedSender;
 
 use crate::args::{Args, Spec, Tier};
@@ -54,14 +54,21 @@ async fn run(args: &Args) -> Option<String> {
             let mut destinations = Destinations::new(guard());
             let mut senders = Vec::new();
             let mut kafka_counts = None;
+            let mut all_counts = Vec::new();
             for (name, config) in loads::topology(load, args.seed) {
                 let sender = ShapedSender::new(name, config);
                 senders.push(sender.clone());
                 let (observed, counts) = Observed::new(sender);
+                all_counts.push((name, Arc::clone(&counts)));
                 if name == loads::KAFKA {
                     kafka_counts = Some(counts);
                 }
-                destinations.add(name, observed);
+                let shape = if name == loads::KAFKA {
+                    Shape::PerRecord
+                } else {
+                    Shape::Batch
+                };
+                destinations.add_shaped(name, observed, shape);
             }
             let destinations = Arc::new(destinations);
             if args.idle {
@@ -79,7 +86,12 @@ async fn run(args: &Args) -> Option<String> {
                 caller_side_peak_bytes: kafka_counts.as_deref().map(Counts::peak_bytes),
             };
             let confirmed = senders.iter().map(|s| s.stats().records_confirmed).sum();
-            Some(result.finish(Some(confirmed), queue).json_line())
+            Some(
+                result
+                    .finish(Some(confirmed), queue)
+                    .attempted(&all_counts)
+                    .json_line(),
+            )
         }
         Tier::Two => tier_two(args, load, spec, approach).await,
     }
@@ -106,7 +118,7 @@ async fn tier_two(args: &Args, load: Load, spec: &Spec, approach: AnyApproach) -
             backpressured_answers: Some(real.kafka.backpressured()),
             caller_side_peak_bytes: Some(real.kafka.peak_bytes()),
         };
-        result.map(|r| r.finish(None, queue).json_line())
+        result.map(|r| r.finish(None, queue).attempted(&real.counts).json_line())
     };
     real.close().await;
     line
@@ -139,7 +151,7 @@ async fn measure<S: TransportSender + 'static>(
     let groups = loads::groups(load, destinations.as_ref());
     let drive = args.rate.map_or(Drive::Closed, |rate| Drive::Open { rate });
     let raw = drive::run(
-        approach,
+        approach.clone(),
         spec.retry,
         drive,
         destinations,
@@ -148,14 +160,9 @@ async fn measure<S: TransportSender + 'static>(
         args.allocs,
     )
     .await?;
-    Some(CellResult::new(
-        args,
-        load,
-        spec,
-        &groups,
-        &raw,
-        host::peak_rss_bytes(),
-    ))
+    let mut result = CellResult::new(args, load, spec, &groups, &raw, host::peak_rss_bytes());
+    result.peak_queued_bytes = approach.peak_queued_bytes();
+    Some(result)
 }
 
 /// A guard with a fixed limit, so leases are counted and never refused.

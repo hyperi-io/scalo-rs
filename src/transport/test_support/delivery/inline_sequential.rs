@@ -17,22 +17,42 @@
 //! first and answered dead-lettered. The first destination that does not take
 //! its block stops the rest, as `RoutedSender::send_batch_fanout` does, and
 //! every record routed to a destination not reached gets that outcome too.
+//! With [`stop_at_failure`](InlineSequential::stop_at_failure) off, every
+//! destination is sent whatever the ones before it answered, the policy the
+//! fan-out, merge and per-destination approaches follow.
 
 use super::{CallerBatch, DeliveryApproach, Destinations, Outcome, answer};
 use crate::transport::{Record, SendResult, TransportSender};
 
 /// Per caller batch, inline, destinations one after another.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct InlineSequential;
+#[derive(Debug, Clone, Copy)]
+pub struct InlineSequential {
+    /// Stop at the first destination that does not take its block.
+    pub stop_at_failure: bool,
+}
+
+impl Default for InlineSequential {
+    fn default() -> Self {
+        Self {
+            stop_at_failure: true,
+        }
+    }
+}
 
 impl InlineSequential {
-    /// Registry name.
+    /// Registry name, stopping at the first failure.
     pub const NAME: &'static str = "inline_sequential";
+    /// Registry name of the same approach sending every destination.
+    pub const CONTINUE: &'static str = "inline_sequential_continue";
 }
 
 impl DeliveryApproach for InlineSequential {
     fn name(&self) -> &'static str {
-        Self::NAME
+        if self.stop_at_failure {
+            Self::NAME
+        } else {
+            Self::CONTINUE
+        }
     }
 
     async fn deliver<'a, S: TransportSender>(
@@ -90,7 +110,7 @@ impl DeliveryApproach for InlineSequential {
             for i in in_block {
                 outcomes[i] = outcomes[i].max(outcome);
             }
-            if outcome.is_undelivered() {
+            if self.stop_at_failure && outcome.is_undelivered() {
                 stopped = Some(outcome);
             }
         }

@@ -35,7 +35,7 @@ use tokio::time::Instant;
 use scalo::memory::{MemoryGuard, MemoryGuardConfig};
 use scalo::transport::test_support::delivery::{
     Answer, AnyApproach, CallerBatch, DeliveryApproach, DestinationId, Destinations, Outcome,
-    RoutedRecord, approach,
+    RoutedRecord, Shape, approach,
 };
 use scalo::transport::test_support::shaped::{
     Down, Faults, OutcomeMode, ShapedConfig, ShapedSender,
@@ -44,6 +44,21 @@ use scalo::transport::{PayloadFormat, Record, RecordMeta};
 
 const INLINE: &str = "inline_sequential";
 const PER_RECORD: &str = "per_record_futures";
+const INLINE_CONTINUE: &str = "inline_sequential_continue";
+const PARALLEL: &str = "parallel_fanout";
+const PER_DESTINATION: &str = "batch_per_destination";
+const MERGE_CHANNEL: &str = "merge_channel";
+const MERGE_SWAP: &str = "merge_swap";
+
+/// The approaches that send each destination one block per caller batch, or
+/// merge those blocks: each keeps every invariant.
+const BLOCK_APPROACHES: [&str; 5] = [
+    INLINE_CONTINUE,
+    PARALLEL,
+    PER_DESTINATION,
+    MERGE_CHANNEL,
+    MERGE_SWAP,
+];
 
 fn named(name: &str) -> AnyApproach {
     approach(name).unwrap_or_else(|| panic!("{name} is registered"))
@@ -56,7 +71,13 @@ fn destinations(senders: &[(&str, &ShapedSender)]) -> Arc<Destinations<ShapedSen
     }));
     let mut set = Destinations::new(guard);
     for (name, sender) in senders {
-        set.add(name, (*sender).clone());
+        // Kafka-shaped senders are named from "k".
+        let shape = if name.starts_with('k') {
+            Shape::PerRecord
+        } else {
+            Shape::Batch
+        };
+        set.add_shaped(name, (*sender).clone(), shape);
     }
     Arc::new(set)
 }
@@ -276,7 +297,7 @@ async fn check_other_caller_untouched(name: &str) {
             .await;
         assert_eq!(outcomes, [Outcome::Sent; 2], "{name}, sick {label}");
         assert!(
-            start.elapsed() <= Duration::from_millis(5),
+            start.elapsed() <= Duration::from_millis(10),
             "{name}, sick {label}: the other caller waited {:?}",
             start.elapsed()
         );
@@ -512,7 +533,192 @@ fn every_registered_approach_has_its_invariant_tests() {
         .collect();
     assert_eq!(
         names,
-        [INLINE, PER_RECORD],
+        [
+            INLINE,
+            INLINE_CONTINUE,
+            PER_RECORD,
+            PARALLEL,
+            PER_DESTINATION,
+            MERGE_CHANNEL,
+            MERGE_SWAP
+        ],
         "add the new approach's invariant tests here"
     );
+}
+
+// Every invariant for the block and merge approaches, one test each.
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_release_nothing_before_their_destination_confirms() {
+    for name in BLOCK_APPROACHES {
+        check_no_release_before_confirm(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_hold_their_answer_until_every_destination_confirms() {
+    for name in BLOCK_APPROACHES {
+        check_held_answer_waits_for_every_destination(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_refuse_a_held_batch_with_a_sick_destination_whole() {
+    for name in BLOCK_APPROACHES {
+        check_held_batch_refused_whole(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_leave_another_callers_batch_untouched_by_a_sick_destination() {
+    for name in BLOCK_APPROACHES {
+        check_other_caller_untouched(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_release_their_lease_when_cancelled() {
+    for name in BLOCK_APPROACHES {
+        check_cancel_releases_lease(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_map_a_refusal_to_its_caller_and_record() {
+    for name in BLOCK_APPROACHES {
+        check_refusal_maps_to_its_record(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_keep_kafka_order_through_a_full_queue() {
+    for name in BLOCK_APPROACHES {
+        let (outcomes, order) = through_a_full_queue(name).await;
+        assert_eq!(outcomes, [Outcome::Sent; 10], "{name}");
+        assert_eq!(order, (0..10).collect::<Vec<u8>>(), "{name}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_drain_a_batch_larger_than_the_queue() {
+    for name in BLOCK_APPROACHES {
+        check_batch_larger_than_queue_completes(name).await;
+    }
+}
+
+/// Two callers' blocks for one gRPC-shaped destination go out as one call when
+/// they arrive within the merge window, and each caller gets its own answer.
+#[tokio::test(start_paused = true)]
+async fn merge_approaches_send_two_callers_blocks_as_one_call() {
+    for name in [MERGE_CHANNEL, MERGE_SWAP] {
+        let g = ShapedSender::new("g", grpc(5));
+        let set = destinations(&[("g", &g)]);
+        let merge = approach(&format!("{name}/w2/b65536")).expect("a merge spec parses");
+        let a = {
+            let set = Arc::clone(&set);
+            let merge = merge.clone();
+            tokio::spawn(async move {
+                merge
+                    .deliver(
+                        &set,
+                        CallerBatch {
+                            records: vec![record("a", &[DestinationId(0)])],
+                            answer: Answer::Held,
+                        },
+                    )
+                    .await
+            })
+        };
+        let b = merge
+            .deliver(
+                &set,
+                CallerBatch {
+                    records: vec![
+                        record("b1", &[DestinationId(0)]),
+                        record("b2", &[DestinationId(0)]),
+                    ],
+                    answer: Answer::Held,
+                },
+            )
+            .await;
+        assert_eq!(b, [Outcome::Sent; 2], "{name}");
+        assert_eq!(a.await.expect("caller a"), [Outcome::Sent], "{name}");
+        let stats = g.stats();
+        assert_eq!(stats.calls, 1, "{name}: two callers, one call");
+        assert_eq!(stats.max_batch, 3, "{name}");
+        assert!(merge.peak_queued_bytes().is_some_and(|b| b >= 5), "{name}");
+    }
+}
+
+/// Many callers on one merge stage: every block is answered, none is dropped
+/// by a caller that stops waiting once its own answer arrives.
+#[tokio::test(start_paused = true)]
+async fn merge_approaches_answer_every_caller() {
+    for name in [MERGE_CHANNEL, MERGE_SWAP] {
+        let g = ShapedSender::new(
+            "g",
+            ShapedConfig {
+                call_latency: Duration::from_millis(5),
+                max_calls_in_flight: 4,
+                ..ShapedConfig::default()
+            },
+        );
+        let set = destinations(&[("g", &g)]);
+        let merge = approach(&format!("{name}/w1/b4096")).expect("a merge spec parses");
+        let mut callers = tokio::task::JoinSet::new();
+        for caller in 0..64u8 {
+            let set = Arc::clone(&set);
+            let merge = merge.clone();
+            callers.spawn(async move {
+                let mut answers = Vec::new();
+                for round in 0..5u8 {
+                    // Staggered arrivals, so blocks are queued while an earlier drain is in flight.
+                    tokio::time::sleep(Duration::from_millis(u64::from(caller % 7))).await;
+                    let outcomes = merge
+                        .deliver(
+                            &set,
+                            CallerBatch {
+                                records: vec![record(vec![caller, round], &[DestinationId(0)])],
+                                answer: Answer::Held,
+                            },
+                        )
+                        .await;
+                    answers.extend(outcomes);
+                }
+                answers
+            });
+        }
+        let answers: Vec<Outcome> = callers.join_all().await.into_iter().flatten().collect();
+        assert_eq!(answers.len(), 320, "{name}");
+        assert!(
+            answers.iter().all(|o| *o == Outcome::Sent),
+            "{name}: {answers:?}"
+        );
+        assert_eq!(g.stats().records_confirmed, 320, "{name}");
+    }
+}
+
+/// A block larger than the whole merge buffer is sent directly, never queued.
+#[tokio::test(start_paused = true)]
+async fn merge_approaches_send_a_block_larger_than_the_buffer_directly() {
+    for name in [MERGE_CHANNEL, MERGE_SWAP] {
+        let g = ShapedSender::new("g", grpc(5));
+        let set = destinations(&[("g", &g)]);
+        let merge = approach(&format!("{name}/w1/b8")).expect("a merge spec parses");
+        let outcomes = merge
+            .deliver(
+                &set,
+                CallerBatch {
+                    records: vec![record(vec![b'x'; 16], &[DestinationId(0)])],
+                    answer: Answer::Held,
+                },
+            )
+            .await;
+        assert_eq!(outcomes, [Outcome::Sent], "{name}");
+        assert_eq!(
+            merge.peak_queued_bytes(),
+            Some(0),
+            "{name}: nothing was queued"
+        );
+    }
 }

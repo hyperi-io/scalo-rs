@@ -36,7 +36,7 @@ use scalo::transport::kafka::test_support::{KAFKA_IMAGE, KAFKA_PORT, kafka_spec,
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::test_support::delivery::{
     Answer, CallerBatch, DeliveryApproach, DestinationId, Destinations, Outcome, RoutedRecord,
-    approach,
+    Shape, approach,
 };
 use scalo::transport::{
     AnySender, PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportSender,
@@ -133,6 +133,8 @@ pub struct RealDestinations {
     pub destinations: Arc<Destinations<Observed<AnySender>>>,
     /// What the Kafka destination held and refused.
     pub kafka: Arc<Counts>,
+    /// What every destination was offered, by name.
+    pub counts: Vec<(&'static str, Arc<Counts>)>,
     listeners: Vec<Listener>,
 }
 
@@ -146,7 +148,7 @@ impl RealDestinations {
         }
         let (kafka, kafka_counts) =
             Observed::new(AnySender::Kafka(KafkaTransport::new(&kafka).await.ok()?));
-        destinations.add(KAFKA, kafka);
+        destinations.add_shaped(KAFKA, kafka, Shape::PerRecord);
 
         let mut listeners = Vec::new();
         let (a_endpoint, a_listener) = Listener::scalo().await?;
@@ -156,7 +158,8 @@ impl RealDestinations {
         }
         listeners.push(a_listener);
         let a_client = GrpcTransport::new(&a_config).await.ok()?;
-        destinations.add(GRPC_A, Observed::new(AnySender::Grpc(a_client)).0);
+        let (a_sender, a_counts) = Observed::new(AnySender::Grpc(a_client));
+        destinations.add(GRPC_A, a_sender);
 
         let (b_endpoint, b_listener) = match load {
             Load::W4 => Listener::slow(W4_DELAY).await?,
@@ -167,9 +170,15 @@ impl RealDestinations {
         let b_client = GrpcTransport::new(&GrpcConfig::client(&b_endpoint))
             .await
             .ok()?;
-        destinations.add(GRPC_B, Observed::new(AnySender::Grpc(b_client)).0);
+        let (b_sender, b_counts) = Observed::new(AnySender::Grpc(b_client));
+        destinations.add(GRPC_B, b_sender);
         Some(Self {
             destinations: Arc::new(destinations),
+            counts: vec![
+                (KAFKA, Arc::clone(&kafka_counts)),
+                (GRPC_A, a_counts),
+                (GRPC_B, b_counts),
+            ],
             kafka: kafka_counts,
             listeners,
         })
