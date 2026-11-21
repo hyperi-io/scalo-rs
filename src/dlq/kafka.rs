@@ -28,6 +28,8 @@
 //!
 //! In cascade mode with a backend after Kafka, a failed delivery is not a
 //! loss: the entry is handed back for the drain to offer to that backend.
+//! With no backend beside Kafka, an entry the broker refuses for its size is
+//! refused for good, and the barrier says so with `DlqError::Refused`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +42,7 @@ use crate::transport::kafka::{KafkaProducer, ProducerProfile};
 
 use super::config::{DlqRouting, KafkaDlqConfig};
 use super::entry::DlqEntry;
-use super::error::DlqError;
+use super::error::{DlqError, RefusedEntries};
 
 /// How long a barrier waits for the reports of the messages it purged.
 const PURGE_REPORT_WAIT: Duration = Duration::from_secs(5);
@@ -81,8 +83,12 @@ pub struct KafkaDlqInner {
     queued_before_failure: usize,
     /// Entries lost since the drain last took them.
     durable_losses: u64,
+    /// Those of `durable_losses` the broker refused for good.
+    refused: RefusedEntries,
     /// Whether a later backend takes what the broker never acked.
     hand_on: bool,
+    /// Whether Kafka is the only backend, so nothing takes what the broker refuses.
+    alone: bool,
     /// Entries the broker never acked, until the drain takes them to hand on.
     returned: Vec<(Unacked, DlqEntry)>,
 }
@@ -140,7 +146,9 @@ impl KafkaDlqInner {
             sole_custody: 0,
             queued_before_failure: 0,
             durable_losses: 0,
+            refused: RefusedEntries::default(),
             hand_on: false,
+            alone: false,
             returned: Vec::new(),
         })
     }
@@ -149,6 +157,12 @@ impl KafkaDlqInner {
     /// backend after this one, instead of counting it lost.
     pub(crate) fn hand_on_unacked(&mut self) {
         self.hand_on = true;
+    }
+
+    /// Report an entry the broker refuses for its size as refused for good,
+    /// since no other backend can take it.
+    pub(crate) fn mark_alone(&mut self) {
+        self.alone = true;
     }
 
     /// Charge the delivery failures reported since the last call to the
@@ -167,6 +181,16 @@ impl KafkaDlqInner {
         }
         if !self.hand_on {
             self.durable_losses += charged;
+            // A loss charged by count alone can't be pinned to an entry, so it stays one a retry may land.
+            if self.alone && charged == failed {
+                let ceiling = self.producer.batch_ceiling();
+                for message in &undelivered {
+                    // A smaller entry can be refused for the batch it shared, and lands on its own.
+                    if message.too_large && message.payload.len() > ceiling {
+                        self.refused.push(&message.payload);
+                    }
+                }
+            }
             return;
         }
         // Cascade queues nothing another backend holds, so every failure goes on: a
@@ -277,8 +301,11 @@ impl KafkaDlqInner {
     ///
     /// # Errors
     ///
-    /// `DlqError::Kafka` when any entry lost since the previous barrier was
-    /// held by Kafka alone, or the blocking task failed.
+    /// `DlqError::Refused` when Kafka is the only backend, every report is in,
+    /// and every entry lost since the previous barrier is one the broker
+    /// refused for its size: one larger than `batch.size`, so it travelled
+    /// alone. `DlqError::Kafka` when any other entry lost since then was held
+    /// by Kafka alone, or the blocking task failed.
     pub async fn flush_durable(&mut self) -> Result<(), DlqError> {
         let producer = Arc::clone(&self.producer);
         let ack_wait = self.ack_wait;
@@ -303,6 +330,11 @@ impl KafkaDlqInner {
             );
         }
         let lost = self.durable_losses;
+        let refused = std::mem::take(&mut self.refused);
+        // An entry with no report yet may be lost too, and a caller told only of refusals would let it go.
+        if drained && lost > 0 && refused.len() as u64 == lost {
+            return Err(DlqError::Refused(refused));
+        }
         if lost > 0 {
             return Err(DlqError::Kafka(format!(
                 "{lost} DLQ entries lost: the broker refused them or did not ack within {} ms",
@@ -341,6 +373,7 @@ impl KafkaDlqInner {
 
     /// Entries the barriers since the last call found lost.
     pub(crate) fn take_durable_losses(&mut self) -> u64 {
+        self.refused = RefusedEntries::default();
         std::mem::take(&mut self.durable_losses)
     }
 

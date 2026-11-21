@@ -66,6 +66,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// librdkafka's own `batch.size`, for a config that leaves it unset: the end of the cascade.
+#[cfg(feature = "dlq-kafka")]
+const LIBRDKAFKA_BATCH_SIZE: usize = 1_000_000;
+
 /// Producer profile for different use cases.
 ///
 /// A profile sets only what the sizing surface leaves alone. Batch size,
@@ -141,6 +145,9 @@ pub struct KafkaProducer {
     /// The effective `message.max.bytes`, which only the Kafka DLQ reads.
     #[cfg(feature = "dlq-kafka")]
     message_max_bytes: usize,
+    /// The effective `batch.size`, which only the Kafka DLQ reads.
+    #[cfg(feature = "dlq-kafka")]
+    batch_size: usize,
     // Metrics
     messages_sent: AtomicU64,
     bytes_sent: AtomicU64,
@@ -199,6 +206,8 @@ pub(crate) struct UndeliveredMessage {
     pub(crate) payload: Vec<u8>,
     /// No ack came in time: the message expired or was purged, rather than refused.
     pub(crate) timed_out: bool,
+    /// The broker refused the batch that carried it for its size.
+    pub(crate) too_large: bool,
 }
 
 #[cfg(feature = "dlq-kafka")]
@@ -217,6 +226,7 @@ impl Undelivered {
         let message = UndeliveredMessage {
             payload: msg.payload().unwrap_or_default().to_vec(),
             timed_out,
+            too_large: classify_send_failure(err) == SendFailure::TooLarge,
         };
         self.0
             .lock()
@@ -279,6 +289,11 @@ impl KafkaProducer {
             .get("message.max.bytes")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(super::LIBRDKAFKA_MESSAGE_MAX_BYTES);
+        #[cfg(feature = "dlq-kafka")]
+        let batch_size = client_config
+            .get("batch.size")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(LIBRDKAFKA_BATCH_SIZE);
         let delivery = Arc::clone(&context.state);
         #[cfg(feature = "dlq-kafka")]
         let undelivered = context.undelivered.clone();
@@ -295,6 +310,8 @@ impl KafkaProducer {
             enqueue_degraded: DegradedLatch::default(),
             #[cfg(feature = "dlq-kafka")]
             message_max_bytes,
+            #[cfg(feature = "dlq-kafka")]
+            batch_size,
             messages_sent: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             errors: AtomicU64::new(0),
@@ -316,6 +333,13 @@ impl KafkaProducer {
     pub(crate) fn payload_ceiling(&self) -> usize {
         self.message_max_bytes
             .saturating_sub(super::RECORD_WIRE_OVERHEAD)
+    }
+
+    /// The effective `batch.size`. librdkafka adds nothing to a batch once its
+    /// first message passes it, so a payload larger than this travels alone.
+    #[cfg(feature = "dlq-kafka")]
+    pub(crate) fn batch_ceiling(&self) -> usize {
+        self.batch_size
     }
 
     /// Create a high-throughput producer (convenience method).
