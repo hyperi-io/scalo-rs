@@ -418,8 +418,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     /// `when_full: dlq`: write the record to the DLQ, or block without one.
     ///
     /// A disabled DLQ, or one with no backend that can hold the record, blocks
-    /// too: the record only overflowed, so dropping it would lose a record the
-    /// sink could still take.
+    /// too, and so does a broker that refuses it for its size: the record only
+    /// overflowed, so dropping it would lose a record the sink could still take.
     async fn full_to_dlq(&self, record: &Record) -> Option<Result<()>> {
         #[cfg(feature = "dlq")]
         if self.dead_letters.dlq().is_some() {
@@ -438,7 +438,11 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             }
             if !self
                 .dead_letters
-                .write(vec![dead], self.config.send_timeout_duration())
+                .write(
+                    vec![dead],
+                    self.config.send_timeout_duration(),
+                    drainer::OnRefusal::Keep,
+                )
                 .await
             {
                 return None;
@@ -1996,6 +2000,134 @@ mod tests {
         assert_eq!(tiered.spool_len().await, 1);
         tiered.shutdown().await;
         shutdown.cancel();
+    }
+
+    /// The drain writes two spooled dead letters to a Kafka-only DLQ whose
+    /// topic refuses one for its size, which the producer's own ceiling
+    /// passes. The refused one is dropped and counted, the other lands once,
+    /// and both spool entries are committed rather than written again.
+    #[cfg(all(feature = "dlq-kafka", feature = "transport-kafka-test-support"))]
+    #[tokio::test]
+    #[ignore = "needs Docker for a Kafka broker -- run: cargo nextest run --run-ignored all --ignore-default-filter"]
+    async fn the_drain_drops_a_dead_letter_the_dlq_broker_refuses_for_good() {
+        use crate::deployment::test_support::shared_service::Suite;
+        use crate::transport::kafka::test_support::{KAFKA_PORT, require_docker, shared_kafka};
+        use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+        use rdkafka::consumer::{BaseConsumer, Consumer};
+
+        const SUITE: Suite = Suite {
+            repo: "scalo-rs",
+            manifest_dir: env!("CARGO_MANIFEST_DIR"),
+            tmp_dir: None,
+        };
+        /// How long the drain may take to empty the spool against the broker.
+        const DRAINED_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+        if !require_docker() {
+            return;
+        }
+        let bootstrap = shared_kafka(SUITE).await.addr(KAFKA_PORT);
+        let topic = format!("tiered.dlq.refused-p{}", std::process::id());
+        let admin: AdminClient<rdkafka::client::DefaultClientContext> =
+            rdkafka::ClientConfig::new()
+                .set("bootstrap.servers", &bootstrap)
+                .create()
+                .expect("admin client");
+        let spec =
+            NewTopic::new(&topic, 1, TopicReplication::Fixed(1)).set("max.message.bytes", "262144");
+        for created in admin
+            .create_topics(&[spec], &AdminOptions::new())
+            .await
+            .expect("create topics")
+        {
+            created.expect("topic created");
+        }
+        let config = crate::dlq::DlqConfig {
+            mode: crate::dlq::DlqMode::KafkaOnly,
+            file: crate::dlq::FileDlqConfig {
+                enabled: false,
+                ..crate::dlq::FileDlqConfig::default()
+            },
+            kafka: crate::dlq::KafkaDlqConfig {
+                enabled: true,
+                routing: crate::dlq::DlqRouting::Common,
+                common_topic: Some(topic.clone()),
+                // A first produce to a new topic can outlast the default ack wait.
+                send_timeout_ms: 30_000,
+                ..crate::dlq::KafkaDlqConfig::default()
+            },
+            ..crate::dlq::DlqConfig::default()
+        };
+        let kafka = crate::transport::KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: String::new(),
+            ..Default::default()
+        };
+        let shutdown = CancellationToken::new();
+        let dlq = Arc::new(
+            crate::dlq::Dlq::spawn(&config, "svc", Some(&kafka), shutdown.clone()).unwrap(),
+        );
+        // Incompressible, so zstd leaves the capped, base64'd entry over the topic's ceiling.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let oversize: &'static [u8] = Box::leak(
+            (0..600_000)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                })
+                .collect::<Vec<u8>>()
+                .into_boxed_slice(),
+        );
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut spill = spilling_config(&dir.path().join("q"));
+        spill.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+        let tiered = TieredSink::new(sink, spill)
+            .await
+            .unwrap()
+            .with_dlq(Arc::clone(&dlq));
+        tiered.send(&rec(b"held")).await.unwrap();
+        tiered.send(&rec(oversize)).await.unwrap();
+
+        // One pass dead-letters both: the screen names one, the sink answers the other FilteredDlq.
+        tiered.inner().screen_payload(Some(oversize));
+        tiered.inner().dead_letter_payload(Some(b"held"));
+        tiered.inner().set_available(true);
+        let deadline = std::time::Instant::now() + DRAINED_WITHIN;
+        while !(tiered.spool_is_empty().await && tiered.spool_bytes() == 0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the spool still holds {} records {DRAINED_WITHIN:?} on",
+                tiered.spool_len().await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            tiered.inner().received_payloads().await,
+            Vec::<Vec<u8>>::new(),
+            "both records were dead letters"
+        );
+        assert_eq!(dlq.dropped(), 1, "only the refused entry is lost");
+        let landed = tokio::task::spawn_blocking(move || {
+            let consumer: BaseConsumer = rdkafka::ClientConfig::new()
+                .set("bootstrap.servers", &bootstrap)
+                .set("group.id", "tiered-dlq-refused-watermarks")
+                .create()
+                .expect("watermark client");
+            consumer
+                .fetch_watermarks(&topic, 0, std::time::Duration::from_secs(10))
+                .expect("watermarks")
+                .1
+        })
+        .await
+        .unwrap();
+        assert_eq!(landed, 1, "the held entry landed once");
+        tiered.shutdown().await;
+        dlq.shutdown().await.expect("DLQ shutdown");
     }
 
     /// The yaque lock files a spool directory can hold.

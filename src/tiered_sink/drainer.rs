@@ -264,6 +264,20 @@ pub(crate) struct Undeliverable {
     pub(crate) reason: String,
 }
 
+/// What [`DeadLetters::write`] does with an entry the DLQ answers
+/// `DlqError::Refused` for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnRefusal {
+    /// Drop and count it: the sink will never take it, and no DLQ backend can.
+    Drop,
+    /// Leave the write unconfirmed, so the caller keeps a record the sink can still take.
+    #[cfg_attr(
+        not(feature = "dlq"),
+        allow(dead_code, reason = "only `when_full: dlq` keeps a refused record")
+    )]
+    Keep,
+}
+
 /// Where the tiered sink writes the records it cannot deliver: the DLQ set
 /// with `TieredSink::with_dlq`, or nowhere, dropping and counting them.
 #[derive(Clone, Default)]
@@ -293,14 +307,21 @@ impl DeadLetters {
 
     /// Write `dead` to the DLQ and wait up to `wait` for it to confirm, or
     /// drop and count them when there is no DLQ. `false` when the DLQ did not
-    /// confirm, so the caller keeps the records.
-    pub(crate) async fn write(&self, dead: Vec<Undeliverable>, wait: Duration) -> bool {
+    /// confirm, so the caller keeps the records. A `DlqError::Refused` answer
+    /// confirms the write under [`OnRefusal::Drop`], dropping and counting the
+    /// entries it names, and leaves it unconfirmed under [`OnRefusal::Keep`].
+    pub(crate) async fn write(
+        &self,
+        dead: Vec<Undeliverable>,
+        wait: Duration,
+        on_refusal: OnRefusal,
+    ) -> bool {
         #[cfg(feature = "dlq")]
         if let Some(dlq) = self.dlq() {
-            return write_to(&dlq, dead, wait).await;
+            return write_to(&dlq, dead, wait, on_refusal).await;
         }
         #[cfg(not(feature = "dlq"))]
-        let _ = wait;
+        let _ = (wait, on_refusal);
         for Undeliverable {
             record,
             label,
@@ -337,7 +358,12 @@ fn dlq_entry(dlq: &crate::dlq::Dlq, dead: &Undeliverable) -> crate::dlq::DlqEntr
 
 /// The DLQ half of [`DeadLetters::write`].
 #[cfg(feature = "dlq")]
-async fn write_to(dlq: &crate::dlq::Dlq, dead: Vec<Undeliverable>, wait: Duration) -> bool {
+async fn write_to(
+    dlq: &crate::dlq::Dlq,
+    dead: Vec<Undeliverable>,
+    wait: Duration,
+    on_refusal: OnRefusal,
+) -> bool {
     let mut labels = Vec::with_capacity(dead.len());
     let mut entries = Vec::with_capacity(dead.len());
     for d in dead {
@@ -359,11 +385,35 @@ async fn write_to(dlq: &crate::dlq::Dlq, dead: Vec<Undeliverable>, wait: Duratio
     if entries.is_empty() {
         return true;
     }
+    // `Refused` names entries by the bytes written, so keep those to match against.
+    let written = match on_refusal {
+        OnRefusal::Drop => entries.clone(),
+        OnRefusal::Keep => Vec::new(),
+    };
     match timeout(wait, dlq.write_confirmed(entries)).await {
         Ok(Ok(())) => {
             for label in labels {
                 count_dead_letter(label, "dlq");
             }
+            true
+        }
+        Ok(Err(crate::dlq::DlqError::Refused(refused))) if on_refusal == OnRefusal::Drop => {
+            let mut dropped = 0_usize;
+            for (label, entry) in labels.into_iter().zip(&written) {
+                if refused.contains(entry) {
+                    count_dead_letter(label, "dropped");
+                    dropped += 1;
+                } else {
+                    count_dead_letter(label, "dlq");
+                }
+            }
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                dropped,
+                "The DLQ's broker refused a dead letter for its size; it is dropped"
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _ = dropped;
             true
         }
         Ok(Err(e)) => {
@@ -538,7 +588,11 @@ async fn drain_once<S: TransportSender>(
         }
     };
     let dead_lettered = dead.len();
-    if dead_lettered > 0 && !dead_letters.write(dead, send_timeout).await {
+    if dead_lettered > 0
+        && !dead_letters
+            .write(dead, send_timeout, OnRefusal::Drop)
+            .await
+    {
         return vec![DrainResult::DeadLetterUnwritten];
     }
     match guard.commit() {
