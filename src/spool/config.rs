@@ -49,6 +49,15 @@ pub struct SpoolConfig {
     /// is refused, never quarantined.
     #[serde(default)]
     pub on_corruption: CorruptionPolicy,
+
+    /// Sync the queue's files to disk before each `push` returns, so a record
+    /// that was pushed survives the host losing power as well as the process
+    /// being killed. Default false: a push is then flushed to the operating
+    /// system, which survives a kill, and [`Spool::sync`](crate::spool::Spool::sync)
+    /// makes a batch of pushes durable with one sync. Costs one disk sync per
+    /// push, about a millisecond on network storage.
+    #[serde(default)]
+    pub sync_on_push: bool,
 }
 
 // The recovery action enum is shared with the TieredSink cold path.
@@ -68,6 +77,7 @@ impl Default for SpoolConfig {
             max_size_bytes: None,
             crc: false,
             on_corruption: CorruptionPolicy::Quarantine,
+            sync_on_push: false,
         }
     }
 }
@@ -131,6 +141,13 @@ impl SpoolConfig {
     #[must_use]
     pub fn on_corruption(mut self, policy: CorruptionPolicy) -> Self {
         self.on_corruption = policy;
+        self
+    }
+
+    /// Sync to disk before each push returns (see [`sync_on_push`](Self::sync_on_push)).
+    #[must_use]
+    pub fn sync_on_push(mut self, enabled: bool) -> Self {
+        self.sync_on_push = enabled;
         self
     }
 }

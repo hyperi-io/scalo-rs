@@ -18,6 +18,11 @@
 //! - **Open** ([`open_queue`]): clears lock files a stopped process left behind,
 //!   refuses a queue a live process still holds, and quarantines a queue that
 //!   will not open under [`CorruptionPolicy::Quarantine`].
+//! - **Receive position** ([`open_queue`] repairs it): a `recv-metadata` yaque
+//!   left torn or pointing at a segment that is gone becomes a replay from the
+//!   first segment, instead of a queue that will not open.
+//! - **Sync** ([`sync_segments`]): fsync of the segment files, which yaque never
+//!   does, so a record that was pushed survives the host losing power.
 //! - **Count** ([`queued_items_and_bytes`]): what a queue directory still
 //!   holds, read once at open so the counters after it move incrementally.
 //! - **Quarantine** ([`quarantine`]): move a corrupt queue's files into a
@@ -27,7 +32,7 @@
 //!
 //! [`Spool`]: crate::spool::Spool
 
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -188,6 +193,12 @@ pub(crate) fn open_queue(
     policy: CorruptionPolicy,
 ) -> Result<(yaque::Sender, yaque::Receiver), OpenError> {
     release_stale_locks(path)?;
+    repair_recv_position(path).map_err(|e| {
+        OpenError::Failed(format!(
+            "cannot repair the receive position in {}: {e}",
+            path.display()
+        ))
+    })?;
     let open_err = match yaque::channel(path) {
         Ok(queue) => return Ok(queue),
         Err(e) => e,
@@ -206,6 +217,141 @@ pub(crate) fn open_queue(
         .map_err(|e| OpenError::Failed(format!("{open_err}; quarantine failed: {e}")))?;
     yaque::channel(path)
         .map_err(|e| OpenError::Failed(format!("{open_err}; fresh open failed: {e}")))
+}
+
+/// The segment numbers in a yaque queue directory, ascending. Segments are
+/// `<n>.q`.
+fn segment_numbers(path: &Path) -> io::Result<Vec<u64>> {
+    let mut segments = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let file = entry?.path();
+        if file.extension().and_then(|e| e.to_str()) == Some("q")
+            && let Some(number) = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+        {
+            segments.push(number);
+        }
+    }
+    segments.sort_unstable();
+    Ok(segments)
+}
+
+/// The file yaque keeps the receive position in: the segment, then the byte
+/// offset in it, as two big-endian u64.
+const RECV_STATE_FILE: &str = "recv-metadata";
+
+/// Replace a receive position yaque cannot use with the start of the queue's
+/// first segment.
+///
+/// yaque saves the position by truncating `recv-metadata` and then writing 16
+/// bytes, with no sync. A kill between the two leaves it short, and a power loss
+/// can leave it naming a segment that is gone or an offset past the end of the
+/// segment, the data it counted never having reached the disk. yaque refuses to
+/// open such a queue, and the quarantine policy then moves every spooled record
+/// aside. Replaying from the first segment instead delivers each record at
+/// least once: the records of that segment already consumed come again, and none
+/// is lost.
+fn repair_recv_position(path: &Path) -> io::Result<()> {
+    let state = path.join(RECV_STATE_FILE);
+    let saved = match std::fs::read(&state) {
+        Ok(saved) => saved,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let segments = segment_numbers(path)?;
+    if recv_position_is_usable(path, &saved, &segments) {
+        return Ok(());
+    }
+    match segments.first() {
+        Some(&first) => write_recv_position(path, first)?,
+        None => std::fs::remove_file(&state)?,
+    }
+    #[cfg(feature = "tracing")]
+    tracing::warn!(
+        path = %path.display(),
+        "the spool's receive position was torn or lost; replaying from its first segment, \
+         so records already consumed may be delivered again"
+    );
+    Ok(())
+}
+
+/// Whether `saved` is a position yaque can resume from: 16 bytes naming a
+/// segment that exists, at an offset inside it.
+fn recv_position_is_usable(path: &Path, saved: &[u8], segments: &[u64]) -> bool {
+    let (Some(segment), Some(offset)) = (saved.get(0..8), saved.get(8..16)) else {
+        return false;
+    };
+    if saved.len() != 16 {
+        return false;
+    }
+    let segment = u64::from_be_bytes(segment.try_into().unwrap_or([0; 8]));
+    let offset = u64::from_be_bytes(offset.try_into().unwrap_or([0; 8]));
+    segments.binary_search(&segment).is_ok()
+        && std::fs::metadata(path.join(format!("{segment}.q"))).is_ok_and(|m| offset <= m.len())
+}
+
+/// Write the receive position as `segment`, offset 0, through a temporary file
+/// and a rename, so a crash leaves the old position or the new one.
+fn write_recv_position(path: &Path, segment: u64) -> io::Result<()> {
+    let temporary = path.join(format!("{RECV_STATE_FILE}.tmp"));
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(&segment.to_be_bytes())?;
+    file.write_all(&0_u64.to_be_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path.join(RECV_STATE_FILE))?;
+    sync_directory(path)
+}
+
+/// Flush a directory's entries to stable storage, so a file created or renamed
+/// in it survives a power loss. Windows has no such call, and does nothing.
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Flush the queue's segment files from `from` upward to stable storage, and
+/// the queue directory and its parent with them, so a spool created by its
+/// first push is not lost with its directory entry. Returns the newest
+/// segment, which the next call passes as its `from`: older segments are full
+/// and already synced.
+///
+/// yaque flushes each send to the operating system and never syncs, so a
+/// pushed record survives its process being killed, and survives the host
+/// losing power only once this has run. Start `from` at 0 to sync everything the
+/// directory holds.
+///
+/// # Errors
+/// Propagates the directory read or a segment's sync [`io::Error`].
+#[cfg(feature = "spool")]
+pub(crate) fn sync_segments(path: &Path, from: u64) -> io::Result<u64> {
+    let mut newest = from;
+    for number in segment_numbers(path)?.into_iter().filter(|n| *n >= from) {
+        // Opened for write, though nothing is written, because Windows cannot
+        // flush a handle that cannot write.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.join(format!("{number}.q")))
+        {
+            Ok(file) => file.sync_data()?,
+            // The receiver consumed it and yaque deleted it since the listing.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+        newest = number;
+    }
+    sync_directory(path)?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    sync_directory(parent)?;
+    Ok(newest)
 }
 
 /// Remove every lock file whose owner is gone. Refuse when a live owner holds one.
@@ -399,7 +545,7 @@ pub(crate) fn queued_items_and_bytes(path: &Path) -> io::Result<(u64, u64)> {
         return Ok((0, 0));
     }
 
-    let recv_metadata_path = path.join("recv-metadata");
+    let recv_metadata_path = path.join(RECV_STATE_FILE);
     let (recv_segment, recv_position) = if recv_metadata_path.exists() {
         let data = std::fs::read(&recv_metadata_path)?;
         match (data.get(0..8), data.get(8..16)) {
@@ -413,20 +559,10 @@ pub(crate) fn queued_items_and_bytes(path: &Path) -> io::Result<(u64, u64)> {
         (0, 0)
     };
 
-    let mut segments: Vec<u64> = Vec::new();
-    for entry in std::fs::read_dir(path)? {
-        let file_path = entry?.path();
-        if file_path.extension().and_then(|e| e.to_str()) == Some("q")
-            && let Some(seg_num) = file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok())
-            && seg_num >= recv_segment
-        {
-            segments.push(seg_num);
-        }
-    }
-    segments.sort_unstable();
+    let segments: Vec<u64> = segment_numbers(path)?
+        .into_iter()
+        .filter(|&seg_num| seg_num >= recv_segment)
+        .collect();
 
     let header_eof: [u8; 4] = [255, 255, 255, 255];
     let mut count = 0_u64;
@@ -533,6 +669,27 @@ mod tests {
             quarantine(&spool, QuarantineTrigger::OpenFailed, "test").unwrap(),
             None,
             "nothing left to move"
+        );
+    }
+
+    /// `sync_segments` reports the newest segment, which the next call starts
+    /// from, and passes over one the receiver deleted since the listing.
+    #[cfg(feature = "spool")]
+    #[test]
+    fn sync_segments_reports_the_newest_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        for number in 0..3 {
+            std::fs::write(dir.path().join(format!("{number}.q")), b"segment").unwrap();
+        }
+        std::fs::write(dir.path().join(RECV_STATE_FILE), b"not a segment").unwrap();
+
+        assert_eq!(sync_segments(dir.path(), 0).unwrap(), 2);
+        std::fs::remove_file(dir.path().join("1.q")).unwrap();
+        assert_eq!(sync_segments(dir.path(), 1).unwrap(), 2);
+        assert_eq!(
+            sync_segments(dir.path(), 5).unwrap(),
+            5,
+            "no segment at or above 5, so the start stays"
         );
     }
 

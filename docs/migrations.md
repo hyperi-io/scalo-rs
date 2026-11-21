@@ -6,6 +6,22 @@ release and the target before bumping.
 
 ---
 
+## 2.14.33
+
+### A spool replays from its first segment when its receive position is lost (BEHAVIOUR CHANGE)
+
+yaque saves the receive position by truncating `recv-metadata` and then writing it. A process killed between the two left the file empty, the queue would not open, and `on_corruption: quarantine` moved every spooled record aside. `Spool::open` and `TieredSink::new` now see a position that is short, or names a segment that is gone or an offset past its end, and replay from the first segment with a warn. Records consumed from that segment before the kill come again, and none is lost.
+
+**Consumer adjustment** -- none. A consumer of a spool or a tiered sink already handles a record twice.
+
+### `Spool::sync` and `SpoolConfig::sync_on_push` (additive)
+
+`Spool::sync().await` syncs every record pushed so far to disk, and `sync_on_push: true` does it before each push returns. yaque never syncs, so before this a pushed record survived the process being killed and not the host losing power.
+
+**Consumer adjustment** -- call `sync` after a batch of pushes, or set `sync_on_push`, where a power loss must not lose an acknowledged record. A literal `SpoolConfig { .. }` with no `..Default::default()` adds `sync_on_push: false`.
+
+---
+
 ## 2.14.32
 
 ### A pipeline sink hands refused records back to the DLQ (additive)
