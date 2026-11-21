@@ -301,20 +301,46 @@ fn block_for<S: TransportSender>(
     sender: &S,
     outcomes: &mut [Outcome],
 ) -> (Vec<Record>, Vec<usize>) {
-    let mut block = Vec::new();
-    let mut places = Vec::new();
+    let split = split_for(batch, id, sender);
+    for i in split.dead_lettered {
+        outcomes[i] = outcomes[i].max(Outcome::DeadLettered);
+    }
+    (split.block, split.places)
+}
+
+/// One destination's share of a caller batch.
+struct Split {
+    block: Vec<Record>,
+    places: Vec<usize>,
+    dead_lettered: Vec<usize>,
+}
+
+/// Split `batch` for `id`: the records `sender` would take, their places, and
+/// the places of those it would dead-letter. Sized up front, as
+/// [`InlineSequential`] sizes its block.
+fn split_for<S: TransportSender>(batch: &CallerBatch, id: DestinationId, sender: &S) -> Split {
+    let routed = batch
+        .records
+        .iter()
+        .filter(|r| r.routes.contains(&id))
+        .count();
+    let mut split = Split {
+        block: Vec::with_capacity(routed),
+        places: Vec::with_capacity(routed),
+        dead_lettered: Vec::new(),
+    };
     for (i, routed) in batch.records.iter().enumerate() {
         if !routed.routes.contains(&id) {
             continue;
         }
         if sender.dead_letter_reason(&routed.record).is_some() {
-            outcomes[i] = outcomes[i].max(Outcome::DeadLettered);
+            split.dead_lettered.push(i);
         } else {
-            block.push(routed.record.clone());
-            places.push(i);
+            split.block.push(routed.record.clone());
+            split.places.push(i);
         }
     }
-    (block, places)
+    split
 }
 
 /// Send `records` in one `send_batch` and return each record's outcome. A
@@ -434,7 +460,12 @@ pub const REGISTRY: &[(&str, fn() -> AnyApproach)] = &[
         AnyApproach::PerRecordFutures(PerRecordFutures::default())
     }),
     (ParallelFanout::NAME, || {
-        AnyApproach::ParallelFanout(ParallelFanout)
+        AnyApproach::ParallelFanout(ParallelFanout::default())
+    }),
+    (ParallelFanout::IN_SEND, || {
+        AnyApproach::ParallelFanout(ParallelFanout {
+            build_in_send: true,
+        })
     }),
     (BatchPerDestination::NAME, || {
         AnyApproach::BatchPerDestination(BatchPerDestination)
