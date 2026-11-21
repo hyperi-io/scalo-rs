@@ -28,6 +28,7 @@
 
 mod auto_fanout;
 mod batch_per_destination;
+mod grpc_coalesce;
 mod inline_sequential;
 mod merge;
 mod parallel_fanout;
@@ -43,6 +44,7 @@ use crate::transport::{Record, SendResult, TransportSender};
 
 pub use auto_fanout::AutoFanout;
 pub use batch_per_destination::BatchPerDestination;
+pub use grpc_coalesce::GrpcCoalesce;
 pub use inline_sequential::InlineSequential;
 pub use merge::{Merge, MergeStore};
 pub use parallel_fanout::ParallelFanout;
@@ -67,7 +69,7 @@ pub enum Shape {
 /// The named destinations a batch can be routed to, and the memory guard every
 /// delivery leases its bytes from.
 pub struct Destinations<S> {
-    entries: Vec<(Arc<str>, S, Shape)>,
+    entries: Vec<(Arc<str>, Arc<S>, Shape)>,
     ledger: Ledger,
 }
 
@@ -90,7 +92,8 @@ impl<S: TransportSender> Destinations<S> {
 
     /// Add `sender` under `name` with the shape it takes records in.
     pub fn add_shaped(&mut self, name: &str, sender: S, shape: Shape) -> DestinationId {
-        self.entries.push((Arc::from(name), sender, shape));
+        self.entries
+            .push((Arc::from(name), Arc::new(sender), shape));
         DestinationId(self.entries.len() - 1)
     }
 
@@ -133,12 +136,23 @@ impl<S: TransportSender> Destinations<S> {
         &self.entries[id.0].1
     }
 
+    /// The destination's sender, shared, for an approach that sends from a task
+    /// of its own.
+    ///
+    /// # Panics
+    ///
+    /// When `id` is not from this set.
+    #[must_use]
+    pub fn sender_arc(&self, id: DestinationId) -> Arc<S> {
+        Arc::clone(&self.entries[id.0].1)
+    }
+
     /// Every destination, in id order.
     pub fn iter(&self) -> impl Iterator<Item = (DestinationId, &str, &S)> {
         self.entries
             .iter()
             .enumerate()
-            .map(|(i, (name, sender, _))| (DestinationId(i), &**name, sender))
+            .map(|(i, (name, sender, _))| (DestinationId(i), &**name, &**sender))
     }
 
     /// Number of destinations.
@@ -414,7 +428,7 @@ pub trait DeliveryApproach: Send + Sync {
     /// Deliver `batch` to its routes in `destinations` and return one outcome
     /// per record, in the batch's order. Every byte held meanwhile is leased
     /// from [`Destinations::ledger`].
-    fn deliver<'a, S: TransportSender>(
+    fn deliver<'a, S: TransportSender + 'static>(
         &'a self,
         destinations: &'a Destinations<S>,
         batch: CallerBatch,
@@ -438,6 +452,8 @@ pub enum AnyApproach {
     BatchPerDestination(BatchPerDestination),
     /// [`Merge`], with a channel or a swapped buffer.
     Merge(Merge),
+    /// [`GrpcCoalesce`].
+    GrpcCoalesce(GrpcCoalesce),
 }
 
 impl AnyApproach {
@@ -447,6 +463,7 @@ impl AnyApproach {
     pub fn peak_queued_bytes(&self) -> Option<u64> {
         match self {
             Self::Merge(a) => Some(a.peak_queued_bytes()),
+            Self::GrpcCoalesce(a) => Some(a.peak_queued_bytes()),
             _ => None,
         }
     }
@@ -462,10 +479,11 @@ impl DeliveryApproach for AnyApproach {
             Self::AutoFanout(a) => a.name(),
             Self::BatchPerDestination(a) => a.name(),
             Self::Merge(a) => a.name(),
+            Self::GrpcCoalesce(a) => a.name(),
         }
     }
 
-    async fn deliver<'a, S: TransportSender>(
+    async fn deliver<'a, S: TransportSender + 'static>(
         &'a self,
         destinations: &'a Destinations<S>,
         batch: CallerBatch,
@@ -478,6 +496,7 @@ impl DeliveryApproach for AnyApproach {
             Self::AutoFanout(a) => a.deliver(destinations, batch).await,
             Self::BatchPerDestination(a) => a.deliver(destinations, batch).await,
             Self::Merge(a) => a.deliver(destinations, batch).await,
+            Self::GrpcCoalesce(a) => a.deliver(destinations, batch).await,
         }
     }
 }
@@ -517,11 +536,16 @@ pub const REGISTRY: &[(&str, fn() -> AnyApproach)] = &[
     (Merge::SWAP, || {
         AnyApproach::Merge(Merge::new(MergeStore::Swap))
     }),
+    (GrpcCoalesce::NAME, || {
+        AnyApproach::GrpcCoalesce(GrpcCoalesce::new())
+    }),
 ];
 
 /// The approach a spec names: a registry name, then for a merge approach
 /// `/w<milliseconds>` for its merge window and `/b<bytes>` for its buffer, as
-/// in `merge_channel/w1/b262144`.
+/// in `merge_channel/w1/b262144`, and for `grpc_coalesce` `/t<bytes>` for its
+/// byte target, `/l<milliseconds>` for its linger and `/n<count>` for the sends
+/// it keeps in flight, as in `grpc_coalesce/t131072/l2/n4`.
 #[must_use]
 pub fn approach(spec: &str) -> Option<AnyApproach> {
     let mut parts = spec.split('/');
@@ -531,20 +555,33 @@ pub fn approach(spec: &str) -> Option<AnyApproach> {
         .find(|(n, _)| *n == name)
         .map(|(_, make)| make())?;
     for part in parts {
-        let AnyApproach::Merge(merge) = &mut found else {
-            return None;
-        };
-        if let Some(ms) = part.strip_prefix('w') {
-            let ms: f64 = ms.parse().ok()?;
-            if !(ms >= 0.0 && ms.is_finite()) {
-                return None;
+        match &mut found {
+            AnyApproach::Merge(merge) => {
+                if let Some(ms) = part.strip_prefix('w') {
+                    merge.window = milliseconds(ms)?;
+                } else {
+                    merge.buffer_bytes = part.strip_prefix('b')?.parse().ok()?;
+                }
             }
-            merge.window = std::time::Duration::from_secs_f64(ms / 1000.0);
-        } else {
-            merge.buffer_bytes = part.strip_prefix('b')?.parse().ok()?;
+            AnyApproach::GrpcCoalesce(coalesce) => {
+                if let Some(bytes) = part.strip_prefix('t') {
+                    coalesce.target_bytes = bytes.parse().ok().filter(|b| *b > 0)?;
+                } else if let Some(ms) = part.strip_prefix('l') {
+                    coalesce.linger = milliseconds(ms)?;
+                } else {
+                    coalesce.in_flight = part.strip_prefix('n')?.parse().ok().filter(|n| *n > 0)?;
+                }
+            }
+            _ => return None,
         }
     }
     Some(found)
+}
+
+/// `text` as a number of milliseconds, never negative.
+fn milliseconds(text: &str) -> Option<std::time::Duration> {
+    let ms: f64 = text.parse().ok()?;
+    (ms >= 0.0 && ms.is_finite()).then(|| std::time::Duration::from_secs_f64(ms / 1000.0))
 }
 
 #[cfg(test)]
@@ -569,6 +606,25 @@ mod tests {
         assert_eq!(per_record, [Outcome::Sent, Outcome::Failed]);
         let delivered = answer(vec![Outcome::Sent, Outcome::DeadLettered], Answer::Held);
         assert_eq!(delivered, [Outcome::Sent, Outcome::DeadLettered]);
+    }
+
+    #[test]
+    fn a_coalesce_spec_sets_its_target_linger_and_sends_in_flight() {
+        let Some(AnyApproach::GrpcCoalesce(c)) = approach("grpc_coalesce/t65536/l0.5/n8") else {
+            panic!("a coalesce spec parses");
+        };
+        assert_eq!(c.target_bytes, 65536);
+        assert_eq!(c.linger, std::time::Duration::from_micros(500));
+        assert_eq!(c.in_flight, 8);
+        for bad in [
+            "grpc_coalesce/t0",
+            "grpc_coalesce/n0",
+            "grpc_coalesce/l-1",
+            "grpc_coalesce/x1",
+            "inline_sequential/t1",
+        ] {
+            assert!(approach(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

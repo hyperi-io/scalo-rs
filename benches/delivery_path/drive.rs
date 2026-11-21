@@ -163,6 +163,9 @@ pub struct RawRun {
     pub groups: Vec<GroupTally>,
     pub peak_held_bytes: u64,
     pub cpu_ns: Option<u64>,
+    /// The listener process's user plus system CPU while the callers ran, when
+    /// the destination is a process of its own.
+    pub listener_cpu_ns: Option<u64>,
     /// (allocations, bytes) while the callers ran, with `--allocs`.
     pub allocs: Option<(u64, u64)>,
 }
@@ -188,9 +191,11 @@ pub async fn run<S: TransportSender + 'static>(
     groups: &[Group],
     duration: Duration,
     count_allocs: bool,
+    listener_pid: Option<u32>,
 ) -> Option<RawRun> {
     destinations.ledger().reset_peak();
     let cpu_start = host::cpu_ns();
+    let listener_cpu_start = listener_pid.and_then(host::cpu_ns_of);
     if count_allocs {
         alloc::start();
     }
@@ -261,6 +266,9 @@ pub async fn run<S: TransportSender + 'static>(
     let cpu_ns = cpu_start
         .zip(host::cpu_ns())
         .map(|(a, b)| b.saturating_sub(a));
+    let listener_cpu_ns = listener_cpu_start
+        .zip(listener_pid.and_then(host::cpu_ns_of))
+        .map(|(a, b)| b.saturating_sub(a));
     Some(RawRun {
         started_unix_ms,
         ended_unix_ms: unix_ms(),
@@ -268,6 +276,7 @@ pub async fn run<S: TransportSender + 'static>(
         groups: tallies,
         peak_held_bytes: destinations.ledger().peak_bytes(),
         cpu_ns,
+        listener_cpu_ns,
         allocs,
     })
 }

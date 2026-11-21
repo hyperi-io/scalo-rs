@@ -135,10 +135,37 @@ pub struct RealDestinations {
     pub kafka: Arc<Counts>,
     /// What every destination was offered, by name.
     pub counts: Vec<(&'static str, Arc<Counts>)>,
+    /// The listener process behind the one gRPC destination of a gRPC-only
+    /// load, whose CPU time the cell reads.
+    pub listener_pid: Option<u32>,
     listeners: Vec<Listener>,
 }
 
 impl RealDestinations {
+    /// The one gRPC destination of a gRPC-only load, served by scalo's receive
+    /// server in a process of its own on `listener_cpus`.
+    pub async fn start_grpc(
+        guard: Arc<MemoryGuard>,
+        listener_cpus: Option<&str>,
+        listener_workers: usize,
+    ) -> Option<Self> {
+        let (endpoint, listener) = Listener::process(listener_cpus, listener_workers).await?;
+        let listener_pid = listener.pid();
+        let client = GrpcTransport::new(&GrpcConfig::client(&endpoint))
+            .await
+            .ok()?;
+        let (sender, counts) = Observed::new(AnySender::Grpc(client));
+        let mut destinations = Destinations::new(guard);
+        destinations.add(GRPC_A, sender);
+        Some(Self {
+            destinations: Arc::new(destinations),
+            kafka: Arc::new(Counts::default()),
+            counts: vec![(GRPC_A, counts)],
+            listener_pid,
+            listeners: vec![listener],
+        })
+    }
+
     /// The three destinations with `load`'s faults, sending to `bootstrap`.
     pub async fn start(load: Load, bootstrap: &str, guard: Arc<MemoryGuard>) -> Option<Self> {
         let mut destinations = Destinations::new(guard);
@@ -180,6 +207,7 @@ impl RealDestinations {
                 (GRPC_B, b_counts),
             ],
             kafka: kafka_counts,
+            listener_pid: None,
             listeners,
         })
     }

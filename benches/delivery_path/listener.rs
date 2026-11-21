@@ -1,11 +1,13 @@
 // Project:   scalo
 // File:      benches/delivery_path/listener.rs
-// Purpose:   In-process gRPC listeners for tier 2: scalo's own, a slow one, and none
+// Purpose:   gRPC listeners for tier 2: scalo's own in process or in a process of its own, a slow one, and none
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -33,6 +35,31 @@ pub enum Listener {
     Slow { serve: JoinHandle<()> },
     /// Nothing listens: the port was bound once and released.
     Down,
+    /// scalo's own receive server in a child process of this binary, reached
+    /// over loopback TCP.
+    Process(Process),
+}
+
+/// A listener process, ended by closing its stdin.
+pub struct Process {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl Process {
+    /// The process id, to read its CPU time.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        // Best effort: the listener also ends when its stdin closes.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Listener {
@@ -50,6 +77,46 @@ impl Listener {
                 drain,
             },
         ))
+    }
+
+    /// scalo's receive server in a process of its own, pinned to `cpus` when
+    /// given, with `workers` runtime threads.
+    pub async fn process(cpus: Option<&str>, workers: usize) -> Option<(String, Self)> {
+        let mut command = Command::new(std::env::current_exe().ok()?);
+        command.args(["--listener", "--listener-workers", &workers.to_string()]);
+        if let Some(cpus) = cpus {
+            command.args(["--listener-cpus", cpus]);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take()?;
+        let process = Process { child, stdin };
+        let line = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                let mut line = String::new();
+                BufReader::new(stdout).read_line(&mut line).ok()?;
+                Some(line)
+            }),
+        )
+        .await
+        .ok()?
+        .ok()??;
+        let endpoint = line.trim().strip_prefix("listening ")?.to_string();
+        Some((endpoint, Self::Process(process)))
+    }
+
+    /// The listener's process id, when it is a process of its own.
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Process(process) => Some(process.id()),
+            _ => None,
+        }
     }
 
     /// A server that waits `delay` before it answers each call.
@@ -85,8 +152,43 @@ impl Listener {
             }
             Self::Slow { serve } => serve.abort(),
             Self::Down => {}
+            Self::Process(process) => {
+                let _ = tokio::task::spawn_blocking(move || drop(process)).await;
+            }
         }
     }
+}
+
+/// Run as a listener process: serve scalo's receive server on a loopback port,
+/// print `listening <endpoint>`, and end when stdin closes.
+pub fn serve(workers: usize) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("delivery_path listener: tokio runtime: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    runtime.block_on(async {
+        let Some((endpoint, listener)) = Listener::scalo().await else {
+            eprintln!("delivery_path listener: scalo's receive server did not start");
+            return ExitCode::from(2);
+        };
+        println!("listening {endpoint}");
+        let _ = std::io::stdout().flush();
+        let _ = tokio::task::spawn_blocking(|| {
+            let mut stdin = std::io::stdin();
+            let mut sink = [0u8; 64];
+            while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+        })
+        .await;
+        listener.close().await;
+        ExitCode::SUCCESS
+    })
 }
 
 /// A loopback address that was free a moment ago.

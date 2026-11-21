@@ -95,6 +95,9 @@ pub struct CellResult {
     pub peak_rss_bytes: Option<u64>,
     /// The cell process's user plus system CPU while its callers ran.
     pub cpu_us_per_record: Option<f64>,
+    /// The listener process's user plus system CPU while the callers ran, for
+    /// a destination that is a process of its own.
+    pub listener_cpu_us_per_record: Option<f64>,
     pub allocs_per_record: Option<f64>,
     pub alloc_bytes_per_record: Option<f64>,
     /// Confirmations at the destinations beyond what the callers were told
@@ -197,6 +200,8 @@ impl CellResult {
             peak_queued_bytes: None,
             peak_rss_bytes,
             cpu_us_per_record: per_record(raw.cpu_ns, records_sent).map(|ns| round(ns / 1000.0)),
+            listener_cpu_us_per_record: per_record(raw.listener_cpu_ns, records_sent)
+                .map(|ns| round(ns / 1000.0)),
             allocs_per_record: per_record(raw.allocs.map(|a| a.0), records_sent).map(round),
             alloc_bytes_per_record: per_record(raw.allocs.map(|a| a.1), records_sent).map(round),
             excess_deliveries: None,
@@ -403,9 +408,9 @@ pub fn tables(args: &Args, collected: &Collected) {
             let _ = writeln!(out, "\n## {} {mode} -- {}", load.id(), load.describe());
             let _ = writeln!(
                 out,
-                "| approach | runs | offered rec/s | rec/s | vs first | paired rec/s | p50 ms | p99 ms | vs first | paired p99 | first-answer p99 ms | p999 ms | iso p99 ms | late | resent | held MiB | queued MiB | rss over idle MiB | cpu us/rec | allocs/rec | excess | invalid |"
+                "| approach | runs | offered rec/s | rec/s | vs first | paired rec/s | p50 ms | p99 ms | vs first | paired p99 | first-answer p99 ms | p999 ms | iso p99 ms | late | resent | held MiB | queued MiB | rss over idle MiB | cpu us/rec | listener cpu us/rec | allocs/rec | excess | invalid |"
             );
-            let _ = writeln!(out, "|{}", "---|".repeat(22));
+            let _ = writeln!(out, "|{}", "---|".repeat(23));
             for spec in &args.approaches {
                 let cells = cells_of(results, *load, &mode, &spec.label);
                 if cells.is_empty() {
@@ -421,7 +426,7 @@ pub fn tables(args: &Args, collected: &Collected) {
                 });
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     spec.label,
                     cells.len(),
                     show(stat(&cells, |c| Some(c.offered_records_per_sec)), 1.0, 0),
@@ -463,6 +468,7 @@ pub fn tables(args: &Args, collected: &Collected) {
                     ),
                     show(rss_over_idle, 1_048_576.0, 1),
                     show(stat(&cells, |c| c.cpu_us_per_record), 1.0, 2),
+                    show(stat(&cells, |c| c.listener_cpu_us_per_record), 1.0, 2),
                     show(stat(&cells, |c| c.allocs_per_record), 1.0, 2),
                     show(
                         stat(&cells, |c| c.excess_deliveries.map(|e| e as f64)),

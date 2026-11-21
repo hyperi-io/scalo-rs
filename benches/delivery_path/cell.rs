@@ -75,7 +75,7 @@ async fn run(args: &Args) -> Option<String> {
                 return idle().await;
             }
             let kafka_shaped = senders.first().cloned();
-            let result = measure(args, load, spec, approach, &destinations).await?;
+            let result = measure(args, load, spec, approach, &destinations, None).await?;
             let shaped = kafka_shaped.map(|k| k.stats());
             let queue = KafkaQueue {
                 cap_bytes: loads::topology(load, args.seed)[0].1.queue_cap_bytes,
@@ -99,24 +99,37 @@ async fn run(args: &Args) -> Option<String> {
 
 #[cfg(all(feature = "testcontainers", feature = "transport-grpc", unix))]
 async fn tier_two(args: &Args, load: Load, spec: &Spec, approach: AnyApproach) -> Option<String> {
-    let bootstrap = args.bootstrap.as_deref()?;
-    let real = crate::tier2::RealDestinations::start(load, bootstrap, guard()).await?;
+    let real = if load.grpc_only() {
+        crate::tier2::RealDestinations::start_grpc(
+            guard(),
+            args.listener_cpus.as_deref(),
+            args.listener_workers,
+        )
+        .await?
+    } else {
+        let bootstrap = args.bootstrap.as_deref()?;
+        crate::tier2::RealDestinations::start(load, bootstrap, guard()).await?
+    };
     let destinations = Arc::clone(&real.destinations);
     let line = if args.idle {
         idle().await
     } else {
-        let result = measure(args, load, spec, approach, &destinations).await;
-        let queue = KafkaQueue {
-            cap_bytes: if load == Load::W6 {
-                loads::W6_QUEUE_BYTES
-            } else {
-                64 * 1024 * 1024
-            },
-            peak_bytes: None,
-            full_waits: None,
-            full_refusals: None,
-            backpressured_answers: Some(real.kafka.backpressured()),
-            caller_side_peak_bytes: Some(real.kafka.peak_bytes()),
+        let result = measure(args, load, spec, approach, &destinations, real.listener_pid).await;
+        let queue = if load.grpc_only() {
+            KafkaQueue::default()
+        } else {
+            KafkaQueue {
+                cap_bytes: if load == Load::W6 {
+                    loads::W6_QUEUE_BYTES
+                } else {
+                    64 * 1024 * 1024
+                },
+                peak_bytes: None,
+                full_waits: None,
+                full_refusals: None,
+                backpressured_answers: Some(real.kafka.backpressured()),
+                caller_side_peak_bytes: Some(real.kafka.peak_bytes()),
+            }
         };
         result.map(|r| r.finish(None, queue).attempted(&real.counts).json_line())
     };
@@ -147,6 +160,7 @@ async fn measure<S: TransportSender + 'static>(
     spec: &Spec,
     approach: AnyApproach,
     destinations: &Arc<Destinations<S>>,
+    listener_pid: Option<u32>,
 ) -> Option<CellResult> {
     let groups = loads::groups(load, destinations.as_ref());
     let drive = args.rate.map_or(Drive::Closed, |rate| Drive::Open { rate });
@@ -158,6 +172,7 @@ async fn measure<S: TransportSender + 'static>(
         &groups,
         args.duration(),
         args.allocs,
+        listener_pid,
     )
     .await?;
     let mut result = CellResult::new(args, load, spec, &groups, &raw, host::peak_rss_bytes());

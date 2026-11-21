@@ -34,7 +34,16 @@ pub fn peak_rss_bytes() -> Option<u64> {
 /// User plus system CPU time of this process, every thread it has had
 /// included, in nanoseconds: `utime + stime` from `/proc/self/stat`.
 pub fn cpu_ns() -> Option<u64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    stat_cpu_ns("/proc/self/stat")
+}
+
+/// User plus system CPU time of process `pid`, in nanoseconds.
+pub fn cpu_ns_of(pid: u32) -> Option<u64> {
+    stat_cpu_ns(&format!("/proc/{pid}/stat"))
+}
+
+fn stat_cpu_ns(path: &str) -> Option<u64> {
+    let stat = std::fs::read_to_string(path).ok()?;
     // Fields after the command name, which is in parentheses and may hold spaces.
     let rest = &stat[stat.rfind(')')? + 2..];
     let mut fields = rest.split_whitespace();
