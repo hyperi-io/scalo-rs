@@ -12,6 +12,8 @@
 //! in the container image. The Dockerfile generator uses this to emit APT repo
 //! setup and `apt-get install` commands automatically.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Runtime native dependencies for a container image.
@@ -101,6 +103,15 @@ pub struct AptRepoContract {
 
     /// APT packages to install from this specific repo.
     pub packages: Vec<String>,
+
+    /// Environment set for the `apt-get install` of this repo's packages only.
+    ///
+    /// Emitted as a prefix on that one command, never as an image `ENV`, so the
+    /// value does not reach the running container. For a package whose
+    /// preinst refuses to run until a licence is accepted, e.g.
+    /// `ACCEPT_EULA=Y`. Values are single-quoted in the Dockerfile.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub install_env: BTreeMap<String, String>,
 }
 
 /// A distro release we can generate runtime package names for.
