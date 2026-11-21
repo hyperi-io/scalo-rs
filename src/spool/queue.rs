@@ -25,6 +25,9 @@ pub struct Spool {
     /// moved by each push and take, so `max_size_bytes` never walks the
     /// directory.
     bytes: u64,
+    /// The oldest segment [`sync`](Self::sync) still has to flush: older ones
+    /// are full and were flushed by an earlier call.
+    synced_from: u64,
 }
 
 /// The open yaque handles. Each holds a lock file in the queue directory.
@@ -76,6 +79,7 @@ impl Spool {
             config,
             len,
             bytes,
+            synced_from: 0,
         })
     }
 
@@ -90,6 +94,7 @@ impl Spool {
         self.queue = None;
         self.len = 0;
         self.bytes = 0;
+        self.synced_from = 0;
         let moved = crate::spool_codec::quarantine(
             &self.config.path,
             crate::spool_codec::QuarantineTrigger::CrcMismatch,
@@ -120,9 +125,16 @@ impl Spool {
 
     /// Push data onto the queue, compressing first if enabled.
     ///
+    /// A push that returns `Ok` is in the operating system's hands, so it
+    /// survives the process being killed. It survives the host losing power
+    /// once [`sync`](Self::sync) has run, which `sync_on_push` does on every
+    /// push.
+    ///
     /// # Errors
     ///
-    /// Errors on size/item-count cap, compression failure, or I/O.
+    /// Errors on size/item-count cap, compression failure, or I/O. A failed
+    /// `sync_on_push` sync returns the error with the record queued, so a retry
+    /// can queue it twice.
     pub async fn push(&mut self, data: &[u8]) -> Result<()> {
         if let Some(max) = self.config.max_items
             && self.len >= max
@@ -154,6 +166,35 @@ impl Spool {
         self.bytes += written;
         #[cfg(feature = "metrics")]
         ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
+        if self.config.sync_on_push {
+            self.sync().await?;
+        }
+        Ok(())
+    }
+
+    /// Sync every record pushed so far to disk.
+    ///
+    /// yaque flushes each push to the operating system and never syncs, so
+    /// without this a record survives the process being killed but not the
+    /// host losing power. One call covers any number of pushes: push a batch,
+    /// then sync once.
+    ///
+    /// The sync runs on tokio's blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Io`] when a segment or the directory cannot be
+    /// synced, and [`SpoolError::Queue`] once a failed recovery has closed the
+    /// spool.
+    pub async fn sync(&mut self) -> Result<()> {
+        live(&mut self.queue)?;
+        let path = self.config.path.clone();
+        let from = self.synced_from;
+        self.synced_from =
+            tokio::task::spawn_blocking(move || crate::spool_codec::sync_segments(&path, from))
+                .await
+                .map_err(|e| SpoolError::Queue(format!("spool sync task failed: {e}")))?
+                .map_err(SpoolError::Io)?;
         Ok(())
     }
 
@@ -861,6 +902,79 @@ mod tests {
             .unwrap();
         spool.push(&data).await.unwrap();
         assert_eq!(spool.pop_front().await.unwrap(), Some(data));
+    }
+
+    /// yaque saves the receive position by truncating `recv-metadata` and then
+    /// writing 16 bytes, so a process killed between the two leaves it short,
+    /// and a power loss can leave it pointing at a segment that is gone. Either
+    /// way the queue refused to open, and the quarantine policy moved every
+    /// spooled record aside. The queue now reopens with its records, replaying
+    /// from its first segment: duplicates, never loss.
+    #[tokio::test]
+    async fn a_lost_receive_position_replays_the_queue_instead_of_quarantining() {
+        let mut gone = 7_u64.to_be_bytes().to_vec();
+        gone.extend_from_slice(&0_u64.to_be_bytes());
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("empty", Vec::new()),
+            ("half written", vec![0; 8]),
+            ("a segment that is gone", gone),
+        ];
+        for (name, torn) in cases {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("torn");
+            let mut spool = Spool::create(&path).await.unwrap();
+            for record in [b"a", b"b", b"c"] {
+                spool.push(record).await.unwrap();
+            }
+            assert_eq!(spool.pop_front().await.unwrap(), Some(b"a".to_vec()));
+            drop(spool);
+            std::fs::write(path.join("recv-metadata"), torn).unwrap();
+
+            let mut reopened = Spool::create(&path)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut replayed = Vec::new();
+            while let Some(record) = reopened.pop_front().await.unwrap() {
+                replayed.push(record);
+            }
+            assert!(
+                replayed.ends_with(&[b"b".to_vec(), b"c".to_vec()]),
+                "{name}: replayed {replayed:?}"
+            );
+            let quarantined = std::fs::read_dir(&path)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("corrupt-"));
+            assert!(!quarantined, "{name}: the queue was quarantined");
+        }
+    }
+
+    /// `sync` and `sync_on_push` leave the queue as it was: a sync of an empty
+    /// or a part-consumed spool succeeds, and the records still come back in
+    /// order.
+    #[tokio::test]
+    async fn sync_leaves_the_queue_readable() {
+        let dir = tempdir().unwrap();
+        let mut spool = Spool::open(SpoolConfig::new(dir.path().join("batched")))
+            .await
+            .unwrap();
+        spool.sync().await.unwrap();
+        spool.push(b"a").await.unwrap();
+        spool.push(b"b").await.unwrap();
+        spool.sync().await.unwrap();
+        assert_eq!(spool.pop_front().await.unwrap(), Some(b"a".to_vec()));
+        spool.sync().await.unwrap();
+        assert_eq!(spool.pop_front().await.unwrap(), Some(b"b".to_vec()));
+
+        let config = SpoolConfig::new(dir.path().join("eager")).sync_on_push(true);
+        assert!(config.sync_on_push);
+        let mut eager = Spool::open(config).await.unwrap();
+        for record in [b"x", b"y", b"z"] {
+            eager.push(record).await.unwrap();
+        }
+        for record in [b"x", b"y", b"z"] {
+            assert_eq!(eager.pop_front().await.unwrap(), Some(record.to_vec()));
+        }
     }
 
     #[tokio::test]

@@ -52,12 +52,31 @@ item count after a restart -- yaque doesn't expose a length API.
 ## Durability and recovery
 
 - A successful `push().await` means yaque has written and flushed the
-  bytes to the segment file, so they survive a process crash. yaque
-  never calls `fsync`, so a power loss before the kernel writes them
-  back can lose them, and `Spool` has no call that syncs them.
+  bytes to the segment file, so they survive the process being killed
+  (`tests/spool_crash.rs` kills a writer with SIGKILL and reads every
+  acknowledged record back). yaque never calls `fsync`, so a power loss
+  before the kernel writes them back can lose them.
+- `sync().await` syncs the segment files, the queue directory and its
+  parent, so every record pushed before it survives a power loss. One call covers any
+  number of pushes: push a batch, then sync once. `sync_on_push: true`
+  does it on every push, at the cost of one disk sync each.
 - On restart, the receiver position is read from `recv-metadata` and
   scanning starts from there. Items consumed before the crash stay
   consumed, and items not yet committed reappear.
+- yaque saves that position by truncating `recv-metadata` and then writing
+  16 bytes, with no sync. A kill between the two leaves the file short, and
+  a power loss can leave it naming a segment that is gone or an offset past
+  the end of one. `Spool::open` and `TieredSink::new` detect either and
+  replay from the first segment, with a warn, so records consumed from it
+  before the crash come again. The queue is not quarantined.
+- A power loss can still strand records that yaque's rollover wrote in two
+  steps: the end-of-segment marker in the old segment, then the next segment.
+  If the new segment survives and the marker does not, the receiver stays at
+  the end of the old one. `sync_on_push` narrows that window and does not
+  close it, and the position repair does not check the segment chain.
+- Two processes that open one spool in the same instant can both pass the
+  lock check before either holds the queue's locks, and a repair then writes
+  a position under the one that won. That costs duplicates, never records.
 - `clear()` walks the queue and commits every item -- empties without
   touching the filesystem directly.
 
@@ -150,12 +169,13 @@ spool:
   compression_level: 3
   max_items: 1000000
   max_size_bytes: 10737418240   # 10 GiB
+  sync_on_push: false           # true syncs to disk before every push returns
 ```
 
 Builder methods on `SpoolConfig` cover the common shapes --
 `SpoolConfig::new(path)`, `SpoolConfig::with_compression(path)`,
 `.compress(bool)`, `.compression_level(i)`, `.max_items(n)`,
-`.max_size_bytes(b)`.
+`.max_size_bytes(b)`, `.sync_on_push(bool)`.
 
 ---
 
@@ -192,7 +212,8 @@ arrives). `pop_front` is the try-style alternative that returns
 | `Spool::open(config)` | Open or create the queue, recovering the item count from disk |
 | `Spool::create(path)` | Convenience for `open(SpoolConfig::new(path))` |
 | `Spool::create_compressed(path)` | Convenience for `open(SpoolConfig::with_compression(path))` |
-| `push(data).await` | Append, checking `max_items` / `max_size_bytes` |
+| `push(data).await` | Append, checking `max_items` / `max_size_bytes`, and syncing first under `sync_on_push` |
+| `sync().await` | Sync every record pushed so far to disk, on tokio's blocking pool |
 | `recv().await` | Wait for next item, committing on success |
 | `pop_front().await` | Non-blocking pop, `Ok(None)` if empty |
 | `peek().await` | Read without removing (guard rollback) |

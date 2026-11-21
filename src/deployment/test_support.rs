@@ -872,10 +872,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_reports_a_peak_and_a_roomy_contract_passes_it() {
-        let before = peak_rss_bytes().expect("VmHWM on Linux");
-        assert!(before > 0);
-        // A high-water mark only rises, so the helper reads at least as much.
+        // proc_pid_status(5) calls VmHWM inaccurate: a second read can be below the first.
         let held = assert_peak_memory("roomy", &resources("1Ei", "1Ei")).expect("a peak");
-        assert!(held >= before, "{held} < {before}");
+        assert!(held > 0);
     }
 }
