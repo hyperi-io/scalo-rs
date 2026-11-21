@@ -26,10 +26,12 @@
 //! A held batch ([`Answer::Held`]) is answered all or nothing: when any record
 //! is not delivered, every record not dead-lettered gets the worst outcome.
 
+mod auto_fanout;
 mod batch_per_destination;
 mod inline_sequential;
 mod merge;
 mod parallel_fanout;
+mod parallel_pinned;
 mod per_record_futures;
 
 use std::future::Future;
@@ -39,10 +41,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::memory::MemoryGuard;
 use crate::transport::{Record, SendResult, TransportSender};
 
+pub use auto_fanout::AutoFanout;
 pub use batch_per_destination::BatchPerDestination;
 pub use inline_sequential::InlineSequential;
 pub use merge::{Merge, MergeStore};
 pub use parallel_fanout::ParallelFanout;
+pub use parallel_pinned::ParallelPinned;
 pub use per_record_futures::PerRecordFutures;
 
 /// Index of a destination in a [`Destinations`] set.
@@ -360,6 +364,31 @@ async fn send_block<S: TransportSender>(sender: &S, records: &[Record]) -> Vec<O
     vec![Outcome::from_send(&result); records.len()]
 }
 
+/// One destination's send: the places in the batch of its `block`, and the
+/// outcome of each record in it. A future built here is large, so an approach
+/// that holds several boxes each one rather than let a collection of them
+/// move it by value.
+pub async fn destination_send<S: TransportSender>(
+    sender: &S,
+    block: Vec<Record>,
+    places: Vec<usize>,
+) -> (Vec<usize>, Vec<Outcome>) {
+    let outcomes = send_block(sender, &block).await;
+    (places, outcomes)
+}
+
+/// Fold the results of [`destination_send`] into the batch's outcomes.
+fn merge_results(
+    outcomes: &mut [Outcome],
+    sent: impl IntoIterator<Item = (Vec<usize>, Vec<Outcome>)>,
+) {
+    for (places, results) in sent {
+        for (i, outcome) in places.into_iter().zip(results) {
+            outcomes[i] = outcomes[i].max(outcome);
+        }
+    }
+}
+
 /// Apply the caller's answer rule to per-record outcomes: a held batch with any
 /// undelivered record gives every record not dead-lettered the worst outcome.
 #[must_use]
@@ -401,6 +430,10 @@ pub enum AnyApproach {
     PerRecordFutures(PerRecordFutures),
     /// [`ParallelFanout`].
     ParallelFanout(ParallelFanout),
+    /// [`ParallelPinned`].
+    ParallelPinned(ParallelPinned),
+    /// [`AutoFanout`].
+    AutoFanout(AutoFanout),
     /// [`BatchPerDestination`].
     BatchPerDestination(BatchPerDestination),
     /// [`Merge`], with a channel or a swapped buffer.
@@ -425,6 +458,8 @@ impl DeliveryApproach for AnyApproach {
             Self::InlineSequential(a) => a.name(),
             Self::PerRecordFutures(a) => a.name(),
             Self::ParallelFanout(a) => a.name(),
+            Self::ParallelPinned(a) => a.name(),
+            Self::AutoFanout(a) => a.name(),
             Self::BatchPerDestination(a) => a.name(),
             Self::Merge(a) => a.name(),
         }
@@ -439,6 +474,8 @@ impl DeliveryApproach for AnyApproach {
             Self::InlineSequential(a) => a.deliver(destinations, batch).await,
             Self::PerRecordFutures(a) => a.deliver(destinations, batch).await,
             Self::ParallelFanout(a) => a.deliver(destinations, batch).await,
+            Self::ParallelPinned(a) => a.deliver(destinations, batch).await,
+            Self::AutoFanout(a) => a.deliver(destinations, batch).await,
             Self::BatchPerDestination(a) => a.deliver(destinations, batch).await,
             Self::Merge(a) => a.deliver(destinations, batch).await,
         }
@@ -467,6 +504,10 @@ pub const REGISTRY: &[(&str, fn() -> AnyApproach)] = &[
             build_in_send: true,
         })
     }),
+    (ParallelPinned::NAME, || {
+        AnyApproach::ParallelPinned(ParallelPinned)
+    }),
+    (AutoFanout::NAME, || AnyApproach::AutoFanout(AutoFanout)),
     (BatchPerDestination::NAME, || {
         AnyApproach::BatchPerDestination(BatchPerDestination)
     }),

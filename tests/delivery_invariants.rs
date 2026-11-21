@@ -47,16 +47,20 @@ const PER_RECORD: &str = "per_record_futures";
 const INLINE_CONTINUE: &str = "inline_sequential_continue";
 const PARALLEL: &str = "parallel_fanout";
 const PARALLEL_IN_SEND: &str = "parallel_fanout_in_send";
+const PARALLEL_PINNED: &str = "parallel_pinned";
+const AUTO: &str = "auto_fanout";
 const PER_DESTINATION: &str = "batch_per_destination";
 const MERGE_CHANNEL: &str = "merge_channel";
 const MERGE_SWAP: &str = "merge_swap";
 
 /// The approaches that send each destination one block per caller batch, or
 /// merge those blocks: each keeps every invariant.
-const BLOCK_APPROACHES: [&str; 6] = [
+const BLOCK_APPROACHES: [&str; 8] = [
     INLINE_CONTINUE,
     PARALLEL,
     PARALLEL_IN_SEND,
+    PARALLEL_PINNED,
+    AUTO,
     PER_DESTINATION,
     MERGE_CHANNEL,
     MERGE_SWAP,
@@ -541,6 +545,8 @@ fn every_registered_approach_has_its_invariant_tests() {
             PER_RECORD,
             PARALLEL,
             PARALLEL_IN_SEND,
+            PARALLEL_PINNED,
+            AUTO,
             PER_DESTINATION,
             MERGE_CHANNEL,
             MERGE_SWAP
