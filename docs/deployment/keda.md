@@ -13,12 +13,12 @@ with the chart's `keda.*` values overriding each field per deployment. Built fro
 
 ```rust
 pub struct KedaContract {
-    pub enabled: bool,                // false renders what `keda: None` does
+    pub enabled: bool,                // false turns KEDA off, as `keda: None` does
     pub min_replicas: u32,
     pub max_replicas: u32,
     pub polling_interval: u32,        // seconds between KEDA polls
     pub cooldown_period: u32,         // seconds idle before scaling to zero (min_replicas 0 only)
-    pub kafka_lag_threshold: u64,     // scale when lag > N per partition
+    pub kafka_lag_threshold: u64,     // scale when topic lag, summed over its partitions, > N
     pub activation_lag_threshold: u64,// wake from zero when lag > N
     pub cpu_enabled: bool,
     pub cpu_threshold: u32,           // % CPU
@@ -49,9 +49,10 @@ the Kafka trigger off and `min_replicas: 0` is refused with
 `InvalidContract` on `keda.min_replicas` by `validate()`, and the chart
 will not render the same combination when values set it.
 
-`enabled` comes across from `KedaConfig::enabled`. Off renders exactly
-what `keda: None` does -- no ScaledObject -- so either way of saying it
-gives the same result.
+`enabled` comes across from `KedaConfig::enabled`. Off renders no
+ScaledObject, as `keda: None` does. A `keda.enabled: true` chart value turns
+KEDA on either way. The Kafka lag trigger then follows `kafka_trigger`, and a
+contract with no `keda` has none unless `keda.kafka.enabled` is also true.
 
 ### `KafkaLagTrigger` -- where the lag trigger looks
 
@@ -127,7 +128,7 @@ KEDA's `cooldownPeriod` governs only the step to zero. Between 1 and N pods the 
    target `cpu_threshold`, `metricType: Utilization`, and
    `keda.cpu.targetUtilization` overrides the target.
 2. **Kafka** (unless `kafka_trigger` or `keda.kafka.enabled` turns it
-   off) -- `lagThreshold` per partition and `activationLagThreshold` for
+   off) -- `lagThreshold` on the first topic's total lag across its partitions, and `activationLagThreshold` for
    wake-from-zero, from the contract or `keda.kafka.*`. Brokers, consumer
    group and topic come from the `kafka_trigger` paths: a broker list is
    joined with commas, and the first topic is taken whether the topics are
@@ -229,7 +230,7 @@ KEDA takes the max. Either fires scale-out independently.
 | Item | Purpose |
 | ------ | --------- |
 | `KedaConfig` | Cascade-loaded runtime config (`enabled`, thresholds) |
-| `KedaContract` | Deployment-time subset, where `enabled: false` renders what `keda: None` does |
+| `KedaContract` | Deployment-time subset, where `enabled: false` turns KEDA off, as `keda: None` does |
 | `KedaContract::from_config(&cfg)` | Build contract from config, `enabled` included |
 | `KedaContract::with_kafka_trigger(t)` | Point the Kafka lag trigger at another values layout, or turn it off |
 | `KedaContract::default()` | Defaults table above |
