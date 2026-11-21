@@ -18,6 +18,9 @@
 //! - **Open** ([`open_queue`]): clears lock files a stopped process left behind,
 //!   refuses a queue a live process still holds, and quarantines a queue that
 //!   will not open under [`CorruptionPolicy::Quarantine`].
+//! - **Queue files** ([`open_queue`] checks them): a `version/contents` yaque
+//!   cannot read, or a `.q` file that is not a segment, would panic yaque, so
+//!   they are refused as an error the open policy handles.
 //! - **Receive position** ([`open_queue`] repairs it): a `recv-metadata` yaque
 //!   left torn or pointing at a segment that is gone becomes a replay from the
 //!   first segment, instead of a queue that will not open.
@@ -193,13 +196,16 @@ pub(crate) fn open_queue(
     policy: CorruptionPolicy,
 ) -> Result<(yaque::Sender, yaque::Receiver), OpenError> {
     release_stale_locks(path)?;
-    repair_recv_position(path).map_err(|e| {
-        OpenError::Failed(format!(
-            "cannot repair the receive position in {}: {e}",
-            path.display()
-        ))
-    })?;
-    let open_err = match yaque::channel(path) {
+    let validated = validate_queue_files(path);
+    if validated.is_ok() {
+        repair_recv_position(path).map_err(|e| {
+            OpenError::Failed(format!(
+                "cannot repair the receive position in {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    let open_err = match validated.and_then(|()| yaque::channel(path)) {
         Ok(queue) => return Ok(queue),
         Err(e) => e,
     };
@@ -215,8 +221,86 @@ pub(crate) fn open_queue(
     }
     quarantine(path, QuarantineTrigger::OpenFailed, &open_err.to_string())
         .map_err(|e| OpenError::Failed(format!("{open_err}; quarantine failed: {e}")))?;
-    yaque::channel(path)
+    validate_queue_files(path)
+        .and_then(|()| yaque::channel(path))
         .map_err(|e| OpenError::Failed(format!("{open_err}; fresh open failed: {e}")))
+}
+
+/// The versions of yaque a queue's `version/contents` may name. It is the
+/// release line `Cargo.toml` pins yaque to, and a test checks that a queue
+/// yaque creates satisfies it.
+const YAQUE_QUEUE_VERSIONS: &str = "0.6.*";
+
+/// Refuse a queue directory yaque would panic on, as an error the open policy
+/// handles like any queue that will not open.
+///
+/// yaque panics, where it could return an error, on a `version/contents` that
+/// does not parse as a version or names another release line, and on a `.q`
+/// file whose name is not a segment number. A panic takes the whole process in
+/// a service built with `panic = "abort"`, so the files are read here first.
+///
+/// # Errors
+/// An [`io::ErrorKind::InvalidData`] error naming the file, or the [`io::Error`]
+/// of a read that failed.
+fn validate_queue_files(path: &Path) -> io::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let file = entry?.path();
+        if file.extension().and_then(|e| e.to_str()) == Some("q")
+            && file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_none()
+        {
+            return Err(invalid_queue(format!(
+                "{} is not a numbered segment",
+                file.display()
+            )));
+        }
+    }
+
+    let version = path.join("version").join("contents");
+    let contents = match std::fs::read(&version) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // An empty file is a queue yaque has not stamped yet, and it stamps it. A
+    // file of only whitespace is not empty to yaque, which parses it as a
+    // version and panics.
+    if contents.is_empty() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&contents);
+    let text = text.trim();
+    let shown: String = text.chars().take(40).collect();
+    let named = semver::Version::parse(text).map_err(|e| {
+        invalid_queue(format!(
+            "{} does not hold a version ({e}): {shown:?}",
+            version.display()
+        ))
+    })?;
+    let accepted = semver::VersionReq::parse(YAQUE_QUEUE_VERSIONS).map_err(|e| {
+        invalid_queue(format!(
+            "{YAQUE_QUEUE_VERSIONS} is not a version range: {e}"
+        ))
+    })?;
+    if !accepted.matches(&named) {
+        return Err(invalid_queue(format!(
+            "{} names version {named}, and this build reads {YAQUE_QUEUE_VERSIONS}",
+            version.display()
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_queue(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 /// The segment numbers in a yaque queue directory, ascending. Segments are
@@ -315,23 +399,50 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Flush the queue's segment files from `from` upward to stable storage, and
-/// the queue directory and its parent with them, so a spool created by its
-/// first push is not lost with its directory entry. Returns the newest
-/// segment, which the next call passes as its `from`: older segments are full
-/// and already synced.
+/// What a queue's syncs have done, so the next one does only what is left.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Synced {
+    /// The oldest segment still to flush: older ones are full and flushed.
+    pub(crate) from: u64,
+    /// Whether the directories above the queue's own are flushed.
+    pub(crate) ancestors: bool,
+}
+
+/// The directories a sync flushes: the queue's own, and on the first sync every
+/// directory above it up to the root, because yaque creates the whole path when
+/// it opens and any of those entries can be new.
+fn directories_to_sync(path: &Path, ancestors: bool) -> Vec<PathBuf> {
+    if !ancestors {
+        return vec![path.to_path_buf()];
+    }
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute
+        .ancestors()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// Flush the queue's segment files from `done.from` upward to stable storage,
+/// and its directory with them. The first call flushes every directory above
+/// it too, so a spool created by its first push is not lost with a directory
+/// entry. Returns what the next call starts from.
 ///
 /// yaque flushes each send to the operating system and never syncs, so a
 /// pushed record survives its process being killed, and survives the host
-/// losing power only once this has run. Start `from` at 0 to sync everything the
-/// directory holds.
+/// losing power only once this has run. Start from [`Synced::default`] to sync
+/// everything the directory holds.
 ///
 /// # Errors
-/// Propagates the directory read or a segment's sync [`io::Error`].
-#[cfg(feature = "spool")]
-pub(crate) fn sync_segments(path: &Path, from: u64) -> io::Result<u64> {
-    let mut newest = from;
-    for number in segment_numbers(path)?.into_iter().filter(|n| *n >= from) {
+/// Propagates the directory read or a segment's or directory's sync
+/// [`io::Error`]. A directory above the queue's parent that this process may
+/// not open is skipped, because it is one this process did not create.
+pub(crate) fn sync_segments(path: &Path, done: Synced) -> io::Result<Synced> {
+    let mut newest = done.from;
+    for number in segment_numbers(path)?
+        .into_iter()
+        .filter(|n| *n >= done.from)
+    {
         // Opened for write, though nothing is written, because Windows cannot
         // flush a handle that cannot write.
         match std::fs::OpenOptions::new()
@@ -345,13 +456,20 @@ pub(crate) fn sync_segments(path: &Path, from: u64) -> io::Result<u64> {
         }
         newest = number;
     }
-    sync_directory(path)?;
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    sync_directory(parent)?;
-    Ok(newest)
+    for (index, dir) in directories_to_sync(path, done.ancestors).iter().enumerate() {
+        match sync_directory(dir) {
+            Ok(()) => {}
+            // The queue's directory and its parent are the ones this process
+            // creates entries in, so they must flush. Above them, one it may not
+            // open is one it did not create.
+            Err(e) if index > 1 && e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Synced {
+        from: newest,
+        ancestors: true,
+    })
 }
 
 /// Remove every lock file whose owner is gone. Refuse when a live owner holds one.
@@ -486,11 +604,14 @@ pub(crate) fn quarantine(
     let mut to_move = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(QUARANTINE_PREFIX)
-        {
+        // Earlier quarantines are directories. A file with the prefix is part of
+        // the queue like any other.
+        let earlier_quarantine = entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(QUARANTINE_PREFIX);
+        if !earlier_quarantine {
             to_move.push(entry.path());
         }
     }
@@ -674,7 +795,6 @@ mod tests {
 
     /// `sync_segments` reports the newest segment, which the next call starts
     /// from, and passes over one the receiver deleted since the listing.
-    #[cfg(feature = "spool")]
     #[test]
     fn sync_segments_reports_the_newest_segment() {
         let dir = tempfile::tempdir().unwrap();
@@ -683,14 +803,63 @@ mod tests {
         }
         std::fs::write(dir.path().join(RECV_STATE_FILE), b"not a segment").unwrap();
 
-        assert_eq!(sync_segments(dir.path(), 0).unwrap(), 2);
+        let synced = sync_segments(dir.path(), Synced::default()).unwrap();
+        assert_eq!(synced.from, 2);
+        assert!(synced.ancestors);
         std::fs::remove_file(dir.path().join("1.q")).unwrap();
-        assert_eq!(sync_segments(dir.path(), 1).unwrap(), 2);
+        let again = sync_segments(dir.path(), Synced { from: 1, ..synced }).unwrap();
+        assert_eq!(again.from, 2);
+        let beyond = sync_segments(dir.path(), Synced { from: 5, ..synced }).unwrap();
         assert_eq!(
-            sync_segments(dir.path(), 5).unwrap(),
-            5,
+            beyond.from, 5,
             "no segment at or above 5, so the start stays"
         );
+    }
+
+    /// yaque creates every missing directory of the queue's path, so the first
+    /// sync flushes each one up to the root, and later syncs only the queue's.
+    #[test]
+    fn the_first_sync_flushes_every_directory_above_the_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let queue = root
+            .path()
+            .join("var")
+            .join("lib")
+            .join("service")
+            .join("spool");
+        std::fs::create_dir_all(&queue).unwrap();
+
+        let first = directories_to_sync(&queue, false);
+        assert_eq!(
+            first,
+            std::slice::from_ref(&queue),
+            "later syncs flush the queue's directory"
+        );
+
+        let all = directories_to_sync(&queue, true);
+        let real = std::fs::canonicalize(&queue).unwrap();
+        assert_eq!(all.first(), Some(&real));
+        for level in ["service", "lib", "var"] {
+            assert!(
+                all.iter().any(|dir| dir.ends_with(level)),
+                "{level} is in {all:?}"
+            );
+        }
+        assert_eq!(all.last().map(PathBuf::as_path), Some(Path::new("/")));
+        sync_segments(&queue, Synced::default()).expect("the whole chain syncs");
+    }
+
+    /// A queue yaque stamps names a version `YAQUE_QUEUE_VERSIONS` accepts, so
+    /// a bump of the yaque pin that leaves the range behind fails here and not
+    /// in a service reopening its spool.
+    #[test]
+    fn a_queue_yaque_creates_passes_the_version_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh");
+        drop(yaque::channel(&path).unwrap());
+        let stamped = std::fs::read_to_string(path.join("version").join("contents")).unwrap();
+        assert!(!stamped.trim().is_empty(), "yaque stamped no version");
+        validate_queue_files(&path).unwrap_or_else(|e| panic!("{stamped:?}: {e}"));
     }
 
     #[test]

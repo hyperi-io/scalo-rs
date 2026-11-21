@@ -33,7 +33,11 @@ pub mod convert;
 pub mod proto;
 pub mod sink;
 pub mod source;
+pub mod tls;
+#[cfg(all(test, feature = "tls"))]
+mod tls_live;
 
 pub use convert::{event_wrapper_to_json, json_to_event_wrapper};
 pub use sink::VectorCompatClient;
 pub use source::VectorCompatService;
+pub use tls::VectorCompatTls;

@@ -102,6 +102,17 @@ pub struct TieredSinkConfig {
     /// startup. A cache another live sink holds is refused, never quarantined.
     #[serde(default)]
     pub on_corruption: CorruptionPolicy,
+
+    /// Sync the spill cache to disk before `send` returns for a spilled record,
+    /// so a record `send` accepted survives the host losing power as well as the
+    /// process being killed. Default false: a spill is then flushed to the
+    /// operating system, which survives a kill, and
+    /// [`TieredSink::sync`](crate::tiered_sink::TieredSink::sync) makes a
+    /// batch of spills durable with one sync. Costs one disk sync per spilled
+    /// record, about a millisecond on network storage, on the path that runs
+    /// when the sink is down.
+    #[serde(default)]
+    pub sync_on_spill: bool,
 }
 
 fn default_send_timeout_ms() -> u64 {
@@ -149,6 +160,7 @@ impl TieredSinkConfig {
             disk_aware: None,
             crc: false,
             on_corruption: CorruptionPolicy::Quarantine,
+            sync_on_spill: false,
         }
     }
 
@@ -205,6 +217,14 @@ impl TieredSinkConfig {
     #[must_use]
     pub fn max_spool_bytes(mut self, max: u64) -> Self {
         self.max_spool_bytes = Some(max);
+        self
+    }
+
+    /// Sync to disk before a spilled record is accepted (see
+    /// [`sync_on_spill`](Self::sync_on_spill)).
+    #[must_use]
+    pub fn sync_on_spill(mut self, enabled: bool) -> Self {
+        self.sync_on_spill = enabled;
         self
     }
 

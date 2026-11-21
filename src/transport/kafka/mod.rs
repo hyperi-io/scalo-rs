@@ -2990,6 +2990,26 @@ fn arena_byte_limit_reached(arena_len: usize, span_count: usize, max_bytes: Opti
     }
 }
 
+/// The largest byte cap the recv-arena is sized to up front. A cap above it,
+/// such as `u64::MAX` for no limit, sizes the arena as `None` does.
+const ARENA_HINT_CEILING: u64 = 1 << 30;
+
+/// Bytes to reserve for the recv-arena before the first record is copied in.
+///
+/// A byte cap up to [`ARENA_HINT_CEILING`] sizes the up-front alloc to the cap
+/// (plus a one-record cushion), so the governed arena is right-sized. With no
+/// cap, or one above the ceiling, it is about 256 bytes per record (a typical
+/// JSON event). The arena grows as needed either way, and one up-front alloc
+/// beats many small ones.
+fn arena_hint(max_bytes: Option<u64>, span_cap: usize) -> usize {
+    match max_bytes {
+        Some(cap) if cap <= ARENA_HINT_CEILING => usize::try_from(cap)
+            .unwrap_or(usize::MAX)
+            .saturating_add(256),
+        _ => span_cap.saturating_mul(256),
+    }
+}
+
 /// One record's worth of OWNED metadata collected during a poll, plus the
 /// byte range of its payload inside the recv-arena.
 ///
@@ -3176,17 +3196,7 @@ impl PollJob {
         }
 
         let mut spans: Vec<Span> = Vec::with_capacity(span_cap);
-        // Arena byte estimate: when a byte cap is set, size the up-front alloc
-        // to the cap (plus a one-record cushion) so the governed arena is right-
-        // sized. Otherwise ~256 bytes/record (typical JSON event). It grows as
-        // needed either way. One up-front alloc beats N small ones.
-        let arena_hint = match self.max_bytes {
-            Some(cap) => usize::try_from(cap)
-                .unwrap_or(usize::MAX)
-                .saturating_add(256),
-            None => span_cap.saturating_mul(256),
-        };
-        let mut arena: Vec<u8> = Vec::with_capacity(arena_hint);
+        let mut arena: Vec<u8> = Vec::with_capacity(arena_hint(self.max_bytes, span_cap));
 
         let topic: Arc<str> = get_or_insert_topic(&self.topic_cache, msg.topic());
         // SAFETY (lifetime, not unsafe): `msg.payload()` borrows librdkafka's
@@ -5849,6 +5859,24 @@ mod tests {
             !arena_byte_limit_reached(512, 2, Some(1024)),
             "arena_len < cap -> keep draining toward the budget"
         );
+    }
+
+    /// The arena is sized to a byte cap up to the ceiling, and to the record
+    /// estimate with no cap or one above it. `u64::MAX` means no limit, and
+    /// once asked for `usize::MAX` bytes and panicked the poll task.
+    #[test]
+    fn the_arena_hint_follows_the_cap_and_saturates_above_the_ceiling() {
+        let cases: [(&str, Option<u64>, usize); 6] = [
+            ("no cap", None, 2_560),
+            ("a small cap", Some(1024), 1_280),
+            ("the governed maximum", Some(128 << 20), (128 << 20) + 256),
+            ("the ceiling", Some(ARENA_HINT_CEILING), (1 << 30) + 256),
+            ("above the ceiling", Some(ARENA_HINT_CEILING + 1), 2_560),
+            ("u64::MAX", Some(u64::MAX), 2_560),
+        ];
+        for (name, cap, want) in cases {
+            assert_eq!(arena_hint(cap, 10), want, "{name}");
+        }
     }
 
     // --- Highest-offset-per-partition commit list -------------------------

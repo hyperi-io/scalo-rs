@@ -13,8 +13,8 @@ use crate::tiered_sink::{
     TieredSinkError, drainer,
 };
 use crate::transport::{Record, SendResult, TransportSender};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, PoisonError};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -57,6 +57,10 @@ pub struct TieredSink<S: TransportSender> {
     /// Where the drain and `when_full: dlq` write records the sink will not take.
     #[cfg(feature = "dlq")]
     dead_letters: drainer::DeadLetters,
+
+    /// What [`sync`](Self::sync) has flushed, so a call does only what is left.
+    /// Held for a read or a write and never across an await.
+    synced: std::sync::Mutex<crate::spool_codec::Synced>,
 
     // Metrics
     hot_path_count: AtomicU64,
@@ -226,6 +230,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             dead_letters,
             hot_path_count: AtomicU64::new(0),
             cold_path_count: AtomicU64::new(0),
+            synced: std::sync::Mutex::new(crate::spool_codec::Synced::default()),
         })
     }
 
@@ -246,6 +251,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     ///   `dlq` with no DLQ set ([`TieredSinkError::SpoolFull`])
     /// - The `disk_aware` threshold is crossed ([`TieredSinkError::DiskUnavailable`])
     /// - Compression or the spool write fails
+    /// - `sync_on_spill` is set and the sync fails, with the record already
+    ///   spilled, so a retry can deliver it twice
     pub async fn send(&self, record: &Record) -> Result<()> {
         // Never spooled: the drain would only meet it again.
         if let Some(reason) = self.sink.dead_letter_reason(record) {
@@ -283,6 +290,34 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         self.cold_path_count.fetch_add(1, AtomicOrdering::Relaxed);
         #[cfg(feature = "metrics")]
         ::metrics::counter!("spool_cold_path_total").increment(1);
+        Ok(())
+    }
+
+    /// Sync every record spilled so far to disk.
+    ///
+    /// A spill is flushed to the operating system and survives the process being
+    /// killed, and survives the host losing power once this has run. One call
+    /// covers any number of spills, so a caller that accepts records in batches
+    /// syncs once per batch. [`sync_on_spill`](TieredSinkConfig::sync_on_spill)
+    /// syncs inside every spilling `send` instead.
+    ///
+    /// The sync runs on tokio's blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TieredSinkError::Spool`] when a segment or the directory cannot
+    /// be synced.
+    pub async fn sync(&self) -> Result<()> {
+        let path = self.config.spool_path.clone();
+        let done = *self.synced.lock().unwrap_or_else(PoisonError::into_inner);
+        let now =
+            tokio::task::spawn_blocking(move || crate::spool_codec::sync_segments(&path, done))
+                .await
+                .map_err(|e| TieredSinkError::Spool(format!("spool sync task failed: {e}")))?
+                .map_err(|e| TieredSinkError::Spool(format!("spool sync failed: {e}")))?;
+        let mut synced = self.synced.lock().unwrap_or_else(PoisonError::into_inner);
+        synced.from = synced.from.max(now.from);
+        synced.ancestors |= now.ancestors;
         Ok(())
     }
 
@@ -515,6 +550,9 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             .map_err(|e| TieredSinkError::Spool(e.to_string()))?;
         drop(sender);
         reservation.kept = true;
+        if self.config.sync_on_spill {
+            self.sync().await?;
+        }
 
         #[cfg(feature = "metrics")]
         {
@@ -2627,6 +2665,80 @@ mod tests {
             "the owner finished writing its lock, so the open is refused"
         );
         assert!(lock.exists());
+    }
+
+    /// A spill reaches the operating system through a file yaque holds open, so
+    /// it succeeds after the spool directory is deleted, and only a sync notices.
+    /// `sync_on_spill` makes that sync part of accepting the record, and `sync`
+    /// reports it on request.
+    #[tokio::test]
+    async fn sync_on_spill_does_not_accept_a_spill_it_cannot_sync() {
+        for (sync_on_spill, accepted) in [(false, true), (true, false)] {
+            let dir = tempdir().unwrap();
+            let spool = dir.path().join("spool");
+            let sink = TestSink::new();
+            sink.set_available(false);
+            let config = spilling_config(&spool).sync_on_spill(sync_on_spill);
+            let tiered = TieredSink::new(sink, config).await.unwrap();
+
+            tiered.send(&rec(b"first")).await.unwrap();
+            tiered.sync().await.expect("a spill that can be synced");
+            std::fs::remove_dir_all(&spool).unwrap();
+
+            let second = tiered.send(&rec(b"second")).await;
+            assert_eq!(
+                second.is_ok(),
+                accepted,
+                "sync_on_spill {sync_on_spill}: {second:?}"
+            );
+            assert!(
+                matches!(tiered.sync().await, Err(TieredSinkError::Spool(_))),
+                "sync_on_spill {sync_on_spill}: an explicit sync reports it"
+            );
+            tiered.shutdown().await;
+        }
+    }
+
+    /// yaque panics on a version file that is not a version or names another
+    /// release, and on a `.q` file that is not a segment number, which ends a
+    /// service built with `panic = "abort"`. `TieredSink::new` refuses each
+    /// under `fail` and sets the queue aside under `quarantine`.
+    #[tokio::test]
+    async fn a_spill_queue_yaque_would_panic_on_is_an_open_failure() {
+        let version = std::path::Path::new("version").join("contents");
+        for (name, corruption) in [
+            ("not a version", Some("not a version")),
+            ("another release", Some("0.5.2")),
+            ("only whitespace", Some("\n")),
+            ("not a segment", None),
+        ] {
+            let dir = tempdir().unwrap();
+            let spool = dir.path().join("spool");
+            spill(&spool, &payloads(2)).await;
+            match corruption {
+                Some(text) => std::fs::write(spool.join(&version), text).unwrap(),
+                None => std::fs::write(spool.join("foo.q"), b"x").unwrap(),
+            }
+
+            let mut failing = spilling_config(&spool);
+            failing.on_corruption = crate::spool_codec::CorruptionPolicy::Fail;
+            let refused = TieredSink::new(TestSink::new(), failing).await;
+            assert!(
+                matches!(refused, Err(TieredSinkError::SpoolOpen { .. })),
+                "{name}: fail refuses"
+            );
+
+            let tiered = TieredSink::new(TestSink::new(), spilling_config(&spool))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: quarantine opens a fresh queue: {e}"));
+            assert_eq!(tiered.spool_len().await, 0, "{name}: a fresh queue");
+            assert_eq!(
+                entries_with_prefix(&spool, "corrupt-").len(),
+                1,
+                "{name}: the corrupt queue is kept"
+            );
+            tiered.shutdown().await;
+        }
     }
 
     #[cfg(unix)]
