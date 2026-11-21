@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.33
 
+### A Kafka-only DLQ answers a broker size refusal as `DlqError::Refused` (API CHANGE)
+
+A topic `max.message.bytes` below the producer's failed `write_confirmed` as `Kafka`, so the pipeline held its block for good. It now answers `Refused(RefusedEntries)`, and the pipeline drops and counts the entries it names. See [dlq.md](pipeline/dlq.md#the-kafka-barrier).
+
+**Consumer adjustment** -- an exhaustive `match` on `DlqError` adds `Refused`, and a `write_confirmed` caller releases the entries `refused.contains` names.
+
 ### A spool replays from its first segment when its receive position is lost (BEHAVIOUR CHANGE)
 
 yaque saves the receive position by truncating `recv-metadata` and then writing it. A process killed between the two left the file empty, the queue would not open, and `on_corruption: quarantine` moved every spooled record aside. `Spool::open` and `TieredSink::new` now see a position that is short, or names a segment that is gone or an offset past its end, and replay from the first segment with a warn. Records consumed from that segment before the kill come again, and none is lost.
