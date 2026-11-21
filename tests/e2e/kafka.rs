@@ -895,6 +895,48 @@ mod broker {
     }
 }
 
+/// `recv_limited` with no byte limit, against a real broker in a container.
+#[cfg(feature = "testcontainers")]
+mod unbounded_receive {
+    use std::time::{Duration, Instant};
+
+    use scalo::transport::{RecvLimits, TransportReceiver};
+
+    use super::broker::{consumer, create_topic, produce, start_kafka};
+
+    /// `max_bytes: u64::MAX` means no limit, so a receive returns the records
+    /// instead of failing. The arena once reserved `usize::MAX` bytes for it
+    /// and the poll task panicked with "capacity overflow".
+    #[tokio::test]
+    async fn a_receive_with_no_byte_limit_returns_its_records() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let topic = "unbounded-receive";
+        create_topic(&bootstrap, topic).await;
+        produce(&bootstrap, topic, 0..5).await;
+        let transport = consumer(&bootstrap, topic, "unbounded-receive-group").await;
+
+        let mut received = 0;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while received < 5 {
+            assert!(
+                Instant::now() < deadline,
+                "read {received} of 5 records within 120 s"
+            );
+            let batch = transport
+                .recv_limited(RecvLimits {
+                    max_records: 100,
+                    max_bytes: u64::MAX,
+                })
+                .await
+                .expect("a receive with no byte limit");
+            received += batch.records.len();
+        }
+        assert_eq!(received, 5);
+    }
+}
+
 /// `sizing.consumer.max_poll_records` against a real broker in a container.
 #[cfg(feature = "testcontainers")]
 mod poll_cap {
