@@ -26,6 +26,12 @@ yaque saves the receive position by truncating `recv-metadata` and then writing 
 
 **Consumer adjustment** -- none for a deployed service whose files sit only at the path it names. A local run that relied on a `settings.yaml` beside a named file moves those keys into the file. A literal `ConfigOptions { .. }` with no `..Default::default()` adds `search_standard_paths: true` to keep its behaviour.
 
+### A spool or spill queue yaque would panic on is an open failure (BEHAVIOUR CHANGE)
+
+yaque panics on a `version/contents` that is not a version or names another release than 0.6, and on a `.q` file that is not a segment number. `Spool::open` and `TieredSink::new` now read those files first. Under `on_corruption: quarantine` the queue moves into a `corrupt-*` subdirectory and a fresh one opens, and under `fail` the open returns an error naming the file.
+
+**Consumer adjustment** -- none. A service that died on such a queue now starts on a fresh one, and its records are in the `corrupt-*` directory. The `spool` and `tiered-sink` features pull `semver`.
+
 ---
 
 ## 2.14.32

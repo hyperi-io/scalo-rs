@@ -18,6 +18,9 @@
 //! - **Open** ([`open_queue`]): clears lock files a stopped process left behind,
 //!   refuses a queue a live process still holds, and quarantines a queue that
 //!   will not open under [`CorruptionPolicy::Quarantine`].
+//! - **Queue files** ([`open_queue`] checks them): a `version/contents` yaque
+//!   cannot read, or a `.q` file that is not a segment, would panic yaque, so
+//!   they are refused as an error the open policy handles.
 //! - **Receive position** ([`open_queue`] repairs it): a `recv-metadata` yaque
 //!   left torn or pointing at a segment that is gone becomes a replay from the
 //!   first segment, instead of a queue that will not open.
@@ -193,13 +196,16 @@ pub(crate) fn open_queue(
     policy: CorruptionPolicy,
 ) -> Result<(yaque::Sender, yaque::Receiver), OpenError> {
     release_stale_locks(path)?;
-    repair_recv_position(path).map_err(|e| {
-        OpenError::Failed(format!(
-            "cannot repair the receive position in {}: {e}",
-            path.display()
-        ))
-    })?;
-    let open_err = match yaque::channel(path) {
+    let validated = validate_queue_files(path);
+    if validated.is_ok() {
+        repair_recv_position(path).map_err(|e| {
+            OpenError::Failed(format!(
+                "cannot repair the receive position in {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    let open_err = match validated.and_then(|()| yaque::channel(path)) {
         Ok(queue) => return Ok(queue),
         Err(e) => e,
     };
@@ -215,8 +221,86 @@ pub(crate) fn open_queue(
     }
     quarantine(path, QuarantineTrigger::OpenFailed, &open_err.to_string())
         .map_err(|e| OpenError::Failed(format!("{open_err}; quarantine failed: {e}")))?;
-    yaque::channel(path)
+    validate_queue_files(path)
+        .and_then(|()| yaque::channel(path))
         .map_err(|e| OpenError::Failed(format!("{open_err}; fresh open failed: {e}")))
+}
+
+/// The versions of yaque a queue's `version/contents` may name. It is the
+/// release line `Cargo.toml` pins yaque to, and a test checks that a queue
+/// yaque creates satisfies it.
+const YAQUE_QUEUE_VERSIONS: &str = "0.6.*";
+
+/// Refuse a queue directory yaque would panic on, as an error the open policy
+/// handles like any queue that will not open.
+///
+/// yaque panics, where it could return an error, on a `version/contents` that
+/// does not parse as a version or names another release line, and on a `.q`
+/// file whose name is not a segment number. A panic takes the whole process in
+/// a service built with `panic = "abort"`, so the files are read here first.
+///
+/// # Errors
+/// An [`io::ErrorKind::InvalidData`] error naming the file, or the [`io::Error`]
+/// of a read that failed.
+fn validate_queue_files(path: &Path) -> io::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let file = entry?.path();
+        if file.extension().and_then(|e| e.to_str()) == Some("q")
+            && file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_none()
+        {
+            return Err(invalid_queue(format!(
+                "{} is not a numbered segment",
+                file.display()
+            )));
+        }
+    }
+
+    let version = path.join("version").join("contents");
+    let contents = match std::fs::read(&version) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    // An empty file is a queue yaque has not stamped yet, and it stamps it. A
+    // file of only whitespace is not empty to yaque, which parses it as a
+    // version and panics.
+    if contents.is_empty() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&contents);
+    let text = text.trim();
+    let shown: String = text.chars().take(40).collect();
+    let named = semver::Version::parse(text).map_err(|e| {
+        invalid_queue(format!(
+            "{} does not hold a version ({e}): {shown:?}",
+            version.display()
+        ))
+    })?;
+    let accepted = semver::VersionReq::parse(YAQUE_QUEUE_VERSIONS).map_err(|e| {
+        invalid_queue(format!(
+            "{YAQUE_QUEUE_VERSIONS} is not a version range: {e}"
+        ))
+    })?;
+    if !accepted.matches(&named) {
+        return Err(invalid_queue(format!(
+            "{} names version {named}, and this build reads {YAQUE_QUEUE_VERSIONS}",
+            version.display()
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_queue(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 /// The segment numbers in a yaque queue directory, ascending. Segments are
@@ -486,11 +570,14 @@ pub(crate) fn quarantine(
     let mut to_move = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(QUARANTINE_PREFIX)
-        {
+        // Earlier quarantines are directories. A file with the prefix is part of
+        // the queue like any other.
+        let earlier_quarantine = entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(QUARANTINE_PREFIX);
+        if !earlier_quarantine {
             to_move.push(entry.path());
         }
     }
@@ -691,6 +778,19 @@ mod tests {
             5,
             "no segment at or above 5, so the start stays"
         );
+    }
+
+    /// A queue yaque stamps names a version `YAQUE_QUEUE_VERSIONS` accepts, so
+    /// a bump of the yaque pin that leaves the range behind fails here and not
+    /// in a service reopening its spool.
+    #[test]
+    fn a_queue_yaque_creates_passes_the_version_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh");
+        drop(yaque::channel(&path).unwrap());
+        let stamped = std::fs::read_to_string(path.join("version").join("contents")).unwrap();
+        assert!(!stamped.trim().is_empty(), "yaque stamped no version");
+        validate_queue_files(&path).unwrap_or_else(|e| panic!("{stamped:?}: {e}"));
     }
 
     #[test]
