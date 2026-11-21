@@ -39,10 +39,13 @@ tuning mistake. Each governs a different hop.
   `send` pays one `linger.ms` window per record.
 
 The poll-safety cap (`max_poll_records`) is a fourth, count-based limit. It
-is NOT a librdkafka property -- there is no broker knob for it. Nothing in
-scalo applies it: `KafkaSizingConfig::effective_poll_cap()` returns it, and an
-app that wants the cap passes that as `recv`'s `max`. The `BatchEngine` run
-loops pass their own `max_chunk_size`.
+is NOT a librdkafka property -- there is no broker knob for it.
+`KafkaTransport` reads `KafkaSizingConfig::effective_poll_cap()` when it is
+built and holds every `recv` and `recv_limited` to it, so a `max` or a
+`max_chunk_size` above the cap returns the cap. A batch larger than the
+profile's cap needs `sizing.consumer.max_poll_records` raised. A receiving
+transport refuses a cap of 0 when it is built, because a receive always takes
+its first record.
 
 ---
 

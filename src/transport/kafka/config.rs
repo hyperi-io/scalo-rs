@@ -340,14 +340,16 @@ pub struct ConsumerKnobs {
     #[serde(default)]
     pub fetch_max_bytes: Option<i32>,
 
-    /// Maximum number of messages the recv() loop returns per call.
+    /// Maximum number of messages one `KafkaTransport::recv()` or `recv_limited()`
+    /// call returns, whatever `max` the caller passes. At least 1: a receiving
+    /// transport refuses 0 when it is built, because a receive always takes its
+    /// first record.
     ///
-    /// NOTE: `max.poll.records` does NOT exist in librdkafka -- there is no
-    /// broker-level property for this. This is a purely CLIENT-SIDE cap,
-    /// enforced by passing this value as the `max` argument to
-    /// `KafkaTransport::recv()` via `KafkaSizingConfig::effective_poll_cap()`.
-    /// It bounds the batch size delivered to the WorkBatch layer, not the
-    /// network fetch size (which is byte-governed by the knobs above).
+    /// `max.poll.records` does NOT exist in librdkafka, so this is a CLIENT-SIDE
+    /// cap, read through `KafkaSizingConfig::effective_poll_cap()` when the
+    /// transport is built. It bounds the batch size delivered to the WorkBatch
+    /// layer, not the network fetch size (which is byte-governed by the knobs
+    /// above).
     #[serde(default)]
     pub max_poll_records: Option<usize>,
 }
@@ -725,8 +727,8 @@ impl KafkaSizingConfig {
     /// Return the effective poll-safety cap (max messages per recv() call).
     ///
     /// This is a CLIENT-SIDE cap only -- there is no librdkafka property for
-    /// `max.poll.records`. The value is passed as the `max` argument to
-    /// `KafkaTransport::recv()` by the ServiceRuntime / WorkBatch layer.
+    /// `max.poll.records`. `KafkaTransport` reads it once, when it is built,
+    /// and holds every `recv()` and `recv_limited()` to it.
     #[must_use]
     pub fn effective_poll_cap(&self) -> usize {
         self.consumer

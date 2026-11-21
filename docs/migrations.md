@@ -26,6 +26,12 @@ yaque saves the receive position by truncating `recv-metadata` and then writing 
 
 **Consumer adjustment** -- none for a deployed service whose files sit only at the path it names. A local run that relied on a `settings.yaml` beside a named file moves those keys into the file. A literal `ConfigOptions { .. }` with no `..Default::default()` adds `search_standard_paths: true` to keep its behaviour.
 
+### `sizing.consumer.max_poll_records` caps every Kafka receive (BEHAVIOUR CHANGE)
+
+The cap was read by nothing, so a Kafka receive took whatever `recv(max)` or `batch_processing.max_chunk_size` asked for. `KafkaTransport` now holds `recv` and `recv_limited` to it: 2000 on `throughput`, 1000 on `balanced`, 500 on `low_latency`, or the value you set. A receiving transport refuses a cap of 0 when it is built, because a receive always takes its first record.
+
+**Consumer adjustment** -- an app that asks for more than the cap in one receive, through `recv(max)` or through `max_chunk_size` with `self_regulation.enabled: false`, now gets the cap. Raise `sizing.consumer.max_poll_records` to keep the larger batch.
+
 ---
 
 ## 2.14.32
