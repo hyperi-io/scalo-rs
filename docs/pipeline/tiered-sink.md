@@ -153,7 +153,7 @@ A spill reserves its item slot and bytes before it writes, and gives them back i
 
 Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailable)` whatever `when_full` says. The caller decides what to do with either error -- the typical pattern is to route the record to the DLQ.
 
-`TieredSink::new` clears spool locks a killed process left behind and rejects a `spool_path` another live sink holds, so each sink needs a path of its own. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. See [spool.md](spool.md#locks-after-a-hard-kill).
+`TieredSink::new` clears spool locks a killed process left behind and rejects a `spool_path` another live sink holds, so each sink needs a path of its own. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. A receive position torn by a kill is not that case: the sink replays from the first segment instead, so some consumed records come again. A spill is flushed to the operating system and never synced to disk, so it survives the process being killed and not the host losing power. See [spool.md](spool.md#locks-after-a-hard-kill).
 
 ---
 
