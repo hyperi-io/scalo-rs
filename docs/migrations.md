@@ -32,6 +32,24 @@ yaque saves the receive position by truncating `recv-metadata` and then writing 
 
 **Consumer adjustment** -- none for a deployed service whose files sit only at the path it names. A local run that relied on a `settings.yaml` beside a named file moves those keys into the file. A literal `ConfigOptions { .. }` with no `..Default::default()` adds `search_standard_paths: true` to keep its behaviour.
 
+### `TieredSink::sync` and `TieredSinkConfig::sync_on_spill` (additive)
+
+`TieredSink::sync().await` syncs every record spilled so far to disk, and `sync_on_spill: true` does it before a spilling `send` returns. Before this a spill survived the process being killed and not the host losing power.
+
+**Consumer adjustment** -- call `sync` after a batch of sends, or set `sync_on_spill`, where a power loss must not lose an accepted record. A literal `TieredSinkConfig { .. }` with no `..Default::default()` adds `sync_on_spill: false`.
+
+### A spool or spill queue yaque would panic on is an open failure (BEHAVIOUR CHANGE)
+
+yaque panics on a `version/contents` that is not a version or names another release than 0.6, and on a `.q` file that is not a segment number. `Spool::open` and `TieredSink::new` now read those files first. Under `on_corruption: quarantine` the queue moves into a `corrupt-*` subdirectory and a fresh one opens, and under `fail` the open returns an error naming the file.
+
+**Consumer adjustment** -- none. A service that died on such a queue now starts on a fresh one, and its records are in the `corrupt-*` directory. The `spool` and `tiered-sink` features pull `semver`.
+
+### `VectorCompatClient::connect_lazy_tls` and `VectorCompatTls` (additive)
+
+`VectorCompatClient` could only dial `http://`, so a service could ship to a Vector source on loopback and nowhere else. `connect_lazy_tls(endpoint, send_timeout_ms, &VectorCompatTls)` connects over TLS with the OS root store, extra PEM roots, an only-these-roots switch and an optional client certificate and key. Every file is read when the client is built.
+
+**Consumer adjustment** -- none. `connect_lazy` and `connect_lazy_within` are unchanged and stay plaintext.
+
 ### `sizing.consumer.max_poll_records` caps every Kafka receive (BEHAVIOUR CHANGE)
 
 The cap was read by nothing, so a Kafka receive took whatever `recv(max)` or `batch_processing.max_chunk_size` asked for. `KafkaTransport` now holds `recv` and `recv_limited` to it: 2000 on `throughput`, 1000 on `balanced`, 500 on `low_latency`, or the value you set. A receiving transport refuses a cap of 0 when it is built, because a receive always takes its first record.

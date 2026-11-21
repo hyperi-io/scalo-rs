@@ -25,9 +25,8 @@ pub struct Spool {
     /// moved by each push and take, so `max_size_bytes` never walks the
     /// directory.
     bytes: u64,
-    /// The oldest segment [`sync`](Self::sync) still has to flush: older ones
-    /// are full and were flushed by an earlier call.
-    synced_from: u64,
+    /// What [`sync`](Self::sync) has flushed, so a call does only what is left.
+    synced: crate::spool_codec::Synced,
 }
 
 /// The open yaque handles. Each holds a lock file in the queue directory.
@@ -79,7 +78,7 @@ impl Spool {
             config,
             len,
             bytes,
-            synced_from: 0,
+            synced: crate::spool_codec::Synced::default(),
         })
     }
 
@@ -94,7 +93,7 @@ impl Spool {
         self.queue = None;
         self.len = 0;
         self.bytes = 0;
-        self.synced_from = 0;
+        self.synced = crate::spool_codec::Synced::default();
         let moved = crate::spool_codec::quarantine(
             &self.config.path,
             crate::spool_codec::QuarantineTrigger::CrcMismatch,
@@ -189,9 +188,9 @@ impl Spool {
     pub async fn sync(&mut self) -> Result<()> {
         live(&mut self.queue)?;
         let path = self.config.path.clone();
-        let from = self.synced_from;
-        self.synced_from =
-            tokio::task::spawn_blocking(move || crate::spool_codec::sync_segments(&path, from))
+        let done = self.synced;
+        self.synced =
+            tokio::task::spawn_blocking(move || crate::spool_codec::sync_segments(&path, done))
                 .await
                 .map_err(|e| SpoolError::Queue(format!("spool sync task failed: {e}")))?
                 .map_err(SpoolError::Io)?;
@@ -946,6 +945,65 @@ mod tests {
                 .filter_map(|entry| entry.ok())
                 .any(|entry| entry.file_name().to_string_lossy().starts_with("corrupt-"));
             assert!(!quarantined, "{name}: the queue was quarantined");
+        }
+    }
+
+    /// yaque panics on a version file that is not a version or names another
+    /// release, and on a `.q` file that is not a segment number, which ends a
+    /// service built with `panic = "abort"`. Each is an open failure instead:
+    /// `fail` returns an error naming the file, and `quarantine` sets the queue
+    /// aside, opens a fresh one and keeps the corrupt files.
+    #[tokio::test]
+    async fn a_queue_yaque_would_panic_on_is_an_open_failure() {
+        let version = std::path::Path::new("version").join("contents");
+        let version_named = version.display().to_string();
+        // (case, text for the version file or None for a stray `.q` file, what the error names)
+        let cases: [(&str, Option<&str>, &str); 5] = [
+            ("not a version", Some("not a version"), &version_named),
+            ("another release", Some("0.5.2"), &version_named),
+            ("only whitespace", Some("\n"), &version_named),
+            ("not a segment", None, "foo.q"),
+            (
+                "not a segment named like a quarantine",
+                None,
+                "corrupt-old.q",
+            ),
+        ];
+        for (name, version_text, named) in cases {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("queue");
+            let mut spool = Spool::create(&path).await.unwrap();
+            spool.push(b"kept").await.unwrap();
+            drop(spool);
+            match version_text {
+                Some(text) => std::fs::write(path.join(&version), text).unwrap(),
+                None => std::fs::write(path.join(named), b"x").unwrap(),
+            }
+
+            let failed = Spool::open(SpoolConfig::new(&path).on_corruption(CorruptionPolicy::Fail))
+                .await
+                .expect_err(name);
+            assert!(
+                matches!(&failed, SpoolError::Open { message, .. } if message.contains(named)),
+                "{name}: {failed}"
+            );
+
+            let mut fresh = Spool::open(SpoolConfig::new(&path))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(fresh.is_empty(), "{name}: a fresh queue");
+            fresh.push(b"new").await.unwrap();
+            assert_eq!(fresh.pop_front().await.unwrap(), Some(b"new".to_vec()));
+            let quarantined: Vec<_> = std::fs::read_dir(&path)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("corrupt-"))
+                .collect();
+            assert_eq!(quarantined.len(), 1, "{name}: one quarantine directory");
+            assert!(
+                quarantined[0].path().join("0.q").exists(),
+                "{name}: records kept"
+            );
         }
     }
 

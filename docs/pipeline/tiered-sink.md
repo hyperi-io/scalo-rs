@@ -153,7 +153,7 @@ A spill reserves its item slot and bytes before it writes, and gives them back i
 
 Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailable)` whatever `when_full` says. The caller decides what to do with either error -- the typical pattern is to route the record to the DLQ.
 
-`TieredSink::new` clears spool locks a killed process left behind and rejects a `spool_path` another live sink holds, so each sink needs a path of its own. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. A receive position torn by a kill is not that case: the sink replays from the first segment instead, so some consumed records come again. A spill is flushed to the operating system and never synced to disk, so it survives the process being killed and not the host losing power. See [spool.md](spool.md#locks-after-a-hard-kill).
+`TieredSink::new` clears spool locks a killed process left behind and rejects a `spool_path` another live sink holds, so each sink needs a path of its own. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. A receive position torn by a kill is not that case: the sink replays from the first segment instead, so some consumed records come again. A spill is flushed to the operating system, so it survives the process being killed. It survives the host losing power once the cache is synced: `TieredSink::sync().await` syncs every spill so far and the directories of the cache's path (the first call flushes each one up to the root, since opening creates any that are missing, and Windows has no directory sync, so there it flushes the files alone), so a caller that accepts records in batches syncs once per batch, and `sync_on_spill: true` syncs inside every spilling `send`. The default is off because a sync costs a disk sync per spilled record on the path that runs when the sink is down. A sync that fails returns `TieredSinkError::Spool` with the record already spilled, so a retry can deliver it twice. It finds the segments through the cache's path, so a spool directory renamed or replaced while the sink runs is not flushed, and a directory above the cache's parent that the process may not open is skipped. See [spool.md](spool.md#locks-after-a-hard-kill).
 
 ---
 
@@ -174,6 +174,7 @@ tiered_sink:
   when_full: block
   crc: false
   on_corruption: quarantine
+  sync_on_spill: false             # true syncs to disk before a spilling send returns
   circuit_failure_threshold: 5
   circuit_reset_timeout_ms: 30000
   drain_interval_ms: 100
