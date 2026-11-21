@@ -34,7 +34,7 @@ pub struct KedaConfig {
     /// Seconds after the last active trigger before KEDA scales to zero, so it
     /// applies only when `min_replicas` is 0.
     pub cooldown_period: u32,
-    /// Scale when the watched topic's lag, summed over its partitions, exceeds this.
+    /// Scale when consumer group lag exceeds this per partition.
     pub kafka_lag_threshold: u64,
     /// Wake from zero replicas when lag exceeds this.
     pub activation_lag_threshold: u64,
@@ -67,10 +67,8 @@ impl Default for KedaConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct KedaContract {
-    /// Whether the chart turns KEDA on. `false` turns it off, as `keda: None`
-    /// does. A `keda.enabled: true` chart value turns it on either way, and
-    /// the Kafka lag trigger then follows `kafka_trigger`. A contract with no
-    /// `keda` has none unless the chart's `keda.kafka.enabled` is also true.
+    /// Whether the chart turns KEDA on. `false` generates exactly what
+    /// `keda: None` does, so there is one meaning for off.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     pub min_replicas: u32,
