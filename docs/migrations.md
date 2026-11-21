@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.33
 
+### `run_app` reads the file `{PREFIX}_CONFIG` names (BEHAVIOUR CHANGE)
+
+Without `--config`, a file named only by `{PREFIX}_CONFIG` reached an app's sections but not scalo's cascade. `run_app` now reads it into the cascade and passes its path to `load_config`. `--config` wins.
+
+**Consumer adjustment** -- an app resolving `{PREFIX}_CONFIG` itself can drop that. Set, it stops `.env` and the standard locations being read.
+
 ### A Kafka-only DLQ answers a broker size refusal as `DlqError::Refused` (API CHANGE)
 
 A topic `max.message.bytes` below the producer's failed `write_confirmed` as `Kafka`, so the pipeline held its block for good. It now answers `Refused(RefusedEntries)`, and the pipeline drops and counts the entries it names. See [dlq.md](pipeline/dlq.md#the-kafka-barrier).

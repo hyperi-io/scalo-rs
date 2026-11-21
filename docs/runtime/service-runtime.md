@@ -76,8 +76,10 @@ Step by step inside `run_app` for the default `run` subcommand:
 
 1. Resolve the subcommand from `app.command()` -- defaults to `Run` --
    and, for every command but `version`, set up the config cascade from
-   `--config` and `app.env_prefix()`. A cascade the app set up first is kept.
-2. Call `app.load_config(args.config.as_deref())` -- apps own this
+   `app.env_prefix()` and the file `--config` names, else the one
+   `{PREFIX}_CONFIG` names (`CommonArgs::config_path`). A cascade the app
+   set up first is kept.
+2. Call `app.load_config` with that file's path -- apps own this
    step so they can deserialise into their typed config.
 3. Install the logger with the service name and version injected for
    JSON output. It comes after the config because the OTLP span exporter

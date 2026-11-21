@@ -2,8 +2,9 @@
 
 Call `config::setup` once at startup, and every module then reads one typed view of
 the whole cascade through the same API. A `ServiceApp` doesn't call it:
-`run_app` sets the cascade up from `--config` and `env_prefix()` before
-`load_config`, for every command but `version`.
+`run_app` sets the cascade up from `env_prefix()` and the file `--config`
+names, else the one `{PREFIX}_CONFIG` names, before `load_config`, for every
+command but `version`. `load_config` is given that file's path.
 
 The cascade is **7 layers** -- one typed view assembled from CLI args, env vars,
 `.env`, the YAML files, and hard-coded defaults.
@@ -32,7 +33,7 @@ Each YAML layer reads every location below that holds the file and merges them i
 <config_paths dir>/<name>.yaml        <config_paths dir>/<name>.yml
 ```
 
-The first four locations are the standard ones, and `ConfigOptions::search_standard_paths` (default true) turns them all off, so only `config_paths` is read. `CommonArgs::to_config_options`, `config::load_typed` and `flat_env::load_config` turn it off, and `.env` with it, when a file is named: the named file is the whole config, and nothing in the working directory, `/config/` or a user's home reaches a service that names it. A service that must never read those, as a privileged one must not, names its file, and nothing sets the global cascade up before it does: the first cascade set up wins, so one built earlier with the search on keeps reading the standard locations. `run_app` sets it up first, from `--config`.
+The first four locations are the standard ones, and `ConfigOptions::search_standard_paths` (default true) turns them all off, so only `config_paths` is read. `CommonArgs::to_config_options`, `config::load_typed` and `flat_env::load_config` turn it off, and `.env` with it, when a file is named: the named file is the whole config, and nothing in the working directory, `/config/` or a user's home reaches a service that names it. A service that must never read those, as a privileged one must not, names its file, and nothing sets the global cascade up before it does: the first cascade set up wins, so one built earlier with the search on keeps reading the standard locations. `run_app` sets it up first, from `--config` or `{PREFIX}_CONFIG`, and the flag wins when both are set.
 
 A `ConfigOptions::config_paths` entry that is a directory is searched like the locations above. An entry that is a file, which is what `--config` passes, joins the `settings` layer only and merges after every other `settings.yaml`, so it outranks those and `defaults.yaml`. `settings.{env}.yaml` and env vars still outrank it. An entry that does not exist, or a file that cannot be read or parsed, fails `config::setup` with `ConfigError::LoadError`, so `--config` with a typo stops the service at start.
 
