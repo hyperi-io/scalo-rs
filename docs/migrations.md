@@ -26,6 +26,12 @@ yaque saves the receive position by truncating `recv-metadata` and then writing 
 
 **Consumer adjustment** -- none for a deployed service whose files sit only at the path it names. A local run that relied on a `settings.yaml` beside a named file moves those keys into the file. A literal `ConfigOptions { .. }` with no `..Default::default()` adds `search_standard_paths: true` to keep its behaviour.
 
+### `TieredSink::sync` and `TieredSinkConfig::sync_on_spill` (additive)
+
+`TieredSink::sync().await` syncs every record spilled so far to disk, and `sync_on_spill: true` does it before a spilling `send` returns. Before this a spill survived the process being killed and not the host losing power.
+
+**Consumer adjustment** -- call `sync` after a batch of sends, or set `sync_on_spill`, where a power loss must not lose an accepted record. A literal `TieredSinkConfig { .. }` with no `..Default::default()` adds `sync_on_spill: false`.
+
 ---
 
 ## 2.14.32

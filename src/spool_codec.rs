@@ -315,23 +315,50 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Flush the queue's segment files from `from` upward to stable storage, and
-/// the queue directory and its parent with them, so a spool created by its
-/// first push is not lost with its directory entry. Returns the newest
-/// segment, which the next call passes as its `from`: older segments are full
-/// and already synced.
+/// What a queue's syncs have done, so the next one does only what is left.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Synced {
+    /// The oldest segment still to flush: older ones are full and flushed.
+    pub(crate) from: u64,
+    /// Whether the directories above the queue's own are flushed.
+    pub(crate) ancestors: bool,
+}
+
+/// The directories a sync flushes: the queue's own, and on the first sync every
+/// directory above it up to the root, because yaque creates the whole path when
+/// it opens and any of those entries can be new.
+fn directories_to_sync(path: &Path, ancestors: bool) -> Vec<PathBuf> {
+    if !ancestors {
+        return vec![path.to_path_buf()];
+    }
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute
+        .ancestors()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// Flush the queue's segment files from `done.from` upward to stable storage,
+/// and its directory with them. The first call flushes every directory above
+/// it too, so a spool created by its first push is not lost with a directory
+/// entry. Returns what the next call starts from.
 ///
 /// yaque flushes each send to the operating system and never syncs, so a
 /// pushed record survives its process being killed, and survives the host
-/// losing power only once this has run. Start `from` at 0 to sync everything the
-/// directory holds.
+/// losing power only once this has run. Start from [`Synced::default`] to sync
+/// everything the directory holds.
 ///
 /// # Errors
-/// Propagates the directory read or a segment's sync [`io::Error`].
-#[cfg(feature = "spool")]
-pub(crate) fn sync_segments(path: &Path, from: u64) -> io::Result<u64> {
-    let mut newest = from;
-    for number in segment_numbers(path)?.into_iter().filter(|n| *n >= from) {
+/// Propagates the directory read or a segment's or directory's sync
+/// [`io::Error`]. A directory above the queue's parent that this process may
+/// not open is skipped, because it is one this process did not create.
+pub(crate) fn sync_segments(path: &Path, done: Synced) -> io::Result<Synced> {
+    let mut newest = done.from;
+    for number in segment_numbers(path)?
+        .into_iter()
+        .filter(|n| *n >= done.from)
+    {
         // Opened for write, though nothing is written, because Windows cannot
         // flush a handle that cannot write.
         match std::fs::OpenOptions::new()
@@ -345,13 +372,20 @@ pub(crate) fn sync_segments(path: &Path, from: u64) -> io::Result<u64> {
         }
         newest = number;
     }
-    sync_directory(path)?;
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    sync_directory(parent)?;
-    Ok(newest)
+    for (index, dir) in directories_to_sync(path, done.ancestors).iter().enumerate() {
+        match sync_directory(dir) {
+            Ok(()) => {}
+            // The queue's directory and its parent are the ones this process
+            // creates entries in, so they must flush. Above them, one it may not
+            // open is one it did not create.
+            Err(e) if index > 1 && e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Synced {
+        from: newest,
+        ancestors: true,
+    })
 }
 
 /// Remove every lock file whose owner is gone. Refuse when a live owner holds one.
@@ -674,7 +708,6 @@ mod tests {
 
     /// `sync_segments` reports the newest segment, which the next call starts
     /// from, and passes over one the receiver deleted since the listing.
-    #[cfg(feature = "spool")]
     #[test]
     fn sync_segments_reports_the_newest_segment() {
         let dir = tempfile::tempdir().unwrap();
@@ -683,14 +716,50 @@ mod tests {
         }
         std::fs::write(dir.path().join(RECV_STATE_FILE), b"not a segment").unwrap();
 
-        assert_eq!(sync_segments(dir.path(), 0).unwrap(), 2);
+        let synced = sync_segments(dir.path(), Synced::default()).unwrap();
+        assert_eq!(synced.from, 2);
+        assert!(synced.ancestors);
         std::fs::remove_file(dir.path().join("1.q")).unwrap();
-        assert_eq!(sync_segments(dir.path(), 1).unwrap(), 2);
+        let again = sync_segments(dir.path(), Synced { from: 1, ..synced }).unwrap();
+        assert_eq!(again.from, 2);
+        let beyond = sync_segments(dir.path(), Synced { from: 5, ..synced }).unwrap();
         assert_eq!(
-            sync_segments(dir.path(), 5).unwrap(),
-            5,
+            beyond.from, 5,
             "no segment at or above 5, so the start stays"
         );
+    }
+
+    /// yaque creates every missing directory of the queue's path, so the first
+    /// sync flushes each one up to the root, and later syncs only the queue's.
+    #[test]
+    fn the_first_sync_flushes_every_directory_above_the_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let queue = root
+            .path()
+            .join("var")
+            .join("lib")
+            .join("service")
+            .join("spool");
+        std::fs::create_dir_all(&queue).unwrap();
+
+        let first = directories_to_sync(&queue, false);
+        assert_eq!(
+            first,
+            std::slice::from_ref(&queue),
+            "later syncs flush the queue's directory"
+        );
+
+        let all = directories_to_sync(&queue, true);
+        let real = std::fs::canonicalize(&queue).unwrap();
+        assert_eq!(all.first(), Some(&real));
+        for level in ["service", "lib", "var"] {
+            assert!(
+                all.iter().any(|dir| dir.ends_with(level)),
+                "{level} is in {all:?}"
+            );
+        }
+        assert_eq!(all.last().map(PathBuf::as_path), Some(Path::new("/")));
+        sync_segments(&queue, Synced::default()).expect("the whole chain syncs");
     }
 
     #[test]
