@@ -895,6 +895,117 @@ mod broker {
     }
 }
 
+/// `sizing.consumer.max_poll_records` against a real broker in a container.
+#[cfg(feature = "testcontainers")]
+mod poll_cap {
+    use std::time::{Duration, Instant};
+
+    use scalo::transport::kafka::KafkaTransport;
+    use scalo::transport::{RecvLimits, TransportReceiver};
+
+    use super::broker::{consumer_config, create_topic, produce, start_kafka};
+
+    /// The cap under test, well under what the callers ask for.
+    const CAP: usize = 7;
+
+    /// Records written to each test topic, several caps' worth.
+    const RECORDS: usize = 40;
+
+    /// A byte bound no record batch here reaches, so only the record cap acts.
+    const BYTES: u64 = 64 * 1024 * 1024;
+
+    /// One receive, asking for `ask` records: the `seq` of each record it
+    /// returned. `bounded` goes through `recv_limited`.
+    async fn take(transport: &KafkaTransport, ask: usize, bounded: bool) -> Vec<usize> {
+        let batch = if bounded {
+            transport
+                .recv_limited(RecvLimits {
+                    max_records: ask,
+                    max_bytes: BYTES,
+                })
+                .await
+        } else {
+            transport.recv(ask).await
+        }
+        .expect("receive");
+        batch
+            .records
+            .iter()
+            .map(|record| {
+                let text = std::str::from_utf8(&record.payload).expect("UTF-8 payload");
+                let digits = text
+                    .strip_prefix("{\"seq\":")
+                    .and_then(|rest| rest.strip_suffix('}'))
+                    .expect("a record written by produce");
+                digits.parse::<usize>().expect("seq is a number")
+            })
+            .collect()
+    }
+
+    /// Receive every record on `topic`, asking for `ask` per call, then three
+    /// calls more for a replay. Returns the size of each non-empty batch and
+    /// the `seq` of every record read.
+    async fn drain(
+        bootstrap: &str,
+        topic: &str,
+        ask: usize,
+        bounded: bool,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let group = format!("{topic}-group");
+        let mut config = consumer_config(bootstrap, topic, &group);
+        config.sizing.consumer.max_poll_records = Some(CAP);
+        let transport = KafkaTransport::new(&config).await.expect("kafka consumer");
+
+        let mut sizes = Vec::new();
+        let mut seqs = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while seqs.len() < RECORDS {
+            assert!(
+                Instant::now() < deadline,
+                "read {sizes:?} of {RECORDS} records within 120 s"
+            );
+            let batch = take(&transport, ask, bounded).await;
+            if !batch.is_empty() {
+                sizes.push(batch.len());
+                seqs.extend(batch);
+            }
+        }
+        for _ in 0..3 {
+            let replay = take(&transport, ask, bounded).await;
+            if !replay.is_empty() {
+                sizes.push(replay.len());
+                seqs.extend(replay);
+            }
+        }
+        (sizes, seqs)
+    }
+
+    /// One receive returns at most the cap, however many records wait and
+    /// however many the caller asks for, and the records all arrive.
+    #[tokio::test]
+    async fn a_receive_returns_no_more_than_the_poll_cap() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        for (topic, bounded) in [("poll-cap-recv", false), ("poll-cap-recv-limited", true)] {
+            create_topic(&bootstrap, topic).await;
+            produce(&bootstrap, topic, 0..RECORDS).await;
+
+            let (sizes, mut seqs) = drain(&bootstrap, topic, 10_000, bounded).await;
+            assert!(
+                sizes.iter().all(|&n| n <= CAP),
+                "{topic}: a batch was over the cap of {CAP}: {sizes:?}"
+            );
+            seqs.sort_unstable();
+            assert_eq!(
+                seqs,
+                (0..RECORDS).collect::<Vec<_>>(),
+                "{topic}: every record once, in {sizes:?}"
+            );
+        }
+    }
+}
+
 /// Held source acknowledgements against a real broker in a container.
 #[cfg(all(feature = "testcontainers", feature = "worker-batch"))]
 mod held_acknowledgements {
