@@ -3,6 +3,25 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.33](https://github.com/hyperi-io/scalo-rs/compare/v2.14.32...v2.14.33) (2026-11-21)
+
+### Bug Fixes
+
+* **cli:** read the file <PREFIX>_CONFIG names ([b415588](https://github.com/hyperi-io/scalo-rs/commit/b415588bb7a04eb77df17b0235dc3ec4d5bffcb4))
+* **config:** skip standard paths when given a config file ([619e706](https://github.com/hyperi-io/scalo-rs/commit/619e7064e8f4a56c72452441c9c9134d9d843a3b))
+* **dlq:** drop a dead letter the broker rejects ([ecb7407](https://github.com/hyperi-io/scalo-rs/commit/ecb7407900e9b2f1fb2ffa13779b61dbc6ca7579))
+* **docs:** correct docs for KEDA lagThreshold and enabled ([30dfab2](https://github.com/hyperi-io/scalo-rs/commit/30dfab27de27b1c85cffbfb47169b032ad18c141))
+* **grpc:** set TCP_NODELAY on accepted connections ([98ad9c4](https://github.com/hyperi-io/scalo-rs/commit/98ad9c44a7156fb931eec0c41ffe0dcf1369e882))
+* **kafka:** cap each receive at max_poll_records ([10d0bcc](https://github.com/hyperi-io/scalo-rs/commit/10d0bcca163992fcabce0047da4b0627aad6b5bb))
+* **kafka:** publish series for the lowest 256 partitions ([b28e8b6](https://github.com/hyperi-io/scalo-rs/commit/b28e8b67afb3fe6aacafdc5d6946acb4eca6d6fb))
+* **kafka:** size the recv arena when there is no byte cap ([86c4579](https://github.com/hyperi-io/scalo-rs/commit/86c4579c4ca1df75007757f912e6563f718559f4))
+* **kafka:** wait for the rebuilt producer in the refusal test ([027d838](https://github.com/hyperi-io/scalo-rs/commit/027d8380314bbb873571125004515ec012d4c9cc))
+* **spool:** recover lost receive positions and add push sync ([352db1f](https://github.com/hyperi-io/scalo-rs/commit/352db1f9da828c4d247789cce7b4767f0080c8ca))
+* **spool:** reject bad queue files before yaque ([b046bda](https://github.com/hyperi-io/scalo-rs/commit/b046bda2f96aef9fa0b9bf6bf60828bbce7c63c9))
+* **tiered-sink:** drop a dead letter the DLQ broker rejects ([4b0d48f](https://github.com/hyperi-io/scalo-rs/commit/4b0d48ff471fa248cc501ad1b71e88784541462a))
+* **tiered-sink:** sync spills before accepting them when configured ([593542d](https://github.com/hyperi-io/scalo-rs/commit/593542d21f443b152e9c73e8f58cfe5d9da82620))
+* **vector-compat:** add TLS to VectorCompatClient ([ca0c81c](https://github.com/hyperi-io/scalo-rs/commit/ca0c81c6d507d9160d9c4cc88a49fbc0e7fed71a))
+
 ## [2.14.32](https://github.com/hyperi-io/scalo-rs/compare/v2.14.31...v2.14.32) (2026-11-19)
 
 ### Bug Fixes
