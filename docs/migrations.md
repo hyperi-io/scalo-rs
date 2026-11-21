@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.33
 
+### `run_app` reads the file `{PREFIX}_CONFIG` names (BEHAVIOUR CHANGE)
+
+Without `--config`, a file named only by `{PREFIX}_CONFIG` reached an app's sections but not scalo's cascade. `run_app` now reads it into the cascade and passes its path to `load_config`. `--config` wins.
+
+**Consumer adjustment** -- an app resolving `{PREFIX}_CONFIG` itself can drop that. Set, it stops `.env` and the standard locations being read.
+
 ### A spool replays from its first segment when its receive position is lost (BEHAVIOUR CHANGE)
 
 yaque saves the receive position by truncating `recv-metadata` and then writing it. A process killed between the two left the file empty, the queue would not open, and `on_corruption: quarantine` moved every spooled record aside. `Spool::open` and `TieredSink::new` now see a position that is short, or names a segment that is gone or an offset past its end, and replay from the first segment with a warn. Records consumed from that segment before the kill come again, and none is lost.

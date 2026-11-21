@@ -204,10 +204,12 @@ pub trait ServiceApp: Sized {
 /// Drive the standard data-plane service lifecycle.
 ///
 /// Every command but `version` first sets up scalo's config cascade from
-/// `--config` and [`env_prefix`](ServiceApp::env_prefix), so each cascade
-/// reader (`version_check`, `scaling`, `logger` and the rest) sees the app's
-/// config however `load_config` reads it. A cascade the app set up already is
-/// kept.
+/// the file `--config` names, else the one `{PREFIX}_CONFIG` names
+/// ([`CommonArgs::config_path`]), with the prefix
+/// [`env_prefix`](ServiceApp::env_prefix). So each cascade reader
+/// (`version_check`, `scaling`, `logger` and the rest) sees the app's config
+/// however `load_config` reads it, and `load_config` is given the same path.
+/// A cascade the app set up already is kept.
 ///
 /// Handles subcommand dispatch:
 /// - `run` (default): load config -> init logger -> run service
@@ -220,6 +222,7 @@ pub trait ServiceApp: Sized {
 pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
     let command = app.command().cloned().unwrap_or(StandardCommand::Run);
     let args = app.common_args();
+    let config_file = args.config_path(app.env_prefix());
     if !matches!(command, StandardCommand::Version) {
         setup_cascade(&app)?;
     }
@@ -235,7 +238,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             // Same order as `run`: the level this command REPORTS is resolved
             // partly from config, so a logger built first would report the
             // default rather than what the cascade actually yields.
-            let config_path = args.config.as_deref();
+            let config_path = config_file.as_deref();
             let loaded = app.load_config(config_path);
             #[cfg(feature = "logger")]
             init_logger(args)?;
@@ -314,7 +317,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
 
         StandardCommand::Run => {
             let version_info = app.version_info();
-            let config_path = args.config.as_deref();
+            let config_path = config_file.as_deref();
 
             // Config loads before the logger: logger setup composes the OTLP
             // span exporter, whose settings live in the cascade. `load_typed`
@@ -466,7 +469,7 @@ fn init_logger_for_service(
     Ok(())
 }
 
-/// Set up the config cascade from `--config` and the app's env prefix.
+/// Set up the config cascade from the app's config file and env prefix.
 #[cfg(feature = "config")]
 fn setup_cascade<A: ServiceApp>(app: &A) -> Result<(), CliError> {
     let options = app.common_args().to_config_options(app.env_prefix());
@@ -500,7 +503,8 @@ const fn setup_cascade<A: ServiceApp>(_app: &A) -> Result<(), CliError> {
 /// Best-effort: a load that fails is reported on stderr, so stdout stays pure
 /// output, and the artefacts take the defaults.
 fn load_config_for_artefacts<A: ServiceApp>(app: &A) {
-    if let Err(e) = app.load_config(app.common_args().config.as_deref()) {
+    let config_file = app.common_args().config_path(app.env_prefix());
+    if let Err(e) = app.load_config(config_file.as_deref()) {
         output::print_warn(&format!(
             "config did not load, so the artefacts take the defaults rather than the config \
              cascade: {e}"
@@ -769,13 +773,14 @@ mod tests {
         assert!(matches!(cmd, StandardCommand::Run));
     }
 
-    /// A service whose `load_config` reports the cascade's `probe` key, as
-    /// an app reading its config straight from `--config` would see it.
+    /// A service whose `load_config` reports the path it is given and the
+    /// cascade's `probe` key, as an app reading its config from the cascade
+    /// would see it.
     #[cfg(feature = "config")]
     struct CascadeApp {
         common: CommonArgs,
         command: StandardCommand,
-        seen: Arc<std::sync::Mutex<Vec<Option<i64>>>>,
+        seen: Arc<std::sync::Mutex<Vec<(Option<String>, Option<i64>)>>>,
     }
 
     #[cfg(feature = "config")]
@@ -797,11 +802,11 @@ mod tests {
         fn command(&self) -> Option<&StandardCommand> {
             Some(&self.command)
         }
-        fn load_config(&self, _path: Option<&str>) -> Result<(), CliError> {
-            self.seen
-                .lock()
-                .expect("lock")
-                .push(crate::config::try_get().and_then(|c| c.get_int("probe")));
+        fn load_config(&self, path: Option<&str>) -> Result<(), CliError> {
+            self.seen.lock().expect("lock").push((
+                path.map(String::from),
+                crate::config::try_get().and_then(|c| c.get_int("probe")),
+            ));
             Ok(())
         }
         fn run_service(
@@ -854,8 +859,47 @@ mod tests {
             .expect("config-check");
         assert_eq!(
             *seen.lock().expect("lock"),
-            [Some(7)],
+            [(Some(file.to_string_lossy().into_owned()), Some(7))],
             "load_config ran once and saw the cascade from --config, not the .env"
+        );
+    }
+
+    /// Without `--config`, `run_app` reads the file `{PREFIX}_CONFIG` names
+    /// into the cascade and hands `load_config` its path, and a `.env` in the
+    /// working directory does not reach it.
+    #[cfg(feature = "config")]
+    #[tokio::test]
+    async fn run_app_sets_up_the_cascade_from_the_file_its_env_var_names() {
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+            eprintln!(
+                "skipped: sets up the process-global config cascade, changes the working \
+                 directory and sets an env var, so it runs only under cargo nextest's \
+                 process-per-test mode"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("app.yaml");
+        std::fs::write(&file, "probe: 5\n").expect("write config");
+        std::fs::write(dir.path().join(".env"), "CASCADE_APP_PROBE=9\n").expect("write .env");
+        std::env::set_current_dir(dir.path()).expect("chdir");
+        let named = file.to_string_lossy().into_owned();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        temp_env::async_with_vars(
+            [("CASCADE_APP_CONFIG", Some(named.as_str()))],
+            run_app(CascadeApp {
+                common: common(),
+                command: StandardCommand::ConfigCheck,
+                seen: Arc::clone(&seen),
+            }),
+        )
+        .await
+        .expect("config-check");
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            [(Some(named), Some(5))],
+            "the cascade and load_config both read the file CASCADE_APP_CONFIG names"
         );
     }
 
