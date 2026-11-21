@@ -800,7 +800,11 @@ impl StatsContext {
     /// process, each keep their own series. They are emitted from the first
     /// statistics callback on, which names the client.
     ///
-    /// Per-partition metrics are bounded by `max_partitions` (default 256).
+    /// Per-partition series are bounded to 256 partitions per client: the
+    /// lowest by topic name, then partition number. The same partitions report
+    /// on every call, so a series never comes and goes with the order the
+    /// statistics arrive in.
+    ///
     /// A context that has served a rebalance also sets
     /// `consumer_partitions_assigned` to the partitions it holds, and
     /// `consumer_lag{topic,partition}` to each one's lag. Both carry
@@ -848,12 +852,7 @@ impl StatsContext {
                 .set(broker.waitresp_cnt as f64);
         }
 
-        // Per-partition consumer lag (capped at 256 partitions for cardinality safety)
-        let max_partitions = 256;
-        for (i, ((topic, partition), lag)) in m.partition_lag.iter().enumerate() {
-            if i >= max_partitions {
-                break;
-            }
+        for ((topic, partition), lag) in lowest_partitions(&m.partition_lag) {
             client
                 .gauge(PARTITION_LAG, partition_labels(topic, *partition))
                 .set(*lag as f64);
@@ -864,10 +863,7 @@ impl StatsContext {
             }
         }
 
-        for (i, ((topic, partition), offset)) in m.partition_committed.iter().enumerate() {
-            if i >= max_partitions {
-                break;
-            }
+        for ((topic, partition), offset) in lowest_partitions(&m.partition_committed) {
             client
                 .gauge(PARTITION_COMMITTED, partition_labels(topic, *partition))
                 .set(*offset as f64);
@@ -880,6 +876,24 @@ impl StatsContext {
                 .set(m.rebalance_count as f64);
         }
     }
+}
+
+/// Most partitions one client publishes per-partition series for, which bounds
+/// the label cardinality a consumer of many partitions adds.
+#[cfg(feature = "metrics")]
+const MAX_PARTITION_SERIES: usize = 256;
+
+/// The entries of `series` that get a series: all of them up to
+/// `MAX_PARTITION_SERIES`, and past it the lowest by topic name and then
+/// partition number, in no particular order.
+#[cfg(feature = "metrics")]
+fn lowest_partitions<V>(series: &HashMap<(String, i32), V>) -> Vec<(&(String, i32), &V)> {
+    let mut entries: Vec<(&(String, i32), &V)> = series.iter().collect();
+    if entries.len() > MAX_PARTITION_SERIES {
+        entries.select_nth_unstable_by(MAX_PARTITION_SERIES, |a, b| a.0.cmp(b.0));
+        entries.truncate(MAX_PARTITION_SERIES);
+    }
+    entries
 }
 
 /// Per-partition lag from librdkafka's statistics.
@@ -1800,6 +1814,108 @@ mod tests {
                 consumer_lag: 50 - committed,
                 ..Default::default()
             })
+        }
+
+        /// Statistics for each `(topic, count)` in `topics`: partitions
+        /// `0..count`, every one committed to 5 with the end at 20.
+        fn partitions_of(topics: &[(&str, i32)]) -> Statistics {
+            let partition = |id: i32| rdkafka::statistics::Partition {
+                partition: id,
+                app_offset: 20,
+                committed_offset: 5,
+                hi_offset: 20,
+                ls_offset: 20,
+                consumer_lag: 15,
+                ..Default::default()
+            };
+            let topics = topics
+                .iter()
+                .map(|(name, count)| {
+                    let topic = rdkafka::statistics::Topic {
+                        topic: (*name).to_string(),
+                        partitions: (0..*count).map(|id| (id, partition(id))).collect(),
+                        ..Default::default()
+                    };
+                    ((*name).to_string(), topic)
+                })
+                .collect();
+            Statistics {
+                topics,
+                ..Default::default()
+            }
+        }
+
+        /// The `(topic, partition)` each series of `name` is for, sorted.
+        fn partitions_published(capture: &GaugeCapture, name: &str) -> Vec<(String, i32)> {
+            let mut found: Vec<(String, i32)> = capture
+                .series(name)
+                .into_iter()
+                .map(|(labels, _)| {
+                    let label = |key: &str| {
+                        labels
+                            .iter()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, v)| v.clone())
+                            .expect("a per-partition series has a topic and a partition")
+                    };
+                    (
+                        label("topic"),
+                        label("partition").parse().expect("a number"),
+                    )
+                })
+                .collect();
+            found.sort();
+            found
+        }
+
+        /// A client with more partitions than the series cap publishes the
+        /// lowest `(topic, partition)` pairs, the same ones on every call.
+        /// `HashMap` order differs per map, so a cap that took the first
+        /// entries it met would publish a different 256 each time.
+        #[test]
+        fn past_the_series_cap_the_lowest_partitions_report() {
+            let want: Vec<(String, i32)> = (0..200)
+                .map(|id| ("alpha".to_string(), id))
+                .chain((0..56).map(|id| ("beta".to_string(), id)))
+                .collect();
+            for _ in 0..5 {
+                let capture = GaugeCapture::default();
+                let context = StatsContext::new();
+                metrics::with_local_recorder(&capture, || {
+                    context.stats(from_client(
+                        "loader",
+                        "consumer",
+                        1,
+                        partitions_of(&[("beta", 150), ("alpha", 200)]),
+                    ));
+                });
+                for series in [
+                    "rdkafka_topic_partition_consumer_lag",
+                    "rdkafka_topic_partition_committed_offset",
+                ] {
+                    assert_eq!(partitions_published(&capture, series), want, "{series}");
+                }
+            }
+        }
+
+        /// A client at or under the cap publishes every partition.
+        #[test]
+        fn at_the_series_cap_every_partition_reports() {
+            let capture = GaugeCapture::default();
+            let context = StatsContext::new();
+            metrics::with_local_recorder(&capture, || {
+                context.stats(from_client(
+                    "loader",
+                    "consumer",
+                    1,
+                    partitions_of(&[("events", 256)]),
+                ));
+            });
+            let want: Vec<(String, i32)> = (0..256).map(|id| ("events".to_string(), id)).collect();
+            assert_eq!(
+                partitions_published(&capture, "rdkafka_topic_partition_consumer_lag"),
+                want
+            );
         }
 
         /// Two consumers in one process, in different groups, each publish
