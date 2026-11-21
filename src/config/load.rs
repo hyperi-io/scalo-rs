@@ -42,8 +42,10 @@ use crate::yaml::{self, Profile};
 /// The global cascade is also set up, with the file as its settings layer, so
 /// the sections the scalo runtime reads (`metrics`, `version_check`, ...)
 /// resolve from the same file. A later call, such as a reload, keeps the
-/// first cascade. `.env` is read only when no `path` is given, so a working
-/// tree's `.env` never reaches a deployment that names its file.
+/// first cascade. `.env` and the standard config locations (the working
+/// directory, `/config/` and the user's `~/.config/`) are read only when no
+/// `path` is given, so nothing outside the named file reaches a deployment
+/// that names it.
 ///
 /// Step 1 round-trips `T` through `Serialize` when a prefixed variable is set,
 /// with secrets exposed for the round trip. A `#[serde(skip)]` field comes back
@@ -61,6 +63,7 @@ where
     let options = ConfigOptions {
         env_prefix: env_prefix.to_string(),
         config_paths: path.map(PathBuf::from).into_iter().collect(),
+        search_standard_paths: path.is_none(),
         load_dotenv: path.is_none(),
         ..ConfigOptions::default()
     };

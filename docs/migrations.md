@@ -6,6 +6,16 @@ release and the target before bumping.
 
 ---
 
+## 2.14.33
+
+### A named config file is the only config file read (BEHAVIOUR CHANGE)
+
+`ConfigOptions` has a new field, `search_standard_paths`, default true, which turns off the search of the working directory, `./config/`, `/config/` and `~/.config/<app_name>/`. `CommonArgs::to_config_options`, `config::load_typed` and `flat_env::load_config` set it false when a file is named, as they do `load_dotenv`, so a service started with `--config` no longer merges a `settings.yaml`, `defaults.yaml` or `settings.{env}.yaml` found in those places under its file. Under `run_app` the first cascade set up wins, so this holds for every service that names its file.
+
+**Consumer adjustment** -- none for a deployed service whose files sit only at the path it names. A local run that relied on a `settings.yaml` beside a named file moves those keys into the file. A literal `ConfigOptions { .. }` with no `..Default::default()` adds `search_standard_paths: true` to keep its behaviour.
+
+---
+
 ## 2.14.32
 
 ### A pipeline sink hands refused records back to the DLQ (additive)
