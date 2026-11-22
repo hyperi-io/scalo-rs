@@ -949,7 +949,7 @@ mod tests {
             ..TransportFilterTierConfig::default()
         };
         // (expression, payload, dropped)
-        let cases: [(&str, &[u8], bool); 6] = [
+        let cases: [(&str, &[u8], bool); 7] = [
             (
                 r#"source.name == "dns" && event.n > 5"#,
                 br#"{"source":{"name":"dns"},"event":{"n":7}}"#,
@@ -978,6 +978,12 @@ mod tests {
             (
                 r#"severity > 3 && source != "internal""#,
                 br#"{"severity":5,"source":"internal"}"#,
+                false,
+            ),
+            // A record without the root declares no variable, so the rule cannot match and it passes.
+            (
+                r#"source.name == "dns" && event.n > 5"#,
+                br#"{"event":{}}"#,
                 false,
             ),
         ];
