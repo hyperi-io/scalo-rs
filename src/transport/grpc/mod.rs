@@ -350,6 +350,13 @@ pub(crate) fn lazy_channel(
     ep.connect_with_connector_lazy(tcp)
 }
 
+/// The connections the receive server accepts, each with TCP_NODELAY on as the
+/// client sets it, so a small HTTP/2 frame is not held back waiting for a
+/// delayed ACK.
+fn accepting(listener: tokio::net::TcpListener) -> tonic::transport::server::TcpIncoming {
+    tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true))
+}
+
 /// gRPC transport for inter-service communication.
 ///
 /// Implements both `TransportSender` and `TransportReceiver`, so it also
@@ -802,10 +809,7 @@ impl GrpcTransport {
             local_addr = Some(listener.local_addr().map_err(|e| {
                 TransportError::Config(format!("cannot read the address bound for {addr}: {e}"))
             })?);
-            // TCP_NODELAY on every accepted socket, as the client sets it, so a
-            // small HTTP/2 frame is not held back waiting for a delayed ACK.
-            let incoming =
-                tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+            let incoming = accepting(listener);
 
             let handle = tokio::spawn(async move {
                 router
@@ -1924,6 +1928,29 @@ pub(crate) mod test_peers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_receive_server_sets_tcp_nodelay_on_an_accepted_connection() {
+        use tokio_stream::StreamExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        let mut incoming = accepting(listener);
+        let _client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the listener");
+        let accepted = incoming
+            .next()
+            .await
+            .expect("a connection is accepted")
+            .expect("the accept succeeds");
+        assert!(
+            accepted.nodelay().expect("read TCP_NODELAY"),
+            "Nagle is on for an accepted connection"
+        );
+    }
 
     #[test]
     fn grpc_token_display() {
