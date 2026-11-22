@@ -1,6 +1,6 @@
 # Delivery path
 
-How a caller's batch reaches its destinations, the alternatives that were benched, and what the numbers decided. Today's behaviour is the first approach below. Parallel fan-out is a parked design, and the fan-in buffer for gRPC destinations is being benched.
+How a caller's batch reaches its destinations, the alternatives that were benched, and what the numbers decided. Today's behaviour is the first approach below, with the fan-in buffer in front of each gRPC destination. Parallel fan-out is a parked design.
 
 ---
 
@@ -45,6 +45,9 @@ The loads are defined in `benches/delivery_path/loads.rs`.
 | W5 | W3 with one destination down |
 | W6 | W3 with the Kafka queue filling in bursts |
 | W7 | W2 with one refused record per batch |
+| W1g | 512 callers, 1 record of 200 B each, one gRPC destination |
+| W2g | 8 callers, 1000 records of 1 KiB each, one gRPC destination |
+| W3g | W1g and W2g together |
 
 The rule, fixed before the runs: a change replaces today's send when multi-destination p99 improves and no load regresses more than 5%. A merge stage is adopted for gRPC only when W1 gains at least 20%, W2 loses no more than 5% and peak held bytes grow no more than 10%. A difference inside the run-to-run spread decides nothing. The no-regression half was later judged on a paired 95% interval over 30 rounds, which is tighter than the spread test.
 
@@ -103,4 +106,38 @@ It comes back for a deploy that routes one batch to 2 or more destinations and h
 
 ## Fan-in buffer for gRPC destinations
 
-The merge stage above is one fan-in design, and it was rejected. A separate fan-in buffer for gRPC destinations is being benched, and its results and decision go here when that bench lands.
+Status: built, on by default. The keys are under `<key>.grpc.coalesce` (see [gRPC](grpc.md)).
+
+Fan-in is many callers each sending a small block to one gRPC destination, such as a receiver taking many small HTTP requests. Without the buffer each `send_batch` is its own `RouteBatch` call.
+
+The buffer sends what is queued the moment a call slot frees:
+
+- Up to `in_flight` (4) calls run at once per destination.
+- A freed slot takes the next block and every block queued behind it, up to `max_batch_bytes` (64 KiB) or `max_message_size`, whichever is less, encoded. There's no timer.
+- A block at or over that cap goes straight out.
+- At low load a slot is free, so a block goes out at once. Under load blocks queue while the slots are busy, and batch that way.
+
+It differs from the rejected merge stage in two ways: several calls run per destination at once, and no block waits on a window.
+
+Delivery stays at-least-once. A caller is answered when the call carrying its records returns. A call that fails for now fails every caller in it, and each sends again: copies, never loss. A call refused for good, or answered `ResourceExhausted`, sends each block again on its own. Queued payload is capped at 4 x `max_batch_bytes` per destination. A caller waits for room, and a block still untaken at `send_timeout_ms` is withdrawn and answered `Backpressured`. Dead letters come out of each block before it joins, so `FilteredDlq` goes only to a caller whose block had them.
+
+Tier 2, the listener in its own process, loopback plaintext, medians of 10 runs with a control run each:
+
+| Load | today's send | buffer (64 KiB, 4 in flight) |
+| --- | --- | --- |
+| W1g closed, rec/s | 32597 | 545674 |
+| W1g closed, p99 ms | 17.16 | 1.50 |
+| W1g half load, p99 ms | 2.89 | 2.32 |
+| W2g closed, rec/s | 697503 | 716606 (ns, control 716295) |
+| W3g closed, rec/s | 222024 | 673148 |
+| W3g closed, p99 ms | 36.33 | 15.07 |
+| W1g closed, listener CPU us/rec | 53.1 | 2.2 |
+
+The same runs set the defaults:
+
+- 8 calls in flight gave 490491 rec/s on W1g closed, and 128 KiB gave 519114. Both are below 4 and 64 KiB.
+- A 0.5 ms linger raised W1g half-load p99 to 4.07 ms, because tokio rounds a timer up to its next 1 ms tick. It did better on W3g closed (701303 rec/s, p99 12.09 ms), but low load is the common case, so there is no linger key.
+
+Not measured: TLS, a network round trip, and the blocks per call. The batching under load is read from the throughput and listener CPU figures.
+
+`coalesce.enabled: false` sends each `send_batch` as its own call.
