@@ -1171,20 +1171,20 @@ impl TransportSender for GrpcTransport {
     ///
     /// ## Joined calls
     ///
-    /// With `coalesce.enabled` (the default), a block under
-    /// `coalesce.max_batch_bytes` of payload waits for one of
-    /// `coalesce.in_flight` call slots and goes out in one `RouteBatch` with
-    /// the blocks queued behind it, within `max_message_size`. The result is
-    /// that call's, given once the call returns: a call that fails for now
-    /// fails every block in it, and each caller sends again. When the receiver
-    /// refuses a call of several blocks for good, each block is sent again on
-    /// its own and gets its own answer. A block the stage has no room for
-    /// waits for room. One `send_timeout_ms` from the start of `send_batch`
-    /// bounds the wait for room and a slot, the call and any resend, and past
-    /// it the result is `Backpressured`. A block whose caller is dropped
-    /// before the stage takes it is not sent. A block sent on its own, at or
-    /// over `max_batch_bytes` or with joining off, has `send_timeout_ms` per
-    /// request, as before.
+    /// With `coalesce.enabled` (the default), a block under the least of
+    /// `coalesce.max_batch_bytes` and `max_message_size`, encoded, waits for one
+    /// of `coalesce.in_flight` call slots and goes out in one `RouteBatch` with
+    /// the blocks queued behind it, within the same cap. The result is that
+    /// call's, given once the call returns: a call that fails for now fails
+    /// every block in it, and each caller sends again. When the receiver
+    /// refuses a call of several blocks for good, each block goes again on its
+    /// own through the same slots and gets its own answer. A block the stage
+    /// has no room for waits for room. One `send_timeout_ms` from the start of
+    /// `send_batch` bounds the wait for room and a slot, the call and any
+    /// resend, and past it, or once the transport closes, the result is
+    /// `Backpressured`. A block whose caller is dropped before the stage takes
+    /// it is not sent. A block at the cap or over it, or any block with joining
+    /// off, goes on its own with `send_timeout_ms` per request, as before.
     ///
     /// ## Atomic (all-or-nothing) acceptance
     ///
@@ -1230,15 +1230,12 @@ impl TransportSender for GrpcTransport {
             return handled;
         }
 
-        let (result, left_out) = match &self.coalesce {
-            Some(stage) if stage.joins(&to_send) => {
-                self.send_joined(stage, wire, records, to_send).await
-            }
-            _ => {
-                // A block over the ceiling goes as several requests in order.
-                let (batches, left_out) = batches_within(to_send, self.max_message_size);
-                (wire.send_bodies(batches).await, left_out)
-            }
+        let (result, left_out) = if let Some(stage) = &self.coalesce {
+            self.send_joined(stage, wire, to_send).await
+        } else {
+            // A block over the ceiling goes as several requests in order.
+            let (batches, left_out) = batches_within(to_send, self.max_message_size);
+            (wire.send_bodies(batches).await, left_out)
         };
         if !result.is_ok() {
             return result;
@@ -1283,6 +1280,7 @@ impl TransportSender for GrpcTransport {
 }
 
 /// A record as a field of a `Batch` body, and the bytes it adds to the body.
+#[derive(Clone)]
 struct Framed {
     record: proto::Record,
     len: usize,
@@ -1408,41 +1406,27 @@ impl GrpcTransport {
         (to_send, handled)
     }
 
-    /// Send `to_send`, the filtered `records`, in a call joined with the
-    /// blocks queued beside it, all within one `send_timeout_ms` from here.
-    /// Returns the result and the records left out for size.
+    /// Send `to_send` in a call joined with the blocks queued beside it, all
+    /// within one `send_timeout_ms` from here, or on its own when it is too
+    /// large to join. Returns the result and the records left out for size.
     async fn send_joined(
         &self,
         stage: &coalesce::Coalescer,
         wire: &Wire,
-        records: &[Record],
         to_send: Vec<Record>,
     ) -> (SendResult, u64) {
-        let deadline = coalesce::Deadline::after(wire.send_timeout_ms);
         // Records over the ceiling on their own are left out here, so a joined
         // call carries only records within max_message_size.
         let (framed, left_out) = framed_within(to_send, self.max_message_size);
-        let result = match stage.send(framed, deadline).await {
-            coalesce::Joined::Answered(result) => result,
-            coalesce::Joined::Alone => self.send_alone(wire, records, deadline).await,
+        let result = if stage.joins(&framed) {
+            let deadline = coalesce::Deadline::after(wire.send_timeout_ms);
+            stage.send(framed, deadline).await
+        } else {
+            // A block over the ceiling goes as several requests in order.
+            wire.send_bodies(bodies_within(framed, self.max_message_size))
+                .await
         };
         (result, left_out)
-    }
-
-    /// Send `records` again as a block of their own, as the direct path does,
-    /// within what is left of `deadline`.
-    async fn send_alone(
-        &self,
-        wire: &Wire,
-        records: &[Record],
-        deadline: coalesce::Deadline,
-    ) -> SendResult {
-        let (to_send, _) = self.outbound(records);
-        let (batches, _) = batches_within(to_send, self.max_message_size);
-        deadline
-            .bound(wire.send_bodies(batches))
-            .await
-            .unwrap_or_else(coalesce::timed_out)
     }
 }
 
@@ -1579,9 +1563,15 @@ impl TransportBase for GrpcTransport {
     /// in-flight RPCs on their own, and the listener is free when this
     /// returns. Waits for a `recv` in progress (at most `recv_timeout_ms`).
     /// Idempotent.
+    ///
+    /// On the send side, the joined calls in flight are stopped, and every
+    /// `send_batch` still waiting on one is answered `Backpressured`.
     async fn close(&self) -> TransportResult<()> {
         let first = !self.closed.swap(true, Ordering::AcqRel);
         self.healthy.store(false, Ordering::Relaxed);
+        if let Some(stage) = &self.coalesce {
+            stage.close();
+        }
 
         // The slot first: once recv sees the channel closed, nothing more can
         // land in the slot.

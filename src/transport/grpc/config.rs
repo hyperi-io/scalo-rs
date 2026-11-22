@@ -111,9 +111,9 @@ pub struct GrpcConfig {
 /// call.
 ///
 /// When a call slot is free, the next queued block goes out with every block
-/// queued behind it, up to `max_batch_bytes` of payload and `max_message_size`
-/// encoded, with no timer. A block of `max_batch_bytes` or more is sent at once
-/// on its own. `send_timeout_ms` bounds the wait for a slot too.
+/// queued behind it, up to `max_batch_bytes` and `max_message_size` encoded,
+/// with no timer. A block at that cap or over it is sent at once on its own.
+/// `send_timeout_ms` bounds the wait for a slot too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
@@ -121,7 +121,7 @@ pub struct CoalesceConfig {
     /// Join blocks. `false` sends every `send_batch` as its own call.
     pub enabled: bool,
 
-    /// Most payload bytes one joined call carries.
+    /// Most bytes one joined call carries, encoded.
     pub max_batch_bytes: u64,
 
     /// Calls in flight to the endpoint at once, joined calls only.
