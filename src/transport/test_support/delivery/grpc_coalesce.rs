@@ -29,8 +29,9 @@
 //! no room waits for it, and nothing is dropped. The bytes are the callers' own,
 //! leased by each caller until it is answered. A caller that is cancelled
 //! releases its lease, and its block is dropped if the stage has not taken it.
-//! tokio's timer fires on whole milliseconds, so a linger under 1 ms waits at
-//! most 1 ms.
+//! tokio's timer fires on whole milliseconds, so a linger under 1 ms waits up
+//! to 1 ms. A linger of zero takes no timer: the stage sends the first block
+//! and whatever is queued behind it as soon as a slot is free.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -297,7 +298,8 @@ async fn run_stage<S: TransportSender + 'static>(
                 taken.push(item);
             }
         }
-        if bytes < flush.target_bytes {
+        // A timer for "now" still waits for the next timer tick, so a zero linger skips it.
+        if bytes < flush.target_bytes && !flush.linger.is_zero() {
             let wait = tokio::time::sleep_until(deadline);
             tokio::pin!(wait);
             while bytes < flush.target_bytes {

@@ -616,6 +616,10 @@ mod tests {
         assert_eq!(c.target_bytes, 65536);
         assert_eq!(c.linger, std::time::Duration::from_micros(500));
         assert_eq!(c.in_flight, 8);
+        let Some(AnyApproach::GrpcCoalesce(zero)) = approach("grpc_coalesce/t65536/l0/n4") else {
+            panic!("a zero linger parses");
+        };
+        assert!(zero.linger.is_zero());
         for bad in [
             "grpc_coalesce/t0",
             "grpc_coalesce/n0",

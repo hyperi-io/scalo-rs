@@ -990,3 +990,29 @@ async fn grpc_coalesce_sends_a_block_at_the_target_by_its_caller_without_queuein
     );
     assert_eq!(approach.peak_queued_bytes(), Some(0));
 }
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_sends_a_block_at_once_when_its_linger_is_zero() {
+    let g = ShapedSender::new("g", grpc(0));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(1 << 20, 0, 4);
+    // Part way into a millisecond, where a timer for "now" is rounded up to the next tick.
+    tokio::time::advance(Duration::from_micros(500)).await;
+    let start = Instant::now();
+    let outcomes = approach
+        .deliver(
+            &set,
+            CallerBatch {
+                records: vec![record("a", &route)],
+                answer: Answer::Held,
+            },
+        )
+        .await;
+    assert_eq!(outcomes, [Outcome::Sent]);
+    assert_eq!(
+        start.elapsed(),
+        Duration::ZERO,
+        "waited with a linger of zero"
+    );
+}
