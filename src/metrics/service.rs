@@ -139,6 +139,10 @@ impl ServiceMetrics {
             "Records the joined gRPC calls carried"
         );
         metrics::describe_counter!(
+            "transport_coalesced_timeouts_total",
+            "gRPC send_batch blocks answered at send_timeout_ms before their joined call did"
+        );
+        metrics::describe_counter!(
             "transport_consumer_rebuilds_total",
             "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with"
         );
@@ -226,6 +230,12 @@ impl ServiceMetrics {
             (
                 "transport_coalesced_records_total",
                 "Records the joined gRPC calls carried",
+                MetricType::Counter,
+                &["transport"],
+            ),
+            (
+                "transport_coalesced_timeouts_total",
+                "gRPC send_batch blocks answered at send_timeout_ms before their joined call did",
                 MetricType::Counter,
                 &["transport"],
             ),

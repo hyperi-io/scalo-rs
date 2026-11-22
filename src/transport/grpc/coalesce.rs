@@ -15,18 +15,22 @@
 //! one call. It sets no timer, so a block that finds a slot free goes out at once.
 //!
 //! A caller is answered once the call carrying its records returns, with that
-//! call's result: a failed call fails every caller in it, and each sends again.
-//! A caller still unanswered at `send_timeout_ms` is answered `Backpressured`.
-//! Queued payload is capped at `ROOM_TARGETS` times `max_batch_bytes`, so a
-//! caller that finds no room waits for it, and nothing is dropped. A block whose
-//! caller has gone is dropped if the stage has not taken it yet.
+//! call's result: a call that fails for now fails every caller in it, and each
+//! sends again. A call of several blocks the receiver refuses for good sends
+//! each caller back to send its block on its own, so one block's refusal stays
+//! its own. A caller still unanswered at its deadline is answered
+//! `Backpressured`. Queued blocks are capped at `ROOM_TARGETS` times
+//! `max_batch_bytes`, counted encoded, so a caller that finds no room waits for
+//! it, and nothing is dropped. A block whose caller has gone is dropped if the
+//! stage has not taken it yet.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 use super::config::CoalesceConfig;
 use super::{Framed, Wire, bodies_within};
@@ -34,11 +38,51 @@ use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::types::SendResult;
 use crate::transport::work_batch::Record;
 
-/// Payload the stage holds queued, in multiples of `max_batch_bytes`.
+/// Room the stage holds for queued blocks, in multiples of `max_batch_bytes`.
 const ROOM_TARGETS: u64 = 4;
 
 /// Blocks the stage holds queued at once, whatever their bytes.
 const QUEUED_BLOCKS: usize = 4096;
+
+/// The least room a queued block takes, for the queue entry it holds whatever
+/// its records weigh.
+const MIN_BLOCK_BYTES: u64 = 64;
+
+/// When a joined `send_batch` gives up: `send_timeout_ms` after it starts, or
+/// never when that is 0.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Deadline(Option<Instant>);
+
+impl Deadline {
+    pub(super) fn after(send_timeout_ms: u64) -> Self {
+        Self((send_timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(send_timeout_ms)))
+    }
+
+    /// `work`'s output, or `None` once the deadline has passed.
+    pub(super) async fn bound<T>(self, work: impl Future<Output = T>) -> Option<T> {
+        match self.0 {
+            None => Some(work.await),
+            Some(at) => tokio::time::timeout_at(at, work).await.ok(),
+        }
+    }
+}
+
+/// The answer to a caller whose deadline passed: `Backpressured`, so it sends
+/// again, counted as a wait that ran out rather than as a failed call.
+pub(super) fn timed_out() -> SendResult {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("transport_coalesced_timeouts_total", "transport" => "grpc").increment(1);
+    SendResult::Backpressured
+}
+
+/// What the stage tells a caller about the call that carried its block.
+pub(super) enum Joined {
+    /// The call's result.
+    Answered(SendResult),
+    /// The receiver refused, for good, a call that carried other blocks too,
+    /// so the caller sends its block again on its own for an answer of its own.
+    Alone,
+}
 
 /// What a stage joins blocks up to.
 #[derive(Debug, Clone, Copy)]
@@ -51,10 +95,14 @@ struct Limits {
 /// One caller's block, queued.
 struct Item {
     records: Vec<Framed>,
+    /// Payload bytes.
     bytes: u64,
     /// The records' encoded length as fields of a `Batch` body.
     framed: usize,
-    reply: oneshot::Sender<SendResult>,
+    /// Room in the queue the block holds: its encoded length, at least
+    /// `MIN_BLOCK_BYTES`.
+    charge: u64,
+    reply: oneshot::Sender<Joined>,
     /// Room in the queue, given back when the stage takes the block.
     room: Option<OwnedSemaphorePermit>,
     /// The caller's trace context, which a call its block opens is sent under.
@@ -68,6 +116,7 @@ pub(super) struct Coalescer {
     room: Arc<Semaphore>,
     /// Permits `room` was made with, one per byte.
     room_bytes: u64,
+    /// Room the queued blocks hold now.
     queued: Arc<AtomicU64>,
     limits: Limits,
     /// Sends a block itself once the stage task has gone.
@@ -127,46 +176,39 @@ impl Coalescer {
         bytes < self.limits.max_batch_bytes
     }
 
-    /// Send `records` in the next call a slot frees for, and return that call's
-    /// result once it returns, or `Backpressured` at `send_timeout_ms`.
-    pub(super) async fn send(&self, records: Vec<Framed>) -> SendResult {
+    /// Send `records` in the next call a slot frees for, and return what that
+    /// call answers once it returns. Past `deadline` the answer is
+    /// `Backpressured`, and a block already in a call is still sent, so the
+    /// caller's resend can duplicate it.
+    pub(super) async fn send(&self, records: Vec<Framed>, deadline: Deadline) -> Joined {
         if records.is_empty() {
-            return SendResult::Ok;
+            return Joined::Answered(SendResult::Ok);
         }
-        let submitted = self.submit(records);
-        let limit_ms = self.wire.send_timeout_ms;
-        let outcome = if limit_ms == 0 {
-            submitted.await
-        } else if let Ok(outcome) =
-            tokio::time::timeout(Duration::from_millis(limit_ms), submitted).await
-        {
-            outcome
-        } else {
-            // Answered as a call past its deadline is. A block already in a call
-            // is still sent, so the caller's resend can duplicate it.
-            return super::failed_rpc_result(&tonic::Status::deadline_exceeded(format!(
-                "no answer within send_timeout_ms ({limit_ms} ms), the wait for a call slot \
-                 included"
-            )));
-        };
-        match outcome {
-            Ok(result) => result,
-            // The stage task has gone, so the block goes out on its own.
-            Err(records) => {
-                self.wire
-                    .send_bodies(bodies_within(records, self.limits.max_message_size))
-                    .await
+        let sent = async move {
+            match self.submit(records).await {
+                Ok(joined) => joined,
+                // The stage task has gone, so the block goes out on its own.
+                Err(records) => Joined::Answered(
+                    self.wire
+                        .send_bodies(bodies_within(records, self.limits.max_message_size))
+                        .await,
+                ),
             }
-        }
+        };
+        deadline
+            .bound(sent)
+            .await
+            .unwrap_or_else(|| Joined::Answered(timed_out()))
     }
 
-    /// Queue `records` and wait for the result of the call that carries them.
+    /// Queue `records` and wait for the answer of the call that carries them.
     /// `Err` hands them back when the stage task has gone.
-    async fn submit(&self, records: Vec<Framed>) -> Result<SendResult, Vec<Framed>> {
+    async fn submit(&self, records: Vec<Framed>) -> Result<Joined, Vec<Framed>> {
         let bytes: u64 = records.iter().map(|r| r.record.payload.len() as u64).sum();
         let framed: usize = records.iter().map(|r| r.len).sum();
         // Capped at the whole room, so a block always fits once the room drains.
-        let permits = u32::try_from(bytes.min(self.room_bytes)).unwrap_or(u32::MAX);
+        let charge = (framed as u64).max(MIN_BLOCK_BYTES).min(self.room_bytes);
+        let permits = u32::try_from(charge).unwrap_or(u32::MAX);
         let Ok(room) = Arc::clone(&self.room).acquire_many_owned(permits).await else {
             return Err(records);
         };
@@ -174,11 +216,12 @@ impl Coalescer {
             return Err(records);
         };
         let (reply, answer) = oneshot::channel();
-        self.queued.fetch_add(bytes, Ordering::AcqRel);
+        self.queued.fetch_add(charge, Ordering::AcqRel);
         slot.send(Item {
             records,
             bytes,
             framed,
+            charge,
             reply,
             room: Some(room),
             #[cfg(feature = "transport-trace")]
@@ -186,11 +229,14 @@ impl Coalescer {
         });
         // Unanswered only when the call's task was dropped mid-call, and the
         // records may have been sent, so the caller sends them again.
-        Ok(answer.await.unwrap_or(SendResult::Backpressured))
+        Ok(answer
+            .await
+            .unwrap_or(Joined::Answered(SendResult::Backpressured)))
     }
 }
 
 impl Drop for Coalescer {
+    /// Stops the stage and, with it, the calls it has in flight.
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -200,9 +246,12 @@ impl Drop for Coalescer {
 /// has dropped and the queue is empty.
 async fn run(wire: Wire, mut blocks: mpsc::Receiver<Item>, queued: Arc<AtomicU64>, limits: Limits) {
     let slots = Arc::new(Semaphore::new(limits.in_flight));
+    // Owned here, so aborting this task aborts the calls in flight too.
+    let mut calls: JoinSet<()> = JoinSet::new();
     // A block that did not fit the last call, still holding its room.
     let mut carried: Option<Item> = None;
     loop {
+        while calls.try_join_next().is_some() {}
         let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
             return;
         };
@@ -226,7 +275,7 @@ async fn run(wire: Wire, mut blocks: mpsc::Receiver<Item>, queued: Arc<AtomicU64
                 taken.push(item);
             }
         }
-        tokio::spawn(send_taken(
+        calls.spawn(send_taken(
             wire.clone(),
             slot,
             taken,
@@ -255,13 +304,13 @@ async fn next_live(
 /// Count `item` out of the queue and give its room back. `None`, the block
 /// unsent, when its caller has gone.
 fn leave_queue(mut item: Item, queued: &AtomicU64) -> Option<Item> {
-    queued.fetch_sub(item.bytes, Ordering::AcqRel);
+    queued.fetch_sub(item.charge, Ordering::AcqRel);
     item.room = None;
     (!item.reply.is_closed()).then_some(item)
 }
 
 /// Send the taken blocks as one call, give its slot back, and answer every
-/// caller in it with the call's result.
+/// caller in it.
 async fn send_taken(
     wire: Wire,
     slot: OwnedSemaphorePermit,
@@ -292,16 +341,23 @@ async fn send_taken(
     answer(replies, result);
 }
 
-/// Answer every caller in a call with its result. A caller that has gone needs
-/// no answer.
-fn answer(replies: Vec<oneshot::Sender<SendResult>>, result: SendResult) {
+/// Answer every caller in a call. A refusal for good of a call of several
+/// blocks may be one block's alone, so each caller sends its own again. A
+/// caller that has gone needs no answer.
+fn answer(replies: Vec<oneshot::Sender<Joined>>, result: SendResult) {
+    if replies.len() > 1 && result.is_fatal() {
+        for reply in replies {
+            let _ = reply.send(Joined::Alone);
+        }
+        return;
+    }
     let mut replies = replies.into_iter();
     let last = replies.next_back();
     for reply in replies {
-        let _ = reply.send(copy_of(&result));
+        let _ = reply.send(Joined::Answered(copy_of(&result)));
     }
     if let Some(reply) = last {
-        let _ = reply.send(result);
+        let _ = reply.send(Joined::Answered(result));
     }
 }
 
@@ -340,7 +396,7 @@ mod tests {
     use tokio::task::JoinHandle;
     use tonic::{Request, Response, Status};
 
-    use super::super::batch::records_to_proto;
+    use super::super::batch::{record_to_proto, records_to_proto};
     use super::super::proto;
     use super::super::{CoalesceConfig, GrpcConfig, GrpcTransport};
     use crate::transport::error::TransportError;
@@ -358,6 +414,8 @@ mod tests {
         Accept,
         Unavailable,
         Refuse,
+        /// Refuse a request carrying a record whose payload starts with `!`.
+        RefuseMarked,
     }
 
     /// The calls a recording receive server took, and the gate its answers
@@ -367,9 +425,22 @@ mod tests {
         arrived: watch::Sender<usize>,
         in_flight: AtomicUsize,
         peak: AtomicUsize,
+        /// Calls the client dropped before they were answered.
+        dropped: AtomicUsize,
         /// One permit answers one call.
         gate: Semaphore,
         reply: parking_lot::Mutex<Reply>,
+    }
+
+    /// Counts a call in `Calls::dropped` unless it is answered.
+    struct Unanswered<'a>(Option<&'a AtomicUsize>);
+
+    impl Drop for Unanswered<'_> {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.0 {
+                dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     impl Calls {
@@ -427,22 +498,28 @@ mod tests {
             let calls = &self.0;
             let batch = request.into_inner();
             let accepted = batch.records.len() as u64;
+            let marked = batch.records.iter().any(|r| r.payload.starts_with(b"!"));
             let now = calls.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             calls.peak.fetch_max(now, Ordering::SeqCst);
             calls.batches.lock().push(batch);
             calls.arrived.send_modify(|n| *n += 1);
+            let mut unanswered = Unanswered(Some(&calls.dropped));
             calls
                 .gate
                 .acquire()
                 .await
                 .expect("the gate is never closed")
                 .forget();
+            unanswered.0 = None;
             calls.in_flight.fetch_sub(1, Ordering::SeqCst);
             let reply = *calls.reply.lock();
             match reply {
                 Reply::Accept => Ok(Response::new(proto::BatchAck { accepted })),
+                Reply::RefuseMarked if !marked => Ok(Response::new(proto::BatchAck { accepted })),
                 Reply::Unavailable => Err(Status::unavailable("receiver busy")),
-                Reply::Refuse => Err(Status::invalid_argument("block refused")),
+                Reply::Refuse | Reply::RefuseMarked => {
+                    Err(Status::invalid_argument("block refused"))
+                }
             }
         }
 
@@ -472,6 +549,7 @@ mod tests {
             arrived: watch::channel(0).0,
             in_flight: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
             gate: Semaphore::new(permits),
             reply: parking_lot::Mutex::new(Reply::Accept),
         });
@@ -528,7 +606,7 @@ mod tests {
         tokio::spawn(async move { sender.send_batch(&records).await })
     }
 
-    /// Payload bytes queued in `sender`'s stage.
+    /// Room the blocks queued in `sender`'s stage hold.
     fn queued(sender: &GrpcTransport) -> u64 {
         sender
             .coalesce
@@ -536,6 +614,18 @@ mod tests {
             .expect("the sender joins blocks")
             .queued
             .load(Ordering::Acquire)
+    }
+
+    /// Blocks queued in `sender`'s stage, counted by the queue itself.
+    fn queued_blocks(sender: &GrpcTransport) -> usize {
+        let stage = sender.coalesce.as_ref().expect("the sender joins blocks");
+        stage.queue.max_capacity() - stage.queue.capacity()
+    }
+
+    /// The room a block of `record` alone takes.
+    fn charge(record: Record) -> u64 {
+        let framed = prost::encoding::message::encoded_len(1, &record_to_proto(record));
+        (framed as u64).max(super::MIN_BLOCK_BYTES)
     }
 
     /// Offer `payloads`, and wait until the stage holds them queued.
@@ -619,8 +709,9 @@ mod tests {
         }
     }
 
-    /// A call the receiver fails answers every block in it with that failure,
-    /// so each caller sends again.
+    /// A call that fails for now answers every block in it with that failure,
+    /// so each caller sends again. One refused for good sends each block again
+    /// on its own, and each caller gets its own block's answer.
     #[tokio::test]
     async fn a_failed_call_answers_every_block_in_it_with_the_failure() {
         for reply in [Reply::Unavailable, Reply::Refuse] {
@@ -632,7 +723,7 @@ mod tests {
             let a = queue(&sender, &["a"]).await;
             let b = queue(&sender, &["b1", "b2"]).await;
 
-            calls.answer(2);
+            calls.answer(1_000);
             for caller in [first, a, b] {
                 let got = result(caller).await;
                 let expected = match reply {
@@ -644,12 +735,48 @@ mod tests {
                 };
                 assert!(expected, "{reply:?}: got {got:?}");
             }
+            let mut payloads = calls.payloads();
             assert_eq!(
-                calls.payloads(),
+                payloads[..2],
                 [vec!["x"], vec!["a", "b1", "b2"]],
                 "{reply:?}"
             );
+            let mut resent = payloads.split_off(2);
+            resent.sort();
+            match reply {
+                Reply::Unavailable => assert!(resent.is_empty(), "resent {resent:?}"),
+                _ => assert_eq!(resent, [vec!["a"], vec!["b1", "b2"]], "{reply:?}"),
+            }
         }
+    }
+
+    /// When the receiver refuses a joined call for one caller's record, the
+    /// blocks go again on their own: that caller is refused and the clean one
+    /// is answered `Ok`.
+    #[tokio::test]
+    async fn a_refusal_of_a_joined_call_fails_only_the_block_it_was_for() {
+        let (calls, uri) = recording(0).await;
+        *calls.reply.lock() = Reply::RefuseMarked;
+        let sender = sender(client(&uri, joining(1 << 16, 1))).await;
+        let first = offer(&sender, &["x"]);
+        calls.arrived(1).await;
+        let bad = queue(&sender, &["a0", "!a1"]).await;
+        let clean = queue(&sender, &["b0"]).await;
+
+        calls.answer(1_000);
+        assert!(result(first).await.is_ok());
+        let refused = result(bad).await;
+        assert!(
+            refused.is_fatal(),
+            "the caller with the bad record got {refused:?}"
+        );
+        let got = result(clean).await;
+        assert!(got.is_ok(), "the clean caller got {got:?}");
+        let mut payloads = calls.payloads();
+        assert_eq!(payloads[..2], [vec!["x"], vec!["a0", "!a1", "b0"]]);
+        let mut resent = payloads.split_off(2);
+        resent.sort();
+        assert_eq!(resent, [vec!["a0", "!a1"], vec!["b0"]]);
     }
 
     /// At most `in_flight` calls run, each carries at most `max_batch_bytes`,
@@ -658,17 +785,21 @@ mod tests {
     #[tokio::test]
     async fn no_more_than_in_flight_calls_run_and_a_caller_with_no_room_waits() {
         let (calls, uri) = recording(0).await;
-        // 4 byte blocks and an 8 byte cap: two blocks a call, and 32 bytes of room.
-        let sender = sender(client(&uri, joining(8, 2))).await;
-        let names: Vec<String> = (0..12).map(|i| format!("r{i:03}")).collect();
+        // 100 byte blocks and a 250 byte cap: two blocks a call, and 1,000 bytes of room.
+        let sender = sender(client(&uri, joining(250, 2))).await;
+        let names: Vec<String> = (0..16)
+            .map(|i| format!("{i:03}{}", "r".repeat(97)))
+            .collect();
+        let each = charge(record(&names[0]));
+        let full = (1_000 / each) * each;
         let callers: Vec<_> = names
             .iter()
             .map(|name| offer(&sender, &[name.as_str()]))
             .collect();
         calls.arrived(2).await;
-        until("the room filled", || queued(&sender) == 32).await;
+        until("the room filled", || queued(&sender) == full).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(queued(&sender), 32, "the queue held more than its room");
+        assert_eq!(queued(&sender), full, "the queue held more than its room");
         assert_eq!(*calls.arrived.borrow(), 2, "a call past in_flight started");
         assert!(
             callers.iter().all(|caller| !caller.is_finished()),
@@ -685,10 +816,48 @@ mod tests {
         assert_eq!(sent, names, "a block was dropped or sent twice");
         for call in &payloads {
             let bytes: usize = call.iter().map(String::len).sum();
-            assert!(bytes <= 8, "a call of {bytes} bytes: {call:?}");
+            assert!(bytes <= 250, "a call of {bytes} bytes");
         }
         assert_eq!(calls.peak(), 2);
         assert_eq!(queued(&sender), 0);
+    }
+
+    /// The room counts a block's encoded length, so blocks of headers and no
+    /// payload stop at it as payload does.
+    #[tokio::test]
+    async fn blocks_of_headers_and_no_payload_stop_at_the_room() {
+        let (calls, uri) = recording(0).await;
+        let sender = sender(client(&uri, joining(1_000, 1))).await;
+        let heavy = || {
+            let mut record = record("");
+            record.headers = (0..8).map(|i| (format!("h{i}"), vec![b'v'; 64])).collect();
+            record
+        };
+        let each = charge(heavy());
+        let fits = usize::try_from(4_000 / each).unwrap();
+        assert!(fits < 20, "{fits} blocks of {each} bytes fit the room");
+
+        let first = offer(&sender, &["x"]);
+        calls.arrived(1).await;
+        let callers: Vec<_> = (0..20)
+            .map(|_| {
+                let sender = Arc::clone(&sender);
+                let records = vec![heavy()];
+                tokio::spawn(async move { sender.send_batch(&records).await })
+            })
+            .collect();
+        until("the room filled", || queued_blocks(&sender) == fits).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(queued_blocks(&sender), fits, "blocks queued past the room");
+        assert!(queued(&sender) <= 4_000);
+
+        calls.answer(1_000);
+        assert!(result(first).await.is_ok());
+        for caller in callers {
+            assert!(result(caller).await.is_ok());
+        }
+        let sent: usize = calls.batches.lock().iter().map(|b| b.records.len()).sum();
+        assert_eq!(sent, 21, "a block was dropped or sent twice");
     }
 
     /// A block whose caller has gone before the stage takes it is not sent.
@@ -848,16 +1017,27 @@ mod tests {
     #[tokio::test]
     async fn a_queued_block_is_answered_at_send_timeout_ms_by_a_receiver_that_hangs() {
         const LIMIT_MS: u64 = 500;
+        #[cfg(feature = "metrics")]
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        // Current-thread runtime: the stage's tasks run on this thread and see it.
+        #[cfg(feature = "metrics")]
+        let _local = metrics::set_default_local_recorder(&recorder);
+
         let (calls, uri) = recording(0).await;
-        // 4 byte blocks and a 5 byte cap: one block a call, so each waits its turn.
-        let mut config = client(&uri, joining(5, 1));
+        // 100 byte blocks and a 150 byte cap: one block a call, so each waits its turn.
+        let mut config = client(&uri, joining(150, 1));
         config.send_timeout_ms = LIMIT_MS;
         let sender = sender(config).await;
-        let first = offer(&sender, &["xxxx"]);
+        let [x, a, b, c] = ['x', 'a', 'b', 'c'].map(|letter| letter.to_string().repeat(100));
+        let first = offer(&sender, &[x.as_str()]);
         calls.arrived(1).await;
+        // Queued well after the first call started, so a is still waiting when
+        // that call ends and is taken next, and b and c are past their deadline
+        // when the second call ends.
+        tokio::time::sleep(Duration::from_millis(LIMIT_MS / 5)).await;
         let mut waiting = Vec::new();
-        for name in ["aaaa", "bbbb", "cccc"] {
-            waiting.push(queue(&sender, &[name]).await);
+        for name in [&a, &b, &c] {
+            waiting.push(queue(&sender, &[name.as_str()]).await);
         }
 
         let started = tokio::time::Instant::now();
@@ -877,13 +1057,100 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(LIMIT_MS * 2)).await;
         let payloads = calls.payloads();
         assert!(
-            payloads
-                .iter()
-                .flatten()
-                .all(|p| p != "bbbb" && p != "cccc"),
-            "a block no call had taken was sent: {payloads:?}"
+            payloads.iter().flatten().all(|p| *p != b && *p != c),
+            "a block no call had taken was sent"
         );
         assert_eq!(queued(&sender), 0);
+
+        // Each caller's deadline counts as a wait that ran out, and each call
+        // past its own deadline counts once, whatever it carried.
+        #[cfg(feature = "metrics")]
+        {
+            let rendered = recorder.handle().render();
+            let timeouts = series(
+                &rendered,
+                "transport_coalesced_timeouts_total",
+                &[r#"transport="grpc""#],
+            );
+            assert!(timeouts >= 3.0, "{timeouts} wait timeouts:\n{rendered}");
+            let redelivered = series(
+                &rendered,
+                "transport_redelivered_total",
+                &[r#"transport="grpc""#, r#"reason="deadline""#],
+            );
+            assert_eq!(
+                redelivered,
+                payloads.len() as f64,
+                "one count per call past its deadline:\n{rendered}"
+            );
+        }
+    }
+
+    /// The deadline runs from the start of `send_batch` through a resend: a
+    /// block sent again on its own after a refused joined call is answered at
+    /// its caller's deadline, not one restarted for the resend.
+    #[tokio::test]
+    async fn a_resend_after_a_refused_joined_call_keeps_the_callers_deadline() {
+        const LIMIT_MS: u64 = 1_000;
+        let (calls, uri) = recording(0).await;
+        *calls.reply.lock() = Reply::RefuseMarked;
+        let mut config = client(&uri, joining(1 << 16, 1));
+        config.send_timeout_ms = LIMIT_MS;
+        let sender = sender(config).await;
+        let first = offer(&sender, &["x"]);
+        calls.arrived(1).await;
+        let started = tokio::time::Instant::now();
+        let bad = queue(&sender, &["!a"]).await;
+        let clean = queue(&sender, &["b"]).await;
+
+        // The joined call is refused past half the deadline, and the resends are held.
+        tokio::time::sleep(Duration::from_millis(LIMIT_MS * 6 / 10)).await;
+        calls.answer(2);
+        calls.arrived(4).await;
+        for caller in [bad, clean] {
+            let got = result(caller).await;
+            assert!(got.is_backpressured(), "a held resend got {got:?}");
+        }
+        let took = started.elapsed();
+        // A deadline restarted for the resend would answer at 1.6 limits.
+        assert!(
+            took < Duration::from_millis(LIMIT_MS * 13 / 10),
+            "answered after {took:?} at a {LIMIT_MS} ms limit"
+        );
+        assert!(result(first).await.is_ok());
+    }
+
+    /// Dropping the transport stops the calls its stage has in flight.
+    #[tokio::test]
+    async fn dropping_the_transport_stops_its_calls_in_flight() {
+        let (calls, uri) = recording(0).await;
+        let sender = GrpcTransport::new(&client(&uri, joining(1 << 16, 1)))
+            .await
+            .unwrap();
+        let records = block(&["x"]);
+        tokio::select! {
+            sent = sender.send_batch(&records) => {
+                panic!("answered by a receiver that holds every call: {sent:?}");
+            }
+            () = calls.arrived(1) => {}
+        }
+        // The caller has gone, and its block is in a call.
+        drop(sender);
+        until("the call in flight stopped", || {
+            calls.dropped.load(Ordering::SeqCst) == 1
+        })
+        .await;
+    }
+
+    /// The value of the series `name` with every one of `labels`, else 0.
+    #[cfg(feature = "metrics")]
+    fn series(rendered: &str, name: &str, labels: &[&str]) -> f64 {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with(&format!("{name}{{")))
+            .filter(|line| labels.iter().all(|label| line.contains(label)))
+            .find_map(|line| line.rsplit(' ').next()?.parse().ok())
+            .unwrap_or(0.0)
     }
 
     /// A block that finds a slot free goes out at once as its own call.

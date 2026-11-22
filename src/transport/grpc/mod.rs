@@ -1175,11 +1175,16 @@ impl TransportSender for GrpcTransport {
     /// `coalesce.max_batch_bytes` of payload waits for one of
     /// `coalesce.in_flight` call slots and goes out in one `RouteBatch` with
     /// the blocks queued behind it, within `max_message_size`. The result is
-    /// that call's, given once the call returns: a failed call fails every
-    /// block in it, and each caller sends again. A block the stage has no room
-    /// for waits for room. `send_timeout_ms` bounds the wait for a slot too,
-    /// and past it the result is `Backpressured`. A block whose caller is
-    /// dropped before the stage takes it is not sent.
+    /// that call's, given once the call returns: a call that fails for now
+    /// fails every block in it, and each caller sends again. When the receiver
+    /// refuses a call of several blocks for good, each block is sent again on
+    /// its own and gets its own answer. A block the stage has no room for
+    /// waits for room. One `send_timeout_ms` from the start of `send_batch`
+    /// bounds the wait for room and a slot, the call and any resend, and past
+    /// it the result is `Backpressured`. A block whose caller is dropped
+    /// before the stage takes it is not sent. A block sent on its own, at or
+    /// over `max_batch_bytes` or with joining off, has `send_timeout_ms` per
+    /// request, as before.
     ///
     /// ## Atomic (all-or-nothing) acceptance
     ///
@@ -1220,39 +1225,14 @@ impl TransportSender for GrpcTransport {
             ));
         };
 
-        // Apply outbound filters BEFORE the wire: a record matched by a `drop`
-        // or `dlq` filter must NOT be transmitted. This path once bypassed the
-        // filter entirely -- a record told to drop sailed through.
-        let mut filtered_to_dlq = false;
-        let to_send: Vec<Record> = if self.filter_engine.has_outbound_filters() {
-            let mut keep = Vec::with_capacity(records.len());
-            for r in records {
-                match self.filter_engine.apply_outbound(&r.payload) {
-                    super::filter::FilterDisposition::Pass => keep.push(r.clone()),
-                    super::filter::FilterDisposition::Drop => {}
-                    super::filter::FilterDisposition::Dlq => filtered_to_dlq = true,
-                }
-            }
-            keep
-        } else {
-            records.to_vec()
-        };
-        let handled = if filtered_to_dlq {
-            SendResult::FilteredDlq
-        } else {
-            SendResult::Ok
-        };
-
+        let (to_send, handled) = self.outbound(records);
         if to_send.is_empty() {
             return handled;
         }
 
-        // Records over the ceiling on their own are left out here, so a joined
-        // call carries only records the receiver's decoder takes.
         let (result, left_out) = match &self.coalesce {
             Some(stage) if stage.joins(&to_send) => {
-                let (framed, left_out) = framed_within(to_send, self.max_message_size);
-                (stage.send(framed).await, left_out)
+                self.send_joined(stage, wire, records, to_send).await
             }
             _ => {
                 // A block over the ceiling goes as several requests in order.
@@ -1396,6 +1376,74 @@ fn count_left_out(left_out: u64) {
     }
     #[cfg(not(feature = "metrics"))]
     let _ = left_out;
+}
+
+impl GrpcTransport {
+    /// The records of `records` the outbound filters let through, and the
+    /// answer for a block that sends them all: `FilteredDlq` when a `dlq`
+    /// filter matched one, else `Ok`.
+    fn outbound(&self, records: &[Record]) -> (Vec<Record>, SendResult) {
+        // Apply outbound filters BEFORE the wire: a record matched by a `drop`
+        // or `dlq` filter must NOT be transmitted. This path once bypassed the
+        // filter entirely -- a record told to drop sailed through.
+        let mut filtered_to_dlq = false;
+        let to_send: Vec<Record> = if self.filter_engine.has_outbound_filters() {
+            let mut keep = Vec::with_capacity(records.len());
+            for r in records {
+                match self.filter_engine.apply_outbound(&r.payload) {
+                    super::filter::FilterDisposition::Pass => keep.push(r.clone()),
+                    super::filter::FilterDisposition::Drop => {}
+                    super::filter::FilterDisposition::Dlq => filtered_to_dlq = true,
+                }
+            }
+            keep
+        } else {
+            records.to_vec()
+        };
+        let handled = if filtered_to_dlq {
+            SendResult::FilteredDlq
+        } else {
+            SendResult::Ok
+        };
+        (to_send, handled)
+    }
+
+    /// Send `to_send`, the filtered `records`, in a call joined with the
+    /// blocks queued beside it, all within one `send_timeout_ms` from here.
+    /// Returns the result and the records left out for size.
+    async fn send_joined(
+        &self,
+        stage: &coalesce::Coalescer,
+        wire: &Wire,
+        records: &[Record],
+        to_send: Vec<Record>,
+    ) -> (SendResult, u64) {
+        let deadline = coalesce::Deadline::after(wire.send_timeout_ms);
+        // Records over the ceiling on their own are left out here, so a joined
+        // call carries only records within max_message_size.
+        let (framed, left_out) = framed_within(to_send, self.max_message_size);
+        let result = match stage.send(framed, deadline).await {
+            coalesce::Joined::Answered(result) => result,
+            coalesce::Joined::Alone => self.send_alone(wire, records, deadline).await,
+        };
+        (result, left_out)
+    }
+
+    /// Send `records` again as a block of their own, as the direct path does,
+    /// within what is left of `deadline`.
+    async fn send_alone(
+        &self,
+        wire: &Wire,
+        records: &[Record],
+        deadline: coalesce::Deadline,
+    ) -> SendResult {
+        let (to_send, _) = self.outbound(records);
+        let (batches, _) = batches_within(to_send, self.max_message_size);
+        deadline
+            .bound(wire.send_bodies(batches))
+            .await
+            .unwrap_or_else(coalesce::timed_out)
+    }
 }
 
 /// The stage joining `wire`'s small blocks, when `coalesce.enabled`.
