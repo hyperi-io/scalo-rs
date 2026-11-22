@@ -79,8 +79,8 @@ enum Joined {
     /// The call's result.
     Answered(SendResult),
     /// The receiver refused, for good, a call that carried other blocks too,
-    /// so the block, handed back, goes again on its own.
-    Alone(Vec<Framed>),
+    /// so the caller sends its block again on its own.
+    Alone,
 }
 
 /// What a stage joins blocks up to.
@@ -190,10 +190,16 @@ impl Coalescer {
     }
 
     /// Send `records` in the next call a slot frees for, and return that call's
-    /// result once it returns. Past `deadline`, or once the transport closes,
-    /// the answer is `Backpressured`, and a block already in a call may still be
-    /// sent, so the caller's resend can duplicate it.
-    pub(super) async fn send(&self, records: Vec<Framed>, deadline: Deadline) -> SendResult {
+    /// result once it returns. `again` frames the block once more for a resend
+    /// on its own. Past `deadline`, or once the transport closes, the answer is
+    /// `Backpressured`, and a block already in a call may still be sent, so the
+    /// caller's resend can duplicate it.
+    pub(super) async fn send(
+        &self,
+        records: Vec<Framed>,
+        deadline: Deadline,
+        again: impl FnOnce() -> Vec<Framed>,
+    ) -> SendResult {
         if records.is_empty() {
             return SendResult::Ok;
         }
@@ -201,8 +207,10 @@ impl Coalescer {
         let sent = async move {
             let records = match self.submit(records).await {
                 Ok(Joined::Answered(result)) => return result,
-                // Refused for good beside other blocks, or the stage task has gone.
-                Ok(Joined::Alone(records)) | Err(records) => records,
+                // Refused for good beside other blocks, and the stage keeps no copy.
+                Ok(Joined::Alone) => again(),
+                // The stage task has gone.
+                Err(records) => records,
             };
             // On its own, through the same slots. A closed transport has none.
             let Ok(_slot) = self.slots.acquire().await else {
@@ -368,9 +376,8 @@ async fn send_taken(
         replies.push(item.reply);
         blocks.push(item.records);
     }
-    // A refusal for good of several blocks may be one block's alone, so each is
-    // kept to go again on its own.
-    let kept = (blocks.len() > 1).then(|| blocks.clone());
+    // A refusal for good of several blocks may be one block's alone.
+    let several = blocks.len() > 1;
     let call = wire.send_bodies(bodies_within(
         blocks.into_iter().flatten(),
         max_message_size,
@@ -379,13 +386,12 @@ async fn send_taken(
     let call = opentelemetry::context::FutureExt::with_context(call, context);
     let result = call.await;
     drop(slot);
-    match kept {
-        Some(kept) if result.is_fatal() => {
-            for (reply, block) in replies.into_iter().zip(kept) {
-                let _ = reply.send(Joined::Alone(block));
-            }
+    if several && result.is_fatal() {
+        for reply in replies {
+            let _ = reply.send(Joined::Alone);
         }
-        _ => answer(replies, result),
+    } else {
+        answer(replies, result);
     }
 }
 
@@ -455,7 +461,7 @@ mod tests {
         Accept,
         Unavailable,
         Refuse,
-        /// Refuse a request carrying a record whose payload starts with `!`.
+        /// Refuse a request carrying a record whose payload has a `!`.
         RefuseMarked,
     }
 
@@ -539,7 +545,7 @@ mod tests {
             let calls = &self.0;
             let batch = request.into_inner();
             let accepted = batch.records.len() as u64;
-            let marked = batch.records.iter().any(|r| r.payload.starts_with(b"!"));
+            let marked = batch.records.iter().any(|r| r.payload.contains(&b'!'));
             let now = calls.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             calls.peak.fetch_max(now, Ordering::SeqCst);
             calls.batches.lock().push(batch);
@@ -792,17 +798,34 @@ mod tests {
     }
 
     /// When the receiver refuses a joined call for one caller's record, the
-    /// blocks go again on their own: that caller is refused and the clean one
-    /// is answered `Ok`.
+    /// blocks go again on their own, through the outbound filters and the size
+    /// check once more: that caller is refused, and the other gets the answer
+    /// its own block earns, with its dead letters left out again and counted
+    /// once.
     #[tokio::test]
     async fn a_refusal_of_a_joined_call_fails_only_the_block_it_was_for() {
+        #[cfg(feature = "metrics")]
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        // Current-thread runtime: the stage's tasks run on this thread and see it.
+        #[cfg(feature = "metrics")]
+        let _local = metrics::set_default_local_recorder(&recorder);
+
         let (calls, uri) = recording(0).await;
         *calls.reply.lock() = Reply::RefuseMarked;
-        let sender = sender(client(&uri, joining(1 << 16, 1))).await;
-        let first = offer(&sender, &["x"]);
+        let mut config = client(&uri, joining(1 << 16, 1)).with_max_message_size(256);
+        config.filters_out = vec![FilterRule {
+            expression: r#"status == "bad""#.into(),
+            action: FilterAction::Dlq,
+        }];
+        let sender = sender(config).await;
+        let oversize = format!(r#"{{"pad":"{}"}}"#, "x".repeat(300));
+        let names = ["x", "a0", "!a1", "b0"].map(|n| format!(r#"{{"n":"{n}"}}"#));
+        let [x, a0, a1, b0] = names.each_ref().map(String::as_str);
+
+        let first = offer(&sender, &[x]);
         calls.arrived(1).await;
-        let bad = queue(&sender, &["a0", "!a1"]).await;
-        let clean = queue(&sender, &["b0"]).await;
+        let bad = queue(&sender, &[a0, a1]).await;
+        let other = queue(&sender, &[b0, r#"{"status":"bad"}"#, oversize.as_str()]).await;
 
         calls.answer(1_000);
         assert!(result(first).await.is_ok());
@@ -811,13 +834,24 @@ mod tests {
             refused.is_fatal(),
             "the caller with the bad record got {refused:?}"
         );
-        let got = result(clean).await;
-        assert!(got.is_ok(), "the clean caller got {got:?}");
+        let got = result(other).await;
+        assert!(got.is_filtered_dlq(), "the other caller got {got:?}");
         let mut payloads = calls.payloads();
-        assert_eq!(payloads[..2], [vec!["x"], vec!["a0", "!a1", "b0"]]);
+        assert_eq!(payloads[..2], [vec![x], vec![a0, a1, b0]]);
         let mut resent = payloads.split_off(2);
         resent.sort();
-        assert_eq!(resent, [vec!["a0", "!a1"], vec!["b0"]]);
+        assert_eq!(resent, [vec![a0, a1], vec![b0]]);
+
+        #[cfg(feature = "metrics")]
+        {
+            let rendered = recorder.handle().render();
+            let too_large = series(
+                &rendered,
+                "transport_message_too_large_total",
+                &[r#"transport="grpc""#],
+            );
+            assert_eq!(too_large, 1.0, "counted on the resend too:\n{rendered}");
+        }
     }
 
     /// At most `in_flight` calls run, each carries at most `max_batch_bytes`,

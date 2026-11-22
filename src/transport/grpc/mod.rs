@@ -1231,7 +1231,7 @@ impl TransportSender for GrpcTransport {
         }
 
         let (result, left_out) = if let Some(stage) = &self.coalesce {
-            self.send_joined(stage, wire, to_send).await
+            self.send_joined(stage, wire, records, to_send).await
         } else {
             // A block over the ceiling goes as several requests in order.
             let (batches, left_out) = batches_within(to_send, self.max_message_size);
@@ -1280,26 +1280,31 @@ impl TransportSender for GrpcTransport {
 }
 
 /// A record as a field of a `Batch` body, and the bytes it adds to the body.
-#[derive(Clone)]
 struct Framed {
     record: proto::Record,
     len: usize,
+}
+
+/// `record` as a field of a `Batch` body.
+fn as_field(record: Record) -> Framed {
+    let record = batch::record_to_proto(record);
+    // The record as a field of `Batch`: its tag, its length prefix, then the
+    // record itself, so the parts sum to the body's encoded length.
+    let len = prost::encoding::message::encoded_len(1, &record);
+    Framed { record, len }
 }
 
 /// `record` as a field of a `Batch` body, or `None`, warned and counted, when
 /// it is over `limit` on its own: the same bytes are refused on every retry.
 fn frame(record: Record, limit: usize) -> Option<Framed> {
     let destination = record.key.clone();
-    let record = batch::record_to_proto(record);
-    // The record as a field of `Batch`: its tag, its length prefix, then the
-    // record itself, so the parts sum to the body's encoded length.
-    let len = prost::encoding::message::encoded_len(1, &record);
-    if len > limit {
+    let framed = as_field(record);
+    if framed.len > limit {
         #[cfg(feature = "metrics")]
         metrics::counter!("transport_message_too_large_total", "transport" => "grpc").increment(1);
         tracing::warn!(
             destination = destination.as_deref().unwrap_or(""),
-            encoded_len = len,
+            encoded_len = framed.len,
             limit,
             "gRPC send_batch: a record over max_message_size on its own is left out of the \
              block; the block's other records are sent and this one is dropped. Screen the \
@@ -1307,7 +1312,17 @@ fn frame(record: Record, limit: usize) -> Option<Framed> {
         );
         return None;
     }
-    Some(Framed { record, len })
+    Some(framed)
+}
+
+/// `records` framed for `limit` again, for a block framed once before: a record
+/// over it was warned of and counted then, so it is left out quietly.
+fn reframed(records: Vec<Record>, limit: usize) -> Vec<Framed> {
+    records
+        .into_iter()
+        .map(as_field)
+        .filter(|framed| framed.len <= limit)
+        .collect()
 }
 
 /// `records` framed for `limit`, in order, counting the ones left out in
@@ -1406,13 +1421,15 @@ impl GrpcTransport {
         (to_send, handled)
     }
 
-    /// Send `to_send` in a call joined with the blocks queued beside it, all
-    /// within one `send_timeout_ms` from here, or on its own when it is too
-    /// large to join. Returns the result and the records left out for size.
+    /// Send `to_send`, the outbound records of `records`, in a call joined with
+    /// the blocks queued beside it, all within one `send_timeout_ms` from here,
+    /// or on its own when it is too large to join. Returns the result and the
+    /// records left out for size.
     async fn send_joined(
         &self,
         stage: &coalesce::Coalescer,
         wire: &Wire,
+        records: &[Record],
         to_send: Vec<Record>,
     ) -> (SendResult, u64) {
         // Records over the ceiling on their own are left out here, so a joined
@@ -1420,7 +1437,10 @@ impl GrpcTransport {
         let (framed, left_out) = framed_within(to_send, self.max_message_size);
         let result = if stage.joins(&framed) {
             let deadline = coalesce::Deadline::after(wire.send_timeout_ms);
-            stage.send(framed, deadline).await
+            // Runs only for a resend after a refused joined call, so no copy of
+            // the block is kept.
+            let again = || reframed(self.outbound(records).0, self.max_message_size);
+            stage.send(framed, deadline, again).await
         } else {
             // A block over the ceiling goes as several requests in order.
             wire.send_bodies(bodies_within(framed, self.max_message_size))
