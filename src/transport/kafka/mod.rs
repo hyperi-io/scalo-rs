@@ -5276,7 +5276,12 @@ mod tests {
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while roles().iter().any(|role| role.generation() == 0) {
+        // The generation advances before the rebuilt producer is swapped in.
+        let swapped = || {
+            transport.current_producer().expect("a producer").generation
+                == transport.auth.producer_auth().generation()
+        };
+        while roles().iter().any(|role| role.generation() == 0) || !swapped() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "no rebuild after the grace and one backoff"
