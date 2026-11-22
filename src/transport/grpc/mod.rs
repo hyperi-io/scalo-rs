@@ -1207,12 +1207,16 @@ impl TransportSender for GrpcTransport {
     /// refuses a call of several blocks for good, or answers it
     /// `ResourceExhausted`, as one with a lower limit does, each block goes
     /// again on its own through the same slots and gets its own answer. A
-    /// block the stage has no room for waits for room. One `send_timeout_ms`
-    /// from the start of `send_batch` bounds the wait for room and a slot, the
-    /// call and any resend, and past it, or once the transport closes, the result is
-    /// `Backpressured`. A block whose caller is dropped before the stage takes
-    /// it is not sent. A block at the cap or over it, or any block with joining
-    /// off, goes on its own with `send_timeout_ms` per request, as before.
+    /// block the stage has no room for waits for room. `send_timeout_ms` from
+    /// the start of `send_batch` bounds the wait for room and a slot, a
+    /// resend's included: a block no call has taken by then is withdrawn
+    /// unsent, and the result is `Backpressured`. A block in a call gets that
+    /// call's answer, which `send_timeout_ms` bounds per request, so a joined
+    /// `send_batch` can take up to about twice `send_timeout_ms`. Once the
+    /// transport closes, the result is `Backpressured`. A block whose caller is
+    /// dropped before the stage takes it is not sent. A block at the cap or
+    /// over it, or any block with joining off, goes on its own with
+    /// `send_timeout_ms` per request, as before.
     ///
     /// ## Atomic (all-or-nothing) acceptance
     ///
@@ -1449,9 +1453,9 @@ impl GrpcTransport {
     }
 
     /// Send `to_send`, the outbound records of `records`, in a call joined with
-    /// the blocks queued beside it, all within one `send_timeout_ms` from here,
-    /// or on its own when it is too large to join. Returns the result and the
-    /// records left out for size.
+    /// the blocks queued beside it, taken by a call within `send_timeout_ms`
+    /// from here, or on its own when it is too large to join. Returns the
+    /// result and the records left out for size.
     async fn send_joined(
         &self,
         stage: &coalesce::Coalescer,
