@@ -174,6 +174,7 @@ transport:
 
 - Cancellation safety: `recv` reads from an internal mpsc, safe
   to drop. `send` is a single unary RPC -- drop cancels cleanly.
+- Joined calls: `send_batch` joins small blocks for one endpoint into one call by default ([grpc.md](grpc.md)).
 - Send deadline: `send_timeout_ms` (default 30 s, `0` for none) bounds the whole of each `send`, and of each request of a `send_batch`, DNS, connect and TLS handshake included, and a send past it is `Backpressured`. A dial whose DNS lookup, TCP connect or TLS handshake has not finished by nine tenths of the limit is abandoned, so the send that started it reports the failure and the next send dials afresh.
 - Send failures: `Unavailable`, `ResourceExhausted`, `DeadlineExceeded` (`send_timeout_ms`), `Cancelled` (a server cutting the RPC at its deadline), and a connection that fails before the server answers are `Backpressured`, so an absent, restarting or overrun receiver is waited out. Any other status the server returns is `Fatal`. A send answered `Unavailable` with the `scalo-hold-expired` trailer, or ended by `DeadlineExceeded` or `Cancelled`, may still be delivered by the receiver, so the retry can duplicate it: it counts in `transport_redelivered_total{reason="hold_expired"|"deadline"}`.
 - Dead connections: the client sends an HTTP/2 PING once a connection has read nothing for `send_timeout_ms` (30 s when it is `0`), and closes the connection when the PING goes unanswered for as long again. A receiver that stays connected but stops answering is dropped that way, and the next send dials afresh.

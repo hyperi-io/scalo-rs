@@ -159,6 +159,10 @@ The transport layer counts both events AND bytes, in both directions. All carry 
 | `transport_sent_bytes_total` | egress | raw bytes written to the wire |
 | `transport_received_events_total` | ingress | events read off the wire |
 | `transport_received_bytes_total` | ingress | raw bytes read off the wire |
+| `transport_coalesced_calls_total` | egress | gRPC `RouteBatch` calls that joined `send_batch` blocks ([../transport/grpc.md](../transport/grpc.md)) |
+| `transport_coalesced_blocks_total` | egress | `send_batch` blocks those calls carried. Over the calls, the blocks joined per call |
+| `transport_coalesced_records_total` | egress | records those calls carried. Over the calls, the records per call |
+| `transport_coalesced_timeouts_total` | egress | `send_batch` blocks answered `Backpressured` at `send_timeout_ms` before their joined call answered. A failed call counts once in `transport_backpressured_total` or `transport_send_errors_total`, however many blocks it carried |
 
 Transport-level ingress counts raw wire receipt (post-filter, pre-decode) and is
 distinct from the pipeline-level `records_received_total` (post-decode records).
