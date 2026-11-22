@@ -227,6 +227,7 @@ Source: [../../src/transport/](../../src/transport/) -- particularly
 ## Related
 
 - [backends.md](backends.md) -- six concrete backends, config and deps
+- [grpc.md](grpc.md) -- gRPC `send_batch` blocks joined into one call
 - [filter-engine.md](filter-engine.md) -- tiered CEL filtering
 - [routing.md](routing.md) -- `RoutedSender` for originators
 - [../auto-wiring.md](../auto-wiring.md) -- factory in the pillar model

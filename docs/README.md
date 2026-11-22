@@ -98,6 +98,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Runtime | [runtime/memory.md](runtime/memory.md) | `MemoryGuard`, cgroup-aware backpressure |
 | Transport | [transport/README.md](transport/README.md) | Trait architecture, factory, `AnySender`, commit tokens |
 | Transport | [transport/backends.md](transport/backends.md) | Kafka, gRPC, Memory, File, Pipe, HTTP |
+| Transport | [transport/grpc.md](transport/grpc.md) | gRPC `send_batch` blocks joined into one call |
 | Transport | [transport/filter-engine.md](transport/filter-engine.md) | 3-tier filter (SIMD / compiled CEL / complex CEL) |
 | Transport | [transport/routing.md](transport/routing.md) | `RoutedSender`, the named sink set: routes, fan-out |
 | Deployment | [deployment/README.md](deployment/README.md) | Section landing |
