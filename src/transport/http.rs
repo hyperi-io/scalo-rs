@@ -768,6 +768,10 @@ impl TransportBase for HttpTransport {
     fn name(&self) -> &'static str {
         "http"
     }
+
+    fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
+        super::DeliveryGuarantee::Acknowledged
+    }
 }
 
 /// What a failure status says about the send.

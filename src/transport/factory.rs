@@ -29,26 +29,27 @@
 //! sender.send("events.land", payload).await;
 //! ```
 
+use std::sync::Arc;
+
 use super::ack::{AckControl, DeadLetterReason, SinkConfirmation};
+use super::custom::DynTransportSender;
+use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::finalizer::DeliveryStatus;
 use super::traits::{CommitToken, TransportBase, TransportReceiver, TransportSender};
-use super::types::SendResult;
-#[cfg(any(
-    feature = "transport-kafka",
-    feature = "transport-grpc",
-    feature = "transport-memory",
-    feature = "transport-pipe",
-    feature = "transport-file",
-    feature = "transport-http"
-))]
-use super::types::TransportType;
+use super::types::{SendResult, TransportType};
 use super::work_batch::{Record, WorkBatch};
 
 /// Type-erased transport sender, created by the factory from config.
 ///
-/// Enum dispatch, not trait objects: `TransportSender` has `impl Future`
-/// returns which prevent `dyn` dispatch.
+/// Enum dispatch for the built-in backends: `TransportSender` has
+/// `impl Future` returns, which prevent `dyn` dispatch. A sender the app
+/// writes itself is [`Custom`](Self::Custom), behind the boxed-future
+/// [`DynTransportSender`].
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a backend is held inline so a send makes no extra pointer hop; only Custom is small"
+)]
 pub enum AnySender {
     #[cfg(feature = "transport-kafka")]
     Kafka(super::kafka::KafkaTransport),
@@ -67,155 +68,74 @@ pub enum AnySender {
 
     #[cfg(feature = "transport-http")]
     Http(super::http::HttpTransport),
+
+    /// A sender the app wrote, built by a constructor registered with
+    /// [`register_sender`](super::register_sender) or wrapped with
+    /// [`AnySender::custom`].
+    Custom(Arc<dyn DynTransportSender>),
+}
+
+/// Run `$body` with `$t` bound to the active backend, or `$custom` for a
+/// custom sender.
+macro_rules! each_sender {
+    ($sender:expr, $t:ident => $body:expr, $c:ident => $custom:expr) => {
+        match $sender {
+            #[cfg(feature = "transport-kafka")]
+            AnySender::Kafka($t) => $body,
+            #[cfg(feature = "transport-grpc")]
+            AnySender::Grpc($t) => $body,
+            #[cfg(feature = "transport-memory")]
+            AnySender::Memory($t) => $body,
+            #[cfg(feature = "transport-pipe")]
+            AnySender::Pipe($t) => $body,
+            #[cfg(feature = "transport-file")]
+            AnySender::File($t) => $body,
+            #[cfg(feature = "transport-http")]
+            AnySender::Http($t) => $body,
+            AnySender::Custom($c) => $custom,
+        }
+    };
 }
 
 impl TransportBase for AnySender {
     async fn close(&self) -> TransportResult<()> {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.close().await,
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.close().await,
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.close().await,
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.close().await,
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.close().await,
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.close().await,
-            #[allow(unreachable_patterns)]
-            _ => Err(TransportError::Config(
-                "no transport variant enabled".into(),
-            )),
-        }
+        each_sender!(self, t => t.close().await, c => c.dyn_close().await)
     }
 
     fn is_healthy(&self) -> bool {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.is_healthy(),
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.is_healthy(),
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.is_healthy(),
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.is_healthy(),
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.is_healthy(),
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.is_healthy(),
-            #[allow(unreachable_patterns)]
-            _ => false,
-        }
+        each_sender!(self, t => t.is_healthy(), c => c.dyn_is_healthy())
     }
 
     fn name(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.name(),
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.name(),
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.name(),
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.name(),
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.name(),
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.name(),
-            #[allow(unreachable_patterns)]
-            _ => "none",
-        }
+        each_sender!(self, t => t.name(), c => c.dyn_name())
     }
 
     async fn healthcheck(&self) -> TransportResult<()> {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.healthcheck().await,
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.healthcheck().await,
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.healthcheck().await,
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.healthcheck().await,
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.healthcheck().await,
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.healthcheck().await,
-            #[allow(unreachable_patterns)]
-            _ => Err(TransportError::Config(
-                "no transport variant enabled".into(),
-            )),
-        }
+        each_sender!(self, t => t.healthcheck().await, c => c.dyn_healthcheck().await)
+    }
+
+    fn delivery_guarantee(&self) -> DeliveryGuarantee {
+        each_sender!(self, t => t.delivery_guarantee(), c => c.dyn_delivery_guarantee())
     }
 }
 
 impl TransportSender for AnySender {
-    #[cfg_attr(
-        not(any(
-            feature = "transport-kafka",
-            feature = "transport-grpc",
-            feature = "transport-memory",
-            feature = "transport-pipe",
-            feature = "transport-file",
-            feature = "transport-http"
-        )),
-        allow(unused_variables)
-    )]
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.send(destination, payload).await,
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.send(destination, payload).await,
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.send(destination, payload).await,
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.send(destination, payload).await,
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.send(destination, payload).await,
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.send(destination, payload).await,
-            #[allow(unreachable_patterns)]
-            _ => SendResult::Fatal(TransportError::Config(
-                "no transport variant enabled".into(),
-            )),
-        }
+        each_sender!(
+            self,
+            t => t.send(destination, payload).await,
+            c => c.dyn_send(destination, payload).await
+        )
     }
 
     /// Forward [`send_record`](TransportSender::send_record) to the active
     /// backend, so one that carries headers keeps them.
-    #[cfg_attr(
-        not(any(
-            feature = "transport-kafka",
-            feature = "transport-grpc",
-            feature = "transport-memory",
-            feature = "transport-pipe",
-            feature = "transport-file",
-            feature = "transport-http"
-        )),
-        allow(unused_variables)
-    )]
     async fn send_record(&self, record: &Record) -> SendResult {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.send_record(record).await,
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.send_record(record).await,
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.send_record(record).await,
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.send_record(record).await,
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.send_record(record).await,
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.send_record(record).await,
-            #[allow(unreachable_patterns)]
-            _ => SendResult::Fatal(TransportError::Config(
-                "no transport variant enabled".into(),
-            )),
-        }
+        each_sender!(
+            self,
+            t => t.send_record(record).await,
+            c => c.dyn_send_record(record).await
+        )
     }
 
     /// Forward [`send_batch`](TransportSender::send_batch) to the active
@@ -223,89 +143,44 @@ impl TransportSender for AnySender {
     /// queues the whole block before awaiting any delivery report. Every other
     /// backend uses the trait's per-record default (see the at-least-once
     /// partial-send caveat on the trait method).
-    #[cfg_attr(
-        not(any(
-            feature = "transport-kafka",
-            feature = "transport-grpc",
-            feature = "transport-memory",
-            feature = "transport-pipe",
-            feature = "transport-file",
-            feature = "transport-http"
-        )),
-        allow(unused_variables)
-    )]
     async fn send_batch(&self, records: &[Record]) -> SendResult {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.send_batch(records).await,
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.send_batch(records).await,
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.send_batch(records).await,
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.send_batch(records).await,
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.send_batch(records).await,
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.send_batch(records).await,
-            #[allow(unreachable_patterns)]
-            _ => SendResult::Fatal(TransportError::Config(
-                "no transport variant enabled".into(),
-            )),
-        }
+        each_sender!(
+            self,
+            t => t.send_batch(records).await,
+            c => c.dyn_send_batch(records).await
+        )
+    }
+
+    /// Forward [`send_batch_by`](TransportSender::send_batch_by), so a backend
+    /// that hands the deadline to its own client keeps doing so.
+    async fn send_batch_by(&self, records: &[Record], deadline: std::time::Instant) -> SendResult {
+        each_sender!(
+            self,
+            t => t.send_batch_by(records, deadline).await,
+            c => c.dyn_send_batch_by(records, deadline).await
+        )
     }
 
     fn confirms_delivery(&self) -> SinkConfirmation {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.confirms_delivery(),
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.confirms_delivery(),
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.confirms_delivery(),
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.confirms_delivery(),
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.confirms_delivery(),
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.confirms_delivery(),
-            #[allow(unreachable_patterns)]
-            _ => SinkConfirmation::None,
-        }
+        each_sender!(self, t => t.confirms_delivery(), c => c.dyn_confirms_delivery())
     }
 
-    #[cfg_attr(
-        not(any(
-            feature = "transport-kafka",
-            feature = "transport-grpc",
-            feature = "transport-memory",
-            feature = "transport-pipe",
-            feature = "transport-file",
-            feature = "transport-http"
-        )),
-        allow(unused_variables)
-    )]
     fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
-        match self {
-            #[cfg(feature = "transport-kafka")]
-            Self::Kafka(t) => t.dead_letter_reason(record),
-            #[cfg(feature = "transport-grpc")]
-            Self::Grpc(t) => t.dead_letter_reason(record),
-            #[cfg(feature = "transport-memory")]
-            Self::Memory(t) => t.dead_letter_reason(record),
-            #[cfg(feature = "transport-pipe")]
-            Self::Pipe(t) => t.dead_letter_reason(record),
-            #[cfg(feature = "transport-file")]
-            Self::File(t) => t.dead_letter_reason(record),
-            #[cfg(feature = "transport-http")]
-            Self::Http(t) => t.dead_letter_reason(record),
-            #[allow(unreachable_patterns)]
-            _ => None,
-        }
+        each_sender!(
+            self,
+            t => t.dead_letter_reason(record),
+            c => c.dyn_dead_letter_reason(record)
+        )
     }
 }
 
 impl AnySender {
+    /// Wrap a sender the app built itself, so it goes where an `AnySender` goes.
+    #[must_use]
+    pub fn custom<S: TransportSender + 'static>(sender: S) -> Self {
+        Self::Custom(Arc::new(sender))
+    }
+
     /// Create a sender from config cascade.
     ///
     /// Reads the transport config from the given key in the config
@@ -324,22 +199,66 @@ impl AnySender {
     /// ```rust,ignore
     /// let sender = AnySender::from_config("transport.output").await?;
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`from_transport_config`](Self::from_transport_config), with the
+    /// `delivery` refusal naming `<key>.delivery`.
     pub async fn from_config(key: &str) -> TransportResult<Self> {
         #[cfg(feature = "config")]
         let config = read_transport_config(key)?;
 
         #[cfg(not(feature = "config"))]
-        let config = {
-            let _ = key;
-            super::TransportConfig::default()
-        };
+        let config = super::TransportConfig::default();
 
-        Self::from_transport_config(&config).await
+        Self::build(&config, Some(key)).await
     }
 
     /// Create a sender from an explicit `TransportConfig`.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Config`] when the backend's section is missing, the
+    /// type is neither built in nor registered, or the sender's
+    /// [`DeliveryGuarantee`] is below the config's `delivery`. The backend's
+    /// own construction errors otherwise.
     pub async fn from_transport_config(config: &super::TransportConfig) -> TransportResult<Self> {
-        match config.transport_type {
+        Self::build(config, None).await
+    }
+
+    /// Build the sender `config` names, then refuse it when its guarantee is
+    /// below `config.delivery`. `key` is where the config was read from.
+    async fn build(config: &super::TransportConfig, key: Option<&str>) -> TransportResult<Self> {
+        let sender = Self::construct(config).await?;
+        let guarantee = sender.delivery_guarantee();
+        if let Err(refused) = config.delivery.check(sender.name(), guarantee, key) {
+            tracing::error!(
+                transport = sender.name(),
+                key = key.unwrap_or(""),
+                guarantee = %guarantee,
+                delivery = %config.delivery,
+                error = %refused,
+                "transport refused: its delivery guarantee is below the configured delivery"
+            );
+            if let Err(e) = sender.close().await {
+                tracing::warn!(transport = sender.name(), error = %e, "refused transport did not close cleanly");
+            }
+            return Err(refused);
+        }
+        tracing::info!(
+            transport = sender.name(),
+            key = key.unwrap_or(""),
+            guarantee = %guarantee,
+            delivery = %config.delivery,
+            custom = matches!(sender, Self::Custom(_)),
+            "transport sender built"
+        );
+        Ok(sender)
+    }
+
+    /// The backend `config.transport_type` names, unchecked.
+    async fn construct(config: &super::TransportConfig) -> TransportResult<Self> {
+        match &config.transport_type {
             #[cfg(feature = "transport-kafka")]
             TransportType::Kafka => {
                 let kafka_config = config
@@ -394,7 +313,14 @@ impl AnySender {
                 Ok(Self::Http(transport))
             }
 
-            // Transport types for modules not yet implemented
+            TransportType::Custom(name) => {
+                let section = config.custom.get(name).cloned();
+                super::custom::build_sender(name, section)
+                    .await
+                    .map(Self::Custom)
+            }
+
+            // Built-in types whose feature is off.
             #[allow(unreachable_patterns)]
             other => Err(TransportError::Config(format!(
                 "transport type '{other}' is not available (feature not enabled or not yet implemented)"
@@ -557,6 +483,25 @@ impl TransportBase for AnyReceiver {
             Self::Http(t) => t.name(),
             #[allow(unreachable_patterns)]
             _ => "none",
+        }
+    }
+
+    fn delivery_guarantee(&self) -> DeliveryGuarantee {
+        match self {
+            #[cfg(feature = "transport-kafka")]
+            Self::Kafka(t) => t.delivery_guarantee(),
+            #[cfg(feature = "transport-grpc")]
+            Self::Grpc(t) => t.delivery_guarantee(),
+            #[cfg(feature = "transport-memory")]
+            Self::Memory(t) => t.delivery_guarantee(),
+            #[cfg(feature = "transport-pipe")]
+            Self::Pipe(t) => t.delivery_guarantee(),
+            #[cfg(feature = "transport-file")]
+            Self::File(t) => t.delivery_guarantee(),
+            #[cfg(feature = "transport-http")]
+            Self::Http(t) => t.delivery_guarantee(),
+            #[allow(unreachable_patterns)]
+            _ => DeliveryGuarantee::Acknowledged,
         }
     }
 
@@ -1242,7 +1187,7 @@ impl AnyReceiver {
 
     /// Create a receiver from an explicit `TransportConfig`.
     pub async fn from_transport_config(config: &super::TransportConfig) -> TransportResult<Self> {
-        match config.transport_type {
+        match &config.transport_type {
             #[cfg(feature = "transport-kafka")]
             TransportType::Kafka => {
                 let kafka_config = config
@@ -1297,7 +1242,12 @@ impl AnyReceiver {
                 Ok(Self::Http(transport))
             }
 
-            // Transport types for modules not yet implemented
+            TransportType::Custom(name) => Err(TransportError::Config(format!(
+                "transport type '{name}' is a custom type, and custom transports send only: \
+                 use a built-in type to receive"
+            ))),
+
+            // Built-in types whose feature is off.
             #[allow(unreachable_patterns)]
             other => Err(TransportError::Config(format!(
                 "transport type '{other}' is not available (feature not enabled or not yet implemented)"
@@ -1377,7 +1327,7 @@ impl AnyReceiver {
         )]
         governor: &crate::SelfRegulationGovernor,
     ) -> TransportResult<Self> {
-        match config.transport_type {
+        match &config.transport_type {
             #[cfg(feature = "transport-kafka")]
             TransportType::Kafka => {
                 let kafka_config = config

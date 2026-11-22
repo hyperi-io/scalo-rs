@@ -99,6 +99,10 @@ impl TransportBase for PerRecord<'_> {
     fn name(&self) -> &'static str {
         "kafka-per-record"
     }
+
+    fn delivery_guarantee(&self) -> scalo::transport::DeliveryGuarantee {
+        self.0.delivery_guarantee()
+    }
 }
 
 impl TransportSender for PerRecord<'_> {

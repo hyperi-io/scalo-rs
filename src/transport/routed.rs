@@ -96,26 +96,14 @@
 //! A routed record is counted once, by the transport that sends it and only
 //! once it has landed. The routed layer adds no `transport_sent_*` series.
 
-// With no backend feature on, `AnySender` is uninhabited and so zero-sized.
-#![cfg_attr(
-    not(any(
-        feature = "transport-kafka",
-        feature = "transport-grpc",
-        feature = "transport-memory",
-        feature = "transport-pipe",
-        feature = "transport-file",
-        feature = "transport-http"
-    )),
-    allow(clippy::zero_sized_map_values)
-)]
-
 use std::collections::HashMap;
 
 use super::ack::{DeadLetterReason, SinkConfirmation};
+use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::factory::AnySender;
 use super::traits::{TransportBase, TransportSender};
-use super::types::SendResult;
+use super::types::{BlockOutcome, SendResult};
 use super::work_batch::Record;
 
 /// A routing transport that dispatches `send()` to different backends
@@ -251,7 +239,7 @@ impl RoutedSender {
         key: &str,
         payload: bytes::Bytes,
     ) -> SendResult {
-        let mut handled = Handled::default();
+        let mut handled = BlockOutcome::default();
         for destination in destinations {
             // Bytes clone is a refcount bump, not a payload copy.
             if let Some(failed) = handled.add(self.send_to(destination, key, payload.clone()).await)
@@ -259,7 +247,7 @@ impl RoutedSender {
                 return failed;
             }
         }
-        handled.result()
+        handled.finish()
     }
 
     /// Fan a whole BLOCK out to every named destination in `destinations`.
@@ -281,7 +269,7 @@ impl RoutedSender {
             return SendResult::Fatal(TransportError::Closed);
         }
 
-        let mut handled = Handled::default();
+        let mut handled = BlockOutcome::default();
         for destination in destinations {
             let Some(sender) = self.resolve(destination) else {
                 return unroutable(destination);
@@ -290,7 +278,7 @@ impl RoutedSender {
                 return failed;
             }
         }
-        handled.result()
+        handled.finish()
     }
 
     /// The sender a key routes to: its route, else the default.
@@ -325,6 +313,17 @@ impl TransportBase for RoutedSender {
 
     fn name(&self) -> &'static str {
         "routed"
+    }
+
+    /// The weakest guarantee across every route and the default, since a
+    /// block can reach any of them. `Acknowledged` with no sender at all.
+    fn delivery_guarantee(&self) -> DeliveryGuarantee {
+        self.routes
+            .values()
+            .chain(self.default.as_ref())
+            .map(AnySender::delivery_guarantee)
+            .min()
+            .unwrap_or(DeliveryGuarantee::Acknowledged)
     }
 }
 
@@ -392,42 +391,13 @@ where
         }
     }
 
-    let mut handled = Handled::default();
+    let mut handled = BlockOutcome::default();
     for (sender, group) in groups {
         if let Some(failed) = handled.add(sender.send_batch(&group).await) {
             return failed;
         }
     }
-    handled.result()
-}
-
-/// The answers of a set of sends that each took its whole input: `FilteredDlq`
-/// when one was, else `Ok`, so a dead-letter answer reaches the caller as itself.
-#[derive(Default)]
-struct Handled {
-    dead_lettered: bool,
-}
-
-impl Handled {
-    /// Take one answer. A `Backpressured` or `Fatal` comes back to return.
-    fn add(&mut self, result: SendResult) -> Option<SendResult> {
-        match result {
-            SendResult::Ok => None,
-            SendResult::FilteredDlq => {
-                self.dead_lettered = true;
-                None
-            }
-            failed @ (SendResult::Backpressured | SendResult::Fatal(_)) => Some(failed),
-        }
-    }
-
-    fn result(self) -> SendResult {
-        if self.dead_lettered {
-            SendResult::FilteredDlq
-        } else {
-            SendResult::Ok
-        }
-    }
+    handled.finish()
 }
 
 impl TransportSender for RoutedSender {
@@ -764,6 +734,10 @@ mod tests {
         }
         fn name(&self) -> &'static str {
             "counting"
+        }
+
+        fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+            crate::transport::DeliveryGuarantee::Acknowledged
         }
     }
 

@@ -465,6 +465,8 @@ fn copy_of(result: &SendResult) -> SendResult {
     match result {
         SendResult::Ok => SendResult::Ok,
         SendResult::Backpressured => SendResult::Backpressured,
+        SendResult::RetryAfter(wait) => SendResult::RetryAfter(*wait),
+        SendResult::Reject(other) => SendResult::Reject(TransportError::Send(other.to_string())),
         SendResult::FilteredDlq => SendResult::FilteredDlq,
         SendResult::Fatal(TransportError::Send(message)) => {
             SendResult::Fatal(TransportError::Send(message.clone()))

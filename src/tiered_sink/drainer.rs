@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use yaque::Receiver;
 
@@ -125,11 +124,10 @@ enum DrainResult {
     /// it did not name. The batch is still spooled, and the next passes send
     /// its entries one at a time.
     Isolate(usize),
-    /// Sink is unavailable / backpressured
+    /// Sink is unavailable, backpressured, or did not answer by `send_timeout`.
+    /// The entry is still on disk, uncommitted, and is offered again on the
+    /// next pass.
     SinkUnavailable,
-    /// The send outlived `send_timeout`. The entry is still on disk,
-    /// uncommitted, and is offered again on the next pass.
-    SendTimedOut,
     /// The DLQ did not confirm the batch's dead letters. The batch is still
     /// spooled, and is offered again on the next pass.
     DeadLetterUnwritten,
@@ -153,12 +151,7 @@ enum DrainResult {
 }
 
 /// Feed one drain outcome back into the rate controller and the breaker.
-async fn settle(
-    result: DrainResult,
-    drainer: &mut Drainer,
-    circuit: &CircuitBreaker,
-    send_timeout: Duration,
-) {
+async fn settle(result: DrainResult, drainer: &mut Drainer, circuit: &CircuitBreaker) {
     match result {
         DrainResult::Success(records) => {
             for _ in 0..records {
@@ -186,16 +179,6 @@ async fn settle(
             circuit.record_failure().await;
             #[cfg(feature = "tracing")]
             tracing::debug!("Sink unavailable during drain, circuit may open");
-        }
-        DrainResult::SendTimedOut => {
-            // Counts toward the breaker as the hot path's timeout does.
-            drainer.record_failure();
-            circuit.record_failure().await;
-            #[cfg(feature = "tracing")]
-            tracing::warn!(
-                send_timeout = ?send_timeout,
-                "Sink send timed out during drain; record stays spooled, will retry"
-            );
         }
         DrainResult::DeadLettered(records) => {
             #[cfg(feature = "tracing")]
@@ -390,7 +373,7 @@ async fn write_to(
         OnRefusal::Drop => entries.clone(),
         OnRefusal::Keep => Vec::new(),
     };
-    match timeout(wait, dlq.write_confirmed(entries)).await {
+    match tokio::time::timeout(wait, dlq.write_confirmed(entries)).await {
         Ok(Ok(())) => {
             for label in labels {
                 count_dead_letter(label, "dlq");
@@ -550,27 +533,31 @@ async fn drain_once<S: TransportSender>(
     let sent = if records.is_empty() {
         None
     } else {
-        Some(timeout(send_timeout, sink.send_batch(&records)).await)
+        let deadline = std::time::Instant::now() + send_timeout;
+        Some(sink.send_batch_by(&records, deadline).await)
     };
     let delivered = match sent {
         // Only unreadable entries and dead letters: nothing to send.
         None => 0,
-        Some(Ok(SendResult::Ok)) => records.len(),
-        // Backpressure, a timeout (the batch may or may not have reached the
-        // sink) and a closed or misconfigured sink keep the whole batch spooled
-        // (at-least-once).
-        Some(Ok(SendResult::Backpressured)) => return vec![DrainResult::SinkUnavailable],
-        Some(Err(_elapsed)) => return vec![DrainResult::SendTimedOut],
-        Some(Ok(SendResult::Fatal(e))) if e.is_fatal() => {
+        Some(SendResult::Ok) => records.len(),
+        // Backpressure, a named wait, an elapsed deadline (the batch may or
+        // may not have reached the sink) and a closed or misconfigured sink
+        // keep the whole batch spooled (at-least-once).
+        Some(SendResult::Backpressured | SendResult::RetryAfter(_)) => {
+            return vec![DrainResult::SinkUnavailable];
+        }
+        Some(SendResult::Fatal(e)) if e.is_fatal() => {
             return vec![DrainResult::SinkUnavailable];
         }
         // A refusal or dead letter in a batch cannot say which record: keep
         // them all and send them one at a time until that one is past.
-        Some(Ok(SendResult::Fatal(_) | SendResult::FilteredDlq)) if records.len() > 1 => {
+        Some(SendResult::Fatal(_) | SendResult::Reject(_) | SendResult::FilteredDlq)
+            if records.len() > 1 =>
+        {
             return vec![DrainResult::Isolate(taken)];
         }
         // On its own, the refused record is its own fault: dead-letter it.
-        Some(Ok(SendResult::Fatal(e))) => {
+        Some(SendResult::Fatal(e) | SendResult::Reject(e)) => {
             dead.extend(records.drain(..).map(|record| Undeliverable {
                 label: crate::transport::DEAD_LETTER_REJECTED,
                 reason: e.to_string(),
@@ -578,7 +565,7 @@ async fn drain_once<S: TransportSender>(
             }));
             0
         }
-        Some(Ok(SendResult::FilteredDlq)) => {
+        Some(SendResult::FilteredDlq) => {
             dead.extend(records.drain(..).map(|record| Undeliverable {
                 label: crate::transport::DEAD_LETTER_REJECTED,
                 reason: crate::transport::DeadLetterReason::Rejected.to_string(),
@@ -727,7 +714,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                 }
                 _ => {}
             }
-            settle(result, &mut drainer, &circuit, send_timeout).await;
+            settle(result, &mut drainer, &circuit).await;
         }
 
         // The strategy's delay is per record, so a batch waits for each one.

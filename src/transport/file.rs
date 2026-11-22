@@ -374,6 +374,10 @@ impl TransportBase for FileTransport {
     fn name(&self) -> &'static str {
         "file"
     }
+
+    fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
+        super::DeliveryGuarantee::Written
+    }
 }
 
 impl TransportSender for FileTransport {

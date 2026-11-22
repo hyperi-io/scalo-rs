@@ -1652,6 +1652,10 @@ impl TransportBase for GrpcTransport {
     fn name(&self) -> &'static str {
         "grpc"
     }
+
+    fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
+        super::DeliveryGuarantee::Acknowledged
+    }
 }
 
 impl TransportReceiver for GrpcTransport {

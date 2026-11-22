@@ -76,6 +76,10 @@ impl<S: TransportSender> TransportBase for Observed<S> {
     fn name(&self) -> &'static str {
         self.inner.name()
     }
+
+    fn delivery_guarantee(&self) -> scalo::transport::DeliveryGuarantee {
+        self.inner.delivery_guarantee()
+    }
 }
 
 impl<S: TransportSender> TransportSender for Observed<S> {

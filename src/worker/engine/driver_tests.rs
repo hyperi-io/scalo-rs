@@ -598,6 +598,10 @@ impl crate::transport::TransportBase for OrderedReceiver {
     fn name(&self) -> &'static str {
         "ordered-test"
     }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
+    }
 }
 
 impl TransportReceiver for OrderedReceiver {
@@ -1266,6 +1270,10 @@ impl crate::transport::TransportBase for CountingReceiver {
     }
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
     }
 }
 
@@ -2088,6 +2096,10 @@ impl crate::transport::TransportBase for ByteAwareSource {
     fn name(&self) -> &'static str {
         "byte-aware-source"
     }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
+    }
 }
 
 impl TransportReceiver for ByteAwareSource {
@@ -2868,6 +2880,10 @@ impl crate::transport::TransportBase for OrderedReceiverBad {
     fn name(&self) -> &'static str {
         "ordered-bad-test"
     }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
+    }
 }
 
 impl TransportReceiver for OrderedReceiverBad {
@@ -2989,6 +3005,10 @@ impl crate::transport::TransportBase for AckedQueueSource {
     }
     fn name(&self) -> &'static str {
         "acked-queue-test"
+    }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
     }
 }
 
@@ -3506,6 +3526,10 @@ async fn the_drain_gives_up_on_a_source_that_never_reports_closed() {
         fn name(&self) -> &'static str {
             "never-closes-test"
         }
+
+        fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+            crate::transport::DeliveryGuarantee::Acknowledged
+        }
     }
 
     impl TransportReceiver for NeverCloses {
@@ -3640,6 +3664,10 @@ impl crate::transport::TransportBase for HeldSource {
     }
     fn name(&self) -> &'static str {
         "held-test"
+    }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
     }
 }
 

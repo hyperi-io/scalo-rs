@@ -82,6 +82,8 @@ flowchart LR
 - Retry re-sends the WHOLE batch on a transient failure. Records are held behind
   an `Arc`, so a retry is a refcount bump, not a copy.
 - A fatal error stops immediately -- no point retrying a permanent failure.
+- A `RetryAfter(wait)` is retried after `wait` in place of the schedule's own, capped at `max_backoff_ms`. It adds no attempt, and once `max_retries` is spent it comes back to the caller.
+- A `Reject` is never retried. A rejected record joins the dead letters as `DeadLetterReason::Rejected`, and a rejected batch is sent again one record at a time, as a `FilteredDlq` one is.
 - The call returns a `SinkOutcome`: the `SendResult` for the records sent, and
   `dead_letters`, the records the sender would or did dead-letter. The caller
   writes the dead letters to its DLQ and fires its commit tokens only on
