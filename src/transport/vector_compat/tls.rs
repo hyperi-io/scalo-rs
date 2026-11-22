@@ -12,18 +12,18 @@
 //! TLS builds a [`VectorCompatTls`] from its own config and passes it to
 //! [`connect_lazy_tls`](super::VectorCompatClient::connect_lazy_tls).
 //!
-//! `VectorCompatClient` is a tonic client, and tonic owns its TLS stack, so this
-//! maps onto tonic's `ClientTlsConfig` the way `GrpcTransport` does, and needs
-//! no `tls` feature. The roots use the vocabulary of `TlsTrust`
-//! (`native_roots`, `extra_roots`, `exclusive`) and the SNI name and client
-//! identity use the one of `GrpcConfig`. The OS store is read through
-//! `rustls-native-certs`, as everywhere else in scalo.
+//! `VectorCompatClient` is a tonic client, so this maps onto tonic's
+//! `ClientTlsConfig` through `crate::tls`, as `GrpcTransport` does. The roots
+//! use the vocabulary of `TlsTrust` (`native_roots`, `extra_roots`,
+//! `exclusive`) and the SNI name and client identity use the one of
+//! `GrpcConfig`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+use tonic::transport::ClientTlsConfig;
 
+use crate::tls::{ClientTls, TrustChoice};
 use crate::transport::error::{TransportError, TransportResult};
 
 /// Client TLS for a [`VectorCompatClient`](super::VectorCompatClient).
@@ -127,38 +127,17 @@ impl VectorCompatTls {
                     .to_string(),
             ));
         }
-        let mut tls = ClientTlsConfig::new();
-        if self.native_roots && !self.exclusive {
-            // tonic fails a client whose OS store is empty, even with
-            // `extra_roots` beside it. An empty store is the common case in a
-            // minimal container that carries its own CA, so it is left out when
-            // there is a root to fall back on.
-            if os_store_has_roots() {
-                tls = tls.with_native_roots();
-            } else if self.extra_roots.is_empty() {
-                return Err(config_error(
-                    "the OS root store holds no certificate, and `extra_roots` is empty"
-                        .to_string(),
-                ));
-            } else {
-                tracing::warn!(
-                    "Vector TLS: the OS root store holds no certificate, so only `extra_roots` is trusted"
-                );
-            }
-        }
-        for path in &self.extra_roots {
-            let pem = read_pem(path, "CA", "-----BEGIN CERTIFICATE-----")?;
-            tls = tls.ca_certificate(Certificate::from_pem(pem));
-        }
-        if let Some(domain) = &self.domain {
-            tls = tls.domain_name(domain.clone());
-        }
+        let trust = if self.native_roots && !self.exclusive {
+            TrustChoice::Native
+        } else {
+            TrustChoice::Bundle
+        };
+        let mut tls = self
+            .extra_roots
+            .iter()
+            .fold(ClientTls::new(trust), |tls, path| tls.with_ca(path));
         match (&self.client_cert, &self.client_key) {
-            (Some(cert), Some(key)) => {
-                let cert_pem = read_pem(cert, "client certificate", "-----BEGIN CERTIFICATE-----")?;
-                let key_pem = read_pem(key, "client key", "PRIVATE KEY-----")?;
-                tls = tls.identity(Identity::from_pem(cert_pem, key_pem));
-            }
+            (Some(cert), Some(key)) => tls = tls.with_identity(cert, key),
             (None, None) => {}
             _ => {
                 return Err(config_error(
@@ -166,27 +145,13 @@ impl VectorCompatTls {
                 ));
             }
         }
+        let mut tls =
+            crate::tls::tonic_client_tls(&tls).map_err(|e| config_error(e.to_string()))?;
+        if let Some(domain) = &self.domain {
+            tls = tls.domain_name(domain.clone());
+        }
         Ok(tls)
     }
-}
-
-/// Whether the OS root store holds a certificate, read as tonic reads it.
-fn os_store_has_roots() -> bool {
-    !rustls_native_certs::load_native_certs().certs.is_empty()
-}
-
-/// Read a PEM file that must hold a block containing `marker`, so a wrong file
-/// fails when the client is built and not at its first RPC.
-fn read_pem(path: &Path, what: &str, marker: &str) -> TransportResult<Vec<u8>> {
-    let pem = std::fs::read(path)
-        .map_err(|e| config_error(format!("cannot read {what} {}: {e}", path.display())))?;
-    if !String::from_utf8_lossy(&pem).contains(marker) {
-        return Err(config_error(format!(
-            "{what} {} holds no PEM block with {marker}",
-            path.display()
-        )));
-    }
-    Ok(pem)
 }
 
 fn config_error(message: String) -> TransportError {
@@ -221,6 +186,8 @@ pub(super) fn require_https(endpoint: &str) -> TransportResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::super::sink::VectorCompatClient;
     use super::*;
 
@@ -232,15 +199,15 @@ mod tests {
         path
     }
 
-    /// Each mistake in the TLS settings fails when the client is built, with a
-    /// message that says which, where tonic would fail the first RPC with a
-    /// handshake error or dial in plaintext.
+    /// Each mistake in the shape of the TLS settings fails when the client is
+    /// built, with a message that says which, where tonic would fail the first
+    /// RPC with a handshake error or dial in plaintext. File mistakes are
+    /// `crate::tls`'s, tested there.
     #[tokio::test]
     async fn a_mistake_in_the_tls_settings_fails_the_build() {
         let dir = tempfile::tempdir().unwrap();
         let pair = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let ca = write(dir.path(), "ca.pem", &pair.cert.pem());
-        let junk = write(dir.path(), "junk.pem", "not a certificate");
         let key = write(dir.path(), "key.pem", &pair.signing_key.serialize_pem());
         let missing = dir.path().join("missing.pem");
         let build = |tls: &VectorCompatTls, endpoint: &str| {
@@ -262,7 +229,6 @@ mod tests {
             client_key: Some(key.clone()),
             ..VectorCompatTls::private_ca(&ca)
         };
-        let key_is_a_cert = VectorCompatTls::private_ca(&ca).with_client_identity(&ca, &ca);
         let cases = [
             (
                 "a plaintext endpoint",
@@ -286,19 +252,9 @@ mod tests {
                 "both `client_cert` and `client_key`",
             ),
             (
-                "a missing CA file",
+                "a file error from crate::tls",
                 build(&VectorCompatTls::private_ca(&missing), ENDPOINT),
                 "missing.pem",
-            ),
-            (
-                "a CA file that is not PEM",
-                build(&VectorCompatTls::private_ca(&junk), ENDPOINT),
-                "junk.pem",
-            ),
-            (
-                "a client key that is not a key",
-                build(&key_is_a_cert, ENDPOINT),
-                "client key",
             ),
         ];
         for (name, error, expected) in cases {

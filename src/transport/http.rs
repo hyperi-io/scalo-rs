@@ -188,12 +188,26 @@ pub struct HttpTransportConfig {
     #[serde(default = "default_max_in_flight_bytes")]
     pub max_in_flight_bytes: usize,
 
-    /// Private-CA PEM path for the send-side HTTPS client (needs the `tls`
-    /// feature). Trusts this CA *in addition to* the OS native roots. None =
-    /// native roots only (reqwest default). Maps to `TlsTrust { native_roots:
-    /// true, extra_roots: [ca] }`.
+    /// CA PEM file the send-side HTTPS client trusts, beside the OS store
+    /// under `native` and `platform`, and alone under `bundle`.
     #[serde(default)]
     pub tls_ca_path: Option<String>,
+
+    /// Which certificates the send-side client accepts the server's from:
+    /// `native`, `platform` or `bundle` (see [`crate::tls::TrustChoice`]).
+    /// Unset is `native` when any other `tls_*` key is set, and the HTTP
+    /// client library's own verifier, the OS one, when none is.
+    #[serde(default)]
+    pub tls_trust: Option<crate::tls::TrustChoice>,
+
+    /// Client certificate PEM for mutual TLS, with `tls_client_key_path`.
+    #[serde(default)]
+    pub tls_client_cert_path: Option<String>,
+
+    /// Client private key PEM for mutual TLS, with `tls_client_cert_path`.
+    /// May name the same file when it holds both.
+    #[serde(default)]
+    pub tls_client_key_path: Option<String>,
 }
 
 impl Default for HttpTransportConfig {
@@ -211,6 +225,9 @@ impl Default for HttpTransportConfig {
             max_body_bytes: default_max_body_bytes(),
             max_in_flight_bytes: default_max_in_flight_bytes(),
             tls_ca_path: None,
+            tls_trust: None,
+            tls_client_cert_path: None,
+            tls_client_key_path: None,
         }
     }
 }
@@ -224,6 +241,38 @@ impl HttpTransportConfig {
     /// `TransportError::Config` when the section is present but does not parse.
     pub fn from_cascade() -> crate::transport::TransportResult<Self> {
         <Self as super::traits::FromCascade>::from_cascade_key("transport.http")
+    }
+
+    /// The client TLS the `tls_*` keys name, or `None` when none is set and
+    /// the HTTP client keeps its own verifier.
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` when only one of the client certificate and
+    /// key is set.
+    fn client_tls(&self) -> TransportResult<Option<crate::tls::ClientTls>> {
+        let identity = match (&self.tls_client_cert_path, &self.tls_client_key_path) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (None, None) => None,
+            _ => {
+                return Err(TransportError::Config(
+                    "HTTP client TLS: mutual TLS needs both tls_client_cert_path and \
+                     tls_client_key_path"
+                        .to_string(),
+                ));
+            }
+        };
+        if self.tls_trust.is_none() && self.tls_ca_path.is_none() && identity.is_none() {
+            return Ok(None);
+        }
+        let mut tls = crate::tls::ClientTls::new(self.tls_trust.unwrap_or_default());
+        if let Some(ca) = &self.tls_ca_path {
+            tls = tls.with_ca(ca);
+        }
+        if let Some((cert, key)) = identity {
+            tls = tls.with_identity(cert, key);
+        }
+        Ok(Some(tls))
     }
 
     /// Create a send-only config pointing at the given endpoint URL.
@@ -338,33 +387,17 @@ impl HttpTransport {
         config: &HttpTransportConfig,
         #[cfg(feature = "governor")] pressure: Option<Arc<crate::governor::UnifiedPressure>>,
     ) -> TransportResult<Self> {
-        // `mut` is only used on the TLS path. Harmless without the feature.
-        #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
         let mut client_builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(config.connect_timeout_ms))
             .timeout(std::time::Duration::from_millis(config.send_timeout_ms));
 
-        // Private-CA trust via the unified TLS module (augments native roots).
-        #[cfg(feature = "tls")]
-        if let Some(ref ca) = config.tls_ca_path {
-            let trust = crate::tls::TlsTrust {
-                native_roots: true,
-                webpki_roots: false,
-                extra_roots: vec![ca.into()],
-                extra_intermediates: Vec::new(),
-                exclusive: false,
-            };
+        if let Some(tls) = config.client_tls()? {
             let tls_cfg =
-                crate::tls::build_client_config(crate::tls::TlsConfigSource::Trust(trust))
+                crate::tls::build_client_tls(crate::crypto::CryptoProfile::default(), &tls)
                     .map_err(|e| TransportError::Config(format!("HTTP client TLS: {e}")))?;
             client_builder = client_builder.use_preconfigured_tls((*tls_cfg).clone());
-        }
-        #[cfg(not(feature = "tls"))]
-        if config.tls_ca_path.is_some() {
-            tracing::warn!(
-                "http transport tls_ca_path is set but the `tls` feature is disabled -- \
-                 ignoring (using reqwest default roots)"
-            );
+        } else {
+            tracing::debug!("HTTP transport client TLS: the client library's own verifier");
         }
 
         let client = client_builder
@@ -1037,6 +1070,236 @@ mod tests {
             Some("http://localhost:8080/ingest")
         );
         assert!(config.listen.is_none());
+    }
+
+    /// Every `tls_*` key reaches the config through the cascade, from YAML and
+    /// from the environment, which wins.
+    #[cfg(feature = "config")]
+    #[test]
+    fn tls_keys_reach_the_config_through_the_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "transport:\n  http:\n    tls_trust: bundle\n    tls_ca_path: /etc/tls/ca.pem\n    \
+             tls_client_cert_path: /etc/tls/client.pem\n    tls_client_key_path: /etc/tls/yaml.key\n",
+        )
+        .unwrap();
+        temp_env::with_vars(
+            [
+                ("HTTPTLS__TRANSPORT__HTTP__TLS_TRUST", Some("platform")),
+                (
+                    "HTTPTLS__TRANSPORT__HTTP__TLS_CLIENT_KEY_PATH",
+                    Some("/etc/tls/env.key"),
+                ),
+            ],
+            || {
+                crate::config::setup(crate::config::ConfigOptions {
+                    env_prefix: "HTTPTLS".to_string(),
+                    config_paths: vec![dir.path().to_path_buf()],
+                    search_standard_paths: false,
+                    load_dotenv: false,
+                    ..crate::config::ConfigOptions::default()
+                })
+                .unwrap();
+            },
+        );
+        let config = HttpTransportConfig::from_cascade().unwrap();
+        assert_eq!(config.tls_trust, Some(crate::tls::TrustChoice::Platform));
+        assert_eq!(config.tls_ca_path.as_deref(), Some("/etc/tls/ca.pem"));
+        assert_eq!(
+            config.tls_client_cert_path.as_deref(),
+            Some("/etc/tls/client.pem")
+        );
+        assert_eq!(
+            config.tls_client_key_path.as_deref(),
+            Some("/etc/tls/env.key")
+        );
+    }
+
+    /// The `tls_*` keys map onto the client TLS they name, and leave the HTTP
+    /// client's own verifier in place when none is set.
+    #[test]
+    fn tls_keys_map_onto_client_tls() {
+        use crate::tls::{ClientTls, TrustChoice};
+        type Mapped = Result<Option<ClientTls>, String>;
+        let with = |trust, ca: Option<&str>, cert: Option<&str>, key: Option<&str>| -> Mapped {
+            HttpTransportConfig {
+                tls_trust: trust,
+                tls_ca_path: ca.map(str::to_string),
+                tls_client_cert_path: cert.map(str::to_string),
+                tls_client_key_path: key.map(str::to_string),
+                ..HttpTransportConfig::default()
+            }
+            .client_tls()
+            .map_err(|e| e.to_string())
+        };
+        let native = || ClientTls::new(TrustChoice::Native);
+        let cases: [(&str, Mapped, Mapped); 6] = [
+            ("nothing set", with(None, None, None, None), Ok(None)),
+            (
+                "a CA alone is native plus the CA",
+                with(None, Some("ca.pem"), None, None),
+                Ok(Some(native().with_ca("ca.pem"))),
+            ),
+            (
+                "an explicit native",
+                with(Some(TrustChoice::Native), None, None, None),
+                Ok(Some(native())),
+            ),
+            (
+                "the pin with an identity",
+                with(
+                    Some(TrustChoice::Bundle),
+                    Some("ca.pem"),
+                    Some("c.pem"),
+                    Some("k.pem"),
+                ),
+                Ok(Some(
+                    ClientTls::pinned("ca.pem").with_identity("c.pem", "k.pem"),
+                )),
+            ),
+            (
+                "an identity alone is native",
+                with(None, None, Some("c.pem"), Some("k.pem")),
+                Ok(Some(native().with_identity("c.pem", "k.pem"))),
+            ),
+            (
+                "a certificate without its key",
+                with(Some(TrustChoice::Platform), None, Some("c.pem"), None),
+                Err(
+                    "transport config error: HTTP client TLS: mutual TLS needs both \
+                     tls_client_cert_path and tls_client_key_path"
+                        .to_string(),
+                ),
+            ),
+        ];
+        for (name, got, expected) in cases {
+            assert_eq!(got, expected, "{name}");
+        }
+    }
+
+    /// A send over HTTPS to a server that asks for a client certificate, under
+    /// each trust choice, with and without the identity.
+    #[tokio::test]
+    async fn https_send_uses_the_trust_and_identity_configured() {
+        use crate::tls::TrustChoice;
+        use crate::tls::test_pki::TestCa;
+
+        let ca = TestCa::new("http transport test CA");
+        let server_leaf = ca.server("http server");
+        let client_leaf = ca.client("http client");
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let ca_path = file("ca.pem", &ca.pem());
+        let cert = file("client.pem", &client_leaf.cert_pem);
+        let key = file("client.key", &client_leaf.key_pem);
+        let addr = mtls_server(&ca, &server_leaf).await;
+        let endpoint = format!("https://localhost:{}", addr.port());
+
+        let cases = [
+            ("bundle with the identity", TrustChoice::Bundle, true, true),
+            ("native with the identity", TrustChoice::Native, true, true),
+            (
+                "platform with the identity",
+                TrustChoice::Platform,
+                true,
+                true,
+            ),
+            (
+                "bundle without the identity",
+                TrustChoice::Bundle,
+                false,
+                false,
+            ),
+        ];
+        for (name, trust, identity, delivered) in cases {
+            let config = HttpTransportConfig {
+                tls_trust: Some(trust),
+                tls_ca_path: Some(ca_path.clone()),
+                tls_client_cert_path: identity.then(|| cert.clone()),
+                tls_client_key_path: identity.then(|| key.clone()),
+                ..HttpTransportConfig::sender(&endpoint)
+            };
+            let transport = HttpTransport::new(&config).await.unwrap();
+            let result = transport
+                .send("ingest", bytes::Bytes::from_static(b"{}"))
+                .await;
+            assert_eq!(result.is_ok(), delivered, "{name}: {result:?}");
+        }
+
+        let missing = HttpTransportConfig {
+            tls_trust: Some(TrustChoice::Bundle),
+            tls_ca_path: Some(dir.path().join("gone.pem").to_string_lossy().into_owned()),
+            ..HttpTransportConfig::sender(&endpoint)
+        };
+        let error = HttpTransport::new(&missing)
+            .await
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains("gone.pem")),
+            "a missing CA file fails the build: {error:?}"
+        );
+    }
+
+    /// An HTTPS server on localhost that requires a client certificate from
+    /// `ca` and answers every request 200.
+    async fn mtls_server(
+        ca: &crate::tls::test_pki::TestCa,
+        leaf: &crate::tls::test_pki::Leaf,
+    ) -> std::net::SocketAddr {
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca.pem().as_bytes()).unwrap())
+            .unwrap();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::clone(&provider),
+        )
+        .build()
+        .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![leaf.der.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let response =
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = stream.write_all(response).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
     }
 
     #[test]

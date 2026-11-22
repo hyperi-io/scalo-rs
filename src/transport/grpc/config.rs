@@ -68,15 +68,13 @@ pub struct GrpcConfig {
     /// Enable gzip compression for gRPC messages.
     pub compression: bool,
 
-    // --- Client TLS. tonic owns its TLS stack (like librdkafka), so these map
-    // TlsTrust onto tonic's ClientTlsConfig rather than crate::tls's rustls
-    // ClientConfig. In-cluster gRPC is usually mesh-mTLS (Istio/Linkerd);
-    // set these only for DIRECT TLS to a remote endpoint. ---
+    // --- Client TLS, mapped onto tonic's ClientTlsConfig by crate::tls. In-cluster
+    // gRPC is usually mesh mTLS, so these are for direct TLS to a remote endpoint. ---
     /// Enable client TLS for the `endpoint` connection.
     #[serde(default)]
     pub tls_enabled: bool,
-    /// Private-CA PEM (maps to `TlsTrust.extra_roots`). When unset with
-    /// `tls_enabled`, falls back to OS native roots.
+    /// CA PEM file, trusted alone when set. Unset with `tls_enabled`, the OS
+    /// native roots are trusted.
     #[serde(default)]
     pub tls_ca_path: Option<String>,
     /// Domain name for SNI / certificate verification (overrides the URI host).

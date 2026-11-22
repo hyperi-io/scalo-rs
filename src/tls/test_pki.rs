@@ -107,6 +107,43 @@ pub(crate) fn connector(ca_pem: &str, identity: Option<&Leaf>, alpn: &[&[u8]]) -
     TlsConnector::from(Arc::new(config))
 }
 
+/// Drive an in-memory handshake to completion, returning the first rustls
+/// error either side raises.
+///
+/// Running out of rounds is an error, so a stalled handshake never reads as a
+/// completed one.
+pub(crate) fn pump(
+    client: &mut rustls::ClientConnection,
+    server: &mut rustls::ServerConnection,
+) -> Result<(), rustls::Error> {
+    for _ in 0..40 {
+        let mut c2s: Vec<u8> = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut c2s).unwrap();
+        }
+        let mut rd: &[u8] = &c2s;
+        while !rd.is_empty() {
+            server.read_tls(&mut rd).unwrap();
+            server.process_new_packets()?;
+        }
+        let mut s2c: Vec<u8> = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut s2c).unwrap();
+        }
+        let mut rd2: &[u8] = &s2c;
+        while !rd2.is_empty() {
+            client.read_tls(&mut rd2).unwrap();
+            client.process_new_packets()?;
+        }
+        if !client.is_handshaking() && !server.is_handshaking() {
+            return Ok(());
+        }
+    }
+    Err(rustls::Error::General(
+        "handshake did not complete within 40 pump rounds".to_string(),
+    ))
+}
+
 /// Connect to `addr` and run the client handshake for `localhost`.
 pub(crate) async fn connect(
     connector: &TlsConnector,
