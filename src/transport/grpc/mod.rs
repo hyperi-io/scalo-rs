@@ -436,6 +436,35 @@ struct Wire {
     inflight: Arc<AtomicU64>,
 }
 
+/// The answer to `RouteBatch` requests: the result, and the status code of
+/// the request that failed, if one did.
+struct Answer {
+    result: SendResult,
+    code: Option<tonic::Code>,
+}
+
+/// One RPC counted in flight until dropped, so an RPC dropped mid-call, as
+/// at a deadline or on close, is counted out too.
+#[cfg(feature = "metrics")]
+struct InFlight<'a>(&'a AtomicU64);
+
+#[cfg(feature = "metrics")]
+impl<'a> InFlight<'a> {
+    fn enter(count: &'a AtomicU64) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+        metrics::gauge!("transport_inflight", "transport" => "grpc")
+            .set(self.0.load(Ordering::Relaxed) as f64);
+    }
+}
+
 /// Build a tonic `ClientTlsConfig` from the unified TLS fields on `GrpcConfig`.
 ///
 /// tonic owns its TLS stack (like librdkafka), so map `TlsTrust` onto
@@ -1118,7 +1147,7 @@ impl TransportSender for GrpcTransport {
         let start = std::time::Instant::now();
 
         #[cfg(feature = "metrics")]
-        self.inflight.fetch_add(1, Ordering::Relaxed);
+        let in_flight = InFlight::enter(&self.inflight);
 
         // tonic clients are cheaply cloneable (shared channel)
         let mut client = client.clone();
@@ -1145,9 +1174,7 @@ impl TransportSender for GrpcTransport {
 
         #[cfg(feature = "metrics")]
         {
-            self.inflight.fetch_sub(1, Ordering::Relaxed);
-            metrics::gauge!("transport_inflight", "transport" => "grpc")
-                .set(self.inflight.load(Ordering::Relaxed) as f64);
+            drop(in_flight);
             metrics::histogram!(
                 "transport_send_duration_seconds",
                 "transport" => "grpc"
@@ -1177,11 +1204,12 @@ impl TransportSender for GrpcTransport {
     /// the blocks queued behind it, within the same cap. The result is that
     /// call's, given once the call returns: a call that fails for now fails
     /// every block in it, and each caller sends again. When the receiver
-    /// refuses a call of several blocks for good, each block goes again on its
-    /// own through the same slots and gets its own answer. A block the stage
-    /// has no room for waits for room. One `send_timeout_ms` from the start of
-    /// `send_batch` bounds the wait for room and a slot, the call and any
-    /// resend, and past it, or once the transport closes, the result is
+    /// refuses a call of several blocks for good, or answers it
+    /// `ResourceExhausted`, as one with a lower limit does, each block goes
+    /// again on its own through the same slots and gets its own answer. A
+    /// block the stage has no room for waits for room. One `send_timeout_ms`
+    /// from the start of `send_batch` bounds the wait for room and a slot, the
+    /// call and any resend, and past it, or once the transport closes, the result is
     /// `Backpressured`. A block whose caller is dropped before the stage takes
     /// it is not sent. A block at the cap or over it, or any block with joining
     /// off, goes on its own with `send_timeout_ms` per request, as before.
@@ -1297,13 +1325,12 @@ fn as_field(record: Record) -> Framed {
 /// `record` as a field of a `Batch` body, or `None`, warned and counted, when
 /// it is over `limit` on its own: the same bytes are refused on every retry.
 fn frame(record: Record, limit: usize) -> Option<Framed> {
-    let destination = record.key.clone();
     let framed = as_field(record);
     if framed.len > limit {
         #[cfg(feature = "metrics")]
         metrics::counter!("transport_message_too_large_total", "transport" => "grpc").increment(1);
         tracing::warn!(
-            destination = destination.as_deref().unwrap_or(""),
+            destination = framed.record.key.as_str(),
             encoded_len = framed.len,
             limit,
             "gRPC send_batch: a record over max_message_size on its own is left out of the \
@@ -1480,17 +1507,25 @@ impl Wire {
     /// Send `bodies` in order, one `RouteBatch` RPC each, stopping at the first
     /// that is not `Ok`.
     async fn send_bodies(&self, bodies: Vec<proto::Batch>) -> SendResult {
+        self.answer_to(bodies).await.result
+    }
+
+    /// As `send_bodies`, with the status code of the RPC that failed.
+    async fn answer_to(&self, bodies: Vec<proto::Batch>) -> Answer {
         for body in bodies {
-            let result = self.route_batch(body).await;
-            if !result.is_ok() {
-                return result;
+            let answer = self.route_batch(body).await;
+            if !answer.result.is_ok() {
+                return answer;
             }
         }
-        SendResult::Ok
+        Answer {
+            result: SendResult::Ok,
+            code: None,
+        }
     }
 
     /// Send one `Batch` body as a `RouteBatch` RPC under `send_timeout_ms`.
-    async fn route_batch(&self, proto_batch: proto::Batch) -> SendResult {
+    async fn route_batch(&self, proto_batch: proto::Batch) -> Answer {
         let sent_count = proto_batch.records.len();
         #[cfg(feature = "metrics")]
         let payload_bytes: usize = proto_batch.records.iter().map(|r| r.payload.len()).sum();
@@ -1514,10 +1549,11 @@ impl Wire {
         #[cfg(feature = "metrics")]
         let start = std::time::Instant::now();
         #[cfg(feature = "metrics")]
-        self.inflight.fetch_add(1, Ordering::Relaxed);
+        let in_flight = InFlight::enter(&self.inflight);
 
         let mut client = self.client.clone();
         let rpc = client.route_batch(request);
+        let mut code = None;
         let result = match within_send_timeout(self.send_timeout_ms, rpc).await {
             Ok(response) => {
                 // Server is all-or-nothing, but the proto permits partial
@@ -1554,12 +1590,15 @@ impl Wire {
                     SendResult::Ok
                 }
             }
-            Err(status) => failed_rpc_result(&status),
+            Err(status) => {
+                code = Some(status.code());
+                failed_rpc_result(&status)
+            }
         };
 
         #[cfg(feature = "metrics")]
         {
-            self.inflight.fetch_sub(1, Ordering::Relaxed);
+            drop(in_flight);
             metrics::histogram!(
                 "transport_send_duration_seconds",
                 "transport" => "grpc"
@@ -1567,7 +1606,7 @@ impl Wire {
             .record(start.elapsed().as_secs_f64());
         }
 
-        result
+        Answer { result, code }
     }
 }
 
@@ -2191,15 +2230,40 @@ mod tests {
         assert_eq!(config.endpoint.as_deref(), Some("http://loader:6000"));
     }
 
+    /// The warning for the record left out names its destination.
     #[tokio::test]
     async fn send_batch_leaves_out_a_record_over_the_limit_on_its_own() {
+        // Current-thread runtime: the send runs on this thread and logs here.
+        #[cfg(feature = "logger")]
+        let (logs, _logging) = {
+            use tracing_subscriber::layer::SubscriberExt;
+            struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Sink {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = Arc::clone(&logs);
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || Sink(Arc::clone(&writer))),
+            );
+            (logs, tracing::subscriber::set_default(subscriber))
+        };
+
         // The same bytes are refused on every retry, so the record is left
         // out before any connection, as `send` refuses it, so no server runs.
         let config = GrpcConfig::client("http://127.0.0.1:1").with_max_message_size(64);
         let transport = GrpcTransport::new(&config).await.unwrap();
         let rec = Record {
             payload: bytes::Bytes::from(vec![b'x'; 256]),
-            key: None,
+            key: Some(Arc::from("events.land")),
             headers: Vec::new(),
             metadata: crate::transport::work_batch::RecordMeta {
                 timestamp_ms: None,
@@ -2211,6 +2275,16 @@ mod tests {
             result.is_filtered_dlq(),
             "the only record, over the limit: got {result:?}"
         );
+
+        #[cfg(feature = "logger")]
+        {
+            let out = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+            assert!(
+                out.lines()
+                    .any(|line| line.contains("left out") && line.contains("events.land")),
+                "no warning names the destination:\n{out}"
+            );
+        }
     }
 
     /// The record left out counts as too large and as a dropped dead letter.

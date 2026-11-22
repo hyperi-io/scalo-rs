@@ -16,13 +16,16 @@
 //!
 //! A caller is answered once the call carrying its records returns, with that
 //! call's result: a call that fails for now fails every caller in it, and each
-//! sends again. When the receiver refuses a call of several blocks for good,
-//! each block goes again on its own through the same slots, so one block's
-//! refusal stays its own. A caller still unanswered at its deadline, or when the
-//! transport closes, is answered `Backpressured`. Queued blocks are capped at
-//! `ROOM_TARGETS` times `max_batch_bytes`, counted encoded, so a caller that
-//! finds no room waits for it, and nothing is dropped. A block whose caller has
-//! gone is dropped if the stage has not taken it yet.
+//! sends again. When the receiver refuses a call of several blocks for good, or
+//! `ResourceExhausted`, each block goes again on its own through the same
+//! slots, so one block's refusal stays its own, and a receiver whose limit is
+//! below the sender's still takes each block.
+//!
+//! A caller still unanswered at its deadline, or when the transport closes, is
+//! answered `Backpressured`. Queued blocks are capped at `ROOM_TARGETS` times
+//! `max_batch_bytes`, counted encoded, so a caller that finds no room waits for
+//! it, and nothing is dropped. A block whose caller has gone is dropped if the
+//! stage has not taken it yet.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,8 +81,8 @@ fn timed_out() -> SendResult {
 enum Joined {
     /// The call's result.
     Answered(SendResult),
-    /// The receiver refused, for good, a call that carried other blocks too,
-    /// so the caller sends its block again on its own.
+    /// The receiver refused a call that carried other blocks too, for good or
+    /// `ResourceExhausted`, so the caller sends its block again on its own.
     Alone,
 }
 
@@ -376,22 +379,24 @@ async fn send_taken(
         replies.push(item.reply);
         blocks.push(item.records);
     }
-    // A refusal for good of several blocks may be one block's alone.
     let several = blocks.len() > 1;
-    let call = wire.send_bodies(bodies_within(
+    let call = wire.answer_to(bodies_within(
         blocks.into_iter().flatten(),
         max_message_size,
     ));
     #[cfg(feature = "transport-trace")]
     let call = opentelemetry::context::FutureExt::with_context(call, context);
-    let result = call.await;
+    let sent = call.await;
     drop(slot);
-    if several && result.is_fatal() {
+    // A refusal for good may be one block's alone, and `ResourceExhausted` the
+    // joined request past a receiver's decode limit once decompressed.
+    let alone = sent.result.is_fatal() || sent.code == Some(tonic::Code::ResourceExhausted);
+    if several && alone {
         for reply in replies {
             let _ = reply.send(Joined::Alone);
         }
     } else {
-        answer(replies, result);
+        answer(replies, sent.result);
     }
 }
 
@@ -587,7 +592,8 @@ mod tests {
         recording_within(permits, 4 * 1024 * 1024).await
     }
 
-    /// As `recording`, refusing a request that decodes past `limit` bytes.
+    /// As `recording`, refusing a request that decodes past `limit` bytes:
+    /// `OutOfRange`, or `ResourceExhausted` once decompressed.
     async fn recording_within(permits: usize, limit: usize) -> (Arc<Calls>, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -604,6 +610,7 @@ mod tests {
             tonic::transport::Server::builder()
                 .add_service(
                     proto::transport_server::TransportServer::new(Recording(Arc::clone(&calls)))
+                        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
                         .max_decoding_message_size(limit),
                 )
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
@@ -1122,8 +1129,8 @@ mod tests {
     }
 
     /// `close` answers every caller still waiting `Backpressured` and stops the
-    /// call in flight, with every slot held by a receiver that never answers and
-    /// no `send_timeout_ms`.
+    /// call in flight, counted out of the RPCs in flight, with every slot held
+    /// by a receiver that never answers and no `send_timeout_ms`.
     #[tokio::test]
     async fn close_answers_every_waiting_caller_backpressured() {
         let (calls, uri) = recording(0).await;
@@ -1134,6 +1141,8 @@ mod tests {
         calls.arrived(1).await;
         let a = queue(&sender, &["a"]).await;
         let b = queue(&sender, &["b"]).await;
+        #[cfg(feature = "metrics")]
+        assert_eq!(sender.inflight.load(Ordering::SeqCst), 1);
 
         sender.close().await.unwrap();
         for caller in [first, a, b] {
@@ -1148,6 +1157,11 @@ mod tests {
         })
         .await;
         assert_eq!(calls.payloads(), [["x"]], "a block was sent after close");
+        #[cfg(feature = "metrics")]
+        until("the stopped call counted out", || {
+            sender.inflight.load(Ordering::SeqCst) == 0
+        })
+        .await;
     }
 
     /// A joined call stays within `max_message_size` encoded, so it is one
@@ -1193,6 +1207,39 @@ mod tests {
             let len = prost::Message::encoded_len(batch);
             assert!(len <= LIMIT, "a request of {len} bytes past {LIMIT}");
         }
+    }
+
+    /// A receiver whose decode limit is below the sender's takes each block
+    /// alone, but refuses the joined call `ResourceExhausted` once it
+    /// decompresses it. Each block then goes again on its own, and every one
+    /// lands.
+    #[tokio::test]
+    async fn a_joined_call_past_the_receivers_limit_goes_again_block_by_block() {
+        const LIMIT: usize = 1024;
+        let (calls, uri) = recording_within(0, LIMIT).await;
+        let sender = sender(client(&uri, joining(1 << 16, 1)).with_compression()).await;
+        let first = offer(&sender, &["x"]);
+        calls.arrived(1).await;
+        // Four blocks of 600 bytes: each fits the receiver, and no two do.
+        let names: Vec<String> = (0..4).map(|i| format!("{i}{}", "z".repeat(599))).collect();
+        let mut callers = Vec::new();
+        for name in &names {
+            callers.push(queue(&sender, &[name.as_str()]).await);
+        }
+
+        calls.answer(1_000);
+        assert!(result(first).await.is_ok());
+        for caller in callers {
+            let got = result(caller).await;
+            assert!(got.is_ok(), "a block the receiver takes alone got {got:?}");
+        }
+        // The refused joined call never reached the service.
+        let mut want = vec![vec!["x".to_owned()]];
+        want.extend(names.iter().map(|name| vec![name.clone()]));
+        let mut got = calls.payloads();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
     }
 
     /// `send_timeout_ms` bounds a joined `send_batch` whole, the wait for a slot
@@ -1273,7 +1320,8 @@ mod tests {
 
     /// The deadline runs from the start of `send_batch` through a resend: a
     /// block sent again on its own after a refused joined call is answered at
-    /// its caller's deadline, not one restarted for the resend.
+    /// its caller's deadline, not one restarted for the resend, and the resend
+    /// stopped there is counted out of the RPCs in flight.
     #[tokio::test]
     async fn a_resend_after_a_refused_joined_call_keeps_the_callers_deadline() {
         const LIMIT_MS: u64 = 1_000;
@@ -1304,6 +1352,11 @@ mod tests {
             "answered after {took:?} at a {LIMIT_MS} ms limit"
         );
         assert!(result(first).await.is_ok());
+        #[cfg(feature = "metrics")]
+        until("the stopped resend counted out", || {
+            sender.inflight.load(Ordering::SeqCst) == 0
+        })
+        .await;
     }
 
     /// Dropping the transport stops the calls its stage has in flight.
