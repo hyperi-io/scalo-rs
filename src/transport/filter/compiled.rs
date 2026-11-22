@@ -83,6 +83,8 @@ pub enum CompiledFilter {
     #[cfg(feature = "expression")]
     CelExpression {
         program: cel::Program,
+        /// The top-level keys the expression reads. A nested path such as `source.name` is
+        /// read through its root, so CEL gets the whole `source` object to select from.
         fields: Vec<String>,
         expression_text: String,
         tier: FilterTier,
@@ -133,7 +135,7 @@ impl CompiledFilter {
                     .map_err(|e| format!("CEL compilation failed: {e}"))?;
                 Ok(Self::CelExpression {
                     program,
-                    fields,
+                    fields: context_roots(fields),
                     expression_text,
                     tier: FilterTier::Tier2,
                     action,
@@ -156,7 +158,7 @@ impl CompiledFilter {
                     .map_err(|e| format!("CEL compilation failed: {e}"))?;
                 Ok(Self::CelExpression {
                     program,
-                    fields,
+                    fields: context_roots(fields),
                     expression_text,
                     tier: FilterTier::Tier3,
                     action,
@@ -424,6 +426,22 @@ impl CompiledFilter {
             } => expression_text,
         }
     }
+}
+
+/// The root segment of each field path, once each, in first-seen order.
+///
+/// CEL resolves `source.name` as member `name` of the variable `source`, so the context
+/// must declare `source` as the whole object, not a variable called `source.name`.
+#[cfg(feature = "expression")]
+fn context_roots(fields: Vec<String>) -> Vec<String> {
+    let mut roots: Vec<String> = Vec::with_capacity(fields.len());
+    for field in fields {
+        let root = field.split('.').next().unwrap_or_default();
+        if !roots.iter().any(|r| r == root) {
+            roots.push(root.to_owned());
+        }
+    }
+    roots
 }
 
 /// Split a dotted field path into segments for `sonic_rs::get_from_slice()`.
@@ -920,6 +938,70 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Tier 2"), "{err}");
+    }
+
+    /// A rule on a nested field reads it through its root object, and a flat field as before.
+    #[cfg(feature = "expression")]
+    #[test]
+    fn cel_rules_read_nested_and_flat_fields() {
+        let tiers = TransportFilterTierConfig {
+            allow_cel_filters_in: true,
+            ..TransportFilterTierConfig::default()
+        };
+        // (expression, payload, dropped)
+        let cases: [(&str, &[u8], bool); 7] = [
+            (
+                r#"source.name == "dns" && event.n > 5"#,
+                br#"{"source":{"name":"dns"},"event":{"n":7}}"#,
+                true,
+            ),
+            (
+                r#"source.name == "dns" && event.n > 5"#,
+                br#"{"source":{"name":"dns"},"event":{"n":3}}"#,
+                false,
+            ),
+            (
+                r#"source.name == "dns" && event.n > 5"#,
+                br#"{"source":{"name":"app"},"event":{"n":7}}"#,
+                false,
+            ),
+            (
+                r#"a.b.c == "x" && a.d > 1"#,
+                br#"{"a":{"b":{"c":"x"},"d":2}}"#,
+                true,
+            ),
+            (
+                r#"severity > 3 && source != "internal""#,
+                br#"{"severity":5,"source":"edge"}"#,
+                true,
+            ),
+            (
+                r#"severity > 3 && source != "internal""#,
+                br#"{"severity":5,"source":"internal"}"#,
+                false,
+            ),
+            // A record without the root declares no variable, so the rule cannot match and it passes.
+            (
+                r#"source.name == "dns" && event.n > 5"#,
+                br#"{"event":{}}"#,
+                false,
+            ),
+        ];
+        for (expr, payload, dropped) in cases {
+            let filter = CompiledFilter::from_expression(
+                expr,
+                FilterAction::Drop,
+                FilterDirection::In,
+                &tiers,
+            )
+            .unwrap();
+            assert_eq!(
+                filter.evaluate(payload).is_some(),
+                dropped,
+                "{expr} on {}",
+                String::from_utf8_lossy(payload)
+            );
+        }
     }
 
     /// The rejection names the cascade key an operator sets to open the gate.
