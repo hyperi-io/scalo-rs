@@ -111,8 +111,9 @@ pub struct GrpcConfig {
 /// call.
 ///
 /// When a call slot is free, the next queued block goes out with every block
-/// queued behind it, up to `max_batch_bytes` of payload, with no timer. A block
-/// of `max_batch_bytes` or more is sent at once on its own.
+/// queued behind it, up to `max_batch_bytes` of payload and `max_message_size`
+/// encoded, with no timer. A block of `max_batch_bytes` or more is sent at once
+/// on its own. `send_timeout_ms` bounds the wait for a slot too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]

@@ -11,17 +11,19 @@
 //!
 //! One task owns the stage. When one of `in_flight` call slots is free, it takes
 //! the next queued block and every block queued behind it, up to
-//! `max_batch_bytes` of payload, and sends them as one call. It sets no timer, so
-//! a block that finds a slot free goes out at once.
+//! `max_batch_bytes` of payload and `max_message_size` encoded, and sends them as
+//! one call. It sets no timer, so a block that finds a slot free goes out at once.
 //!
 //! A caller is answered once the call carrying its records returns, with that
 //! call's result: a failed call fails every caller in it, and each sends again.
+//! A caller still unanswered at `send_timeout_ms` is answered `Backpressured`.
 //! Queued payload is capped at `ROOM_TARGETS` times `max_batch_bytes`, so a
 //! caller that finds no room waits for it, and nothing is dropped. A block whose
 //! caller has gone is dropped if the stage has not taken it yet.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -50,6 +52,8 @@ struct Limits {
 struct Item {
     records: Vec<Framed>,
     bytes: u64,
+    /// The records' encoded length as fields of a `Batch` body.
+    framed: usize,
     reply: oneshot::Sender<SendResult>,
     /// Room in the queue, given back when the stage takes the block.
     room: Option<OwnedSemaphorePermit>,
@@ -124,12 +128,28 @@ impl Coalescer {
     }
 
     /// Send `records` in the next call a slot frees for, and return that call's
-    /// result once it returns.
+    /// result once it returns, or `Backpressured` at `send_timeout_ms`.
     pub(super) async fn send(&self, records: Vec<Framed>) -> SendResult {
         if records.is_empty() {
             return SendResult::Ok;
         }
-        match self.submit(records).await {
+        let submitted = self.submit(records);
+        let limit_ms = self.wire.send_timeout_ms;
+        let outcome = if limit_ms == 0 {
+            submitted.await
+        } else if let Ok(outcome) =
+            tokio::time::timeout(Duration::from_millis(limit_ms), submitted).await
+        {
+            outcome
+        } else {
+            // Answered as a call past its deadline is. A block already in a call
+            // is still sent, so the caller's resend can duplicate it.
+            return super::failed_rpc_result(&tonic::Status::deadline_exceeded(format!(
+                "no answer within send_timeout_ms ({limit_ms} ms), the wait for a call slot \
+                 included"
+            )));
+        };
+        match outcome {
             Ok(result) => result,
             // The stage task has gone, so the block goes out on its own.
             Err(records) => {
@@ -144,6 +164,7 @@ impl Coalescer {
     /// `Err` hands them back when the stage task has gone.
     async fn submit(&self, records: Vec<Framed>) -> Result<SendResult, Vec<Framed>> {
         let bytes: u64 = records.iter().map(|r| r.record.payload.len() as u64).sum();
+        let framed: usize = records.iter().map(|r| r.len).sum();
         // Capped at the whole room, so a block always fits once the room drains.
         let permits = u32::try_from(bytes.min(self.room_bytes)).unwrap_or(u32::MAX);
         let Ok(room) = Arc::clone(&self.room).acquire_many_owned(permits).await else {
@@ -157,6 +178,7 @@ impl Coalescer {
         slot.send(Item {
             records,
             bytes,
+            framed,
             reply,
             room: Some(room),
             #[cfg(feature = "transport-trace")]
@@ -188,14 +210,19 @@ async fn run(wire: Wire, mut blocks: mpsc::Receiver<Item>, queued: Arc<AtomicU64
             return;
         };
         let mut bytes = first.bytes;
+        let mut framed = first.framed;
         let mut taken = vec![first];
         while let Ok(item) = blocks.try_recv() {
-            if !item.reply.is_closed() && bytes + item.bytes > limits.max_batch_bytes {
+            // Within max_message_size too, so the call is one request.
+            let fits = bytes + item.bytes <= limits.max_batch_bytes
+                && framed + item.framed <= limits.max_message_size;
+            if !item.reply.is_closed() && !fits {
                 carried = Some(item);
                 break;
             }
             if let Some(item) = leave_queue(item, &queued) {
                 bytes += item.bytes;
+                framed += item.framed;
                 taken.push(item);
             }
         }
@@ -432,6 +459,12 @@ mod tests {
     /// A recording receive server on a loopback port, answering `permits`
     /// calls before it holds the rest, and its URI.
     async fn recording(permits: usize) -> (Arc<Calls>, String) {
+        // tonic's own default decoding limit.
+        recording_within(permits, 4 * 1024 * 1024).await
+    }
+
+    /// As `recording`, refusing a request that decodes past `limit` bytes.
+    async fn recording_within(permits: usize, limit: usize) -> (Arc<Calls>, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let calls = Arc::new(Calls {
@@ -444,9 +477,10 @@ mod tests {
         });
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(proto::transport_server::TransportServer::new(Recording(
-                    Arc::clone(&calls),
-                )))
+                .add_service(
+                    proto::transport_server::TransportServer::new(Recording(Arc::clone(&calls)))
+                        .max_decoding_message_size(limit),
+                )
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
         (calls, format!("http://{addr}"))
@@ -760,6 +794,96 @@ mod tests {
         assert!(result(small).await.is_ok());
         assert!(result(large).await.is_ok());
         assert_eq!(calls.payloads(), [["1234"], ["12345678"]]);
+    }
+
+    /// A joined call stays within `max_message_size` encoded, so it is one
+    /// request a receiver with the same limit takes, and its callers are
+    /// answered when that request returns.
+    #[tokio::test]
+    async fn a_joined_call_stays_within_max_message_size() {
+        const LIMIT: usize = 1024;
+        let (calls, uri) = recording_within(0, LIMIT).await;
+        let sender = sender(client(&uri, joining(1 << 16, 1)).with_max_message_size(LIMIT)).await;
+        let first = offer(&sender, &["x"]);
+        calls.arrived(1).await;
+        // 40 blocks of 60 bytes: about 15 fit a call at this limit, 2,400 bytes all told.
+        let names: Vec<String> = (0..40)
+            .map(|i| format!("{i:03}{}", "y".repeat(57)))
+            .collect();
+        let mut callers = Vec::new();
+        for name in &names {
+            callers.push(queue(&sender, &[name.as_str()]).await);
+        }
+
+        calls.answer(2);
+        calls.arrived(3).await;
+        assert!(result(first).await.is_ok());
+        let joined = calls.payloads()[1].len();
+        assert!(
+            joined > 1 && joined < names.len(),
+            "the first joined call carried {joined} blocks"
+        );
+        until("the first joined call's callers answered", || {
+            callers.iter().filter(|caller| caller.is_finished()).count() == joined
+        })
+        .await;
+
+        calls.answer(1_000);
+        for caller in callers {
+            assert!(result(caller).await.is_ok(), "a call the receiver refused");
+        }
+        let batches = calls.batches.lock();
+        let sent: usize = batches.iter().map(|batch| batch.records.len()).sum();
+        assert_eq!(sent, names.len() + 1, "a block was dropped or sent twice");
+        for batch in batches.iter() {
+            let len = prost::Message::encoded_len(batch);
+            assert!(len <= LIMIT, "a request of {len} bytes past {LIMIT}");
+        }
+    }
+
+    /// `send_timeout_ms` bounds a joined `send_batch` whole, the wait for a slot
+    /// included. Against a receiver that never answers, every queued caller is
+    /// answered `Backpressured` within about one limit, and a block no call took
+    /// is not sent.
+    #[tokio::test]
+    async fn a_queued_block_is_answered_at_send_timeout_ms_by_a_receiver_that_hangs() {
+        const LIMIT_MS: u64 = 500;
+        let (calls, uri) = recording(0).await;
+        // 4 byte blocks and a 5 byte cap: one block a call, so each waits its turn.
+        let mut config = client(&uri, joining(5, 1));
+        config.send_timeout_ms = LIMIT_MS;
+        let sender = sender(config).await;
+        let first = offer(&sender, &["xxxx"]);
+        calls.arrived(1).await;
+        let mut waiting = Vec::new();
+        for name in ["aaaa", "bbbb", "cccc"] {
+            waiting.push(queue(&sender, &[name]).await);
+        }
+
+        let started = tokio::time::Instant::now();
+        for caller in waiting {
+            let got = result(caller).await;
+            assert!(got.is_backpressured(), "a queued caller got {got:?}");
+        }
+        let took = started.elapsed();
+        // One call after another would answer the last at four limits.
+        assert!(
+            took < Duration::from_millis(LIMIT_MS * 9 / 5),
+            "queued callers answered after {took:?} at a {LIMIT_MS} ms limit"
+        );
+        assert!(result(first).await.is_backpressured());
+
+        // Past the calls a slot could still have started for the blocks.
+        tokio::time::sleep(Duration::from_millis(LIMIT_MS * 2)).await;
+        let payloads = calls.payloads();
+        assert!(
+            payloads
+                .iter()
+                .flatten()
+                .all(|p| p != "bbbb" && p != "cccc"),
+            "a block no call had taken was sent: {payloads:?}"
+        );
+        assert_eq!(queued(&sender), 0);
     }
 
     /// A block that finds a slot free goes out at once as its own call.

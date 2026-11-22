@@ -1174,10 +1174,12 @@ impl TransportSender for GrpcTransport {
     /// With `coalesce.enabled` (the default), a block under
     /// `coalesce.max_batch_bytes` of payload waits for one of
     /// `coalesce.in_flight` call slots and goes out in one `RouteBatch` with
-    /// the blocks queued behind it. The result is that call's, given once the
-    /// call returns: a failed call fails every block in it, and each caller
-    /// sends again. A block the stage has no room for waits for room. A block
-    /// whose caller is dropped before the stage takes it is not sent.
+    /// the blocks queued behind it, within `max_message_size`. The result is
+    /// that call's, given once the call returns: a failed call fails every
+    /// block in it, and each caller sends again. A block the stage has no room
+    /// for waits for room. `send_timeout_ms` bounds the wait for a slot too,
+    /// and past it the result is `Backpressured`. A block whose caller is
+    /// dropped before the stage takes it is not sent.
     ///
     /// ## Atomic (all-or-nothing) acceptance
     ///

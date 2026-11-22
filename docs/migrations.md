@@ -6,6 +6,14 @@ release and the target before bumping.
 
 ---
 
+## 2.14.34
+
+### gRPC `send_batch` joins small blocks into one call (BEHAVIOUR CHANGE)
+
+A block under `coalesce.max_batch_bytes` (64 KiB) of payload now waits for one of `coalesce.in_flight` (4) call slots and goes out in one `RouteBatch` with the blocks queued behind it, within `max_message_size`. Its caller gets that call's result, so a failed call fails every block in it. `send_timeout_ms` bounds the wait for a slot as well as the call. See [grpc.md](transport/grpc.md).
+
+**Consumer adjustment** -- none. `<key>.grpc.coalesce.enabled: false` sends each `send_batch` as its own call, the request it sent before. A receiver whose `max_message_size` is below the sender's can refuse a joined call that each block alone would fit, so set the two limits alike.
+
 ## 2.14.33
 
 ### `run_app` reads the file `{PREFIX}_CONFIG` names (BEHAVIOUR CHANGE)
