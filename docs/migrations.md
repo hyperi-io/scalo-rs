@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.34
 
+### `MemoryGuard` reads the process's resident memory on Windows and macOS (BEHAVIOUR CHANGE)
+
+`UsageSource::detect()` falls back to `WorkingSet` on Windows and `TaskInfo` on macOS before `Reservations`, so a guard there trips on the process's real usage instead of only the bytes callers reserved. `UsageSource` is `#[non_exhaustive]`. See [memory.md](runtime/memory.md#usage-detection).
+
+**Consumer adjustment** -- an exhaustive match on `UsageSource` adds a wildcard arm. An explicit `limit_bytes` on Windows or macOS is now compared against the whole process's resident memory, so size it as a process ceiling, not a lease budget.
+
 ### `scalo::framing` holds every batch framing, and `worker::ndjson` is gone (API CHANGE)
 
 The `Framing` trait, its built-ins and `StreamDecoder` are what the file and pipe transports, the file output and the DLQ's file and HTTP backends now frame with, byte for byte as before. `FramingError` moves to `scalo::framing`, still re-exported as `scalo::transport::FramingError`, with new variants and messages. See [transport/framing.md](transport/framing.md).

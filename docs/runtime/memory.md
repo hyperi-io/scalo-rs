@@ -69,15 +69,15 @@ is resolved once per guard, in this order:
 | 1 | cgroup v2 | `/sys/fs/cgroup/memory.current` less `inactive_file` in `memory.stat` | `cgroup-v2` |
 | 2 | cgroup v1 | `/sys/fs/cgroup/memory/memory.usage_in_bytes` less `total_inactive_file` | `cgroup-v1` |
 | 3 | procfs | `/proc/self/status` `VmRSS` | `proc-status` |
-| 4 | reservations | -- | `reservations` |
+| 4 | Windows working set | `GetProcessMemoryInfo` `WorkingSetSize` | `working-set` |
+| 5 | macOS task info | `proc_pidinfo(PROC_PIDTASKINFO)` `pti_resident_size` | `task-info` |
+| 6 | reservations | -- | `reservations` |
 
 Rungs 1 and 2 read the working set kubelet evicts on: the usage less the inactive page cache, which the kernel reclaims before it OOM-kills. So file writes (a spool, staged uploads) do not trip the guard, whatever allocator the binary installed. Rung 3 covers a Linux host running no cgroup memory
 controller. It reads kB, so no page-size constant can be wrong on a 16K
-or 64K kernel. Rung 4 is the last resort where no kernel accounting is
-readable at all (non-Linux): the guard then sees only bytes callers
-reserved by hand, and says so with a warn at init.
+or 64K kernel. Rungs 4 and 5 read this process's resident memory on Windows and macOS. Rung 6 is the last resort where the OS exposes none of these: the guard then sees only bytes callers reserved by hand, and says so with a warn at init.
 
-The file read is cached for 50 ms. The guard is sampled per payload on
+The reading is cached for 50 ms. The guard is sampled per payload on
 the receive path, and the kernel charges memory in per-CPU batches, so
 a reading is approximate below that interval anyway.
 
@@ -100,8 +100,8 @@ the detected source and gates on the larger figure, so the reading is
 never below what the kernel charges. On its own the allocator figure is
 narrower than the cgroup: it cannot see thread stacks, mmap'd buffers,
 a C library's own allocations, or pages the allocator retains after a
-free. Where the guard has no usage source (its reservation counter, off
-Linux), the heap source is the reading. `usage_source()` names it
+free. Where the guard has no usage source (its reservation counter, rung
+6), the heap source is the reading. `usage_source()` names it
 `max(explicit,cgroup-v2)`, or `explicit` on its own.
 
 The source is allocator-agnostic: pass `cap::Cap::allocated`, a
@@ -183,10 +183,10 @@ if guard.under_pressure() {
 
 | Operation | Cost |
 | ----------- | ------ |
-| `try_reserve(n)` | one cached usage read + a compare-exchange that judges and charges the ledger in one step (rollback on the reservation counter only on rung 4) |
+| `try_reserve(n)` | one cached usage read + a compare-exchange that judges and charges the ledger in one step (rollback on the reservation counter only on rung 6) |
 | `add_bytes(n)` | two `fetch_add` + threshold update |
 | `release(n)` | two `try_update` -- the reservation counter floors at zero, the ledger discharges oldest-first and never past what is outstanding |
-| `under_pressure()` | one cached usage read + compare, one file read per 50 ms |
+| `under_pressure()` | one cached usage read + compare, one file read or OS call per 50 ms |
 | `pressure_ratio()` | the same read + one float division. Over 1.0 means a misconfigured limit |
 
 ---
@@ -248,7 +248,7 @@ Env vars:
 | `MemoryGuard::reserved_bytes() -> u64` | Outstanding byte leases, not process usage |
 | `MemoryGuard::usage_source() -> &'static str` | Which source is in force |
 | `MemoryGuard::limit_bytes() -> u64` | Effective limit (after headroom) |
-| `UsageSource` | `CgroupV2` / `CgroupV1` / `ProcStatus` / `Reservations` |
+| `UsageSource` | `CgroupV2` / `CgroupV1` / `ProcStatus` / `WorkingSet` / `TaskInfo` / `Reservations`, `#[non_exhaustive]` |
 | `MemoryGuardConfig` | Serde-deserialisable config struct |
 | `MemoryGuardConfig::from_cascade()` | Load from the 7-layer cascade |
 | `MemoryGuardConfig::from_env(prefix)` | Build from `{PREFIX}_MEMORY_*` env vars |
