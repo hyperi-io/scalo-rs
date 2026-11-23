@@ -457,23 +457,24 @@ pub fn tls_parts(profile: CryptoProfile, trust: &TlsTrust) -> TlsParts {
 /// refused, or an alert from the peer, such as a client certificate it would
 /// not take.
 ///
-/// tokio-rustls wraps a rustls error in an `io::Error`, whose `source` skips
-/// it, so each `io::Error` in the chain is opened as well.
+/// An `io::Error`'s `source` skips the error it wraps, and reqwest wraps
+/// tokio-rustls's `io::Error` in another, so the walk steps into each
+/// `io::Error` rather than to its source.
 #[cfg(any(feature = "transport-syslog", feature = "transport-otlp"))]
-pub(crate) fn rustls_error(error: &(dyn std::error::Error + 'static)) -> Option<&rustls::Error> {
+pub(crate) fn rustls_error<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a rustls::Error> {
     let mut link = Some(error);
     while let Some(current) = link {
         if let Some(tls) = current.downcast_ref::<rustls::Error>() {
             return Some(tls);
         }
-        let wrapped = current
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::get_ref)
-            .and_then(|inner| inner.downcast_ref::<rustls::Error>());
-        if wrapped.is_some() {
-            return wrapped;
-        }
-        link = current.source();
+        link = match current.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => current.source(),
+        };
     }
     None
 }
@@ -694,10 +695,15 @@ mod tests {
 
         let refused = || rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
         let wrapped = || std::io::Error::new(std::io::ErrorKind::InvalidData, refused());
-        let cases: [(&str, Box<dyn std::error::Error>, bool); 4] = [
+        let cases: [(&str, Box<dyn std::error::Error>, bool); 5] = [
             ("bare", Box::new(refused()), true),
             ("in an io::Error", Box::new(wrapped()), true),
             ("a link down", Box::new(Outer(wrapped())), true),
+            (
+                "an io::Error in an io::Error",
+                Box::new(Outer(std::io::Error::other(wrapped()))),
+                true,
+            ),
             (
                 "a refused connection",
                 Box::new(Outer(std::io::ErrorKind::ConnectionRefused.into())),

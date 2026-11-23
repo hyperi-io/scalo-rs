@@ -234,15 +234,16 @@ impl OtlpTransport {
                     ))),
                     // A refused certificate, name or key pin is the config's to fix. Refused,
                     // reset and timed-out connections clear when the collector is back.
-                    Err(e) => match crate::tls::rustls_error(&e) {
-                        Some(tls) => SendResult::Fatal(TransportError::Config(format!(
-                            "OTLP HTTP: TLS with the collector failed: {tls}"
-                        ))),
-                        None => {
+                    Err(e) => {
+                        if let Some(tls) = crate::tls::rustls_error(&e) {
+                            SendResult::Fatal(TransportError::Config(format!(
+                                "OTLP HTTP: TLS with the collector failed: {tls}"
+                            )))
+                        } else {
                             tracing::debug!(endpoint = %self.endpoint, error = %e, "OTLP HTTP request failed");
                             SendResult::Backpressured
                         }
-                    },
+                    }
                 }
             }
         }
