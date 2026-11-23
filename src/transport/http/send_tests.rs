@@ -898,8 +898,8 @@ async fn secrets_never_reach_debug_errors_or_logs() {
         "{config:?} {:?}",
         HttpProxy::Url(secret("http://pu:pp-proxy@proxy.example:3128"))
     );
-    for leaked in secrets {
-        assert!(!shown.contains(leaked), "Debug leaked {leaked}: {shown}");
+    for (i, leaked) in secrets.iter().enumerate() {
+        assert!(!shown.contains(leaked), "Debug leaked secret {i}");
     }
     assert!(shown.contains("X-Api-Key") && shown.contains("proxy.example:3128"));
 
@@ -920,15 +920,9 @@ async fn secrets_never_reach_debug_errors_or_logs() {
     assert_eq!(got(&result), Got::Hold, "{error}");
     let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
     assert!(logged.contains("HTTP sender ready"), "{logged}");
-    for leaked in secrets {
-        assert!(
-            !error.contains(leaked),
-            "the error leaked {leaked}: {error}"
-        );
-        assert!(
-            !logged.contains(leaked),
-            "the logs leaked {leaked}: {logged}"
-        );
+    for (i, leaked) in secrets.iter().enumerate() {
+        assert!(!error.contains(leaked), "the error leaked secret {i}");
+        assert!(!logged.contains(leaked), "the logs leaked secret {i}");
     }
 }
 
