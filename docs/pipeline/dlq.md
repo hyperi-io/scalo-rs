@@ -18,11 +18,13 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 
 | Backend | Feature | Storage |
 | --------- | --------- | --------- |
-| File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, with rotation (`Hourly` default) and gzip on rotation |
+| File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, rotated by time (`Hourly` default) or size, gzipped after rotation, created `0600` in a `0700` folder |
 | Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic -- per-table (`acme.auth` -> `acme.auth.dlq`) or single common topic (`<service>.dlq` unless `common_topic` names one) |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
 
-After a refused write the file backend reopens its file on a later write, waiting 250 ms and doubling up to 30 s while writes keep failing. So a deleted file or a restored directory recovers without a restart. It never recreates a missing directory, because that could put the DLQ on the filesystem under an unmounted volume. While its file is missing it rejects writes before they reach `file-rotate`, whose rotation would otherwise panic -- an abort in a `panic = "abort"` service.
+After a refused write the file backend reopens its file on a later write, waiting 250 ms and doubling up to 30 s while writes keep failing. So a deleted file or a restored directory recovers without a restart. It never recreates a missing directory, because that could put the DLQ on the filesystem under an unmounted volume. While its file is missing, or another file sits at its path, it rejects writes, so none lands in a file nothing reads.
+
+A write lands whole: one that fails is cut back off the file. Opening a DLQ file whose last line has no newline, as a crash mid-write leaves it, cuts that line off first, logs it at warn with `cut_bytes` and counts it in `file_writer_cut_bytes_total{writer="dlq"}`. Rotation, size limits, `durable` and file modes are the file transport's, see [backends.md](../transport/backends.md#file).
 
 External rotation of the DLQ file (logrotate, say) is unsupported: the backend rotates it itself. If something renames the file and puts a new one at the path, the writes until the next reopen report lost and count in `dropped()`, although their entries are in the renamed file.
 
@@ -147,7 +149,7 @@ What "accepted" means depends on the backend:
 
 | Backend | Accepted means |
 | --------- | ---------------- |
-| File | Written to the kernel page cache. No `fsync`, so power loss before write-back can still lose it |
+| File | Written to the kernel page cache, so power loss before write-back can still lose it. With `file.durable: true` each batch is synced to disk first |
 | Kafka | Acknowledged by the broker, under the producer's `acks` setting. The barrier waits up to `kafka.send_timeout_ms` -- see [The Kafka barrier](#the-kafka-barrier) |
 | HTTP | The endpoint returned a 2xx status. The barrier adds no wait: the write waited for the response |
 
@@ -229,9 +231,14 @@ dlq:
   file:
     enabled: true
     path: /var/spool/scalo/dlq   # the service name is appended as a subdirectory
-    rotation: hourly             # hourly | daily
+    rotation: hourly             # hourly | daily | never, by local time
     max_age_days: 30
-    compress_rotated: true
+    compress_rotated: true       # gzip all but the six newest rotated files
+    max_bytes: null              # rotate before a batch that would pass this many bytes
+    max_files: null              # rotated files kept; null: no count limit
+    durable: false               # sync each batch and the folder after a rotation
+    file_mode: "0600"            # files created, before the umask. Unix only
+    dir_mode: "0700"             # folders created, before the umask. Unix only
   kafka:                         # dlq-kafka feature
     enabled: true
     routing: per_table           # per_table | common

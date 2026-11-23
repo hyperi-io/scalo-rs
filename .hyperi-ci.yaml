@@ -31,7 +31,7 @@ quality:
     # Not a vulnerability: the advisory marks chrono unmaintained, and deny.toml ignores it for the same reason.
     - tool: osv-scanner
       id: RUSTSEC-2026-0543
-      reason: "chrono is unmaintained, not vulnerable, and no patched release exists. The spool, tiered-sink, io, version-check, geoip-download and transport features use it directly, and cel and file-rotate depend on it too. Drop when the dependency graph no longer has chrono."
+      reason: "chrono is unmaintained, not vulnerable, and no patched release exists. cel depends on it. Drop when the dependency graph no longer has chrono."
     # renovate.json is JSON, which has no comment syntax for a line-level nosemgrep.
     - tool: semgrep
       id: package_managers.renovate.renovate-missing-minimum-release-age.renovate-missing-minimum-release-age

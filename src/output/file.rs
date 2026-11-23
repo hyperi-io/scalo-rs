@@ -30,8 +30,8 @@
 //! ```text
 //! /var/spool/scalo/output/loader/
 //! |-- events.ndjson              # Current file
-//! |-- events.ndjson.20260302T14  # Rotated (hourly)
-//! `-- events.ndjson.20260302T13.gz  # Compressed
+//! |-- events.ndjson.20260302T140000     # Rotated, local time of the rotation
+//! `-- events.ndjson.20260302T080000.gz  # Compressed, past the six newest
 //! ```
 
 use std::sync::Arc;
@@ -195,6 +195,7 @@ mod tests {
             rotation: RotationPeriod::Daily,
             max_age_days: 1,
             compress_rotated: false,
+            ..FileOutputConfig::default()
         }
     }
 

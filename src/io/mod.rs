@@ -8,15 +8,20 @@
 
 //! Shared NDJSON file I/O primitives.
 //!
-//! Provides [`NdjsonWriter`] -- a rotating file writer for newline-delimited JSON.
-//! Used by both the DLQ file backend and the file output sink.
+//! Provides [`NdjsonWriter`] -- a rotating file writer for newline-delimited
+//! JSON, used by the DLQ file backend, the file output sink and the file
+//! transport.
 //!
 //! ## Design
 //!
-//! `NdjsonWriter` is a thin wrapper around `file-rotate` that handles:
-//! - Rotating NDJSON files by time (hourly/daily)
-//! - Optional gzip compression of rotated files
-//! - Age-based cleanup of old files
+//! `NdjsonWriter` handles:
+//! - Rotation by local time (hourly, daily), by size, or both
+//! - Gzip of rotated files, keeping the six newest plain
+//! - Removal of rotated files by age and by count
+//! - Optional `durable` writes, synced to disk before they return
+//! - Private file and directory modes on Unix (`0600`, `0700` by default)
+//! - Whole writes: a failed write is cut back off, and a partial last line
+//!   left by a crash is cut off when the file is opened
 //! - Atomic write counters for metrics
 //!
 //! It knows nothing about DLQ or output semantics -- callers serialise their
@@ -24,6 +29,9 @@
 
 mod config;
 mod ndjson_writer;
+mod rotating;
 
-pub use config::{DEFAULT_SPOOL_ROOT, FileWriterConfig, RotationPeriod};
+pub use config::{
+    DEFAULT_SPOOL_ROOT, FileMode, FileWriteOptions, FileWriterConfig, RotationPeriod,
+};
 pub use ndjson_writer::{AsyncNdjsonWriter, NdjsonWriter};

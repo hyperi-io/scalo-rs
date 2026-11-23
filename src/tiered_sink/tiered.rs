@@ -1850,6 +1850,7 @@ mod tests {
                 rotation: crate::dlq::RotationPeriod::Daily,
                 max_age_days: 1,
                 compress_rotated: false,
+                ..crate::dlq::FileDlqConfig::default()
             },
             mode: crate::dlq::DlqMode::FileOnly,
             flush_interval_ms: 20,

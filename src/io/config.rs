@@ -8,7 +8,7 @@
 
 //! Shared configuration for NDJSON file writers.
 //!
-//! Used by both the DLQ file backend and the file output sink.
+//! Used by the DLQ file backend, the file output sink and the file transport.
 
 use std::path::PathBuf;
 
@@ -19,22 +19,153 @@ use serde::{Deserialize, Serialize};
 /// the service name, so apps sharing one volume keep separate directories.
 pub const DEFAULT_SPOOL_ROOT: &str = "/var/spool/scalo";
 
-/// File rotation period.
+/// File rotation period, by local time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RotationPeriod {
-    /// Rotate files every hour.
+    /// Rotate before the first write in a new hour.
     #[default]
     Hourly,
-    /// Rotate files every day.
+    /// Rotate before the first write on a new day.
     Daily,
+    /// No time rotation. `max_bytes` can still rotate the file.
+    Never,
+}
+
+/// A Unix permission mode, written in octal: `"0600"`, `"600"` or `"0o600"`.
+///
+/// An integer is read by its decimal digits as octal, so `600` from an env var
+/// or an unquoted YAML `0600` is mode `0o600`. YAML 1.2 reads `0o600` unquoted
+/// as decimal 384, which this refuses, so quote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMode(u32);
+
+impl FileMode {
+    /// Owner read and write, the default for files.
+    pub const PRIVATE_FILE: Self = Self(0o600);
+    /// Owner read, write and search, the default for directories.
+    pub const PRIVATE_DIR: Self = Self(0o700);
+
+    /// A mode from its bits.
+    ///
+    /// # Errors
+    ///
+    /// A value above `0o7777`.
+    pub fn new(bits: u32) -> Result<Self, String> {
+        if bits > 0o7777 {
+            return Err(format!("mode {bits:o} is above 7777"));
+        }
+        Ok(Self(bits))
+    }
+
+    /// The permission bits.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        let digits = text.trim();
+        let digits = digits.strip_prefix("0o").unwrap_or(digits);
+        if digits.is_empty() {
+            return Err("a mode needs octal digits, such as \"0600\"".into());
+        }
+        u32::from_str_radix(digits, 8)
+            .map_err(|_| format!("mode {text:?} is not octal, write it as \"0600\""))
+            .and_then(Self::new)
+    }
+}
+
+impl std::fmt::Display for FileMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04o}", self.0)
+    }
+}
+
+impl Serialize for FileMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for FileMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Text(String),
+            Number(u64),
+        }
+        match Written::deserialize(deserializer)? {
+            Written::Text(text) => Self::parse(&text),
+            Written::Number(n) => Self::parse(&n.to_string()),
+        }
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "config-schema")]
+impl schemars::JsonSchema for FileMode {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FileMode".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": "^(0o)?[0-7]{1,4}$",
+            "description": "Unix permission mode in octal, such as \"0600\". Ignored on Windows."
+        })
+    }
+}
+
+/// How a writer rotates by size, keeps rotated files, syncs, and sets
+/// permissions. Flattened into each file config, so its keys sit beside
+/// `rotation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct FileWriteOptions {
+    /// Rotate before a write that would take the file past this many bytes.
+    /// A write into an empty file always lands, however large. Unset: no size
+    /// rotation. Works beside the time rotation: either rotates.
+    pub max_bytes: Option<u64>,
+
+    /// Rotated files kept, newest first. Older ones are deleted at each
+    /// rotation. Unset: no count limit, only the age limit.
+    pub max_files: Option<u32>,
+
+    /// Sync the file's data to disk after each write, and its directory after
+    /// the file is created or rotated, so a write that returned `Ok` survives
+    /// power loss. Costs a disk flush per batch. Off by default.
+    pub durable: bool,
+
+    /// Mode for files the writer creates, before the umask. Unix only: a
+    /// Windows file takes its folder's ACL. Existing files keep theirs.
+    pub file_mode: FileMode,
+
+    /// Mode for directories the writer creates, before the umask. Unix only.
+    pub dir_mode: FileMode,
+}
+
+impl Default for FileWriteOptions {
+    fn default() -> Self {
+        Self {
+            max_bytes: None,
+            max_files: None,
+            durable: false,
+            file_mode: FileMode::PRIVATE_FILE,
+            dir_mode: FileMode::PRIVATE_DIR,
+        }
+    }
 }
 
 /// Shared file writer configuration.
 ///
 /// Contains the core settings for rotating NDJSON file output. Used by
-/// [`super::NdjsonWriter`] and consumed by both DLQ and file output modules.
+/// [`super::NdjsonWriter`] and consumed by the DLQ, the file output and the
+/// file transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWriterConfig {
     /// Base directory for output files.
@@ -43,11 +174,15 @@ pub struct FileWriterConfig {
     /// File rotation period.
     pub rotation: RotationPeriod,
 
-    /// Auto-cleanup files older than this many days.
+    /// Delete rotated files older than this many days, at each rotation.
     pub max_age_days: u32,
 
-    /// Compress rotated files with flate2/gzip.
+    /// Gzip rotated files, keeping the six newest uncompressed.
     pub compress_rotated: bool,
+
+    /// Size rotation, retention by count, syncing and permissions.
+    #[serde(flatten)]
+    pub write: FileWriteOptions,
 }
 
 impl Default for FileWriterConfig {
@@ -57,6 +192,7 @@ impl Default for FileWriterConfig {
             rotation: RotationPeriod::default(),
             max_age_days: 30,
             compress_rotated: true,
+            write: FileWriteOptions::default(),
         }
     }
 }
@@ -72,18 +208,25 @@ mod tests {
         assert_eq!(config.rotation, RotationPeriod::Hourly);
         assert_eq!(config.max_age_days, 30);
         assert!(config.compress_rotated);
+        assert_eq!(config.write, FileWriteOptions::default());
+        assert_eq!(config.write.file_mode.bits(), 0o600);
+        assert_eq!(config.write.dir_mode.bits(), 0o700);
+        assert!(!config.write.durable);
     }
 
     #[cfg(feature = "serde_json")]
     #[test]
     fn test_rotation_period_serde() {
-        let json = r#""hourly""#;
-        let period: RotationPeriod = serde_json::from_str(json).expect("deserialise");
-        assert_eq!(period, RotationPeriod::Hourly);
-
-        let json = r#""daily""#;
-        let period: RotationPeriod = serde_json::from_str(json).expect("deserialise");
-        assert_eq!(period, RotationPeriod::Daily);
+        for (text, period) in [
+            ("hourly", RotationPeriod::Hourly),
+            ("daily", RotationPeriod::Daily),
+            ("never", RotationPeriod::Never),
+        ] {
+            let parsed: RotationPeriod =
+                serde_json::from_str(&format!("{text:?}")).expect("deserialise");
+            assert_eq!(parsed, period, "{text}");
+        }
+        assert!(serde_json::from_str::<RotationPeriod>(r#""weekly""#).is_err());
     }
 
     #[cfg(feature = "serde_json")]
@@ -94,12 +237,60 @@ mod tests {
             rotation: RotationPeriod::Daily,
             max_age_days: 7,
             compress_rotated: false,
+            write: FileWriteOptions {
+                max_bytes: Some(1024),
+                max_files: Some(3),
+                durable: true,
+                file_mode: FileMode::new(0o640).unwrap(),
+                dir_mode: FileMode::new(0o750).unwrap(),
+            },
         };
         let json = serde_json::to_string(&config).expect("serialise");
+        assert!(json.contains(r#""file_mode":"0640""#), "{json}");
         let parsed: FileWriterConfig = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(parsed.path, PathBuf::from("/tmp/test"));
         assert_eq!(parsed.rotation, RotationPeriod::Daily);
         assert_eq!(parsed.max_age_days, 7);
         assert!(!parsed.compress_rotated);
+        assert_eq!(parsed.write, config.write);
+    }
+
+    /// The write keys are optional and sit beside the others.
+    #[cfg(feature = "serde_json")]
+    #[test]
+    fn test_write_options_are_flat_and_optional() {
+        let bare = r#"{"path":"/x","rotation":"never","max_age_days":1,"compress_rotated":false}"#;
+        let parsed: FileWriterConfig = serde_json::from_str(bare).expect("deserialise");
+        assert_eq!(parsed.write, FileWriteOptions::default());
+
+        let flat = r#"{"path":"/x","rotation":"never","max_age_days":1,"compress_rotated":false,
+            "max_bytes":10,"max_files":2,"durable":true}"#;
+        let parsed: FileWriterConfig = serde_json::from_str(flat).expect("deserialise");
+        assert_eq!(parsed.write.max_bytes, Some(10));
+        assert_eq!(parsed.write.max_files, Some(2));
+        assert!(parsed.write.durable);
+    }
+
+    #[cfg(feature = "serde_json")]
+    #[test]
+    fn test_file_mode_reads_octal_in_each_form() {
+        let cases: [(&str, Option<u32>); 10] = [
+            (r#""0600""#, Some(0o600)),
+            (r#""600""#, Some(0o600)),
+            (r#""0o640""#, Some(0o640)),
+            ("600", Some(0o600)),
+            ("640", Some(0o640)),
+            (r#""7777""#, Some(0o7777)),
+            (r#""0800""#, None),
+            ("384", None),
+            (r#""17777""#, None),
+            (r#""""#, None),
+        ];
+        for (json, want) in cases {
+            let got = serde_json::from_str::<FileMode>(json)
+                .ok()
+                .map(FileMode::bits);
+            assert_eq!(got, want, "{json}");
+        }
     }
 }
