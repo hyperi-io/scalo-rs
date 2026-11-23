@@ -31,7 +31,7 @@ mod record;
 #[cfg(test)]
 mod tests;
 
-pub use config::{OtlpCompression, OtlpConfig, OtlpProtocol, OtlpTlsConfig};
+pub use config::{OtlpCompression, OtlpConfig, OtlpProtocol};
 pub use record::SEVERITY_HEADER;
 
 use std::sync::Arc;

@@ -22,9 +22,9 @@ use prost::Message as _;
 use tonic::Code;
 use tonic_types::{ErrorDetails, StatusExt as _};
 
-use super::{OtlpCompression, OtlpConfig, OtlpProtocol, OtlpTlsConfig};
-use crate::tls::TrustChoice;
+use super::{OtlpCompression, OtlpConfig, OtlpProtocol};
 use crate::tls::test_pki::TestCa;
+use crate::tls::{ClientTlsConfig, TrustChoice};
 use crate::transport::filter::{FilterAction, FilterRule};
 use crate::transport::{
     AnySender, PayloadFormat, Record, RecordMeta, TransportBase, TransportConfig, TransportSender,
@@ -600,7 +600,7 @@ async fn each_collector_answer_maps_onto_a_send_result() {
             ..OtlpConfig::default()
         };
         if case.tls != Tls::Off {
-            config.tls = Some(OtlpTlsConfig {
+            config.tls = Some(ClientTlsConfig {
                 trust: TrustChoice::Bundle,
                 ca_path: Some(files.ca.clone()),
                 client_cert_path: (case.tls == Tls::WithIdentity).then(|| files.cert.clone()),
@@ -649,10 +649,10 @@ async fn a_bad_setting_fails_the_build_and_a_closed_transport_refuses() {
     let missing = PathBuf::from("/nonexistent/otlp-ca.pem");
     let pinned = |protocol, trust| OtlpConfig {
         protocol,
-        tls: Some(OtlpTlsConfig {
+        tls: Some(ClientTlsConfig {
             trust,
             ca_path: Some(missing.clone()),
-            ..OtlpTlsConfig::default()
+            ..ClientTlsConfig::default()
         }),
         ..OtlpConfig::grpc("https://collector:4317")
     };

@@ -7,12 +7,11 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::otel_endpoint::{DEFAULT_GRPC_ENDPOINT, append_signal_path, endpoint_for_protocol};
-use crate::tls::{ClientTls, TrustChoice};
+use crate::tls::{ClientTls, ClientTlsConfig};
 use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::filter::FilterRule;
 
@@ -54,49 +53,6 @@ pub enum OtlpCompression {
     Gzip,
 }
 
-/// Client TLS to an `https://` collector, the `tls` section.
-///
-/// Without the section an `https://` endpoint is verified against the OS root
-/// store. With it, the endpoint must be `https://`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OtlpTlsConfig {
-    /// `native` (default), `platform` or `bundle`, as in
-    /// [`TrustChoice`]. gRPC takes `native` or `bundle`.
-    pub trust: TrustChoice,
-    /// CA PEM file, trusted beside the OS store under `native` and
-    /// `platform`, and alone under `bundle`.
-    pub ca_path: Option<PathBuf>,
-    /// Client certificate PEM for mutual TLS, with `client_key_path`.
-    pub client_cert_path: Option<PathBuf>,
-    /// Client private key PEM for mutual TLS, with `client_cert_path`. May
-    /// name the same file when it holds both.
-    pub client_key_path: Option<PathBuf>,
-}
-
-impl OtlpTlsConfig {
-    /// The client TLS this section names.
-    ///
-    /// # Errors
-    ///
-    /// `TransportError::Config` when only one of the client certificate and
-    /// key is set.
-    fn client_tls(&self) -> TransportResult<ClientTls> {
-        let mut tls = ClientTls::new(self.trust);
-        if let Some(ca) = &self.ca_path {
-            tls = tls.with_ca(ca);
-        }
-        match (&self.client_cert_path, &self.client_key_path) {
-            (Some(cert), Some(key)) => Ok(tls.with_identity(cert, key)),
-            (None, None) => Ok(tls),
-            _ => Err(TransportError::Config(
-                "OTLP TLS: mutual TLS needs both tls.client_cert_path and tls.client_key_path"
-                    .to_string(),
-            )),
-        }
-    }
-}
-
 /// OTLP logs transport configuration, read from `transport.otlp` or from the
 /// `otlp` section of a [`TransportConfig`](crate::transport::TransportConfig).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,8 +92,11 @@ pub struct OtlpConfig {
     /// `OTEL_RESOURCE_ATTRIBUTES`.
     pub resource_attributes: BTreeMap<String, String>,
 
-    /// Client TLS for an `https://` endpoint.
-    pub tls: Option<OtlpTlsConfig>,
+    /// Client TLS for an `https://` endpoint, in the [`ClientTlsConfig`] keys.
+    /// Without it an `https://` endpoint is verified against the OS root
+    /// store. With it, the endpoint must be `https://`. gRPC takes `native` or
+    /// `bundle` trust.
+    pub tls: Option<ClientTlsConfig>,
 
     /// Outbound message filters, applied to each record's payload before the
     /// request is built.
@@ -226,7 +185,10 @@ impl OtlpConfig {
             .split_once("://")
             .map(|(scheme, _)| scheme.to_ascii_lowercase());
         match (scheme.as_deref(), &self.tls) {
-            (Some("https"), Some(tls)) => tls.client_tls().map(Some),
+            (Some("https"), Some(tls)) => tls
+                .client_tls()
+                .map(Some)
+                .map_err(|e| TransportError::Config(format!("OTLP {e}"))),
             (Some("https"), None) => Ok(Some(ClientTls::default())),
             (Some("http"), None) => Ok(None),
             (Some("http"), Some(_)) => Err(TransportError::Config(
@@ -255,7 +217,10 @@ impl OtlpConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::tls::TrustChoice;
 
     /// Each key reaches the config through the cascade, from YAML and from
     /// the environment, which wins.
@@ -321,7 +286,7 @@ mod tests {
         );
         assert_eq!(
             config.tls,
-            Some(OtlpTlsConfig {
+            Some(ClientTlsConfig {
                 trust: TrustChoice::Bundle,
                 ca_path: Some(PathBuf::from("/etc/tls/ca.pem")),
                 client_cert_path: Some(PathBuf::from("/etc/tls/client.pem")),
@@ -340,7 +305,7 @@ mod tests {
     #[test]
     fn the_endpoint_and_tls_section_give_the_url_and_trust() {
         type Want = Result<(&'static str, Option<ClientTls>), &'static str>;
-        let tls = |trust, cert: Option<&str>, key: Option<&str>| OtlpTlsConfig {
+        let tls = |trust, cert: Option<&str>, key: Option<&str>| ClientTlsConfig {
             trust,
             ca_path: Some(PathBuf::from("ca.pem")),
             client_cert_path: cert.map(PathBuf::from),

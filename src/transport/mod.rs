@@ -180,4 +180,4 @@ pub use http::{HttpAuth, HttpEndpoint, HttpProxy, HttpToken, HttpTransport, Http
 pub use syslog::{SyslogConfig, SyslogTransport};
 
 #[cfg(feature = "transport-otlp")]
-pub use otlp::{OtlpCompression, OtlpConfig, OtlpProtocol, OtlpTlsConfig, OtlpTransport};
+pub use otlp::{OtlpCompression, OtlpConfig, OtlpProtocol, OtlpTransport};
