@@ -44,6 +44,18 @@ The `transport-otlp` feature sends records to an OpenTelemetry collector as OTLP
 
 **Consumer adjustment** -- exhaustive matches on `TransportType` and `AnySender` add the `Otlp` arm. A literal `TransportConfig` adds `otlp`. `otlp` joins the built-in type names, so a custom sender registered under it is refused: register it under another name.
 
+### An env var's text reaches a field that refuses its parsed value (BEHAVIOUR CHANGE)
+
+`APP__KAFKA__SASL_PASSWORD=0123` failed the load, because the env layer parsed it as the integer 123 and a `String` or `SensitiveString` field refuses that. Such a field now gets the text as set, trimmed. Numbers and bools still parse into numeric and bool fields. `Config::get_string` on such a key returns the text where it returned `None`.
+
+**Consumer adjustment** -- none. A value quoted to keep it text (`APP_X="0123"`) still reads as `0123`.
+
+### `config::load_typed_cascade` and `config::Loaded` (additive)
+
+`load_typed_cascade(path, prefix, managed)` loads an app's struct as `load_typed` does and returns its cascade by value, leaving the global alone. A test can build a cascade per case where the global kept the first test's environment.
+
+**Consumer adjustment** -- none.
+
 ### `ConfigOptions::managed`, `load_typed_managed` and `ServiceApp::managed_source` (additive)
 
 An app can name a Group Policy key and an MDM preference domain in a `ManagedSource`, and the cascade then reads them as a layer after every config file and before env vars. A key that looks like a secret fails the load. See [managed-config.md](core-pillars/managed-config.md).

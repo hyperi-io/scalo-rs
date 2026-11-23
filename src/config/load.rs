@@ -17,6 +17,7 @@ use figment::providers::{Env, Serialized};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::env_text::EnvText;
 use super::flat_env::{ApplyFlatEnv, Normalize};
 use super::managed::{self, ManagedLayer, ManagedSource};
 use super::{CONFIG, Config, ConfigError, ConfigOptions};
@@ -36,14 +37,17 @@ use crate::yaml::{self, Profile};
 ///
 /// 1. `{env_prefix}_` variables nest with `__`, after either separator:
 ///    `APP__KAFKA__BROKERS` and `APP_KAFKA__BROKERS` both set
-///    `kafka.brokers`. An empty variable counts as unset.
+///    `kafka.brokers`. An empty variable counts as unset. A field that
+///    refuses a variable's parsed value gets its text, so `0123` reaches a
+///    `String` field as `0123`.
 /// 2. [`ApplyFlatEnv`] applies the flat spellings (`APP_KAFKA_BROKERS`).
 /// 3. [`Normalize`] fills in implied settings.
 ///
 /// The global cascade is also set up, with the file as its settings layer, so
 /// the sections the scalo runtime reads (`metrics`, `version_check`, ...)
 /// resolve from the same file. A later call, such as a reload, keeps the
-/// first cascade. `.env` and the standard config locations (the working
+/// first cascade. [`load_typed_cascade`] returns the cascade instead of
+/// setting it up. `.env` and the standard config locations (the working
 /// directory, `/config/` and the user's `~/.config/`) are read only when no
 /// `path` is given, so nothing outside the named file reaches a deployment
 /// that names it.
@@ -83,6 +87,41 @@ where
     load(path, env_prefix, Some(managed))
 }
 
+/// An app's config struct and the cascade it was read from.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Loaded<T> {
+    /// The app's config struct.
+    pub config: T,
+    /// The cascade, built as [`load_typed`] builds the global one.
+    pub cascade: Config,
+}
+
+/// [`load_typed`] that returns the cascade it builds instead of setting up the
+/// global one. `managed` is merged as [`load_typed_managed`] merges it.
+///
+/// The environment is read before it returns, so a test that calls it inside
+/// `temp_env` keeps that environment to its own result: a load in another
+/// thread neither sees it nor shares its cascade. [`load_typed`] and
+/// [`load_typed_managed`] build their cascade the same way. [`Normalize`] runs
+/// with the global cascade, if one is set up, not this one.
+///
+/// # Errors
+///
+/// As [`load_typed_managed`].
+pub fn load_typed_cascade<T>(
+    path: Option<&str>,
+    env_prefix: &str,
+    managed: Option<&ManagedSource>,
+) -> Result<Loaded<T>, ConfigError>
+where
+    T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
+    let (cascade, read) = read_typed(path, env_prefix, managed)?;
+    let config = finish(read?, env_prefix)?;
+    Ok(Loaded { config, cascade })
+}
+
 fn load<T>(
     path: Option<&str>,
     env_prefix: &str,
@@ -90,6 +129,23 @@ fn load<T>(
 ) -> Result<T, ConfigError>
 where
     T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
+    let (cascade, read) = read_typed(path, env_prefix, source)?;
+    // The first cascade set up is kept, so a reload leaves it in place.
+    let _ = CONFIG.set(cascade);
+    finish(read?, env_prefix)
+}
+
+/// The cascade, and `T` read from the named file or from that cascade.
+///
+/// The outer error is the cascade's, the inner one `T`'s.
+fn read_typed<T>(
+    path: Option<&str>,
+    env_prefix: &str,
+    source: Option<&ManagedSource>,
+) -> Result<(Config, Result<T, ConfigError>), ConfigError>
+where
+    T: DeserializeOwned + Serialize,
 {
     let options = ConfigOptions {
         env_prefix: env_prefix.to_string(),
@@ -108,10 +164,14 @@ where
         Some(config) => overlay(config, layer.as_ref()),
         None => cascade.unmarshal(),
     };
-    // The first cascade set up is kept, so a reload leaves it in place.
-    let _ = CONFIG.set(cascade);
+    Ok((cascade, read))
+}
 
-    let mut config: T = read?;
+/// Nested env, flat env and [`Normalize`], on `T` as [`read_typed`] read it.
+fn finish<T>(mut config: T, env_prefix: &str) -> Result<T, ConfigError>
+where
+    T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
     merge_nested_env(&mut config, env_prefix)?;
     config.apply_flat_env(env_prefix);
     config.normalize();
@@ -269,9 +329,9 @@ where
                 Some(key.as_str()[prefix.len()..].trim_start_matches('_').into())
             })
             .split("__");
-        Figment::from(Serialized::defaults(&*config))
-            .merge(env)
-            .extract::<T>()
+        let mut env_text = EnvText::default();
+        let figment = env_text.merge(Figment::from(Serialized::defaults(&*config)), env);
+        env_text.extract::<T>(&figment, None)
     })?;
     *config = merged;
     Ok(())
@@ -384,6 +444,125 @@ mod tests {
             let app: App = load_typed(None, "LOADTEST").unwrap();
             assert_eq!(app.kafka.username, "cascade-user");
             assert!(app.sasl_enabled);
+        });
+    }
+
+    #[derive(Debug, Default, Deserialize, Serialize)]
+    #[serde(default)]
+    struct Typed {
+        text: String,
+        secret: SensitiveString,
+        port: u16,
+        ratio: f64,
+        on: bool,
+    }
+
+    impl ApplyFlatEnv for Typed {
+        fn apply_flat_env(&mut self, _prefix: &str) {}
+    }
+
+    impl Normalize for Typed {}
+
+    /// What a load with one env var set must do.
+    enum Expect {
+        /// Load, and the struct passes the check.
+        Read(fn(&Typed) -> bool),
+        /// Fail, naming the value as figment parsed it.
+        Refused(&'static str),
+    }
+
+    /// A field that refuses an env var's parsed value gets its text, numbers
+    /// and bools still parse, and a value no reading fits is refused with
+    /// the parsed value's error. Through the cascade and through a file.
+    #[test]
+    fn env_values_keep_their_text_where_the_field_needs_it() {
+        use Expect::{Read, Refused};
+        let cases: [(&str, &str, Expect); 14] = [
+            ("TEXT", "0123", Read(|t| t.text == "0123")),
+            ("TEXT", "007", Read(|t| t.text == "007")),
+            ("TEXT", "true", Read(|t| t.text == "true")),
+            ("TEXT", "1e5", Read(|t| t.text == "1e5")),
+            ("TEXT", "1.10", Read(|t| t.text == "1.10")),
+            ("TEXT", "[a, b]", Read(|t| t.text == "[a, b]")),
+            ("TEXT", " 0123\n", Read(|t| t.text == "0123")),
+            ("SECRET", "0123", Read(|t| t.secret.expose() == "0123")),
+            ("PORT", "0123", Read(|t| t.port == 123)),
+            (
+                "RATIO",
+                "0.1",
+                Read(|t| t.ratio.to_bits() == 0.1_f64.to_bits()),
+            ),
+            ("ON", "true", Read(|t| t.on)),
+            ("PORT", "abc", Refused("\"abc\"")),
+            ("PORT", "[1]", Refused("sequence")),
+            ("ON", "yes", Refused("\"yes\"")),
+        ];
+        let (_dir, file) = file("text: from-file\n");
+        for (var, value, expect) in &cases {
+            for path in [None, Some(file.as_str())] {
+                let name = format!("ENVTEXT__{var}={value:?} with file {path:?}");
+                let loaded = temp_env::with_var(format!("ENVTEXT__{var}"), Some(value), || {
+                    load_typed::<Typed>(path, "ENVTEXT")
+                });
+                match (expect, loaded) {
+                    (Read(check), Ok(typed)) => assert!(check(&typed), "{name}: {typed:?}"),
+                    (Refused(names), Err(ConfigError::ExtractError(err))) => {
+                        assert!(err.to_string().contains(*names), "{name}: {err}");
+                    }
+                    (_, other) => panic!("{name}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A cascade built by value keeps its environment: a load in another
+    /// thread neither sees the variable this one was built with nor shares
+    /// its cascade.
+    #[test]
+    fn a_cascade_built_by_value_keeps_its_environment() {
+        let build = || load_typed_cascade::<App>(None, "BYVALUE", None).unwrap();
+        let set = std::thread::spawn(move || {
+            temp_env::with_var("BYVALUE__KAFKA__USERNAME", Some("this-thread"), build)
+        })
+        .join()
+        .unwrap();
+        let other = std::thread::spawn(build).join().unwrap();
+
+        assert_eq!(set.config.kafka.username, "this-thread");
+        assert_eq!(
+            set.cascade.get_string("kafka.username").as_deref(),
+            Some("this-thread")
+        );
+        assert_eq!(other.config.kafka.username, "", "the other load saw it");
+        assert_eq!(other.cascade.get_string("kafka.username"), None);
+    }
+
+    /// An all-digit Kafka SASL password reaches the field as set, where the
+    /// load failed on the integer figment parsed it into.
+    #[cfg(feature = "transport-kafka-config")]
+    #[test]
+    fn a_numeric_sasl_password_reaches_kafka_config() {
+        #[derive(Debug, Default, Deserialize, Serialize)]
+        #[serde(default)]
+        struct WithKafka {
+            kafka: crate::transport::KafkaConfig,
+        }
+        impl ApplyFlatEnv for WithKafka {
+            fn apply_flat_env(&mut self, _prefix: &str) {}
+        }
+        impl Normalize for WithKafka {}
+
+        let (_dir, file) = file("kafka:\n  brokers: [a]\n");
+        temp_env::with_var("KAFKATEXT__KAFKA__SASL_PASSWORD", Some("0123"), || {
+            for path in [None, Some(file.as_str())] {
+                let app: WithKafka = load_typed(path, "KAFKATEXT").unwrap();
+                let password = app
+                    .kafka
+                    .sasl_password
+                    .as_ref()
+                    .map(SensitiveString::expose);
+                assert_eq!(password, Some("0123"), "with file {path:?}");
+            }
         });
     }
 
