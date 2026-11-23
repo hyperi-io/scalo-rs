@@ -141,7 +141,7 @@ impl ClientTls {
 }
 
 /// The config section a transport reads its client TLS from: a trust choice,
-/// one CA file and an optional client certificate.
+/// one CA file, an optional client certificate and optional key pins.
 ///
 /// ```yaml
 /// tls:
@@ -149,6 +149,7 @@ impl ClientTls {
 ///   ca_path: /etc/tls/ca.pem
 ///   client_cert_path: /etc/tls/client.pem
 ///   client_key_path: /etc/tls/client.key
+///   pin_sha256: ["47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="]
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
@@ -164,6 +165,9 @@ pub struct ClientTlsConfig {
     /// Client private key PEM for mutual TLS, with `client_cert_path`. May
     /// name the same file when it holds both.
     pub client_key_path: Option<PathBuf>,
+    /// SHA-256 pins on the server's public key, as in [`SpkiPin`]. Once the
+    /// chain verifies, the key must match one. Empty checks no key.
+    pub pin_sha256: Vec<SpkiPin>,
 }
 
 impl ClientTlsConfig {
@@ -177,6 +181,9 @@ impl ClientTlsConfig {
         let mut tls = ClientTls::new(self.trust);
         if let Some(ca) = &self.ca_path {
             tls = tls.with_ca(ca);
+        }
+        for pin in &self.pin_sha256 {
+            tls = tls.with_pin(*pin);
         }
         match (&self.client_cert_path, &self.client_key_path) {
             (Some(cert), Some(key)) => Ok(tls.with_identity(cert, key)),

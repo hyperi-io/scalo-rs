@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use super::{ClientTls, TrustChoice, build_client_tls, read_certs};
 use crate::crypto::{CryptoProfile, PqcMode};
 use crate::tls::test_pki::{Leaf, TestCa, pump};
-use crate::tls::{SpkiPin, TlsError, posture_provider};
+use crate::tls::{TlsError, posture_provider};
 
 /// What building a client and running its handshake came to.
 #[derive(Debug, PartialEq, Eq)]
@@ -315,22 +315,6 @@ fn the_profile_applies_under_every_trust_choice() {
     }
 }
 
-/// The pin an operator writes for `leaf`: base64 of the SHA-256 of its key's
-/// SubjectPublicKeyInfo, worked out from the key and not the certificate.
-fn pin_of(leaf: &Leaf) -> SpkiPin {
-    use base64::Engine as _;
-    use rcgen::PublicKeyData as _;
-    use sha2::Digest as _;
-
-    let spki = rcgen::KeyPair::from_pem(&leaf.key_pem)
-        .unwrap()
-        .subject_public_key_info();
-    base64::engine::general_purpose::STANDARD
-        .encode(sha2::Sha256::digest(&spki))
-        .parse()
-        .unwrap()
-}
-
 /// Key pins under each trust choice: the pinned key connects, a leaf re-keyed
 /// under the same CA is refused, and a pinned key still needs a trusted chain.
 #[test]
@@ -338,8 +322,8 @@ fn a_key_pin_accepts_its_key_and_refuses_a_rekeyed_leaf() {
     let pki = Pki::new();
     let ca_a = pki.path("ca_a.pem");
     let rekeyed = pki.ca_a.server("server a");
-    let pin_a = pin_of(&pki.server_a);
-    let pin_rekeyed = pin_of(&rekeyed);
+    let pin_a = pki.server_a.pin();
+    let pin_rekeyed = rekeyed.pin();
     assert_ne!(pin_a, pin_rekeyed, "a fresh key has a fresh pin");
 
     for trust in [
@@ -370,7 +354,7 @@ fn a_key_pin_accepts_its_key_and_refuses_a_rekeyed_leaf() {
             ),
             (
                 "the key pinned, its chain not trusted",
-                base().with_pin(pin_of(&pki.server_b)),
+                base().with_pin(pki.server_b.pin()),
                 &pki.server_b,
                 Outcome::Refused,
             ),

@@ -24,7 +24,7 @@ let config = build_client_tls(CryptoProfile::Prod, &pinned)?;
 
 The identity is a PEM certificate chain and its key, and both paths may name one file holding the pair. Every file is read when the config is built, so the build fails when a file is missing, holds no certificate or key, or the key does not match the certificate. `bundle` with no CA file trusts nothing and is refused. tonic has no OS verifier, so a gRPC client takes `native` or `bundle`.
 
-`with_pin(SpkiPin)` pins the server's public key under any trust choice: the chain must still verify, then the leaf's key must match one pin. A certificate re-issued on the same key keeps working, and a re-keyed one is refused and logged at warn with its pin, so list both across a rotation. A pin is the SHA-256 of the SubjectPublicKeyInfo in base64 or 64 hex digits. Other text fails the load with `TlsError::InvalidPin`. The HTTP transport reads `tls_pin_sha256`. gRPC clients refuse pins.
+`with_pin(SpkiPin)` pins the server's public key under any trust choice: the chain must still verify, then the leaf's key must match one pin. A certificate re-issued on the same key keeps working, and a re-keyed one is refused and logged at warn with its pin, so list both across a rotation. A pin is the SHA-256 of the SubjectPublicKeyInfo in base64 or 64 hex digits. Other text fails the load with `TlsError::InvalidPin`. The HTTP transport reads `tls_pin_sha256`, and `ClientTlsConfig` sections `pin_sha256`. gRPC clients refuse pins.
 
 ```bash
 openssl x509 -in server.pem -pubkey -noout | openssl pkey -pubin -outform der \

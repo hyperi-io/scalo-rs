@@ -38,6 +38,24 @@ pub(crate) struct Leaf {
     pub der: CertificateDer<'static>,
 }
 
+impl Leaf {
+    /// The pin an operator writes for this leaf, worked out from its key and
+    /// not from the certificate.
+    pub(crate) fn pin(&self) -> super::SpkiPin {
+        use base64::Engine as _;
+        use rcgen::PublicKeyData as _;
+        use sha2::Digest as _;
+
+        let spki = KeyPair::from_pem(&self.key_pem)
+            .unwrap()
+            .subject_public_key_info();
+        base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(&spki))
+            .parse()
+            .unwrap()
+    }
+}
+
 impl TestCa {
     pub(crate) fn new(name: &str) -> Self {
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
