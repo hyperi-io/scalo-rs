@@ -408,6 +408,19 @@ impl Sender {
         SendResult::Ok
     }
 
+    /// The body as sent, gzipped when `gzip` is set.
+    fn body(&self, framed: Vec<u8>) -> Result<bytes::Bytes, SendResult> {
+        if !self.gzip {
+            return Ok(bytes::Bytes::from(framed));
+        }
+        gzip(&framed).map(bytes::Bytes::from).map_err(|e| {
+            SendResult::Fatal(TransportError::Internal(format!(
+                "HTTP gzip of a {}-byte body: {e}",
+                framed.len()
+            )))
+        })
+    }
+
     /// Post one body to each endpoint in turn until one stores or rejects it.
     /// Each endpoint gets an equal share of the time left.
     async fn post(
@@ -418,19 +431,10 @@ impl Sender {
         deadline: Instant,
     ) -> SendResult {
         let framed_len = framed.len();
-        let body = if self.gzip {
-            match gzip(&framed) {
-                Ok(zipped) => zipped,
-                Err(e) => {
-                    return SendResult::Fatal(TransportError::Internal(format!(
-                        "HTTP gzip of a {framed_len}-byte body: {e}"
-                    )));
-                }
-            }
-        } else {
-            framed
+        let body = match self.body(framed) {
+            Ok(body) => body,
+            Err(fatal) => return fatal,
         };
-        let body = bytes::Bytes::from(body);
 
         let mut retry = false;
         let mut refusal: Option<ProxyRefused> = None;
@@ -478,9 +482,16 @@ impl Sender {
                 Err(e) => {
                     let held = e.is_redirect();
                     let timed_out = e.is_timeout();
+                    let tls = crate::tls::rustls_error(&e).map(ToString::to_string);
                     let detail = describe(e);
                     tracing::warn!(endpoint = %shown, records, error = %detail, "HTTP request failed");
                     count_error();
+                    // A refused certificate, name or key pin is the config's to fix, so it
+                    // holds the batch unless another endpoint takes it or can be retried.
+                    if let Some(tls) = tls {
+                        reasons.push(format!("{shown}: TLS: {tls}"));
+                        continue;
+                    }
                     if !held
                         && !timed_out
                         && let Some(refused) = self.refused(target, deadline).await

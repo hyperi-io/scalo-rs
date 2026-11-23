@@ -460,7 +460,11 @@ pub fn tls_parts(profile: CryptoProfile, trust: &TlsTrust) -> TlsParts {
 /// An `io::Error`'s `source` skips the error it wraps, and reqwest wraps
 /// tokio-rustls's `io::Error` in another, so the walk steps into each
 /// `io::Error` rather than to its source.
-#[cfg(any(feature = "transport-syslog", feature = "transport-otlp"))]
+#[cfg(any(
+    feature = "transport-http",
+    feature = "transport-syslog",
+    feature = "transport-otlp"
+))]
 pub(crate) fn rustls_error<'a>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a rustls::Error> {
@@ -686,7 +690,11 @@ mod tests {
 
     /// A rustls error is found bare, inside an `io::Error`, and further down a
     /// chain, and an error with none in it gives `None`.
-    #[cfg(any(feature = "transport-syslog", feature = "transport-otlp"))]
+    #[cfg(any(
+        feature = "transport-http",
+        feature = "transport-syslog",
+        feature = "transport-otlp"
+    ))]
     #[test]
     fn rustls_error_is_found_anywhere_in_the_chain() {
         #[derive(Debug, thiserror::Error)]

@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.34
 
+### The HTTP transport holds a batch every endpoint refuses at TLS (BEHAVIOUR CHANGE)
+
+A TLS handshake that fails (an untrusted or misnamed certificate, a key off the pin, a client certificate the endpoint turns away) was `Backpressured`, so the batch was resent for ever. When every endpoint fails that way it is `Fatal(Config)` naming each endpoint and the rustls error. A refused, reset or timed-out connection on any endpoint still makes it a retry. See [transport/http.md](transport/http.md#answers-failover-and-the-deadline).
+
+**Consumer adjustment** -- none in code. A sink whose drain retried a bad certificate now holds the records until the TLS config is fixed.
+
 ### Syslog transport, `TransportType::Syslog` (API CHANGE)
 
 The `transport-syslog` feature sends records to a syslog receiver as RFC 5424 or RFC 3164 messages over TCP, TLS, UDP or RELP, as `type: syslog`. `scalo::tls::ClientTlsConfig` is the `trust`, `ca_path`, `client_cert_path` and `client_key_path` section a transport reads its client TLS from. See [transport/syslog.md](transport/syslog.md). `transport-all`, and so `full`, pulls it.
