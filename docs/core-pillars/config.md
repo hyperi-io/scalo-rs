@@ -16,7 +16,7 @@ The cascade is **7 layers** -- one typed view assembled from CLI args, env vars,
 | # | Source | Notes |
 | --- | -------- | ------- |
 | 1 | CLI args | `Config::merge_cli(args)` after `Config::new` |
-| 2 | Environment variables | Prefix from `ConfigOptions::env_prefix`, double-underscore for nesting (`DFE_LOADER__KAFKA__BROKERS`) |
+| 2 | Environment variables | Prefix from `ConfigOptions::env_prefix`, double-underscore for nesting (`DFE_LOADER__KAFKA__BROKERS`). A value is parsed: `8080` is a number, `true` a bool, `[a, b]` a list. A field that refuses the parsed value gets the text as set, trimmed, so `0123` reaches a `String` field as `0123` and a `u16` as 123 |
 | 3 | `.env` file | `./.env` (plus `~/.env` beneath it with `load_home_dotenv`), loaded by `dotenvy` into env vars -- same precedence as layer 2. Parent directories are not searched. Not read at all when a file is named: `--config`, or a path given to `load_typed` or `flat_env::load_config` |
 | - | Managed policy | Opt-in: Group Policy on Windows, MDM managed preferences on macOS, when `ConfigOptions::managed` or `load_typed_managed` names the store. See [managed-config.md](managed-config.md) |
 | 4 | `settings.{env}.yaml` | `{env}` from `APP_ENV` / `ENVIRONMENT` / `ENV` (default `development`) |

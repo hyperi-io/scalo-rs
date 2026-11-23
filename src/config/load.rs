@@ -17,6 +17,7 @@ use figment::providers::{Env, Serialized};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::env_text::EnvText;
 use super::flat_env::{ApplyFlatEnv, Normalize};
 use super::managed::{self, ManagedLayer, ManagedSource};
 use super::{CONFIG, Config, ConfigError, ConfigOptions};
@@ -36,7 +37,9 @@ use crate::yaml::{self, Profile};
 ///
 /// 1. `{env_prefix}_` variables nest with `__`, after either separator:
 ///    `APP__KAFKA__BROKERS` and `APP_KAFKA__BROKERS` both set
-///    `kafka.brokers`. An empty variable counts as unset.
+///    `kafka.brokers`. An empty variable counts as unset. A field that
+///    refuses a variable's parsed value gets its text, so `0123` reaches a
+///    `String` field as `0123`.
 /// 2. [`ApplyFlatEnv`] applies the flat spellings (`APP_KAFKA_BROKERS`).
 /// 3. [`Normalize`] fills in implied settings.
 ///
@@ -269,9 +272,9 @@ where
                 Some(key.as_str()[prefix.len()..].trim_start_matches('_').into())
             })
             .split("__");
-        Figment::from(Serialized::defaults(&*config))
-            .merge(env)
-            .extract::<T>()
+        let mut env_text = EnvText::default();
+        let figment = env_text.merge(Figment::from(Serialized::defaults(&*config)), env);
+        env_text.extract::<T>(&figment, None)
     })?;
     *config = merged;
     Ok(())
@@ -384,6 +387,103 @@ mod tests {
             let app: App = load_typed(None, "LOADTEST").unwrap();
             assert_eq!(app.kafka.username, "cascade-user");
             assert!(app.sasl_enabled);
+        });
+    }
+
+    #[derive(Debug, Default, Deserialize, Serialize)]
+    #[serde(default)]
+    struct Typed {
+        text: String,
+        secret: SensitiveString,
+        port: u16,
+        ratio: f64,
+        on: bool,
+    }
+
+    impl ApplyFlatEnv for Typed {
+        fn apply_flat_env(&mut self, _prefix: &str) {}
+    }
+
+    impl Normalize for Typed {}
+
+    /// What a load with one env var set must do.
+    enum Expect {
+        /// Load, and the struct passes the check.
+        Read(fn(&Typed) -> bool),
+        /// Fail, naming the value as figment parsed it.
+        Refused(&'static str),
+    }
+
+    /// A field that refuses an env var's parsed value gets its text, numbers
+    /// and bools still parse, and a value no reading fits is refused with
+    /// the parsed value's error. Through the cascade and through a file.
+    #[test]
+    fn env_values_keep_their_text_where_the_field_needs_it() {
+        use Expect::{Read, Refused};
+        let cases: [(&str, &str, Expect); 14] = [
+            ("TEXT", "0123", Read(|t| t.text == "0123")),
+            ("TEXT", "007", Read(|t| t.text == "007")),
+            ("TEXT", "true", Read(|t| t.text == "true")),
+            ("TEXT", "1e5", Read(|t| t.text == "1e5")),
+            ("TEXT", "1.10", Read(|t| t.text == "1.10")),
+            ("TEXT", "[a, b]", Read(|t| t.text == "[a, b]")),
+            ("TEXT", " 0123\n", Read(|t| t.text == "0123")),
+            ("SECRET", "0123", Read(|t| t.secret.expose() == "0123")),
+            ("PORT", "0123", Read(|t| t.port == 123)),
+            (
+                "RATIO",
+                "0.1",
+                Read(|t| t.ratio.to_bits() == 0.1_f64.to_bits()),
+            ),
+            ("ON", "true", Read(|t| t.on)),
+            ("PORT", "abc", Refused("\"abc\"")),
+            ("PORT", "[1]", Refused("sequence")),
+            ("ON", "yes", Refused("\"yes\"")),
+        ];
+        let (_dir, file) = file("text: from-file\n");
+        for (var, value, expect) in &cases {
+            for path in [None, Some(file.as_str())] {
+                let name = format!("ENVTEXT__{var}={value:?} with file {path:?}");
+                let loaded = temp_env::with_var(format!("ENVTEXT__{var}"), Some(value), || {
+                    load_typed::<Typed>(path, "ENVTEXT")
+                });
+                match (expect, loaded) {
+                    (Read(check), Ok(typed)) => assert!(check(&typed), "{name}: {typed:?}"),
+                    (Refused(names), Err(ConfigError::ExtractError(err))) => {
+                        assert!(err.to_string().contains(*names), "{name}: {err}");
+                    }
+                    (_, other) => panic!("{name}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// An all-digit Kafka SASL password reaches the field as set, where the
+    /// load failed on the integer figment parsed it into.
+    #[cfg(feature = "transport-kafka-config")]
+    #[test]
+    fn a_numeric_sasl_password_reaches_kafka_config() {
+        #[derive(Debug, Default, Deserialize, Serialize)]
+        #[serde(default)]
+        struct WithKafka {
+            kafka: crate::transport::KafkaConfig,
+        }
+        impl ApplyFlatEnv for WithKafka {
+            fn apply_flat_env(&mut self, _prefix: &str) {}
+        }
+        impl Normalize for WithKafka {}
+
+        let (_dir, file) = file("kafka:\n  brokers: [a]\n");
+        temp_env::with_var("KAFKATEXT__KAFKA__SASL_PASSWORD", Some("0123"), || {
+            for path in [None, Some(file.as_str())] {
+                let app: WithKafka = load_typed(path, "KAFKATEXT").unwrap();
+                let password = app
+                    .kafka
+                    .sasl_password
+                    .as_ref()
+                    .map(SensitiveString::expose);
+                assert_eq!(password, Some("0123"), "with file {path:?}");
+            }
         });
     }
 
