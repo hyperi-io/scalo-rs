@@ -244,6 +244,7 @@ impl ProxyDialer {
 
     /// The proxy URL, credentials included, for a client library that dials
     /// its own proxy, such as reqwest.
+    #[cfg(feature = "transport-http")]
     pub(crate) fn proxy_url(&self, scheme: Scheme, host: &str, port: u16) -> Option<String> {
         let routes = self.routes.as_ref()?;
         routes.route(scheme, host, port)?;
