@@ -4,7 +4,7 @@ How a batch gets from a caller to its destinations, and why. We benched four way
 
 - Each batch is sent inline. No queue, no spool, and nothing acknowledged before its destination has it.
 - A gRPC destination fed by many small callers gets a fan-in buffer, on by default. About 17x the throughput on small blocks.
-- Parallel fan-out to several destinations works, but it's parked. Most deploys have one destination, so there's nothing to overlap.
+- Parallel fan-out to several destinations benched well, but it's parked and not built. Most deploys have one destination, so there's nothing to overlap.
 - A merge stage in front of gRPC lost on four of five loads.
 
 ---
@@ -132,15 +132,15 @@ The buffer sends what's queued the moment a call slot frees:
 - A block at or over that cap goes straight out.
 - At low load a slot is free, so a block goes out at once. Under load, blocks queue while the slots are busy, and batch that way.
 
-It differs from the merge stage that lost in two ways: several calls run per destination at once, and no block waits on a window.
+Unlike the merge stage that lost, several calls run per destination at once, and no block waits on a window.
 
 Delivery stays at-least-once:
 
 - A caller is answered when the call carrying its records returns.
-- A call that fails for now fails every caller in it, and each sends again. Copies, never loss.
-- A call refused for good, or answered `ResourceExhausted`, re-sends each block separately.
-- Queued payload is capped at 4 x `max_batch_bytes` per destination, and a caller waits for room. A block still untaken at `send_timeout_ms` is withdrawn and answered `Backpressured`.
-- Dead letters come out of each block before it joins, so `FilteredDlq` only goes to a caller whose block had them.
+- A call that fails transiently fails every caller in it, and each caller sends its records again. Copies, never loss.
+- A call of several blocks that's refused for good, or answered `ResourceExhausted`, sends each block again alone, and each caller gets its block's answer.
+- Queued payload is capped at 4 x `max_batch_bytes` per destination, and a caller waits for room. A block still untaken at `send_timeout_ms` is withdrawn and answered `Backpressured`. A `send_timeout_ms` of 0 turns that deadline off.
+- Dead letters come out of each block before it joins, so `FilteredDlq` only goes to a caller whose block had a dead letter or a record too large to send.
 
 Tier 2, listener in a separate process, loopback plaintext, medians of 10 runs, each with a control run:
 
@@ -159,6 +159,6 @@ The same runs set the defaults:
 - 8 calls in flight gave 490491 rec/s on W1g closed, and 128 KiB gave 519114. Both are below 4 and 64 KiB.
 - A 0.5 ms linger pushed W1g half-load p99 to 4.07 ms, because tokio rounds a timer up to its next 1 ms tick. It did win W3g closed (701303 rec/s, p99 12.09 ms). But low load is the common case. Hence no linger key.
 
-The bench didn't cover TLS, a real network round trip, or blocks per call. The batching under load is read off the throughput and listener CPU.
+The bench didn't cover TLS, a network round trip, or blocks per call. The batching under load is read off the throughput and listener CPU.
 
 `coalesce.enabled: false` turns it off, and each `send_batch` is a separate call again.
