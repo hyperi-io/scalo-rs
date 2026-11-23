@@ -344,7 +344,9 @@ cost of a disk flush per block. Without it a block is in the kernel page
 cache when `send` returns.
 
 Missing folders are created with `dir_mode`, and a new file with
-`file_mode`, both private by default. A file or folder that already exists
+`file_mode`, both private by default in this transport. The DLQ file backend
+and the file output leave them unset, so the process umask decides there and
+an operator or shipper can read the files. A file or folder that already exists
 keeps its mode. On Windows the modes are ignored: a file takes its folder's
 ACL, so set the ACL on the folder.
 

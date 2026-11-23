@@ -245,30 +245,33 @@ fn last_newline_end(file: &mut (impl Read + Seek), len: u64) -> io::Result<u64> 
     Ok(0)
 }
 
-/// Options that create files with `mode` on Unix. A Windows file takes its
-/// folder's ACL.
+/// Options that create files with `mode` on Unix, or `0666` before the umask
+/// when it is unset. A Windows file takes its folder's ACL.
 #[cfg(unix)]
-fn file_options(mode: FileMode) -> OpenOptions {
+fn file_options(mode: Option<FileMode>) -> OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = OpenOptions::new();
-    options.mode(mode.bits());
+    if let Some(mode) = mode {
+        options.mode(mode.bits());
+    }
     options
 }
 
 /// Options that create files with `mode` on Unix. A Windows file takes its
 /// folder's ACL.
 #[cfg(not(unix))]
-fn file_options(_mode: FileMode) -> OpenOptions {
+fn file_options(_mode: Option<FileMode>) -> OpenOptions {
     OpenOptions::new()
 }
 
-/// Creates `dir` and any missing parents, each with `mode` on Unix.
+/// Creates `dir` and any missing parents, each with `mode` on Unix, or
+/// `0777` before the umask when it is unset.
 #[cfg_attr(not(unix), allow(unused_variables))]
-pub(super) fn create_dir(dir: &Path, mode: FileMode) -> io::Result<()> {
+pub(super) fn create_dir(dir: &Path, mode: Option<FileMode>) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
-    {
+    if let Some(mode) = mode {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(mode.bits());
     }

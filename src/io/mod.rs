@@ -19,7 +19,7 @@
 //! - Gzip of rotated files, keeping the six newest plain
 //! - Removal of rotated files by age and by count
 //! - Optional `durable` writes, synced to disk before they return
-//! - Private file and directory modes on Unix (`0600`, `0700` by default)
+//! - File and directory modes on Unix, the umask's unless set
 //! - Whole writes: a failed write is cut back off, and a partial last line
 //!   left by a crash is cut off when the file is opened
 //! - Atomic write counters for metrics

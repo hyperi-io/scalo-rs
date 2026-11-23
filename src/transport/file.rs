@@ -93,7 +93,8 @@ pub struct FileTransportConfig {
     #[serde(default)]
     pub compress_rotated: bool,
 
-    /// Size rotation, retention by count, `durable` and file modes.
+    /// Size rotation, retention by count, `durable` and file modes. An unset
+    /// mode is private here: files `0600`, folders `0700`.
     #[serde(flatten)]
     pub write: FileWriteOptions,
 
@@ -156,7 +157,7 @@ impl FileTransportConfig {
             rotation: self.rotation,
             max_age_days: self.max_age_days.unwrap_or(u32::MAX),
             compress_rotated: self.compress_rotated,
-            write: self.write,
+            write: self.write.private_by_default(),
         };
         Ok((config, name.to_owned()))
     }
@@ -1252,8 +1253,15 @@ mod tests {
         assert_eq!(config.write.max_bytes, Some(1_048_576));
         assert_eq!(config.write.max_files, Some(9), "env wins");
         assert!(config.write.durable, "from env");
-        assert_eq!(config.write.file_mode.bits(), 0o640);
-        assert_eq!(config.write.dir_mode.bits(), 0o750, "from env");
+        assert_eq!(
+            config.write.file_mode.map(crate::io::FileMode::bits),
+            Some(0o640)
+        );
+        assert_eq!(
+            config.write.dir_mode.map(crate::io::FileMode::bits),
+            Some(0o750),
+            "from env"
+        );
     }
 
     #[test]
@@ -1263,5 +1271,57 @@ mod tests {
         assert_eq!(config.max_age_days, None);
         assert!(!config.compress_rotated);
         assert_eq!(config.write, FileWriteOptions::default());
+    }
+
+    /// The sent file and the folders made for it are private by default, and
+    /// a set mode is kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sent_files_are_private_unless_a_mode_is_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let cases = [
+            (None, None, 0o600, 0o700),
+            (
+                crate::io::FileMode::new(0o640).ok(),
+                crate::io::FileMode::new(0o750).ok(),
+                0o640,
+                0o750,
+            ),
+        ];
+        for (file_mode, dir_mode, want_file, want_dir) in cases {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("made").join("sent.ndjson");
+            let transport = FileTransport::new(&FileTransportConfig {
+                path: path.display().to_string(),
+                write: FileWriteOptions {
+                    file_mode,
+                    dir_mode,
+                    ..FileWriteOptions::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert!(
+                transport
+                    .send("k", bytes::Bytes::from_static(b"x"))
+                    .await
+                    .is_ok()
+            );
+            // A mode with no group or other bits is untouched by any umask.
+            if want_file == 0o600 {
+                assert_eq!(mode(&path), want_file, "file");
+                assert_eq!(mode(path.parent().unwrap()), want_dir, "folder");
+            } else {
+                assert_eq!(mode(&path) & 0o700, want_file & 0o700, "file");
+                assert_eq!(mode(&path) & !want_file, 0, "file adds no bits");
+                assert_eq!(
+                    mode(path.parent().unwrap()) & !want_dir,
+                    0,
+                    "folder adds no bits"
+                );
+            }
+        }
     }
 }

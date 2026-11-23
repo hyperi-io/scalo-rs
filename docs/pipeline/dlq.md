@@ -18,7 +18,7 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 
 | Backend | Feature | Storage |
 | --------- | --------- | --------- |
-| File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, rotated by time (`Hourly` default) or size, gzipped after rotation, created `0600` in a `0700` folder |
+| File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, rotated by time (`Hourly` default) or size, gzipped after rotation, with the modes the process umask gives unless `file_mode` and `dir_mode` set them |
 | Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic -- per-table (`acme.auth` -> `acme.auth.dlq`) or single common topic (`<service>.dlq` unless `common_topic` names one) |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
 
@@ -237,8 +237,8 @@ dlq:
     max_bytes: null              # rotate before a batch that would pass this many bytes
     max_files: null              # rotated files kept; null: no count limit
     durable: false               # sync each batch and the folder after a rotation
-    file_mode: "0600"            # files created, before the umask. Unix only
-    dir_mode: "0700"             # folders created, before the umask. Unix only
+    file_mode: null              # files created, before the umask; null: 0666. Unix only
+    dir_mode: null               # folders created, before the umask; null: 0777. Unix only
   kafka:                         # dlq-kafka feature
     enabled: true
     routing: per_table           # per_table | common

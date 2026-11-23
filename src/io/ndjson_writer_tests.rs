@@ -425,8 +425,8 @@ fn umask(dir: &Path) -> u32 {
     !mode & 0o777
 }
 
-/// Created files and directories take the configured modes, private by
-/// default, and an existing file keeps its own.
+/// Created files and directories take the configured modes, the umask's
+/// with none set, and an existing file keeps its own.
 #[cfg(unix)]
 #[test]
 fn created_files_and_directories_take_their_modes() {
@@ -436,12 +436,18 @@ fn created_files_and_directories_take_their_modes() {
 
     let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
     let cases = [
-        ("default", FileWriteOptions::default(), 0o600, 0o700),
+        ("unset", FileWriteOptions::default(), 0o666, 0o777),
+        (
+            "private",
+            FileWriteOptions::default().private_by_default(),
+            0o600,
+            0o700,
+        ),
         (
             "configured",
             FileWriteOptions {
-                file_mode: FileMode::new(0o640).expect("mode"),
-                dir_mode: FileMode::new(0o750).expect("mode"),
+                file_mode: FileMode::new(0o640).ok(),
+                dir_mode: FileMode::new(0o750).ok(),
                 ..FileWriteOptions::default()
             },
             0o640,

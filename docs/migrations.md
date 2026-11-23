@@ -8,13 +8,13 @@ release and the target before bumping.
 
 ## 2.14.34
 
-### File writers rotate by size, sync on request, create private files and cut a partial last line (API and BEHAVIOUR CHANGE)
+### File writers rotate by size, sync on request, set file modes and cut a partial last line (API and BEHAVIOUR CHANGE)
 
-`io::NdjsonWriter` no longer uses `file-rotate`, and `chrono` leaves the `io` feature. The DLQ file backend, the file output and now the file transport write through it. `FileWriterConfig`, `FileDlqConfig` and `FileOutputConfig` gain a flattened `write: FileWriteOptions`, so its keys sit beside `rotation`: `max_bytes` (rotate before a write that would pass it), `max_files` (rotated files kept), `durable` (sync each write, and the folder after a create or rotation, off by default), `file_mode` and `dir_mode`. `RotationPeriod` gains `Never`. `FileTransportConfig` gains `rotation` (default `never`), `max_age_days` (default none), `compress_rotated` (default off) and the same `write` keys. See [transport/backends.md](transport/backends.md#file).
+`io::NdjsonWriter` no longer uses `file-rotate`, and `chrono` leaves the `io` feature. The DLQ file backend, the file output and now the file transport write through it. `FileWriterConfig`, `FileDlqConfig` and `FileOutputConfig` gain a flattened `write: FileWriteOptions`, so its keys sit beside `rotation`: `max_bytes` (rotate before a write that would pass it), `max_files` (rotated files kept), `durable` (sync each write, and the folder after a create or rotation, off by default), `file_mode` and `dir_mode` (unset by default, so the umask decides as before). `RotationPeriod` gains `Never`. `FileTransportConfig` gains `rotation` (default `never`), `max_age_days` (default none), `compress_rotated` (default off) and the same `write` keys. See [transport/backends.md](transport/backends.md#file).
 
 Behaviour that changes with no config:
 
-- Files the writers create are `0600` and folders `0700` on Unix, where the umask decided before. Existing files and folders keep their modes.
+- Files the file transport creates are `0600` and its folders `0700` on Unix, where the umask decided before. The DLQ file backend and the file output keep the umask modes. Existing files and folders keep their modes.
 - Opening a file whose last line has no newline cuts that line off before appending, with a warn log and `file_writer_cut_bytes_total{writer}`.
 - A write that fails is cut back off the file, so no half line stays for the retry to follow.
 - A write is refused while another file sits at the writer's path, not only while the path is empty.
@@ -22,7 +22,7 @@ Behaviour that changes with no config:
 - `NdjsonWriter::flush` syncs to disk when `durable` is set and does nothing otherwise.
 - Rotated file names keep the local `YYYYMMDDTHHMMSS` suffix and the six-newest-uncompressed gzip rule, so retention picks up files an older release rotated.
 
-**Consumer adjustment** -- a struct literal of `FileWriterConfig`, `FileDlqConfig` or `FileOutputConfig` adds `write` or `..Default::default()`, and an exhaustive match on `RotationPeriod` adds `Never`. A process reading DLQ or output files as another user sets `file_mode: "0640"` and `dir_mode: "0750"` (or wider), or loses read access to new files.
+**Consumer adjustment** -- a struct literal of `FileWriterConfig`, `FileDlqConfig` or `FileOutputConfig` adds `write` or `..Default::default()`, and an exhaustive match on `RotationPeriod` adds `Never`. A process reading the file transport's output as another user sets `file_mode: "0640"` and `dir_mode: "0750"` (or wider) on that transport, or loses read access to new files.
 
 ### `MemoryGuard` reads the process's resident memory on Windows and macOS (BEHAVIOUR CHANGE)
 

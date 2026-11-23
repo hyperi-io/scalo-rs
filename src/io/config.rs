@@ -123,7 +123,7 @@ impl schemars::JsonSchema for FileMode {
 /// How a writer rotates by size, keeps rotated files, syncs, and sets
 /// permissions. Flattened into each file config, so its keys sit beside
 /// `rotation`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct FileWriteOptions {
@@ -141,22 +141,27 @@ pub struct FileWriteOptions {
     /// power loss. Costs a disk flush per batch. Off by default.
     pub durable: bool,
 
-    /// Mode for files the writer creates, before the umask. Unix only: a
-    /// Windows file takes its folder's ACL. Existing files keep theirs.
-    pub file_mode: FileMode,
+    /// Mode for files the writer creates, before the umask. Unset: `0666`
+    /// before the umask, except in the file transport, where it is `0600`.
+    /// Unix only: a Windows file takes its folder's ACL. Existing files keep
+    /// theirs.
+    pub file_mode: Option<FileMode>,
 
-    /// Mode for directories the writer creates, before the umask. Unix only.
-    pub dir_mode: FileMode,
+    /// Mode for directories the writer creates, before the umask. Unset:
+    /// `0777` before the umask, except in the file transport, where it is
+    /// `0700`. Unix only.
+    pub dir_mode: Option<FileMode>,
 }
 
-impl Default for FileWriteOptions {
-    fn default() -> Self {
+impl FileWriteOptions {
+    /// These options with an unset mode made private: `0600` for files,
+    /// `0700` for directories.
+    #[must_use]
+    pub fn private_by_default(self) -> Self {
         Self {
-            max_bytes: None,
-            max_files: None,
-            durable: false,
-            file_mode: FileMode::PRIVATE_FILE,
-            dir_mode: FileMode::PRIVATE_DIR,
+            file_mode: self.file_mode.or(Some(FileMode::PRIVATE_FILE)),
+            dir_mode: self.dir_mode.or(Some(FileMode::PRIVATE_DIR)),
+            ..self
         }
     }
 }
@@ -209,8 +214,20 @@ mod tests {
         assert_eq!(config.max_age_days, 30);
         assert!(config.compress_rotated);
         assert_eq!(config.write, FileWriteOptions::default());
-        assert_eq!(config.write.file_mode.bits(), 0o600);
-        assert_eq!(config.write.dir_mode.bits(), 0o700);
+        assert_eq!(config.write.file_mode, None, "the umask decides");
+        assert_eq!(config.write.dir_mode, None, "the umask decides");
+        let private = config.write.private_by_default();
+        assert_eq!(private.file_mode, Some(FileMode::PRIVATE_FILE));
+        assert_eq!(private.dir_mode, Some(FileMode::PRIVATE_DIR));
+        let set = FileWriteOptions {
+            file_mode: FileMode::new(0o640).ok(),
+            ..FileWriteOptions::default()
+        };
+        assert_eq!(
+            set.private_by_default().file_mode,
+            FileMode::new(0o640).ok(),
+            "a set mode stays"
+        );
         assert!(!config.write.durable);
     }
 
@@ -241,8 +258,8 @@ mod tests {
                 max_bytes: Some(1024),
                 max_files: Some(3),
                 durable: true,
-                file_mode: FileMode::new(0o640).unwrap(),
-                dir_mode: FileMode::new(0o750).unwrap(),
+                file_mode: FileMode::new(0o640).ok(),
+                dir_mode: FileMode::new(0o750).ok(),
             },
         };
         let json = serde_json::to_string(&config).expect("serialise");
