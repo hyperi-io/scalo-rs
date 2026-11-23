@@ -20,24 +20,41 @@ fn url(text: &str) -> ProxyConfig {
 }
 
 /// The proxy environment variables, all unset but `set`.
+///
+/// Windows names are case-insensitive, so there a name is matched without
+/// case and the upper-case spelling alone is written.
 fn proxy_env(set: &[(&'static str, &'static str)]) -> Vec<(&'static str, Option<&'static str>)> {
-    [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "NO_PROXY",
-        "no_proxy",
-        "REQUEST_METHOD",
-    ]
-    .into_iter()
-    .map(|name| {
-        let value = set.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
-        (name, value)
-    })
-    .collect()
+    let names: &[&'static str] = if cfg!(windows) {
+        &[
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "REQUEST_METHOD",
+        ]
+    } else {
+        &[
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "REQUEST_METHOD",
+        ]
+    };
+    names
+        .iter()
+        .map(|name| {
+            let value = set
+                .iter()
+                .find(|(n, _)| n == name || (cfg!(windows) && n.eq_ignore_ascii_case(name)))
+                .map(|(_, v)| *v);
+            (*name, value)
+        })
+        .collect()
 }
 
 #[test]
