@@ -353,8 +353,7 @@ rdkafka = { version = ">=0.40.0, <0.41", default-features = false, features = ["
 # Reads MDM managed preferences for the managed config layer.
 plist = { version = ">=1.10.3, <2", default-features = false, optional = true }
 
-# Reads Group Policy for the managed config layer. Held below 0.7, as hyper-util's
-# `client-proxy-system` holds it, so a consumer's Windows build compiles one copy.
+# Reads Group Policy for the managed config layer.
 [target.'cfg(windows)'.dependencies]
 windows-registry = { version = ">=0.100.0, <0.101", optional = true }
 # The process working set for the memory guard. Held to the 0.62 line sysinfo
