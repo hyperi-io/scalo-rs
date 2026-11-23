@@ -878,6 +878,98 @@ async fn https_goes_through_a_connect_proxy() {
     assert_eq!(target.seen().len(), 2, "one request per allowed tunnel");
 }
 
+/// A failed TLS handshake is not retried: once no other endpoint takes the
+/// body or is worth a retry, the batch is held, naming each endpoint and the
+/// rustls error.
+#[tokio::test]
+async fn a_tls_refusal_holds_the_batch_once_no_endpoint_takes_it() {
+    #[derive(Debug, Clone, Copy)]
+    enum End {
+        Trusted,
+        Untrusted,
+        Down,
+    }
+    use End::{Down, Trusted, Untrusted};
+
+    let target = Server::status(200).await;
+    let (trusted, ca) = tls_front(target.addr, &[b"http/1.1"]).await;
+    let ca_file = tempfile::NamedTempFile::new().unwrap();
+    tokio::fs::write(ca_file.path(), &ca).await.unwrap();
+    // (endpoints, a pin off the trusted key, wanted, text the answer names)
+    let rows: Vec<(Vec<End>, bool, Got, &str)> = vec![
+        (
+            vec![Untrusted],
+            false,
+            Got::Hold,
+            "invalid peer certificate",
+        ),
+        (
+            vec![Untrusted, Untrusted],
+            false,
+            Got::Hold,
+            "invalid peer certificate",
+        ),
+        (vec![Untrusted, Trusted], false, Got::Ok, ""),
+        (vec![Untrusted, Down], false, Got::Backpressured, ""),
+        (
+            vec![Trusted],
+            true,
+            Got::Hold,
+            "ApplicationVerificationFailure",
+        ),
+    ];
+    for (ends, pinned, want, named) in rows {
+        let mut hosts = Vec::new();
+        let mut urls = Vec::new();
+        for end in &ends {
+            let url = match end {
+                Trusted => format!("https://localhost:{}", trusted.port()),
+                Untrusted => {
+                    let (front, _) = tls_front(target.addr, &[b"http/1.1"]).await;
+                    format!("https://localhost:{}", front.port())
+                }
+                Down => refused_url(),
+            };
+            hosts.push(url.split("//").nth(1).unwrap_or_default().to_string());
+            urls.push(url);
+        }
+        let config = HttpTransportConfig {
+            failover: urls[1..]
+                .iter()
+                .map(|url| HttpEndpoint {
+                    url: url.clone(),
+                    auth: None,
+                })
+                .collect(),
+            tls_trust: Some(crate::tls::TrustChoice::Bundle),
+            tls_ca_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            tls_pin_sha256: if pinned {
+                vec!["00".repeat(32).parse().unwrap()]
+            } else {
+                Vec::new()
+            },
+            ..HttpTransportConfig::sender(&urls[0])
+        };
+        let result = sender(&config).await.send("ingest", "{}".into()).await;
+        assert_eq!(got(&result), want, "{ends:?}: {result:?}");
+        if want == Got::Hold {
+            let text = format!("{result:?}");
+            assert!(text.contains(named), "{ends:?}: {text}");
+            for host in &hosts {
+                assert!(
+                    text.contains(host.as_str()),
+                    "{ends:?} names {host}: {text}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        target.seen().len(),
+        1,
+        "only the trusted endpoint is reached"
+    );
+}
+
 /// A send answers by its deadline, and a hung endpoint gets only its share
 /// of it, so the next endpoint still gets a turn.
 #[tokio::test]
