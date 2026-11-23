@@ -16,13 +16,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustls::client::WantsClientCert;
+use rustls::client::danger::ServerCertVerifier;
+use rustls::client::{WantsClientCert, WebPkiServerVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 
+use super::pin::{self, SpkiPin};
 use super::{TlsError, posture_provider, protocol_versions};
 use crate::crypto::CryptoProfile;
 
@@ -88,6 +90,9 @@ pub struct ClientTls {
     pub ca_paths: Vec<PathBuf>,
     /// The certificate the client presents, when the server asks for one.
     pub identity: Option<ClientIdentity>,
+    /// Pins on the server's public key, checked after its chain verifies.
+    /// Empty checks no key.
+    pub pin_sha256: Vec<SpkiPin>,
 }
 
 impl ClientTls {
@@ -126,10 +131,17 @@ impl ClientTls {
         });
         self
     }
+
+    /// Accept the server's key when it matches `pin`, or any other pin given.
+    #[must_use]
+    pub fn with_pin(mut self, pin: SpkiPin) -> Self {
+        self.pin_sha256.push(pin);
+        self
+    }
 }
 
 /// The config section a transport reads its client TLS from: a trust choice,
-/// one CA file and an optional client certificate.
+/// one CA file, an optional client certificate and optional key pins.
 ///
 /// ```yaml
 /// tls:
@@ -137,6 +149,7 @@ impl ClientTls {
 ///   ca_path: /etc/tls/ca.pem
 ///   client_cert_path: /etc/tls/client.pem
 ///   client_key_path: /etc/tls/client.key
+///   pin_sha256: ["47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="]
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
@@ -152,6 +165,9 @@ pub struct ClientTlsConfig {
     /// Client private key PEM for mutual TLS, with `client_cert_path`. May
     /// name the same file when it holds both.
     pub client_key_path: Option<PathBuf>,
+    /// SHA-256 pins on the server's public key, as in [`SpkiPin`]. Once the
+    /// chain verifies, the key must match one. Empty checks no key.
+    pub pin_sha256: Vec<SpkiPin>,
 }
 
 impl ClientTlsConfig {
@@ -165,6 +181,9 @@ impl ClientTlsConfig {
         let mut tls = ClientTls::new(self.trust);
         if let Some(ca) = &self.ca_path {
             tls = tls.with_ca(ca);
+        }
+        for pin in &self.pin_sha256 {
+            tls = tls.with_pin(*pin);
         }
         match (&self.client_cert_path, &self.client_key_path) {
             (Some(cert), Some(key)) => Ok(tls.with_identity(cert, key)),
@@ -196,17 +215,16 @@ pub fn build_client_tls(
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(protocol_versions(profile.tls_floor()))
         .map_err(|e| TlsError::Build(e.to_string()))?;
-    let builder: ConfigBuilder<ClientConfig, WantsClientCert> = match tls.trust {
+    let verifier: Arc<dyn ServerCertVerifier> = match tls.trust {
         TrustChoice::Native => {
-            builder.with_root_certificates(root_store(&tls.ca_paths, Roots::WithOs)?)
+            webpki_verifier(root_store(&tls.ca_paths, Roots::WithOs)?, provider)?
         }
-        TrustChoice::Bundle => {
-            builder.with_root_certificates(root_store(&tls.ca_paths, Roots::Only)?)
-        }
-        TrustChoice::Platform => builder
-            .dangerous()
-            .with_custom_certificate_verifier(platform_verifier(&tls.ca_paths, provider)?),
+        TrustChoice::Bundle => webpki_verifier(root_store(&tls.ca_paths, Roots::Only)?, provider)?,
+        TrustChoice::Platform => platform_verifier(&tls.ca_paths, provider)?,
     };
+    let builder: ConfigBuilder<ClientConfig, WantsClientCert> = builder
+        .dangerous()
+        .with_custom_certificate_verifier(pin::pinned(verifier, &tls.pin_sha256));
     let config = match &tls.identity {
         Some(identity) => {
             let (chain, key) = read_identity(identity)?;
@@ -220,10 +238,22 @@ pub fn build_client_tls(
         trust = %tls.trust,
         ca_files = tls.ca_paths.len(),
         mutual_tls = tls.identity.is_some(),
+        key_pins = tls.pin_sha256.len(),
         profile = ?profile,
         "TLS client config built"
     );
     Ok(Arc::new(config))
+}
+
+/// rustls's WebPKI verifier over `roots`.
+fn webpki_verifier(
+    roots: RootCertStore,
+    provider: Arc<CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, TlsError> {
+    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+        .build()
+        .map_err(|e| TlsError::Build(format!("certificate verifier: {e}")))?;
+    Ok(verifier)
 }
 
 /// Whether a root store holds the OS roots beside the CA files.

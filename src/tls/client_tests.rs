@@ -315,6 +315,60 @@ fn the_profile_applies_under_every_trust_choice() {
     }
 }
 
+/// Key pins under each trust choice: the pinned key connects, a leaf re-keyed
+/// under the same CA is refused, and a pinned key still needs a trusted chain.
+#[test]
+fn a_key_pin_accepts_its_key_and_refuses_a_rekeyed_leaf() {
+    let pki = Pki::new();
+    let ca_a = pki.path("ca_a.pem");
+    let rekeyed = pki.ca_a.server("server a");
+    let pin_a = pki.server_a.pin();
+    let pin_rekeyed = rekeyed.pin();
+    assert_ne!(pin_a, pin_rekeyed, "a fresh key has a fresh pin");
+
+    for trust in [
+        TrustChoice::Native,
+        TrustChoice::Platform,
+        TrustChoice::Bundle,
+    ] {
+        let base = || ClientTls::new(trust).with_ca(&ca_a);
+        let cases: Vec<(&str, ClientTls, &Leaf, Outcome)> = vec![
+            ("no pin", base(), &rekeyed, Outcome::Connects),
+            (
+                "the key pinned",
+                base().with_pin(pin_a),
+                &pki.server_a,
+                Outcome::Connects,
+            ),
+            (
+                "the leaf re-keyed under the same CA",
+                base().with_pin(pin_a),
+                &rekeyed,
+                Outcome::Refused,
+            ),
+            (
+                "the re-keyed leaf beside the old pin",
+                base().with_pin(pin_a).with_pin(pin_rekeyed),
+                &rekeyed,
+                Outcome::Connects,
+            ),
+            (
+                "the key pinned, its chain not trusted",
+                base().with_pin(pki.server_b.pin()),
+                &pki.server_b,
+                Outcome::Refused,
+            ),
+        ];
+        for (name, tls, leaf, expected) in cases {
+            let got = connect(CryptoProfile::Prod, &tls, server_config(leaf, None));
+            assert!(
+                is(&expected, &got),
+                "{trust} {name}: expected {expected:?}, got {got:?}"
+            );
+        }
+    }
+}
+
 /// Config spells the choices in lower case and refuses any other word.
 #[test]
 fn trust_choice_reads_its_three_names_and_refuses_others() {

@@ -183,7 +183,7 @@ secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager"]
 secrets-all = ["secrets-vault", "secrets-aws"]
 
 # docs/api/tls.md
-tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", "dep:rustls-pki-types", "dep:webpki-roots", "dep:tokio-rustls", "dep:arc-swap", "tokio", "tracing"]
+tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", "dep:rustls-pki-types", "dep:webpki-roots", "dep:tokio-rustls", "dep:arc-swap", "dep:sha2", "base64", "tokio", "tracing"]
 
 # Can leak secrets: not in `full`, off in every shipping build.
 dangerous-diagnostics = []
