@@ -8,6 +8,18 @@ release and the target before bumping.
 
 ## 2.14.34
 
+### `scalo::framing` holds every batch framing, and `worker::ndjson` is gone (API CHANGE)
+
+The `Framing` trait, its built-ins and `StreamDecoder` are what the file and pipe transports, the file output and the DLQ's file and HTTP backends now frame with, byte for byte as before. `FramingError` moves to `scalo::framing`, still re-exported as `scalo::transport::FramingError`, with new variants and messages. See [transport/framing.md](transport/framing.md).
+
+**Consumer adjustment** -- `scalo::worker::ndjson::split_lines(payload)` becomes `Ndjson.decode(payload, &DecodeLimits::UNBOUNDED)?.records`, which also trims spaces around each line and skips lines of only whitespace. `count_lines(payload)` becomes the `len()` of those records. An exhaustive `match` on `FramingError` cannot exist, as it is `#[non_exhaustive]`.
+
+### The file transport's `max_line_bytes` no longer counts the newline (BEHAVIOUR CHANGE)
+
+A line of exactly `max_line_bytes` before its `\n` is now a record, where it was a dead letter. Carriage returns before the `\n` still count.
+
+**Consumer adjustment** -- none.
+
 ### A file or pipe sender from the factory needs `delivery: flush` (BEHAVIOUR CHANGE)
 
 `TransportConfig.delivery`, default `ack`, is the weakest guarantee a factory-built sender may have. File and pipe write and flush with no acknowledgement, so they are refused under the default, naming the key: `set transport.output.delivery: flush to accept that`. Kafka with `acks=0` needs `delivery: none`. See [transport/custom.md](transport/custom.md#delivery-guarantee).

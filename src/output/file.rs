@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use crate::framing::{Framing, Ndjson};
 use crate::io::NdjsonWriter;
 
 use super::config::FileOutputConfig;
@@ -100,14 +101,7 @@ impl FileOutput {
     /// thread on disk I/O. Safe from sync code; **never call from an
     /// `async fn` body** -- use [`Self::write_async`] instead.
     pub fn write(&self, data: &[u8]) -> Result<(), OutputError> {
-        if data.last() == Some(&b'\n') {
-            self.writer.write_line(data)?;
-        } else {
-            let mut line = Vec::with_capacity(data.len() + 1);
-            line.extend_from_slice(data);
-            line.push(b'\n');
-            self.writer.write_line(&line)?;
-        }
+        self.writer.write_line(&lines(&[data]))?;
         Ok(())
     }
 
@@ -117,18 +111,7 @@ impl FileOutput {
         if data.is_empty() {
             return Ok(());
         }
-
-        let total_len: usize = data.iter().map(|d| d.len() + 1).sum();
-        let mut buf = Vec::with_capacity(total_len);
-        for entry in data {
-            buf.extend_from_slice(entry);
-            if entry.last() != Some(&b'\n') {
-                buf.push(b'\n');
-            }
-        }
-
-        let count = data.len() as u64;
-        self.writer.write_buf(&buf, count)?;
+        self.writer.write_buf(&lines(data), data.len() as u64)?;
         Ok(())
     }
 
@@ -142,18 +125,9 @@ impl FileOutput {
     pub async fn write_async(&self, data: Vec<u8>) -> Result<(), OutputError> {
         let writer = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || -> Result<(), OutputError> {
-            let line: &[u8] = if data.last() == Some(&b'\n') {
-                &data
-            } else {
-                // Borrow check: build the owned buffer in the same scope.
-                return {
-                    let mut line = Vec::with_capacity(data.len() + 1);
-                    line.extend_from_slice(&data);
-                    line.push(b'\n');
-                    writer.write_line(&line).map_err(OutputError::from)
-                };
-            };
-            writer.write_line(line).map_err(OutputError::from)
+            writer
+                .write_line(&lines(&[&data]))
+                .map_err(OutputError::from)
         })
         .await
         .map_err(|e| OutputError::Io(std::io::Error::other(e)))?
@@ -171,16 +145,10 @@ impl FileOutput {
         }
         let writer = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || -> Result<(), OutputError> {
-            let total_len: usize = data.iter().map(|d| d.len() + 1).sum();
-            let mut buf = Vec::with_capacity(total_len);
-            for entry in &data {
-                buf.extend_from_slice(entry);
-                if entry.last() != Some(&b'\n') {
-                    buf.push(b'\n');
-                }
-            }
-            let count = data.len() as u64;
-            writer.write_buf(&buf, count).map_err(OutputError::from)
+            let entries: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+            writer
+                .write_buf(&lines(&entries), data.len() as u64)
+                .map_err(OutputError::from)
         })
         .await
         .map_err(|e| OutputError::Io(std::io::Error::other(e)))?
@@ -205,6 +173,13 @@ impl FileOutput {
     pub fn shared_writer(&self) -> Arc<NdjsonWriter> {
         Arc::clone(&self.writer)
     }
+}
+
+/// `entries` as NDJSON lines in one buffer.
+fn lines(entries: &[&[u8]]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(entries.iter().map(|e| e.len() + 1).sum());
+    let _ = Ndjson.encode(entries, &mut buf);
+    buf
 }
 
 #[cfg(test)]
@@ -232,6 +207,34 @@ mod tests {
             matches!(result.unwrap_err(), OutputError::Disabled),
             "expected Disabled error"
         );
+    }
+
+    /// Every write path ends each entry with one newline, adding none to an
+    /// entry that has one.
+    #[tokio::test]
+    async fn every_write_path_frames_bytes_the_same() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = FileOutput::new(&test_config(dir.path()), "frame-svc").expect("create");
+        output.write(b"a").expect("write");
+        output.write(b"b\n").expect("write");
+        output
+            .write_batch(&[b"c", b"d\n", b""])
+            .expect("write_batch");
+        output
+            .write_async(b"e".to_vec())
+            .await
+            .expect("write_async");
+        output
+            .write_async(b"f\n".to_vec())
+            .await
+            .expect("write_async");
+        output
+            .write_batch_async(vec![b"g".to_vec(), b"h\n".to_vec()])
+            .await
+            .expect("write_batch_async");
+        let written = std::fs::read(dir.path().join("frame-svc/events.ndjson")).expect("read");
+        assert_eq!(written, b"a\nb\nc\nd\n\ne\nf\ng\nh\n");
+        assert_eq!(output.lines_written(), 9);
     }
 
     #[test]

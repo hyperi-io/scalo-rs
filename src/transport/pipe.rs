@@ -30,10 +30,11 @@ use super::error::{TransportError, TransportResult};
 use super::traits::{CommitToken, RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::WorkBatch;
+use crate::framing::{DecodeLimits, Frame, Framing, Lf, StreamDecoder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Commit token for pipe transport.
 ///
@@ -98,8 +99,8 @@ impl PipeTransportConfig {
 /// Read side, kept across `recv` calls so a dropped call loses nothing.
 struct ReadState {
     reader: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
-    /// Bytes of a line still waiting for its newline.
-    line: Vec<u8>,
+    /// Holds a line still waiting for its newline.
+    decoder: StreamDecoder,
     /// Records read but not yet returned.
     pending: Vec<Message<PipeToken>>,
 }
@@ -114,7 +115,7 @@ pub struct PipeTransport {
     #[cfg(feature = "health")]
     _health_registration: crate::health::HealthRegistration,
     stdin: tokio::sync::Mutex<ReadState>,
-    stdout: tokio::sync::Mutex<tokio::io::Stdout>,
+    stdout: tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
     sequence: AtomicU64,
     closed: Arc<AtomicBool>,
     recv_timeout_ms: u64,
@@ -143,7 +144,12 @@ impl PipeTransport {
                 "Pipe transport filters failed to compile -- send and recv refuse until the rules are fixed"
             );
         }
-        Self::with_filter_engine(config, filter_engine, Box::new(tokio::io::stdin()))
+        Self::with_filter_engine(
+            config,
+            filter_engine,
+            Box::new(tokio::io::stdin()),
+            Box::new(tokio::io::stdout()),
+        )
     }
 
     /// Create a pipe transport, failing when a filter rule does not compile.
@@ -156,20 +162,23 @@ impl PipeTransport {
             config,
             Ok(filter_engine),
             Box::new(tokio::io::stdin()),
+            Box::new(tokio::io::stdout()),
         ))
     }
 
-    /// A pipe transport reading `input` in place of stdin.
-    #[cfg(all(test, unix))]
-    fn with_input(
+    /// A pipe transport reading `input` and writing `output` in place of stdin and stdout.
+    #[cfg(test)]
+    fn with_io(
         config: &PipeTransportConfig,
         input: impl AsyncRead + Send + Unpin + 'static,
+        output: impl AsyncWrite + Send + Unpin + 'static,
     ) -> TransportResult<Self> {
         let filter_engine = Self::compile_filters(config)?;
         Ok(Self::with_filter_engine(
             config,
             Ok(filter_engine),
             Box::new(input),
+            Box::new(output),
         ))
     }
 
@@ -187,6 +196,7 @@ impl PipeTransport {
         config: &PipeTransportConfig,
         filter_engine: Result<super::filter::TransportFilterEngine, String>,
         input: Box<dyn AsyncRead + Send + Unpin>,
+        output: Box<dyn AsyncWrite + Send + Unpin>,
     ) -> Self {
         #[cfg(feature = "logger")]
         tracing::info!(
@@ -214,10 +224,10 @@ impl PipeTransport {
             _health_registration: health_registration,
             stdin: tokio::sync::Mutex::new(ReadState {
                 reader: BufReader::new(input),
-                line: Vec::new(),
+                decoder: StreamDecoder::new(Arc::new(Lf), DecodeLimits::UNBOUNDED),
                 pending: Vec::new(),
             }),
-            stdout: tokio::sync::Mutex::new(tokio::io::stdout()),
+            stdout: tokio::sync::Mutex::new(output),
             sequence: AtomicU64::new(0),
             closed,
             recv_timeout_ms: config.recv_timeout_ms,
@@ -293,14 +303,10 @@ impl TransportSender for PipeTransport {
 
         let mut stdout = self.stdout.lock().await;
 
-        // Write payload + newline
-        if let Err(e) = stdout.write_all(&payload).await {
+        let mut line = Vec::with_capacity(payload.len() + 1);
+        let _ = Lf.encode(&[&payload], &mut line);
+        if let Err(e) = stdout.write_all(&line).await {
             return SendResult::Fatal(TransportError::Send(format!("stdout write failed: {e}")));
-        }
-        if let Err(e) = stdout.write_all(b"\n").await {
-            return SendResult::Fatal(TransportError::Send(format!(
-                "stdout newline write failed: {e}"
-            )));
         }
         if let Err(e) = stdout.flush().await {
             return SendResult::Fatal(TransportError::Send(format!("stdout flush failed: {e}")));
@@ -333,23 +339,24 @@ impl TransportReceiver for PipeTransport {
         let filter_engine = self.filters()?;
 
         let mut stdin = self.stdin.lock().await;
-        // `read_until` leaves a partial line in `line` when dropped, and
-        // `pending` holds finished records, so a dropped call resumes here.
+        // A dropped read leaves a partial line in the decoder, and `pending`
+        // holds finished records, so a dropped call resumes here.
         let ReadState {
             reader,
-            line,
+            decoder,
             pending,
         } = &mut *stdin;
 
         for _ in pending.len()..max {
+            let read = decoder.read(reader);
             let read_result = if self.recv_timeout_ms == 0 {
                 // Block until data arrives
-                reader.read_until(b'\n', line).await
+                read.await
             } else if pending.is_empty() {
                 // First message: wait up to timeout
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(self.recv_timeout_ms),
-                    reader.read_until(b'\n', line),
+                    read,
                 )
                 .await
                 {
@@ -358,54 +365,45 @@ impl TransportReceiver for PipeTransport {
                 }
             } else {
                 // Subsequent messages: non-blocking attempt via short timeout
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(1),
-                    reader.read_until(b'\n', line),
-                )
-                .await
-                {
+                match tokio::time::timeout(std::time::Duration::from_millis(1), read).await {
                     Ok(result) => result,
                     Err(_) => break, // No more data ready
                 }
             };
 
-            match read_result {
-                Ok(_) if line.is_empty() => {
-                    // EOF on stdin
-                    if pending.is_empty() {
-                        return Err(TransportError::Closed);
+            let frame = match read_result {
+                Ok(Some(frame)) => frame,
+                // EOF on stdin: a last line with no newline is still a record.
+                Ok(None) => {
+                    decoder.finish();
+                    match decoder.next_frame() {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) if pending.is_empty() => return Err(TransportError::Closed),
+                        Ok(None) => break,
+                        Err(e) => {
+                            return Err(TransportError::Recv(format!("stdin read failed: {e}")));
+                        }
                     }
-                    break;
                 }
-                Ok(_) => {
-                    // Strip the trailing newline and any carriage returns before it
-                    let end = line
-                        .iter()
-                        .rposition(|&b| b != b'\n' && b != b'\r')
-                        .map_or(0, |i| i + 1);
-                    let payload_bytes = bytes::Bytes::copy_from_slice(&line[..end]);
-                    line.clear();
-                    if payload_bytes.is_empty() {
-                        continue;
-                    }
+                Err(e) => return Err(TransportError::Recv(format!("stdin read failed: {e}"))),
+            };
+            let Frame::Record(payload) = frame else {
+                unreachable!("invariant: no line is oversize under unbounded limits");
+            };
 
-                    let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-                    let format = PayloadFormat::detect(&payload_bytes);
-                    let timestamp_ms = crate::clock::epoch_millis();
+            let payload_bytes = bytes::Bytes::from(payload);
+            let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+            let format = PayloadFormat::detect(&payload_bytes);
+            let timestamp_ms = crate::clock::epoch_millis();
 
-                    pending.push(Message {
-                        key: None,
-                        payload: payload_bytes,
-                        token: PipeToken { seq },
-                        timestamp_ms: Some(timestamp_ms),
-                        format,
-                        headers: Vec::new(),
-                    });
-                }
-                Err(e) => {
-                    return Err(TransportError::Recv(format!("stdin read failed: {e}")));
-                }
-            }
+            pending.push(Message {
+                key: None,
+                payload: payload_bytes,
+                token: PipeToken { seq },
+                timestamp_ms: Some(timestamp_ms),
+                format,
+                headers: Vec::new(),
+            });
         }
         // A call with a smaller `max` than the dropped one leaves the rest queued.
         let rest = pending.split_off(pending.len().min(max));
@@ -613,7 +611,10 @@ mod tests {
             recv_timeout_ms,
             ..PipeTransportConfig::default()
         };
-        (tx, PipeTransport::with_input(&config, rx).unwrap())
+        (
+            tx,
+            PipeTransport::with_io(&config, rx, tokio::io::sink()).unwrap(),
+        )
     }
 
     #[cfg(unix)]
@@ -706,6 +707,46 @@ mod tests {
         assert_eq!(payloads(&recv_now(&transport, 1).await.unwrap()), [b"c"]);
         tx.write_all(b"\n").await.unwrap();
         assert_eq!(payloads(&recv_now(&transport, 1).await.unwrap()), [b"d"]);
+    }
+
+    /// Each payload goes out followed by a newline, added even when it ends in one.
+    #[tokio::test]
+    async fn send_writes_each_payload_then_a_newline() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (output, mut written) = tokio::io::duplex(1024);
+        let transport =
+            PipeTransport::with_io(&PipeTransportConfig::default(), tokio::io::empty(), output)
+                .unwrap();
+        for payload in [&b"a"[..], b"b\n", b""] {
+            let sent = transport
+                .send("ignored", bytes::Bytes::copy_from_slice(payload))
+                .await;
+            assert!(sent.is_ok(), "{sent:?}");
+        }
+        drop(transport);
+        let mut bytes = Vec::new();
+        written.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"a\nb\n\n\n");
+    }
+
+    /// A line loses its newline and every carriage return before it, a blank
+    /// line is no record, and a last line cut off by EOF is one.
+    #[tokio::test]
+    async fn recv_strips_line_endings_and_skips_blank_lines() {
+        let config = PipeTransportConfig {
+            recv_timeout_ms: 0,
+            ..PipeTransportConfig::default()
+        };
+        let input: &'static [u8] = b"a\r\n\r\n\nb\r\r\n c \nlast";
+        let transport = PipeTransport::with_io(&config, input, tokio::io::sink()).unwrap();
+        let batch = transport.recv(10).await.unwrap();
+        let payloads: Vec<&[u8]> = batch.records.iter().map(|r| r.payload.as_ref()).collect();
+        assert_eq!(payloads, [&b"a"[..], b"b", b" c ", b"last"]);
+        assert!(matches!(
+            transport.recv(10).await,
+            Err(TransportError::Closed)
+        ));
     }
 
     #[tokio::test]

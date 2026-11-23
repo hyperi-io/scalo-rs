@@ -15,6 +15,7 @@ use serde::de::{Error as _, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
+use crate::framing::{Framing, Ndjson};
 use crate::parse_guard::{MAX_PARSE_DEPTH, json_depth_within};
 
 /// Deepest original filed under `_json`: the entry wraps it one level deeper, which a loader's parse still holds.
@@ -224,6 +225,19 @@ impl Header {
 }
 
 impl DlqEntry {
+    /// `entries` as NDJSON, each entry's JSON on its own line: what the file
+    /// and HTTP backends write.
+    pub(crate) fn ndjson(entries: &[Self]) -> serde_json::Result<Vec<u8>> {
+        let mut lines = Vec::with_capacity(entries.len() * 256);
+        let mut json = Vec::new();
+        for entry in entries {
+            json.clear();
+            serde_json::to_writer(&mut json, entry)?;
+            let _ = Ndjson.encode(&[&json], &mut lines);
+        }
+        Ok(lines)
+    }
+
     /// Create a new DLQ entry with the current timestamp.
     pub fn new(service: impl Into<String>, reason: impl Into<String>, payload: Vec<u8>) -> Self {
         Self {

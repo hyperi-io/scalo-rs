@@ -141,6 +141,9 @@ pub(crate) mod clock;
 // Constructors registered by config type name.
 pub mod registry;
 
+// Many encoded records in one unit, and back: NDJSON, JSON arrays, RFC 6587.
+pub mod framing;
+
 #[cfg(feature = "runtime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 pub mod runtime;

@@ -77,12 +77,8 @@ impl FileDlqInner {
             return Ok(());
         }
 
-        let mut buf = Vec::with_capacity(batch.len() * 256);
-        for entry in batch {
-            serde_json::to_writer(&mut buf, entry)
-                .map_err(|e| DlqError::Serialization(format!("DLQ serialise: {e}")))?;
-            buf.push(b'\n');
-        }
+        let buf = DlqEntry::ndjson(batch)
+            .map_err(|e| DlqError::Serialization(format!("DLQ serialise: {e}")))?;
 
         let count = batch.len() as u64;
         self.writer
@@ -171,6 +167,25 @@ mod tests {
         assert_eq!(lines.len(), 2);
         let parsed: DlqEntry = serde_json::from_str(lines[0]).expect("parse");
         assert_eq!(parsed.reason, "parse_error");
+    }
+
+    /// The file holds each entry as its JSON followed by one newline.
+    #[tokio::test]
+    async fn send_batch_writes_one_json_line_per_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut backend = FileDlqInner::new(&cfg(dir.path()), "lines").expect("create");
+        let entries = [
+            DlqEntry::new("svc", "parse_error", b"a".to_vec()),
+            DlqEntry::new("svc", "too_large", b"b\n".to_vec()),
+        ];
+        backend.send_batch(&entries).await.expect("send");
+        let mut expected = Vec::new();
+        for entry in &entries {
+            expected.extend(serde_json::to_vec(entry).expect("serialise"));
+            expected.push(b'\n');
+        }
+        let written = std::fs::read(dir.path().join("lines/dlq.ndjson")).expect("read");
+        assert_eq!(written, expected);
     }
 
     #[tokio::test]

@@ -120,6 +120,7 @@ pub mod routed;
 pub mod test_support;
 
 // Re-exports -- traits and factory
+pub use crate::framing::FramingError;
 pub use ack::{
     AckControl, AckKind, AcknowledgementsConfig, AcknowledgingReceiver, DEAD_LETTER_REJECTED,
     DeadLetter, DeadLetterReason, HeldAcks, SinkConfirmation, SourceAck, screen,
@@ -139,7 +140,7 @@ pub use traits::{
     TransportReceiver, TransportSender, boot_healthcheck,
 };
 pub use types::{Message, SendResult, TransportConfig, TransportType};
-pub use work_batch::{FramingError, Record, RecordCodecError, RecordMeta, WorkBatch};
+pub use work_batch::{Record, RecordCodecError, RecordMeta, WorkBatch};
 
 #[cfg(feature = "transport-kafka")]
 pub use kafka::KafkaTransport;
