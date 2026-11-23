@@ -313,44 +313,6 @@ pub(crate) fn count_received(records: u64, bytes: usize) {
     metrics::counter!("transport_received_events_total", "transport" => "grpc").increment(records);
 }
 
-/// A lazily dialled channel to `ep`, as both gRPC clients build it.
-///
-/// A dial whose DNS lookup, TCP connect or TLS handshake is unfinished at nine
-/// tenths of `send_timeout_ms` is abandoned. A connection that has read nothing
-/// for `send_timeout_ms` is sent an HTTP/2 PING and closed if the PING goes
-/// unanswered for as long again, so a peer that stays connected but stops
-/// answering is dropped and the next call dials afresh. `0` leaves the dial
-/// unbounded and PINGs at the default send limit.
-pub(crate) fn lazy_channel(
-    mut ep: tonic::transport::Endpoint,
-    send_timeout_ms: u64,
-) -> tonic::transport::Channel {
-    // A dial left running when its send gives up hands its failure to the
-    // next send, so the dial ends at nine tenths of the limit.
-    if send_timeout_ms > 0 {
-        ep = ep.connect_timeout(Duration::from_millis(send_timeout_ms) * 9 / 10);
-    }
-
-    let keep_alive = Duration::from_millis(if send_timeout_ms > 0 {
-        send_timeout_ms
-    } else {
-        config::DEFAULT_SEND_TIMEOUT_MS
-    });
-    ep = ep
-        .http2_keep_alive_interval(keep_alive)
-        .keep_alive_timeout(keep_alive)
-        .keep_alive_while_idle(true);
-
-    // Given the connector, tonic abandons a dial whose DNS, TCP connect or TLS
-    // handshake outruns the connect timeout, where connect_lazy() bounds the
-    // TCP connect alone and the next send queues behind it.
-    let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
-    // tonic's own settings: an https URI passes through to its TLS layer.
-    tcp.enforce_http(false);
-    tcp.set_nodelay(true);
-    ep.connect_with_connector_lazy(tcp)
-}
-
 /// The connections the receive server accepts, each with TCP_NODELAY on as the
 /// client sets it, so a small HTTP/2 frame is not held back waiting for a
 /// delayed ACK.
@@ -653,7 +615,7 @@ fn build_client(
             .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
     }
 
-    let channel = lazy_channel(ep, config.send_timeout_ms);
+    let channel = super::tonic_channel::lazy_channel(ep, config.send_timeout_ms);
 
     // No encoding limit: tonic's refusal arrives as a stream reset that
     // reads as an outage, so send and send_batch check the size instead.

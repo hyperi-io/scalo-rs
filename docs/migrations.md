@@ -38,6 +38,12 @@ A line of exactly `max_line_bytes` before its `\n` is now a record, where it was
 
 **Consumer adjustment** -- exhaustive matches on `SendResult`, `AnySender` and `TransportType` add the new arms. Each own `TransportBase` impl adds `delivery_guarantee`. A literal `TransportConfig` adds `delivery` and `custom`.
 
+### OTLP logs transport, `TransportType::Otlp` (API CHANGE)
+
+The `transport-otlp` feature sends records to an OpenTelemetry collector as OTLP log records over gRPC or HTTP/protobuf, as `type: otlp`. See [transport/otlp.md](transport/otlp.md). `transport-all`, and so `full`, pulls it.
+
+**Consumer adjustment** -- exhaustive matches on `TransportType` and `AnySender` add the `Otlp` arm. A literal `TransportConfig` adds `otlp`. `otlp` joins the built-in type names, so a custom sender registered under it is refused: register it under another name.
+
 ### `ConfigOptions::managed`, `load_typed_managed` and `ServiceApp::managed_source` (additive)
 
 An app can name a Group Policy key and an MDM preference domain in a `ManagedSource`, and the cascade then reads them as a layer after every config file and before env vars. A key that looks like a secret fails the load. See [managed-config.md](core-pillars/managed-config.md).

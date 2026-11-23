@@ -88,10 +88,10 @@ mod client;
 mod server;
 #[cfg(test)]
 pub(crate) mod test_pki;
-#[cfg(feature = "transport-grpc")]
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 mod tonic;
 
-#[cfg(feature = "transport-grpc")]
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 pub(crate) use self::tonic::tonic_client_tls;
 pub use client::{ClientIdentity, ClientTls, TrustChoice, build_client_tls};
 pub use server::{

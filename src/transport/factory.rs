@@ -69,6 +69,9 @@ pub enum AnySender {
     #[cfg(feature = "transport-http")]
     Http(super::http::HttpTransport),
 
+    #[cfg(feature = "transport-otlp")]
+    Otlp(super::otlp::OtlpTransport),
+
     /// A sender the app wrote, built by a constructor registered with
     /// [`register_sender`](super::register_sender) or wrapped with
     /// [`AnySender::custom`].
@@ -92,6 +95,8 @@ macro_rules! each_sender {
             AnySender::File($t) => $body,
             #[cfg(feature = "transport-http")]
             AnySender::Http($t) => $body,
+            #[cfg(feature = "transport-otlp")]
+            AnySender::Otlp($t) => $body,
             AnySender::Custom($c) => $custom,
         }
     };
@@ -139,8 +144,9 @@ impl TransportSender for AnySender {
     }
 
     /// Forward [`send_batch`](TransportSender::send_batch) to the active
-    /// backend. gRPC uses its native single-RPC `RouteBatch` override and Kafka
-    /// queues the whole block before awaiting any delivery report. Every other
+    /// backend. gRPC uses its native single-RPC `RouteBatch` override, OTLP
+    /// sends the block as one export request, and Kafka queues the whole block
+    /// before awaiting any delivery report. Every other
     /// backend uses the trait's per-record default (see the at-least-once
     /// partial-send caveat on the trait method).
     async fn send_batch(&self, records: &[Record]) -> SendResult {
@@ -311,6 +317,16 @@ impl AnySender {
                     .ok_or_else(|| TransportError::Config("http config missing".into()))?;
                 let transport = super::http::HttpTransport::new(http_config).await?;
                 Ok(Self::Http(transport))
+            }
+
+            #[cfg(feature = "transport-otlp")]
+            TransportType::Otlp => {
+                let otlp_config = config
+                    .otlp
+                    .as_ref()
+                    .ok_or_else(|| TransportError::Config("otlp config missing".into()))?;
+                let transport = super::otlp::OtlpTransport::new(otlp_config)?;
+                Ok(Self::Otlp(transport))
             }
 
             TransportType::Custom(name) => {
@@ -1246,6 +1262,10 @@ impl AnyReceiver {
                 "transport type '{name}' is a custom type, and custom transports send only: \
                  use a built-in type to receive"
             ))),
+
+            TransportType::Otlp => Err(TransportError::Config(
+                "transport type 'otlp' sends only: use a built-in type to receive".into(),
+            )),
 
             // Built-in types whose feature is off.
             #[allow(unreachable_patterns)]

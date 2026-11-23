@@ -1201,7 +1201,7 @@ mod tests {
         let ca_path = file("ca.pem", &ca.pem());
         let cert = file("client.pem", &client_leaf.cert_pem);
         let key = file("client.key", &client_leaf.key_pem);
-        let addr = mtls_server(&ca, &server_leaf).await;
+        let addr = crate::tls::test_pki::mtls_ok_server(&ca, &server_leaf).await;
         let endpoint = format!("https://localhost:{}", addr.port());
 
         let cases = [
@@ -1248,62 +1248,6 @@ mod tests {
             error.as_deref().is_some_and(|e| e.contains("gone.pem")),
             "a missing CA file fails the build: {error:?}"
         );
-    }
-
-    /// An HTTPS server on localhost that requires a client certificate from
-    /// `ca` and answers every request 200.
-    async fn mtls_server(
-        ca: &crate::tls::test_pki::TestCa,
-        leaf: &crate::tls::test_pki::Leaf,
-    ) -> std::net::SocketAddr {
-        use rustls_pki_types::pem::PemObject;
-        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from_pem_slice(ca.pem().as_bytes()).unwrap())
-            .unwrap();
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(roots),
-            Arc::clone(&provider),
-        )
-        .build()
-        .unwrap();
-        let key = PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap();
-        let server = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(vec![leaf.der.clone()], key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let acceptor = acceptor.clone();
-                tokio::spawn(async move {
-                    let Ok(mut stream) = acceptor.accept(stream).await else {
-                        return;
-                    };
-                    let mut request = Vec::new();
-                    let mut buf = [0u8; 4096];
-                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => request.extend_from_slice(&buf[..n]),
-                        }
-                    }
-                    let response =
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                    let _ = stream.write_all(response).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
-        addr
     }
 
     #[test]

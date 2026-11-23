@@ -182,7 +182,18 @@ pub mod metrics;
 #[cfg(any(feature = "otel-metrics", feature = "otel-tracing"))]
 mod otel_backoff;
 
-#[cfg(any(feature = "otel-metrics", feature = "otel-tracing"))]
+#[cfg(any(
+    feature = "otel-metrics",
+    feature = "otel-tracing",
+    feature = "transport-otlp"
+))]
+mod otel_endpoint;
+
+#[cfg(any(
+    feature = "otel-metrics",
+    feature = "otel-tracing",
+    feature = "transport-otlp"
+))]
 mod otel_resource;
 
 #[cfg(feature = "otel-tracing")]

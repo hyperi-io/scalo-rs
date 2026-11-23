@@ -53,6 +53,7 @@
 //! | **File** | Yes | Yes | Debugging, audit trails, replay |
 //! | **Pipe** | Yes | Yes | Unix pipelines, sidecar pattern |
 //! | **HTTP** | Yes | Yes | Webhook delivery, REST ingest |
+//! | **OTLP** | Yes | No | Log records to an OpenTelemetry collector |
 //! | **Custom** | Yes | No | A sender the app registers with [`register_sender`] |
 //!
 //! ## Example
@@ -114,6 +115,12 @@ pub mod file;
 #[cfg(feature = "transport-http")]
 pub mod http;
 
+#[cfg(feature = "transport-otlp")]
+pub mod otlp;
+
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
+mod tonic_channel;
+
 pub mod routed;
 
 #[cfg(feature = "transport-test-support")]
@@ -164,3 +171,6 @@ pub use file::{FileToken, FileTransport, FileTransportConfig};
 
 #[cfg(feature = "transport-http")]
 pub use http::{HttpToken, HttpTransport, HttpTransportConfig};
+
+#[cfg(feature = "transport-otlp")]
+pub use otlp::{OtlpCompression, OtlpConfig, OtlpProtocol, OtlpTlsConfig, OtlpTransport};

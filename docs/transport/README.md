@@ -2,7 +2,7 @@
 
 The transport layer is the boundary between an app and any
 message-shaped backend -- Kafka, gRPC, Memory, File, Pipe,
-HTTP. Apps depend on the traits, and the concrete backend is selected
+HTTP, OTLP. Apps depend on the traits, and the concrete backend is selected
 at runtime from config. Embedded filter engine, embedded metrics,
 embedded propagation -- see [filter-engine.md](filter-engine.md) and
 [backends.md](backends.md).
@@ -218,7 +218,7 @@ routes per record, and a sink stage sends 1:1. See [routing.md](routing.md).
 | `TransportSender::send_batch_by(&records, deadline)` | A block answered by an `Instant`, `Backpressured` once it passes |
 | `TransportBase::delivery_guarantee()` | `Acknowledged` / `Written` / `FireAndForget`, required of every transport |
 | `TransportConfig` | Top-level config struct read by the factory. `delivery: ack \| flush \| none` (default `ack`) refuses a sender below it |
-| `TransportType` | Enum: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http`, `Custom(name)` |
+| `TransportType` | Enum: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http`, `Otlp`, `Custom(name)` |
 | `register_sender(name, constructor)` / `AnySender::Custom` / `DynTransportSender` | An app's own sender, built from config by type name ([custom.md](custom.md)) |
 
 Source: [../../src/transport/](../../src/transport/) -- particularly
@@ -231,8 +231,9 @@ Source: [../../src/transport/](../../src/transport/) -- particularly
 
 ## Related
 
-- [backends.md](backends.md) -- six concrete backends, config and deps
+- [backends.md](backends.md) -- seven concrete backends, config and deps
 - [grpc.md](grpc.md) -- gRPC `send_batch` blocks joined into one call
+- [otlp.md](otlp.md) -- OTLP log records to a collector, send only
 - [filter-engine.md](filter-engine.md) -- tiered CEL filtering
 - [routing.md](routing.md) -- `RoutedSender` for originators
 - [custom.md](custom.md) -- writing a custom sender, the delivery guarantee

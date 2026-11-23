@@ -8,8 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Default send limit, and the HTTP/2 PING period for a client with none.
-pub(crate) const DEFAULT_SEND_TIMEOUT_MS: u64 = 30_000;
+use crate::transport::tonic_channel::DEFAULT_SEND_TIMEOUT_MS;
 
 /// gRPC transport configuration.
 ///

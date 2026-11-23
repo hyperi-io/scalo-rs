@@ -203,6 +203,7 @@ pub trait TransportSender: TransportBase {
     /// - HTTP: URL path suffix or ignored
     /// - File: filename suffix or ignored
     /// - Pipe: ignored (single stdout)
+    /// - OTLP: ignored (one collector)
     fn send(
         &self,
         destination: &str,
@@ -227,9 +228,9 @@ pub trait TransportSender: TransportBase {
     /// The default sends each record individually via
     /// [`send_record`](Self::send_record), awaiting each before the next.
     /// Transports that can do better override this: gRPC sends the block as one
-    /// `RouteBatch` RPC, and Kafka queues the whole block before awaiting any
-    /// delivery report. Commit tokens and inline-DLQ entries are NOT
-    /// sent -- they are the SENDER's local concern. Fire the commit tokens
+    /// `RouteBatch` RPC, OTLP as one export request, and Kafka queues the whole
+    /// block before awaiting any delivery report. Commit tokens and inline-DLQ
+    /// entries are NOT sent -- they are the SENDER's local concern. Fire the commit tokens
     /// locally after this returns [`SendResult::Ok`].
     ///
     /// ## At-least-once caveat -- per-record fallback can partially send

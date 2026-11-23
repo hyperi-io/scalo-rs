@@ -17,7 +17,8 @@ use super::convert::json_to_event_wrapper;
 use super::proto::vector;
 use super::tls::VectorCompatTls;
 use crate::transport::error::{TransportError, TransportResult};
-use crate::transport::grpc::{GrpcConfig, lazy_channel};
+use crate::transport::grpc::GrpcConfig;
+use crate::transport::tonic_channel::lazy_channel;
 
 /// Client that sends events to a Vector source via gRPC.
 ///

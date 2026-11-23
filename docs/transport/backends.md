@@ -1,6 +1,6 @@
 # Backends
 
-Six concrete backends behind the
+Seven concrete backends behind the
 [transport traits](README.md). Each is gated behind its own
 feature flag -- apps pull only what they ship.
 
@@ -12,6 +12,7 @@ feature flag -- apps pull only what they ship.
 | File | `transport-file` | None | Debugging, audit trails, replay | No |
 | Pipe | `transport-pipe` | None | Unix pipeline composition | No, none to hold |
 | HTTP | `transport-http` | None | Webhook delivery, REST ingest | No |
+| OTLP | `transport-otlp` | None (pure Rust, no `protoc`) | Log records to an OpenTelemetry collector, send only ([otlp.md](otlp.md)) | No, sends only |
 
 A source that holds its acknowledgement releases it only once its records are delivered. See [../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#which-sources-hold-it).
 
@@ -24,7 +25,7 @@ gRPC server.
 ## Two deployment models (Kafka vs gRPC)
 
 The picture below applies to the Kafka and gRPC backends -- the other
-four don't make a transit-network choice.
+five don't make a transit-network choice.
 
 | Model | Persistence | Replay | Latency | Failure mode | Use when |
 | ------- | ------------- | -------- | --------- | -------------- | ---------- |
@@ -400,7 +401,7 @@ Source: [../../src/transport/http.rs](../../src/transport/http.rs).
 Every backend reads `filters_in` and `filters_out` from its own
 config section and instantiates a [`TransportFilterEngine`](filter-engine.md)
 at construction. No backend-specific filter code -- the engine is the
-same across all six. A backend with no filters configured skips the
+same across all seven. A backend with no filters configured skips the
 engine, and Tier-1 filters run without CEL.
 
 ---
