@@ -674,6 +674,102 @@ mod tests {
         assert_eq!(engine.apply_outbound(payload_out), FilterDisposition::Drop);
     }
 
+    /// Every tier resolves a dotted path through the record's nested objects. A path with
+    /// no value, or a value of the wrong type, can't match and the record passes.
+    #[cfg(feature = "expression")]
+    #[test]
+    fn engine_resolves_nested_fields_in_every_tier() {
+        let tiers = TransportFilterTierConfig {
+            allow_cel_filters_in: true,
+            allow_complex_filters_in: true,
+            ..Default::default()
+        };
+        let src = br#"{"source":{"type":"file","name":"dns"},"event":{"message":"a2","n":7,"fields":{"level":"debug"},"tags":["x","y"]}}"#;
+        let other = br#"{"source":{"type":"file","name":"app"},"event":{"message":"b1","n":3,"fields":{"level":"info"},"tags":["z"]}}"#;
+        let no_event = br#"{"source":{"type":"file","name":"dns"}}"#;
+        let empty_event = br#"{"source":{"type":"file","name":"dns"},"event":{}}"#;
+        let wrong_type =
+            br#"{"source":{"type":"file","name":"dns"},"event":{"message":5,"n":"seven"}}"#;
+        // (expression, payload, dropped)
+        let cases: [(&str, &[u8], bool); 37] = [
+            // Tier 1: raw-byte field extraction.
+            (r#"event.message == "a2""#, src, true),
+            (r#"event.message == "a2""#, other, false),
+            (r#"event.message != "a2""#, other, true),
+            (r#"event.message.startsWith("a")"#, src, true),
+            (r#"event.message.startsWith("a")"#, other, false),
+            ("has(event.message)", src, true),
+            ("has(event.message)", empty_event, false),
+            ("has(event.message)", no_event, false),
+            ("!has(event.message)", no_event, true),
+            (r#"event.fields.level == "debug""#, src, true),
+            (r#"event.fields.level == "debug""#, other, false),
+            // Tier 2: pre-compiled CEL, no regex.
+            (r#"source.name == "dns" && event.n > 5"#, src, true),
+            (r#"source.name == "dns" && event.n > 5"#, other, false),
+            (r#"source.name == "dns" && event.n > 5"#, empty_event, false),
+            (r#"source.name == "dns" && event.n > 5"#, no_event, false),
+            (r#"source.name == "dns" && event.n > 5"#, wrong_type, false),
+            ("event.n > 5 && event.n < 10", src, true),
+            ("event.n > 5 && event.n < 10", other, false),
+            (r#"event.message == "a2" || event.n > 100"#, src, true),
+            (r#"event.message == "a2" || event.n > 100"#, other, false),
+            (r"has(event.message) && event.n > 5", src, true),
+            (r"has(event.message) && event.n > 5", empty_event, false),
+            (r#"event.message.contains("2") && event.n > 5"#, src, true),
+            (
+                r#"event.fields.level == "debug" && source.type == "file""#,
+                src,
+                true,
+            ),
+            (
+                r#"event.fields.level == "debug" && source.type == "file""#,
+                other,
+                false,
+            ),
+            (r"event.tags.size() == 2 && event.n > 5", src, true),
+            (r"event.tags.size() == 2 && event.n > 5", other, false),
+            // Tier 3: regex and iteration.
+            (r#"event.message.matches("^a")"#, src, true),
+            (r#"event.message.matches("^a")"#, other, false),
+            (r#"event.message.matches("^a")"#, empty_event, false),
+            (r#"event.message.matches("^a")"#, no_event, false),
+            (r#"event.message.matches("^a")"#, wrong_type, false),
+            (
+                r#"source.name == "dns" && event.message.matches("^a[0-9]$")"#,
+                src,
+                true,
+            ),
+            (
+                r#"source.name == "dns" && event.message.matches("^a[0-9]$")"#,
+                other,
+                false,
+            ),
+            (r#"event.fields.level.matches("^deb")"#, src, true),
+            (r#"event.tags.exists(t, t == "y")"#, src, true),
+            (r#"event.tags.exists(t, t == "y")"#, other, false),
+        ];
+        for (expression, payload, dropped) in cases {
+            let rules = vec![FilterRule {
+                expression: expression.into(),
+                action: FilterAction::Drop,
+            }];
+            let engine = TransportFilterEngine::new(&rules, &[], &tiers)
+                .unwrap_or_else(|e| panic!("{expression} must compile: {e}"));
+            let expected = if dropped {
+                FilterDisposition::Drop
+            } else {
+                FilterDisposition::Pass
+            };
+            assert_eq!(
+                engine.apply_inbound(payload),
+                expected,
+                "{expression} on {}",
+                String::from_utf8_lossy(payload)
+            );
+        }
+    }
+
     #[test]
     fn is_likely_msgpack_detection() {
         assert!(is_likely_msgpack(&[0x81])); // fixmap
