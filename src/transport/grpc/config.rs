@@ -87,6 +87,12 @@ pub struct GrpcConfig {
     #[serde(default)]
     pub tls_client_key_path: Option<String>,
 
+    /// Proxy the `endpoint` connection goes through: `none` (default),
+    /// `system` (the machine's proxy) or a proxy URL. The connection is an
+    /// HTTP CONNECT tunnel, and TLS runs inside it. See
+    /// [`ProxyConfig`](crate::transport::ProxyConfig).
+    pub proxy: crate::transport::ProxyConfig,
+
     /// Enable Vector wire protocol compatibility on the same server.
     /// When true, the server also accepts `/vector.Vector/PushEvents` RPCs
     /// from legacy Vector sinks.
@@ -151,6 +157,7 @@ impl Default for GrpcConfig {
             tls_domain: None,
             tls_client_cert_path: None,
             tls_client_key_path: None,
+            proxy: crate::transport::ProxyConfig::None,
             #[cfg(feature = "transport-grpc-vector-compat")]
             vector_compat: false,
             filters_in: Vec::new(),

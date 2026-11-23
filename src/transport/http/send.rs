@@ -23,12 +23,13 @@ use reqwest::StatusCode;
 use reqwest::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER,
 };
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use super::HttpTransportConfig;
 use crate::framing::Framing;
 use crate::sensitive::SensitiveString;
 use crate::transport::error::{TransportError, TransportResult};
+use crate::transport::proxy::{self, ProxyConfig, ProxyDialer, ProxyError, ProxyRefused, Scheme};
 use crate::transport::types::SendResult;
 
 /// Longest same-origin redirect chain `follow_redirects` follows.
@@ -123,80 +124,26 @@ impl fmt::Debug for HttpEndpoint {
     }
 }
 
-/// Which proxy requests go through: `none`, `system`, or a proxy URL.
-///
-/// `system` is the `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` environment
-/// variables. A proxy URL may carry `user:password@` for basic proxy auth,
-/// so it serialises as a secret.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub enum HttpProxy {
-    /// Connect directly, whatever the environment names.
-    #[default]
-    None,
-    /// The proxy the environment names.
-    System,
-    /// This proxy.
-    Url(SensitiveString),
-}
-
-impl HttpProxy {
-    /// The kind, for logs.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::System => "system",
-            Self::Url(_) => "url",
-        }
+/// `builder` routed by `dialer`. reqwest dials the proxy and opens the
+/// CONNECT tunnel to an https endpoint itself, and sends a plain http request
+/// to the proxy whole.
+fn with_proxy(
+    builder: reqwest::ClientBuilder,
+    config: &ProxyConfig,
+    dialer: &ProxyDialer,
+) -> reqwest::ClientBuilder {
+    if *config == ProxyConfig::None {
+        return builder.no_proxy();
     }
-
-    fn apply(&self, builder: reqwest::ClientBuilder) -> TransportResult<reqwest::ClientBuilder> {
-        let url = match self {
-            Self::None => return Ok(builder.no_proxy()),
-            Self::System => return Ok(builder),
-            Self::Url(url) => url,
+    let dialer = dialer.clone();
+    builder.proxy(reqwest::Proxy::custom(move |url| {
+        let scheme = if url.scheme() == "https" {
+            Scheme::Tls
+        } else {
+            Scheme::Plain
         };
-        let parsed = reqwest::Url::parse(url.expose())
-            .map_err(|e| TransportError::Config(format!("HTTP proxy is not a URL: {e}")))?;
-        let shown = shown(&parsed);
-        let proxy = reqwest::Proxy::all(parsed)
-            .map_err(|e| TransportError::Config(format!("HTTP proxy {shown}: {}", describe(e))))?;
-        Ok(builder.proxy(proxy))
-    }
-}
-
-impl fmt::Debug for HttpProxy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::None => f.write_str("None"),
-            Self::System => f.write_str("System"),
-            Self::Url(url) => f
-                .debug_tuple("Url")
-                .field(&shown_text(url.expose()))
-                .finish(),
-        }
-    }
-}
-
-impl Serialize for HttpProxy {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::None => serializer.serialize_str("none"),
-            Self::System => serializer.serialize_str("system"),
-            Self::Url(url) => url.serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for HttpProxy {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
-        Ok(match text.trim() {
-            "" | "none" => Self::None,
-            "system" => Self::System,
-            url => Self::Url(SensitiveString::new(url)),
-        })
-    }
+        dialer.proxy_url(scheme, url.host_str()?, url.port_or_known_default()?)
+    }))
 }
 
 /// `url` as it may be logged, without a user name or password.
@@ -330,6 +277,9 @@ struct Target {
     url: String,
     shown: String,
     auth: Option<(HeaderName, HeaderValue)>,
+    scheme: Scheme,
+    host: String,
+    port: u16,
 }
 
 impl Target {
@@ -349,10 +299,18 @@ impl Target {
                 auth.kind()
             )));
         }
+        let scheme = if parsed.scheme() == "https" {
+            Scheme::Tls
+        } else {
+            Scheme::Plain
+        };
         Ok(Self {
             url: url.to_string(),
             shown,
             auth: auth.header()?,
+            scheme,
+            host: parsed.host_str().unwrap_or_default().to_string(),
+            port: parsed.port_or_known_default().unwrap_or(80),
         })
     }
 }
@@ -360,6 +318,7 @@ impl Target {
 /// The send half of an HTTP transport.
 pub(super) struct Sender {
     client: reqwest::Client,
+    dialer: ProxyDialer,
     targets: Vec<Target>,
     framing: Arc<dyn Framing>,
     gzip: bool,
@@ -406,9 +365,8 @@ impl Sender {
             Some(agent) => builder.user_agent(agent),
             None => builder,
         };
-        let client = config
-            .proxy
-            .apply(builder)?
+        let dialer = config.proxy.dialer()?;
+        let client = with_proxy(builder, &config.proxy, &dialer)
             .build()
             .map_err(|e| TransportError::Config(format!("HTTP client: {}", describe(e))))?;
 
@@ -425,6 +383,7 @@ impl Sender {
         );
         Ok(Self {
             client,
+            dialer,
             targets,
             framing,
             gzip: config.gzip,
@@ -496,6 +455,7 @@ impl Sender {
         let body = bytes::Bytes::from(body);
 
         let mut retry = false;
+        let mut refusal: Option<ProxyRefused> = None;
         let mut wait: Option<Duration> = None;
         let mut reasons = Vec::new();
         let total = self.targets.len();
@@ -539,9 +499,18 @@ impl Sender {
                 }
                 Err(e) => {
                     let held = e.is_redirect();
+                    let timed_out = e.is_timeout();
                     let detail = describe(e);
                     tracing::warn!(endpoint = %shown, records, error = %detail, "HTTP request failed");
                     count_error();
+                    if !held
+                        && !timed_out
+                        && let Some(refused) = self.refused(target, deadline).await
+                    {
+                        reasons.push(format!("{shown}: {refused}"));
+                        refusal = Some(refused);
+                        continue;
+                    }
                     retry |= !held;
                     reasons.push(format!("{shown}: {detail}"));
                     continue;
@@ -608,6 +577,9 @@ impl Sender {
             tracing::debug!(records, reason = %reason, "HTTP batch to be sent again");
             return wait.map_or(SendResult::Backpressured, SendResult::RetryAfter);
         }
+        if let Some(refused) = refusal {
+            return proxy::rejected(&refused, "http");
+        }
         tracing::error!(
             records,
             reason = %reason,
@@ -616,6 +588,28 @@ impl Sender {
         SendResult::Fatal(TransportError::Config(format!(
             "HTTP: no endpoint takes the batch: {reason}"
         )))
+    }
+}
+
+impl Sender {
+    /// The proxy's refusal of a CONNECT to `target`. reqwest's tunnel error
+    /// carries no status, so one CONNECT of our own reads it.
+    async fn refused(&self, target: &Target, deadline: Instant) -> Option<ProxyRefused> {
+        if target.scheme != Scheme::Tls
+            || !self
+                .dialer
+                .proxies(target.scheme, &target.host, target.port)
+        {
+            return None;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        let probe = self
+            .dialer
+            .connect(target.scheme, &target.host, target.port);
+        match tokio::time::timeout(left, probe).await {
+            Ok(Err(ProxyError::Refused(refused))) => Some(refused),
+            _ => None,
+        }
     }
 }
 

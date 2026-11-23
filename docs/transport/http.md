@@ -89,7 +89,7 @@ Each body goes to `endpoint`, then each `failover` endpoint in order, starting f
 
 ## Proxy, redirects and logs
 
-- `proxy: none`, the default, connects directly whatever `HTTP_PROXY` says. `system` takes `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` from the environment. A URL sends every request through that proxy, and `user:password@` in it is basic proxy auth, never logged.
+- `proxy: none`, the default, connects directly whatever `HTTP_PROXY` says. `system` takes `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` from the environment, then fills what they leave unset from the machine WinHTTP proxy on Windows (`netsh winhttp set proxy`) or the System Settings proxies on macOS. A URL sends every request through that proxy, and `user:password@` in it is basic proxy auth, never logged. Only an `http://` proxy is taken. An https endpoint goes through a CONNECT tunnel, and a CONNECT the proxy refuses is `Reject` with its status and the endpoint's port: many proxies allow CONNECT to port 443 only. The gRPC transport takes the same `proxy` key.
 - Redirects are refused: a 3xx is `Fatal(Config)`, and the `Location` is never requested. `follow_redirects: true` follows up to 5 redirects within the endpoint's own scheme, host and port, so a credential never goes to a host the config didn't name. A 307 or 308 resends the body. A 301, 302 or 303 turns the POST into a body-less GET, which an intake answers with an error.
 
 - `info` once at build: the endpoints, the `auth` kind, the header names, framing, gzip, proxy kind and redirect setting.

@@ -324,6 +324,7 @@ pub(crate) fn count_received(records: u64, bytes: usize) {
 pub(crate) fn lazy_channel(
     mut ep: tonic::transport::Endpoint,
     send_timeout_ms: u64,
+    proxy: crate::transport::ProxyDialer,
 ) -> tonic::transport::Channel {
     // A dial left running when its send gives up hands its failure to the
     // next send, so the dial ends at nine tenths of the limit.
@@ -348,7 +349,7 @@ pub(crate) fn lazy_channel(
     // tonic's own settings: an https URI passes through to its TLS layer.
     tcp.enforce_http(false);
     tcp.set_nodelay(true);
-    ep.connect_with_connector_lazy(tcp)
+    ep.connect_with_connector_lazy(crate::transport::proxy::Connector::new(proxy, tcp))
 }
 
 /// The connections the receive server accepts, each with TCP_NODELAY on as the
@@ -653,7 +654,7 @@ fn build_client(
             .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
     }
 
-    let channel = lazy_channel(ep, config.send_timeout_ms);
+    let channel = lazy_channel(ep, config.send_timeout_ms, config.proxy.dialer()?);
 
     // No encoding limit: tonic's refusal arrives as a stream reset that
     // reads as an outage, so send and send_batch check the size instead.
@@ -1055,8 +1056,14 @@ fn redelivery_reason(status: &tonic::Status) -> Option<&'static str> {
 }
 
 /// The send result for a failed RPC: backpressure while the server is down or
-/// busy, so the caller retries rather than drops.
+/// busy, so the caller retries rather than drops, and `Reject` when the proxy
+/// refused the tunnel.
 fn failed_rpc_result(status: &tonic::Status) -> SendResult {
+    if let Some(refused) = crate::transport::proxy::refusal(status) {
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_send_errors_total", "transport" => "grpc").increment(1);
+        return crate::transport::proxy::rejected(refused, "grpc");
+    }
     if downstream_unavailable(status) {
         #[cfg(feature = "metrics")]
         {
@@ -2688,6 +2695,75 @@ mod tests {
         let server = GrpcTransport::new(&config).await.unwrap();
         let addr = server.local_addr().expect("server mode binds a listener");
         (server, format!("http://{addr}"))
+    }
+
+    /// A send goes through the proxy's CONNECT tunnel, plain or with TLS
+    /// inside it, and a refused CONNECT is `Reject` with the proxy's status
+    /// and the endpoint's port.
+    #[tokio::test]
+    async fn sends_go_through_a_connect_proxy() {
+        use crate::sensitive::SensitiveString;
+        use crate::transport::ProxyConfig;
+        use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, credentials, tls_front};
+
+        let (server, plain) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
+        let listening = server.local_addr().unwrap();
+        let (front, ca) = tls_front(listening, &[b"h2"]).await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(ca_file.path(), &ca).await.unwrap();
+        let tls = format!("https://localhost:{}", front.port());
+        let good = credentials();
+        let auth = good.header.clone();
+        // (policy, credentials, TLS inside the tunnel, refusal status)
+        let rows = [
+            (Policy::Allow, None, false, None),
+            (Policy::Allow, None, true, None),
+            (Policy::Refuse(403), None, false, Some(403)),
+            (Policy::Auth(auth.clone()), None, true, Some(407)),
+            (Policy::Auth(auth), Some(&good), true, None),
+            (Policy::OnlyPort(443), None, true, Some(403)),
+        ];
+        let mut delivered = 0;
+        for (policy, credentials, over_tls, status) in rows {
+            let name = format!(
+                "{policy:?} credentials={} tls={over_tls}",
+                credentials.is_some()
+            );
+            let proxy = ConnectProxy::start(policy).await;
+            let url = credentials.map_or_else(|| proxy.url(), |c| proxy.url_with(c));
+            let mut config = GrpcConfig::client(if over_tls { &tls } else { &plain });
+            config.proxy = ProxyConfig::Url(SensitiveString::new(url));
+            config.send_timeout_ms = 5_000;
+            if over_tls {
+                config.tls_enabled = true;
+                config.tls_ca_path = Some(ca_file.path().to_string_lossy().into_owned());
+            }
+            let client = GrpcTransport::new(&config).await.unwrap();
+            let result = client.send("events", filled(8)).await;
+
+            let tunnel = if over_tls {
+                format!("localhost:{}", front.port())
+            } else {
+                listening.to_string()
+            };
+            let seen = proxy.seen();
+            assert!(
+                !seen.is_empty() && seen.iter().all(|c| c.target == tunnel),
+                "{name}: {seen:?}"
+            );
+            match (status, &result) {
+                (None, SendResult::Ok) => delivered += 1,
+                (Some(status), SendResult::Reject(error)) => {
+                    let text = error.to_string();
+                    assert!(
+                        text.contains(&format!("HTTP {status}")) && text.contains(&tunnel),
+                        "{name}: {text}"
+                    );
+                }
+                _ => panic!("{name}: got {result:?}"),
+            }
+        }
+        assert_eq!(server.recv(10).await.unwrap().records.len(), delivered);
     }
 
     /// Record headers, the dedup key among them, reach `recv` from a
