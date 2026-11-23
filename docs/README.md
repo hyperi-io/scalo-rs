@@ -102,6 +102,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Transport | [transport/grpc.md](transport/grpc.md) | gRPC `send_batch` blocks joined into one call |
 | Transport | [transport/filter-engine.md](transport/filter-engine.md) | 3-tier filter (SIMD / compiled CEL / complex CEL) |
 | Transport | [transport/routing.md](transport/routing.md) | `RoutedSender`, the named sink set: routes, fan-out |
+| Transport | [transport/delivery-path.md](transport/delivery-path.md) | Inline delivery, the gRPC fan-in buffer, the benched alternatives and their numbers, parked parallel fan-out |
 | Transport | [transport/custom.md](transport/custom.md) | Writing a custom sender, registering it by type name, the delivery guarantee |
 | Deployment | [deployment/README.md](deployment/README.md) | Section landing |
 | Deployment | [deployment/contract.md](deployment/contract.md) | `DeploymentContract` struct, schema versioning |

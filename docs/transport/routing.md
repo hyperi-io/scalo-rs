@@ -151,6 +151,8 @@ caller retries the whole fan-out and re-delivers to whichever destinations
 accepted: at-least-once, duplicates never loss -- the same contract
 as `send_batch`'s per-record fallback. An empty list is `Ok`.
 
+Destinations are sent to in turn. Sending to all at once is a parked design, see [delivery-path.md](delivery-path.md#parallel-fan-out-parked).
+
 ---
 
 ## Batches
