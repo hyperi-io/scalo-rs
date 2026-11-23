@@ -104,6 +104,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Transport | [transport/routing.md](transport/routing.md) | `RoutedSender`, the named sink set: routes, fan-out |
 | Transport | [transport/delivery-path.md](transport/delivery-path.md) | Inline delivery, the gRPC fan-in buffer, the benched alternatives and their numbers, parked parallel fan-out |
 | Transport | [transport/custom.md](transport/custom.md) | Writing a custom sender, registering it by type name, the delivery guarantee |
+| Transport | [transport/framing.md](transport/framing.md) | NDJSON, JSON array, RFC 6587 and the other batch framings, decode limits, streams, your own framing |
 | Deployment | [deployment/README.md](deployment/README.md) | Section landing |
 | Deployment | [deployment/contract.md](deployment/contract.md) | `DeploymentContract` struct, schema versioning |
 | Deployment | [deployment/artefacts.md](deployment/artefacts.md) | Generated Dockerfile, container manifest, contract JSON |

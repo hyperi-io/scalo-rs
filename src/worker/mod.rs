@@ -45,8 +45,6 @@ mod config;
 #[cfg(feature = "worker-batch")]
 pub mod engine;
 pub(crate) mod metrics;
-#[cfg(feature = "worker-batch")]
-pub mod ndjson;
 mod pool;
 pub(crate) mod scaler;
 mod stats;

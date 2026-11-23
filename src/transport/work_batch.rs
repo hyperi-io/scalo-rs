@@ -37,41 +37,10 @@
 use super::filter::FilteredDlqEntry;
 use super::traits::CommitToken;
 use super::types::PayloadFormat;
+use crate::framing::{DecodeLimits, Framing, FramingError, JsonArray, Ndjson};
 use bytes::Bytes;
 use std::sync::Arc;
 use thiserror::Error;
-
-/// Failure modes for [`WorkBatch::from_json_array`] framing.
-///
-/// These cover only the **framing** contract -- slicing a top-level JSON array
-/// into per-element byte views. Element values are NOT parsed, so a malformed
-/// element body (e.g. `[1,nul]`) is not detected here. That is the downstream
-/// parser's job. What IS detected: a missing opening `[`, an unterminated array
-/// or string, structural imbalance, empty elements (leading/trailing/double
-/// commas), and trailing garbage after the closing `]`.
-#[derive(Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FramingError {
-    /// The blob did not start (after optional whitespace) with `[`.
-    #[error("json-array framing: expected opening '[', found {0}")]
-    NotAnArray(String),
-
-    /// The array (or a string within it) was not terminated before end-of-input.
-    #[error("json-array framing: unexpected end of input (unterminated array or string)")]
-    UnexpectedEof,
-
-    /// An element position held no value (leading, trailing, or doubled comma).
-    #[error("json-array framing: empty element at byte offset {0} (stray comma)")]
-    EmptyElement(usize),
-
-    /// Structure closed more containers than it opened.
-    #[error("json-array framing: unbalanced closing bracket at byte offset {0}")]
-    Unbalanced(usize),
-
-    /// Non-whitespace content appeared after the array's closing `]`.
-    #[error("json-array framing: trailing garbage after closing ']' at byte offset {0}")]
-    TrailingGarbage(usize),
-}
 
 /// Lean per-record metadata.
 ///
@@ -451,247 +420,53 @@ impl<T: CommitToken> WorkBatch<T> {
         }
     }
 
-    /// Frame an NDJSON (newline-delimited JSON) blob into one record per line.
+    /// One record per line of an NDJSON blob, each a zero-copy view of it.
     ///
-    /// Splits on `\n` using `memchr`. Each line is trimmed of a trailing `\r`
-    /// (so Windows CRLF endings work) and of surrounding ASCII whitespace. Blank
-    /// or whitespace-only lines are skipped. Each surviving line becomes a
-    /// [`Record`] whose payload is a zero-copy `blob.slice(start..end)` view.
-    /// `format` is set to [`PayloadFormat::Json`].
-    ///
-    /// This is framing, not parsing -- it never fails. A line that is not valid
-    /// JSON still becomes a record. The downstream parser surfaces that.
+    /// Each line is trimmed of ASCII whitespace, a trailing `\r` included, and
+    /// blank lines are skipped, as [`Ndjson`] decodes. A line that is not JSON
+    /// is still a record: the parser downstream refuses it. The format is
+    /// [`PayloadFormat::Json`].
     #[must_use]
     pub fn from_ndjson(blob: Bytes) -> Self {
-        let mut records = Vec::new();
-        let mut line_start = 0usize;
-        let bytes = blob.as_ref();
+        let records = Ndjson
+            .decode(&blob, &DecodeLimits::UNBOUNDED)
+            .map(|decoded| decoded.records)
+            .unwrap_or_default();
+        Self::json_records(&blob, records)
+    }
 
-        // Walk newline boundaries. The tail after the last `\n` is its own line.
-        for nl in memchr::memchr_iter(b'\n', bytes) {
-            Self::push_ndjson_line(&mut records, &blob, line_start, nl);
-            line_start = nl + 1;
-        }
-        if line_start < bytes.len() {
-            Self::push_ndjson_line(&mut records, &blob, line_start, bytes.len());
-        }
+    /// One record per element of a top-level JSON array blob, each a zero-copy
+    /// view of it. Elements are framed, not parsed, as [`JsonArray`] decodes,
+    /// and `[]` yields no records.
+    ///
+    /// # Errors
+    ///
+    /// [`FramingError`] when the blob is not one well-framed array.
+    pub fn from_json_array(blob: Bytes) -> Result<Self, FramingError> {
+        let records = JsonArray.decode(&blob, &DecodeLimits::UNBOUNDED)?.records;
+        Ok(Self::json_records(&blob, records))
+    }
 
+    /// `records`, slices of `blob`, as JSON records sharing its allocation.
+    fn json_records(blob: &Bytes, records: Vec<&[u8]>) -> Self {
+        let records = records
+            .into_iter()
+            .map(|record| Record {
+                payload: blob.slice_ref(record),
+                key: None,
+                headers: Vec::new(),
+                metadata: RecordMeta {
+                    timestamp_ms: None,
+                    format: PayloadFormat::Json,
+                },
+            })
+            .collect();
         Self {
             records,
             commit_tokens: Vec::new(),
             dlq_entries: Vec::new(),
         }
     }
-
-    /// Trim one NDJSON line `[start, end)` (end is the `\n` index or EOF) and,
-    /// if non-empty after trimming, push it as a zero-copy record.
-    fn push_ndjson_line(records: &mut Vec<Record>, blob: &Bytes, start: usize, mut end: usize) {
-        let bytes = blob.as_ref();
-        // Strip a single trailing CR (CRLF) before generic whitespace trimming.
-        if end > start && bytes[end - 1] == b'\r' {
-            end -= 1;
-        }
-        // Trim surrounding ASCII whitespace so the slice is the bare record.
-        while end > start && bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-        let mut begin = start;
-        while begin < end && bytes[begin].is_ascii_whitespace() {
-            begin += 1;
-        }
-        if begin >= end {
-            return; // blank / whitespace-only line
-        }
-        records.push(Record {
-            payload: blob.slice(begin..end),
-            key: None,
-            headers: Vec::new(),
-            metadata: RecordMeta {
-                timestamp_ms: None,
-                format: PayloadFormat::Json,
-            },
-        });
-    }
-
-    /// Frame a top-level JSON array blob into one record per top-level element.
-    ///
-    /// Each element becomes a zero-copy `blob.slice(start..end)` view. Element
-    /// VALUES are not parsed. The byte-level scanner tracks string state (so
-    /// `[`, `]`, `{`, `}` and `,` inside a string are literal), JSON escapes
-    /// (`\"`, `\\`), and container depth, so nested objects/arrays frame
-    /// correctly. An empty array `[]` yields zero records (`Ok`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FramingError`] when the blob is not a well-framed top-level
-    /// array: missing opening `[`, unterminated array/string, an empty element
-    /// position (leading / trailing / doubled comma), an over-close, or trailing
-    /// non-whitespace after the closing `]`.
-    pub fn from_json_array(blob: Bytes) -> Result<Self, FramingError> {
-        let records = scan_json_array(&blob)?;
-        Ok(Self {
-            records,
-            commit_tokens: Vec::new(),
-            dlq_entries: Vec::new(),
-        })
-    }
-}
-
-/// Byte-level top-level JSON-array element scanner (framing, NOT parsing).
-///
-/// Returns one zero-copy [`Record`] per top-level element. See
-/// [`WorkBatch::from_json_array`] for the contract and error modes.
-fn scan_json_array(blob: &Bytes) -> Result<Vec<Record>, FramingError> {
-    let bytes = blob.as_ref();
-    let len = bytes.len();
-
-    // Skip leading whitespace. The first significant byte must be '['.
-    let mut i = 0usize;
-    while i < len && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= len {
-        return Err(FramingError::NotAnArray("end of input".to_string()));
-    }
-    if bytes[i] != b'[' {
-        return Err(FramingError::NotAnArray(format!(
-            "byte {:#04x} ('{}')",
-            bytes[i], bytes[i] as char
-        )));
-    }
-    i += 1; // consume '['
-
-    let mut records: Vec<Record> = Vec::new();
-    // `expect_value` distinguishes the slot just after '[' or ',' (where a value
-    // or -- only after '[' -- a closing ']' may appear) from between elements.
-    let mut first_element = true;
-
-    loop {
-        // Skip whitespace before an element (or the closing ']').
-        while i < len && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= len {
-            return Err(FramingError::UnexpectedEof);
-        }
-
-        if bytes[i] == b']' {
-            // Closing the array. Only legal here if the array is empty (we are
-            // still on the first element) -- otherwise we'd have consumed a ']'
-            // inside the element-scan loop below after a value.
-            if first_element {
-                i += 1;
-                return finish(blob, records, i);
-            }
-            // We reached here via the top of the loop after a ',', so a ']' now
-            // means a trailing comma: `[1, ]`.
-            return Err(FramingError::EmptyElement(i));
-        }
-        if bytes[i] == b',' {
-            // A ',' where a value is expected: leading or doubled comma.
-            return Err(FramingError::EmptyElement(i));
-        }
-
-        // Scan one element value, tracking string + escape + container depth.
-        let elem_start = i;
-        let mut depth: usize = 0;
-        let mut in_string = false;
-        let mut escaped = false;
-
-        let elem_end;
-        loop {
-            if i >= len {
-                return Err(FramingError::UnexpectedEof);
-            }
-            let c = bytes[i];
-
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if c == b'\\' {
-                    escaped = true;
-                } else if c == b'"' {
-                    in_string = false;
-                }
-                i += 1;
-                continue;
-            }
-
-            match c {
-                b'"' => {
-                    in_string = true;
-                    i += 1;
-                }
-                b'{' | b'[' => {
-                    depth += 1;
-                    i += 1;
-                }
-                b'}' => {
-                    // A '}' at depth 0 has no matching opener inside this element.
-                    depth = depth.checked_sub(1).ok_or(FramingError::Unbalanced(i))?;
-                    i += 1;
-                }
-                b']' => {
-                    if depth == 0 {
-                        // This ']' closes the ARRAY -- the element ends here.
-                        elem_end = i;
-                        i += 1; // consume ']'
-                        push_element(blob, &mut records, elem_start, elem_end);
-                        return finish(blob, records, i);
-                    }
-                    depth -= 1;
-                    i += 1;
-                }
-                b',' if depth == 0 => {
-                    // Top-level separator -- the element ends just before it.
-                    elem_end = i;
-                    i += 1; // consume ','
-                    break;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-
-        push_element(blob, &mut records, elem_start, elem_end);
-        first_element = false;
-    }
-}
-
-/// Trim trailing whitespace from `[start, end)` and push the zero-copy slice.
-///
-/// Leading whitespace was already skipped by the caller, so only the trailing
-/// edge (between the value and the `,`/`]`) needs trimming.
-fn push_element(blob: &Bytes, records: &mut Vec<Record>, start: usize, end: usize) {
-    let bytes = blob.as_ref();
-    let mut e = end;
-    while e > start && bytes[e - 1].is_ascii_whitespace() {
-        e -= 1;
-    }
-    records.push(Record {
-        payload: blob.slice(start..e),
-        key: None,
-        headers: Vec::new(),
-        metadata: RecordMeta {
-            timestamp_ms: None,
-            format: PayloadFormat::Json,
-        },
-    });
-}
-
-/// After the closing `]`, only trailing whitespace is permitted. Build the
-/// records vector into a `Vec<Record>` result, or error on trailing garbage.
-fn finish(blob: &Bytes, records: Vec<Record>, mut i: usize) -> Result<Vec<Record>, FramingError> {
-    let bytes = blob.as_ref();
-    let len = bytes.len();
-    while i < len && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i < len {
-        return Err(FramingError::TrailingGarbage(i));
-    }
-    Ok(records)
 }
 
 impl<T: CommitToken> From<crate::Message<T>> for WorkBatch<T> {
@@ -1211,268 +986,35 @@ mod tests {
         assert_eq!(b.records[0].metadata.format, PayloadFormat::MsgPack);
     }
 
-    // --- from_ndjson() ------------------------------------------------------
+    // --- from_ndjson() and from_json_array() -------------------------------
+    // How each blob splits is tested with the framings in crate::framing.
 
     #[test]
-    fn ndjson_splits_lines_into_records() {
-        let blob = Bytes::from_static(b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}");
-        let b = WorkBatch::<TestToken>::from_ndjson(blob.clone());
-        assert_eq!(b.record_count(), 3);
-        assert_eq!(b.records[0].payload.as_ref(), b"{\"a\":1}");
-        assert_eq!(b.records[1].payload.as_ref(), b"{\"b\":2}");
-        assert_eq!(b.records[2].payload.as_ref(), b"{\"c\":3}");
-        for r in &b.records {
-            assert_eq!(r.metadata.format, PayloadFormat::Json);
-            assert_within(&r.payload, &blob);
+    fn framed_blobs_become_json_records_sharing_the_blob() {
+        let ndjson = Bytes::from_static(b"{\"a\":1}\r\n\n  {\"b\":2}  ");
+        let array = Bytes::from_static(b"[{\"a\":1}, {\"b\":2}]");
+        let batches = [
+            (ndjson.clone(), WorkBatch::<TestToken>::from_ndjson(ndjson)),
+            (array.clone(), WorkBatch::from_json_array(array).unwrap()),
+        ];
+        for (blob, batch) in batches {
+            let payloads: Vec<&[u8]> = batch.records.iter().map(|r| r.payload.as_ref()).collect();
+            assert_eq!(payloads, [&b"{\"a\":1}"[..], b"{\"b\":2}"]);
+            for record in &batch.records {
+                assert_eq!(record.metadata.format, PayloadFormat::Json);
+                assert_within(&record.payload, &blob);
+            }
+            assert!(batch.commit_tokens.is_empty() && batch.dlq_entries.is_empty());
         }
         assert_eq!(
-            b.commit_tokens,
-            [] as [crate::transport::work_batch::tests::TestToken; 0]
+            WorkBatch::<TestToken>::from_ndjson(Bytes::new()).record_count(),
+            0
         );
     }
 
     #[test]
-    fn ndjson_trims_trailing_carriage_return() {
-        // Windows CRLF line endings.
-        let blob = Bytes::from_static(b"{\"a\":1}\r\n{\"b\":2}\r\n");
-        let b = WorkBatch::<TestToken>::from_ndjson(blob);
-        assert_eq!(b.record_count(), 2);
-        assert_eq!(b.records[0].payload.as_ref(), b"{\"a\":1}");
-        assert_eq!(b.records[1].payload.as_ref(), b"{\"b\":2}");
-    }
-
-    #[test]
-    fn ndjson_skips_blank_and_whitespace_only_lines() {
-        let blob = Bytes::from_static(b"{\"a\":1}\n\n   \n{\"b\":2}\n\t\r\n");
-        let b = WorkBatch::<TestToken>::from_ndjson(blob);
-        assert_eq!(b.record_count(), 2);
-        assert_eq!(b.records[0].payload.as_ref(), b"{\"a\":1}");
-        assert_eq!(b.records[1].payload.as_ref(), b"{\"b\":2}");
-    }
-
-    #[test]
-    fn ndjson_empty_blob_yields_no_records() {
-        let b = WorkBatch::<TestToken>::from_ndjson(Bytes::new());
-        assert_eq!(b.record_count(), 0);
-    }
-
-    #[test]
-    fn ndjson_single_line_no_newline() {
-        let blob = Bytes::from_static(b"{\"only\":true}");
-        let b = WorkBatch::<TestToken>::from_ndjson(blob.clone());
-        assert_eq!(b.record_count(), 1);
-        assert_eq!(b.records[0].payload.as_ref(), b"{\"only\":true}");
-        assert_within(&b.records[0].payload, &blob);
-    }
-
-    #[test]
-    fn ndjson_preserves_inner_whitespace_but_trims_edges() {
-        // Leading/trailing spaces on a line are trimmed for framing.
-        let blob = Bytes::from_static(b"  {\"a\": 1}  \n");
-        let b = WorkBatch::<TestToken>::from_ndjson(blob);
-        assert_eq!(b.record_count(), 1);
-        assert_eq!(b.records[0].payload.as_ref(), b"{\"a\": 1}");
-    }
-
-    // --- from_json_array() --------------------------------------------------
-
-    #[test]
-    fn json_array_empty_yields_no_records() {
-        let b = WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[]")).unwrap();
-        assert_eq!(b.record_count(), 0);
-        assert_eq!(
-            b.commit_tokens,
-            [] as [crate::transport::work_batch::tests::TestToken; 0]
-        );
-        assert!(b.dlq_entries.is_empty());
-    }
-
-    #[test]
-    fn json_array_empty_with_whitespace() {
-        let b = WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"  [  ]  ")).unwrap();
-        assert_eq!(b.record_count(), 0);
-    }
-
-    #[test]
-    fn json_array_single_element() {
-        let blob = Bytes::from_static(b"[{\"a\":1}]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob.clone()).unwrap();
-        assert_eq!(b.record_count(), 1);
-        assert_eq!(b.records[0].payload.as_ref(), b"{\"a\":1}");
-        assert_eq!(b.records[0].metadata.format, PayloadFormat::Json);
-        assert_within(&b.records[0].payload, &blob);
-    }
-
-    #[test]
-    fn json_array_multiple_scalar_elements() {
-        let blob = Bytes::from_static(b"[1, 2, 3]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();
-        assert_eq!(b.record_count(), 3);
-        assert_eq!(b.records[0].payload.as_ref(), b"1");
-        assert_eq!(b.records[1].payload.as_ref(), b"2");
-        assert_eq!(b.records[2].payload.as_ref(), b"3");
-    }
-
-    #[test]
-    fn json_array_trims_whitespace_around_elements() {
-        let blob = Bytes::from_static(b"[  {\"a\":1}  ,  {\"b\":2}  ]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();
-        assert_eq!(b.record_count(), 2);
-        assert_eq!(b.records[0].payload.as_ref(), b"{\"a\":1}");
-        assert_eq!(b.records[1].payload.as_ref(), b"{\"b\":2}");
-    }
-
-    #[test]
-    fn json_array_leading_trailing_whitespace_and_newlines() {
-        let blob = Bytes::from_static(b"\n\t [\n  1,\n  2\n] \n");
-        let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();
-        assert_eq!(b.record_count(), 2);
-        assert_eq!(b.records[0].payload.as_ref(), b"1");
-        assert_eq!(b.records[1].payload.as_ref(), b"2");
-    }
-
-    #[test]
-    fn json_array_string_with_brackets_and_commas() {
-        // The commas/brackets INSIDE the string must not split or change depth.
-        let blob = Bytes::from_static(b"[\"a,b[c]{d}\", \"plain\"]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();
-        assert_eq!(b.record_count(), 2);
-        assert_eq!(b.records[0].payload.as_ref(), b"\"a,b[c]{d}\"");
-        assert_eq!(b.records[1].payload.as_ref(), b"\"plain\"");
-    }
-
-    #[test]
-    fn json_array_string_with_escaped_quote() {
-        // `\"` does not terminate the string.
-        let blob = Bytes::from_static(b"[\"he said \\\"hi\\\", then left\", 7]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();
-        assert_eq!(b.record_count(), 2);
-        assert_eq!(
-            b.records[0].payload.as_ref(),
-            b"\"he said \\\"hi\\\", then left\""
-        );
-        assert_eq!(b.records[1].payload.as_ref(), b"7");
-    }
-
-    #[test]
-    fn json_array_string_with_escaped_backslash_then_closing_quote() {
-        // `\\` is an escaped backslash. The following `"` DOES close the string.
-        // Element 0 is the string "path\\" and element 1 is the number 1.
-        let blob = Bytes::from_static(b"[\"path\\\\\", 1]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();
-        assert_eq!(b.record_count(), 2);
-        assert_eq!(b.records[0].payload.as_ref(), b"\"path\\\\\"");
-        assert_eq!(b.records[1].payload.as_ref(), b"1");
-    }
-
-    #[test]
-    fn json_array_nested_arrays_and_objects() {
-        let blob = Bytes::from_static(b"[[1,2],[3],{\"k\":[4,5]}]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();
-        assert_eq!(b.record_count(), 3);
-        assert_eq!(b.records[0].payload.as_ref(), b"[1,2]");
-        assert_eq!(b.records[1].payload.as_ref(), b"[3]");
-        assert_eq!(b.records[2].payload.as_ref(), b"{\"k\":[4,5]}");
-    }
-
-    #[test]
-    fn json_array_deeply_nested_object_one_element() {
-        let blob = Bytes::from_static(b"[{\"a\":{\"b\":{\"c\":[1,{\"d\":2}]}}}]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob).unwrap();
-        assert_eq!(b.record_count(), 1);
-        assert_eq!(
-            b.records[0].payload.as_ref(),
-            b"{\"a\":{\"b\":{\"c\":[1,{\"d\":2}]}}}"
-        );
-    }
-
-    #[test]
-    fn json_array_unicode_in_strings() {
-        // Multi-byte UTF-8 inside an element string must pass through verbatim.
-        let blob = Bytes::from(r#"["café", "naïve"]"#.as_bytes().to_vec());
-        let b = WorkBatch::<TestToken>::from_json_array(blob.clone()).unwrap();
-        assert_eq!(b.record_count(), 2);
-        assert_eq!(b.records[0].payload.as_ref(), "\"café\"".as_bytes());
-        assert_eq!(b.records[1].payload.as_ref(), "\"naïve\"".as_bytes());
-        assert_within(&b.records[1].payload, &blob);
-    }
-
-    #[test]
-    fn json_array_zero_copy_views_into_blob() {
-        let blob = Bytes::from_static(b"[{\"a\":1}, {\"b\":2}, {\"c\":3}]");
-        let b = WorkBatch::<TestToken>::from_json_array(blob.clone()).unwrap();
-        assert_eq!(b.record_count(), 3);
-        for r in &b.records {
-            assert_within(&r.payload, &blob);
-        }
-    }
-
-    // malformed inputs -> Err
-
-    #[test]
-    fn json_array_no_opening_bracket_errors() {
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"{\"a\":1}")).is_err());
-    }
-
-    #[test]
-    fn json_array_empty_blob_errors() {
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::new()).is_err());
-    }
-
-    #[test]
-    fn json_array_whitespace_only_errors() {
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"   \n\t ")).is_err());
-    }
-
-    #[test]
-    fn json_array_unterminated_errors() {
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[1, 2")).is_err());
-    }
-
-    #[test]
-    fn json_array_unterminated_string_errors() {
-        assert!(
-            WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[\"unclosed]")).is_err()
-        );
-    }
-
-    #[test]
-    fn json_array_trailing_garbage_errors() {
-        assert!(
-            WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[1, 2] junk")).is_err()
-        );
-    }
-
-    #[test]
-    fn json_array_trailing_comma_errors() {
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[1, 2, ]")).is_err());
-    }
-
-    #[test]
-    fn json_array_leading_comma_errors() {
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[, 1]")).is_err());
-    }
-
-    #[test]
-    fn json_array_double_comma_errors() {
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[1,, 2]")).is_err());
-    }
-
-    #[test]
-    fn json_array_only_open_bracket_errors() {
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[")).is_err());
-    }
-
-    #[test]
-    fn json_array_unbalanced_extra_close_errors() {
-        // A nested structure that closes too many times.
-        assert!(WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"[1]]")).is_err());
-    }
-
-    #[test]
-    fn framing_error_is_displayable() {
-        let err = WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"nope")).unwrap_err();
-        // thiserror Display should produce a non-empty, informative message.
-        assert_ne!(err.to_string(), "");
+    fn a_blob_that_is_not_an_array_is_refused() {
+        let refused = WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"nope"));
+        assert!(matches!(refused, Err(FramingError::NotAnArray(_))));
     }
 }

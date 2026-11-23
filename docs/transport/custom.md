@@ -11,7 +11,7 @@ Two traits do the work. `TransportSender` is the one you implement. `DynTranspor
 Every transport states what its `Ok` proves, through `TransportBase::delivery_guarantee`. There is no default, so a new sender says what it keeps.
 
 | Guarantee | `Ok` means | Built-ins |
-|---|---|---|
+| --- | --- | --- |
 | `Acknowledged` | the destination answered | Kafka, gRPC, HTTP, memory |
 | `Written` | written and flushed here, no answer | file, pipe |
 | `FireAndForget` | handed off, no flush, no answer | Kafka with `acks=0` |
@@ -160,7 +160,7 @@ transport:
 ## What a send answers
 
 | Answer | Means | The caller |
-|---|---|---|
+| --- | --- | --- |
 | `Ok` | sent, to the guarantee stated | releases the records |
 | `Backpressured` | busy, try again | sends them again later |
 | `RetryAfter(wait)` | busy, and the destination named the wait | sends them again after `wait` |

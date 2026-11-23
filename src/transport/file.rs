@@ -40,11 +40,12 @@ use super::error::{TransportError, TransportResult};
 use super::traits::{CommitToken, RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::WorkBatch;
+use crate::framing::{DecodeLimits, Frame, Framing, Lf, StreamDecoder};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 /// Commit token for file transport.
@@ -82,9 +83,9 @@ pub struct FileTransportConfig {
     #[serde(default)]
     pub filters_out: Vec<super::filter::FilterRule>,
 
-    /// Longest line read into memory, newline included. Default 16 MiB. A
-    /// longer line is read past without being held and returned as a dead
-    /// letter carrying its first `max_line_bytes`.
+    /// Longest line read into memory, not counting its newline. Default
+    /// 16 MiB. A longer line is read past without being held and returned as
+    /// a dead letter carrying its first `max_line_bytes`.
     #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
 }
@@ -130,12 +131,10 @@ struct WriteState {
 /// call loses nothing.
 struct ReadState {
     reader: BufReader<tokio::fs::File>,
-    /// Byte offset just past the last complete line read.
-    offset: u64,
-    /// Bytes of a line still waiting for its newline, at most `max_line_bytes`.
-    line: Vec<u8>,
-    /// Bytes of the current line read past the cap and not kept.
-    skipped: u64,
+    /// Byte offset the reader started at.
+    base: u64,
+    /// Holds a line still waiting for its newline.
+    decoder: StreamDecoder,
     /// Lines read but not yet returned, in file order.
     pending: Vec<ReadLine>,
 }
@@ -146,35 +145,6 @@ enum ReadLine {
     Record(Message<FileToken>),
     /// A line over `max_line_bytes`, as a dead letter of its head.
     TooLong(super::filter::FilteredDlqEntry, FileToken),
-}
-
-/// Read to the next `\n`, appending at most `cap` bytes of the line to `line`
-/// and counting the rest in `skipped`. `Ok(false)` at end of file with the line
-/// unfinished. Cancel-safe: the bytes consumed are in `line` or `skipped`.
-async fn read_line_capped(
-    reader: &mut BufReader<tokio::fs::File>,
-    line: &mut Vec<u8>,
-    skipped: &mut u64,
-    cap: usize,
-) -> std::io::Result<bool> {
-    loop {
-        let buf = reader.fill_buf().await?;
-        if buf.is_empty() {
-            return Ok(false);
-        }
-        let (chunk, ended) = match memchr::memchr(b'\n', buf) {
-            Some(i) => (&buf[..=i], true),
-            None => (buf, false),
-        };
-        let keep = chunk.len().min(cap.saturating_sub(line.len()));
-        line.extend_from_slice(&chunk[..keep]);
-        *skipped += (chunk.len() - keep) as u64;
-        let used = chunk.len();
-        reader.consume(used);
-        if ended {
-            return Ok(true);
-        }
-    }
 }
 
 /// NDJSON file transport.
@@ -340,11 +310,14 @@ impl FileTransport {
                     TransportError::Recv(format!("failed to seek to offset {offset}: {e}"))
                 })?;
 
+            let limits = DecodeLimits {
+                max_record_bytes: self.config.max_line_bytes,
+                ..DecodeLimits::UNBOUNDED
+            };
             *guard = Some(ReadState {
                 reader: BufReader::new(file),
-                offset,
-                line: Vec::with_capacity(4096),
-                skipped: 0,
+                base: offset,
+                decoder: StreamDecoder::new(Arc::new(Lf), limits),
                 pending: Vec::new(),
             });
         }
@@ -414,16 +387,12 @@ impl TransportSender for FileTransport {
             return SendResult::Fatal(TransportError::Internal("writer not initialised".into()));
         };
 
-        // Write payload + newline as a single operation
-        if let Err(e) = state.file.write_all(&payload).await {
+        let mut line = Vec::with_capacity(payload.len() + 1);
+        let _ = Lf.encode(&[&payload], &mut line);
+        if let Err(e) = state.file.write_all(&line).await {
             #[cfg(feature = "logger")]
             tracing::warn!(error = %e, "File transport: write error");
             return SendResult::Fatal(TransportError::Send(format!("write failed: {e}")));
-        }
-        if let Err(e) = state.file.write_all(b"\n").await {
-            #[cfg(feature = "logger")]
-            tracing::warn!(error = %e, "File transport: newline write error");
-            return SendResult::Fatal(TransportError::Send(format!("write newline failed: {e}")));
         }
         if let Err(e) = state.file.flush().await {
             #[cfg(feature = "logger")]
@@ -460,81 +429,65 @@ impl TransportReceiver for FileTransport {
             .as_mut()
             .ok_or_else(|| TransportError::Internal("reader not initialised".into()))?;
 
-        // A dropped read leaves a partial line in `line` and `skipped`, and
-        // `pending` holds finished lines, so a dropped call resumes here.
+        // A dropped read leaves a partial line in the decoder, and `pending`
+        // holds finished lines, so a dropped call resumes here.
         let ReadState {
             reader,
-            offset,
-            line,
-            skipped,
+            base,
+            decoder,
             pending,
         } = state;
         let cap = self.config.max_line_bytes;
 
         for _ in pending.len()..max {
-            let ended = read_line_capped(reader, line, skipped, cap)
+            // EOF, or a line the writer has not finished: the decoder keeps
+            // the partial bytes for the next call.
+            let Some(frame) = decoder
+                .read(reader)
                 .await
-                .map_err(|e| TransportError::Recv(format!("read failed: {e}")))?;
-
-            // EOF, or a line the writer has not finished: keep the partial
-            // bytes for the next call and leave `offset` before them.
-            if !ended {
+                .map_err(|e| TransportError::Recv(format!("read failed: {e}")))?
+            else {
                 break;
-            }
-
-            // Every byte of the line, across dropped calls too, is in `line`
-            // or `skipped`.
-            *offset += line.len() as u64 + *skipped;
-
-            if *skipped > 0 {
-                let total = line.len() as u64 + *skipped;
-                *skipped = 0;
-                #[cfg(feature = "logger")]
-                tracing::warn!(
-                    offset = *offset,
-                    line_bytes = total,
-                    max_line_bytes = cap,
-                    "File transport: a line over max_line_bytes is returned as a dead letter"
-                );
-                #[cfg(feature = "metrics")]
-                metrics::counter!("transport_message_too_large_total", "transport" => "file")
-                    .increment(1);
-                pending.push(ReadLine::TooLong(
-                    super::filter::FilteredDlqEntry {
-                        payload: std::mem::take(line),
+            };
+            let offset = *base + decoder.taken();
+            match frame {
+                Frame::Oversize { head, len } => {
+                    #[cfg(feature = "logger")]
+                    tracing::warn!(
+                        offset,
+                        line_bytes = len,
+                        max_line_bytes = cap,
+                        "File transport: a line over max_line_bytes is returned as a dead letter"
+                    );
+                    #[cfg(feature = "metrics")]
+                    metrics::counter!("transport_message_too_large_total", "transport" => "file")
+                        .increment(1);
+                    pending.push(ReadLine::TooLong(
+                        super::filter::FilteredDlqEntry {
+                            payload: head,
+                            key: None,
+                            reason: format!(
+                                "line of {len} bytes exceeds max_line_bytes {cap}; the first {cap} \
+                                 bytes are kept"
+                            ),
+                        },
+                        FileToken { offset },
+                    ));
+                }
+                Frame::Record(payload) => {
+                    let payload = bytes::Bytes::from(payload);
+                    let format = PayloadFormat::detect(&payload);
+                    let timestamp_ms = crate::clock::epoch_millis();
+                    pending.push(ReadLine::Record(Message {
                         key: None,
-                        reason: format!(
-                            "line of {total} bytes exceeds max_line_bytes {cap}; the first {cap} \
-                             bytes are kept"
-                        ),
-                    },
-                    FileToken { offset: *offset },
-                ));
-                continue;
+                        payload,
+                        token: FileToken { offset },
+                        timestamp_ms: Some(timestamp_ms),
+                        format,
+                        headers: Vec::new(),
+                    }));
+                }
             }
-
-            // Strip the trailing newline and any carriage returns before it
-            let end = line
-                .iter()
-                .rposition(|&b| b != b'\n' && b != b'\r')
-                .map_or(0, |i| i + 1);
-            let payload = bytes::Bytes::copy_from_slice(&line[..end]);
-            line.clear();
-            if payload.is_empty() {
-                continue;
-            }
-
-            let format = PayloadFormat::detect(&payload);
-            let timestamp_ms = crate::clock::epoch_millis();
-
-            pending.push(ReadLine::Record(Message {
-                key: None,
-                payload,
-                token: FileToken { offset: *offset },
-                timestamp_ms: Some(timestamp_ms),
-                format,
-                headers: Vec::new(),
-            }));
         }
         // A call with a smaller `max` than the dropped one leaves the rest queued.
         let rest = pending.split_off(pending.len().min(max));
@@ -727,6 +680,41 @@ mod tests {
         // Commit tokens (carried on the batch, in record order) should have
         // increasing offsets.
         assert!(batch.commit_tokens[1].offset > batch.commit_tokens[0].offset);
+    }
+
+    /// Each payload is written followed by a newline, added even when it ends in one.
+    #[tokio::test]
+    async fn send_writes_each_payload_then_a_newline() {
+        let dir = TempDir::new().unwrap();
+        let transport = make_transport(&dir, "sent.ndjson").await;
+        for payload in [&b"a"[..], b"b\n", b""] {
+            let sent = transport
+                .send("ignored", bytes::Bytes::copy_from_slice(payload))
+                .await;
+            assert!(sent.is_ok(), "{sent:?}");
+        }
+        transport.close().await.unwrap();
+        let written = std::fs::read(dir.path().join("sent.ndjson")).unwrap();
+        assert_eq!(written, b"a\nb\n\n\n");
+    }
+
+    /// A line loses its newline and every carriage return before it, a blank
+    /// line is no record but its bytes count toward the next offset, and a
+    /// line with no newline yet is held.
+    #[tokio::test]
+    async fn recv_strips_line_endings_and_skips_blank_lines() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("endings.ndjson"),
+            b"a\r\n\r\n\nb\r\r\n c \nlast",
+        )
+        .unwrap();
+        let transport = make_transport(&dir, "endings.ndjson").await;
+        let batch = transport.recv(10).await.unwrap();
+        let payloads: Vec<&[u8]> = batch.records.iter().map(|r| r.payload.as_ref()).collect();
+        assert_eq!(payloads, [&b"a"[..], b"b", b" c "]);
+        let offsets: Vec<u64> = batch.commit_tokens.iter().map(|t| t.offset).collect();
+        assert_eq!(offsets, [3, 10, 14]);
     }
 
     #[tokio::test]

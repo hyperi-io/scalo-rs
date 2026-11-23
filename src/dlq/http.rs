@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::entry::DlqEntry;
 use super::error::DlqError;
+use crate::framing::{Framing, Ndjson};
 
 /// Configuration for the HTTP DLQ backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,17 +79,12 @@ impl HttpDlqInner {
             return Ok(());
         }
 
-        let mut body = Vec::with_capacity(batch.len() * 256);
-        for entry in batch {
-            serde_json::to_writer(&mut body, entry)
-                .map_err(|e| DlqError::Serialization(e.to_string()))?;
-            body.push(b'\n');
-        }
+        let body = DlqEntry::ndjson(batch).map_err(|e| DlqError::Serialization(e.to_string()))?;
 
         let resp = self
             .client
             .post(&self.endpoint)
-            .header("content-type", "application/x-ndjson")
+            .header("content-type", Ndjson.content_type())
             .body(body)
             .send()
             .await
@@ -111,6 +107,66 @@ impl HttpDlqInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body is each entry's JSON followed by one newline, sent as NDJSON.
+    #[tokio::test]
+    async fn send_batch_posts_one_json_line_per_entry() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let body_at = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..body_at]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap();
+            while request.len() < body_at + length {
+                let n = socket.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..n]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            (head, request[body_at..].to_vec())
+        });
+
+        let mut backend = HttpDlqInner::new(&HttpDlqConfig {
+            enabled: true,
+            endpoint: format!("http://{address}/dlq"),
+            timeout_secs: 5,
+        })
+        .unwrap();
+        let entries = [
+            DlqEntry::new("svc", "parse_error", b"a".to_vec()),
+            DlqEntry::new("svc", "too_large", b"b\n".to_vec()),
+        ];
+        backend.send_batch(&entries).await.unwrap();
+
+        let (head, body) = server.await.unwrap();
+        let mut expected = Vec::new();
+        for entry in &entries {
+            expected.extend(serde_json::to_vec(entry).unwrap());
+            expected.push(b'\n');
+        }
+        assert_eq!(body, expected);
+        assert!(
+            head.contains("content-type: application/x-ndjson"),
+            "{head}"
+        );
+    }
 
     #[test]
     fn config_defaults() {
