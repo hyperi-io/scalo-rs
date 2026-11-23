@@ -68,7 +68,7 @@ pub enum FramingError {
     #[error("json framing: no '{0}' member holds the records")]
     MissingKey(String),
 
-    /// The unit ended inside a frame: an array, a string or a counted frame.
+    /// The unit ended inside an array, a string, or a frame its framing could not end.
     #[error("framing: unexpected end of input (unterminated array, string or frame)")]
     UnexpectedEof,
 
@@ -295,7 +295,8 @@ pub trait Framing: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// [`FramingError::NotAStream`], the default, from a framing that does
-    /// not stream. A stream framing errs only at the end, on a cut frame.
+    /// not stream. A stream framing errs only at the end of input, on a frame
+    /// it cannot end.
     fn split(
         &self,
         buf: &[u8],
@@ -343,16 +344,8 @@ impl Framing for Ndjson {
         limits: &DecodeLimits,
         at_end: bool,
     ) -> Result<Split, FramingError> {
-        Ok(split_line(buf, seen, limits, at_end, |line| {
-            let end = line
-                .iter()
-                .rposition(|b| !b.is_ascii_whitespace())
-                .map_or(0, |i| i + 1);
-            let start = line[..end]
-                .iter()
-                .position(|b| !b.is_ascii_whitespace())
-                .unwrap_or(end);
-            start..end
+        Ok(split_line(buf, seen, limits, at_end, |line, _| {
+            without_whitespace(line)
         }))
     }
 }
@@ -391,13 +384,9 @@ impl Framing for Lf {
         limits: &DecodeLimits,
         at_end: bool,
     ) -> Result<Split, FramingError> {
-        Ok(split_line(
-            buf,
-            seen,
-            limits,
-            at_end,
-            without_carriage_returns,
-        ))
+        Ok(split_line(buf, seen, limits, at_end, |line, _| {
+            without_carriage_returns(line)
+        }))
     }
 }
 
@@ -412,6 +401,10 @@ impl Framing for Lf {
 /// `max_frame_bytes` is skipped whole. A count over `max_frame_bytes` is not
 /// trusted: the bytes to the next `\n` are read as an LF line and counting
 /// resumes after it.
+///
+/// At the end of input a counted frame cut short is dropped, or reported as
+/// oversize when its count is over `max_record_bytes`. A last line with no
+/// `\n` loses its ASCII whitespace, and is dropped when nothing is left.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OctetCounting;
 
@@ -444,16 +437,16 @@ impl Framing for OctetCounting {
         limits: &DecodeLimits,
         at_end: bool,
     ) -> Result<Split, FramingError> {
-        if let Some(split) = split_counted(buf, limits, at_end)? {
+        if let Some(split) = split_counted(buf, limits, at_end) {
             return Ok(split);
         }
-        Ok(split_line(
-            buf,
-            seen,
-            limits,
-            at_end,
-            without_carriage_returns,
-        ))
+        Ok(split_line(buf, seen, limits, at_end, |line, ended| {
+            if ended {
+                without_carriage_returns(line)
+            } else {
+                without_whitespace(line)
+            }
+        }))
     }
 }
 
@@ -879,11 +872,11 @@ impl StreamDecoder {
     /// # Errors
     ///
     /// [`FramingError`] from the framing, and [`FramingError::UnexpectedEof`]
-    /// when the input ended inside a counted frame.
+    /// when the input ended inside a frame the framing could not end.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, FramingError> {
         loop {
             if self.skipping.is_some() {
-                let frame = self.skip()?;
+                let frame = self.skip();
                 if frame.is_none() {
                     self.compact();
                 }
@@ -930,13 +923,11 @@ impl StreamDecoder {
         }
     }
 
-    /// Read on past the oversize frame: `Some` once it ends, `None` when the
-    /// buffer is spent first.
-    fn skip(&mut self) -> Result<Option<Frame>, FramingError> {
+    /// Read on past the oversize frame: `Some` once it ends or the input does,
+    /// `None` when the buffer is spent first.
+    fn skip(&mut self) -> Option<Frame> {
         let pending = &self.buf[self.start..];
-        let Some(skipping) = &mut self.skipping else {
-            return Ok(None);
-        };
+        let skipping = self.skipping.as_mut()?;
         // (frame bytes taken, record bytes among them, whether the frame ends)
         let (len, record, done) = match skipping.rest {
             Rest::Bytes(more) => {
@@ -959,16 +950,14 @@ impl StreamDecoder {
             .extend_from_slice(&pending[..record.min(room)]);
         skipping.len += len as u64;
         self.advance(len);
-        if done {
-            return Ok(self
+        // At the end of input a frame cut short still reports as oversize.
+        if done || self.at_end {
+            return self
                 .skipping
                 .take()
-                .map(|Skipping { head, len, .. }| Frame::Oversize { head, len }));
+                .map(|Skipping { head, len, .. }| Frame::Oversize { head, len });
         }
-        if self.at_end {
-            return Err(FramingError::UnexpectedEof);
-        }
-        Ok(None)
+        None
     }
 
     /// The next frame from `reader`, `None` once it has no more bytes and
@@ -1013,17 +1002,18 @@ impl StreamDecoder {
     }
 }
 
-/// The line at the front of `buf`, the record in it being `record(line)`.
+/// The line at the front of `buf`, the record in it being `record(line,
+/// ended)`, where `ended` is false for a last line the end of input cut off.
 fn split_line(
     buf: &[u8],
     seen: usize,
     limits: &DecodeLimits,
     at_end: bool,
-    record: impl Fn(&[u8]) -> Range<usize>,
+    record: impl Fn(&[u8], bool) -> Range<usize>,
 ) -> Split {
-    let (line, len) = match newline(buf.get(seen..).unwrap_or_default()) {
-        Some(at) => (&buf[..seen + at], seen + at + 1),
-        None if at_end => (buf, buf.len()),
+    let (line, len, ended) = match newline(buf.get(seen..).unwrap_or_default()) {
+        Some(at) => (&buf[..seen + at], seen + at + 1, true),
+        None if at_end => (buf, buf.len(), false),
         None if buf.len() > limits.max_record_bytes => {
             return Split::Oversize {
                 record: 0..buf.len(),
@@ -1040,7 +1030,7 @@ fn split_line(
             rest: None,
         };
     }
-    let record = record(line);
+    let record = record(line, ended);
     if record.is_empty() {
         Split::Skip { len }
     } else {
@@ -1053,15 +1043,24 @@ fn without_carriage_returns(line: &[u8]) -> Range<usize> {
     0..line.iter().rposition(|&b| b != b'\r').map_or(0, |i| i + 1)
 }
 
+/// The line without the ASCII whitespace around it.
+fn without_whitespace(line: &[u8]) -> Range<usize> {
+    let end = line
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    let start = line[..end]
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(end);
+    start..end
+}
+
 /// The counted frame at the front of `buf`, or `None` when it does not start
 /// with a count to trust.
-fn split_counted(
-    buf: &[u8],
-    limits: &DecodeLimits,
-    at_end: bool,
-) -> Result<Option<Split>, FramingError> {
+fn split_counted(buf: &[u8], limits: &DecodeLimits, at_end: bool) -> Option<Split> {
     if !matches!(buf.first(), Some(b'1'..=b'9')) {
-        return Ok(None);
+        return None;
     }
     let digits = buf.iter().take_while(|b| b.is_ascii_digit()).count();
     let count = buf[..digits].iter().try_fold(0_usize, |count, &digit| {
@@ -1070,43 +1069,32 @@ fn split_counted(
             .and_then(|count| count.checked_add(usize::from(digit - b'0')))
     });
     let frame_limit = limits.max_frame_bytes.max(limits.max_record_bytes);
-    let Some(count) = count.filter(|&count| count <= frame_limit) else {
-        return Ok(None);
-    };
+    let count = count.filter(|&count| count <= frame_limit)?;
     let start = digits + 1;
     match (buf.get(digits), buf.get(start)) {
         (Some(b' '), Some(b'<')) => {}
-        (Some(b' '), None) | (None, _) if !at_end => return Ok(Some(Split::More)),
-        _ => return Ok(None),
+        (Some(b' '), None) | (None, _) if !at_end => return Some(Split::More),
+        _ => return None,
     }
     let held = buf.len() - start;
+    // A frame the end of input cut short holds what arrived of it.
+    let end = buf.len().min(start + count);
     if count > limits.max_record_bytes {
-        if held >= count {
-            return Ok(Some(Split::Oversize {
-                record: start..start + count,
-                len: start + count,
-                rest: None,
-            }));
-        }
-        if at_end {
-            return Err(FramingError::UnexpectedEof);
-        }
-        return Ok(Some(Split::Oversize {
-            record: start..buf.len(),
-            len: buf.len(),
-            rest: Some(Rest::Bytes((count - held) as u64)),
-        }));
+        let rest = (held < count && !at_end).then(|| Rest::Bytes((count - held) as u64));
+        return Some(Split::Oversize {
+            record: start..end,
+            len: end,
+            rest,
+        });
     }
-    if held >= count {
-        return Ok(Some(Split::Record {
-            record: start..start + count,
-            len: start + count,
-        }));
-    }
-    if at_end {
-        return Err(FramingError::UnexpectedEof);
-    }
-    Ok(Some(Split::More))
+    Some(match (held >= count, at_end) {
+        (true, _) => Split::Record {
+            record: start..end,
+            len: end,
+        },
+        (false, true) => Split::Skip { len: end },
+        (false, false) => Split::More,
+    })
 }
 
 /// The index of the first `\n` in `bytes`.
@@ -1296,7 +1284,7 @@ mod tests {
     #[test]
     fn each_framing_decodes_these_records() {
         // (framing, unit, records)
-        let cases: [(&dyn Framing, &[u8], &[&[u8]]); 25] = [
+        let cases: [(&dyn Framing, &[u8], &[&[u8]]); 29] = [
             (
                 &Ndjson,
                 b"{\"a\":1}\r\n\n   \n  {\"b\": 2}  \n\t\r\nlast",
@@ -1321,8 +1309,16 @@ mod tests {
                 b"2026 Oct 11 10:00:00 host msg\n4 <1>a",
                 &[b"2026 Oct 11 10:00:00 host msg", b"<1>a"],
             ),
-            // The input ends after the space: an LF line.
-            (&OctetCounting, b"4 ", &[b"4 "]),
+            // The input ends after the space: an LF line, its whitespace trimmed.
+            (&OctetCounting, b"4 ", &[b"4"]),
+            // A line keeps its spaces, and the last one with no \n loses them.
+            (&OctetCounting, b"<1>a \n  x  ", &[b"<1>a ", b"x"]),
+            // Whitespace left at the end of input is no record.
+            (&OctetCounting, b"4 <1>a \t ", &[b"<1>a"]),
+            // A counted frame the end of input cut short is dropped.
+            (&OctetCounting, b"<1>a\n10 <short", &[b"<1>a"]),
+            // lf keeps the spaces of its last line, as of every other.
+            (&Lf, b"a\n \t ", &[b"a", b" \t "]),
             (&OctetCounting, b"", &[]),
             (
                 &JsonConcat,
@@ -1397,7 +1393,7 @@ mod tests {
         let not_an_array = |found: &str| FramingError::NotAnArray(found.to_string());
         let eof = FramingError::UnexpectedEof;
         // (framing, unit, limits, error)
-        let cases: [(&dyn Framing, &[u8], DecodeLimits, FramingError); 21] = [
+        let cases: [(&dyn Framing, &[u8], DecodeLimits, FramingError); 20] = [
             (
                 &JsonArray,
                 br#"{"a":1}"#,
@@ -1452,7 +1448,6 @@ mod tests {
                 ANY,
                 FramingError::UnexpectedByte(8),
             ),
-            (&OctetCounting, b"10 <short", ANY, eof.clone()),
             (
                 &Ndjson,
                 b"1234",
@@ -1475,7 +1470,7 @@ mod tests {
     fn records_over_the_limit_are_reported_not_returned() {
         // (framing, unit, records, oversize)
         type Records = &'static [&'static [u8]];
-        let cases: [(&dyn Framing, &[u8], Records, Records); 6] = [
+        let cases: [(&dyn Framing, &[u8], Records, Records); 7] = [
             (
                 &Ndjson,
                 b"abc\n abcdef \nxy",
@@ -1489,6 +1484,8 @@ mod tests {
                 &[b"<ab", b"<x"],
                 &[b"<abcde"],
             ),
+            // A frame over the limit the end of input cut short reports as oversize.
+            (&OctetCounting, b"2 <x6 <ab", &[b"<x"], &[b"<ab"]),
             // A count over max_frame_bytes reads as an LF line, and counting resumes after it.
             (
                 &OctetCounting,
@@ -1538,7 +1535,7 @@ mod tests {
             (Arc::new(Lf), b"ab\r\n\ncdefghij\n\nk"),
             (
                 Arc::new(OctetCounting),
-                b"2 <a6 <abcde\n20 <abcdefghi\n1 <<5>lf\n3 ab\n0 x\n4 <1>a",
+                b"2 <a6 <abcde\n20 <abcdefghi\n1 <<5>lf\n3 ab\n0 x\n4 <1>a6 <ab",
             ),
         ];
         for (framing, unit) in cases {
@@ -1549,7 +1546,7 @@ mod tests {
                     .iter()
                     .map(|record| Frame::Record(record.to_vec()))
                     .chain(whole.oversize.iter().map(|record| Frame::Oversize {
-                        head: record[..4].to_vec(),
+                        head: record[..record.len().min(4)].to_vec(),
                         len: 0,
                     }))
                     .collect(),
@@ -1589,11 +1586,22 @@ mod tests {
         );
         assert_eq!(lines.taken(), 4);
 
+        // At the end of input a cut oversize frame reports, and a cut frame
+        // within the limit is dropped, its bytes counted as taken.
         let mut counted = StreamDecoder::new(Arc::new(OctetCounting), SMALL);
         counted.push(b"6 <ab");
         assert_eq!(counted.next_frame(), Ok(None));
         counted.finish();
-        assert_eq!(counted.next_frame(), Err(FramingError::UnexpectedEof));
+        let head = b"<ab".to_vec();
+        assert_eq!(
+            counted.next_frame(),
+            Ok(Some(Frame::Oversize { head, len: 5 }))
+        );
+        let mut cut = StreamDecoder::new(Arc::new(OctetCounting), ANY);
+        cut.push(b"10 <short");
+        assert_eq!(cut.next_frame(), Ok(None));
+        cut.finish();
+        assert_eq!((cut.next_frame(), cut.taken()), (Ok(None), 9));
 
         // A space at the end of what arrived waits for the byte after it.
         let mut split = StreamDecoder::new(Arc::new(OctetCounting), ANY);
@@ -1611,7 +1619,7 @@ mod tests {
         split.finish();
         assert_eq!(
             split.next_frame(),
-            record(b"4 "),
+            record(b"4"),
             "the input ended after the space"
         );
 

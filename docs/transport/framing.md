@@ -32,6 +32,8 @@ Appends means two units back to back decode as the records of both, so a file ca
 
 `octet_counting` is for syslog. A frame is counted only when it is a count starting 1 to 9, one space, then the `<` of the PRI. Anything else is an LF line, so one stream can carry both, and a line such as `2026 Oct 11 ...` never swallows what follows it. A space at the end of the input so far waits for the next byte, and at the end of input it is a line.
 
+At the end of input `octet_counting` drops a counted frame cut short, or reports it as oversize when its count is over `max_record_bytes`. A last line with no `\n` loses its ASCII whitespace and is dropped when nothing is left. `lf` keeps a last line as it keeps every other, spaces and all, which is what the pipe transport reads at EOF.
+
 A framing that streams decodes a byte stream as it arrives:
 
 ```rust
