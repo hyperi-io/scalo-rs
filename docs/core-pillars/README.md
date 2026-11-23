@@ -11,6 +11,7 @@ would otherwise write, identically, and get subtly wrong.
 | Doc | Covers |
 | --- | --- |
 | [config.md](config.md) | 7-layer cascade, hot-reload, section registry, `/config` endpoint |
+| [managed-config.md](managed-config.md) | Opt-in Group Policy and MDM config layer |
 | [logging.md](logging.md) | tracing setup, JSON/text autodetect, field masking, flood control |
 | [metrics.md](metrics.md) | Prometheus exporter, manifest catalogue, transport throughput, OTel mode |
 | [tracing.md](tracing.md) | OTel, W3C traceparent, transport propagation |

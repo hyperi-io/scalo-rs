@@ -86,6 +86,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Data plane | [kafka-path.md](kafka-path.md) | The three batch sizes, sizing profiles and librdkafka names, how the byte budget moves, the partition-limited diagnostic |
 | Core pillars | [core-pillars/README.md](core-pillars/README.md) | Section landing |
 | Core pillars | [core-pillars/config.md](core-pillars/config.md) | 7-layer cascade, hot-reload, registry, `/config` endpoint |
+| Core pillars | [core-pillars/managed-config.md](core-pillars/managed-config.md) | Opt-in Group Policy and MDM layer, after the files and before env vars |
 | Core pillars | [core-pillars/logging.md](core-pillars/logging.md) | tracing setup, JSON/text autodetect, masking, flood control |
 | Core pillars | [core-pillars/metrics.md](core-pillars/metrics.md) | Prometheus, the manifest, transport throughput, OTel mode |
 | Core pillars | [core-pillars/tracing.md](core-pillars/tracing.md) | OTel, W3C traceparent, transport propagation |

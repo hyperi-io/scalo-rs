@@ -56,7 +56,7 @@ default = ["config", "logger"]
 health = []
 shutdown = ["tokio", "tokio-util", "tracing"]
 runtime = ["dirs"]
-config = ["figment", "dotenvy", "yaml", "serde_json", "dirs", "tracing"]
+config = ["figment", "dotenvy", "yaml", "serde_json", "dirs", "tracing", "dep:windows-registry", "dep:plist"]
 
 yaml = ["dep:serde-saphyr", "dep:serde_ignored", "serde_json"]
 logger = ["tracing", "tracing-subscriber", "owo-colors", "serde_json", "tracing-throttle"]
@@ -343,6 +343,13 @@ rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["cmake-build", "ssl-vendored", "zstd", "libz", "tokio"], optional = true }
+# Reads MDM managed preferences for the managed config layer.
+plist = { version = ">=1.10.3, <2", default-features = false, optional = true }
+
+# Reads Group Policy for the managed config layer. Held below 0.7, as hyper-util's
+# `client-proxy-system` holds it, so a consumer's Windows build compiles one copy.
+[target.'cfg(windows)'.dependencies]
+windows-registry = { version = ">=0.6.1, <0.7", optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = ">=0.14.9, <0.15", optional = true }

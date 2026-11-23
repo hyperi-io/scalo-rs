@@ -18,7 +18,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::flat_env::{ApplyFlatEnv, Normalize};
-use super::{Config, ConfigError, ConfigOptions, setup};
+use super::managed::{self, ManagedLayer, ManagedSource};
+use super::{CONFIG, Config, ConfigError, ConfigOptions};
 use crate::yaml::{self, Profile};
 
 /// Load an app's config struct.
@@ -60,29 +61,78 @@ pub fn load_typed<T>(path: Option<&str>, env_prefix: &str) -> Result<T, ConfigEr
 where
     T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
 {
+    load(path, env_prefix, None)
+}
+
+/// [`load_typed`], with the store `managed` names merged after the file and
+/// before env vars, in `T` and in the global cascade. Call it again to reread
+/// the store on a reload. A key set there round-trips `T` as step 1 does.
+///
+/// # Errors
+///
+/// As [`load_typed`], plus [`ConfigError::InvalidValue`] when the store holds
+/// a secret and [`ConfigError::LoadError`] when it can't be read.
+pub fn load_typed_managed<T>(
+    path: Option<&str>,
+    env_prefix: &str,
+    managed: &ManagedSource,
+) -> Result<T, ConfigError>
+where
+    T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
+    load(path, env_prefix, Some(managed))
+}
+
+fn load<T>(
+    path: Option<&str>,
+    env_prefix: &str,
+    source: Option<&ManagedSource>,
+) -> Result<T, ConfigError>
+where
+    T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
     let options = ConfigOptions {
         env_prefix: env_prefix.to_string(),
         config_paths: path.map(PathBuf::from).into_iter().collect(),
         search_standard_paths: path.is_none(),
         load_dotenv: path.is_none(),
+        managed: source.cloned(),
         ..ConfigOptions::default()
     };
     // The file is read first so its errors are `Yaml`, located, before the
     // cascade refuses the same file.
     let from_file: Option<T> = path.map(|path| read_file(Path::new(path))).transpose()?;
-    match setup(options.clone()) {
-        Ok(()) | Err(ConfigError::AlreadyInitialised) => {}
-        Err(e) => return Err(e),
-    }
-
-    let mut config: T = match from_file {
-        Some(config) => config,
-        None => Config::new(options)?.unmarshal()?,
+    let layer = managed::read(source)?;
+    let cascade = Config::build(options, layer.as_ref())?;
+    let read = match from_file {
+        Some(config) => overlay(config, layer.as_ref()),
+        None => cascade.unmarshal(),
     };
+    // The first cascade set up is kept, so a reload leaves it in place.
+    let _ = CONFIG.set(cascade);
+
+    let mut config: T = read?;
     merge_nested_env(&mut config, env_prefix)?;
     config.apply_flat_env(env_prefix);
     config.normalize();
     Ok(config)
+}
+
+/// Merge the managed layer onto `config`, read from its file.
+fn overlay<T>(config: T, layer: Option<&ManagedLayer>) -> Result<T, ConfigError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let Some(layer) = layer.filter(|layer| !layer.is_empty()) else {
+        return Ok(config);
+    };
+    // Secrets serialise as the mask outside an expose window.
+    let merged = crate::sensitive::expose_during(|| {
+        Figment::from(Serialized::defaults(&config))
+            .merge(layer)
+            .extract::<T>()
+    })?;
+    Ok(merged)
 }
 
 /// Parse the named file into `T`, logging the keys it skipped and the lints.
@@ -111,14 +161,20 @@ fn read_file<T: DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
 /// Notes [`load_typed`] made before any subscriber existed, for [`log_deferred`].
 static HELD: Mutex<Vec<FileNote>> = Mutex::new(Vec::new());
 
-/// A log line about the config file [`load_typed`] read.
-enum FileNote {
+/// A log line about a config source read, perhaps before logging is set up.
+pub(super) enum FileNote {
     /// A nested key no field took.
     UnknownKey { key: String, path: String },
     /// A top-level key no field took, which a runtime section may read.
     RuntimeKey { key: String, path: String },
     /// A lint the parse raised.
     Lint { path: String, lint: yaml::Lint },
+    /// The managed layer was read.
+    ManagedRead { source: String, keys: usize },
+    /// A key the managed layer set. Its value is never logged.
+    ManagedKey { source: String, key: String },
+    /// A managed value or store skipped.
+    ManagedSkipped { source: String, detail: String },
 }
 
 impl FileNote {
@@ -143,11 +199,20 @@ impl FileNote {
                     lint.message
                 );
             }
+            Self::ManagedRead { source, keys } => {
+                tracing::info!(source, keys, "managed config layer read");
+            }
+            Self::ManagedKey { source, key } => {
+                tracing::debug!(source, key, "managed config key set");
+            }
+            Self::ManagedSkipped { source, detail } => {
+                tracing::warn!(source, "managed config skipped: {detail}");
+            }
         }
     }
 
     /// Log now when a subscriber exists, else hold the note for [`log_deferred`].
-    fn log_or_hold(self) {
+    pub(super) fn log_or_hold(self) {
         let subscribed = tracing::dispatcher::get_default(|current| {
             !current.is::<tracing::subscriber::NoSubscriber>()
         });
@@ -297,6 +362,19 @@ mod tests {
             panic!("expected a YAML error");
         };
         assert_eq!(err.line, Some(3));
+    }
+
+    /// The managed layer beats the named file key by key, and a secret from
+    /// the file survives the round trip.
+    #[test]
+    fn the_managed_layer_overlays_the_file() {
+        let (_dir, path) = file("name: from-file\nkafka:\n  brokers: [a]\n  password: hunter2\n");
+        let dict: figment::value::Dict = [("name".to_string(), "from-policy".into())].into();
+        let layer = ManagedLayer::new("test".into(), dict);
+        let app: App = overlay(read_file(Path::new(&path)).unwrap(), Some(&layer)).unwrap();
+        assert_eq!(app.name, "from-policy");
+        assert_eq!(app.kafka.brokers, ["a"]);
+        assert_eq!(app.kafka.password.expose(), "hunter2");
     }
 
     /// No `path` reads the cascade, nested env included.
