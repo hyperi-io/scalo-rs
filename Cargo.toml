@@ -37,7 +37,7 @@ features = [
     "http", "http-server",
     "transport", "transport-trace",
     "transport-memory", "transport-grpc", "transport-file",
-    "transport-pipe", "transport-http", "transport-kafka-config",
+    "transport-pipe", "transport-http", "transport-kafka-config", "transport-proxy",
     "directory-config",
     "secrets", "secrets-vault",
     "dlq", "dlq-http",
@@ -168,11 +168,13 @@ transport-kafka = ["transport-kafka-config", "rdkafka", "regex", "tokio-util"]
 transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
 # Shaped senders and delivery approaches for tests and benches: src/transport/test_support/mod.rs
 transport-test-support = ["transport", "memory", "tokio", "dep:futures-util"]
-transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util", "tls"]
+transport-grpc = ["transport", "transport-proxy", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util", "tls"]
 transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
-transport-http = ["transport", "http", "tls", "dep:flate2"]
+transport-http = ["transport", "transport-proxy", "http", "tls", "dep:flate2"]
+# One egress proxy setting for the stream transports: src/transport/proxy.rs
+transport-proxy = ["transport", "tokio", "dep:http", "dep:hyper-util", "hyper-util/client-proxy", "dep:system-configuration", "dep:windows", "windows/Win32_Networking_WinHttp"]
 transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http"]
 
 secrets = ["tokio", "tokio-util", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2"]
@@ -279,6 +281,8 @@ prost-types = { version = ">=0.14.4, <0.15", optional = true }
 tokio-stream = { version = ">=0.1.19, <0.2", features = ["net"], optional = true }
 # Endpoint::connect_with_connector_lazy takes it, so the connect timeout covers the TLS handshake.
 hyper-util = { version = ">=0.1.21, <0.2", features = ["client-legacy", "tokio"], optional = true }
+# The `Uri` the proxy matcher and tonic's connector take. Already in the graph through hyper.
+http = { version = ">=1.4.0, <2", optional = true }
 
 ratatui = { version = ">=0.30.2, <0.32", optional = true }
 
@@ -348,13 +352,17 @@ rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["
 rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["cmake-build", "ssl-vendored", "zstd", "libz", "tokio"], optional = true }
 # Reads MDM managed preferences for the managed config layer.
 plist = { version = ">=1.10.3, <2", default-features = false, optional = true }
+# Reads the system proxy for `proxy: system`. Held to the 0.7 line hyper-util's
+# `client-proxy-system` takes, so a consumer's macOS build compiles one copy.
+system-configuration = { version = ">=0.7.0, <0.8", optional = true }
 
 # Reads Group Policy for the managed config layer. Held below 0.7, as hyper-util's
 # `client-proxy-system` holds it, so a consumer's Windows build compiles one copy.
 [target.'cfg(windows)'.dependencies]
 windows-registry = { version = ">=0.6.1, <0.7", optional = true }
-# The process working set for the memory guard. Held to the 0.62 line sysinfo
-# builds with these features, so `memory` compiles one copy.
+# The process working set for the memory guard, and the machine WinHTTP proxy for
+# `proxy: system`. Held to the 0.62 line sysinfo builds with these features, so
+# `memory` compiles one copy.
 windows = { version = ">=0.62.2, <0.63", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"], optional = true }
 
 [build-dependencies]
