@@ -291,6 +291,7 @@ mod tests {
                 ca_path: Some(PathBuf::from("/etc/tls/ca.pem")),
                 client_cert_path: Some(PathBuf::from("/etc/tls/client.pem")),
                 client_key_path: Some(PathBuf::from("/etc/tls/env.key")),
+                ..ClientTlsConfig::default()
             })
         );
         assert_eq!(config.filters_out.len(), 1);
@@ -310,6 +311,7 @@ mod tests {
             ca_path: Some(PathBuf::from("ca.pem")),
             client_cert_path: cert.map(PathBuf::from),
             client_key_path: key.map(PathBuf::from),
+            ..ClientTlsConfig::default()
         };
         // (case, config, url and client TLS, or the error text)
         let cases: Vec<(&str, OtlpConfig, Want)> = vec![

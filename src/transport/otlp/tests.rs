@@ -23,7 +23,7 @@ use tonic::Code;
 use tonic_types::{ErrorDetails, StatusExt as _};
 
 use super::{OtlpCompression, OtlpConfig, OtlpProtocol};
-use crate::tls::test_pki::TestCa;
+use crate::tls::test_pki::{Leaf, TestCa};
 use crate::tls::{ClientTlsConfig, TrustChoice};
 use crate::transport::filter::{FilterAction, FilterRule};
 use crate::transport::{
@@ -282,12 +282,16 @@ fn dead_letter_filter(config: &mut OtlpConfig) {
     }];
 }
 
-/// Mutual TLS, presenting the client certificate or not.
+/// Mutual TLS, presenting the client certificate or not, and with a pin on
+/// the collector's key, served by that key or by a leaf re-keyed under the
+/// same CA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tls {
     Off,
     WithIdentity,
     WithoutIdentity,
+    Pinned,
+    Rekeyed,
 }
 
 struct Case {
@@ -531,6 +535,26 @@ const CASES: &[Case] = &[
             "Backpressured",
         )
     },
+    Case {
+        tls: Tls::Pinned,
+        records: 0,
+        ..case(
+            "http pin on the collector's key",
+            HTTP,
+            Answer::Accept,
+            "Ok",
+        )
+    },
+    Case {
+        tls: Tls::Rekeyed,
+        records: 0,
+        ..case(
+            "http collector re-keyed off the pin",
+            HTTP,
+            Answer::Accept,
+            "Backpressured",
+        )
+    },
 ];
 
 /// Files for a client that trusts `ca` and presents a certificate from it.
@@ -557,8 +581,9 @@ fn client_files(ca: &TestCa) -> ClientFiles {
     }
 }
 
-/// The endpoint a case sends to, with the collector it starts.
-async fn endpoint(case: &Case, seen: &Shared, ca: &TestCa) -> String {
+/// The endpoint a case sends to, with the collector it starts. An HTTPS
+/// collector presents `pinned`, or a fresh leaf for [`Tls::Rekeyed`].
+async fn endpoint(case: &Case, seen: &Shared, ca: &TestCa, pinned: &Leaf) -> String {
     if matches!(case.answer, Answer::Down) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         return format!("http://{}", listener.local_addr().unwrap());
@@ -575,8 +600,15 @@ async fn endpoint(case: &Case, seen: &Shared, ca: &TestCa) -> String {
         (OtlpProtocol::Http, Tls::Off) => {
             format!("http://{}", http_collector(case.answer, shared).await)
         }
-        (OtlpProtocol::Http, _) => {
-            let addr = crate::tls::test_pki::mtls_ok_server(ca, &ca.server("otlp collector")).await;
+        (OtlpProtocol::Http, tls) => {
+            let rekeyed;
+            let leaf = if tls == Tls::Rekeyed {
+                rekeyed = ca.server("otlp collector");
+                &rekeyed
+            } else {
+                pinned
+            };
+            let addr = crate::tls::test_pki::mtls_ok_server(ca, leaf).await;
             format!("https://localhost:{}", addr.port())
         }
     }
@@ -588,10 +620,11 @@ async fn endpoint(case: &Case, seen: &Shared, ca: &TestCa) -> String {
 async fn each_collector_answer_maps_onto_a_send_result() {
     let ca = TestCa::new("otlp test CA");
     let files = client_files(&ca);
+    let pinned = ca.server("otlp collector");
     for case in CASES {
         let seen = Shared::default();
         let mut config = OtlpConfig {
-            endpoint: endpoint(case, &seen, &ca).await,
+            endpoint: endpoint(case, &seen, &ca, &pinned).await,
             protocol: case.protocol,
             service_name: Some("stub-test".to_string()),
             headers: [("x-tenant".to_string(), "blue".to_string())]
@@ -600,11 +633,14 @@ async fn each_collector_answer_maps_onto_a_send_result() {
             ..OtlpConfig::default()
         };
         if case.tls != Tls::Off {
+            let identity = case.tls != Tls::WithoutIdentity;
+            let pin = matches!(case.tls, Tls::Pinned | Tls::Rekeyed);
             config.tls = Some(ClientTlsConfig {
                 trust: TrustChoice::Bundle,
                 ca_path: Some(files.ca.clone()),
-                client_cert_path: (case.tls == Tls::WithIdentity).then(|| files.cert.clone()),
-                client_key_path: (case.tls == Tls::WithIdentity).then(|| files.key.clone()),
+                client_cert_path: identity.then(|| files.cert.clone()),
+                client_key_path: identity.then(|| files.key.clone()),
+                pin_sha256: pin.then(|| pinned.pin()).into_iter().collect(),
             });
         }
         (case.tweak)(&mut config);
