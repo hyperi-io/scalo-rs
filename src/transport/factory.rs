@@ -69,6 +69,9 @@ pub enum AnySender {
     #[cfg(feature = "transport-http")]
     Http(super::http::HttpTransport),
 
+    #[cfg(feature = "transport-syslog")]
+    Syslog(super::syslog::SyslogTransport),
+
     /// A sender the app wrote, built by a constructor registered with
     /// [`register_sender`](super::register_sender) or wrapped with
     /// [`AnySender::custom`].
@@ -92,6 +95,8 @@ macro_rules! each_sender {
             AnySender::File($t) => $body,
             #[cfg(feature = "transport-http")]
             AnySender::Http($t) => $body,
+            #[cfg(feature = "transport-syslog")]
+            AnySender::Syslog($t) => $body,
             AnySender::Custom($c) => $custom,
         }
     };
@@ -312,6 +317,17 @@ impl AnySender {
                     .ok_or_else(|| TransportError::Config("http config missing".into()))?;
                 let transport = super::http::HttpTransport::new(http_config).await?;
                 Ok(Self::Http(transport))
+            }
+
+            #[cfg(feature = "transport-syslog")]
+            TransportType::Syslog => {
+                let syslog_config = config
+                    .syslog
+                    .as_ref()
+                    .ok_or_else(|| TransportError::Config("syslog config missing".into()))?;
+                Ok(Self::Syslog(super::syslog::SyslogTransport::new(
+                    syslog_config,
+                )?))
             }
 
             TransportType::Custom(name) => {
@@ -1247,6 +1263,10 @@ impl AnyReceiver {
                 "transport type '{name}' is a custom type, and custom transports send only: \
                  use a built-in type to receive"
             ))),
+
+            TransportType::Syslog => Err(TransportError::Config(
+                "transport type 'syslog' sends only: use a built-in type to receive".into(),
+            )),
 
             // Built-in types whose feature is off.
             #[allow(unreachable_patterns)]
