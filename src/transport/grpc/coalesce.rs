@@ -435,9 +435,11 @@ async fn send_taken(
     let call = opentelemetry::context::FutureExt::with_context(call, context);
     let sent = call.await;
     drop(slot);
-    // A refusal for good may be one block's alone, and `ResourceExhausted` the
-    // joined request past a receiver's decode limit once decompressed.
-    let alone = sent.result.is_fatal() || sent.code == Some(tonic::Code::ResourceExhausted);
+    // A refusal, for good or of these records, may be one block's alone, and
+    // `ResourceExhausted` the joined request past a receiver's decode limit once decompressed.
+    let alone = sent.result.is_fatal()
+        || matches!(sent.result, SendResult::Reject(_))
+        || sent.code == Some(tonic::Code::ResourceExhausted);
     if several && alone {
         for reply in replies {
             let _ = reply.send(Joined::Alone);
