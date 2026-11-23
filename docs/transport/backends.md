@@ -174,6 +174,7 @@ transport:
 
 - Cancellation safety: `recv` reads from an internal mpsc, safe
   to drop. `send` is a single unary RPC -- drop cancels cleanly.
+- Joined calls: `send_batch` joins small blocks for one endpoint into one call by default ([grpc.md](grpc.md)).
 - Send deadline: `send_timeout_ms` (default 30 s, `0` for none) bounds the whole of each `send`, and of each request of a `send_batch`, DNS, connect and TLS handshake included, and a send past it is `Backpressured`. A dial whose DNS lookup, TCP connect or TLS handshake has not finished by nine tenths of the limit is abandoned, so the send that started it reports the failure and the next send dials afresh.
 - Send failures: `Unavailable`, `ResourceExhausted`, `DeadlineExceeded` (`send_timeout_ms`), `Cancelled` (a server cutting the RPC at its deadline), and a connection that fails before the server answers are `Backpressured`, so an absent, restarting or overrun receiver is waited out. Any other status the server returns is `Fatal`. A send answered `Unavailable` with the `scalo-hold-expired` trailer, or ended by `DeadlineExceeded` or `Cancelled`, may still be delivered by the receiver, so the retry can duplicate it: it counts in `transport_redelivered_total{reason="hold_expired"|"deadline"}`.
 - Dead connections: the client sends an HTTP/2 PING once a connection has read nothing for `send_timeout_ms` (30 s when it is `0`), and closes the connection when the PING goes unanswered for as long again. A receiver that stays connected but stops answering is dropped that way, and the next send dials afresh.
@@ -242,7 +243,7 @@ A `PushEvents` goes through the same intake as a native push: refused with `Unav
 
 Armed, a `PushEvents` is held like a native push, over the same registry, ceiling and hold budget, one entry per request: `OK` once its events are released, `Unavailable`, which Vector retries, when any was not delivered or the hold ran out. Metric events are skipped rather than queued, and a request that skipped any is released no better than `Dropped`. A request larger than `recv_buffer_size` that the receiver closes part-way is answered `Unavailable`, and the events queued still release.
 
-`VectorCompatClient` (the sending side) connects in plaintext through `connect_lazy` and `connect_lazy_within`, and an `https` endpoint there fails on the first RPC. `connect_lazy_tls(endpoint, send_timeout_ms, &VectorCompatTls)` connects over TLS instead, with the settings the caller owns: `native_roots` (the OS root store, on by default), `extra_roots` (PEM files trusted beside it), `exclusive` (trust only `extra_roots`), `domain` (the name to verify and send as SNI) and `client_cert` with `client_key` for mutual TLS. `VectorCompatTls::private_ca(path)` pins one private CA. The endpoint must be `https://`, and each file is read when the client is built, so a missing file, a file that is not PEM, no trusted root or a certificate without its key fails the call and not the first RPC. A PEM block that is not a certificate rustls can use as a root passes that check and fails each handshake. An OS store with no certificate is left out when `extra_roots` is set, and is an error when it is the only root. The settings take the roots vocabulary of `TlsTrust` and the name and identity fields of `GrpcConfig`, mapped onto tonic's TLS as `GrpcTransport` does, so they need no `tls` feature. A dial whose DNS lookup or TCP connect is unfinished at nine tenths of the gRPC transport's default `send_timeout_ms` (30 s) is abandoned, so the call that started it returns an error and the next call dials afresh. `health_check`, a short probe, gives up at the full 30 s. `send_events` has no limit once connected: a Vector source with acknowledgements on holds `PushEvents` open until its own sink has delivered, and cutting that off to retry would push the same events twice. The client sends an HTTP/2 PING once a connection has read nothing for 30 s and closes the connection when the PING goes unanswered for 30 s more, so a send to a peer that stays connected but stops answering returns an error, and the next call dials afresh. A peer that holds the RPC and still answers the PING is waited on. `VectorCompatClient::connect_lazy_within(endpoint, send_timeout_ms)` sets that limit instead of 30 s, for the dial, the health check and the PING alike (0 = none, with the PING at 30 s). A transform that holds its own source's answer sets it below that hold, so a stalled dial fails while the source can still answer its sender.
+`VectorCompatClient` (the sending side) connects in plaintext through `connect_lazy` and `connect_lazy_within`, and an `https` endpoint there fails on the first RPC. `connect_lazy_tls(endpoint, send_timeout_ms, &VectorCompatTls)` connects over TLS instead, with the settings the caller owns: `native_roots` (the OS root store, on by default), `extra_roots` (PEM files trusted beside it), `exclusive` (trust only `extra_roots`), `domain` (the name to verify and send as SNI) and `client_cert` with `client_key` for mutual TLS. `VectorCompatTls::private_ca(path)` pins one private CA. The endpoint must be `https://`, and each file is read when the client is built, so a missing file, a file that is not PEM, no trusted root or a certificate without its key fails the call and not the first RPC. A PEM block that is not a certificate rustls can use as a root passes that check and fails each handshake. An OS store with no certificate is left out when `extra_roots` is set, and is an error when it is the only root. The settings take the roots vocabulary of `TlsTrust` and the name and identity fields of `GrpcConfig`, mapped onto tonic's TLS by `scalo::tls` as for `GrpcTransport`. A dial whose DNS lookup or TCP connect is unfinished at nine tenths of the gRPC transport's default `send_timeout_ms` (30 s) is abandoned, so the call that started it returns an error and the next call dials afresh. `health_check`, a short probe, gives up at the full 30 s. `send_events` has no limit once connected: a Vector source with acknowledgements on holds `PushEvents` open until its own sink has delivered, and cutting that off to retry would push the same events twice. The client sends an HTTP/2 PING once a connection has read nothing for 30 s and closes the connection when the PING goes unanswered for 30 s more, so a send to a peer that stays connected but stops answering returns an error, and the next call dials afresh. A peer that holds the RPC and still answers the PING is waited on. `VectorCompatClient::connect_lazy_within(endpoint, send_timeout_ms)` sets that limit instead of 30 s, for the dial, the health check and the PING alike (0 = none, with the PING at 30 s). A transform that holds its own source's answer sets it below that hold, so a stalled dial fails while the source can still answer its sender.
 
 `send_events` fails with `TransportError::Send`, which does not say whether a resend can succeed. `send_events_status` fails with the gRPC status instead, and `VectorCompatClient::is_permanent_rejection(&status)` names the refusals no resend clears:
 
@@ -307,6 +308,7 @@ offset commits with the block.
 transport:
   output:
     type: file
+    delivery: flush
     file:
       path: "/var/log/myapp/events.ndjson"
       append: true
@@ -319,6 +321,7 @@ transport:
   byte of a line read across dropped calls.
 - Line bytes: passed through as read, so a line need not be UTF-8.
 - `is_healthy()`: `!closed` atomic flag.
+- Delivery guarantee: `Written`, so a factory-built sender needs `delivery: flush` ([custom.md](custom.md#delivery-guarantee)).
 - Acknowledgements: not held. `commit` and `release` save the highest offset they are given, so a restart reads again from the last position released, but a block released `Errored` is skipped once a later block is delivered. `<key>.file.acknowledgements` has no effect, and the factory warns once.
 
 Source: [../../src/transport/file.rs](../../src/transport/file.rs).
@@ -336,6 +339,7 @@ no-op because stdin is forward-only.
 transport:
   output:
     type: pipe
+    delivery: flush
     pipe:
       recv_timeout_ms: 100
 ```
@@ -346,6 +350,7 @@ transport:
   returns them.
 - Line bytes: passed through as read, so a line need not be UTF-8.
 - `is_healthy()`: `!closed`, and `false` when its filters failed to build.
+- Delivery guarantee: `Written`, so a factory-built sender needs `delivery: flush`.
 - Acknowledgements: none to hold. `<key>.pipe.acknowledgements` has no effect, and the factory warns once.
 
 Source: [../../src/transport/pipe.rs](../../src/transport/pipe.rs).
@@ -375,6 +380,7 @@ transport:
 
 - Admission: a POST is checked before its body is read. A held governor answers 503, then the request reserves its declared `Content-Length` (or `max_body_bytes` without one) from `max_in_flight_bytes`, and answers 503 with `Retry-After: 1` when that does not fit. The bytes stay reserved while the record is queued and come back as `recv` hands it over, so bodies read and queued never exceed `max_in_flight_bytes`. A declared length over `max_body_bytes` is 413 at once. `max_in_flight_bytes` below `max_body_bytes` is refused at construction.
 
+- Client TLS: the `tls_*` keys ([../api/tls.md](../api/tls.md#client-trust)). None set keeps `reqwest`'s OS verifier, and `tls_trust` unset means `native`.
 - Cancellation safety: send is `reqwest`'s async path -- drop
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.

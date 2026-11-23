@@ -567,7 +567,8 @@ impl SecretsManager {
         let manager = Arc::clone(self);
         Some(tokio::spawn(async move {
             loop {
-                let Some(wait) = refresh_wait(interval, jitter, clock_seed()) else {
+                let Some(wait) = refresh_wait(interval, jitter, crate::backoff::clock_seed())
+                else {
                     return;
                 };
                 tokio::select! {
@@ -664,13 +665,6 @@ fn refresh_wait(interval: Duration, jitter: Duration, seed: u64) -> Option<Durat
     let span = u64::try_from(jitter.as_millis()).unwrap_or(u64::MAX);
     let extra = seed % span.saturating_add(1);
     Some(interval.saturating_add(Duration::from_millis(extra)))
-}
-
-/// Sub-second clock nanoseconds: replicas only need different offsets.
-fn clock_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()))
 }
 
 /// Cache statistics.

@@ -126,14 +126,11 @@ pub mod parse_guard;
 #[cfg(any(feature = "expression", feature = "transport"))]
 pub(crate) mod cel_lexer;
 
-// Retry backoff, compiled only with a feature that retries.
-#[cfg(any(
-    feature = "otel-metrics",
-    feature = "otel-tracing",
-    feature = "transport-kafka",
-    all(feature = "worker-batch", feature = "transport")
-))]
-pub(crate) mod backoff;
+// Retry backoff with jitter and Retry-After hints, std only.
+pub mod backoff;
+
+// Constructors registered by config type name.
+pub mod registry;
 
 #[cfg(feature = "runtime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]

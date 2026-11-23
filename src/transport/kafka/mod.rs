@@ -75,10 +75,11 @@ use metrics::Rebalanced;
 use super::ack::{
     AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
 };
+use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::finalizer::DeliveryStatus;
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
-use super::types::{Message, PayloadFormat, SendResult};
+use super::types::{BlockOutcome, Message, PayloadFormat, SendResult};
 use super::work_batch::{Record, WorkBatch};
 use crate::backoff::Backoff;
 use rdkafka::config::ClientConfig;
@@ -167,8 +168,8 @@ fn produce_record<'a>(
     }
 }
 
-/// Fold per-record results into the block's result: the first `Backpressured`
-/// or `Fatal` in record order, else `Ok`.
+/// Fold per-record results into the block's result: the first result in
+/// record order that is neither `Ok` nor `FilteredDlq`, else `Ok`.
 ///
 /// `Ok` (sent or dropped by a filter) and `FilteredDlq` are handled records, so
 /// they never fail the block. Any other result means at least one record is
@@ -176,18 +177,25 @@ fn produce_record<'a>(
 /// handled block with a `FilteredDlq` in it answers `FilteredDlq`, as the
 /// trait's `send_batch` does.
 fn block_result(results: Vec<SendResult>) -> SendResult {
-    let mut dead_lettered = false;
+    let mut outcome = BlockOutcome::default();
     for result in results {
-        match result {
-            SendResult::Ok => {}
-            SendResult::FilteredDlq => dead_lettered = true,
-            failed @ (SendResult::Backpressured | SendResult::Fatal(_)) => return failed,
+        if let Some(failed) = outcome.add(result) {
+            return failed;
         }
     }
-    if dead_lettered {
-        SendResult::FilteredDlq
+    outcome.finish()
+}
+
+/// What a send's `Ok` proves under the producer's `acks`, set by either name:
+/// nothing at `acks=0`, the broker's acknowledgement otherwise.
+fn producer_guarantee(producer_config: &ClientConfig) -> DeliveryGuarantee {
+    let acks = producer_config
+        .get("acks")
+        .or_else(|| producer_config.get("request.required.acks"));
+    if acks.is_some_and(|v| v.trim() == "0") {
+        DeliveryGuarantee::FireAndForget
     } else {
-        SendResult::Ok
+        DeliveryGuarantee::Acknowledged
     }
 }
 
@@ -416,6 +424,8 @@ pub struct KafkaTransport {
     acks: acks::KafkaAcks,
     /// The producer's `message.max.bytes`, for screening records before a send.
     message_max_bytes: usize,
+    /// What a send's `Ok` proves under the producer's `acks`.
+    delivery: DeliveryGuarantee,
     /// Most records one receive returns, whatever the caller asks for.
     /// `sizing.consumer.max_poll_records`, or its profile's default.
     poll_cap: usize,
@@ -677,19 +687,7 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
         client_config.set("sasl.password", password.expose());
     }
 
-    // TLS.
-    if let Some(ref ca) = config.ssl_ca_location {
-        client_config.set("ssl.ca.location", ca);
-    }
-    if let Some(ref cert) = config.ssl_certificate_location {
-        client_config.set("ssl.certificate.location", cert);
-    }
-    if let Some(ref key) = config.ssl_key_location {
-        client_config.set("ssl.key.location", key);
-    }
-    if config.ssl_skip_verify {
-        client_config.set("enable.ssl.certificate.verification", "false");
-    }
+    set_tls(&mut client_config, config);
 
     client_config.set("client.id", &config.client_id);
     // Fetch-from-follower (KIP-392): with a rack set, the consumer reads
@@ -753,6 +751,21 @@ pub fn producer_client_config(
     if let Some(ref password) = config.sasl_password {
         client_config.set("sasl.password", password.expose());
     }
+    set_tls(&mut client_config, config);
+    // librdkafka's producer default is `true`. Set before the layers, so a raw override wins.
+    client_config.set(
+        "allow.auto.create.topics",
+        config.allow_auto_create_topics.to_string(),
+    );
+    apply_layer(&mut client_config, profile_defaults);
+    let settings = config.resolved_producer_settings();
+    apply_layer(&mut client_config, &raw_layer(&settings));
+    set_default_ca(&mut client_config);
+    client_config
+}
+
+/// Set librdkafka's TLS properties from the `ssl_*` fields of `config`.
+pub(super) fn set_tls(client_config: &mut ClientConfig, config: &KafkaConfig) {
     if let Some(ref ca) = config.ssl_ca_location {
         client_config.set("ssl.ca.location", ca);
     }
@@ -765,16 +778,6 @@ pub fn producer_client_config(
     if config.ssl_skip_verify {
         client_config.set("enable.ssl.certificate.verification", "false");
     }
-    // librdkafka's producer default is `true`. Set before the layers, so a raw override wins.
-    client_config.set(
-        "allow.auto.create.topics",
-        config.allow_auto_create_topics.to_string(),
-    );
-    apply_layer(&mut client_config, profile_defaults);
-    let settings = config.resolved_producer_settings();
-    apply_layer(&mut client_config, &raw_layer(&settings));
-    set_default_ca(&mut client_config);
-    client_config
 }
 
 /// With TLS on and no CA named, trust what [`default_ca_location`] picks. A
@@ -1388,6 +1391,7 @@ impl KafkaTransport {
         }
 
         let producer_config = transport_producer_config(config);
+        let delivery = producer_guarantee(&producer_config);
         let message_max_bytes = producer_config
             .get("message.max.bytes")
             .and_then(|v| v.parse::<usize>().ok())
@@ -1516,6 +1520,7 @@ impl KafkaTransport {
             asked_ends: AskedEnds::new(consumer_config.as_ref()),
             acks: acks::KafkaAcks::default(),
             message_max_bytes,
+            delivery,
             poll_cap: config.sizing.effective_poll_cap(),
         })
     }
@@ -2248,6 +2253,10 @@ impl TransportBase for KafkaTransport {
 
     fn name(&self) -> &'static str {
         "kafka"
+    }
+
+    fn delivery_guarantee(&self) -> DeliveryGuarantee {
+        self.delivery
     }
 }
 
@@ -4797,6 +4806,78 @@ mod tests {
         assert_eq!(librdkafka_resolves(&built, "request.required.acks"), "1");
     }
 
+    /// `acks=0` by either name is fire-and-forget, any other setting the
+    /// broker's acknowledgement.
+    #[test]
+    fn the_guarantee_follows_the_producer_acks() {
+        // (case, key, value, guarantee)
+        let cases = [
+            ("default", None, "", DeliveryGuarantee::Acknowledged),
+            (
+                "acks 0",
+                Some("acks"),
+                "0",
+                DeliveryGuarantee::FireAndForget,
+            ),
+            (
+                "alias 0",
+                Some("request.required.acks"),
+                "0",
+                DeliveryGuarantee::FireAndForget,
+            ),
+            ("acks 1", Some("acks"), "1", DeliveryGuarantee::Acknowledged),
+            (
+                "acks all",
+                Some("acks"),
+                "all",
+                DeliveryGuarantee::Acknowledged,
+            ),
+            (
+                "acks -1",
+                Some("acks"),
+                "-1",
+                DeliveryGuarantee::Acknowledged,
+            ),
+        ];
+        for (case, key, value, guarantee) in cases {
+            let mut config = KafkaConfig::default();
+            config.sizing.producer.idempotence = Some(false);
+            if let Some(key) = key {
+                config
+                    .librdkafka_overrides
+                    .insert(key.to_string(), value.to_string());
+            }
+            let built = transport_producer_config(&config);
+            assert_eq!(producer_guarantee(&built), guarantee, "{case}");
+        }
+    }
+
+    /// A sender with `acks=0` is refused under the default `delivery`, naming
+    /// the value that accepts it, and built under `delivery: none`.
+    #[tokio::test]
+    async fn the_factory_refuses_an_acks_zero_sender_unless_delivery_is_none() {
+        let mut kafka = KafkaConfig::for_testing("localhost:9092", "acks-zero", Vec::new());
+        kafka.sizing.producer.idempotence = Some(false);
+        kafka
+            .librdkafka_overrides
+            .insert("acks".to_string(), "0".to_string());
+        let mut config = crate::transport::TransportConfig {
+            transport_type: crate::transport::TransportType::Kafka,
+            kafka: Some(kafka),
+            ..Default::default()
+        };
+        let refused = crate::transport::AnySender::from_transport_config(&config).await;
+        assert!(
+            matches!(&refused, Err(TransportError::Config(m)) if m.contains("set delivery: none")),
+            "acks=0 under delivery: ack"
+        );
+        config.delivery = crate::transport::DeliveryRequirement::None;
+        let built = crate::transport::AnySender::from_transport_config(&config)
+            .await
+            .expect("delivery: none accepts fire-and-forget");
+        assert_eq!(built.delivery_guarantee(), DeliveryGuarantee::FireAndForget);
+    }
+
     // =========================================================================
     // Consumer config: one property under two librdkafka names
     // =========================================================================
@@ -5215,8 +5296,14 @@ mod tests {
             );
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        // The generation advances before the rebuilt producer is swapped in.
+        let swapped = || {
+            transport.current_producer().expect("a producer").generation
+                == transport.auth.producer_auth().generation()
+        };
         while transport.auth.producer_auth().generation() == 0
             || transport.auth.consumer_auth().generation() == 0
+            || !swapped()
         {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -5276,7 +5363,12 @@ mod tests {
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while roles().iter().any(|role| role.generation() == 0) {
+        // The generation advances before the rebuilt producer is swapped in.
+        let swapped = || {
+            transport.current_producer().expect("a producer").generation
+                == transport.auth.producer_auth().generation()
+        };
+        while roles().iter().any(|role| role.generation() == 0) || !swapped() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "no rebuild after the grace and one backoff"

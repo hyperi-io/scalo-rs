@@ -84,9 +84,7 @@ async fn fan_out<S: TransportSender>(
         match result {
             SendResult::Ok => {}
             SendResult::FilteredDlq => outcome = Outcome::DeadLettered,
-            SendResult::Backpressured | SendResult::Fatal(_) => {
-                return Outcome::from_send(&result);
-            }
+            _ => return Outcome::from_send(&result),
         }
     }
     outcome

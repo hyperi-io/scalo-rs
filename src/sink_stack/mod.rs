@@ -51,6 +51,12 @@
 //! - Retry re-sends the WHOLE batch on a transient failure (records are held
 //!   behind an `Arc`, so a retry is a refcount bump, not a copy).
 //! - A fatal error stops immediately (no point retrying a permanent failure).
+//! - A `RetryAfter` is retried after the wait the destination named, capped at
+//!   `max_backoff_ms`, in place of the schedule's own wait. It never adds an
+//!   attempt beyond `max_retries`.
+//! - A `Reject` is never retried. A rejected single record is dead-lettered,
+//!   and a rejected batch is sent again one record at a time to find the ones
+//!   refused, as a `FilteredDlq` batch is.
 //! - Records the sender would or did dead-letter come back in
 //!   [`SinkOutcome::dead_letters`], never counted as sent. The caller writes
 //!   them to its DLQ and fires its commit tokens only on [`SendResult::Ok`]. Retries
@@ -124,13 +130,20 @@ pub enum SinkError {
     /// batch. Retrying refuses the same record again.
     #[error("sink dead-lettered a record of the batch")]
     DeadLetter,
+    /// The destination is busy and named the wait before the next attempt.
+    #[error("sink asked for a retry after {0:?}")]
+    RetryAfter(Duration),
+    /// The destination refused the batch for good. Retrying refuses it again.
+    #[error("sink rejected the batch: {0}")]
+    Rejected(TransportError),
 }
 
 /// What a send through the stack did with a block.
 #[derive(Debug)]
 #[must_use = "route the dead letters to a DLQ before committing"]
 pub struct SinkOutcome {
-    /// The result for the records sent: `Ok`, `Backpressured` or `Fatal`.
+    /// The result for the records sent: `Ok`, `Backpressured`, `RetryAfter`
+    /// or `Fatal`.
     pub result: SendResult,
     /// Records the sender would or did dead-letter, never sent. On `Ok` the
     /// caller writes them to its DLQ before it commits. On any other result
@@ -207,6 +220,8 @@ where
                 SendResult::Ok => Ok(()),
                 SendResult::FilteredDlq => Err(SinkError::DeadLetter),
                 SendResult::Backpressured => Err(SinkError::Transient),
+                SendResult::RetryAfter(wait) => Err(SinkError::RetryAfter(wait)),
+                SendResult::Reject(e) => Err(SinkError::Rejected(e)),
                 SendResult::Fatal(e) => Err(SinkError::Fatal(e)),
             }
         })
@@ -291,6 +306,7 @@ pub struct SinkStack {
     svc: BoxCloneService<SinkBatch, (), BoxError>,
     screen: Screen,
     backoff: ExponentialBuilder,
+    max_backoff: Duration,
     max_retries: usize,
 }
 
@@ -353,6 +369,7 @@ impl SinkStack {
             svc,
             screen,
             backoff: cfg.backoff(),
+            max_backoff: Duration::from_millis(cfg.max_backoff_ms),
             max_retries: cfg.max_retries,
         }
     }
@@ -380,11 +397,20 @@ impl SinkStack {
         }
         let batch = SinkBatch::new(kept);
         let result = self.deliver(batch.clone()).await;
-        if !result.is_filtered_dlq() {
-            return SinkOutcome {
-                result,
-                dead_letters,
-            };
+        let refused = match result {
+            SendResult::FilteredDlq => None,
+            SendResult::Reject(e) => Some(e),
+            result => {
+                return SinkOutcome {
+                    result,
+                    dead_letters,
+                };
+            }
+        };
+        // A refused single record is already found: it is never sent again.
+        if let (Some(e), [record]) = (&refused, batch.0.as_slice()) {
+            reject(record.clone(), e, &mut dead_letters);
+            return SinkOutcome::ok(dead_letters);
         }
         // Resending repeats the records already sent: duplicates, never loss.
         for record in batch.0.iter().cloned() {
@@ -394,7 +420,8 @@ impl SinkStack {
                     record,
                     reason: DeadLetterReason::Rejected,
                 }),
-                failed @ (SendResult::Backpressured | SendResult::Fatal(_)) => {
+                SendResult::Reject(e) => reject(record, &e, &mut dead_letters),
+                failed => {
                     return SinkOutcome {
                         result: failed,
                         dead_letters,
@@ -417,11 +444,18 @@ impl SinkStack {
             async move { svc.ready().await?.call(batch).await }
         };
 
+        let max_wait = self.max_backoff;
         let result = attempt
             .retry(self.backoff.with_max_times(self.max_retries))
             .when(is_transient)
+            .adjust(move |e: &BoxError, candidate| {
+                crate::backoff::hinted_delay(asked_wait(e), candidate, max_wait)
+            })
             .sleep(tokio::time::sleep)
-            .notify(|_e: &BoxError, _d: Duration| record_retry())
+            .notify(|e: &BoxError, wait: Duration| {
+                tracing::debug!(error = %e, wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX), "sink stack retrying a batch");
+                record_retry();
+            })
             .await;
 
         match result {
@@ -561,14 +595,32 @@ where
     }
 }
 
-/// Whether a boxed stack error is transient (retryable). `SinkError::Fatal` and
-/// `SinkError::DeadLetter` are not. Timeout (`Elapsed`) and load-shed
-/// (`Overloaded`) are transient and worth another attempt.
+/// Whether a boxed stack error is transient (retryable). `SinkError::Fatal`,
+/// `SinkError::DeadLetter` and `SinkError::Rejected` are not. Timeout
+/// (`Elapsed`), load-shed (`Overloaded`) and `RetryAfter` are transient and
+/// worth another attempt.
 fn is_transient(e: &BoxError) -> bool {
     !matches!(
         e.downcast_ref::<SinkError>(),
-        Some(SinkError::Fatal(_) | SinkError::DeadLetter)
+        Some(SinkError::Fatal(_) | SinkError::DeadLetter | SinkError::Rejected(_))
     )
+}
+
+/// The wait the destination asked for, when the attempt ended on one.
+fn asked_wait(e: &BoxError) -> Option<Duration> {
+    match e.downcast_ref::<SinkError>() {
+        Some(SinkError::RetryAfter(wait)) => Some(*wait),
+        _ => None,
+    }
+}
+
+/// Dead-letter `record`, which the destination refused for good.
+fn reject(record: Record, e: &TransportError, dead_letters: &mut Vec<DeadLetter>) {
+    tracing::warn!(error = %e, bytes = record.payload.len(), "sink stack: the destination rejected a record; it goes to the DLQ");
+    dead_letters.push(DeadLetter {
+        record,
+        reason: DeadLetterReason::Rejected,
+    });
 }
 
 /// Map a terminal boxed error back to a [`SendResult`] for the caller's commit
@@ -582,6 +634,8 @@ fn classify_final(e: BoxError) -> SendResult {
             SinkError::Fatal(te) => SendResult::Fatal(te),
             SinkError::DeadLetter => SendResult::FilteredDlq,
             SinkError::Transient => SendResult::Backpressured,
+            SinkError::RetryAfter(wait) => SendResult::RetryAfter(wait),
+            SinkError::Rejected(te) => SendResult::Reject(te),
         },
         Err(_) => SendResult::Backpressured,
     }

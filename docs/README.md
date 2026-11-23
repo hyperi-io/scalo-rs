@@ -86,6 +86,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Data plane | [kafka-path.md](kafka-path.md) | The three batch sizes, sizing profiles and librdkafka names, how the byte budget moves, the partition-limited diagnostic |
 | Core pillars | [core-pillars/README.md](core-pillars/README.md) | Section landing |
 | Core pillars | [core-pillars/config.md](core-pillars/config.md) | 7-layer cascade, hot-reload, registry, `/config` endpoint |
+| Core pillars | [core-pillars/managed-config.md](core-pillars/managed-config.md) | Opt-in Group Policy and MDM layer, after the files and before env vars |
 | Core pillars | [core-pillars/logging.md](core-pillars/logging.md) | tracing setup, JSON/text autodetect, masking, flood control |
 | Core pillars | [core-pillars/metrics.md](core-pillars/metrics.md) | Prometheus, the manifest, transport throughput, OTel mode |
 | Core pillars | [core-pillars/tracing.md](core-pillars/tracing.md) | OTel, W3C traceparent, transport propagation |
@@ -98,9 +99,11 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Runtime | [runtime/memory.md](runtime/memory.md) | `MemoryGuard`, cgroup-aware backpressure |
 | Transport | [transport/README.md](transport/README.md) | Trait architecture, factory, `AnySender`, commit tokens |
 | Transport | [transport/backends.md](transport/backends.md) | Kafka, gRPC, Memory, File, Pipe, HTTP |
+| Transport | [transport/grpc.md](transport/grpc.md) | gRPC `send_batch` blocks joined into one call |
 | Transport | [transport/filter-engine.md](transport/filter-engine.md) | 3-tier filter (SIMD / compiled CEL / complex CEL) |
 | Transport | [transport/routing.md](transport/routing.md) | `RoutedSender`, the named sink set: routes, fan-out |
-| Transport | [transport/delivery-path.md](transport/delivery-path.md) | Inline delivery, the benched alternatives and their numbers, parked parallel fan-out |
+| Transport | [transport/delivery-path.md](transport/delivery-path.md) | Inline delivery, the gRPC fan-in buffer, the benched alternatives and their numbers, parked parallel fan-out |
+| Transport | [transport/custom.md](transport/custom.md) | Writing a custom sender, registering it by type name, the delivery guarantee |
 | Deployment | [deployment/README.md](deployment/README.md) | Section landing |
 | Deployment | [deployment/contract.md](deployment/contract.md) | `DeploymentContract` struct, schema versioning |
 | Deployment | [deployment/artefacts.md](deployment/artefacts.md) | Generated Dockerfile, container manifest, contract JSON |

@@ -98,19 +98,7 @@ pub(super) fn admin_client_config(config: &KafkaConfig) -> ClientConfig {
         client_config.set("sasl.password", password.expose());
     }
 
-    // TLS.
-    if let Some(ref ca) = config.ssl_ca_location {
-        client_config.set("ssl.ca.location", ca);
-    }
-    if let Some(ref cert) = config.ssl_certificate_location {
-        client_config.set("ssl.certificate.location", cert);
-    }
-    if let Some(ref key) = config.ssl_key_location {
-        client_config.set("ssl.key.location", key);
-    }
-    if config.ssl_skip_verify {
-        client_config.set("enable.ssl.certificate.verification", "false");
-    }
+    super::set_tls(&mut client_config, config);
 
     // Profile defaults and user overrides.
     let rdkafka_config = config.build_librdkafka_config();

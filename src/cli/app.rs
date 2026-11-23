@@ -111,6 +111,16 @@ pub trait ServiceApp: Sized {
     /// config. The default does nothing.
     fn on_config_loaded(&self, _config: &Self::Config) {}
 
+    /// The Group Policy or MDM store an administrator manages this service
+    /// through. [`run_app`] merges it into the cascade after the config files
+    /// and before env vars, and `load_config` reads it into `Self::Config` with
+    /// [`load_typed_managed`](crate::config::load_typed_managed). The default
+    /// is `None`, so nothing is read.
+    #[cfg(feature = "config")]
+    fn managed_source(&self) -> Option<crate::config::ManagedSource> {
+        None
+    }
+
     /// Does this configuration give the service work to do?
     ///
     /// The app's EMPTINESS PREDICATE, and nothing else: `load_config` still
@@ -472,7 +482,8 @@ fn init_logger_for_service(
 /// Set up the config cascade from the app's config file and env prefix.
 #[cfg(feature = "config")]
 fn setup_cascade<A: ServiceApp>(app: &A) -> Result<(), CliError> {
-    let options = app.common_args().to_config_options(app.env_prefix());
+    let mut options = app.common_args().to_config_options(app.env_prefix());
+    options.managed = app.managed_source();
     match crate::config::setup(options) {
         Ok(()) | Err(crate::config::ConfigError::AlreadyInitialised) => {}
         Err(e) => return Err(CliError::Config(e.to_string())),

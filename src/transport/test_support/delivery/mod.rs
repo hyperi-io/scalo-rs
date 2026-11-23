@@ -248,8 +248,8 @@ impl Outcome {
     pub fn from_send(result: &SendResult) -> Self {
         match result {
             SendResult::Ok => Self::Sent,
-            SendResult::FilteredDlq => Self::DeadLettered,
-            SendResult::Backpressured => Self::Backpressured,
+            SendResult::FilteredDlq | SendResult::Reject(_) => Self::DeadLettered,
+            SendResult::Backpressured | SendResult::RetryAfter(_) => Self::Backpressured,
             SendResult::Fatal(_) => Self::Failed,
         }
     }

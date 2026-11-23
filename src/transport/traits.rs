@@ -7,10 +7,11 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 use super::ack::{AckControl, DeadLetterReason, SinkConfirmation};
+use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::filter::FilteredDlqEntry;
 use super::finalizer::DeliveryStatus;
-use super::types::{Message, SendResult};
+use super::types::{BlockOutcome, Message, SendResult};
 use super::work_batch::{Record, WorkBatch};
 use std::fmt::{Debug, Display};
 use std::future::Future;
@@ -95,6 +96,14 @@ pub trait TransportBase: Send + Sync {
 
     /// Get transport name for logging/metrics.
     fn name(&self) -> &'static str;
+
+    /// What this transport's [`SendResult::Ok`] proves about delivery.
+    ///
+    /// Required, with no default, so a new backend states the guarantee it
+    /// keeps rather than inheriting one. The factory refuses to build a sender
+    /// below its config's `delivery` key (see [`DeliveryRequirement`](super::DeliveryRequirement)).
+    /// A receive-only transport states the guarantee of the senders it pairs with.
+    fn delivery_guarantee(&self) -> DeliveryGuarantee;
 
     /// Active boot-time health probe.
     ///
@@ -237,8 +246,9 @@ pub trait TransportSender: TransportBase {
     /// A per-record `FilteredDlq` is not a send failure: the rest of the block
     /// is still sent. Stopping there would make the caller retry the whole
     /// block forever, since the same bytes are refused every time. `Drop`
-    /// records never reach the wire. Only `Backpressured`/`Fatal`
-    /// short-circuit.
+    /// records never reach the wire. Every other non-`Ok` result
+    /// (`Backpressured`, `RetryAfter`, `Reject`, `Fatal`) ends the block and is
+    /// returned as it came.
     ///
     /// The result is then `FilteredDlq`, never `Ok`: every other record was
     /// sent, and at least one was dead-lettered and written nowhere. The answer
@@ -249,18 +259,63 @@ pub trait TransportSender: TransportBase {
     /// delivered.
     fn send_batch(&self, records: &[Record]) -> impl Future<Output = SendResult> + Send {
         async move {
-            let mut dead_lettered = false;
+            let mut outcome = BlockOutcome::default();
             for record in records {
-                match self.send_record(record).await {
-                    SendResult::Ok => {}
-                    SendResult::FilteredDlq => dead_lettered = true,
-                    other @ (SendResult::Backpressured | SendResult::Fatal(_)) => return other,
+                let result = self.send_record(record).await;
+                tracing::trace!(
+                    transport = self.name(),
+                    bytes = record.payload.len(),
+                    result = ?result,
+                    "record send"
+                );
+                if let Some(ended) = outcome.add(result) {
+                    return ended;
                 }
             }
-            if dead_lettered {
-                SendResult::FilteredDlq
-            } else {
-                SendResult::Ok
+            outcome.finish()
+        }
+    }
+
+    /// Send a block, answering by `deadline` whatever the destination does.
+    ///
+    /// The default runs [`send_batch`](Self::send_batch) under
+    /// `tokio::time::timeout_at`, which polls the send once before it looks at
+    /// the clock, so a deadline already past still takes a send that answers at
+    /// once. An elapsed deadline is
+    /// [`SendResult::Backpressured`]: the records may or may not have reached
+    /// the destination, so the caller keeps them and sends them again
+    /// (at-least-once, duplicates never loss). A transport with its own
+    /// request timeout may override this to hand the deadline to its client,
+    /// and must still answer by it.
+    fn send_batch_by(
+        &self,
+        records: &[Record],
+        deadline: std::time::Instant,
+    ) -> impl Future<Output = SendResult> + Send {
+        async move {
+            let now = std::time::Instant::now();
+            let until = tokio::time::Instant::from_std(deadline);
+            match tokio::time::timeout_at(until, self.send_batch(records)).await {
+                Ok(result) => {
+                    tracing::debug!(
+                        transport = self.name(),
+                        records = records.len(),
+                        result = ?result,
+                        "batch sent by deadline"
+                    );
+                    result
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        transport = self.name(),
+                        records = records.len(),
+                        budget_ms =
+                            u64::try_from(deadline.saturating_duration_since(now).as_millis())
+                                .unwrap_or(u64::MAX),
+                        "send deadline elapsed; the records may have arrived and are sent again"
+                    );
+                    SendResult::Backpressured
+                }
             }
         }
     }
@@ -507,6 +562,10 @@ mod healthcheck_tests {
         fn name(&self) -> &'static str {
             "default-probe"
         }
+
+        fn delivery_guarantee(&self) -> DeliveryGuarantee {
+            DeliveryGuarantee::Acknowledged
+        }
     }
 
     /// Probe that OVERRIDES `healthcheck` with a real (here: scripted) body,
@@ -524,6 +583,10 @@ mod healthcheck_tests {
         }
         fn name(&self) -> &'static str {
             "active-probe"
+        }
+
+        fn delivery_guarantee(&self) -> DeliveryGuarantee {
+            DeliveryGuarantee::Acknowledged
         }
         async fn healthcheck(&self) -> TransportResult<()> {
             if self.hang {
@@ -602,6 +665,119 @@ mod healthcheck_tests {
             boot_healthcheck(&t, cfg).await.is_err(),
             "a hanging probe must hit the boot timeout"
         );
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use crate::transport::{PayloadFormat, RecordMeta};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Answers each record by its payload: `reject`, `wait`, `busy`, `dlq` or
+    /// `ok`, and never answers `hang`. Counts every send.
+    #[derive(Default)]
+    struct Scripted {
+        sends: AtomicUsize,
+    }
+
+    impl TransportBase for Scripted {
+        async fn close(&self) -> TransportResult<()> {
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        fn delivery_guarantee(&self) -> DeliveryGuarantee {
+            DeliveryGuarantee::Acknowledged
+        }
+    }
+
+    impl TransportSender for Scripted {
+        async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            match String::from_utf8_lossy(&payload).as_ref() {
+                "reject" => SendResult::Reject(TransportError::Send("refused".into())),
+                "wait" => SendResult::RetryAfter(Duration::from_secs(7)),
+                "busy" => SendResult::Backpressured,
+                "dlq" => SendResult::FilteredDlq,
+                "hang" => std::future::pending().await,
+                _ => SendResult::Ok,
+            }
+        }
+    }
+
+    fn block(payloads: &[&'static str]) -> Vec<Record> {
+        payloads
+            .iter()
+            .map(|p| Record {
+                payload: bytes::Bytes::from_static(p.as_bytes()),
+                key: None,
+                headers: Vec::new(),
+                metadata: RecordMeta {
+                    timestamp_ms: None,
+                    format: PayloadFormat::Json,
+                },
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_per_record_default_stops_at_a_reject_or_a_named_wait() {
+        // (case, block, result as text, records sent)
+        let cases = [
+            ("all sent", vec!["ok", "ok"], "Ok", 2),
+            ("dead letter goes on", vec!["dlq", "ok"], "FilteredDlq", 2),
+            ("reject stops", vec!["ok", "reject", "ok"], "Reject", 2),
+            ("wait stops", vec!["wait", "ok"], "RetryAfter(7s)", 1),
+            (
+                "busy stops",
+                vec!["ok", "busy", "reject"],
+                "Backpressured",
+                2,
+            ),
+        ];
+        for (case, payloads, want, sent) in cases {
+            let sender = Scripted::default();
+            let got = sender.send_batch(&block(&payloads)).await;
+            assert!(format!("{got:?}").starts_with(want), "{case}: {got:?}");
+            assert_eq!(sender.sends.load(Ordering::SeqCst), sent, "{case}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_answers_in_time_or_hands_the_records_back() {
+        let sender = Scripted::default();
+        let records = block(&["ok", "reject"]);
+
+        let in_time = sender
+            .send_batch_by(&records, Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(in_time.is_reject(), "the sender's own answer: {in_time:?}");
+
+        let hung = Scripted::default();
+        let elapsed = hung
+            .send_batch_by(
+                &block(&["ok", "hang"]),
+                Instant::now() + Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            elapsed.is_backpressured(),
+            "an elapsed deadline keeps the records for a resend: {elapsed:?}"
+        );
+        assert_eq!(hung.sends.load(Ordering::SeqCst), 2, "the send was started");
+
+        // A deadline already past still gets the first poll, as a zero timeout does.
+        let late = Scripted::default();
+        let at_once = late.send_batch_by(&block(&["ok"]), Instant::now()).await;
+        assert!(at_once.is_ok(), "{at_once:?}");
+        let late_hang = late.send_batch_by(&block(&["hang"]), Instant::now()).await;
+        assert!(late_hang.is_backpressured(), "{late_hang:?}");
     }
 }
 

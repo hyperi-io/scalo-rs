@@ -6,6 +6,32 @@ release and the target before bumping.
 
 ---
 
+## 2.14.34
+
+### A file or pipe sender from the factory needs `delivery: flush` (BEHAVIOUR CHANGE)
+
+`TransportConfig.delivery`, default `ack`, is the weakest guarantee a factory-built sender may have. File and pipe write and flush with no acknowledgement, so they are refused under the default, naming the key: `set transport.output.delivery: flush to accept that`. Kafka with `acks=0` needs `delivery: none`. See [transport/custom.md](transport/custom.md#delivery-guarantee).
+
+**Consumer adjustment** -- add `delivery: flush` to a file or pipe output, `delivery: none` to an `acks: 0` Kafka output.
+
+### `SendResult::Reject` and `RetryAfter`, a required `delivery_guarantee`, custom senders (API CHANGE)
+
+`Reject` is a permanent refusal, never retried. `RetryAfter(wait)` retries after the destination's wait. `TransportBase::delivery_guarantee` has no default. `register_sender` builds an app's own sender by type name as `AnySender::Custom`, and `TransportType` gains `Custom(String)`, losing `Copy`.
+
+**Consumer adjustment** -- exhaustive matches on `SendResult`, `AnySender` and `TransportType` add the new arms. Each own `TransportBase` impl adds `delivery_guarantee`. A literal `TransportConfig` adds `delivery` and `custom`.
+
+### `ConfigOptions::managed`, `load_typed_managed` and `ServiceApp::managed_source` (additive)
+
+An app can name a Group Policy key and an MDM preference domain in a `ManagedSource`, and the cascade then reads them as a layer after every config file and before env vars. A key that looks like a secret fails the load. See [managed-config.md](core-pillars/managed-config.md).
+
+**Consumer adjustment** -- none. A `ConfigOptions` built without `..Default::default()` adds `managed: None`.
+
+### gRPC `send_batch` joins small blocks into one call (BEHAVIOUR CHANGE)
+
+A block under `coalesce.max_batch_bytes` (64 KiB), encoded, now waits for one of `coalesce.in_flight` (4) call slots and goes out in one `RouteBatch` with the blocks queued behind it, within `max_message_size`. Its caller gets that call's result, so a failed call fails every block in it. `send_timeout_ms` bounds the wait for a slot, and then the call, so a joined `send_batch` can take up to about twice `send_timeout_ms`. See [grpc.md](transport/grpc.md).
+
+**Consumer adjustment** -- none. `<key>.grpc.coalesce.enabled: false` sends each `send_batch` as its own call, the request it sent before. A receiver whose `max_message_size` is below the sender's refuses a joined call that each block alone would fit, and each block then goes again on its own, so set the two limits alike to save those requests.
+
 ## 2.14.33
 
 ### `run_app` reads the file `{PREFIX}_CONFIG` names (BEHAVIOUR CHANGE)

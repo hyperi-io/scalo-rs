@@ -127,6 +127,22 @@ impl ServiceMetrics {
             "Records over a sender's size ceiling, refused before sending or by the receiver"
         );
         metrics::describe_counter!(
+            "transport_coalesced_calls_total",
+            "gRPC RouteBatch calls that joined send_batch blocks"
+        );
+        metrics::describe_counter!(
+            "transport_coalesced_blocks_total",
+            "send_batch blocks the joined gRPC calls carried"
+        );
+        metrics::describe_counter!(
+            "transport_coalesced_records_total",
+            "Records the joined gRPC calls carried"
+        );
+        metrics::describe_counter!(
+            "transport_coalesced_timeouts_total",
+            "gRPC send_batch blocks answered at send_timeout_ms before their joined call did"
+        );
+        metrics::describe_counter!(
             "transport_consumer_rebuilds_total",
             "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with"
         );
@@ -196,6 +212,30 @@ impl ServiceMetrics {
             (
                 "transport_message_too_large_total",
                 "Records over a sender's size ceiling, refused before sending or by the receiver",
+                MetricType::Counter,
+                &["transport"],
+            ),
+            (
+                "transport_coalesced_calls_total",
+                "gRPC RouteBatch calls that joined send_batch blocks",
+                MetricType::Counter,
+                &["transport"],
+            ),
+            (
+                "transport_coalesced_blocks_total",
+                "send_batch blocks the joined gRPC calls carried",
+                MetricType::Counter,
+                &["transport"],
+            ),
+            (
+                "transport_coalesced_records_total",
+                "Records the joined gRPC calls carried",
+                MetricType::Counter,
+                &["transport"],
+            ),
+            (
+                "transport_coalesced_timeouts_total",
+                "gRPC send_batch blocks answered at send_timeout_ms before their joined call did",
                 MetricType::Counter,
                 &["transport"],
             ),
@@ -1018,6 +1058,10 @@ mod tests {
             ("test_app_transport_commit_errors_total", vec!["transport"]),
             (
                 "test_app_transport_message_too_large_total",
+                vec!["transport"],
+            ),
+            (
+                "test_app_transport_coalesced_records_total",
                 vec!["transport"],
             ),
             ("test_app_pipeline_retries_total", vec!["stage"]),

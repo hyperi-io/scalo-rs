@@ -68,15 +68,13 @@ pub struct GrpcConfig {
     /// Enable gzip compression for gRPC messages.
     pub compression: bool,
 
-    // --- Client TLS. tonic owns its TLS stack (like librdkafka), so these map
-    // TlsTrust onto tonic's ClientTlsConfig rather than crate::tls's rustls
-    // ClientConfig. In-cluster gRPC is usually mesh-mTLS (Istio/Linkerd);
-    // set these only for DIRECT TLS to a remote endpoint. ---
+    // --- Client TLS, mapped onto tonic's ClientTlsConfig by crate::tls. In-cluster
+    // gRPC is usually mesh mTLS, so these are for direct TLS to a remote endpoint. ---
     /// Enable client TLS for the `endpoint` connection.
     #[serde(default)]
     pub tls_enabled: bool,
-    /// Private-CA PEM (maps to `TlsTrust.extra_roots`). When unset with
-    /// `tls_enabled`, falls back to OS native roots.
+    /// CA PEM file, trusted alone when set. Unset with `tls_enabled`, the OS
+    /// native roots are trusted.
     #[serde(default)]
     pub tls_ca_path: Option<String>,
     /// Domain name for SNI / certificate verification (overrides the URI host).
@@ -101,6 +99,41 @@ pub struct GrpcConfig {
 
     /// Outbound message filters (applied on send before transport dispatches).
     pub filters_out: Vec<crate::transport::filter::FilterRule>,
+
+    /// Joining small `send_batch` blocks for `endpoint` into one `RouteBatch`
+    /// call.
+    pub coalesce: CoalesceConfig,
+}
+
+/// How `send_batch` joins small blocks for one endpoint into one `RouteBatch`
+/// call.
+///
+/// When a call slot is free, the next queued block goes out with every block
+/// queued behind it, up to `max_batch_bytes` and `max_message_size` encoded,
+/// with no timer. A block at that cap or over it is sent at once on its own.
+/// `send_timeout_ms` bounds the wait for a slot too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct CoalesceConfig {
+    /// Join blocks. `false` sends every `send_batch` as its own call.
+    pub enabled: bool,
+
+    /// Most bytes one joined call carries, encoded.
+    pub max_batch_bytes: u64,
+
+    /// Calls in flight to the endpoint at once, joined calls only.
+    pub in_flight: usize,
+}
+
+impl Default for CoalesceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_batch_bytes: 65_536,
+            in_flight: 4,
+        }
+    }
 }
 
 impl Default for GrpcConfig {
@@ -122,6 +155,7 @@ impl Default for GrpcConfig {
             vector_compat: false,
             filters_in: Vec::new(),
             filters_out: Vec::new(),
+            coalesce: CoalesceConfig::default(),
         }
     }
 }

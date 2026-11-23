@@ -22,6 +22,9 @@
 //! 6. `defaults.yaml`
 //! 7. Hard-coded defaults
 //!
+//! An app that names a [`ManagedSource`] adds a layer between 3 and 4: the
+//! settings Group Policy or an MDM pushes.
+//!
 //! ## How .env Files Work in the Cascade
 //!
 //! `.env` in the working directory (parent directories are not searched) is
@@ -54,11 +57,13 @@
 pub mod env_compat;
 pub mod flat_env;
 mod load;
+mod managed;
 pub mod registry;
 pub mod sensitive;
 mod yaml_file;
 
-pub use load::{load_typed, log_deferred};
+pub use load::{load_typed, load_typed_managed, log_deferred};
+pub use managed::ManagedSource;
 
 #[cfg(feature = "config-reload")]
 pub mod reloader;
@@ -78,6 +83,7 @@ use figment::providers::{Env, Serialized};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use self::managed::ManagedLayer;
 use self::yaml_file::YamlFile;
 use crate::env::get_app_env;
 
@@ -169,6 +175,13 @@ pub struct ConfigOptions {
     /// Only applies when `load_dotenv` is true.
     /// Default: false (opt-in, matching scalo-py)
     pub load_home_dotenv: bool,
+
+    /// The OS store an administrator manages this app's settings through:
+    /// Group Policy on Windows, MDM managed preferences on macOS. It merges
+    /// after every config file and before env vars. See [`ManagedSource`].
+    ///
+    /// Default: None, so nothing is read.
+    pub managed: Option<ManagedSource>,
 }
 
 impl Default for ConfigOptions {
@@ -181,6 +194,7 @@ impl Default for ConfigOptions {
             search_standard_paths: true,
             load_dotenv: true,
             load_home_dotenv: false,
+            managed: None,
         }
     }
 }
@@ -218,8 +232,16 @@ impl Config {
     /// # Errors
     ///
     /// [`ConfigError::LoadError`] when a `config_paths` entry does not exist,
-    /// or names a file that cannot be read or parsed.
+    /// or names a file that cannot be read or parsed, or the managed store
+    /// can't be read. [`ConfigError::InvalidValue`] when the managed store
+    /// holds a secret.
     pub fn new(opts: ConfigOptions) -> Result<Self, ConfigError> {
+        let layer = managed::read(opts.managed.as_ref())?;
+        Self::build(opts, layer.as_ref())
+    }
+
+    /// [`Config::new`] with the managed layer already read.
+    fn build(opts: ConfigOptions, managed: Option<&ManagedLayer>) -> Result<Self, ConfigError> {
         for path in &opts.config_paths {
             Self::check_named_path(path)?;
         }
@@ -259,6 +281,11 @@ impl Config {
         let env_settings = format!("settings.{app_env}");
         for path in Self::find_config_files(&env_settings, &search) {
             figment = figment.merge(YamlFile::new(path));
+        }
+
+        // Managed policy beats every file, and env vars beat it.
+        if let Some(layer) = managed {
+            figment = figment.merge(layer);
         }
 
         // 3. .env file values are already loaded into env vars
@@ -654,6 +681,7 @@ mod tests {
         assert!(opts.search_standard_paths);
         assert!(opts.load_dotenv);
         assert!(!opts.load_home_dotenv);
+        assert!(opts.managed.is_none());
     }
 
     #[test]

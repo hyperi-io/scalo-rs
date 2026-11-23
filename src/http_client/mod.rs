@@ -167,42 +167,18 @@ impl HttpError {
         let Self::Status(resp) = self else {
             return None;
         };
-        let secs: u64 = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)?
-            .to_str()
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        Some(Duration::from_secs(secs))
+        crate::backoff::parse_retry_after(
+            resp.headers()
+                .get(reqwest::header::RETRY_AFTER)?
+                .to_str()
+                .ok()?,
+        )
     }
 }
 
 /// Status codes worth retrying: throttling + transient server failures.
 fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
-}
-
-/// How long to wait before the next attempt: the delay the downstream
-/// advertised if it sent one, else the exponential candidate.
-///
-/// The advertised delay is capped at `max`, the configured retry ceiling. A
-/// throttled downstream can advertise hours (`Retry-After: 86400` is legal), and
-/// taking that whole parks the request inside the retry loop for a day.
-///
-/// No candidate means the retry budget is spent, and that answer stands
-/// whatever the downstream advertises: a delay is how long to wait before an
-/// attempt the schedule has already granted, not a grant of another one.
-fn retry_delay(
-    advertised: Option<Duration>,
-    candidate: Option<Duration>,
-    max: Duration,
-) -> Option<Duration> {
-    match (advertised, candidate) {
-        (Some(delay), Some(_)) => Some(delay.min(max)),
-        (_, candidate) => candidate,
-    }
 }
 
 /// The metric label for a method, as a static string: a label must outlive the
@@ -359,7 +335,7 @@ impl HttpClient {
                 .retry(self.backoff())
                 .when(move |e: &HttpError| e.is_retryable(replayable))
                 .adjust(move |e: &HttpError, candidate| {
-                    retry_delay(e.retry_after(), candidate, max_delay)
+                    crate::backoff::hinted_delay(e.retry_after(), candidate, max_delay)
                 })
                 .sleep(tokio::time::sleep)
                 .notify(|_e: &HttpError, _dur: Duration| Self::record_retry(method))
@@ -627,59 +603,6 @@ mod tests {
         );
         let refused = HttpError::Sign(SignError::new("invalid_client"));
         assert!(!refused.is_retryable(true));
-    }
-
-    #[test]
-    fn retry_after_is_capped_at_the_configured_maximum() {
-        let max = Duration::from_millis(30_000);
-        assert_eq!(
-            retry_delay(
-                Some(Duration::from_secs(86_400)),
-                Some(Duration::from_millis(5)),
-                max
-            ),
-            Some(max),
-            "an advertised day must not park the request for a day"
-        );
-    }
-
-    #[test]
-    fn a_retry_after_under_the_cap_is_taken_whole() {
-        assert_eq!(
-            retry_delay(
-                Some(Duration::from_secs(2)),
-                Some(Duration::from_millis(5)),
-                Duration::from_millis(30_000)
-            ),
-            Some(Duration::from_secs(2)),
-            "the downstream's own pacing wins over the exponential candidate"
-        );
-    }
-
-    #[test]
-    fn an_advertised_delay_cannot_outlive_the_retry_budget() {
-        assert_eq!(
-            retry_delay(
-                Some(Duration::from_secs(1)),
-                None,
-                Duration::from_millis(20)
-            ),
-            None,
-            "no candidate means the budget is spent, whatever the downstream advertises"
-        );
-    }
-
-    #[test]
-    fn without_a_retry_after_the_exponential_candidate_stands() {
-        assert_eq!(
-            retry_delay(
-                None,
-                Some(Duration::from_millis(5)),
-                Duration::from_millis(30_000)
-            ),
-            Some(Duration::from_millis(5))
-        );
-        assert_eq!(retry_delay(None, None, Duration::from_millis(1)), None);
     }
 
     #[test]
