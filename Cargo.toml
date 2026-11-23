@@ -172,7 +172,7 @@ transport-grpc = ["transport", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep
 transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
-transport-http = ["transport", "http", "tls"]
+transport-http = ["transport", "http", "tls", "dep:flate2"]
 transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http"]
 
 secrets = ["tokio", "tokio-util", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2"]

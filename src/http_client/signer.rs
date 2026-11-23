@@ -189,7 +189,11 @@ impl<A: RequestSigner, B: RequestSigner, C: RequestSigner, D: RequestSigner> Req
 /// field separator RFC 7617 gives the username no way to escape, or when the
 /// encoding will not fit a header value.
 #[cfg_attr(
-    not(any(feature = "auth", feature = "geoip-download")),
+    not(any(
+        feature = "auth",
+        feature = "geoip-download",
+        feature = "transport-http"
+    )),
     allow(dead_code)
 )]
 pub(crate) fn basic_auth_value(

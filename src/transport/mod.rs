@@ -163,4 +163,4 @@ pub use pipe::{PipeToken, PipeTransport, PipeTransportConfig};
 pub use file::{FileToken, FileTransport, FileTransportConfig};
 
 #[cfg(feature = "transport-http")]
-pub use http::{HttpToken, HttpTransport, HttpTransportConfig};
+pub use http::{HttpAuth, HttpEndpoint, HttpProxy, HttpToken, HttpTransport, HttpTransportConfig};
