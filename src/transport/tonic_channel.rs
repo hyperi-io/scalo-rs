@@ -15,7 +15,7 @@ use std::time::Duration;
 /// has none.
 pub(crate) const DEFAULT_SEND_TIMEOUT_MS: u64 = 30_000;
 
-/// A lazily dialled channel to `ep`.
+/// A lazily dialled channel to `ep`, direct or through `proxy`.
 ///
 /// A dial whose DNS lookup, TCP connect or TLS handshake is unfinished at nine
 /// tenths of `send_timeout_ms` is abandoned. A connection that has read nothing
@@ -26,6 +26,7 @@ pub(crate) const DEFAULT_SEND_TIMEOUT_MS: u64 = 30_000;
 pub(crate) fn lazy_channel(
     mut ep: tonic::transport::Endpoint,
     send_timeout_ms: u64,
+    proxy: crate::transport::ProxyDialer,
 ) -> tonic::transport::Channel {
     // A dial left running when its send gives up hands its failure to the
     // next send, so the dial ends at nine tenths of the limit.
@@ -50,5 +51,5 @@ pub(crate) fn lazy_channel(
     // tonic's own settings: an https URI passes through to its TLS layer.
     tcp.enforce_http(false);
     tcp.set_nodelay(true);
-    ep.connect_with_connector_lazy(tcp)
+    ep.connect_with_connector_lazy(crate::transport::proxy::Connector::new(proxy, tcp))
 }

@@ -49,7 +49,7 @@ mod send;
 #[cfg(test)]
 mod send_tests;
 
-pub use send::{HttpAuth, HttpEndpoint, HttpProxy};
+pub use send::{HttpAuth, HttpEndpoint};
 
 use super::error::{TransportError, TransportResult};
 #[cfg(feature = "http-server")]
@@ -193,9 +193,10 @@ pub struct HttpTransportConfig {
     #[serde(default)]
     pub success_status: Vec<u16>,
 
-    /// `none` (default), `system` (the proxy environment variables) or a proxy URL.
+    /// `none` (default), `system` (the machine's proxy) or a proxy URL. See
+    /// [`ProxyConfig`](crate::transport::ProxyConfig).
     #[serde(default)]
-    pub proxy: HttpProxy,
+    pub proxy: crate::transport::ProxyConfig,
 
     /// Follow same-origin redirects, up to 5. Default off: a 3xx is the
     /// endpoint's fault and holds the records.
@@ -292,7 +293,7 @@ impl Default for HttpTransportConfig {
             framing: default_framing(),
             gzip: false,
             success_status: Vec::new(),
-            proxy: HttpProxy::None,
+            proxy: crate::transport::ProxyConfig::None,
             follow_redirects: false,
             max_retry_after_ms: default_max_retry_after_ms(),
             listen: None,

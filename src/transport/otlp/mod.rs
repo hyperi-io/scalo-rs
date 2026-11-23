@@ -453,7 +453,11 @@ fn grpc_wire(
             .tls_config(tls)
             .map_err(|e| config_error(format!("TLS: {e}")))?;
     }
-    let channel = super::tonic_channel::lazy_channel(endpoint, config.timeout_ms);
+    let channel = super::tonic_channel::lazy_channel(
+        endpoint,
+        config.timeout_ms,
+        crate::transport::ProxyDialer::direct(),
+    );
     let mut client = LogsServiceClient::new(channel).accept_compressed(CompressionEncoding::Gzip);
     if config.compression == OtlpCompression::Gzip {
         client = client.send_compressed(CompressionEncoding::Gzip);

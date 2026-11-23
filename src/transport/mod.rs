@@ -116,6 +116,9 @@ pub mod file;
 #[cfg(feature = "transport-http")]
 pub mod http;
 
+#[cfg(feature = "transport-proxy")]
+pub mod proxy;
+
 #[cfg(feature = "transport-syslog")]
 pub mod syslog;
 
@@ -167,6 +170,9 @@ pub use vector_compat::{VectorCompatClient, VectorCompatService, VectorCompatTls
 #[cfg(feature = "transport-memory")]
 pub use memory::{MemoryConfig, MemoryToken, MemoryTransport};
 
+#[cfg(feature = "transport-proxy")]
+pub use proxy::{ProxyConfig, ProxyDialer, ProxyError, ProxyRefused};
+
 #[cfg(feature = "transport-pipe")]
 pub use pipe::{PipeToken, PipeTransport, PipeTransportConfig};
 
@@ -174,7 +180,7 @@ pub use pipe::{PipeToken, PipeTransport, PipeTransportConfig};
 pub use file::{FileToken, FileTransport, FileTransportConfig};
 
 #[cfg(feature = "transport-http")]
-pub use http::{HttpAuth, HttpEndpoint, HttpProxy, HttpToken, HttpTransport, HttpTransportConfig};
+pub use http::{HttpAuth, HttpEndpoint, HttpToken, HttpTransport, HttpTransportConfig};
 
 #[cfg(feature = "transport-syslog")]
 pub use syslog::{SyslogConfig, SyslogTransport};

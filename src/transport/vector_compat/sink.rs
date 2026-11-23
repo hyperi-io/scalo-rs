@@ -112,7 +112,7 @@ impl VectorCompatClient {
                 .tls_config(tls.client_config()?)
                 .map_err(|e| super::tls::tonic_error(&e))?;
         }
-        let channel = lazy_channel(ep, send_timeout_ms);
+        let channel = lazy_channel(ep, send_timeout_ms, crate::transport::ProxyDialer::direct());
 
         let client = vector::vector_client::VectorClient::new(channel)
             .max_decoding_message_size(MAX_DECODE_BYTES)

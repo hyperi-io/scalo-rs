@@ -24,7 +24,8 @@
 //! `Backpressured`, so the caller sends it again: never `Ok`. RELP first
 //! reconnects once within the call and sends again only the messages not yet
 //! answered. TCP and TLS have no answer, so a receiver that fails after the
-//! write loses what it held. The guide is `docs/transport/syslog.md`.
+//! write loses what it held. `proxy` sends `tcp`, `tls` and `relp` through an
+//! HTTP CONNECT tunnel. The guide is `docs/transport/syslog.md`.
 
 mod config;
 mod format;
@@ -139,9 +140,15 @@ impl SyslogTransport {
             send_timeout: Duration::from_millis(config.send_timeout_ms),
             relp_window: config.relp_window,
             connector: Connector::new(
-                config.address.clone(),
+                (
+                    config::host_of(&config.address)
+                        .unwrap_or_default()
+                        .to_string(),
+                    config::port_of(&config.address).unwrap_or_default(),
+                ),
                 Duration::from_millis(config.connect_timeout_ms),
                 tls,
+                config.proxy.dialer()?,
             ),
             filter_engine,
             state: Mutex::new(State::default()),
@@ -153,6 +160,7 @@ impl SyslogTransport {
             format = ?config.format,
             framing = ?config.framing,
             tls = config.uses_tls(),
+            proxy = config.proxy.kind(),
             trust = config.tls.as_ref().map(|t| t.client.trust.as_str()),
             guarantee = %transport.delivery_guarantee(),
             max_message_bytes = transport.limit,
@@ -473,6 +481,7 @@ impl SyslogTransport {
                 tracing::warn!(address = %self.address, error = %e, "syslog: cannot connect");
                 SendResult::Backpressured
             }
+            ConnectError::Refused(refused) => crate::transport::proxy::rejected(refused, "syslog"),
             ConnectError::Trust(_) => {
                 tracing::error!(address = %self.address, error = %e, "syslog: TLS refused");
                 SendResult::Fatal(TransportError::Config(format!(

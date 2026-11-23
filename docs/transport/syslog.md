@@ -72,6 +72,7 @@ One connection is held and reused, behind a lock, so concurrent sends go one aft
 | Connect refused or timed out, DNS failed | `Backpressured` |
 | Write broke off mid-batch, or the deadline passed | `Backpressured`, the connection dropped, never `Ok` |
 | TLS refused the receiver's certificate or ours | `Fatal(Config)` |
+| The proxy refused CONNECT | `Reject`, with the proxy's status and the receiver's port: many proxies allow CONNECT to port 443 only |
 | RELP session lost mid-batch | reconnect once in the same call and send only the unanswered messages, then `Backpressured` if that fails too |
 | RELP answer other than `200` for a message | `Backpressured`, the session kept |
 | RELP receiver refuses the session, or offers no `syslog` command | `Fatal(Config)` |
@@ -111,6 +112,7 @@ There is no maintained Rust RELP crate. The client is in `src/transport/syslog/r
 | `connect_timeout_ms` | 5000 | TCP connect, TLS handshake and RELP open |
 | `send_timeout_ms` | 30000 | one send with no deadline of its own |
 | `relp_window` | 128 | RELP messages in flight |
+| `proxy` | `none` | `none`, `system` or an `http://` proxy URL, for `tcp`, `tls` and `relp`: an HTTP CONNECT tunnel with TLS inside it ([http.md](http.md#proxy-redirects-and-logs)) |
 | `tls.trust` | `native` | `native`, `platform` or `bundle` ([../api/tls.md](../api/tls.md)) |
 | `tls.ca_path` | none | CA PEM file |
 | `tls.client_cert_path`, `tls.client_key_path` | none | client certificate for mutual TLS, both or neither |
@@ -118,6 +120,6 @@ There is no maintained Rust RELP crate. The client is in `src/transport/syslog/r
 | `tls.server_name` | host of `address` | the name the receiver's certificate is checked against |
 | `filters_out` | none | outbound filters on each payload ([filter-engine.md](filter-engine.md)) |
 
-A `tls` section with `protocol: tcp` or `udp` is refused at build, and so are an address with no port, a `max_message_bytes` under 480 or, for UDP, over 65507, and a `relp_window` of 0.
+A `tls` section with `protocol: tcp` or `udp` is refused at build, and so are a `proxy` other than `none` with `udp`, an address with no port, a `max_message_bytes` under 480 or, for UDP, over 65507, and a `relp_window` of 0.
 
 All carry `transport="syslog"`: `transport_sent_total` (messages), `transport_sent_bytes_total` (message bytes before framing), `transport_send_errors_total`, `transport_backpressured_total`, `transport_send_duration_seconds`, `transport_message_too_large_total`, `transport_truncated_total`, and `transport_redelivered_total` with `reason` `reconnect` (a RELP resend in the call) or `deadline`.
