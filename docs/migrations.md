@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.34
 
+### Syslog transport, `TransportType::Syslog` (API CHANGE)
+
+The `transport-syslog` feature sends records to a syslog receiver as RFC 5424 or RFC 3164 messages over TCP, TLS, UDP or RELP, as `type: syslog`. `scalo::tls::ClientTlsConfig` is the `trust`, `ca_path`, `client_cert_path` and `client_key_path` section a transport reads its client TLS from. See [transport/syslog.md](transport/syslog.md). `transport-all`, and so `full`, pulls it.
+
+**Consumer adjustment** -- exhaustive matches on `TransportType` and `AnySender` add the `Syslog` arm. A literal `TransportConfig` adds `syslog`. `syslog` joins the built-in type names, so a custom sender registered under it is refused: register it under another name.
+
 ### `scalo::framing` holds every batch framing, and `worker::ndjson` is gone (API CHANGE)
 
 The `Framing` trait, its built-ins and `StreamDecoder` are what the file and pipe transports, the file output and the DLQ's file and HTTP backends now frame with, byte for byte as before. `FramingError` moves to `scalo::framing`, still re-exported as `scalo::transport::FramingError`, with new variants and messages. See [transport/framing.md](transport/framing.md).
