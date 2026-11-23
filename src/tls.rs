@@ -93,7 +93,7 @@ mod tonic;
 
 #[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 pub(crate) use self::tonic::tonic_client_tls;
-pub use client::{ClientIdentity, ClientTls, TrustChoice, build_client_tls};
+pub use client::{ClientIdentity, ClientTls, ClientTlsConfig, TrustChoice, build_client_tls};
 pub use server::{
     CertResolver, ClientAuth, HandshakeError, Reloaded, ServerTls, ServerTlsConfig,
     ServerTlsOptions,

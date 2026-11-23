@@ -12,7 +12,11 @@
 //!
 //! ## Send
 //!
-//! POSTs payload bytes to `{endpoint}/{key}` using reqwest.
+//! POSTs each run of records with the same key to `{endpoint}/{key}` as one
+//! body, framed by `framing` and gzipped when `gzip` is set. `failover`
+//! endpoints are tried in order after `endpoint`. Redirects are refused unless
+//! `follow_redirects` is set, and no proxy is used unless `proxy` names one.
+//! The guide is `docs/transport/http.md`.
 //!
 //! ## Receive (requires `http-server` feature)
 //!
@@ -40,6 +44,12 @@
 //! let transport = HttpTransport::new(&config).await?;
 //! transport.send("events", bytes::Bytes::from_static(b"{\"msg\":\"hello\"}")).await;
 //! ```
+
+mod send;
+#[cfg(test)]
+mod send_tests;
+
+pub use send::{HttpAuth, HttpEndpoint, HttpProxy};
 
 use super::error::{TransportError, TransportResult};
 #[cfg(feature = "http-server")]
@@ -134,12 +144,67 @@ fn default_max_in_flight_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+fn default_framing() -> crate::framing::FramingConfig {
+    crate::framing::FramingConfig {
+        framing_type: "single".to_string(),
+        ..crate::framing::FramingConfig::default()
+    }
+}
+
+fn default_max_retry_after_ms() -> u64 {
+    60_000
+}
+
 /// Configuration for HTTP transport.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HttpTransportConfig {
     /// Endpoint URL for sending (e.g., "http://loader:8080/ingest"). None = send disabled.
+    /// `user:password@` in it is basic auth, and is never logged.
     #[serde(default)]
     pub endpoint: Option<String>,
+
+    /// Endpoints tried in order after `endpoint`, each with its own `auth` or
+    /// the transport's. Every request starts at `endpoint`.
+    #[serde(default)]
+    pub failover: Vec<HttpEndpoint>,
+
+    /// Credentials for `endpoint`, and for each `failover` endpoint without its own.
+    #[serde(default)]
+    pub auth: HttpAuth,
+
+    /// Headers sent on every request. Values are secrets: never logged.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, crate::sensitive::SensitiveString>,
+
+    /// `User-Agent` header. Unset sends none.
+    #[serde(default)]
+    pub user_agent: Option<String>,
+
+    /// How records share a request body. Default `single`, one record per
+    /// request. Any [`crate::framing`] name, an app's own included.
+    #[serde(default = "default_framing")]
+    pub framing: crate::framing::FramingConfig,
+
+    /// Gzip request bodies, with `Content-Encoding: gzip`. Default off.
+    #[serde(default)]
+    pub gzip: bool,
+
+    /// Statuses that mean the body is stored. Empty, the default, is any 2xx.
+    #[serde(default)]
+    pub success_status: Vec<u16>,
+
+    /// `none` (default), `system` (the proxy environment variables) or a proxy URL.
+    #[serde(default)]
+    pub proxy: HttpProxy,
+
+    /// Follow same-origin redirects, up to 5. Default off: a 3xx is the
+    /// endpoint's fault and holds the records.
+    #[serde(default)]
+    pub follow_redirects: bool,
+
+    /// Longest `Retry-After` wait taken, in ms. Default 60000. 0 ignores the header.
+    #[serde(default = "default_max_retry_after_ms")]
+    pub max_retry_after_ms: u64,
 
     /// Listen address for receiving (e.g., "0.0.0.0:8080"). None = receive disabled.
     /// Requires the `http-server` feature.
@@ -214,6 +279,16 @@ impl Default for HttpTransportConfig {
     fn default() -> Self {
         Self {
             endpoint: None,
+            failover: Vec::new(),
+            auth: HttpAuth::None,
+            headers: std::collections::BTreeMap::new(),
+            user_agent: None,
+            framing: default_framing(),
+            gzip: false,
+            success_status: Vec::new(),
+            proxy: HttpProxy::None,
+            follow_redirects: false,
+            max_retry_after_ms: default_max_retry_after_ms(),
             listen: None,
             recv_path: default_recv_path(),
             recv_buffer_size: default_buffer_size(),
@@ -229,6 +304,39 @@ impl Default for HttpTransportConfig {
             tls_client_cert_path: None,
             tls_client_key_path: None,
         }
+    }
+}
+
+/// Written out so `endpoint` shows without its user name and password.
+impl std::fmt::Debug for HttpTransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpTransportConfig")
+            .field("endpoint", &self.endpoint.as_deref().map(send::shown_text))
+            .field("failover", &self.failover)
+            .field("auth", &self.auth)
+            .field("headers", &self.headers)
+            .field("user_agent", &self.user_agent)
+            .field("framing", &self.framing)
+            .field("gzip", &self.gzip)
+            .field("success_status", &self.success_status)
+            .field("proxy", &self.proxy)
+            .field("follow_redirects", &self.follow_redirects)
+            .field("max_retry_after_ms", &self.max_retry_after_ms)
+            .field("listen", &self.listen)
+            .field("recv_path", &self.recv_path)
+            .field("recv_buffer_size", &self.recv_buffer_size)
+            .field("recv_timeout_ms", &self.recv_timeout_ms)
+            .field("filters_in", &self.filters_in)
+            .field("filters_out", &self.filters_out)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("send_timeout_ms", &self.send_timeout_ms)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_in_flight_bytes", &self.max_in_flight_bytes)
+            .field("tls_ca_path", &self.tls_ca_path)
+            .field("tls_trust", &self.tls_trust)
+            .field("tls_client_cert_path", &self.tls_client_cert_path)
+            .field("tls_client_key_path", &self.tls_client_key_path)
+            .finish()
     }
 }
 
@@ -302,11 +410,8 @@ pub struct HttpTransport {
     /// Removes this component from the health registry when it drops.
     #[cfg(feature = "health")]
     _health_registration: crate::health::HealthRegistration,
-    /// reqwest client for sending (always available when transport-http is enabled).
-    client: reqwest::Client,
-
-    /// Base URL for sending (None = send disabled).
-    endpoint: Option<String>,
+    /// The send side, `None` when no `endpoint` is set.
+    sender: Option<send::Sender>,
 
     /// Receiver channel populated by the embedded HTTP server.
     /// Only available when `http-server` feature is enabled AND `listen` is configured.
@@ -400,9 +505,16 @@ impl HttpTransport {
             tracing::debug!("HTTP transport client TLS: the client library's own verifier");
         }
 
-        let client = client_builder
-            .build()
-            .map_err(|e| TransportError::Config(format!("failed to create HTTP client: {e}")))?;
+        let sender = config
+            .endpoint
+            .as_deref()
+            .map(|endpoint| send::Sender::new(config, endpoint, client_builder))
+            .transpose()?;
+        if sender.is_none() && !config.failover.is_empty() {
+            return Err(TransportError::Config(
+                "HTTP failover endpoints need an endpoint to fail over from".into(),
+            ));
+        }
 
         #[cfg(feature = "http-server")]
         let (receiver, local_addr, in_flight, shutdown_tx, server_handle) = if let Some(listen) =
@@ -468,7 +580,7 @@ impl HttpTransport {
 
         #[cfg(feature = "logger")]
         tracing::info!(
-            endpoint = ?config.endpoint,
+            send = sender.is_some(),
             listen = ?config.listen,
             "HTTP transport opened"
         );
@@ -498,8 +610,7 @@ impl HttpTransport {
         Ok(Self {
             #[cfg(feature = "health")]
             _health_registration: health_registration,
-            client,
-            endpoint: config.endpoint.clone(),
+            sender,
             #[cfg(feature = "http-server")]
             receiver,
             #[cfg(feature = "http-server")]
@@ -774,38 +885,61 @@ impl TransportBase for HttpTransport {
     }
 }
 
-/// What a failure status says about the send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusClass {
-    /// The endpoint, or the gateway in front of it, is busy or failing: retry.
-    Unavailable,
-    /// The credential or the endpoint is wrong, which says nothing about this
-    /// record: keep it until the sink is fixed.
-    Misconfigured,
-    /// The body is over the endpoint's limit: it can never be accepted.
-    TooLarge,
-    /// The endpoint refused this record as malformed: it can never be accepted.
-    Refused,
-}
-
-/// Classify a non-2xx response. Every 5xx is retried, and only a 4xx that is
-/// the payload's fault marks the record undeliverable.
-fn classify_status(status: reqwest::StatusCode) -> StatusClass {
-    use reqwest::StatusCode as S;
-    match status {
-        S::REQUEST_TIMEOUT | S::TOO_MANY_REQUESTS => StatusClass::Unavailable,
-        s if s.is_server_error() => StatusClass::Unavailable,
-        S::PAYLOAD_TOO_LARGE => StatusClass::TooLarge,
-        S::UNAUTHORIZED
-        | S::FORBIDDEN
-        | S::NOT_FOUND
-        | S::METHOD_NOT_ALLOWED
-        | S::PROXY_AUTHENTICATION_REQUIRED
-        | S::GONE
-        | S::MISDIRECTED_REQUEST => StatusClass::Misconfigured,
-        s if s.is_client_error() => StatusClass::Refused,
-        // 1xx and an unfollowed 3xx: the endpoint is not one that takes a POST.
-        _ => StatusClass::Misconfigured,
+impl HttpTransport {
+    /// Send `records`, the block answering by `deadline` when there is one,
+    /// and each body by `send_timeout_ms` when there is not.
+    async fn send_block(
+        &self,
+        records: impl Iterator<Item = (&str, &bytes::Bytes)>,
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
+        if self.closed.load(Ordering::Relaxed) {
+            return SendResult::Fatal(TransportError::Closed);
+        }
+        let filtered = self.filter_engine.has_outbound_filters();
+        let mut outcome = super::types::BlockOutcome::default();
+        let mut kept: Vec<(&str, &[u8])> = Vec::new();
+        for (destination, payload) in records {
+            if filtered {
+                match self.filter_engine.apply_outbound(payload) {
+                    super::filter::FilterDisposition::Pass => {}
+                    super::filter::FilterDisposition::Drop => continue,
+                    super::filter::FilterDisposition::Dlq => {
+                        let _ = outcome.add(SendResult::FilteredDlq);
+                        continue;
+                    }
+                }
+            }
+            kept.push((destination, payload.as_ref()));
+        }
+        if kept.is_empty() {
+            return outcome.finish();
+        }
+        let Some(sender) = &self.sender else {
+            return SendResult::Fatal(TransportError::Config(
+                "no endpoint configured for sending".into(),
+            ));
+        };
+        let sent = match deadline {
+            None => sender.send(&kept, None).await,
+            Some(deadline) => {
+                let until = tokio::time::Instant::from_std(deadline);
+                tokio::time::timeout_at(until, sender.send(&kept, Some(deadline)))
+                    .await
+                    .unwrap_or_else(|_elapsed| {
+                        tracing::warn!(
+                            records = kept.len(),
+                            "HTTP send deadline elapsed; the records may have arrived and are \
+                             sent again"
+                        );
+                        SendResult::Backpressured
+                    })
+            }
+        };
+        match outcome.add(sent) {
+            Some(ended) => ended,
+            None => outcome.finish(),
+        }
     }
 }
 
@@ -821,115 +955,31 @@ impl TransportSender for HttpTransport {
     }
 
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
-            return SendResult::Fatal(TransportError::Closed);
-        }
-
-        // Outbound filter check
-        if self.filter_engine.has_outbound_filters() {
-            match self.filter_engine.apply_outbound(&payload) {
-                super::filter::FilterDisposition::Pass => {}
-                super::filter::FilterDisposition::Drop => return SendResult::Ok,
-                super::filter::FilterDisposition::Dlq => return SendResult::FilteredDlq,
-            }
-        }
-
-        let Some(base_url) = &self.endpoint else {
-            return SendResult::Fatal(TransportError::Config(
-                "no endpoint configured for sending".into(),
-            ));
-        };
-
-        // Build URL: {base_url}/{destination} when non-empty, otherwise just {base_url}
-        let url = if destination.is_empty() {
-            base_url.clone()
-        } else {
-            let base = base_url.trim_end_matches('/');
-            let suffix = destination.trim_start_matches('/');
-            format!("{base}/{suffix}")
-        };
-
-        #[cfg(feature = "metrics")]
-        let start = std::time::Instant::now();
-
-        // Build request with optional W3C traceparent header for distributed tracing
-        let request_builder = self
-            .client
-            .post(&url)
-            .header("content-type", "application/octet-stream");
-
-        #[cfg(feature = "transport-trace")]
-        let request_builder = if let Some(tp) = super::propagation::current_traceparent() {
-            request_builder.header(super::propagation::TRACEPARENT_HEADER, tp)
-        } else {
-            request_builder
-        };
-
-        // Wire size, taken before `payload` moves into the request body.
-        let payload_len = payload.len();
-        let result = match request_builder.body(payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                #[cfg(feature = "logger")]
-                tracing::debug!(url = %url, bytes = payload_len, "HTTP transport: POST sent");
-
-                #[cfg(feature = "metrics")]
-                {
-                    metrics::counter!("transport_sent_total", "transport" => "http").increment(1);
-                    metrics::counter!("transport_sent_bytes_total", "transport" => "http")
-                        .increment(payload_len as u64);
-                }
-                SendResult::Ok
-            }
-            Ok(resp) if classify_status(resp.status()) == StatusClass::Unavailable => {
-                #[cfg(feature = "logger")]
-                tracing::warn!(status = %resp.status(), url = %url, "HTTP transport: backpressure");
-
-                #[cfg(feature = "metrics")]
-                metrics::counter!("transport_backpressured_total", "transport" => "http")
-                    .increment(1);
-                SendResult::Backpressured
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                #[cfg(feature = "logger")]
-                tracing::warn!(status = %status, url = %url, "HTTP transport: send error");
-
-                #[cfg(feature = "metrics")]
-                metrics::counter!("transport_send_errors_total", "transport" => "http")
-                    .increment(1);
-                let detail = format!("HTTP {status} from {url}");
-                SendResult::Fatal(match classify_status(status) {
-                    StatusClass::Misconfigured => TransportError::Config(detail),
-                    StatusClass::TooLarge => TransportError::MessageTooLarge {
-                        bytes: payload_len,
-                        detail,
-                    },
-                    StatusClass::Refused | StatusClass::Unavailable => TransportError::Send(detail),
-                })
-            }
-            Err(e) => {
-                #[cfg(feature = "logger")]
-                tracing::warn!(error = %e, url = %url, "HTTP transport: request failed");
-
-                #[cfg(feature = "metrics")]
-                metrics::counter!("transport_send_errors_total", "transport" => "http")
-                    .increment(1);
-                // Only a request that could never be built or followed is permanent.
-                // Refused, reset and timed-out connections clear when the endpoint returns.
-                if e.is_builder() || e.is_redirect() {
-                    SendResult::Fatal(TransportError::Send(format!("HTTP request failed: {e}")))
-                } else {
-                    SendResult::Backpressured
-                }
-            }
-        };
-
-        #[cfg(feature = "metrics")]
-        metrics::histogram!("transport_send_duration_seconds", "transport" => "http")
-            .record(start.elapsed().as_secs_f64());
-
-        result
+        self.send_block(std::iter::once((destination, &payload)), None)
+            .await
     }
+
+    /// One body per run of records with the same key, each by `send_timeout_ms`.
+    async fn send_batch(&self, records: &[super::work_batch::Record]) -> SendResult {
+        self.send_block(keyed(records), None).await
+    }
+
+    /// One body per run of records with the same key. Each request's timeout
+    /// is its share of the time left, so failover endpoints all get a turn.
+    async fn send_batch_by(
+        &self,
+        records: &[super::work_batch::Record],
+        deadline: std::time::Instant,
+    ) -> SendResult {
+        self.send_block(keyed(records), Some(deadline)).await
+    }
+}
+
+/// Each record's destination, its key or none, beside its payload.
+fn keyed(records: &[super::work_batch::Record]) -> impl Iterator<Item = (&str, &bytes::Bytes)> {
+    records
+        .iter()
+        .map(|r| (r.key.as_deref().unwrap_or(""), &r.payload))
 }
 
 impl TransportReceiver for HttpTransport {
@@ -1312,97 +1362,6 @@ mod tests {
         );
     }
 
-    /// Whether `buf` holds a full request head and the body it declares.
-    fn request_complete(buf: &[u8]) -> bool {
-        let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-            return false;
-        };
-        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
-        let body_len = head
-            .lines()
-            .find_map(|l| l.strip_prefix("content-length:"))
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        buf.len() >= head_end + 4 + body_len
-    }
-
-    /// A loopback endpoint that answers every request with `status`.
-    async fn status_endpoint(status: u16) -> std::net::SocketAddr {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                // Read the whole request so the reply never races the upload.
-                let mut buf = Vec::new();
-                let mut chunk = [0_u8; 4096];
-                loop {
-                    let n = stream.read(&mut chunk).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if request_complete(&buf) {
-                        break;
-                    }
-                }
-                let reply = format!(
-                    "HTTP/1.1 {status} Canned\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                );
-                let _ = stream.write_all(reply.as_bytes()).await;
-            }
-        });
-        addr
-    }
-
-    /// How the sender answers each failure status: every 5xx and the busy 4xx
-    /// are retried, a wrong credential or endpoint is the sink's fault (the
-    /// record is kept), and only a 4xx about the payload marks it undeliverable.
-    #[tokio::test]
-    async fn a_failure_status_is_retried_unless_the_payload_is_at_fault() {
-        #[derive(Debug, PartialEq)]
-        enum Want {
-            Retried,
-            SinkFault,
-            Undeliverable,
-            Refused,
-        }
-        for (status, want) in [
-            (408, Want::Retried),
-            (429, Want::Retried),
-            (500, Want::Retried),
-            (501, Want::Retried),
-            (502, Want::Retried),
-            (503, Want::Retried),
-            (504, Want::Retried),
-            (599, Want::Retried),
-            (401, Want::SinkFault),
-            (403, Want::SinkFault),
-            (404, Want::SinkFault),
-            (413, Want::Undeliverable),
-            (400, Want::Refused),
-            (422, Want::Refused),
-        ] {
-            let addr = status_endpoint(status).await;
-            let transport =
-                HttpTransport::new(&HttpTransportConfig::sender(&format!("http://{addr}")))
-                    .await
-                    .unwrap();
-            let result = transport
-                .send("ingest", bytes::Bytes::from_static(b"{}"))
-                .await;
-            let got = match &result {
-                SendResult::Backpressured => Want::Retried,
-                SendResult::Fatal(e) if e.is_fatal() => Want::SinkFault,
-                SendResult::Fatal(e) if e.is_undeliverable() => Want::Undeliverable,
-                SendResult::Fatal(TransportError::Send(_)) => Want::Refused,
-                other => panic!("HTTP {status}: unexpected {other:?}"),
-            };
-            assert_eq!(got, want, "HTTP {status}: got {result:?}");
-        }
-    }
-
     /// A record spooled while the endpoint answers 500 stays spooled through
     /// the 500s and is delivered once the endpoint recovers.
     #[cfg(feature = "tiered-sink")]
@@ -1457,35 +1416,9 @@ mod tests {
     async fn switchable_endpoint(
         status: Arc<std::sync::atomic::AtomicU16>,
     ) -> std::net::SocketAddr {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let status = Arc::clone(&status);
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut chunk = [0_u8; 4096];
-                    loop {
-                        let n = stream.read(&mut chunk).await.unwrap_or(0);
-                        if n == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                        if request_complete(&buf) {
-                            break;
-                        }
-                    }
-                    let code = status.load(Ordering::SeqCst);
-                    let reply = format!(
-                        "HTTP/1.1 {code} Canned\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                    );
-                    let _ = stream.write_all(reply.as_bytes()).await;
-                });
-            }
-        });
-        addr
+        send_tests::Server::start(move |_| send_tests::reply(status.load(Ordering::SeqCst), &[]))
+            .await
+            .addr
     }
 
     #[tokio::test]

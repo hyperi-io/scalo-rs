@@ -877,6 +877,7 @@ mod tests {
                 rotation: RotationPeriod::Daily,
                 max_age_days: 1,
                 compress_rotated: false,
+                ..FileDlqConfig::default()
             },
             mode: DlqMode::FileOnly,
             queue_capacity: 1024,

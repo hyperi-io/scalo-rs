@@ -53,6 +53,7 @@
 //! | **File** | Yes | Yes | Debugging, audit trails, replay |
 //! | **Pipe** | Yes | Yes | Unix pipelines, sidecar pattern |
 //! | **HTTP** | Yes | Yes | Webhook delivery, REST ingest |
+//! | **Syslog** | Yes | No | RFC 5424 and 3164 over TCP, TLS, UDP and RELP |
 //! | **OTLP** | Yes | No | Log records to an OpenTelemetry collector |
 //! | **Custom** | Yes | No | A sender the app registers with [`register_sender`] |
 //!
@@ -115,6 +116,9 @@ pub mod file;
 #[cfg(feature = "transport-http")]
 pub mod http;
 
+#[cfg(feature = "transport-syslog")]
+pub mod syslog;
+
 #[cfg(feature = "transport-otlp")]
 pub mod otlp;
 
@@ -170,7 +174,10 @@ pub use pipe::{PipeToken, PipeTransport, PipeTransportConfig};
 pub use file::{FileToken, FileTransport, FileTransportConfig};
 
 #[cfg(feature = "transport-http")]
-pub use http::{HttpToken, HttpTransport, HttpTransportConfig};
+pub use http::{HttpAuth, HttpEndpoint, HttpProxy, HttpToken, HttpTransport, HttpTransportConfig};
+
+#[cfg(feature = "transport-syslog")]
+pub use syslog::{SyslogConfig, SyslogTransport};
 
 #[cfg(feature = "transport-otlp")]
 pub use otlp::{OtlpCompression, OtlpConfig, OtlpProtocol, OtlpTlsConfig, OtlpTransport};

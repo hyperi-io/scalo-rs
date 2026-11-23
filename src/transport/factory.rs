@@ -69,6 +69,8 @@ pub enum AnySender {
     #[cfg(feature = "transport-http")]
     Http(super::http::HttpTransport),
 
+    #[cfg(feature = "transport-syslog")]
+    Syslog(super::syslog::SyslogTransport),
     #[cfg(feature = "transport-otlp")]
     Otlp(super::otlp::OtlpTransport),
 
@@ -95,6 +97,8 @@ macro_rules! each_sender {
             AnySender::File($t) => $body,
             #[cfg(feature = "transport-http")]
             AnySender::Http($t) => $body,
+            #[cfg(feature = "transport-syslog")]
+            AnySender::Syslog($t) => $body,
             #[cfg(feature = "transport-otlp")]
             AnySender::Otlp($t) => $body,
             AnySender::Custom($c) => $custom,
@@ -146,8 +150,9 @@ impl TransportSender for AnySender {
     /// Forward [`send_batch`](TransportSender::send_batch) to the active
     /// backend. gRPC uses its native single-RPC `RouteBatch` override, OTLP
     /// sends the block as one export request, and Kafka queues the whole block
-    /// before awaiting any delivery report. Every other
-    /// backend uses the trait's per-record default (see the at-least-once
+    /// before awaiting any delivery report. HTTP posts each run of records with
+    /// the same key as one body, framed as configured. Every other backend
+    /// uses the trait's per-record default (see the at-least-once
     /// partial-send caveat on the trait method).
     async fn send_batch(&self, records: &[Record]) -> SendResult {
         each_sender!(
@@ -319,6 +324,16 @@ impl AnySender {
                 Ok(Self::Http(transport))
             }
 
+            #[cfg(feature = "transport-syslog")]
+            TransportType::Syslog => {
+                let syslog_config = config
+                    .syslog
+                    .as_ref()
+                    .ok_or_else(|| TransportError::Config("syslog config missing".into()))?;
+                Ok(Self::Syslog(super::syslog::SyslogTransport::new(
+                    syslog_config,
+                )?))
+            }
             #[cfg(feature = "transport-otlp")]
             TransportType::Otlp => {
                 let otlp_config = config
@@ -1263,6 +1278,9 @@ impl AnyReceiver {
                  use a built-in type to receive"
             ))),
 
+            TransportType::Syslog => Err(TransportError::Config(
+                "transport type 'syslog' sends only: use a built-in type to receive".into(),
+            )),
             TransportType::Otlp => Err(TransportError::Config(
                 "transport type 'otlp' sends only: use a built-in type to receive".into(),
             )),

@@ -12,6 +12,7 @@ feature flag -- apps pull only what they ship.
 | File | `transport-file` | None | Debugging, audit trails, replay | No |
 | Pipe | `transport-pipe` | None | Unix pipeline composition | No, none to hold |
 | HTTP | `transport-http` | None | Webhook delivery, REST ingest | No |
+| Syslog | `transport-syslog` | None | Syslog receivers over TCP, TLS, UDP and RELP, send only ([syslog.md](syslog.md)) | No, sends only |
 | OTLP | `transport-otlp` | None (pure Rust, no `protoc`) | Log records to an OpenTelemetry collector, send only ([otlp.md](otlp.md)) | No, sends only |
 
 A source that holds its acknowledgement releases it only once its records are delivered. See [../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#which-sources-hold-it).
@@ -294,7 +295,14 @@ Source: [../../src/transport/memory/](../../src/transport/memory/).
 
 ## File
 
-NDJSON file I/O. Each `send()` appends one newline-delimited line.
+NDJSON file I/O. Each record sent is one newline-delimited line, and a
+`send_batch` block goes to the file in one write through `io::NdjsonWriter`.
+A write lands whole: a failed one is cut back off the file. When the first
+send opens a file whose last line has no newline, as a crash mid-write leaves
+it, that line is cut off before the next record, logged at warn with
+`cut_bytes`, and counted in `file_writer_cut_bytes_total{writer}`. So a
+half-written record never joins the next one.
+
 Read side tracks a byte offset and persists it to a `.pos` sidecar
 file so reads survive restarts. `FileToken` has the byte offset, and
 `commit()` writes the highest committed offset to a temporary file, syncs it
@@ -312,9 +320,37 @@ transport:
     delivery: flush
     file:
       path: "/var/log/myapp/events.ndjson"
-      append: true
+      append: true              # false empties the file at the first send
       max_line_bytes: 16777216
+      rotation: never           # never (default) | hourly | daily, by local time
+      max_bytes: 104857600      # rotate before a write that would pass this; unset: no size rotation
+      max_files: 5              # rotated files kept; unset: no count limit
+      max_age_days: 30          # unset (default): no age limit
+      compress_rotated: false   # gzip all but the six newest rotated files
+      durable: false            # true: sync the file after each block, the folder after a create or rotation
+      file_mode: "0600"         # files created, before the umask. Unix only
+      dir_mode: "0700"          # folders created, before the umask. Unix only
 ```
+
+Rotation renames the file to `<path>.<local YYYYMMDDTHHMMSS>`, adding `.1`,
+`.2` within one second, and starts a new one. Size and time rotation work
+together: either triggers it. A block larger than `max_bytes` still lands
+whole, in a file of its own. A rotation the folder refuses (a read-only folder,
+say) is logged at warn, the block goes into the current file, and rotation is tried again after 250 ms, doubling to
+30 s. A reader of the same path does not follow a rotation, so rotate only a
+file nothing reads through this transport. Each rotation is logged at info and
+counted in `file_writer_rotations_total{writer, trigger}`.
+
+`durable: true` makes a block that returned `Ok` survive power loss, at the
+cost of a disk flush per block. Without it a block is in the kernel page
+cache when `send` returns.
+
+Missing folders are created with `dir_mode`, and a new file with
+`file_mode`, both private by default in this transport. The DLQ file backend
+and the file output leave them unset, so the process umask decides there and
+an operator or shipper can read the files. A file or folder that already exists
+keeps its mode. On Windows the modes are ignored: a file takes its folder's
+ACL, so set the ACL on the folder.
 
 - Cancellation safety: `recv` keeps a partly read line, and any
   records it has not returned yet, in the transport, so a dropped call
@@ -385,7 +421,7 @@ transport:
 - Cancellation safety: send is `reqwest`'s async path -- drop
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
-- Send failures: a refused, reset or timed-out connection, HTTP 408 and 429, and every 5xx are `Backpressured`, so a down or failing endpoint is waited out. A wrong credential or endpoint (401, 403, 404, 405, 407, 410, 421, an unfollowed 3xx) is `Fatal(Config)`, which a tiered sink's drain keeps spooled until the sink is fixed. 413 is `Fatal(MessageTooLarge)`, and any other 4xx `Fatal(Send)`: both are the payload's fault, so the drain drops the record. A request that cannot be built is `Fatal(Send)`.
+- Sending: credentials, headers, body framing, gzip, failover, proxy, redirects and what each status answers are in [http.md](http.md). A refused, reset or timed-out connection, 408, 429 and every 5xx are retried. 400, 413 and 422 are `Reject`. Any other 3xx or 4xx is `Fatal(Config)`, which a tiered sink's drain keeps spooled until the sink is fixed.
 - Acknowledgement: the server answers 200 once the record is queued for `recv`, not once the consumer reads it, so a crash loses what it answered but had not delivered. A full queue (`recv_buffer_size`), a held inbound gate, and a closed receiver answer 503 with `Retry-After: 1`. It does not hold its answer: `<key>.http.acknowledgements` has no effect, and the factory warns once. An endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#a-hand-rolled-loop)).
 - `close()`: answers new POSTs with 503, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Open connections finish their in-flight requests on their own, the listener is free when `close()` returns, and a client that never finishes its request does not hold it open. Dropping the transport stops the server too.
 - Shutdown order: `close()`, then `recv` until `Closed`, then flush. The `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). Flushing first loses the records still queued.
