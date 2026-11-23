@@ -926,6 +926,23 @@ async fn silent_listener() -> (std::net::SocketAddr, Arc<std::sync::atomic::Atom
     (addr, accepts)
 }
 
+/// Hold a paused clock until `accepts` reaches `count`, or 5 s of real time
+/// pass. Tokio does not auto-advance the clock while a blocking task runs.
+fn hold_clock_until(
+    accepts: &Arc<std::sync::atomic::AtomicUsize>,
+    count: usize,
+) -> tokio::task::JoinHandle<()> {
+    let accepts = Arc::clone(accepts);
+    tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while accepts.load(std::sync::atomic::Ordering::SeqCst) < count
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    })
+}
+
 /// A TLS client to `addr` that trusts a throwaway CA, with the given send
 /// limit. The CA is read when the transport is built.
 async fn tls_client(addr: std::net::SocketAddr, send_timeout_ms: u64) -> GrpcTransport {
@@ -981,18 +998,23 @@ async fn a_send_to_a_server_that_never_answers_ends_at_send_timeout() {
 /// the stalled one.
 ///
 /// The clock is paused, so the dial's limit, nine tenths of the send's, always
-/// fires first: a stalled test thread cannot reach both limits at once.
+/// fires first: a stalled test thread cannot reach both limits at once. It
+/// holds until the listener accepts each dial, as a loopback connect on macOS
+/// is still in flight when the runtime first idles, and the clock would jump
+/// to the dial's limit and abandon it.
 #[tokio::test(start_paused = true)]
 async fn each_send_after_a_stalled_tls_handshake_dials_afresh() {
     let (addr, accepts) = silent_listener().await;
     let client = tls_client(addr, 1_000).await;
 
     for dialled in 1..=3 {
+        let held = hold_clock_until(&accepts, dialled);
         let sent = tokio::time::timeout(
             Duration::from_secs(5),
             client.send("main", bytes::Bytes::from_static(b"{}")),
         )
         .await;
+        held.await.expect("clock hold");
         assert!(
             matches!(sent, Ok(SendResult::Backpressured)),
             "send must end at send_timeout_ms as backpressure, got {sent:?}"

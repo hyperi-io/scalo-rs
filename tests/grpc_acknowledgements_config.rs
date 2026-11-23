@@ -22,8 +22,8 @@ use scalo::transport::{
 
 /// A client pushing one record to `receiver`, in a task of its own.
 // A `let ... else` is irrefutable, and warned about, when gRPC is the only
-// transport compiled in.
-#[allow(clippy::manual_let_else)]
+// transport compiled in. With one other, clippy reads the wildcard as it.
+#[allow(clippy::manual_let_else, clippy::match_wildcard_for_single_variants)]
 async fn push(receiver: &AnyReceiver) -> tokio::task::JoinHandle<SendResult> {
     let server = match receiver {
         AnyReceiver::Grpc(server) => server,

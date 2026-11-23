@@ -266,7 +266,8 @@ mod tests {
         socket
             .bind("127.0.0.1:0".parse().expect("addr"))
             .expect("bind");
-        // Backlog 0 holds one completed connection. The filler takes that slot.
+        // On Linux, backlog 0 holds one completed connection and the filler
+        // takes it. macOS reads 0 as somaxconn and resets a SYN to a full queue.
         let listener = socket.listen(0).expect("listen");
         let addr = listener.local_addr().expect("addr");
         let filler = tokio::net::TcpStream::connect(addr)
@@ -563,6 +564,10 @@ mod tests {
     /// running would next reach the server at 3 s, well past the 500 ms the
     /// fresh dial is given.
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS resets a SYN to a full accept queue, so no connect stalls"
+    )]
     async fn each_send_after_a_stalled_connect_dials_afresh() {
         let (addr, release, accepts) = stalled_connect_listener().await;
         let client = Arc::new(

@@ -22,12 +22,14 @@ transport:
         ca_path: /etc/tls/ca.pem
         client_cert_path: /etc/tls/client.pem
         client_key_path: /etc/tls/client.key
+      proxy: system               # none (default), system or a proxy URL
 ```
 
 - Endpoint: a base URL. Unset, it is `http://localhost:4317`, or `http://localhost:4318` under `http`. Under `http`, `/v1/logs` is appended unless the URL already ends in it.
 - TLS: an `https://` endpoint with no `tls` section trusts the OS root store, and a `tls` section beside an `http://` endpoint is refused at build. The section is the `ClientTlsConfig` that syslog reads too ([../api/tls.md](../api/tls.md#client-trust)). gRPC takes `native` or `bundle` and no `pin_sha256`, which `http` checks.
 - Headers: gRPC metadata or HTTP headers on every request, commonly an API key. They are never logged or serialised back out, and a name or value the protocol cannot carry fails the build, naming the header and not its value.
 - Deadline: `timeout_ms` (default 10 s, 0 refused) bounds each export, connect and TLS handshake included. `send_batch_by` answers by its deadline when that comes first. Either one running out is `Backpressured`: the records may have arrived, so the retry can duplicate them. gRPC sends the limit as `grpc-timeout` too.
+- Proxy: `proxy` is `none`, `system` or an `http://` proxy URL, as for the HTTP transport ([http.md](http.md#proxy-redirects-and-logs)). gRPC and an `https` collector go through an HTTP CONNECT tunnel, and a refused CONNECT is `Reject` with the proxy's status and the collector's port.
 - Redirects: not followed.
 - Filters: `filters_out` runs on each payload before the request is built. A `dlq` match makes the block's result `FilteredDlq`, and `dead_letter_reason` names the record.
 

@@ -242,9 +242,29 @@ impl ProxyDialer {
         self.routes.as_ref()?.route(scheme, host, port)
     }
 
+    /// The proxy's refusal of a CONNECT to `host:port`, read by opening one
+    /// tunnel within `within`. `None` when the proxy does not cover the
+    /// target, opens the tunnel, or fails some other way.
+    #[cfg(any(feature = "transport-http", feature = "transport-otlp"))]
+    pub(crate) async fn refusal_of(
+        &self,
+        scheme: Scheme,
+        host: &str,
+        port: u16,
+        within: std::time::Duration,
+    ) -> Option<ProxyRefused> {
+        if !self.proxies(scheme, host, port) {
+            return None;
+        }
+        match tokio::time::timeout(within, self.connect(scheme, host, port)).await {
+            Ok(Err(ProxyError::Refused(refused))) => Some(refused),
+            _ => None,
+        }
+    }
+
     /// The proxy URL, credentials included, for a client library that dials
     /// its own proxy, such as reqwest.
-    #[cfg(feature = "transport-http")]
+    #[cfg(any(feature = "transport-http", feature = "transport-otlp"))]
     pub(crate) fn proxy_url(&self, scheme: Scheme, host: &str, port: u16) -> Option<String> {
         let routes = self.routes.as_ref()?;
         routes.route(scheme, host, port)?;
@@ -254,6 +274,29 @@ impl ProxyDialer {
         }?;
         Some(entry.url.expose().to_string())
     }
+}
+
+/// `builder` routed by `dialer`. reqwest dials the proxy and opens the
+/// CONNECT tunnel to an https endpoint itself, and sends a plain http request
+/// to the proxy whole.
+#[cfg(any(feature = "transport-http", feature = "transport-otlp"))]
+pub(crate) fn reqwest_proxy(
+    builder: reqwest::ClientBuilder,
+    config: &ProxyConfig,
+    dialer: &ProxyDialer,
+) -> reqwest::ClientBuilder {
+    if *config == ProxyConfig::None {
+        return builder.no_proxy();
+    }
+    let dialer = dialer.clone();
+    builder.proxy(reqwest::Proxy::custom(move |url| {
+        let scheme = if url.scheme() == "https" {
+            Scheme::Tls
+        } else {
+            Scheme::Plain
+        };
+        dialer.proxy_url(scheme, url.host_str()?, url.port_or_known_default()?)
+    }))
 }
 
 /// Why a connection through the proxy failed.

@@ -437,6 +437,10 @@ impl CommitToken for AnyToken {}
 /// [`AnyReceiver::recv`] wraps each backend token in the matching [`AnyToken`]
 /// variant; [`AnyReceiver::commit`] forwards the inner tokens to that backend
 /// (variant mismatches skipped defensively -- cannot legitimately appear).
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a backend is held inline so a recv makes no extra pointer hop"
+)]
 pub enum AnyReceiver {
     #[cfg(feature = "transport-kafka")]
     Kafka(super::kafka::KafkaTransport),
