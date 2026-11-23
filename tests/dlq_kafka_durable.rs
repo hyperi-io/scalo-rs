@@ -192,6 +192,7 @@ fn dlq_config(mode: DlqMode, topic: &str, file_dir: Option<&Path>) -> DlqConfig 
             rotation: RotationPeriod::Daily,
             max_age_days: 1,
             compress_rotated: false,
+            ..FileDlqConfig::default()
         },
         kafka: KafkaDlqConfig {
             enabled: true,

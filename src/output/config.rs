@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::io::{DEFAULT_SPOOL_ROOT, FileWriterConfig, RotationPeriod};
+use crate::io::{DEFAULT_SPOOL_ROOT, FileWriteOptions, FileWriterConfig, RotationPeriod};
 
 /// File output sink configuration.
 ///
@@ -37,8 +37,12 @@ pub struct FileOutputConfig {
     /// Auto-cleanup files older than this many days.
     pub max_age_days: u32,
 
-    /// Compress rotated files with flate2/gzip.
+    /// Gzip rotated files, keeping the six newest uncompressed.
     pub compress_rotated: bool,
+
+    /// Size rotation, retention by count, `durable` and file modes.
+    #[serde(flatten)]
+    pub write: FileWriteOptions,
 }
 
 impl Default for FileOutputConfig {
@@ -50,6 +54,7 @@ impl Default for FileOutputConfig {
             rotation: RotationPeriod::Hourly,
             max_age_days: 7,
             compress_rotated: true,
+            write: FileWriteOptions::default(),
         }
     }
 }
@@ -63,6 +68,7 @@ impl FileOutputConfig {
             rotation: self.rotation,
             max_age_days: self.max_age_days,
             compress_rotated: self.compress_rotated,
+            write: self.write,
         }
     }
 }
@@ -80,6 +86,7 @@ mod tests {
         assert_eq!(config.rotation, RotationPeriod::Hourly);
         assert_eq!(config.max_age_days, 7);
         assert!(config.compress_rotated);
+        assert_eq!(config.write, FileWriteOptions::default());
     }
 
     #[test]
@@ -91,9 +98,15 @@ mod tests {
             rotation: RotationPeriod::Daily,
             max_age_days: 30,
             compress_rotated: false,
+            write: FileWriteOptions {
+                max_bytes: Some(4096),
+                durable: true,
+                ..FileWriteOptions::default()
+            },
         };
         let json = serde_json::to_string(&config).expect("serialise");
         let parsed: FileOutputConfig = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(parsed.write, config.write);
         assert!(parsed.enabled);
         assert_eq!(parsed.filename, "data.ndjson");
         assert_eq!(parsed.rotation, RotationPeriod::Daily);

@@ -18,8 +18,8 @@
 //! ```text
 //! /var/spool/scalo/dlq/loader/
 //! |-- dlq.ndjson              # Current file
-//! |-- dlq.ndjson.20260302T14  # Rotated (hourly)
-//! `-- dlq.ndjson.20260302T13.gz  # Compressed
+//! |-- dlq.ndjson.20260302T140000     # Rotated, local time of the rotation
+//! `-- dlq.ndjson.20260302T080000.gz  # Compressed, past the six newest
 //! ```
 
 use tracing::debug;
@@ -101,11 +101,8 @@ impl FileDlqInner {
         Ok(())
     }
 
-    /// Flush buffered bytes to the kernel page cache.
-    ///
-    /// See [`crate::io::NdjsonWriter::flush`] for the durability
-    /// caveat -- best-effort through the kernel page cache
-    /// only.
+    /// Sync the DLQ file's data to disk when `durable` is set. See
+    /// [`crate::io::NdjsonWriter::flush`].
     ///
     /// # Errors
     ///
@@ -144,6 +141,7 @@ mod tests {
             rotation: RotationPeriod::Daily,
             max_age_days: 1,
             compress_rotated: false,
+            ..FileDlqConfig::default()
         }
     }
 

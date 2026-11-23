@@ -13,7 +13,10 @@
 //!
 //! ## Send
 //!
-//! Appends one NDJSON line per `send()` call to the configured file path.
+//! Appends one NDJSON line per record through [`crate::io::NdjsonWriter`],
+//! a whole `send_batch` block in one write. Rotation by size or time,
+//! `durable` syncing and file modes come from the writer's keys. Rotation is
+//! off by default, and a reader of the same path does not follow a rotation.
 //!
 //! ## Receive
 //!
@@ -41,6 +44,7 @@ use super::traits::{CommitToken, RecvBatch, TransportBase, TransportReceiver, Tr
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::WorkBatch;
 use crate::framing::{DecodeLimits, Frame, Framing, Lf, StreamDecoder};
+use crate::io::{FileWriteOptions, FileWriterConfig, NdjsonWriter, RotationPeriod};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,9 +75,28 @@ pub struct FileTransportConfig {
     /// File path for read/write.
     pub path: String,
 
-    /// Append mode (default true for send).
+    /// Append to what the file holds (default). `false` empties the file
+    /// when the first send opens it.
     #[serde(default = "default_append")]
     pub append: bool,
+
+    /// Time rotation of the sent file. Default `never`.
+    #[serde(default = "default_rotation")]
+    pub rotation: RotationPeriod,
+
+    /// Delete rotated files older than this many days, at each rotation.
+    /// Unset by default: no age limit.
+    #[serde(default)]
+    pub max_age_days: Option<u32>,
+
+    /// Gzip rotated files, keeping the six newest uncompressed. Default off.
+    #[serde(default)]
+    pub compress_rotated: bool,
+
+    /// Size rotation, retention by count, `durable` and file modes. An unset
+    /// mode is private here: files `0600`, folders `0700`.
+    #[serde(flatten)]
+    pub write: FileWriteOptions,
 
     /// Inbound message filters (applied on recv before caller sees messages).
     #[serde(default)]
@@ -94,6 +117,10 @@ fn default_append() -> bool {
     true
 }
 
+fn default_rotation() -> RotationPeriod {
+    RotationPeriod::Never
+}
+
 fn default_max_line_bytes() -> usize {
     16 * 1024 * 1024
 }
@@ -103,6 +130,10 @@ impl Default for FileTransportConfig {
         Self {
             path: String::new(),
             append: true,
+            rotation: default_rotation(),
+            max_age_days: None,
+            compress_rotated: false,
+            write: FileWriteOptions::default(),
             filters_in: Vec::new(),
             filters_out: Vec::new(),
             max_line_bytes: default_max_line_bytes(),
@@ -111,6 +142,26 @@ impl Default for FileTransportConfig {
 }
 
 impl FileTransportConfig {
+    /// The writer settings and file name for the send side.
+    fn writer_config(&self) -> TransportResult<(FileWriterConfig, String)> {
+        let path = Path::new(&self.path);
+        let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            TransportError::Config(format!("file path {:?} names no file", self.path))
+        })?;
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let config = FileWriterConfig {
+            path: dir.to_path_buf(),
+            rotation: self.rotation,
+            max_age_days: self.max_age_days.unwrap_or(u32::MAX),
+            compress_rotated: self.compress_rotated,
+            write: self.write.private_by_default(),
+        };
+        Ok((config, name.to_owned()))
+    }
+
     /// Load from the config cascade under the `transport.file` key, or the defaults
     /// when it is absent.
     ///
@@ -120,11 +171,6 @@ impl FileTransportConfig {
     pub fn from_cascade() -> crate::transport::TransportResult<Self> {
         <Self as super::traits::FromCascade>::from_cascade_key("transport.file")
     }
-}
-
-/// Internal state for the write side.
-struct WriteState {
-    file: tokio::fs::File,
 }
 
 /// Internal state for the read side, kept across `recv` calls so a dropped
@@ -157,7 +203,8 @@ pub struct FileTransport {
     #[cfg(feature = "health")]
     _health_registration: crate::health::HealthRegistration,
     config: FileTransportConfig,
-    writer: Mutex<Option<WriteState>>,
+    /// The send side's writer, opened on the first send.
+    writer: Mutex<Option<Arc<NdjsonWriter>>>,
     reader: Mutex<Option<ReadState>>,
     closed: Arc<AtomicBool>,
     filter_engine: super::filter::TransportFilterEngine,
@@ -168,11 +215,12 @@ impl FileTransport {
     ///
     /// # Errors
     ///
-    /// Returns error if the file path is empty.
+    /// Returns error if the file path is empty or names no file.
     pub async fn new(config: &FileTransportConfig) -> TransportResult<Self> {
         if config.path.is_empty() {
             return Err(TransportError::Config("file path is empty".into()));
         }
+        config.writer_config()?;
         if config.max_line_bytes == 0 {
             return Err(TransportError::Config(
                 "max_line_bytes is 0, which turns every line into a dead letter".into(),
@@ -180,7 +228,14 @@ impl FileTransport {
         }
 
         #[cfg(feature = "logger")]
-        tracing::info!(path = %config.path, append = config.append, "File transport opened");
+        tracing::info!(
+            path = %config.path,
+            append = config.append,
+            rotation = ?config.rotation,
+            max_bytes = ?config.write.max_bytes,
+            durable = config.write.durable,
+            "File transport opened"
+        );
 
         // Fail loud on bad filter config -- silently disabling filters
         // turns a misconfigured `drop` / `dlq` rule into a permanent pass.
@@ -258,25 +313,75 @@ impl FileTransport {
             .map_err(commit_err)
     }
 
-    /// Lazily open the write file handle.
-    async fn ensure_writer(&self) -> TransportResult<()> {
+    /// The writer, opened on the first call. Creates missing directories.
+    async fn writer(&self) -> TransportResult<Arc<NdjsonWriter>> {
         let mut guard = self.writer.lock().await;
-        if guard.is_none() {
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(self.config.append)
-                .write(true)
-                .open(&self.config.path)
-                .await
-                .map_err(|e| {
-                    TransportError::Connection(format!(
-                        "failed to open '{}' for writing: {e}",
-                        self.config.path
-                    ))
-                })?;
-            *guard = Some(WriteState { file });
+        if let Some(writer) = guard.as_ref() {
+            return Ok(Arc::clone(writer));
         }
-        Ok(())
+        let (config, name) = self.config.writer_config()?;
+        let append = self.config.append;
+        let opened = tokio::task::spawn_blocking(move || {
+            if append {
+                NdjsonWriter::new(&config, "", &name, "file transport")
+            } else {
+                NdjsonWriter::truncating(&config, "", &name, "file transport")
+            }
+        })
+        .await
+        .map_err(|e| TransportError::Internal(format!("file writer open panicked: {e}")))?
+        .map_err(|e| {
+            TransportError::Connection(format!(
+                "failed to open '{}' for writing: {e}",
+                self.config.path
+            ))
+        })?;
+        let writer = Arc::new(opened);
+        *guard = Some(Arc::clone(&writer));
+        Ok(writer)
+    }
+
+    /// Writes `block`, holding `records` framed lines of `payload_bytes`
+    /// before framing, in one write.
+    #[cfg_attr(
+        not(any(feature = "logger", feature = "metrics")),
+        allow(unused_variables)
+    )]
+    async fn write_block(&self, block: Vec<u8>, records: u64, payload_bytes: u64) -> SendResult {
+        let writer = match self.writer().await {
+            Ok(writer) => writer,
+            Err(e) => return SendResult::Fatal(e),
+        };
+        let written = tokio::task::spawn_blocking(move || writer.write_buf(&block, records)).await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                #[cfg(feature = "logger")]
+                tracing::warn!(error = %e, path = %self.config.path, "File transport: write error");
+                return SendResult::Fatal(TransportError::Send(format!("write failed: {e}")));
+            }
+            Err(e) => {
+                return SendResult::Fatal(TransportError::Internal(format!(
+                    "file write panicked: {e}"
+                )));
+            }
+        }
+
+        #[cfg(feature = "logger")]
+        tracing::debug!(
+            records,
+            bytes = payload_bytes,
+            "File transport: block written"
+        );
+
+        #[cfg(feature = "metrics")]
+        {
+            metrics::counter!("transport_sent_total", "transport" => "file").increment(records);
+            metrics::counter!("transport_sent_bytes_total", "transport" => "file")
+                .increment(payload_bytes);
+        }
+
+        SendResult::Ok
     }
 
     /// Lazily open the read file handle and seek to committed position.
@@ -329,9 +434,15 @@ impl TransportBase for FileTransport {
     async fn close(&self) -> TransportResult<()> {
         self.closed.store(true, Ordering::Relaxed);
 
-        // Flush and drop writer
-        if let Some(mut state) = self.writer.lock().await.take() {
-            let _ = state.file.flush().await;
+        // Sync a durable writer, then drop it.
+        if let Some(writer) = self.writer.lock().await.take() {
+            let synced = tokio::task::spawn_blocking(move || writer.flush()).await;
+            #[cfg(feature = "logger")]
+            if let Ok(Err(e)) = synced {
+                tracing::warn!(error = %e, path = %self.config.path, "File transport: sync on close failed");
+            }
+            #[cfg(not(feature = "logger"))]
+            drop(synced);
         }
 
         // Drop reader
@@ -378,39 +489,48 @@ impl TransportSender for FileTransport {
             }
         }
 
-        if let Err(e) = self.ensure_writer().await {
-            return SendResult::Fatal(e);
-        }
-
-        let mut guard = self.writer.lock().await;
-        let Some(state) = guard.as_mut() else {
-            return SendResult::Fatal(TransportError::Internal("writer not initialised".into()));
-        };
-
         let mut line = Vec::with_capacity(payload.len() + 1);
         let _ = Lf.encode(&[&payload], &mut line);
-        if let Err(e) = state.file.write_all(&line).await {
-            #[cfg(feature = "logger")]
-            tracing::warn!(error = %e, "File transport: write error");
-            return SendResult::Fatal(TransportError::Send(format!("write failed: {e}")));
-        }
-        if let Err(e) = state.file.flush().await {
-            #[cfg(feature = "logger")]
-            tracing::warn!(error = %e, "File transport: flush error");
-            return SendResult::Fatal(TransportError::Send(format!("flush failed: {e}")));
-        }
+        self.write_block(line, 1, payload.len() as u64).await
+    }
 
-        #[cfg(feature = "logger")]
-        tracing::debug!(bytes = payload.len(), "File transport: message sent");
-
-        #[cfg(feature = "metrics")]
-        {
-            metrics::counter!("transport_sent_total", "transport" => "file").increment(1);
-            metrics::counter!("transport_sent_bytes_total", "transport" => "file")
-                .increment(payload.len() as u64);
+    /// Writes the records the outbound filters pass as one block. A record
+    /// they dead-letter leaves the rest to be written and makes the answer
+    /// `FilteredDlq`.
+    async fn send_batch(&self, records: &[super::work_batch::Record]) -> SendResult {
+        if self.closed.load(Ordering::Relaxed) {
+            return SendResult::Fatal(TransportError::Closed);
         }
-
-        SendResult::Ok
+        let mut dead_lettered = false;
+        let mut passed: Vec<&[u8]> = Vec::with_capacity(records.len());
+        for record in records {
+            let disposition = if self.filter_engine.has_outbound_filters() {
+                self.filter_engine.apply_outbound(&record.payload)
+            } else {
+                super::filter::FilterDisposition::Pass
+            };
+            match disposition {
+                super::filter::FilterDisposition::Pass => passed.push(&record.payload),
+                super::filter::FilterDisposition::Drop => {}
+                super::filter::FilterDisposition::Dlq => dead_lettered = true,
+            }
+        }
+        if !passed.is_empty() {
+            let payload_bytes: usize = passed.iter().map(|p| p.len()).sum();
+            let mut block = Vec::with_capacity(payload_bytes + passed.len());
+            let _ = Lf.encode(&passed, &mut block);
+            let written = self
+                .write_block(block, passed.len() as u64, payload_bytes as u64)
+                .await;
+            if !written.is_ok() {
+                return written;
+            }
+        }
+        if dead_lettered {
+            SendResult::FilteredDlq
+        } else {
+            SendResult::Ok
+        }
     }
 }
 
@@ -938,5 +1058,270 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let transport = make_transport(&dir, "name_test.ndjson").await;
         assert_eq!(transport.name(), "file");
+    }
+
+    fn record(payload: &'static [u8]) -> crate::transport::work_batch::Record {
+        crate::transport::work_batch::Record {
+            payload: bytes::Bytes::from_static(payload),
+            key: None,
+            headers: Vec::new(),
+            metadata: crate::transport::work_batch::RecordMeta {
+                timestamp_ms: None,
+                format: PayloadFormat::detect(payload),
+            },
+        }
+    }
+
+    /// A block goes out as one write, and the writer's keys rotate it by size
+    /// and keep `max_files` rotated files.
+    #[tokio::test]
+    async fn send_batch_writes_a_block_and_rotates_by_size() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out").join("sent.ndjson");
+        let transport = FileTransport::new(&FileTransportConfig {
+            path: path.display().to_string(),
+            write: FileWriteOptions {
+                max_bytes: Some(4),
+                max_files: Some(1),
+                durable: true,
+                ..FileWriteOptions::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        for block in [
+            [record(b"a"), record(b"b")],
+            [record(b"c"), record(b"d")],
+            [record(b"e"), record(b"f")],
+        ] {
+            let sent = transport.send_batch(&block).await;
+            assert!(sent.is_ok(), "{sent:?}");
+        }
+        transport.close().await.unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"e\nf\n");
+        let rotated: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "sent.ndjson")
+            .collect();
+        assert_eq!(rotated.len(), 1, "max_files keeps one: {rotated:?}");
+        let kept = std::fs::read(path.parent().unwrap().join(&rotated[0])).unwrap();
+        assert_eq!(kept, b"c\nd\n", "the newest rotated block");
+    }
+
+    /// The crash-cut fixture through the transport: a sent file left ending
+    /// mid-line is cut back before the next record, so the two never join and
+    /// a reader gets both whole lines.
+    #[tokio::test]
+    async fn a_half_written_line_is_cut_before_the_next_send() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("crash.ndjson");
+        std::fs::write(&path, b"{\"first\":1}\n{\"half\":").unwrap();
+        let sender = make_transport(&dir, "crash.ndjson").await;
+        assert!(
+            sender
+                .send("k", bytes::Bytes::from_static(b"{\"next\":2}"))
+                .await
+                .is_ok()
+        );
+        sender.close().await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"first\":1}\n{\"next\":2}\n"
+        );
+        let reader = make_transport(&dir, "crash.ndjson").await;
+        let batch = reader.recv(10).await.unwrap();
+        let payloads: Vec<&[u8]> = batch.records.iter().map(|r| r.payload.as_ref()).collect();
+        assert_eq!(payloads, [&b"{\"first\":1}"[..], b"{\"next\":2}"]);
+    }
+
+    /// `append: false` empties the file at the first send, and `true` keeps it.
+    #[tokio::test]
+    async fn append_false_empties_the_file_first() {
+        for (append, want) in [(true, &b"old\nnew\n"[..]), (false, b"new\n")] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("f.ndjson");
+            std::fs::write(&path, b"old\n").unwrap();
+            let transport = FileTransport::new(&FileTransportConfig {
+                path: path.display().to_string(),
+                append,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert!(
+                transport
+                    .send("k", bytes::Bytes::from_static(b"new"))
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), want, "append {append}");
+        }
+    }
+
+    /// Outbound filters apply per record in a block: a dropped record is not
+    /// written, a dead-lettered one makes the answer `FilteredDlq`, and the
+    /// rest are written.
+    #[tokio::test]
+    async fn send_batch_applies_outbound_filters_per_record() {
+        use crate::transport::filter::{FilterAction, FilterRule};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("filtered.ndjson");
+        let rules = vec![
+            FilterRule {
+                expression: r#"kind == "noise""#.into(),
+                action: FilterAction::Drop,
+            },
+            FilterRule {
+                expression: r#"kind == "bad""#.into(),
+                action: FilterAction::Dlq,
+            },
+        ];
+        let transport = FileTransport::new(&FileTransportConfig {
+            path: path.display().to_string(),
+            filters_out: rules,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let block = [
+            record(br#"{"kind":"ok","n":1}"#),
+            record(br#"{"kind":"noise"}"#),
+            record(br#"{"kind":"bad"}"#),
+            record(br#"{"kind":"ok","n":2}"#),
+        ];
+        assert!(matches!(
+            transport.send_batch(&block).await,
+            SendResult::FilteredDlq
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"kind\":\"ok\",\"n\":1}\n{\"kind\":\"ok\",\"n\":2}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_naming_no_file_is_a_config_error() {
+        for path in ["..", "/"] {
+            let result = FileTransport::new(&FileTransportConfig {
+                path: path.into(),
+                ..Default::default()
+            })
+            .await;
+            assert!(matches!(result, Err(TransportError::Config(_))), "{path}");
+        }
+    }
+
+    /// Every writer key reaches the transport config through the cascade, from
+    /// YAML and from the environment, which wins.
+    #[cfg(feature = "config")]
+    #[test]
+    fn writer_keys_reach_the_config_through_the_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "transport:\n  file:\n    path: /var/log/app/out.ndjson\n    rotation: daily\n    \
+             max_age_days: 3\n    compress_rotated: true\n    max_bytes: 1048576\n    \
+             max_files: 4\n    file_mode: \"0640\"\n",
+        )
+        .unwrap();
+        temp_env::with_vars(
+            [
+                ("FILEKEYS__TRANSPORT__FILE__DURABLE", Some("true")),
+                ("FILEKEYS__TRANSPORT__FILE__MAX_FILES", Some("9")),
+                ("FILEKEYS__TRANSPORT__FILE__DIR_MODE", Some("0750")),
+            ],
+            || {
+                crate::config::setup(crate::config::ConfigOptions {
+                    env_prefix: "FILEKEYS".to_string(),
+                    config_paths: vec![dir.path().to_path_buf()],
+                    search_standard_paths: false,
+                    load_dotenv: false,
+                    ..crate::config::ConfigOptions::default()
+                })
+                .unwrap();
+            },
+        );
+        let config = FileTransportConfig::from_cascade().unwrap();
+        assert_eq!(config.rotation, RotationPeriod::Daily);
+        assert_eq!(config.max_age_days, Some(3));
+        assert!(config.compress_rotated);
+        assert_eq!(config.write.max_bytes, Some(1_048_576));
+        assert_eq!(config.write.max_files, Some(9), "env wins");
+        assert!(config.write.durable, "from env");
+        assert_eq!(
+            config.write.file_mode.map(crate::io::FileMode::bits),
+            Some(0o640)
+        );
+        assert_eq!(
+            config.write.dir_mode.map(crate::io::FileMode::bits),
+            Some(0o750),
+            "from env"
+        );
+    }
+
+    #[test]
+    fn writer_keys_default_off_and_private() {
+        let config = FileTransportConfig::default();
+        assert_eq!(config.rotation, RotationPeriod::Never);
+        assert_eq!(config.max_age_days, None);
+        assert!(!config.compress_rotated);
+        assert_eq!(config.write, FileWriteOptions::default());
+    }
+
+    /// The sent file and the folders made for it are private by default, and
+    /// a set mode is kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sent_files_are_private_unless_a_mode_is_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let cases = [
+            (None, None, 0o600, 0o700),
+            (
+                crate::io::FileMode::new(0o640).ok(),
+                crate::io::FileMode::new(0o750).ok(),
+                0o640,
+                0o750,
+            ),
+        ];
+        for (file_mode, dir_mode, want_file, want_dir) in cases {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("made").join("sent.ndjson");
+            let transport = FileTransport::new(&FileTransportConfig {
+                path: path.display().to_string(),
+                write: FileWriteOptions {
+                    file_mode,
+                    dir_mode,
+                    ..FileWriteOptions::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert!(
+                transport
+                    .send("k", bytes::Bytes::from_static(b"x"))
+                    .await
+                    .is_ok()
+            );
+            // A mode with no group or other bits is untouched by any umask.
+            if want_file == 0o600 {
+                assert_eq!(mode(&path), want_file, "file");
+                assert_eq!(mode(path.parent().unwrap()), want_dir, "folder");
+            } else {
+                assert_eq!(mode(&path) & 0o700, want_file & 0o700, "file");
+                assert_eq!(mode(&path) & !want_file, 0, "file adds no bits");
+                assert_eq!(
+                    mode(path.parent().unwrap()) & !want_dir,
+                    0,
+                    "folder adds no bits"
+                );
+            }
+        }
     }
 }

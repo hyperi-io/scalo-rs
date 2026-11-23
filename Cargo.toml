@@ -124,7 +124,7 @@ cli-service = ["cli", "health", "metrics", "memory", "scaling", "shutdown", "gov
 lifecycle = ["config", "tokio", "tracing"]
 top = ["cli-service", "ratatui"]
 
-io = ["file-rotate", "parking_lot", "chrono", "tracing", "tokio"]
+io = ["parking_lot", "dep:jiff", "dep:flate2", "tracing", "tokio"]
 
 # `wide` compiles parse_guard, which caps the depth of an original filed under `_json`.
 dlq = ["io", "concurrency", "base64", "serde_json", "serde_json/raw_value", "tokio", "tokio-util", "tracing", "dep:wide"]
@@ -264,8 +264,6 @@ axum = { version = ">=0.8.9, <0.9", optional = true }
 tower = { version = ">=0.5.3, <0.6", features = ["limit", "timeout", "load-shed", "retry", "util"], optional = true }
 tower-http = { version = ">=0.7.1, <0.8", features = ["timeout", "trace", "limit"], optional = true }
 
-# Only for file-rotate's `FileLimit::Age`, which takes a chrono duration.
-chrono = { version = ">=0.4.45, <0.5", optional = true }
 jiff = { version = ">=1.0.0, <2", optional = true }
 
 # The one MsgPack decode the parse path uses, with no serde_json bridge.
@@ -283,8 +281,6 @@ tokio-stream = { version = ">=0.1.19, <0.2", features = ["net"], optional = true
 hyper-util = { version = ">=0.1.21, <0.2", features = ["client-legacy", "tokio"], optional = true }
 
 ratatui = { version = ">=0.30.2, <0.32", optional = true }
-
-file-rotate = { version = ">=0.8.0, <0.9", optional = true }
 
 libc = { version = ">=0.2.191, <0.3", optional = true }
 
