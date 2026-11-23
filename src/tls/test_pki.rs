@@ -162,6 +162,83 @@ pub(crate) fn pump(
     ))
 }
 
+/// An HTTPS server on localhost that requires a client certificate from `ca`,
+/// presents `leaf`, reads each request whole and answers it 200 with no body.
+#[cfg(any(feature = "transport-http", feature = "transport-otlp"))]
+pub(crate) async fn mtls_ok_server(ca: &TestCa, leaf: &Leaf) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(ca.pem().as_bytes()).unwrap())
+        .unwrap();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::clone(&provider),
+    )
+    .build()
+    .unwrap();
+    let key = PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap();
+    let server = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(vec![leaf.der.clone()], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let mut stream = match acceptor.accept(stream).into_fallible().await {
+                    Ok(stream) => stream,
+                    // Read until the client closes, so the alert the handshake sent
+                    // reaches it ahead of a reset.
+                    Err((_, mut tcp)) => {
+                        let mut buf = [0u8; 4096];
+                        let drain =
+                            async { while matches!(tcp.read(&mut buf).await, Ok(n) if n > 0) {} };
+                        let _ =
+                            tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
+                        return;
+                    }
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                // The whole body is read, so closing leaves nothing unread to reset.
+                while !request_complete(&request) {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                let _ = stream.write_all(response).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// Whether `request` holds its headers and the `content-length` bytes after them.
+#[cfg(any(feature = "transport-http", feature = "transport-otlp"))]
+fn request_complete(request: &[u8]) -> bool {
+    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+    let length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    request.len() >= end + 4 + length
+}
+
 /// Connect to `addr` and run the client handshake for `localhost`.
 pub(crate) async fn connect(
     connector: &TlsConnector,

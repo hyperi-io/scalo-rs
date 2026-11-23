@@ -117,7 +117,7 @@ impl Default for OtelTracingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            endpoint: crate::otel_backoff::DEFAULT_GRPC_ENDPOINT.into(),
+            endpoint: crate::otel_endpoint::DEFAULT_GRPC_ENDPOINT.into(),
             protocol: OtelTracingProtocol::Grpc,
             service_name: String::new(),
             sample_ratio: 0.05,
@@ -179,7 +179,7 @@ fn resolve(config: &OtelTracingConfig) -> OtelTracingConfig {
     // Resolved after the protocol, as the default endpoint depends on it.
     resolved.endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| {
-            crate::otel_backoff::endpoint_for_protocol(
+            crate::otel_endpoint::endpoint_for_protocol(
                 &config.endpoint,
                 resolved.protocol == OtelTracingProtocol::Http,
             )
@@ -213,7 +213,7 @@ fn build_span_exporter(
         // The builder POSTs to the endpoint verbatim, so the base URL needs the signal path.
         OtelTracingProtocol::Http => opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(crate::otel_backoff::append_signal_path(
+            .with_endpoint(crate::otel_endpoint::append_signal_path(
                 &config.endpoint,
                 "v1/traces",
             ))

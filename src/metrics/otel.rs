@@ -208,7 +208,7 @@ fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
 
     // Resolved after the protocol, as the default endpoint depends on it.
     let endpoint =
-        super::otel_types::resolved_endpoint(crate::otel_backoff::endpoint_for_protocol(
+        super::otel_types::resolved_endpoint(crate::otel_endpoint::endpoint_for_protocol(
             &config.endpoint,
             protocol == OtelProtocol::Http,
         ));
@@ -275,7 +275,7 @@ fn build_otlp_exporter(
         // The builder POSTs to the endpoint verbatim, so the base URL needs the signal path.
         OtelProtocol::Http => opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(crate::otel_backoff::append_signal_path(
+            .with_endpoint(crate::otel_endpoint::append_signal_path(
                 &resolved.endpoint,
                 "v1/metrics",
             ))

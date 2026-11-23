@@ -12,7 +12,7 @@ Every transport states what its `Ok` proves, through `TransportBase::delivery_gu
 
 | Guarantee | `Ok` means | Built-ins |
 | --- | --- | --- |
-| `Acknowledged` | the destination answered | Kafka, gRPC, HTTP, memory |
+| `Acknowledged` | the destination answered | Kafka, gRPC, HTTP, OTLP, memory |
 | `Written` | written and flushed here, no answer | file, pipe |
 | `FireAndForget` | handed off, no flush, no answer | Kafka with `acks=0` |
 

@@ -92,10 +92,10 @@ mod pin;
 mod server;
 #[cfg(test)]
 pub(crate) mod test_pki;
-#[cfg(feature = "transport-grpc")]
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 mod tonic;
 
-#[cfg(feature = "transport-grpc")]
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 pub(crate) use self::tonic::tonic_client_tls;
 pub use client::{ClientIdentity, ClientTls, ClientTlsConfig, TrustChoice, build_client_tls};
 pub use server::{
@@ -453,6 +453,32 @@ pub fn tls_parts(profile: CryptoProfile, trust: &TlsTrust) -> TlsParts {
     }
 }
 
+/// The rustls error in `error` or its causes: a certificate, name or key pin
+/// refused, or an alert from the peer, such as a client certificate it would
+/// not take.
+///
+/// An `io::Error`'s `source` skips the error it wraps, and reqwest wraps
+/// tokio-rustls's `io::Error` in another, so the walk steps into each
+/// `io::Error` rather than to its source.
+#[cfg(any(feature = "transport-syslog", feature = "transport-otlp"))]
+pub(crate) fn rustls_error<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a rustls::Error> {
+    let mut link = Some(error);
+    while let Some(current) = link {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            return Some(tls);
+        }
+        link = match current.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => current.source(),
+        };
+    }
+    None
+}
+
 /// Warn (via `tracing`) if a COMPLETED handshake negotiated below the profile's
 /// preferred posture - a classical key exchange when hybrid was preferred, or
 /// TLS 1.2 when 1.3 was available. Call after the handshake on a scalo-owned
@@ -656,6 +682,37 @@ mod tests {
             "highsec negotiates the hybrid PQC group"
         );
         assert_eq!(client.protocol_version(), Some(ProtocolVersion::TLSv1_3));
+    }
+
+    /// A rustls error is found bare, inside an `io::Error`, and further down a
+    /// chain, and an error with none in it gives `None`.
+    #[cfg(any(feature = "transport-syslog", feature = "transport-otlp"))]
+    #[test]
+    fn rustls_error_is_found_anywhere_in_the_chain() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("request failed")]
+        struct Outer(#[source] std::io::Error);
+
+        let refused = || rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        let wrapped = || std::io::Error::new(std::io::ErrorKind::InvalidData, refused());
+        let cases: [(&str, Box<dyn std::error::Error>, bool); 5] = [
+            ("bare", Box::new(refused()), true),
+            ("in an io::Error", Box::new(wrapped()), true),
+            ("a link down", Box::new(Outer(wrapped())), true),
+            (
+                "an io::Error in an io::Error",
+                Box::new(Outer(std::io::Error::other(wrapped()))),
+                true,
+            ),
+            (
+                "a refused connection",
+                Box::new(Outer(std::io::ErrorKind::ConnectionRefused.into())),
+                false,
+            ),
+        ];
+        for (name, error, found) in cases {
+            assert_eq!(rustls_error(error.as_ref()).is_some(), found, "{name}");
+        }
     }
 
     #[test]

@@ -10,8 +10,8 @@
 //!
 //! [`ClientTls`] is what a transport's config maps onto. [`build_client_tls`]
 //! turns it into a rustls [`ClientConfig`], and `tonic_client_tls` (the
-//! `transport-grpc` feature) into tonic's client config, so every client reads
-//! its CA and identity files through the same code.
+//! `transport-grpc` and `transport-otlp` features) into tonic's client config,
+//! so every client reads its CA and identity files through the same code.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

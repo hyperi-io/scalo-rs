@@ -66,6 +66,12 @@ A line of exactly `max_line_bytes` before its `\n` is now a record, where it was
 
 **Consumer adjustment** -- exhaustive matches on `SendResult`, `AnySender` and `TransportType` add the new arms. Each own `TransportBase` impl adds `delivery_guarantee`. A literal `TransportConfig` adds `delivery` and `custom`.
 
+### OTLP logs transport, `TransportType::Otlp` (API CHANGE)
+
+The `transport-otlp` feature sends records to an OpenTelemetry collector as OTLP log records over gRPC or HTTP/protobuf, as `type: otlp`. See [transport/otlp.md](transport/otlp.md). `transport-all`, and so `full`, pulls it.
+
+**Consumer adjustment** -- exhaustive matches on `TransportType` and `AnySender` add the `Otlp` arm. A literal `TransportConfig` adds `otlp`. `otlp` joins the built-in type names, so a custom sender registered under it is refused: register it under another name.
+
 ### An env var's text reaches a field that refuses its parsed value (BEHAVIOUR CHANGE)
 
 `APP__KAFKA__SASL_PASSWORD=0123` failed the load, because the env layer parsed it as the integer 123 and a `String` or `SensitiveString` field refuses that. Such a field now gets the text as set, trimmed. Numbers and bools still parse into numeric and bool fields. `Config::get_string` on such a key returns the text where it returned `None`.

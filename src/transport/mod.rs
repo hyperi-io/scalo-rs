@@ -54,6 +54,7 @@
 //! | **Pipe** | Yes | Yes | Unix pipelines, sidecar pattern |
 //! | **HTTP** | Yes | Yes | Webhook delivery, REST ingest |
 //! | **Syslog** | Yes | No | RFC 5424 and 3164 over TCP, TLS, UDP and RELP |
+//! | **OTLP** | Yes | No | Log records to an OpenTelemetry collector |
 //! | **Custom** | Yes | No | A sender the app registers with [`register_sender`] |
 //!
 //! ## Example
@@ -121,6 +122,12 @@ pub mod proxy;
 #[cfg(feature = "transport-syslog")]
 pub mod syslog;
 
+#[cfg(feature = "transport-otlp")]
+pub mod otlp;
+
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
+mod tonic_channel;
+
 pub mod routed;
 
 #[cfg(feature = "transport-test-support")]
@@ -177,3 +184,6 @@ pub use http::{HttpAuth, HttpEndpoint, HttpToken, HttpTransport, HttpTransportCo
 
 #[cfg(feature = "transport-syslog")]
 pub use syslog::{SyslogConfig, SyslogTransport};
+
+#[cfg(feature = "transport-otlp")]
+pub use otlp::{OtlpCompression, OtlpConfig, OtlpProtocol, OtlpTransport};

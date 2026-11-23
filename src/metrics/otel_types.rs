@@ -31,8 +31,8 @@ impl OtelProtocol {
     #[must_use]
     pub fn default_endpoint(self) -> &'static str {
         match self {
-            Self::Grpc => crate::otel_backoff::DEFAULT_GRPC_ENDPOINT,
-            Self::Http => crate::otel_backoff::DEFAULT_HTTP_ENDPOINT,
+            Self::Grpc => crate::otel_endpoint::DEFAULT_GRPC_ENDPOINT,
+            Self::Http => crate::otel_endpoint::DEFAULT_HTTP_ENDPOINT,
         }
     }
 }

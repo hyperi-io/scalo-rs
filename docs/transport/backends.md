@@ -13,6 +13,7 @@ feature flag -- apps pull only what they ship.
 | Pipe | `transport-pipe` | None | Unix pipeline composition | No, none to hold |
 | HTTP | `transport-http` | None | Webhook delivery, REST ingest | No |
 | Syslog | `transport-syslog` | None | Syslog receivers over TCP, TLS, UDP and RELP, send only ([syslog.md](syslog.md)) | No, sends only |
+| OTLP | `transport-otlp` | None (pure Rust, no `protoc`) | Log records to an OpenTelemetry collector, send only ([otlp.md](otlp.md)) | No, sends only |
 
 A source that holds its acknowledgement releases it only once its records are delivered. See [../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#which-sources-hold-it).
 

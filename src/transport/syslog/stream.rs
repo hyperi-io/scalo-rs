@@ -115,12 +115,10 @@ impl Connector {
     }
 }
 
-/// A rustls refusal (bad certificate, unknown CA, wrong name) is a trust
-/// error. tokio-rustls reports one as `InvalidData` wrapping the rustls error.
+/// A rustls refusal (bad certificate, unknown CA, wrong name, key pin) is a
+/// trust error.
 fn classify_handshake(e: io::Error) -> ConnectError {
-    let refused = e.kind() == io::ErrorKind::InvalidData
-        && e.get_ref().is_some_and(|inner| inner.is::<rustls::Error>());
-    if refused {
+    if crate::tls::rustls_error(&e).is_some() {
         ConnectError::Trust(e)
     } else {
         ConnectError::Unreachable(e)

@@ -27,7 +27,7 @@ use hyper_util::client::proxy::matcher::Matcher;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-#[cfg(feature = "transport-grpc")]
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 use tonic::codegen::Service;
 
 use crate::sensitive::SensitiveString;
@@ -522,14 +522,14 @@ fn bracketed(host: &str) -> String {
 
 /// tonic's connector: each dial goes through [`ProxyDialer`], and tonic runs
 /// its TLS over the stream.
-#[cfg(feature = "transport-grpc")]
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 #[derive(Clone)]
 pub(crate) struct Connector {
     dialer: ProxyDialer,
     direct: hyper_util::client::legacy::connect::HttpConnector,
 }
 
-#[cfg(feature = "transport-grpc")]
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 impl Connector {
     /// `direct` dials whatever the proxy does not cover.
     pub(crate) fn new(
@@ -540,7 +540,7 @@ impl Connector {
     }
 }
 
-#[cfg(feature = "transport-grpc")]
+#[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 impl Service<http::Uri> for Connector {
     type Response = hyper_util::rt::TokioIo<TcpStream>;
     type Error = Box<dyn std::error::Error + Send + Sync>;

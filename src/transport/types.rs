@@ -34,14 +34,17 @@ pub enum TransportType {
     Http,
     /// Syslog over TCP, TLS, UDP or RELP (send only).
     Syslog,
+    /// OTLP log records to an OpenTelemetry collector (send only).
+    Otlp,
     /// A sender registered under this type name.
     Custom(String),
 }
 
 impl TransportType {
     /// The built-in type names, which no custom sender may take.
-    pub const BUILT_IN: &'static [&'static str] =
-        &["kafka", "grpc", "memory", "file", "pipe", "http", "syslog"];
+    pub const BUILT_IN: &'static [&'static str] = &[
+        "kafka", "grpc", "memory", "file", "pipe", "http", "syslog", "otlp",
+    ];
 
     /// The config name of this type.
     #[must_use]
@@ -54,6 +57,7 @@ impl TransportType {
             Self::Pipe => "pipe",
             Self::Http => "http",
             Self::Syslog => "syslog",
+            Self::Otlp => "otlp",
             Self::Custom(name) => name,
         }
     }
@@ -69,6 +73,7 @@ impl TransportType {
             "pipe" => Self::Pipe,
             "http" => Self::Http,
             "syslog" => Self::Syslog,
+            "otlp" => Self::Otlp,
             other => Self::Custom(other.to_string()),
         }
     }
@@ -310,7 +315,7 @@ impl BlockOutcome {
 /// matching `transport_type` is read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransportConfig {
-    /// Transport type (kafka, grpc, memory, file, pipe, http, syslog), or the
+    /// Transport type (kafka, grpc, memory, file, pipe, http, syslog, otlp), or the
     /// name a custom sender was registered under.
     #[serde(rename = "type", default)]
     pub transport_type: TransportType,
@@ -360,6 +365,11 @@ pub struct TransportConfig {
     #[serde(default)]
     pub syslog: Option<super::syslog::SyslogConfig>,
 
+    /// OTLP logs transport configuration (send only).
+    #[cfg(feature = "transport-otlp")]
+    #[serde(default)]
+    pub otlp: Option<super::otlp::OtlpConfig>,
+
     // Placeholder fields when features are disabled
     #[cfg(not(feature = "transport-kafka"))]
     #[serde(default, skip)]
@@ -388,6 +398,9 @@ pub struct TransportConfig {
     #[cfg(not(feature = "transport-syslog"))]
     #[serde(default, skip)]
     pub syslog: Option<()>,
+    #[cfg(not(feature = "transport-otlp"))]
+    #[serde(default, skip)]
+    pub otlp: Option<()>,
 
     /// Every other key, by name. A custom sender reads its section from the
     /// key named after its type.
@@ -555,6 +568,7 @@ mod tests {
             ("pipe", TransportType::Pipe),
             ("http", TransportType::Http),
             ("syslog", TransportType::Syslog),
+            ("otlp", TransportType::Otlp),
             ("audit_log", TransportType::Custom("audit_log".into())),
             ("Kafka", TransportType::Custom("Kafka".into())),
         ];
