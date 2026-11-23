@@ -838,7 +838,7 @@ async fn https_goes_through_a_connect_proxy() {
     let target = Server::status(200).await;
     let (front, ca) = tls_front(target.addr, &[b"http/1.1"]).await;
     let ca_file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(ca_file.path(), &ca).unwrap();
+    tokio::fs::write(ca_file.path(), &ca).await.unwrap();
     let endpoint = format!("https://localhost:{}", front.port());
     let tunnel = format!("localhost:{}", front.port());
     let good = credentials();

@@ -2710,7 +2710,7 @@ mod tests {
         let listening = server.local_addr().unwrap();
         let (front, ca) = tls_front(listening, &[b"h2"]).await;
         let ca_file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(ca_file.path(), &ca).unwrap();
+        tokio::fs::write(ca_file.path(), &ca).await.unwrap();
         let tls = format!("https://localhost:{}", front.port());
         let good = credentials();
         let auth = good.header.clone();
