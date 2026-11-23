@@ -59,4 +59,6 @@ jobs:
       from-head: ${{ inputs.from-head || '' }}
       bump: ${{ inputs.bump || 'auto' }}
       test-tier: ${{ inputs.test-tier || 'core' }}
+      # A timed-out PR run keeps its log, which a lost runner drops (#548). PR runs are always core.
+      test-timeout-minutes: ${{ github.event_name == 'pull_request' && 25 || 360 }}
     secrets: inherit
