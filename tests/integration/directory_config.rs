@@ -28,6 +28,18 @@ fn test_config(dir: &std::path::Path) -> DirectoryConfigStoreConfig {
     }
 }
 
+/// Polls `check` until it holds, failing after 5 s, so a loaded host can't race the 100 ms refresh.
+async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !check().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not seen within 5 s: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Write a YAML file into the given directory.
 /// Supports subdirectory table names (e.g. `loaders/my-service`).
 fn write_yaml(dir: &std::path::Path, name: &str, content: &str) {
@@ -429,11 +441,13 @@ async fn test_background_refresh_picks_up_changes() {
     // Modify the file on disk
     write_yaml(tmp.path(), "app", "version: 2\n");
 
-    // Wait for refresh to pick it up (interval is 100ms)
-    tokio::time::sleep(Duration::from_millis(350)).await;
-
-    let value = store.get_key("app", "version").await.unwrap();
-    assert_eq!(value, serde_json::Value::Number(2.into()));
+    eventually("app version 2", async || {
+        store
+            .get_key("app", "version")
+            .await
+            .is_ok_and(|v| v == serde_json::Value::Number(2.into()))
+    })
+    .await;
 
     store.stop().await.unwrap();
 }
@@ -452,10 +466,13 @@ async fn test_background_refresh_detects_new_table() {
     // Add a new file on disk
     write_yaml(tmp.path(), "new-service", "enabled: true\n");
 
-    tokio::time::sleep(Duration::from_millis(350)).await;
-
-    let tables = store.list_tables().await;
-    assert!(tables.contains(&"new-service".to_string()));
+    eventually("table new-service", async || {
+        store
+            .list_tables()
+            .await
+            .contains(&"new-service".to_string())
+    })
+    .await;
 
     store.stop().await.unwrap();
 }
@@ -475,9 +492,7 @@ async fn test_background_refresh_detects_removed_table() {
     // Remove the file
     std::fs::remove_file(tmp.path().join("temporary.yaml")).unwrap();
 
-    tokio::time::sleep(Duration::from_millis(350)).await;
-
-    assert_eq!(store.list_tables().await, [] as [std::string::String; 0]);
+    eventually("no tables", async || store.list_tables().await.is_empty()).await;
 
     store.stop().await.unwrap();
 }
@@ -781,10 +796,13 @@ async fn test_subdirectory_background_refresh() {
     // Modify file on disk
     write_yaml(tmp.path(), "loaders/dfe", "version: 2\n");
 
-    tokio::time::sleep(Duration::from_millis(350)).await;
-
-    let value = store.get_key("loaders/dfe", "version").await.unwrap();
-    assert_eq!(value, serde_json::Value::Number(2.into()));
+    eventually("loaders/dfe version 2", async || {
+        store
+            .get_key("loaders/dfe", "version")
+            .await
+            .is_ok_and(|v| v == serde_json::Value::Number(2.into()))
+    })
+    .await;
 
     store.stop().await.unwrap();
 }
@@ -803,10 +821,13 @@ async fn test_subdirectory_background_refresh_new_subdir() {
     // Add a new subdirectory and file
     write_yaml(tmp.path(), "sinks/kafka", "brokers: b1\n");
 
-    tokio::time::sleep(Duration::from_millis(350)).await;
-
-    let tables = store.list_tables().await;
-    assert!(tables.contains(&"sinks/kafka".to_string()));
+    eventually("table sinks/kafka", async || {
+        store
+            .list_tables()
+            .await
+            .contains(&"sinks/kafka".to_string())
+    })
+    .await;
 
     store.stop().await.unwrap();
 }
