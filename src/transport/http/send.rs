@@ -29,7 +29,7 @@ use super::HttpTransportConfig;
 use crate::framing::Framing;
 use crate::sensitive::SensitiveString;
 use crate::transport::error::{TransportError, TransportResult};
-use crate::transport::proxy::{self, ProxyConfig, ProxyDialer, ProxyError, ProxyRefused, Scheme};
+use crate::transport::proxy::{self, ProxyDialer, ProxyRefused, Scheme};
 use crate::transport::types::SendResult;
 
 /// Longest same-origin redirect chain `follow_redirects` follows.
@@ -122,28 +122,6 @@ impl fmt::Debug for HttpEndpoint {
             .field("auth", &self.auth)
             .finish()
     }
-}
-
-/// `builder` routed by `dialer`. reqwest dials the proxy and opens the
-/// CONNECT tunnel to an https endpoint itself, and sends a plain http request
-/// to the proxy whole.
-fn with_proxy(
-    builder: reqwest::ClientBuilder,
-    config: &ProxyConfig,
-    dialer: &ProxyDialer,
-) -> reqwest::ClientBuilder {
-    if *config == ProxyConfig::None {
-        return builder.no_proxy();
-    }
-    let dialer = dialer.clone();
-    builder.proxy(reqwest::Proxy::custom(move |url| {
-        let scheme = if url.scheme() == "https" {
-            Scheme::Tls
-        } else {
-            Scheme::Plain
-        };
-        dialer.proxy_url(scheme, url.host_str()?, url.port_or_known_default()?)
-    }))
 }
 
 /// `url` as it may be logged, without a user name or password.
@@ -366,7 +344,7 @@ impl Sender {
             None => builder,
         };
         let dialer = config.proxy.dialer()?;
-        let client = with_proxy(builder, &config.proxy, &dialer)
+        let client = proxy::reqwest_proxy(builder, &config.proxy, &dialer)
             .build()
             .map_err(|e| TransportError::Config(format!("HTTP client: {}", describe(e))))?;
 
@@ -595,21 +573,13 @@ impl Sender {
     /// The proxy's refusal of a CONNECT to `target`. reqwest's tunnel error
     /// carries no status, so one CONNECT of our own reads it.
     async fn refused(&self, target: &Target, deadline: Instant) -> Option<ProxyRefused> {
-        if target.scheme != Scheme::Tls
-            || !self
-                .dialer
-                .proxies(target.scheme, &target.host, target.port)
-        {
+        if target.scheme != Scheme::Tls {
             return None;
         }
         let left = deadline.saturating_duration_since(Instant::now());
-        let probe = self
-            .dialer
-            .connect(target.scheme, &target.host, target.port);
-        match tokio::time::timeout(left, probe).await {
-            Ok(Err(ProxyError::Refused(refused))) => Some(refused),
-            _ => None,
-        }
+        self.dialer
+            .refusal_of(target.scheme, &target.host, target.port, left)
+            .await
     }
 }
 
