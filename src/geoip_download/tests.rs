@@ -92,6 +92,19 @@ fn plan_destinations_match_the_expected_filenames() {
     }
 }
 
+#[test]
+fn dbip_month_is_the_utc_year_and_month() {
+    for (instant, month) in [
+        ("2026-03-31T23:59:59Z", "2026-03"),
+        ("2026-04-01T09:30:00+10:00", "2026-03"),
+        ("2026-12-01T00:00:00Z", "2026-12"),
+        ("0999-01-15T00:00:00Z", "0999-01"),
+    ] {
+        let now: jiff::Timestamp = instant.parse().unwrap();
+        assert_eq!(dbip_month(now), month, "{instant}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // is_fresh
 // ---------------------------------------------------------------------------

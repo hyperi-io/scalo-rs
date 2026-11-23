@@ -147,7 +147,7 @@ impl MemoryTransport {
         }
 
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let timestamp_ms = chrono::Utc::now().timestamp_millis();
+        let timestamp_ms = crate::clock::epoch_millis();
 
         let msg = InternalMessage {
             key: key.map(Arc::from),
@@ -184,7 +184,7 @@ impl MemorySender<'_> {
     /// Returns error if the channel is full or closed.
     pub async fn send(&self, key: Option<&str>, payload: Vec<u8>) -> TransportResult<()> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let timestamp_ms = chrono::Utc::now().timestamp_millis();
+        let timestamp_ms = crate::clock::epoch_millis();
 
         let msg = InternalMessage {
             key: key.map(Arc::from),
@@ -268,7 +268,7 @@ impl MemoryTransport {
         }
 
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let timestamp_ms = chrono::Utc::now().timestamp_millis();
+        let timestamp_ms = crate::clock::epoch_millis();
 
         let msg = InternalMessage {
             key: Some(Arc::from(destination)),

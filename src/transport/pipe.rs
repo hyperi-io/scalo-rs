@@ -391,7 +391,7 @@ impl TransportReceiver for PipeTransport {
 
                     let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
                     let format = PayloadFormat::detect(&payload_bytes);
-                    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+                    let timestamp_ms = crate::clock::epoch_millis();
 
                     pending.push(Message {
                         key: None,
