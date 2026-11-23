@@ -2704,7 +2704,7 @@ mod tests {
     async fn sends_go_through_a_connect_proxy() {
         use crate::sensitive::SensitiveString;
         use crate::transport::ProxyConfig;
-        use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, tls_front};
+        use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, credentials, tls_front};
 
         let (server, plain) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
         let listening = server.local_addr().unwrap();
@@ -2712,21 +2712,25 @@ mod tests {
         let ca_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(ca_file.path(), &ca).unwrap();
         let tls = format!("https://localhost:{}", front.port());
-        let auth = "Basic dTpwdw==".to_string();
+        let good = credentials();
+        let auth = good.header.clone();
         // (policy, credentials, TLS inside the tunnel, refusal status)
         let rows = [
             (Policy::Allow, None, false, None),
             (Policy::Allow, None, true, None),
             (Policy::Refuse(403), None, false, Some(403)),
             (Policy::Auth(auth.clone()), None, true, Some(407)),
-            (Policy::Auth(auth), Some(("u", "pw")), true, None),
+            (Policy::Auth(auth), Some(&good), true, None),
             (Policy::OnlyPort(443), None, true, Some(403)),
         ];
         let mut delivered = 0;
         for (policy, credentials, over_tls, status) in rows {
-            let name = format!("{policy:?} {credentials:?} tls={over_tls}");
+            let name = format!(
+                "{policy:?} credentials={} tls={over_tls}",
+                credentials.is_some()
+            );
             let proxy = ConnectProxy::start(policy).await;
-            let url = credentials.map_or_else(|| proxy.url(), |(u, p)| proxy.url_with(u, p));
+            let url = credentials.map_or_else(|| proxy.url(), |c| proxy.url_with(c));
             let mut config = GrpcConfig::client(if over_tls { &tls } else { &plain });
             config.proxy = ProxyConfig::Url(SensitiveString::new(url));
             config.send_timeout_ms = 5_000;

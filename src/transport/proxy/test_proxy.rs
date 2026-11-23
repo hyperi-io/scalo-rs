@@ -34,6 +34,51 @@ pub(crate) struct Connect {
     pub auth: Option<String>,
 }
 
+/// A proxy user and password made at run time, and the `Proxy-Authorization`
+/// value the proxy matcher builds from them.
+#[derive(Clone)]
+pub(crate) struct Credentials {
+    pub user: String,
+    pub password: String,
+    pub header: String,
+}
+
+impl Credentials {
+    /// The same user with another password, which the proxy answers 407.
+    pub(crate) fn wrong_password(&self) -> Self {
+        Self {
+            password: format!("{}-wrong", self.password),
+            ..self.clone()
+        }
+    }
+}
+
+/// Fresh [`Credentials`] for one test.
+pub(crate) fn credentials() -> Credentials {
+    let user = format!("user-{}", std::process::id());
+    let password = format!(
+        "pass-{:x}",
+        std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+    );
+    let proxy = format!("http://{user}:{password}@proxy.test:3128");
+    let matcher = hyper_util::client::proxy::matcher::Matcher::builder()
+        .all(proxy)
+        .build();
+    let target: http::Uri = "https://target.test".parse().unwrap();
+    let header = matcher
+        .intercept(&target)
+        .and_then(|i| i.basic_auth().cloned())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    Credentials {
+        user,
+        password,
+        header,
+    }
+}
+
 /// A loopback HTTP CONNECT proxy that records each CONNECT.
 pub(crate) struct ConnectProxy {
     pub addr: SocketAddr,
@@ -59,9 +104,12 @@ impl ConnectProxy {
         format!("http://{}", self.addr)
     }
 
-    /// The URL with `user:password@`.
-    pub(crate) fn url_with(&self, user: &str, password: &str) -> String {
-        format!("http://{user}:{password}@{}", self.addr)
+    /// The URL with `credentials` as `user:password@`.
+    pub(crate) fn url_with(&self, credentials: &Credentials) -> String {
+        format!(
+            "http://{}:{}@{}",
+            credentials.user, credentials.password, self.addr
+        )
     }
 
     pub(crate) fn seen(&self) -> Vec<Connect> {

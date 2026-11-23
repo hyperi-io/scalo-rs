@@ -9,7 +9,7 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::system::{Settings, from_winhttp, wildcard_to_rule};
-use super::test_proxy::{ConnectProxy, Policy, echo};
+use super::test_proxy::{ConnectProxy, Credentials, Policy, credentials, echo};
 use super::{ProxyConfig, ProxyDialer, ProxyError, ProxyRefused, Scheme, refusal, rejected};
 use crate::sensitive::SensitiveString;
 use crate::transport::error::TransportError;
@@ -212,28 +212,23 @@ fn the_os_proxy_store_reads() {
 #[tokio::test]
 async fn connect_through_the_proxy() {
     let target = echo().await;
+    let good = credentials();
+    let bad = good.wrong_password();
+    let auth = || Policy::Auth(good.header.clone());
     // (policy, credentials, wanted: Ok or the refusal status)
-    let rows: [(Policy, Option<(&str, &str)>, Result<(), u16>); 6] = [
+    let rows: [(Policy, Option<&Credentials>, Result<(), u16>); 6] = [
         (Policy::Allow, None, Ok(())),
         (Policy::Refuse(403), None, Err(403)),
-        (Policy::Auth("Basic dTpwdw==".into()), None, Err(407)),
-        (
-            Policy::Auth("Basic dTpwdw==".into()),
-            Some(("u", "pw")),
-            Ok(()),
-        ),
-        (
-            Policy::Auth("Basic dTpwdw==".into()),
-            Some(("u", "wrong")),
-            Err(407),
-        ),
+        (auth(), None, Err(407)),
+        (auth(), Some(&good), Ok(())),
+        (auth(), Some(&bad), Err(407)),
         (Policy::OnlyPort(443), None, Err(403)),
     ];
     for (policy, credentials, wanted) in rows {
-        let name = format!("{policy:?} {credentials:?}");
+        let name = format!("{policy:?} credentials={}", credentials.is_some());
         let proxy = ConnectProxy::start(policy).await;
         let setting = match credentials {
-            Some((user, password)) => url(&proxy.url_with(user, password)),
+            Some(credentials) => url(&proxy.url_with(credentials)),
             None => url(&proxy.url()),
         };
         let dialer = setting.dialer().unwrap();
@@ -264,7 +259,7 @@ async fn connect_through_the_proxy() {
                 );
                 let text = refused.to_string();
                 assert!(text.contains(&status.to_string()), "{name}: {text}");
-                assert!(!text.contains("pw"), "{name}: {text}");
+                assert!(!text.contains(&good.password), "{name}: {text}");
             }
             (got, _) => panic!("{name}: got {got:?}"),
         }

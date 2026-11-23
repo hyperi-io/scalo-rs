@@ -19,7 +19,7 @@ use crate::framing::FramingConfig;
 use crate::sensitive::SensitiveString;
 use crate::transport::error::TransportError;
 use crate::transport::proxy::ProxyConfig;
-use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, tls_front};
+use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, credentials, tls_front};
 use crate::transport::traits::TransportSender;
 use crate::transport::types::{PayloadFormat, SendResult};
 use crate::transport::{Record, RecordMeta};
@@ -841,19 +841,20 @@ async fn https_goes_through_a_connect_proxy() {
     std::fs::write(ca_file.path(), &ca).unwrap();
     let endpoint = format!("https://localhost:{}", front.port());
     let tunnel = format!("localhost:{}", front.port());
-    let auth = "Basic dTpwdw==".to_string();
+    let good = credentials();
+    let auth = good.header.clone();
     // (policy, credentials, wanted, refusal status)
     let rows = [
         (Policy::Allow, None, Got::Ok, None),
         (Policy::Refuse(403), None, Got::Reject, Some(403)),
         (Policy::Auth(auth.clone()), None, Got::Reject, Some(407)),
-        (Policy::Auth(auth), Some(("u", "pw")), Got::Ok, None),
+        (Policy::Auth(auth), Some(&good), Got::Ok, None),
         (Policy::OnlyPort(443), None, Got::Reject, Some(403)),
     ];
     for (policy, credentials, want, status) in rows {
-        let name = format!("{policy:?} {credentials:?}");
+        let name = format!("{policy:?} credentials={}", credentials.is_some());
         let proxy = ConnectProxy::start(policy).await;
-        let url = credentials.map_or_else(|| proxy.url(), |(u, p)| proxy.url_with(u, p));
+        let url = credentials.map_or_else(|| proxy.url(), |c| proxy.url_with(c));
         let config = HttpTransportConfig {
             proxy: ProxyConfig::Url(secret(&url)),
             tls_ca_path: Some(ca_file.path().to_string_lossy().into_owned()),
