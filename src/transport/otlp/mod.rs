@@ -232,11 +232,17 @@ impl OtlpTransport {
                     Err(e) if e.is_builder() => SendResult::Fatal(TransportError::Send(format!(
                         "OTLP HTTP request could not be built: {e}"
                     ))),
-                    // Refused, reset and timed-out connections clear when the collector is back.
-                    Err(e) => {
-                        tracing::debug!(endpoint = %self.endpoint, error = %e, "OTLP HTTP request failed");
-                        SendResult::Backpressured
-                    }
+                    // A refused certificate, name or key pin is the config's to fix. Refused,
+                    // reset and timed-out connections clear when the collector is back.
+                    Err(e) => match crate::tls::rustls_error(&e) {
+                        Some(tls) => SendResult::Fatal(TransportError::Config(format!(
+                            "OTLP HTTP: TLS with the collector failed: {tls}"
+                        ))),
+                        None => {
+                            tracing::debug!(endpoint = %self.endpoint, error = %e, "OTLP HTTP request failed");
+                            SendResult::Backpressured
+                        }
+                    },
                 }
             }
         }

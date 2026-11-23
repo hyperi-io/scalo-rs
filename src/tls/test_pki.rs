@@ -193,8 +193,18 @@ pub(crate) async fn mtls_ok_server(ca: &TestCa, leaf: &Leaf) -> SocketAddr {
         while let Ok((stream, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let Ok(mut stream) = acceptor.accept(stream).await else {
-                    return;
+                let mut stream = match acceptor.accept(stream).into_fallible().await {
+                    Ok(stream) => stream,
+                    // Read until the client closes, so the alert the handshake sent
+                    // reaches it ahead of a reset.
+                    Err((_, mut tcp)) => {
+                        let mut buf = [0u8; 4096];
+                        let drain =
+                            async { while matches!(tcp.read(&mut buf).await, Ok(n) if n > 0) {} };
+                        let _ =
+                            tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
+                        return;
+                    }
                 };
                 let mut request = Vec::new();
                 let mut buf = [0u8; 4096];

@@ -282,14 +282,15 @@ fn dead_letter_filter(config: &mut OtlpConfig) {
     }];
 }
 
-/// Mutual TLS, presenting the client certificate or not, and with a pin on
-/// the collector's key, served by that key or by a leaf re-keyed under the
-/// same CA.
+/// Mutual TLS, presenting the client certificate or not, trusting another CA,
+/// and with a pin on the collector's key, served by that key or by a leaf
+/// re-keyed under the same CA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tls {
     Off,
     WithIdentity,
     WithoutIdentity,
+    Untrusted,
     Pinned,
     Rekeyed,
 }
@@ -528,11 +529,23 @@ const CASES: &[Case] = &[
     Case {
         tls: Tls::WithoutIdentity,
         records: 0,
+        detail: "CertificateRequired",
         ..case(
             "http mutual TLS without the certificate",
             HTTP,
             Answer::Accept,
-            "Backpressured",
+            "Fatal(Config",
+        )
+    },
+    Case {
+        tls: Tls::Untrusted,
+        records: 0,
+        detail: "UnknownIssuer",
+        ..case(
+            "http collector from a CA the client does not trust",
+            HTTP,
+            Answer::Accept,
+            "Fatal(Config",
         )
     },
     Case {
@@ -548,19 +561,22 @@ const CASES: &[Case] = &[
     Case {
         tls: Tls::Rekeyed,
         records: 0,
+        detail: "ApplicationVerificationFailure",
         ..case(
             "http collector re-keyed off the pin",
             HTTP,
             Answer::Accept,
-            "Backpressured",
+            "Fatal(Config",
         )
     },
 ];
 
-/// Files for a client that trusts `ca` and presents a certificate from it.
+/// Files for a client that trusts `ca` and presents a certificate from it, and
+/// another CA's certificate.
 struct ClientFiles {
     _dir: tempfile::TempDir,
     ca: PathBuf,
+    other_ca: PathBuf,
     cert: PathBuf,
     key: PathBuf,
 }
@@ -575,6 +591,7 @@ fn client_files(ca: &TestCa) -> ClientFiles {
     };
     ClientFiles {
         ca: write("ca.pem", &ca.pem()),
+        other_ca: write("other-ca.pem", &TestCa::new("otlp other CA").pem()),
         cert: write("client.pem", &leaf.cert_pem),
         key: write("client.key", &leaf.key_pem),
         _dir: dir,
@@ -637,7 +654,11 @@ async fn each_collector_answer_maps_onto_a_send_result() {
             let pin = matches!(case.tls, Tls::Pinned | Tls::Rekeyed);
             config.tls = Some(ClientTlsConfig {
                 trust: TrustChoice::Bundle,
-                ca_path: Some(files.ca.clone()),
+                ca_path: Some(if case.tls == Tls::Untrusted {
+                    files.other_ca.clone()
+                } else {
+                    files.ca.clone()
+                }),
                 client_cert_path: identity.then(|| files.cert.clone()),
                 client_key_path: identity.then(|| files.key.clone()),
                 pin_sha256: pin.then(|| pinned.pin()).into_iter().collect(),

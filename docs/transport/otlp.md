@@ -53,6 +53,7 @@ Each answer from the collector maps onto the result the caller acts on:
 | gRPC `RESOURCE_EXHAUSTED` | `RetryAfter(wait)` with `RetryInfo`, else `Reject`: without one it is most often a request over the collector's size limit |
 | gRPC `CANCELLED`, `DEADLINE_EXCEEDED`, `ABORTED`, `OUT_OF_RANGE`, `DATA_LOSS`, or no answer (refused, reset, timed out) | `Backpressured` |
 | HTTP 401, 403, 404, 405, 407, 410, 421, 1xx and 3xx, gRPC `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `UNIMPLEMENTED` | `Fatal(Config)`: the credential or endpoint is wrong, which says nothing about the records |
+| over `http`, a TLS refusal: an untrusted or misnamed certificate, a key off the pin, or the client certificate turned away | `Fatal(Config)`, naming the rustls error |
 | HTTP 413 | `Reject(MessageTooLarge)` |
 | any other HTTP 4xx or 5xx, any other gRPC code | `Reject` |
 

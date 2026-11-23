@@ -453,6 +453,31 @@ pub fn tls_parts(profile: CryptoProfile, trust: &TlsTrust) -> TlsParts {
     }
 }
 
+/// The rustls error in `error` or its causes: a certificate, name or key pin
+/// refused, or an alert from the peer, such as a client certificate it would
+/// not take.
+///
+/// tokio-rustls wraps a rustls error in an `io::Error`, whose `source` skips
+/// it, so each `io::Error` in the chain is opened as well.
+#[cfg(any(feature = "transport-syslog", feature = "transport-otlp"))]
+pub(crate) fn rustls_error(error: &(dyn std::error::Error + 'static)) -> Option<&rustls::Error> {
+    let mut link = Some(error);
+    while let Some(current) = link {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            return Some(tls);
+        }
+        let wrapped = current
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+        if wrapped.is_some() {
+            return wrapped;
+        }
+        link = current.source();
+    }
+    None
+}
+
 /// Warn (via `tracing`) if a COMPLETED handshake negotiated below the profile's
 /// preferred posture - a classical key exchange when hybrid was preferred, or
 /// TLS 1.2 when 1.3 was available. Call after the handshake on a scalo-owned
@@ -656,6 +681,32 @@ mod tests {
             "highsec negotiates the hybrid PQC group"
         );
         assert_eq!(client.protocol_version(), Some(ProtocolVersion::TLSv1_3));
+    }
+
+    /// A rustls error is found bare, inside an `io::Error`, and further down a
+    /// chain, and an error with none in it gives `None`.
+    #[cfg(any(feature = "transport-syslog", feature = "transport-otlp"))]
+    #[test]
+    fn rustls_error_is_found_anywhere_in_the_chain() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("request failed")]
+        struct Outer(#[source] std::io::Error);
+
+        let refused = || rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        let wrapped = || std::io::Error::new(std::io::ErrorKind::InvalidData, refused());
+        let cases: [(&str, Box<dyn std::error::Error>, bool); 4] = [
+            ("bare", Box::new(refused()), true),
+            ("in an io::Error", Box::new(wrapped()), true),
+            ("a link down", Box::new(Outer(wrapped())), true),
+            (
+                "a refused connection",
+                Box::new(Outer(std::io::ErrorKind::ConnectionRefused.into())),
+                false,
+            ),
+        ];
+        for (name, error, found) in cases {
+            assert_eq!(rustls_error(error.as_ref()).is_some(), found, "{name}");
+        }
     }
 
     #[test]
