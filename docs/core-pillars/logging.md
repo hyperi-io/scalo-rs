@@ -45,6 +45,14 @@ setup(LoggerOptions {
 
 When config is loaded, `setup_default()` reads `logger.format` and `setup()` reads `logger.color` from the cascade.
 
+`logger::level_handle()` returns the handle on the running level once either has run, so a config reload or an admin endpoint can change it without a restart. `set` takes the names `LOG_LEVEL` takes and refuses anything else with the level unchanged. The `rdkafka=warn` floor and the `RUST_LOG` directives read at setup stay layered over it.
+
+```rust
+if let Some(level) = scalo::logger::level_handle() {
+    level.set("debug")?;               // level.current() is now Level::DEBUG
+}
+```
+
 ---
 
 ## Format and colour
@@ -189,6 +197,7 @@ collapse into one.
 | `logger::setup(opts)` | Explicit install |
 | `LoggerOptions` | `level`, `format`, `add_source`, `enable_masking`, `sensitive_fields`, `span_events`, `throttle`, `service_name`, `service_version` |
 | `LogFormat::{Json, Text, Auto}` | Format. `Auto` resolves on `setup` |
+| `logger::level_handle() -> Option<LevelHandle>` | `set(level)` and `current()` on the running level |
 | `LoggerSettings` | `level`, `format`, `color` under the `logger` config key, read by `LoggerSettings::from_cascade()` |
 | `ThrottleConfig` | `enabled`, `burst`, `rate`, `max_signatures`, `excluded_fields` |
 | `logger::default_sensitive_fields() -> Vec<String>` | Baseline mask list -- extend, don't replace |
