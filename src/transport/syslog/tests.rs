@@ -556,11 +556,11 @@ async fn sends_answer_each_failure_with_the_result_the_caller_acts_on() {
             "Fatal(Config(",
         ),
         (
-            "RELP nack",
+            "RELP nack is a retry",
             config(nack.addr, SyslogProtocol::Relp),
             vec!["ok", "refuse-me", "after"],
             Duration::from_secs(5),
-            "Reject(Send(\"RELP receiver",
+            "Backpressured",
         ),
         (
             "RELP never answers by the deadline",

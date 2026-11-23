@@ -363,21 +363,18 @@ impl SyslogTransport {
             Some(Answer::Refused(text)) => Some((i, text)),
             _ => None,
         });
+        // RELP has no permanent refusal: a receiver answers 500 for a full
+        // queue as well as a bad message, so the whole batch is sent again.
         if let Some((index, text)) = refused {
             tracing::warn!(
                 address = %self.address,
-                index,
+                message = index + 1,
+                records = messages.len(),
                 answer = %text,
-                "syslog: RELP receiver refused a message"
+                "syslog: RELP receiver refused a message, the batch is sent again"
             );
             metrics::counter!("transport_send_errors_total", "transport" => "syslog").increment(1);
-            let error = TransportError::Send(format!(
-                "RELP receiver {} refused message {} of {}: {text}",
-                self.address,
-                index + 1,
-                messages.len()
-            ));
-            return (SendResult::Reject(error), session.map(Session::Relp));
+            return (SendResult::Backpressured, session.map(Session::Relp));
         }
         (SendResult::Ok, session.map(Session::Relp))
     }

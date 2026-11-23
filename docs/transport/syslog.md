@@ -73,7 +73,7 @@ One connection is held and reused, behind a lock, so concurrent sends go one aft
 | Write broke off mid-batch, or the deadline passed | `Backpressured`, the connection dropped, never `Ok` |
 | TLS refused the receiver's certificate or ours | `Fatal(Config)` |
 | RELP session lost mid-batch | reconnect once in the same call and send only the unanswered messages, then `Backpressured` if that fails too |
-| RELP answer other than `200` for a message | `Reject`, naming the message and the receiver's text |
+| RELP answer other than `200` for a message | `Backpressured`, the session kept |
 | RELP receiver refuses the session, or offers no `syslog` command | `Fatal(Config)` |
 | Sender closed | `Fatal(Closed)` |
 
@@ -81,7 +81,7 @@ A send dropped at its deadline takes its connection with it, so a later batch ne
 
 TCP and TLS have no answer. A receiver that takes the bytes and fails before handling them loses them, and so does one that closes between the idle check and the write. Use `relp` where that loss matters.
 
-A RELP `Reject` is for the whole block: a caller that needs the refused record sends the block again in halves. The messages before and after it were sent, and the ones answered `200` arrive twice if it does.
+RELP has no answer that means a message can never be taken: a receiver answers `500` for a full queue as well as a bad message. So a `500` is a retry of the whole block, and the messages answered `200` arrive twice. A receiver that refuses one message every time holds the block until the caller's retry limit gives up on it.
 
 The client opens a session with `relp_version=0` and `commands=syslog`, then sends each message as a `syslog` command with its own transaction number. Up to `relp_window` (default 128) go out before an answer is awaited. `close` sends the `close` command and waits a second for the answer. A `serverclose` from the receiver ends the session, and the next batch opens another.
 
