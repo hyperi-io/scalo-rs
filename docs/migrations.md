@@ -8,6 +8,22 @@ release and the target before bumping.
 
 ## 2.14.34
 
+### File writers rotate by size, sync on request, set file modes and cut a partial last line (API and BEHAVIOUR CHANGE)
+
+`io::NdjsonWriter` no longer uses `file-rotate`, and `chrono` leaves the `io` feature. The DLQ file backend, the file output and now the file transport write through it. `FileWriterConfig`, `FileDlqConfig` and `FileOutputConfig` gain a flattened `write: FileWriteOptions`, so its keys sit beside `rotation`: `max_bytes` (rotate before a write that would pass it), `max_files` (rotated files kept), `durable` (sync each write, and the folder after a create or rotation, off by default), `file_mode` and `dir_mode` (unset by default, so the umask decides as before). `RotationPeriod` gains `Never`. `FileTransportConfig` gains `rotation` (default `never`), `max_age_days` (default none), `compress_rotated` (default off) and the same `write` keys. See [transport/backends.md](transport/backends.md#file).
+
+Behaviour that changes with no config:
+
+- Files the file transport creates are `0600` and its folders `0700` on Unix, where the umask decided before. The DLQ file backend and the file output keep the umask modes. Existing files and folders keep their modes.
+- Opening a file whose last line has no newline cuts that line off before appending, with a warn log and `file_writer_cut_bytes_total{writer}`.
+- A write that fails is cut back off the file, so no half line stays for the retry to follow.
+- A write is refused while another file sits at the writer's path, not only while the path is empty.
+- The file transport writes a `send_batch` block in one write, creates missing folders, and with `append: false` empties the file at the first send, where it wrote over the start of it.
+- `NdjsonWriter::flush` syncs to disk when `durable` is set and does nothing otherwise.
+- Rotated file names keep the local `YYYYMMDDTHHMMSS` suffix and the six-newest-uncompressed gzip rule, so retention picks up files an older release rotated.
+
+**Consumer adjustment** -- a struct literal of `FileWriterConfig`, `FileDlqConfig` or `FileOutputConfig` adds `write` or `..Default::default()`, and an exhaustive match on `RotationPeriod` adds `Never`. A process reading the file transport's output as another user sets `file_mode: "0640"` and `dir_mode: "0750"` (or wider) on that transport, or loses read access to new files.
+
 ### `MemoryGuard` reads the process's resident memory on Windows and macOS (BEHAVIOUR CHANGE)
 
 `UsageSource::detect()` falls back to `WorkingSet` on Windows and `TaskInfo` on macOS before `Reservations`, so a guard there trips on the process's real usage instead of only the bytes callers reserved. `UsageSource` is `#[non_exhaustive]`. See [memory.md](runtime/memory.md#usage-detection).

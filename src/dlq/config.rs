@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 // Re-export RotationPeriod from the shared io module so existing consumers
 // of `dlq::RotationPeriod` continue to work without changes.
 pub use crate::io::RotationPeriod;
-use crate::io::{DEFAULT_SPOOL_ROOT, FileWriterConfig};
+use crate::io::{DEFAULT_SPOOL_ROOT, FileWriteOptions, FileWriterConfig};
 
 /// How backends are used when multiple are enabled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,8 +144,12 @@ pub struct FileDlqConfig {
     /// Auto-cleanup files older than this many days.
     pub max_age_days: u32,
 
-    /// Compress rotated files with flate2/gzip.
+    /// Gzip rotated files, keeping the six newest uncompressed.
     pub compress_rotated: bool,
+
+    /// Size rotation, retention by count, `durable` and file modes.
+    #[serde(flatten)]
+    pub write: FileWriteOptions,
 }
 
 impl Default for FileDlqConfig {
@@ -156,6 +160,7 @@ impl Default for FileDlqConfig {
             rotation: RotationPeriod::default(),
             max_age_days: 30,
             compress_rotated: true,
+            write: FileWriteOptions::default(),
         }
     }
 }
@@ -169,6 +174,7 @@ impl FileDlqConfig {
             rotation: self.rotation,
             max_age_days: self.max_age_days,
             compress_rotated: self.compress_rotated,
+            write: self.write,
         }
     }
 }
@@ -312,6 +318,12 @@ mod tests {
                 rotation: RotationPeriod::Daily,
                 max_age_days: 7,
                 compress_rotated: false,
+                write: crate::io::FileWriteOptions {
+                    max_bytes: Some(1 << 20),
+                    max_files: Some(4),
+                    durable: true,
+                    ..crate::io::FileWriteOptions::default()
+                },
             },
             queue_capacity: 50_000,
             batch_size: 128,
@@ -323,6 +335,11 @@ mod tests {
         assert_eq!(parsed.mode, DlqMode::FanOut);
         assert_eq!(parsed.file.rotation, RotationPeriod::Daily);
         assert_eq!(parsed.file.max_age_days, 7);
+        assert_eq!(parsed.file.write, config.file.write);
+        assert!(
+            json.contains(r#""max_files":4"#),
+            "the write keys sit in `file`: {json}"
+        );
         assert_eq!(parsed.queue_capacity, 50_000);
         assert_eq!(parsed.batch_size, 128);
         assert_eq!(parsed.flush_interval_ms, 250);
