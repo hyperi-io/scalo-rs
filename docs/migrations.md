@@ -20,6 +20,12 @@ release and the target before bumping.
 
 **Consumer adjustment** -- exhaustive matches on `SendResult`, `AnySender` and `TransportType` add the new arms. Each own `TransportBase` impl adds `delivery_guarantee`. A literal `TransportConfig` adds `delivery` and `custom`.
 
+### `ConfigOptions::managed`, `load_typed_managed` and `ServiceApp::managed_source` (additive)
+
+An app can name a Group Policy key and an MDM preference domain in a `ManagedSource`, and the cascade then reads them as a layer after every config file and before env vars. A key that looks like a secret fails the load. See [managed-config.md](core-pillars/managed-config.md).
+
+**Consumer adjustment** -- none. A `ConfigOptions` built without `..Default::default()` adds `managed: None`.
+
 ### gRPC `send_batch` joins small blocks into one call (BEHAVIOUR CHANGE)
 
 A block under `coalesce.max_batch_bytes` (64 KiB), encoded, now waits for one of `coalesce.in_flight` (4) call slots and goes out in one `RouteBatch` with the blocks queued behind it, within `max_message_size`. Its caller gets that call's result, so a failed call fails every block in it. `send_timeout_ms` bounds the wait for a slot, and then the call, so a joined `send_batch` can take up to about twice `send_timeout_ms`. See [grpc.md](transport/grpc.md).
