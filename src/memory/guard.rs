@@ -33,13 +33,13 @@ static HEAP_SOURCE: OnceLock<fn() -> usize> = OnceLock::new();
 /// ([`current_bytes`](MemoryGuard::current_bytes), pressure checks, and
 /// [`try_reserve`](MemoryGuard::try_reserve) admission), so registering a
 /// source never lets the guard see less than the kernel charges. Where the
-/// guard has no usage source to read (its reservation counter, off Linux),
-/// the heap source is the reading.
+/// guard has no usage source to read (its reservation counter, on an OS with
+/// none of the [`UsageSource`] readings), the heap source is the reading.
 ///
 /// **Why a global hook and not a dependency:** a tracking allocator must be
 /// the binary's single `#[global_allocator]`, which is the *application's*
-/// choice, not a library's -- and scalo is `#![forbid(unsafe_code)]`, so it
-/// cannot implement one anyway. The application installs its allocator and
+/// choice, not a library's -- and scalo denies `unsafe_code`, which a global
+/// allocator needs. The application installs its allocator and
 /// wires it here in a few lines. This keeps scalo allocator-agnostic with no
 /// allocator dependency in its graph.
 ///
@@ -98,6 +98,8 @@ fn source_name(source: &UsageSource) -> &'static str {
         UsageSource::CgroupV2(_) => "max(explicit,cgroup-v2)",
         UsageSource::CgroupV1(_) => "max(explicit,cgroup-v1)",
         UsageSource::ProcStatus(_) => "max(explicit,proc-status)",
+        UsageSource::WorkingSet => "max(explicit,working-set)",
+        UsageSource::TaskInfo => "max(explicit,task-info)",
         UsageSource::Reservations => "explicit",
     }
 }
@@ -423,8 +425,8 @@ impl MemoryGuard {
         );
         if usage_bytes.is_none() {
             tracing::warn!(
-                "no cgroup or procfs memory accounting readable: the guard sees \
-                 only bytes callers reserve and release, not the process's usage"
+                "no OS memory accounting readable: the guard sees only bytes \
+                 callers reserve and release, not the process's usage"
             );
         }
 
@@ -802,6 +804,50 @@ mod tests {
             !guard.try_reserve(64 * 1024 * 1024),
             "admission is projected against the cgroup, so 450 + 64 MiB is refused"
         );
+    }
+
+    /// A guard on this process's own figure (procfs on Linux, the working set
+    /// on Windows, the task info on macOS) trips once a touched block lands
+    /// past a limit set just above the current reading.
+    #[test]
+    fn a_guard_trips_on_this_process_real_usage() {
+        let source = crate::memory::usage::native_process_source()
+            .unwrap_or_else(|| UsageSource::ProcStatus("/proc/self".into()));
+        let name = source.name();
+        let Some(before) = source.read() else {
+            eprintln!("skipped: {name} reads nothing on this OS");
+            return;
+        };
+        let headroom = 32 * 1024 * 1024;
+        let guard = MemoryGuard::with_usage_reader(
+            MemoryGuardConfig {
+                limit_bytes: before + headroom,
+                ..Default::default()
+            },
+            UsageReader::with_interval(source, EVERY_CALL),
+        );
+        assert!(
+            guard.try_reserve(1024 * 1024),
+            "{name}: 1 MiB fits in 32 MiB of headroom over {before}"
+        );
+
+        let block = vec![7u8; 64 * 1024 * 1024];
+        // Read every page back, so the writes are not elided and the OS counts them resident.
+        assert_eq!(
+            block.iter().map(|b| u64::from(*b)).sum::<u64>(),
+            7 * 64 * 1024 * 1024
+        );
+        let after = guard.current_bytes();
+        assert!(
+            after >= before + headroom,
+            "{name}: 64 MiB of touched pages must show: {before} -> {after}"
+        );
+        assert_eq!(guard.pressure(), MemoryPressure::High, "{name}");
+        assert!(
+            !guard.try_reserve(1),
+            "{name}: over the limit admits nothing"
+        );
+        drop(block);
     }
 
     /// A reading that never goes stale, so every call in a test shares one window.

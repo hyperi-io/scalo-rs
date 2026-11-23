@@ -14,6 +14,12 @@ The `transport-syslog` feature sends records to a syslog receiver as RFC 5424 or
 
 **Consumer adjustment** -- exhaustive matches on `TransportType` and `AnySender` add the `Syslog` arm. A literal `TransportConfig` adds `syslog`. `syslog` joins the built-in type names, so a custom sender registered under it is refused: register it under another name.
 
+### `MemoryGuard` reads the process's resident memory on Windows and macOS (BEHAVIOUR CHANGE)
+
+`UsageSource::detect()` falls back to `WorkingSet` on Windows and `TaskInfo` on macOS before `Reservations`, so a guard there trips on the process's real usage instead of only the bytes callers reserved. `UsageSource` is `#[non_exhaustive]`. See [memory.md](runtime/memory.md#usage-detection).
+
+**Consumer adjustment** -- an exhaustive match on `UsageSource` adds a wildcard arm. An explicit `limit_bytes` on Windows or macOS is now compared against the whole process's resident memory, so size it as a process ceiling, not a lease budget.
+
 ### `scalo::framing` holds every batch framing, and `worker::ndjson` is gone (API CHANGE)
 
 The `Framing` trait, its built-ins and `StreamDecoder` are what the file and pipe transports, the file output and the DLQ's file and HTTP backends now frame with, byte for byte as before. `FramingError` moves to `scalo::framing`, still re-exported as `scalo::transport::FramingError`, with new variants and messages. See [transport/framing.md](transport/framing.md).
@@ -37,6 +43,18 @@ A line of exactly `max_line_bytes` before its `\n` is now a record, where it was
 `Reject` is a permanent refusal, never retried. `RetryAfter(wait)` retries after the destination's wait. `TransportBase::delivery_guarantee` has no default. `register_sender` builds an app's own sender by type name as `AnySender::Custom`, and `TransportType` gains `Custom(String)`, losing `Copy`.
 
 **Consumer adjustment** -- exhaustive matches on `SendResult`, `AnySender` and `TransportType` add the new arms. Each own `TransportBase` impl adds `delivery_guarantee`. A literal `TransportConfig` adds `delivery` and `custom`.
+
+### An env var's text reaches a field that refuses its parsed value (BEHAVIOUR CHANGE)
+
+`APP__KAFKA__SASL_PASSWORD=0123` failed the load, because the env layer parsed it as the integer 123 and a `String` or `SensitiveString` field refuses that. Such a field now gets the text as set, trimmed. Numbers and bools still parse into numeric and bool fields. `Config::get_string` on such a key returns the text where it returned `None`.
+
+**Consumer adjustment** -- none. A value quoted to keep it text (`APP_X="0123"`) still reads as `0123`.
+
+### `config::load_typed_cascade` and `config::Loaded` (additive)
+
+`load_typed_cascade(path, prefix, managed)` loads an app's struct as `load_typed` does and returns its cascade by value, leaving the global alone. A test can build a cascade per case where the global kept the first test's environment.
+
+**Consumer adjustment** -- none.
 
 ### `ConfigOptions::managed`, `load_typed_managed` and `ServiceApp::managed_source` (additive)
 

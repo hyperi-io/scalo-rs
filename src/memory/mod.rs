@@ -13,8 +13,9 @@
 //! backpressure before hitting the container memory limit.
 //!
 //! Both halves of the ratio come from the kernel: [`UsageSource`] reads what
-//! the cgroup is charged, [`cgroup`] reads what it is allowed. Neither depends
-//! on which allocator the binary installed.
+//! the cgroup is charged (the process's resident memory on Windows and macOS),
+//! [`cgroup`] reads what it is allowed. Neither depends on which allocator the
+//! binary installed.
 //!
 //! # Architecture
 //!

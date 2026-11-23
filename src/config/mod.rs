@@ -37,6 +37,20 @@
 //! Use the `env_compat` module for standardised environment variable names
 //! with legacy alias support and deprecation warnings.
 //!
+//! ## Environment Variable Values
+//!
+//! A value is parsed before any field reads it: `8080` is a number, `true` a
+//! bool, `[a, b]` a list. A field that refuses the parsed value gets the text
+//! the variable was set to, trimmed, so `0123` reaches a `String` field as
+//! `0123` and a `u16` field as 123.
+//!
+//! ## A Cascade Without the Global
+//!
+//! [`setup`] and [`load_typed`] keep the first cascade set up in a process.
+//! [`Config::new`] and [`load_typed_cascade`] build one into a value instead,
+//! holding the environment it was built in, so tests sharing a process each
+//! read their own. `setup` and `load_typed` build theirs the same way.
+//!
 //! ## Example
 //!
 //! ```rust,no_run
@@ -55,6 +69,7 @@
 //! ```
 
 pub mod env_compat;
+mod env_text;
 pub mod flat_env;
 mod load;
 mod managed;
@@ -62,7 +77,7 @@ pub mod registry;
 pub mod sensitive;
 mod yaml_file;
 
-pub use load::{load_typed, load_typed_managed, log_deferred};
+pub use load::{Loaded, load_typed, load_typed_cascade, load_typed_managed, log_deferred};
 pub use managed::ManagedSource;
 
 #[cfg(feature = "config-reload")]
@@ -83,6 +98,7 @@ use figment::providers::{Env, Serialized};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use self::env_text::EnvText;
 use self::managed::ManagedLayer;
 use self::yaml_file::YamlFile;
 use crate::env::get_app_env;
@@ -214,6 +230,8 @@ struct SearchPaths<'a> {
 pub struct Config {
     figment: Figment,
     env_prefix: String,
+    /// The env layers' text, for a field that refuses a parsed env value.
+    env_text: EnvText,
 }
 
 impl Config {
@@ -298,9 +316,12 @@ impl Config {
         // `{prefix}_` leaves a leading underscore on the nested spelling --
         // TEST__DATABASE__HOST becomes `_database.host`, a key nothing reads --
         // and that is the spelling charts emit for secret env vars.
+        let mut env_text = EnvText::default();
         if !opts.env_prefix.is_empty() {
-            figment = figment.merge(Env::prefixed(&format!("{}__", opts.env_prefix)).split("__"));
-            figment = figment.merge(Env::prefixed(&format!("{}_", opts.env_prefix)).split("__"));
+            let nested = Env::prefixed(&format!("{}__", opts.env_prefix)).split("__");
+            figment = env_text.merge(figment, nested);
+            let single = Env::prefixed(&format!("{}_", opts.env_prefix)).split("__");
+            figment = env_text.merge(figment, single);
         }
 
         // 1. CLI args would be merged by the application via merge_cli()
@@ -308,6 +329,7 @@ impl Config {
         Ok(Self {
             figment,
             env_prefix: opts.env_prefix,
+            env_text,
         })
     }
 
@@ -464,28 +486,33 @@ impl Config {
         self
     }
 
+    /// Deserialise `T` at `key`, or the whole cascade.
+    fn extract<T: DeserializeOwned>(&self, key: Option<&str>) -> Result<T, figment::Error> {
+        self.env_text.extract(&self.figment, key)
+    }
+
     /// Get a string value.
     #[must_use]
     pub fn get_string(&self, key: &str) -> Option<String> {
-        self.figment.extract_inner::<String>(key).ok()
+        self.extract(Some(key)).ok()
     }
 
     /// Get an integer value.
     #[must_use]
     pub fn get_int(&self, key: &str) -> Option<i64> {
-        self.figment.extract_inner::<i64>(key).ok()
+        self.extract(Some(key)).ok()
     }
 
     /// Get a float value.
     #[must_use]
     pub fn get_float(&self, key: &str) -> Option<f64> {
-        self.figment.extract_inner::<f64>(key).ok()
+        self.extract(Some(key)).ok()
     }
 
     /// Get a boolean value.
     #[must_use]
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        self.figment.extract_inner::<bool>(key).ok()
+        self.extract(Some(key)).ok()
     }
 
     /// Get a duration value (parses strings like "30s", "5m", "1h").
@@ -498,7 +525,7 @@ impl Config {
     /// Get a list of strings.
     #[must_use]
     pub fn get_string_list(&self, key: &str) -> Option<Vec<String>> {
-        self.figment.extract_inner::<Vec<String>>(key).ok()
+        self.extract(Some(key)).ok()
     }
 
     /// Check if a key exists.
@@ -513,7 +540,7 @@ impl Config {
     ///
     /// Returns an error if deserialisation fails.
     pub fn unmarshal<T: DeserializeOwned>(&self) -> Result<T, ConfigError> {
-        self.figment.extract().map_err(ConfigError::ExtractError)
+        self.extract(None).map_err(ConfigError::ExtractError)
     }
 
     /// Deserialise a specific key into a typed struct.
@@ -522,9 +549,7 @@ impl Config {
     ///
     /// Returns an error if deserialisation fails.
     pub fn unmarshal_key<T: DeserializeOwned>(&self, key: &str) -> Result<T, ConfigError> {
-        self.figment
-            .extract_inner(key)
-            .map_err(ConfigError::ExtractError)
+        self.extract(Some(key)).map_err(ConfigError::ExtractError)
     }
 
     /// Deserialise a specific key and auto-register it in the config registry.
@@ -779,6 +804,54 @@ mod tests {
                 Some("single-host".to_string()),
                 "the single-underscore spelling stopped resolving"
             );
+        });
+    }
+
+    /// Every reader gives a field that refuses an env var's parsed value the
+    /// variable's text, at a leaf key, a section and the root. A value a
+    /// higher layer set is not replaced by the env text beneath it.
+    #[test]
+    fn every_reader_gives_a_string_field_the_env_text() {
+        #[derive(Debug, Default, serde::Deserialize)]
+        #[serde(default)]
+        struct Kafka {
+            password: String,
+            port: u16,
+        }
+        #[derive(Debug, Default, serde::Deserialize)]
+        #[serde(default)]
+        struct Root {
+            kafka: Kafka,
+        }
+
+        let vars = [
+            ("READTEST__KAFKA__PASSWORD", Some("0123")),
+            ("READTEST_KAFKA__PORT", Some("0123")),
+        ];
+        temp_env::with_vars(vars, || {
+            let config = Config::new(ConfigOptions {
+                env_prefix: "READTEST".into(),
+                search_standard_paths: false,
+                load_dotenv: false,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(config.get_string("kafka.password").as_deref(), Some("0123"));
+            assert_eq!(config.get_int("kafka.port"), Some(123));
+            let kafka: Kafka = config.unmarshal_key("kafka").unwrap();
+            assert_eq!((kafka.password.as_str(), kafka.port), ("0123", 123));
+            let root: Root = config.unmarshal().unwrap();
+            assert_eq!(
+                (root.kafka.password.as_str(), root.kafka.port),
+                ("0123", 123)
+            );
+
+            let cli = std::collections::BTreeMap::from([(
+                "kafka",
+                std::collections::BTreeMap::from([("password", 7)]),
+            )]);
+            let config = config.merge_cli(cli);
+            assert_eq!(config.get_string("kafka.password"), None, "a CLI number");
         });
     }
 
