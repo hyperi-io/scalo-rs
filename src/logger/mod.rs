@@ -39,16 +39,16 @@ pub mod helpers;
 mod masking;
 pub mod security;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use thiserror::Error;
 use tracing::Level;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry, reload};
 
 use tracing_throttle::{Policy, TracingRateLimitLayer};
 
@@ -61,6 +61,98 @@ pub use security::{SecurityEvent, SecurityOutcome};
 
 /// Global flag to track initialisation.
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
+
+/// The level handle of the logger [`setup`] started.
+static LEVEL_HANDLE: OnceLock<LevelHandle> = OnceLock::new();
+
+/// Changes the level of a running logger.
+///
+/// The `rdkafka=warn` floor and the `RUST_LOG` directives read at [`setup`]
+/// stay layered over the new level, as they are at start.
+///
+/// ```rust,no_run
+/// scalo::logger::setup_default()?;
+/// if let Some(level) = scalo::logger::level_handle() {
+///     level.set("debug")?;
+/// }
+/// # Ok::<(), scalo::logger::LoggerError>(())
+/// ```
+#[derive(Clone)]
+pub struct LevelHandle {
+    filter: reload::Handle<EnvFilter, Registry>,
+    rust_log: Option<String>,
+    level: Arc<Mutex<Level>>,
+}
+
+impl LevelHandle {
+    /// A filter at `level`, with `rust_log` layered over it, and the handle
+    /// that changes it.
+    fn new(level: Level, rust_log: Option<String>) -> (reload::Layer<EnvFilter, Registry>, Self) {
+        let (filter, handle) = reload::Layer::new(env_filter(level, rust_log.as_deref()));
+        let handle = Self {
+            filter: handle,
+            rust_log,
+            level: Arc::new(Mutex::new(level)),
+        };
+        (filter, handle)
+    }
+
+    /// Run at `level`, written as `LOG_LEVEL` takes it: a `tracing` name or
+    /// `1`-`5`, or `warning`, `critical` or `fatal`, in any case.
+    ///
+    /// # Errors
+    ///
+    /// [`LoggerError::InvalidLevel`] for any other text, and
+    /// [`LoggerError::SetGlobalError`] when the subscriber is gone. Either
+    /// leaves the level as it was.
+    pub fn set(&self, level: &str) -> Result<(), LoggerError> {
+        let wanted =
+            parse_level(level).ok_or_else(|| LoggerError::InvalidLevel(level.to_string()))?;
+        let mut current = self.level.lock().unwrap_or_else(PoisonError::into_inner);
+        self.filter
+            .reload(env_filter(wanted, self.rust_log.as_deref()))
+            .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
+        let previous = std::mem::replace(&mut *current, wanted);
+        drop(current);
+        tracing::info!(from = %previous, to = %wanted, "log level changed");
+        Ok(())
+    }
+
+    /// The level the logger runs at.
+    #[must_use]
+    pub fn current(&self) -> Level {
+        *self.level.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for LevelHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LevelHandle")
+            .field("level", &self.current())
+            .field("rust_log", &self.rust_log)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The handle on the level of the logger [`setup`] started, or `None` before
+/// it has run.
+#[must_use]
+pub fn level_handle() -> Option<LevelHandle> {
+    LEVEL_HANDLE.get().cloned()
+}
+
+/// The filter at `level`, with `rdkafka` held at warn and `rust_log` layered
+/// over both.
+///
+/// rdkafka logs client lifecycle at info, which floods service logs. A later
+/// directive wins per target, so `RUST_LOG=rdkafka=info` turns it back on.
+fn env_filter(level: Level, rust_log: Option<&str>) -> EnvFilter {
+    let quiet_defaults = format!("{level},rdkafka=warn");
+    match rust_log {
+        Some(rust_log) => EnvFilter::new(format!("{quiet_defaults},{rust_log}")),
+        None => EnvFilter::new(quiet_defaults),
+    }
+}
 
 /// Logger errors.
 #[derive(Debug, Error)]
@@ -279,17 +371,10 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
 
     let format = opts.format.resolve();
 
-    // Build the env filter. The rdkafka crate logs client/consumer/producer
-    // lifecycle at INFO and floods service logs, so seed rdkafka=warn as a
-    // floor. RUST_LOG is layered AFTER the defaults, and a later directive
-    // wins per target, so `RUST_LOG=rdkafka=info` still turns them back on.
-    let quiet_defaults = format!("{},rdkafka=warn", opts.level);
-    let filter = match std::env::var("RUST_LOG") {
-        Ok(rust_log) if !rust_log.trim().is_empty() => {
-            EnvFilter::new(format!("{quiet_defaults},{rust_log}"))
-        }
-        _ => EnvFilter::new(quiet_defaults),
-    };
+    let rust_log = std::env::var("RUST_LOG")
+        .ok()
+        .filter(|rust_log| !rust_log.trim().is_empty());
+    let (filter, level_handle) = LevelHandle::new(opts.level, rust_log);
 
     // RFC 3339 timestamp format
     let timer = UtcTime::rfc_3339();
@@ -350,15 +435,15 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
 
             if let Some(throttle) = throttle_filter {
                 tracing_subscriber::registry()
-                    .with(otel)
                     .with(filter)
+                    .with(otel)
                     .with(layer.with_filter(throttle))
                     .try_init()
                     .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
             } else {
                 tracing_subscriber::registry()
-                    .with(otel)
                     .with(filter)
+                    .with(otel)
                     .with(layer)
                     .try_init()
                     .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
@@ -383,15 +468,15 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
 
             if let Some(throttle) = throttle_filter {
                 tracing_subscriber::registry()
-                    .with(otel)
                     .with(filter)
+                    .with(otel)
                     .with(layer.with_filter(throttle))
                     .try_init()
                     .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
             } else {
                 tracing_subscriber::registry()
-                    .with(otel)
                     .with(filter)
+                    .with(otel)
                     .with(layer)
                     .try_init()
                     .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
@@ -401,6 +486,7 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
     }
 
     let _ = LOGGER_INIT.set(());
+    let _ = LEVEL_HANDLE.set(level_handle);
 
     #[cfg(feature = "otel-tracing")]
     crate::otel_tracing::log_init_status();
@@ -715,5 +801,79 @@ mod tests {
     fn test_is_no_color() {
         temp_env::with_var("NO_COLOR", None::<&str>, || assert!(!is_no_color()));
         temp_env::with_var("NO_COLOR", Some("1"), || assert!(is_no_color()));
+    }
+
+    /// Log lines a test subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The handle changes what a running subscriber writes and keeps the
+    /// rdkafka floor. Text it cannot read leaves the level as it was.
+    #[test]
+    fn the_level_handle_changes_the_level_live() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let (filter, handle) = LevelHandle::new(Level::INFO, None);
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || writer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("first debug line");
+            handle.set("debug").unwrap();
+            tracing::debug!("second debug line");
+            tracing::info!(target: "rdkafka", "rdkafka info line");
+            for bad in ["loud", "", "debug,my_app=trace"] {
+                assert!(
+                    matches!(handle.set(bad), Err(LoggerError::InvalidLevel(_))),
+                    "{bad:?} must not parse"
+                );
+            }
+            assert_eq!(handle.current(), Level::DEBUG);
+            tracing::debug!("third debug line");
+            handle.set("Warning").unwrap();
+            tracing::info!("info line at warn");
+        });
+        assert_eq!(handle.current(), Level::WARN);
+
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for (line, written) in [
+            ("first debug line", false),
+            ("second debug line", true),
+            ("rdkafka info line", false),
+            ("third debug line", true),
+            ("info line at warn", false),
+        ] {
+            assert_eq!(text.contains(line), written, "{line}:\n{text}");
+        }
+    }
+
+    /// `setup` hands out the handle on the logger it starts.
+    #[test]
+    fn setup_hands_out_the_level_handle() {
+        temp_env::with_var("RUST_LOG", None::<&str>, || {
+            setup(LoggerOptions {
+                format: LogFormat::Json,
+                ..LoggerOptions::default()
+            })
+            .unwrap();
+        });
+        let handle = level_handle().unwrap();
+        assert_eq!(handle.current(), Level::INFO);
+        assert!(!tracing::enabled!(Level::DEBUG));
+        handle.set("debug").unwrap();
+        assert!(tracing::enabled!(Level::DEBUG));
     }
 }

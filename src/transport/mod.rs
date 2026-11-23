@@ -53,6 +53,7 @@
 //! | **File** | Yes | Yes | Debugging, audit trails, replay |
 //! | **Pipe** | Yes | Yes | Unix pipelines, sidecar pattern |
 //! | **HTTP** | Yes | Yes | Webhook delivery, REST ingest |
+//! | **Syslog** | Yes | No | RFC 5424 and 3164 over TCP, TLS, UDP and RELP |
 //! | **Custom** | Yes | No | A sender the app registers with [`register_sender`] |
 //!
 //! ## Example
@@ -117,6 +118,9 @@ pub mod http;
 #[cfg(feature = "transport-proxy")]
 pub mod proxy;
 
+#[cfg(feature = "transport-syslog")]
+pub mod syslog;
+
 pub mod routed;
 
 #[cfg(feature = "transport-test-support")]
@@ -170,3 +174,6 @@ pub use file::{FileToken, FileTransport, FileTransportConfig};
 
 #[cfg(feature = "transport-http")]
 pub use http::{HttpAuth, HttpEndpoint, HttpToken, HttpTransport, HttpTransportConfig};
+
+#[cfg(feature = "transport-syslog")]
+pub use syslog::{SyslogConfig, SyslogTransport};
