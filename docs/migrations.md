@@ -30,6 +30,12 @@ Behaviour that changes with no config:
 
 **Consumer adjustment** -- a struct literal of `FileWriterConfig`, `FileDlqConfig` or `FileOutputConfig` adds `write` or `..Default::default()`, and an exhaustive match on `RotationPeriod` adds `Never`. A process reading the file transport's output as another user sets `file_mode: "0640"` and `dir_mode: "0750"` (or wider) on that transport, or loses read access to new files.
 
+### Client TLS pins the server's public key, `TlsError::InvalidPin` (API CHANGE)
+
+`ClientTls` gains `pin_sha256` and `with_pin(SpkiPin)`, and the HTTP transport `tls_pin_sha256`: SHA-256 pins on the server's public key, checked once its chain verifies. Empty, the default, changes nothing. A malformed pin fails the load with the new `TlsError::InvalidPin`. See [api/tls.md](api/tls.md#client-trust).
+
+**Consumer adjustment** -- an exhaustive match on `TlsError` adds `InvalidPin`.
+
 ### `MemoryGuard` reads the process's resident memory on Windows and macOS (BEHAVIOUR CHANGE)
 
 `UsageSource::detect()` falls back to `WorkingSet` on Windows and `TaskInfo` on macOS before `Reservations`, so a guard there trips on the process's real usage instead of only the bytes callers reserved. `UsageSource` is `#[non_exhaustive]`. See [memory.md](runtime/memory.md#usage-detection).

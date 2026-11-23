@@ -20,7 +20,7 @@ use super::relp::{encode_frame, parse_frame};
 use super::*;
 use crate::framing::{DecodeLimits, Frame, StreamDecoder};
 use crate::tls::test_pki::{TestCa, write};
-use crate::tls::{ClientAuth, ClientTlsConfig, ServerTls, ServerTlsConfig, TrustChoice};
+use crate::tls::{ClientAuth, ClientTlsConfig, ServerTls, ServerTlsConfig, SpkiPin, TrustChoice};
 
 /// 2026-10-11T22:14:15.003Z
 const WHEN: i64 = 1_791_756_855_003;
@@ -299,10 +299,13 @@ async fn relp_session(
     }
 }
 
-/// A CA, a server certificate for `localhost`, and a client certificate,
-/// written under `dir`, and a server requiring a client certificate.
+/// A CA, a server certificate for `localhost`, the same server re-keyed, and
+/// a client certificate, written under `dir`, and a server requiring a client
+/// certificate.
 struct Pki {
     dir: tempfile::TempDir,
+    /// The pin of the server's key.
+    pin: SpkiPin,
 }
 
 impl Pki {
@@ -310,27 +313,41 @@ impl Pki {
         let dir = tempfile::tempdir().unwrap();
         let ca = TestCa::new("syslog test CA");
         let server = ca.server("receiver");
+        let rekeyed = ca.server("receiver");
         let client = ca.client("sender");
         let path = |name: &str| dir.path().join(name);
         write(&path("ca.pem"), &ca.pem());
         write(&path("server.pem"), &server.cert_pem);
         write(&path("server.key"), &server.key_pem);
+        write(&path("rekeyed.pem"), &rekeyed.cert_pem);
+        write(&path("rekeyed.key"), &rekeyed.key_pem);
         write(&path("client.pem"), &client.cert_pem);
         write(&path("client.key"), &client.key_pem);
         let other = TestCa::new("unrelated CA");
         write(&path("other.pem"), &other.pem());
-        let server_tls = ServerTls::load(&ServerTlsConfig {
-            ca_file: Some(path("ca.pem")),
-            client_auth: ClientAuth::Required,
-            reload_interval_secs: 0,
-            ..ServerTlsConfig::from_files(path("server.pem"), path("server.key"))
-        })
-        .await
-        .unwrap();
-        (Self { dir }, server_tls)
+        let pki = Self {
+            dir,
+            pin: server.pin(),
+        };
+        let server_tls = pki.server("server").await;
+        (pki, server_tls)
     }
 
-    /// Client TLS trusting `ca` (a file under the dir), with the client cert.
+    /// A server presenting the certificate and key named `name` under the dir.
+    async fn server(&self, name: &str) -> ServerTls {
+        let path = |file: String| self.dir.path().join(file);
+        ServerTls::load(&ServerTlsConfig {
+            ca_file: Some(path("ca.pem".into())),
+            client_auth: ClientAuth::Required,
+            reload_interval_secs: 0,
+            ..ServerTlsConfig::from_files(path(format!("{name}.pem")), path(format!("{name}.key")))
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Client TLS trusting `ca` (a file under the dir), with the client cert,
+    /// pinned to the server's key.
     fn client(&self, ca: &str) -> SyslogTlsConfig {
         let path = |name: &str| self.dir.path().join(name);
         SyslogTlsConfig {
@@ -339,6 +356,7 @@ impl Pki {
                 ca_path: Some(path(ca)),
                 client_cert_path: Some(path("client.pem")),
                 client_key_path: Some(path("client.key")),
+                pin_sha256: vec![self.pin],
             },
             server_name: Some("localhost".into()),
         }
@@ -535,10 +553,13 @@ async fn sends_answer_each_failure_with_the_result_the_caller_acts_on() {
     let nack = RelpPeer::start(None, RelpMode::Nack("refuse-me")).await;
     let silent = RelpPeer::start(None, RelpMode::Silent).await;
     let tls_peer = StreamPeer::start(Some(server_tls), StreamMode::Keep).await;
+    let rekeyed_peer = StreamPeer::start(Some(pki.server("rekeyed").await), StreamMode::Keep).await;
     let big = "q".repeat(9_000);
 
     let mut untrusted = config(tls_peer.addr, SyslogProtocol::Tls);
     untrusted.tls = Some(pki.client("other.pem"));
+    let mut rekeyed = config(rekeyed_peer.addr, SyslogProtocol::Tls);
+    rekeyed.tls = Some(pki.client("ca.pem"));
     // (case, config, payloads, deadline, result as text)
     let cases: Vec<(&str, SyslogConfig, Vec<&str>, Duration, &str)> = vec![
         (
@@ -551,6 +572,13 @@ async fn sends_answer_each_failure_with_the_result_the_caller_acts_on() {
         (
             "receiver certificate from another CA",
             untrusted,
+            vec!["x"],
+            Duration::from_secs(5),
+            "Fatal(Config(",
+        ),
+        (
+            "receiver re-keyed under the same CA, off the pin",
+            rekeyed,
             vec!["x"],
             Duration::from_secs(5),
             "Fatal(Config(",
@@ -760,6 +788,7 @@ fn every_key_reaches_the_config_through_the_cascade() {
          max_message_bytes: 4096\n    connect_timeout_ms: 7\n    send_timeout_ms: 8\n    \
          relp_window: 9\n    tls:\n      trust: bundle\n      ca_path: /etc/tls/ca.pem\n      \
          client_cert_path: /etc/tls/c.pem\n      client_key_path: /etc/tls/c.key\n      \
+         pin_sha256: [\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"]\n      \
          server_name: logs.internal\n    filters_out:\n      - expression: 'level == \"debug\"'\n        \
          action: drop\n",
     )
@@ -808,6 +837,11 @@ fn every_key_reaches_the_config_through_the_cascade() {
                 ca_path: Some("/etc/tls/ca.pem".into()),
                 client_cert_path: Some("/etc/tls/c.pem".into()),
                 client_key_path: Some("/etc/tls/c.key".into()),
+                pin_sha256: vec![
+                    "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+                        .parse()
+                        .unwrap(),
+                ],
             },
             server_name: Some("logs.internal".into()),
         }),

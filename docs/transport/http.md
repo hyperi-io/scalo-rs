@@ -73,7 +73,7 @@ register_framing("counted", Arc::new(Counted))?;
 ## Answers, failover and the deadline
 
 | Status | Answer | The caller |
-|---|---|---|
+| --- | --- | --- |
 | one in `success_status`, or any 2xx when it is empty | `Ok` | releases the records |
 | 400, 413, 422 | `Reject` (413 as `MessageTooLarge`) | dead-letters them, never resends |
 | 408, 429, 5xx, a 2xx not in `success_status` | `RetryAfter(wait)` with a `Retry-After` in seconds, else `Backpressured` | sends them again |

@@ -185,7 +185,7 @@ secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager"]
 secrets-all = ["secrets-vault", "secrets-aws"]
 
 # docs/api/tls.md
-tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", "dep:rustls-pki-types", "dep:webpki-roots", "dep:tokio-rustls", "dep:arc-swap", "tokio", "tracing"]
+tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", "dep:rustls-pki-types", "dep:webpki-roots", "dep:tokio-rustls", "dep:arc-swap", "dep:sha2", "base64", "tokio", "tracing"]
 
 # Can leak secrets: not in `full`, off in every shipping build.
 dangerous-diagnostics = []
@@ -241,7 +241,7 @@ metrics-exporter-prometheus = { version = ">=0.18.3, <0.19", default-features = 
 crossbeam-epoch = { version = ">=0.9.21, <0.10", optional = true }
 metrics-util = { version = ">=0.20.4, <0.21", optional = true }
 metrics-exporter-opentelemetry = { version = ">=0.2.2, <0.2.3", optional = true }
-sysinfo = { version = ">=0.40.1, <0.41", optional = true }
+sysinfo = { version = ">=0.40.3, <0.41", optional = true }
 
 tokio = { version = ">=1.54.1, <2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-std", "io-util"], optional = true }
 tokio-util = { version = ">=0.7.20, <0.8", optional = true }
@@ -251,7 +251,7 @@ reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["
 backon = { version = ">=1.6.0, <2", optional = true }
 
 # Holds the cached `auth` credential: a hit is one atomic load and never parks.
-arc-swap = { version = ">=1.9.4, <2", optional = true }
+arc-swap = { version = ">=1.9.5, <2", optional = true }
 
 # An explicit aws-lc-rs provider: the graph has both aws-lc-rs and ring, so there is no single process
 # default. `default-features = false` keeps ring out. Never below 0.23.45: RUSTSEC-2026-0285.
@@ -259,8 +259,8 @@ rustls = { version = ">=0.23.46, <0.24", default-features = false, features = ["
 rustls-native-certs = { version = ">=0.8.5, <0.9", optional = true }
 # The OS verifier behind `TrustChoice::Platform`, already in the graph through reqwest.
 rustls-platform-verifier = { version = ">=0.7.1, <0.8", optional = true }
-rustls-pki-types = { version = ">=1.15.1, <2", features = ["std"], optional = true }
-webpki-roots = { version = ">=1.0.11, <2", optional = true }
+rustls-pki-types = { version = ">=1.16.0, <2", features = ["std"], optional = true }
+webpki-roots = { version = ">=1.0.12, <2", optional = true }
 # The provider comes from the rustls entry above.
 tokio-rustls = { version = ">=0.26.6, <0.27", default-features = false, features = ["logging", "tls12"], optional = true }
 
@@ -279,8 +279,8 @@ tonic = { version = ">=0.14.9, <0.15", features = ["gzip", "tls-aws-lc", "tls-na
 tonic-prost = { version = ">=0.14.9, <0.15", optional = true }
 # RetryInfo from a gRPC status, for transport-otlp. Released with tonic.
 tonic-types = { version = ">=0.14.9, <0.15", optional = true }
-prost = { version = ">=0.14.4, <0.15", optional = true }
-prost-types = { version = ">=0.14.4, <0.15", optional = true }
+prost = { version = ">=0.14.6, <0.15", optional = true }
+prost-types = { version = ">=0.14.6, <0.15", optional = true }
 # A three-component floor: `net` does not exist before 0.1.1.
 tokio-stream = { version = ">=0.1.19, <0.2", features = ["net"], optional = true }
 # Endpoint::connect_with_connector_lazy takes it, so the connect timeout covers the TLS handshake.
@@ -297,14 +297,14 @@ tar = { version = ">=0.4.46, <0.5", optional = true }
 yaque = { version = ">=0.6.6, <0.7", optional = true, features = ["recovery"] }
 # Checks a queue's version file before yaque, which panics on one it cannot read.
 semver = { version = ">=1.0.28, <2", optional = true }
-zstd = { version = ">=0.14.3, <0.15", optional = true }
+zstd = { version = ">=0.14.4, <0.15", optional = true }
 crc32c = { version = ">=0.6.9, <0.7", optional = true }
 
 # Never below 0.12.1: RUSTSEC-2026-0041.
-lz4_flex = { version = ">=0.14.0, <0.15", optional = true }
+lz4_flex = { version = ">=0.14.2, <0.15", optional = true }
 snap = { version = ">=1.1.2, <2", optional = true }
 
-sonic-rs = { version = ">=0.5.10, <1", optional = true }
+sonic-rs = { version = ">=0.5.11, <1", optional = true }
 
 # The unsafe lives in wide/safe_arch, since this crate denies unsafe_code.
 wide = { version = ">=1.7.1, <2", optional = true }
@@ -339,31 +339,31 @@ vaultrs = { version = ">=0.8, <0.9", optional = true }
 
 # Default features off: the aws-sdk `rustls` feature pulls rustls 0.21 (RUSTSEC-2026-0098, -0099, -0104),
 # and `default-https-client` takes rustls 0.23.
-aws-config = { version = ">=1.13.0, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+aws-config = { version = ">=1.13.2, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
 # Floor 1.117: the first release to need aws-smithy-json 0.63.1.
-aws-sdk-secretsmanager = { version = ">=1.125.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-secretsmanager = { version = ">=1.128.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
 # One `rdkafka` per target: `dynamic-linking` and `cmake-build` must never both reach rdkafka-sys.
 # docs/deployment/native-deps.md
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["dynamic-linking", "tokio"], optional = true }
+rdkafka = { version = ">=0.40.0, <0.41", default-features = false, features = ["dynamic-linking", "tokio"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["cmake-build", "ssl-vendored", "zstd", "libz", "tokio"], optional = true }
+rdkafka = { version = ">=0.40.0, <0.41", default-features = false, features = ["cmake-build", "ssl-vendored", "zstd", "libz", "tokio"], optional = true }
 # Reads MDM managed preferences for the managed config layer.
 plist = { version = ">=1.10.3, <2", default-features = false, optional = true }
 
 # Reads Group Policy for the managed config layer. Held below 0.7, as hyper-util's
 # `client-proxy-system` holds it, so a consumer's Windows build compiles one copy.
 [target.'cfg(windows)'.dependencies]
-windows-registry = { version = ">=0.6.1, <0.7", optional = true }
+windows-registry = { version = ">=0.100.0, <0.101", optional = true }
 # The process working set for the memory guard. Held to the 0.62 line sysinfo
 # builds with these features, so `memory` compiles one copy.
 windows = { version = ">=0.62.2, <0.63", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = ">=0.14.9, <0.15", optional = true }
-prost-build = { version = ">=0.14.4, <0.15", optional = true }
+prost-build = { version = ">=0.14.6, <0.15", optional = true }
 
 [dev-dependencies]
 # `testing` carries InMemoryMetricExporter, which proves what the OTel recorder exports.
@@ -390,9 +390,9 @@ reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["
 # Same declaration as the optional `http-server` dependency, for the reason above.
 axum = ">=0.8.9, <0.9"
 # Mergeable latency quantiles for the delivery_path bench. Already in the graph through metrics-util.
-sketches-ddsketch = ">=0.3.2, <0.4"
+sketches-ddsketch = ">=0.4.2, <0.5"
 # Local refs only, so no HTTP resolver.
-jsonschema = { version = ">=0.61.0, <0.62", default-features = false }
+jsonschema = { version = ">=0.61.2, <0.62", default-features = false }
 
 # Pins the delivery_path bench to a CPU set. Already in the graph through tempfile.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
