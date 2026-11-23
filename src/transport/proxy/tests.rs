@@ -243,6 +243,7 @@ async fn connect_through_the_proxy() {
         let seen = proxy.seen();
         assert_eq!(seen.len(), 1, "{name}");
         assert_eq!(seen[0].target, target.to_string(), "{name}");
+        assert_eq!(seen[0].auth.is_some(), credentials.is_some(), "{name}");
         match (connected, wanted) {
             (Ok(mut stream), Ok(())) => {
                 stream.write_all(b"through").await.unwrap();

@@ -298,7 +298,7 @@ pub struct ProxyRefused {
 /// The [`ProxyRefused`] in `error` or its causes, through boxes and
 /// `std::io::Error`.
 #[must_use]
-pub fn refusal(error: &(dyn std::error::Error + 'static)) -> Option<&ProxyRefused> {
+pub fn refusal<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a ProxyRefused> {
     let mut next = Some(error);
     while let Some(error) = next {
         if let Some(refused) = error.downcast_ref::<ProxyRefused>() {

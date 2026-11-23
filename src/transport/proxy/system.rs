@@ -82,6 +82,7 @@ pub(super) fn from_env() -> Settings {
 /// Bypass entries are split by `;` or white space. `<local>` is any host
 /// without a dot, `*.example.com` becomes `.example.com`, and `10.*` becomes
 /// `10.0.0.0/8`.
+#[cfg(any(windows, test))]
 pub(super) fn from_winhttp(proxy: &str, bypass: &str) -> Settings {
     let mut settings = Settings::default();
     for entry in proxy
@@ -116,6 +117,7 @@ pub(super) fn from_winhttp(proxy: &str, bypass: &str) -> Settings {
 }
 
 /// One WinHTTP or macOS bypass entry as a `NO_PROXY` rule.
+#[cfg(any(windows, target_os = "macos", test))]
 pub(super) fn wildcard_to_rule(entry: &str) -> String {
     if entry == "*" {
         return entry.to_string();
