@@ -101,7 +101,8 @@ tiered-sink = ["transport", "yaque", "dep:semver", "zstd", "lz4_flex", "snap", "
 # docs/pipeline/sink-stack.md
 sink-stack = ["transport", "tower", "dep:backon", "governor", "tokio", "tracing"]
 
-memory = ["sysinfo", "tracing"]
+# `libc` and `windows` read the process's resident memory on macOS and Windows. docs/runtime/memory.md
+memory = ["sysinfo", "tracing", "libc", "dep:windows"]
 
 # `gcra` is the `governor` crate, renamed so it does not clash with this feature. docs/self-regulation.md
 governor = ["memory", "tokio", "parking_lot", "dep:gcra"]
@@ -352,6 +353,9 @@ plist = { version = ">=1.10.3, <2", default-features = false, optional = true }
 # `client-proxy-system` holds it, so a consumer's Windows build compiles one copy.
 [target.'cfg(windows)'.dependencies]
 windows-registry = { version = ">=0.6.1, <0.7", optional = true }
+# The process working set for the memory guard. Held to the 0.62 line sysinfo
+# builds with these features, so `memory` compiles one copy.
+windows = { version = ">=0.62.2, <0.63", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = { version = ">=0.14.9, <0.15", optional = true }

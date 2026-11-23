@@ -19,14 +19,18 @@
 //! inactive page cache in `memory.stat`, which the kernel reclaims before it
 //! kills anything.
 //!
-//! Four sources, tried in that order of fidelity to the kill decision:
+//! Six sources, tried in that order of fidelity to the kill decision:
 //!
 //! - **cgroup v2** `memory.current` less `inactive_file`.
 //! - **cgroup v1** `memory.usage_in_bytes` less `total_inactive_file`.
 //! - **`/proc/self/status`** `VmRSS` -- this process alone, for a Linux host
 //!   running no cgroup memory controller.
+//! - **working set** -- this process's resident pages on Windows, from
+//!   `GetProcessMemoryInfo`.
+//! - **task info** -- this process's resident size on macOS, from
+//!   `proc_pidinfo(PROC_PIDTASKINFO)`.
 //! - **reservations** -- the guard's own outstanding leases, which is all that
-//!   is left where the kernel exposes no accounting (non-Linux).
+//!   is left where the OS exposes none of the above.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,6 +59,7 @@ const CACHE_INTERVAL: Duration = Duration::from_millis(50);
 /// [`MemoryGuard::with_usage_source`](super::MemoryGuard::with_usage_source)
 /// to pin it (a test fixture directory, or a host where detection is wrong).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UsageSource {
     /// cgroup v2 `memory.current` under this root.
     CgroupV2(PathBuf),
@@ -62,6 +67,10 @@ pub enum UsageSource {
     CgroupV1(PathBuf),
     /// `VmRSS` from the `status` file under this procfs directory.
     ProcStatus(PathBuf),
+    /// This process's working set on Windows. Reads nothing on any other OS.
+    WorkingSet,
+    /// This process's resident size on macOS. Reads nothing on any other OS.
+    TaskInfo,
     /// The guard's own outstanding reservations -- sees only what callers
     /// reserved and released by hand, never the process's real usage.
     Reservations,
@@ -79,16 +88,16 @@ impl UsageSource {
     }
 
     fn detect_in(v2_root: &Path, v1_root: &Path, proc_self: &Path) -> Self {
-        if read_u64_file(&v2_root.join("memory.current")).is_some() {
-            return Self::CgroupV2(v2_root.to_path_buf());
-        }
-        if read_u64_file(&v1_root.join("memory.usage_in_bytes")).is_some() {
-            return Self::CgroupV1(v1_root.to_path_buf());
-        }
-        if read_vm_rss(proc_self).is_some() {
-            return Self::ProcStatus(proc_self.to_path_buf());
-        }
-        Self::Reservations
+        [
+            Self::CgroupV2(v2_root.to_path_buf()),
+            Self::CgroupV1(v1_root.to_path_buf()),
+            Self::ProcStatus(proc_self.to_path_buf()),
+            Self::WorkingSet,
+            Self::TaskInfo,
+        ]
+        .into_iter()
+        .find(|source| source.read().is_some())
+        .unwrap_or(Self::Reservations)
     }
 
     /// Short name for the init log line.
@@ -98,12 +107,15 @@ impl UsageSource {
             Self::CgroupV2(_) => "cgroup-v2",
             Self::CgroupV1(_) => "cgroup-v1",
             Self::ProcStatus(_) => "proc-status",
+            Self::WorkingSet => "working-set",
+            Self::TaskInfo => "task-info",
             Self::Reservations => "reservations",
         }
     }
 
-    /// Current usage in bytes, or `None` for [`Self::Reservations`] and for a
-    /// file that has become unreadable since detection.
+    /// Current usage in bytes, or `None` for [`Self::Reservations`], for an
+    /// OS source off its own OS, and for a file that has become unreadable
+    /// since detection.
     #[must_use]
     pub fn read(&self) -> Option<u64> {
         match self {
@@ -112,6 +124,8 @@ impl UsageSource {
                 working_set(root, "memory.usage_in_bytes", "total_inactive_file")
             }
             Self::ProcStatus(root) => read_vm_rss(root),
+            Self::WorkingSet => process_working_set(),
+            Self::TaskInfo => task_resident_size(),
             Self::Reservations => None,
         }
     }
@@ -151,6 +165,48 @@ fn read_vm_rss(proc_self: &Path) -> Option<u64> {
     let line = content.lines().find(|l| l.starts_with("VmRSS:"))?;
     let kb = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     kb.checked_mul(1024)
+}
+
+/// The pages Windows holds resident for this process.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn process_working_set() -> Option<u64> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let size = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?;
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    // SAFETY: the pseudo-handle GetCurrentProcess returns needs no closing, and
+    // `counters` is a live struct of the `size` bytes the call may write.
+    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &raw mut counters, size) }.ok()?;
+    u64::try_from(counters.WorkingSetSize).ok()
+}
+
+#[cfg(not(windows))]
+fn process_working_set() -> Option<u64> {
+    None
+}
+
+/// This process's resident size, the figure macOS `task_info` reports.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn task_resident_size() -> Option<u64> {
+    let pid = libc::c_int::try_from(std::process::id()).ok()?;
+    let size = libc::c_int::try_from(size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: proc_taskinfo holds integers only, so all-zero bytes are a valid
+    // value, and proc_pidinfo writes at most `size` bytes into it.
+    let (written, info) = unsafe {
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let written =
+            libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size);
+        (written, info)
+    };
+    (written == size).then_some(info.pti_resident_size)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn task_resident_size() -> Option<u64> {
+    None
 }
 
 /// A [`UsageSource`] plus the short-interval cache that keeps its file read off
@@ -346,6 +402,19 @@ fn since_sample(charged: u64, charged_at_sample: u64, released: u64) -> u64 {
         .min(charged.wrapping_sub(released))
 }
 
+/// The OS source that reads this process's resident memory where the tests
+/// run, or `None` on Linux, where procfs and the cgroup cover it.
+#[cfg(test)]
+pub(super) fn native_process_source() -> Option<UsageSource> {
+    if cfg!(windows) {
+        Some(UsageSource::WorkingSet)
+    } else if cfg!(target_os = "macos") {
+        Some(UsageSource::TaskInfo)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,8 +455,8 @@ mod tests {
         let no_proc = fixture(&[]);
         assert_eq!(
             UsageSource::detect_in(no_v2.path(), no_v1.path(), no_proc.path()),
-            UsageSource::Reservations,
-            "no kernel accounting readable -> reservations only"
+            native_process_source().unwrap_or(UsageSource::Reservations),
+            "no cgroup or procfs -> the OS's own figure, else reservations only"
         );
     }
 
@@ -459,31 +528,29 @@ mod tests {
         );
     }
 
+    /// Each per-process source reads the running process on its own OS and
+    /// nothing anywhere else. The guard tests cover the figure growing.
     #[test]
-    fn proc_status_returns_this_process_resident_size() {
-        // The real procfs, not a fixture: the fallback must report the running
-        // process, so allocate a known block and watch the figure cover it.
-        let source = UsageSource::ProcStatus(PathBuf::from(PROC_SELF));
-        let Some(before) = source.read() else {
-            return; // not Linux; nothing to assert
-        };
-        assert!(
-            before > 512 * 1024,
-            "a running Rust test process holds more than 512 KiB, got {before}"
-        );
-
-        let block = vec![7u8; 64 * 1024 * 1024];
-        // Touch every page so the kernel actually charges it as resident.
-        assert_eq!(
-            block.iter().map(|b| u64::from(*b)).sum::<u64>(),
-            7 * 64 * 1024 * 1024
-        );
-        let after = source.read().expect("procfs still readable");
-        assert!(
-            after >= before + 32 * 1024 * 1024,
-            "64 MiB of touched pages must show in VmRSS: {before} -> {after}"
-        );
-        drop(block);
+    fn process_sources_read_only_on_their_own_os() {
+        let cases = [
+            (
+                UsageSource::ProcStatus(PathBuf::from(PROC_SELF)),
+                cfg!(target_os = "linux"),
+            ),
+            (UsageSource::WorkingSet, cfg!(windows)),
+            (UsageSource::TaskInfo, cfg!(target_os = "macos")),
+        ];
+        for (source, own_os) in cases {
+            let name = source.name();
+            match (source.read(), own_os) {
+                (Some(bytes), true) => assert!(
+                    bytes > 512 * 1024,
+                    "{name}: a running Rust test process holds more than 512 KiB, got {bytes}"
+                ),
+                (None, false) => {}
+                (reading, own_os) => panic!("{name}: read {reading:?}, own OS {own_os}"),
+            }
+        }
     }
 
     #[test]
