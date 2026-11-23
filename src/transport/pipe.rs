@@ -254,6 +254,10 @@ impl TransportBase for PipeTransport {
     fn name(&self) -> &'static str {
         "pipe"
     }
+
+    fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
+        super::DeliveryGuarantee::Written
+    }
 }
 
 impl TransportSender for PipeTransport {

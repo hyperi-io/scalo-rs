@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, PoisonError};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use yaque::{Receiver, Sender};
 
@@ -238,14 +237,14 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     ///
     /// The message goes through the hot path (direct to sink) when the circuit
     /// breaker admits it (closed, or the single half-open probe) and, in
-    /// StrictFifo, the spool is empty. A `Backpressured` answer or a send past
-    /// `send_timeout_ms` spools it instead, as does a refused hot path.
+    /// StrictFifo, the spool is empty. A `Backpressured` or `RetryAfter` answer, or
+    /// a send past `send_timeout_ms`, spools it instead, as does a refused hot path.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The sink names the record in `dead_letter_reason`, or answers
-    ///   `FilteredDlq` for it ([`TieredSinkError::DeadLetter`])
+    ///   `FilteredDlq` or `Reject` for it ([`TieredSinkError::DeadLetter`])
     /// - The sink answers `Fatal` ([`TieredSinkError::Sink`])
     /// - The spool is full and `when_full` is `block`, or
     ///   `dlq` with no DLQ set ([`TieredSinkError::SpoolFull`])
@@ -359,42 +358,40 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
     /// Try to send via hot path (direct to the downstream sender, no encode).
     async fn try_hot_path(&self, record: &Record) -> Result<()> {
-        let send_timeout = self.config.send_timeout_duration();
+        let deadline = std::time::Instant::now() + self.config.send_timeout_duration();
 
-        match timeout(
-            send_timeout,
-            self.sink.send_batch(std::slice::from_ref(record)),
-        )
-        .await
+        match self
+            .sink
+            .send_batch_by(std::slice::from_ref(record), deadline)
+            .await
         {
-            Ok(SendResult::Ok) => {
+            SendResult::Ok => {
                 self.circuit.record_success().await;
                 Ok(())
             }
-            Ok(SendResult::FilteredDlq) => {
+            SendResult::FilteredDlq => {
                 // The sink answered, so the breaker counts a success.
                 self.circuit.record_success().await;
                 Err(TieredSinkError::DeadLetter(
                     crate::transport::DeadLetterReason::Rejected.to_string(),
                 ))
             }
-            Ok(SendResult::Backpressured) => {
-                // Downstream backpressured/unavailable: spool and count toward
-                // the circuit so sustained failure trips it.
+            SendResult::Reject(e) => {
+                // The sink answered, so the breaker counts a success.
+                self.circuit.record_success().await;
+                Err(TieredSinkError::DeadLetter(e.to_string()))
+            }
+            // Backpressured, a named wait, or the deadline elapsed: spool and
+            // count toward the circuit so sustained failure trips it.
+            SendResult::Backpressured | SendResult::RetryAfter(_) => {
                 self.circuit.record_failure().await;
                 #[cfg(feature = "metrics")]
                 ::metrics::counter!("spool_circuit_trips_total").increment(1);
                 Err(TieredSinkError::Spool("sink backpressured".into()))
             }
-            Ok(SendResult::Fatal(e)) => {
+            SendResult::Fatal(e) => {
                 // Fatal error - propagate, don't spool.
                 Err(TieredSinkError::Sink(e.to_string()))
-            }
-            Err(_timeout) => {
-                self.circuit.record_failure().await;
-                #[cfg(feature = "metrics")]
-                ::metrics::counter!("spool_circuit_trips_total").increment(1);
-                Err(TieredSinkError::Spool("send timeout".into()))
             }
         }
     }
@@ -891,6 +888,10 @@ mod tests {
         }
         fn name(&self) -> &'static str {
             "test-sink"
+        }
+
+        fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+            crate::transport::DeliveryGuarantee::Acknowledged
         }
     }
 
@@ -2432,6 +2433,10 @@ mod tests {
         }
         fn name(&self) -> &'static str {
             "hanging-sink"
+        }
+
+        fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+            crate::transport::DeliveryGuarantee::Acknowledged
         }
     }
 

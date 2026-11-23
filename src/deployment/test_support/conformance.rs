@@ -335,6 +335,10 @@ impl TransportBase for PullSource {
     fn name(&self) -> &'static str {
         "conformance-pull"
     }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
+    }
 }
 
 impl TransportReceiver for PullSource {
@@ -574,6 +578,10 @@ impl TransportBase for PushSource {
 
     fn name(&self) -> &'static str {
         "conformance-push"
+    }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
     }
 }
 
@@ -841,6 +849,10 @@ impl TransportBase for FaultSink {
 
     fn name(&self) -> &'static str {
         "conformance-sink"
+    }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
     }
 }
 
