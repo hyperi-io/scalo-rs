@@ -14,6 +14,17 @@ A TLS handshake that fails (an untrusted or misnamed certificate, a key off the 
 
 **Consumer adjustment** -- none in code. A sink whose drain retried a bad certificate now holds the records until the TLS config is fixed.
 
+### The HTTP sender gains credentials, framing, gzip, failover and a proxy, and refuses redirects (API and BEHAVIOUR CHANGE)
+
+`HttpTransportConfig` gains `failover`, `auth`, `headers`, `user_agent`, `framing`, `gzip`, `success_status`, `proxy` and `follow_redirects`, all off or empty by default, with `HttpAuth` and `HttpEndpoint`. It also gains `max_retry_after_ms`, default 60000. `proxy` takes the shared `ProxyConfig`. See [transport/http.md](transport/http.md). Four defaults change what goes on the wire:
+
+- A 3xx is no longer followed. It is `Fatal(Config)`. Set `follow_redirects: true` for same-origin redirects.
+- `HTTP_PROXY` and `HTTPS_PROXY` are no longer read. Set `proxy: system` to use them.
+- 400 and 422 are `Reject`, and 413 `Reject(MessageTooLarge)`, where they were `Fatal`. Any other 4xx outside 401, 403, 404, 405, 407, 410 and 421 is `Fatal(Config)`, held, where it was `Fatal(Send)`, dead-lettered. A busy answer with `Retry-After` is `RetryAfter`.
+- An `endpoint` that isn't an `http` or `https` URL fails `HttpTransport::new`, where it failed each send.
+
+**Consumer adjustment** -- a struct literal of `HttpTransportConfig` adds the fields or `..Default::default()`. A sender that relied on a redirect or an environment proxy sets `follow_redirects` or `proxy: system`.
+
 ### Syslog transport, `TransportType::Syslog` (API CHANGE)
 
 The `transport-syslog` feature sends records to a syslog receiver as RFC 5424 or RFC 3164 messages over TCP, TLS, UDP or RELP, as `type: syslog`. `scalo::tls::ClientTlsConfig` is the `trust`, `ca_path`, `client_cert_path` and `client_key_path` section a transport reads its client TLS from. See [transport/syslog.md](transport/syslog.md). `transport-all`, and so `full`, pulls it.
