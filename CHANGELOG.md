@@ -3,6 +3,34 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.34](https://github.com/hyperi-io/scalo-rs/compare/v2.14.33...v2.14.34) (2026-11-23)
+
+### Bug Fixes
+
+* **config:** keep env text and return a separate cascade ([bf5a387](https://github.com/hyperi-io/scalo-rs/commit/bf5a387f2307c5a1d8f00e5f64e234d58beb6100))
+* **config:** read Group Policy and MDM settings ([0e539c9](https://github.com/hyperi-io/scalo-rs/commit/0e539c97bca7bee91775e77646c457a56fb3298a))
+* **deps:** raise aws-sdk minimum versions ([fdd7406](https://github.com/hyperi-io/scalo-rs/commit/fdd7406ee6b20186c31dbfb3dc485d07e53b2abb))
+* **deps:** replace chrono with jiff and std ([ce578d4](https://github.com/hyperi-io/scalo-rs/commit/ce578d44230569f84aec37331a50bd34815d518f))
+* **deps:** update rdkafka to >=0.40.0, <0.41 ([4898e84](https://github.com/hyperi-io/scalo-rs/commit/4898e845fa822901d9807fddc56ca086564d7d87))
+* **deps:** update rust-dependencies ([1bebda2](https://github.com/hyperi-io/scalo-rs/commit/1bebda24f44b69f2d2791099993d44f15c382edf))
+* **deps:** update tonic-prost to >=0.14.6, <0.15 ([adc5d8c](https://github.com/hyperi-io/scalo-rs/commit/adc5d8c12483ce065d0fd1dae162ec186d2992b1))
+* **filter:** match CEL rules on nested fields ([8a3ddc8](https://github.com/hyperi-io/scalo-rs/commit/8a3ddc8170b4d9d4e1196f994c859182e0c189f9))
+* **framing:** use one trait for batch framing ([996e2e4](https://github.com/hyperi-io/scalo-rs/commit/996e2e4d4689edaa95a1482521f5f70898a1143c))
+* **grpc:** coalesce small send_batch blocks ([3f64922](https://github.com/hyperi-io/scalo-rs/commit/3f64922c4b6e6e0c21931b6287a0226ec0d1b93d))
+* **http:** skip retry on TLS cert and pin errors ([24dfbb3](https://github.com/hyperi-io/scalo-rs/commit/24dfbb3342e1b74709209bc3acf9e57498212baf))
+* **io:** rotate by size, sync, cut partial lines ([53d1b14](https://github.com/hyperi-io/scalo-rs/commit/53d1b14b5df775bcfda6561ac241e2107c72ad49))
+* **logger:** change the log level at run time ([a7d9a15](https://github.com/hyperi-io/scalo-rs/commit/a7d9a151e9ba4fb566804187acfec19a2bedcc8b))
+* **memory:** read usage on Windows and macOS ([1f1456c](https://github.com/hyperi-io/scalo-rs/commit/1f1456c78e820e9fa1986e89ddc0a2b7d84efd53))
+* **test:** hold the macOS dial clock and pick the Vector asset ([57e5fcb](https://github.com/hyperi-io/scalo-rs/commit/57e5fcb0e041294ed39b10280ac3c5f1e40a2049)), closes [#550](https://github.com/hyperi-io/scalo-rs/issues/550)
+* **tls:** add client certs, CA pin and trust modes ([4123d69](https://github.com/hyperi-io/scalo-rs/commit/4123d696f2582f7b58f1fa48ce4239bdaa1fa63a))
+* **tls:** pin the server's public key ([6020759](https://github.com/hyperi-io/scalo-rs/commit/6020759acdfb11317c14aaba94ae83016324c31f))
+* **transport:** add custom senders, check delivery ([c5e7d4c](https://github.com/hyperi-io/scalo-rs/commit/c5e7d4cf454b88308589123cc0c99d6bde37de67))
+* **transport:** add HTTP auth, framing, failover ([99493ab](https://github.com/hyperi-io/scalo-rs/commit/99493ab13a9020c6d5d2c18d28bdb3e0b5933abc))
+* **transport:** send logs over OTLP ([d52d2b8](https://github.com/hyperi-io/scalo-rs/commit/d52d2b8119a1d25d6198e03a11520ce5a22c0208))
+* **transport:** send OTLP through the egress proxy ([93a6254](https://github.com/hyperi-io/scalo-rs/commit/93a62547c29a1a61c39273372748cfdc2e3b182c))
+* **transport:** send records to syslog receivers ([3fd804c](https://github.com/hyperi-io/scalo-rs/commit/3fd804ca88e339bb4e0fd1505e0606a43260b32a))
+* **transport:** share one egress proxy setting ([08213cf](https://github.com/hyperi-io/scalo-rs/commit/08213cf8adad6afcd076375722967ee40c8fc783))
+
 ## [2.14.33](https://github.com/hyperi-io/scalo-rs/compare/v2.14.32...v2.14.33) (2026-11-21)
 
 ### Bug Fixes
