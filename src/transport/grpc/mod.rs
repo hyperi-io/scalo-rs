@@ -465,42 +465,18 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// Build a tonic `ClientTlsConfig` from the unified TLS fields on `GrpcConfig`.
-///
-/// tonic owns its TLS stack (like librdkafka), so map `TlsTrust` onto
-/// `ClientTlsConfig`: private-CA PEM (else OS native roots), optional SNI
-/// override, optional mTLS client identity.
+/// tonic's client TLS config for the `tls_*` fields on `GrpcConfig`: only the
+/// CA when `tls_ca_path` is set, else the OS roots, and the client identity
+/// when both its paths are set.
 fn build_grpc_client_tls(
     config: &GrpcConfig,
 ) -> TransportResult<tonic::transport::ClientTlsConfig> {
-    use tonic::transport::{Certificate, ClientTlsConfig, Identity};
-
-    let mut tls = ClientTlsConfig::new();
-
-    if let Some(ref ca) = config.tls_ca_path {
-        let pem = std::fs::read(ca)
-            .map_err(|e| TransportError::Config(format!("gRPC TLS: cannot read ca {ca}: {e}")))?;
-        tls = tls.ca_certificate(Certificate::from_pem(pem));
-    } else {
-        // No private CA -> trust the OS native roots.
-        tls = tls.with_native_roots();
-    }
-
-    if let Some(ref domain) = config.tls_domain {
-        tls = tls.domain_name(domain.clone());
-    }
-
-    // mTLS identity -- both cert and key, or neither.
+    let mut tls = match &config.tls_ca_path {
+        Some(ca) => crate::tls::ClientTls::pinned(ca),
+        None => crate::tls::ClientTls::default(),
+    };
     match (&config.tls_client_cert_path, &config.tls_client_key_path) {
-        (Some(cert), Some(key)) => {
-            let cert_pem = std::fs::read(cert).map_err(|e| {
-                TransportError::Config(format!("gRPC TLS: cannot read client cert {cert}: {e}"))
-            })?;
-            let key_pem = std::fs::read(key).map_err(|e| {
-                TransportError::Config(format!("gRPC TLS: cannot read client key {key}: {e}"))
-            })?;
-            tls = tls.identity(Identity::from_pem(cert_pem, key_pem));
-        }
+        (Some(cert), Some(key)) => tls = tls.with_identity(cert, key),
         (None, None) => {}
         _ => {
             return Err(TransportError::Config(
@@ -509,7 +485,11 @@ fn build_grpc_client_tls(
             ));
         }
     }
-
+    let mut tls = crate::tls::tonic_client_tls(&tls)
+        .map_err(|e| TransportError::Config(format!("gRPC TLS: {e}")))?;
+    if let Some(domain) = &config.tls_domain {
+        tls = tls.domain_name(domain.clone());
+    }
     Ok(tls)
 }
 

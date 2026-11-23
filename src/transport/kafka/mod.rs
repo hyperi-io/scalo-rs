@@ -677,19 +677,7 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
         client_config.set("sasl.password", password.expose());
     }
 
-    // TLS.
-    if let Some(ref ca) = config.ssl_ca_location {
-        client_config.set("ssl.ca.location", ca);
-    }
-    if let Some(ref cert) = config.ssl_certificate_location {
-        client_config.set("ssl.certificate.location", cert);
-    }
-    if let Some(ref key) = config.ssl_key_location {
-        client_config.set("ssl.key.location", key);
-    }
-    if config.ssl_skip_verify {
-        client_config.set("enable.ssl.certificate.verification", "false");
-    }
+    set_tls(&mut client_config, config);
 
     client_config.set("client.id", &config.client_id);
     // Fetch-from-follower (KIP-392): with a rack set, the consumer reads
@@ -753,6 +741,21 @@ pub fn producer_client_config(
     if let Some(ref password) = config.sasl_password {
         client_config.set("sasl.password", password.expose());
     }
+    set_tls(&mut client_config, config);
+    // librdkafka's producer default is `true`. Set before the layers, so a raw override wins.
+    client_config.set(
+        "allow.auto.create.topics",
+        config.allow_auto_create_topics.to_string(),
+    );
+    apply_layer(&mut client_config, profile_defaults);
+    let settings = config.resolved_producer_settings();
+    apply_layer(&mut client_config, &raw_layer(&settings));
+    set_default_ca(&mut client_config);
+    client_config
+}
+
+/// Set librdkafka's TLS properties from the `ssl_*` fields of `config`.
+pub(super) fn set_tls(client_config: &mut ClientConfig, config: &KafkaConfig) {
     if let Some(ref ca) = config.ssl_ca_location {
         client_config.set("ssl.ca.location", ca);
     }
@@ -765,16 +768,6 @@ pub fn producer_client_config(
     if config.ssl_skip_verify {
         client_config.set("enable.ssl.certificate.verification", "false");
     }
-    // librdkafka's producer default is `true`. Set before the layers, so a raw override wins.
-    client_config.set(
-        "allow.auto.create.topics",
-        config.allow_auto_create_topics.to_string(),
-    );
-    apply_layer(&mut client_config, profile_defaults);
-    let settings = config.resolved_producer_settings();
-    apply_layer(&mut client_config, &raw_layer(&settings));
-    set_default_ca(&mut client_config);
-    client_config
 }
 
 /// With TLS on and no CA named, trust what [`default_ca_location`] picks. A

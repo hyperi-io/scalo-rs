@@ -8,12 +8,33 @@
 
 //! # Unified TLS trust
 //!
-//! One place to build a rustls [`ClientConfig`] for every transport that
-//! speaks TLS (HTTP, gRPC, Vault -- Kafka maps the same vocabulary onto
-//! librdkafka file paths). One trust model replaces per-transport TLS
-//! handling, with first-class **private-CA** support
-//! -- the common deployment shape (an internal CA, not the public web
-//! PKI). Mirrors the design used in the clickhouse-rs fork.
+//! One place to build client TLS for every transport that speaks it: a rustls
+//! [`ClientConfig`] for HTTP, and tonic's client config for gRPC. Kafka maps
+//! the same vocabulary onto librdkafka file paths, and Vault onto its client's
+//! own settings. Every builder takes a private CA, the common deployment
+//! shape.
+//!
+//! ## Client trust and identity
+//!
+//! [`ClientTls`] names a [`TrustChoice`], CA files and an optional
+//! [`ClientIdentity`] for mutual TLS, and [`build_client_tls`] builds it:
+//!
+//! - `native` (the default): the OS root store, read through
+//!   `rustls-native-certs` and checked by rustls, plus the CA files.
+//! - `platform`: the OS verifier through `rustls-platform-verifier`, which
+//!   applies the Windows and macOS policy and revocation checks, plus the CA
+//!   files.
+//! - `bundle`: the CA files and nothing else, the exclusive pin.
+//!
+//! ```rust,no_run
+//! use scalo::crypto::CryptoProfile;
+//! use scalo::tls::{ClientTls, build_client_tls};
+//!
+//! let tls = ClientTls::pinned("/etc/tls/ca.pem")
+//!     .with_identity("/etc/tls/client.pem", "/etc/tls/client.key");
+//! let config = build_client_tls(CryptoProfile::Prod, &tls)?;
+//! # Ok::<(), scalo::tls::TlsError>(())
+//! ```
 //!
 //! ## Crypto provider
 //!
@@ -23,15 +44,16 @@
 //! via reqwest / aws-smithy, plus ring via some TLS-enabling crates), so there
 //! is no guaranteed unambiguous process-default -- `ClientConfig::builder()`
 //! would panic at runtime ("no process-level CryptoProvider"). Selecting
-//! aws-lc-rs explicitly matches the reqwest / AWS path and removes that footgun.
+//! aws-lc-rs explicitly matches the reqwest / AWS path and removes that panic.
 //!
 //! scalo installs no process default. A binary that builds a server config,
 //! tonic server TLS included, calls [`install_default_provider`] first thing
 //! in `main`.
 //!
-//! ## Trust model
+//! ## Root store
 //!
-//! [`TlsTrust`] composes roots from up to three sources:
+//! [`TlsTrust`], the older root-store form [`build_client_config`] takes,
+//! composes roots from up to three sources:
 //! - **native** OS roots (`rustls-native-certs`),
 //! - **webpki** Mozilla roots (`webpki-roots`),
 //! - **extra** PEM files (`extra_roots` + `extra_intermediates`) -- the private
@@ -59,15 +81,19 @@ use std::sync::Arc;
 
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, NamedGroup, ProtocolVersion, RootCertStore};
-use rustls_pki_types::CertificateDer;
-use rustls_pki_types::pem::PemObject;
 
 use crate::crypto::{CryptoProfile, PqcMode, TlsFloor};
 
+mod client;
 mod server;
 #[cfg(test)]
 pub(crate) mod test_pki;
+#[cfg(feature = "transport-grpc")]
+mod tonic;
 
+#[cfg(feature = "transport-grpc")]
+pub(crate) use self::tonic::tonic_client_tls;
+pub use client::{ClientIdentity, ClientTls, TrustChoice, build_client_tls};
 pub use server::{
     CertResolver, ClientAuth, HandshakeError, Reloaded, ServerTls, ServerTlsConfig,
     ServerTlsOptions,
@@ -225,23 +251,8 @@ pub enum TlsConfigSource {
 /// [`TlsError::PemRead`] if the path is not a readable file;
 /// [`TlsError::NoCertsFound`] if no certificate parsed from it.
 pub fn add_pem_file_certs(store: &mut RootCertStore, path: &Path) -> Result<usize, TlsError> {
-    // Guard the known footgun: `pem_file_iter` loops forever on a directory
-    // (rustls/pki-types#98). Also gives a clean error for missing files.
-    if !path.is_file() {
-        return Err(TlsError::PemRead {
-            path: path.to_path_buf(),
-            reason: "not a readable file".to_string(),
-        });
-    }
-
-    let iter = CertificateDer::pem_file_iter(path).map_err(|e| TlsError::PemRead {
-        path: path.to_path_buf(),
-        reason: e.to_string(),
-    })?;
-
-    // Lenient: drop unreadable PEM blocks (filter_map ok), then let
-    // add_parsable_certificates drop any DER that is not a valid certificate.
-    let certs: Vec<CertificateDer<'static>> = iter.filter_map(Result::ok).collect();
+    // Read as bytes: `pem_file_iter` loops forever on a directory (rustls/pki-types#98).
+    let (_, certs) = client::read_certs(path)?;
     let (added, _ignored) = store.add_parsable_certificates(certs);
 
     if added == 0 {
@@ -263,11 +274,7 @@ pub fn build_root_store(trust: &TlsTrust) -> Result<RootCertStore, TlsError> {
 
     if !trust.exclusive {
         if trust.native_roots {
-            let result = rustls_native_certs::load_native_certs();
-            let (_added, _ignored) = store.add_parsable_certificates(result.certs);
-            for err in result.errors {
-                tracing::warn!(error = %err, "TLS: error loading a native root (continuing)");
-            }
+            client::add_native_roots(&mut store);
         }
         if trust.webpki_roots {
             store
@@ -486,7 +493,8 @@ mod tests {
     }
 
     // --- real in-process TLS handshake harness (no network, real crypto) ---
-    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use super::test_pki::pump;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::{ClientConnection, ServerConfig, ServerConnection};
 
     /// A P-384 self-signed server cert: (DER cert, DER key, PEM for the CA file).
@@ -511,44 +519,6 @@ mod tests {
                 .with_single_cert(vec![cert.clone()], key.clone_key())
                 .unwrap(),
         )
-    }
-
-    /// Drive an in-memory handshake to completion. Propagate the first rustls
-    /// error (e.g. no common kx group under `Require` vs a classical peer).
-    ///
-    /// Running out of rounds is an error, not a success: `Ok(())` on
-    /// exhaustion would make a stalled handshake indistinguishable from a
-    /// completed one to a caller asserting `is_ok()`.
-    fn pump(
-        client: &mut ClientConnection,
-        server: &mut ServerConnection,
-    ) -> Result<(), rustls::Error> {
-        for _ in 0..40 {
-            let mut c2s: Vec<u8> = Vec::new();
-            while client.wants_write() {
-                client.write_tls(&mut c2s).unwrap();
-            }
-            let mut rd: &[u8] = &c2s;
-            while !rd.is_empty() {
-                server.read_tls(&mut rd).unwrap();
-                server.process_new_packets()?;
-            }
-            let mut s2c: Vec<u8> = Vec::new();
-            while server.wants_write() {
-                server.write_tls(&mut s2c).unwrap();
-            }
-            let mut rd2: &[u8] = &s2c;
-            while !rd2.is_empty() {
-                client.read_tls(&mut rd2).unwrap();
-                client.process_new_packets()?;
-            }
-            if !client.is_handshaking() && !server.is_handshaking() {
-                return Ok(());
-            }
-        }
-        Err(rustls::Error::General(
-            "handshake did not complete within 40 pump rounds".to_string(),
-        ))
     }
 
     fn client_for(profile: CryptoProfile, ca_path: &Path) -> Arc<ClientConfig> {

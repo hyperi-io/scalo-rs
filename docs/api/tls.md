@@ -1,8 +1,36 @@
 # TLS
 
-The `tls` feature covers both ends of a TLS connection. Client trust (`TlsTrust`, `build_client_config`) is described in the `scalo::tls` rustdoc. This page is the server side: `ServerTls`, a certificate that reloads without a restart, and one handshake helper for every kind of listener.
+The `tls` feature covers both ends of a TLS connection: client trust and identity first, then `ServerTls`, a certificate that reloads without a restart, and one handshake helper for every kind of listener.
 
-`ServerTls` reads a certificate, its key and an optional client CA, and builds a rustls `ServerConfig` with the aws-lc-rs provider on a `CryptoProfile`. Each of the three comes from a file or from a secret spec, never both:
+## Client trust
+
+`ClientTls` names what a client trusts and the certificate it presents. `build_client_tls(profile, &tls)` turns it into a rustls `ClientConfig`, and the gRPC transports map the same type onto tonic's client TLS, so every client reads its files through one path.
+
+| `trust` | Accepts a server certificate from | CA files |
+| --- | --- | --- |
+| `native` (default) | the OS root store, read through `rustls-native-certs` and checked by rustls | trusted beside the OS store |
+| `platform` | the OS verifier through `rustls-platform-verifier`, which applies Windows and macOS policy and revocation | trusted beside the OS store |
+| `bundle` | the CA files only, the exclusive pin | required |
+
+```rust
+use scalo::crypto::CryptoProfile;
+use scalo::tls::{ClientTls, TrustChoice, build_client_tls};
+
+let pinned = ClientTls::pinned("/etc/tls/ca.pem")
+    .with_identity("/etc/tls/client.pem", "/etc/tls/client.key");
+let os = ClientTls::new(TrustChoice::Platform);
+let config = build_client_tls(CryptoProfile::Prod, &pinned)?;
+```
+
+The identity is a PEM certificate chain and its key, and both paths may name one file holding the pair. Every file is read when the config is built, so the build fails when a file is missing, holds no certificate or key, or the key does not match the certificate. `bundle` with no CA file trusts nothing and is refused. tonic has no OS verifier, so a gRPC client takes `native` or `bundle`.
+
+The build logs the trust choice, the number of CA files and whether mutual TLS is on at info, each file read at debug, and a native root that could not be read at warn. Paths are logged, never key material.
+
+The older `TlsTrust` root store, with webpki roots and `exclusive`, still builds through `build_client_config`.
+
+---
+
+On the server side, `ServerTls` reads a certificate, its key and an optional client CA, and builds a rustls `ServerConfig` with the aws-lc-rs provider on a `CryptoProfile`. Each of the three comes from a file or from a secret spec, never both:
 
 ```yaml
 tls:
