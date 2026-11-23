@@ -332,9 +332,9 @@ vaultrs = { version = ">=0.8, <0.9", optional = true }
 
 # Default features off: the aws-sdk `rustls` feature pulls rustls 0.21 (RUSTSEC-2026-0098, -0099, -0104),
 # and `default-https-client` takes rustls 0.23.
-aws-config = { version = ">=1.13.0, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+aws-config = { version = ">=1.13.2, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
 # Floor 1.117: the first release to need aws-smithy-json 0.63.1.
-aws-sdk-secretsmanager = { version = ">=1.125.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-secretsmanager = { version = ">=1.128.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
 # One `rdkafka` per target: `dynamic-linking` and `cmake-build` must never both reach rdkafka-sys.
 # docs/deployment/native-deps.md
