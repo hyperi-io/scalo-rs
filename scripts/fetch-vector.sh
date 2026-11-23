@@ -26,13 +26,23 @@
 #     one rename. A reader therefore sees either no directory or a complete one,
 #     never a half-extracted binary. A mkdir lock keeps concurrent runs from
 #     downloading the same tarball N times; losing the lock race means waiting
-#     for the winner, not failing.
+#     for the winner, and failing with it if it fails.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CACHE_DIR="${REPO_ROOT}/.tmp/vector"
 ARCH="$(uname -m)"
+
+# Vector's release target: `uname -m` plus the OS, as in arm64-apple-darwin.
+case "$(uname -s)" in
+    Linux) TARGET="${ARCH}-unknown-linux-gnu" ;;
+    Darwin) TARGET="${ARCH}-apple-darwin" ;;
+    *)
+        echo "ERROR: no Vector release tarball for $(uname -s)" >&2
+        exit 1
+        ;;
+esac
 
 # Pinned. A floating "latest" made the harness retarget on every upstream
 # release, so a break landed with nothing in the diff to explain it -- and it
@@ -44,9 +54,9 @@ DEFAULT_VECTOR_VERSION="0.61.0"
 WANT_VERSION="${VECTOR_VERSION:-$DEFAULT_VECTOR_VERSION}"
 
 # Version-keyed, so a fetch for one version cannot disturb another.
-VERSION_DIR="${CACHE_DIR}/${WANT_VERSION}-${ARCH}"
+VERSION_DIR="${CACHE_DIR}/${WANT_VERSION}-${TARGET}"
 BINARY="${VERSION_DIR}/vector"
-LOCK_DIR="${CACHE_DIR}/.lock-${WANT_VERSION}-${ARCH}"
+LOCK_DIR="${CACHE_DIR}/.lock-${WANT_VERSION}-${TARGET}"
 
 if [[ -x "$BINARY" ]]; then
     echo "Vector ${WANT_VERSION} already cached" >&2
@@ -57,13 +67,22 @@ fi
 mkdir -p "${CACHE_DIR}"
 
 # mkdir is atomic on POSIX: exactly one concurrent run creates the lock and
-# downloads. The rest wait for the binary to appear.
+# downloads. The rest wait for the binary, or fail once the lock goes without it.
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "Another run is fetching Vector ${WANT_VERSION}; waiting..." >&2
     for _ in $(seq 1 300); do
         if [[ -x "$BINARY" ]]; then
             echo "$BINARY"
             exit 0
+        fi
+        if [[ ! -d "$LOCK_DIR" ]]; then
+            # The winner publishes the binary before it releases the lock.
+            if [[ -x "$BINARY" ]]; then
+                echo "$BINARY"
+                exit 0
+            fi
+            echo "ERROR: the run fetching Vector ${WANT_VERSION} failed" >&2
+            exit 1
         fi
         sleep 1
     done
@@ -81,8 +100,8 @@ trap cleanup EXIT
 
 WORK_DIR="$(mktemp -d "${CACHE_DIR}/.fetch-XXXXXX")"
 
-echo "Downloading Vector ${WANT_VERSION} for ${ARCH}..." >&2
-TARBALL_NAME="vector-${WANT_VERSION}-${ARCH}-unknown-linux-gnu.tar.gz"
+echo "Downloading Vector ${WANT_VERSION} for ${TARGET}..." >&2
+TARBALL_NAME="vector-${WANT_VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/vectordotdev/vector/releases/download/v${WANT_VERSION}/${TARBALL_NAME}"
 
 curl -fSL --progress-bar -o "${WORK_DIR}/${TARBALL_NAME}" "$DOWNLOAD_URL"
@@ -90,8 +109,8 @@ curl -fSL --progress-bar -o "${WORK_DIR}/${TARBALL_NAME}" "$DOWNLOAD_URL"
 echo "Extracting..." >&2
 tar xzf "${WORK_DIR}/${TARBALL_NAME}" -C "${WORK_DIR}"
 
-# The tarball contains vector-{ARCH}-unknown-linux-gnu/bin/vector.
-EXTRACTED_BIN="${WORK_DIR}/vector-${ARCH}-unknown-linux-gnu/bin"
+# The tarball contains vector-{TARGET}/bin/vector.
+EXTRACTED_BIN="${WORK_DIR}/vector-${TARGET}/bin"
 if [[ ! -x "${EXTRACTED_BIN}/vector" ]]; then
     echo "ERROR: no vector binary in ${TARBALL_NAME} at the expected path" >&2
     exit 1

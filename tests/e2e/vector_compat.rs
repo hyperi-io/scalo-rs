@@ -18,7 +18,7 @@
 //! ```
 //!
 //! Requirements:
-//! - `gh` or `jq` + `curl` (for auto-downloading Vector)
+//! - `curl` and `tar` (for auto-downloading Vector), or `vector` on PATH
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
@@ -36,7 +36,7 @@ use scalo::transport::{SendResult, TransportBase, TransportReceiver, TransportSe
 /// Resolve the path to the Vector binary (cached via fetch-vector.sh or system PATH).
 ///
 /// Runs the fetch script once per test binary via `OnceLock`. If the script fails
-/// (offline, no `jq`, etc.), falls back to `vector` in PATH.
+/// (offline, no release build for this platform), falls back to `vector` in PATH.
 fn vector_binary_path() -> Option<&'static PathBuf> {
     static VECTOR_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
 
