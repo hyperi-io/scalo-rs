@@ -415,7 +415,7 @@ transport:
 
 - Admission: a POST is checked before its body is read. A held governor answers 503, then the request reserves its declared `Content-Length` (or `max_body_bytes` without one) from `max_in_flight_bytes`, and answers 503 with `Retry-After: 1` when that does not fit. The bytes stay reserved while the record is queued and come back as `recv` hands it over, so bodies read and queued never exceed `max_in_flight_bytes`. A declared length over `max_body_bytes` is 413 at once. `max_in_flight_bytes` below `max_body_bytes` is refused at construction.
 
-- Client TLS: the `tls_*` keys ([../api/tls.md](../api/tls.md#client-trust)). None set keeps `reqwest`'s OS verifier, and `tls_trust` unset means `native`.
+- Client TLS: the `tls_*` keys ([../api/tls.md](../api/tls.md#client-trust)), with `tls_pin_sha256` for key pins. None set keeps `reqwest`'s OS verifier, and `tls_trust` unset means `native`.
 - Cancellation safety: send is `reqwest`'s async path -- drop
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
