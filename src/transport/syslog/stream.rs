@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+
+use crate::transport::proxy::{ProxyDialer, ProxyError, ProxyRefused, Scheme};
 
 /// A connection that can be written to and checked for a close by the peer.
 pub(super) trait Connection: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -31,6 +32,8 @@ pub(super) enum ConnectError {
     /// The TLS handshake refused the receiver's certificate or ours: no retry
     /// fixes it.
     Trust(io::Error),
+    /// The proxy refused to open a tunnel to the receiver.
+    Refused(ProxyRefused),
 }
 
 impl std::fmt::Display for ConnectError {
@@ -38,27 +41,33 @@ impl std::fmt::Display for ConnectError {
         match self {
             Self::Unreachable(e) => write!(f, "unreachable: {e}"),
             Self::Trust(e) => write!(f, "TLS refused: {e}"),
+            Self::Refused(e) => write!(f, "{e}"),
         }
     }
 }
 
-/// Opens connections to one receiver.
+/// Opens connections to one receiver, directly or through the proxy.
 pub(super) struct Connector {
-    address: String,
+    host: String,
+    port: u16,
     timeout: Duration,
     tls: Option<(TlsConnector, ServerName<'static>)>,
+    dialer: ProxyDialer,
 }
 
 impl Connector {
     pub(super) fn new(
-        address: String,
+        (host, port): (String, u16),
         timeout: Duration,
         tls: Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>,
+        dialer: ProxyDialer,
     ) -> Self {
         Self {
-            address,
+            host,
+            port,
             timeout,
             tls: tls.map(|(config, name)| (TlsConnector::from(config), name)),
+            dialer,
         }
     }
 
@@ -70,9 +79,20 @@ impl Connector {
     /// A new connection, its TLS handshake done, within the connect timeout.
     pub(super) async fn connect(&self) -> Result<Stream, ConnectError> {
         let connecting = async {
-            let tcp = TcpStream::connect(&self.address)
+            let scheme = if self.tls.is_some() {
+                Scheme::Tls
+            } else {
+                Scheme::Plain
+            };
+            let tcp = self
+                .dialer
+                .connect(scheme, &self.host, self.port)
                 .await
-                .map_err(ConnectError::Unreachable)?;
+                .map_err(|e| match e {
+                    ProxyError::Refused(refused) => ConnectError::Refused(refused),
+                    ProxyError::Target(e) => ConnectError::Unreachable(e),
+                    other => ConnectError::Unreachable(io::Error::other(other)),
+                })?;
             tcp.set_nodelay(true).map_err(ConnectError::Unreachable)?;
             let stream: Stream = match &self.tls {
                 None => Box::new(tcp),

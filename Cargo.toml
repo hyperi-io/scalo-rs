@@ -174,7 +174,7 @@ transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
 transport-http = ["transport", "transport-proxy", "http", "tls", "dep:flate2"]
 # RFC 5424 and 3164 over TCP, TLS, UDP and RELP: docs/transport/syslog.md
-transport-syslog = ["transport", "tls", "dep:jiff", "sysinfo"]
+transport-syslog = ["transport", "transport-proxy", "tls", "dep:jiff", "sysinfo"]
 # One egress proxy setting for the stream transports: src/transport/proxy.rs
 transport-proxy = ["transport", "tokio", "dep:http", "dep:hyper-util", "hyper-util/client-proxy", "dep:system-configuration", "dep:windows", "windows/Win32_Networking_WinHttp"]
 transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http", "transport-syslog"]

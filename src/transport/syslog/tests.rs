@@ -400,6 +400,86 @@ async fn each_stream_protocol_and_framing_round_trips() {
     }
 }
 
+/// `tcp`, `tls` and `relp` go through the proxy's CONNECT tunnel, TLS inside
+/// it, and a refused CONNECT is `Reject` with the proxy's status and the
+/// receiver's port.
+#[tokio::test]
+async fn sends_go_through_a_connect_proxy() {
+    use crate::transport::ProxyConfig;
+    use crate::transport::proxy::test_proxy::{ConnectProxy, Policy};
+
+    let (pki, server_tls) = Pki::start().await;
+    // (case, protocol, TLS, proxy policy, refusal status)
+    let cases = [
+        ("tcp", SyslogProtocol::Tcp, false, Policy::Allow, None),
+        ("tls", SyslogProtocol::Tls, true, Policy::Allow, None),
+        ("relp", SyslogProtocol::Relp, false, Policy::Allow, None),
+        (
+            "tcp refused",
+            SyslogProtocol::Tcp,
+            false,
+            Policy::Refuse(403),
+            Some(403),
+        ),
+        (
+            "tls port 443 only",
+            SyslogProtocol::Tls,
+            true,
+            Policy::OnlyPort(443),
+            Some(403),
+        ),
+    ];
+    for (case, protocol, tls, policy, refused) in cases {
+        let server = tls.then(|| server_tls.clone());
+        let (addr, check): (SocketAddr, Box<dyn Fn() -> Vec<String>>) =
+            if protocol == SyslogProtocol::Relp {
+                let peer = Arc::new(RelpPeer::start(server, RelpMode::AckAll).await);
+                let seen = Arc::clone(&peer);
+                (peer.addr, Box::new(move || seen.messages().concat()))
+            } else {
+                let peer = Arc::new(StreamPeer::start(server, StreamMode::Keep).await);
+                let seen = Arc::clone(&peer);
+                (
+                    peer.addr,
+                    Box::new(move || {
+                        let bytes = seen.received.lock().unwrap().concat();
+                        decode(SyslogFraming::OctetCounting, &bytes)
+                    }),
+                )
+            };
+        let proxy = ConnectProxy::start(policy).await;
+        let mut cfg = config(addr, protocol);
+        cfg.tls = tls.then(|| pki.client("ca.pem"));
+        cfg.proxy = ProxyConfig::Url(crate::sensitive::SensitiveString::new(proxy.url()));
+        let sender = SyslogTransport::new(&cfg).unwrap();
+        let result = sender.send_batch(&records(&["through"])).await;
+
+        let seen = proxy.seen();
+        assert!(
+            !seen.is_empty() && seen.iter().all(|c| c.target == addr.to_string()),
+            "{case}: {seen:?}"
+        );
+        match (refused, &result) {
+            (None, SendResult::Ok) => {
+                let until = Instant::now() + Duration::from_secs(5);
+                while check().is_empty() && Instant::now() < until {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(check(), vec![message("through")], "{case}");
+            }
+            (Some(status), SendResult::Reject(error)) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains(&format!("HTTP {status}")) && text.contains(&addr.to_string()),
+                    "{case}: {text}"
+                );
+            }
+            _ => panic!("{case}: got {result:?}"),
+        }
+        sender.close().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn relp_round_trips_plain_and_over_tls() {
     let (pki, server_tls) = Pki::start().await;
@@ -685,6 +765,14 @@ fn configs_that_cannot_send_are_refused_at_build() {
             "largest UDP",
         ),
         (
+            "udp through a proxy",
+            SyslogConfig {
+                proxy: crate::transport::ProxyConfig::System,
+                ..SyslogConfig::new("logs.example:514", SyslogProtocol::Udp)
+            },
+            "UDP can't go through",
+        ),
+        (
             "window 0",
             SyslogConfig {
                 relp_window: 0,
@@ -758,7 +846,7 @@ fn every_key_reaches_the_config_through_the_cascade() {
          severity: warning\n    hostname: h1\n    app_name: a1\n    proc_id: p1\n    \
          msg_id: m1\n    structured_data:\n      meta@1:\n        k: v\n    \
          max_message_bytes: 4096\n    connect_timeout_ms: 7\n    send_timeout_ms: 8\n    \
-         relp_window: 9\n    tls:\n      trust: bundle\n      ca_path: /etc/tls/ca.pem\n      \
+         relp_window: 9\n    proxy: system\n    tls:\n      trust: bundle\n      ca_path: /etc/tls/ca.pem\n      \
          client_cert_path: /etc/tls/c.pem\n      client_key_path: /etc/tls/c.key\n      \
          server_name: logs.internal\n    filters_out:\n      - expression: 'level == \"debug\"'\n        \
          action: drop\n",
@@ -802,6 +890,7 @@ fn every_key_reaches_the_config_through_the_cascade() {
         connect_timeout_ms: 7,
         send_timeout_ms: 8,
         relp_window: 9,
+        proxy: crate::transport::ProxyConfig::System,
         tls: Some(SyslogTlsConfig {
             client: ClientTlsConfig {
                 trust: TrustChoice::Platform,

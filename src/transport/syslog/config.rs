@@ -186,6 +186,11 @@ pub struct SyslogConfig {
     pub relp_window: usize,
     /// Client TLS, for `tls`, and for `relp` over TLS. Default trust `native`.
     pub tls: Option<SyslogTlsConfig>,
+    /// Proxy for `tcp`, `tls` and `relp`: `none` (default), `system` or a
+    /// proxy URL. The connection is an HTTP CONNECT tunnel, and TLS runs
+    /// inside it. `udp` takes `none` only. See
+    /// [`ProxyConfig`](crate::transport::ProxyConfig).
+    pub proxy: crate::transport::ProxyConfig,
     /// Outbound message filters, applied to each record's payload.
     pub filters_out: Vec<FilterRule>,
 }
@@ -230,6 +235,7 @@ impl Default for SyslogConfig {
             send_timeout_ms: 30_000,
             relp_window: 128,
             tls: None,
+            proxy: crate::transport::ProxyConfig::None,
             filters_out: Vec::new(),
         }
     }
@@ -297,6 +303,9 @@ impl SyslogConfig {
                 self.protocol.as_str()
             ));
         }
+        if self.protocol == SyslogProtocol::Udp {
+            self.proxy.refuse_for_udp("syslog")?;
+        }
         let limit = self.message_limit();
         if limit < MIN_MESSAGE_BYTES {
             return fail(format!(
@@ -339,6 +348,12 @@ fn is_sd_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_graphic() && !matches!(b, b'=' | b']' | b'"'))
+}
+
+/// The port of an address [`host_of`] takes.
+pub(super) fn port_of(address: &str) -> Option<u16> {
+    host_of(address)?;
+    address.rsplit_once(':')?.1.parse().ok()
 }
 
 /// The host part of `host:port` or `[v6]:port`.
