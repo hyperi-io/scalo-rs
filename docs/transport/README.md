@@ -234,6 +234,7 @@ Source: [../../src/transport/](../../src/transport/) -- particularly
 - [backends.md](backends.md) -- seven concrete backends, config and deps
 - [syslog.md](syslog.md) -- syslog over TCP, TLS, UDP and RELP, send only
 - [grpc.md](grpc.md) -- gRPC `send_batch` blocks joined into one call
+- [http.md](http.md) -- HTTP sending: credentials, framing, failover, proxy, status answers
 - [filter-engine.md](filter-engine.md) -- tiered CEL filtering
 - [routing.md](routing.md) -- `RoutedSender` for originators
 - [custom.md](custom.md) -- writing a custom sender, the delivery guarantee
