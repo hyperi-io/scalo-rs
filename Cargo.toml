@@ -340,10 +340,10 @@ aws-sdk-secretsmanager = { version = ">=1.128.0, <2", default-features = false, 
 # One `rdkafka` per target: `dynamic-linking` and `cmake-build` must never both reach rdkafka-sys.
 # docs/deployment/native-deps.md
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["dynamic-linking", "tokio"], optional = true }
+rdkafka = { version = ">=0.40.0, <0.41", default-features = false, features = ["dynamic-linking", "tokio"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-rdkafka = { version = ">=0.39.0, <0.40", default-features = false, features = ["cmake-build", "ssl-vendored", "zstd", "libz", "tokio"], optional = true }
+rdkafka = { version = ">=0.40.0, <0.41", default-features = false, features = ["cmake-build", "ssl-vendored", "zstd", "libz", "tokio"], optional = true }
 # Reads MDM managed preferences for the managed config layer.
 plist = { version = ">=1.10.3, <2", default-features = false, optional = true }
 
