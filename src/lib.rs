@@ -129,7 +129,13 @@ pub(crate) mod cel_lexer;
 // Retry backoff with jitter and Retry-After hints, std only.
 pub mod backoff;
 
-#[cfg(any(feature = "transport", feature = "dlq"))]
+#[cfg(any(
+    feature = "dlq",
+    feature = "transport-memory",
+    feature = "transport-pipe",
+    feature = "transport-file",
+    all(feature = "transport-http", feature = "http-server")
+))]
 pub(crate) mod clock;
 
 // Constructors registered by config type name.
