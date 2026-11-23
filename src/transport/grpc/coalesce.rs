@@ -435,9 +435,11 @@ async fn send_taken(
     let call = opentelemetry::context::FutureExt::with_context(call, context);
     let sent = call.await;
     drop(slot);
-    // A refusal for good may be one block's alone, and `ResourceExhausted` the
-    // joined request past a receiver's decode limit once decompressed.
-    let alone = sent.result.is_fatal() || sent.code == Some(tonic::Code::ResourceExhausted);
+    // A refusal, for good or of these records, may be one block's alone, and
+    // `ResourceExhausted` the joined request past a receiver's decode limit once decompressed.
+    let alone = sent.result.is_fatal()
+        || matches!(sent.result, SendResult::Reject(_))
+        || sent.code == Some(tonic::Code::ResourceExhausted);
     if several && alone {
         for reply in replies {
             let _ = reply.send(Joined::Alone);
@@ -465,6 +467,8 @@ fn copy_of(result: &SendResult) -> SendResult {
     match result {
         SendResult::Ok => SendResult::Ok,
         SendResult::Backpressured => SendResult::Backpressured,
+        SendResult::RetryAfter(wait) => SendResult::RetryAfter(*wait),
+        SendResult::Reject(other) => SendResult::Reject(TransportError::Send(other.to_string())),
         SendResult::FilteredDlq => SendResult::FilteredDlq,
         SendResult::Fatal(TransportError::Send(message)) => {
             SendResult::Fatal(TransportError::Send(message.clone()))
@@ -1462,7 +1466,7 @@ mod tests {
     /// request.
     #[tokio::test]
     async fn a_block_taken_near_its_deadline_gets_its_calls_answer() {
-        const LIMIT_MS: u64 = 1_000;
+        const LIMIT_MS: u64 = 2_000;
         let (calls, uri) = recording(0).await;
         let mut config = client(&uri, joining(1 << 16, 1));
         config.send_timeout_ms = LIMIT_MS;
@@ -1471,12 +1475,16 @@ mod tests {
         calls.arrived(1).await;
         let a = queue(&sender, &["a"]).await;
 
-        // The slot frees at 0.8 of a's deadline, and its call returns past it.
+        // The slot frees at 0.8 of a's deadline. The check lands past that
+        // deadline and well before a's call times out, at 1.8 of the limit.
         tokio::time::sleep(Duration::from_millis(LIMIT_MS * 8 / 10)).await;
         calls.answer(1);
         calls.arrived(2).await;
-        tokio::time::sleep(Duration::from_millis(LIMIT_MS * 4 / 10)).await;
-        assert!(!a.is_finished(), "answered before its call returned");
+        tokio::time::sleep(Duration::from_millis(LIMIT_MS * 3 / 10)).await;
+        if a.is_finished() {
+            let early = result(a).await;
+            panic!("answered before its call returned: {early:?}");
+        }
         calls.answer(1);
         assert!(result(first).await.is_ok());
         let got = result(a).await;

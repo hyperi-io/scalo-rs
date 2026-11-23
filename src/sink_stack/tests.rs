@@ -35,6 +35,10 @@ enum Script {
     Slow(u64),
     /// Answer `FilteredDlq` for any call carrying this payload, `Ok` otherwise.
     DeadLetters(&'static [u8]),
+    /// Answer `Reject` for any call carrying this payload, `Ok` otherwise.
+    Rejects(&'static [u8]),
+    /// Answer `RetryAfter` with this many ms for the first `n` calls, then `Ok`.
+    WaitThenOk(usize, u64),
 }
 
 /// The payload every `FakeSender` names in `dead_letter_reason`.
@@ -71,6 +75,10 @@ impl crate::transport::TransportBase for FakeSender {
     fn name(&self) -> &'static str {
         "fake"
     }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
+    }
 }
 
 impl TransportSender for FakeSender {
@@ -92,6 +100,20 @@ impl TransportSender for FakeSender {
             Script::DeadLetters(bad) => {
                 if records.iter().any(|r| r.payload.as_ref() == bad) {
                     SendResult::FilteredDlq
+                } else {
+                    SendResult::Ok
+                }
+            }
+            Script::Rejects(bad) => {
+                if records.iter().any(|r| r.payload.as_ref() == bad) {
+                    SendResult::Reject(TransportError::Send("scripted reject".into()))
+                } else {
+                    SendResult::Ok
+                }
+            }
+            Script::WaitThenOk(waits, ms) => {
+                if n < waits {
+                    SendResult::RetryAfter(Duration::from_millis(ms))
                 } else {
                     SendResult::Ok
                 }
@@ -198,6 +220,86 @@ async fn dead_letters_come_back_rather_than_counting_as_sent() {
         !sender.seen.lock().unwrap().iter().any(|p| p == SCREENED),
         "a screened record never reaches the sender"
     );
+}
+
+/// A rejected block is sent again one record at a time, and only the refused
+/// record is dead-lettered. A rejected single record is never sent twice.
+#[tokio::test]
+async fn a_reject_is_never_retried_and_only_the_refused_record_is_dead_lettered() {
+    const REFUSED: &[u8] = b"{\"refused\":1}";
+    // (case, block, sends, dead letters)
+    let cases: [(&str, Vec<Record>, usize, Vec<&[u8]>); 2] = [
+        (
+            "block",
+            vec![rec(b"{\"a\":1}"), rec(REFUSED), rec(b"{\"b\":2}")],
+            4,
+            vec![REFUSED],
+        ),
+        ("single record", vec![rec(REFUSED)], 1, vec![REFUSED]),
+    ];
+    for (case, records, sends, dead) in cases {
+        let sender = FakeSender::new(Script::Rejects(REFUSED));
+        let stack = SinkStack::new(Arc::clone(&sender), &fast_cfg());
+        let sent = stack.send_batch(records).await;
+        assert!(sent.result.is_ok(), "{case}: {:?}", sent.result);
+        let got: Vec<Vec<u8>> = sent
+            .dead_letters
+            .iter()
+            .map(|d| d.record.payload.to_vec())
+            .collect();
+        let want: Vec<Vec<u8>> = dead.iter().map(|p| p.to_vec()).collect();
+        assert_eq!(got, want, "{case}");
+        assert!(
+            sent.dead_letters
+                .iter()
+                .all(|d| d.reason == DeadLetterReason::Rejected),
+            "{case}"
+        );
+        assert_eq!(sender.call_count(), sends, "{case}: no retry of a reject");
+    }
+}
+
+/// A named wait replaces the schedule's own, capped at `max_backoff_ms`, and
+/// adds no attempt: past `max_retries` the wait comes back to the caller.
+#[tokio::test(start_paused = true)]
+async fn a_named_wait_paces_the_retry_and_comes_back_once_retries_run_out() {
+    let cfg = SinkStackConfig {
+        min_backoff_ms: 1,
+        max_backoff_ms: 2_000,
+        max_retries: 2,
+        ..Default::default()
+    };
+    // (case, script, result as text, sends, least time taken in ms)
+    let cases = [
+        (
+            "retried after the wait",
+            Script::WaitThenOk(1, 1_500),
+            "Ok",
+            2,
+            1_500,
+        ),
+        ("wait capped", Script::WaitThenOk(1, 60_000), "Ok", 2, 2_000),
+        (
+            "retries spent",
+            Script::WaitThenOk(9, 100),
+            "RetryAfter(100ms)",
+            3,
+            200,
+        ),
+    ];
+    for (case, script, want, sends, least_ms) in cases {
+        let sender = FakeSender::new(script);
+        let stack = SinkStack::new(Arc::clone(&sender), &cfg);
+        let started = tokio::time::Instant::now();
+        let result = stack.send_batch(batch()).await.result;
+        let took = started.elapsed();
+        assert_eq!(format!("{result:?}"), want, "{case}");
+        assert_eq!(sender.call_count(), sends, "{case}");
+        assert!(
+            took >= Duration::from_millis(least_ms) && took < Duration::from_millis(least_ms + 500),
+            "{case}: took {took:?}"
+        );
+    }
 }
 
 #[tokio::test]

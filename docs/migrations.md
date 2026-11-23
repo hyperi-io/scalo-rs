@@ -8,6 +8,18 @@ release and the target before bumping.
 
 ## 2.14.34
 
+### A file or pipe sender from the factory needs `delivery: flush` (BEHAVIOUR CHANGE)
+
+`TransportConfig.delivery`, default `ack`, is the weakest guarantee a factory-built sender may have. File and pipe write and flush with no acknowledgement, so they are refused under the default, naming the key: `set transport.output.delivery: flush to accept that`. Kafka with `acks=0` needs `delivery: none`. See [transport/custom.md](transport/custom.md#delivery-guarantee).
+
+**Consumer adjustment** -- add `delivery: flush` to a file or pipe output, `delivery: none` to an `acks: 0` Kafka output.
+
+### `SendResult::Reject` and `RetryAfter`, a required `delivery_guarantee`, custom senders (API CHANGE)
+
+`Reject` is a permanent refusal, never retried. `RetryAfter(wait)` retries after the destination's wait. `TransportBase::delivery_guarantee` has no default. `register_sender` builds an app's own sender by type name as `AnySender::Custom`, and `TransportType` gains `Custom(String)`, losing `Copy`.
+
+**Consumer adjustment** -- exhaustive matches on `SendResult`, `AnySender` and `TransportType` add the new arms. Each own `TransportBase` impl adds `delivery_guarantee`. A literal `TransportConfig` adds `delivery` and `custom`.
+
 ### `ConfigOptions::managed`, `load_typed_managed` and `ServiceApp::managed_source` (additive)
 
 An app can name a Group Policy key and an MDM preference domain in a `ManagedSource`, and the cascade then reads them as a layer after every config file and before env vars. A key that looks like a secret fails the load. See [managed-config.md](core-pillars/managed-config.md).

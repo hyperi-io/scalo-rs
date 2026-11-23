@@ -218,6 +218,10 @@ impl TransportBase for MemoryTransport {
     fn name(&self) -> &'static str {
         "memory"
     }
+
+    fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
+        super::DeliveryGuarantee::Acknowledged
+    }
 }
 
 impl TransportSender for MemoryTransport {

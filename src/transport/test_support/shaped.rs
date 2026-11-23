@@ -804,6 +804,10 @@ impl TransportBase for ShapedSender {
     fn name(&self) -> &'static str {
         self.inner.name
     }
+
+    fn delivery_guarantee(&self) -> crate::transport::DeliveryGuarantee {
+        crate::transport::DeliveryGuarantee::Acknowledged
+    }
 }
 
 impl TransportSender for ShapedSender {

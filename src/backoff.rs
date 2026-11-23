@@ -1,18 +1,34 @@
 // Project:   scalo
 // File:      src/backoff.rs
-// Purpose:   Exponential backoff with jitter shared by every retry loop
+// Purpose:   Exponential backoff with jitter and Retry-After hints
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Exponential backoff with jitter, shared by every hand-rolled retry loop in
-//! the crate: the OTLP export gate, the Kafka poll and commit retries, and the
-//! batch engine's recv and sink retries.
+//! Exponential backoff with jitter, and a destination's `Retry-After` hint as
+//! the next wait.
 //!
 //! The wait doubles with each consecutive failure up to a ceiling and is spread
 //! by +/-20% so a fleet that lost the same dependency does not retry in
 //! lockstep. Callers keep their own failure count and reset it on success.
+//!
+//! A destination that names its own wait (`SendResult::RetryAfter`, an HTTP
+//! `Retry-After` header) gets that wait, capped at the schedule's ceiling: a
+//! throttled downstream can legally ask for a day.
+//!
+//! ```
+//! use std::time::Duration;
+//! use scalo::backoff::Backoff;
+//!
+//! let schedule = Backoff::new(Duration::from_millis(100), Duration::from_secs(5));
+//! let third = schedule.delay(3);
+//! assert!(third >= Duration::from_millis(320) && third <= Duration::from_millis(480));
+//!
+//! // The destination's hint wins, capped at the ceiling.
+//! assert_eq!(schedule.next_delay(3, Some(Duration::from_secs(2))), Duration::from_secs(2));
+//! assert_eq!(schedule.next_delay(3, Some(Duration::from_secs(60))), Duration::from_secs(5));
+//! ```
 
 use std::time::Duration;
 
@@ -24,7 +40,7 @@ const MAX_DOUBLINGS: u32 = 16;
 
 /// A doubling wait schedule between `base` and `max`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Backoff {
+pub struct Backoff {
     base: Duration,
     max: Duration,
 }
@@ -32,21 +48,30 @@ pub(crate) struct Backoff {
 impl Backoff {
     /// The schedule for a dependency that is expected back within seconds: a
     /// broker, a coordinator or a sink. 100 ms doubling to 2 s.
-    #[cfg(any(
-        feature = "transport-kafka",
-        all(feature = "worker-batch", feature = "transport")
-    ))]
-    pub(crate) const TRANSIENT: Self =
-        Self::new(Duration::from_millis(100), Duration::from_secs(2));
+    pub const TRANSIENT: Self = Self::new(Duration::from_millis(100), Duration::from_secs(2));
 
     /// A schedule whose first wait is `base` and whose waits never exceed `max`.
-    pub(crate) const fn new(base: Duration, max: Duration) -> Self {
+    #[must_use]
+    pub const fn new(base: Duration, max: Duration) -> Self {
         Self { base, max }
+    }
+
+    /// The first wait.
+    #[must_use]
+    pub const fn base(&self) -> Duration {
+        self.base
+    }
+
+    /// The ceiling no wait passes, a destination's hint included.
+    #[must_use]
+    pub const fn max(&self) -> Duration {
+        self.max
     }
 
     /// The jittered wait before retrying after the `failures`-th consecutive
     /// failure (1-based), never above the ceiling.
-    pub(crate) fn delay(&self, failures: u32) -> Duration {
+    #[must_use]
+    pub fn delay(&self, failures: u32) -> Duration {
         let doublings = failures.saturating_sub(1).min(MAX_DOUBLINGS);
         let wait = self
             .base
@@ -55,22 +80,62 @@ impl Backoff {
         // Clamped again: jitter widens either side, so a wait at the ceiling could pass it.
         jitter(wait).min(self.max)
     }
+
+    /// The wait after the `failures`-th consecutive failure: the destination's
+    /// `retry_after` hint when it gave one, else [`delay`](Self::delay). The
+    /// hint is taken whole, unjittered, up to the ceiling.
+    #[must_use]
+    pub fn next_delay(&self, failures: u32, retry_after: Option<Duration>) -> Duration {
+        match retry_after {
+            Some(hint) => hint.min(self.max),
+            None => self.delay(failures),
+        }
+    }
+}
+
+/// The wait for a retry loop that already has a candidate wait, such as a
+/// `backon` schedule's: the destination's `advertised` wait, capped at `max`,
+/// when it gave one, else `candidate`.
+///
+/// `None` for `candidate` means the retry budget is spent, and that stands
+/// whatever the destination advertised: a hint paces an attempt the schedule
+/// already granted and never grants another.
+#[must_use]
+pub fn hinted_delay(
+    advertised: Option<Duration>,
+    candidate: Option<Duration>,
+    max: Duration,
+) -> Option<Duration> {
+    match (advertised, candidate) {
+        (Some(delay), Some(_)) => Some(delay.min(max)),
+        (_, candidate) => candidate,
+    }
+}
+
+/// The wait an HTTP `Retry-After` header value asks for, in its delta-seconds
+/// form. The HTTP-date form, and anything unparseable, is `None`, which leaves
+/// the caller's own schedule in charge.
+#[must_use]
+pub fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Sub-second nanoseconds of the system clock: enough to give two processes
+/// different offsets without a random-number dependency.
+pub(crate) fn clock_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()))
 }
 
 /// Spread a wait by +/-[`JITTER_PCT`].
-///
-/// Seeded from the clock rather than an RNG: two processes only need different
-/// offsets, which does not justify a dependency.
 fn jitter(base: Duration) -> Duration {
     let base_millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
     let span = base_millis / 100 * JITTER_PCT;
     if span == 0 {
         return base;
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()));
-    let offset = nanos % (span * 2);
+    let offset = clock_seed() % (span * 2);
     Duration::from_millis(base_millis.saturating_add(offset).saturating_sub(span))
 }
 
@@ -114,5 +179,67 @@ mod tests {
         let schedule = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
         let wait = schedule.delay(0);
         assert!(wait >= Duration::from_millis(80) && wait <= Duration::from_millis(120));
+    }
+
+    #[test]
+    fn a_hint_replaces_the_schedule_up_to_the_ceiling() {
+        let schedule = Backoff::new(Duration::from_millis(100), Duration::from_secs(30));
+        let secs = Duration::from_secs;
+        // (case, hint, wait)
+        let cases = [
+            ("under the ceiling", secs(5), secs(5)),
+            ("at the ceiling", secs(30), secs(30)),
+            ("over the ceiling", secs(86_400), secs(30)),
+            ("zero", Duration::ZERO, Duration::ZERO),
+        ];
+        for (case, hint, wait) in cases {
+            assert_eq!(schedule.next_delay(7, Some(hint)), wait, "{case}");
+        }
+        let unhinted = schedule.next_delay(1, None);
+        assert!(unhinted >= Duration::from_millis(80) && unhinted <= Duration::from_millis(120));
+    }
+
+    #[test]
+    fn a_hinted_delay_paces_a_granted_attempt_and_never_grants_one() {
+        let secs = Duration::from_secs;
+        let max = secs(30);
+        // (case, advertised, candidate, wait)
+        let cases = [
+            (
+                "hint under the cap",
+                Some(secs(5)),
+                Some(secs(1)),
+                Some(secs(5)),
+            ),
+            (
+                "hint over the cap",
+                Some(secs(86_400)),
+                Some(secs(1)),
+                Some(max),
+            ),
+            ("no hint", None, Some(secs(2)), Some(secs(2))),
+            ("budget spent, hinted", Some(secs(5)), None, None),
+            ("budget spent", None, None, None),
+        ];
+        for (case, advertised, candidate, wait) in cases {
+            assert_eq!(hinted_delay(advertised, candidate, max), wait, "{case}");
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_delta_seconds_only() {
+        // (case, header, wait)
+        let cases = [
+            ("seconds", "120", Some(Duration::from_secs(120))),
+            ("padded", " 3 ", Some(Duration::from_secs(3))),
+            ("zero", "0", Some(Duration::ZERO)),
+            ("http date", "Wed, 21 Oct 2015 07:28:00 GMT", None),
+            ("negative", "-5", None),
+            ("fraction", "1.5", None),
+            ("empty", "", None),
+        ];
+        for (case, header, wait) in cases {
+            assert_eq!(parse_retry_after(header), wait, "{case}");
+        }
     }
 }

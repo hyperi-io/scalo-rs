@@ -9,27 +9,30 @@
 //! Every record whose source ack is released arrives, under each fault the
 //! harness injects: the engine pipeline builder over a pull-shaped source, a
 //! push-shaped source built armed, and the real gRPC server built armed, and a
-//! hand-rolled `SourceAck` loop over the push source.
+//! hand-rolled `SourceAck` loop over the push source. The same engine pipeline
+//! sends through `AnySender::Custom` too, the path an app's own sender takes.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use scalo::deployment::test_support::conformance::{Case, Fault, FaultSink, Ledger, Verdict};
 use scalo::transport::{
-    DeliveryStatus, Record, SendResult, SourceAck, TransportError, TransportReceiver,
-    TransportSender, WorkBatch,
+    AnySender, DeliveryStatus, Record, SendResult, SourceAck, TransportBase, TransportError,
+    TransportReceiver, TransportSender, WorkBatch,
 };
 use scalo::worker::{BatchEngine, BatchProcessingConfig, EngineError};
 use tokio_util::sync::CancellationToken;
 
-/// Hand a block to the fault sink, mapping its answer onto the engine's retry rules.
-async fn deliver(sink: &FaultSink, records: &[Record]) -> Result<(), EngineError> {
+/// Hand a block to the sink, mapping its answer onto the engine's retry rules.
+async fn deliver<S: TransportSender>(sink: &S, records: &[Record]) -> Result<(), EngineError> {
     match sink.send_batch(records).await {
         SendResult::Ok => Ok(()),
         // Names no record, so the block is never released as delivered.
         SendResult::FilteredDlq => Err(EngineError::Sink("the sink dead-lettered a record".into())),
-        SendResult::Backpressured => Err(TransportError::Backpressure.into()),
-        SendResult::Fatal(e) => Err(EngineError::Sink(e.to_string())),
+        SendResult::Backpressured | SendResult::RetryAfter(_) => {
+            Err(TransportError::Backpressure.into())
+        }
+        SendResult::Fatal(e) | SendResult::Reject(e) => Err(EngineError::Sink(e.to_string())),
     }
 }
 
@@ -37,10 +40,37 @@ async fn deliver(sink: &FaultSink, records: &[Record]) -> Result<(), EngineError
 async fn engine_pipeline<R>(
     source: Arc<R>,
     sink: Arc<FaultSink>,
+    ledger: Ledger,
+    shutdown: CancellationToken,
+) where
+    R: TransportReceiver + 'static,
+{
+    engine_pipeline_via(source, sink, ledger, shutdown).await;
+}
+
+/// The engine pipeline sending through `AnySender::Custom` wrapping the fault sink.
+async fn custom_pipeline<R>(
+    source: Arc<R>,
+    sink: Arc<FaultSink>,
+    ledger: Ledger,
+    shutdown: CancellationToken,
+) where
+    R: TransportReceiver + 'static,
+{
+    let custom = Arc::new(AnySender::Custom(sink));
+    assert_eq!(custom.name(), "conformance-sink", "the custom arm forwards");
+    engine_pipeline_via(source, custom, ledger, shutdown).await;
+}
+
+/// The engine pipeline builder, an identity process, any sender.
+async fn engine_pipeline_via<R, S>(
+    source: Arc<R>,
+    sink: Arc<S>,
     _ledger: Ledger,
     shutdown: CancellationToken,
 ) where
     R: TransportReceiver + 'static,
+    S: TransportSender + 'static,
 {
     let engine = BatchEngine::new(BatchProcessingConfig::default());
     let _ = engine
@@ -50,7 +80,7 @@ async fn engine_pipeline<R>(
         .run(Ok, |out: &WorkBatch<R::Token>| {
             let sink = Arc::clone(&sink);
             let records = out.records.clone();
-            async move { deliver(&sink, &records).await }
+            async move { deliver(&*sink, &records).await }
         })
         .await;
 }
@@ -65,8 +95,8 @@ async fn send_block(
         match sink.send_batch(records).await {
             SendResult::Ok => return Some(DeliveryStatus::Delivered),
             SendResult::FilteredDlq => return Some(DeliveryStatus::Rejected),
-            SendResult::Fatal(_) => return Some(DeliveryStatus::Errored),
-            SendResult::Backpressured => {
+            SendResult::Fatal(_) | SendResult::Reject(_) => return Some(DeliveryStatus::Errored),
+            SendResult::Backpressured | SendResult::RetryAfter(_) => {
                 if shutdown.is_cancelled() {
                     return None;
                 }
@@ -157,6 +187,18 @@ async fn push_via_builder(fault: Fault) -> Verdict {
         .await
 }
 
+async fn pull_custom(fault: Fault) -> Verdict {
+    Case::new(fault)
+        .run_pull(|source, sink, ledger, shutdown| custom_pipeline(source, sink, ledger, shutdown))
+        .await
+}
+
+async fn push_custom(fault: Fault) -> Verdict {
+    Case::new(fault)
+        .run_push(|source, sink, ledger, shutdown| custom_pipeline(source, sink, ledger, shutdown))
+        .await
+}
+
 /// Nothing acknowledged is lost, and after the restart every record was acknowledged.
 #[track_caller]
 fn assert_conforms(verdict: &Verdict) {
@@ -241,6 +283,24 @@ async fn engine_push_record_rejected_mid_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_push_two_instances_over_one_source() {
     assert_conforms(&push_via_builder(Fault::TwoInstances).await);
+}
+
+/// Every fault over a pull source, with the sink behind `AnySender::Custom`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_pull_custom_sender_conforms_under_every_fault() {
+    for fault in Fault::ALL {
+        eprintln!("{fault:?}");
+        assert_conforms(&pull_custom(fault).await);
+    }
+}
+
+/// Every fault over a push source, with the sink behind `AnySender::Custom`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_push_custom_sender_conforms_under_every_fault() {
+    for fault in Fault::ALL {
+        eprintln!("{fault:?}");
+        assert_conforms(&push_custom(fault).await);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

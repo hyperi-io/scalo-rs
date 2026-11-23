@@ -17,18 +17,20 @@ Four traits stack: sender and receiver each extend `TransportBase`, and `Transpo
 classDiagram
     direction LR
     accTitle: L4 Detail -- Transport traits
-    accDescr: TransportSender and TransportReceiver each extend TransportBase, which carries close, is_healthy, name and healthcheck. Transport extends both through a blanket impl.
+    accDescr: TransportSender and TransportReceiver each extend TransportBase, which carries close, is_healthy, name, healthcheck and delivery_guarantee. Transport extends both through a blanket impl.
     class TransportBase {
         <<trait>>
         +close()
         +is_healthy()
         +name()
         +healthcheck()
+        +delivery_guarantee()
     }
     class TransportSender {
         <<trait>>
         +send(destination, payload)
         +send_batch(records)
+        +send_batch_by(records, deadline)
     }
     class TransportReceiver {
         <<trait>>
@@ -58,7 +60,7 @@ classDiagram
 and `commit`. Native async-fn-in-trait is not object-safe -- the
 opaque return type means `Box<dyn TransportSender>` won't compile.
 
-The fix is **enum dispatch**, not `dyn`.
+The fix is **enum dispatch**, not `dyn`. A sender the app writes itself goes behind `DynTransportSender`, the boxed-future form every `TransportSender` gets through a blanket impl, as `AnySender::Custom` ([custom.md](custom.md)).
 
 ---
 
@@ -212,9 +214,12 @@ routes per record, and a sink stage sends 1:1. See [routing.md](routing.md).
 | `RoutedSender::from_route_configs(routes, default).await` | Per-key routing factory |
 | `WorkBatch<Token>` / `Record` | What `recv` returns: records + source acks + inline DLQ entries |
 | `Message<Token>` | Payload + key + token + timestamp + format |
-| `SendResult` | `Ok` / `Backpressured` / `Fatal(err)` / `FilteredDlq` |
-| `TransportConfig` | Top-level config struct read by the factory |
-| `TransportType` | Enum: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http` |
+| `SendResult` | `Ok` / `Backpressured` / `RetryAfter(wait)` / `Reject(err)` / `FilteredDlq` / `Fatal(err)`, compared in [custom.md](custom.md#what-a-send-answers) |
+| `TransportSender::send_batch_by(&records, deadline)` | A block answered by an `Instant`, `Backpressured` once it passes |
+| `TransportBase::delivery_guarantee()` | `Acknowledged` / `Written` / `FireAndForget`, required of every transport |
+| `TransportConfig` | Top-level config struct read by the factory. `delivery: ack \| flush \| none` (default `ack`) refuses a sender below it |
+| `TransportType` | Enum: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http`, `Custom(name)` |
+| `register_sender(name, constructor)` / `AnySender::Custom` / `DynTransportSender` | An app's own sender, built from config by type name ([custom.md](custom.md)) |
 
 Source: [../../src/transport/](../../src/transport/) -- particularly
 [mod.rs](../../src/transport/mod.rs),
@@ -230,6 +235,7 @@ Source: [../../src/transport/](../../src/transport/) -- particularly
 - [grpc.md](grpc.md) -- gRPC `send_batch` blocks joined into one call
 - [filter-engine.md](filter-engine.md) -- tiered CEL filtering
 - [routing.md](routing.md) -- `RoutedSender` for originators
+- [custom.md](custom.md) -- writing a custom sender, the delivery guarantee
 - [../auto-wiring.md](../auto-wiring.md) -- factory in the pillar model
 - [../integration.md](../integration.md) -- ServiceApp wiring recipe
 - [../feature-flags.md](../feature-flags.md) -- per-backend features

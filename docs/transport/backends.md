@@ -308,6 +308,7 @@ offset commits with the block.
 transport:
   output:
     type: file
+    delivery: flush
     file:
       path: "/var/log/myapp/events.ndjson"
       append: true
@@ -320,6 +321,7 @@ transport:
   byte of a line read across dropped calls.
 - Line bytes: passed through as read, so a line need not be UTF-8.
 - `is_healthy()`: `!closed` atomic flag.
+- Delivery guarantee: `Written`, so a factory-built sender needs `delivery: flush` ([custom.md](custom.md#delivery-guarantee)).
 - Acknowledgements: not held. `commit` and `release` save the highest offset they are given, so a restart reads again from the last position released, but a block released `Errored` is skipped once a later block is delivered. `<key>.file.acknowledgements` has no effect, and the factory warns once.
 
 Source: [../../src/transport/file.rs](../../src/transport/file.rs).
@@ -337,6 +339,7 @@ no-op because stdin is forward-only.
 transport:
   output:
     type: pipe
+    delivery: flush
     pipe:
       recv_timeout_ms: 100
 ```
@@ -347,6 +350,7 @@ transport:
   returns them.
 - Line bytes: passed through as read, so a line need not be UTF-8.
 - `is_healthy()`: `!closed`, and `false` when its filters failed to build.
+- Delivery guarantee: `Written`, so a factory-built sender needs `delivery: flush`.
 - Acknowledgements: none to hold. `<key>.pipe.acknowledgements` has no effect, and the factory warns once.
 
 Source: [../../src/transport/pipe.rs](../../src/transport/pipe.rs).

@@ -30,7 +30,9 @@
 //!
 //! None of these traits is object safe: every async method returns
 //! `impl Future`, so `Box<dyn TransportSender>` does not compile. Runtime
-//! selection uses enum dispatch instead.
+//! selection uses enum dispatch instead, and a sender the app writes itself
+//! goes behind [`DynTransportSender`], the boxed-future form every
+//! `TransportSender` gets through a blanket impl, as [`AnySender::Custom`].
 //!
 //! - **Output stages** (DLQ, forwarding, archiving): [`AnySender`] when config
 //!   picks the backend, or a generic `S: TransportSender`
@@ -51,6 +53,7 @@
 //! | **File** | Yes | Yes | Debugging, audit trails, replay |
 //! | **Pipe** | Yes | Yes | Unix pipelines, sidecar pattern |
 //! | **HTTP** | Yes | Yes | Webhook delivery, REST ingest |
+//! | **Custom** | Yes | No | A sender the app registers with [`register_sender`] |
 //!
 //! ## Example
 //!
@@ -64,6 +67,8 @@
 
 pub mod ack;
 pub mod codec;
+mod custom;
+mod delivery;
 mod detect;
 mod error;
 pub mod factory;
@@ -120,6 +125,11 @@ pub use ack::{
     DeadLetter, DeadLetterReason, HeldAcks, SinkConfirmation, SourceAck, screen,
 };
 pub use codec::{CodecError, FieldRef, ParsedPayload, parse};
+pub use custom::{
+    BoxSendFuture, CustomSenderConfig, DynTransportSender, SenderConstructor, register_sender,
+    registered_senders,
+};
+pub use delivery::{DeliveryGuarantee, DeliveryRequirement};
 pub use error::{TransportError, TransportResult};
 pub use factory::{AnyReceiver, AnySender, AnyToken};
 pub use finalizer::{BatchFinalizer, DeliveryStatus, PieceFinalizer};
