@@ -39,6 +39,9 @@ quality:
 test:
   enabled: true
   coverage: false
+  # Logs memory and stalls during the test command, so a lost runner leaves evidence (#548).
+  memory_watch:
+    enabled: true
   rust:
     # Process-per-test isolation.
     nextest: true
