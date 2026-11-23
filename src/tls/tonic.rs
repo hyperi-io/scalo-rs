@@ -17,17 +17,23 @@ use super::client::{ClientTls, TrustChoice, read_certs, read_key};
 
 /// tonic's client TLS config for `tls`, with every file read and parsed.
 ///
-/// tonic has no OS verifier, so [`TrustChoice::Platform`] is refused. tonic
-/// fails a client whose OS store is empty even with CA files beside it, so
-/// under [`TrustChoice::Native`] an empty OS store is left out when a CA file
-/// is given.
+/// tonic has no OS verifier, so [`TrustChoice::Platform`] is refused, and
+/// takes no verifier of ours, so a key pin is refused. tonic fails a client
+/// whose OS store is empty even with CA files beside it, so under
+/// [`TrustChoice::Native`] an empty OS store is left out when a CA file is
+/// given.
 ///
 /// # Errors
 ///
-/// [`TlsError::Build`] for `platform`, [`TlsError::EmptyTrustStore`] when
-/// nothing is trusted, and the file errors of
-/// [`build_client_tls`](super::build_client_tls).
+/// [`TlsError::Build`] for `platform` or a key pin,
+/// [`TlsError::EmptyTrustStore`] when nothing is trusted, and the file errors
+/// of [`build_client_tls`](super::build_client_tls).
 pub(crate) fn tonic_client_tls(tls: &ClientTls) -> Result<ClientTlsConfig, TlsError> {
+    if !tls.pin_sha256.is_empty() {
+        return Err(TlsError::Build(
+            "a gRPC client takes no key pin: tonic verifies the server itself".to_string(),
+        ));
+    }
     let mut config = ClientTlsConfig::new();
     match tls.trust {
         TrustChoice::Platform => {
@@ -103,11 +109,17 @@ mod tests {
         let junk = write(dir.path(), "junk.pem", "not a certificate");
         let missing = dir.path().join("missing.pem");
 
-        let refused: [(&str, ClientTls, &str); 6] = [
+        let pin: crate::tls::SpkiPin = "00".repeat(32).parse().unwrap();
+        let refused: [(&str, ClientTls, &str); 7] = [
             (
                 "platform trust",
                 ClientTls::new(TrustChoice::Platform),
                 "not `platform`",
+            ),
+            (
+                "a key pin",
+                ClientTls::pinned(&ca_file).with_pin(pin),
+                "no key pin",
             ),
             (
                 "a bundle with no CA",

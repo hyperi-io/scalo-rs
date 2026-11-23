@@ -274,6 +274,12 @@ pub struct HttpTransportConfig {
     /// May name the same file when it holds both.
     #[serde(default)]
     pub tls_client_key_path: Option<String>,
+
+    /// SHA-256 pins on the server's public key, in base64 or hex (see
+    /// [`crate::tls::SpkiPin`]). Once the chain verifies, the key must match
+    /// one. Empty (the default) checks no key.
+    #[serde(default)]
+    pub tls_pin_sha256: Vec<crate::tls::SpkiPin>,
 }
 
 impl Default for HttpTransportConfig {
@@ -304,6 +310,7 @@ impl Default for HttpTransportConfig {
             tls_trust: None,
             tls_client_cert_path: None,
             tls_client_key_path: None,
+            tls_pin_sha256: Vec::new(),
         }
     }
 }
@@ -337,6 +344,7 @@ impl std::fmt::Debug for HttpTransportConfig {
             .field("tls_trust", &self.tls_trust)
             .field("tls_client_cert_path", &self.tls_client_cert_path)
             .field("tls_client_key_path", &self.tls_client_key_path)
+            .field("tls_pin_sha256", &self.tls_pin_sha256)
             .finish()
     }
 }
@@ -371,7 +379,11 @@ impl HttpTransportConfig {
                 ));
             }
         };
-        if self.tls_trust.is_none() && self.tls_ca_path.is_none() && identity.is_none() {
+        if self.tls_trust.is_none()
+            && self.tls_ca_path.is_none()
+            && identity.is_none()
+            && self.tls_pin_sha256.is_empty()
+        {
             return Ok(None);
         }
         let mut tls = crate::tls::ClientTls::new(self.tls_trust.unwrap_or_default());
@@ -380,6 +392,9 @@ impl HttpTransportConfig {
         }
         if let Some((cert, key)) = identity {
             tls = tls.with_identity(cert, key);
+        }
+        for pin in &self.tls_pin_sha256 {
+            tls = tls.with_pin(*pin);
         }
         Ok(Some(tls))
     }
@@ -1136,7 +1151,8 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.yaml"),
             "transport:\n  http:\n    tls_trust: bundle\n    tls_ca_path: /etc/tls/ca.pem\n    \
-             tls_client_cert_path: /etc/tls/client.pem\n    tls_client_key_path: /etc/tls/yaml.key\n",
+             tls_client_cert_path: /etc/tls/client.pem\n    tls_client_key_path: /etc/tls/yaml.key\n    \
+             tls_pin_sha256: [\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"]\n",
         )
         .unwrap();
         temp_env::with_vars(
@@ -1169,6 +1185,12 @@ mod tests {
             config.tls_client_key_path.as_deref(),
             Some("/etc/tls/env.key")
         );
+        let pins: Vec<String> = config
+            .tls_pin_sha256
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        assert_eq!(pins, ["47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="]);
     }
 
     /// The `tls_*` keys map onto the client TLS they name, and leave the HTTP
@@ -1231,6 +1253,29 @@ mod tests {
         for (name, got, expected) in cases {
             assert_eq!(got, expected, "{name}");
         }
+
+        let pin: crate::tls::SpkiPin = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+            .parse()
+            .unwrap();
+        let pinned = HttpTransportConfig {
+            tls_pin_sha256: vec![pin],
+            ..HttpTransportConfig::default()
+        };
+        assert_eq!(
+            pinned.client_tls().map_err(|e| e.to_string()),
+            Ok(Some(native().with_pin(pin))),
+            "a pin alone is native plus the pin"
+        );
+        let bad = serde_json::from_value::<HttpTransportConfig>(
+            serde_json::json!({"tls_pin_sha256": ["not a pin"]}),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        assert!(
+            bad.as_ref()
+                .is_err_and(|e| e.contains("\"not a pin\" is not a SHA-256")),
+            "a malformed pin fails the config load: {bad:?}"
+        );
     }
 
     /// A send over HTTPS to a server that asks for a client certificate, under

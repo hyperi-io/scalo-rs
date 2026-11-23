@@ -26,6 +26,9 @@
 //!   files.
 //! - `bundle`: the CA files and nothing else, the exclusive pin.
 //!
+//! Key pins ([`SpkiPin`]) add a check on top of any choice: once the chain
+//! verifies, the server's public key must match one of them.
+//!
 //! ```rust,no_run
 //! use scalo::crypto::CryptoProfile;
 //! use scalo::tls::{ClientTls, build_client_tls};
@@ -85,6 +88,7 @@ use rustls::{ClientConfig, NamedGroup, ProtocolVersion, RootCertStore};
 use crate::crypto::{CryptoProfile, PqcMode, TlsFloor};
 
 mod client;
+mod pin;
 mod server;
 #[cfg(test)]
 pub(crate) mod test_pki;
@@ -98,6 +102,8 @@ pub use server::{
     CertResolver, ClientAuth, HandshakeError, Reloaded, ServerTls, ServerTlsConfig,
     ServerTlsOptions,
 };
+
+pub use pin::SpkiPin;
 
 /// Errors building a TLS trust store or client config.
 #[derive(Debug, thiserror::Error)]
@@ -179,6 +185,13 @@ pub enum TlsError {
         what: &'static str,
         /// Why it was refused.
         reason: String,
+    },
+
+    /// A key pin is not a SHA-256 in base64 or hex.
+    #[error("TLS: key pin {pin:?} is not a SHA-256 in base64 or 64 hex digits")]
+    InvalidPin {
+        /// The pin as written. It hashes a public key, so it is not secret.
+        pin: String,
     },
 }
 

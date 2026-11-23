@@ -116,6 +116,7 @@ There is no maintained Rust RELP crate. The client is in `src/transport/syslog/r
 | `tls.trust` | `native` | `native`, `platform` or `bundle` ([../api/tls.md](../api/tls.md)) |
 | `tls.ca_path` | none | CA PEM file |
 | `tls.client_cert_path`, `tls.client_key_path` | none | client certificate for mutual TLS, both or neither |
+| `tls.pin_sha256` | none | SHA-256 pins on the receiver's public key, checked after its chain ([key pins](../api/tls.md#client-trust)) |
 | `tls.server_name` | host of `address` | the name the receiver's certificate is checked against |
 | `filters_out` | none | outbound filters on each payload ([filter-engine.md](filter-engine.md)) |
 
