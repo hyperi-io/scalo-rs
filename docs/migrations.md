@@ -38,6 +38,12 @@ A line of exactly `max_line_bytes` before its `\n` is now a record, where it was
 
 **Consumer adjustment** -- none. A value quoted to keep it text (`APP_X="0123"`) still reads as `0123`.
 
+### `config::load_typed_cascade` and `config::Loaded` (additive)
+
+`load_typed_cascade(path, prefix, managed)` loads an app's struct as `load_typed` does and returns its cascade by value, leaving the global alone. A test can build a cascade per case where the global kept the first test's environment.
+
+**Consumer adjustment** -- none.
+
 ### `ConfigOptions::managed`, `load_typed_managed` and `ServiceApp::managed_source` (additive)
 
 An app can name a Group Policy key and an MDM preference domain in a `ManagedSource`, and the cascade then reads them as a layer after every config file and before env vars. A key that looks like a secret fails the load. See [managed-config.md](core-pillars/managed-config.md).

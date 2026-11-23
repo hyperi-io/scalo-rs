@@ -44,6 +44,13 @@
 //! the variable was set to, trimmed, so `0123` reaches a `String` field as
 //! `0123` and a `u16` field as 123.
 //!
+//! ## A Cascade Without the Global
+//!
+//! [`setup`] and [`load_typed`] keep the first cascade set up in a process.
+//! [`Config::new`] and [`load_typed_cascade`] build one into a value instead,
+//! holding the environment it was built in, so tests sharing a process each
+//! read their own. `setup` and `load_typed` build theirs the same way.
+//!
 //! ## Example
 //!
 //! ```rust,no_run
@@ -70,7 +77,7 @@ pub mod registry;
 pub mod sensitive;
 mod yaml_file;
 
-pub use load::{load_typed, load_typed_managed, log_deferred};
+pub use load::{Loaded, load_typed, load_typed_cascade, load_typed_managed, log_deferred};
 pub use managed::ManagedSource;
 
 #[cfg(feature = "config-reload")]

@@ -98,6 +98,8 @@ fn load_config(&self, path: Option<&str>) -> Result<LoaderConfig, CliError> {
 }
 ```
 
+`config::load_typed_cascade(path, prefix, managed)` does the same and returns `Loaded { config, cascade }`, the cascade by value, instead of setting up the global one. `load_typed` and `load_typed_managed` build theirs through it.
+
 The config type derives `Serialize` as well as `Deserialize`, because the env merge round-trips it. A `#[serde(skip)]` field comes back at its default, so set it after the call.
 
 `run_app` loads the config before it sets up logging, because the logger reads its settings from that config. So `load_typed` holds the lines it would log until a subscriber exists, and `logger::setup` emits them. An app that installs its own subscriber calls `config::log_deferred()` after doing so.
@@ -246,6 +248,7 @@ inside the cluster. See [http_server/config.rs](../../src/http_server/config.rs)
 | `Config::unmarshal_key::<T>(key)` | Deserialise one section |
 | `Config::unmarshal_key_registered::<T>(key)` | Same, plus registers the section |
 | `config::load_typed(path, prefix)` | An app's config struct: the named file or the cascade, then nested env, flat env and `Normalize` |
+| `config::load_typed_cascade(path, prefix, managed)` | The same, returning the struct and its cascade as `Loaded<T>` without setting up the global |
 | `config::log_deferred()` | Log what `load_typed` noted before a subscriber existed (`logger::setup` calls it) |
 | `config::flat_env::ApplyFlatEnv` | K8s flat-env bridge trait |
 | `config::flat_env::load_config(path, prefix)` | Cascade with `path` as the settings layer, then flat env and `Normalize` |
@@ -275,6 +278,8 @@ let cfg = Config::new(ConfigOptions {
 
 For tests mutating env vars, use the `temp-env` crate -- `std::env::set_var` is
 `unsafe` in edition 2024 and this crate denies unsafe code (`#![deny(unsafe_code)]`).
+
+The global cascade keeps the environment of the first test in a process to set it up, so under plain `cargo test` a later test reads an earlier one's variables. A test of an app's loader calls `load_typed_cascade` and reads its sections from the returned `cascade`, which holds only the environment it was built in.
 
 ---
 

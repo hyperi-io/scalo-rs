@@ -46,7 +46,8 @@ use crate::yaml::{self, Profile};
 /// The global cascade is also set up, with the file as its settings layer, so
 /// the sections the scalo runtime reads (`metrics`, `version_check`, ...)
 /// resolve from the same file. A later call, such as a reload, keeps the
-/// first cascade. `.env` and the standard config locations (the working
+/// first cascade. [`load_typed_cascade`] returns the cascade instead of
+/// setting it up. `.env` and the standard config locations (the working
 /// directory, `/config/` and the user's `~/.config/`) are read only when no
 /// `path` is given, so nothing outside the named file reaches a deployment
 /// that names it.
@@ -86,6 +87,41 @@ where
     load(path, env_prefix, Some(managed))
 }
 
+/// An app's config struct and the cascade it was read from.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Loaded<T> {
+    /// The app's config struct.
+    pub config: T,
+    /// The cascade, built as [`load_typed`] builds the global one.
+    pub cascade: Config,
+}
+
+/// [`load_typed`] that returns the cascade it builds instead of setting up the
+/// global one. `managed` is merged as [`load_typed_managed`] merges it.
+///
+/// The environment is read before it returns, so a test that calls it inside
+/// `temp_env` keeps that environment to its own result: a load in another
+/// thread neither sees it nor shares its cascade. [`load_typed`] and
+/// [`load_typed_managed`] build their cascade the same way. [`Normalize`] runs
+/// with the global cascade, if one is set up, not this one.
+///
+/// # Errors
+///
+/// As [`load_typed_managed`].
+pub fn load_typed_cascade<T>(
+    path: Option<&str>,
+    env_prefix: &str,
+    managed: Option<&ManagedSource>,
+) -> Result<Loaded<T>, ConfigError>
+where
+    T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
+    let (cascade, read) = read_typed(path, env_prefix, managed)?;
+    let config = finish(read?, env_prefix)?;
+    Ok(Loaded { config, cascade })
+}
+
 fn load<T>(
     path: Option<&str>,
     env_prefix: &str,
@@ -93,6 +129,23 @@ fn load<T>(
 ) -> Result<T, ConfigError>
 where
     T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
+    let (cascade, read) = read_typed(path, env_prefix, source)?;
+    // The first cascade set up is kept, so a reload leaves it in place.
+    let _ = CONFIG.set(cascade);
+    finish(read?, env_prefix)
+}
+
+/// The cascade, and `T` read from the named file or from that cascade.
+///
+/// The outer error is the cascade's, the inner one `T`'s.
+fn read_typed<T>(
+    path: Option<&str>,
+    env_prefix: &str,
+    source: Option<&ManagedSource>,
+) -> Result<(Config, Result<T, ConfigError>), ConfigError>
+where
+    T: DeserializeOwned + Serialize,
 {
     let options = ConfigOptions {
         env_prefix: env_prefix.to_string(),
@@ -111,10 +164,14 @@ where
         Some(config) => overlay(config, layer.as_ref()),
         None => cascade.unmarshal(),
     };
-    // The first cascade set up is kept, so a reload leaves it in place.
-    let _ = CONFIG.set(cascade);
+    Ok((cascade, read))
+}
 
-    let mut config: T = read?;
+/// Nested env, flat env and [`Normalize`], on `T` as [`read_typed`] read it.
+fn finish<T>(mut config: T, env_prefix: &str) -> Result<T, ConfigError>
+where
+    T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
     merge_nested_env(&mut config, env_prefix)?;
     config.apply_flat_env(env_prefix);
     config.normalize();
@@ -456,6 +513,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A cascade built by value keeps its environment: a load in another
+    /// thread neither sees the variable this one was built with nor shares
+    /// its cascade.
+    #[test]
+    fn a_cascade_built_by_value_keeps_its_environment() {
+        let build = || load_typed_cascade::<App>(None, "BYVALUE", None).unwrap();
+        let set = std::thread::spawn(move || {
+            temp_env::with_var("BYVALUE__KAFKA__USERNAME", Some("this-thread"), build)
+        })
+        .join()
+        .unwrap();
+        let other = std::thread::spawn(build).join().unwrap();
+
+        assert_eq!(set.config.kafka.username, "this-thread");
+        assert_eq!(
+            set.cascade.get_string("kafka.username").as_deref(),
+            Some("this-thread")
+        );
+        assert_eq!(other.config.kafka.username, "", "the other load saw it");
+        assert_eq!(other.cascade.get_string("kafka.username"), None);
     }
 
     /// An all-digit Kafka SASL password reaches the field as set, where the
