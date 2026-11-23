@@ -98,6 +98,11 @@ pub struct OtlpConfig {
     /// `bundle` trust.
     pub tls: Option<ClientTlsConfig>,
 
+    /// `none` (default), `system` (the machine's proxy) or a proxy URL, as the
+    /// other transports read it. See
+    /// [`ProxyConfig`](crate::transport::ProxyConfig).
+    pub proxy: crate::transport::ProxyConfig,
+
     /// Outbound message filters, applied to each record's payload before the
     /// request is built.
     pub filters_out: Vec<FilterRule>,
@@ -115,6 +120,7 @@ impl Default for OtlpConfig {
             service_name: None,
             resource_attributes: BTreeMap::new(),
             tls: None,
+            proxy: crate::transport::ProxyConfig::None,
             filters_out: Vec::new(),
         }
     }
@@ -236,7 +242,8 @@ mod tests {
              max_retry_delay_ms: 60000\n    service_name: from-yaml\n    \
              resource_attributes:\n      team: data\n    tls:\n      trust: bundle\n      \
              ca_path: /etc/tls/ca.pem\n      client_cert_path: /etc/tls/client.pem\n      \
-             client_key_path: /etc/tls/yaml.key\n    filters_out:\n      \
+             client_key_path: /etc/tls/yaml.key\n    proxy: http://proxy.example:3128\n    \
+             filters_out:\n      \
              - expression: 'has(_debug)'\n        action: drop\n",
         )
         .unwrap();
@@ -293,6 +300,12 @@ mod tests {
                 client_key_path: Some(PathBuf::from("/etc/tls/env.key")),
                 ..ClientTlsConfig::default()
             })
+        );
+        assert_eq!(
+            config.proxy,
+            crate::transport::ProxyConfig::Url(crate::sensitive::SensitiveString::new(
+                "http://proxy.example:3128"
+            ))
         );
         assert_eq!(config.filters_out.len(), 1);
         assert!(

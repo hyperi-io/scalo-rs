@@ -804,3 +804,81 @@ async fn a_bad_setting_fails_the_build_and_a_closed_transport_refuses() {
         "{closed:?}"
     );
 }
+
+/// Both protocols export through the proxy's CONNECT tunnel, gRPC in plain
+/// text and HTTP with TLS inside it, and a refused CONNECT is `Reject` naming
+/// the proxy's status and the collector's port.
+#[tokio::test]
+async fn exports_go_through_a_connect_proxy() {
+    use crate::sensitive::SensitiveString;
+    use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, tls_front};
+    use crate::transport::{ProxyConfig, SendResult};
+
+    let grpc_seen = Shared::default();
+    let grpc_addr = grpc_collector(Answer::Accept, Arc::clone(&grpc_seen), None).await;
+    let http_seen = Shared::default();
+    let http_addr = http_collector(Answer::Accept, Arc::clone(&http_seen)).await;
+    let (front, ca) = tls_front(http_addr, &[b"http/1.1"]).await;
+    let ca_file = tempfile::NamedTempFile::new().unwrap();
+    tokio::fs::write(ca_file.path(), ca).await.unwrap();
+
+    // (protocol, policy, refusal status)
+    let rows = [
+        (GRPC, Policy::Allow, None),
+        (GRPC, Policy::Refuse(403), Some(403)),
+        (HTTP, Policy::Allow, None),
+        (HTTP, Policy::Refuse(403), Some(403)),
+    ];
+    for (protocol, policy, status) in rows {
+        let name = format!("{protocol:?} {policy:?}");
+        let proxy = ConnectProxy::start(policy).await;
+        let (endpoint, tunnel, tls) = if protocol == GRPC {
+            (format!("http://{grpc_addr}"), grpc_addr.to_string(), None)
+        } else {
+            let tls = ClientTlsConfig {
+                trust: TrustChoice::Bundle,
+                ca_path: Some(ca_file.path().to_path_buf()),
+                ..ClientTlsConfig::default()
+            };
+            let host = format!("localhost:{}", front.port());
+            (format!("https://{host}"), host, Some(tls))
+        };
+        let transport = super::OtlpTransport::new(&OtlpConfig {
+            endpoint,
+            protocol,
+            timeout_ms: 5_000,
+            tls,
+            proxy: ProxyConfig::Url(SensitiveString::new(proxy.url())),
+            ..OtlpConfig::default()
+        })
+        .unwrap();
+        let result = transport.send_batch(&block()).await;
+
+        let seen = proxy.seen();
+        assert!(
+            !seen.is_empty() && seen.iter().all(|c| c.target == tunnel),
+            "{name}: {seen:?}"
+        );
+        match (status, &result) {
+            (None, SendResult::Ok) => {}
+            (Some(status), SendResult::Reject(error)) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains(&format!("HTTP {status}")) && text.contains(&tunnel),
+                    "{name}: {text}"
+                );
+            }
+            _ => panic!("{name}: got {result:?}"),
+        }
+    }
+    assert_eq!(
+        grpc_seen.lock().unwrap().requests.len(),
+        1,
+        "one gRPC export"
+    );
+    assert_eq!(
+        http_seen.lock().unwrap().requests.len(),
+        1,
+        "one HTTP export"
+    );
+}

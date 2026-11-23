@@ -49,6 +49,7 @@ use super::ack::{DeadLetterReason, SinkConfirmation};
 use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::filter::{FilterDisposition, TransportFilterEngine, TransportFilterTierConfig};
+use super::proxy::Scheme;
 use super::traits::{TransportBase, TransportSender};
 use super::types::{PayloadFormat, SendResult};
 use super::work_batch::{Record, RecordMeta};
@@ -86,6 +87,9 @@ enum Wire {
         url: String,
         headers: reqwest::header::HeaderMap,
         gzip: bool,
+        dialer: crate::transport::ProxyDialer,
+        /// The https collector's host and port, for reading a refused CONNECT.
+        tunnel: Option<(String, u16)>,
     },
 }
 
@@ -204,6 +208,8 @@ impl OtlpTransport {
                 url,
                 headers,
                 gzip,
+                dialer,
+                tunnel,
             } => {
                 let body = request.encode_to_vec();
                 let encoded_len = body.len();
@@ -236,13 +242,19 @@ impl OtlpTransport {
                     // reset and timed-out connections clear when the collector is back.
                     Err(e) => {
                         if let Some(tls) = crate::tls::rustls_error(&e) {
-                            SendResult::Fatal(TransportError::Config(format!(
+                            return SendResult::Fatal(TransportError::Config(format!(
                                 "OTLP HTTP: TLS with the collector failed: {tls}"
-                            )))
-                        } else {
-                            tracing::debug!(endpoint = %self.endpoint, error = %e, "OTLP HTTP request failed");
-                            SendResult::Backpressured
+                            )));
                         }
+                        if !e.is_timeout()
+                            && let Some((host, port)) = tunnel
+                            && let Some(refused) =
+                                dialer.refusal_of(Scheme::Tls, host, *port, budget).await
+                        {
+                            return crate::transport::proxy::rejected(&refused, "otlp");
+                        }
+                        tracing::debug!(endpoint = %self.endpoint, error = %e, "OTLP HTTP request failed");
+                        SendResult::Backpressured
                     }
                 }
             }
@@ -453,11 +465,8 @@ fn grpc_wire(
             .tls_config(tls)
             .map_err(|e| config_error(format!("TLS: {e}")))?;
     }
-    let channel = super::tonic_channel::lazy_channel(
-        endpoint,
-        config.timeout_ms,
-        crate::transport::ProxyDialer::direct(),
-    );
+    let channel =
+        super::tonic_channel::lazy_channel(endpoint, config.timeout_ms, config.proxy.dialer()?);
     let mut client = LogsServiceClient::new(channel).accept_compressed(CompressionEncoding::Gzip);
     if config.compression == OtlpCompression::Gzip {
         client = client.send_compressed(CompressionEncoding::Gzip);
@@ -492,9 +501,16 @@ fn http_wire(
             .map_err(|e| config_error(e.to_string()))?;
         builder = builder.use_preconfigured_tls((*tls).clone());
     }
-    let client = builder
+    let dialer = config.proxy.dialer()?;
+    let client = crate::transport::proxy::reqwest_proxy(builder, &config.proxy, &dialer)
         .build()
         .map_err(|e| config_error(format!("HTTP client: {e}")))?;
+    // reqwest's tunnel error carries no status, so a refused CONNECT is read
+    // by one CONNECT of the transport's own to an https collector.
+    let tunnel = reqwest::Url::parse(&url)
+        .ok()
+        .filter(|u| u.scheme() == "https")
+        .and_then(|u| Some((u.host_str()?.to_string(), u.port_or_known_default()?)));
 
     let mut headers = HeaderMap::new();
     for (name, value) in &config.headers {
@@ -521,6 +537,8 @@ fn http_wire(
         url,
         headers,
         gzip,
+        dialer,
+        tunnel,
     })
 }
 
@@ -553,6 +571,9 @@ fn accepted(partial: Option<ExportLogsPartialSuccess>, sent: usize) -> SendResul
 fn grpc_failure(status: &tonic::Status, max_retry_delay: Duration) -> SendResult {
     use tonic::Code;
 
+    if let Some(refused) = crate::transport::proxy::refusal(status) {
+        return crate::transport::proxy::rejected(refused, "otlp");
+    }
     // tonic attaches a source error only when the client's own connection
     // failed or its stream was reset: the collector never answered.
     if std::error::Error::source(status).is_some() {
