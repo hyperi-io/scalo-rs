@@ -37,7 +37,7 @@ features = [
     "http", "http-server",
     "transport", "transport-trace",
     "transport-memory", "transport-grpc", "transport-file",
-    "transport-pipe", "transport-http", "transport-kafka-config",
+    "transport-pipe", "transport-http", "transport-syslog", "transport-kafka-config",
     "directory-config",
     "secrets", "secrets-vault",
     "dlq", "dlq-http",
@@ -173,7 +173,9 @@ transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
 transport-http = ["transport", "http", "tls", "dep:flate2"]
-transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http"]
+# RFC 5424 and 3164 over TCP, TLS, UDP and RELP: docs/transport/syslog.md
+transport-syslog = ["transport", "tls", "dep:jiff", "sysinfo"]
+transport-all = ["transport-memory", "transport-kafka", "transport-grpc", "transport-file", "transport-pipe", "transport-http", "transport-syslog"]
 
 secrets = ["tokio", "tokio-util", "serde_json", "parking_lot", "base64", "dirs", "tracing", "dep:aes-gcm", "dep:hkdf", "dep:sha2"]
 secrets-vault = ["secrets", "vaultrs"]

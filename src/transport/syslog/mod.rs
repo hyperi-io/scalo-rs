@@ -1,0 +1,668 @@
+// Project:   scalo
+// File:      src/transport/syslog/mod.rs
+// Purpose:   Syslog sender: RFC 5424 and 3164 over TCP, TLS, UDP and RELP
+// Language:  Rust
+//
+// License:   Apache-2.0
+// Copyright: (c) 2026 HYPERI PTY LIMITED
+
+//! Sends records as syslog messages, send only.
+//!
+//! Each record's payload is the MSG, after an RFC 5424 or RFC 3164 header
+//! built from config, or as it is when `passthrough` is set and it already
+//! starts with a `<PRI>`. A record's key is its RFC 5424 MSGID.
+//!
+//! | Protocol | Wire | Guarantee |
+//! |---|---|---|
+//! | `tcp` | octet counting or LF lines (RFC 6587) | `written` |
+//! | `tls` | the same inside TLS (RFC 5425) | `written` |
+//! | `udp` | one message per datagram (RFC 5426) | `fire_and_forget` |
+//! | `relp` | RELP frames, each answered, TLS when `tls` is set | `acknowledged` |
+//!
+//! A connection the receiver closed while idle is replaced before the next
+//! batch, with nothing lost. A batch whose write or answers break off returns
+//! `Backpressured`, so the caller sends it again: never `Ok`. RELP first
+//! reconnects once within the call and sends again only the messages not yet
+//! answered. TCP and TLS have no answer, so a receiver that fails after the
+//! write loses what it held. The guide is `docs/transport/syslog.md`.
+
+mod config;
+mod format;
+pub(crate) mod relp;
+mod stream;
+
+#[cfg(test)]
+mod tests;
+
+pub use config::{
+    Facility, Severity, SyslogConfig, SyslogFormat, SyslogFraming, SyslogProtocol, SyslogTlsConfig,
+};
+
+use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use rustls_pki_types::ServerName;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+
+use self::format::Formatter;
+use self::relp::{Answer, RelpError, RelpSession};
+use self::stream::{ConnectError, Connector, Idle, Stream, check_idle};
+use super::ack::DeadLetterReason;
+use super::delivery::DeliveryGuarantee;
+use super::error::{TransportError, TransportResult};
+use super::filter::{FilterDisposition, TransportFilterEngine, TransportFilterTierConfig};
+use super::traits::{TransportBase, TransportSender};
+use super::types::{BlockOutcome, PayloadFormat, SendResult};
+use super::work_batch::{Record, RecordMeta};
+use crate::framing::{Framing, Lf, OctetCounting};
+
+/// The open connection, of the protocol's kind.
+enum Session {
+    Stream(Stream),
+    Relp(RelpSession),
+    Udp(UdpSocket),
+}
+
+/// Buffers reused from batch to batch, and the connection.
+#[derive(Default)]
+struct State {
+    session: Option<Session>,
+    /// The batch's messages, back to back.
+    messages: Vec<u8>,
+    /// Where each message sits in `messages`.
+    ranges: Vec<Range<usize>>,
+    /// The framed batch, for TCP and TLS.
+    wire: Vec<u8>,
+}
+
+/// Sends records to one syslog receiver. Build it from a [`SyslogConfig`].
+pub struct SyslogTransport {
+    address: String,
+    protocol: SyslogProtocol,
+    framing: SyslogFraming,
+    formatter: Formatter,
+    limit: usize,
+    send_timeout: Duration,
+    relp_window: usize,
+    connector: Connector,
+    filter_engine: TransportFilterEngine,
+    state: Mutex<State>,
+    closed: AtomicBool,
+}
+
+impl SyslogTransport {
+    /// A sender for `config`. Reads every TLS file now and connects on the
+    /// first send or [`healthcheck`](TransportBase::healthcheck).
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` for an address that is not `host:port`, a
+    /// setting out of range, a TLS file that cannot be read, or an outbound
+    /// filter that does not compile.
+    pub fn new(config: &SyslogConfig) -> TransportResult<Self> {
+        config.validate()?;
+        let tls = if config.uses_tls() {
+            let section = config.tls.clone().unwrap_or_default();
+            let host = config::host_of(&config.address).unwrap_or_default();
+            let name = section.server_name.as_deref().unwrap_or(host).to_string();
+            let name = ServerName::try_from(name.clone()).map_err(|e| {
+                TransportError::Config(format!("syslog: TLS server name `{name}`: {e}"))
+            })?;
+            let client = section
+                .client
+                .client_tls()
+                .and_then(|tls| {
+                    crate::tls::build_client_tls(crate::crypto::CryptoProfile::default(), &tls)
+                })
+                .map_err(|e| TransportError::Config(format!("syslog: {e}")))?;
+            Some((client, name))
+        } else {
+            None
+        };
+        let filter_engine = TransportFilterEngine::new(
+            &[],
+            &config.filters_out,
+            &TransportFilterTierConfig::from_cascade()?,
+        )?;
+        let escape_lf = matches!(config.protocol, SyslogProtocol::Tcp | SyslogProtocol::Tls)
+            && config.framing == SyslogFraming::Lf;
+        let transport = Self {
+            address: config.address.clone(),
+            protocol: config.protocol,
+            framing: config.framing,
+            formatter: Formatter::new(config, escape_lf, jiff::tz::TimeZone::system()),
+            limit: config.message_limit(),
+            send_timeout: Duration::from_millis(config.send_timeout_ms),
+            relp_window: config.relp_window,
+            connector: Connector::new(
+                config.address.clone(),
+                Duration::from_millis(config.connect_timeout_ms),
+                tls,
+            ),
+            filter_engine,
+            state: Mutex::new(State::default()),
+            closed: AtomicBool::new(false),
+        };
+        tracing::info!(
+            address = %config.address,
+            protocol = config.protocol.as_str(),
+            format = ?config.format,
+            framing = ?config.framing,
+            tls = config.uses_tls(),
+            trust = config.tls.as_ref().map(|t| t.client.trust.as_str()),
+            guarantee = %transport.delivery_guarantee(),
+            max_message_bytes = transport.limit,
+            "syslog sender built"
+        );
+        Ok(transport)
+    }
+
+    /// Load the config from the cascade under `transport.syslog` and build.
+    ///
+    /// # Errors
+    ///
+    /// As [`SyslogConfig::from_cascade`] and [`new`](Self::new).
+    pub fn from_cascade() -> TransportResult<Self> {
+        Self::new(&SyslogConfig::from_cascade()?)
+    }
+
+    /// Format the records that pass the filters into `state.messages`, one
+    /// range each, and fold the ones handled without sending into `outcome`.
+    fn format_batch(&self, records: &[Record], state: &mut State, outcome: &mut BlockOutcome) {
+        state.messages.clear();
+        state.ranges.clear();
+        for record in records {
+            if self.filter_engine.has_outbound_filters() {
+                match self.filter_engine.apply_outbound(&record.payload) {
+                    FilterDisposition::Pass => {}
+                    FilterDisposition::Drop => continue,
+                    FilterDisposition::Dlq => {
+                        let _ = outcome.add(SendResult::FilteredDlq);
+                        continue;
+                    }
+                }
+            }
+            let begin = state.messages.len();
+            self.formatter.write(
+                &record.payload,
+                record.key.as_deref(),
+                record.metadata.timestamp_ms,
+                &mut state.messages,
+            );
+            let len = state.messages.len() - begin;
+            if len > self.limit {
+                if self.protocol == SyslogProtocol::Udp {
+                    let cut = utf8_floor(&state.messages[begin..], self.limit);
+                    state.messages.truncate(begin + cut);
+                    metrics::counter!("transport_truncated_total", "transport" => "syslog")
+                        .increment(1);
+                    tracing::debug!(bytes = len, limit = self.limit, "syslog: datagram cut");
+                } else {
+                    state.messages.truncate(begin);
+                    metrics::counter!("transport_message_too_large_total", "transport" => "syslog")
+                        .increment(1);
+                    tracing::warn!(
+                        bytes = len,
+                        limit = self.limit,
+                        "syslog: message over max_message_bytes dead-lettered"
+                    );
+                    let _ = outcome.add(SendResult::FilteredDlq);
+                    continue;
+                }
+            }
+            tracing::trace!(
+                bytes = state.messages.len() - begin,
+                "syslog: message formatted"
+            );
+            state.ranges.push(begin..state.messages.len());
+        }
+    }
+
+    /// Send the formatted messages over the open session, opening one first
+    /// when there is none or the receiver closed it.
+    async fn deliver(&self, state: &mut State) -> SendResult {
+        let State {
+            session,
+            messages,
+            ranges,
+            wire,
+        } = state;
+        let messages: Vec<&[u8]> = ranges.iter().map(|r| &messages[r.clone()]).collect();
+        // Taken out for the send and put back only after it, so a send dropped
+        // at its deadline drops the connection with it, never one cut mid-frame.
+        let current = session.take();
+        let (result, kept) = match self.protocol {
+            SyslogProtocol::Tcp | SyslogProtocol::Tls => {
+                self.deliver_stream(current, &messages, wire).await
+            }
+            SyslogProtocol::Relp => self.deliver_relp(current, &messages).await,
+            SyslogProtocol::Udp => self.deliver_udp(current, &messages).await,
+        };
+        *session = kept;
+        result
+    }
+
+    async fn deliver_stream(
+        &self,
+        current: Option<Session>,
+        messages: &[&[u8]],
+        wire: &mut Vec<u8>,
+    ) -> (SendResult, Option<Session>) {
+        wire.clear();
+        let _ = match self.framing {
+            SyslogFraming::OctetCounting => OctetCounting.encode(messages, wire),
+            SyslogFraming::Lf => Lf.encode(messages, wire),
+        };
+        let open = match current {
+            Some(Session::Stream(mut stream)) => match check_idle(&mut stream).await {
+                Idle::Closed => {
+                    tracing::info!(
+                        address = %self.address,
+                        "syslog: receiver closed the idle connection, reconnecting"
+                    );
+                    None
+                }
+                Idle::Open | Idle::Data => Some(stream),
+            },
+            _ => None,
+        };
+        let mut stream = match open {
+            Some(stream) => stream,
+            None => match self.connect().await {
+                Ok(stream) => stream,
+                Err(e) => return (self.connect_failed(&e), None),
+            },
+        };
+        let written = async {
+            stream.write_all(wire).await?;
+            stream.flush().await
+        };
+        match written.await {
+            Ok(()) => (SendResult::Ok, Some(Session::Stream(stream))),
+            Err(e) => {
+                tracing::warn!(
+                    address = %self.address,
+                    error = %e,
+                    records = messages.len(),
+                    "syslog: write broke off, the batch is sent again"
+                );
+                metrics::counter!("transport_send_errors_total", "transport" => "syslog")
+                    .increment(1);
+                (SendResult::Backpressured, None)
+            }
+        }
+    }
+
+    async fn deliver_relp(
+        &self,
+        current: Option<Session>,
+        messages: &[&[u8]],
+    ) -> (SendResult, Option<Session>) {
+        let mut answers: Vec<Option<Answer>> = vec![None; messages.len()];
+        let mut session = match current {
+            Some(Session::Relp(mut session)) => {
+                if check_idle(session.stream_mut()).await == Idle::Open {
+                    Some(session)
+                } else {
+                    tracing::info!(
+                        address = %self.address,
+                        "syslog: RELP receiver closed the idle session, reconnecting"
+                    );
+                    None
+                }
+            }
+            _ => None,
+        };
+        let mut reconnected = false;
+        loop {
+            let mut open = match session.take() {
+                Some(open) => open,
+                None => match self.open_relp().await {
+                    Ok(open) => open,
+                    Err(result) => return (result, None),
+                },
+            };
+            match open.send(messages, &mut answers, self.relp_window).await {
+                Ok(()) => {
+                    session = Some(open);
+                    break;
+                }
+                Err(RelpError::Io(e)) if !reconnected => {
+                    let unanswered = answers.iter().filter(|a| a.is_none()).count();
+                    tracing::warn!(
+                        address = %self.address,
+                        error = %e,
+                        unanswered,
+                        "syslog: RELP session lost mid-batch, resending the unanswered messages"
+                    );
+                    metrics::counter!(
+                        "transport_redelivered_total",
+                        "transport" => "syslog",
+                        "reason" => "reconnect"
+                    )
+                    .increment(1);
+                    reconnected = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        address = %self.address,
+                        error = %e,
+                        "syslog: RELP send broke off, the batch is sent again"
+                    );
+                    metrics::counter!("transport_send_errors_total", "transport" => "syslog")
+                        .increment(1);
+                    return (SendResult::Backpressured, None);
+                }
+            }
+        }
+        let refused = answers.iter().enumerate().find_map(|(i, a)| match a {
+            Some(Answer::Refused(text)) => Some((i, text)),
+            _ => None,
+        });
+        // RELP has no permanent refusal: a receiver answers 500 for a full
+        // queue as well as a bad message, so the whole batch is sent again.
+        if let Some((index, text)) = refused {
+            tracing::warn!(
+                address = %self.address,
+                message = index + 1,
+                records = messages.len(),
+                answer = %text,
+                "syslog: RELP receiver refused a message, the batch is sent again"
+            );
+            metrics::counter!("transport_send_errors_total", "transport" => "syslog").increment(1);
+            return (SendResult::Backpressured, session.map(Session::Relp));
+        }
+        (SendResult::Ok, session.map(Session::Relp))
+    }
+
+    async fn deliver_udp(
+        &self,
+        current: Option<Session>,
+        messages: &[&[u8]],
+    ) -> (SendResult, Option<Session>) {
+        let socket = match current {
+            Some(Session::Udp(socket)) => socket,
+            _ => match self.bind_udp().await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    tracing::warn!(address = %self.address, error = %e, "syslog: UDP socket failed");
+                    metrics::counter!("transport_send_errors_total", "transport" => "syslog")
+                        .increment(1);
+                    return (SendResult::Backpressured, None);
+                }
+            },
+        };
+        for message in messages {
+            if let Err(e) = socket.send(message).await {
+                tracing::warn!(
+                    address = %self.address,
+                    error = %e,
+                    "syslog: datagram not sent, the batch is sent again"
+                );
+                metrics::counter!("transport_send_errors_total", "transport" => "syslog")
+                    .increment(1);
+                return (SendResult::Backpressured, None);
+            }
+        }
+        (SendResult::Ok, Some(Session::Udp(socket)))
+    }
+
+    async fn connect(&self) -> Result<Stream, ConnectError> {
+        let stream = self.connector.connect().await?;
+        tracing::info!(
+            address = %self.address,
+            protocol = self.protocol.as_str(),
+            "syslog: connected"
+        );
+        Ok(stream)
+    }
+
+    /// A new RELP session, or the result to answer the batch with.
+    async fn open_relp(&self) -> Result<RelpSession, SendResult> {
+        let stream = self.connect().await.map_err(|e| self.connect_failed(&e))?;
+        let opening = tokio::time::timeout(self.connector.timeout(), RelpSession::open(stream));
+        match opening.await {
+            Ok(Ok(session)) => Ok(session),
+            Ok(Err(RelpError::Refused(why))) => {
+                tracing::error!(address = %self.address, reason = %why, "syslog: RELP session refused");
+                Err(SendResult::Fatal(TransportError::Config(format!(
+                    "RELP receiver {} refused the session: {why}",
+                    self.address
+                ))))
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(address = %self.address, error = %e, "syslog: RELP open failed");
+                metrics::counter!("transport_send_errors_total", "transport" => "syslog")
+                    .increment(1);
+                Err(SendResult::Backpressured)
+            }
+            Err(_) => {
+                tracing::warn!(address = %self.address, "syslog: RELP open not answered in time");
+                metrics::counter!("transport_send_errors_total", "transport" => "syslog")
+                    .increment(1);
+                Err(SendResult::Backpressured)
+            }
+        }
+    }
+
+    async fn bind_udp(&self) -> std::io::Result<UdpSocket> {
+        let target = tokio::net::lookup_host(&self.address)
+            .await?
+            .next()
+            .ok_or_else(|| std::io::Error::other("the address resolved to nothing"))?;
+        let local = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(local).await?;
+        socket.connect(target).await?;
+        tracing::info!(address = %self.address, peer = %target, "syslog: UDP socket ready");
+        Ok(socket)
+    }
+
+    /// The answer to a batch whose connection could not be made.
+    fn connect_failed(&self, e: &ConnectError) -> SendResult {
+        metrics::counter!("transport_send_errors_total", "transport" => "syslog").increment(1);
+        match e {
+            ConnectError::Unreachable(_) => {
+                tracing::warn!(address = %self.address, error = %e, "syslog: cannot connect");
+                SendResult::Backpressured
+            }
+            ConnectError::Trust(_) => {
+                tracing::error!(address = %self.address, error = %e, "syslog: TLS refused");
+                SendResult::Fatal(TransportError::Config(format!(
+                    "syslog {}: {e}",
+                    self.address
+                )))
+            }
+        }
+    }
+}
+
+/// The longest prefix of `bytes` within `limit` that does not end inside a
+/// UTF-8 sequence.
+fn utf8_floor(bytes: &[u8], limit: usize) -> usize {
+    let mut cut = limit.min(bytes.len());
+    while cut > 0 && cut < bytes.len() && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
+        cut -= 1;
+    }
+    cut
+}
+
+impl TransportBase for SyslogTransport {
+    /// Stop sending. A RELP session is closed with its `close` command, a
+    /// stream shut down. Idempotent.
+    async fn close(&self) -> TransportResult<()> {
+        self.closed.store(true, Ordering::Relaxed);
+        let session = self.state.lock().await.session.take();
+        match session {
+            Some(Session::Relp(session)) => session.close().await,
+            Some(Session::Stream(mut stream)) => {
+                if let Err(e) = stream.shutdown().await {
+                    tracing::debug!(error = %e, "syslog: stream shutdown");
+                }
+            }
+            Some(Session::Udp(_)) | None => {}
+        }
+        Ok(())
+    }
+
+    fn is_healthy(&self) -> bool {
+        !self.closed.load(Ordering::Relaxed)
+    }
+
+    fn name(&self) -> &'static str {
+        "syslog"
+    }
+
+    fn delivery_guarantee(&self) -> DeliveryGuarantee {
+        match self.protocol {
+            SyslogProtocol::Tcp | SyslogProtocol::Tls => DeliveryGuarantee::Written,
+            SyslogProtocol::Udp => DeliveryGuarantee::FireAndForget,
+            SyslogProtocol::Relp => DeliveryGuarantee::Acknowledged,
+        }
+    }
+
+    /// Connect, and open the RELP session, keeping it for the first send.
+    /// UDP resolves the address.
+    async fn healthcheck(&self) -> TransportResult<()> {
+        let fail =
+            |what: String| TransportError::Connection(format!("syslog {}: {what}", self.address));
+        let mut state = self.state.lock().await;
+        if state.session.is_some() {
+            return Ok(());
+        }
+        state.session = Some(match self.protocol {
+            SyslogProtocol::Tcp | SyslogProtocol::Tls => {
+                Session::Stream(self.connect().await.map_err(|e| fail(e.to_string()))?)
+            }
+            SyslogProtocol::Relp => Session::Relp(
+                self.open_relp()
+                    .await
+                    .map_err(|result| fail(format!("{result:?}")))?,
+            ),
+            SyslogProtocol::Udp => {
+                Session::Udp(self.bind_udp().await.map_err(|e| fail(e.to_string()))?)
+            }
+        });
+        Ok(())
+    }
+}
+
+impl TransportSender for SyslogTransport {
+    /// Send `payload` as one message, with `destination` as its MSGID.
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
+        let format = PayloadFormat::detect(&payload);
+        let record = Record {
+            payload,
+            key: (!destination.is_empty()).then(|| Arc::from(destination)),
+            headers: Vec::new(),
+            metadata: RecordMeta {
+                timestamp_ms: None,
+                format,
+            },
+        };
+        self.send_batch(std::slice::from_ref(&record)).await
+    }
+
+    async fn send_record(&self, record: &Record) -> SendResult {
+        self.send_batch(std::slice::from_ref(record)).await
+    }
+
+    /// Send the block within `send_timeout_ms`.
+    async fn send_batch(&self, records: &[Record]) -> SendResult {
+        self.send_batch_by(records, Instant::now() + self.send_timeout)
+            .await
+    }
+
+    /// Format the block, write it as one unit, and answer by `deadline`.
+    async fn send_batch_by(&self, records: &[Record], deadline: Instant) -> SendResult {
+        if self.closed.load(Ordering::Relaxed) {
+            return SendResult::Fatal(TransportError::Closed);
+        }
+        let started = Instant::now();
+        let mut outcome = BlockOutcome::default();
+        // The wait for the lock counts against the deadline too.
+        let work = async {
+            let mut state = self.state.lock().await;
+            self.format_batch(records, &mut state, &mut outcome);
+            let count = state.ranges.len();
+            let bytes = state.messages.len();
+            if count == 0 {
+                return (None, 0, 0);
+            }
+            (Some(self.deliver(&mut state).await), count, bytes)
+        };
+        let until = tokio::time::Instant::from_std(deadline);
+        let (result, count, bytes) =
+            tokio::time::timeout_at(until, work)
+                .await
+                .unwrap_or_else(|_elapsed| {
+                    tracing::warn!(
+                        address = %self.address,
+                        records = records.len(),
+                        "syslog: send deadline elapsed, the batch is sent again"
+                    );
+                    metrics::counter!(
+                        "transport_redelivered_total",
+                        "transport" => "syslog",
+                        "reason" => "deadline"
+                    )
+                    .increment(1);
+                    (Some(SendResult::Backpressured), 0, 0)
+                });
+        let Some(result) = result else {
+            return outcome.finish();
+        };
+        metrics::histogram!("transport_send_duration_seconds", "transport" => "syslog")
+            .record(started.elapsed().as_secs_f64());
+        match result {
+            SendResult::Ok => {
+                metrics::counter!("transport_sent_total", "transport" => "syslog")
+                    .increment(count as u64);
+                metrics::counter!("transport_sent_bytes_total", "transport" => "syslog")
+                    .increment(bytes as u64);
+                tracing::debug!(
+                    address = %self.address,
+                    records = count,
+                    bytes,
+                    "syslog: batch sent"
+                );
+                outcome.finish()
+            }
+            SendResult::Backpressured => {
+                metrics::counter!("transport_backpressured_total", "transport" => "syslog")
+                    .increment(1);
+                SendResult::Backpressured
+            }
+            other => other,
+        }
+    }
+
+    /// A record an outbound `dlq` filter matches, or whose message is over
+    /// `max_message_bytes` on a protocol that does not cut it.
+    fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
+        if self.filter_engine.outbound_dead_letter(&record.payload) {
+            return Some(DeadLetterReason::OutboundFilter);
+        }
+        if self.protocol == SyslogProtocol::Udp {
+            return None;
+        }
+        let mut message = Vec::with_capacity(record.payload.len() + 128);
+        self.formatter.write(
+            &record.payload,
+            record.key.as_deref(),
+            record.metadata.timestamp_ms,
+            &mut message,
+        );
+        (message.len() > self.limit).then_some(DeadLetterReason::TooLarge {
+            bytes: message.len(),
+            limit: self.limit,
+        })
+    }
+}

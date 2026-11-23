@@ -140,6 +140,54 @@ impl ClientTls {
     }
 }
 
+/// The config section a transport reads its client TLS from: a trust choice,
+/// one CA file and an optional client certificate.
+///
+/// ```yaml
+/// tls:
+///   trust: bundle
+///   ca_path: /etc/tls/ca.pem
+///   client_cert_path: /etc/tls/client.pem
+///   client_key_path: /etc/tls/client.key
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct ClientTlsConfig {
+    /// `native` (default), `platform` or `bundle`, as in [`TrustChoice`].
+    pub trust: TrustChoice,
+    /// CA PEM file, trusted beside the OS store under `native` and
+    /// `platform`, and alone under `bundle`.
+    pub ca_path: Option<PathBuf>,
+    /// Client certificate PEM for mutual TLS, with `client_key_path`.
+    pub client_cert_path: Option<PathBuf>,
+    /// Client private key PEM for mutual TLS, with `client_cert_path`. May
+    /// name the same file when it holds both.
+    pub client_key_path: Option<PathBuf>,
+}
+
+impl ClientTlsConfig {
+    /// The [`ClientTls`] this section names.
+    ///
+    /// # Errors
+    ///
+    /// [`TlsError::Build`] when only one of the client certificate and key is
+    /// set.
+    pub fn client_tls(&self) -> Result<ClientTls, TlsError> {
+        let mut tls = ClientTls::new(self.trust);
+        if let Some(ca) = &self.ca_path {
+            tls = tls.with_ca(ca);
+        }
+        match (&self.client_cert_path, &self.client_key_path) {
+            (Some(cert), Some(key)) => Ok(tls.with_identity(cert, key)),
+            (None, None) => Ok(tls),
+            _ => Err(TlsError::Build(
+                "mutual TLS needs both client_cert_path and client_key_path".to_string(),
+            )),
+        }
+    }
+}
+
 /// Build a rustls [`ClientConfig`] for `tls` on `profile`.
 ///
 /// Every file is read here, so a missing or wrong file fails the build and

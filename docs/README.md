@@ -98,7 +98,8 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Runtime | [runtime/runtime-context.md](runtime/runtime-context.md) | Kubernetes, Docker, container and bare-metal detection, pod metadata |
 | Runtime | [runtime/memory.md](runtime/memory.md) | `MemoryGuard`, cgroup-aware backpressure |
 | Transport | [transport/README.md](transport/README.md) | Trait architecture, factory, `AnySender`, commit tokens |
-| Transport | [transport/backends.md](transport/backends.md) | Kafka, gRPC, Memory, File, Pipe, HTTP |
+| Transport | [transport/backends.md](transport/backends.md) | Kafka, gRPC, Memory, File, Pipe, HTTP, Syslog |
+| Transport | [transport/syslog.md](transport/syslog.md) | RFC 5424 and 3164 over TCP, TLS, UDP and RELP, and how each failure answers |
 | Transport | [transport/grpc.md](transport/grpc.md) | gRPC `send_batch` blocks joined into one call |
 | Transport | [transport/http.md](transport/http.md) | HTTP sending: credentials, body framing, gzip, failover, proxy, redirects, status answers |
 | Transport | [transport/filter-engine.md](transport/filter-engine.md) | 3-tier filter (SIMD / compiled CEL / complex CEL) |

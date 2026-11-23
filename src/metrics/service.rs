@@ -127,6 +127,10 @@ impl ServiceMetrics {
             "Records over a sender's size ceiling, refused before sending or by the receiver"
         );
         metrics::describe_counter!(
+            "transport_truncated_total",
+            "Messages cut to a sender's size ceiling and sent"
+        );
+        metrics::describe_counter!(
             "transport_coalesced_calls_total",
             "gRPC RouteBatch calls that joined send_batch blocks"
         );
@@ -212,6 +216,12 @@ impl ServiceMetrics {
             (
                 "transport_message_too_large_total",
                 "Records over a sender's size ceiling, refused before sending or by the receiver",
+                MetricType::Counter,
+                &["transport"],
+            ),
+            (
+                "transport_truncated_total",
+                "Messages cut to a sender's size ceiling and sent",
                 MetricType::Counter,
                 &["transport"],
             ),

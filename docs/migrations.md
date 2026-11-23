@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.34
 
+### Syslog transport, `TransportType::Syslog` (API CHANGE)
+
+The `transport-syslog` feature sends records to a syslog receiver as RFC 5424 or RFC 3164 messages over TCP, TLS, UDP or RELP, as `type: syslog`. `scalo::tls::ClientTlsConfig` is the `trust`, `ca_path`, `client_cert_path` and `client_key_path` section a transport reads its client TLS from. See [transport/syslog.md](transport/syslog.md). `transport-all`, and so `full`, pulls it.
+
+**Consumer adjustment** -- exhaustive matches on `TransportType` and `AnySender` add the `Syslog` arm. A literal `TransportConfig` adds `syslog`. `syslog` joins the built-in type names, so a custom sender registered under it is refused: register it under another name.
+
 ### File writers rotate by size, sync on request, set file modes and cut a partial last line (API and BEHAVIOUR CHANGE)
 
 `io::NdjsonWriter` no longer uses `file-rotate`, and `chrono` leaves the `io` feature. The DLQ file backend, the file output and now the file transport write through it. `FileWriterConfig`, `FileDlqConfig` and `FileOutputConfig` gain a flattened `write: FileWriteOptions`, so its keys sit beside `rotation`: `max_bytes` (rotate before a write that would pass it), `max_files` (rotated files kept), `durable` (sync each write, and the folder after a create or rotation, off by default), `file_mode` and `dir_mode` (unset by default, so the umask decides as before). `RotationPeriod` gains `Never`. `FileTransportConfig` gains `rotation` (default `never`), `max_age_days` (default none), `compress_rotated` (default off) and the same `write` keys. See [transport/backends.md](transport/backends.md#file).

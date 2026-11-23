@@ -32,6 +32,8 @@ pub enum TransportType {
     Pipe,
     /// HTTP/HTTPS (webhook delivery, REST ingest).
     Http,
+    /// Syslog over TCP, TLS, UDP or RELP (send only).
+    Syslog,
     /// A sender registered under this type name.
     Custom(String),
 }
@@ -39,7 +41,7 @@ pub enum TransportType {
 impl TransportType {
     /// The built-in type names, which no custom sender may take.
     pub const BUILT_IN: &'static [&'static str] =
-        &["kafka", "grpc", "memory", "file", "pipe", "http"];
+        &["kafka", "grpc", "memory", "file", "pipe", "http", "syslog"];
 
     /// The config name of this type.
     #[must_use]
@@ -51,6 +53,7 @@ impl TransportType {
             Self::File => "file",
             Self::Pipe => "pipe",
             Self::Http => "http",
+            Self::Syslog => "syslog",
             Self::Custom(name) => name,
         }
     }
@@ -65,6 +68,7 @@ impl TransportType {
             "file" => Self::File,
             "pipe" => Self::Pipe,
             "http" => Self::Http,
+            "syslog" => Self::Syslog,
             other => Self::Custom(other.to_string()),
         }
     }
@@ -306,8 +310,8 @@ impl BlockOutcome {
 /// matching `transport_type` is read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransportConfig {
-    /// Transport type (kafka, grpc, memory, file, pipe, http), or the name a
-    /// custom sender was registered under.
+    /// Transport type (kafka, grpc, memory, file, pipe, http, syslog), or the
+    /// name a custom sender was registered under.
     #[serde(rename = "type", default)]
     pub transport_type: TransportType,
 
@@ -351,6 +355,11 @@ pub struct TransportConfig {
     #[serde(default)]
     pub http: Option<super::http::HttpTransportConfig>,
 
+    /// Syslog transport configuration (send only).
+    #[cfg(feature = "transport-syslog")]
+    #[serde(default)]
+    pub syslog: Option<super::syslog::SyslogConfig>,
+
     // Placeholder fields when features are disabled
     #[cfg(not(feature = "transport-kafka"))]
     #[serde(default, skip)]
@@ -375,6 +384,10 @@ pub struct TransportConfig {
     #[cfg(not(feature = "transport-http"))]
     #[serde(default, skip)]
     pub http: Option<()>,
+
+    #[cfg(not(feature = "transport-syslog"))]
+    #[serde(default, skip)]
+    pub syslog: Option<()>,
 
     /// Every other key, by name. A custom sender reads its section from the
     /// key named after its type.
@@ -541,6 +554,7 @@ mod tests {
             ("file", TransportType::File),
             ("pipe", TransportType::Pipe),
             ("http", TransportType::Http),
+            ("syslog", TransportType::Syslog),
             ("audit_log", TransportType::Custom("audit_log".into())),
             ("Kafka", TransportType::Custom("Kafka".into())),
         ];
