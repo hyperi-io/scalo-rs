@@ -536,7 +536,7 @@ fn log_version_response(config: &VersionCheckConfig, resp: &VersionCheckResponse
             let age = resp
                 .published_at
                 .as_deref()
-                .and_then(format_age)
+                .and_then(|published| format_age(published, jiff::Timestamp::now()))
                 .unwrap_or_default();
 
             tracing::info!(
@@ -563,24 +563,20 @@ fn log_version_response(config: &VersionCheckConfig, resp: &VersionCheckResponse
     }
 }
 
-/// Format an ISO 8601 timestamp into a human-readable age string.
+/// Format an ISO 8601 timestamp into a human-readable age as of `now`.
 ///
-/// Returns `None` if the timestamp cannot be parsed.
-fn format_age(published_at: &str) -> Option<String> {
-    // Parse ISO 8601 with timezone (e.g., "2026-01-15T10:00:00Z")
-    // Try with timezone first, then without
-    let published = published_at
-        .parse::<chrono::DateTime<chrono::Utc>>()
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(published_at, "%Y-%m-%dT%H:%M:%S")
-                .map(|dt| dt.and_utc())
-        })
-        .ok()?;
+/// Returns `None` if the timestamp cannot be parsed. One with no offset is
+/// read as UTC.
+fn format_age(published_at: &str, now: jiff::Timestamp) -> Option<String> {
+    let published: jiff::Timestamp = match published_at.parse() {
+        Ok(published) => published,
+        Err(_) => jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", published_at)
+            .and_then(|dt| dt.to_zoned_datetime(jiff::tz::TimeZone::UTC))
+            .ok()?
+            .timestamp(),
+    };
 
-    let now = chrono::Utc::now();
-    let duration = now.signed_duration_since(published);
-
-    let days = duration.num_days();
+    let days = now.duration_since(published).as_secs() / 86_400;
     if days < 0 {
         return Some("just released".into());
     }
@@ -868,33 +864,23 @@ mod tests {
     }
 
     #[test]
-    fn test_format_age_today() {
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let age = format_age(&now).unwrap();
-        assert_eq!(age, "released today");
-    }
-
-    #[test]
-    fn test_format_age_days() {
-        let ten_days_ago = (chrono::Utc::now() - chrono::Duration::days(10))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-        let age = format_age(&ten_days_ago).unwrap();
-        assert_eq!(age, "released 10 days ago");
-    }
-
-    #[test]
-    fn test_format_age_months() {
-        let three_months_ago = (chrono::Utc::now() - chrono::Duration::days(90))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-        let age = format_age(&three_months_ago).unwrap();
-        assert_eq!(age, "released 3 months ago");
-    }
-
-    #[test]
-    fn test_format_age_invalid() {
-        assert!(format_age("not-a-date").is_none());
+    fn format_age_counts_whole_days_back_from_now() {
+        let now: jiff::Timestamp = "2026-11-23T12:00:00Z".parse().unwrap();
+        for (published, age) in [
+            ("2026-11-24T12:00:00Z", Some("just released")),
+            ("2026-11-23T12:00:00Z", Some("released today")),
+            ("2026-11-22T11:00:00Z", Some("released 1 day ago")),
+            ("2026-11-13T12:00:00Z", Some("released 10 days ago")),
+            ("2026-11-13T22:00:00+10:00", Some("released 10 days ago")),
+            ("2026-11-13T12:00:00", Some("released 10 days ago")),
+            ("2026-10-24T12:00:00Z", Some("released 1 month ago")),
+            ("2026-08-25T12:00:00Z", Some("released 3 months ago")),
+            ("2025-11-23T12:00:00Z", Some("released 1y ago")),
+            ("2024-09-23T12:00:00Z", Some("released 2y 2m ago")),
+            ("not-a-date", None),
+        ] {
+            assert_eq!(format_age(published, now).as_deref(), age, "{published}");
+        }
     }
 
     #[test]

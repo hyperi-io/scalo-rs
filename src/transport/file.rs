@@ -525,7 +525,7 @@ impl TransportReceiver for FileTransport {
             }
 
             let format = PayloadFormat::detect(&payload);
-            let timestamp_ms = chrono::Utc::now().timestamp_millis();
+            let timestamp_ms = crate::clock::epoch_millis();
 
             pending.push(ReadLine::Record(Message {
                 key: None,

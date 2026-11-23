@@ -227,7 +227,7 @@ impl DlqEntry {
     /// Create a new DLQ entry with the current timestamp.
     pub fn new(service: impl Into<String>, reason: impl Into<String>, payload: Vec<u8>) -> Self {
         Self {
-            timestamp: chrono::Utc::now().timestamp_millis(),
+            timestamp: crate::clock::epoch_millis(),
             service: service.into(),
             reason: reason.into(),
             attempts: 0,

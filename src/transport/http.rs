@@ -682,7 +682,7 @@ async fn ingest_handler(
 
     let seq = state.sequence.fetch_add(1, Ordering::Relaxed);
     let format = PayloadFormat::detect(&body);
-    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    let timestamp_ms = crate::clock::epoch_millis();
 
     // Capture wire size before `body` moves into the message.
     #[cfg(feature = "metrics")]

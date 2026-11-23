@@ -289,6 +289,11 @@ async fn download(kind: Kind, config: &GeoIpConfig) -> Result<PathBuf, GeoIpDown
         .await
 }
 
+/// The UTC `YYYY-MM` DB-IP puts in each monthly file name.
+fn dbip_month(now: jiff::Timestamp) -> String {
+    now.strftime("%Y-%m").to_string()
+}
+
 /// Map (provider, kind) onto a concrete transfer.
 ///
 /// Errors here are configuration faults -- a missing credential or a provider
@@ -305,7 +310,7 @@ fn plan(kind: Kind, config: &GeoIpConfig) -> Result<Transfer, GeoIpDownloadError
         // DB-IP publishes a fresh dated file each month. The current month is
         // the only URL that resolves.
         (GeoIpProvider::DbIpLite, _) => {
-            let month = chrono::Utc::now().format("%Y-%m");
+            let month = dbip_month(jiff::Timestamp::now());
             let (slug, file) = match kind {
                 Kind::City => ("city", "dbip-city-lite.mmdb"),
                 Kind::Asn => ("asn", "dbip-asn-lite.mmdb"),

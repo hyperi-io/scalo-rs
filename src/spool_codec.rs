@@ -638,9 +638,14 @@ pub(crate) fn quarantine(
     Ok(Some(dest))
 }
 
+/// The local-time `YYYYMMDD-HHMMSS-<nanos>` in a quarantine directory's name.
+fn quarantine_stamp(now: &jiff::ZonedDateTime) -> String {
+    now.strftime("%Y%m%d-%H%M%S-%9f").to_string()
+}
+
 /// Create a uniquely named quarantine subdirectory inside `path`.
 fn create_quarantine_dir(path: &Path) -> io::Result<PathBuf> {
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%9f").to_string();
+    let stamp = quarantine_stamp(&jiff::ZonedDateTime::now());
     let mut last = io::Error::from(io::ErrorKind::AlreadyExists);
     for n in 0..100u32 {
         let dest = path.join(format!("{QUARANTINE_PREFIX}{stamp}-{n}"));
@@ -770,6 +775,13 @@ mod tests {
             .unwrap()
             .expect("files moved");
         assert!(first.starts_with(&spool), "inside the spool path");
+        let name = first.file_name().unwrap().to_str().unwrap();
+        let shape: Vec<usize> = name
+            .trim_start_matches(QUARANTINE_PREFIX)
+            .split('-')
+            .map(str::len)
+            .collect();
+        assert_eq!(shape, [8, 6, 9, 1], "{name}");
         assert!(first.join("0.q").exists());
         assert!(first.join("version").is_dir());
         assert!(!spool.join("0.q").exists());
@@ -791,6 +803,27 @@ mod tests {
             None,
             "nothing left to move"
         );
+    }
+
+    #[test]
+    fn quarantine_stamp_is_the_civil_time_with_nine_fraction_digits() {
+        for (instant, stamp) in [
+            (
+                "2026-03-07T04:05:06.000000789+00:00[UTC]",
+                "20260307-040506-000000789",
+            ),
+            (
+                "2026-12-31T23:59:59.5+10:00[+10:00]",
+                "20261231-235959-500000000",
+            ),
+            (
+                "2026-01-01T00:00:00-05:00[-05:00]",
+                "20260101-000000-000000000",
+            ),
+        ] {
+            let now: jiff::ZonedDateTime = instant.parse().unwrap();
+            assert_eq!(quarantine_stamp(&now), stamp, "{instant}");
+        }
     }
 
     /// `sync_segments` reports the newest segment, which the next call starts
