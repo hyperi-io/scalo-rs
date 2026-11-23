@@ -401,15 +401,17 @@ impl Framing for Lf {
     }
 }
 
-/// RFC 6587 octet counting: each record as its length in ASCII digits, a
-/// space, then the record.
+/// RFC 6587 octet counting: each syslog record as its length in ASCII digits,
+/// a space, then the record, which starts with its `<PRI>`.
 ///
-/// Decoding reads a frame that starts with a digit as counted, and anything
-/// else as an LF line, so a stream can mix the two. An empty record is `0 `. A counted frame
-/// over `max_record_bytes` but within `max_frame_bytes` is skipped whole. A
-/// count over `max_frame_bytes`, or digits not followed by a space, means the
-/// stream lost its place: the bytes to the next `\n` are read as an LF line and
-/// counting resumes after it.
+/// Decoding reads a frame as counted only when it is a count starting 1 to 9,
+/// one space, then `<`. Anything else is an LF line, so a stream can mix the
+/// two, and a line such as `2026 Oct 11 ...` never swallows what follows it.
+/// A record that is empty or does not start with `<` encodes, but decodes as
+/// an LF line. A counted frame over `max_record_bytes` but within
+/// `max_frame_bytes` is skipped whole. A count over `max_frame_bytes` is not
+/// trusted: the bytes to the next `\n` are read as an LF line and counting
+/// resumes after it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OctetCounting;
 
@@ -1058,7 +1060,7 @@ fn split_counted(
     limits: &DecodeLimits,
     at_end: bool,
 ) -> Result<Option<Split>, FramingError> {
-    if !buf.first().is_some_and(u8::is_ascii_digit) {
+    if !matches!(buf.first(), Some(b'1'..=b'9')) {
         return Ok(None);
     }
     let digits = buf.iter().take_while(|b| b.is_ascii_digit()).count();
@@ -1071,13 +1073,12 @@ fn split_counted(
     let Some(count) = count.filter(|&count| count <= frame_limit) else {
         return Ok(None);
     };
-    match buf.get(digits) {
-        Some(b' ') => {}
-        Some(_) => return Ok(None),
-        None if at_end => return Ok(None),
-        None => return Ok(Some(Split::More)),
-    }
     let start = digits + 1;
+    match (buf.get(digits), buf.get(start)) {
+        (Some(b' '), Some(b'<')) => {}
+        (Some(b' '), None) | (None, _) if !at_end => return Ok(Some(Split::More)),
+        _ => return Ok(None),
+    }
     let held = buf.len() - start;
     if count > limits.max_record_bytes {
         if held >= count {
@@ -1270,7 +1271,7 @@ mod tests {
         let cases: [(&dyn Framing, &[&[u8]], &[u8], usize); 11] = [
             (&Ndjson, &[b"a", b"b\n", b""], b"a\nb\n\n", 3),
             (&Lf, &[b"a", b"b\n", b""], b"a\nb\n\n\n", 3),
-            (&OctetCounting, &[b"<1>a", b""], b"4 <1>a0 ", 2),
+            (&OctetCounting, &[b"<1>a", b"<2>bc"], b"4 <1>a5 <2>bc", 2),
             (&JsonConcat, &[br#"{"a":1}"#, b"[2]"], br#"{"a":1}[2]"#, 2),
             (&JsonArray, &[b"1", b"{}"], b"[1,{}]", 2),
             (&JsonArray, &[], b"[]", 0),
@@ -1295,7 +1296,7 @@ mod tests {
     #[test]
     fn each_framing_decodes_these_records() {
         // (framing, unit, records)
-        let cases: [(&dyn Framing, &[u8], &[&[u8]]); 22] = [
+        let cases: [(&dyn Framing, &[u8], &[&[u8]]); 25] = [
             (
                 &Ndjson,
                 b"{\"a\":1}\r\n\n   \n  {\"b\": 2}  \n\t\r\nlast",
@@ -1309,9 +1310,19 @@ mod tests {
             ),
             (
                 &OctetCounting,
-                b"4 <1>a5 <2>bc\n6 <3>def0 <4>lf line\r\n",
-                &[b"<1>a", b"<2>bc", b"<3>def", b"", b"<4>lf line"],
+                b"4 <1>a5 <2>bc\n6 <3>def<4>lf line\r\n",
+                &[b"<1>a", b"<2>bc", b"<3>def", b"<4>lf line"],
             ),
+            // A count starts 1 to 9: a leading 0 makes the frame an LF line.
+            (&OctetCounting, b"05 <1>ab\n0 \n", &[b"05 <1>ab", b"0 "]),
+            // A count needs a space then `<` after it, or the frame is an LF line.
+            (
+                &OctetCounting,
+                b"2026 Oct 11 10:00:00 host msg\n4 <1>a",
+                &[b"2026 Oct 11 10:00:00 host msg", b"<1>a"],
+            ),
+            // The input ends after the space: an LF line.
+            (&OctetCounting, b"4 ", &[b"4 "]),
             (&OctetCounting, b"", &[]),
             (
                 &JsonConcat,
@@ -1441,7 +1452,7 @@ mod tests {
                 ANY,
                 FramingError::UnexpectedByte(8),
             ),
-            (&OctetCounting, b"10 short", ANY, eof.clone()),
+            (&OctetCounting, b"10 <short", ANY, eof.clone()),
             (
                 &Ndjson,
                 b"1234",
@@ -1474,16 +1485,16 @@ mod tests {
             (&Lf, b"abc\nabcd\r\nxy", &[b"abc", b"xy"], &[b"abcd\r"]),
             (
                 &OctetCounting,
-                b"3 abc6 abcdef2 xy",
-                &[b"abc", b"xy"],
-                &[b"abcdef"],
+                b"3 <ab6 <abcde2 <x",
+                &[b"<ab", b"<x"],
+                &[b"<abcde"],
             ),
             // A count over max_frame_bytes reads as an LF line, and counting resumes after it.
             (
                 &OctetCounting,
-                b"20 abcdefghij\n2 ok",
-                &[b"ok"],
-                &[b"20 abcdefghij"],
+                b"20 <abcdefghi\n2 <o",
+                &[b"<o"],
+                &[b"20 <abcdefghi"],
             ),
             (
                 &JsonArray,
@@ -1527,7 +1538,7 @@ mod tests {
             (Arc::new(Lf), b"ab\r\n\ncdefghij\n\nk"),
             (
                 Arc::new(OctetCounting),
-                b"2 ab6 abcdef\n20 abcdefghij\n1 z<5>lf\n",
+                b"2 <a6 <abcde\n20 <abcdefghi\n1 <<5>lf\n3 ab\n0 x\n4 <1>a",
             ),
         ];
         for (framing, unit) in cases {
@@ -1579,10 +1590,30 @@ mod tests {
         assert_eq!(lines.taken(), 4);
 
         let mut counted = StreamDecoder::new(Arc::new(OctetCounting), SMALL);
-        counted.push(b"6 abc");
+        counted.push(b"6 <ab");
         assert_eq!(counted.next_frame(), Ok(None));
         counted.finish();
         assert_eq!(counted.next_frame(), Err(FramingError::UnexpectedEof));
+
+        // A space at the end of what arrived waits for the byte after it.
+        let mut split = StreamDecoder::new(Arc::new(OctetCounting), ANY);
+        let record = |bytes: &[u8]| -> Result<Option<Frame>, FramingError> {
+            Ok(Some(Frame::Record(bytes.to_vec())))
+        };
+        split.push(b"4 ");
+        assert_eq!(split.next_frame(), Ok(None));
+        split.push(b"<1>a3 ");
+        assert_eq!(split.next_frame(), record(b"<1>a"));
+        assert_eq!(split.next_frame(), Ok(None));
+        split.push(b"x\n4 ");
+        assert_eq!(split.next_frame(), record(b"3 x"), "no `<`: an LF line");
+        assert_eq!(split.next_frame(), Ok(None));
+        split.finish();
+        assert_eq!(
+            split.next_frame(),
+            record(b"4 "),
+            "the input ended after the space"
+        );
 
         let mut whole = StreamDecoder::new(Arc::new(JsonArray), SMALL);
         whole.push(b"[1]");
@@ -1593,10 +1624,14 @@ mod tests {
     /// end to end, decode as the records of both.
     #[test]
     fn built_in_names_build_framings_that_append_as_they_say() {
-        let records: [&[u8]; 2] = [br#"{"a":1}"#, b"[2]"];
-        let mut twice = records.to_vec();
-        twice.extend(records);
         for name in BUILT_IN {
+            let records: [&[u8]; 2] = if *name == "octet_counting" {
+                [b"<1>a", b"<2>b"]
+            } else {
+                [br#"{"a":1}"#, b"[2]"]
+            };
+            let mut twice = records.to_vec();
+            twice.extend(records);
             let framing = FramingConfig {
                 framing_type: (*name).to_string(),
                 ..FramingConfig::default()

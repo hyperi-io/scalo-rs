@@ -30,7 +30,7 @@ Appends means two units back to back decode as the records of both, so a file ca
 | `max_record_bytes` | one record. A longer one goes to `Decoded::oversize`, or arrives from a stream as `Frame::Oversize` with its first `max_record_bytes`, and is never held whole |
 | `max_frame_bytes` | an octet count. A frame over `max_record_bytes` and within this is skipped whole. A larger count is not trusted: the bytes from it to the next `\n` are read as an LF line, and counting resumes after it |
 
-`octet_counting` reads a frame that starts with a digit as counted and anything else as an LF line, so one stream can carry both.
+`octet_counting` is for syslog. A frame is counted only when it is a count starting 1 to 9, one space, then the `<` of the PRI. Anything else is an LF line, so one stream can carry both, and a line such as `2026 Oct 11 ...` never swallows what follows it. A space at the end of the input so far waits for the next byte, and at the end of input it is a line.
 
 A framing that streams decodes a byte stream as it arrives:
 
