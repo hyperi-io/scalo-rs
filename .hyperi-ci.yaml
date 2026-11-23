@@ -59,6 +59,8 @@ build:
   rust:
     features: all
     targets: []
+    # The test compile's link stalled a free runner on memory at 3 cargo jobs (#548).
+    free_memory_per_job_gib: 6
 release:
   enabled: true
   # Named by exact directory: a glob skips library charts.
