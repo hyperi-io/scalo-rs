@@ -229,8 +229,8 @@ pub(crate) fn open_queue(
 }
 
 /// The versions of yaque a queue's `version/contents` may name. It is the
-/// release line `Cargo.toml` pins yaque to, and a test checks that a queue
-/// yaque creates satisfies it.
+/// range `src/yaque/version.rs` accepts, and a test checks that a queue yaque
+/// creates satisfies it.
 const YAQUE_QUEUE_VERSIONS: &str = "0.6.*";
 
 /// Refuse a queue directory yaque would panic on, as an error the open policy
@@ -885,8 +885,8 @@ mod tests {
     }
 
     /// A queue yaque stamps names a version `YAQUE_QUEUE_VERSIONS` accepts, so
-    /// a bump of the yaque pin that leaves the range behind fails here and not
-    /// in a service reopening its spool.
+    /// a change to the stamped version that leaves the range behind fails here
+    /// and not in a service reopening its spool.
     #[test]
     fn a_queue_yaque_creates_passes_the_version_check() {
         let dir = tempfile::tempdir().unwrap();
