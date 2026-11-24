@@ -69,6 +69,16 @@
 
 pub mod ack;
 pub mod codec;
+#[cfg(any(
+    feature = "transport-file",
+    feature = "transport-pipe",
+    feature = "transport-http",
+    feature = "transport-grpc",
+    feature = "transport-kafka",
+    feature = "transport-syslog",
+    feature = "transport-otlp"
+))]
+mod core;
 mod custom;
 mod delivery;
 mod detect;

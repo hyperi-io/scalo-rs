@@ -53,9 +53,10 @@ use self::format::Formatter;
 use self::relp::{Answer, RelpError, RelpSession};
 use self::stream::{ConnectError, Connector, Idle, Stream, check_idle};
 use super::ack::DeadLetterReason;
+use super::core::Meter;
 use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
-use super::filter::{FilterDisposition, TransportFilterEngine, TransportFilterTierConfig};
+use super::filter::{TransportFilterEngine, TransportFilterTierConfig};
 use super::traits::{TransportBase, TransportSender};
 use super::types::{BlockOutcome, PayloadFormat, SendResult};
 use super::work_batch::{Record, RecordMeta};
@@ -187,15 +188,9 @@ impl SyslogTransport {
         state.messages.clear();
         state.ranges.clear();
         for record in records {
-            if self.filter_engine.has_outbound_filters() {
-                match self.filter_engine.apply_outbound(&record.payload) {
-                    FilterDisposition::Pass => {}
-                    FilterDisposition::Drop => continue,
-                    FilterDisposition::Dlq => {
-                        let _ = outcome.add(SendResult::FilteredDlq);
-                        continue;
-                    }
-                }
+            if let Some(settled) = self.filter_engine.outbound_one(&record.payload) {
+                let _ = outcome.add(settled);
+                continue;
             }
             let begin = state.messages.len();
             self.formatter.write(
@@ -209,13 +204,13 @@ impl SyslogTransport {
                 if self.protocol == SyslogProtocol::Udp {
                     let cut = utf8_floor(&state.messages[begin..], self.limit);
                     state.messages.truncate(begin + cut);
+                    #[cfg(feature = "metrics")]
                     metrics::counter!("transport_truncated_total", "transport" => "syslog")
                         .increment(1);
                     tracing::debug!(bytes = len, limit = self.limit, "syslog: datagram cut");
                 } else {
                     state.messages.truncate(begin);
-                    metrics::counter!("transport_message_too_large_total", "transport" => "syslog")
-                        .increment(1);
+                    Self::count_too_large();
                     tracing::warn!(
                         bytes = len,
                         limit = self.limit,
@@ -304,8 +299,7 @@ impl SyslogTransport {
                     records = messages.len(),
                     "syslog: write broke off, the batch is sent again"
                 );
-                metrics::counter!("transport_send_errors_total", "transport" => "syslog")
-                    .increment(1);
+                Self::count_send_error();
                 (SendResult::Backpressured, None)
             }
         }
@@ -353,6 +347,7 @@ impl SyslogTransport {
                         unanswered,
                         "syslog: RELP session lost mid-batch, resending the unanswered messages"
                     );
+                    #[cfg(feature = "metrics")]
                     metrics::counter!(
                         "transport_redelivered_total",
                         "transport" => "syslog",
@@ -367,8 +362,7 @@ impl SyslogTransport {
                         error = %e,
                         "syslog: RELP send broke off, the batch is sent again"
                     );
-                    metrics::counter!("transport_send_errors_total", "transport" => "syslog")
-                        .increment(1);
+                    Self::count_send_error();
                     return (SendResult::Backpressured, None);
                 }
             }
@@ -387,7 +381,7 @@ impl SyslogTransport {
                 answer = %text,
                 "syslog: RELP receiver refused a message, the batch is sent again"
             );
-            metrics::counter!("transport_send_errors_total", "transport" => "syslog").increment(1);
+            Self::count_send_error();
             return (SendResult::Backpressured, session.map(Session::Relp));
         }
         (SendResult::Ok, session.map(Session::Relp))
@@ -404,8 +398,7 @@ impl SyslogTransport {
                 Ok(socket) => socket,
                 Err(e) => {
                     tracing::warn!(address = %self.address, error = %e, "syslog: UDP socket failed");
-                    metrics::counter!("transport_send_errors_total", "transport" => "syslog")
-                        .increment(1);
+                    Self::count_send_error();
                     return (SendResult::Backpressured, None);
                 }
             },
@@ -417,8 +410,7 @@ impl SyslogTransport {
                     error = %e,
                     "syslog: datagram not sent, the batch is sent again"
                 );
-                metrics::counter!("transport_send_errors_total", "transport" => "syslog")
-                    .increment(1);
+                Self::count_send_error();
                 return (SendResult::Backpressured, None);
             }
         }
@@ -450,14 +442,12 @@ impl SyslogTransport {
             }
             Ok(Err(e)) => {
                 tracing::warn!(address = %self.address, error = %e, "syslog: RELP open failed");
-                metrics::counter!("transport_send_errors_total", "transport" => "syslog")
-                    .increment(1);
+                Self::count_send_error();
                 Err(SendResult::Backpressured)
             }
             Err(_) => {
                 tracing::warn!(address = %self.address, "syslog: RELP open not answered in time");
-                metrics::counter!("transport_send_errors_total", "transport" => "syslog")
-                    .increment(1);
+                Self::count_send_error();
                 Err(SendResult::Backpressured)
             }
         }
@@ -481,7 +471,7 @@ impl SyslogTransport {
 
     /// The answer to a batch whose connection could not be made.
     fn connect_failed(&self, e: &ConnectError) -> SendResult {
-        metrics::counter!("transport_send_errors_total", "transport" => "syslog").increment(1);
+        Self::count_send_error();
         match e {
             ConnectError::Unreachable(_) => {
                 tracing::warn!(address = %self.address, error = %e, "syslog: cannot connect");
@@ -532,7 +522,7 @@ impl TransportBase for SyslogTransport {
     }
 
     fn name(&self) -> &'static str {
-        "syslog"
+        Self::TRANSPORT
     }
 
     fn delivery_guarantee(&self) -> DeliveryGuarantee {
@@ -569,6 +559,10 @@ impl TransportBase for SyslogTransport {
     }
 }
 
+impl Meter for SyslogTransport {
+    const TRANSPORT: &'static str = "syslog";
+}
+
 impl TransportSender for SyslogTransport {
     /// Send `payload` as one message, with `destination` as its MSGID.
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
@@ -600,7 +594,7 @@ impl TransportSender for SyslogTransport {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
-        let started = Instant::now();
+        let timer = Self::send_timer();
         let mut outcome = BlockOutcome::default();
         // The wait for the lock counts against the deadline too.
         let work = async {
@@ -623,6 +617,7 @@ impl TransportSender for SyslogTransport {
                         records = records.len(),
                         "syslog: send deadline elapsed, the batch is sent again"
                     );
+                    #[cfg(feature = "metrics")]
                     metrics::counter!(
                         "transport_redelivered_total",
                         "transport" => "syslog",
@@ -634,14 +629,10 @@ impl TransportSender for SyslogTransport {
         let Some(result) = result else {
             return outcome.finish();
         };
-        metrics::histogram!("transport_send_duration_seconds", "transport" => "syslog")
-            .record(started.elapsed().as_secs_f64());
+        timer.record();
         match result {
             SendResult::Ok => {
-                metrics::counter!("transport_sent_total", "transport" => "syslog")
-                    .increment(count as u64);
-                metrics::counter!("transport_sent_bytes_total", "transport" => "syslog")
-                    .increment(bytes as u64);
+                Self::count_sent(count as u64, bytes as u64);
                 tracing::debug!(
                     address = %self.address,
                     records = count,
@@ -651,8 +642,7 @@ impl TransportSender for SyslogTransport {
                 outcome.finish()
             }
             SendResult::Backpressured => {
-                metrics::counter!("transport_backpressured_total", "transport" => "syslog")
-                    .increment(1);
+                Self::count_backpressured();
                 SendResult::Backpressured
             }
             other => other,

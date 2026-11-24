@@ -151,7 +151,7 @@ A counter emitted both with and without labels is two series under one name, and
 
 ## Transport throughput
 
-The transport layer counts both events AND bytes, in both directions. All carry the `transport` label (backend kind: `kafka` / `grpc` / `http` / `file` / `pipe` / `memory`). A record sent through a `RoutedSender` counts once, under the transport that sent it, and only once it has landed. Bytes are RAW wire bytes (summed `payload.len()` per `WorkBatch`), incremented once per batch send/recv -- not per event.
+The transport layer counts both events AND bytes, in both directions. All carry the `transport` label (backend kind: `kafka` / `grpc` / `http` / `file` / `pipe` / `syslog` / `otlp`), and the memory transport counts none. A record sent through a `RoutedSender` counts once, under the transport that sent it, and only once it has landed. Bytes are payload bytes, summed `payload.len()`.
 
 | Metric | Direction | Meaning |
 | --- | --- | --- |

@@ -248,6 +248,15 @@ for entry in batch.dlq_entries {
     dlq_sender.send(entry).await?;
 }
 
+// A sender's answer for one payload: None sends it, Some(SendResult::Ok)
+// for a `drop` match, Some(SendResult::FilteredDlq) for a `dlq` match:
+if let Some(settled) = engine.outbound_one(&payload) {
+    return settled;
+}
+
+// A block: the records to send, borrowed, and the answer once they are sent:
+let (to_send, handled) = engine.partition_outbound(&records, |r| &r.payload);
+
 // Cheap fast-paths:
 if !engine.has_inbound_filters() {
     /* short-circuit, skip evaluation */
@@ -278,6 +287,8 @@ its own config section's `filters_in` / `filters_out` plus the
 | File | [src/transport/file.rs](../../src/transport/file.rs) |
 | Pipe | [src/transport/pipe.rs](../../src/transport/pipe.rs) |
 | HTTP | [src/transport/http.rs](../../src/transport/http.rs) |
+| Syslog | [src/transport/syslog/mod.rs](../../src/transport/syslog/mod.rs) |
+| OTLP (outbound only) | [src/transport/otlp/mod.rs](../../src/transport/otlp/mod.rs) |
 
 `PipeTransport::new` returns the transport rather than a `Result`, so a rule that fails to compile cannot fail its constructor. The pipe starts unhealthy instead: `send` returns `SendResult::Fatal` and `recv` returns `TransportError::Config`, both carrying the compile error, until it is rebuilt with valid rules. `AnySender` and `AnyReceiver` fail construction on the same rule, as for every other backend.
 

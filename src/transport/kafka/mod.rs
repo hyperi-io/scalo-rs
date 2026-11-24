@@ -75,6 +75,7 @@ use metrics::Rebalanced;
 use super::ack::{
     AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
 };
+use super::core::Meter;
 use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::finalizer::DeliveryStatus;
@@ -2027,22 +2028,9 @@ impl KafkaTransport {
     }
 }
 
-/// Produce-path steps shared by `send` and `send_batch`, so both paths filter,
-/// classify and count a record the same way.
+/// Produce-path steps shared by `send` and `send_batch`, so both paths classify
+/// and count a record the same way.
 impl KafkaTransport {
-    /// The settled result for a record the outbound filters keep off the wire,
-    /// or `None` when it passes.
-    fn outbound_disposition(&self, payload: &[u8]) -> Option<SendResult> {
-        if !self.filter_engine.has_outbound_filters() {
-            return None;
-        }
-        match self.filter_engine.apply_outbound(payload) {
-            super::filter::FilterDisposition::Pass => None,
-            super::filter::FilterDisposition::Drop => Some(SendResult::Ok),
-            super::filter::FilterDisposition::Dlq => Some(SendResult::FilteredDlq),
-        }
-    }
-
     /// Offer one record to `producer`'s queue without waiting for delivery.
     ///
     /// A full queue is re-offered every [`QUEUE_FULL_RETRY`] for up to
@@ -2084,13 +2072,7 @@ impl KafkaTransport {
     ) -> SendResult {
         match report {
             Ok(_) => {
-                #[cfg(feature = "metrics")]
-                {
-                    ::metrics::counter!("transport_sent_total", "transport" => "kafka")
-                        .increment(1);
-                    ::metrics::counter!("transport_sent_bytes_total", "transport" => "kafka")
-                        .increment(bytes as u64);
-                }
+                Self::count_sent(1, bytes as u64);
                 if let Some(role) = &self.auth.producer {
                     role.auth.mark_proven_by(generation);
                 }
@@ -2117,18 +2099,12 @@ impl KafkaTransport {
                 | classify::SendFailure::Fatal
         ) && self.auth.producer_refused()
         {
-            #[cfg(feature = "metrics")]
-            ::metrics::counter!("transport_send_errors_total", "transport" => "kafka").increment(1);
+            Self::count_send_error();
             return SendResult::Backpressured;
         }
         match class {
             classify::SendFailure::QueueFull => {
-                #[cfg(feature = "metrics")]
-                ::metrics::counter!(
-                    "transport_backpressured_total",
-                    "transport" => "kafka"
-                )
-                .increment(1);
+                Self::count_backpressured();
                 SendResult::Backpressured
             }
             classify::SendFailure::TooLarge => {
@@ -2136,12 +2112,7 @@ impl KafkaTransport {
                     bytes,
                     detail: err.to_string(),
                 };
-                #[cfg(feature = "metrics")]
-                ::metrics::counter!(
-                    "transport_message_too_large_total",
-                    "transport" => "kafka"
-                )
-                .increment(1);
+                Self::count_too_large();
                 tracing::warn!(
                     destination,
                     error = %refused,
@@ -2151,12 +2122,7 @@ impl KafkaTransport {
                 SendResult::FilteredDlq
             }
             classify::SendFailure::Retryable => {
-                #[cfg(feature = "metrics")]
-                ::metrics::counter!(
-                    "transport_send_errors_total",
-                    "transport" => "kafka"
-                )
-                .increment(1);
+                Self::count_send_error();
                 if self.send_degraded.enter() {
                     tracing::warn!(
                         destination,
@@ -2187,12 +2153,7 @@ impl KafkaTransport {
                 SendResult::Backpressured
             }
             classify::SendFailure::Fatal => {
-                #[cfg(feature = "metrics")]
-                ::metrics::counter!(
-                    "transport_send_errors_total",
-                    "transport" => "kafka"
-                )
-                .increment(1);
+                Self::count_send_error();
                 SendResult::Fatal(TransportError::Send(err.to_string()))
             }
         }
@@ -2252,7 +2213,7 @@ impl TransportBase for KafkaTransport {
     }
 
     fn name(&self) -> &'static str {
-        "kafka"
+        Self::TRANSPORT
     }
 
     fn delivery_guarantee(&self) -> DeliveryGuarantee {
@@ -2260,12 +2221,16 @@ impl TransportBase for KafkaTransport {
     }
 }
 
+impl Meter for KafkaTransport {
+    const TRANSPORT: &'static str = "kafka";
+}
+
 impl TransportSender for KafkaTransport {
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
-        if let Some(settled) = self.outbound_disposition(&payload) {
+        if let Some(settled) = self.filter_engine.outbound_one(&payload) {
             return settled;
         }
         let Some(producer) = self.current_producer() else {
@@ -2275,8 +2240,7 @@ impl TransportSender for KafkaTransport {
         let headers = trace_headers();
         let record = produce_record(destination, &payload, headers.as_ref());
 
-        #[cfg(feature = "metrics")]
-        let start = std::time::Instant::now();
+        let timer = Self::send_timer();
 
         let result = self.delivery_result(
             destination,
@@ -2288,14 +2252,7 @@ impl TransportSender for KafkaTransport {
             producer.generation,
         );
         let result = self.settle_on_replaced(result, producer.generation);
-
-        #[cfg(feature = "metrics")]
-        ::metrics::histogram!(
-            "transport_send_duration_seconds",
-            "transport" => "kafka"
-        )
-        .record(start.elapsed().as_secs_f64());
-
+        timer.record();
         result
     }
 
@@ -2344,14 +2301,13 @@ impl TransportSender for KafkaTransport {
         };
 
         let headers = trace_headers();
-        #[cfg(feature = "metrics")]
-        let start = std::time::Instant::now();
+        let timer = Self::send_timer();
 
         let mut offered = Vec::with_capacity(records.len());
         for record in records {
             // A block of tens of thousands must not hold the runtime worker between awaits.
             tokio::task::coop::consume_budget().await;
-            if let Some(settled) = self.outbound_disposition(&record.payload) {
+            if let Some(settled) = self.filter_engine.outbound_one(&record.payload) {
                 offered.push(Offered::Settled(settled));
                 continue;
             }
@@ -2398,12 +2354,7 @@ impl TransportSender for KafkaTransport {
                             "kafka delivery report lost: producer dropped".into(),
                         )),
                     };
-                    #[cfg(feature = "metrics")]
-                    ::metrics::histogram!(
-                        "transport_send_duration_seconds",
-                        "transport" => "kafka"
-                    )
-                    .record(start.elapsed().as_secs_f64());
+                    timer.record();
                     result
                 }
             };
@@ -2427,10 +2378,11 @@ impl TransportSender for KafkaTransport {
                 limit,
             });
         }
-        match self.outbound_disposition(&record.payload) {
-            Some(SendResult::FilteredDlq) => Some(DeadLetterReason::OutboundFilter),
-            _ => None,
-        }
+        matches!(
+            self.filter_engine.outbound_one(&record.payload),
+            Some(SendResult::FilteredDlq)
+        )
+        .then_some(DeadLetterReason::OutboundFilter)
     }
 }
 
@@ -2795,14 +2747,7 @@ impl KafkaTransport {
 
         // Transport-level ingress (raw wire receipt, post-filter). Batch-at-a-time,
         // distinct from the pipeline-level records_received_total (post-decode).
-        #[cfg(feature = "metrics")]
-        if !messages.is_empty() {
-            let bytes: usize = messages.iter().map(|m| m.payload.len()).sum();
-            ::metrics::counter!("transport_received_bytes_total", "transport" => "kafka")
-                .increment(bytes as u64);
-            ::metrics::counter!("transport_received_events_total", "transport" => "kafka")
-                .increment(messages.len() as u64);
-        }
+        Self::count_received_messages(&messages);
 
         // Once armed every offset handed out is held until released, so a
         // release out of order never commits past one still in flight.

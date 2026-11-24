@@ -14,10 +14,11 @@
 
 use super::convert::event_wrapper_to_json;
 use super::proto::vector;
+use crate::transport::core::Meter;
 use crate::transport::finalizer::DeliveryStatus;
 use crate::transport::grpc::pending::PendingRegistry;
 use crate::transport::grpc::{
-    GrpcToken, admit, answer, note_refusal, receiver_closed, sender_deadline,
+    GrpcToken, GrpcTransport, admit, answer, note_refusal, receiver_closed, sender_deadline,
 };
 use crate::transport::types::{Message, PayloadFormat};
 use std::panic::AssertUnwindSafe;
@@ -157,7 +158,6 @@ impl vector::vector_server::Vector for VectorCompatService {
         if count > self.sender.max_capacity() {
             // Too many to reserve at once: queue as room frees up.
             for (index, payload) in (0_u64..).zip(payloads) {
-                #[cfg(feature = "metrics")]
                 let bytes = payload.len();
                 if self
                     .sender
@@ -173,8 +173,7 @@ impl vector::vector_server::Vector for VectorCompatService {
                 if let Some(held) = held.as_mut() {
                     held.advance();
                 }
-                #[cfg(feature = "metrics")]
-                crate::transport::grpc::count_received(1, bytes);
+                GrpcTransport::count_received(1, bytes as u64);
             }
         } else {
             let permits = self
@@ -186,8 +185,7 @@ impl vector::vector_server::Vector for VectorCompatService {
             for (permit, (payload, seq)) in permits.zip(payloads.into_iter().zip(base..)) {
                 permit.send(Self::message(payload, seq));
             }
-            #[cfg(feature = "metrics")]
-            crate::transport::grpc::count_received(count as u64, bytes);
+            GrpcTransport::count_received(count as u64, bytes as u64);
         }
 
         let response = vector::PushEventsResponse {};

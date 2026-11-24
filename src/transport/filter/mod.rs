@@ -47,6 +47,7 @@ use compiled::CompiledFilter;
 use metrics::FilterMetrics;
 
 use crate::transport::error::TransportError;
+use crate::transport::types::{BlockOutcome, SendResult};
 
 /// Result of evaluating a filter against a message payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +328,48 @@ impl TransportFilterEngine {
     #[must_use]
     pub fn apply_outbound(&self, payload: &[u8]) -> FilterDisposition {
         self.apply_filters(payload, &self.filters_out, FilterDirection::Out)
+    }
+
+    /// A sender's answer for a payload the outbound filters keep off the wire:
+    /// `Ok` for a `drop` match, `FilteredDlq` for a `dlq` match. `None` when it
+    /// passes and is to be sent.
+    #[inline]
+    #[must_use]
+    pub fn outbound_one(&self, payload: &[u8]) -> Option<SendResult> {
+        if !self.has_outbound_filters() {
+            return None;
+        }
+        match self.apply_outbound(payload) {
+            FilterDisposition::Pass => None,
+            FilterDisposition::Drop => Some(SendResult::Ok),
+            FilterDisposition::Dlq => Some(SendResult::FilteredDlq),
+        }
+    }
+
+    /// The items the outbound filters pass, in order, and a sender's answer
+    /// for the block once they are sent: `FilteredDlq` when a `dlq` filter
+    /// matched one, else `Ok`. Items are kept as given, so a borrowed record
+    /// is never copied.
+    pub fn partition_outbound<T>(
+        &self,
+        items: impl IntoIterator<Item = T>,
+        payload: impl Fn(&T) -> &[u8],
+    ) -> (Vec<T>, SendResult) {
+        if !self.has_outbound_filters() {
+            return (items.into_iter().collect(), SendResult::Ok);
+        }
+        let mut outcome = BlockOutcome::default();
+        let kept: Vec<T> = items
+            .into_iter()
+            .filter(|item| match self.outbound_one(payload(item)) {
+                None => true,
+                Some(settled) => {
+                    let _ = outcome.add(settled);
+                    false
+                }
+            })
+            .collect();
+        (kept, outcome.finish())
     }
 
     fn apply_filters(

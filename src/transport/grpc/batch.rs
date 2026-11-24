@@ -67,23 +67,23 @@ fn format_from_proto(format: i32) -> PayloadFormat {
 
 /// Map one scalo [`Record`] onto a proto [`Record`](proto::Record).
 ///
-/// The payload `Bytes` handle is MOVED onto the proto field (no copy). `key`
-/// `None` becomes the empty string. `Some(k)` carries the key text.
-pub(crate) fn record_to_proto(record: Record) -> proto::Record {
+/// The payload `Bytes` handle is shared with the proto field, a refcount and no
+/// copy. `key` `None` becomes the empty string. `Some(k)` carries the key text.
+pub(crate) fn record_to_proto(record: &Record) -> proto::Record {
     let (timestamp_ms, has_timestamp_ms) = match record.metadata.timestamp_ms {
         Some(ts) => (ts, true),
         None => (0, false),
     };
 
     proto::Record {
-        payload: record.payload,
+        payload: record.payload.clone(),
         key: record.key.as_deref().unwrap_or("").to_string(),
         headers: record
             .headers
-            .into_iter()
+            .iter()
             .map(|(key, value)| proto::Header {
-                key,
-                value: Bytes::from(value),
+                key: key.clone(),
+                value: Bytes::copy_from_slice(value),
             })
             .collect(),
         timestamp_ms,
@@ -127,11 +127,11 @@ fn record_from_proto(record: proto::Record) -> Record {
 ///
 /// SEND-side mapper. Takes records, not the whole `WorkBatch<T>` (commit
 /// tokens and DLQ entries do not cross the wire -- see module docs). Payloads
-/// are moved, not copied.
+/// are shared, not copied.
 #[must_use]
-pub fn records_to_proto(records: Vec<Record>) -> proto::Batch {
+pub fn records_to_proto(records: &[Record]) -> proto::Batch {
     proto::Batch {
-        records: records.into_iter().map(record_to_proto).collect(),
+        records: records.iter().map(record_to_proto).collect(),
     }
 }
 
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn record_round_trips_byte_identical() {
         let original = full_record();
-        let p = record_to_proto(original.clone());
+        let p = record_to_proto(&original);
 
         // The proto payload field is `bytes::Bytes` (zero-copy config). This
         // line would not compile if prost emitted `Vec<u8>` here.
@@ -213,7 +213,7 @@ mod tests {
         ];
 
         // Map -> encode (prost) -> decode (prost) -> map back.
-        let proto_batch = records_to_proto(records.clone());
+        let proto_batch = records_to_proto(&records);
         let encoded = proto_batch.encode_to_vec();
         let decoded = proto::Batch::decode(Bytes::from(encoded)).expect("prost decode");
         let back = proto_batch_to_records(decoded);
@@ -247,7 +247,7 @@ mod tests {
             },
         }];
 
-        let encoded = records_to_proto(records).encode_to_vec();
+        let encoded = records_to_proto(&records).encode_to_vec();
         let decoded = proto::Batch::decode(Bytes::from(encoded)).expect("prost decode");
         let back = proto_batch_to_records(decoded);
 
@@ -260,7 +260,7 @@ mod tests {
     fn empty_batch_round_trips() {
         use prost::Message as _;
 
-        let encoded = records_to_proto(Vec::new()).encode_to_vec();
+        let encoded = records_to_proto(&[]).encode_to_vec();
         let decoded = proto::Batch::decode(Bytes::from(encoded)).expect("prost decode");
         let back = proto_batch_to_records(decoded);
         assert_eq!(back, [] as [crate::transport::work_batch::Record; 0]);
@@ -283,7 +283,7 @@ mod tests {
             })
             .collect();
 
-        let encoded = records_to_proto(records.clone()).encode_to_vec();
+        let encoded = records_to_proto(&records).encode_to_vec();
         let decoded = proto::Batch::decode(Bytes::from(encoded)).expect("prost decode");
         let back = proto_batch_to_records(decoded);
 
@@ -316,7 +316,7 @@ mod tests {
                 format: PayloadFormat::Auto,
             },
         };
-        let p = record_to_proto(r);
+        let p = record_to_proto(&r);
         assert_eq!(p.key, "");
         let back = record_from_proto(p);
         assert_eq!(back.key, None);
