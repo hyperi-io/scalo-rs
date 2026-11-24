@@ -1246,7 +1246,7 @@ struct Framed {
 
 /// `record` as a field of a `Batch` body.
 fn as_field(record: &Record) -> Framed {
-    let record = batch::record_to_proto(record);
+    let record = batch::record_ref_to_proto(record);
     // The record as a field of `Batch`: its tag, its length prefix, then the
     // record itself, so the parts sum to the body's encoded length.
     let len = prost::encoding::message::encoded_len(1, &record);
@@ -3036,7 +3036,7 @@ mod tests {
     #[test]
     fn split_batches_each_encode_within_the_limit() {
         let records: Vec<Record> = (0..40).map(|_| json_record(b"0123456789abcdef")).collect();
-        let whole = prost::Message::encoded_len(&batch::records_to_proto(&records));
+        let whole = prost::Message::encoded_len(&batch::records_to_proto(records.clone()));
         let limit = whole / 3;
         let (batches, left_out) = batches_within(records.iter().collect(), limit);
         assert_eq!(left_out, 0);

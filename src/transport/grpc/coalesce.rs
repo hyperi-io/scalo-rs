@@ -751,7 +751,7 @@ mod tests {
 
     /// The room a block of `record` alone takes.
     fn charge(record: Record) -> u64 {
-        let framed = prost::encoding::message::encoded_len(1, &record_to_proto(&record));
+        let framed = prost::encoding::message::encoded_len(1, &record_to_proto(record));
         (framed as u64).max(super::MIN_BLOCK_BYTES)
     }
 
@@ -816,7 +816,7 @@ mod tests {
         assert_eq!(calls.payloads(), [vec!["x"], vec!["a1", "a2", "b1"]]);
         assert_eq!(
             calls.batches.lock()[1],
-            records_to_proto(&block(&["a1", "a2", "b1"]))
+            records_to_proto(block(&["a1", "a2", "b1"]))
         );
         assert_eq!(queued(&sender), 0);
 
@@ -1600,7 +1600,7 @@ mod tests {
             .collect();
         let mut want: Vec<Vec<u8>> = blocks
             .iter()
-            .map(|b| prost::Message::encode_to_vec(&records_to_proto(&block(b))))
+            .map(|b| prost::Message::encode_to_vec(&records_to_proto(block(b))))
             .collect();
         got.sort();
         want.sort();
