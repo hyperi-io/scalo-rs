@@ -6,7 +6,23 @@ release and the target before bumping.
 
 ---
 
-## 2.14.35
+## 2.14.37
+
+### `kafka_config`'s producer profiles name no batching or codec key (BEHAVIOUR CHANGE)
+
+The Kafka profile constants are defined once, in `kafka_config`, and `transport::kafka` re-exports them under its names: `PRODUCTION_PROFILE` is `CONSUMER_PRODUCTION`, `DEVTEST_PROFILE` is `CONSUMER_DEVTEST`, `LOW_LATENCY_CONSUMER_DEFAULTS` is `CONSUMER_LOW_LATENCY` and `PRODUCER_HIGH_THROUGHPUT` is `PRODUCER_PRODUCTION`. Nothing under `transport::kafka` changes value. Three `kafka_config` producer profiles drop the keys the sizing surface owns:
+
+| Profile | Dropped |
+| --- | --- |
+| `PRODUCER_PRODUCTION` | `linger.ms=100`, `compression.type=zstd` |
+| `PRODUCER_EXACTLY_ONCE` | `linger.ms=20`, `compression.type=zstd` |
+| `PRODUCER_LOW_LATENCY` | `linger.ms=0`, `compression.type=lz4` |
+
+A scalo producer never ran these: every producer path lays the sizing surface over the profile, and the `throughput` default lingers 20 ms with zstd at level 3.
+
+**Consumer adjustment** -- code that hands one of these maps to a client scalo doesn't build, such as a generated Vector config, now gets librdkafka's own `linger.ms` and codec, or its own. To produce as a scalo producer does, lay `KafkaSizingConfig::default().resolved_producer_map()` (`transport-kafka-config`) over the profile, or set the two keys itself.
+
+## 2.14.36
 
 ### Every compression setting is one `{codec, level}` key, `scalo::compression` (API and BEHAVIOUR CHANGE)
 
@@ -33,6 +49,8 @@ Behaviour that changes with no config:
 - `tiered-sink` no longer pulls `snap`, and `tonic` is built with `zstd` as well as `gzip`.
 
 **Consumer adjustment** -- rewrite each key in the table, in YAML, env (`..._COMPRESSION__CODEC=gzip`) and struct literals (`Compression::new(Codec::Gzip)`, `Compression::NONE`). A tiered sink set to `snappy` enables `compression-snappy`. Drain a tiered sink's spill cache before changing its codec: entries carry no codec tag.
+
+## 2.14.35
 
 ### A refused proxy CONNECT holds the records (BEHAVIOUR CHANGE)
 
