@@ -2,120 +2,94 @@
 // Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
 // Modified for scalo.
 
-//! Versioning to pester the user not to write to incompatible queues.
-//!
+//! The format version stamped in a queue, so a build never reads a queue
+//! written in a format it does not know.
 
-use semver::{Version, VersionReq};
 use std::io;
 use std::path::Path;
 
-use super::mutex::Mutex;
+use semver::{Version, VersionReq};
 
-/// The version stamped in `version/contents`. It names the on-disk format, so it
-/// stays yaque's release and never follows scalo's.
-const QUEUE_FORMAT_VERSION: &str = "0.6.6";
+/// The version stamped in `version/contents`. It names the on-disk format, so
+/// it never follows scalo's release.
+pub(crate) const QUEUE_FORMAT_VERSION: &str = "0.6.6";
 
 /// The stamped versions a queue may carry and still open.
-const QUEUE_FORMAT_ACCEPTS: &str = "0.6.*";
+pub(crate) const QUEUE_FORMAT_ACCEPTS: &str = "0.6.*";
 
-// fn get_version_for_queue<P: AsRef<Path>>(base: P) -> io::Result<Version> {
-//     let version_file_contents = read_to_string(base.as_ref().join("yaque-version"))?;
-//     let version_string = version_file_contents.trim();
-
-//     match version_string.parse() {
-//         Ok(version) => Ok(version),
-//         Err(err) => panic!(
-//             "failed to parse `{:?}` version file: {}; contents were `{}`",
-//             base.as_ref().join("yaque-version"),
-//             err,
-//             version_file_contents
-//         ),
-//     }
-// }
-
-// /// Panics if the queue is not compatible with the current version.
-// pub fn panic_if_queue_incompatible<P: AsRef<Path>>(base: P) -> io::Result<()> {
-//     let version = get_version_for_queue(base.as_ref())?;
-//     let requirement = VersionReq::parse(&format!(
-//         "{}.{}.*",
-//         env!("CARGO_PKG_VERSION_MAJOR"),
-//         env!("CARGO_PKG_VERSION_MINOR")
-//     ))
-//     .expect("requirement is valid");
-
-//     if !requirement.matches(&version) {
-//         panic!(
-//             "queue `{:?}` is of version {}, but you have yaque version {}, which is compatible with {}",
-//             base.as_ref(),
-//             version,
-//             env!("CARGO_PKG_VERSION"),
-//             requirement
-//         );
-//     } else {
-//         Ok(())
-//     }
-// }
-
-// /// Sets the version of the queue, if one doesn't exist yet.
-// pub fn set_version_for_queue<P: AsRef<Path>>(base: P) -> io::Result<()> {
-//     let version_file = OpenOptions::new()
-//         .create_new(true)
-//         .write(true)
-//         .open(base.as_ref().join("yaque-version"));
-//     match version_file {
-//         Ok(mut file) => {
-//             writeln!(file, "queue `{:?}` version is {}", base.as_ref(), env!("CARGO_PKG_VERSION"))
-//         }
-//         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-//         Err(err) => Err(err),
-//     }
-// }
-
-/// Gets the version of the queue, or sets it if there is not one and then checks if the version is
-/// compatible with the current loaded version of `yaque`. It uses a mutex to implement atomicity
-/// (yes, we have had some race conditions during testing), but, for the sake of API compatibility
-/// in [`crate::Sender::open`] and [`crate::Receiver::open`], it performs a spin lock, instead of
-/// `.await`ing.
-pub fn check_queue_version<P: AsRef<Path>>(base: P) -> io::Result<()> {
-    let mutex = Mutex::open(base.as_ref().join("version"))?;
-
-    // Spin lock but it should be fine...
-    let lock = loop {
-        if let Some(lock) = mutex.try_lock()? {
-            break lock;
-        } else {
-            std::thread::yield_now();
-        }
+/// Stamps the format into a queue that has none, or checks the one it has.
+/// The caller holds the queue's locks, so no other open races the stamp.
+///
+/// # Errors
+///
+/// `InvalidData` naming the file when it holds no version or one outside
+/// [`QUEUE_FORMAT_ACCEPTS`], or the read's or write's error.
+pub(crate) fn check_queue_version(base: &Path) -> io::Result<()> {
+    let dir = base.join("version");
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join("contents");
+    let contents = match std::fs::read(&file) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
     };
-
-    let contents = lock.read()?;
-    let str_contents = String::from_utf8_lossy(&contents);
-
-    if str_contents.is_empty() {
-        lock.write(format!("{}\n", QUEUE_FORMAT_VERSION).as_bytes())?;
-    } else {
-        let version = match str_contents.trim().parse::<Version>() {
-            Ok(version) => version,
-            Err(err) => panic!(
-                "failed to parse `{:?}` version file: {}; contents were `{}`",
-                base.as_ref().join("yaque-version"),
-                err,
-                str_contents
-            ),
-        };
-
-        let requirement = VersionReq::parse(QUEUE_FORMAT_ACCEPTS).expect("requirement is valid");
-
-        if !requirement.matches(&version) {
-            panic!(
-                "queue `{:?}` is of version {}, but you have yaque version {}, which is compatible with {}",
-                base.as_ref(),
-                version,
-                QUEUE_FORMAT_VERSION,
-                requirement
-            );
-        }
+    if contents.is_empty() {
+        return std::fs::write(&file, format!("{QUEUE_FORMAT_VERSION}\n"));
     }
-
+    let text = String::from_utf8_lossy(&contents);
+    let shown: String = text.trim().chars().take(40).collect();
+    let invalid = |why: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} {why}", file.display()),
+        )
+    };
+    let named = Version::parse(text.trim())
+        .map_err(|e| invalid(format!("does not hold a version ({e}): {shown:?}")))?;
+    let accepted = VersionReq::parse(QUEUE_FORMAT_ACCEPTS)
+        .map_err(|e| invalid(format!("cannot be checked: {e}")))?;
+    if !accepted.matches(&named) {
+        return Err(invalid(format!(
+            "names format {named}, and this build reads {QUEUE_FORMAT_ACCEPTS}"
+        )));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh queue is stamped with a version it accepts, and every other
+    /// stamp is an error naming the file, never a panic.
+    #[test]
+    fn a_stamp_is_written_once_and_checked_after() {
+        let rows: [(&str, Option<&[u8]>, bool); 5] = [
+            ("fresh", None, true),
+            ("this format", Some(b"0.6.6\n"), true),
+            ("another format", Some(b"0.5.2\n"), false),
+            ("not a version", Some(b"not a version"), false),
+            ("only whitespace", Some(b"\n"), false),
+        ];
+        for (name, stamp, opens) in rows {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(stamp) = stamp {
+                std::fs::create_dir_all(dir.path().join("version")).unwrap();
+                std::fs::write(dir.path().join("version").join("contents"), stamp).unwrap();
+            }
+            match check_queue_version(dir.path()) {
+                Ok(()) => assert!(opens, "{name}: opened"),
+                Err(e) => {
+                    assert!(!opens, "{name}: {e}");
+                    assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{name}");
+                    assert!(e.to_string().contains("contents"), "{name}: {e}");
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        check_queue_version(dir.path()).unwrap();
+        let stamped = std::fs::read_to_string(dir.path().join("version").join("contents")).unwrap();
+        assert_eq!(stamped.trim(), QUEUE_FORMAT_VERSION);
+        check_queue_version(dir.path()).expect("a stamped queue reopens");
+    }
 }

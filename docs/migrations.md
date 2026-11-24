@@ -8,6 +8,16 @@ release and the target before bumping.
 
 ## 2.14.38
 
+### The spool and the tiered sink sync on a timer, hold OS locks, and cap the disk (BEHAVIOUR CHANGE)
+
+Both stores sync to disk every `sync_interval_ms` (500 ms), flushing the open segment, the directory when a segment was created since, and the read position, so a power loss loses at most about one interval of records. A segment holds 16 MiB (`segment_bytes`) before the next one starts, where it held 4 MiB. Each half of a queue holds an OS lock on `send.lock` or `recv.lock`, which the OS drops with a dead process, so the files stay after a clean stop and `spool_stale_locks_cleared_total` is gone. A full disk returns `SpoolError::DiskFull` from `Spool::push`, and applies `when_full` in `TieredSink::send`.
+
+Under `when_full: block` a `send` the full spool refuses waits up to `when_full_wait_ms` (1000 ms) for a drain pass to free room before it returns `SpoolFull`.
+
+`TieredSink`'s `max_spool_bytes` caps the spill's files on disk: each record counts with its 4-byte header, and one segment of delivered records is held back, the segment shrinking to a quarter of the cap. `spool_bytes` counts the headers too, and the drain now sets it and `spool_messages`. On Windows `disk_aware` reads `GetDiskFreeSpaceExW`. `Spool` gains `pop_front_into`, `close` and `with_memory_guard`, and `TieredSink` `with_memory_guard`. The `spool` feature pulls `compression` and `concurrency`, and neither feature pulls `notify`.
+
+**Consumer adjustment** -- a `match` on `SpoolError` adds a `DiskFull` arm. A service that sized `max_spool_bytes` by records raises it by one segment, or sets `segment_bytes` lower. `sync_interval_ms: 0` turns the timed sync off, and `when_full_wait_ms: 0` keeps a blocked `send` returning at once. An alert on `spool_stale_locks_cleared_total` goes.
+
 ### `SinkStackConfig::backoff()` returns `scalo::backoff::Backoff`, and retries wait +/-20% (API and BEHAVIOUR CHANGE)
 
 `SinkStackConfig::backoff()` returns `scalo::backoff::Backoff` in place of `backon::ExponentialBuilder`. `Backoff::delays()` yields its waits as an endless iterator, which `backon` takes as a schedule, and `SinkStack` and `HttpClient` run `backon`'s retry loop on it.

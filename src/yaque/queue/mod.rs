@@ -2,789 +2,724 @@
 // Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
 // Modified for scalo.
 
-//! Queue implementation and utility functions.
+//! A queue directory: numbered segment files of entries, one sender and one
+//! receiver, opened together.
 
-mod iter;
 mod receiver;
 mod sender;
 
-pub use iter::QueueIter;
-pub use receiver::{Receiver, ReceiverBuilder, RecvGuard};
-pub use sender::{Sender, SenderBuilder};
+pub(crate) use receiver::Receiver;
+#[cfg(feature = "tiered-sink")]
+pub(crate) use receiver::Taken;
+pub(crate) use sender::Sender;
 
-pub(crate) use receiver::recv_lock_filename;
-pub(crate) use sender::send_lock_filename;
-
-use std::fs::*;
-use std::io::{self};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use receiver::{acquire_recv_lock, try_acquire_recv_lock};
-use sender::{acquire_send_lock, try_acquire_send_lock};
+use super::header::{EOF, Header};
+use super::sync::{FileGuard, Shared};
+use super::version::check_queue_version;
 
-/// The name of segment file in the queue folder.
-fn segment_filename<P: AsRef<Path>>(base: P, segment: u64) -> PathBuf {
-    base.as_ref().join(format!("{}.q", segment))
+/// What a queue opens with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Options {
+    /// Bytes a segment holds before the next entry starts a new one.
+    pub(crate) segment_bytes: u64,
+    /// The receiver's read-ahead buffer.
+    pub(crate) read_buffer_bytes: usize,
+    /// Most bytes of record buffers the receiver keeps to reuse.
+    pub(crate) recycle_bytes: usize,
+    /// Checks the last entry of the newest segment at open. One that fails is
+    /// cut off with the torn entries.
+    pub(crate) whole: Option<fn(&[u8]) -> bool>,
+    /// The `store` label on the queue's metrics.
+    pub(crate) store: &'static str,
 }
 
-/// The value of a header EOF.
-const HEADER_EOF: [u8; 4] = [255, 255, 255, 255];
-
-/// Convenience function for opening the queue for both sending and receiving.
-pub fn channel<P: AsRef<Path>>(base: P) -> io::Result<(Sender, Receiver)> {
-    Ok((Sender::open(base.as_ref())?, Receiver::open(base.as_ref())?))
+/// The name of a segment file in the queue directory.
+pub(crate) fn segment_filename(base: &Path, segment: u64) -> PathBuf {
+    base.join(format!("{segment}.q"))
 }
 
-/// Tries to deletes a queue at the given path. This function will fail if the
-/// queue is in use either for sending or receiving.
-pub fn try_clear<P: AsRef<Path>>(base: P) -> io::Result<()> {
-    let mut send_lock = try_acquire_send_lock(base.as_ref())?;
-    let mut recv_lock = try_acquire_recv_lock(base.as_ref())?;
-
-    // Sets the the locks to ignore when their files magically disappear.
-    send_lock.ignore();
-    recv_lock.ignore();
-
-    remove_dir_all(base.as_ref())?;
-
-    Ok(())
+/// Opens the queue in `base` for sending and receiving, creating it if absent.
+///
+/// The two halves share what the sender has written, so the receiver reads
+/// only whole entries and wakes when one lands.
+///
+/// # Errors
+///
+/// `WouldBlock` when another open holds either half, `InvalidData` for a
+/// version stamp or segment name this build does not read, or the I/O error.
+pub(crate) fn channel(base: &Path, options: Options) -> io::Result<(Sender, Receiver)> {
+    std::fs::create_dir_all(base)?;
+    let send_lock = lock(base, "send.lock", "sender")?;
+    let recv_lock = lock(base, "recv.lock", "receiver")?;
+    check_queue_version(base)?;
+    let shared = Arc::new(Shared::default());
+    let sender = Sender::open(base, options, Arc::clone(&shared), send_lock)?;
+    let receiver = Receiver::open(base, options, shared, recv_lock)?;
+    Ok((sender, receiver))
 }
 
-/// Deletes a queue at the given path. This function will await the queue to
-/// become available for both sending and receiving.
-pub async fn clear<P: AsRef<Path>>(base: P) -> io::Result<()> {
-    let mut send_lock = acquire_send_lock(base.as_ref()).await?;
-    let mut recv_lock = acquire_recv_lock(base.as_ref()).await?;
+/// Waits between lock attempts, about a quarter second in all.
+const LOCK_RETRY_MS: [u64; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
-    // Sets the the locks to ignore when their files magically disappear.
-    send_lock.ignore();
-    recv_lock.ignore();
+/// A process spawned anywhere in this one holds a copy of every open file
+/// until it execs, so a lock just released can read as held for that long.
+fn lock(base: &Path, name: &str, side: &str) -> io::Result<FileGuard> {
+    let path = base.join(name);
+    for wait in LOCK_RETRY_MS {
+        if let Some(guard) = FileGuard::try_lock(&path)? {
+            return Ok(guard);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+    }
+    FileGuard::try_lock(&path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "queue {} {side} side is held by another open",
+                base.display()
+            ),
+        )
+    })
+}
 
-    remove_dir_all(base.as_ref())?;
+/// The segment numbers in `base`, ascending.
+///
+/// # Errors
+///
+/// `InvalidData` for a `.q` file whose name is not a segment number, or the
+/// directory read's error.
+pub(crate) fn segments(base: &Path) -> io::Result<Vec<u64>> {
+    let mut numbers = Vec::new();
+    for entry in std::fs::read_dir(base)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("q") {
+            continue;
+        }
+        let number = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not a numbered segment", path.display()),
+                )
+            })?;
+        numbers.push(number);
+    }
+    numbers.sort_unstable();
+    Ok(numbers)
+}
 
-    Ok(())
+/// What a walk over one segment's headers found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Scan {
+    /// Whole entries after the start offset.
+    pub(crate) entries: u64,
+    /// Their payload bytes.
+    pub(crate) bytes: u64,
+    /// The offset after the last whole entry, or after the end-of-segment marker.
+    pub(crate) end: u64,
+    /// Whether an end-of-segment marker closes the segment.
+    pub(crate) sealed: bool,
+    /// The file's length.
+    pub(crate) len: u64,
+}
+
+/// Payloads longer than this are skipped with a seek, and the next header is
+/// read on its own rather than through the buffer.
+const SCAN_BUFFER: usize = 64 * 1024;
+
+/// Walks the headers of the segment at `path` from `from`. Payloads are
+/// skipped, except the last when `whole` checks it. The walk stops at the
+/// end-of-segment marker, at an entry the file does not hold in full, and at
+/// a header that fails its parity check.
+///
+/// # Errors
+///
+/// The open's or a read's error.
+pub(crate) fn scan(path: &Path, from: u64, whole: Option<fn(&[u8]) -> bool>) -> io::Result<Scan> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut found = Scan {
+        end: from,
+        len,
+        ..Scan::default()
+    };
+    let mut reader = BufReader::with_capacity(SCAN_BUFFER, file);
+    reader.seek(SeekFrom::Start(from))?;
+    // After a long seek the buffer is empty, so the next header is read from
+    // the file alone instead of refilling the whole buffer for 4 bytes.
+    let mut direct = false;
+    let mut header = [0_u8; 4];
+    while found.end + 4 <= len {
+        if direct {
+            reader.get_mut().read_exact(&mut header)?;
+        } else {
+            reader.read_exact(&mut header)?;
+        }
+        if header == EOF {
+            found.end += 4;
+            found.sealed = true;
+            break;
+        }
+        let Ok(header) = Header::decode(header) else {
+            break;
+        };
+        let payload = u64::from(header.len());
+        let next = found.end + 4 + payload;
+        if next > len {
+            break;
+        }
+        if next == len
+            && let Some(whole) = whole
+        {
+            let mut last = vec![0_u8; usize::try_from(payload).unwrap_or(usize::MAX)];
+            reader.read_exact(&mut last)?;
+            if !whole(&last) {
+                break;
+            }
+        } else if payload > SCAN_BUFFER as u64 {
+            reader.seek(SeekFrom::Start(next))?;
+            direct = true;
+        } else {
+            reader.seek_relative(i64::try_from(payload).unwrap_or(i64::MAX))?;
+            direct = false;
+        }
+        found.entries += 1;
+        found.bytes += payload;
+        found.end = next;
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use crate::yaque::test_queue_dir;
 
-    use crate::yaque::error::{TryRecvError, TrySendError};
-    use crate::yaque::{block_on, test_queue_dir, test_rng};
-
-    use self::sender::get_queue_size;
-
-    fn data_lots_of_data() -> impl Iterator<Item = Vec<u8>> {
-        let mut rng = test_rng();
-        (0..).map(move |_| {
-            (0..rng() as usize % 128)
-                .map(|_| rng() as u8)
-                .collect::<Vec<_>>()
-        })
-    }
-
-    fn delay(duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(tokio::time::sleep(duration))
-    }
-
-    #[test]
-    fn create_and_clear() {
-        let (_dir, path) = test_queue_dir();
-        let _ = Sender::open(&path).unwrap();
-        try_clear(&path).unwrap();
-    }
-
-    #[test]
-    #[should_panic]
-    fn create_and_clear_fails() {
-        let (_dir, path) = test_queue_dir();
-        let sender = Sender::open(&path).unwrap();
-        try_clear(&path).unwrap();
-        drop(sender);
-    }
-
-    #[test]
-    fn create_and_clear_async() {
-        let (_dir, path) = test_queue_dir();
-        let _ = Sender::open(&path).unwrap();
-
-        block_on(async { clear(&path).await.unwrap() });
-    }
-
-    #[test]
-    fn test_enqueue() {
-        let (_dir, path) = test_queue_dir();
-        let mut sender = Sender::open(&path).unwrap();
-        for data in data_lots_of_data().take(100_000) {
-            sender.try_send(&data).unwrap();
+    fn options(segment_bytes: u64) -> Options {
+        Options {
+            segment_bytes,
+            read_buffer_bytes: 1024,
+            recycle_bytes: 1 << 20,
+            whole: None,
+            store: "test",
         }
     }
 
-    /// Test enqueuing everything and then dequeueing everything, with no persistence.
-    #[test]
-    fn test_enqueue_then_dequeue() {
-        let (_dir, path) = test_queue_dir();
+    fn entry(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Header::for_len(payload.len()).unwrap().encode().to_vec();
+        bytes.extend_from_slice(payload);
+        bytes
+    }
 
-        // Enqueue:
-        let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
-        let mut sender = Sender::open(&path).unwrap();
-        for data in &dataset {
-            sender.try_send(data).unwrap();
+    /// The walk counts whole entries and stops at a torn one, at the
+    /// end-of-segment marker and at a damaged header, past the long-payload
+    /// seek as well as through the buffer.
+    #[test]
+    fn a_scan_counts_whole_entries_and_stops_where_the_segment_does() {
+        let long = vec![7_u8; SCAN_BUFFER + 10];
+        let whole: Vec<u8> = [entry(b"a"), entry(&long), entry(b"bc")].concat();
+        let torn = [whole.clone(), entry(b"defg")[..5].to_vec()].concat();
+        let sealed = [whole.clone(), EOF.to_vec(), entry(b"x")].concat();
+        let damaged = [whole.clone(), b"Asbt".to_vec(), entry(b"y")].concat();
+        let end = whole.len() as u64;
+        let bytes = 3 + long.len() as u64;
+        let rows: [(&str, &[u8], u64, bool); 4] = [
+            ("whole", &whole, end, false),
+            ("torn", &torn, end, false),
+            ("sealed", &sealed, end + 4, true),
+            ("damaged header", &damaged, end, false),
+        ];
+        for (name, file, want_end, sealed) in rows {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("0.q");
+            std::fs::write(&path, file).unwrap();
+            let found = scan(&path, 0, None).unwrap();
+            assert_eq!(found.entries, 3, "{name}");
+            assert_eq!(found.bytes, bytes, "{name}");
+            assert_eq!(found.end, want_end, "{name}");
+            assert_eq!(found.sealed, sealed, "{name}");
+            assert_eq!(found.len, file.len() as u64, "{name}");
+            let from = scan(&path, entry(b"a").len() as u64, None).unwrap();
+            assert_eq!(from.entries, 2, "{name}: walked from the second entry");
         }
-
-        tracing::trace!("enqueued");
-
-        // Dequeue:
-        block_on(async {
-            let mut receiver = Receiver::open(&path).unwrap();
-            let dataset_iter = dataset.iter();
-            let mut i = 0u64;
-
-            for should_be in dataset_iter {
-                let data = receiver.recv().await.unwrap();
-                assert_eq!(&*data, should_be, "at sample {}", i);
-                i += 1;
-                data.commit().unwrap();
-            }
-        });
-    }
-
-    /// Test enqueuing and dequeueing, round robin, with no persistence.
-    #[test]
-    fn test_enqueue_and_dequeue() {
-        let (_dir, path) = test_queue_dir();
-
-        // Enqueue:
-        let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
-        let mut sender = Sender::open(&path).unwrap();
-
-        block_on(async {
-            let mut receiver = Receiver::open(&path).unwrap();
-            let mut i = 0;
-
-            for data in &dataset {
-                sender.try_send(data).unwrap();
-                let received = receiver.recv().await.unwrap();
-                assert_eq!(&*received, data, "at sample {}", i);
-
-                i += 1;
-                received.commit().unwrap();
-            }
-        });
-    }
-
-    /// Test enqueuing and dequeueing in parallel.
-    #[test]
-    fn test_enqueue_dequeue_parallel() {
-        let (_dir, path) = test_queue_dir();
-        let send_path = path.clone();
-
-        // Generate data:
-        let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
-        let arc_sender = Arc::new(dataset);
-        let arc_receiver = arc_sender.clone();
-
-        // Enqueue (let's test async send!):
-        let enqueue = std::thread::spawn(move || {
-            block_on(async {
-                let mut sender = Sender::open(&send_path).unwrap();
-                for data in &*arc_sender {
-                    sender.send(data).await.unwrap();
-                }
-            });
-        });
-
-        // Dequeue:
-        let dequeue = std::thread::spawn(move || {
-            block_on(async {
-                let mut receiver = Receiver::open(&path).unwrap();
-                let dataset_iter = arc_receiver.iter();
-                let mut i = 0u64;
-
-                for should_be in dataset_iter {
-                    let data = receiver.recv().await.unwrap();
-                    assert_eq!(&*data, should_be, "at sample {}", i);
-                    i += 1;
-                    data.commit().unwrap();
-                }
-            });
-        });
-
-        enqueue.join().expect("enqueue thread panicked");
-        dequeue.join().expect("dequeue thread panicked");
-    }
-
-    /// Test enqueuing and dequeueing in parallel, using batches.
-    #[test]
-    fn test_enqueue_dequeue_parallel_with_batches() {
-        let (_dir, path) = test_queue_dir();
-        let send_path = path.clone();
-
-        // Generate data:
-        let mut dataset = vec![];
-        let mut batch = vec![];
-
-        for data in data_lots_of_data().take(100_000) {
-            batch.push(data);
-
-            if batch.len() >= 256 {
-                dataset.push(batch);
-                batch = vec![];
-            }
-        }
-
-        let arc_sender = Arc::new(dataset);
-        let arc_receiver = arc_sender.clone();
-
-        // Enqueue:
-        let enqueue = std::thread::spawn(move || {
-            let mut sender = Sender::open(&send_path).unwrap();
-            for batch in &*arc_sender {
-                sender.try_send_batch(batch).unwrap();
-            }
-        });
-
-        // Dequeue:
-        let dequeue = std::thread::spawn(move || {
-            block_on(async {
-                let mut receiver = Receiver::open(&path).unwrap();
-                let dataset_iter = arc_receiver.iter();
-                let mut i = 0u64;
-
-                for should_be in dataset_iter {
-                    let batch = receiver.recv_batch(256).await.unwrap();
-                    assert_eq!(&*batch, should_be, "at sample {}", i);
-                    i += 1;
-                    batch.commit().unwrap();
-                }
-            });
-        });
-
-        enqueue.join().expect("enqueue thread panicked");
-        dequeue.join().expect("dequeue thread panicked");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.q");
+        std::fs::write(&path, &whole).unwrap();
+        let refused = scan(&path, 0, Some(|last: &[u8]| last != b"bc")).unwrap();
+        assert_eq!(refused.entries, 2, "the last entry fails its check");
     }
 
     #[test]
-    fn test_dequeue_is_atomic() {
+    fn a_stray_q_file_is_an_error_naming_it() {
         let (_dir, path) = test_queue_dir();
-        let mut sender = Sender::open(&path).unwrap();
-        let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
-
-        block_on(async move {
-            let mut receiver = Receiver::open(&path).unwrap();
-            let dataset_iter = dataset.iter();
-            let mut i = 0u64;
-
-            for data in dataset_iter {
-                sender.try_send(data).unwrap();
-                // Try not to poll the future to the end.
-                let incomplete =
-                    futures_util::future::select(Box::pin(receiver.recv()), Box::pin(async {}))
-                        .await;
-                drop(incomplete); // need to force this explicitly.
-
-                //
-                let received = receiver.recv().await.unwrap();
-                assert_eq!(&*received, data, "at sample {}", i);
-                i += 1;
-                received.commit().unwrap();
-            }
-        });
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("foo.q"), b"").unwrap();
+        let err = segments(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("foo.q"), "{err}");
+        assert!(channel(&path, options(512)).is_err());
     }
 
-    #[test]
-    fn test_rollback() {
-        let (_dir, path) = test_queue_dir();
-        block_on(async move {
-            let (mut sender, mut receiver) = channel(&path).unwrap();
-            sender.try_send(b"123").unwrap();
-            sender.try_send(b"456").unwrap();
-
-            assert_eq!(&*receiver.recv().await.unwrap(), b"123");
-            assert_eq!(&*receiver.recv().await.unwrap(), b"123");
-
-            receiver.recv().await.unwrap().commit().unwrap();
-
-            assert_eq!(&*receiver.recv().await.unwrap(), b"456");
-            assert_eq!(&*receiver.recv().await.unwrap(), b"456");
-        });
-    }
-
-    #[test]
-    fn test_recv_timeout_nothing() {
-        let (_dir, path) = test_queue_dir();
-        block_on(async move {
-            let (_, mut receiver) = channel(&path).unwrap();
-
-            assert!(
-                receiver
-                    .recv_timeout(delay(Duration::from_secs(1)))
-                    .await
-                    .unwrap()
-                    .is_none(),
-            );
-        });
-    }
-
-    #[test]
-    fn test_recv_timeout_immediate() {
-        let (_dir, path) = test_queue_dir();
-        block_on(async move {
-            let (mut sender, mut receiver) = channel(&path).unwrap();
-
-            sender.try_send(b"123").unwrap();
-
-            assert_eq!(
-                &*receiver
-                    .recv_timeout(delay(Duration::from_secs(1)))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                b"123"
-            );
-        });
-    }
-
-    #[test]
-    fn test_recv_timeout_delayed() {
-        let (_dir, path) = test_queue_dir();
-        block_on(async move {
-            let (mut sender, mut receiver) = channel(&path).unwrap();
-
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(1));
-                sender.try_send(b"123").unwrap();
-            });
-
-            assert_eq!(
-                &*receiver
-                    .recv_timeout(delay(Duration::from_secs(2)))
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                b"123"
-            );
-        });
-    }
-
-    #[test]
-    fn test_recv_batch_timeout_nothing() {
-        let (_dir, path) = test_queue_dir();
-        block_on(async move {
-            let (_, mut receiver) = channel(&path).unwrap();
-
-            assert!(
-                receiver
-                    .recv_batch_timeout(2, delay(Duration::from_secs(1)))
-                    .await
-                    .unwrap()
-                    .is_empty(),
-            );
-        });
-    }
-
-    #[test]
-    fn test_recv_batch_timeout_immediate() {
-        let (_dir, path) = test_queue_dir();
-        block_on(async move {
-            let (mut sender, mut receiver) = channel(&path).unwrap();
-
-            sender.try_send(b"123").unwrap();
-            sender.try_send(b"456").unwrap();
-
-            assert_eq!(
-                &*receiver
-                    .recv_batch_timeout(2, delay(Duration::from_secs(1)))
-                    .await
-                    .unwrap(),
-                &[b"123", b"456"],
-            );
-        });
-    }
-
-    #[test]
-    fn test_recv_batch_timeout_delayed_1() {
-        let (_dir, path) = test_queue_dir();
-        block_on(async move {
-            let (mut sender, mut receiver) = channel(&path).unwrap();
-
-            std::thread::spawn(move || {
-                for i in 0..5usize {
-                    std::thread::sleep(Duration::from_secs_f64(0.5));
-                    sender.try_send(i.to_string().as_bytes()).unwrap();
-                }
-            });
-
-            assert_eq!(
-                &*receiver
-                    .recv_batch_timeout(3, delay(Duration::from_secs(2)))
-                    .await
-                    .unwrap(),
-                &[b"0", b"1", b"2"]
-            );
-        });
-    }
-
-    #[test]
-    fn test_recv_batch_timeout_delayed_2() {
-        let (_dir, path) = test_queue_dir();
-        block_on(async move {
-            let (mut sender, mut receiver) = channel(&path).unwrap();
-
-            std::thread::spawn(move || {
-                for i in 0..5usize {
-                    std::thread::sleep(Duration::from_secs_f64(0.6));
-                    sender.try_send(i.to_string().as_bytes()).unwrap();
-                }
-            });
-
-            assert_eq!(
-                &*receiver
-                    .recv_batch_timeout(5, delay(Duration::from_secs(2)))
-                    .await
-                    .unwrap(),
-                &[b"0", b"1", b"2"]
-            );
-        });
-    }
-
-    #[test]
-    fn test_max_queue_size() {
-        let (_dir, path) = test_queue_dir();
-        let mut sender = SenderBuilder::new()
-            .max_queue_size(Some(2048))
-            .segment_size(512)
-            .open(&path)
+    /// Appends raw bytes to a segment, as a writer part way through an entry
+    /// leaves them, behind the sender's back.
+    fn append_raw(base: &Path, segment: u64, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(segment_filename(base, segment))
             .unwrap();
-        let mut data = data_lots_of_data();
-
-        loop {
-            let item = data.next().unwrap();
-            match sender.try_send(&item) {
-                Ok(_) => {}
-                Err(TrySendError::Io(err)) => Err(err).unwrap(),
-                Err(TrySendError::QueueFull { .. }) => break,
-            }
-        }
-
-        let size = get_queue_size(&path).unwrap().in_bytes;
-        assert!(
-            size >= 2048,
-            "size was {}; should be at least {}",
-            size,
-            2048
-        );
+        file.write_all(bytes).unwrap();
     }
 
-    #[test]
-    fn test_max_queue_size_with_drain() {
-        let (_dir, path) = test_queue_dir();
-        let mut sender = SenderBuilder::new()
-            .max_queue_size(Some(2048))
-            .segment_size(512)
-            .open(&path)
-            .unwrap();
-        let mut receiver = Receiver::open(&path).unwrap();
-        let mut data = data_lots_of_data();
-
-        loop {
-            let item = data.next().unwrap();
-            match sender.try_send(&item) {
-                Ok(_) => {}
-                Err(TrySendError::Io(err)) => Err(err).unwrap(),
-                Err(TrySendError::QueueFull { .. }) => break,
-            }
-        }
-
-        let size = get_queue_size(&path).unwrap().in_bytes;
-        assert!(
-            size >= 2048,
-            "size was {}; should be at least {}",
-            size,
-            2048
-        );
-
-        // Drain queue:
-        loop {
-            match receiver.try_recv() {
-                Ok(thing) => thing.commit().unwrap(),
-                Err(TryRecvError::QueueEmpty) => break,
-                Err(TryRecvError::Io(err)) => Err(err).unwrap(),
-            }
-        }
-
-        for _ in 0..8 {
-            sender.try_send(data.next().unwrap()).unwrap();
-        }
+    fn send(sender: &mut Sender, payload: &[u8]) {
+        sender.send(&[], payload).unwrap();
     }
 
-    /// Test enqueuing and dequeueing in parallel.
+    /// Reads and commits up to `n` entries.
+    fn take(receiver: &mut Receiver, n: usize) -> Vec<Vec<u8>> {
+        let taken = receiver.read(n, u64::MAX, None).unwrap();
+        let entries = receiver.taken().to_vec();
+        receiver.commit(taken.entries, None);
+        entries
+    }
+
+    /// What the next read gives, rolled back: an entry, `empty`, or the error.
+    fn peek(receiver: &mut Receiver) -> String {
+        let outcome = match receiver.read(1, u64::MAX, None) {
+            Ok(taken) if taken.entries == 0 => "empty".to_string(),
+            Ok(_) => format!("{:?}", String::from_utf8_lossy(&receiver.taken()[0])),
+            Err(e) => format!("error {:?}", e.kind()),
+        };
+        receiver.commit(0, None);
+        outcome
+    }
+
+    fn segment_files(base: &Path) -> usize {
+        segments(base).unwrap().len()
+    }
+
+    fn disk_on(base: &Path) -> u64 {
+        segments(base)
+            .unwrap()
+            .into_iter()
+            .map(|n| std::fs::metadata(segment_filename(base, n)).unwrap().len())
+            .sum()
+    }
+
+    /// Entries come back in order, whole, across every segment boundary, and
+    /// a segment holds entries until it passes its size: at 16 MiB, entries
+    /// over 4 MiB share one, where 4 MiB segments gave each its own.
     #[test]
-    fn test_enqueue_dequeue_parallel_with_max_queue_size() {
-        fn test(queue_size: u64) {
+    fn entries_round_trip_in_order_across_segments() {
+        let mut rng = crate::yaque::test_rng();
+        let small: Vec<Vec<u8>> = (0..300)
+            .map(|_| (0..rng() % 128).map(|_| rng().to_le_bytes()[0]).collect())
+            .collect();
+        let large: Vec<Vec<u8>> = [5 << 20, 5 << 20, 1, 20 << 20]
+            .into_iter()
+            .map(|len| vec![b'L'; len])
+            .collect();
+        let rows: [(&str, u64, &[Vec<u8>], usize); 3] = [
+            ("small entries, 64-byte segments", 64, &small, 0),
+            ("entries over 4 MiB, 16 MiB segments", 16 << 20, &large, 1),
+            ("entries over 4 MiB, 4 MiB segments", 4 << 20, &large, 3),
+        ];
+        for (name, segment_bytes, entries, files) in rows {
             let (_dir, path) = test_queue_dir();
-            let send_path = path.clone();
-            let clear_path = path.clone();
+            let (mut sender, mut receiver) = channel(&path, options(segment_bytes)).unwrap();
+            for entry in entries {
+                send(&mut sender, entry);
+            }
+            if files > 0 {
+                assert_eq!(segment_files(&path), files, "{name}: segments written");
+            }
+            let mut read = Vec::new();
+            while read.len() < entries.len() {
+                let batch = take(&mut receiver, 7);
+                assert!(!batch.is_empty(), "{name}: stalled after {}", read.len());
+                read.extend(batch);
+            }
+            assert!(read == *entries, "{name}: entries changed or reordered");
+            assert_eq!(peek(&mut receiver), "empty", "{name}");
+            assert_eq!(sender.disk_bytes(), disk_on(&path), "{name}: disk gauge");
+        }
+    }
 
-            // Generate data:
-            let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
-            let arc_sender = Arc::new(dataset);
-            let arc_receiver = arc_sender.clone();
-
-            // Enqueue (let's test async send!):
-            let enqueue = std::thread::spawn(move || {
-                block_on(async {
-                    let mut sender = SenderBuilder::new()
-                        .max_queue_size(Some(queue_size))
-                        .open(&send_path)
-                        .unwrap();
-                    for data in &*arc_sender {
-                        sender.send(data).await.unwrap();
-                    }
-                });
+    /// A receiver parked on an empty queue wakes for each send, in the same
+    /// segment and across a new one, with no watcher thread.
+    #[cfg(feature = "spool")]
+    #[test]
+    fn a_parked_receiver_wakes_on_each_send() {
+        for segment_bytes in [1 << 20, 16] {
+            let (_dir, path) = test_queue_dir();
+            let (mut sender, mut receiver) = channel(&path, options(segment_bytes)).unwrap();
+            let writer = std::thread::spawn(move || {
+                for i in 0..20_u8 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    sender.send(&[i], b"-after-a-pause").unwrap();
+                }
+                sender
             });
-
-            // Dequeue:
-            let dequeue = std::thread::spawn(move || {
-                block_on(async {
-                    let mut receiver = Receiver::open(&path).unwrap();
-                    let dataset_iter = arc_receiver.iter();
-                    let mut i = 0u64;
-
-                    for should_be in dataset_iter {
-                        let data = receiver.recv().await.unwrap();
-                        assert_eq!(&*data, should_be, "at sample {}", i);
-                        i += 1;
-                        data.commit().unwrap();
-                    }
-                });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let got = runtime.block_on(async {
+                let mut got = Vec::new();
+                while got.len() < 20 {
+                    std::future::poll_fn(|cx| receiver.poll_ready(cx)).await;
+                    got.extend(take(&mut receiver, 100).into_iter().map(|e| e[0]));
+                }
+                got
             });
-
-            enqueue.join().expect("enqueue thread panicked");
-            dequeue.join().expect("dequeue thread panicked");
-
-            try_clear(&clear_path).unwrap();
-        }
-
-        test(2 * 1024 * 1024); // smaller than segment
-        test(4 * 1024 * 1024); // equal to segment
-        test(8 * 1024 * 1024); // bigger than segment
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_small_queue_size() {
-        SenderBuilder::new().max_queue_size(Some(0));
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_small_segment_size() {
-        SenderBuilder::new().segment_size(0);
-    }
-
-    // test small segment size + big batch transaction: commit and rollback.
-    #[test]
-    fn test_trans_segment_transactions() {
-        let (_dir, path) = test_queue_dir();
-        let data = data_lots_of_data().take(100).collect::<Vec<_>>();
-
-        // Populate a queue:
-        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
-
-        sender.try_send_batch(&data).unwrap();
-
-        block_on(async move {
-            let mut receiver = Receiver::open(&path).unwrap();
-
-            // Do some rollbacks:
-            for _ in 0..7 {
-                let batch = receiver.recv_batch(50).await.unwrap();
-
-                for (batch_item, item) in batch.iter().zip(&data) {
-                    assert_eq!(batch_item, item);
-                }
-
-                batch.rollback().unwrap();
-            }
-
-            // Now commit:
-            let batch = receiver.recv_batch(50).await.unwrap();
-
-            for (batch_item, item) in batch.iter().zip(&data) {
-                assert_eq!(batch_item, item);
-            }
-
-            batch.commit().unwrap();
-
-            // And now do some more rollbacks:
-            for _ in 0..7 {
-                let batch = receiver.recv_batch(50).await.unwrap();
-
-                for (batch_item, item) in batch.iter().zip(&data[50..]) {
-                    assert_eq!(batch_item, item);
-                }
-
-                batch.rollback().unwrap();
-            }
-        });
-    }
-
-    // test simple try_recv uses.
-    #[test]
-    fn test_try_recv() {
-        let (_dir, path) = test_queue_dir();
-        let data = data_lots_of_data().take(100).collect::<Vec<_>>();
-
-        // Populate a queue:
-        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
-
-        sender.try_send_batch(&data[..25]).unwrap();
-
-        let mut receiver = Receiver::open(&path).unwrap();
-
-        let mut count = 0;
-        loop {
-            match receiver.try_recv() {
-                Ok(item) => {
-                    assert_eq!(&*item, &data[count]);
-                    item.commit().unwrap();
-                    count += 1;
-                }
-                Err(TryRecvError::Io(err)) => Err(err).unwrap(),
-                Err(TryRecvError::QueueEmpty) => break,
-            }
-        }
-
-        assert_eq!(count, 25);
-    }
-
-    // test simple try_recv_batch uses.
-    #[test]
-    fn test_try_recv_batch() {
-        let (_dir, path) = test_queue_dir();
-        let data = data_lots_of_data().take(100).collect::<Vec<_>>();
-
-        // Populate a queue:
-        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
-
-        let mut receiver = Receiver::open(&path).unwrap();
-
-        // only works for multiples of 25, up to 25
-        for recv_size in [1, 5, 25] {
-            sender.try_send_batch(&data[..25]).unwrap();
-
-            let mut count = 0;
-            loop {
-                match receiver.try_recv_batch(recv_size) {
-                    Ok(items) => {
-                        for item in items.iter() {
-                            assert_eq!(&*item, &data[count]);
-                            count += 1;
-                        }
-                        items.commit().unwrap();
-                    }
-                    Err(TryRecvError::Io(err)) => Err(err).unwrap(),
-                    Err(TryRecvError::QueueEmpty) => break,
-                }
-            }
-
-            assert_eq!(count, 25);
+            drop(writer.join().unwrap());
+            assert_eq!(got, (0..20).collect::<Vec<u8>>(), "segment {segment_bytes}");
         }
     }
 
-    // test simple try_recv_batch_up_to uses.
+    /// A transaction commits a prefix and returns the rest. A segment goes
+    /// only once every entry in it is committed.
     #[test]
-    fn test_try_recv_batch_up_to() {
+    fn a_commit_keeps_a_prefix_and_returns_the_rest() {
         let (_dir, path) = test_queue_dir();
-        let data = data_lots_of_data().take(100).collect::<Vec<_>>();
+        let (mut sender, mut receiver) = channel(&path, options(16)).unwrap();
+        for payload in [[b'a'; 20], [b'b'; 20], [b'c'; 20]] {
+            send(&mut sender, &payload);
+        }
+        assert_eq!(segment_files(&path), 3);
+        assert_eq!(receiver.read(3, u64::MAX, None).unwrap().entries, 3);
+        receiver.commit(0, None);
+        assert_eq!(segment_files(&path), 3, "a rollback deletes nothing");
+        assert_eq!(receiver.read(3, u64::MAX, None).unwrap().entries, 3);
+        receiver.commit(2, None);
+        assert_eq!(
+            segment_files(&path),
+            2,
+            "the first segment goes, and the second holds its end marker"
+        );
+        assert_eq!(take(&mut receiver, 3), vec![vec![b'c'; 20]]);
+        assert_eq!(sender.disk_bytes(), disk_on(&path));
+    }
 
-        // Populate a queue:
-        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
-
-        let mut receiver = Receiver::open(&path).unwrap();
-
-        for send_size in [1, 10, 25, 100] {
-            for recv_size in [1, 7, 25, 30, 100] {
-                sender.try_send_batch(&data[..send_size]).unwrap();
-
-                let mut count = 0;
-                loop {
-                    match receiver.try_recv_batch_up_to(recv_size) {
-                        Ok(items) => {
-                            for item in items.iter() {
-                                assert_eq!(&*item, &data[count]);
-                                count += 1;
-                            }
-                            items.commit().unwrap();
-                        }
-                        Err(TryRecvError::Io(err)) => Err(err).unwrap(),
-                        Err(TryRecvError::QueueEmpty) => break,
-                    }
-                }
-
-                assert_eq!(
-                    count, send_size,
-                    "send_size: {send_size}, recv_size: {recv_size}"
-                );
-            }
+    /// A read holds to its byte budget after the first entry, and reads the
+    /// first entry whatever its size.
+    #[test]
+    fn a_read_holds_to_its_byte_budget() {
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        for _ in 0..5 {
+            send(&mut sender, &[0; 100]);
+        }
+        for (budget, want) in [(1, 1), (100, 1), (250, 2), (500, 5)] {
+            assert_eq!(
+                receiver.read(10, budget, None).unwrap().entries,
+                want,
+                "{budget}"
+            );
+            receiver.commit(0, None);
         }
     }
 
+    /// Under a memory guard, a refused reservation stops the read after its
+    /// first entry and never before it, and a commit releases what it held.
+    #[cfg(feature = "memory")]
     #[test]
-    fn test_try_recv_batch_up_to_zero() {
+    fn a_refused_reservation_stops_the_read_early() {
+        use crate::memory::{MemoryGuard, MemoryGuardConfig, UsageSource};
+        let config = MemoryGuardConfig {
+            limit_bytes: 1000,
+            ..MemoryGuardConfig::default()
+        };
+        let guard = MemoryGuard::with_usage_source(config, UsageSource::Reservations);
         let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        for _ in 0..6 {
+            send(&mut sender, &[0; 400]);
+        }
+        let taken = receiver.read(10, u64::MAX, Some(&guard)).unwrap();
+        assert!(taken.held_back, "the guard refused an entry");
+        assert!(taken.entries >= 1 && taken.entries < 6, "{taken:?}");
+        assert!(receiver.reserved_bytes() > 0);
+        receiver.commit(taken.entries, Some(&guard));
+        assert_eq!(receiver.reserved_bytes(), 0);
+        let mut drained = taken.entries;
+        while drained < 6 {
+            let taken = receiver.read(10, u64::MAX, Some(&guard)).unwrap();
+            assert!(taken.entries >= 1, "the drain went on under pressure");
+            drained += taken.entries;
+            receiver.commit(taken.entries, Some(&guard));
+        }
+    }
 
-        // Populate a queue:
-        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
+    /// A segment the receiver has drained is ended and deleted at once, so
+    /// the queue stops holding the disk.
+    #[test]
+    fn a_drained_segment_is_released() {
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(1600)).unwrap();
+        for _ in 0..2 {
+            send(&mut sender, &[1; 200]);
+        }
+        assert_eq!(take(&mut receiver, 10).len(), 2);
+        assert!(sender.release_drained(receiver.position()).unwrap());
+        receiver.sweep().unwrap();
+        assert!(
+            !segment_filename(&path, 0).exists(),
+            "the drained segment went"
+        );
+        assert_eq!(sender.disk_bytes(), 0);
+        assert_eq!(disk_on(&path), 0);
+        send(&mut sender, b"next");
+        assert_eq!(take(&mut receiver, 10), vec![b"next".to_vec()]);
+        assert!(
+            !sender.release_drained(receiver.position()).unwrap(),
+            "a segment under a sixteenth of its size is kept"
+        );
+    }
 
-        let mut receiver = Receiver::open(&path).unwrap();
-        sender.try_send_batch([[1]]).unwrap();
-
-        let no_items = receiver
-            .try_recv_batch_up_to(0)
-            .unwrap()
-            .try_into_inner()
-            .unwrap();
-        assert!(no_items.is_empty());
+    /// A rotation that cannot open the next segment loses nothing sent after it.
+    #[test]
+    fn a_failed_rotation_loses_no_later_entry() {
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(16)).unwrap();
+        send(&mut sender, b"first-record-twenty!");
+        std::fs::create_dir(segment_filename(&path, 1)).unwrap();
+        assert!(sender.send(&[], b"refused").is_err());
+        std::fs::remove_dir(segment_filename(&path, 1)).unwrap();
+        send(&mut sender, b"accepted-after");
+        assert_eq!(
+            take(&mut receiver, 1),
+            vec![b"first-record-twenty!".to_vec()]
+        );
+        assert_eq!(peek(&mut receiver), "\"accepted-after\"");
     }
 
     #[test]
-    fn test_iterate() {
+    fn an_entry_past_the_header_limit_is_an_error() {
         let (_dir, path) = test_queue_dir();
-        let data = data_lots_of_data().take(10_000).collect::<Vec<_>>();
-
-        // Populate a queue:
-        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
-
-        sender.try_send_batch(&data).unwrap();
-
-        let iterated = QueueIter::open(&path)
-            .unwrap()
-            .map(|item| item.unwrap())
-            .collect::<Vec<_>>();
-
-        assert_eq!(data, iterated);
+        let (mut sender, _receiver) = channel(&path, options(1 << 20)).unwrap();
+        let big = vec![0_u8; 1 << 26];
+        let err = sender.send(&[], &big).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            sender.send(&[0; 2], &big[..(1 << 26) - 2]).is_err(),
+            "the prefix counts"
+        );
     }
 
+    /// Bytes written behind the sender's back, as a torn or half-written
+    /// entry, are never read. A rollback redelivers what it held, a commit
+    /// saves a whole-entry position, and a reopen keeps the entry once whole
+    /// or cuts it off while torn.
     #[test]
-    fn test_try_recv_empty_msg() {
+    fn a_half_written_entry_is_never_read() {
+        let torn_header = Header::for_len(100).unwrap().encode();
+        // Rolled back beside a half-written entry, the batch comes back whole.
         let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        send(&mut sender, b"zero-record-bytes");
+        assert_eq!(take(&mut receiver, 1).len(), 1);
+        send(&mut sender, b"first-record");
+        append_raw(&path, 0, &torn_header);
+        append_raw(&path, 0, &[7; 10]);
+        assert_eq!(receiver.read(10, u64::MAX, None).unwrap().entries, 1);
+        receiver.commit(0, None);
+        append_raw(&path, 0, &[7; 90]);
+        assert_eq!(peek(&mut receiver), "\"first-record\"");
+        drop((sender, receiver));
 
-        // Populate a queue:
-        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
+        // Committed beside it, the saved position is at the whole entry, and
+        // the reopen reads it once the rest landed.
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        send(&mut sender, b"first-record");
+        append_raw(&path, 0, &torn_header);
+        append_raw(&path, 0, &[7; 10]);
+        assert_eq!(take(&mut receiver, 10).len(), 1);
+        drop((sender, receiver));
+        append_raw(&path, 0, &[7; 90]);
+        let (_sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        assert_eq!(take(&mut receiver, 10), vec![vec![7; 100]]);
 
-        sender.try_send(&[]).unwrap();
+        // Still torn at the reopen, it is cut off and later entries read.
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, receiver) = channel(&path, options(1 << 20)).unwrap();
+        send(&mut sender, b"first-record");
+        append_raw(&path, 0, &torn_header);
+        append_raw(&path, 0, &[7; 10]);
+        drop((sender, receiver));
+        let (mut sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        send(&mut sender, b"after-restart");
+        assert_eq!(
+            take(&mut receiver, 10),
+            vec![b"first-record".to_vec(), b"after-restart".to_vec()]
+        );
+        assert_eq!(sender.disk_bytes(), disk_on(&path));
+    }
 
-        let mut receiver = Receiver::open(&path).unwrap();
+    /// A segment closed by its marker before the next existed, as a kill
+    /// between the two leaves it, takes no entry after a restart.
+    #[test]
+    fn a_sealed_segment_takes_no_entry_after_a_restart() {
+        let (_dir, path) = test_queue_dir();
+        drop(channel(&path, options(1 << 20)).unwrap());
+        std::fs::write(
+            segment_filename(&path, 0),
+            [entry(b"first-record"), EOF.to_vec()].concat(),
+        )
+        .unwrap();
+        let (mut sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        send(&mut sender, b"after-restart");
+        assert_eq!(
+            take(&mut receiver, 10),
+            vec![b"first-record".to_vec(), b"after-restart".to_vec()]
+        );
+    }
 
-        let item = receiver.try_recv().unwrap();
-        assert!(item.is_empty());
-        item.commit().unwrap();
+    /// A commit whose segment cannot be deleted still commits, and the
+    /// receiver and a reopen go on.
+    #[test]
+    fn a_segment_that_cannot_be_deleted_does_not_wedge_the_receiver() {
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(16)).unwrap();
+        for byte in *b"abc" {
+            send(&mut sender, &[byte; 20]);
+        }
+        assert_eq!(receiver.read(3, u64::MAX, None).unwrap().entries, 3);
+        // Segment 1 cannot be removed, as when another program holds it open on Windows.
+        std::fs::remove_file(segment_filename(&path, 1)).unwrap();
+        std::fs::create_dir(segment_filename(&path, 1)).unwrap();
+        std::fs::write(segment_filename(&path, 1).join("held"), b"x").unwrap();
+        receiver.commit(3, None);
+        std::fs::remove_dir_all(segment_filename(&path, 1)).unwrap();
+        send(&mut sender, &[b'd'; 20]);
+        assert_eq!(peek(&mut receiver), format!("{:?}", "d".repeat(20)));
+        drop((sender, receiver));
+        let (_sender, mut receiver) = channel(&path, options(16)).unwrap();
+        assert_eq!(take(&mut receiver, 10), vec![vec![b'd'; 20]]);
+    }
+
+    /// A read error returns at once: never a spin, and never an entry lost.
+    #[test]
+    fn a_read_error_returns_and_the_next_read_meets_it() {
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(16)).unwrap();
+        send(&mut sender, b"first-record-twenty!");
+        send(&mut sender, b"second-record");
+        // The next segment reads back an error, as a failing disk does.
+        std::fs::remove_file(segment_filename(&path, 1)).unwrap();
+        std::fs::create_dir(segment_filename(&path, 1)).unwrap();
+        let taken = receiver.read(10, u64::MAX, None).unwrap();
+        assert_eq!(taken.entries, 1, "the read stops at the error");
+        receiver.commit(1, None);
+        assert!(
+            receiver.read(10, u64::MAX, None).is_err(),
+            "the next read meets it"
+        );
+    }
+
+    /// The committed position is saved every 250 entries however they are
+    /// batched, and again on drop.
+    #[test]
+    fn the_position_is_saved_every_250_entries() {
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        for _ in 0..1000 {
+            send(&mut sender, b"r");
+        }
+        let mut taken = 0;
+        while taken < 994 {
+            taken += take(&mut receiver, 7).len();
+        }
+        let saved = std::fs::read(path.join(crate::yaque::RECV_METADATA)).unwrap();
+        let position = u64::from_be_bytes(saved[8..].try_into().unwrap());
+        assert!(
+            position >= 5 * 744,
+            "saved at {position} after {taken} entries"
+        );
+    }
+
+    /// A write that fails part way, here past RLIMIT_FSIZE, is cut back, so
+    /// the entries sent after it are read.
+    #[cfg(all(unix, feature = "tiered-sink"))]
+    #[test]
+    #[ignore = "caps RLIMIT_FSIZE for the whole process -- run: cargo nextest run --run-ignored all --ignore-default-filter"]
+    #[allow(unsafe_code)]
+    fn a_failed_large_append_keeps_later_entries_readable() {
+        let (_dir, path) = test_queue_dir();
+        let (mut sender, mut receiver) = channel(&path, options(1 << 20)).unwrap();
+        send(&mut sender, &[1; 100]);
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: libc calls on stack values this function owns.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut old);
+            let capped = libc::rlimit {
+                rlim_cur: 5000,
+                rlim_max: old.rlim_max,
+            };
+            libc::setrlimit(libc::RLIMIT_FSIZE, &raw const capped);
+        }
+        let failed = sender.send(&[], &[2; 16 * 1024]);
+        // SAFETY: as above.
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_FSIZE, &raw const old);
+        }
+        let err = failed.expect_err("the capped write fails");
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge, "{err}");
+        assert_eq!(disk_on(&path), 104, "the torn write was cut back");
+        send(&mut sender, b"accepted-after");
+        assert_eq!(
+            take(&mut receiver, 10),
+            vec![vec![1; 100], b"accepted-after".to_vec()]
+        );
+    }
+
+    /// A second open of a queue another open holds is refused as `WouldBlock`.
+    #[test]
+    fn a_second_open_is_refused() {
+        let (_dir, path) = test_queue_dir();
+        let first = channel(&path, options(512)).unwrap();
+        let err = channel(&path, options(512)).err().expect("held");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        drop(first);
+        channel(&path, options(512)).expect("released");
+    }
+
+    /// A copy of a lock's handle, as a spawned child holds until it execs,
+    /// delays the open while it lasts and refuses it past the retries.
+    #[test]
+    fn an_open_waits_out_a_briefly_held_copy_of_the_lock() {
+        for (held_ms, opens) in [(30, true), (2_000, false)] {
+            let (_dir, path) = test_queue_dir();
+            drop(channel(&path, options(512)).unwrap());
+            let copy = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path.join("send.lock"))
+                .unwrap();
+            copy.try_lock().unwrap();
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(held_ms));
+                drop(copy);
+            });
+            let opened = channel(&path, options(512));
+            assert_eq!(opened.is_ok(), opens, "held {held_ms} ms");
+            if let Err(e) = opened {
+                assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+            }
+            release.join().unwrap();
+        }
     }
 }

@@ -9,9 +9,12 @@
 //! Background drain task for spooled messages.
 
 use crate::compression::Compressor;
+use crate::spool_codec::{QueueCell, StoreMetrics};
+use crate::tiered_sink::tiered::Spill;
 use crate::tiered_sink::{CircuitBreaker, DrainStrategy};
 use crate::transport::{Record, SendResult, TransportSender};
-use crate::yaque::{self, Receiver};
+use crate::yaque::{self, Receiver, Taken};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -142,15 +145,13 @@ enum DrainResult {
     /// the spill codec, as when it was written under another. Nothing is
     /// committed, and the drain holds until the codec that wrote it is back.
     Held(String),
+    /// A header failed its parity check, so no later entry can be found. The
+    /// spill is quarantined and a fresh one opened.
+    Damaged(String),
     /// Queue is empty
     Empty,
-    /// I/O error
-    IoError,
-    /// `guard.commit()` failed after the sink/codec returned a result
-    /// that would normally consume the entry. The entry is STILL on
-    /// disk. Counters were NOT decremented. StrictFifo must stay
-    /// gated until the next drain iteration retries.
-    CommitFailed(String),
+    /// The read failed. Nothing was taken, and the next pass tries again.
+    IoError(String),
 }
 
 /// Feed one drain outcome back into the rate controller and the breaker.
@@ -209,15 +210,14 @@ async fn settle(result: DrainResult, drainer: &mut Drainer, circuit: &CircuitBre
             // The loop logs the hold once, and the entry stays spooled.
             drainer.record_failure();
         }
-        DrainResult::Empty | DrainResult::IoError => {
-            // Nothing to do, just continue
-        }
-        DrainResult::CommitFailed(e) => {
-            // Counters intact. Entry still on disk. Treat as
-            // failure so StrictFifo stays gated until retry.
-            drainer.record_failure();
+        DrainResult::Damaged(e) => {
             #[cfg(feature = "tracing")]
-            tracing::error!(error = %e, "yaque commit failed; counters preserved, will retry");
+            tracing::error!(error = %e, "A spilled entry's header is damaged; quarantining the spill");
+            #[cfg(not(feature = "tracing"))]
+            let _ = e;
+        }
+        DrainResult::Empty | DrainResult::IoError(_) => {
+            // Nothing to do, just continue
         }
     }
 }
@@ -237,6 +237,18 @@ fn release_many(count: &AtomicU64, total: &AtomicU64, entries: u64, bytes: u64) 
     let _ = total.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
         Some(n.saturating_sub(bytes))
     });
+    refresh_gauges(count, total);
+}
+
+/// Sets the spool's record and byte gauges from its counters.
+fn refresh_gauges(count: &AtomicU64, total: &AtomicU64) {
+    #[cfg(feature = "metrics")]
+    {
+        ::metrics::gauge!("spool_messages").set(count.load(AtomicOrdering::Relaxed) as f64);
+        ::metrics::gauge!("spool_bytes").set(total.load(AtomicOrdering::Relaxed) as f64);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (count, total);
 }
 
 /// The `service` field of the dead letters the tiered sink writes.
@@ -438,19 +450,6 @@ pub(crate) struct DrainBatch {
     pub(crate) max_bytes: u64,
 }
 
-/// How many leading entries of `sizes` fit `max_bytes`, never fewer than one.
-fn fitting(sizes: &[u64], max_bytes: u64) -> usize {
-    let mut total = 0_u64;
-    let fit = sizes
-        .iter()
-        .take_while(|&&size| {
-            total = total.saturating_add(size);
-            total <= max_bytes
-        })
-        .count();
-    fit.max(1)
-}
-
 /// Why a spooled entry did not decode.
 enum Unreadable {
     /// It failed its CRC, so it is dropped.
@@ -466,88 +465,244 @@ fn decode_entry(
     decoder: &mut Compressor,
     scratch: &mut Vec<u8>,
 ) -> Result<Record, Unreadable> {
-    let body =
-        crate::spool_codec::unframe(crc, raw.to_vec()).map_err(|c| Unreadable::Corrupt(c.0))?;
+    let body = crate::spool_codec::unframe(crc, raw).map_err(|c| Unreadable::Corrupt(c.0))?;
     // The spill keeps no codec per entry, so a failure past the CRC is read as
     // an entry another codec wrote, never dropped.
     decoder
-        .decompress_into(&body, scratch, usize::MAX)
+        .decompress_into(body, scratch, usize::MAX)
         .map_err(|e| Unreadable::WrongCodec(e.to_string()))?;
     Record::decode(scratch).map_err(|e| Unreadable::WrongCodec(e.to_string()))
 }
 
+/// The spill the drain reads from, and what it touches when the queue changes.
+pub(crate) struct DrainQueue {
+    pub(crate) spill: Arc<Mutex<Spill>>,
+    /// `None` while a quarantine swaps in a fresh queue, or after it failed.
+    pub(crate) receiver: Arc<parking_lot::Mutex<Option<Receiver>>>,
+    pub(crate) cell: QueueCell,
+    pub(crate) path: PathBuf,
+    pub(crate) options: yaque::Options,
+    pub(crate) metrics: Arc<StoreMetrics>,
+    #[cfg(feature = "memory")]
+    pub(crate) memory: Arc<std::sync::OnceLock<Arc<crate::memory::MemoryGuard>>>,
+}
+
+/// The spool's entry and byte counters, shared with the sink.
+pub(crate) struct Counters {
+    pub(crate) count: Arc<AtomicU64>,
+    pub(crate) bytes: Arc<AtomicU64>,
+    /// Wakes the sends a full spool blocks once a pass frees room.
+    pub(crate) progress: Arc<tokio::sync::Notify>,
+}
+
+/// The drain's health, shared with the sink's health check.
+pub(crate) struct Flags {
+    /// Set while the drain holds at an entry its codec cannot read.
+    pub(crate) held: Arc<AtomicBool>,
+    /// Set while the spool counts records the drain does not find.
+    pub(crate) stalled: Arc<AtomicBool>,
+}
+
+impl DrainQueue {
+    fn guard(&self) -> Option<Arc<yaque::MemoryGuard>> {
+        #[cfg(feature = "memory")]
+        return self.memory.get().cloned();
+        #[cfg(not(feature = "memory"))]
+        {
+            let _ = self;
+            None
+        }
+    }
+
+    /// Reads up to `cap` entries within `max_bytes` on the blocking pool.
+    async fn read(&self, cap: usize, max_bytes: u64) -> std::io::Result<Taken> {
+        let receiver = Arc::clone(&self.receiver);
+        let guard = self.guard();
+        let (taken, reserved) = tokio::task::spawn_blocking(move || {
+            let mut receiver = receiver.lock();
+            let Some(receiver) = receiver.as_mut() else {
+                return Ok((Taken::default(), 0));
+            };
+            let taken = receiver.read(cap, max_bytes, guard.as_deref())?;
+            Ok::<_, std::io::Error>((taken, receiver.reserved_bytes()))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        self.metrics.reserved(reserved, taken.held_back);
+        Ok(taken)
+    }
+
+    /// Commits the first `entries` read and returns the rest, on the blocking
+    /// pool: a commit can delete segments and save the position.
+    async fn commit(&self, entries: usize) {
+        let receiver = Arc::clone(&self.receiver);
+        let guard = self.guard();
+        let disk = tokio::task::spawn_blocking(move || {
+            receiver.lock().as_mut().map(|receiver| {
+                receiver.commit(entries, guard.as_deref());
+                receiver.disk_bytes()
+            })
+        })
+        .await;
+        self.metrics.reserved(0, false);
+        if let Ok(Some(disk)) = disk {
+            self.metrics.disk(disk);
+        }
+    }
+
+    /// Ends a drained segment so its file goes, once the spool is empty.
+    async fn release_drained(&self) {
+        let Some(position) = self.receiver.lock().as_ref().map(Receiver::position) else {
+            return;
+        };
+        let spill = Arc::clone(&self.spill);
+        let receiver = Arc::clone(&self.receiver);
+        let released = tokio::task::spawn_blocking(move || {
+            let released = match spill.blocking_lock().sender.as_mut() {
+                Some(sender) => sender.release_drained(position)?,
+                None => false,
+            };
+            match receiver.lock().as_mut() {
+                Some(receiver) if released => {
+                    receiver.sweep()?;
+                    Ok(Some(receiver.disk_bytes()))
+                }
+                _ => Ok(None),
+            }
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|released: std::io::Result<Option<u64>>| released);
+        match released {
+            Ok(Some(disk)) => self.metrics.disk(disk),
+            Ok(None) => {}
+            Err(e) => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(error = %e, "cannot release the spill's drained segment");
+                let _ = e;
+            }
+        }
+    }
+
+    /// Moves a spill whose header is damaged aside and opens a fresh one in
+    /// its place. Every record from the damaged header on is set aside with it.
+    async fn quarantine(&self, reason: String, counters: &Counters) {
+        let spill = Arc::clone(&self.spill);
+        let receiver = Arc::clone(&self.receiver);
+        let cell = Arc::clone(&self.cell);
+        let path = self.path.clone();
+        let options = self.options;
+        let reopened = tokio::task::spawn_blocking(move || {
+            let mut spill = spill.blocking_lock();
+            let mut receiver = receiver.lock();
+            // The halves hold the queue's locks, so they close before the fresh queue opens.
+            spill.sender = None;
+            *receiver = None;
+            *cell.lock() = None;
+            let (sender, fresh) = crate::spool_codec::quarantine_damaged(&path, &reason, options)
+                .map_err(|e| e.to_string())?;
+            *cell.lock() = Some(sender.shared());
+            spill.sender = Some(sender);
+            *receiver = Some(fresh);
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|reopened| reopened);
+        counters.count.store(0, AtomicOrdering::Relaxed);
+        counters.bytes.store(0, AtomicOrdering::Relaxed);
+        refresh_gauges(&counters.count, &counters.bytes);
+        if let Err(e) = reopened {
+            #[cfg(feature = "tracing")]
+            tracing::error!(error = %e, "cannot reopen the spill after quarantining it; spills fail until a restart");
+            let _ = e;
+        }
+    }
+}
+
 /// Take up to `cap` entries within `batch.max_bytes`, send the readable ones in
 /// one `send_batch` under `send_timeout`, and commit every entry only when the
-/// sink takes them. Any other answer rolls the whole batch back.
+/// sink takes them. Any other answer returns the whole batch to the queue.
 #[allow(clippy::too_many_arguments)]
 async fn drain_once<S: TransportSender>(
     sink: &S,
-    receiver: &mut Receiver,
+    queue: &DrainQueue,
     cap: usize,
     batch: DrainBatch,
     decoder: &mut Compressor,
     scratch: &mut Vec<u8>,
     crc: bool,
     send_timeout: Duration,
-    spool_count: &AtomicU64,
-    spool_bytes: &AtomicU64,
+    counters: &Counters,
     dead_letters: &DeadLetters,
 ) -> Vec<DrainResult> {
-    let first = match receiver.try_recv_batch_up_to(cap) {
-        Ok(guard) => guard,
-        Err(yaque::TryRecvError::QueueEmpty) => return vec![DrainResult::Empty],
-        Err(yaque::TryRecvError::Io(e)) => {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(error = %e, "I/O error reading from spool");
-            #[cfg(not(feature = "tracing"))]
-            let _ = e;
-            return vec![DrainResult::IoError];
+    let taken = match queue.read(cap, batch.max_bytes).await {
+        Ok(taken) if taken.entries == 0 => return vec![DrainResult::Empty],
+        Ok(taken) => taken.entries,
+        Err(e) if crate::spool_codec::is_damaged_header(&e) => {
+            return vec![DrainResult::Damaged(e.to_string())];
         }
+        Err(e) => return vec![DrainResult::IoError(e.to_string())],
     };
-    let sizes: Vec<u64> = first.iter().map(|e| e.len() as u64).collect();
-    let mut take = fitting(&sizes, batch.max_bytes);
-    // yaque commits a guard whole, so a batch over the byte cap is rolled
-    // back (on drop) and only what fits is taken again.
-    let guard = if take == first.len() {
-        first
-    } else {
-        drop(first);
-        match receiver.try_recv_batch_up_to(take) {
-            Ok(guard) => guard,
-            Err(yaque::TryRecvError::QueueEmpty) => return vec![DrainResult::Empty],
-            Err(yaque::TryRecvError::Io(_)) => return vec![DrainResult::IoError],
-        }
-    };
-    let mut read_back = Vec::with_capacity(guard.len());
+    let (outcome, commit) = deliver(
+        sink,
+        queue,
+        taken,
+        decoder,
+        scratch,
+        crc,
+        send_timeout,
+        counters,
+        dead_letters,
+    )
+    .await;
+    queue.commit(commit).await;
+    outcome
+}
+
+/// Decode, send and dead-letter the `taken` entries the receiver holds. Returns
+/// the outcome and how many entries to commit, the rest going back to the queue.
+#[allow(clippy::too_many_arguments)]
+async fn deliver<S: TransportSender>(
+    sink: &S,
+    queue: &DrainQueue,
+    taken: usize,
+    decoder: &mut Compressor,
+    scratch: &mut Vec<u8>,
+    crc: bool,
+    send_timeout: Duration,
+    counters: &Counters,
+    dead_letters: &DeadLetters,
+) -> (Vec<DrainResult>, usize) {
+    let mut read_back = Vec::with_capacity(taken);
     let mut unreadable = Vec::new();
     let mut wrong_codec = None;
-    for (index, raw) in guard.iter().enumerate() {
-        match decode_entry(raw, crc, decoder, scratch) {
-            Ok(record) => read_back.push(record),
-            Err(Unreadable::Corrupt(e)) => unreadable.push(DrainResult::Corrupt(e)),
-            Err(Unreadable::WrongCodec(e)) => {
-                wrong_codec = Some((index, e));
-                break;
+    let mut stored = 0_u64;
+    {
+        let receiver = queue.receiver.lock();
+        let Some(receiver) = receiver.as_ref() else {
+            return (vec![DrainResult::Empty], 0);
+        };
+        for (index, raw) in receiver.taken().iter().enumerate() {
+            match decode_entry(raw, crc, decoder, scratch) {
+                Ok(record) => read_back.push(record),
+                Err(Unreadable::Corrupt(e)) => unreadable.push(DrainResult::Corrupt(e)),
+                Err(Unreadable::WrongCodec(e)) => {
+                    wrong_codec = Some((index, e));
+                    break;
+                }
             }
+            // What the entry takes on disk, its 4-byte header included.
+            stored += 4 + raw.len() as u64;
         }
     }
-    // Only the entries before one the codec cannot read are taken: dropping
-    // the guard rolls the batch back, so the rest stay spooled in order.
-    let guard = match wrong_codec {
-        None => guard,
-        Some((0, error)) => return vec![DrainResult::Held(error)],
-        Some((index, _)) => {
-            drop(guard);
-            take = index;
-            match receiver.try_recv_batch_up_to(take) {
-                Ok(guard) => guard,
-                Err(yaque::TryRecvError::QueueEmpty) => return vec![DrainResult::Empty],
-                Err(yaque::TryRecvError::Io(_)) => return vec![DrainResult::IoError],
-            }
-        }
+    // Only the entries before one the codec cannot read are taken. The rest
+    // stay spooled in order.
+    let take = match wrong_codec {
+        None => taken,
+        Some((0, error)) => return (vec![DrainResult::Held(error)], 0),
+        Some((index, _)) => index,
     };
-    let taken = guard.len();
-    let stored: u64 = sizes.iter().take(taken).sum();
     let mut records = Vec::with_capacity(read_back.len());
     let mut dead = Vec::new();
     for record in read_back {
@@ -575,17 +730,17 @@ async fn drain_once<S: TransportSender>(
         // may not have reached the sink) and a closed or misconfigured sink
         // keep the whole batch spooled (at-least-once).
         Some(SendResult::Backpressured | SendResult::RetryAfter(_)) => {
-            return vec![DrainResult::SinkUnavailable];
+            return (vec![DrainResult::SinkUnavailable], 0);
         }
         Some(SendResult::Fatal(e)) if e.is_fatal() => {
-            return vec![DrainResult::SinkUnavailable];
+            return (vec![DrainResult::SinkUnavailable], 0);
         }
         // A refusal or dead letter in a batch cannot say which record: keep
         // them all and send them one at a time until that one is past.
         Some(SendResult::Fatal(_) | SendResult::Reject(_) | SendResult::FilteredDlq)
             if records.len() > 1 =>
         {
-            return vec![DrainResult::Isolate(taken)];
+            return (vec![DrainResult::Isolate(take)], 0);
         }
         // On its own, the refused record is its own fault: dead-letter it.
         Some(SendResult::Fatal(e) | SendResult::Reject(e)) => {
@@ -611,43 +766,42 @@ async fn drain_once<S: TransportSender>(
             .write(dead, send_timeout, OnRefusal::Drop)
             .await
     {
-        return vec![DrainResult::DeadLetterUnwritten];
+        return (vec![DrainResult::DeadLetterUnwritten], 0);
     }
-    match guard.commit() {
-        Ok(()) => {
-            release_many(spool_count, spool_bytes, taken as u64, stored);
-            let mut results = unreadable;
-            if dead_lettered > 0 {
-                results.push(DrainResult::DeadLettered(dead_lettered));
-            }
-            if delivered > 0 {
-                results.push(DrainResult::Success(delivered));
-            }
-            results
-        }
-        Err(e) => vec![DrainResult::CommitFailed(e.to_string())],
+    release_many(&counters.count, &counters.bytes, take as u64, stored);
+    let mut results = unreadable;
+    if dead_lettered > 0 {
+        results.push(DrainResult::DeadLettered(dead_lettered));
     }
+    if delivered > 0 {
+        results.push(DrainResult::Success(delivered));
+    }
+    (results, take)
 }
+
+/// Passes in a row that find nothing while the spool counts records, before
+/// the drain reports itself stalled.
+const STALLED_AFTER_PASSES: u32 = 50;
 
 /// Drain loop. Runs until shutdown signalled.
 ///
 /// Each pass takes up to `batch` entries, at most one second's worth at the
-/// strategy's current rate, and sends them in one `send_batch`.
+/// strategy's current rate, and sends them in one `send_batch`. Reads and
+/// commits run on the blocking pool, and no lock is held across the send.
 ///
 /// `send_timeout`: bounds each downstream send, the hot path's limit, so a hung
-/// sink cannot pin the spool lock, the StrictFifo gate or `shutdown()`.
+/// sink cannot pin the StrictFifo gate or `shutdown()`.
 ///
 /// `fifo_gate`: `Some` in StrictFifo, acquired per delivery cycle
 /// to serialise with senders. `None` in Interleaved (lock-free).
 #[allow(clippy::too_many_arguments)]
 pub async fn drain_loop<S: TransportSender + 'static>(
+    queue: DrainQueue,
     sink: Arc<S>,
-    spool_receiver: Arc<Mutex<Receiver>>,
-    spool_count: Arc<AtomicU64>,
-    spool_bytes: Arc<AtomicU64>,
+    counters: Counters,
     circuit: Arc<CircuitBreaker>,
     mut decoder: Compressor,
-    held: Arc<AtomicBool>,
+    flags: Flags,
     crc: bool,
     strategy: DrainStrategy,
     interval: Duration,
@@ -662,6 +816,8 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     let mut isolate = 0_usize;
     // Decompressed entries land here, reused across passes.
     let mut scratch = Vec::new();
+    let mut read_failing = false;
+    let mut empty_passes = 0_u32;
 
     #[cfg(feature = "shutdown")]
     let global_shutdown = crate::shutdown::token();
@@ -714,42 +870,62 @@ pub async fn drain_loop<S: TransportSender + 'static>(
         } else {
             per_pass(batch.max_records, drainer.current_rate())
         };
-        // RecvGuard borrows the Receiver, so take, send and commit under its lock.
-        let results = {
-            let mut receiver = spool_receiver.lock().await;
-            drain_once(
-                sink.as_ref(),
-                &mut receiver,
-                cap,
-                batch,
-                &mut decoder,
-                &mut scratch,
-                crc,
-                send_timeout,
-                &spool_count,
-                &spool_bytes,
-                &dead_letters,
-            )
-            .await
-        };
+        let results = drain_once(
+            sink.as_ref(),
+            &queue,
+            cap,
+            batch,
+            &mut decoder,
+            &mut scratch,
+            crc,
+            send_timeout,
+            &counters,
+            &dead_letters,
+        )
+        .await;
 
         let mut took = 0_usize;
+        let mut progressed = false;
         for result in results {
-            note_hold(&result, &held, decoder.compression());
-            match result {
+            note_hold(&result, &flags.held, decoder.compression());
+            note_read_error(&result, &mut read_failing);
+            match &result {
                 DrainResult::Success(records) => {
                     took += records;
                     pause = Duration::ZERO;
+                    progressed = true;
                 }
-                DrainResult::DeadLettered(_) | DrainResult::Corrupt(_) => pause = Duration::ZERO,
-                DrainResult::Isolate(entries) => {
-                    isolate = entries;
+                DrainResult::DeadLettered(_) | DrainResult::Corrupt(_) => {
                     pause = Duration::ZERO;
+                    progressed = true;
+                }
+                DrainResult::Isolate(entries) => {
+                    isolate = *entries;
+                    pause = Duration::ZERO;
+                }
+                DrainResult::Damaged(reason) => {
+                    queue.quarantine(reason.clone(), &counters).await;
+                    progressed = true;
+                }
+                DrainResult::Empty => {
+                    if counters.count.load(AtomicOrdering::Relaxed) > 0 {
+                        empty_passes = empty_passes.saturating_add(1);
+                    } else {
+                        empty_passes = 0;
+                    }
                 }
                 _ => {}
             }
             settle(result, &mut drainer, &circuit).await;
         }
+        if progressed {
+            empty_passes = 0;
+            if counters.count.load(AtomicOrdering::Relaxed) == 0 {
+                queue.release_drained().await;
+            }
+            counters.progress.notify_waiters();
+        }
+        note_stall(empty_passes >= STALLED_AFTER_PASSES, &flags.stalled);
 
         // The strategy's delay is per record, so a batch waits for each one.
         pause += drainer
@@ -758,12 +934,50 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     }
 }
 
+/// Count a pass's read error, logging only when reads start or stop failing.
+fn note_read_error(result: &DrainResult, failing: &mut bool) {
+    let now_failing = match result {
+        DrainResult::IoError(_) => true,
+        DrainResult::Empty | DrainResult::SinkUnavailable => return,
+        _ => false,
+    };
+    if let DrainResult::IoError(_) = result {
+        #[cfg(feature = "metrics")]
+        ::metrics::counter!("tiered_sink_drain_read_errors_total").increment(1);
+    }
+    if *failing == now_failing {
+        return;
+    }
+    *failing = now_failing;
+    #[cfg(feature = "tracing")]
+    if let DrainResult::IoError(error) = result {
+        tracing::warn!(error = %error, "the drain cannot read the spill; retrying each pass");
+    } else {
+        tracing::info!("the drain reads the spill again");
+    }
+}
+
+/// Set or clear `stalled`, logging and gauging only the change.
+fn note_stall(stalled: bool, flag: &AtomicBool) {
+    if flag.swap(stalled, AtomicOrdering::Relaxed) == stalled {
+        return;
+    }
+    #[cfg(feature = "metrics")]
+    ::metrics::gauge!("tiered_sink_drain_stalled").set(if stalled { 1.0 } else { 0.0 });
+    #[cfg(feature = "tracing")]
+    if stalled {
+        tracing::warn!("the spool counts records the drain does not find; it may be stalled");
+    } else {
+        tracing::info!("the drain is taking records again");
+    }
+}
+
 /// Set or clear `held` from a pass's result, logging and counting only the
 /// change, so a hold is reported once however many passes it lasts.
 fn note_hold(result: &DrainResult, held: &AtomicBool, codec: crate::compression::Compression) {
     let holding = match result {
         DrainResult::Held(_) => true,
-        DrainResult::Empty | DrainResult::IoError | DrainResult::SinkUnavailable => return,
+        DrainResult::Empty | DrainResult::IoError(_) | DrainResult::SinkUnavailable => return,
         _ => false,
     };
     if held.swap(holding, AtomicOrdering::Relaxed) == holding {

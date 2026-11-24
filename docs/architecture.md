@@ -78,7 +78,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 
 | Module | Feature | Purpose |
 | -------- | --------- | --------- |
-| `spool` | `spool` | Disk-backed async FIFO queue (`src/yaque`, a copy of yaque 0.6.6, + `zstd`), with an opt-in per-record CRC32C check (`crc`, off by default) |
+| `spool` | `spool` | Disk-backed async FIFO queue (`src/yaque`, derived from yaque 0.6.6, + `compression`), with an opt-in per-record CRC32C check (`crc`, off by default) |
 | `tiered_sink` | `tiered-sink` | Transport + spool + circuit breaker + background drain |
 | `sink_stack` | `sink-stack` | Outbound control stack - composes timeout, load-shed, concurrency-limit, retry/backoff and rate-limit around a transport sender (tower `ServiceBuilder`), and preserves at-least-once |
 | `worker::pool` | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio), pressure-based scaling |
@@ -124,7 +124,7 @@ A handful of dependencies aren't visible from layer naming alone:
 
 - `worker-batch` depends on `worker-pool` (the engine sits on top of the
   pool), which in turn depends on `metrics` and `config`.
-- `tiered-sink` does not enable `spool`. It runs a separate `yaque` queue through the crate-private `spool_codec` it shares with `spool`, plus an L3 transport.
+- `tiered-sink` does not enable `spool`. It runs a separate queue from `src/yaque` through the crate-private `spool_codec` it shares with `spool`, plus an L3 transport.
 - `dlq` needs `concurrency` (L2) for the `BackgroundSink` actor that
   drains queued entries.
 - `transport-trace` is the *only* transport feature that pulls in OpenTelemetry, and it takes the `opentelemetry` API crate, not the SDK. Apps that send/receive without distributed tracing avoid that dep entirely.

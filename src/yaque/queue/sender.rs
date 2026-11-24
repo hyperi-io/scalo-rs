@@ -2,413 +2,225 @@
 // Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
 // Modified for scalo.
 
-use std::fs::*;
-use std::io::{self, Write};
-use std::num::NonZeroU64;
+//! The sending half: appends whole entries to the newest segment.
+
+use std::fs::{File, OpenOptions};
+use std::io::{self, IoSlice, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::yaque::error::TrySendError;
-use crate::yaque::header::Header;
+use super::{Options, scan, segment_filename, segments};
+use crate::yaque::count;
+use crate::yaque::header::{EOF, Header, MAX_LEN};
 use crate::yaque::state::QueueState;
-use crate::yaque::sync::{DeletionEvent, FileGuard};
-use crate::yaque::version::check_queue_version;
+use crate::yaque::sync::{FileGuard, Shared};
 
-use super::{HEADER_EOF, segment_filename};
-
-/// The name of the sender lock in the queue folder.
-pub(crate) fn send_lock_filename<P: AsRef<Path>>(base: P) -> PathBuf {
-    base.as_ref().join("send.lock")
-}
-
-/// Tries to acquire the sender lock for a queue.
-pub(crate) fn try_acquire_send_lock<P: AsRef<Path>>(base: P) -> io::Result<FileGuard> {
-    FileGuard::try_lock(send_lock_filename(base.as_ref()))?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "queue `{}` sender side already in use",
-                base.as_ref().to_string_lossy()
-            ),
-        )
-    })
-}
-
-/// Acquire the sender lock for a queue, awaiting if locked.
-pub(crate) async fn acquire_send_lock<P: AsRef<Path>>(base: P) -> io::Result<FileGuard> {
-    FileGuard::lock(send_lock_filename(base.as_ref())).await
-}
-
-pub(crate) struct QueueSize {
-    pub(crate) in_bytes: u64,
-    pub(crate) in_segments: u64,
-}
-
-/// Non-recursively get the directory size of a given path.
-pub(crate) fn get_queue_size<P: AsRef<Path>>(base: P) -> io::Result<QueueSize> {
-    let mut in_bytes = 0;
-    let mut in_segments = 0;
-
-    for dir_entry in read_dir(base.as_ref())? {
-        let dir_entry = dir_entry?;
-
-        if let Some(extension) = dir_entry.path().extension() {
-            if extension == "q" {
-                in_bytes += dir_entry.metadata()?.len();
-                in_segments += 1;
-            }
-        }
-    }
-
-    Ok(QueueSize {
-        in_bytes,
-        in_segments,
-    })
-}
-
-/// A builder for the sender side of the queue. Use this if you want to have fine-grained control
-/// over the configuration of the queue. Most defaults should be ok of most applications.
-pub struct SenderBuilder {
-    /// The segment size in bytes that will trigger a new segment to be created. Segments an be
-    /// bigger than this to accommodate the last element, but nothing beyond that (each segment
-    /// must store at least one element).
-    ///
-    /// Default value: 4MB
-    segment_size: NonZeroU64,
-
-    /// The queue size that will block the sender from creating a new segment (until the receiver
-    /// catches up, deleting old segments). The queue can get bigger than that, but only to
-    /// accommodate the last segment (the queue must have at least one segment). Set this to `None`
-    /// to create an unbounded queue.
-    ///
-    /// This value will be ignored if the queue has only one segment, since the queue would
-    /// deadlock otherwise. It is recommended that you set `max_queue_size >> segment_size`.
-    ///
-    /// Default value: None
-    max_queue_size: Option<NonZeroU64>,
-}
-
-impl Default for SenderBuilder {
-    fn default() -> SenderBuilder {
-        SenderBuilder {
-            segment_size: NonZeroU64::new(1024 * 1024 * 4).expect("impossible"), // 4MB
-            max_queue_size: None,
-        }
-    }
-}
-
-impl SenderBuilder {
-    /// Creates a new sender builder. Finish build it by invoking [`SenderBuilder::open`].
-    pub fn new() -> SenderBuilder {
-        SenderBuilder::default()
-    }
-
-    /// The segment size in bytes that will trigger a new segment to be created. Segments an be
-    /// bigger than this to accommodate the last element, but nothing beyond that (each segment
-    /// must store at least one element).
-    ///
-    /// Default value: `4 * 1024 * 1024`, or 4MB.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `size` is zero.
-    pub fn segment_size(mut self, size: u64) -> SenderBuilder {
-        let size = NonZeroU64::new(size).expect("got segment_size=0");
-        self.segment_size = size;
-        self
-    }
-
-    /// The queue size that will block the sender from creating a new segment (until the receiver
-    /// catches up, deleting old segments). The queue can get bigger than that, but only to
-    /// accommodate the last segment (the queue must have at least one segment). Set this to `None`
-    /// to create an unbounded queue.
-    ///
-    /// This value will be ignored if the queue has only one segment, since the queue would
-    /// deadlock otherwise. It is recommended that you set `max_queue_size >> segment_size`.
-    ///
-    /// Default value: `None`
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `size` is zero.
-    pub fn max_queue_size(mut self, size: Option<u64>) -> SenderBuilder {
-        let size = size.map(|s| NonZeroU64::new(s).expect("got max_queue_size=0"));
-        self.max_queue_size = size;
-        self
-    }
-
-    /// Opens a queue on a folder indicated by the `base` path for sending. The
-    /// folder will be created if it does not already exist.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an IO error if the queue is already in use for
-    /// sending, which is indicated by a lock file. Also, any other IO error
-    /// encountered while opening will be sent.
-    pub fn open<P: AsRef<Path>>(self, base: P) -> io::Result<Sender> {
-        // Guarantee that the queue exists:
-        create_dir_all(base.as_ref())?;
-
-        tracing::trace!("created queue directory");
-
-        // Versioning stuff (this should be lightning-fast. Therefore, shameless block):
-        check_queue_version(base.as_ref())?;
-
-        // Acquire lock and guess state:
-        let file_guard = try_acquire_send_lock(base.as_ref())?;
-        let state = QueueState::for_send_metadata(base.as_ref())?;
-
-        tracing::trace!("sender lock acquired. Sender state now is {:?}", state);
-
-        // See the docs on OpenOptions::append for why the BufWriter here.
-        let file = io::BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(segment_filename(base.as_ref(), state.segment))?,
-        );
-
-        tracing::trace!("last segment opened for appending");
-
-        Ok(Sender {
-            segment_size: self.segment_size,
-            max_queue_size: self.max_queue_size,
-            _file_guard: file_guard,
-            file,
-            state,
-            deletion_stream: None,
-            base: PathBuf::from(base.as_ref()),
-        })
-    }
-}
-
-/// The sender part of the queue. This part is lock-free and therefore can be
-/// used outside an asynchronous context.
-pub struct Sender {
-    segment_size: NonZeroU64,
-    max_queue_size: Option<NonZeroU64>,
-    _file_guard: FileGuard,
-    file: io::BufWriter<File>,
-    state: QueueState,
-    deletion_stream: Option<DeletionEvent>, // lazy initiated!
+/// The sending half of a queue.
+pub(crate) struct Sender {
     base: PathBuf,
+    segment_bytes: u64,
+    file: Arc<File>,
+    state: QueueState,
+    /// A failed write's bytes are still in the segment past `state`.
+    torn: bool,
+    shared: Arc<Shared>,
+    _lock: FileGuard,
 }
 
 impl Sender {
-    /// Opens a queue on a folder indicated by the `base` path for sending. The
-    /// folder will be created if it does not already exist.
+    /// Opens the newest segment for appending.
+    ///
+    /// A torn entry at its end, left by a kill or a full disk, is cut off,
+    /// and a segment already closed by its end marker is followed by a new one.
+    pub(crate) fn open(
+        base: &Path,
+        options: Options,
+        shared: Arc<Shared>,
+        lock: FileGuard,
+    ) -> io::Result<Self> {
+        let numbers = segments(base)?;
+        let mut disk = 0;
+        for &number in &numbers {
+            disk += std::fs::metadata(segment_filename(base, number))?.len();
+        }
+        shared.add_disk(disk);
+        let newest = numbers.last().copied().unwrap_or(0);
+        let path = segment_filename(base, newest);
+        let found = match scan(&path, 0, options.whole) {
+            Ok(found) => Some(found),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let (state, file) = match found {
+            Some(found) if found.sealed => {
+                let state = QueueState {
+                    segment: newest,
+                    position: found.end,
+                }
+                .next_segment();
+                (state, open_segment(base, state.segment)?)
+            }
+            found => {
+                let end = found.map_or(0, |f| f.end);
+                let file = open_segment(base, newest)?;
+                if let Some(found) = found.filter(|f| f.len > f.end) {
+                    count("spool_torn_entries_cut_total", options.store);
+                    tracing::warn!(
+                        segment = %path.display(),
+                        torn_bytes = found.len - found.end,
+                        "cutting a torn entry off the end of the spool"
+                    );
+                    file.set_len(end)?;
+                    shared.remove_disk(found.len - end);
+                }
+                let state = QueueState {
+                    segment: newest,
+                    position: end,
+                };
+                (state, file)
+            }
+        };
+        (&file).seek(SeekFrom::Start(state.position))?;
+        let file = Arc::new(file);
+        shared.set_open(state.segment, Arc::clone(&file));
+        shared.publish(state.segment, state.position);
+        Ok(Self {
+            base: base.to_path_buf(),
+            segment_bytes: options.segment_bytes.max(1),
+            file,
+            state,
+            torn: false,
+            shared,
+            _lock: lock,
+        })
+    }
+
+    /// Appends one entry made of `prefix` then `body`, with one write, and
+    /// publishes it to the receiver once it is whole.
+    ///
+    /// A write that fails is cut back off the segment, so the receiver never
+    /// meets a torn entry, and the error is returned.
     ///
     /// # Errors
     ///
-    /// This function will return an IO error if the queue is already in use for
-    /// sending, which is indicated by a lock file. Also, any other IO error
-    /// encountered while opening will be sent.
-    pub fn open<P: AsRef<Path>>(base: P) -> io::Result<Sender> {
-        SenderBuilder::default().open(base)
-    }
-
-    /// Saves the sender queue state. You do not need to use method in most
-    /// circumstances, since it is automatically done on drop (yes, it will be
-    /// called eve if your thread panics). However, you can use this function to
-    ///
-    /// 1. Make periodical backups. Use an external timer implementation for this.
-    ///
-    /// 2. Handle possible IO errors in sending. The `drop` implementation will
-    /// ignore (but log) any io errors, which may lead to data loss in an
-    /// unreliable filesystem. It was implemented this way because no errors
-    /// are allowed to propagate on drop and panicking will abort the program if
-    /// drop is called during a panic.
-    #[deprecated(
-        since = "0.5.0",
-        note = "the sender state is now always inferred. There is no need to save anything"
-    )]
-    pub fn save(&mut self) -> io::Result<()> {
+    /// `InvalidInput` for an entry longer than 64 MiB less one byte, or the
+    /// error of the write or of starting the next segment.
+    pub(crate) fn send(&mut self, prefix: &[u8], body: &[u8]) -> io::Result<()> {
+        let len = prefix.len() + body.len();
+        let header = Header::for_len(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("an entry of {len} bytes is longer than the {MAX_LEN} a spool entry holds"),
+            )
+        })?;
+        if self.torn {
+            self.cut_back()?;
+        }
+        if self.state.position >= self.segment_bytes {
+            self.roll()?;
+        }
+        self.append(&mut [
+            IoSlice::new(&header.encode()),
+            IoSlice::new(prefix),
+            IoSlice::new(body),
+        ])?;
+        let written = 4 + len as u64;
+        self.state.position += written;
+        self.shared.add_disk(written);
+        self.shared.publish(self.state.segment, self.state.position);
         Ok(())
     }
 
-    /// Just writes to the internal buffer, but doesn't flush it.
-    fn write(&mut self, data: &[u8]) -> io::Result<u64> {
-        // Get length of the data and write the header:
-        let len = data.len();
-        assert!(len < u64::MAX as usize);
-        let header = Header::new(len as u32).encode();
-
-        // Write stuff to the file:
-        self.file.write_all(&header)?;
-        self.file.write_all(data)?;
-
-        Ok(4 + len as u64)
+    /// What this queue's halves share, for a sync on another thread.
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
     }
 
-    /// Tests whether the queue is past the end of the current segment.
-    fn is_past_end(&self) -> bool {
-        self.state.position > self.segment_size.get()
+    /// Whether the next send starts a segment, creating a file.
+    #[cfg(feature = "tiered-sink")]
+    pub(crate) fn rolls_next(&self) -> bool {
+        self.torn || self.state.position >= self.segment_bytes
     }
 
-    /// Caps off a segment by writing an EOF header and then moves segment.
-    /// This function returns `Ok(true)` if it has created a new segment or
-    /// `Ok(false)` if it has not (because the queue was too big).
-    #[must_use = "you need to always check if a segment was created or not!"]
-    fn try_cap_off_and_move(&mut self) -> io::Result<bool> {
-        if let Some(max_queue_size) = self.max_queue_size {
-            let queue_size = get_queue_size(&self.base)?;
+    /// Bytes the queue's segment files hold.
+    pub(crate) fn disk_bytes(&self) -> u64 {
+        self.shared.disk_bytes()
+    }
 
-            // Have to check if the number of segments is at least one. Otherwise, the queue will
-            // deadlock.
-            if queue_size.in_bytes >= max_queue_size.get() && queue_size.in_segments > 1 {
-                tracing::trace!(
-                    "oops! Directory size is {}, but max queue size is {}",
-                    queue_size.in_bytes,
-                    max_queue_size.get()
-                );
-                return Ok(false);
-            }
+    /// Ends the open segment when the receiver has read to its end and it
+    /// holds a sixteenth of a segment or more, so the receiver can delete it
+    /// and the queue stops holding the disk. `Ok(true)` when it did.
+    ///
+    /// # Errors
+    ///
+    /// The error of writing the end marker or starting the next segment.
+    pub(crate) fn release_drained(&mut self, read_to: QueueState) -> io::Result<bool> {
+        if read_to != self.state || self.state.position < self.segment_bytes / 16 {
+            return Ok(false);
         }
-
-        tracing::trace!("there is enough space for a new segment. Let's cap off and move on!");
-
-        // Write EOF header:
-        self.file.write(&HEADER_EOF)?;
-        self.file.flush()?;
-
-        // Preserves the already allocated buffer:
-        *self.file.get_mut() = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(segment_filename(&self.base, self.state.advance_segment()))?;
-
+        self.roll()?;
         Ok(true)
     }
 
-    fn maybe_cap_off_and_move<T>(&mut self, item: T) -> Result<T, TrySendError<T>> {
-        // See if you are past the end of the file
-        if self.is_past_end() {
-            tracing::trace!("is past the segment end. Trying to cap off and move");
-
-            // If so, create a new file, if you are able to:
-            if !self.try_cap_off_and_move()? {
-                tracing::trace!(
-                    "could not cap off and move. The queue `{:?}` is full",
-                    self.base
-                );
-
-                return Err(TrySendError::QueueFull {
-                    item,
-                    base: self.base.clone(),
-                });
-            }
-        }
-
-        Ok(item)
-    }
-
-    /// Lazy inits the future that completes every time a file is deleted.
-    fn deletion_stream(&mut self) -> &mut DeletionEvent {
-        if self.deletion_stream.is_none() {
-            let deletion_stream = DeletionEvent::new(&self.base);
-            self.deletion_stream = Some(deletion_stream);
-        }
-
-        self.deletion_stream.as_mut().unwrap() // because if was not Some, now it is.
-    }
-
-    /// Tries to sends some data into the queue. If the queue is too big to
-    /// insert (as set in `max_queue_size`), this returns
-    /// [`TrySendError::QueueFull`]. One send is always atomic.
+    /// Ends this segment with its marker and starts the next.
     ///
-    /// # Errors
-    ///
-    /// This function returns any underlying errors encountered while writing or
-    /// flushing the queue. Also, it returns [`TrySendError::QueueFull`] if the
-    /// queue is too big.
-    pub fn try_send<D: AsRef<[u8]>>(&mut self, data: D) -> Result<(), TrySendError<D>> {
-        let data = self.maybe_cap_off_and_move(data)?;
-
-        // Write to the queue and flush:
-        let written = self.write(data.as_ref())?;
-        self.file.flush()?; // guarantees atomic operation. See `new`.
-        self.state.advance_position(written);
-
+    /// A start that fails leaves the sender in this segment, past the marker,
+    /// so the retry writes a second marker no receiver reaches.
+    fn roll(&mut self) -> io::Result<()> {
+        self.append(&mut [IoSlice::new(&EOF)])?;
+        self.state.position += 4;
+        self.shared.add_disk(4);
+        self.shared.publish(self.state.segment, self.state.position);
+        let next = self.state.next_segment();
+        let file = Arc::new(open_segment(&self.base, next.segment)?);
+        self.shared.set_open(next.segment, Arc::clone(&file));
+        self.file = file;
+        self.state = next;
+        self.shared.publish(next.segment, 0);
         Ok(())
     }
 
-    /// Sends some data into the queue. One send is always atomic. This function is
-    /// `async` because the queue might be full and so we need to `.await` the
-    /// receiver to consume enough segments to clear the queue.
-    ///
-    /// # Errors
-    ///
-    /// This function returns any underlying errors encountered while writing or
-    /// flushing the queue.
-    ///
-    pub async fn send<D: AsRef<[u8]>>(&mut self, mut data: D) -> io::Result<()> {
-        loop {
-            match self.try_send(data) {
-                Ok(()) => break Ok(()),
-                Err(TrySendError::Io(err)) => break Err(err),
-                Err(TrySendError::QueueFull { item, .. }) => {
-                    data = item; // the "unmove"!
-                    self.deletion_stream().await // prevents spin lock
-                }
+    /// Writes `slices` in full at the end of the segment, or cuts the segment
+    /// back to its last whole entry and returns the error.
+    fn append(&mut self, slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+        let mut rest = slices;
+        IoSlice::advance_slices(&mut rest, 0);
+        while !rest.is_empty() {
+            match (&*self.file).write_vectored(rest) {
+                Ok(0) => return Err(self.failed(io::ErrorKind::WriteZero.into())),
+                Ok(written) => IoSlice::advance_slices(&mut rest, written),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(self.failed(e)),
             }
         }
-    }
-
-    /// Tries to send all the contents of an iterable into the queue. If the
-    /// queue is too big to insert (as set in `max_queue_size`), this returns
-    /// [`TrySendError::QueueFull`]. All is buffered to be sent atomically, in
-    /// one flush operation. Since this operation is atomic, it does not create
-    /// new segments during the iteration. Be mindful of that when using this
-    /// method for large writes.
-    ///
-    /// # Errors
-    ///
-    /// This function returns any underlying errors encountered while writing or
-    /// flushing the queue. Also, it returns [`TrySendError::QueueFull`] if the
-    /// queue is too big.
-    pub fn try_send_batch<I>(&mut self, it: I) -> Result<(), TrySendError<I>>
-    where
-        I: IntoIterator,
-        I::Item: AsRef<[u8]>,
-    {
-        let it = self.maybe_cap_off_and_move(it)?;
-
-        let mut written = 0;
-        // Drain iterator into the buffer.
-        for item in it {
-            written += self.write(item.as_ref())?;
-        }
-
-        self.file.flush()?; // guarantees atomic operation. See `new`.
-        self.state.advance_position(written);
-
         Ok(())
     }
 
-    /// Sends all the contents of an iterable into the queue. This function is
-    /// `async` because the queue might be full and so we need to `.await` the
-    /// receiver to consume enough segments to clear the queue. All is buffered
-    /// to be sent atomically, in one flush operation. Since this operation is
-    /// atomic, it does not create new segments during the iteration. Be
-    /// mindful of that when using this method for large writes.
-    ///
-    /// # Errors
-    ///
-    /// This function returns any underlying errors encountered while writing or
-    /// flushing the queue.
-    pub async fn send_batch<I>(&mut self, mut it: I) -> io::Result<()>
-    where
-        I: IntoIterator,
-        I::Item: AsRef<[u8]>,
-    {
-        loop {
-            match self.try_send_batch(it) {
-                Ok(()) => break Ok(()),
-                Err(TrySendError::Io(err)) => break Err(err),
-                Err(TrySendError::QueueFull { item, .. }) => {
-                    it = item; // the "unmove"!
-                    self.deletion_stream().await // prevents spin lock
-                }
-            }
+    /// Cuts a failed write off the segment. A cut that fails too is retried
+    /// before the next write, so nothing is ever written after a torn entry.
+    #[cold]
+    fn failed(&mut self, error: io::Error) -> io::Error {
+        self.torn = true;
+        if let Err(cut) = self.cut_back() {
+            tracing::warn!(error = %cut, "cannot cut a failed spool write back; retrying on the next write");
         }
+        error
     }
+
+    fn cut_back(&mut self) -> io::Result<()> {
+        self.file.set_len(self.state.position)?;
+        (&*self.file).seek(SeekFrom::Start(self.state.position))?;
+        self.torn = false;
+        Ok(())
+    }
+}
+
+/// Opens segment `number` for writing, creating it, without truncating it.
+/// Not append mode, which Windows opens without the rights to cut or sync.
+fn open_segment(base: &Path, number: u64) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(segment_filename(base, number))
 }

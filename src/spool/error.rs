@@ -45,4 +45,9 @@ pub enum SpoolError {
     /// Queue file is corrupted.
     #[error("spool file is corrupted: {0}")]
     Corrupted(String),
+
+    /// The disk is full. The push was refused and nothing was written. Retry
+    /// once the consumer has freed space.
+    #[error("spool disk is full: {0}")]
+    DiskFull(String),
 }

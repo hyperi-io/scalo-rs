@@ -11,8 +11,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::spool_codec::{
+    DEFAULT_READ_BUFFER_BYTES, DEFAULT_SEGMENT_BYTES, DEFAULT_SYNC_INTERVAL_MS,
+};
+
 /// Configuration for the disk-backed spool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct SpoolConfig {
     /// Path to the queue file.
     pub path: PathBuf,
@@ -58,6 +63,18 @@ pub struct SpoolConfig {
     /// push, about a millisecond on network storage.
     #[serde(default)]
     pub sync_on_push: bool,
+
+    /// Milliseconds between timed syncs of the spool to disk. 0 turns them off. Default 500.
+    #[serde(default = "default_sync_interval_ms")]
+    pub sync_interval_ms: u64,
+
+    /// Bytes a segment file holds before the next record starts a new one. Default 16 MiB.
+    #[serde(default = "default_segment_bytes")]
+    pub segment_bytes: u64,
+
+    /// Read-ahead buffer, and the most record buffers kept to reuse, in bytes. Default 64 KiB.
+    #[serde(default = "default_read_buffer_bytes")]
+    pub read_buffer_bytes: usize,
 }
 
 // The recovery action enum is shared with the TieredSink cold path.
@@ -65,6 +82,18 @@ pub use crate::spool_codec::CorruptionPolicy;
 
 fn default_compression_level() -> i32 {
     3
+}
+
+fn default_sync_interval_ms() -> u64 {
+    DEFAULT_SYNC_INTERVAL_MS
+}
+
+fn default_segment_bytes() -> u64 {
+    DEFAULT_SEGMENT_BYTES
+}
+
+fn default_read_buffer_bytes() -> usize {
+    DEFAULT_READ_BUFFER_BYTES
 }
 
 impl Default for SpoolConfig {
@@ -78,6 +107,9 @@ impl Default for SpoolConfig {
             crc: false,
             on_corruption: CorruptionPolicy::Quarantine,
             sync_on_push: false,
+            sync_interval_ms: default_sync_interval_ms(),
+            segment_bytes: default_segment_bytes(),
+            read_buffer_bytes: default_read_buffer_bytes(),
         }
     }
 }
@@ -150,6 +182,27 @@ impl SpoolConfig {
         self.sync_on_push = enabled;
         self
     }
+
+    /// Set the time between timed syncs (see [`sync_interval_ms`](Self::sync_interval_ms)).
+    #[must_use]
+    pub fn sync_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.sync_interval_ms = interval_ms;
+        self
+    }
+
+    /// Set the segment size (see [`segment_bytes`](Self::segment_bytes)).
+    #[must_use]
+    pub fn segment_bytes(mut self, bytes: u64) -> Self {
+        self.segment_bytes = bytes;
+        self
+    }
+
+    /// Set the read buffer (see [`read_buffer_bytes`](Self::read_buffer_bytes)).
+    #[must_use]
+    pub fn read_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.read_buffer_bytes = bytes;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +217,9 @@ mod tests {
         assert_eq!(config.compression_level, 3);
         assert!(config.max_items.is_none());
         assert!(config.max_size_bytes.is_none());
+        assert_eq!(config.sync_interval_ms, 500);
+        assert_eq!(config.segment_bytes, 16 << 20);
+        assert_eq!(config.read_buffer_bytes, 64 << 10);
     }
 
     #[test]
@@ -184,12 +240,18 @@ mod tests {
             .compress(true)
             .compression_level(10)
             .max_items(1000)
-            .max_size_bytes(1024 * 1024);
+            .max_size_bytes(1024 * 1024)
+            .sync_interval_ms(0)
+            .segment_bytes(1 << 20)
+            .read_buffer_bytes(8192);
 
         assert!(config.compress);
         assert_eq!(config.compression_level, 10);
         assert_eq!(config.max_items, Some(1000));
         assert_eq!(config.max_size_bytes, Some(1024 * 1024));
+        assert_eq!(config.sync_interval_ms, 0);
+        assert_eq!(config.segment_bytes, 1 << 20);
+        assert_eq!(config.read_buffer_bytes, 8192);
     }
 
     #[test]
