@@ -69,7 +69,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | `transport::filter` | `transport` (the two CEL tiers need `expression`) | 3-tier engine (SIMD field ops / compiled CEL / complex CEL) embedded in every backend |
 | `http_server` | `http-server` | axum-based server serving `/livez`, `/readyz`, `/health/detailed` and `/config`. `/metrics` and `/metrics/manifest` are on the `MetricsManager` listener |
 | `compression` | always (types), `compression` and `compression-snappy` (engines) | `Codec`, `Compression` and `Accepts`, the one `compression` key every surface reads, and the zstd, LZ4, gzip and snappy engines ([compression.md](compression.md)) |
-| `http_client` | `http` | `reqwest`, with retry and backoff from `backon` |
+| `http_client` | `http` | `reqwest`, retried by `backon` on the `scalo::backoff` schedule |
 | `secrets` | `secrets`, `secrets-vault`, `secrets-aws` | `SecretsManager` over the `SecretProvider` trait, with file, OpenBao/Vault and AWS Secrets Manager providers |
 | `directory_config` | `directory-config`, `directory-config-git` | YAML directory store with optional `git2` |
 | `output` | `output-file` | NDJSON file output sink |

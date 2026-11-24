@@ -17,6 +17,9 @@
 //! `Retry-After` header) gets that wait, capped at the schedule's ceiling: a
 //! throttled downstream can legally ask for a day.
 //!
+//! [`Backoff::delays`] is the same schedule as an iterator, the shape a retry
+//! loop such as `backon`'s takes.
+//!
 //! ```
 //! use std::time::Duration;
 //! use scalo::backoff::Backoff;
@@ -28,6 +31,9 @@
 //! // The destination's hint wins, capped at the ceiling.
 //! assert_eq!(schedule.next_delay(3, Some(Duration::from_secs(2))), Duration::from_secs(2));
 //! assert_eq!(schedule.next_delay(3, Some(Duration::from_secs(60))), Duration::from_secs(5));
+//!
+//! // Three retries' waits.
+//! assert_eq!(schedule.delays().take(3).count(), 3);
 //! ```
 
 use std::time::Duration;
@@ -91,11 +97,41 @@ impl Backoff {
             None => self.delay(failures),
         }
     }
+
+    /// The waits after the first, second, third and later consecutive
+    /// failures, without end. `take(n)` bounds it to `n` retries.
+    #[must_use]
+    pub const fn delays(self) -> Delays {
+        Delays {
+            schedule: self,
+            failures: 0,
+        }
+    }
 }
 
-/// The wait for a retry loop that already has a candidate wait, such as a
-/// `backon` schedule's: the destination's `advertised` wait, capped at `max`,
-/// when it gave one, else `candidate`.
+/// The endless iterator of a [`Backoff`]'s waits, from [`Backoff::delays`].
+#[derive(Debug, Clone)]
+pub struct Delays {
+    schedule: Backoff,
+    failures: u32,
+}
+
+impl Iterator for Delays {
+    type Item = Duration;
+
+    fn next(&mut self) -> Option<Duration> {
+        self.failures = self.failures.saturating_add(1);
+        Some(self.schedule.delay(self.failures))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (usize::MAX, None)
+    }
+}
+
+/// The wait for a retry loop that already has a candidate wait, such as one
+/// from [`Backoff::delays`]: the destination's `advertised` wait, capped at
+/// `max`, when it gave one, else `candidate`.
 ///
 /// `None` for `candidate` means the retry budget is spent, and that stands
 /// whatever the destination advertised: a hint paces an attempt the schedule
@@ -179,6 +215,31 @@ mod tests {
         let schedule = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
         let wait = schedule.delay(0);
         assert!(wait >= Duration::from_millis(80) && wait <= Duration::from_millis(120));
+    }
+
+    #[test]
+    fn delays_walk_the_schedule_without_end_until_taken() {
+        let schedule = Backoff::new(Duration::from_millis(100), Duration::from_millis(500));
+        let ms = Duration::from_millis;
+        // (failures, least, most): 100 ms doubling to the 500 ms ceiling, +/-20%.
+        let bands = [
+            (1, ms(80), ms(120)),
+            (2, ms(160), ms(240)),
+            (3, ms(320), ms(480)),
+            (4, ms(400), ms(500)),
+            (1_000, ms(400), ms(500)),
+        ];
+        for (failures, least, most) in bands {
+            let wait = schedule.delays().nth(failures - 1).unwrap_or_default();
+            assert!(
+                wait >= least && wait <= most,
+                "wait {failures} is {wait:?}, outside {least:?}..={most:?}"
+            );
+        }
+        for retries in [0_usize, 1, 3, 1_000] {
+            assert_eq!(schedule.delays().take(retries).count(), retries);
+        }
+        assert_eq!(schedule.delays().size_hint(), (usize::MAX, None));
     }
 
     #[test]

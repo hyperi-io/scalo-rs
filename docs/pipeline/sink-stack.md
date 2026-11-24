@@ -50,11 +50,7 @@ overload should shed requests rather than queue them.
 
 ## Retry and the circuit breaker live outside the stack
 
-Retry/backoff wraps the whole composed service as the OUTERMOST control (driven
-by `backon`), so each retry re-enters at `load-shed` and every attempt is
-independently timeout-bounded. Circuit-breaking is deliberately NOT a layer
-here: the `TieredSink` wraps its sink in a breaker of its own, and a second
-one would double-regulate.
+Retry/backoff wraps the whole composed service as the OUTERMOST control (`backon`'s retry loop on the `scalo::backoff::Backoff` schedule that `SinkStackConfig::backoff()` returns), so each retry re-enters at `load-shed` and every attempt is independently timeout-bounded. Circuit-breaking is deliberately NOT a layer here: the `TieredSink` wraps its sink in a breaker of its own, and a second one would double-regulate.
 
 ```mermaid
 flowchart LR
@@ -113,8 +109,8 @@ Defaults preserve behaviour: no concurrency cap, ARC off, queue-don't-shed.
 | `attempt_timeout_ms` | `30000` | Per-attempt timeout |
 | `load_shed` | `false` | Shed (fail-fast) instead of queueing when the inner service is not ready |
 | `max_retries` | `3` | Retry attempts on transient failure |
-| `min_backoff_ms` | `100` | Exponential backoff floor |
-| `max_backoff_ms` | `30000` | Exponential backoff ceiling |
+| `min_backoff_ms` | `100` | First retry wait, doubled on each retry, +/-20% jitter |
+| `max_backoff_ms` | `30000` | Ceiling no wait passes, a `RetryAfter` included |
 | `rate_limit` | off | Token-bucket admission rate (see `RateLimitConfig`) |
 
 ARC sub-knobs (`adaptive`): `initial_limit` (`10`), `min_limit` (`1`),

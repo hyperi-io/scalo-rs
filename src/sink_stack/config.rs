@@ -10,9 +10,9 @@
 
 use std::time::Duration;
 
-use backon::ExponentialBuilder;
 use serde::{Deserialize, Serialize};
 
+use crate::backoff::Backoff;
 use crate::governor::RateLimitConfig;
 use crate::transport::FromCascade;
 
@@ -117,14 +117,14 @@ impl SinkStackConfig {
         }
     }
 
-    /// Build the jittered exponential backoff schedule from config (the
-    /// `max_times` cap is applied at send time from `max_retries`).
+    /// The retry schedule: `min_backoff_ms` doubling to `max_backoff_ms`,
+    /// +/-20% jitter. The send path takes `max_retries` of its waits.
     #[must_use]
-    pub fn backoff(&self) -> ExponentialBuilder {
-        ExponentialBuilder::new()
-            .with_min_delay(Duration::from_millis(self.min_backoff_ms))
-            .with_max_delay(Duration::from_millis(self.max_backoff_ms))
-            .with_jitter()
+    pub const fn backoff(&self) -> Backoff {
+        Backoff::new(
+            Duration::from_millis(self.min_backoff_ms),
+            Duration::from_millis(self.max_backoff_ms),
+        )
     }
 }
 

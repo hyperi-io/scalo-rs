@@ -1,9 +1,6 @@
 # HTTP client
 
-`HttpClient` is the wrapping `reqwest::Client` you should use for every
-outbound HTTP call from a service. It wires exponential backoff with
-jitter (the `backon` crate) around every request, owns a connection
-pool, emits the request metrics, and reads its config from the cascade.
+`HttpClient` is the wrapping `reqwest::Client` you should use for every outbound HTTP call from a service. It retries every request through `backon`'s retry loop on the `scalo::backoff` schedule, owns a connection pool, emits the request metrics, and reads its config from the cascade.
 
 Use this rather than rolling a `reqwest::Client` per call site -- the
 retry policy, the `Retry-After` handling and the metrics all come with
@@ -34,9 +31,7 @@ transfer, say).
 
 ## What the retry loop gives you
 
-- Retry with exponential backoff and jitter, on the transient set
-  only: 408, 429, 500, 502, 503, 504, plus connect and timeout failures.
-  Any other 4xx returns immediately.
+- Retry on the transient set only: 408, 429, 500, 502, 503, 504, plus connect and timeout failures. Any other 4xx returns immediately. The first wait is `min_retry_interval_ms`, doubled on each retry with +/-20% jitter, and no wait passes `max_retry_interval_ms`.
 - Idempotent methods only by default. GET, HEAD, PUT, DELETE and
   OPTIONS are replayable, and POST and PATCH need
   `retry_non_idempotent: true`, which is for endpoints that dedupe. A

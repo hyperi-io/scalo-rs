@@ -170,6 +170,6 @@ transport:
 
 `SinkStack` waits out a `RetryAfter`, capped at `max_backoff_ms`, and dead-letters a rejected record. A rejected batch names no record, so it sends the batch again one record at a time to find it. A deadline that passes in `send_batch_by` answers `Backpressured`, because the records may or may not have landed.
 
-`scalo::backoff::Backoff` is the schedule the in-tree retry loops use. `next_delay(failures, hint)` takes the destination's wait in place of its own, up to the ceiling, and `parse_retry_after` reads an HTTP `Retry-After` header.
+`scalo::backoff::Backoff` is the schedule the in-tree retry loops use. `next_delay(failures, hint)` takes the destination's wait in place of its own, up to the ceiling, `delays()` yields the waits as an endless iterator for a loop such as `backon`'s, and `parse_retry_after` reads an HTTP `Retry-After` header.
 
 The trait architecture and the factory are in [README.md](README.md), the built-in backends in [backends.md](backends.md), custom routes in [routing.md](routing.md), and retries and dead letters around a sender in [../pipeline/sink-stack.md](../pipeline/sink-stack.md).

@@ -8,7 +8,7 @@
 
 //! Production HTTP client with automatic retries and timeouts.
 //!
-//! Wraps [`reqwest`] with exponential backoff (the `backon` crate) for
+//! Wraps [`reqwest`] in `backon`'s retry loop on the [`Backoff`] schedule for
 //! transient failures (5xx, 429, 408, connect/timeout errors). Permanent
 //! errors (other 4xx) return immediately.
 //!
@@ -77,8 +77,10 @@ pub use signer::{RequestSigner, SignError, Unsigned};
 
 use std::time::Duration;
 
-use backon::{ExponentialBuilder, Retryable};
+use backon::Retryable;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
+
+use crate::backoff::{Backoff, Delays};
 
 /// HTTP client build error.
 #[derive(Debug, thiserror::Error)]
@@ -276,14 +278,15 @@ impl HttpClient {
         Self::new(HttpClientConfig::from_cascade()?)
     }
 
-    /// Exponential backoff schedule from config (jittered to avoid sync'd
-    /// retry storms across many clients hitting the same downstream).
-    fn backoff(&self) -> ExponentialBuilder {
-        ExponentialBuilder::new()
-            .with_min_delay(Duration::from_millis(self.config.min_retry_interval_ms))
-            .with_max_delay(Duration::from_millis(self.config.max_retry_interval_ms))
-            .with_max_times(self.config.max_retries as usize)
-            .with_jitter()
+    /// The `max_retries` waits from config, jittered so clients retrying one
+    /// downstream do not arrive in step.
+    fn backoff(&self) -> std::iter::Take<Delays> {
+        Backoff::new(
+            Duration::from_millis(self.config.min_retry_interval_ms),
+            Duration::from_millis(self.config.max_retry_interval_ms),
+        )
+        .delays()
+        .take(self.config.max_retries as usize)
     }
 
     /// Send a request (built fresh per attempt by `make`), retrying transient
@@ -629,8 +632,10 @@ mod tests {
     async fn build_client_from_default_config() {
         let client = HttpClient::new(HttpClientConfig::default()).unwrap();
         assert_eq!(client.config().max_retries, 3);
-        // The backoff honours config bounds.
-        let _ = client.backoff();
+        // One wait per retry, none past the ceiling.
+        let waits: Vec<Duration> = client.backoff().collect();
+        assert_eq!(waits.len(), 3);
+        assert!(waits.iter().all(|wait| *wait <= Duration::from_secs(30)));
     }
 
     #[test]

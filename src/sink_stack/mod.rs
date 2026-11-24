@@ -41,9 +41,10 @@
 //! Retry/backoff wraps the whole composed service as the OUTERMOST control,
 //! driven by `backon` (a closure-shaped retry loop -- the natural fit, and the
 //! same retry-outermost shape proven elsewhere: each attempt is independently
-//! timeout-bounded). Circuit-breaking is deliberately NOT a layer here: the
-//! `TieredSink` already wraps its sink in its own breaker, and stacking a second
-//! one would double-regulate.
+//! timeout-bounded) on the [`crate::backoff::Backoff`] schedule.
+//! Circuit-breaking is deliberately NOT a layer here: the `TieredSink` already
+//! wraps its sink in its own breaker, and stacking a second one would
+//! double-regulate.
 //!
 //! ## Delivery guarantee (at-least-once preserved)
 //!
@@ -77,10 +78,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use backon::{ExponentialBuilder, Retryable};
+use backon::Retryable;
 use tower::util::BoxCloneService;
 use tower::{BoxError, Layer, Service, ServiceBuilder, ServiceExt};
 
+use crate::backoff::Backoff;
 use crate::governor::RateLimiter;
 use crate::transport::{
     CommitToken, DeadLetter, DeadLetterReason, Record, SendResult, TransportError, TransportSender,
@@ -305,8 +307,7 @@ const UNLIMITED_CONCURRENCY: usize = 1 << 20;
 pub struct SinkStack {
     svc: BoxCloneService<SinkBatch, (), BoxError>,
     screen: Screen,
-    backoff: ExponentialBuilder,
-    max_backoff: Duration,
+    backoff: Backoff,
     max_retries: usize,
 }
 
@@ -369,7 +370,6 @@ impl SinkStack {
             svc,
             screen,
             backoff: cfg.backoff(),
-            max_backoff: Duration::from_millis(cfg.max_backoff_ms),
             max_retries: cfg.max_retries,
         }
     }
@@ -444,9 +444,9 @@ impl SinkStack {
             async move { svc.ready().await?.call(batch).await }
         };
 
-        let max_wait = self.max_backoff;
+        let max_wait = self.backoff.max();
         let result = attempt
-            .retry(self.backoff.with_max_times(self.max_retries))
+            .retry(self.backoff.delays().take(self.max_retries))
             .when(is_transient)
             .adjust(move |e: &BoxError, candidate| {
                 crate::backoff::hinted_delay(asked_wait(e), candidate, max_wait)

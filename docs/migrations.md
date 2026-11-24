@@ -6,6 +6,16 @@ release and the target before bumping.
 
 ---
 
+## 2.14.38
+
+### `SinkStackConfig::backoff()` returns `scalo::backoff::Backoff`, and retries wait +/-20% (API and BEHAVIOUR CHANGE)
+
+`SinkStackConfig::backoff()` returns `scalo::backoff::Backoff` in place of `backon::ExponentialBuilder`. `Backoff::delays()` yields its waits as an endless iterator, which `backon` takes as a schedule, and `SinkStack` and `HttpClient` run `backon`'s retry loop on it.
+
+Each wait was the doubled base plus up to the same again, 1.5x on average, and could pass the ceiling. It is now the doubled base +/-20%, and never passes `max_backoff_ms` or `max_retry_interval_ms`. A `min_backoff_ms` above `max_backoff_ms` waits the ceiling from the first retry.
+
+**Consumer adjustment** -- replace `.backoff().without_max_times().build()` with `.backoff().delays()`, `.with_max_times(n)` with `.delays().take(n)` and `.build().nth(k)` with `.delay(k + 1)`, then drop a direct `backon` dependency kept only to step the schedule. A service that wants its old average wait raises `min_backoff_ms` and `max_backoff_ms`, or `min_retry_interval_ms` and `max_retry_interval_ms`, by half.
+
 ## 2.14.37
 
 ### A syslog sender fails readiness when closed or refused (BEHAVIOUR CHANGE)
