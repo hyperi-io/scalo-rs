@@ -67,7 +67,7 @@ In Jamf Pro, add an Application & Custom Settings payload to a computer-level pr
 
 ## Secrets never come from policy
 
-Group Policy's `Registry.pol` sits in SYSVOL, where every domain user can read it. So the load fails, naming the key, when a key's last segment is `password`, `passwd`, `secret`, `token`, `api_key`, `apikey`, `private_key`, `credential` or `credentials`, or ends `_` and one of them: `kafka.sasl_password`, `client_secret`, `auth.token`. Case doesn't matter. `auth.mode`, `max_tokens` and `partition_key` are allowed. Put the secret in a file the service alone can read and set the key's file-path form instead: a name ending `_file` or `_path`, such as `tls.key_file`, is allowed.
+Group Policy's `Registry.pol` sits in SYSVOL, where every domain user can read it. So the load fails, naming the key, when a key's last segment is `password`, `passwd`, `secret`, `token`, `api_key`, `apikey`, `private_key`, `credential`, `credentials` or `authorization`, or ends `_` and one of them: `kafka.sasl_password`, `client_secret`, `auth.token`. Case doesn't matter. `auth.mode`, `max_tokens` and `partition_key` are allowed. Put the secret in a file the service alone can read and set the key's file-path form instead: a name ending `_file` or `_path`, such as `tls.key_file`, is allowed. The load fails the same way for `auth.key`, any value in a `headers` section, and a URL with a user name or password in it (`http://user:password@proxy:3128`). Those come from a config file or the environment.
 
 ## What it logs
 

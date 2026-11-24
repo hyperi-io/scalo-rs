@@ -212,7 +212,7 @@ fn an_empty_os_store_leaves_extra_roots_trusted() {
             let os_store_alone = VectorCompatTls::default().with_domain("localhost");
             let refused = VectorCompatClient::connect_lazy_tls(&source.endpoint(), 5000, &os_store_alone);
             assert!(
-                matches!(&refused, Err(crate::transport::TransportError::Config(m)) if m.contains("trust store is empty")),
+                matches!(&refused, Err(crate::transport::TransportError::Config(m)) if m.contains("OS root store is empty")),
                 "{:?}",
                 refused.err()
             );

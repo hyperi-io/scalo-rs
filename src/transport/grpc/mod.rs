@@ -1022,10 +1022,20 @@ fn redelivery_reason(status: &tonic::Status) -> Option<&'static str> {
 }
 
 /// The send result for a failed RPC: backpressure while the server is down or
-/// busy or the proxy refused the tunnel, so the caller retries rather than drops.
+/// busy or the proxy refused the tunnel, so the caller retries rather than drops,
+/// and `Fatal(Config)` when TLS refused the server's certificate or name, which
+/// no retry fixes.
 fn failed_rpc_result(status: &tonic::Status, refusals: &Refusals) -> SendResult {
     if let Some(refused) = crate::transport::proxy::refusal(status) {
         return refusals.hold(refused, "grpc");
+    }
+    if let Some(tls) = crate::tls::rustls_error(status) {
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_send_errors_total", "transport" => "grpc").increment(1);
+        tracing::error!(error = %tls, "gRPC: TLS with the server failed");
+        return SendResult::Fatal(TransportError::Config(format!(
+            "gRPC: TLS with the server failed: {tls}"
+        )));
     }
     if downstream_unavailable(status) {
         #[cfg(feature = "metrics")]
@@ -2712,6 +2722,29 @@ mod tests {
             assert!(result.is_ok(), "tls={over_tls}: got {result:?}");
         }
         assert_eq!(server.recv(10).await.unwrap().records.len(), rows.len());
+    }
+
+    /// A server certificate the client does not trust holds the batch as
+    /// `Fatal(Config)` naming the rustls error, never a retry.
+    #[cfg(any(
+        feature = "transport-http",
+        all(feature = "transport-proxy-test-support", unix)
+    ))]
+    #[tokio::test]
+    async fn an_untrusted_server_certificate_holds_the_batch() {
+        use crate::transport::proxy::test_front::tls_front;
+
+        let (server, _) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
+        let (front, _ca) = tls_front(server.local_addr().unwrap(), &[b"h2"]).await;
+        let mut config = GrpcConfig::client(&format!("https://localhost:{}", front.port()));
+        config.tls_enabled = true;
+        config.send_timeout_ms = 5_000;
+        let client = GrpcTransport::new(&config).await.unwrap();
+        let result = client.send("events", filled(8)).await;
+        let SendResult::Fatal(TransportError::Config(text)) = &result else {
+            panic!("got {result:?}");
+        };
+        assert!(text.contains("UnknownIssuer"), "{text}");
     }
 
     /// Record headers, the dedup key among them, reach `recv` from a

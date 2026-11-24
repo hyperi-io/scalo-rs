@@ -255,7 +255,8 @@ pub struct HttpTransportConfig {
     pub max_in_flight_bytes: usize,
 
     /// CA PEM file the send-side HTTPS client trusts, beside the OS store
-    /// under `native` and `platform`, and alone under `bundle`.
+    /// under `native` and `platform`, and alone under `bundle`. The gRPC
+    /// transport's `tls_ca_path` differs: it trusts that CA alone.
     #[serde(default)]
     pub tls_ca_path: Option<String>,
 

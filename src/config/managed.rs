@@ -202,35 +202,61 @@ const SECRET_NAMES: &[&str] = &[
     "private_key",
     "credential",
     "credentials",
+    "authorization",
 ];
 
 /// Refuse a secret: Group Policy's `Registry.pol` sits in SYSVOL, where every
 /// domain user can read it. A name that ends `_file` or `_path` matches none
 /// of [`SECRET_NAMES`], so a path to the secret may come from policy.
+/// `auth.key`, every value in a `headers` section and a URL with a user name
+/// or password in it are refused as well.
 fn refuse_secrets(key: &str, value: &Value) -> Result<(), ConfigError> {
     match value {
         Value::Dict(_, dict) => dict
             .iter()
             .try_for_each(|(name, item)| refuse_secrets(&format!("{key}.{name}"), item)),
         Value::Array(_, items) => items.iter().try_for_each(|item| refuse_secrets(key, item)),
-        _ => {
-            let leaf = key.rsplit('.').next().unwrap_or(key).to_lowercase();
-            let secret = SECRET_NAMES.iter().any(|name| {
-                leaf.strip_suffix(name)
-                    .is_some_and(|head| head.is_empty() || head.ends_with('_'))
-            });
-            if secret {
-                return Err(ConfigError::InvalidValue {
-                    key: key.to_string(),
-                    reason: format!(
-                        "other users can read managed policy, so it can't hold a secret: \
-                         use the key's file-path form, such as {leaf}_file"
-                    ),
-                });
-            }
-            Ok(())
-        }
+        _ => secret_hint(key, value).map_or(Ok(()), |hint| {
+            Err(ConfigError::InvalidValue {
+                key: key.to_string(),
+                reason: format!(
+                    "other users can read managed policy, so it can't hold a secret: {hint}"
+                ),
+            })
+        }),
     }
+}
+
+/// Where the secret in the leaf `key` belongs instead, or `None` for no secret.
+fn secret_hint(key: &str, value: &Value) -> Option<String> {
+    let mut segments = key.rsplit('.').map(str::to_lowercase);
+    let leaf = segments.next().unwrap_or_default();
+    let parent = segments.next().unwrap_or_default();
+    let named = SECRET_NAMES.iter().any(|name| {
+        leaf.strip_suffix(name)
+            .is_some_and(|head| head.is_empty() || head.ends_with('_'))
+    });
+    if named {
+        Some(format!("use the key's file-path form, such as {leaf}_file"))
+    } else if parent == "headers" || (parent == "auth" && leaf == "key") {
+        Some("set it in a config file or the environment".to_string())
+    } else if value.as_str().is_some_and(has_userinfo) {
+        Some(
+            "the URL has a user name or password: set it in a config file or the environment"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Whether `text` is a URL with user info, `scheme://user:password@host`.
+fn has_userinfo(text: &str) -> bool {
+    text.split_once("://").is_some_and(|(_, rest)| {
+        rest.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    })
 }
 
 /// Where a store was read from, and what it holds. `None` when there is none.
@@ -479,9 +505,15 @@ mod tests {
                         "Tls",
                         section(&[("Key_File", text("/k.pem")), ("Password_Path", text("/p"))]),
                     ),
+                    ("Framing", section(&[("Key", text("records"))])),
+                    ("Endpoint", text("https://intake.example:8443/v1?q=a@b")),
+                    ("Contact", text("ops@example.com")),
                 ],
                 json!({"auth": {"mode": "basic"}, "max_tokens": 512, "partition_key": "host",
-                       "verify_cert": true, "tls": {"key_file": "/k.pem", "password_path": "/p"}}),
+                       "verify_cert": true, "tls": {"key_file": "/k.pem", "password_path": "/p"},
+                       "framing": {"key": "records"},
+                       "endpoint": "https://intake.example:8443/v1?q=a@b",
+                       "contact": "ops@example.com"}),
                 vec![],
             ),
         ];
@@ -494,36 +526,91 @@ mod tests {
 
     /// A secret anywhere in the layer fails the read, naming the key.
     #[test]
-    fn a_secret_is_refused_by_name() {
-        let cases: Vec<(&str, Vec<(&str, Raw)>, &str)> = vec![
+    fn a_secret_is_refused() {
+        const FILE: &str = "file-path form";
+        const ELSEWHERE: &str = "config file or the environment";
+        let cases: Vec<(&str, Vec<(&str, Raw)>, &str, &str)> = vec![
             (
                 "a suffix in a section",
                 vec![("Kafka", section(&[("Sasl_Password", text("x"))]))],
                 "kafka.sasl_password",
+                FILE,
             ),
-            ("a whole name", vec![("Api_Key", text("x"))], "api_key"),
+            (
+                "a whole name",
+                vec![("Api_Key", text("x"))],
+                "api_key",
+                FILE,
+            ),
             (
                 "a suffix",
                 vec![("Client_Secret", text("x"))],
                 "client_secret",
+                FILE,
             ),
-            ("an __ name", vec![("Auth__Token", text("x"))], "auth.token"),
+            (
+                "an __ name",
+                vec![("Auth__Token", text("x"))],
+                "auth.token",
+                FILE,
+            ),
             (
                 "inside REG_SZ text",
                 vec![("Outputs", text("[{Private_Key=x}]"))],
                 "outputs.Private_Key",
+                FILE,
             ),
             (
                 "a list",
                 vec![("Credentials", Raw::List(vec![text("x")]))],
                 "credentials",
+                FILE,
+            ),
+            (
+                "an authorization name",
+                vec![("Proxy_Authorization", text("Basic x"))],
+                "proxy_authorization",
+                FILE,
+            ),
+            (
+                "the api_key auth key",
+                vec![("Http__Auth__Key", text("x"))],
+                "http.auth.key",
+                ELSEWHERE,
+            ),
+            (
+                "a header value",
+                vec![(
+                    "Otlp",
+                    section(&[("Headers", section(&[("X-Api-Key", text("x"))]))]),
+                )],
+                "otlp.headers.x-api-key",
+                ELSEWHERE,
+            ),
+            (
+                "a header value inside REG_SZ text",
+                vec![("Http", text("{headers={X-Scope=x}}"))],
+                "http.headers.X-Scope",
+                ELSEWHERE,
+            ),
+            (
+                "a proxy URL with user and password",
+                vec![("Proxy", text("http://u:p@proxy:3128"))],
+                "proxy",
+                "user name or password",
+            ),
+            (
+                "an endpoint with a user only",
+                vec![("Endpoint", text("https://tok@intake.example/v1"))],
+                "endpoint",
+                "user name or password",
             ),
         ];
-        for (name, tree, key) in cases {
+        for (name, tree, key, hint) in cases {
             match mapped(&tree) {
                 Err(ConfigError::InvalidValue { key: got, reason }) => {
                     assert_eq!(got, key, "{name}");
-                    assert!(reason.contains("file-path form"), "{name}: {reason}");
+                    assert!(reason.contains(hint), "{name}: {reason}");
                 }
                 other => panic!("{name}: expected a refusal, got {other:?}"),
             }

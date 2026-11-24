@@ -126,8 +126,8 @@ pub enum TlsError {
 
     /// The resulting trust store has no roots (would trust nothing).
     #[error(
-        "TLS: trust store is empty -- no roots from native/webpki/extra sources \
-         (check `native_roots`/`webpki_roots`/`extra_roots`, or `exclusive` with no files)"
+        "TLS: no trusted root: `trust: bundle` needs a CA file, the OS root store is empty, \
+         or a `TlsTrust` takes no root source"
     )]
     EmptyTrustStore,
 
@@ -463,7 +463,8 @@ pub fn tls_parts(profile: CryptoProfile, trust: &TlsTrust) -> TlsParts {
 #[cfg(any(
     feature = "transport-http",
     feature = "transport-syslog",
-    feature = "transport-otlp"
+    feature = "transport-otlp",
+    feature = "transport-grpc"
 ))]
 pub(crate) fn rustls_error<'a>(
     error: &'a (dyn std::error::Error + 'static),

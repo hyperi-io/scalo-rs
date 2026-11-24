@@ -591,6 +591,11 @@ fn accepted(partial: Option<ExportLogsPartialSuccess>, sent: usize) -> SendResul
 fn grpc_failure(status: &tonic::Status, max_retry_delay: Duration) -> SendResult {
     use tonic::Code;
 
+    if let Some(tls) = crate::tls::rustls_error(status) {
+        return SendResult::Fatal(TransportError::Config(format!(
+            "OTLP gRPC: TLS with the collector failed: {tls}"
+        )));
+    }
     // tonic attaches a source error only when the client's own connection
     // failed or its stream was reset: the collector never answered.
     if std::error::Error::source(status).is_some() {

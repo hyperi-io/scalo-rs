@@ -73,7 +73,8 @@ pub struct GrpcConfig {
     #[serde(default)]
     pub tls_enabled: bool,
     /// CA PEM file, trusted alone when set. Unset with `tls_enabled`, the OS
-    /// native roots are trusted.
+    /// native roots are trusted. The HTTP transport's `tls_ca_path` differs:
+    /// by default it adds the CA beside the OS store.
     #[serde(default)]
     pub tls_ca_path: Option<String>,
     /// Domain name for SNI / certificate verification (overrides the URI host).

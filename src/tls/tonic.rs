@@ -124,7 +124,7 @@ mod tests {
             (
                 "a bundle with no CA",
                 ClientTls::new(TrustChoice::Bundle),
-                "trust store is empty",
+                "needs a CA file",
             ),
             (
                 "a missing CA file",
