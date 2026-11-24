@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.38](https://github.com/hyperi-io/scalo-rs/compare/v2.14.37...v2.14.38) (2026-11-24)
+
+### Bug Fixes
+
+* **backoff:** use Backoff in backon's retry loop ([b52a643](https://github.com/hyperi-io/scalo-rs/commit/b52a643cf427c120f1c391724ce50f3bca077275))
+* **runtime:** move timer loops to PeriodicWorker ([7aec198](https://github.com/hyperi-io/scalo-rs/commit/7aec1984759a67031642805b56c7f75878d41712))
+
 ## [2.14.37](https://github.com/hyperi-io/scalo-rs/compare/v2.14.36...v2.14.37) (2026-11-24)
 
 ### Bug Fixes
