@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.36](https://github.com/hyperi-io/scalo-rs/compare/v2.14.35...v2.14.36) (2026-11-24)
+
+### Bug Fixes
+
+* **compression:** share codec settings and engines ([#562](https://github.com/hyperi-io/scalo-rs/issues/562)) ([a3c8041](https://github.com/hyperi-io/scalo-rs/commit/a3c8041352f3cfcb004a9e9a34b6fa0c296b86b8))
+
 ## [2.14.35](https://github.com/hyperi-io/scalo-rs/compare/v2.14.34...v2.14.35) (2026-11-24)
 
 ### Bug Fixes
