@@ -228,13 +228,13 @@ impl Sender {
     /// Just writes to the internal buffer, but doesn't flush it.
     fn write(&mut self, data: &[u8]) -> io::Result<u64> {
         // Get length of the data and write the header:
-        let len = data.as_ref().len();
+        let len = data.len();
         assert!(len < u64::MAX as usize);
         let header = Header::new(len as u32).encode();
 
         // Write stuff to the file:
         self.file.write_all(&header)?;
-        self.file.write_all(data.as_ref())?;
+        self.file.write_all(data)?;
 
         Ok(4 + len as u64)
     }
