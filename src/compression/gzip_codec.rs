@@ -31,8 +31,9 @@ impl Block {
     /// One gzip member: header, deflate, then CRC-32 and length mod 2^32.
     pub(super) fn compress_into(&mut self, src: &[u8], dst: &mut Vec<u8>) -> io::Result<()> {
         self.deflate.reset();
-        // Deflate grows incompressible input by about 5 bytes per 16 KiB block.
-        let estimate = HEADER.len() + src.len() + src.len() / 1024 + 64;
+        // A quarter of the input fits most records. Incompressible input grows
+        // `dst` as deflate fills it.
+        let estimate = HEADER.len() + src.len() / 4 + 64;
         dst.try_reserve(estimate).map_err(io::Error::other)?;
         dst.extend_from_slice(&HEADER);
         loop {

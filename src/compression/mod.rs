@@ -51,7 +51,7 @@ mod zstd_codec;
 
 #[cfg(feature = "compression")]
 #[cfg_attr(docsrs, doc(cfg(feature = "compression")))]
-pub use engine::{Compressor, Decoder, Encoder};
+pub use engine::{Compressor, CompressorPool, Decoder, Encoder};
 
 /// A compression codec.
 #[non_exhaustive]

@@ -9,6 +9,7 @@
 //! The engines: [`Compressor`] for blocks, [`Encoder`] and [`Decoder`] for streams.
 
 use std::io::{self, Read, Write};
+use std::sync::{Mutex, PoisonError};
 
 use super::{Codec, Compression, CompressionError, gzip_codec, lz4_codec, zstd_codec};
 
@@ -126,6 +127,97 @@ impl Compressor {
 impl std::fmt::Debug for Compressor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Compressor")
+            .field("compression", &self.compression)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Compressors for callers that compress at the same time. Each call takes an
+/// idle one, or makes one when every one is busy, and gives it back, so the
+/// pool holds at most as many as were ever in use at once.
+///
+/// ```
+/// use scalo::compression::{Codec, Compression, CompressorPool};
+///
+/// let pool = CompressorPool::new(Compression::new(Codec::Gzip))?;
+/// let mut packed = Vec::new();
+/// pool.compress_into(b"aaaaaaaaaaaaaaaaaaaaaaaa", &mut packed)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub struct CompressorPool {
+    compression: Compression,
+    idle: Mutex<Vec<Compressor>>,
+}
+
+impl CompressorPool {
+    /// A pool for `compression`, holding one idle compressor.
+    ///
+    /// # Errors
+    ///
+    /// As [`Compressor::new`].
+    pub fn new(compression: Compression) -> Result<Self, CompressionError> {
+        let first = Compressor::new(compression)?;
+        Ok(Self {
+            compression: first.compression(),
+            idle: Mutex::new(vec![first]),
+        })
+    }
+
+    /// The setting it runs.
+    #[must_use]
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
+    /// [`Compressor::compress_into`] on an idle compressor.
+    ///
+    /// # Errors
+    ///
+    /// As [`Compressor::compress_into`].
+    pub fn compress_into(&self, src: &[u8], dst: &mut Vec<u8>) -> io::Result<()> {
+        self.with(|c| c.compress_into(src, dst))
+    }
+
+    /// [`Compressor::decompress_into`] on an idle compressor.
+    ///
+    /// # Errors
+    ///
+    /// As [`Compressor::decompress_into`].
+    pub fn decompress_into(&self, src: &[u8], dst: &mut Vec<u8>, limit: usize) -> io::Result<()> {
+        self.with(|c| c.decompress_into(src, dst, limit))
+    }
+
+    /// Idle compressors, for tests.
+    #[cfg(test)]
+    fn idle(&self) -> usize {
+        self.idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    fn with(&self, run: impl FnOnce(&mut Compressor) -> io::Result<()>) -> io::Result<()> {
+        let taken = self
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let mut compressor = match taken {
+            Some(compressor) => compressor,
+            None => Compressor::new(self.compression).map_err(io::Error::other)?,
+        };
+        let result = run(&mut compressor);
+        self.idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(compressor);
+        result
+    }
+}
+
+impl std::fmt::Debug for CompressorPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompressorPool")
             .field("compression", &self.compression)
             .finish_non_exhaustive()
     }
@@ -328,6 +420,20 @@ mod tests {
         br#"{"host":"web-01","level":"info","msg":"GET /index.html 200"}"#.repeat(64)
     }
 
+    /// Bytes no codec shrinks (xorshift output), so gzip outgrows its first
+    /// reservation.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
     /// Block and stream round trips, for every compiled codec and level edge,
     /// with one reused compressor across sizes.
     #[test]
@@ -342,7 +448,8 @@ mod tests {
                 let compression = Compression { codec, level };
                 let mut compressor = Compressor::new(compression).unwrap();
                 let (mut packed, mut unpacked) = (Vec::new(), Vec::new());
-                for input in [&b""[..], b"x", &data[..], &data[..10]] {
+                let noise = incompressible(70_000);
+                for input in [&b""[..], b"x", &data[..], &noise[..], &data[..10]] {
                     compressor.compress_into(input, &mut packed).unwrap();
                     compressor
                         .decompress_into(&packed, &mut unpacked, input.len())
@@ -417,6 +524,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Overlapping callers each get a compressor, and the pool keeps them all
+    /// for the next calls rather than making one per call.
+    #[test]
+    fn a_pool_reuses_compressors_across_overlapping_calls() {
+        let pool = CompressorPool::new(Compression::new(Codec::Gzip)).unwrap();
+        let data = sample();
+        let mut packed = Vec::new();
+        pool.with(|outer| {
+            pool.compress_into(&data, &mut packed).unwrap();
+            outer.compress_into(&data, &mut Vec::new())
+        })
+        .unwrap();
+        assert_eq!(pool.idle(), 2, "the overlapping call's compressor is kept");
+        for _ in 0..5 {
+            pool.compress_into(&data, &mut packed).unwrap();
+        }
+        assert_eq!(pool.idle(), 2, "serial calls make none");
+        let mut unpacked = Vec::new();
+        pool.decompress_into(&packed, &mut unpacked, data.len())
+            .unwrap();
+        assert_eq!(unpacked, data);
+        assert!(CompressorPool::new(Compression::new(Codec::Gzip).with_level(0)).is_err());
     }
 
     #[test]

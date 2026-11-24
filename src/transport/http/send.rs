@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, TryLockError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
@@ -25,7 +25,7 @@ use reqwest::header::{
 use serde::{Deserialize, Serialize};
 
 use super::{HTTP_ACCEPTS, HttpTransportConfig};
-use crate::compression::{Compression, Compressor};
+use crate::compression::CompressorPool;
 use crate::framing::Framing;
 use crate::sensitive::SensitiveString;
 use crate::transport::error::{TransportError, TransportResult};
@@ -292,10 +292,9 @@ pub(super) struct Sender {
     refusals: Refusals,
     targets: Vec<Target>,
     framing: Arc<dyn Framing>,
-    /// The body codec and its context, kept between bodies. `None` sends as framed.
-    compressor: Option<std::sync::Mutex<Compressor>>,
-    /// The body codec, checked against `HTTP_ACCEPTS`.
-    compression: Compression,
+    /// One body codec context per send compressing at once, kept between
+    /// bodies. `None` sends as framed.
+    compressors: Option<CompressorPool>,
     /// The `Content-Encoding` a compressed body goes with.
     encoding: Option<&'static str>,
     success: Vec<StatusCode>,
@@ -327,12 +326,12 @@ impl Sender {
         let compression = HTTP_ACCEPTS
             .check(config.compression)
             .map_err(|e| TransportError::Config(e.to_string()))?;
-        let compressor = if compression.is_none() {
+        let compressors = if compression.is_none() {
             None
         } else {
-            let compressor =
-                Compressor::new(compression).map_err(|e| TransportError::Config(e.to_string()))?;
-            Some(std::sync::Mutex::new(compressor))
+            let pool = CompressorPool::new(compression)
+                .map_err(|e| TransportError::Config(e.to_string()))?;
+            Some(pool)
         };
         let success = config
             .success_status
@@ -373,9 +372,8 @@ impl Sender {
             refusals: Refusals::default(),
             targets,
             framing,
-            compressor,
+            compressors,
             encoding: (!compression.is_none()).then_some(compression.codec.name()),
-            compression,
             success,
             max_retry_after: Duration::from_millis(config.max_retry_after_ms),
             send_timeout: Duration::from_millis(config.send_timeout_ms),
@@ -426,36 +424,16 @@ impl Sender {
 
     /// The body as sent, compressed when `compression` names a codec.
     fn body(&self, framed: Vec<u8>) -> Result<bytes::Bytes, SendResult> {
-        let Some(shared) = &self.compressor else {
+        let Some(pool) = &self.compressors else {
             return Ok(bytes::Bytes::from(framed));
         };
-        // A concurrent send holding the kept context gets one of its own, so
-        // callers never queue behind each other's compression.
-        let mut own;
-        let mut held;
-        let compressor: &mut Compressor = match shared.try_lock() {
-            Ok(guard) => {
-                held = guard;
-                &mut held
-            }
-            Err(TryLockError::Poisoned(poisoned)) => {
-                held = poisoned.into_inner();
-                &mut held
-            }
-            Err(TryLockError::WouldBlock) => {
-                own = Compressor::new(self.compression)
-                    .map_err(|e| SendResult::Fatal(TransportError::Internal(e.to_string())))?;
-                &mut own
-            }
-        };
         let mut body = Vec::new();
-        compressor
-            .compress_into(&framed, &mut body)
+        pool.compress_into(&framed, &mut body)
             .map(|()| bytes::Bytes::from(body))
             .map_err(|e| {
                 SendResult::Fatal(TransportError::Internal(format!(
                     "HTTP {} of a {}-byte body: {e}",
-                    compressor.compression().codec,
+                    pool.compression().codec,
                     framed.len()
                 )))
             })
