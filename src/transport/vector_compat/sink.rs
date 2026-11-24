@@ -21,14 +21,12 @@ use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::grpc::GrpcConfig;
 use crate::transport::tonic_channel::{self, lazy_channel};
 
-/// The codecs a push to a Vector source takes. tonic applies them and fixes
-/// the level.
-pub const VECTOR_ACCEPTS: Accepts = Accepts::new(
-    "vector_compat.compression",
-    &[Codec::None, Codec::Gzip, Codec::Zstd],
-)
-.without_level()
-.external();
+/// The codecs a push to a Vector source takes: none, gzip, and zstd with the
+/// `compression` feature. tonic applies them and fixes the level.
+pub const VECTOR_ACCEPTS: Accepts =
+    Accepts::new("vector_compat.compression", tonic_channel::TONIC_CODECS)
+        .without_level()
+        .external();
 
 /// Client that sends events to a Vector source via gRPC.
 ///
@@ -267,14 +265,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The client takes none, gzip or zstd with no level, and refuses the rest.
+    /// The client takes none, gzip, or zstd with `compression`, with no level,
+    /// and refuses the rest.
     #[tokio::test]
     async fn with_compression_takes_only_what_tonic_sends() {
         let client = || VectorCompatClient::connect_lazy("http://127.0.0.1:1").unwrap();
         assert_eq!(client().compression, Compression::new(Codec::Gzip));
         for (compression, ok) in [
             (Compression::NONE, true),
-            (Compression::new(Codec::Zstd), true),
+            (Compression::new(Codec::Zstd), cfg!(feature = "compression")),
             (Compression::new(Codec::Lz4), false),
             (Compression::new(Codec::Gzip).with_level(6), false),
         ] {

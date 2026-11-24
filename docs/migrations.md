@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.37
 
+### gRPC zstd needs the `compression` feature (BEHAVIOUR CHANGE)
+
+`transport-grpc` turns on tonic's gzip only, so a gRPC build links the zstd C library only with `compression`. Without it, `transport.grpc.compression: {codec: zstd}` and `VectorCompatClient::with_compression` with zstd fail validation naming `none, gzip`, and gRPC servers, gRPC clients and the OTLP gRPC client read gzip alone.
+
+**Consumer adjustment** -- a service that sends or receives gRPC zstd enables `compression` beside `transport-grpc`.
+
 ### `kafka_config`'s producer profiles name no batching or codec key (BEHAVIOUR CHANGE)
 
 The Kafka profile constants are defined once, in `kafka_config`, and `transport::kafka` re-exports them under its names: `PRODUCTION_PROFILE` is `CONSUMER_PRODUCTION`, `DEVTEST_PROFILE` is `CONSUMER_DEVTEST`, `LOW_LATENCY_CONSUMER_DEFAULTS` is `CONSUMER_LOW_LATENCY` and `PRODUCER_HIGH_THROUGHPUT` is `PRODUCER_PRODUCTION`. Nothing under `transport::kafka` changes value. Three `kafka_config` producer profiles drop the keys the sizing surface owns:

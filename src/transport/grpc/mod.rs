@@ -601,6 +601,21 @@ impl GrpcTransportBuilder<'_> {
     }
 }
 
+/// The native service, reading and answering in every encoding this build
+/// compiles, within `max_message_size` both ways.
+fn native_server(
+    service: TransportServiceImpl,
+    max_message_size: usize,
+) -> proto::transport_server::TransportServer<TransportServiceImpl> {
+    let mut server = proto::transport_server::TransportServer::new(service)
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size);
+    for &encoding in super::tonic_channel::ACCEPTED_ENCODINGS {
+        server = server.accept_compressed(encoding).send_compressed(encoding);
+    }
+    server
+}
+
 /// The lazily connected client for `endpoint`, with the configured TLS,
 /// deadlines and compression.
 fn build_client(
@@ -749,13 +764,7 @@ impl GrpcTransport {
                 pressure: pressure.clone(),
             };
 
-            let transport_server = proto::transport_server::TransportServer::new(transport_svc)
-                .max_decoding_message_size(config.max_message_size)
-                .max_encoding_message_size(config.max_message_size)
-                .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-                .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
-                .send_compressed(tonic::codec::CompressionEncoding::Gzip)
-                .send_compressed(tonic::codec::CompressionEncoding::Zstd);
+            let transport_server = native_server(transport_svc, config.max_message_size);
 
             // Build server with optional Vector compat
             let mut builder = tonic::transport::Server::builder();
@@ -767,14 +776,15 @@ impl GrpcTransport {
                     sequence.clone(),
                     pending.clone(),
                 );
-                let vector_server =
+                let mut vector_server =
                     super::vector_compat::proto::vector::vector_server::VectorServer::new(
                         vector_svc,
                     )
                     .max_decoding_message_size(config.max_message_size)
-                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-                    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
                     .send_compressed(tonic::codec::CompressionEncoding::Gzip);
+                for &encoding in super::tonic_channel::ACCEPTED_ENCODINGS {
+                    vector_server = vector_server.accept_compressed(encoding);
+                }
 
                 // Hand the governor to the Vector-compat pushes, which shed on it
                 // as the native handlers do.
@@ -2301,12 +2311,13 @@ mod tests {
         }
     }
 
-    /// A server with no codec set reads a gzip or zstd client, and a codec
-    /// or a level gRPC does not take fails the build.
+    /// A server with no codec set reads a gzip client, and a zstd one with
+    /// `compression`. A codec or a level the build does not take fails it.
     #[tokio::test]
     async fn each_codec_reaches_a_plain_server_and_others_are_refused() {
         let (server, endpoint) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
-        for codec in [Codec::Gzip, Codec::Zstd] {
+        let zstd = cfg!(feature = "compression").then_some(Codec::Zstd);
+        for codec in std::iter::once(Codec::Gzip).chain(zstd) {
             let client = GrpcTransport::new(
                 &GrpcConfig::client(&endpoint).with_compression(Compression::new(codec)),
             )
@@ -2321,10 +2332,14 @@ mod tests {
         }
         server.close().await.unwrap();
 
+        let no_zstd = (!cfg!(feature = "compression")).then_some(Compression::new(Codec::Zstd));
         for refused in [
             Compression::new(Codec::Lz4),
             Compression::new(Codec::Zstd).with_level(3),
-        ] {
+        ]
+        .into_iter()
+        .chain(no_zstd)
+        {
             let built = GrpcTransport::new(
                 &GrpcConfig::client("http://127.0.0.1:1").with_compression(refused),
             )

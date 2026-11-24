@@ -8,17 +8,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compression::{Accepts, Codec, Compression};
-use crate::transport::tonic_channel::DEFAULT_SEND_TIMEOUT_MS;
+use crate::compression::{Accepts, Compression};
+use crate::transport::tonic_channel::{DEFAULT_SEND_TIMEOUT_MS, TONIC_CODECS};
 
-/// The codecs a gRPC or Vector-compat client sends with. tonic applies them
-/// and fixes the level, so none is taken and scalo's engine is not needed.
-pub const GRPC_ACCEPTS: Accepts = Accepts::new(
-    "transport.grpc.compression",
-    &[Codec::None, Codec::Gzip, Codec::Zstd],
-)
-.without_level()
-.external();
+/// The codecs a gRPC client sends with: none, gzip, and zstd with the
+/// `compression` feature. tonic applies them and fixes the level, so none is
+/// taken and scalo's engine is not needed.
+pub const GRPC_ACCEPTS: Accepts = Accepts::new("transport.grpc.compression", TONIC_CODECS)
+    .without_level()
+    .external();
 
 #[cfg(feature = "config-schema")]
 fn compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -80,7 +78,8 @@ pub struct GrpcConfig {
     pub max_message_size: usize,
 
     /// Codec the client sends requests with: `none` (default), `gzip` or
-    /// `zstd`, with no level. The server reads either on every connection.
+    /// `zstd` with the `compression` feature, with no level. The server reads
+    /// what the build compiles on every connection.
     #[cfg_attr(
         feature = "config-schema",
         schemars(schema_with = "compression_schema")
